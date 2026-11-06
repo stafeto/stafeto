@@ -38,9 +38,15 @@ use rt::{
 const BASE: usize = 0x1000_0000;
 const PAGE: usize = 4096;
 /// The pages of the first chunk of the heap (64 KiB); each chunk is twice
-/// the one before, up to MAX_CHUNK (4 MiB).
+/// the one before, up to MAX_CHUNK (64 MiB): a process with a big quota
+/// needs hundreds of megabytes in fewer chunks than the kernel's table has
+/// places (a sixteenth of what the quota has left keeps a small process from
+/// taking a big chunk it never fills).
 const FIRST_CHUNK: usize = 16;
-const MAX_CHUNK: usize = 1024;
+const MAX_CHUNK: usize = 16_384;
+/// A process with a quota above this (64 MiB, in bytes) may grow its room
+/// from 32 MiB to 1 GiB (`extend_room`); the others keep the small one.
+const BIG_QUOTA: u64 = 64 << 20;
 /// The places of the table kept for objects of the program's own and the
 /// heap's chunks when freed pages lose their access.
 const RESERVE: usize = 16;
@@ -178,6 +184,12 @@ pub fn probe_committed() -> usize {
 #[cfg(feature = "thread-probe")]
 pub fn probe_own_pages() -> usize {
     heap(|state| state.space.count(Page::Own))
+}
+
+/// The pages of the room now (8192, or 262144 once it grew), for the
+/// guest probes.
+pub fn room_pages() -> usize {
+    heap(|state| state.space.pages())
 }
 
 /// Runs `run` holding the heap's lock, for the guest probes.
@@ -676,6 +688,69 @@ impl State {
         Ok(())
     }
 
+    /// A run of `pages` unbacked pages of the room, from the bottom or the
+    /// top; the room grows (`extend_room`) once when it has none.
+    fn find_unbacked(&mut self, pages: usize, from_top: bool) -> Option<usize> {
+        if let Some(at) = self.space.find(pages, Page::Unbacked, from_top) {
+            return Some(at);
+        }
+        self.extend_room().ok()?;
+        self.space.find(pages, Page::Unbacked, from_top)
+    }
+
+    /// The room grows from 32 MiB to 1 GiB for a process with a quota above
+    /// 64 MiB, once. The bitmap of the big room is an object of 16 pages of
+    /// its own, the first pages above the old room: the map holds it like
+    /// any object (a forked child gets it at the same address, with the
+    /// `Space` the copy of the data holds), and its pages are the room's.
+    /// Nothing changes for a process with a smaller quota.
+    fn extend_room(&mut self) -> Result<(), i32> {
+        if self.space.grown() {
+            return Err(ENOMEM);
+        }
+        let quota = sys::process_memory(&config().process)
+            .map_err(|_| ENOMEM)?
+            .quota;
+        if quota <= BIG_QUOTA {
+            return Err(ENOMEM);
+        }
+        if self.room() == 0 || !self.map.has_room_for_object() {
+            return Err(ENOMEM);
+        }
+        let pages = posix_map::space::MAX_BITS_BYTES / PAGE;
+        let address = self.space.limit();
+        self.within_address_space(pages)?;
+        let length = (pages * PAGE) as u64;
+        let memory = sys::mem_create(length).map_err(|_| ENOMEM)?;
+        let kept = sys::handle_duplicate(&memory, KEPT).map_err(|_| ENOMEM)?;
+        drop(memory);
+        sys::mem_map(
+            &config().process,
+            &kept,
+            0,
+            length,
+            address,
+            Access::ReadWrite,
+        )
+        .map_err(|e| self.refused(e))?;
+        self.map
+            .push(
+                address,
+                pages,
+                Access::ReadWrite,
+                0,
+                Object::new(kept, false, None),
+            )
+            .map_err(|_| ENOMEM)?;
+        // SAFETY: the object is new, so its bytes are zeros; the map keeps
+        // it for as long as the process lives (a program that unmaps these
+        // pages by guessing their address breaks its own heap), and the
+        // heap's lock gives this borrow alone.
+        unsafe { self.space.extend(address as *mut u8) };
+        self.space.set(address, pages, Page::Own);
+        Ok(())
+    }
+
     fn grow(&mut self, needed: usize) -> Result<(), i32> {
         // Twice the last chunk, but no more than a sixteenth of what the
         // process's quota has left: a small process does not pay for a big
@@ -688,14 +763,10 @@ impl State {
             .clamp(FIRST_CHUNK, MAX_CHUNK)
             .min(spare)
             .max(needed);
-        let (pages, address) = [wanted, needed]
-            .into_iter()
-            .find_map(|pages| {
-                self.space
-                    .find(pages, Page::Unbacked, false)
-                    .map(|at| (pages, at))
-            })
-            .ok_or(ENOMEM)?;
+        let (pages, address) = match self.find_unbacked(wanted, false) {
+            Some(at) => (wanted, at),
+            None => (needed, self.find_unbacked(needed, false).ok_or(ENOMEM)?),
+        };
         // A chunk the map has no room for is not made: the kernel's limit
         // of mappings is the map's.
         if self.room() == 0 || !self.map.has_room_for_object() {
@@ -786,12 +857,7 @@ impl State {
         let address = match at {
             Some(address) if self.space.all(address, pages, Page::Unbacked) => address,
             Some(_) => return Err(ENOMEM),
-            None => {
-                self.space
-                    .find(pages + guard, Page::Unbacked, true)
-                    .ok_or(ENOMEM)?
-                    + guard * PAGE
-            }
+            None => self.find_unbacked(pages + guard, true).ok_or(ENOMEM)? + guard * PAGE,
         };
         if self.room() == 0 || !self.map.has_room_for_object() {
             return Err(ENOMEM);

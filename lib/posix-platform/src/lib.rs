@@ -1232,12 +1232,12 @@ pub extern "C" fn stafeto_probe_share_map_write(fd: c_int, key: u64) -> c_int {
         &memory,
         0,
         4096,
-        0x3000_0000,
+        posix_abi::process::SPAWN_WINDOW,
         rt::abi::Access::ReadWrite,
     ) {
         Ok(()) => {
             // SAFETY: the mapping was made just now, and nothing uses it.
-            let _ = unsafe { rt::sys::mem_unmap(process, 0x3000_0000, 4096) };
+            let _ = unsafe { rt::sys::mem_unmap(process, posix_abi::process::SPAWN_WINDOW, 4096) };
             0
         }
         Err(_) => 200,
@@ -1298,6 +1298,12 @@ pub unsafe extern "C" fn stafeto_probe_memory_map(out: *mut u64, max: usize) -> 
         }
         map.len()
     })
+}
+
+/// The pages of the layer's room now (posix_abi::allocation::room_pages).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_room_pages() -> u64 {
+    posix_abi::allocation::room_pages() as u64
 }
 
 /// The bytes charged to the process (object_info PROCESS_MEMORY), for the
