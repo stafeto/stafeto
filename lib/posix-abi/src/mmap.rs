@@ -145,6 +145,13 @@ fn load_limits() {
     LIMITS_LOADED.store(true, Ordering::Release);
 }
 
+/// A child of `fork` reads the limits again: its record in the process
+/// service has its own (a place of a grant of quota raises them), and the
+/// values and the quota the parent compared them with are not its.
+pub(crate) fn forget_limits() {
+    LIMITS_LOADED.store(false, Ordering::Release);
+}
+
 /// `setrlimit` of RLIMIT_DATA or RLIMIT_AS (Linux's 2 and 9): the soft
 /// limit the heap's section checks.
 pub(crate) fn set_limit(resource: i32, soft: u64) {

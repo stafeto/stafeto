@@ -955,6 +955,7 @@ fn child() -> Result<(), &'static str> {
     // SAFETY: the child's only thread, before anything else of the layer.
     unsafe {
         crate::allocation::after_fork(process, map).map_err(|_| "its memory map")?;
+        crate::mmap::forget_limits();
         crate::threads::after_fork(thread).map_err(|_| "its thread")?;
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
