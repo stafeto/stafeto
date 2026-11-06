@@ -1224,17 +1224,29 @@ impl Init {
             return Answer::Status(Status::BadSize);
         }
         let rights = Rights::SEND | Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER;
-        let fits = r.handles.len() == 1
-            && matches!(r.handles.info(0), Some((ObjectKind::Channel, got))
-                if got.contains(rights) && !got.contains(Rights::RECEIVE));
+        // One channel, or two: the second is where the first binding of the
+        // record is made (`objects`).
+        let fits = (1..=2).contains(&r.handles.len())
+            && (0..r.handles.len()).all(|i| {
+                matches!(r.handles.info(i), Some((ObjectKind::Channel, got))
+                    if got.contains(rights) && !got.contains(Rights::RECEIVE))
+            });
         let Some(channel) = fits.then(|| r.handles.take::<Channel>(0).ok()).flatten() else {
             return refuse(Error::AccessDenied);
+        };
+        let bound = if r.handles.len() == 2 {
+            match r.handles.take::<Channel>(1) {
+                Ok(bound) => Some(bound),
+                Err(_) => return refuse(Error::AccessDenied),
+            }
+        } else {
+            None
         };
         let mut reply = RegisterReply {
             names: [None; START_NAMES],
         };
         let mut handles = Outgoing::new();
-        if let Err(e) = self.objects(record, &channel, &mut reply, &mut handles) {
+        if let Err(e) = self.objects(record, &channel, bound.as_ref(), &mut reply, &mut handles) {
             return refuse(e);
         }
         if let Err(status) = reply.write(r.reply()) {
@@ -1279,6 +1291,7 @@ impl Init {
         &self,
         record: &Record,
         channel: &Handle<Channel>,
+        bound: Option<&Handle<Channel>>,
         reply: &mut RegisterReply,
         handles: &mut Outgoing,
     ) -> Result<(), Error> {
@@ -1305,6 +1318,16 @@ impl Init {
         // tells its lines apart. The session goes right after; the binding
         // keeps its label.
         for (i, b) in record.bindings.iter().enumerate() {
+            // The first binding of a service that brought a second channel
+            // goes through it, at the record's ceiling: the interrupts of
+            // the line reach a thread of that level on its own.
+            if let (0, Some(bound)) = (i, bound) {
+                let bound = sys::irq_bind(&self.resource, b.line, bound, record.ceiling, b.edge)?;
+                let only = sys::handle_duplicate(&bound, Rights::MANAGE | Rights::TRANSFER)?;
+                drop(bound);
+                let _ = handles.push(only.erase());
+                continue;
+            }
             let session = match table::binding_label(record, i) {
                 Some(label) => Some(sys::handle_label(
                     channel,

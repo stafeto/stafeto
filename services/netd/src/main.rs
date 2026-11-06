@@ -17,6 +17,13 @@
 //! stops the device (Status 0) before it lets the objects of an instance
 //! go.
 //!
+//! The service has two threads (`switch.rs`). The switch thread, one level
+//! above the stack on the CPU of the line, owns the device's transport,
+//! queues, doorbells and binding; the stack thread described below is its
+//! consumer, and they pass the numbers of the device's buffers in rings,
+//! with no copy. The text below tells the steps of the stack as they were
+//! before the split, with the queue of the device replaced by those rings.
+//!
 //! The service never waits for the device. An interrupt (or the service's
 //! own notification STEP, or its timer) starts a step: the used buffers of
 //! sending come back, the stack takes the frames of the loopback and then of
@@ -52,6 +59,7 @@ mod second;
 mod seed;
 mod split;
 mod stack;
+mod switch;
 
 use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
@@ -76,9 +84,8 @@ use second::Second;
 use smoltcp::iface::SocketStorage;
 use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
-use virtio_drivers::transport::{SomeTransport, Transport};
-use virtio_mmio::{Isr, PAGE};
-use virtio_net::barrier::ring;
+use virtio_drivers::transport::SomeTransport;
+use virtio_mmio::PAGE;
 use virtio_net::open::{MAC, MTU, STATUS};
 use virtio_net::transport::{self, Function, OpenError};
 use virtio_net::{OpenFailure, Opened};
@@ -249,6 +256,16 @@ fn main(_: u64) -> u64 {
     let Ok(timer) = sys::timer_create(&view, level) else {
         return NOT_REGISTERED;
     };
+    // The switch thread's channel, one level above the stack's: the line's
+    // interrupts come to it (init binds the first line through it) and the
+    // stack's notifications. The stack's copy with NOTIFY is for the
+    // stack to wake it.
+    let Ok(switch_channel) = sys::channel_create(level + 1) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(wake_switch) = sys::handle_duplicate(&switch_channel, Rights::NOTIFY) else {
+        return NOT_REGISTERED;
+    };
 
     // The key of the stack: its first 8 bytes seed the stack, the next 16
     // are the secret of the choice of ports (RFC 6056), and the rest is
@@ -300,7 +317,7 @@ fn main(_: u64) -> u64 {
         }
     };
 
-    let Ok(mut got) = rt::service::register(&s.parent, &channel) else {
+    let Ok(mut got) = rt::service::register_with(&s.parent, &channel, Some(&switch_channel)) else {
         return NOT_REGISTERED;
     };
     let Ok(irq) = got.take::<Interrupt>("irq") else {
@@ -403,12 +420,9 @@ fn main(_: u64) -> u64 {
         second,
         second_storage,
     } = tables;
-    let mut device = NetDevice::new(RxRing::new(rx_queue), TxRing::new(tx_queue), mac);
-    device.rx.fill();
-    transport.finish_init();
-    ring(&mut transport, RECEIVEQ);
-    device.rx.ring.rung();
+    let mut device = NetDevice::new(RxRing::inner(), TxRing::inner(), mac);
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
+    let switch = switch::Switch::new(transport, rx_queue, tx_queue, irq, switch_channel, link);
     if pci {
         rt::println!(
             "virtio-net: 1af4:1041 at {at:#x}, line {line}, status {status:#x}, mac {}",
@@ -461,20 +475,22 @@ fn main(_: u64) -> u64 {
     let (own, count) = stack.addresses();
     device.set_addresses(&own[..count]);
     device.seed_neighbours();
+    // The switch thread starts now: the stack and its tables are built, and
+    // from here the device is the switch's.
+    let Ok(switch_thread) = switch::start(switch, &s.process, level + 1, (&notify, &wake_switch))
+    else {
+        return NOT_STARTED;
+    };
     let mut driver = Driver {
-        transport,
         device,
         stack,
         net,
-        irq,
         notify,
+        _switch: (switch_thread, wake_switch),
         timer,
         _view: view,
         ping: None,
         mac,
-        link,
-        interrupted: false,
-        line_closed: false,
         second,
         own_said: false,
         told: 0,
@@ -497,8 +513,6 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "probe")]
         hold: false,
         #[cfg(feature = "probe")]
-        held_irq: false,
-        #[cfg(feature = "probe")]
         held_rx: false,
         #[cfg(feature = "probe")]
         held_tx: false,
@@ -517,10 +531,8 @@ fn main(_: u64) -> u64 {
     if driver.stack.lease.is_some() {
         driver.tell(RESOLV);
     }
-    // The line opens once the queues are up; the first step starts the
-    // DHCP client.
-    virtio_mmio::reopen(&driver.irq);
-    driver.rx_step(false);
+    // The first step starts the DHCP client.
+    driver.rx_step();
     driver.tx_step(false);
     driver.rx1_step(false);
     #[cfg(feature = "steps")]
@@ -749,24 +761,19 @@ struct Maps {
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
-    transport: SomeTransport<'static>,
     device: NetDevice,
     stack: Stack<'static>,
     net: &'a mut Net,
-    irq: Handle<Interrupt>,
     /// A copy of the service's channel with NOTIFY: the service tells
-    /// itself a step is due.
+    /// itself a step is due, and the switch tells the stack of frames.
     notify: Handle<Channel>,
+    /// The switch thread (`switch.rs`) and the copy of its channel with
+    /// NOTIFY the stack wakes it with: the service holds them for its life.
+    _switch: (Handle<rt::handle::Thread>, Handle<Channel>),
     timer: Handle<Timer>,
     _view: Handle<Channel>,
     ping: Option<Pending>,
     mac: [u8; 6],
-    link: bool,
-    /// The first interrupt of the device came (and was said once).
-    interrupted: bool,
-    /// The line is closed (the kernel masked it at delivery and the step
-    /// has not opened it yet).
-    line_closed: bool,
     /// The second device, if the record has one.
     second: Option<&'a mut Second>,
     /// The second device said its own interrupt (see `rx1_step`).
@@ -797,8 +804,6 @@ struct Driver<'a> {
     /// meanwhile.
     #[cfg(feature = "probe")]
     hold: bool,
-    #[cfg(feature = "probe")]
-    held_irq: bool,
     /// A step of each kind was asked for while the steps were held.
     #[cfg(feature = "probe")]
     held_rx: bool,
@@ -901,33 +906,25 @@ impl Driver<'_> {
         }
     }
 
-    /// The step of receiving: from the interrupt (`interrupt`: read the
-    /// status first) or the service's own notification. It takes up to
-    /// STEP_RX frames, with the stack's answers to them, and asks for the
+    /// The step of receiving: from the switch's notification or the
+    /// service's own. It takes up to STEP_RX frames the switch passed
+    /// (loopback first), with the stack's answers to them, and asks for the
     /// steps that follow.
-    fn rx_step(&mut self, interrupt: bool) {
+    fn rx_step(&mut self) {
         rt::service::step_own();
         profile::count(Counter::StepRx);
+        // Seen before the ring is looked at: frames the switch passes after
+        // this tell the stack again.
+        switch::INNER
+            .stack_told
+            .store(false, core::sync::atomic::Ordering::Release);
         #[cfg(feature = "probe")]
         if self.hold {
-            self.held_irq |= interrupt;
             self.held_rx = true;
             return;
         }
         let began = split::now();
         split::begin_step();
-        if interrupt {
-            self.line_closed = true;
-            let began = profile::now();
-            let isr = Isr::read(&mut self.transport);
-            profile::timed(Counter::IsrN, Counter::IsrTicks, Counter::IsrMax, began);
-            if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
-                rt::println!("virtio-net: first interrupt");
-            }
-            if isr.config() {
-                self.link_changed();
-            }
-        }
         let now = now_ns();
         self.device.rx.begin_step(Budget::receiving());
         self.device.tx.begin_step(Budget::receiving());
@@ -935,41 +932,15 @@ impl Driver<'_> {
         self.events(now);
         self.finish_step(now);
         rt::service::step_detail(self.device.step_frames() as u64);
-        // Frames the share of the step left in the queue or in the loop:
-        // another step of receiving, with the line closed. A refused
-        // notification opens the line instead: the level brings the
-        // interrupt back for the frames still in the queue.
+        // Frames the share of the step left in the switch's ring or in the
+        // loop: another step of receiving.
         let kernel = split::now();
-        let more = self.device.rx.ring.queue.can_pop()
+        let more = !switch::INNER.rx_ready.is_empty()
             || self.device.looped.waiting() > 0
             || self.device.has_deferred();
         let continued = more && self.tell(RX);
-        // While steps follow, the device is asked for no interrupt (the
-        // line is closed and the steps look at the queue anyway). The run
-        // ends with the interrupts asked for again, a full barrier and one
-        // more look at the queue, so that a frame that came between is not
-        // left to wait (`ring::settle_interrupts`).
-        let continued = {
-            let this = core::cell::RefCell::new(&mut *self);
-            netd::ring::settle_interrupts(
-                continued,
-                || this.borrow_mut().tell(RX),
-                |on| virtio_net::rings::notify_on(&mut this.borrow_mut().device.rx.ring.queue, on),
-                || this.borrow().device.rx.ring.queue.can_pop(),
-            )
-        };
-        if !continued && core::mem::take(&mut self.line_closed) {
-            let began = profile::now();
-            virtio_mmio::reopen(&self.irq);
-            profile::timed(
-                Counter::ReopenN,
-                Counter::ReopenTicks,
-                Counter::ReopenMax,
-                began,
-            );
-        }
         let sending = self.next_steps(now, continued);
-        self.doorbells(continued || sending);
+        self.kick_switch(continued || sending);
         let end = split::now();
         split::record(split::KERNEL, end - kernel);
         let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
@@ -1018,7 +989,7 @@ impl Driver<'_> {
         let kernel = split::now();
         let continued = self.device.looped.waiting() > 0 && self.tell(RX);
         let sending = self.next_steps(now, continued);
-        self.doorbells(continued || sending);
+        self.kick_switch(continued || sending);
         let end = split::now();
         split::record(split::KERNEL, end - kernel);
         let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
@@ -1127,17 +1098,6 @@ impl Driver<'_> {
             second::Returned::Failed => {
                 rt::println!("virtio-net1: the device did not come back");
             }
-        }
-    }
-
-    /// The change of the link (the interrupt's configuration bit).
-    fn link_changed(&mut self) {
-        let Ok((_, up)) = virtio_net::open::read_config(&self.transport) else {
-            return;
-        };
-        if up != self.link {
-            self.link = up;
-            rt::println!("virtio-net: link {}", if up { "up" } else { "down" });
         }
     }
 
@@ -1257,43 +1217,13 @@ impl Driver<'_> {
         }
     }
 
-    /// Rings the doorbell of each queue that got buffers, once for a batch
-    /// of steps: a ring is an exit from the guest and costs far more than
-    /// the frame it announces. The queue of sending rings when the run of
-    /// steps ends (`more` false) or holds `ring::BELL_TX` frames. The queue of
-    /// receiving rings when the buffers the device was shown last run low
-    /// (`virtio_net::rings::RX_LOW`): it reads the ring of available buffers when a frame
-    /// comes, and the 256 buffers outlast a long run of frames. The device
-    /// may ask not to be rung (`should_notify`).
-    fn doorbells(&mut self, more: bool) {
-        let rx = &mut self.device.rx.ring;
-        let wanted = virtio_net::rings::wants_ring(&rx.queue);
-        if rx.stock.due(wanted) {
-            rx.rung();
-            if wanted {
-                let began = profile::now();
-                ring(&mut self.transport, RECEIVEQ);
-                profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
-                profile::count(Counter::BellRx);
-            } else {
-                profile::count(Counter::Skipped);
-            }
-        }
-        let tx = &mut self.device.tx.ring;
-        if tx.pending > 0 {
-            tx.waited += 1;
-        }
-        if netd::ring::tx_bell_due(tx.pending, tx.waited, more) {
-            tx.rung();
-            if virtio_net::rings::wants_ring(&tx.queue) {
-                let began = profile::now();
-                ring(&mut self.transport, TRANSMITQ);
-                profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
-                profile::count(Counter::BellTx);
-            } else {
-                profile::count(Counter::Skipped);
-            }
-        }
+    /// The end of a step: the switch is told when the run of steps is over
+    /// (`more` false) and buffers, frames or a held doorbell wait for it
+    /// (`switch::Inner::kick`). A doorbell is an exit from the guest, so the
+    /// switch rings once for the run, and takes the buffers of receiving back
+    /// then.
+    fn kick_switch(&mut self, more: bool) {
+        switch::INNER.kick(more);
     }
 
     /// Sets the timer for the stack's next work (`next`), the PING's
@@ -1600,12 +1530,8 @@ impl Service<0> for Driver<'_> {
                 profile::count(Counter::Irq);
                 self.rx1_step(true);
             }
-            Source::Interrupt => {
-                profile::count(Counter::Irq);
-                let began = profile::now();
-                self.rx_step(true);
-                profile::add(Counter::StepRxTicks, profile::now().saturating_sub(began));
-            }
+            // The first line's interrupts come to the switch thread.
+            Source::Interrupt => {}
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
@@ -1623,13 +1549,7 @@ impl Service<0> for Driver<'_> {
                 }
                 let began = profile::now();
                 match bit {
-                    RX => {
-                        #[cfg(feature = "probe")]
-                        let irq = core::mem::take(&mut self.held_irq);
-                        #[cfg(not(feature = "probe"))]
-                        let irq = false;
-                        self.rx_step(irq)
-                    }
+                    RX => self.rx_step(),
                     RX1 => {
                         self.rx1_step(false);
                     }

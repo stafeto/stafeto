@@ -15,10 +15,12 @@
 //! a step, the counters and the loopback.
 
 use crate::dma::{Host, net_at};
+use crate::switch;
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::{is_dhcp_client_frame, second_device_takes};
 use netd::profile::{self, Counter};
 use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RECLAIM_STEP, RX_BUFFERS, offset};
+use netd::spsc::{pack, unpack};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
@@ -43,7 +45,7 @@ pub struct Counters {
 /// ends with this code, and init stops the device and starts it again.
 pub const FAILED: u64 = 8;
 
-fn fail(what: &str) -> ! {
+pub(crate) fn fail(what: &str) -> ! {
     rt::println!("virtio-net: {what}");
     rt::sys::process_exit(FAILED)
 }
@@ -61,10 +63,29 @@ unsafe fn buffer_at<'a, const D: usize>(n: u16) -> &'a mut [u8] {
     unsafe { core::slice::from_raw_parts_mut((net_at(D) + offset(n)) as *mut u8, BUFFER_LEN) }
 }
 
+/// Where the frames of a ring of receiving come from.
+#[allow(clippy::large_enum_variant)] // one per ring, built once; the queue lies in it
+enum RxPort<const D: usize> {
+    /// The device's queue, which this thread drives.
+    Wire(virtio_net::RxRing<Host<D>>),
+    /// The switch thread's ring of received frames.
+    Inner,
+}
+
+/// Where the frames of a ring of sending go.
+#[allow(clippy::large_enum_variant)] // one per ring, built once; the queue lies in it
+enum TxPort<const D: usize> {
+    /// The device's queue and the pool of its buffers.
+    Wire(virtio_net::TxRing<Host<D>>),
+    /// The switch thread's rings: buffers come from its supply and the
+    /// frames go to its ring of frames to send.
+    Inner,
+}
+
 /// The ring of receiving (`virtio_net::RxRing`) with the share of the step
 /// and the counters of the service.
 pub struct RxRing<const D: usize = 0> {
-    pub ring: virtio_net::RxRing<Host<D>>,
+    port: RxPort<D>,
     budget: Budget,
     dropped: u64,
     frames: u64,
@@ -73,9 +94,20 @@ pub struct RxRing<const D: usize = 0> {
 }
 
 impl<const D: usize> RxRing<D> {
+    /// The ring over the device's own queue (the second device).
     pub fn new(queue: Queue<D>) -> RxRing<D> {
+        RxRing::with(RxPort::Wire(virtio_net::RxRing::new(queue, net_at(D))))
+    }
+
+    /// The ring over the switch's (`switch.rs`): the frames come from its
+    /// ring of received frames and the buffers go back through its ring.
+    pub fn inner() -> RxRing<D> {
+        RxRing::with(RxPort::Inner)
+    }
+
+    fn with(port: RxPort<D>) -> RxRing<D> {
         RxRing {
-            ring: virtio_net::RxRing::new(queue, net_at(D)),
+            port,
             budget: Budget::new(),
             dropped: 0,
             frames: 0,
@@ -83,16 +115,32 @@ impl<const D: usize> RxRing<D> {
         }
     }
 
-    /// Puts buffer `n` in the queue.
+    /// The device's ring (the second device's; the first device's lies in
+    /// the switch).
+    pub fn wire(&mut self) -> &mut virtio_net::RxRing<Host<D>> {
+        match &mut self.port {
+            RxPort::Wire(ring) => ring,
+            RxPort::Inner => unreachable!("the switch owns the queue"),
+        }
+    }
+
+    /// Puts buffer `n` back: in the queue, or in the switch's ring.
     pub(crate) fn give(&mut self, n: u16) {
-        if let Err(broken) = self.ring.give(n) {
-            fail(broken.text(false));
+        match &mut self.port {
+            RxPort::Wire(ring) => {
+                if let Err(broken) = ring.give(n) {
+                    fail(broken.text(false));
+                }
+            }
+            RxPort::Inner => {
+                let _ = switch::INNER.rx_back.push(u32::from(n));
+            }
         }
     }
 
     /// Fills the queue with every receive buffer, at the start.
     pub fn fill(&mut self) {
-        if let Err(broken) = self.ring.fill(RX_BUFFERS) {
+        if let Err(broken) = self.wire().fill(RX_BUFFERS) {
             fail(broken.text(false));
         }
     }
@@ -113,7 +161,13 @@ impl<const D: usize> RxRing<D> {
 
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub fn counters(&self) -> (u64, u64, u64) {
-        (self.frames, self.dropped, self.martian)
+        match self.port {
+            RxPort::Wire(_) => (self.frames, self.dropped, self.martian),
+            RxPort::Inner => {
+                let (dropped, martian) = switch::INNER.rx_counts();
+                (self.frames, self.dropped + dropped, self.martian + martian)
+            }
+        }
     }
 
     /// Takes the next used buffer: its number and the length of its frame,
@@ -126,10 +180,22 @@ impl<const D: usize> RxRing<D> {
             if self.budget.rx_left() == 0 {
                 return None;
             }
-            let (n, used) = match self.ring.pop() {
-                Ok(Some(popped)) => popped,
-                Ok(None) => return None,
-                Err(broken) => fail(broken.text(false)),
+            let (n, used) = match &mut self.port {
+                RxPort::Wire(ring) => match ring.pop() {
+                    Ok(Some(popped)) => popped,
+                    Ok(None) => return None,
+                    Err(broken) => fail(broken.text(false)),
+                },
+                // The switch took the frame off the queue and checked its
+                // header (`switch::Switch::receive`): the length is the
+                // frame's.
+                RxPort::Inner => {
+                    let word = switch::INNER.rx_ready.pop()?;
+                    let (n, len) = unpack(word);
+                    self.budget.take_rx();
+                    self.frames += 1;
+                    return Some((n, usize::from(len)));
+                }
             };
             self.budget.take_rx();
             // SAFETY: the device returned the buffer (it is used).
@@ -157,7 +223,7 @@ impl<const D: usize> RxRing<D> {
 /// The ring of sending (`virtio_net::TxRing`, with its pool of buffers) with
 /// the share of the step and the counters of the service.
 pub struct TxRing<const D: usize = 0> {
-    pub ring: virtio_net::TxRing<Host<D>>,
+    port: TxPort<D>,
     budget: Budget,
     counters: Counters,
     /// The probe's test of the timers: the next frames of the loopback that
@@ -168,13 +234,31 @@ pub struct TxRing<const D: usize = 0> {
 }
 
 impl<const D: usize> TxRing<D> {
+    /// The ring over the device's own queue (the second device).
     pub fn new(queue: Queue<D>) -> TxRing<D> {
+        TxRing::with(TxPort::Wire(virtio_net::TxRing::new(queue, net_at(D))))
+    }
+
+    /// The ring over the switch's (`switch.rs`).
+    pub fn inner() -> TxRing<D> {
+        TxRing::with(TxPort::Inner)
+    }
+
+    fn with(port: TxPort<D>) -> TxRing<D> {
         TxRing {
-            ring: virtio_net::TxRing::new(queue, net_at(D)),
+            port,
             budget: Budget::new(),
             counters: Counters::default(),
             drop_loop: 0,
             scratch: [0; MAX_FRAME],
+        }
+    }
+
+    /// The device's ring (the second device's).
+    pub fn wire(&mut self) -> &mut virtio_net::TxRing<Host<D>> {
+        match &mut self.port {
+            TxPort::Wire(ring) => ring,
+            TxPort::Inner => unreachable!("the switch owns the queue"),
         }
     }
 
@@ -183,10 +267,39 @@ impl<const D: usize> TxRing<D> {
         self.reclaim();
     }
 
+    /// How many buffers of the pool are free to build a frame in.
+    fn free(&self) -> usize {
+        match &self.port {
+            TxPort::Wire(ring) => ring.book.free(),
+            TxPort::Inner => switch::INNER.supply_len(),
+        }
+    }
+
+    /// Takes a free buffer of the pool. None says the pool is dry, and the
+    /// switch is asked to tell when it has buffers again.
+    fn alloc(&mut self) -> Option<u16> {
+        match &mut self.port {
+            TxPort::Wire(ring) => ring.book.alloc(),
+            TxPort::Inner => switch::INNER.take_supply(),
+        }
+    }
+
+    /// Gives back a buffer that was never sent.
+    fn release(&mut self, n: u16) {
+        match &mut self.port {
+            TxPort::Wire(ring) => {
+                ring.book.release(n);
+            }
+            TxPort::Inner => {
+                let _ = switch::INNER.tx_back.push(u32::from(n));
+            }
+        }
+    }
+
     /// Whether the step may still send a frame: its share is not spent and a
     /// buffer is free.
     pub fn can_send(&self) -> bool {
-        self.budget.tx_left() > 0 && self.ring.book.free() > 0
+        self.budget.tx_left() > 0 && self.free() > 0
     }
 
     /// The frames the step sent.
@@ -196,7 +309,11 @@ impl<const D: usize> TxRing<D> {
 
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub fn counters(&self) -> Counters {
-        self.counters
+        let mut counters = self.counters;
+        if matches!(self.port, TxPort::Inner) {
+            counters.dropped += switch::INNER.tx_dropped();
+        }
+        counters
     }
 
     /// Puts the frame of `len` bytes in buffer `n` (the pool's, after its
@@ -211,20 +328,33 @@ impl<const D: usize> TxRing<D> {
         profile::add(Counter::SumN, 1);
         profile::add(Counter::SumBytes, len as u64);
         let dhcp = is_dhcp_client_frame(frame);
-        match self.ring.submit(n, len) {
-            Ok(Sent::Queued) => {
+        match &mut self.port {
+            TxPort::Wire(ring) => match ring.submit(n, len) {
+                Ok(Sent::Queued) => {
+                    profile::count(Counter::FramesTx);
+                    self.counters.tx += 1;
+                    self.counters.dhcp += u64::from(dhcp);
+                }
+                Ok(Sent::Dropped) => self.counters.dropped += 1,
+                Err(broken) => fail(broken.text(true)),
+            },
+            // The ring holds as many words as there are buffers, and the
+            // pool lent this one.
+            TxPort::Inner => {
+                let _ = switch::INNER.tx_sub.push(pack(n, len as u16));
                 profile::count(Counter::FramesTx);
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);
             }
-            Ok(Sent::Dropped) => self.counters.dropped += 1,
-            Err(broken) => fail(broken.text(true)),
         }
     }
 
-    /// Takes back up to `RECLAIM_STEP` of the buffers the device sent.
+    /// Takes back up to `RECLAIM_STEP` of the buffers the device sent (the
+    /// switch does it for the first device).
     pub fn reclaim(&mut self) {
-        if let Err(broken) = self.ring.reclaim(RECLAIM_STEP) {
+        if let TxPort::Wire(ring) = &mut self.port
+            && let Err(broken) = ring.reclaim(RECLAIM_STEP)
+        {
             fail(broken.text(true));
         }
     }
@@ -441,14 +571,14 @@ impl<const D: usize> NetDevice<D> {
             f[28..32].copy_from_slice(&ip);
             f[32..38].copy_from_slice(&mac);
             f[38..42].copy_from_slice(&ip);
-            let Some(n) = self.tx.ring.book.alloc() else {
+            let Some(n) = self.tx.alloc() else {
                 continue;
             };
             // SAFETY: the buffer is the pool's and the device does not hold it.
             let slice = unsafe { buffer_at::<D>(n) };
             slice[HDR_LEN..HDR_LEN + f.len()].copy_from_slice(&f);
             if !self.looped.push(n, f.len()) {
-                self.tx.ring.book.release(n);
+                self.tx.release(n);
             }
         }
     }
@@ -466,7 +596,7 @@ impl<const D: usize> NetDevice<D> {
             if !self.tx.can_send() || !self.tx.budget.take_tx() {
                 break;
             }
-            let Some(n) = self.tx.ring.book.alloc() else {
+            let Some(n) = self.tx.alloc() else {
                 break;
             };
             let request = frames::arp_request(self.mac, sender, target);
@@ -486,7 +616,7 @@ impl<const D: usize> NetDevice<D> {
             fail("the list of returned buffers of the loop overflowed");
         }
         while let Some(n) = self.looped.take_returned() {
-            self.tx.ring.book.release(n);
+            self.tx.release(n);
         }
     }
 
@@ -586,10 +716,10 @@ impl<const D: usize> TxToken<'_, D> {
     {
         let ring = self.ring;
         while let Some(n) = self.looped.take_returned() {
-            ring.ring.book.release(n);
+            ring.release(n);
         }
         let spare = len <= MAX_FRAME && ring.budget.take_tx();
-        let n = if spare { ring.ring.book.alloc() } else { None };
+        let n = if spare { ring.alloc() } else { None };
         let Some(n) = n else {
             // No buffer or no share of the step left: the stack builds the
             // frame where it harms nothing, and the protocol repeats it
@@ -606,17 +736,17 @@ impl<const D: usize> TxToken<'_, D> {
             // The frame stays inside, in its buffer, for the next reception.
             if ring.drop_loop > 0 {
                 ring.drop_loop -= 1;
-                ring.ring.book.release(n);
+                ring.release(n);
                 return (result, false);
             }
             if !self.looped.push(n, len) {
                 ring.counters.dropped += 1;
-                ring.ring.book.release(n);
+                ring.release(n);
             }
             return (result, false);
         }
         if frames::martian(frame) {
-            ring.ring.book.release(n);
+            ring.release(n);
             ring.counters.martian += 1;
             return (result, false);
         }
@@ -664,10 +794,7 @@ impl<const D: usize> phy::Device for NetDevice<D> {
         // A frame of the loop that finds no place is lost, and a lost segment
         // of TCP costs a second of the retransmission timer: the frame of
         // sending waits for the step in which the loop has room.
-        if self.tx.budget.tx_left() == 0
-            || self.tx.ring.book.free() == 0
-            || !self.looped.room_to_send()
-        {
+        if self.tx.budget.tx_left() == 0 || self.tx.free() == 0 || !self.looped.room_to_send() {
             return None;
         }
         Some(TxToken {
