@@ -2077,6 +2077,10 @@ static int big_ok(const char *fixed) {
 static void big(void) {
     check("big: a room of 8192 pages before the first need", stafeto_probe_room_pages() == 8192);
     check("big: the quota is above 64 MiB", stafeto_probe_memory_quota() > (64UL << 20));
+    struct rlimit data, space;
+    check("big: the limits of a holder show its place",
+          getrlimit(RLIMIT_DATA, &data) == 0 && getrlimit(RLIMIT_AS, &space) == 0 &&
+              data.rlim_cur == (256UL << 20) && space.rlim_cur == (256UL << 20));
     size_t made = 0;
     for (; made < BIG_SMALL; made++) {
         big_page[made] = anon(PAGE, PROT_READ | PROT_WRITE);
@@ -2178,9 +2182,9 @@ static int quota_of_fork_child(void) {
     return WEXITSTATUS(status);
 }
 
-/* A process that runs a file and asks for the quota of its fork child. */
-static int ask_child(const char *path) {
-    char *args[] = {"map", "quotafork", NULL};
+/* A process that runs a file with a role and returns its exit code. */
+static int run_role(const char *path, const char *role) {
+    char *args[] = {"map", (char *)role, NULL};
     pid_t child;
     int status = 0;
     if (posix_spawn(&child, path, NULL, NULL, args, environ)) return -1;
@@ -2188,14 +2192,61 @@ static int ask_child(const char *path) {
     return WEXITSTATUS(status);
 }
 
-/* The grant of the process service goes to the child of fork of the file
- * of the layer the grant is pinned to, and to no copy of it (#598). */
+static int ask_child(const char *path) { return run_role(path, "quotafork"); }
+
+/* Three generations of fork below the program (the grant has depth 2): the
+ * first child A and its child B hold the places, A ends, and B's child C
+ * is the third generation, which has the quota of a command though a place
+ * is free. C tells its quota to the program through a pipe. */
+static int deep(void) {
+    int up[2], gone[2];
+    if (pipe(up) || pipe(gone)) return 2;
+    pid_t a = fork();
+    if (a < 0) return 2;
+    if (a == 0) {
+        pid_t b = fork();
+        if (b < 0) _exit(2);
+        if (b == 0) {
+            char byte;
+            close(gone[1]);
+            /* Wait until A has ended: its place is free. */
+            if (read(gone[0], &byte, 1) != 0) _exit(2);
+            int own = stafeto_probe_memory_quota() > (64UL << 20);
+            pid_t c = fork();
+            if (c < 0) _exit(3);
+            if (c == 0) {
+                byte = stafeto_probe_memory_quota() > (64UL << 20) ? '1' : '0';
+                _exit(write(up[1], &byte, 1) == 1 ? 0 : 4);
+            }
+            int status = 0;
+            waitpid(c, &status, 0);
+            _exit(own ? 0 : 5);
+        }
+        _exit(0);
+    }
+    close(gone[1]);
+    close(up[1]);
+    int status = 0;
+    if (waitpid(a, &status, 0) != a) return 2;
+    char byte = 0;
+    if (read(up[0], &byte, 1) != 1) return 2;
+    return byte == '0' ? 0 : 1;
+}
+
+/* The grant of quota goes to the children of fork of the program the grant
+ * names, opened by that exact path, and to no copy of it, no link to it and
+ * no process of any user in particular (#598, K5). */
 static int bigrun(void) {
     check("grant: this process has the quota of a command", stafeto_probe_memory_quota() <= (64UL << 20));
-    check("grant: the fork child of the file of the layer has the grant", ask_child("/bin/procs-child") == 1);
-    check("grant: a copy of the file has none", copy_file("/bin/procs-child", "/tmp/procs-copy") == 0 && chmod("/tmp/procs-copy", 0755) == 0);
-    check("grant: the fork child of the copy has the quota of a command", ask_child("/tmp/procs-copy") == 0);
-    unlink("/tmp/procs-copy");
+    check("grant: the fork child of the file has the grant", ask_child("/bin/procs-child") == 1);
+    check("grant: a copy under the same last name has none",
+          copy_file("/bin/procs-child", "/tmp/procs-child") == 0 && chmod("/tmp/procs-child", 0755) == 0 &&
+              ask_child("/tmp/procs-child") == 0);
+    check("grant: a link to the file has none",
+          symlink("/bin/procs-child", "/tmp/procs-link") == 0 && ask_child("/tmp/procs-link") == 0);
+    unlink("/tmp/procs-child");
+    unlink("/tmp/procs-link");
+    check("grant: the third generation has the quota of a command", run_role("/bin/procs-child", "deep") == 0);
     pid_t child = fork();
     if (child < 0) { printf("posix-map: big: fork failed with %d\n", errno); return 1; }
     if (child == 0) {
@@ -2205,6 +2256,8 @@ static int bigrun(void) {
     int status = 0;
     check("big: waitpid of the granted child", waitpid(child, &status, 0) == child);
     check("big: the granted child passed", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* The user plays no part: nobody's program gets the grant as root's did. */
+    check("grant: a program of nobody's has it", setuid(65534) == 0 && ask_child("/bin/procs-child") == 1);
     if (failures) {
         printf("posix-map: big: %d failures\n", failures);
         return 1;
@@ -2217,6 +2270,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "noop") == 0) return 0;
     if (argc == 2 && strcmp(argv[1], "bigrun") == 0) return bigrun();
     if (argc == 2 && strcmp(argv[1], "quotafork") == 0) return quota_of_fork_child();
+    if (argc == 2 && strcmp(argv[1], "deep") == 0) return deep();
     if (argc == 2 && strcmp(argv[1], "big") == 0) {
         /* fork needs a program the process service started, and the child
          * has the quota of the launcher. */
