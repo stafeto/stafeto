@@ -2048,7 +2048,253 @@ static void foreign_processes(void) {
     shm_unlink(name);
 }
 
+
+/* The big room (#598): a process with a quota above 64 MiB maps hundreds of
+ * megabytes a page at a time, within the 128 places of the kernel's table,
+ * in a room that grew to 1 GiB; its objects lie above the old room, and
+ * fork and posix_spawn still work with a mapping at the old window. */
+extern uint64_t stafeto_probe_room_pages(void);
+extern size_t stafeto_probe_memory_map(uint64_t *out, size_t max);
+
+#define BIG_SMALL 48000UL
+#define BIG_OBJECTS 2
+#define BIG_OBJECT (16UL << 20)
+#define OLD_WINDOW ((void *)0x30000000UL)
+static char *big_page[BIG_SMALL];
+static char *big_object[BIG_OBJECTS];
+
+static uint8_t big_byte(size_t i) { return (uint8_t)(i * 167 + 13); }
+
+static int big_ok(const char *fixed) {
+    for (size_t i = 0; i < BIG_SMALL; i++)
+        if (*(volatile uint8_t *)big_page[i] != big_byte(i)) return 1;
+    for (int o = 0; o < BIG_OBJECTS; o++)
+        if (big_object[o][0] != (char)(o + 1) || big_object[o][BIG_OBJECT - 1] != (char)(o + 101)) return 2;
+    if (*fixed != 77) return 3;
+    return 0;
+}
+
+static void big(void) {
+    check("big: a room of 8192 pages before the first need", stafeto_probe_room_pages() == 8192);
+    check("big: the quota is above 64 MiB", stafeto_probe_memory_quota() > (64UL << 20));
+    struct rlimit data, space;
+    check("big: the limits of a holder show its place",
+          getrlimit(RLIMIT_DATA, &data) == 0 && getrlimit(RLIMIT_AS, &space) == 0 &&
+              data.rlim_cur == (256UL << 20) && space.rlim_cur == (256UL << 20));
+    size_t made = 0;
+    for (; made < BIG_SMALL; made++) {
+        big_page[made] = anon(PAGE, PROT_READ | PROT_WRITE);
+        if (!big_page[made]) break;
+        *(volatile uint8_t *)big_page[made] = big_byte(made);
+    }
+    check("big: 48000 pages of 4 KiB", made == BIG_SMALL);
+    if (made != BIG_SMALL) return;
+    check("big: the room grew to 262144 pages", stafeto_probe_room_pages() == 262144);
+    for (int o = 0; o < BIG_OBJECTS; o++) {
+        big_object[o] = anon(BIG_OBJECT, PROT_READ | PROT_WRITE);
+        check("big: an object of 16 MiB", big_object[o] != NULL);
+        if (!big_object[o]) return;
+        big_object[o][0] = (char)(o + 1);
+        big_object[o][BIG_OBJECT - 1] = (char)(o + 101);
+        check("big: the object lies above the old room", (uintptr_t)big_object[o] >= 0x30000000UL);
+    }
+    size_t places = stafeto_probe_memory_map(NULL, 0);
+    printf("posix-map: big: %zu places of the table\n", places);
+    check("big: at most 44 places of the table", places <= 44);
+    char *fixed = mmap(OLD_WINDOW, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    check("big: a page at the old window of posix_spawn", fixed == OLD_WINDOW);
+    if (fixed != OLD_WINDOW) return;
+    *fixed = 77;
+    int hold[2];
+    check("big: a pipe", pipe(hold) == 0);
+    pid_t child = fork();
+    if (child < 0) { printf("posix-map: big: fork failed with %d\n", errno); failures++; return; }
+    if (child == 0) {
+        char byte;
+        int bad = big_ok(fixed);
+        /* Keep the second place until the parent lets go. */
+        if (read(hold[0], &byte, 1) != 1) bad |= 64;
+        _exit(bad);
+    }
+    /* Both places of the grant are held (this process and its child): a
+     * third child has the quota of a command and cannot hold a copy. */
+    pid_t third = fork();
+    check("big: no third place of the grant", third < 0 && errno == ENOMEM);
+    if (third == 0) _exit(0);
+    char go = 'x';
+    check("big: the second place is let go", write(hold[1], &go, 1) == 1);
+    int status = 0;
+    check("big: waitpid of the fork", waitpid(child, &status, 0) == child);
+    check("big: the child of fork saw all the pages", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: big: fork child bits %d\n", WEXITSTATUS(status));
+    char *args[] = {"map", "noop", NULL};
+    int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+    check("big: posix_spawn with a page at its old window", error == 0);
+    if (!error) {
+        check("big: waitpid of the spawn", waitpid(child, &status, 0) == child);
+        check("big: the spawned child ran", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    check("big: the parent's pages are whole", big_ok(fixed) == 0);
+    for (size_t i = 0; i < BIG_SMALL; i++) munmap(big_page[i], PAGE);
+    for (int o = 0; o < BIG_OBJECTS; o++) munmap(big_object[o], BIG_OBJECT);
+    munmap(fixed, PAGE);
+}
+
+/* A process with the quota of a command keeps the small room. */
+static void *park_thread(void *arg) {
+    char byte;
+    return read(*(int *)arg, &byte, 1) == 1 ? NULL : arg;
+}
+
+static void small_room(void) {
+    /* The guard of a stack is a hole of the room that costs no memory: two
+     * guards of 30 MiB do not fit the room of 8192 pages (32 MiB). The room
+     * would grow if the quota allowed it; a process with the quota of a
+     * command is refused the second thread and keeps the small room. */
+    int fds[2];
+    pthread_attr_t attr;
+    pthread_t first, second;
+    check("small: a pipe", pipe(fds) == 0);
+    pthread_attr_init(&attr);
+    pthread_attr_setguardsize(&attr, 30UL << 20);
+    int one = pthread_create(&first, &attr, park_thread, &fds[0]);
+    check("small: a thread with a guard of 30 MiB", one == 0);
+    int two = pthread_create(&second, &attr, park_thread, &fds[0]);
+    check("small: the second guard of 30 MiB is refused", two != 0);
+    check("small: the room stays 8192 pages", stafeto_probe_room_pages() == 8192);
+    char byte = 'x';
+    if (one == 0 && write(fds[1], &byte, 1) == 1) pthread_join(first, NULL);
+    if (two == 0 && write(fds[1], &byte, 1) == 1) pthread_join(second, NULL);
+    pthread_attr_destroy(&attr);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* The quota of the child of a fork of this process: 1 when it has the
+ * grant of the process service (above 64 MiB), 0 otherwise. */
+static int quota_of_fork_child(void) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) _exit(stafeto_probe_memory_quota() > (64UL << 20) ? 1 : 0);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+/* A process that runs a file with a role and returns its exit code. */
+static int run_role(const char *path, const char *role) {
+    char *args[] = {"map", (char *)role, NULL};
+    pid_t child;
+    int status = 0;
+    if (posix_spawn(&child, path, NULL, NULL, args, environ)) return -1;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static int ask_child(const char *path) { return run_role(path, "quotafork"); }
+
+/* Three generations of fork below the program (the grant has depth 2): the
+ * first child A and its child B hold the places, A ends, and B's child C
+ * is the third generation, which has the quota of a command though a place
+ * is free. C tells its quota to the program through a pipe. */
+static int deep(void) {
+    int up[2], gone[2];
+    if (pipe(up) || pipe(gone)) return 2;
+    pid_t a = fork();
+    if (a < 0) return 2;
+    if (a == 0) {
+        pid_t b = fork();
+        if (b < 0) _exit(2);
+        if (b == 0) {
+            char byte;
+            close(gone[1]);
+            /* Wait until A has ended: its place is free. */
+            if (read(gone[0], &byte, 1) != 0) _exit(2);
+            int own = stafeto_probe_memory_quota() > (64UL << 20);
+            pid_t c = fork();
+            if (c < 0) _exit(3);
+            if (c == 0) {
+                byte = stafeto_probe_memory_quota() > (64UL << 20) ? '1' : '0';
+                _exit(write(up[1], &byte, 1) == 1 ? 0 : 4);
+            }
+            int status = 0;
+            waitpid(c, &status, 0);
+            _exit(own ? 0 : 5);
+        }
+        _exit(0);
+    }
+    close(gone[1]);
+    close(up[1]);
+    int status = 0;
+    if (waitpid(a, &status, 0) != a) return 2;
+    char byte = 0;
+    if (read(up[0], &byte, 1) != 1) return 2;
+    return byte == '0' ? 0 : 1;
+}
+
+/* The grant of quota goes to the children of fork of the program the grant
+ * names, opened by that exact path, and to no copy of it, no link to it and
+ * no process of any user in particular (#598, K5). */
+static int bigrun(void) {
+    check("grant: this process has the quota of a command", stafeto_probe_memory_quota() <= (64UL << 20));
+    check("grant: the fork child of the file has the grant", ask_child("/bin/procs-child") == 1);
+    check("grant: a copy under the same last name has none",
+          copy_file("/bin/procs-child", "/tmp/procs-child") == 0 && chmod("/tmp/procs-child", 0755) == 0 &&
+              ask_child("/tmp/procs-child") == 0);
+    check("grant: a link to the file has none",
+          symlink("/bin/procs-child", "/tmp/procs-link") == 0 && ask_child("/tmp/procs-link") == 0);
+    unlink("/tmp/procs-child");
+    unlink("/tmp/procs-link");
+    check("grant: a hard link to the file has none",
+          link("/bin/procs-child", "/tmp/procs-hard") == 0 && ask_child("/tmp/procs-hard") == 0);
+    unlink("/tmp/procs-hard");
+    /* The second line names /tmp/procs-mode: the loader gives the path to the
+     * service only for a file of UID 0 that the group and the others
+     * cannot write, so the mode and the owner decide here. */
+    const char *mode_path = "/tmp/procs-mode";
+    check("grant: a copy for the second line", copy_file("/bin/procs-child", mode_path) == 0);
+    check("grant: mode 0775 has none", chmod(mode_path, 0775) == 0 && ask_child(mode_path) == 0);
+    check("grant: mode 0757 has none", chmod(mode_path, 0757) == 0 && ask_child(mode_path) == 0);
+    check("grant: a file of nobody's has none",
+          chmod(mode_path, 0755) == 0 && chown(mode_path, 65534, 65534) == 0 && ask_child(mode_path) == 0);
+    check("grant: mode 0755 of UID 0 has it",
+          chown(mode_path, 0, 0) == 0 && chmod(mode_path, 0755) == 0 && ask_child(mode_path) == 1);
+    unlink(mode_path);
+    check("grant: the third generation has the quota of a command", run_role("/bin/procs-child", "deep") == 0);
+    pid_t child = fork();
+    if (child < 0) { printf("posix-map: big: fork failed with %d\n", errno); return 1; }
+    if (child == 0) {
+        big();
+        _exit(failures != 0);
+    }
+    int status = 0;
+    check("big: waitpid of the granted child", waitpid(child, &status, 0) == child);
+    check("big: the granted child passed", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* The user plays no part: nobody's program gets the grant as root's did. */
+    check("grant: a program of nobody's has it", setuid(65534) == 0 && ask_child("/bin/procs-child") == 1);
+    if (failures) {
+        printf("posix-map: big: %d failures\n", failures);
+        return 1;
+    }
+    printf("posix-map: big room ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "noop") == 0) return 0;
+    if (argc == 2 && strcmp(argv[1], "bigrun") == 0) return bigrun();
+    if (argc == 2 && strcmp(argv[1], "quotafork") == 0) return quota_of_fork_child();
+    if (argc == 2 && strcmp(argv[1], "deep") == 0) return deep();
+    if (argc == 2 && strcmp(argv[1], "big") == 0) {
+        /* fork needs a program the process service started, and the child
+         * has the quota of the launcher. */
+        char *args[] = {"map", "bigrun", NULL};
+        pid_t child;
+        int status = 0;
+        if (posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ)) return 1;
+        return waitpid(child, &status, 0) == child && WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
     if (argc == 6 && strcmp(argv[1], "role") == 0)
         return role(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]));
     if (argc == 3 && strcmp(argv[1], "intruder") == 0) return intruder(argv[2]);
@@ -2113,6 +2359,7 @@ int main(int argc, char **argv) {
     rights();
     limits();
     image_race();
+    small_room();
     if (failures) {
         printf("posix-map: %d failures\n", failures);
         return 1;

@@ -67,7 +67,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -1137,7 +1137,7 @@ pub const REGIONS_MAX: usize = abi::MAX_MAPPINGS as usize;
 /// u32 and the flags u32 (`REGION_SHARED`, `REGION_IMAGE`).
 pub const REGION: usize = 24;
 /// The heap of the POSIX layer, where the chunks of its map lie.
-pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x2000_0000;
+pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x5000_0000;
 /// The rooms of a program's layout a region of a copy lies in, each whole
 /// in one: the segments, libc.so, the layer's heap, the start area and the main
 /// stack. The loader's region, the page of the record, the clock's page
@@ -2306,19 +2306,29 @@ mod tests {
             region(0x22_1000, 1, ReadWrite),               // meets the data
             region(0x1000_8000, 4, ReadWrite),             // inside a chunk
             region(0x0FFF_F000, 2, ReadWrite),             // across the heap's edge
+            region(0x4FFF_F000, 2, ReadWrite),             // across its far edge, 1 GiB on
             region(LOADER_BASE, 1, Read),                  // the loader's region
             region(LOADER_BASE + (8 << 20), 1, ReadWrite), // its window
             region(0x0D00_0000, 1, ReadWrite),             // the page of the record
             region(0x0E00_0000, 1, Read),                  // the clock's page
             region(0x0200_0000, 1, ReadWrite),             // a buffer of a thread
             region(abi::INIT_MSGBUF, 1, ReadWrite),        // the main buffer
-            region(0x3000_0000, 1, ReadWrite),             // the window of spawn
+            region(0x6000_0000, 1, ReadWrite),             // the window of spawn
             region(0x1F_F800, 1, ReadWrite),               // off a page
             region(0x1F00_0000, u32::MAX, ReadWrite),      // past the heap
             region(!0xFFF, 2, ReadWrite),                  // wraps
         ];
         for r in refused {
             assert_eq!(admit(&held, &r), Err(Status::BadSize), "{r:?}");
+        }
+        // The heap's room is the 1 GiB of a process with a big quota: the
+        // objects the layer puts at the top of it are copied too.
+        for r in [
+            region(0x3000_0000, 1, ReadWrite),
+            region(0x4C00_0000, 4096, ReadWrite),
+            region(0x4FFF_F000, 1, ReadWrite),
+        ] {
+            assert_eq!(admit(&held, &r), Ok(()), "{r:?}");
         }
         let mut full: Vec<_> = (0..REGIONS_MAX as u64)
             .map(|i| region(0x1000_0000 + i * 0x1000, 1, ReadWrite))

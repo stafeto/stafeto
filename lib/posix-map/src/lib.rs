@@ -245,6 +245,11 @@ pub enum Kind {
     /// stay until the process ends; `fork` and `exec` are refused while
     /// the map has one.
     Fast,
+    /// The bitmap of a room that grew (`space::Space::extend`): `munmap`,
+    /// `mprotect` and `MAP_FIXED` refuse it as they refuse the others, and
+    /// `fork` copies it, since the child's copy of the room's states
+    /// points at it.
+    RoomMap,
 }
 
 /// Why a map refused a change.
@@ -499,8 +504,10 @@ impl<H> Map<H> {
     /// The pieces a forked child gets: all but the layer's own (the display piece, the network
     /// buffer piece and the file buffer piece).
     pub fn inherited(&self) -> impl Iterator<Item = &Piece> {
-        self.iter()
-            .filter(|piece| !self.object(piece.object()).special())
+        self.iter().filter(|piece| {
+            let object = self.object(piece.object());
+            !object.special() || object.kind == Kind::RoomMap
+        })
     }
 
     /// The first address and the pages of the piece of `kind` (Display, NetBuffer or
@@ -1188,5 +1195,32 @@ mod tests {
             Some(9)
         );
         let _ = again;
+    }
+
+    #[test]
+    fn the_bitmap_of_a_grown_room_is_refused_to_the_program_and_copied_by_fork() {
+        let mut map: Map<u32> = Map::new();
+        let mut object = object(7, 16);
+        object.kind = Kind::RoomMap;
+        map.push(0x1200_0000, 16, Access::ReadWrite, 0, object)
+            .unwrap();
+        map.push(
+            0x1000_0000,
+            4,
+            Access::ReadWrite,
+            0,
+            super::tests::object(8, 4),
+        )
+        .unwrap();
+        assert!(map.meets_special(0x1200_0000, 1));
+        assert!(map.meets_special(0x11FF_F000, 2));
+        let at = map.find(0x1200_0000).unwrap();
+        assert_eq!(
+            map.protect(at, 0x1200_0000, 16, Access::None),
+            Err(Refused::Special)
+        );
+        assert_eq!(map.unmap(at, 0x1200_0000, 16).err(), Some(Refused::Special));
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x1200_0000]);
     }
 }

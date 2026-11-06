@@ -670,7 +670,18 @@ pub fn probe_no_pipes_session(on: bool) {
 
 /// The window where the layer writes the block of a spawn (5c); one
 /// spawn of the process writes there at a time (SPAWN_LOCK).
-const SPAWN_WINDOW: usize = 0x3000_0000;
+pub const SPAWN_WINDOW: usize = 0x6000_0000;
+// The window lies in none of the rooms of a program's layout, so that no
+// mapping of the program or of the layer can meet it, and a forked child's
+// copy never holds it.
+const _: () = {
+    let mut room = 0;
+    while room < proto_loader::ROOMS.len() {
+        let r = &proto_loader::ROOMS[room];
+        assert!(SPAWN_WINDOW as u64 + 4096 <= r.start || SPAWN_WINDOW as u64 >= r.end);
+        room += 1;
+    }
+};
 static SPAWN_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
 
 /// A file action of posix_spawn (spawn.h): open `path` with `flags` (and

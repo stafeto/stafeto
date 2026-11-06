@@ -477,7 +477,11 @@ pub enum Method {
     LoaderClock = 45,
     /// The table of images (spec 2, 3.12.2), through the session of a loader
     /// that loads: a body of the operation u32 (`IMAGE_GET`, `IMAGE_PUT`,
-    /// `IMAGE_DETACH`), an `ImageKey` and the pages u32. Put carries the
+    /// `IMAGE_DETACH`), an `ImageKey`, the pages u32 and a path (its length
+    /// u32 and its bytes, at most `IMAGE_PATH_MAX`). The path of a Get of a
+    /// code part is the one the loader opened for the program, when the
+    /// file belongs to UID 0 and has no write bit for the group and the
+    /// others; empty for the rest. Put carries the
     /// memory object (MAP_READ, DUPLICATE, TRANSFER, MAP_EXEC for the code,
     /// never MAP_WRITE); a Get that finds the object answers with a copy of
     /// it. The reply to Get: status, the kind u32 (`IMAGE_FOUND` ...) and
@@ -605,6 +609,8 @@ pub const SHARED_BUSY: u32 = 3;
 pub const IMAGES: usize = 32;
 /// Image: the object of a key, or the right to make it (Get).
 pub const IMAGE_GET: u32 = 1;
+/// The longest path an Image request carries (see `Method::Image`).
+pub const IMAGE_PATH_MAX: usize = 63;
 /// Image: the maker of an object hands it over (Put).
 pub const IMAGE_PUT: u32 = 2;
 /// Image: the caller made nothing of the entry it reserved (Detach).

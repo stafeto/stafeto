@@ -310,6 +310,12 @@ struct Processes {
     window_issued: [[u32; MAX_CPUS]; 2],
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
+    /// The grants of quota init's table gives the service (K5), and the
+    /// part of the table each works in: the root of the expenditure of the
+    /// init record the grant is `under`, once init has created it.
+    grants: proto_init::Grants,
+    grant_scope: [proto_process::ExpenditureRoot; proto_init::GRANTS_MAX],
+    grant_scoped: [bool; proto_init::GRANTS_MAX],
     /// The ExecCommit of each record that waits for init, by the record's
     /// index, the records whose new process waits for the thread that
     /// tells init, and that thread's Replace that waits for one.
@@ -505,6 +511,17 @@ fn main(_: u64) -> u64 {
         return 6;
     }
     let args = proto_init::ServiceArgs::read(start.args()).ok();
+    // The grants of quota: a line at fault refuses all of them, and the
+    // quota of a child of fork stays that of the rule K4.
+    if let Some(args) = args.filter(|a| !a.own.is_empty()) {
+        match proto_init::Grants::parse(args.own) {
+            Ok(grants) if loaders::grants_fit(free_quota(), &grants) => owner.grants = grants,
+            Ok(_) => rt::println!("process: grants refused: the pool does not hold their places"),
+            Err(proto_init::GrantsError(line)) => {
+                rt::println!("process: grants refused at line {line}");
+            }
+        }
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -652,6 +669,21 @@ fn number(r: &mut Request<'_>, n: u32) -> Answer {
     Answer::Reply(Outgoing::new())
 }
 impl Processes {
+    /// Whether the record in `record` is in the part of init's table the
+    /// grant `grant` (1 and up, 0 for none) works in: it descends from the
+    /// init record the grant is `under`.
+    fn in_scope(&self, record: usize, grant: u8) -> bool {
+        let Some(g) = usize::from(grant).checked_sub(1) else {
+            return false;
+        };
+        g < self.grants.len
+            && self.grant_scoped[g]
+            && self
+                .records
+                .get(record)
+                .is_some_and(|r| r.root == self.grant_scope[g])
+    }
+
     /// Create (label 0): a record of init's table, LOADING, of a new
     /// process with the parameters of the body and the start channel the
     /// request brought, the process's end told through the record's exit
@@ -735,6 +767,16 @@ impl Processes {
             record.cpus = cpus;
             // A process of init's table shows the program init named.
             record.name = create.name;
+            // A grant is `under` the init record of that name: its processes
+            // descend from this one, the newest of the name (a restart gives
+            // a new root).
+            let root = record.root;
+            for (n, line) in self.grants.lines().iter().enumerate() {
+                if proto_process::name_of(line.under()) == create.name {
+                    self.grant_scope[n] = root;
+                    self.grant_scoped[n] = true;
+                }
+            }
         }
         self.witnesses[index] = Some(witness);
         self.tickets[index] = create.ticket;
@@ -1519,14 +1561,33 @@ impl Processes {
             return refuse(proto_process::PERMISSION);
         }
         let mut body = r.body();
-        let (Ok(operation), Ok(key), Ok(pages), Ok(())) = (
+        let (Ok(operation), Ok(key), Ok(pages), Ok(path_len)) = (
             body.u32(),
             proto_process::ImageKey::read(&mut body),
             body.u32(),
-            body.finish(),
+            body.u32(),
         ) else {
             return Answer::Status(Status::BadSize);
         };
+        let path = match usize::try_from(path_len)
+            .ok()
+            .filter(|&n| n <= proto_process::IMAGE_PATH_MAX)
+            .map(|n| body.bytes(n))
+        {
+            Some(Ok(path)) if body.finish().is_ok() => path,
+            _ => return Answer::Status(Status::BadSize),
+        };
+        // The path the loader opened for the code of a program, when the
+        // file is the system's own, names the grant of quota the process
+        // of this load may carry (K5, the mark at its commit).
+        // (A library's Get has no path and leaves the program's grant.)
+        if operation == proto_process::IMAGE_GET
+            && key.part == proto_process::IMAGE_CODE
+            && let Some(g) = self.grants.find(path)
+            && let Some(place) = self.loaders.get_mut(slot)
+        {
+            place.grant = u8::try_from(g + 1).unwrap_or(0);
+        }
         match operation {
             proto_process::IMAGE_GET if r.handles.is_empty() => {
                 let (kind, found) = match self.image_take(child, &key) {
@@ -3292,10 +3353,21 @@ impl Processes {
         // the record less those pages (the record keeps the whole quota for
         // the children and the execs it makes; spec 2, 3.12.2).
         let fork = matches!(birth.page, PageStart::Fork { .. });
-        let process_quota = if fork {
+        // The child of fork of a process a grant of quota marks (K5) is one
+        // generation deeper and holds a place when the grant allows it.
+        let mark = if fork {
+            loaders::fork_mark(parent.mark, &self.grants, |g| self.records.places_held(g))
+        } else {
+            None
+        };
+        let holder = mark.filter(|m| m.holds);
+        let process_quota = if let Some(m) = holder {
+            u64::from(self.grants.lines()[usize::from(m.grant)].pages) * 4096
+        } else if fork {
             // A record no Create or exec set the quota of its process for
-            // has the whole.
-            let own = if parent.process_quota == 0 {
+            // has the whole; a process that holds a place of a grant has
+            // the quota of its record for a child that finds no place.
+            let own = if parent.mark.is_some_and(|m| m.holds) || parent.process_quota == 0 {
                 parent.quota
             } else {
                 parent.process_quota
@@ -3306,7 +3378,15 @@ impl Processes {
         };
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
-        if !loaders::pool_allows(free_quota(), process_quota) {
+        // The pages of the free places of the grants are set apart: a child
+        // that holds a place takes them, another child does not.
+        if !loaders::pool_admits(
+            free_quota(),
+            &self.grants,
+            |g| self.records.places_held(g),
+            holder.is_some(),
+            process_quota,
+        ) {
             self.refused[proto_process::REFUSED_POOL] += 1;
             return kernel(abi::Error::NoMemory);
         }
@@ -3349,6 +3429,14 @@ impl Processes {
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
             record.process_quota = process_quota;
+            if let Some(m) = holder {
+                // The limits of data and of the address space that still
+                // show the quota of the record show the place.
+                let pages = self.grants.lines()[usize::from(m.grant)].pages;
+                record
+                    .limits
+                    .raise_memory(create.quota, u64::from(pages) * 4096);
+            }
             record.handle_limit = create.handle_limit;
             record.ctty = inherited_ctty;
             // A child of a file shows its program's name; a child of fork
@@ -3357,6 +3445,8 @@ impl Processes {
                 record.name = birth.name;
             }
         }
+        // The child of fork carries the mark, and its place is counted.
+        self.records.set_mark(child, mark);
         self.generations.raise(child);
         self.publish_groups(child);
         // The reply waits for Boot; the page, the loader's code, its data
@@ -3730,7 +3820,15 @@ impl Processes {
         {
             return refuse(proto_process::AGAIN);
         }
-        if !loaders::pool_allows(free_quota(), record.quota) {
+        // The pages of the free places of the grants are set apart for
+        // exec as they are for fork and posix_spawn.
+        if !loaders::pool_admits(
+            free_quota(),
+            &self.grants,
+            |g| self.records.places_held(g),
+            false,
+            record.quota,
+        ) {
             return kernel(abi::Error::NoMemory);
         }
         let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
@@ -3831,6 +3929,8 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         let slot = self.loaders.of(index).expect("an exec's place");
+        let place_grant = self.loaders.get(slot).map_or(0, |p| p.grant);
+        let record_scope_ok = self.in_scope(index, place_grant);
         let committed_ticket = self.loaders.ticket(slot);
         let place = self.loaders.get_mut(slot).expect("a place");
         let image = place.image;
@@ -3842,6 +3942,12 @@ impl Processes {
         let copy = (ticket != 0)
             .then(|| sys::handle_duplicate(&incoming, Rights::DUPLICATE | Rights::TRANSFER).ok())
             .flatten();
+        // The new image has the quota of the record: it holds no place of a
+        // grant, and carries the mark of the file it was loaded from.
+        self.records.set_mark(
+            index,
+            loaders::load_mark((place_grant != 0).then(|| place_grant - 1), record_scope_ok),
+        );
         let record = self.records.get_mut(index).expect("the caller");
         let old = core::mem::replace(&mut record.process, incoming);
         // The time of the images before this one goes on counting.
@@ -4285,6 +4391,8 @@ impl Processes {
         };
         let committed_slot = self.loaders.of(child).expect("a committed place");
         let committed_ticket = self.loaders.ticket(committed_slot);
+        let place_grant = self.loaders.get(committed_slot).map_or(0, |p| p.grant);
+        let scope_ok = self.in_scope(child, place_grant);
         let image_pages = self
             .loaders
             .get(committed_slot)
@@ -4292,6 +4400,14 @@ impl Processes {
         if !fork {
             self.images.commit(child);
             self.wake_loaders();
+        }
+        if !fork {
+            // The file the loader opened may be a grant's: the mark of its
+            // process (a child of fork got its mark at ForkStart).
+            self.records.set_mark(
+                child,
+                loaders::load_mark((place_grant != 0).then(|| place_grant - 1), scope_ok),
+            );
         }
         let record = self.records.get_mut(child).expect("a loading record");
         if !fork {

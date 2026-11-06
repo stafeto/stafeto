@@ -171,6 +171,29 @@
  }
  
  /*
+--- a/lib/ff_glue.c
++++ b/lib/ff_glue.c
+@@ -1031,7 +1031,20 @@
+ void *
+ kmem_malloc(vm_size_t bytes, int flags)
+ {
++#ifdef FF_STAFETO
++    /* A request that may fail (M_NOWAIT) gets NULL when the process has no
++     * more memory: the socket, the frame or the cluster is refused and the
++     * stack lives on. Any other request is made again by ff_mmap, which
++     * ends the program on a refusal. */
++    void *alloc = ff_mmap_try(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
++    if (alloc == (void *)-1) {
++        if (flags & M_NOWAIT)
++            return (NULL);
++        alloc = ff_mmap(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
++    }
++#else
+     void *alloc = ff_mmap(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
++#endif
+     if ((flags & M_ZERO) && alloc != NULL)
+         bzero(alloc, bytes);
+     return (alloc);
 --- a/lib/ff_host_interface.c
 +++ b/lib/ff_host_interface.c
 @@ -54,8 +54,12 @@
@@ -186,7 +209,31 @@
  
  #include "ff_host_interface.h"
  #include "ff_errno.h"
-@@ -206,7 +210,7 @@
+@@ -65,6 +69,23 @@
+ extern void* ff_mem_get_page();
+ extern int ff_mem_free_addr(void* p);
+ 
++#ifdef FF_STAFETO
++/* The mapping of ff_mmap, with MAP_FAILED left to the caller. */
++void *
++ff_mmap_try(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset)
++{
++    int host_prot = 0;
++    int host_flags = 0;
++
++    if ((prot & ff_PROT_READ) == ff_PROT_READ)   host_prot |= PROT_READ;
++    if ((prot & ff_PROT_WRITE) == ff_PROT_WRITE) host_prot |= PROT_WRITE;
++    if ((flags & ff_MAP_SHARED) == ff_MAP_SHARED)   host_flags |= MAP_SHARED;
++    if ((flags & ff_MAP_PRIVATE) == ff_MAP_PRIVATE) host_flags |= MAP_PRIVATE;
++    if ((flags & ff_MAP_ANON) == ff_MAP_ANON)       host_flags |= MAP_ANON;
++    return mmap(addr, len, host_prot, host_flags, fd, offset);
++}
++#endif
++
+ void *
+ ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset)
+ {
+@@ -206,7 +227,7 @@
  }
  
  void
@@ -195,7 +242,7 @@
  {
      if (sec) {
          *sec = current_ts.tv_sec;
-@@ -229,7 +233,22 @@
+@@ -229,7 +250,22 @@
  {
      (void)reseed;
  
@@ -218,7 +265,7 @@
  }
  
  uint32_t
-@@ -566,7 +585,13 @@
+@@ -566,7 +602,13 @@
          case ff_ERANGE:      errno = ERANGE; break;
  
          /* case ff_EAGAIN:       same as EWOULDBLOCK */
@@ -234,7 +281,18 @@
          case ff_EALREADY:        errno = EALREADY; break;
 --- a/lib/ff_host_interface.h
 +++ b/lib/ff_host_interface.h
-@@ -72,6 +72,10 @@
+@@ -41,6 +41,10 @@
+ #define ff_MAP_FAILED    ((void *)-1)
+ 
+ void *ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
++#ifdef FF_STAFETO
++/* As ff_mmap; a refusal returns MAP_FAILED to the caller. */
++void *ff_mmap_try(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
++#endif
+ int ff_munmap(void *addr, uint64_t len);
+ 
+ void *ff_malloc(uint64_t size);
+@@ -72,6 +76,10 @@
  char *ff_getenv(const char *name);
  
  void ff_os_errno(int error);

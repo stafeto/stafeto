@@ -166,6 +166,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-interrupt EL2", 10),
     ("posix-spawn-churn", 43),
     ("posix-map", 10),
+    ("posix-map big", 15),
     ("posix-so", 20),
     ("posix-resources", 14),
     ("posix-sync", 10),

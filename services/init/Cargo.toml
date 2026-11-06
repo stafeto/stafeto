@@ -99,6 +99,11 @@ table-fstack-device = []
 # nginx on the stack in a process, on QEMU and on Apple VZ (xtask fast-probe nginx, net-vz --nginx).
 table-fast-nginx = []
 table-fast-nginx-vz = []
+# The same with the quota grant of the worker, for 100 000 connections (xtask fast-probe scale).
+table-fast-scale = []
+table-fast-scale-vz = []
+# The probe of the big room (xtask posix-map big).
+table-posix-map-big = []
 # The walk of Apple VZ's bus 0 (xtask pci-walk-vz).
 table-pci-walk-vz = []
 # The walk of QEMU's bus 0 (xtask pci-walk).

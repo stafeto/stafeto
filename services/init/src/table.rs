@@ -1111,7 +1111,10 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fstack-probe") as usize
     + cfg!(feature = "table-fstack-device") as usize
     + cfg!(feature = "table-fast-nginx") as usize
-    + cfg!(feature = "table-fast-nginx-vz") as usize;
+    + cfg!(feature = "table-fast-nginx-vz") as usize
+    + cfg!(feature = "table-fast-scale") as usize
+    + cfg!(feature = "table-fast-scale-vz") as usize
+    + cfg!(feature = "table-posix-map-big") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -1184,7 +1187,10 @@ const _: () = assert!(
     feature = "table-fstack-probe",
     feature = "table-fstack-device",
     feature = "table-fast-nginx",
-    feature = "table-fast-nginx-vz"
+    feature = "table-fast-nginx-vz",
+    feature = "table-fast-scale",
+    feature = "table-fast-scale-vz",
+    feature = "table-posix-map-big"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1315,6 +1321,12 @@ pub const TABLE: &[Record] = fstack::FSTACK_DEVICE_TABLE;
 pub const TABLE: &[Record] = fstack::FAST_NGINX_TABLE;
 #[cfg(feature = "table-fast-nginx-vz")]
 pub const TABLE: &[Record] = fstack::FAST_NGINX_VZ_TABLE;
+#[cfg(feature = "table-fast-scale")]
+pub const TABLE: &[Record] = fstack::FAST_SCALE_TABLE;
+#[cfg(feature = "table-fast-scale-vz")]
+pub const TABLE: &[Record] = fstack::FAST_SCALE_VZ_TABLE;
+#[cfg(feature = "table-posix-map-big")]
+pub const TABLE: &[Record] = ramfs::POSIX_MAP_BIG_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -2415,6 +2427,51 @@ mod tests {
         }
     }
 
+    /// The grants of quota in the tables (spec 2, 3.12.2, K5): every line
+    /// is read, the init record it is `under` is the only one of its
+    /// program in the same table, and the pool of the process service holds
+    /// the pages of all the places.
+    #[test]
+    fn the_grants_of_the_tables_are_read_name_a_record_and_fit_the_pool() {
+        let tables: [(&[Record], &[Record]); 4] = [
+            (fstack::FAST_SCALE_TABLE, fstack::FAST_NGINX_TABLE),
+            (fstack::FAST_SCALE_VZ_TABLE, fstack::FAST_NGINX_VZ_TABLE),
+            (ramfs::POSIX_MAP_BIG_TABLE, ramfs::POSIX_PROCS_TABLE),
+            (ramfs::POSIX_STEPS_TABLE, ramfs::POSIX_STEPS_TABLE),
+        ];
+        for (n, (table, plain)) in tables.into_iter().enumerate() {
+            let service = table
+                .iter()
+                .find(|r| r.args.starts_with(b"grant "))
+                .expect("the process service carries the grants");
+            assert_eq!(service.program, "posix-process-service");
+            let grants = proto_init::Grants::parse(service.args).expect("the lines are read");
+            assert!(proto_init::OWN_ARGS_MAX >= service.args.len());
+            assert!(grants.len > 0);
+            for line in grants.lines() {
+                let under = core::str::from_utf8(line.under()).unwrap();
+                assert_eq!(
+                    table.iter().filter(|r| r.program == under).count(),
+                    1,
+                    "{under} is not the program of exactly one record of the table"
+                );
+            }
+            let pool = service.quota;
+            if n < 3 {
+                let base = plain.iter().find(|r| r.program == service.program).unwrap();
+                assert_eq!(
+                    pool,
+                    base.quota + grants.pages_total() * PAGE,
+                    "the pool holds the places of the grants and no more"
+                );
+            }
+            assert!(
+                pool >= grants.pages_total() * PAGE + 384 * PAGE,
+                "the pool holds the places of the grants and the reserve of the service"
+            );
+        }
+    }
+
     /// The image of the row F1 is the image of nginx on the stack on VZ with
     /// the launcher of the shell on all four CPUs and nothing else changed.
     #[test]
@@ -2498,6 +2555,9 @@ mod tests {
             fstack::FSTACK_DEVICE_TABLE,
             fstack::FAST_NGINX_TABLE,
             fstack::FAST_NGINX_VZ_TABLE,
+            fstack::FAST_SCALE_TABLE,
+            fstack::FAST_SCALE_VZ_TABLE,
+            ramfs::POSIX_MAP_BIG_TABLE,
             net::NET_TABLE,
             net::NET_TWO_TABLE,
             net::NET_VZ_TABLE,
@@ -2721,6 +2781,18 @@ mod tests {
         assert_eq!(
             order_of(fstack::FAST_NGINX_VZ_TABLE),
             order_of(net::NET_VZ2_TABLE)
+        );
+        assert_eq!(
+            order_of(fstack::FAST_SCALE_TABLE),
+            order_of(fstack::FAST_NGINX_TABLE)
+        );
+        assert_eq!(
+            order_of(fstack::FAST_SCALE_VZ_TABLE),
+            order_of(fstack::FAST_NGINX_VZ_TABLE)
+        );
+        assert_eq!(
+            order_of(ramfs::POSIX_MAP_BIG_TABLE),
+            order_of(ramfs::POSIX_PROCS_TABLE)
         );
         assert_eq!(order_of(vz::TABLE), ["uart", "shell"]);
         assert_eq!(

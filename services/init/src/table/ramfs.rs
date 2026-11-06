@@ -586,6 +586,42 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The grants of the probe of the big room (`posix-map big`): the children
+/// of fork of `/bin/procs-child` started by the probe's record hold two
+/// places of 256 MiB, above the 64 MiB from which a process may grow its
+/// room, down to the depth 2 (the child and its own child of fork). The
+/// second line names a copy the probe makes at `/tmp/procs-mode`, to see
+/// that the loader gives the path to the service only for a file of UID 0
+/// that the group and the others cannot write.
+pub const MAP_BIG_GRANTS: &[u8] =
+    b"grant map-big program=/bin/procs-child under=posix-procs memory=256M places=2 depth=2\n\
+grant map-mode program=/tmp/procs-mode under=posix-procs memory=80M places=1 depth=1\n";
+
+/// The pages of the places of the grants above, set apart in the pool.
+const MAP_BIG_PAGES: u64 = 2 * 65_536 + 20_480;
+
+/// The probe of the big room and of the grant of quota (tests/posix-map,
+/// the argument `big`): the table of POSIX_PROCS_TABLE with the grant above
+/// and the pages of its places in the pool of the service. The probe itself
+/// and its children of spawn have the quota of a command. The guest has
+/// 1 GiB.
+pub const POSIX_MAP_BIG_TABLE: &[Record] = &[
+    POSIX_PROCS_TABLE[0],
+    Record {
+        quota: POSIX_PROCS_TABLE[1].quota + MAP_BIG_PAGES * PAGE,
+        args: MAP_BIG_GRANTS,
+        ..POSIX_PROCS_TABLE[1]
+    },
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        args: b"posix-procs\0big\0",
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
+];
+
 /// The share of thread numbers the process service has in the probe of
 /// shares: few enough for a probe to use up in a moment (kernel spec 7.5).
 pub const SHARES_PROBE_THREADS: u32 = 24;
@@ -624,6 +660,10 @@ pub const POSIX_SHARES_TABLE: &[Record] = &[
 /// services at 40 it measures. The pool for the crowd of
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
+pub const STEPS_GRANTS: &[u8] =
+    b"grant steps program=/bin/steps-grant under=ramfs memory=64M places=1 depth=1\n";
+const STEPS_GRANT_PAGES: u64 = 16_384;
+
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
@@ -631,7 +671,13 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         ..RAM_FIFO_CLOCKED
     },
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + (STEPS_CHILDREN + 2) * STEPS_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota
+            + (STEPS_CHILDREN + 2) * STEPS_QUOTA
+            + 384 * PAGE
+            + STEPS_GRANT_PAGES * PAGE,
+        // A grant no program of the image uses: the steps of fork, spawn and
+        // exec are measured with the reserve and the counter of places there.
+        args: STEPS_GRANTS,
         ..POSIX_ABI_TABLE[1]
     },
     Record {
@@ -696,8 +742,10 @@ const STEPS_QUOTA: u64 = 608 * PAGE;
 /// with 736 pages: 13.7% left, 27 pages to 90%. Step 6, part 1 (the memory
 /// streams without a file, the probes of relibc in the image, 64 descriptions
 /// of poll) measured 651 and 649 pages: 11 to 90% of 736. With 768 pages 90% is
-/// 691, 40 pages away, about two threads of a volley.
-pub(super) const PROCS_QUOTA: u64 = 768 * PAGE;
+/// 691, 40 pages away, about two threads of a volley. The room that grows
+/// and the search by words (P6b-4a) added 10: 692 measured, and 800 pages
+/// leave 14.3% with 28 pages to 90%.
+pub(super) const PROCS_QUOTA: u64 = 800 * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
