@@ -3,17 +3,17 @@
 
 //! The probes of the packages (docs/packages.md):
 //!
-//! * `dist-licenses`: the release archive of the shell image carries the
-//!   notices of the packages it holds and no others, and no archive carries
-//!   the notices of F-Stack unless F-Stack is in it;
+//! * `dist-licenses`: the release archive of each image carries the notices
+//!   of the packages it holds and no others, and no archive carries the
+//!   notices of F-Stack unless F-Stack is in it;
 //! * `pkg-identity`: the flat images and the packages give the same bytes at
 //!   the same paths, the repository is whole and a package builds again to
 //!   the same bytes;
 //! * `pkg-ci`: `pkg-build`, `repo`, `pkg-identity` and `dist-licenses` in a
 //!   row, which is what the job `pkg` of CI runs.
 //!
-//! `stage_licenses` is also what `cargo xtask dist` uses to give
-//! `tools/dist.py` the notices of the packages of the shell image.
+//! `stage_licenses` is also what `release-build` uses to give `tools/dist.py`
+//! the notices of the packages of each image.
 
 use crate::notices;
 use crate::packages::{self, Package};
@@ -35,19 +35,10 @@ const FSTACK_MARKERS: [&str; 4] = [
 ];
 /// The packages whose notices may hold the marks above.
 const FSTACK_PACKAGES: [&str; 2] = ["f-stack", "nginx-fast"];
-const SHELL_IMAGE: &str = "boot-ash-dialog.img";
 const LICENSES: &str = "/usr/share/licenses";
 
 fn has_files(p: &Package) -> bool {
     !(p.files.is_empty() && p.dirs.is_empty())
-}
-
-/// The packages of the shell image that have files.
-fn shell_packages() -> Result<Vec<Package>, String> {
-    Ok(packages::of_image(SHELL_IMAGE)?
-        .into_iter()
-        .filter(has_files)
-        .collect())
 }
 
 fn options(names: Vec<String>, out: Option<PathBuf>) -> pkg::Options {
@@ -343,35 +334,33 @@ fn notice_files(file: &PackageFile<'_>, name: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Builds the packages of the shell image and lays their notices out in
-/// `target/dist-licenses/<name>/`, with `packages.txt` (name, version-release,
-/// licence) and `sources.txt` (the packages and those linked into them).
-pub fn stage_licenses() -> Result<PathBuf, String> {
-    let dir = crate::target_dir().join("dist-licenses");
+/// Lays the notices of the packages of the image `image` out in
+/// `target/dist-licenses/<flavour>/<name>/`, with `packages.txt` (name,
+/// version-release, licence) and `sources.txt` (the packages and those linked
+/// into them). The notices come from the package files in `packages`, the
+/// bytes the archive of the image will hold.
+pub fn stage_licenses(image: &str, flavour: &str, packages: &Path) -> Result<PathBuf, String> {
+    let dir = crate::target_dir().join("dist-licenses").join(flavour);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let wanted = shell_packages()?;
-    let built = pkg::build(&options(
-        wanted.iter().map(|p| p.name.clone()).collect(),
-        None,
-    ))?;
     let mut rows = String::new();
     let mut sources: BTreeSet<String> = BTreeSet::new();
-    for b in &built {
-        let bytes = std::fs::read(&b.path).map_err(|e| format!("{}: {e}", b.path.display()))?;
-        let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", b.path.display()))?;
-        for (rest, data) in notice_files(&file, &b.package.name) {
-            let path = dir.join(&b.package.name).join(&rest);
+    for p in packages::of_image(image)?.into_iter().filter(has_files) {
+        let path = packages.join(pkg::file_name(&p));
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        for (rest, data) in notice_files(&file, &p.name) {
+            let path = dir.join(&p.name).join(&rest);
             std::fs::create_dir_all(path.parent().expect("has a parent"))
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         rows += &format!(
             "{}\t{}-{}\t{}\n",
-            b.package.name, b.package.version, b.package.release, b.package.license
+            p.name, file.meta.version, file.meta.release, file.meta.license
         );
-        sources.insert(b.package.name.clone());
-        sources.extend(b.package.build_depends.iter().cloned());
+        sources.insert(p.name.clone());
+        sources.extend(p.build_depends.iter().cloned());
     }
     std::fs::write(dir.join("packages.txt"), rows).map_err(|e| e.to_string())?;
     std::fs::write(
@@ -403,7 +392,9 @@ fn tar_members(archive: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn scan(archive: &Path) -> Result<(), String> {
+/// Whether the archive holds a mark of F-Stack or a name of its files outside
+/// the members whose names hold one of `allowed`.
+fn scan(archive: &Path, allowed: &[&str]) -> Result<(), String> {
     let mut cmd = Command::new("python3");
     cmd.arg("-I")
         .arg(crate::root().join("tools/pkg-source.py"))
@@ -414,6 +405,9 @@ fn scan(archive: &Path) -> Result<(), String> {
     }
     for n in ["FSTACK-LICENSE", "f-stack"] {
         cmd.args(["--forbid-name", n]);
+    }
+    for a in allowed {
+        cmd.args(["--allow-path", a]);
     }
     let out = cmd.output().map_err(|e| format!("pkg-source.py: {e}"))?;
     if out.status.success() {
@@ -450,15 +444,86 @@ fn marked_packages(dir: &Path) -> Result<BTreeSet<String>, String> {
     Ok(found)
 }
 
+/// The packages of the image `image` that have files.
+fn image_packages(image: &str) -> Result<Vec<Package>, String> {
+    Ok(packages::of_image(image)?
+        .into_iter()
+        .filter(has_files)
+        .collect())
+}
+
+/// The packages whose files hold a mark of F-Stack's notices in the image,
+/// and whether a file of the image that is no package holds one.
+fn marked_in_image(image: &Path) -> Result<(BTreeSet<String>, bool), String> {
+    let bytes = std::fs::read(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    let parsed = BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", image.display()))?;
+    let holds = |data: &[u8]| {
+        FSTACK_MARKERS
+            .iter()
+            .any(|m| data.windows(m.len()).any(|w| w == m.as_bytes()))
+    };
+    let (mut found, mut stray) = (BTreeSet::new(), false);
+    for f in parsed.files() {
+        if f.name.ends_with(".stpkg") {
+            let file = PackageFile::parse(f.data).map_err(|e| format!("{}: {e}", f.name))?;
+            if (0..file.rootfs.len() as u32).any(|n| holds(file.content(n))) {
+                found.insert(file.meta.name.to_string());
+            }
+        } else if holds(f.data) {
+            stray = true;
+        }
+    }
+    Ok((found, stray))
+}
+
+/// The names under `LICENSES/packages/` of an archive, with their files.
+fn archive_notices(archive: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for m in tar_members(archive)? {
+        if let Some((_, rest)) = m.split_once("/LICENSES/packages/")
+            && let Some((name, file)) = rest.split_once('/')
+        {
+            seen.entry(name.to_string())
+                .or_default()
+                .insert(file.to_string());
+        }
+    }
+    Ok(seen)
+}
+
+/// The archive of the image `flavour` holds the notices of the packages of
+/// the image and no others.
+fn check_archive_notices(archive: &Path, image: &str) -> Result<(), String> {
+    let seen = archive_notices(archive)?;
+    let want: BTreeSet<String> = image_packages(image)?.into_iter().map(|p| p.name).collect();
+    let have: BTreeSet<String> = seen.keys().cloned().collect();
+    if want != have {
+        return Err(format!(
+            "dist-licenses: {} holds LICENSES/packages/ of {have:?}, the packages of {image} are {want:?}",
+            archive.display()
+        ));
+    }
+    for (name, files) in &seen {
+        for needed in ["LICENSE", "SOURCE"] {
+            if !files.contains(needed) {
+                return Err(format!(
+                    "dist-licenses: {} has no LICENSES/packages/{name}/{needed}",
+                    archive.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn dist_licenses() -> Result<(), String> {
     let started = std::time::Instant::now();
-    crate::dist()?;
-    let dir = repo::run(&repo::Options {
-        sources: true,
-        ..repo::parse_options(&[])?
-    })?;
+    crate::release::dist()?;
+    let release = crate::release::directory();
+    let dir = release.join("pkg");
     let version = env!("CARGO_PKG_VERSION");
     let dist = crate::target_dir().join("dist");
+    let archive = |name: &str| dist.join(format!("stafeto-{version}-{name}.tar.xz"));
     // 1: every mark is in the package of F-Stack, so a mark that has gone
     // from the notices cannot make the probe pass without saying so.
     let marked = marked_packages(&dir)?;
@@ -484,46 +549,45 @@ pub fn dist_licenses() -> Result<(), String> {
         }
     }
     say("the marks of F-Stack are in its package");
-    // 2: the kernel archive and the archive of aarch64-virt.
-    for name in [
-        format!("stafeto-{version}-kernel.tar.xz"),
-        format!("stafeto-{version}-aarch64-virt.tar.xz"),
-    ] {
-        scan(&dist.join(&name)).map_err(|e| format!("dist-licenses: {e}"))?;
+    // 2: the kernel archive and the archive of the base image carry no
+    // notice of F-Stack; the archive of the full image carries them under
+    // LICENSES/packages/f-stack/ and nginx-fast/ alone (the image inside is
+    // checked below, file by file).
+    for name in ["kernel", "aarch64-virt-base"] {
+        scan(&archive(name), &[]).map_err(|e| format!("dist-licenses: {e}"))?;
     }
-    say("the kernel and aarch64-virt archives carry no notice of F-Stack");
-    // 3: LICENSES/packages/ of aarch64-virt are the packages of the shell image.
-    let archive = dist.join(format!("stafeto-{version}-aarch64-virt.tar.xz"));
-    let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for m in tar_members(&archive)? {
-        if let Some((_, rest)) = m.split_once("/LICENSES/packages/")
-            && let Some((name, file)) = rest.split_once('/')
-        {
-            seen.entry(name.to_string())
-                .or_default()
-                .insert(file.to_string());
-        }
-    }
-    let want: BTreeSet<String> = shell_packages()?.into_iter().map(|p| p.name).collect();
-    let have: BTreeSet<String> = seen.keys().cloned().collect();
-    if want != have {
+    scan(
+        &archive("aarch64-virt-full"),
+        &[
+            "/LICENSES/packages/f-stack",
+            "/LICENSES/packages/nginx-fast",
+            "/boot-full.img",
+        ],
+    )
+    .map_err(|e| format!("dist-licenses: {e}"))?;
+    say(
+        "the kernel and base archives carry no notice of F-Stack, the full archive only under its packages",
+    );
+    // 3: LICENSES/packages/ of each archive are the packages of its image.
+    check_archive_notices(&archive("aarch64-virt-base"), crate::base_image::BASE_IMAGE)?;
+    check_archive_notices(&archive("aarch64-virt-full"), crate::base_image::FULL_IMAGE)?;
+    say("LICENSES/packages/ of the base and full archives are the packages of their images");
+    // 4: the images. The base image holds no mark; the full image holds them
+    // in the packages of F-Stack alone.
+    let (in_base, stray) = marked_in_image(&release.join(crate::base_image::BASE_IMAGE))?;
+    if !in_base.is_empty() || stray {
         return Err(format!(
-            "dist-licenses: {} holds LICENSES/packages/ of {have:?}, the packages of {SHELL_IMAGE} are {want:?}",
-            archive.display()
+            "dist-licenses: boot-base.img holds marks of F-Stack ({in_base:?}, outside packages: {stray})"
         ));
     }
-    for (name, files) in &seen {
-        for needed in ["LICENSE", "SOURCE"] {
-            if !files.contains(needed) {
-                return Err(format!(
-                    "dist-licenses: {} has no LICENSES/packages/{name}/{needed}",
-                    archive.display()
-                ));
-            }
-        }
+    let (in_full, stray) = marked_in_image(&release.join(crate::base_image::FULL_IMAGE))?;
+    if stray || in_full != FSTACK_PACKAGES.iter().map(|s| s.to_string()).collect() {
+        return Err(format!(
+            "dist-licenses: boot-full.img holds marks of F-Stack in {in_full:?} (outside packages: {stray}), want {FSTACK_PACKAGES:?}"
+        ));
     }
-    say("LICENSES/packages/ of aarch64-virt are the packages of the shell image");
-    // 4: the marks stay in F-Stack's packages, and every package passes the policy.
+    say("boot-base.img holds no notice of F-Stack, boot-full.img only in f-stack and nginx-fast");
+    // 5: the marks stay in F-Stack's packages, and every package passes the policy.
     let stray: Vec<_> = marked
         .iter()
         .filter(|n| !FSTACK_PACKAGES.contains(&n.as_str()))
@@ -543,7 +607,7 @@ pub fn dist_licenses() -> Result<(), String> {
             "dist-licenses: nginx-fast links F-Stack and carries none of its notices".into(),
         );
     }
-    // 5: the sources of the GPL packages.
+    // 6: the sources of the GPL packages.
     crate::run_cmd(
         Command::new("python3")
             .arg(crate::root().join("tools/pkg-source.py"))

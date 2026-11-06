@@ -16,7 +16,7 @@ linked into it, is a GPL licence.
       checks that every entry of DIR/INDEX that needs a source archive has
       one, and that the archive holds the source of each package it names with
       the SHA-256 of its description.
-  pkg-source.py scan ARCHIVE [--marker TEXT]... [--forbid-name TEXT]...
+  pkg-source.py scan ARCHIVE [--marker TEXT]... [--forbid-name TEXT]... [--allow-path TEXT]...
       prints the members of a tar.xz whose name holds a forbidden text and
       the markers found in the bytes of its members.
 
@@ -134,6 +134,12 @@ def check(repo: Path, describe=pkgdesc.load) -> int:
         if "source" not in entry:
             raise SystemExit(f"pkg-source: {name} is GPL (or links GPL) and its entry has no source")
         archive = repo / entry["source"]
+        if entry["source"].startswith("https://"):
+            # An address in a storage release: the file is next to the index
+            # in src/ when this build made it, else it was published before.
+            archive = repo / "src" / entry["source"].rsplit("/", 1)[-1]
+            if not archive.is_file():
+                continue
         if not archive.is_file():
             raise SystemExit(f"pkg-source: {archive} is missing")
         with tempfile.TemporaryDirectory() as work:
@@ -150,12 +156,15 @@ def check(repo: Path, describe=pkgdesc.load) -> int:
     return count
 
 
-def scan(archive: Path, markers: list[str], forbidden: list[str]) -> list[str]:
-    """What is wrong with a tar.xz: forbidden names and markers in bytes."""
+def scan(archive: Path, markers: list[str], forbidden: list[str], allowed: list[str] = ()) -> list[str]:
+    """What is wrong with a tar.xz: forbidden names and markers in bytes. A
+    member whose name holds one of `allowed` is not looked at."""
     problems = []
     needles = [m.encode() for m in markers]
     with tarfile.open(archive) as tar:
         for member in tar:
+            if any(text in member.name for text in allowed):
+                continue
             for text in forbidden:
                 if text in member.name:
                     problems.append(f"{archive.name}: member {member.name} has {text!r} in its name")
@@ -183,13 +192,14 @@ def main() -> None:
     s.add_argument("archive", type=Path)
     s.add_argument("--marker", action="append", default=[])
     s.add_argument("--forbid-name", action="append", default=[])
+    s.add_argument("--allow-path", action="append", default=[])
     args = parser.parse_args()
     if args.command == "build":
         build(args.name, args.out, args.inputs, args.commit, args.relibc, args.cache)
     elif args.command == "check":
         print(f"pkg-source: {check(args.repo)} source archives hold the sources their descriptions pin")
     else:
-        problems = scan(args.archive, args.marker, args.forbid_name)
+        problems = scan(args.archive, args.marker, args.forbid_name, args.allow_path)
         for problem in problems:
             print(problem)
         sys.exit(1 if problems else 0)
