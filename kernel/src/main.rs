@@ -120,6 +120,7 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
     if let Some(r) = info.initrd {
         kprintln!("boot image {:#x}..{:#x}", r.base, r.end());
     }
+    kprintln!("cpu        MIDR_EL1 {:#x}", arch::registers::midr_el1());
     let [code, rodata, data] = &init.segments;
     kprintln!(
         "init       entry {:#x}, stack {:#x}, code {:#x?}, rodata {:#x?}, data {:#x?}",
