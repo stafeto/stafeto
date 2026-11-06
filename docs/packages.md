@@ -119,8 +119,9 @@ them for the licence notes of the image.
   holds F-Stack's (`/usr/share/licenses/nginx-fast/f-stack/`, with the file
   `NOTICES` of the copyright lines and terms of the files the stack's build
   compiled, which `tools/build-fstack.py` writes). F-Stack's notices are in
-  these two packages in the distribution: the kernel archive and the archive of
-  the shell image carry none of them (`cargo xtask dist-licenses` checks it).
+  these two packages in the distribution: the kernel archive, the base archive and `boot-base.img`
+  carry none of them, the full archive and `boot-full.img` carry them only in these two packages,
+  and the full image built without F-Stack holds none (`cargo xtask dist-licenses` checks it).
   The probe images that hold the stack (`fstack-probe`, `fast-layer`,
   `nginx-fast`) carry the same notices at the level of the image, in
   `FSTACK-LICENSE`.
@@ -380,7 +381,25 @@ link programs (for a package with programs) and `build-depends <name>
   `https://github.com/stafeto/packages/releases/download/NAME/<file>`, the
   carried ones keep theirs; `--serial` is required. `repo --check --official` verifies with the roots
   of `keys/` and `--official` takes `keys/revoked` and `keys/revoked.sig`
-  as the list.
+  as the list. `repo --check --official --remote ADDRESS` fetches the index, the list and every
+  package file of the repository at `ADDRESS` (the pages of a published series) and checks them as a
+  directory is checked, except for the source archives.
+- `cargo xtask repo resign --index F --serial N --out D [--sig F.sig] [--expires-days D]
+  [--key K.key --cert K.cert] [--root R.pub] [--min-certificate-days N]` signs a published index
+  again: the roots of `keys/` (or the root of a probe) and `keys/revoked` judge the old signature
+  first, and an index they refuse is not signed; the serial may not go back; the certificate of the
+  signing key has to last `--min-certificate-days` more; only `serial` and `expires` change and the
+  records stay byte for byte (the new text is parsed again and its entries compared). The weekly job
+  and the publication of a release run it through `tools/pages.py`.
+- `cargo xtask release-build [--previous INDEX] [--no-abi]` is the first half of a release
+  (docs/release.md): the check of the ABI fingerprint (with `--release` for a version without a
+  suffix), the repository of `target/release/pkg` with the carried and the built packages and their
+  source archives, `boot-base.img`, `boot-full.img`, the kernel and the stage of `tools/dist.py`. It
+  refuses a build that sets `STAFETO_PKG_ROOTS`. `cargo xtask release-pack` is the second half after
+  the signing; `cargo xtask dist` runs both with the development key.
+- `cargo xtask image full --without PACKAGE` builds the full image without an optional package and
+  the packages that depend on it, as `target/boot-full-without-PACKAGE.img`. It runs on 1024M like
+  the full image.
 - `cargo xtask pkg-sign [--key K.key --cert K.cert] --dir D [--time T]` signs
   again with the release key the packages of `D` that the development key
   signed: only the last page changes, the length and the covered bytes are
@@ -416,10 +435,10 @@ link programs (for a package with programs) and `build-depends <name>
   trailer. It also carries: a published repository made of the packages of
   the run (signed by a first probe key), a build with `--previous` and one
   recipe changed on purpose on purpose, `pkg-sign` with a second probe key
-  and `image-repack` into the full image. `cargo xtask dist-licenses` builds the release files and the
-  repository and checks that the archive of `aarch64-virt` carries the notices
-  of the packages of the shell image and no others, that no archive without
-  F-Stack holds a mark of F-Stack's notices and that the GPL packages come
+  and `image-repack` into the full image. `cargo xtask dist-licenses` builds the release files, the repository and the
+  full image without F-Stack, and checks that the archives of the base and the full image
+  carry the notices of the packages of their images and no others, that nothing
+  without F-Stack holds a mark of F-Stack's notices and that the GPL packages come
   with their sources. `cargo xtask pkg-ci` runs `pkg-build`, `repo`, `abi --check`,
   `pkg-identity` and `dist-licenses` in a row;
   it is the job `pkg` of the CI.
