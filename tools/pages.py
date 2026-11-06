@@ -12,6 +12,7 @@ of stafeto/packages.
                   no published series and a pre-release are a clean end)
   previous        where a release carries its packages from: the published index
                   of its series, or nothing when the series is not published yet
+  check-copy      a release is the newest of its series and its copy follows the others
   new-files       the package files and source archives of a release that its
                   storage release takes (the carried packages are in theirs)
   verify-storage  the attachments of the draft of the storage release are
@@ -110,25 +111,59 @@ def recorded_series(tree: Path) -> tuple[str, ...]:
     return tuple(l.split(" ")[0] for l in path.read_text().splitlines() if l.strip())
 
 
-def newest_copies(releases: list[dict]) -> dict[str, dict]:
-    """The newest published release of each series that carries a signed copy
-    of the index (`stafeto-<version>-INDEX` and `.sig`). Drafts, pre-releases
-    and releases with a suffix hold none that counts. The copy is where the
-    records of a series come from; the pages only deliver them."""
-    best: dict[str, tuple[tuple[int, ...], dict]] = {}
+def copies_of(releases: list[dict]) -> list[dict]:
+    """The published releases that carry a signed copy of the index
+    (`stafeto-<version>-INDEX` and `.sig`): version numbers, series, tag and
+    addresses. Drafts, pre-releases and releases with a suffix hold none that
+    counts. The copy is where the records of a series come from; the pages
+    only deliver them."""
+    found = []
     for r in releases:
         tag = r.get("tag_name", "")
         if r.get("draft") or r.get("prerelease") or not FINAL.fullmatch(tag):
             continue
         urls = {a["name"]: a["browser_download_url"] for a in r.get("assets", [])}
         names = (f"stafeto-{tag[1:]}-INDEX", f"stafeto-{tag[1:]}-INDEX.sig")
-        if not all(n in urls for n in names):
-            continue
-        number = tuple(int(x) for x in tag[1:].split("."))
-        series = f"{number[0]}.{number[1]}"
-        if series not in best or number > best[series][0]:
-            best[series] = (number, {"tag": tag, "index": urls[names[0]], "sig": urls[names[1]]})
-    return {s: v for s, (_, v) in best.items()}
+        if all(n in urls for n in names):
+            number = tuple(int(x) for x in tag[1:].split("."))
+            found.append({"number": number, "series": f"{number[0]}.{number[1]}", "tag": tag,
+                          "index": urls[names[0]], "sig": urls[names[1]]})
+    return found
+
+
+def newest_copies(releases: list[dict]) -> dict[str, dict]:
+    """The newest copy of each series."""
+    best: dict[str, dict] = {}
+    for c in copies_of(releases):
+        if c["series"] not in best or c["number"] > best[c["series"]]["number"]:
+            best[c["series"]] = c
+    return best
+
+
+def serial_in(text: str) -> int:
+    return int(header(text)["serial"])
+
+
+def check_copy(tag: str, text: str, releases: list[dict], get) -> None:
+    """The copy `text` of the release `tag` may be written to the pages (a
+    release is published) or followed (the week): it names the series of the
+    tag, the tag is the newest release of that series, and its serial is above
+    the serial of the copy of every other published release of the series.
+    The right to write to stafeto/stafeto is enough to publish an old release
+    again, to swap an older copy into a draft or to put in a copy of another
+    series; none of them gets past this."""
+    number = tuple(int(x) for x in tag[1:].split("."))
+    series = f"{number[0]}.{number[1]}"
+    if header(text).get("series") != series:
+        raise Refusal(f"the copy of {tag} is of the series {header(text).get('series')}, the tag is of {series}")
+    others = [c for c in copies_of(releases) if c["series"] == series and c["tag"] != tag]
+    newer = [c["tag"] for c in others if c["number"] > number]
+    if newer:
+        raise Refusal(f"{tag} is not the newest release of the series {series} ({', '.join(newer)} is newer)")
+    serial = serial_in(text)
+    for c in others:
+        if serial <= serial_in(get(c["index"]).decode()):
+            raise Refusal(f"the serial {serial} of the copy of {tag} is not above that of the copy of {c['tag']}")
 
 
 def download(url: str) -> bytes:
@@ -139,13 +174,17 @@ def download(url: str) -> bytes:
 
 
 def fetch_copy(series: str, releases: list[dict], out: Path, get=download) -> Path:
-    """The signed copy of the newest release of `series` in `out/<series>/`."""
+    """The signed copy of the newest release of `series` in `out/<series>/`,
+    after the checks of `check_copy` (a copy swapped into an old release stops
+    the week as it stops a publication)."""
     copies = newest_copies(releases)
     if series not in copies:
         raise Refusal(f"no published release of stafeto/stafeto carries a signed index of the series {series}")
     directory = out / series
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "INDEX").write_bytes(get(copies[series]["index"]))
+    text = get(copies[series]["index"])
+    check_copy(copies[series]["tag"], text.decode(), releases, get)
+    (directory / "INDEX").write_bytes(text)
     (directory / "INDEX.sig").write_bytes(get(copies[series]["sig"]))
     return directory
 
@@ -268,12 +307,12 @@ def git(directory: Path, *args: str) -> str:
     return done.stdout
 
 
-def resign(command: str, index: Path, serial: int, out: Path, anchor: Path) -> tuple[str, bytes]:
+def resign(command: str, index: Path, serial: int, out: Path, anchor: Path, strict: bool = False) -> tuple[str, bytes]:
     """The index signed again by `command` (cargo xtask repo resign ...) with the
     records of the signed copy `anchor`."""
     done = subprocess.run(
         [*shlex.split(command), "--index", str(index), "--anchor", str(anchor), "--serial", str(serial),
-         "--out", str(out)],
+         "--out", str(out), *(["--strict"] if strict else [])],
         capture_output=True, text=True)
     if done.returncode != 0:
         raise Refusal(f"signing {index.parent.parent.name} again failed: {(done.stdout + done.stderr).strip()}")
@@ -318,13 +357,15 @@ def serial_of(path: Path) -> int | None:
     return int(header(path.read_text())["serial"]) if path.is_file() else None
 
 
-def publish(pages: Path, version: str, index_dir: Path, revoked: Path, command: str, push: bool) -> int:
+def publish(pages: Path, version: str, index_dir: Path, revoked: Path, command: str, push: bool,
+            releases: list[dict], get=download) -> int:
     text = (index_dir / "INDEX").read_text()
+    check_copy(f"v{version}", text, releases, get)
     series = header(text)["series"]
     on_pages = serial_of(pages / series / ARCH / "INDEX")
     serial = max((on_pages or 0) + 1, int(header(text)["serial"]))
     with tempfile.TemporaryDirectory() as work:
-        new_text, signature = resign(command, index_dir / "INDEX", serial, Path(work), index_dir / "INDEX")
+        new_text, signature = resign(command, index_dir / "INDEX", serial, Path(work), index_dir / "INDEX", True)
     place(pages, series, new_text, signature, revoked)
     if series not in listed(pages):
         (pages / "series.txt").write_text("".join(f"{s}\n" for s in sorted(listed(pages) + [series])))
@@ -370,6 +411,10 @@ def main() -> None:
     r.add_argument("--tree", type=Path, default=Path("."))
     r.add_argument("--releases", type=Path, required=True)
     r.add_argument("--out", type=Path, required=True)
+    k = steps.add_parser("check-copy")
+    k.add_argument("--tag", required=True)
+    k.add_argument("--index", type=Path, required=True)
+    k.add_argument("--releases", type=Path, required=True)
     n = steps.add_parser("new-files")
     n.add_argument("--dir", type=Path, required=True)
     v = steps.add_parser("verify-storage")
@@ -385,8 +430,8 @@ def main() -> None:
         p.add_argument("--resign-command", required=True)
         p.add_argument("--push", action="store_true")
         if name == "weekly":
-            p.add_argument("--releases", type=Path, required=True)
             p.add_argument("--anchors", type=Path, required=True)
+        p.add_argument("--releases", type=Path, required=True)
         if name == "publish":
             p.add_argument("--version", required=True)
             p.add_argument("--index-dir", type=Path, required=True)
@@ -400,6 +445,9 @@ def main() -> None:
         print(f"--previous {address}" if address else "")
         print(f"pages: {'carrying from ' + address if address else 'series ' + args.series + ' is not published: every package is new'}",
               file=sys.stderr)
+    elif args.step == "check-copy":
+        check_copy(args.tag, args.index.read_text(), json.loads(args.releases.read_text()), download)
+        print(f"pages: the copy of {args.tag} is of its series, the newest release of it, with a serial above the others")
     elif args.step == "new-files":
         print(" ".join(str(p) for p in new_files(args.dir)))
     elif args.step == "verify-storage":
@@ -407,7 +455,8 @@ def main() -> None:
     elif args.step == "check-addresses":
         print(f"pages: {check_addresses(args.index)} addresses answer")
     elif args.step == "publish":
-        serial = publish(args.pages_dir, args.version, args.index_dir, args.revoked_dir, args.resign_command, args.push)
+        serial = publish(args.pages_dir, args.version, args.index_dir, args.revoked_dir, args.resign_command, args.push,
+                        json.loads(args.releases.read_text()))
         print(f"pages: published {args.version} with serial {serial}")
     else:
         done = weekly(args.pages_dir, args.revoked_dir, args.resign_command, args.push,

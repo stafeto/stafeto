@@ -31,8 +31,14 @@ pub struct Term {
 /// An index with its signature, as the copy of a release holds it.
 pub type Signed<'a> = (&'a [u8], &'a [u8]);
 
-/// The roots accept the signature of `signed` (revocations left aside: see `resign`).
-fn authentic(what: &str, (text, signature): Signed<'_>, roots: &[Key]) -> Result<(), String> {
+/// The roots accept the signature of `signed`; `revocations` are the list the signing key must
+/// not be on (see `resign`).
+fn authentic(
+    what: &str,
+    (text, signature): Signed<'_>,
+    roots: &[Key],
+    revocations: &[Revocation],
+) -> Result<(), String> {
     let block = Block::parse(signature).map_err(|e| format!("{what}.sig: {e}"))?;
     pkgfmt::trust::verify(
         &block,
@@ -40,7 +46,7 @@ fn authentic(what: &str, (text, signature): Signed<'_>, roots: &[Key]) -> Result
         &sha::sha256(text),
         text.len() as u64,
         &Trust { roots, direct: &[] },
-        &[],
+        revocations,
     )
     .map(drop)
     .map_err(|e| format!("{what}.sig is not accepted: {e}"))
@@ -57,17 +63,24 @@ fn authentic(what: &str, (text, signature): Signed<'_>, roots: &[Key]) -> Result
 /// Its own signature is checked by the roots too, because its serial is the
 /// number the new one follows. `signing` signs the new index, and `revocations`
 /// and `accepts` judge that signature: a revoked key signs nothing.
+///
+/// With `strict` the list judges the signatures of the copy and of the index too: the path
+/// that publishes a new release takes a copy that the key of the day signed, and a copy signed
+/// by a key the list names is refused there.
+#[allow(clippy::too_many_arguments)]
 pub fn resign(
     (text, old_signature): Signed<'_>,
     anchor: Signed<'_>,
+    strict: bool,
     roots: &[Key],
     revocations: &[Revocation],
     signing: &Signing,
     term: &Term,
     accepts: &Trust,
 ) -> Result<(String, Vec<u8>), String> {
-    authentic("the copy of the release INDEX", anchor, roots)?;
-    authentic("INDEX", (text, old_signature), roots)?;
+    let judge = if strict { revocations } else { &[] };
+    authentic("the copy of the release INDEX", anchor, roots, judge)?;
+    authentic("INDEX", (text, old_signature), roots, judge)?;
     let records = |t: &[u8]| {
         t.windows(2)
             .position(|w| w == b"\n\n")
@@ -193,14 +206,19 @@ pub fn serial_after(
 /// [--min-certificate-days N]`. The roots are the official ones and the list
 /// is `keys/revoked`, unless `--root` names the root of a probe.
 pub fn command(args: &[String]) -> Result<(), String> {
-    let usage = "usage: cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig] [--expires-days D] [--key K.key [--cert K.cert]] [--root R.pub] [--min-certificate-days N]";
+    let usage = "usage: cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig] [--expires-days D] [--key K.key [--cert K.cert]] [--root R.pub] [--min-certificate-days N] [--strict]";
     let (mut index, mut sig, mut out, mut key, mut cert, mut root, mut anchor) =
         (None, None, None, None, None, None, None);
+    let mut strict = false;
     let (mut serial, mut expires_days, mut certificate_days) = (None, 30u64, 0u64);
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
         i += 1;
+        if flag == "--strict" {
+            strict = true;
+            continue;
+        }
         let value = args
             .get(i)
             .cloned()
@@ -268,6 +286,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let (new_text, new_sig) = resign(
         (&text, &old),
         (&anchor_text, &anchor_block),
+        strict,
         &roots,
         &revocations,
         &signing,
@@ -398,7 +417,16 @@ mod tests {
             roots: &[root()],
             direct: &[],
         };
-        resign((text, sig), (text, sig), &[root()], revoked, by, t, &trust)
+        resign(
+            (text, sig),
+            (text, sig),
+            false,
+            &[root()],
+            revoked,
+            by,
+            t,
+            &trust,
+        )
     }
 
     fn anchored(
@@ -415,6 +443,7 @@ mod tests {
         resign(
             (text, sig),
             anchor,
+            false,
             &[root()],
             revoked,
             by,
@@ -502,6 +531,62 @@ mod tests {
         assert!(new_text.contains("\nserial 6\n"));
         // The revoked key itself signs nothing more.
         assert!(anchored(text.as_bytes(), &sig, (text.as_bytes(), &sig), &leak, &old).is_err());
+    }
+
+    #[test]
+    fn a_copy_signed_by_a_revoked_key_is_no_new_release() {
+        // On the path that publishes a release the list judges the copy too.
+        let leaked = signing(&REL, "t-release-2026", NOW * 2);
+        let (text, sig) = index(&leaked);
+        let list = [Revocation {
+            name: n("t-release-2026"),
+            since: NOW - 2 * DAY,
+        }];
+        let next = signing(&OTHER, "t-release-2027", NOW * 2);
+        let trust = Trust {
+            roots: &[root()],
+            direct: &[],
+        };
+        let (t, s) = (text.as_bytes(), sig.as_slice());
+        let strict = resign(
+            (t, s),
+            (t, s),
+            true,
+            &[root()],
+            &list,
+            &next,
+            &term(6),
+            &trust,
+        );
+        assert!(strict.unwrap_err().contains("not accepted"));
+        // The weekly path, with the same copy, goes on.
+        assert!(
+            resign(
+                (t, s),
+                (t, s),
+                false,
+                &[root()],
+                &list,
+                &next,
+                &term(6),
+                &trust
+            )
+            .is_ok()
+        );
+        // A copy of a key the list does not name passes strict.
+        assert!(
+            resign(
+                (t, s),
+                (t, s),
+                true,
+                &[root()],
+                &[],
+                &next,
+                &term(6),
+                &trust
+            )
+            .is_ok()
+        );
     }
 
     #[test]

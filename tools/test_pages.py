@@ -47,6 +47,7 @@ text = re.sub(r"^expires .*$", "expires EXPIRES", text, count=1, flags=re.M)
 import pathlib
 out = pathlib.Path(args["--out"]); out.mkdir(parents=True, exist_ok=True)
 (out / "INDEX").write_text(text)
+open("LOG", "a").write("strict\n" if "--strict" in sys.argv else "plain\n")
 (out / "INDEX.sig").write_bytes(b"sig:" + hashlib.sha256(text.encode()).hexdigest().encode())
 '''
 
@@ -81,7 +82,8 @@ class Branch(unittest.TestCase):
         git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "start")
         git(seed, "push", "-q", str(self.origin), "gh-pages")
         self.stub = self.dir / "stub.py"
-        self.stub.write_text(STUB.replace("EXPIRES", FAR))
+        self.log = self.dir / "calls.log"
+        self.stub.write_text(STUB.replace("EXPIRES", FAR).replace("LOG", str(self.log)))
         self.command = f"{sys.executable} {self.stub}"
         self.revoked = self.dir / "keys"
         self.revoked.mkdir()
@@ -100,8 +102,25 @@ class Branch(unittest.TestCase):
         (directory / "INDEX.sig").write_bytes(signature if signature is not None else signed(text))
         return directory
 
-    def publish(self, text: str, signature: bytes | None = None, version="0.3.0") -> int:
-        return pages.publish(self.pages, version, self.release(text, signature), self.revoked, self.command, True)
+    def publish(self, text: str, signature: bytes | None = None, version="0.3.0", others: dict | None = None) -> int:
+        """Publishes `version` with the copy `text`; `others` maps the tags of other published
+        releases to their copies."""
+        series = ".".join(version.split(".")[:2])
+        listing, files = self.releases(**{series.replace(".", "_"): text})
+        listing[0]["tag_name"] = f"v{version}"
+        base = f"{pages.RELEASES}/v{version}/stafeto-{version}-INDEX"
+        listing[0]["assets"] = [{"name": f"stafeto-{version}-INDEX", "browser_download_url": base},
+                                {"name": f"stafeto-{version}-INDEX.sig", "browser_download_url": base + ".sig"}]
+        for tag, copy in (others or {}).items():
+            more, extra = self.releases(**{".".join(tag[1:].split(".")[:2]).replace(".", "_"): copy})
+            more[0]["tag_name"] = tag
+            base = f"{pages.RELEASES}/{tag}/stafeto-{tag[1:]}-INDEX"
+            more[0]["assets"] = [{"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
+                                 {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]
+            files[base] = copy.encode()
+            listing += more
+        return pages.publish(self.pages, version, self.release(text, signature), self.revoked, self.command, True,
+                             listing, files.get)
 
     def remote(self, path: str) -> str:
         return git(self.origin, "show", f"gh-pages:{path}")
@@ -137,6 +156,50 @@ class Branch(unittest.TestCase):
         self.assertEqual(self.remote("series.txt"), "0.3\n")
         self.assertEqual(self.remote(".nojekyll"), "")
         self.assertEqual(len(git(self.origin, "rev-list", "gh-pages").split()), 2)
+
+    def test_a_release_is_signed_with_the_list_judging_its_copy_and_the_week_is_not(self):
+        self.publish(index(serial=5))
+        self.week(push=False, **{"0_3": index(serial=5)})
+        self.assertEqual(self.log.read_text().split(), ["strict", "plain"])
+
+    def test_an_old_release_published_again_is_refused(self):
+        self.publish(index(serial=5), version="0.3.1")
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(index(serial=4), version="0.3.0", others={"v0.3.1": index(serial=5)})
+        self.assertIn("not the newest", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
+    def test_an_older_copy_swapped_into_a_draft_is_refused(self):
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(index(serial=5), version="0.3.1", others={"v0.3.0": index(serial=7)})
+        self.assertIn("not above", str(stopped.exception))
+        with self.assertRaises(SystemExit):
+            self.publish(index(serial=7), version="0.3.1", others={"v0.3.0": index(serial=7)})
+        self.assertEqual(self.head(), before)
+        self.publish(index(serial=8), version="0.3.1", others={"v0.3.0": index(serial=7)})
+
+    def test_a_copy_of_another_series_is_refused(self):
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(index(series="0.4", serial=5), version="0.3.1")
+        self.assertIn("series", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
+    def test_the_week_follows_the_same_checks(self):
+        self.publish(index(serial=5))
+        listing, files = self.releases(**{"0_3": index(serial=3)})
+        more, extra = self.releases(**{"0_3": index(serial=9)})
+        more[0]["tag_name"] = "v0.3.1"
+        old, new = more[0]["assets"][0]["browser_download_url"], more[0]["assets"][1]["browser_download_url"]
+        base = f"{pages.RELEASES}/v0.3.1/stafeto-0.3.1-INDEX"
+        more[0]["assets"] = [{"name": "stafeto-0.3.1-INDEX", "browser_download_url": base},
+                             {"name": "stafeto-0.3.1-INDEX.sig", "browser_download_url": base + ".sig"}]
+        files[base], files[base + ".sig"] = index(serial=2).encode(), signed(index(serial=2))
+        with self.assertRaises(SystemExit) as stopped:
+            pages.weekly(self.pages, self.revoked, self.command, False, listing + more, self.dir / "anchors", get=files.__getitem__)
+        self.assertIn("not above", str(stopped.exception))
 
     def test_the_serial_on_the_pages_goes_up_past_the_serial_of_the_release(self):
         self.publish(index(serial=5))
@@ -198,7 +261,7 @@ class Branch(unittest.TestCase):
 
     def test_a_term_under_14_days_stops_the_week(self):
         self.publish(index(serial=5))
-        self.stub.write_text(STUB.replace("EXPIRES", SOON))
+        self.stub.write_text(STUB.replace("EXPIRES", SOON).replace("LOG", str(self.log)))
         with self.assertRaises(SystemExit) as stopped:
             self.week(push=False, **{"0_3": index(serial=5)})
         self.assertIn("14 days", str(stopped.exception))
@@ -322,7 +385,7 @@ class Previous(unittest.TestCase):
         listing = [{"tag_name": "v0.3.0", "draft": False, "prerelease": False, "assets": [
             {"name": "stafeto-0.3.0-INDEX", "browser_download_url": base},
             {"name": "stafeto-0.3.0-INDEX.sig", "browser_download_url": base + ".sig"}]}]
-        return listing, {base: b"index", base + ".sig": b"sig"}
+        return listing, {base: index(serial=5).encode(), base + ".sig": b"sig"}
 
     def test_a_series_that_nobody_published_is_built_new(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -336,7 +399,7 @@ class Previous(unittest.TestCase):
             out = Path(tmp) / "out"
             where = pages.previous("0.3", self.tree(tmp, "0.3 12\n"), lambda url: None, listing, out, files.__getitem__)
             self.assertEqual(where, str(out / "0.3"))
-            self.assertEqual((out / "0.3" / "INDEX").read_bytes(), b"index")
+            self.assertEqual((out / "0.3" / "INDEX").read_text(), index(serial=5))
             self.assertEqual((out / "0.3" / "revoked").read_text(), "list\n")
             # A recorded series with no release that carries its index stops the build.
             with self.assertRaises(SystemExit):
