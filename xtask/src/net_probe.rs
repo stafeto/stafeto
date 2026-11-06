@@ -2077,7 +2077,7 @@ mod tests {
                 .contains("counted")
         );
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 9"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 25"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)

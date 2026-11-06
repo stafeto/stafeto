@@ -780,6 +780,23 @@ impl Run {
         Ok(())
     }
 
+    /// Waits up to `timeout` until the whole line `line` has come `times`
+    /// times in all the output so far: for an effect of a service that
+    /// follows the end of the program that caused it, such as the clearing
+    /// of a screen in portions.
+    pub fn expect_times(
+        &mut self,
+        line: &str,
+        times: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while self.lines.iter().filter(|l| l.as_str() == line).count() < times {
+            self.wait_on(deadline, &format!("{line:?} {times} times"))?;
+        }
+        Ok(())
+    }
+
     /// Types `line` and a CR, as Enter sends it, into the pipe of the
     /// child's stdin.
     pub fn send(&mut self, line: &str) -> Result<(), String> {

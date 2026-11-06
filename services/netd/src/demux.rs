@@ -16,11 +16,17 @@ use core::hash::Hasher;
 use core::hash::SipHasher;
 
 /// The places of the table: six times the 1 280 sockets it must hold (one
-/// sixth full), so that the chains of linear probing stay short (at most 8
-/// in the probe's runs: with 4 096 places a chain of 9 came up).
+/// sixth full), so that the chains of linear probing stay short.
 pub const DEMUX_SLOTS: usize = 8192;
-/// The longest chain a probe is allowed to find (acceptance).
-pub const PROBE_LIMIT: usize = 8;
+/// The longest chain a probe is allowed to find (acceptance). The secret of
+/// the service is new at every start, so the longest chain of a run is a
+/// random number: with 1 280 connections and as many lookups of absent
+/// fours in 100 000 simulated starts it was 9 or more in 2.1 % of them
+/// (4 at the least, 16 in one start of 100 000), and the tail falls about
+/// threefold with each place, which leaves 24 for a false alarm once in a
+/// billion starts. A hash that does not spread the fours (the zero key)
+/// chains 64 of them, far above the limit.
+pub const PROBE_LIMIT: usize = 24;
 
 /// What a socket is found by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

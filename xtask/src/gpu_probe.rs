@@ -237,6 +237,10 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     }
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
     run.expect_line(ENDED_B, |l| l == ENDED_B, WITHIN)?;
+    // The service clears the screen of the second client in portions after
+    // the client ended, so its line can come after the launcher's: the run
+    // is not stopped before the third return of the screen.
+    run.expect_times(RELEASED, 3, WITHIN)?;
     Ok(())
 }
 
