@@ -18,7 +18,7 @@ use crate::dma::{Host, net_at};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::{is_dhcp_client_frame, second_device_takes};
 use netd::profile::{self, Counter};
-use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, offset};
+use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RECLAIM_STEP, RX_BUFFERS, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
@@ -222,9 +222,9 @@ impl<const D: usize> TxRing<D> {
         }
     }
 
-    /// Takes back the buffers the device sent.
+    /// Takes back up to `RECLAIM_STEP` of the buffers the device sent.
     pub fn reclaim(&mut self) {
-        if let Err(broken) = self.ring.reclaim() {
+        if let Err(broken) = self.ring.reclaim(RECLAIM_STEP) {
             fail(broken.text(true));
         }
     }

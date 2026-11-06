@@ -325,13 +325,20 @@ impl<H: Hal> TxRing<H> {
         }
     }
 
-    /// Takes back the buffers the device sent.
+    /// Takes back up to `limit` of the buffers the device sent; how many.
+    /// The rest stay in the ring of used buffers for the next call: a device
+    /// that sends a whole queue at once (QEMU's bottom half run late, VZ)
+    /// returns up to QUEUE_SIZE buffers, and taking all of them in one step
+    /// of the service would make that step as long as the queue.
     #[inline]
-    pub fn reclaim(&mut self) -> Result<(), Broken> {
-        while self.queue.can_pop() {
+    pub fn reclaim(&mut self, limit: usize) -> Result<usize, Broken> {
+        take_back(limit, || {
+            if !self.queue.can_pop() {
+                return Ok(false);
+            }
             barrier::rmb();
             let Some(token) = self.queue.peek_used() else {
-                break;
+                return Ok(false);
             };
             let n = self.book.reclaim(token).ok_or(Broken::Unknown)?;
             // SAFETY: the device returned the buffer; the book gave it back
@@ -340,12 +347,19 @@ impl<H: Hal> TxRing<H> {
             // SAFETY: the buffer `submit` added with this token; only the
             // number of descriptors of the chain matters to the crate.
             let popped = unsafe { self.queue.pop_used(token, &[&slice[..HDR_LEN]], &mut []) };
-            if popped.is_err() {
-                return Err(Broken::NotTaken);
-            }
-        }
-        Ok(())
+            popped.map(|_| true).map_err(|_| Broken::NotTaken)
+        })
     }
+}
+
+/// Calls `one` until it says there was nothing to take back, fails, or has
+/// taken back `limit` buffers; how many it took.
+fn take_back(limit: usize, mut one: impl FnMut() -> Result<bool, Broken>) -> Result<usize, Broken> {
+    let mut taken = 0;
+    while taken < limit && one()? {
+        taken += 1;
+    }
+    Ok(taken)
 }
 
 #[cfg(test)]
@@ -394,6 +408,33 @@ mod tests {
         stock.used();
         stock.added();
         assert!(stock.due(true));
+    }
+
+    #[test]
+    fn taking_back_stops_at_the_limit_and_leaves_the_rest() {
+        let mut used = QUEUE_SIZE;
+        let mut one = || {
+            if used == 0 {
+                return Ok(false);
+            }
+            used -= 1;
+            Ok(true)
+        };
+        assert_eq!(take_back(16, &mut one), Ok(16));
+        assert_eq!(used, QUEUE_SIZE - 16);
+        let mut few = 3;
+        let one = || {
+            if few == 0 {
+                return Ok(false);
+            }
+            few -= 1;
+            Ok(true)
+        };
+        assert_eq!(take_back(16, one), Ok(3));
+        assert_eq!(
+            take_back(16, || Err(Broken::NotTaken)),
+            Err(Broken::NotTaken)
+        );
     }
 
     #[test]
