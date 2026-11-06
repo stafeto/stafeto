@@ -23,12 +23,18 @@ Publishing the release of `stafeto/stafeto` is the approval that starts
    - `ci`: the groups of `ci` on the tagged commit, called with no secret.
    - `build`: no secret and no environment. It checks that the tag equals
      `v<version>`, runs `cargo xtask release-build` (the check of the ABI
-     fingerprint, the packages carried from the index of the series when it is
-     published and built otherwise, both boot images, the kernel and the stage
+     fingerprint, the packages carried from the signed index in the newest release
+     of the series when it is published and built otherwise, both boot images, the kernel and the stage
      of `tools/dist.py`) and keeps the result for the next job. It may run for
      up to 120 minutes.
-   - `sign`: a clean machine that builds nothing but `xtask`, in the
-     environment `packages`. It holds the release key alone. It signs again
+   - `sign`: a clean machine that builds `xtask` alone (with its crates as
+     `Cargo.lock` pins them), in the environment `packages`. It holds the
+     release key alone. Nothing from the build job reaches a shell of this
+     job: `cargo xtask release-check` refuses every file that is not a file of a
+     release before the key is written, the version is that of the checkout,
+     and the serial of the index is that of the published index of the
+     series plus one (1 for a new series), taken after the roots accepted its
+     signature. It signs again
      the packages that the build signed with the development key
      (`cargo xtask pkg-sign`), puts the signed files into both boot images
      (`image-repack`), writes the index (`repo --from`), checks the result with
@@ -46,7 +52,7 @@ Publishing the release of `stafeto/stafeto` is the approval that starts
    with a suffix (`0.3.0-pre.1`) makes a pre-release draft and no packages:
    the promise of a series (below) starts with `0.N.0`, and a pre-release may
    still change the ABI.
-6. Publish the release of `stafeto/stafeto`. `publish-packages.yml` starts
+6. Publish the release of `stafeto/stafeto` (all its files live in `target/stafeto-release`, apart from the `target/release` of cargo). `publish-packages.yml` starts
    from the event: it checks the signed copy of the index in the release,
    checks every attachment of the draft storage release against that index,
    publishes the storage release, tries every address of the index, writes
@@ -141,32 +147,74 @@ publication of a series.
 `https://stafeto.github.io/packages/<series>/aarch64/` serves `INDEX`,
 `INDEX.sig`, `revoked` and `revoked.sig`; the package files are in the storage
 releases of `stafeto/packages` and the index names them by address.
-`series.txt` lists the series that get a weekly signature. An index lives 30
-days, so a signature every Monday at 03:17 UTC (`cargo xtask repo resign`)
-keeps it valid for three weeks past a missed run. The signing step refuses an
-index whose signature the roots of the tree do not accept or whose key the
-list names, and it moves nothing but `serial` and `expires`. The job fails,
-and GitHub mails the owner, when the certificate of the release key ends in
-under 35 days, when a series of `series.txt` has no index, or when an index
-would expire in under 14 days. Take a series out of `series.txt` to stop its
-support: its index runs out 30 days later. A push to `main` that changes
-`keys/revoked` runs the job at once, so the new list reaches every series.
+`series.txt` lists the series that get a weekly signature. The pages only
+deliver: whoever holds `PACKAGES_TOKEN` can write them. The records of a series
+are those of the signed index that its newest release in `stafeto/stafeto`
+carries (`stafeto-<version>-INDEX` and `.sig`); the carrying of a build and
+the weekly signature take them from there, with the roots accepting that
+signature. An index lives 30 days, so a signature every Monday at 03:17 UTC
+(`cargo xtask repo resign --anchor COPY`) keeps it valid for three weeks past a
+missed run. The signing step refuses an index of the pages whose signature the
+roots do not accept (its serial is the number the new one follows) or whose
+records differ from the copy, so an old signed index laid into the pages is
+not signed again, and it refuses to sign with a key that the list names. It
+moves nothing but `serial` and `expires`. The job fails, and GitHub mails the
+owner, when the certificate of the release key ends in under 35 days, when a
+series of `series.txt` has no release that carries an index, or when the pages
+cannot be read. Take a series out of `series.txt` to stop its support: its
+index runs out 30 days later. A push to `main` that changes `keys/revoked` runs
+the job at once, so the new list reaches every series.
 
 GitHub switches off a schedule after 60 days without activity in a public
 repository. A frozen schedule shows as an index that expires and a `pkg` that
 says so in one line; start the workflow by hand (`workflow_dispatch`) to sign
-again.
+again. The group `packages-pages` runs one job at a time and keeps one waiting
+run: when a run for a release was cancelled by a later one, press "Re-run" on it.
 
 ## Before the owner has set anything up
 
 The workflows are safe to merge at any time. `publish-packages.yml` has a job
-`gate` with no secret that ends the run with a line in the log when no series
-is published or when the release has a suffix, is a pre-release or holds no
-signed index. The job with the secrets skips its steps with a warning when
-`RELEASE_SIGNING_KEY` or `PACKAGES_TOKEN` is empty. `packages-token.yml` and
+`gate` with no secret that ends the run green with a line in the log when no
+series is published or when the release has a suffix, is a pre-release or holds
+no signed index. A pages site that cannot be reached, or one that lists no series
+while `packages/published-serial.txt` records one, fails the gate: only the clean
+answer "there is no such file" means that nothing is published. Once the gate
+says go, an empty `RELEASE_SIGNING_KEY` or `PACKAGES_TOKEN` fails the run. `packages-token.yml` and
 the dry run start by hand only. A test of `xtask` reads the text of the
-workflows and fails when a secret is named outside its job or when a step of
-the publishing job could run before the secrets are known.
+workflows and fails when a secret is named outside its job, when a step of
+the publishing job could run before the secrets are known, when an action is not
+pinned by the full commit it was read at, or when this file stops asking the
+owner for the rulesets below.
+
+## Who may set a tag
+
+The environment `packages` lets in any run on a tag `v*` and on `main`, and anyone
+who may write to the repository can set a tag on a commit of their own branch with
+a changed `release.yml`. Before any secret goes into the environment the owner makes
+two rulesets: tags `v*` that only the owner may create, change or delete (the owner
+is the only actor that bypasses the rule), and `main` that takes changes through a
+pull request only, with no force push and no deletion. Replace `OWNER_ID` with the
+id of the owner (`gh api user --jq .id`); the role "repository admin" is `5`.
+
+    gh api -X POST repos/stafeto/stafeto/rulesets --input - <<'JSON'
+    {"name": "release tags", "target": "tag", "enforcement": "active",
+     "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+     "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
+     "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
+    JSON
+    gh api -X POST repos/stafeto/stafeto/rulesets --input - <<'JSON'
+    {"name": "main", "target": "branch", "enforcement": "active",
+     "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+     "rules": [{"type": "pull_request", "parameters": {"required_approving_review_count": 0,
+       "dismiss_stale_reviews_on_push": false, "require_code_owner_review": false,
+       "require_last_push_approval": false, "required_review_thread_resolution": false}},
+       {"type": "non_fast_forward"}, {"type": "deletion"}],
+     "bypass_actors": []}
+    JSON
+
+The agents that work on the repository push branches and open pull requests, and the
+coordinator creates tags only on the word of the owner. A leaked token of the owner's
+account is out of this model.
 
 ## Keys
 
@@ -208,9 +256,11 @@ request to `keys/`.
 with a time a little before the leak (`--since start` when the time is
 unknown: every signature of the key falls). Commit the public files and the new
 `keys/revoked`, set the new secret. The push of the list runs the signature of
-every series with the new key. Packages signed after `since` are refused by
-`pkg`, and the next patch release builds them again: carrying does not take a
-package whose key is revoked.
+every series with the new key; the records stay those of the signed copy in the
+release, which the old key signed in good time, so the series is not locked.
+Packages signed after `since` are refused by `pkg`, and the next patch release
+builds them again: carrying does not take a package whose key is revoked, and
+it takes the other records from the same copy.
 
 **Changing the root.** The root changes only with a new base system: new
 `keys/stafeto-root-N.pub`, a new `OFFICIAL_ROOTS`, and a new series.
