@@ -161,8 +161,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # 9,999,999 refused, a setting that starts with $ and is not ASCII refused;
 # tagged pin-60b70ca6.
 # getspnam and getspnam_r match the whole name
-# (stafeto-design#634); head of stafeto/relibc#7, to be moved to its pin tag.
-COMMIT = "e1024928bcf6373a4c234569199cc315ba7aac8e"
+# (stafeto-design#634); tagged pin-bbcd2dcc.
+COMMIT = "bbcd2dcc3465ca73b765c7ad0b724487652b2ed7"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
