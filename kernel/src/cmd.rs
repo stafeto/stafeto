@@ -259,7 +259,7 @@ pub fn flush_posted() {
 }
 
 /// Sends what the sections posted: each thread into the queue to its CPU,
-/// and one SGI to each CPU that has something new. Outside OBJ, with the
+/// and one ring (`idle::ring`: a bell, and an SGI when the CPU does not poll) to each CPU that has something new. Outside OBJ, with the
 /// copies of messages made.
 #[inline(never)]
 pub fn flush() {
@@ -367,7 +367,7 @@ pub fn serve_batch(batch: &[(NonNull<Thread>, u8)]) {
     }
     let timers_left = serve_all(batch);
     // A batch that was not full left the queues empty, and each later push
-    // comes with an SGI of its own.
+    // comes with a ring of its own.
     if timers_left || n == DRAIN_BATCH && (0..cpus).any(|f| f != me && !RINGS[me][f].is_empty()) {
         gic::send_sgi(me, SGI_CMD);
     }

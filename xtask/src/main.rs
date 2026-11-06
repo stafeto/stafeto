@@ -11162,13 +11162,21 @@ fn smp_window() -> Result<(), String> {
 }
 
 /// The pairs of the probe of the bell (tests/init/src/smp.rs, `idle_bell_pairs`).
-const IDLE_PAIRS_BEGIN: &str = "smp idle bell  20000 pairs begin";
-const IDLE_PAIRS_DONE: &str = "smp idle bell  20000 pairs done";
-const IDLE_IRQ_DONE: &str = "smp idle bell  20 interrupt rounds done";
+/// The line of the first test of the smp group.
+const SMP_FIRST_LINE: &str = "smp: 4 CPUs, threads ran together on every CPU";
+const IDLE_PAIRS_BEGIN: &str = "smp idle bell  pairs begin";
+const IDLE_PAIRS_DONE: &str = "smp idle bell  pairs done";
+const IDLE_IRQ_DONE: &str = "smp idle bell  interrupt rounds done";
 const IDLE_IRQ_LINE: &str = "idle poll  an interrupt was pending at the end of the window";
-/// The windows of 20 rounds that may end with an interrupt pending in the
+/// The windows of the rounds of the test of the interrupt that may end with an interrupt pending in the
 /// kernel that reads ISR_EL1 every turn: it arrives in the last turn.
 const IDLE_IRQ_NOISE: usize = 2;
+
+/// The windows that ended with an interrupt pending while the test of the
+/// pairs and the interrupt ran (the probe kernel prints the line from the arm of the pairs to the end of the interrupt test).
+fn late_windows(lines: &[String]) -> usize {
+    lines.iter().filter(|l| *l == IDLE_IRQ_LINE).count()
+}
 
 /// The probe of the bell and the poll of the idle loop on four CPUs (kernel
 /// features `idle-probe` and the three `break-idle-*`): the kernel that
@@ -11187,33 +11195,32 @@ fn smp_idle_bell() -> Result<(), String> {
         (drain, "the drain of the queues after a bell"),
     ] {
         let o = idle_probe_run(variant)?;
-        // A lost wake-up fails the tests of the stage before the pairs too;
-        // the verdict is that the pairs did not end.
-        let begun = o.lines.iter().any(|l| l == IDLE_PAIRS_BEGIN);
+        // A lost wake-up leaves a call for good: the run hangs until the cut,
+        // the kernel does not stop, the tests of the stage began, and the
+        // pairs did not end. A panic or an exit of init is another failure.
+        let began = o.lines.iter().any(|l| l == SMP_FIRST_LINE);
         let done = o.lines.iter().any(|l| l == IDLE_PAIRS_DONE);
-        if done {
+        let stopped = o
+            .lines
+            .iter()
+            .any(|l| l.contains("KERNEL PANIC") || l.contains("init exited"));
+        if !(o.timed_out && began && !done && !stopped) {
             return Err(format!(
-                "no probe caught the kernel without {what}: the pairs ended"
+                "the kernel without {what} did not hang in a call: timed out {}, the smp tests began {began}, the pairs ended {done}, the kernel stopped {stopped}",
+                o.timed_out
             ));
         }
-        println!(
-            "smp idle bell: the kernel without {what} is caught: the pairs {} end",
-            if begun {
-                "did not"
-            } else {
-                "did not begin, and did not"
-            }
-        );
+        println!("smp idle bell: the kernel without {what} is caught: a call hangs");
     }
     let o = idle_probe_run(irq)?;
-    let late = o.lines.iter().filter(|l| *l == IDLE_IRQ_LINE).count();
+    let late = late_windows(&o.lines);
     if late <= IDLE_IRQ_NOISE {
         return Err(format!(
             "no probe caught the kernel without the look at ISR_EL1 in the window: {late} windows ended with an interrupt pending"
         ));
     }
     println!(
-        "smp idle bell: the kernel without the look at ISR_EL1 is caught: {late} windows of 20 ended with an interrupt pending"
+        "smp idle bell: the kernel without the look at ISR_EL1 is caught: {late} windows of the pairs and the rounds ended with an interrupt pending"
     );
     Ok(())
 }
@@ -11454,7 +11461,7 @@ fn init_tests_in(
             for line in [IDLE_PAIRS_BEGIN, IDLE_PAIRS_DONE, IDLE_IRQ_DONE] {
                 qemu::expect_line(&o, line)?;
             }
-            let late = o.lines.iter().filter(|l| *l == IDLE_IRQ_LINE).count();
+            let late = late_windows(&o.lines);
             if late > IDLE_IRQ_NOISE {
                 return Err(format!(
                     "{late} windows of the poll of the probe kernel ended with an interrupt pending"

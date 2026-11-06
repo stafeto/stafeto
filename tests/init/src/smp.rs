@@ -2297,12 +2297,14 @@ fn idle_bell_pairs() -> Outcome {
     CHANNEL.store(c.raw().0, Relaxed);
     let server = spawn_on(0, 1, echo_service, 0, TEST_PRIORITY + 1)?;
     check(wait_for(|| mark(0) == 1), "the service did not start")?;
-    println!("smp idle bell  {BELL_PAIRS} pairs begin");
+    // The probe kernels with a deliberate break act from here on.
+    let _ = sys::debug_write(&resource(), b"idle-probe arm");
+    println!("smp idle bell  pairs begin");
     let mut sent = 0;
     while sent < BELL_PAIRS && sys::send(&c, &[1]).is_ok() {
         sent += 1;
     }
-    println!("smp idle bell  {sent} pairs done");
+    println!("smp idle bell  pairs done");
     let _ = sys::send(&c, &[0]);
     let ended =
         wait_for(|| sys::thread_info(&server).is_ok_and(|i| i.state == abi::ThreadState::Ended));
@@ -2331,7 +2333,8 @@ fn idle_poll_interrupts() -> Outcome {
             fired += 1;
         }
     }
-    println!("smp idle bell  {fired} interrupt rounds done");
+    let _ = sys::debug_write(&resource(), b"idle-probe unwatch");
+    println!("smp idle bell  interrupt rounds done");
     close(t)?;
     close(c)?;
     check(fired == IRQ_ROUNDS, "a timer of an idle CPU did not fire")

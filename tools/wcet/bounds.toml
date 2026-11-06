@@ -470,33 +470,13 @@ why = "the commands a section posts: at most OUTBOX = 96"
 function = "kernel::cmd::flush"
 at = "0xf8"
 bound = 8
-why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
-
-[[copy]]
-function = "kernel::thread::flush_deferred"
-bytes = 1024
-why = "the bytes of a message that wait to be copied: a message is at most abi::MESSAGE_MAX = 1024 bytes"
-
-[[copy]]
-function = "kernel::channel::message::deliver"
-bytes = 1024
-why = "the bytes of a message: at most abi::MESSAGE_MAX = 1024"
-
-[[copy]]
-function = "kernel::syscall::info::debug_write"
-bytes = 64
-why = "the text of debug_write: eight words, 64 bytes"
-
-[[copy]]
-function = "kernel::cleanup::portion"
-bytes = 4096
-why = "no object the kernel moves or fills is larger than a frame"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU with a command: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cmd::flush"
 at = "0x100"
 bound = 8
-why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU with a command: at most MAX_CPUS = 8"
 
 [[copy]]
 function = "kernel::thread::flush_deferred"
@@ -645,7 +625,7 @@ why = "a wait for another CPU (a command or an acknowledgement it owes), which i
 function = "kernel::smp::handle"
 at = "0xaa0"
 bound = 8
-why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU with a command: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::syscall::mem::portions"
@@ -693,7 +673,7 @@ why = "the CPUs: at most MAX_CPUS = 8"
 function = "kernel::smp::handle"
 at = "0xbfc"
 bound = 8
-why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU with a command: at most MAX_CPUS = 8"
 
 [[free]]
 prefix = "kernel::smp::lock_rounds"
@@ -961,19 +941,19 @@ why = "the epochs of the CPUs a retired object waits for: at most MAX_CPUS = 8 (
 function = "kernel::cleanup::portion"
 at = "0x1948"
 bound = 8
-why = "one SGI for each CPU that has something to take: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"
 at = "0xeb8"
 bound = 8
-why = "one SGI for each CPU that has something to take: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"
 at = "0x2028"
 bound = 8
-why = "one SGI for each CPU that has something to take: at most MAX_CPUS = 8"
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"

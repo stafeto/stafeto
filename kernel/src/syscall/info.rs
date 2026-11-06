@@ -303,6 +303,18 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         }
         _ => {}
     }
+    #[cfg(feature = "idle-probe")]
+    match text {
+        b"idle-probe arm" => {
+            crate::idle::arm();
+            return Ok(Values::new(&[a[1]]));
+        }
+        b"idle-probe unwatch" => {
+            crate::idle::watch(false);
+            return Ok(Values::new(&[a[1]]));
+        }
+        _ => {}
+    }
     crate::log::text(text);
     Ok(Values::new(&[a[1]]))
 }

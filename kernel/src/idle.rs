@@ -24,15 +24,57 @@ const POLLING: u32 = 1;
 /// Another CPU put work for this one.
 const BELL: u32 = 2;
 
-/// The word of a CPU, on a line of its own (ERG 64 bytes), so that a bell
+/// The word of a CPU, on a line of its own (128 bytes, the line of Apple's cores; more than the 64 bytes of the reservation granule of the Cortex-A53), so that a bell
 /// for one CPU never writes the line of another.
-#[repr(align(64))]
+#[repr(align(128))]
 struct Word(AtomicU32);
 
 static IDLE: [Word; MAX_CPUS] = [const { Word(AtomicU32::new(0)) }; MAX_CPUS];
 
 /// Whether the machine polls: set once by CPU 0 before the others start.
 static POLL_ON: AtomicBool = AtomicBool::new(false);
+
+/// The deliberate breaks act once the test of the pairs asks for them
+/// (`arm`), so that the earlier tests of the group run on a sound kernel and
+/// the break shows as a call that hangs.
+#[cfg(feature = "idle-probe")]
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// The test of the pairs arms the breaks (debug_write "idle-probe arm").
+#[cfg(feature = "idle-probe")]
+pub fn arm() {
+    ARMED.store(true, Ordering::Relaxed);
+    WATCH.store(true, Ordering::Relaxed);
+}
+
+/// The probe kernels print their line about an interrupt pending at the end
+/// of a window from the start of the test of the pairs (`arm`) to the end of
+/// the test of the interrupt (`watch(false)`).
+#[cfg(feature = "idle-probe")]
+static WATCH: AtomicBool = AtomicBool::new(false);
+
+/// The test of the interrupt stops the watch.
+#[cfg(feature = "idle-probe")]
+pub fn watch(on: bool) {
+    WATCH.store(on, Ordering::Relaxed);
+}
+
+/// Whether a break is in force.
+#[allow(dead_code)]
+fn armed() -> bool {
+    cfg!(feature = "idle-probe") && {
+        #[cfg(feature = "idle-probe")]
+        let on = ARMED.load(Ordering::Relaxed);
+        #[cfg(not(feature = "idle-probe"))]
+        let on = false;
+        on
+    }
+}
+
+/// The break `break-idle-drain`: the bell ends the poll with no drain.
+pub fn skips_drain() -> bool {
+    cfg!(feature = "break-idle-drain") && armed()
+}
 
 /// The window of the probe kernels, in ticks of the counter: 1 ms.
 const PROBE_WINDOW_DIV: u64 = 1000;
@@ -87,7 +129,7 @@ pub fn ring(to: usize) {
     #[cfg(feature = "break-idle-bell")]
     let old = {
         let old = IDLE[to].0.load(Ordering::Acquire);
-        if old & POLLING != 0 {
+        if old & POLLING != 0 && armed() {
             let until = arch::timer::now() + 2 * arch::timer::frequency() / 1000;
             while arch::timer::now() < until {}
         }
@@ -136,7 +178,7 @@ pub fn poll(window: u64) -> Polled {
     }
     let old = word.fetch_and(!(POLLING | BELL), Ordering::Acquire);
     #[cfg(feature = "idle-probe")]
-    if quiet && old & BELL == 0 && arch::irq_pending() {
+    if quiet && old & BELL == 0 && WATCH.load(Ordering::Relaxed) && arch::irq_pending() {
         kprintln!("idle poll  an interrupt was pending at the end of the window");
     }
     let bell = old & BELL != 0;

@@ -980,8 +980,9 @@ fn sleep() {
     }
     if bell {
         // The same as the SGI of the commands (smp.rs).
-        #[cfg(not(feature = "break-idle-drain"))]
-        crate::cmd::drain();
+        if !crate::idle::skips_drain() {
+            crate::cmd::drain();
+        }
         crate::cmd::flush_posted();
     }
     local().sched.lock().waking = false;

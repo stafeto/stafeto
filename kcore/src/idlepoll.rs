@@ -70,14 +70,20 @@ impl Default for Poll {
     }
 }
 
-/// The maker of the CPU in MIDR_EL1 (bits 31:24) of a guest of Apple's
-/// hypervisor: HVF under QEMU and Virtualization.framework both set it.
-const APPLE: u64 = 0x61;
+/// MIDR_EL1 of a guest of Apple's hypervisor: maker 0x61 (bits 31:24) and
+/// part number 0 (bits 15:4), what HVF under QEMU and Virtualization.framework
+/// both give (0x610f0000, recorded in F2-0). The mask leaves variant,
+/// architecture and revision free. A core of Apple itself has a part number
+/// of its own and stays off: a native start on Apple silicon is a decision
+/// of its own. A guest MIDR that a future macOS changes switches the poll
+/// off, which is the old path of SGIs.
+const GUEST_MASK: u64 = 0xff00_fff0;
+const GUEST: u64 = 0x6100_0000;
 
 /// Whether the machine with this MIDR_EL1 polls by default. Others (QEMU's
 /// TCG, the A64 of the PinePhone, AWS) do not, until measured there.
 pub const fn enabled(midr: u64) -> bool {
-    (midr >> 24) & 0xff == APPLE
+    midr & GUEST_MASK == GUEST
 }
 
 #[cfg(test)]
@@ -188,5 +194,6 @@ mod tests {
         assert!(!enabled(0x410f_d070)); // TCG -cpu max reports Arm's
         assert!(!enabled(0));
         assert!(!enabled(0x0061_0000)); // 0x61 in the wrong field
+        assert!(!enabled(0x611f_0220)); // a core of Apple itself
     }
 }
