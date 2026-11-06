@@ -210,12 +210,15 @@ pub enum Kind {
     Vz,
     /// Apple VZ, the service counting its steps.
     VzSteps,
+    /// The image of scale on QEMU (`fast-probe scale`).
+    Scale,
 }
 
 /// The programs of the image: those of the image with the network and both
 /// devices, init's table for the program, and `nginx-fast`.
 pub fn programs(kind: Kind) -> &'static [ImageProgram] {
-    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 5] = [
+    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 6] = [
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
@@ -228,6 +231,7 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
         Kind::Steps => 2,
         Kind::Vz => 3,
         Kind::VzSteps => 4,
+        Kind::Scale => 5,
     };
     LISTS[at].get_or_init(|| {
         let vz = matches!(kind, Kind::Vz | Kind::VzSteps);
@@ -238,6 +242,8 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
         };
         let table: &'static [&'static str] = if vz {
             &["table-fast-nginx-vz"]
+        } else if kind == Kind::Scale {
+            &["table-fast-scale"]
         } else {
             &["table-fast-nginx"]
         };
@@ -291,6 +297,7 @@ fn image_of(kind: Kind) -> &'static str {
         Kind::Steps => STEPS_IMAGE,
         Kind::Vz => VZ_IMAGE,
         Kind::VzSteps => VZ_STEPS_IMAGE,
+        Kind::Scale => crate::fast_scale::IMAGE,
     }
 }
 
@@ -368,7 +375,7 @@ fn master_pid(run: &mut qemu::Run) -> Result<u32, String> {
 }
 
 /// The processes of nginx: the master `m` and the PIDs of the others.
-fn master_and_workers(
+pub(crate) fn master_and_workers(
     run: &mut qemu::Run,
     tag: &str,
     root: bool,
@@ -417,7 +424,7 @@ fn quit_end(run: &mut qemu::Run, tag: &str) -> Result<(), String> {
 }
 
 /// `kill -QUIT $M; wait $M`, within `QUIT_WITHIN`; the time it took.
-fn quit(run: &mut qemu::Run, tag: &str) -> Result<Duration, String> {
+pub(crate) fn quit(run: &mut qemu::Run, tag: &str) -> Result<Duration, String> {
     let at = Instant::now();
     quit_send(run, tag)?;
     quit_end(run, tag)?;
@@ -799,7 +806,7 @@ fn nobody(run: &mut qemu::Run) -> Result<String, String> {
 /// Fails on a line of nginx at `crit` or above, but for the alerts the
 /// scenarios cause (a worker killed, a worker that ended with 2), or on a
 /// fault of the image.
-fn verdict(lines: &[String], faults_allowed: usize) -> Result<(), String> {
+pub(crate) fn verdict(lines: &[String], faults_allowed: usize) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| {
         ["[alert]", "[emerg]", "[crit]"]
             .iter()
@@ -827,7 +834,7 @@ fn verdict(lines: &[String], faults_allowed: usize) -> Result<(), String> {
 }
 
 /// The shell prompt, the leases of both devices and the shell.
-fn booted(run: &mut qemu::Run) -> Result<(), String> {
+pub(crate) fn booted(run: &mut qemu::Run) -> Result<(), String> {
     run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
     expect_all(
         run,

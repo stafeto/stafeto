@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +46,9 @@ _Static_assert(sizeof(struct kevent) == 64, "struct kevent of FreeBSD");
 #define BSD_MSG_WAITALL 0x40
 #define BSD_MSG_DONTWAIT 0x80
 #define BSD_MSG_NOSIGNAL 0x20000
+
+/* The layer's counts of the process (libc.so, posix-platform). */
+extern void stafeto_probe_heap(uint64_t *out);
 
 static long
 done(long r)
@@ -81,6 +85,102 @@ flags_of(int linux_flags)
 static int stats_on;
 static uint64_t stats_said;
 
+/* A number of the stack's sysctl tree (4 or 8 bytes), -1 when it has none. */
+static long long
+sysctl_number(const char *name)
+{
+    int mib[24];
+    int query[2] = { 0, 3 };
+    size_t len = sizeof(mib);
+    union { int32_t i; int64_t l; } value = { 0 };
+    size_t size = sizeof(value);
+
+    if (ff_sysctl(query, 2, mib, &len, name, strlen(name)) != 0)
+        return -1;
+    if (ff_sysctl(mib, (unsigned)(len / sizeof(int)), &value, &size, NULL, 0) != 0)
+        return -1;
+    return size == sizeof(value.i) ? value.i : size == sizeof(value.l) ? value.l : -1;
+}
+
+static uint64_t
+monotonic_ns(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+/* The longest step of the stack and the longest gap between two steps since
+ * the last line of `fast: scale`, in microseconds. */
+static uint64_t pass_longest_us, gap_longest_us, pass_ended_ns;
+
+/* The limits the stack runs under, said once at the start: the settings
+ * of fstack.ini are the ones the image wants, and these are the ones the
+ * stack took. */
+static void
+glue_limits(void)
+{
+    static const char *const names[] = {
+        "kern.ipc.maxsockets", "kern.maxfiles", "kern.maxfilesperproc",
+        "net.inet.tcp.tcbhashsize", "net.inet.tcp.syncache.hashsize",
+        "kern.ipc.somaxconn", "kern.ipc.nmbclusters", "kern.ipc.nmbufs",
+        "kern.ncallout", "net.inet.tcp.sendspace", "net.inet.tcp.recvspace",
+    };
+
+    fprintf(stderr, "fast: start");
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        fprintf(stderr, " %s=%lld", names[i], sysctl_number(names[i]));
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/*
+ * The state of the stack's memory and of the process's, beside `fast:
+ * stats`: the open sockets, for the zones that hold a connection their item
+ * size and items (the sysctl tree of UMA), the quota and what the
+ * process uses, the heap of the layer (pages of the room unbacked, free,
+ * user and own, the places of the kernel's table the layer's map holds and
+ * the entries it does not show, the chunks taken and the longest time one
+ * held the heap's lock) and the longest step and gap of the stack.
+ */
+static void
+glue_scale(void)
+{
+    static const char *const zones[] = { "socket", "tcp_inpcb", "mbuf", "mbuf_cluster", "KNOTE", "Files" };
+    uint64_t heap[11];
+    char name[96];
+    struct rlimit data;
+    int tight;
+
+    /* A sysctl of the stack takes memory that may not be refused, and a
+     * process within a megabyte of its data limit or its quota ends in it:
+     * the line then holds the heap alone. */
+    stafeto_probe_heap(heap);
+    tight = heap[10] - heap[9] < (1u << 20);
+    if (getrlimit(RLIMIT_DATA, &data) == 0 && data.rlim_cur != RLIM_INFINITY &&
+        (heap[3] + heap[4]) * 4096 + (1u << 20) > data.rlim_cur)
+        tight = 1;
+    fprintf(stderr, "fast: scale sockets=%lld", tight ? -1 : sysctl_number("kern.ipc.numopensockets"));
+    for (unsigned i = 0; i < sizeof(zones) / sizeof(zones[0]) && !tight; i++) {
+        long long size, items;
+
+        snprintf(name, sizeof(name), "vm.uma.%s.size", zones[i]);
+        size = sysctl_number(name);
+        snprintf(name, sizeof(name), "vm.uma.%s.stats.current", zones[i]);
+        items = sysctl_number(name);
+        fprintf(stderr, " %s=%lld/%lld", zones[i], size, items);
+    }
+    fprintf(stderr,
+        " quota=%llu used=%llu room=%llu unbacked=%llu free=%llu user=%llu own=%llu places=%llu hidden=%llu grows=%llu grow_longest_us=%llu pass_longest_us=%llu gap_longest_us=%llu\n",
+        (unsigned long long)heap[10], (unsigned long long)heap[9],
+        (unsigned long long)heap[0], (unsigned long long)heap[1], (unsigned long long)heap[2],
+        (unsigned long long)heap[3], (unsigned long long)heap[4], (unsigned long long)heap[5],
+        (unsigned long long)heap[6], (unsigned long long)heap[7], (unsigned long long)(heap[8] / 1000),
+        (unsigned long long)pass_longest_us, (unsigned long long)gap_longest_us);
+    pass_longest_us = gap_longest_us = 0;
+}
+
 /*
  * With STAFETO_FAST_EXIT_IN_PASS=N the process ends with status 1 inside its
  * Nth step of the stack, as the stack's ff_mmap does when mmap fails: the
@@ -108,6 +208,7 @@ glue_stats(void)
         (unsigned long long)st.rx_frames, (unsigned long long)st.tx_frames,
         (unsigned long long)st.bell_rx_passes, (unsigned long long)st.bell_rx,
         (unsigned long long)st.bell_tx);
+    glue_scale();
     fflush(stderr);
 }
 
@@ -124,6 +225,7 @@ glue_start(const struct stafeto_fast_claim *claim)
         claim->config.address[1], claim->config.address[2], claim->config.address[3],
         claim->config.prefix);
     fflush(stderr);
+    glue_limits();
     stats_on = getenv("STAFETO_FAST_STATS") != NULL;
     if (getenv("STAFETO_FAST_EXIT_IN_PASS") != NULL)
         exit_in_pass = atol(getenv("STAFETO_FAST_EXIT_IN_PASS"));
@@ -133,8 +235,18 @@ glue_start(const struct stafeto_fast_claim *claim)
 static int
 glue_pass(void)
 {
+    uint64_t began = stats_on ? monotonic_ns() : 0;
     int work = ff_stafeto_pass();
 
+    if (stats_on) {
+        uint64_t ended = monotonic_ns();
+
+        if (pass_ended_ns != 0 && (began - pass_ended_ns) / 1000 > gap_longest_us)
+            gap_longest_us = (began - pass_ended_ns) / 1000;
+        if ((ended - began) / 1000 > pass_longest_us)
+            pass_longest_us = (ended - began) / 1000;
+        pass_ended_ns = ended;
+    }
     if (exit_in_pass > 0 && --exit_in_pass == 0)
         exit(1);
     if (stats_on)

@@ -21,6 +21,42 @@
  
  #define	PCPU_GET(member)	(pcpup->pc_ ## member)
  #define	PCPU_ADD(member, value)	(pcpup->pc_ ## member += (value))
+--- a/freebsd/kern/kern_descrip.c
++++ b/freebsd/kern/kern_descrip.c
+@@ -2229,7 +2229,17 @@
+ 		}
+ 		return (ENFILE);
+ 	}
++#ifdef FF_STAFETO
++	/* The stack cannot wait for memory: a process at its quota refuses the
++	 * file, and accept() answers ENFILE. */
++	fp = uma_zalloc(file_zone, M_NOWAIT);
++	if (fp == NULL) {
++		atomic_subtract_int(&openfiles, 1);
++		return (ENFILE);
++	}
++#else
+ 	fp = uma_zalloc(file_zone, M_WAITOK);
++#endif
+ 	bzero(fp, sizeof(*fp));
+ 	refcount_init(&fp->f_count, n);
+ 	fp->f_cred = crhold(td->td_ucred);
+--- a/freebsd/kern/kern_event.c
++++ b/freebsd/kern/kern_event.c
+@@ -1444,7 +1444,13 @@
+ 			if (!kevp->filter)
+ 				continue;
+ 			kevp->flags &= ~EV_SYSFLAGS;
++#ifdef FF_STAFETO
++			/* No wait for memory (the stack's threads cannot sleep): a
++			 * process at its quota gets ENOMEM for the registration. */
++			error = kqueue_register(kq, kevp, td, M_NOWAIT);
++#else
+ 			error = kqueue_register(kq, kevp, td, M_WAITOK);
++#endif
+ 			if (error || (kevp->flags & EV_RECEIPT)) {
+ 				if (nevents == 0)
+ 					return (error);
 --- a/freebsd/net/netisr.c
 +++ b/freebsd/net/netisr.c
 @@ -984,6 +984,50 @@
@@ -74,6 +110,32 @@
  static int
  netisr_queue_workstream(struct netisr_workstream *nwsp, u_int proto,
      struct netisr_work *npwp, struct mbuf *m, int *dosignalp)
+--- a/freebsd/vm/uma_core.c
++++ b/freebsd/vm/uma_core.c
+@@ -1737,6 +1737,10 @@
+ 	ZONE_UNLOCK(zone);
+ }
+ 
++#ifdef FF_STAFETO
++extern unsigned ff_stafeto_refused;
++#endif
++
+ /*
+  * Allocate a new slab for a keg and inserts it into the partial slab list.
+  * The keg should be unlocked on entry.  If the allocation succeeds it will
+@@ -1799,6 +1803,12 @@
+ 	size = keg->uk_ppera * PAGE_SIZE;
+ 	mem = keg->uk_allocf(zone, size, domain, &sflags, aflags);
+ 	if (mem == NULL) {
++#ifdef FF_STAFETO
++		/* A request that may not fail finds no page: the zone is named
++		 * before the program ends (ff_glue.c, kmem_malloc). */
++		if ((flags & M_WAITOK) != 0 && ff_stafeto_refused == 1)
++			printf("fst: zone %s waits for memory\n", zone->uz_name);
++#endif
+ 		if (keg->uk_flags & UMA_ZFLAG_OFFPAGE)
+ 			zone_free_item(slabzone(keg->uk_ipers),
+ 			    slab_tohashslab(slab), NULL, SKIP_NONE);
 --- a/lib/ff_compat.c
 +++ b/lib/ff_compat.c
 @@ -364,12 +364,31 @@
@@ -173,19 +235,33 @@
  /*
 --- a/lib/ff_glue.c
 +++ b/lib/ff_glue.c
-@@ -1031,7 +1031,20 @@
+@@ -1028,10 +1028,34 @@
+     panic("kproc_exit unsupported");
+ }
+ 
++#ifdef FF_STAFETO
++/* The refusals of the memory since the stack's last step. */
++unsigned ff_stafeto_refused;
++#endif
++
  void *
  kmem_malloc(vm_size_t bytes, int flags)
  {
 +#ifdef FF_STAFETO
 +    /* A request that may fail (M_NOWAIT) gets NULL when the process has no
 +     * more memory: the socket, the frame or the cluster is refused and the
-+     * stack lives on. Any other request is made again by ff_mmap, which
-+     * ends the program on a refusal. */
++     * stack lives on. UMA asks for the pages of a request that may not fail
++     * with M_NOWAIT too and asks again at once, for ever, so a step of the
++     * stack that is refused 1000 times ends the program, as ff_mmap does.
++     * Any other request is made again by ff_mmap, which ends the program on
++     * a refusal. */
 +    void *alloc = ff_mmap_try(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
 +    if (alloc == (void *)-1) {
-+        if (flags & M_NOWAIT)
++        if (flags & M_NOWAIT) {
++            if (++ff_stafeto_refused > 1000)
++                ff_stafeto_exhausted(bytes);
 +            return (NULL);
++        }
 +        alloc = ff_mmap(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
 +    }
 +#else
@@ -194,6 +270,29 @@
      if ((flags & M_ZERO) && alloc != NULL)
          bzero(alloc, bytes);
      return (alloc);
+@@ -1067,12 +1091,22 @@
+ malloc(unsigned long size, struct malloc_type *type, int flags)
+ {
+     void *alloc;
++#ifdef FF_STAFETO
++    int tries = 0;
++#endif
+ 
+     do {
+         alloc = ff_malloc(size);
+         if (alloc || !(flags & M_WAITOK))
+             break;
+ 
++#ifdef FF_STAFETO
++        /* Nothing frees memory while this waits, so a process at its quota
++         * would wait for ever: after 100 tries (a second) it ends, as
++         * ff_mmap does, and its main process starts another. */
++        if (++tries == 100)
++            ff_stafeto_exhausted(size);
++#endif
+         pause("malloc", hz/100);
+     } while (alloc == NULL);
+ 
 --- a/lib/ff_host_interface.c
 +++ b/lib/ff_host_interface.c
 @@ -54,8 +54,12 @@
@@ -209,7 +308,7 @@
  
  #include "ff_host_interface.h"
  #include "ff_errno.h"
-@@ -65,6 +69,23 @@
+@@ -65,6 +69,31 @@
  extern void* ff_mem_get_page();
  extern int ff_mem_free_addr(void* p);
  
@@ -228,12 +327,20 @@
 +    if ((flags & ff_MAP_ANON) == ff_MAP_ANON)       host_flags |= MAP_ANON;
 +    return mmap(addr, len, host_prot, host_flags, fd, offset);
 +}
++
++/* The program ends: a request that cannot fail found no memory. */
++void
++ff_stafeto_exhausted(uint64_t size)
++{
++    ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_LIB, "fst malloc failed:%llu bytes\n", (unsigned long long)size);
++    exit(1);
++}
 +#endif
 +
  void *
  ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset)
  {
-@@ -206,7 +227,7 @@
+@@ -206,7 +235,7 @@
  }
  
  void
@@ -242,7 +349,7 @@
  {
      if (sec) {
          *sec = current_ts.tv_sec;
-@@ -229,7 +250,22 @@
+@@ -229,7 +258,22 @@
  {
      (void)reseed;
  
@@ -265,7 +372,7 @@
  }
  
  uint32_t
-@@ -566,7 +602,13 @@
+@@ -566,7 +610,13 @@
          case ff_ERANGE:      errno = ERANGE; break;
  
          /* case ff_EAGAIN:       same as EWOULDBLOCK */
@@ -281,18 +388,20 @@
          case ff_EALREADY:        errno = EALREADY; break;
 --- a/lib/ff_host_interface.h
 +++ b/lib/ff_host_interface.h
-@@ -41,6 +41,10 @@
+@@ -41,6 +41,12 @@
  #define ff_MAP_FAILED    ((void *)-1)
  
  void *ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
 +#ifdef FF_STAFETO
 +/* As ff_mmap; a refusal returns MAP_FAILED to the caller. */
 +void *ff_mmap_try(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
++/* Ends the program: an allocation that may not fail found no memory. */
++void ff_stafeto_exhausted(uint64_t size);
 +#endif
  int ff_munmap(void *addr, uint64_t len);
  
  void *ff_malloc(uint64_t size);
-@@ -72,6 +76,10 @@
+@@ -72,6 +78,10 @@
  char *ff_getenv(const char *name);
  
  void ff_os_errno(int error);

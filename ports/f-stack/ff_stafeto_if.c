@@ -77,6 +77,8 @@ extern void ff_hardclock(void);
 /* The workstreams of the stack's software interrupts that had work
  * (freebsd/net/netisr.c, FF_STAFETO). */
 extern unsigned long ff_stafeto_netisr_runs;
+/* The refusals of the memory since the last step (stafeto.patch, ff_glue.c). */
+extern unsigned ff_stafeto_refused;
 extern int ff_stafeto_netisr_pending(void);
 struct ff_flow_key;
 
@@ -660,6 +662,7 @@ ff_stafeto_pass(void)
     int ticks = 0, received = 0;
 
     passes++;
+    ff_stafeto_refused = 0;
     tx_stalled = 0;
     while (now >= next_tick_ns && ticks < FF_STAFETO_MAX_TICKS) {
         ff_hardclock();

@@ -1306,6 +1306,26 @@ pub extern "C" fn stafeto_probe_room_pages() -> u64 {
     posix_abi::allocation::room_pages() as u64
 }
 
+/// The heap's counts into `out` (posix_abi::allocation::probe_heap): the
+/// pages of the room, those unbacked, free, user and own, the places of the
+/// map, the entries it does not show, the chunks taken and the longest time
+/// one held the heap's lock in nanoseconds, then the bytes charged to the
+/// process and its quota.
+///
+/// # Safety
+/// `out` has room for 11 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_heap(out: *mut u64) {
+    let words = posix_abi::allocation::probe_heap();
+    let memory = rt::sys::process_memory(posix_abi::allocation::process());
+    // SAFETY: the caller gives room for 11 words.
+    unsafe {
+        out.copy_from_nonoverlapping(words.as_ptr(), words.len());
+        out.add(9).write(memory.as_ref().map_or(0, |m| m.used));
+        out.add(10).write(memory.as_ref().map_or(0, |m| m.quota));
+    }
+}
+
 /// The bytes charged to the process (object_info PROCESS_MEMORY), for the
 /// probe that compares them with the memory map; 0 when the call fails.
 #[unsafe(no_mangle)]

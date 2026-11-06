@@ -1557,6 +1557,7 @@ pub const IMAGES: &[&str] = &[
     "boot-fast-nginx-steps.img",
     "boot-fast-nginx-vz.img",
     "boot-fast-nginx-vz-steps.img",
+    "boot-fast-scale.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1771,6 +1772,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             }
             files
         }
+        "boot-fast-scale.img" => crate::fast_scale::files(fast_nginx_files(name)),
         "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
@@ -2639,6 +2641,9 @@ mod tests {
                 }
                 "boot-fast-nginx-vz-steps.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::VzSteps)
+                }
+                "boot-fast-scale.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Scale)
                 }
                 "boot-nginx-probe.img" => crate::nginx_probe::programs(),
                 "boot-nginx-probe-steps.img" => crate::nginx_probe::steps_programs(),

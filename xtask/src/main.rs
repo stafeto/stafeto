@@ -56,6 +56,7 @@ mod entropy;
 mod fast_layer;
 mod fast_nginx;
 mod fast_probe;
+mod fast_scale;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -9340,6 +9341,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("fast-nginx-steps", || {
             fast_nginx::probe(&qemu::VIRT, fast_nginx::Kind::Steps)
         }),
+        // nginx on the stack at 10 000 connections on a quota of 128 MiB
+        // (the grant of the process service), the memory per connection,
+        // a worker killed (the place of the grant comes back), and the quota
+        // ending: connections refused, the worker alive.
+        job("fast-scale", || fast_scale::probe(&qemu::VIRT_1G)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
