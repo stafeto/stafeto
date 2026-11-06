@@ -38,6 +38,8 @@ pub struct Options {
     pub from: Option<PathBuf>,
     /// The release of the storage new files are stored in (`v0.3.0-aarch64`).
     pub storage: Option<String>,
+    /// The serial is that of the index published at this address, plus one.
+    pub serial_after: Option<String>,
     /// `--serial` was given.
     pub serial_given: bool,
     /// `--check` reads the repository at this address, every file over the
@@ -63,6 +65,7 @@ impl Default for Options {
             from: None,
             storage: None,
             serial_given: false,
+            serial_after: None,
             remote: None,
             perturb: Vec::new(),
         }
@@ -88,6 +91,7 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--from" => o.from = Some(value.into()),
             "--storage" => o.storage = Some(value),
             "--remote" => o.remote = Some(value),
+            "--serial-after" => o.serial_after = Some(value),
             "--serial" => {
                 o.serial_given = true;
                 o.serial = value
@@ -614,6 +618,16 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
             "--from writes next to the files it reads: no --check, --previous or --dir".into(),
         );
     }
+    let mut o = o.clone();
+    if let Some(base) = &o.serial_after {
+        if o.serial_given || o.from.is_none() {
+            return Err("--serial-after goes with --from and without --serial".into());
+        }
+        o.serial =
+            crate::resign::serial_after(base, &crate::carry::fetch, &keys::official_roots()?)?;
+        o.serial_given = true;
+    }
+    let o = &o;
     if o.from.is_some() && !o.serial_given {
         return Err("--from wants --serial: an index with a number a device has seen is refused as a rollback".into());
     }

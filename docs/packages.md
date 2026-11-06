@@ -393,7 +393,7 @@ link programs (for a package with programs) and `build-depends <name>
   and the publication of a release run it through `tools/pages.py`.
 - `cargo xtask release-build [--previous INDEX] [--no-abi]` is the first half of a release
   (docs/release.md): the check of the ABI fingerprint (with `--release` for a version without a
-  suffix), the repository of `target/release/pkg` with the carried and the built packages and their
+  suffix), the repository of `target/stafeto-release/pkg` with the carried and the built packages and their
   source archives, `boot-base.img`, `boot-full.img`, the kernel and the stage of `tools/dist.py`. It
   refuses a build that sets `STAFETO_PKG_ROOTS`. `cargo xtask release-pack` is the second half after
   the signing; `cargo xtask dist` runs both with the development key.

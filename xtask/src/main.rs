@@ -1665,9 +1665,10 @@ commands:
             the shell ends the machine and gives its status)
   dist       build the release files of this version in target/dist, signed with the development
             key (docs/release.md)
-  release-build [--previous INDEX] [--no-abi]  the first half of a release in target/release: the
+  release-build [--previous INDEX] [--no-abi]  the first half of a release in target/stafeto-release: the
             packages (carried from INDEX), both images, the kernel and the stage of tools/dist.py
-  release-pack  the archives of a release in target/dist from target/release after it is signed
+  release-check [DIR]  refuse what the build job left that is not a file of a release
+  release-pack  the archives of a release in target/dist from target/stafeto-release after it is signed
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   image base|full [run]
@@ -2087,6 +2088,7 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("dist") => release::dist(),
         Some("release-build") => release::build_command(&args[1..]),
+        Some("release-check") => release::check_command(&args[1..]),
         Some("release-pack") => release::pack(&target_dir().join("dist")),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),

@@ -120,6 +120,42 @@ pub fn resign(
     Ok((new_text, block.to_bytes().to_vec()))
 }
 
+/// The serial for the index of a release: that of the index published at `base`
+/// plus one, after the roots of the tree have accepted its signature (the time of
+/// a revoked key does not matter here: only the number is taken), or 1 when
+/// the series is not published. The signing job takes the number from nowhere else.
+pub fn serial_after(
+    base: &str,
+    fetch: crate::carry::Fetch<'_>,
+    roots: &[Key],
+) -> Result<u64, String> {
+    let get = |name: &str| fetch(&crate::carry::address_of(base, name));
+    let Some(text) = get("INDEX")? else {
+        return Ok(1);
+    };
+    let sig = get("INDEX.sig")?.ok_or_else(|| format!("{base}: INDEX.sig is missing"))?;
+    let block = Block::parse(&sig).map_err(|e| format!("INDEX.sig: {e}"))?;
+    pkgfmt::trust::verify(
+        &block,
+        Kind::Index,
+        &sha::sha256(&text),
+        text.len() as u64,
+        &Trust { roots, direct: &[] },
+        &[],
+    )
+    .map_err(|e| format!("{base}: INDEX.sig is not accepted: {e}"))?;
+    let text = std::str::from_utf8(&text).map_err(|e| format!("INDEX: {e}"))?;
+    let serial = Index::parse(text)
+        .map_err(|e| format!("INDEX: {e}"))?
+        .header
+        .serial;
+    // A number near the end of u64 is a number nobody could follow.
+    if serial >= u64::MAX / 2 {
+        return Err(format!("{base}: the serial {serial} is out of reason"));
+    }
+    Ok(serial + 1)
+}
+
 /// `cargo xtask repo resign --index F --serial N --out D [--sig F.sig]
 /// [--expires-days D] [--key K.key --cert K.cert] [--root R.pub]
 /// [--min-certificate-days N]`. The roots are the official ones and the list
@@ -396,6 +432,49 @@ mod tests {
             since: NOW,
         }];
         assert!(go(text.as_bytes(), &sig, &before, &old, &term(6)).is_ok());
+    }
+
+    #[test]
+    fn the_serial_of_a_release_follows_the_published_index_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("stafeto-after-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.to_str().unwrap();
+        let fetch = crate::carry::fetch;
+        assert_eq!(
+            serial_after(base, &fetch, &[root()]).unwrap(),
+            1,
+            "not published"
+        );
+        let by = signing(&REL, "t-release", NOW * 2);
+        let (text, sig) = index(&by);
+        std::fs::write(dir.join("INDEX"), &text).unwrap();
+        std::fs::write(dir.join("INDEX.sig"), &sig).unwrap();
+        assert_eq!(serial_after(base, &fetch, &[root()]).unwrap(), 6);
+        // A forged number, a stranger's signature and a number near the end are refused.
+        std::fs::write(dir.join("INDEX"), text.replace("serial 5", "serial 9")).unwrap();
+        assert!(serial_after(base, &fetch, &[root()]).is_err());
+        let high = text.replace("serial 5", "serial 18446744073709551614");
+        std::fs::write(dir.join("INDEX"), &high).unwrap();
+        let block = Block::sign(
+            &by.seed,
+            Kind::Index,
+            high.len() as u64,
+            sha::sha256(high.as_bytes()),
+            NOW,
+            by.key,
+            by.certificate,
+        );
+        std::fs::write(dir.join("INDEX.sig"), block.to_bytes()).unwrap();
+        assert!(
+            serial_after(base, &fetch, &[root()])
+                .unwrap_err()
+                .contains("out of reason")
+        );
+        std::fs::write(dir.join("INDEX"), &text).unwrap();
+        std::fs::write(dir.join("INDEX.sig"), &sig).unwrap();
+        assert!(serial_after(base, &fetch, &[]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

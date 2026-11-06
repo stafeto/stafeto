@@ -5,7 +5,7 @@
 //! release, which runs where the code of the packages is built and holds no
 //! secret: the packages (carried from the published index when there is one),
 //! the base image, the full image, the kernel and the stage of
-//! `tools/dist.py`, all in `target/release/`. The second half signs them
+//! `tools/dist.py`, all in `target/stafeto-release/`. The second half signs them
 //! (`pkg-sign`, `image-repack`, `repo --from`) and `tools/dist.py pack` makes
 //! the archives. `cargo xtask dist` runs both halves on a development machine
 //! with the development key, so that both ways go through the same code.
@@ -17,7 +17,7 @@ use std::process::Command;
 
 /// Where `release-build` leaves its output.
 pub fn directory() -> PathBuf {
-    crate::target_dir().join("release")
+    crate::target_dir().join("stafeto-release")
 }
 
 fn version() -> &'static str {
@@ -80,7 +80,7 @@ pub fn build_command(args: &[String]) -> Result<(), String> {
     build(previous)
 }
 
-/// The packages, the images, the kernel and the stage in `target/release/`.
+/// The packages, the images, the kernel and the stage in `target/stafeto-release/`.
 pub fn build(previous: Option<String>) -> Result<(), String> {
     // The commit goes into the version field of `uname`; the builds below
     // see it through their environment.
@@ -101,11 +101,6 @@ pub fn build(previous: Option<String>) -> Result<(), String> {
     // way to those of the signing step.
     for stale in ["INDEX", "INDEX.sig", "revoked", "revoked.sig"] {
         let _ = std::fs::remove_file(packages.join(stale));
-    }
-    let serial = crate::carry::directory().join("previous-serial");
-    if serial.is_file() {
-        std::fs::copy(&serial, out.join("previous-serial"))
-            .map_err(|e| format!("previous-serial: {e}"))?;
     }
     for name in [BASE_IMAGE, FULL_IMAGE] {
         let image = crate::base_image::rebuild_image(name)?;
@@ -133,6 +128,88 @@ pub fn build(previous: Option<String>) -> Result<(), String> {
             .arg(out.join("stage")),
     )?;
     println!("release-build: {} is ready", out.display());
+    Ok(())
+}
+
+/// `cargo xtask release-check [DIR]`: the signing job runs it before the key
+/// is written. What the build job hands over is the files of a release and
+/// nothing else, every name in the shape the signing job expects, no link, and
+/// `carried.txt` in its strict form. The signing job reads no other file of
+/// the directory.
+pub fn check_command(args: &[String]) -> Result<(), String> {
+    let dir = args.first().map_or_else(directory, PathBuf::from);
+    check_directory(&dir)?;
+    println!(
+        "release-check: {} holds the files of a release and no others",
+        dir.display()
+    );
+    Ok(())
+}
+
+fn plain_name(name: &str, suffix: &str) -> bool {
+    name.strip_suffix(suffix).is_some_and(|stem| {
+        !stem.is_empty()
+            && stem
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            && stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+    })
+}
+
+fn entries_of(dir: &Path) -> Result<Vec<(String, std::fs::Metadata)>, String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let e = e.map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(e.path()).map_err(|e| e.to_string())?;
+        out.push((e.file_name().to_string_lossy().into_owned(), meta));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn check_directory(dir: &Path) -> Result<(), String> {
+    let refuse = |what: &str| Err(format!("release-check: {}: {what}", dir.display()));
+    for (name, meta) in entries_of(dir)? {
+        let file = meta.is_file();
+        let ok = match name.as_str() {
+            "Image" | "kernel.elf" | "boot-base.img" | "boot-full.img" => file,
+            "pkg" | "stage" => meta.is_dir(),
+            _ => false,
+        };
+        if !ok {
+            return refuse(&format!("{name:?} is not a file of a release"));
+        }
+    }
+    let pkg = dir.join("pkg");
+    for (name, meta) in entries_of(&pkg)? {
+        let ok = (meta.is_file() && (plain_name(&name, ".stpkg") || name == repo::CARRIED))
+            || (meta.is_dir() && name == "src");
+        if !ok {
+            return refuse(&format!("pkg/{name:?} is not a package file"));
+        }
+    }
+    if pkg.join("src").is_dir() {
+        for (name, meta) in entries_of(&pkg.join("src"))? {
+            if !(meta.is_file() && plain_name(&name, "-src.tar.xz")) {
+                return refuse(&format!("pkg/src/{name:?} is not a source archive"));
+            }
+        }
+    }
+    // The stage holds archives and trees of notices that only tools/dist.py reads; no link in it.
+    let mut stack = vec![dir.join("stage")];
+    while let Some(d) = stack.pop() {
+        for (name, meta) in entries_of(&d)? {
+            if meta.is_dir() {
+                stack.push(d.join(&name));
+            } else if !meta.is_file() {
+                return refuse(&format!("stage {name:?} is no plain file"));
+            }
+        }
+    }
+    repo::read_carried(&pkg)?;
     Ok(())
 }
 
@@ -197,6 +274,57 @@ pub fn dist() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stafeto-rcheck-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkg/src")).unwrap();
+        std::fs::create_dir_all(dir.join("stage/base")).unwrap();
+        for f in [
+            "Image",
+            "kernel.elf",
+            "boot-base.img",
+            "boot-full.img",
+            "pkg/a-1-1.stpkg",
+            "pkg/src/a-1-1-src.tar.xz",
+            "stage/base/x",
+        ] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_signing_job_takes_the_files_of_a_release_and_no_other() {
+        let dir = release_dir("ok");
+        check_directory(&dir).unwrap();
+        for (path, text) in [
+            // The file the old job read in its shell: a number with a command in it.
+            ("previous-serial", "a[$(id)]"),
+            ("pkg/a b.stpkg", "x"),
+            ("pkg/$(id).stpkg", "x"),
+            ("pkg/src/x.sh", "x"),
+            ("pkg/README", "x"),
+        ] {
+            let bad = release_dir("bad");
+            std::fs::write(bad.join(path), text).unwrap();
+            assert!(check_directory(&bad).is_err(), "{path}");
+            std::fs::remove_dir_all(&bad).unwrap();
+        }
+        let linked = release_dir("link");
+        std::os::unix::fs::symlink("/etc/passwd", linked.join("stage/base/y")).unwrap();
+        assert!(check_directory(&linked).is_err());
+        let carried = release_dir("carried");
+        std::fs::write(
+            carried.join("pkg/carried.txt"),
+            "a-1-1.stpkg\tnot an address\t-\n",
+        )
+        .unwrap();
+        assert!(check_directory(&carried).is_err());
+        for d in [dir, linked, carried] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
 
     #[test]
     fn a_suffix_makes_a_version_no_final_one() {

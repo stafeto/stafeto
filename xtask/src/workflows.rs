@@ -126,13 +126,42 @@ fn the_release_key_is_in_the_signing_job_and_the_token_in_the_draft_job_alone() 
     // The signing job builds nothing but xtask, before the key is written,
     // and removes the key whatever happens.
     let sign = code(&release["sign"]);
-    let built = sign.find("cargo build -p xtask").expect("xtask is built");
+    let built = sign
+        .find("cargo build --locked -p xtask")
+        .expect("xtask is built");
     let written = sign
         .find("RELEASE_SIGNING_KEY: ${{")
         .expect("the key is read");
     assert!(built < written);
     assert!(sign.contains("if: always()") && sign.contains("rm -rf \"$RUNNER_TEMP/keys\""));
     assert!(!sign.contains("cache"), "a clean machine restores no cache");
+    assert!(sign.contains("cargo build --locked -p xtask"));
+    // Nothing the build job made reaches a shell of this job or any value in it: xtask
+    // reads the files in their strict form before the key is there.
+    assert!(
+        sign.find("cargo xtask release-check")
+            .expect("the files are checked")
+            < written
+    );
+    for word in [
+        "cat target",
+        "$(<",
+        "read ",
+        "needs.build.outputs",
+        "previous-serial",
+        "source target",
+        ". target",
+    ] {
+        assert!(
+            !sign.contains(word),
+            "the signing job must not use {word:?}"
+        );
+    }
+    assert!(
+        sign.contains("--serial-after"),
+        "the serial is that of the published index"
+    );
+    assert!(!code(&release["draft"]).contains("needs.build.outputs"));
     assert!(
         !sign.contains("tools/build-"),
         "the signing job builds no package"
@@ -162,7 +191,7 @@ fn the_dry_run_makes_no_draft_and_the_tag_makes_both() {
         assert!(!release[job].contains("gh release create"), "{job}");
     }
     // A suffix is a pre-release, and its packages are not stored.
-    assert!(release["draft"].contains("needs.build.outputs.final == 'true'"));
+    assert!(release["draft"].contains("env.FINAL == 'true'"));
     assert!(release["draft"].contains("--prerelease"));
 }
 
