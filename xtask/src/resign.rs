@@ -28,31 +28,63 @@ pub struct Term {
     pub certificate_days: u64,
 }
 
-/// The new text of the index and its signature block. `roots` and
-/// `revocations` judge the signature of the old index; `signing` signs the
-/// new one, and `accepts` is what a device must accept of it.
+/// An index with its signature, as the copy of a release holds it.
+pub type Signed<'a> = (&'a [u8], &'a [u8]);
+
+/// The roots accept the signature of `signed` (revocations left aside: see `resign`).
+fn authentic(what: &str, (text, signature): Signed<'_>, roots: &[Key]) -> Result<(), String> {
+    let block = Block::parse(signature).map_err(|e| format!("{what}.sig: {e}"))?;
+    pkgfmt::trust::verify(
+        &block,
+        Kind::Index,
+        &sha::sha256(text),
+        text.len() as u64,
+        &Trust { roots, direct: &[] },
+        &[],
+    )
+    .map(drop)
+    .map_err(|e| format!("{what}.sig is not accepted: {e}"))
+}
+
+/// The new text of the index and its signature block.
+///
+/// The records are anchored on `anchor`, the signed copy of the index that
+/// the release of the series carries in stafeto/stafeto: its signature is
+/// accepted by the roots (a key revoked since signed it in good time, and a
+/// revocation takes packages away from the devices, not records from the
+/// series), and the index to sign again, which lies in the pages that a holder
+/// of the token can write, must have the records of the copy byte for byte.
+/// Its own signature is checked by the roots too, because its serial is the
+/// number the new one follows. `signing` signs the new index, and `revocations`
+/// and `accepts` judge that signature: a revoked key signs nothing.
 pub fn resign(
-    text: &[u8],
-    old_signature: &[u8],
+    (text, old_signature): Signed<'_>,
+    anchor: Signed<'_>,
     roots: &[Key],
     revocations: &[Revocation],
     signing: &Signing,
     term: &Term,
     accepts: &Trust,
 ) -> Result<(String, Vec<u8>), String> {
-    let old_block = Block::parse(old_signature).map_err(|e| format!("INDEX.sig: {e}"))?;
-    pkgfmt::trust::verify(
-        &old_block,
-        Kind::Index,
-        &sha::sha256(text),
-        text.len() as u64,
-        &Trust { roots, direct: &[] },
-        revocations,
-    )
-    .map_err(|e| format!("INDEX.sig is not accepted: {e}"))?;
+    authentic("the copy of the release INDEX", anchor, roots)?;
+    authentic("INDEX", (text, old_signature), roots)?;
+    let records = |t: &[u8]| {
+        t.windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|at| t[at..].to_vec())
+    };
+    let (anchor_text, anchor_records) = (
+        std::str::from_utf8(anchor.0).map_err(|e| e.to_string())?,
+        records(anchor.0),
+    );
+    let anchor_index =
+        Index::parse(anchor_text).map_err(|e| format!("the copy of the release INDEX: {e}"))?;
+    if records(text) != anchor_records {
+        return Err("the records of the index are not those of the signed copy in the release of the series".into());
+    }
     let old_text = std::str::from_utf8(text).map_err(|e| format!("INDEX: {e}"))?;
     let old = Index::parse(old_text).map_err(|e| format!("INDEX: {e}"))?;
-    if term.serial < old.header.serial {
+    if term.serial < old.header.serial.max(anchor_index.header.serial) {
         return Err(format!(
             "--serial {} is under the serial {} of the index: a device that has seen it refuses the rollback",
             term.serial, old.header.serial
@@ -109,7 +141,7 @@ pub fn resign(
         &sha::sha256(new_text.as_bytes()),
         new_text.len() as u64,
         accepts,
-        &[],
+        revocations,
     )
     .map_err(|e| {
         format!(
@@ -156,14 +188,14 @@ pub fn serial_after(
     Ok(serial + 1)
 }
 
-/// `cargo xtask repo resign --index F --serial N --out D [--sig F.sig]
+/// `cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig]
 /// [--expires-days D] [--key K.key --cert K.cert] [--root R.pub]
 /// [--min-certificate-days N]`. The roots are the official ones and the list
 /// is `keys/revoked`, unless `--root` names the root of a probe.
 pub fn command(args: &[String]) -> Result<(), String> {
-    let usage = "usage: cargo xtask repo resign --index F --serial N --out D [--sig F.sig] [--expires-days D] [--key K.key [--cert K.cert]] [--root R.pub] [--min-certificate-days N]";
-    let (mut index, mut sig, mut out, mut key, mut cert, mut root) =
-        (None, None, None, None, None, None);
+    let usage = "usage: cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig] [--expires-days D] [--key K.key [--cert K.cert]] [--root R.pub] [--min-certificate-days N]";
+    let (mut index, mut sig, mut out, mut key, mut cert, mut root, mut anchor) =
+        (None, None, None, None, None, None, None);
     let (mut serial, mut expires_days, mut certificate_days) = (None, 30u64, 0u64);
     let mut i = 0;
     while i < args.len() {
@@ -185,6 +217,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "--key" => key = Some(PathBuf::from(&value)),
             "--cert" => cert = Some(PathBuf::from(&value)),
             "--root" => root = Some(PathBuf::from(&value)),
+            "--anchor" => anchor = Some(PathBuf::from(&value)),
             "--serial" => serial = Some(number("--serial")?),
             "--expires-days" => {
                 expires_days = number("--expires-days")?;
@@ -197,7 +230,12 @@ pub fn command(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
-    let (index, out, serial) = (index.ok_or(usage)?, out.ok_or(usage)?, serial.ok_or(usage)?);
+    let (index, out, serial, anchor) = (
+        index.ok_or(usage)?,
+        out.ok_or(usage)?,
+        serial.ok_or(usage)?,
+        anchor.ok_or(usage)?,
+    );
     let sig = sig.unwrap_or_else(|| PathBuf::from(format!("{}.sig", index.display())));
     let tree = crate::root();
     let (roots, revocations) = match &root {
@@ -222,10 +260,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
         .map_or(0, |d| d.as_secs());
     let text = std::fs::read(&index).map_err(|e| format!("{}: {e}", index.display()))?;
     let old = std::fs::read(&sig).map_err(|e| format!("{}: {e}", sig.display()))?;
+    let anchor_sig = PathBuf::from(format!("{}.sig", anchor.display()));
+    let anchor_text = std::fs::read(&anchor).map_err(|e| format!("{}: {e}", anchor.display()))?;
+    let anchor_block =
+        std::fs::read(&anchor_sig).map_err(|e| format!("{}: {e}", anchor_sig.display()))?;
     let (own_roots, direct) = keys::trust_of(&signing, &tree)?;
     let (new_text, new_sig) = resign(
-        &text,
-        &old,
+        (&text, &old),
+        (&anchor_text, &anchor_block),
         &roots,
         &revocations,
         &signing,
@@ -356,7 +398,29 @@ mod tests {
             roots: &[root()],
             direct: &[],
         };
-        resign(text, sig, &[root()], revoked, by, t, &trust)
+        resign((text, sig), (text, sig), &[root()], revoked, by, t, &trust)
+    }
+
+    fn anchored(
+        text: &[u8],
+        sig: &[u8],
+        anchor: (&[u8], &[u8]),
+        revoked: &[Revocation],
+        by: &Signing,
+    ) -> Result<(String, Vec<u8>), String> {
+        let trust = Trust {
+            roots: &[root()],
+            direct: &[],
+        };
+        resign(
+            (text, sig),
+            anchor,
+            &[root()],
+            revoked,
+            by,
+            &term(6),
+            &trust,
+        )
     }
 
     #[test]
@@ -419,19 +483,76 @@ mod tests {
     }
 
     #[test]
-    fn an_index_signed_after_the_leak_of_its_key_is_not_signed_again() {
-        let old = signing(&REL, "t-release", NOW * 2);
+    fn a_revoked_release_key_does_not_lock_the_series() {
+        // The index on the pages and the copy of the release were signed by the key that leaked
+        // later; the list names it from before their time. The next key signs them again.
+        let old = signing(&REL, "t-release-2026", NOW * 2);
         let (text, sig) = index(&old);
         let leak = [Revocation {
-            name: n("t-release"),
+            name: n("t-release-2026"),
             since: NOW - 2 * DAY,
         }];
-        assert!(go(text.as_bytes(), &sig, &leak, &old, &term(6)).is_err());
-        let before = [Revocation {
-            name: n("t-release"),
-            since: NOW,
-        }];
-        assert!(go(text.as_bytes(), &sig, &before, &old, &term(6)).is_ok());
+        let next = signing(&OTHER, "t-release-2027", NOW * 2);
+        let (new_text, new_sig) =
+            anchored(text.as_bytes(), &sig, (text.as_bytes(), &sig), &leak, &next).unwrap();
+        assert_eq!(
+            Block::parse(&new_sig).unwrap().key.as_str(),
+            "t-release-2027"
+        );
+        assert!(new_text.contains("\nserial 6\n"));
+        // The revoked key itself signs nothing more.
+        assert!(anchored(text.as_bytes(), &sig, (text.as_bytes(), &sig), &leak, &old).is_err());
+    }
+
+    #[test]
+    fn an_old_signed_index_laid_into_the_pages_is_not_signed_again() {
+        let by = signing(&REL, "t-release", NOW * 2);
+        let (copy, copy_sig) = index(&by);
+        // An older release: other records, a good signature, a lower serial.
+        let older = copy
+            .replace("size 7", "size 6")
+            .replace("serial 5", "serial 4");
+        let block = Block::sign(
+            &by.seed,
+            Kind::Index,
+            older.len() as u64,
+            sha::sha256(older.as_bytes()),
+            NOW - 9 * DAY,
+            by.key,
+            by.certificate,
+        );
+        let e = anchored(
+            older.as_bytes(),
+            &block.to_bytes(),
+            (copy.as_bytes(), &copy_sig),
+            &[],
+            &by,
+        )
+        .unwrap_err();
+        assert!(e.contains("not those of the signed copy"), "{e}");
+        // A copy nobody signed is no anchor.
+        let forged = copy.replace("size 7", "size 8");
+        let e = anchored(
+            forged.as_bytes(),
+            &copy_sig,
+            (forged.as_bytes(), &copy_sig),
+            &[],
+            &by,
+        )
+        .unwrap_err();
+        assert!(e.contains("not accepted"), "{e}");
+        // A forged number on the pages is no number to follow.
+        let high = copy.replace("serial 5", "serial 900");
+        assert!(
+            anchored(
+                high.as_bytes(),
+                &copy_sig,
+                (copy.as_bytes(), &copy_sig),
+                &[],
+                &by
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -89,9 +89,12 @@ jobs:
         id: previous
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           series=$(echo "$VERSION" | cut -d. -f1,2)
-          flag=$(python3 tools/pages.py previous --series "$series")
+          # The records of a published series come from the signed index that its release carries.
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          flag=$(python3 tools/pages.py previous --series "$series" --releases releases.json --out anchor)
           echo "flag=$flag" >> "$GITHUB_OUTPUT"
 
       # The fingerprint of the ABI (a frozen series for a final version), the

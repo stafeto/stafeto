@@ -29,11 +29,16 @@ PREFIX = f"{pages.STORAGE}/{STORAGE}/"
 
 # The stand-in for `cargo xtask repo resign`: the same arguments and the same
 # refusals in the form that the test needs.
-STUB = '''
+STUB = r'''
 import hashlib, re, sys
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 text = open(args["--index"]).read()
 sig = open(args["--index"] + ".sig", "rb").read()
+records = lambda t: t.split("\n\n", 1)[1]
+anchor = open(args["--anchor"]).read()
+if records(text) != records(anchor):
+    print("the records of the index are not those of the signed copy")
+    sys.exit(1)
 if sig != b"sig:" + hashlib.sha256(text.encode()).hexdigest().encode():
     print("INDEX.sig is not accepted")
     sys.exit(1)
@@ -101,6 +106,23 @@ class Branch(unittest.TestCase):
     def remote(self, path: str) -> str:
         return git(self.origin, "show", f"gh-pages:{path}")
 
+    def releases(self, **texts: str) -> tuple[list[dict], dict[str, bytes]]:
+        """Releases of stafeto/stafeto holding the signed copies `texts` (series 0_3 as 0.3)."""
+        listing, files = [], {}
+        for series, text in texts.items():
+            series = series.replace("_", ".")
+            tag = f"v{series}.0"
+            base = f"{pages.RELEASES}/{tag}/stafeto-{series}.0-INDEX"
+            listing.append({"tag_name": tag, "draft": False, "prerelease": False, "assets": [
+                {"name": f"stafeto-{series}.0-INDEX", "browser_download_url": base},
+                {"name": f"stafeto-{series}.0-INDEX.sig", "browser_download_url": base + ".sig"}]})
+            files[base], files[base + ".sig"] = text.encode(), signed(text)
+        return listing, files
+
+    def week(self, push=True, **texts: str) -> dict:
+        listing, files = self.releases(**texts)
+        return pages.weekly(self.pages, self.revoked, self.command, push, listing, self.dir / "anchors", get=files.__getitem__)
+
     def head(self) -> str:
         return git(self.origin, "rev-parse", "gh-pages").strip()
 
@@ -140,7 +162,7 @@ class Branch(unittest.TestCase):
     def test_the_weekly_job_signs_every_series_again_in_one_commit(self):
         self.publish(index(series="0.3", serial=5))
         self.publish(index(series="0.4", serial=7), version="0.4.0")
-        done = pages.weekly(self.pages, self.revoked, self.command, True)
+        done = self.week(**{"0_3": index(series="0.3", serial=5), "0_4": index(series="0.4", serial=7)})
         self.assertEqual(done, {"0.3": 6, "0.4": 8})
         self.assertIn("serial 6", self.remote("0.3/aarch64/INDEX"))
         self.assertIn("serial 8", self.remote("0.4/aarch64/INDEX"))
@@ -151,7 +173,7 @@ class Branch(unittest.TestCase):
         self.publish(index(serial=5))
         records = self.remote("0.3/aarch64/INDEX").split("\n\n", 1)[1]
         (self.revoked / "revoked").write_text("list 2\n")
-        pages.weekly(self.pages, self.revoked, self.command, True)
+        self.week(**{"0_3": index(serial=5)})
         self.assertEqual(self.remote("0.3/aarch64/INDEX").split("\n\n", 1)[1], records)
         self.assertEqual(self.remote("0.3/aarch64/revoked"), "list 2\n")
 
@@ -162,7 +184,7 @@ class Branch(unittest.TestCase):
         git(self.pages, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "lay a file")
         before = self.head()
         with self.assertRaises(SystemExit) as stopped:
-            pages.weekly(self.pages, self.revoked, self.command, True)
+            self.week(**{"0_3": index(series="0.3", serial=5), "0_4": index(series="0.4", serial=7)})
         self.assertIn("0.4", str(stopped.exception))
         self.assertEqual(self.head(), before)
         # 0.3 was not written either.
@@ -171,21 +193,44 @@ class Branch(unittest.TestCase):
     def test_a_series_that_is_listed_and_missing_stops_the_week(self):
         (self.pages / "series.txt").write_text("0.3\n")
         with self.assertRaises(SystemExit) as stopped:
-            pages.weekly(self.pages, self.revoked, self.command, False)
+            self.week(push=False, **{"0_3": index(serial=5)})
         self.assertIn("0.3", str(stopped.exception))
 
     def test_a_term_under_14_days_stops_the_week(self):
         self.publish(index(serial=5))
         self.stub.write_text(STUB.replace("EXPIRES", SOON))
         with self.assertRaises(SystemExit) as stopped:
-            pages.weekly(self.pages, self.revoked, self.command, False)
+            self.week(push=False, **{"0_3": index(serial=5)})
         self.assertIn("14 days", str(stopped.exception))
+
+    def test_an_old_signed_index_laid_into_the_pages_is_not_signed_again(self):
+        self.publish(index(serial=5))
+        old = index(serial=4, files=(("a", "a-1-1.stpkg", b"AAAA"), ("b", "b-1-1.stpkg", b"BB")))
+        (self.pages / "0.3/aarch64/INDEX").write_text(old)
+        (self.pages / "0.3/aarch64/INDEX.sig").write_bytes(signed(old))
+        git(self.pages, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "lay an old index")
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.week(**{"0_3": index(serial=5)})
+        self.assertIn("not those of the signed copy", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
+    def test_a_series_that_no_release_carries_stops_the_week(self):
+        self.publish(index(serial=5))
+        with self.assertRaises(SystemExit) as stopped:
+            self.week(push=False)
+        self.assertIn("no published release", str(stopped.exception))
+
+    def test_a_name_that_is_no_series_stops_the_week(self):
+        (self.pages / "series.txt").write_text("0.3\n../../x\n")
+        with self.assertRaises(SystemExit):
+            self.week(push=False, **{"0_3": index()})
 
     def test_a_series_taken_off_the_list_is_not_signed_again(self):
         self.publish(index(series="0.3", serial=5))
         self.publish(index(series="0.4", serial=7), version="0.4.0")
         (self.pages / "series.txt").write_text("0.4\n")
-        self.assertEqual(pages.weekly(self.pages, self.revoked, self.command, False), {"0.4": 8})
+        self.assertEqual(self.week(push=False, **{"0_4": index(series="0.4", serial=7)}), {"0.4": 8})
         self.assertIn("serial 5", (self.pages / "0.3/aarch64/INDEX").read_text())
 
 
@@ -265,25 +310,54 @@ class Previous(unittest.TestCase):
     def tree(self, tmp: str, line: str | None) -> Path:
         tree = Path(tmp)
         (tree / "packages").mkdir(exist_ok=True)
+        (tree / "keys").mkdir(exist_ok=True)
+        (tree / "keys" / "revoked").write_text("list\n")
+        (tree / "keys" / "revoked.sig").write_bytes(b"sig")
         if line is not None:
             (tree / "packages" / "published-serial.txt").write_text(line)
         return tree
 
+    def releases(self):
+        base = f"{pages.RELEASES}/v0.3.0/stafeto-0.3.0-INDEX"
+        listing = [{"tag_name": "v0.3.0", "draft": False, "prerelease": False, "assets": [
+            {"name": "stafeto-0.3.0-INDEX", "browser_download_url": base},
+            {"name": "stafeto-0.3.0-INDEX.sig", "browser_download_url": base + ".sig"}]}]
+        return listing, {base: b"index", base + ".sig": b"sig"}
+
     def test_a_series_that_nobody_published_is_built_new(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(pages.previous("0.3", self.tree(tmp, None), lambda url: None), "")
-            self.assertEqual(pages.previous("0.3", self.tree(tmp, "0.2 4\n"), lambda url: "0.2\n"), "")
+            out = Path(tmp) / "out"
+            self.assertEqual(pages.previous("0.3", self.tree(tmp, None), lambda url: None, [], out), "")
+            self.assertEqual(pages.previous("0.3", self.tree(tmp, "0.2 4\n"), lambda url: "0.2\n", [], out), "")
 
-    def test_a_recorded_series_is_carried_from_its_pages(self):
+    def test_a_recorded_series_is_carried_from_the_signed_copy_of_its_release(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(pages.previous("0.3", self.tree(tmp, "0.3 12\n"), lambda url: None),
-                             "https://stafeto.github.io/packages/0.3/aarch64")
+            listing, files = self.releases()
+            out = Path(tmp) / "out"
+            where = pages.previous("0.3", self.tree(tmp, "0.3 12\n"), lambda url: None, listing, out, files.__getitem__)
+            self.assertEqual(where, str(out / "0.3"))
+            self.assertEqual((out / "0.3" / "INDEX").read_bytes(), b"index")
+            self.assertEqual((out / "0.3" / "revoked").read_text(), "list\n")
+            # A recorded series with no release that carries its index stops the build.
+            with self.assertRaises(SystemExit):
+                pages.previous("0.3", self.tree(tmp, "0.3 12\n"), lambda url: None, [], out)
 
     def test_a_series_on_the_pages_and_not_recorded_stops_the_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit) as stopped:
-                pages.previous("0.3", self.tree(tmp, None), lambda url: "0.3\n")
+                pages.previous("0.3", self.tree(tmp, None), lambda url: "0.3\n", [], Path(tmp) / "o")
             self.assertIn("published-serial.txt", str(stopped.exception))
+
+    def test_the_newest_final_release_of_a_series_is_the_anchor(self):
+        def release(tag, **kw):
+            base = f"{pages.RELEASES}/{tag}/stafeto-{tag[1:]}-INDEX"
+            return {"tag_name": tag, "draft": False, "prerelease": False, **kw, "assets": [
+                {"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
+                {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]}
+        found = pages.newest_copies([release("v0.3.0"), release("v0.3.2"), release("v0.3.10"),
+                                     release("v0.3.11", draft=True), release("v0.4.0", prerelease=True),
+                                     release("v0.4.0-pre.1"), release("v0.2.5")])
+        self.assertEqual({s: v["tag"] for s, v in found.items()}, {"0.3": "v0.3.10", "0.2": "v0.2.5"})
 
 
 class Gate(unittest.TestCase):
@@ -293,6 +367,17 @@ class Gate(unittest.TestCase):
             self.assertFalse(go, event)
             self.assertIn("no series is published", reason)
         self.assertFalse(pages.gate("schedule", "false", "", [], lambda url: "\n")[0])
+
+    def test_a_network_error_is_not_the_absence_of_a_series(self):
+        def broken(url):
+            raise OSError("connection reset")
+        with self.assertRaises(SystemExit) as stopped:
+            pages.gate("schedule", "false", "", [], broken)
+        self.assertIn("cannot be read", str(stopped.exception))
+
+    def test_a_series_the_tree_records_and_the_pages_do_not_list_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            pages.gate("schedule", "false", "", [], lambda url: None, ("0.3",))
 
     def test_a_published_series_wakes_the_weekly_job(self):
         self.assertTrue(pages.gate("schedule", "false", "", [], lambda url: "0.3\n")[0])

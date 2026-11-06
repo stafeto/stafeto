@@ -113,7 +113,7 @@ jobs:
           mv "copy/stafeto-$version-INDEX.sig" copy/INDEX.sig
           serial=$(sed -n 's/^serial //p' copy/INDEX | head -1)
           # Signing it again to nowhere shows that the roots of the tree accept the copy.
-          cargo xtask repo resign --index copy/INDEX --serial "$serial" --out "$RUNNER_TEMP/verify" \
+          cargo xtask repo resign --index copy/INDEX --anchor copy/INDEX --serial "$serial" --out "$RUNNER_TEMP/verify" \
             --key "$KEY" --cert "$CERT"
 
       - name: The attachments of the storage release
@@ -156,15 +156,19 @@ jobs:
             --resign-command "cargo xtask repo resign --key $KEY --cert $CERT --min-certificate-days 35"
 
       # The weekly signature, and the list of revocations after a push.
+      # The records of every series are those of the signed copy in its newest release;
+      # the pages hold what is delivered and are written by whoever holds the token.
       - name: Every series signed again
         if: steps.secrets.outputs.ok == 'true' && github.event_name != 'release'
         env:
           GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          RELEASES_TOKEN: ${{ github.token }}
         run: |
           set -e
+          GH_TOKEN="$RELEASES_TOKEN" gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
           gh auth setup-git
           gh repo clone stafeto/packages pages -- --branch gh-pages --single-branch
-          python3 tools/pages.py weekly --pages-dir pages --revoked-dir keys --push \
+          python3 tools/pages.py weekly --pages-dir pages --revoked-dir keys --push --releases releases.json --anchors anchors \
             --resign-command "cargo xtask repo resign --key $KEY --cert $CERT --min-certificate-days 35"
 
       - name: Remove the key

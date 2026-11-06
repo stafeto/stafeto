@@ -25,6 +25,7 @@ of stafeto/packages.
 import argparse
 import datetime
 import hashlib
+import json
 import re
 import shlex
 import subprocess
@@ -39,6 +40,7 @@ sys.dont_write_bytecode = True
 
 PAGES = "https://stafeto.github.io/packages"
 STORAGE = "https://github.com/stafeto/packages/releases/download"
+RELEASES = "https://github.com/stafeto/stafeto/releases/download"
 ARCH = "aarch64"
 EXPIRES_MIN_DAYS = 14
 AUTHOR = ("Sergey Subbotin", "ssubbotin@gmail.com")
@@ -72,7 +74,7 @@ def entries(text: str) -> list[dict[str, str]]:
 
 # ---- gate ----
 
-def gate(event: str, prerelease: str, tag: str, assets: list[str], fetch) -> tuple[bool, str]:
+def gate(event: str, prerelease: str, tag: str, assets: list[str], fetch, recorded: tuple[str, ...] = ()) -> tuple[bool, str]:
     """Whether the publication or the weekly job has work, and the line that
     says why not. `fetch(url)` gives the text at an address or None."""
     if event == "release":
@@ -85,35 +87,86 @@ def gate(event: str, prerelease: str, tag: str, assets: list[str], fetch) -> tup
         if missing:
             return False, f"release {tag} has no {', '.join(missing)}: it holds no packages to publish"
         return True, f"release {tag} holds a signed index: publishing"
-    series = fetch(f"{PAGES}/series.txt")
+    # Only a clean answer "there is no such file" means no series; a network error or
+    # a server error stops the run with its reason (a published series that cannot be
+    # reached is not an unpublished one), and so does an empty list once the tree
+    # records a published series.
+    try:
+        series = fetch(f"{PAGES}/series.txt")
+    except (OSError, ValueError) as e:
+        raise Refusal(f"{PAGES}/series.txt cannot be read: {e}")
     if series is None or not series.split():
+        if recorded:
+            raise Refusal(f"packages/published-serial.txt records {', '.join(recorded)} and the pages list no series")
         return False, f"no series is published at {PAGES}/series.txt: there is nothing to sign again"
     return True, f"series published: {' '.join(series.split())}"
 
 
-def previous(series: str, tree: Path, fetch) -> str:
-    """The published index of `series` for `--previous`, or an empty string
-    when the series was never published. A series that the pages list and the
-    tree does not record as published is an error: building it as new would
-    give new packages the names of published ones with other bytes."""
-    recorded = (tree / "packages" / "published-serial.txt")
-    known = recorded.is_file() and any(
-        l.split(" ")[0] == series for l in recorded.read_text().splitlines() if l.strip())
+def recorded_series(tree: Path) -> tuple[str, ...]:
+    """The series that `packages/published-serial.txt` records as published."""
+    path = tree / "packages" / "published-serial.txt"
+    if not path.is_file():
+        return ()
+    return tuple(l.split(" ")[0] for l in path.read_text().splitlines() if l.strip())
+
+
+def newest_copies(releases: list[dict]) -> dict[str, dict]:
+    """The newest published release of each series that carries a signed copy
+    of the index (`stafeto-<version>-INDEX` and `.sig`). Drafts, pre-releases
+    and releases with a suffix hold none that counts. The copy is where the
+    records of a series come from; the pages only deliver them."""
+    best: dict[str, tuple[tuple[int, ...], dict]] = {}
+    for r in releases:
+        tag = r.get("tag_name", "")
+        if r.get("draft") or r.get("prerelease") or not FINAL.fullmatch(tag):
+            continue
+        urls = {a["name"]: a["browser_download_url"] for a in r.get("assets", [])}
+        names = (f"stafeto-{tag[1:]}-INDEX", f"stafeto-{tag[1:]}-INDEX.sig")
+        if not all(n in urls for n in names):
+            continue
+        number = tuple(int(x) for x in tag[1:].split("."))
+        series = f"{number[0]}.{number[1]}"
+        if series not in best or number > best[series][0]:
+            best[series] = (number, {"tag": tag, "index": urls[names[0]], "sig": urls[names[1]]})
+    return {s: v for s, (_, v) in best.items()}
+
+
+def download(url: str) -> bytes:
+    if not url.startswith(RELEASES + "/"):
+        raise Refusal(f"{url} is no file of a release of stafeto/stafeto")
+    with urllib.request.urlopen(url, timeout=120) as reply:
+        return reply.read()
+
+
+def fetch_copy(series: str, releases: list[dict], out: Path, get=download) -> Path:
+    """The signed copy of the newest release of `series` in `out/<series>/`."""
+    copies = newest_copies(releases)
+    if series not in copies:
+        raise Refusal(f"no published release of stafeto/stafeto carries a signed index of the series {series}")
+    directory = out / series
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "INDEX").write_bytes(get(copies[series]["index"]))
+    (directory / "INDEX.sig").write_bytes(get(copies[series]["sig"]))
+    return directory
+
+
+def previous(series: str, tree: Path, fetch, releases: list[dict], out: Path, get=download) -> str:
+    """The directory a build carries from, or an empty string when the series
+    was never published. The records come from the signed copy in the release
+    of the series, with the list of revocations of the tree beside them; a
+    series that the pages list and the tree does not record as published is an
+    error: building it as new would give new packages the names of published
+    ones with other bytes."""
+    known = series in recorded_series(tree)
     listed = (fetch(f"{PAGES}/series.txt") or "").split()
     if known:
-        return f"{PAGES}/{series}/{ARCH}"
+        directory = fetch_copy(series, releases, out, get)
+        for name in ("revoked", "revoked.sig"):
+            (directory / name).write_bytes((tree / "keys" / name).read_bytes())
+        return str(directory)
     if series in listed:
         raise Refusal(f"the pages list the series {series} and packages/published-serial.txt does not record it; add its line first")
     return ""
-
-
-def fetch_quietly(url: str):
-    """`fetch_text` for the gate: a pages site that cannot be reached is no
-    published series, and the next weekly run looks again."""
-    try:
-        return fetch_text(url)
-    except (OSError, ValueError):
-        return None
 
 
 def new_files(directory: Path) -> list[Path]:
@@ -215,10 +268,12 @@ def git(directory: Path, *args: str) -> str:
     return done.stdout
 
 
-def resign(command: str, index: Path, serial: int, out: Path) -> tuple[str, bytes]:
-    """The index signed again by `command` (cargo xtask repo resign ...)."""
+def resign(command: str, index: Path, serial: int, out: Path, anchor: Path) -> tuple[str, bytes]:
+    """The index signed again by `command` (cargo xtask repo resign ...) with the
+    records of the signed copy `anchor`."""
     done = subprocess.run(
-        [*shlex.split(command), "--index", str(index), "--serial", str(serial), "--out", str(out)],
+        [*shlex.split(command), "--index", str(index), "--anchor", str(anchor), "--serial", str(serial),
+         "--out", str(out)],
         capture_output=True, text=True)
     if done.returncode != 0:
         raise Refusal(f"signing {index.parent.parent.name} again failed: {(done.stdout + done.stderr).strip()}")
@@ -244,7 +299,11 @@ def listed(pages: Path) -> list[str]:
     path = pages / "series.txt"
     if not path.is_file():
         return []
-    return [l.strip() for l in path.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    found = [l.strip() for l in path.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    for name in found:
+        if not re.fullmatch(r"\d+\.\d+", name):
+            raise Refusal(f"series.txt names {name!r}, which is no series")
+    return found
 
 
 def commit(pages: Path, message: str, push: bool) -> None:
@@ -265,7 +324,7 @@ def publish(pages: Path, version: str, index_dir: Path, revoked: Path, command: 
     on_pages = serial_of(pages / series / ARCH / "INDEX")
     serial = max((on_pages or 0) + 1, int(header(text)["serial"]))
     with tempfile.TemporaryDirectory() as work:
-        new_text, signature = resign(command, index_dir / "INDEX", serial, Path(work))
+        new_text, signature = resign(command, index_dir / "INDEX", serial, Path(work), index_dir / "INDEX")
     place(pages, series, new_text, signature, revoked)
     if series not in listed(pages):
         (pages / "series.txt").write_text("".join(f"{s}\n" for s in sorted(listed(pages) + [series])))
@@ -273,7 +332,8 @@ def publish(pages: Path, version: str, index_dir: Path, revoked: Path, command: 
     return serial
 
 
-def weekly(pages: Path, revoked: Path, command: str, push: bool, now: datetime.datetime | None = None) -> dict[str, int]:
+def weekly(pages: Path, revoked: Path, command: str, push: bool, releases: list[dict], anchors: Path,
+           now: datetime.datetime | None = None, get=download) -> dict[str, int]:
     series = listed(pages)
     if not series:
         raise Refusal("series.txt lists no series")
@@ -285,7 +345,8 @@ def weekly(pages: Path, revoked: Path, command: str, push: bool, now: datetime.d
             if not index.is_file():
                 raise Refusal(f"the series {s} is in series.txt and has no {s}/{ARCH}/INDEX")
             serial = serial_of(index) + 1
-            text, signature = resign(command, index, serial, Path(work) / s)
+            copy = fetch_copy(s, releases, anchors, get)
+            text, signature = resign(command, index, serial, Path(work) / s, copy / "INDEX")
             if expires_of(text) < now + datetime.timedelta(days=EXPIRES_MIN_DAYS):
                 raise Refusal(f"the index of {s} would expire in under {EXPIRES_MIN_DAYS} days")
             signed[s] = (text, signature, serial)
@@ -303,9 +364,12 @@ def main() -> None:
     g.add_argument("--prerelease", default="false")
     g.add_argument("--tag", default="")
     g.add_argument("--assets", default="")
+    g.add_argument("--tree", type=Path, default=Path("."))
     r = steps.add_parser("previous")
     r.add_argument("--series", required=True)
     r.add_argument("--tree", type=Path, default=Path("."))
+    r.add_argument("--releases", type=Path, required=True)
+    r.add_argument("--out", type=Path, required=True)
     n = steps.add_parser("new-files")
     n.add_argument("--dir", type=Path, required=True)
     v = steps.add_parser("verify-storage")
@@ -320,16 +384,19 @@ def main() -> None:
         p.add_argument("--revoked-dir", type=Path, required=True)
         p.add_argument("--resign-command", required=True)
         p.add_argument("--push", action="store_true")
+        if name == "weekly":
+            p.add_argument("--releases", type=Path, required=True)
+            p.add_argument("--anchors", type=Path, required=True)
         if name == "publish":
             p.add_argument("--version", required=True)
             p.add_argument("--index-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.step == "gate":
-        go, reason = gate(args.event, args.prerelease, args.tag, args.assets.split(), fetch_quietly)
+        go, reason = gate(args.event, args.prerelease, args.tag, args.assets.split(), fetch_text, recorded_series(args.tree))
         print(f"pages: {reason}", file=sys.stderr)
         print(f"go={'true' if go else 'false'}")
     elif args.step == "previous":
-        address = previous(args.series, args.tree, fetch_text)
+        address = previous(args.series, args.tree, fetch_text, json.loads(args.releases.read_text()), args.out)
         print(f"--previous {address}" if address else "")
         print(f"pages: {'carrying from ' + address if address else 'series ' + args.series + ' is not published: every package is new'}",
               file=sys.stderr)
@@ -343,7 +410,8 @@ def main() -> None:
         serial = publish(args.pages_dir, args.version, args.index_dir, args.revoked_dir, args.resign_command, args.push)
         print(f"pages: published {args.version} with serial {serial}")
     else:
-        done = weekly(args.pages_dir, args.revoked_dir, args.resign_command, args.push)
+        done = weekly(args.pages_dir, args.revoked_dir, args.resign_command, args.push,
+                      json.loads(args.releases.read_text()), args.anchors)
         print("pages: signed again " + ", ".join(f"{s} (serial {n})" for s, n in done.items()))
 
 

@@ -199,6 +199,10 @@ fn the_dry_run_makes_no_draft_and_the_tag_makes_both() {
 fn the_build_job_refuses_a_series_it_would_build_as_new_by_mistake() {
     let build = &jobs(&workflow("release.yml"))["build"];
     assert!(build.contains("tools/pages.py previous"));
+    assert!(
+        build.contains("repos/stafeto/stafeto/releases"),
+        "the records come from the release copy"
+    );
     assert!(build.contains("cargo xtask release-build"));
     assert!(build.contains("timeout-minutes: 120"));
 }
@@ -290,4 +294,7 @@ fn the_publication_runs_for_a_release_without_a_suffix_and_the_week_for_the_page
     // The key leaves the machine whatever happens.
     assert!(text.contains("if: always() && steps.secrets.outputs.ok == 'true'"));
     assert!(text.contains("--min-certificate-days 35"));
+    // The weekly signature and the one of a release follow the signed copy of a release.
+    assert!(text.contains("--releases releases.json --anchors anchors"));
+    assert!(text.contains("resign --index copy/INDEX --anchor copy/INDEX"));
 }
