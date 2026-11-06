@@ -233,17 +233,18 @@ static int directories(void) {
     entry = readdir(dir);
     if (!entry || !same(entry->d_name, "motd", 5) || entry->d_ino != 4 || entry->d_type != DT_REG) return 68;
     unsigned accounts = 0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         entry = readdir(dir);
         if (!entry || entry->d_type != DT_REG) return 69;
         unsigned account = same(entry->d_name, "group", 6) ? 1
-            : same(entry->d_name, "passwd", 7) ? 2 : 0;
+            : same(entry->d_name, "passwd", 7) ? 2
+            : same(entry->d_name, "shadow", 7) ? 4 : 0;
         if (!account || (accounts & account) || stat(entry->d_name, &info)
                 || !S_ISREG(info.st_mode) || entry->d_ino != info.st_ino) return 69;
         accounts |= account;
     }
     long final_cookie = telldir(dir);
-    if (accounts != 3 || final_cookie <= cookie) return 69;
+    if (accounts != 7 || final_cookie <= cookie) return 69;
     errno = 123;
     if (readdir(dir) != NULL || errno != 123 || telldir(dir) != final_cookie) return 69;
     seekdir(dir, final_cookie);

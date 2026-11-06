@@ -156,7 +156,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # pin-0ea4997a.
 # setgroups goes to the layer, which has the process service keep the list
 # (nginx's workers drop root's groups by initgroups); tagged pin-e0e895e4.
-COMMIT = "e0e895e41e949cd6779d8d721858c70b2718666b"
+# crypt (stafeto-design#631): errno on every failure, the SHA setting read as
+# bytes (a salt with a non-ASCII character is refused), rounds above
+# 9,999,999 refused, a setting that starts with $ and is not ASCII refused;
+# tagged pin-60b70ca6.
+COMMIT = "60b70ca6ed808f66d0e33c32a11646e9f4f64882"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

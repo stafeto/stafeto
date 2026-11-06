@@ -148,7 +148,7 @@ const ROOT: (u32, u32) = (0, 0);
 const USER: (u32, u32) = (1000, 100);
 
 /// Account databases are ordinary root-owned files in each shipped image.
-fn accounts() -> [RootFile; 3] {
+fn accounts() -> [RootFile; 4] {
     [
         dir("/etc"),
         of(
@@ -165,6 +165,17 @@ fn accounts() -> [RootFile; 3] {
             0o644,
             ROOT,
             Source::Bytes("group", b"root:x:0:root\nuser:x:100:user\nnobody:x:65534:nobody\n"),
+        ),
+        // Every account is locked: `!` in the password field matches no
+        // hash, and the image carries no password of any owner.
+        of(
+            "/etc/shadow",
+            0o600,
+            ROOT,
+            Source::Bytes(
+                "shadow",
+                b"root:!:20000:0:99999:7:::\nuser:!:20000:0:99999:7:::\nnobody:!:20000:0:99999:7:::\n",
+            ),
         ),
     ]
 }
@@ -247,7 +258,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 60] = [
+const SYSTEM_PATHS: [&str; 61] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -280,6 +291,7 @@ const SYSTEM_PATHS: [&str; 60] = [
     "/etc/mtab",
     "/etc/passwd",
     "/etc/group",
+    "/etc/shadow",
     "/etc/resolv.conf",
     // The image on VZ with a static address for its second device.
     "/etc/netd.conf",
@@ -2175,6 +2187,59 @@ mod tests {
         assert!(Rootfs::parse(&table(&files, 3, total).unwrap(), total).is_ok());
     }
 
+    /// stafeto-design#631: no image has an empty or `*` password field. The
+    /// field of /etc/passwd is `x`, that of /etc/shadow starts with `!`, and
+    /// each name of the one file is in the other.
+    #[test]
+    fn no_image_has_an_empty_or_star_password_field() {
+        for image in IMAGES {
+            let files = files_of(image);
+            let text = |path: &str| -> String {
+                let file = files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .unwrap_or_else(|| panic!("{image}: no {path}"));
+                let Some(Source::Bytes(_, bytes)) = file.source else {
+                    panic!("{image}: {path} is not bytes");
+                };
+                String::from_utf8(bytes.to_vec()).unwrap()
+            };
+            let field = |line: &str| line.split(':').nth(1).unwrap_or("").to_owned();
+            let passwd: Vec<(String, String)> = text("/etc/passwd")
+                .lines()
+                .map(|l| (l.split(':').next().unwrap().to_owned(), field(l)))
+                .collect();
+            let shadow: Vec<(String, String)> = text("/etc/shadow")
+                .lines()
+                .map(|l| (l.split(':').next().unwrap().to_owned(), field(l)))
+                .collect();
+            assert!(!passwd.is_empty(), "{image}");
+            for (name, value) in &passwd {
+                assert_eq!(value, "x", "{image}: /etc/passwd field of {name}");
+            }
+            for (name, value) in &shadow {
+                assert!(
+                    value.starts_with('!') && value != "*",
+                    "{image}: /etc/shadow field of {name} is not locked"
+                );
+            }
+            let names =
+                |rows: &[(String, String)]| rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+            assert_eq!(names(&passwd), names(&shadow), "{image}");
+            let shadow_file = files.iter().find(|f| f.path == "/etc/shadow").unwrap();
+            assert_eq!(
+                shadow_file.mode & 0o077,
+                0,
+                "{image}: /etc/shadow is open to others"
+            );
+            assert_eq!(
+                (shadow_file.uid, shadow_file.gid),
+                ROOT,
+                "{image}: /etc/shadow owner"
+            );
+        }
+    }
+
     #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {
         let bytes = table(&ramfs(), 5, 9).unwrap();
@@ -2677,7 +2742,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 15);
+        assert_eq!(wanted.len(), 16);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

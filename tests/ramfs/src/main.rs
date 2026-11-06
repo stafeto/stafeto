@@ -852,6 +852,7 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
         b"motd".as_slice(),
         b"group".as_slice(),
         b"passwd".as_slice(),
+        b"shadow".as_slice(),
     ] {
         let entry = posix
             .readdir(&mut dir, &mut name)

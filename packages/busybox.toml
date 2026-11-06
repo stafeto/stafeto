@@ -56,6 +56,7 @@ files = [
   "/bin/ln = link:busybox",
   "/bin/logger = link:busybox",
   "/libexec/login-probe = elf:busybox-probe",
+  "/libexec/crypt-probe = elf:busybox-probe",
   "/bin/logname = link:busybox",
   "/bin/ls = link:busybox",
   "/bin/mesg = link:busybox",

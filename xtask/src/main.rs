@@ -4121,7 +4121,7 @@ fn relibc_hello_probe() -> Result<(), String> {
     // stand in front of it.
     qemu::expect_line_end(
         &outcome,
-        "end_badly: hello.c:457: Assertion `how == NULL` failed.",
+        "end_badly: hello.c:458: Assertion `how == NULL` failed.",
     )?;
     println!("relibc C-program guest probe passed");
     Ok(())
@@ -5586,14 +5586,14 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
         .iter()
         .filter(|line| {
             let names: Vec<_> = line.split_whitespace().collect();
-            names.len() == 3
-                && ["motd", "passwd", "group"]
+            names.len() == 4
+                && ["motd", "passwd", "group", "shadow"]
                     .iter()
                     .all(|name| names.contains(name))
         })
         .count();
     if listings < 2 {
-        return Err("ls of /etc printed the three account-file names fewer than twice".into());
+        return Err("ls of /etc printed the four account-file names fewer than twice".into());
     }
     check_process_memory_reserve(&outcome.lines)?;
     // The new image of an exec whose old image ended first never runs.
@@ -7686,6 +7686,30 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
             r#"login-probe: 0 failures"#,
         ],
     ),
+    // stafeto-design#631: crypt gives NULL, never a string that equals a
+    // short password field; every account is locked in /etc/shadow; newgrp
+    // refuses a user with a password of 1024 bytes.
+    (
+        r#"/libexec/crypt-probe crypt"#,
+        &[
+            r#"crypt-probe: a key of 257 to 1024 bytes against *, !, x, an empty field and a borrowed $6$ salt is refused: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
+    (
+        r#"/libexec/crypt-probe accounts"#,
+        &[
+            r#"crypt-probe: every entry of /etc/shadow is locked with !: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
+    (
+        r#"/libexec/crypt-probe newgrp"#,
+        &[
+            r#"crypt-probe: newgrp as user refuses a password of 1024 bytes: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
 ];
 
 /// Types `command` and waits for the lines `lines` and the prompt.
@@ -7929,8 +7953,8 @@ fn ash_dialog() -> Result<(), String> {
     let link = |name: &'static str| ("lrwxrwxrwx", "1".to_string(), name, "7".to_string());
     let bin_listing = [
         link("ash"),
-        // One more link: /libexec/login-probe is a name of the same file.
-        ("-rwxr-xr-x", "2".to_string(), "busybox", busybox.clone()),
+        // Two more links: /libexec/login-probe and /libexec/crypt-probe are names of the same file.
+        ("-rwxr-xr-x", "3".to_string(), "busybox", busybox.clone()),
         ("-rwxr-xr-x", "1".to_string(), "bash", elf_size("bash")?),
         link("cat"),
         link("head"),
@@ -8382,7 +8406,7 @@ fn ash_dialog() -> Result<(), String> {
         // ends and gives its status.
         run.send("/bin/ls -1 /etc & wait")?;
         run.expect("/bin/ls -1 /etc & wait", DIALOG_STEP)?;
-        let mut accounts = vec!["motd", "passwd", "group"];
+        let mut accounts = vec!["motd", "passwd", "group", "shadow"];
         while !accounts.is_empty() {
             let name = run.expect_line(
                 "a remaining /etc account file",
