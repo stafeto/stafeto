@@ -22,6 +22,9 @@
 
 #include <crypt.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
+#include <shadow.h>
 #include <sys/wait.h>
 #include "libbb.h"
 
@@ -126,6 +129,58 @@ static void probe_crypt(void)
 	check(!accepts("pw", borrowed), "a locked hash accepts nothing");
 }
 
+/* A lookup by name compares the whole name: a prefix of a name finds nothing,
+ * and a name finds its own entry. */
+static int lookups_exact(const char *name, int is_group)
+{
+	char prefix[64];
+	size_t len = strlen(name);
+	int ok = 1;
+
+	if (len < 2 || len >= sizeof(prefix))
+		return 1;
+	if (is_group) {
+		struct group *g = getgrnam(name);
+
+		ok = g && strcmp(g->gr_name, name) == 0;
+	} else {
+		struct passwd *p = getpwnam(name);
+		struct spwd *s = getspnam(name);
+
+		ok = p && strcmp(p->pw_name, name) == 0 && s && strcmp(s->sp_namp, name) == 0;
+	}
+	if (!ok)
+		printf("crypt-probe: the name \"%s\" does not find its own entry\n", name);
+	memcpy(prefix, name, len - 1);
+	prefix[len - 1] = '\0';
+	if (getpwnam(prefix) || getgrnam(prefix) || getspnam(prefix)) {
+		printf("crypt-probe: the prefix \"%s\" of \"%s\" finds an entry\n", prefix, name);
+		ok = 0;
+	}
+	return ok;
+}
+
+static int names_exact(const char *path, int is_group)
+{
+	char line[512];
+	FILE *f = fopen(path, "r");
+	int rows = 0, ok = 1;
+
+	while (f && fgets(line, sizeof(line), f)) {
+		char *colon = strchr(line, ':');
+
+		if (!colon)
+			continue;
+		*colon = '\0';
+		rows++;
+		if (!lookups_exact(line, is_group))
+			ok = 0;
+	}
+	if (f)
+		fclose(f);
+	return rows >= 3 && ok;
+}
+
 static void probe_accounts(void)
 {
 	char line[512];
@@ -161,6 +216,13 @@ static void probe_accounts(void)
 	if (f)
 		fclose(f);
 	check(rows >= 3 && ok, "every password field of /etc/passwd is x");
+
+	check(names_exact("/etc/passwd", 0),
+		"a prefix of an account name finds nothing with getpwnam, getgrnam and getspnam");
+	check(names_exact("/etc/group", 1),
+		"a prefix of a group name finds nothing with getpwnam, getgrnam and getspnam");
+	check(getpwnam("") == NULL && getgrnam("") == NULL && getspnam("") == NULL,
+		"the empty name finds nothing");
 }
 
 static void probe_newgrp(void)

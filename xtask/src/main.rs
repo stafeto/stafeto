@@ -7700,6 +7700,9 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"/libexec/crypt-probe accounts"#,
         &[
             r#"crypt-probe: every entry of /etc/shadow is locked with !: ok"#,
+            r#"crypt-probe: a prefix of an account name finds nothing with getpwnam, getgrnam and getspnam: ok"#,
+            r#"crypt-probe: a prefix of a group name finds nothing with getpwnam, getgrnam and getspnam: ok"#,
+            r#"crypt-probe: the empty name finds nothing: ok"#,
             r#"crypt-probe: 0 failures"#,
         ],
     ),
