@@ -759,6 +759,63 @@ impl<'a> ServiceArgs<'a> {
     }
 }
 
+/// The bytes of a quota grant in the own arguments of the process service.
+pub const GRANT_LEN: usize = 24;
+/// The longest name of a grant (a record's name has 15 bytes at most).
+pub const GRANT_NAME_LEN: usize = 16;
+
+/// A quota the process service gives the child of fork of one program
+/// (spec 2, 3.12.2): `pages` pages for each of `places` children at a
+/// time, when the parent's process runs the program `name` with the
+/// effective user ID 0. Own arguments of the process service: bytes 0..4
+/// the pages, 4..8 the places, 8..24 the name, zeros after it. A record
+/// with no grant has own arguments of another length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub pages: u32,
+    pub places: u32,
+    pub name: [u8; GRANT_NAME_LEN],
+}
+
+impl Grant {
+    /// The grant of `pages` pages at `places` places for the program
+    /// `name` (15 bytes at most), as constant bytes for a table.
+    pub const fn bytes(pages: u32, places: u32, name: &str) -> [u8; GRANT_LEN] {
+        let name = name.as_bytes();
+        assert!(name.len() < GRANT_NAME_LEN);
+        let mut out = [0; GRANT_LEN];
+        let (p, q) = (pages.to_le_bytes(), places.to_le_bytes());
+        let mut i = 0;
+        while i < 4 {
+            out[i] = p[i];
+            out[4 + i] = q[i];
+            i += 1;
+        }
+        let mut i = 0;
+        while i < name.len() {
+            out[8 + i] = name[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// The grant in the own arguments `own` of the service: None unless
+    /// they are exactly a grant with a name.
+    pub fn read(own: &[u8]) -> Option<Grant> {
+        if own.len() != GRANT_LEN || own[8] == 0 {
+            return None;
+        }
+        let word = |at: usize| u32::from_le_bytes(own[at..at + 4].try_into().expect("4 bytes"));
+        let mut name = [0; GRANT_NAME_LEN];
+        name.copy_from_slice(&own[8..]);
+        Some(Grant {
+            pages: word(0),
+            places: word(4),
+            name,
+        })
+    }
+}
+
 /// The length of the reply to HEARTBEAT that is no refusal.
 pub const HEARTBEAT_REPLY_LEN: usize = 12;
 
@@ -1145,6 +1202,17 @@ mod tests {
         assert_eq!(ServiceArgs::read(&[0; 15]), Err(Status::BadSize));
         // They fit the start data of a program (rt::startup::ARGS_MAX).
         assert_eq!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX, 256);
+    }
+
+    #[test]
+    fn a_grant_round_trips_through_the_own_arguments() {
+        const BYTES: [u8; GRANT_LEN] = Grant::bytes(196_608, 1, "nginx-fast");
+        let grant = Grant::read(&BYTES).unwrap();
+        assert_eq!((grant.pages, grant.places), (196_608, 1));
+        assert_eq!(&grant.name[..11], b"nginx-fast\0");
+        assert_eq!(Grant::read(&BYTES[..23]), None);
+        assert_eq!(Grant::read(&[0; GRANT_LEN]), None);
+        assert_eq!(Grant::read(b"posix-procs\0"), None);
     }
 
     #[test]

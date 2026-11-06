@@ -1111,7 +1111,10 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fstack-probe") as usize
     + cfg!(feature = "table-fstack-device") as usize
     + cfg!(feature = "table-fast-nginx") as usize
-    + cfg!(feature = "table-fast-nginx-vz") as usize;
+    + cfg!(feature = "table-fast-nginx-vz") as usize
+    + cfg!(feature = "table-fast-scale") as usize
+    + cfg!(feature = "table-fast-scale-vz") as usize
+    + cfg!(feature = "table-posix-map-big") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -1184,7 +1187,10 @@ const _: () = assert!(
     feature = "table-fstack-probe",
     feature = "table-fstack-device",
     feature = "table-fast-nginx",
-    feature = "table-fast-nginx-vz"
+    feature = "table-fast-nginx-vz",
+    feature = "table-fast-scale",
+    feature = "table-fast-scale-vz",
+    feature = "table-posix-map-big"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1315,6 +1321,12 @@ pub const TABLE: &[Record] = fstack::FSTACK_DEVICE_TABLE;
 pub const TABLE: &[Record] = fstack::FAST_NGINX_TABLE;
 #[cfg(feature = "table-fast-nginx-vz")]
 pub const TABLE: &[Record] = fstack::FAST_NGINX_VZ_TABLE;
+#[cfg(feature = "table-fast-scale")]
+pub const TABLE: &[Record] = fstack::FAST_SCALE_TABLE;
+#[cfg(feature = "table-fast-scale-vz")]
+pub const TABLE: &[Record] = fstack::FAST_SCALE_VZ_TABLE;
+#[cfg(feature = "table-posix-map-big")]
+pub const TABLE: &[Record] = ramfs::POSIX_MAP_BIG_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -2498,6 +2510,9 @@ mod tests {
             fstack::FSTACK_DEVICE_TABLE,
             fstack::FAST_NGINX_TABLE,
             fstack::FAST_NGINX_VZ_TABLE,
+            fstack::FAST_SCALE_TABLE,
+            fstack::FAST_SCALE_VZ_TABLE,
+            ramfs::POSIX_MAP_BIG_TABLE,
             net::NET_TABLE,
             net::NET_TWO_TABLE,
             net::NET_VZ_TABLE,
@@ -2721,6 +2736,18 @@ mod tests {
         assert_eq!(
             order_of(fstack::FAST_NGINX_VZ_TABLE),
             order_of(net::NET_VZ2_TABLE)
+        );
+        assert_eq!(
+            order_of(fstack::FAST_SCALE_TABLE),
+            order_of(fstack::FAST_NGINX_TABLE)
+        );
+        assert_eq!(
+            order_of(fstack::FAST_SCALE_VZ_TABLE),
+            order_of(fstack::FAST_NGINX_VZ_TABLE)
+        );
+        assert_eq!(
+            order_of(ramfs::POSIX_MAP_BIG_TABLE),
+            order_of(ramfs::POSIX_PROCS_TABLE)
         );
         assert_eq!(order_of(vz::TABLE), ["uart", "shell"]);
         assert_eq!(

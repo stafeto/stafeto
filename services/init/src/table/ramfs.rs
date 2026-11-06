@@ -586,6 +586,33 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The pages of the quota of the probe of the big room (`posix-map big`):
+/// 240 MiB, above the 64 MiB from which a process may grow its room. The
+/// launcher, the probe it spawns and the child of fork of the probe each
+/// have it: three of them in the 1 GiB of the guest.
+pub const MAP_BIG_PAGES: u64 = 61_440;
+
+/// The probe of the big room (tests/posix-map, the argument `big`): the
+/// table of POSIX_PROCS_TABLE with a quota of MAP_BIG_PAGES for the probe
+/// and a pool that holds two children of that size at a time (the probe
+/// and its child of fork or of posix_spawn). The guest has 1 GiB.
+pub const POSIX_MAP_BIG_TABLE: &[Record] = &[
+    POSIX_PROCS_TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2 * MAP_BIG_PAGES * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        args: b"posix-procs\0big\0",
+        quota: MAP_BIG_PAGES * PAGE,
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
+];
+
 /// The share of thread numbers the process service has in the probe of
 /// shares: few enough for a probe to use up in a moment (kernel spec 7.5).
 pub const SHARES_PROBE_THREADS: u32 = 24;
@@ -696,8 +723,10 @@ const STEPS_QUOTA: u64 = 608 * PAGE;
 /// with 736 pages: 13.7% left, 27 pages to 90%. Step 6, part 1 (the memory
 /// streams without a file, the probes of relibc in the image, 64 descriptions
 /// of poll) measured 651 and 649 pages: 11 to 90% of 736. With 768 pages 90% is
-/// 691, 40 pages away, about two threads of a volley.
-pub(super) const PROCS_QUOTA: u64 = 768 * PAGE;
+/// 691, 40 pages away, about two threads of a volley. The room that grows
+/// and the search by words (P6b-4a) added 10: 692 measured, and 800 pages
+/// leave 14.3% with 28 pages to 90%.
+pub(super) const PROCS_QUOTA: u64 = 800 * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and

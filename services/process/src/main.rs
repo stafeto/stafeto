@@ -310,6 +310,9 @@ struct Processes {
     window_issued: [[u32; MAX_CPUS]; 2],
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
+    /// The quota init's table grants the child of fork of one program
+    /// (`loaders::grant_applies`); `pages` 0 for none.
+    grant: proto_init::Grant,
     /// The ExecCommit of each record that waits for init, by the record's
     /// index, the records whose new process waits for the thread that
     /// tells init, and that thread's Replace that waits for one.
@@ -505,6 +508,9 @@ fn main(_: u64) -> u64 {
         return 6;
     }
     let args = proto_init::ServiceArgs::read(start.args()).ok();
+    if let Some(grant) = args.and_then(|a| proto_init::Grant::read(a.own)) {
+        owner.grant = grant;
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -3292,10 +3298,22 @@ impl Processes {
         // the record less those pages (the record keeps the whole quota for
         // the children and the execs it makes; spec 2, 3.12.2).
         let fork = matches!(birth.page, PageStart::Fork { .. });
-        let process_quota = if fork {
+        // The child of fork of the program the table grants a quota to
+        // gets it, while a place of the grant is free.
+        let granted = fork
+            && loaders::grant_applies(
+                &self.grant,
+                &parent.name,
+                parent.credentials.euid,
+                self.records.granted(),
+            );
+        let process_quota = if granted {
+            u64::from(self.grant.pages) * 4096
+        } else if fork {
             // A record no Create or exec set the quota of its process for
-            // has the whole.
-            let own = if parent.process_quota == 0 {
+            // has the whole; a child of a grant has the quota of its
+            // record (the grant is not passed on).
+            let own = if parent.granted || parent.process_quota == 0 {
                 parent.quota
             } else {
                 parent.process_quota
@@ -3349,6 +3367,7 @@ impl Processes {
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
             record.process_quota = process_quota;
+            record.granted = granted;
             record.handle_limit = create.handle_limit;
             record.ctty = inherited_ctty;
             // A child of a file shows its program's name; a child of fork

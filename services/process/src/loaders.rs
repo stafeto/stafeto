@@ -46,6 +46,20 @@ pub const fn fork_quota(nominal: u64, image_pages: u32) -> u64 {
     if quota > nominal { nominal } else { quota }
 }
 
+/// Whether the child of fork of a process that runs the program `name`
+/// with the effective user ID `euid` gets the quota of `grant`: the grant
+/// names that program, the user is root (a device is root's alone, so the
+/// grant widens no circle) and `taken` places of the grant are in use
+/// fewer than it has.
+pub fn grant_applies(
+    grant: &proto_init::Grant,
+    name: &[u8; proto_process::NAME_LEN],
+    euid: u32,
+    taken: u32,
+) -> bool {
+    grant.pages != 0 && euid == 0 && grant.name == *name && taken < grant.places
+}
+
 /// The credentials a child of `parent` starts with: those of an exec, the
 /// saved IDs taken from the effective ones, and the effective ones reset
 /// to the real ones for POSIX_SPAWN_RESETIDS ([P24-SPAWN], [P24-EXEC]).
@@ -388,6 +402,27 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grant_goes_to_root_running_its_program_while_a_place_is_free() {
+        use proto_init::Grant;
+        let grant = |bytes: [u8; proto_init::GRANT_LEN]| Grant::read(&bytes).unwrap();
+        let g = grant(Grant::bytes(196_608, 1, "nginx-fast"));
+        let mut name = [0; proto_process::NAME_LEN];
+        name[..10].copy_from_slice(b"nginx-fast");
+        assert!(grant_applies(&g, &name, 0, 0));
+        assert!(!grant_applies(&g, &name, 1000, 0), "not root");
+        assert!(!grant_applies(&g, &name, 0, 1), "the place is taken");
+        let mut other = name;
+        other[9] = b'x';
+        assert!(!grant_applies(&g, &other, 0, 0), "another program");
+        let none = Grant {
+            pages: 0,
+            places: 0,
+            name: [0; proto_init::GRANT_NAME_LEN],
+        };
+        assert!(!grant_applies(&none, &[0; proto_process::NAME_LEN], 0, 0));
+    }
 
     #[test]
     fn a_forked_child_pays_for_what_it_does_not_share() {

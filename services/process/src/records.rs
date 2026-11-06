@@ -105,6 +105,8 @@ pub struct Record<P> {
     /// The quota of its process, which is `quota` unless it is a child of
     /// fork that does not pay for the image of its parent (spec 2, 3.12.2).
     pub process_quota: u64,
+    /// Its process has the quota init's table grants (`Records::granted`).
+    pub granted: bool,
     /// The pages of the code and the read-only data of its image that its
     /// process pays for, which a child of fork shares and does not pay for.
     pub image_pages: u32,
@@ -406,6 +408,16 @@ impl<P> Records<P> {
         self.records.get_mut(index)?.as_mut()
     }
 
+    /// The records whose process holds a place of the quota grant and still
+    /// runs: a zombie has given its quota back.
+    pub fn granted(&self) -> u32 {
+        self.records
+            .iter()
+            .flatten()
+            .filter(|r| r.granted && !matches!(r.state, State::Zombie(_)))
+            .count() as u32
+    }
+
     /// The unavailable places: records, live group/session numbers and
     /// permanently retired indices whose label generation is exhausted.
     pub fn count(&self) -> usize {
@@ -525,6 +537,7 @@ impl<P> Records<P> {
             quota: 0,
             handle_limit: 0,
             process_quota: 0,
+            granted: false,
             image_pages: 0,
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,
