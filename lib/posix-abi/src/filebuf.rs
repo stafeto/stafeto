@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The process's buffer for the large reads of files: a memory object of `SIZE` bytes of the
-//! process's own quota, mapped as the *file buffer piece* of the memory map
+//! The process's buffer for the large reads of files: a memory object of `SIZE` bytes (60 KiB,
+//! 15 pages) of the process's own quota, mapped as the *file buffer piece* of the memory map
 //! (posix_map::Kind::FileBuffer). The layer cuts it into cells of `proto_fs::READ_PORTION`
 //! bytes, rounded up to pages. A `read` or `pread` of a file of the RAM service for more than
 //! one message (`MAX_READ`) takes a cell, asks the service to fill it (READ_FD_INTO or
@@ -13,14 +13,34 @@
 //!
 //! * The first large read asks for the buffer; the other threads go by messages meanwhile. A
 //!   refusal (no memory, no room in the map) is final until `exec`, and the object goes at once.
-//! * A read that finds no free cell goes by messages: not atomic, as every read of more than
-//!   one message was before.
+//! * A read of up to the portion that finds no free cell waits a little for one (a cell is held
+//!   for one step of the service) and goes by messages when none comes: then it is not atomic,
+//!   as every read of more than one message was before. A read inside a signal handler does not
+//!   wait.
+//! * A failure of the means (`handle_duplicate`, the service's `mem_map`, a service without the
+//!   methods) sends the read by messages as well, never an error the messages would not give.
+//! * The cost is 15 pages of quota and one piece of the map for the life of the process
+//!   (docs/posix-coverage.md); only `read` and `pread` ask for it, not the fill of a mapping.
+//! * A `siglongjmp` out of a handler that interrupted a read keeps its cell for good, as it
+//!   keeps the holds of the files (`abandon_holds`); five such exits leave the process reading
+//!   by messages.
 //! * A forked child has neither the piece (`Map::inherited` leaves it out) nor the cells, and
 //!   asks for its own. An exec'd image starts without one.
 //! * The state and the cells are atomic words; no lock of the layer is held over a request.
 //!   The object is made and mapped under the lock of the heap alone.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+/// The reads that went through a cell, for the probes.
+static THROUGH: AtomicU64 = AtomicU64::new(0);
+
+/// How many reads went through a cell of the buffer so far.
+pub fn probe_through() -> u64 {
+    THROUGH.load(Ordering::Relaxed)
+}
+
+/// The turns a read of up to a portion looks for a free cell for before it goes by messages.
+const WAIT: u32 = 2000;
 use posix_fs::{FsError, MAX_READ, Transport};
 use proto_fs::READ_PORTION;
 use rt::handle::{Handle, Memory};
@@ -28,7 +48,7 @@ use rt::sys;
 
 /// The bytes of one cell: the portion, whole pages.
 const CELL: usize = READ_PORTION.next_multiple_of(posix_map::PAGE);
-/// The bytes of the buffer: 64 KiB, as many whole cells as they hold.
+/// The bytes of the buffer: as many whole cells as 64 KiB holds (5 of 12 KiB).
 const CELLS: usize = 64 * 1024 / CELL;
 const SIZE: usize = (CELLS * CELL).next_multiple_of(posix_map::PAGE);
 
@@ -105,6 +125,35 @@ fn cell(size: usize) -> Option<Cell> {
     }
 }
 
+/// A cell for a read of `size` bytes. A read of one portion at most that finds none waits a
+/// little for one, unless it runs inside a signal handler (the thread that holds the cell may
+/// be the one the handler interrupted).
+fn cell_waiting(size: usize) -> Option<Cell> {
+    if let Some(cell) = cell(size) {
+        return Some(cell);
+    }
+    if size > READ_PORTION
+        || STATE.load(Ordering::Acquire) == REFUSED
+        || rt::upcall::query().is_ok_and(|q| q.depth != 0)
+    {
+        return None;
+    }
+    for turn in 0..WAIT {
+        if let Some(cell) = cell(size) {
+            return Some(cell);
+        }
+        if STATE.load(Ordering::Acquire) == REFUSED {
+            return None;
+        }
+        if turn % 16 == 15 {
+            let _ = sys::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    None
+}
+
 /// The buffer is asked for by one thread: the object and its piece. The address of the piece,
 /// or None (refused, or another thread asks).
 fn ask() -> Option<usize> {
@@ -150,10 +199,17 @@ pub(crate) fn read(
     out: &mut [u8],
 ) -> Option<Result<usize, FsError>> {
     let count = out.len().min(READ_PORTION);
-    let cell = cell(count)?;
+    let cell = cell_waiting(count)?;
     let object = Handle::<Memory>::borrowed(rt::abi::Handle(OBJECT.load(Ordering::Acquire)));
-    let read = transport.read_into(fd, offset, count, &object, cell.place());
-    Some(read.inspect(|&n| out[..n].copy_from_slice(cell.bytes(n))))
+    match transport.read_into(fd, offset, count, &object, cell.place()) {
+        Ok(Some(n)) => {
+            THROUGH.fetch_add(1, Ordering::Relaxed);
+            out[..n].copy_from_slice(cell.bytes(n));
+            Some(Ok(n))
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    }
 }
 
 /// A forked child: no buffer and no cell.

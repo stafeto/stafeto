@@ -567,6 +567,20 @@ const CONSOLE_INFO: NodeInfo = NodeInfo {
     change_time: proto_fs::Timestamp::ZERO,
 };
 
+/// The answer of a READ_FD_INTO as `Transport::read_into` gives it: the count, None when the
+/// means of the transfer failed (the read goes by messages), an error when the answer is about
+/// the file or the call was interrupted.
+fn classify_read_into(answer: Result<usize, Status>) -> Result<Option<usize>, FsError> {
+    match answer {
+        Ok(n) => Ok(Some(n)),
+        Err(Status::Kernel(rt::abi::Error::Interrupted)) => Err(FsError::Interrupted),
+        Err(Status::Kernel(_) | Status::UnknownMethod | Status::BadVersion | Status::BadSize) => {
+            Ok(None)
+        }
+        Err(status) => Err(FsError::from(status)),
+    }
+}
+
 impl Transport {
     /// Borrow the existing file session for paid client phases.
     pub fn files(&self) -> ManuallyDrop<Files> {
@@ -770,7 +784,10 @@ impl Transport {
 
     /// READ_FD_INTO (READ_AT_FD_INTO with `offset`) of the service's description `fd`: up to
     /// `count` bytes, `proto_fs::READ_PORTION` at most, into `memory` from `place`, one step of
-    /// the service (see `rt::fs::Files::read_into`).
+    /// the service (see `rt::fs::Files::read_into`). None when the means of the transfer
+    /// failed (a copy of the object cannot be made, the service cannot map it, or it does not
+    /// know the method): the read then goes by messages, which need none of them. An answer
+    /// about the file (a bad descriptor, a directory) and an interruption are errors.
     pub fn read_into(
         &self,
         fd: u32,
@@ -778,10 +795,8 @@ impl Transport {
         count: usize,
         memory: &Handle<rt::handle::Memory>,
         place: u64,
-    ) -> Result<usize, FsError> {
-        self.files()
-            .read_into(fd, offset, count, memory, place)
-            .map_err(FsError::from)
+    ) -> Result<Option<usize>, FsError> {
+        classify_read_into(self.files().read_into(fd, offset, count, memory, place))
     }
 
     /// pwrite of the service's description `fd`.
@@ -2197,5 +2212,39 @@ mod net_tests {
         files.close(b).unwrap();
         assert_eq!(CLOSED.load(Ordering::SeqCst), 0x1005);
         let _ = c;
+    }
+}
+
+#[cfg(test)]
+mod read_into_tests {
+    use super::*;
+    use rt::abi::Error;
+
+    /// A failure of the means of the transfer sends the read by messages; an answer about the
+    /// file stays an error the messages would give too.
+    #[test]
+    fn a_failed_transfer_falls_back_and_an_answer_about_the_file_does_not() {
+        assert_eq!(classify_read_into(Ok(12288)), Ok(Some(12288)));
+        for failed in [
+            Status::Kernel(Error::LimitReached),
+            Status::Kernel(Error::NoMemory),
+            Status::UnknownMethod,
+            Status::BadVersion,
+            Status::BadSize,
+        ] {
+            assert_eq!(classify_read_into(Err(failed)), Ok(None), "{failed:?}");
+        }
+        assert_eq!(
+            classify_read_into(Err(Status::Kernel(Error::Interrupted))),
+            Err(FsError::Interrupted)
+        );
+        assert_eq!(
+            classify_read_into(Err(Status::Unknown(proto_fs::BAD_FD))),
+            Err(FsError::BadFileDescriptor)
+        );
+        assert_eq!(
+            classify_read_into(Err(Status::Unknown(proto_fs::IS_DIRECTORY))),
+            Err(FsError::IsDirectory)
+        );
     }
 }

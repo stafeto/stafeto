@@ -408,6 +408,13 @@ fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
 /// descriptor, and when no cell of the buffer is to be had; the read then goes by messages.
 #[inline(never)]
 fn read_file_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
+    // Only a file of the RAM service is held for it; the kind is looked at under the lock of the
+    // files without a hold, so that the other descriptors are held once, by their own reads.
+    let ram = shared::with_fd(fd, |files| files.target(fd).map_err(error))
+        .is_ok_and(|target| matches!(target, posix_fs::Target::Ram(_)));
+    if !ram {
+        return None;
+    }
     let result =
         shared::held(fd, |transport, target| match target {
             posix_fs::Target::Ram(file) => Ok(filebuf::read(&transport, file.fd(), None, buffer)
@@ -418,6 +425,11 @@ fn read_file_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
         Ok(read) => read,
         Err(errno) => Some(Err(errno)),
     }
+}
+
+/// How many reads went through a cell of the buffer of the large reads (for the probes).
+pub fn probe_file_reads() -> u64 {
+    filebuf::probe_through()
 }
 
 /// The same for `pread` of the description `fd` of the RAM service at `offset`: the platform's

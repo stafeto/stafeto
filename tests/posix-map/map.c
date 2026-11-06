@@ -761,7 +761,8 @@ static void image_spawned(void) {
 
 /* A fork of a map with 96 groups of regions that do not adjoin (the table of
  * pieces holds 128, the program's own take some 30 and the buffer of the
- * large reads of files one): four objects of 64 pages, of which every second
+ * large reads of files one, which the 16 KiB reads of `copy_file` make before this test and
+ * which stays until the process ends): four objects of 64 pages, of which every second
  * page is given back (the first object keeps 31 groups and gives back its
  * last two pages in one run, the last keeps one page and loses the rest in
  * one run). The child binds an object for each group (the loader joins

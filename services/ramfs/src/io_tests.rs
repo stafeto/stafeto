@@ -991,7 +991,7 @@ fn a_portion_read_is_one_state_of_the_file() {
         Ok(3)
     );
     assert_eq!(ram.read_at(&mut reader, rfd, &mut out, now), Ok(0));
-    // A write between two portions shows whole in the second and not at all in the first.
+    // The portion after a write shows the write whole; the one before it shows the bytes that were there.
     let mut before = vec![0; portion];
     assert_eq!(ram.pread(&reader, rfd, 0, &mut before, now), Ok(portion));
     let patch = vec![0xA5; 1000];

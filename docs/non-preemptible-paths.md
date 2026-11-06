@@ -800,8 +800,9 @@ fails when any check goes.
 A `read` or `pread` of an ordinary session for more than one message goes the same way
 (READ_FD_INTO and READ_AT_FD_INTO, `proto_fs::READ_PORTION` = 12 KiB at most): the service maps
 the caller's object, makes the read of READ or READ_AT into it in one step, and unmaps it. The
-copy takes about 550 ticks a KiB, so 12 KiB is the portion: a larger one passes 0.9 B (18,369
-ticks) with the fixed part of the step. A read of up to the portion is one step, hence atomic
+copy takes about 550 ticks a KiB (a rough slope from two different kinds of step, and a count
+under -icount, which compares versions), so 12 KiB is the portion: a larger one passes 0.9 B
+(18,369 ticks) with the fixed part of the step. A read of up to the portion is one step, hence atomic
 against the writes of other processes (XSH 2.9.7); a longer read goes in portions, and a read that
 finds no cell of the layer's buffer goes by messages of 1,016 bytes and is not atomic. The
 statistics of `process-steps` count the methods from 64 on in the kind 63; the detail of its

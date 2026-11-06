@@ -85,19 +85,16 @@ pub fn payload() -> bool {
     {
         return fail(69);
     }
-    // A read of more than one message goes through the buffer of the large reads when it has a
-    // cell and by two messages when it has none: all the bytes come back either way.
+    // A read of more than one message goes through a cell of the buffer of the large reads:
+    // one call gives all 1,024 bytes, and the counter of the cells says it went that way.
     let mut again = [0; 1024];
     if abi::lseek(fd, 0, SEEK_SET) != Ok(0) {
         return fail(72);
     }
-    let first = abi::read(fd, &mut again);
-    if !matches!(first, Ok(n) if n == again.len() || n == MAX_READ) {
-        return fail(72);
-    }
-    let first = first.unwrap_or(0);
-    if abi::read(fd, &mut again[first..]) != Ok(again.len() - first)
+    let through = abi::probe_file_reads();
+    if abi::read(fd, &mut again) != Ok(again.len())
         || again != bytes
+        || abi::probe_file_reads() != through + 1
         || abi::close(fd).is_err()
     {
         return fail(73);

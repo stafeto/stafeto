@@ -1064,6 +1064,17 @@ static int steps_open(void) {
     if (steps_open_files(fds, STEPS_OPEN_FILES) != STEPS_OPEN_FILES) return 88;
     for (int i = 0; i < STEPS_OPEN_FILES; i += 100)
         if (pread(fds[i], block, 12288, 0) != 12288) return 84;
+    /* The longest step of a read through an object (stafeto-design#628): 12,288 bytes from an
+     * offset off a page boundary, of a file the process wrote (the path of private pages) and of
+     * an image file. */
+    if (pread(fds[0], block, 12288, 4095) != 12288) return 91;
+    int written = open("/tmp/steps-readinto", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (written < 0) return 92;
+    memset(block, 'w', 12288);
+    for (int part = 0; part < 2; part++)
+        if (write(written, block, 12288) != 12288) return 93;
+    if (pread(written, block, 12288, 4095) != 12288 || pread(written, block, 12288, 0) != 12288) return 94;
+    if (close(written) || unlink("/tmp/steps-readinto")) return 95;
     for (int i = 0; i < 3; i++) {
         pid_t pid = fork();
         if (pid < 0) {

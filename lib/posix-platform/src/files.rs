@@ -281,19 +281,29 @@ pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offs
         return -(posix_abi::fastnet::unsupported(fd) as isize);
     }
     // SAFETY: the caller's promise.
-    unsafe { read_at(Place::Fd(fd), buf, len, offset) }
+    unsafe { read_at(Place::Fd(fd), buf, len, offset, true) }
 }
 
-/// Whether a read of a file that asked for `size` bytes and got `got` stopped at a portion
-/// or a message and not at the end of the file: more is read after it.
+/// Whether a read of a file that asked for `size` bytes and got `got` stopped at a full portion
+/// or message before the end of the file: more is read after it.
 pub(crate) fn full_portion(got: isize, size: usize) -> bool {
     size > posix_request::MAX_READ
+        && got < size as isize
         && (got == posix_request::MAX_READ as isize || got == proto_fs::READ_PORTION as isize)
 }
 
+/// `buffered` lets the read go through the buffer of the large reads; the fill of a mapping
+/// does not, so that a mapping never makes the buffer (its cost is for the reads of programs).
+///
 /// # Safety
 /// `buf` is writable for `len` bytes.
-pub(crate) unsafe fn read_at(place: Place, buf: *mut u8, len: usize, offset: i64) -> isize {
+pub(crate) unsafe fn read_at(
+    place: Place,
+    buf: *mut u8,
+    len: usize,
+    offset: i64,
+    buffered: bool,
+) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     // A read of more than one message goes in portions of up to READ_PORTION bytes, one step of
@@ -306,7 +316,9 @@ pub(crate) unsafe fn read_at(place: Place, buf: *mut u8, len: usize, offset: i64
         let at = offset.saturating_add(done as i64);
         let rest = &mut out[done..];
         let got = at_offset(place, at, |files, fd, at| {
-            posix_abi::pread_file_large(&files, fd, at, rest)
+            buffered
+                .then(|| posix_abi::pread_file_large(&files, fd, at, rest))
+                .flatten()
                 .unwrap_or_else(|| files.read_at(fd, at, rest))
         });
         if full_portion(got, size) {

@@ -922,6 +922,13 @@ pub unsafe extern "C" fn stafeto_probe_start_refusals(out: *mut u64, n: usize) -
     posix_abi::process::probe_start_refusals(unsafe { core::slice::from_raw_parts_mut(out, n) })
 }
 
+/// How many reads went through a cell of the buffer of the large reads so far
+/// (posix_abi::probe_file_reads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_file_reads() -> u64 {
+    posix_abi::probe_file_reads()
+}
+
 /// Where the last fork of the process was refused (posix_abi::fork::
 /// probe_refusal): `step | sub << 8 | status << 16`.
 #[unsafe(no_mangle)]

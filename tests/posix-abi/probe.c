@@ -1035,6 +1035,7 @@ static int usage_split(void) {
  * 12 KiB, one step of the service each: the bytes against the pattern written, the position
  * and the end of the file, an appending writer beside, and the atomicity of XSH 2.9.7: a read
  * of a portion sees a write of a message whole or not at all. */
+unsigned long long stafeto_probe_file_reads(void);
 #define LARGE_SIZE 40000
 static unsigned char large_byte(size_t i) { return (unsigned char)((i * 7 + (i >> 8)) & 0xff); }
 
@@ -1077,7 +1078,10 @@ static int large_reads(void) {
     }
     if (lseek(fd, 0, SEEK_CUR) != LARGE_SIZE || lseek(fd, 0, SEEK_SET) != 0) return 402;
     /* read: a portion and a few, each filled whole unless the file ends. */
+    unsigned long long through = stafeto_probe_file_reads();
     if (read(fd, buffer, 1017) != 1017 || !large_same(buffer, 0, 1017)) return 403;
+    /* The read went through a cell of the buffer, not by messages. */
+    if (stafeto_probe_file_reads() != through + 1) return 429;
     if (read(fd, buffer, 5000) != 5000 || !large_same(buffer, 1017, 5000)) return 404;
     if (lseek(fd, 0, SEEK_CUR) != 6017) return 405;
     if (read(fd, buffer, 12288) != 12288 || !large_same(buffer, 6017, 12288)) return 406;
@@ -1086,7 +1090,9 @@ static int large_reads(void) {
     if (read(fd, buffer, 20000) != (ssize_t)(LARGE_SIZE - at) || !large_same(buffer, at, LARGE_SIZE - at)) return 408;
     if (read(fd, buffer, 20000) != 0 || read(fd, buffer, 1017) != 0 || lseek(fd, 0, SEEK_CUR) != LARGE_SIZE) return 409;
     /* pread: the position stays; the rest is short at the end; nothing at or past it. */
+    through = stafeto_probe_file_reads();
     if (pread(fd, buffer, 1017, 1) != 1017 || !large_same(buffer, 1, 1017)) return 410;
+    if (stafeto_probe_file_reads() != through + 1) return 430;
     if (pread(fd, buffer, 12289, 100) != 12289 || !large_same(buffer, 100, 12289)) return 411;
     if (pread(fd, buffer, LARGE_SIZE, 0) != LARGE_SIZE || !large_same(buffer, 0, LARGE_SIZE)) return 412;
     if (pread(fd, buffer, LARGE_SIZE + 4096, 100) != LARGE_SIZE - 100 || !large_same(buffer, 100, LARGE_SIZE - 100)) return 413;
