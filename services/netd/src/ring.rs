@@ -96,6 +96,19 @@ pub fn settle_interrupts(
     continued
 }
 
+/// The sent buffers a step takes back from the ring of sending at most
+/// (stafeto-design#635). Each costs 129 ticks under -icount; a device that
+/// sends the whole queue at once (QEMU's bottom half run late on a busy
+/// host) returned about 250 of them to one step of receiving, which took
+/// 44 215 ticks against the bound of 18 369. Sixteen cost about 2 100 ticks
+/// and are more than any step sends (`STEP_RX`, `STEP_TX`), so the pool does
+/// not run dry: the rest come back in the next steps.
+pub const RECLAIM_STEP: usize = 16;
+// A step takes back more than it may send, and the taking back fits the
+// bound beside the longest step of receiving of `net-curl steps` (12 521).
+const _: () = assert!(RECLAIM_STEP >= STEP_RX && RECLAIM_STEP >= STEP_TX);
+const _: () = assert!(12_521 + RECLAIM_STEP * 129 < 18_369);
+
 /// The frames the loopback keeps for the next reception: two steps of
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
