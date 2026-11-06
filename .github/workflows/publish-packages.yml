@@ -8,8 +8,9 @@ name: publish-packages
 #
 # Until the owner has made the environment `packages` and its secrets and has
 # published a series, every run ends green without doing anything: the job
-# `gate` (no environment, no secret) decides from public facts, and the job
-# `publish` skips its steps when a secret is empty.
+# `gate` (no environment, no secret) decides from public facts. Once it says go,
+# an empty secret fails the run loudly: a silent skip would let a published
+# index run out without a letter to the owner.
 on:
   release:
     types: [published]
@@ -38,7 +39,9 @@ jobs:
     outputs:
       go: ${{ steps.gate.outputs.go }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Is there anything to do
         id: gate
@@ -47,7 +50,7 @@ jobs:
           PRERELEASE: ${{ github.event.release.prerelease }}
           TAG: ${{ github.event.release.tag_name }}
           ASSETS: ${{ join(github.event.release.assets.*.name, ' ') }}
-        run: python3 tools/pages.py gate --event "$EVENT" --prerelease "$PRERELEASE" --tag "$TAG" --assets "$ASSETS" >> "$GITHUB_OUTPUT"
+        run: python3 tools/pages.py gate --event "$EVENT" --prerelease "$PRERELEASE" --tag "$TAG" --assets "$ASSETS" --tree . >> "$GITHUB_OUTPUT"
 
   publish:
     name: publish
@@ -62,7 +65,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: The secrets of the environment
         id: secrets
@@ -71,17 +76,16 @@ jobs:
           PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
         run: |
           if [ -z "$RELEASE_SIGNING_KEY" ] || [ -z "$PACKAGES_TOKEN" ]; then
-            echo "::warning::RELEASE_SIGNING_KEY or PACKAGES_TOKEN of the environment packages is empty or missing: nothing to do"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "::error::RELEASE_SIGNING_KEY or PACKAGES_TOKEN of the environment packages is empty or missing"
+            exit 1
           fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
 
       - name: The pinned toolchain and xtask, before the key is written
         if: steps.secrets.outputs.ok == 'true'
         run: |
           rustup toolchain install
-          cargo build -p xtask
+          cargo build --locked -p xtask
 
       - name: The release key
         if: steps.secrets.outputs.ok == 'true'
@@ -129,7 +133,7 @@ jobs:
           test -n "$id" || { echo "::error::stafeto/packages has no release $storage"; exit 1; }
           echo "STORAGE_ID=$id" >> "$GITHUB_ENV"
           mkdir -p storage
-          gh api "repos/stafeto/packages/releases/$id/assets" --jq '.[] | "\(.id) \(.name)"' | while read -r asset name; do
+          gh api --paginate "repos/stafeto/packages/releases/$id/assets?per_page=100" --jq '.[] | "\(.id) \(.name)"' | while read -r asset name; do
             gh api -H "Accept: application/octet-stream" "repos/stafeto/packages/releases/assets/$asset" > "storage/$name"
           done
           python3 tools/pages.py verify-storage --index copy/INDEX --storage "$storage" --dir storage

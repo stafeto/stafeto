@@ -269,14 +269,12 @@ fn nothing_publishes_or_signs_again_before_the_owner_has_made_the_environment_an
         waits += usize::from(guarded);
     }
     assert!(waits >= 6);
-    // An empty secret is a warning and a clean end.
+    // Once the gate has said go, an empty secret fails the run: the owner gets the letter.
     let check = steps(publish)
         .into_iter()
         .find(|s| s.contains("id: secrets"))
         .unwrap();
-    assert!(
-        check.contains("::warning::") && check.contains("ok=false") && !check.contains("exit 1")
-    );
+    assert!(check.contains("::error::") && check.contains("exit 1") && !check.contains("ok=false"));
 }
 
 #[test]
@@ -294,7 +292,61 @@ fn the_publication_runs_for_a_release_without_a_suffix_and_the_week_for_the_page
     // The key leaves the machine whatever happens.
     assert!(text.contains("if: always() && steps.secrets.outputs.ok == 'true'"));
     assert!(text.contains("--min-certificate-days 35"));
+    // A storage release of more than 30 files is listed in full.
+    assert!(
+        text.contains(
+            "gh api --paginate \"repos/stafeto/packages/releases/$id/assets?per_page=100\""
+        )
+    );
     // The weekly signature and the one of a release follow the signed copy of a release.
     assert!(text.contains("--releases releases.json --anchors anchors"));
     assert!(text.contains("resign --index copy/INDEX --anchor copy/INDEX"));
+}
+
+#[test]
+fn every_action_is_pinned_by_the_commit_it_was_read_at() {
+    let mut roots = vec![crate::root().join(".github/actions/setup/action.yml")];
+    roots.extend(
+        names()
+            .iter()
+            .map(|n| crate::root().join(".github/workflows").join(n)),
+    );
+    for path in roots {
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let Some(at) = line
+                .trim()
+                .strip_prefix("- uses: ")
+                .or_else(|| line.trim().strip_prefix("uses: "))
+            else {
+                continue;
+            };
+            if at.starts_with("./") {
+                continue;
+            }
+            let (name, pin) = at
+                .split_once('@')
+                .unwrap_or_else(|| panic!("{}: {at}", path.display()));
+            let sha = pin.split_whitespace().next().unwrap();
+            assert!(
+                sha.len() == 40
+                    && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                    && pin.contains(" # v"),
+                "{}: {name} is not pinned by a full commit with a version comment",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_owner_is_told_to_guard_the_tags_and_main_before_a_secret_goes_into_the_environment() {
+    // The environment lets in any run on a tag v*, and anyone with the right to write can set a
+    // tag on a commit of a branch of theirs: the rulesets are what keeps the secrets safe.
+    let text = std::fs::read_to_string(crate::root().join("docs/release.md")).unwrap();
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("docs/release.md lacks {needle:?}"))
+    };
+    assert!(at("refs/tags/v*") < at("gh secret set RELEASE_SIGNING_KEY"));
+    assert!(text.contains("\"type\": \"creation\"") && text.contains("refs/heads/main"));
 }

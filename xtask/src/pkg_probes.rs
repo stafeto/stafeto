@@ -571,8 +571,8 @@ pub fn dist_licenses() -> Result<(), String> {
     scan(
         &archive("aarch64-virt-full"),
         &[
-            "/LICENSES/packages/f-stack",
-            "/LICENSES/packages/nginx-fast",
+            "/LICENSES/packages/f-stack/",
+            "/LICENSES/packages/nginx-fast/",
             "/boot-full.img",
         ],
     )

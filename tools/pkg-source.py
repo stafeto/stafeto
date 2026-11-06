@@ -163,7 +163,8 @@ def scan(archive: Path, markers: list[str], forbidden: list[str], allowed: list[
     needles = [m.encode() for m in markers]
     with tarfile.open(archive) as tar:
         for member in tar:
-            if any(text in member.name for text in allowed):
+            # A directory is looked at with its closing slash, so that a path names whole components.
+            if any(text in member.name + ("/" if member.isdir() else "") for text in allowed):
                 continue
             for text in forbidden:
                 if text in member.name:
