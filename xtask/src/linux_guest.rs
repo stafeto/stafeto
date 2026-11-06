@@ -63,6 +63,18 @@ pub const FAST_ADDRESS: &str = "192.168.64.250";
 /// The machine of both guests (the provisional ruling B2 of the owner).
 pub const CPUS: usize = 4;
 pub const MEMORY_MIB: u64 = 1024;
+
+/// The CPUs the shell of a variant of the image may use, which is what
+/// `nproc` says there: `BENCH_CPUS` has four, `BENCH_PINNED_CPUS` three and
+/// the image `cpu0` one (`init::table::bench`). The machine has `CPUS`
+/// in each.
+pub const fn shell_cpus(variant: BenchImage) -> usize {
+    match variant {
+        BenchImage::Profile => CPUS,
+        BenchImage::Pinned => CPUS - 1,
+        BenchImage::Cpu0 => 1,
+    }
+}
 /// How long the guest of Linux takes to give its prompt, and nginx to
 /// answer, after the start of the machine.
 const LINUX_WITHIN: Duration = Duration::from_secs(60);
@@ -626,8 +638,9 @@ pub(crate) fn read_fingerprints(
     run: &mut qemu::Run,
     report: &mut Report,
     kernel_settings: bool,
+    cpus: usize,
 ) -> Result<(), String> {
-    read_fingerprints_of(run, report, kernel_settings, "nginx", "nginx -T")
+    read_fingerprints_of(run, report, kernel_settings, cpus, "nginx", "nginx -T")
 }
 
 /// The same for a program of nginx other than `nginx`: `program` for the
@@ -637,6 +650,7 @@ pub(crate) fn read_fingerprints_of(
     run: &mut qemu::Run,
     report: &mut Report,
     kernel_settings: bool,
+    cpus: usize,
     program: &str,
     dump: &str,
 ) -> Result<(), String> {
@@ -647,9 +661,9 @@ pub(crate) fn read_fingerprints_of(
         .find(|l| l.trim().parse::<usize>().is_ok())
         .map(|l| l.trim().to_owned())
         .unwrap_or_default();
-    if report.cpus != CPUS.to_string() {
+    if report.cpus != cpus.to_string() {
         return Err(format!(
-            "{}: nproc says {:?}, {CPUS} wanted",
+            "{}: nproc says {:?}, {cpus} wanted",
             report.system, report.cpus
         ));
     }
@@ -948,7 +962,7 @@ fn check_linux(dir: &Path, expected: &(String, String)) -> Result<Guest, String>
         report.attempts = attempts;
         report.served = served;
         net_vz::lease_is_ours("linux-guest", &own, address)?;
-        read_fingerprints(&mut run, &mut report, true)?;
+        read_fingerprints(&mut run, &mut report, true, CPUS)?;
         report.conditions.push(format!(
             "at the end: {}",
             crate::nginx_bench::other_guests(1)
@@ -1023,7 +1037,7 @@ fn check_stafeto(expected: &(String, String)) -> Result<Guest, String> {
         report.attempts = attempts;
         report.served = served;
         net_vz::lease_is_ours("stafeto", &own, lease.address)?;
-        read_fingerprints(&mut run, &mut report, false)?;
+        read_fingerprints(&mut run, &mut report, false, CPUS)?;
         report.conditions.push(format!(
             "at the end: {}",
             crate::nginx_bench::other_guests(1)
@@ -1472,6 +1486,24 @@ mod tests {
             }
         }
         assert!(!bench_programs().iter().any(|p| p.3.contains(&"profile")));
+    }
+
+    /// `nproc` in the shell of a variant counts the CPUs of the launcher's
+    /// mask in the table of the image.
+    #[test]
+    fn the_cpus_nproc_wants_are_those_of_the_shells_mask_in_the_table() {
+        use init::table::{bench, net};
+        let of = |table: &[init::table::Record]| {
+            let launcher = table.iter().find(|r| r.name == net::NET_LAUNCHER.name);
+            let mask = launcher.unwrap().cpus & ((1u8 << CPUS) - 1);
+            mask.count_ones() as usize
+        };
+        assert_eq!(shell_cpus(BenchImage::Profile), of(bench::BENCH_VZ_TABLE));
+        assert_eq!(
+            shell_cpus(BenchImage::Pinned),
+            of(bench::BENCH_PINNED_VZ_TABLE)
+        );
+        assert_eq!(shell_cpus(BenchImage::Cpu0), of(bench::BENCH_CPU0_VZ_TABLE));
     }
 
     #[test]

@@ -349,6 +349,7 @@ pub fn cpus_of(record: &Record) -> u8 {
 /// data could not be made is killed; its thread never ran.
 fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> Loaded {
     let channel = view::<Channel>(CHANNEL);
+    let cpus = cpus_of(record);
     let params = SpawnParams {
         channel: &channel,
         label,
@@ -359,15 +360,16 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
         priority: record.priority,
         policy: Policy::Fifo,
         // The driver of the console and its log (the record that has `log`)
-        // runs on CPU 1 when the machine has one: its requests come from
-        // the shell on CPU 0 across CPUs (SMP stage 4); with one CPU the
-        // loader leaves it on CPU 0.
-        cpu: if record.log { 2 } else { 0 },
+        // runs on CPU 1 when the machine has one and its mask allows it: its
+        // requests come from the shell on CPU 0 across CPUs (SMP stage 4);
+        // with one CPU, or a mask without CPU 1 (the image `cpu0`), the
+        // loader leaves it on the CPU of its mask.
+        cpu: init::table::first_cpu(record.log, cpus),
         shares: sys::Shares {
             threads: record.shares.threads,
             timers: record.shares.timers,
         },
-        cpus: cpus_of(record),
+        cpus,
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;
