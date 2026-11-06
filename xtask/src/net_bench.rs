@@ -1388,6 +1388,8 @@ struct Prepared {
     /// The fingerprint of the settings of F1 (its own file).
     fast_config: String,
     www: String,
+    /// The CPUs the shell of the image of S4 has (`nproc`).
+    shell_cpus: usize,
 }
 
 /// A guest on VZ with its console on a pipe.
@@ -1634,11 +1636,12 @@ fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> 
                 &mut run,
                 &mut report,
                 false,
+                linux_guest::CPUS,
                 "nginx",
                 &format!("nginx -T -c {conf}"),
             )?;
         } else {
-            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+            linux_guest::read_fingerprints(&mut run, &mut report, false, linux_guest::CPUS)?;
         }
         let wanted = if tls { &prep.config_tls } else { &prep.config };
         linux_guest::verify(&report, wanted, &prep.www)?;
@@ -1696,6 +1699,7 @@ fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> 
 fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
     let fast = sys == System::F1;
     let suffix = vz::claim_suffix()?;
+    let shell_cpus = prep.shell_cpus;
     let mut report = Report {
         system: sys.name(),
         ..Report::default()
@@ -1752,6 +1756,7 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 &mut run,
                 &mut report,
                 false,
+                linux_guest::CPUS,
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
@@ -1787,11 +1792,12 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 &mut run,
                 &mut report,
                 false,
+                shell_cpus,
                 "nginx",
                 &format!("nginx -T -c {conf}"),
             )?;
         } else {
-            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+            linux_guest::read_fingerprints(&mut run, &mut report, false, shell_cpus)?;
         }
         let wanted = if tls { &prep.config_tls } else { &prep.config };
         linux_guest::verify(&report, wanted, &prep.www)?;
@@ -3311,6 +3317,13 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         config,
         fast_config,
         www,
+        shell_cpus: match o.image {
+            ImageKind::Plain | ImageKind::Profile => {
+                linux_guest::shell_cpus(linux_guest::BenchImage::Profile)
+            }
+            ImageKind::Pinned => linux_guest::shell_cpus(linux_guest::BenchImage::Pinned),
+            ImageKind::Cpu0 => linux_guest::shell_cpus(linux_guest::BenchImage::Cpu0),
+        },
     })
 }
 
