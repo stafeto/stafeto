@@ -196,8 +196,6 @@ two rulesets and, when GitHub offers it, one setting. The first ruleset covers t
     gh api 'repos/stafeto/stafeto/collaborators?permission=admin' --jq '.[].login'
     gh api 'orgs/stafeto/members?role=admin' --jq '.[].login'
 
-The setting is "Immutable releases" (repository settings, General, Releases): the files of a published release can no longer be replaced. The signed copy of the index in a release is the anchor of the records of its series, and a holder of the right to write could swap it; turn the setting on before the first release is published. The serial check of `pages.py` (the next paragraph) stays when it is on.
-
     gh api -X POST repos/stafeto/stafeto/rulesets --input - <<'JSON'
     {"name": "release tags", "target": "tag", "enforcement": "active",
      "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
@@ -214,7 +212,9 @@ The setting is "Immutable releases" (repository settings, General, Releases): th
      "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
     JSON
 
-What the publication checks whatever the settings are: the copy of the index of the release that is published follows the list of revocations of the tree, its series is the series of the tag, the tag is the newest release of that series, and the serial of the copy is above that of the copy of every other published release of the series. The weekly signature applies the serial and series checks to the copy it anchors on. A copy signed by a revoked key, swapped into the newest release while the setting is off, passes the weekly checks; that residue is the reason to turn the setting on.
+The setting is "Immutable releases" (repository settings, General, Releases): the files of a published release can no longer be replaced. The signed copy of the index in a release is the anchor of the records of its series, and a holder of the right to write could swap it; turn the setting on, if GitHub offers it, before the first release is published.
+
+What the publication checks, with or without that setting: the copy of the index of the release follows the list of revocations of the tree, its series is the series of the tag, the tag is the newest published release of that series, and the serial of the copy is above that of the copy of every other published release of the series. Those four rest on what `stafeto/stafeto` shows, and a holder of the right to write can change that (draft the newest release, then publish an older one), so the publication also keeps the version of the release it last published in `<series>/aarch64/release` on the pages, where only `PACKAGES_TOKEN` writes: a version below it is refused, and the same version only when the records of the copy are those on the pages. The weekly signature reads the same file and refuses an anchor older than it, and applies the series and serial checks to the copy it anchors on. Rolling a series back therefore takes both the right to write to `stafeto/stafeto` and the token of `stafeto/packages`. What the weekly signature still lacks is a judgment of the anchor by the list of revocations: a copy signed by a revoked key, swapped into the newest release while the setting is off and with the token also in the wrong hands, passes. That is the reason to turn the setting on.
 
 The agents that work on the repository push branches and open pull requests, and the
 coordinator creates tags only on the word of the owner. A leaked token of the owner's

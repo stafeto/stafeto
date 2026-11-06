@@ -140,6 +140,29 @@ def newest_copies(releases: list[dict]) -> dict[str, dict]:
     return best
 
 
+def version_of(text: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in text.strip().split("."))
+
+
+def recorded_version(pages: Path, series: str) -> tuple[int, ...] | None:
+    """The version of the release last published for `series`, as the pages
+    record it in `<series>/aarch64/release`. Only the token of stafeto/packages
+    writes there, so a holder of the right to write to stafeto/stafeto, who can
+    draft a release and publish an older one, cannot take it back."""
+    path = pages / series / ARCH / "release"
+    return version_of(path.read_text()) if path.is_file() else None
+
+
+def check_floor(version: tuple[int, ...], floor: tuple[int, ...] | None, same_records: bool) -> None:
+    if floor is None or version > floor:
+        return
+    word = ".".join(map(str, floor))
+    if version == floor and same_records:
+        return
+    raise Refusal(f"{'.'.join(map(str, version))} is not above {word}, the release last published for the series"
+                  + ("" if version < floor else " (a release published again must have the records of the pages)"))
+
+
 def serial_in(text: str) -> int:
     return int(header(text)["serial"])
 
@@ -173,7 +196,7 @@ def download(url: str) -> bytes:
         return reply.read()
 
 
-def fetch_copy(series: str, releases: list[dict], out: Path, get=download) -> Path:
+def fetch_copy(series: str, releases: list[dict], out: Path, get=download, floor: tuple[int, ...] | None = None) -> Path:
     """The signed copy of the newest release of `series` in `out/<series>/`,
     after the checks of `check_copy` (a copy swapped into an old release stops
     the week as it stops a publication)."""
@@ -183,6 +206,7 @@ def fetch_copy(series: str, releases: list[dict], out: Path, get=download) -> Pa
     directory = out / series
     directory.mkdir(parents=True, exist_ok=True)
     text = get(copies[series]["index"])
+    check_floor(copies[series]["number"], floor, True)
     check_copy(copies[series]["tag"], text.decode(), releases, get)
     (directory / "INDEX").write_bytes(text)
     (directory / "INDEX.sig").write_bytes(get(copies[series]["sig"]))
@@ -363,10 +387,17 @@ def publish(pages: Path, version: str, index_dir: Path, revoked: Path, command: 
     check_copy(f"v{version}", text, releases, get)
     series = header(text)["series"]
     on_pages = serial_of(pages / series / ARCH / "INDEX")
+    # The release last published for the series is on the pages: a draft and a publication of an
+    # older release on stafeto/stafeto does not roll the series back. The same release again is
+    # accepted when its records are those on the pages.
+    on_pages_text = (pages / series / ARCH / "INDEX")
+    same = on_pages_text.is_file() and text.split("\n\n", 1)[1:] == on_pages_text.read_text().split("\n\n", 1)[1:]
+    check_floor(version_of(version), recorded_version(pages, series), same)
     serial = max((on_pages or 0) + 1, int(header(text)["serial"]))
     with tempfile.TemporaryDirectory() as work:
         new_text, signature = resign(command, index_dir / "INDEX", serial, Path(work), index_dir / "INDEX", True)
     place(pages, series, new_text, signature, revoked)
+    (pages / series / ARCH / "release").write_text(f"{version}\n")
     if series not in listed(pages):
         (pages / "series.txt").write_text("".join(f"{s}\n" for s in sorted(listed(pages) + [series])))
     commit(pages, f"publish {version}: serial {serial}", push)
@@ -386,7 +417,7 @@ def weekly(pages: Path, revoked: Path, command: str, push: bool, releases: list[
             if not index.is_file():
                 raise Refusal(f"the series {s} is in series.txt and has no {s}/{ARCH}/INDEX")
             serial = serial_of(index) + 1
-            copy = fetch_copy(s, releases, anchors, get)
+            copy = fetch_copy(s, releases, anchors, get, recorded_version(pages, s))
             text, signature = resign(command, index, serial, Path(work) / s, copy / "INDEX")
             if expires_of(text) < now + datetime.timedelta(days=EXPIRES_MIN_DAYS):
                 raise Refusal(f"the index of {s} would expire in under {EXPIRES_MIN_DAYS} days")

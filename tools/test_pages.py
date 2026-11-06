@@ -170,6 +170,32 @@ class Branch(unittest.TestCase):
         self.assertIn("not the newest", str(stopped.exception))
         self.assertEqual(self.head(), before)
 
+    def test_a_newer_release_drafted_and_an_older_one_published_does_not_roll_the_series_back(self):
+        self.publish(index(serial=5), version="0.3.1")
+        self.assertEqual(self.remote("0.3/aarch64/release"), "0.3.1\n")
+        before = self.head()
+        # The writer drafts v0.3.1: the list of releases no longer shows it, and v0.3.0 is published.
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(index(serial=9), version="0.3.0")
+        self.assertIn("not above 0.3.1", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+        # The same release again, with the records on the pages, is a re-verification.
+        self.publish(index(serial=5), version="0.3.1")
+        self.assertEqual(self.remote("0.3/aarch64/release"), "0.3.1\n")
+        # The same version with other records is not.
+        other = index(serial=9, files=(("a", "a-1-1.stpkg", b"AAAA"), ("b", "b-1-1.stpkg", b"BB")))
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(other, version="0.3.1")
+        self.assertIn("records of the pages", str(stopped.exception))
+
+    def test_the_week_refuses_an_anchor_older_than_the_release_last_published(self):
+        self.publish(index(serial=5), version="0.3.1")
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.week(**{"0_3": index(serial=9)})  # the only release the list shows is v0.3.0
+        self.assertIn("not above 0.3.1", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
     def test_an_older_copy_swapped_into_a_draft_is_refused(self):
         before = self.head()
         with self.assertRaises(SystemExit) as stopped:
