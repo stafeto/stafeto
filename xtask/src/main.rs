@@ -5274,7 +5274,7 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
 }
 
 /// `cargo xtask posix-map big`: the probe of the room that grows to 1 GiB
-/// for a process with a quota of 240 MiB, on 1 GiB of memory (#598).
+/// for the fork child of the probe, which the grant of the process service gives 320 MiB, on 1 GiB of memory (#598).
 fn posix_map_big_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;

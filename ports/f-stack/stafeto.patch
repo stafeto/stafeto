@@ -286,7 +286,7 @@
  
  void *ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
 +#ifdef FF_STAFETO
-+/* As ff_mmap, but a refusal returns MAP_FAILED instead of ending the program. */
++/* As ff_mmap; a refusal returns MAP_FAILED to the caller. */
 +void *ff_mmap_try(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
 +#endif
  int ff_munmap(void *addr, uint64_t len);
