@@ -436,29 +436,14 @@ fn load_root(path: &Path, tree: &Path) -> Result<(Name, [u8; 32]), String> {
     Ok((issuer, seed))
 }
 
-/// The roots of the official repository: every `keys/*-root*.pub` of the
-/// tree, so that a rotation needs only a new file there.
-pub fn official_roots(tree: &Path) -> Result<Vec<Key>, String> {
-    let dir = tree.join("keys");
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "pub"))
-        .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| role_name(s, Role::Root))
-        })
-        .collect();
-    paths.sort();
-    let roots = paths
-        .iter()
-        .map(|p| read_public(p))
-        .collect::<Result<Vec<_>, _>>()?;
-    if roots.is_empty() {
-        return Err(format!("{}: no root key", dir.display()));
-    }
-    Ok(roots)
+/// The roots of the official repository: `pkgfmt::OFFICIAL_ROOTS`, the roots
+/// baked into `pkg` and `pkgd`. A new root enters by a change of that list
+/// (and of the file in `keys/` that it includes), which a review sees; no file
+/// that merely lies in `keys/` is trusted.
+pub fn official_roots() -> Result<Vec<Key>, String> {
+    pkgfmt::official_roots()
+        .map(|roots| roots.to_vec())
+        .map_err(|e| format!("pkgfmt::OFFICIAL_ROOTS: {e}"))
 }
 
 /// The certificate of `keys/*.cert` to sign a release with at `at`: purpose
@@ -595,8 +580,14 @@ pub fn revoke(r: &Revoke, tree: &Path) -> Result<String, String> {
             .map_err(|e| format!("{}: {e}", found.display()))?
             .not_before
     } else {
-        time::parse(when)
-            .ok_or_else(|| format!("{when}: not a time YYYY-MM-DDThh:mm:ssZ or start"))?
+        let at = time::parse(when)
+            .ok_or_else(|| format!("{when}: not a time YYYY-MM-DDThh:mm:ssZ or start"))?;
+        if at > now() {
+            return Err(format!(
+                "{when}: a revocation since a time to come revokes nothing until then; check the year"
+            ));
+        }
+        at
     };
     let text =
         fs::read_to_string(&list_path).map_err(|e| format!("{}: {e}", list_path.display()))?;
@@ -1160,7 +1151,7 @@ mod tests {
             &revoke_args(
                 &root,
                 "t-release-2026",
-                "2027-01-10T00:00:00Z",
+                "2026-01-10T00:00:00Z",
                 &list,
                 &dir.join("b"),
             ),
@@ -1184,7 +1175,7 @@ mod tests {
         assert_eq!(serial, 3);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "t-release-2025");
-        assert_eq!(entries[1], ("t-release-2026".into(), 1_799_539_200));
+        assert_eq!(entries[1], ("t-release-2026".into(), 1768003200));
         // The list verifies with kind 3 and refuses another kind.
         let text = fs::read(dir.join("c").join("revoked")).unwrap();
         let roots = [Key {
@@ -1215,7 +1206,7 @@ mod tests {
         let again = revoke_args(
             &root,
             "t-release-2026",
-            "2027-02-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
             &dir.join("c").join("revoked"),
             &dir.join("d"),
         );
@@ -1223,7 +1214,7 @@ mod tests {
         let a_root = revoke_args(
             &root,
             "t-root",
-            "2027-02-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
             &dir.join("c").join("revoked"),
             &dir.join("d"),
         );
@@ -1339,7 +1330,7 @@ mod tests {
             &revoke_args(
                 &other.join("t-root.key"),
                 "t-release",
-                "2027-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
                 &list,
                 &dir.join("b"),
             ),
@@ -1352,7 +1343,7 @@ mod tests {
             &revoke_args(
                 &other.join("t-root-2.key"),
                 "t-release",
-                "2027-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
                 &list,
                 &dir.join("b"),
             ),
@@ -1367,7 +1358,7 @@ mod tests {
             &revoke_args(
                 &dir.join("t-root.key"),
                 "t-release",
-                "2027-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
                 &list,
                 &dir.join("b"),
             ),
@@ -1387,7 +1378,7 @@ mod tests {
                 &revoke_args(
                     &dir.join("t-root.key"),
                     "t-release",
-                    "2027-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
                     &list,
                     &dir.join("b")
                 ),
@@ -1437,7 +1428,48 @@ mod tests {
     }
 
     #[test]
-    fn either_root_of_the_tree_can_be_the_trusted_one() {
+    fn the_roots_files_of_keys_are_exactly_the_baked_in_roots() {
+        // A root file that is not in `OFFICIAL_ROOTS` fails here, so that a
+        // key put into keys/ is never trusted unseen.
+        let dir = crate::root().join("keys");
+        let mut found: Vec<(String, String)> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "pub"))
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().to_string(),
+                    fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        found.sort();
+        let mut baked: Vec<String> = pkgfmt::OFFICIAL_ROOTS
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        baked.sort();
+        let texts: Vec<String> = found.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(
+            texts,
+            baked,
+            "keys/*.pub: {:?}",
+            found.iter().map(|f| &f.0).collect::<Vec<_>>()
+        );
+        for (name, text) in &found {
+            let key = keyfile::parse_public(text).unwrap();
+            assert_eq!(format!("{}.pub", key.name.as_str()), *name);
+            assert!(
+                role_name(key.name.as_str(), Role::Root),
+                "{name} is not a root"
+            );
+        }
+        let roots = official_roots().unwrap();
+        assert_eq!(roots.len(), pkgfmt::OFFICIAL_ROOTS.len());
+    }
+
+    #[test]
+    fn a_certificate_is_trusted_through_the_file_of_its_issuer() {
         let dir = scratch("two-roots");
         let k = crate::root();
         generate(Role::Root, "t-root-1", &dir, &k).unwrap();
@@ -1450,9 +1482,6 @@ mod tests {
                 ("t-root-2.pub", &line("t-root-2")),
             ],
         );
-        let roots = official_roots(&tree).unwrap();
-        assert_eq!(roots.len(), 2);
-        // A key certified by the second root is trusted through keys/t-root-2.pub.
         generate(Role::Release, "t-release", &dir, &k).unwrap();
         certify(
             &Certify {
@@ -1476,13 +1505,41 @@ mod tests {
         assert_eq!(trusted.len(), 1);
         assert_eq!(trusted[0].name.as_str(), "t-root-2");
         assert!(direct.is_empty());
-        // Only the first root in the tree: the same certificate has no root.
         fs::remove_file(tree.join("keys").join("t-root-2.pub")).unwrap();
-        assert_eq!(official_roots(&tree).unwrap().len(), 1);
         assert!(trust_of(&s, &tree).is_err());
-        // An empty keys/ has no root.
-        fs::remove_file(tree.join("keys").join("t-root-1.pub")).unwrap();
-        assert!(official_roots(&tree).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&tree).unwrap();
+    }
+
+    #[test]
+    fn a_revocation_since_a_time_to_come_is_refused() {
+        let dir = scratch("revoke-future");
+        let tree = tree_with("revoke-future-tree", &[]);
+        generate(Role::Root, "t-root", &dir, &crate::root()).unwrap();
+        let root = dir.join("t-root.key");
+        let init = Revoke {
+            root_key: root.clone(),
+            init: true,
+            key: None,
+            since: None,
+            list: None,
+            out: Some(dir.join("a")),
+        };
+        revoke(&init, &tree).unwrap();
+        let list = dir.join("a").join("revoked");
+        let err = revoke(
+            &revoke_args(
+                &root,
+                "t-release",
+                "2999-01-01T00:00:00Z",
+                &list,
+                &dir.join("b"),
+            ),
+            &tree,
+        )
+        .unwrap_err();
+        assert!(err.contains("a time to come"), "{err}");
+        assert!(!dir.join("b").exists());
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&tree).unwrap();
     }

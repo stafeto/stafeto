@@ -141,7 +141,19 @@ fn carry_over(built: &Path) -> Result<(), String> {
     copy_files(built, &published, |n| n.ends_with(".stpkg"))?;
     let (key1, cert1) = probe_key(&tree, "stafeto-probe-release-1")?;
     let first = keys::signing(Some(&key1), Some(&cert1), &tree)?;
-    pkg_sign::sign_dir(&published, &first, dev.release.name, &[dev.root], &[], None)?;
+    let none = BTreeSet::new();
+    pkg_sign::sign_dir(
+        &published,
+        &first,
+        &pkg_sign::Setting {
+            development: dev.release.name,
+            roots: &[dev.root],
+            direct: &[],
+            revocations: &[],
+            carried: &none,
+            time: None,
+        },
+    )?;
     repo::from_files(
         &published,
         &repo::Options {
@@ -218,7 +230,19 @@ fn carry_over(built: &Path) -> Result<(), String> {
     })?;
     let (key2, cert2) = probe_key(&tree, "stafeto-probe-release-2")?;
     let second = keys::signing(Some(&key2), Some(&cert2), &tree)?;
-    let done = pkg_sign::sign_dir(&signed, &second, dev.release.name, &[dev.root], &[], None)?;
+    let listed: BTreeSet<String> = repo::read_carried(&signed)?.into_keys().collect();
+    let done = pkg_sign::sign_dir(
+        &signed,
+        &second,
+        &pkg_sign::Setting {
+            development: dev.release.name,
+            roots: &[dev.root],
+            direct: &[],
+            revocations: &[],
+            carried: &listed,
+            time: None,
+        },
+    )?;
     let new_name = pkg::file_name(
         packages::load()?
             .iter()

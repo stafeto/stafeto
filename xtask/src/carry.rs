@@ -66,12 +66,18 @@ pub fn fetch(address: &str) -> Result<Option<Vec<u8>>, String> {
             Err(e) => Err(format!("{address}: {e}")),
         };
     }
+    // As the `curl` of the device (apps/pkg/src/fetch.rs): no `~/.curlrc`, https
+    // for the first request and for every redirection, TLS 1.2 and above.
     let out = Command::new("curl")
         .args([
+            "-q",
             "-sS",
             "-L",
             "--proto",
             "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
             "--max-redirs",
             "5",
             "--max-time",
@@ -119,6 +125,102 @@ fn split_version(version: &str) -> Option<(&str, &str)> {
     version.rsplit_once('-')
 }
 
+/// What the tree says about the index to carry from, besides its signature.
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    /// The time now; an index that expired before it is refused (the index of
+    /// a series is signed again every week).
+    pub now: u64,
+    /// The `serial` of `keys/revoked` of the tree and its entries: the list
+    /// next to the index may not be older, and the entries count too.
+    pub tree_list: Option<(u64, Vec<Revocation>)>,
+    /// The `serial` of the index last published for the series, from
+    /// `packages/published-serial.txt`; an older index is a rollback.
+    pub min_serial: u64,
+    /// The series is frozen in `packages/abi.txt`, so it is published: no index
+    /// is a failure of the place it is served from, not a new series.
+    pub frozen: bool,
+}
+
+/// `keys/revoked` of the tree with its signature checked by the official
+/// roots: the `serial` and the entries. A missing list is an error unless
+/// `optional`.
+pub fn tree_revocations(
+    tree: &Path,
+    optional: bool,
+) -> Result<Option<(u64, Vec<Revocation>)>, String> {
+    let list_path = tree.join("keys/revoked");
+    let sig_path = tree.join("keys/revoked.sig");
+    let (Ok(list_bytes), Ok(sig_bytes)) = (std::fs::read(&list_path), std::fs::read(&sig_path))
+    else {
+        return if optional {
+            Ok(None)
+        } else {
+            Err(format!(
+                "{}: the list of revocations is missing",
+                list_path.display()
+            ))
+        };
+    };
+    let fail = |e: String| format!("{}: {e}", list_path.display());
+    let roots = crate::keys::official_roots()?;
+    let text = String::from_utf8(list_bytes.clone()).map_err(|e| fail(e.to_string()))?;
+    let list = revoked::Revoked::parse(&text).map_err(|e| fail(e.to_string()))?;
+    let block = Block::parse(&sig_bytes).map_err(|e| fail(e.to_string()))?;
+    pkgfmt::trust::verify(
+        &block,
+        Kind::Revoked,
+        &sha::sha256(&list_bytes),
+        list_bytes.len() as u64,
+        &Trust {
+            roots: &roots,
+            direct: &[],
+        },
+        &[],
+    )
+    .map_err(|e| fail(e.to_string()))?;
+    Ok(Some((list.serial, list.entries().collect())))
+}
+
+impl Policy {
+    /// The policy of the tree for the index at `base`: for an address the
+    /// list of the tree is required, for a directory (a probe) it is used if
+    /// it is there.
+    pub fn of_tree(tree: &Path, base: &str, series: &str) -> Result<Policy, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let tree_list = tree_revocations(tree, !base.starts_with("https://"))?;
+        let min_serial = match std::fs::read_to_string(tree.join("packages/published-serial.txt")) {
+            Ok(text) => text
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .find(|(s, _)| *s == series)
+                .map_or(Ok(0), |(_, n)| {
+                    n.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("published-serial.txt: {n:?} is no serial"))
+                })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(format!("packages/published-serial.txt: {e}")),
+        };
+        let frozen = match std::fs::read_to_string(crate::abi_fingerprint::file_path(tree)) {
+            Ok(text) => {
+                let f = crate::abi_fingerprint::File::parse(&text)?;
+                f.series == series && f.state == crate::abi_fingerprint::State::Frozen
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("packages/abi.txt: {e}")),
+        };
+        Ok(Policy {
+            now,
+            tree_list,
+            min_serial,
+            frozen,
+        })
+    }
+}
+
 /// Loads and verifies the list of revocations and the index at `base`. `None`
 /// when the index is not there.
 pub fn load(
@@ -126,9 +228,16 @@ pub fn load(
     series: &str,
     fetch: Fetch<'_>,
     roots: &[Key],
+    policy: &Policy,
 ) -> Result<Option<Previous>, String> {
     let get = |name: &str| fetch(&join(base, name));
     let Some(index_bytes) = get("INDEX")? else {
+        if policy.frozen {
+            return Err(format!(
+                "{}: no index for the series {series}, which is frozen, so published; the place it is served from has failed",
+                join(base, "")
+            ));
+        }
         return Ok(None);
     };
     let need =
@@ -150,7 +259,19 @@ pub fn load(
         &[],
     )
     .map_err(|e| fail("revoked.sig", e.to_string()))?;
-    let revocations: Vec<Revocation> = list.entries().collect();
+    let mut revocations: Vec<Revocation> = list.entries().collect();
+    if let Some((serial, entries)) = &policy.tree_list {
+        if list.serial < *serial {
+            return Err(fail(
+                "revoked",
+                format!(
+                    "serial {} is older than serial {serial} of keys/revoked",
+                    list.serial
+                ),
+            ));
+        }
+        revocations.extend(entries.iter().copied());
+    }
     let text = String::from_utf8(index_bytes.clone()).map_err(|e| fail("INDEX", e.to_string()))?;
     let index = Index::parse(&text).map_err(|e| fail("INDEX", e.to_string()))?;
     let iblock = Block::parse(&need("INDEX.sig")?).map_err(|e| fail("INDEX.sig", e.to_string()))?;
@@ -164,6 +285,22 @@ pub fn load(
     )
     .map_err(|e| fail("INDEX.sig", e.to_string()))?;
     let h = &index.header;
+    if h.expires < policy.now {
+        return Err(fail(
+            "INDEX",
+            "the index expired; the series is signed again every week, so something has failed"
+                .into(),
+        ));
+    }
+    if h.serial < policy.min_serial {
+        return Err(fail(
+            "INDEX",
+            format!(
+                "serial {} is older than the {} published last",
+                h.serial, policy.min_serial
+            ),
+        ));
+    }
     if h.repository != "stafeto" || h.series != series || h.arch != "aarch64" {
         return Err(fail(
             "INDEX",
@@ -415,12 +552,9 @@ pub fn describe(plan: &Plan, previous: Option<&Previous>, series: &str) -> Vec<S
 /// `--previous` for a directory or an address: the roots to verify with are
 /// the official ones, and for a directory also the development root.
 pub fn roots_for(base: &str, tree: &Path) -> Result<Vec<Key>, String> {
-    let mut roots = crate::keys::official_roots(tree).unwrap_or_default();
+    let mut roots = crate::keys::official_roots()?;
     if !base.starts_with("https://") {
         roots.push(crate::keys::dev_keys(tree)?.root);
-    }
-    if roots.is_empty() {
-        return Err("no root to verify the previous index with".into());
     }
     Ok(roots)
 }
@@ -643,7 +777,7 @@ pub(crate) mod tests {
             ],
             &[],
         );
-        let prev = load(&base(&dir), "0.2", &fetch, &[root()])
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
             .unwrap()
             .unwrap();
         assert_eq!(prev.serial, 7);
@@ -699,7 +833,7 @@ pub(crate) mod tests {
     fn a_new_version_starts_at_release_1_and_the_version_alone_does_not_carry() {
         let a = "a".repeat(64);
         let dir = repository("version", &[("alpha", "1.0", "4", &a, "t-release")], &[]);
-        let prev = load(&base(&dir), "0.2", &fetch, &[root()])
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
             .unwrap()
             .unwrap();
         // The same recipe with another version: not carried (the version is
@@ -727,7 +861,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
-            load(&base(&dir), "0.2", &fetch, &[root()])
+            load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
                 .unwrap()
                 .is_none()
         );
@@ -748,15 +882,21 @@ pub(crate) mod tests {
         let down =
             |_: &str| -> Result<Option<Vec<u8>>, String> { Err("connection refused".into()) };
         assert!(
-            load("https://example.org/p", "0.2", &down, &[root()])
-                .unwrap_err()
-                .contains("connection refused")
+            load(
+                "https://example.org/p",
+                "0.2",
+                &down,
+                &[root()],
+                &Policy::default()
+            )
+            .unwrap_err()
+            .contains("connection refused")
         );
         // So is a missing signature next to an index.
         let repo = repository("nosig", &[("alpha", "1", "1", &a, "t-release")], &[]);
         std::fs::remove_file(repo.join("INDEX.sig")).unwrap();
         assert!(
-            load(&base(&repo), "0.2", &fetch, &[root()])
+            load(&base(&repo), "0.2", &fetch, &[root()], &Policy::default())
                 .unwrap_err()
                 .contains("INDEX.sig")
         );
@@ -776,7 +916,7 @@ pub(crate) mod tests {
             &[("t-release", 500)],
         );
         // The index is signed at 1000 by the same key: the list refuses it.
-        let err = load(&base(&dir), "0.2", &fetch, &[root()]).unwrap_err();
+        let err = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default()).unwrap_err();
         assert!(err.contains("INDEX.sig"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
         // A list that revokes the key from a later time than the index leaves the
@@ -786,14 +926,14 @@ pub(crate) mod tests {
             &[("alpha", "1", "2", &a, "t-release")],
             &[("t-release", 1000)],
         );
-        let err = load(&base(&dir), "0.2", &fetch, &[root()]).unwrap_err();
+        let err = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default()).unwrap_err();
         assert!(err.contains("INDEX.sig"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
-        // The index is not revoked (signed before `since`) but the package is
-        // signed at the time the key falls: build the repository, then rewrite
+        // The index was signed before `since` and stays valid; the package is
+        // signed at the time the key falls. Build the repository, then rewrite
         // the list so that the package falls and the index does not.
         let dir = repository("split", &[("alpha", "1", "2", &a, "t-release")], &[]);
-        let prev = load(&base(&dir), "0.2", &fetch, &[root()])
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
             .unwrap()
             .unwrap();
         let mut prev = prev;
@@ -826,13 +966,13 @@ pub(crate) mod tests {
             name: n("t-root"),
             public: sig::public_key(&[9; 32]),
         };
-        assert!(load(&base(&dir), "0.2", &fetch, &[other]).is_err());
+        assert!(load(&base(&dir), "0.2", &fetch, &[other], &Policy::default()).is_err());
         assert!(
-            load(&base(&dir), "0.3", &fetch, &[root()])
+            load(&base(&dir), "0.3", &fetch, &[root()], &Policy::default())
                 .unwrap_err()
                 .contains("this build is stafeto 0.3")
         );
-        let prev = load(&base(&dir), "0.2", &fetch, &[root()])
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
             .unwrap()
             .unwrap();
         let path = dir.join("alpha-1-1.stpkg");
@@ -883,5 +1023,77 @@ pub(crate) mod tests {
         assert_eq!(release_of("zzz-test").as_deref(), Some("5"));
         assert_eq!(release_of("other"), None);
         set_releases(BTreeMap::new());
+    }
+
+    #[test]
+    fn an_expired_index_an_older_serial_and_an_older_list_are_refused() {
+        let a = "a".repeat(64);
+        let dir = repository("policy", &[("alpha", "1", "1", &a, "t-release")], &[]);
+        let ok = |p: &Policy| load(&base(&dir), "0.2", &fetch, &[root()], p);
+        // The index expires at 5000 and has the serial 7, the list the serial 1.
+        assert!(
+            ok(&Policy {
+                now: 4000,
+                ..Policy::default()
+            })
+            .unwrap()
+            .is_some()
+        );
+        let err = ok(&Policy {
+            now: 6000,
+            ..Policy::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        let err = ok(&Policy {
+            min_serial: 8,
+            ..Policy::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("older than the 8"), "{err}");
+        assert!(
+            ok(&Policy {
+                min_serial: 7,
+                ..Policy::default()
+            })
+            .is_ok()
+        );
+        let err = ok(&Policy {
+            tree_list: Some((2, Vec::new())),
+            ..Policy::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("older than serial 2 of keys/revoked"), "{err}");
+        // The entries of the list of the tree count: the index is signed at 1000.
+        let revoked = vec![Revocation {
+            name: n("t-release"),
+            since: 500,
+        }];
+        let err = ok(&Policy {
+            tree_list: Some((1, revoked)),
+            ..Policy::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("INDEX.sig"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_index_for_a_frozen_series_is_a_failure() {
+        let dir = std::env::temp_dir().join(format!("stafeto-carry-frozen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frozen = Policy {
+            frozen: true,
+            ..Policy::default()
+        };
+        let err = load(&base(&dir), "0.2", &fetch, &[root()], &frozen).unwrap_err();
+        assert!(err.contains("frozen"), "{err}");
+        assert!(
+            load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

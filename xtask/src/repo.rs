@@ -40,7 +40,7 @@ pub struct Options {
     pub storage: Option<String>,
     /// `--serial` was given.
     pub serial_given: bool,
-    /// Packages whose recipe is changed on purpose (`pkg-build --perturb`).
+    /// Packages whose recipe is changed on purpose (the carrying probe of `pkg-identity`).
     pub perturb: Vec<String>,
 }
 
@@ -83,7 +83,6 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--previous" => o.previous = Some(value),
             "--from" => o.from = Some(value.into()),
             "--storage" => o.storage = Some(value),
-            "--perturb" => o.perturb.push(value),
             "--serial" => {
                 o.serial_given = true;
                 o.serial = value
@@ -274,6 +273,57 @@ fn write_repository(dir: &Path, rows: &[Row], o: &Options) -> Result<(), String>
 /// source archive (`-` for none), separated by tabs.
 pub const CARRIED: &str = "carried.txt";
 
+/// A location an index may hold: a full `https://` address or a relative
+/// path that stays below the directory of the index.
+fn valid_location(text: &str) -> bool {
+    if text.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return false;
+    }
+    if let Some(rest) = text.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    !text.contains("://")
+        && !text.starts_with('/')
+        && text
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..")
+}
+
+/// The packages `carried.txt` of `dir` lists (name of the file, its address,
+/// the address of its source archive); none if there is no such file. A
+/// line that is not three fields, or an address that is no location, is an
+/// error.
+pub fn read_carried(
+    dir: &Path,
+) -> Result<std::collections::BTreeMap<String, (String, Option<String>)>, String> {
+    let path = dir.join(CARRIED);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [name, address, source] = f[..] else {
+            return Err(format!("{}:{}: not three fields", path.display(), n + 1));
+        };
+        let source = (source != "-").then_some(source);
+        if !valid_location(address) || source.is_some_and(|s| !valid_location(s)) {
+            return Err(format!(
+                "{}:{}: an address that an index cannot hold",
+                path.display(),
+                n + 1
+            ));
+        }
+        out.insert(
+            name.to_string(),
+            (address.to_string(), source.map(str::to_string)),
+        );
+    }
+    Ok(out)
+}
+
 /// The address of a file of the new packages in the storage of a release.
 fn stored(storage: &str, name: &str) -> String {
     format!("https://github.com/stafeto/packages/releases/download/{storage}/{name}")
@@ -364,21 +414,7 @@ pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, St
 /// of its file; the others get `file` and `source` in the storage `o.storage`
 /// (as full addresses) or as plain names.
 pub fn from_files(dir: &Path, o: &Options) -> Result<usize, String> {
-    let carried: std::collections::BTreeMap<String, (String, Option<String>)> =
-        match std::fs::read_to_string(dir.join(CARRIED)) {
-            Ok(text) => text
-                .lines()
-                .filter_map(|l| {
-                    let mut f = l.split('\t');
-                    let name = f.next()?.to_string();
-                    let address = f.next()?.to_string();
-                    let source = f.next().filter(|s| *s != "-").map(str::to_string);
-                    Some((name, (address, source)))
-                })
-                .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(e) => return Err(format!("{}: {e}", dir.display())),
-        };
+    let carried = read_carried(dir)?;
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -540,6 +576,9 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
             "--from writes next to the files it reads: no --check, --previous or --dir".into(),
         );
     }
+    if o.from.is_some() && !o.serial_given {
+        return Err("--from wants --serial: an index with a number a device has seen is refused as a rollback".into());
+    }
     if o.storage.is_some() && o.from.is_none() {
         return Err("--storage goes with --from".into());
     }
@@ -552,7 +591,7 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         return Ok(dir.clone());
     }
     let roots = match &o.root {
-        _ if o.official => keys::official_roots(&tree)?,
+        _ if o.official => keys::official_roots()?,
         Some(path) => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -926,6 +965,32 @@ mod tests {
         let bad = |v: &[&str]| run(&parse_options(&args(v)).unwrap()).unwrap_err();
         assert!(bad(&["--from", "x", "--check"]).contains("--from"));
         assert!(bad(&["--storage", "x"]).contains("--from"));
+        assert!(bad(&["--from", "x"]).contains("--serial"));
+        assert!(parse_options(&args(&["--perturb", "x"])).is_err());
         assert!(bad(&["--official", "--root", "r.pub"]).contains("--official"));
+    }
+
+    #[test]
+    fn carried_txt_holds_locations_an_index_can_hold() {
+        let dir = std::env::temp_dir().join(format!("stafeto-carried-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let put = |text: &str| std::fs::write(dir.join(CARRIED), text).unwrap();
+        put("a.stpkg\thttps://h/p/a.stpkg\tsrc/a-src.tar.xz\nb.stpkg\tb.stpkg\t-\n");
+        assert_eq!(read_carried(&dir).unwrap().len(), 2);
+        for bad in [
+            "a.stpkg\thttp://h/a.stpkg\t-\n",
+            "a.stpkg\t/etc/passwd\t-\n",
+            "a.stpkg\t../a.stpkg\t-\n",
+            "a.stpkg\thttps://h/a b\t-\n",
+            "a.stpkg\thttps://h/a.stpkg\tfile:///x\n",
+            "a.stpkg\thttps://h/a.stpkg\n",
+        ] {
+            put(bad);
+            assert!(read_carried(&dir).is_err(), "{bad}");
+        }
+        std::fs::remove_file(dir.join(CARRIED)).unwrap();
+        assert!(read_carried(&dir).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

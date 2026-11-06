@@ -702,7 +702,8 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>)> = BTreeMap::new();
     if let Some(base) = &opts.previous {
         let roots = carry::roots_for(base, &tree)?;
-        let previous = carry::load(base, &series(), &carry::fetch, &roots)?;
+        let policy = carry::Policy::of_tree(&tree, base, &series())?;
+        let previous = carry::load(base, &series(), &carry::fetch, &roots, &policy)?;
         let wanted: Vec<carry::Wanted<'_>> = selected
             .iter()
             .map(|p| carry::Wanted {
@@ -951,7 +952,6 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--recipe" => o.recipe = true,
             "--previous" => o.previous = Some(value(&mut i)?),
-            "--perturb" => o.perturb.push(value(&mut i)?),
             name if !name.starts_with("--") => o.names.push(name.to_string()),
             other => return Err(format!("{other}: unknown argument")),
         }
