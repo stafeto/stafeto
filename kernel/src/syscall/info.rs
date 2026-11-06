@@ -293,8 +293,24 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
             crate::smpm::reset();
             return Ok(Values::new(&[a[1]]));
         }
+        b"smp-measure poll" => {
+            crate::smpm::report_poll();
+            return Ok(Values::new(&[a[1]]));
+        }
         b"smp-measure report" => {
             crate::smpm::report();
+            return Ok(Values::new(&[a[1]]));
+        }
+        _ => {}
+    }
+    #[cfg(feature = "idle-probe")]
+    match text {
+        b"idle-probe arm" => {
+            crate::idle::arm();
+            return Ok(Values::new(&[a[1]]));
+        }
+        b"idle-probe unwatch" => {
+            crate::idle::watch(false);
             return Ok(Values::new(&[a[1]]));
         }
         _ => {}

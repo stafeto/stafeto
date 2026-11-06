@@ -58,6 +58,8 @@ pub(crate) struct Sched {
     /// interrupt, in ticks: after `wfi`, and otherwise.
     idle_latency: u64,
     irq_latency: u64,
+    /// The window of the poll in the idle loop (idle.rs).
+    poll: kcore::idlepoll::Poll,
 }
 
 impl Sched {
@@ -71,6 +73,7 @@ impl Sched {
             fired: (0, false),
             idle_latency: 0,
             irq_latency: 0,
+            poll: kcore::idlepoll::Poll::new(),
         }
     }
 }
@@ -222,7 +225,9 @@ impl Timer for VirtualTimer {
 pub fn init(clock: Clock) {
     let quantum = clock.ns_to_ticks(abi::RR_QUANTUM_NS);
     QUANTUM.store(quantum, core::sync::atomic::Ordering::Relaxed);
-    local().sched.lock().s.set_quantum(quantum);
+    let mut g = local().sched.lock();
+    g.s.set_quantum(quantum);
+    g.poll.scale(clock.hz());
 }
 
 /// The quantum in ticks, which every CPU's scheduler takes (`init_cpu`).
@@ -232,7 +237,11 @@ static QUANTUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 /// `init` set on CPU 0.
 pub fn init_cpu() {
     let quantum = QUANTUM.load(core::sync::atomic::Ordering::Relaxed);
-    local().sched.lock().s.set_quantum(quantum);
+    {
+        let mut g = local().sched.lock();
+        g.s.set_quantum(quantum);
+        g.poll.scale(timer::frequency());
+    }
     local().time.started(timer::now());
 }
 
@@ -930,9 +939,30 @@ fn sleep() {
     crate::obj::stretch_ends(slept);
     local().time.sleeps(slept);
     crate::qsbr::idle();
-    let ack = gic::wait();
+    // The window of the poll (idle.rs); a bell ends it like an SGI would.
+    let window = crate::idle::window(local().sched.lock().poll.window());
+    let began = timer::now();
+    let (ack, bell, hit) = if window == 0 {
+        (gic::wait(), false, false)
+    } else {
+        let polled = crate::idle::poll(window);
+        let ack = if polled.quiet {
+            gic::wait()
+        } else if arch::irq_pending() {
+            gic::acknowledge()
+        } else {
+            None
+        };
+        (ack, polled.bell, !polled.quiet)
+    };
     crate::qsbr::awake();
     let woke = timer::now();
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::polled(window, hit, woke.saturating_sub(began));
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::periodic(woke);
+    #[cfg(not(feature = "smp-measure"))]
+    let _ = hit;
     #[cfg(feature = "measure")]
     crate::obj::stretch_begins(woke);
     local().time.woke(woke);
@@ -940,9 +970,19 @@ fn sleep() {
         let mut g = local().sched.lock();
         g.idle += woke.saturating_sub(slept);
         g.waking = true;
+        if crate::idle::on() {
+            g.poll.woke(woke.saturating_sub(began));
+        }
     }
     if let Some(ack) = ack {
         crate::interrupt::handle(ack);
+        crate::cmd::flush_posted();
+    }
+    if bell {
+        // The same as the SGI of the commands (smp.rs).
+        if !crate::idle::skips_drain() {
+            crate::cmd::drain();
+        }
         crate::cmd::flush_posted();
     }
     local().sched.lock().waking = false;

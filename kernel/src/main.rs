@@ -23,6 +23,7 @@ mod boot;
 mod channel;
 mod cleanup;
 mod cmd;
+mod idle;
 mod init;
 mod interrupt;
 mod irq;
@@ -77,6 +78,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     memory::forbid(&boot.info);
     let clock = arch::timer::init();
     sched::init(clock);
+    idle::init();
     smp::start(boot);
     report(boot, clock, &init);
     smp::sgi_probe();
@@ -120,6 +122,7 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
     if let Some(r) = info.initrd {
         kprintln!("boot image {:#x}..{:#x}", r.base, r.end());
     }
+    kprintln!("cpu        MIDR_EL1 {:#x}", arch::registers::midr_el1());
     let [code, rodata, data] = &init.segments;
     kprintln!(
         "init       entry {:#x}, stack {:#x}, code {:#x?}, rodata {:#x?}, data {:#x?}",

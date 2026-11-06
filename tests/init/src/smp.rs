@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 28] = [
+pub(crate) const TESTS: [Test; 30] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -114,6 +114,11 @@ pub(crate) const TESTS: [Test; 28] = [
     (
         "smp_request_with_a_handle_is_taken_in_one_section",
         request_with_a_handle_is_taken_in_one_section,
+    ),
+    ("smp_idle_bell_loses_no_wake_up", idle_bell_pairs),
+    (
+        "smp_idle_poll_sees_an_interrupt_at_once",
+        idle_poll_interrupts,
     ),
     ("smp_measures_of_stage_6", stage_6_measures),
     ("smp_litmus_tests_of_memory_order", litmus_tests),
@@ -2150,7 +2155,11 @@ fn upcall_rounds(t: &Handle<Thread>) -> Result<[u64; MEASURE_ROUNDS], &'static s
 }
 
 /// The ticks of each of the rounds of a call to the service on `cpu`.
-fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+fn call_rounds(
+    cpu: usize,
+    slot: usize,
+    gap_ns: u64,
+) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
     reset_marks();
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
@@ -2163,7 +2172,7 @@ fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'stati
         let before = time::now();
         done &= sys::send(&c, &[1]).is_ok();
         *row = time::now().wrapping_sub(before);
-        pause(50_000);
+        pause(gap_ns);
     }
     let _ = sys::send(&c, &[0]);
     let ended =
@@ -2247,7 +2256,7 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     let rows = if kind == 0 {
         target_rows(0, &[3], false)
     } else {
-        call_rounds(0, 3)
+        call_rounds(0, 3, 50_000)
     };
     let _ = sys::debug_write(&resource(), b"smp-measure report");
     STORM_OVER.store(1, Relaxed);
@@ -2269,6 +2278,68 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     rows
 }
 
+/// Requests and replies between two CPUs that are idle between them: each
+/// request wakes the service on CPU 1 and each reply the caller on CPU 0, and
+/// with the poll of the idle loop (kernel idle.rs) the bell of either wake-up
+/// comes while its CPU is in the window, leaves it, or finds it asleep with an
+/// SGI. A wake-up lost on the way leaves the caller in its call: xtask
+/// `smp-idle-bell` gives the kernel with a deliberate break 20 s between the
+/// two lines.
+const BELL_PAIRS: u64 = 20_000;
+
+fn idle_bell_pairs() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let server = spawn_on(0, 1, echo_service, 0, TEST_PRIORITY + 1)?;
+    check(wait_for(|| mark(0) == 1), "the service did not start")?;
+    // The probe kernels with a deliberate break act from here on.
+    let _ = sys::debug_write(&resource(), b"idle-probe arm");
+    println!("smp idle bell  pairs begin");
+    let mut sent = 0;
+    while sent < BELL_PAIRS && sys::send(&c, &[1]).is_ok() {
+        sent += 1;
+    }
+    println!("smp idle bell  pairs done");
+    let _ = sys::send(&c, &[0]);
+    let ended =
+        wait_for(|| sys::thread_info(&server).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close_ended(server)?;
+    close(c)?;
+    check(sent == BELL_PAIRS && ended, "a pair of calls failed")
+}
+
+/// Rounds of the wait for a timer in an idle CPU, and the time the timer
+/// is set ahead (in a window of the poll of the probe kernel, 1 ms long).
+const IRQ_ROUNDS: u64 = 20;
+const IRQ_AHEAD_NS: u64 = 300_000;
+
+/// The CPU waits on an empty channel for a timer: its idle loop polls, and
+/// the interrupt of the timer ends the window at once. The probe kernel says
+/// so when a window ran out with an interrupt pending
+/// (`break-idle-irq` polls without looking at ISR_EL1).
+fn idle_poll_interrupts() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer_at(&c, TEST_PRIORITY)?;
+    let mut fired = 0;
+    for _ in 0..IRQ_ROUNDS {
+        let _ = sys::timer_set(&t, time::ticks_to_ns(time::now()) + IRQ_AHEAD_NS);
+        if sys::receive(&c).is_ok() {
+            fired += 1;
+        }
+    }
+    let _ = sys::debug_write(&resource(), b"idle-probe unwatch");
+    println!("smp idle bell  interrupt rounds done");
+    close(t)?;
+    close(c)?;
+    check(fired == IRQ_ROUNDS, "a timer of an idle CPU did not fire")
+}
+
 /// The numbers of the decision of SMP (tasks/2026-10-17-smp/decision.md,
 /// stage 6): the latency of a request to a thread on another CPU (S5x) with
 /// the target waiting in WFI and with a lower thread on its CPU, a call to
@@ -2287,9 +2358,18 @@ fn stage_6_measures() -> Outcome {
         "S5x target waiting, a lower thread on its CPU",
         target_rows(1, &[0, 1], true)?,
     );
-    print_row("call to a service on this CPU", call_rounds(0, 0)?);
+    print_row("call to a service on this CPU", call_rounds(0, 0, 50_000)?);
     let far = if n > 2 { 2 } else { 1 };
-    print_row("call to a service on another CPU", call_rounds(far, 0)?);
+    print_row(
+        "call to a service on another CPU",
+        call_rounds(far, 0, 50_000)?,
+    );
+    // The next call comes within the window of the poll of the idle CPUs
+    // (kcore::idlepoll), which a gap of 50 us never meets.
+    let _ = sys::debug_write(&resource(), b"smp-measure reset");
+    let rows = call_rounds(far, 0, 0);
+    let _ = sys::debug_write(&resource(), b"smp-measure poll");
+    print_row("call to a service on another CPU, back to back", rows?);
     print_row(
         "S5 on this CPU under a storm of the others",
         storm_rows(n, 0)?,

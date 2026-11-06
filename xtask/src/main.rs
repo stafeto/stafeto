@@ -1308,7 +1308,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 268;
+const INIT_TESTS: u32 = 270;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1425,10 +1425,25 @@ enum Variant {
     /// A wait inside the removal of any thread from a ready queue
     /// (kernel feature `ready-gap`; `posix-procs` with STAFETO_READY_GAP).
     ReadyGap,
+    /// The CPUs poll in the idle loop on every machine, and on none, for the
+    /// limits under `-icount` and the pairs of images on Apple silicon
+    /// (kernel features `idle-poll`, `no-idle-poll`).
+    IdlePoll,
+    NoIdlePoll,
+    /// The counters with the poll off, the partner of `SmpMeasure` on
+    /// Apple silicon.
+    SmpMeasureNoPoll,
+    /// The poll with a window of 1 ms, and with one deliberate break each:
+    /// the bell written apart from the look at POLLING, no drain after a
+    /// bell, no look at ISR_EL1 in the window (`smp_idle_bell`).
+    IdleProbe,
+    IdleNoBell,
+    IdleNoDrain,
+    IdleNoIrq,
 }
 
 impl Variant {
-    const ALL: [Variant; 24] = [
+    const ALL: [Variant; 31] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1453,6 +1468,13 @@ impl Variant {
         Variant::SmpMeasure,
         Variant::SmpChecks,
         Variant::ReadyGap,
+        Variant::IdlePoll,
+        Variant::NoIdlePoll,
+        Variant::SmpMeasureNoPoll,
+        Variant::IdleProbe,
+        Variant::IdleNoBell,
+        Variant::IdleNoDrain,
+        Variant::IdleNoIrq,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1485,6 +1507,13 @@ impl Variant {
             Variant::SmpMeasure => Some("smp-measure"),
             Variant::SmpChecks => Some("obj-checks"),
             Variant::ReadyGap => Some("ready-gap"),
+            Variant::IdlePoll => Some("idle-poll"),
+            Variant::NoIdlePoll => Some("no-idle-poll"),
+            Variant::SmpMeasureNoPoll => Some("smp-measure,no-idle-poll"),
+            Variant::IdleProbe => Some("idle-probe"),
+            Variant::IdleNoBell => Some("break-idle-bell"),
+            Variant::IdleNoDrain => Some("break-idle-drain"),
+            Variant::IdleNoIrq => Some("break-idle-irq"),
         }
     }
 
@@ -1508,6 +1537,12 @@ impl Variant {
             | Variant::AsidEarly
             | Variant::UnmapLocal
             | Variant::ReadyGap
+            | Variant::IdlePoll
+            | Variant::NoIdlePoll
+            | Variant::IdleProbe
+            | Variant::IdleNoBell
+            | Variant::IdleNoDrain
+            | Variant::IdleNoIrq
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1518,6 +1553,7 @@ impl Variant {
             | Variant::TraceEl0
             | Variant::TestIcountEl0
             | Variant::SmpMeasure
+            | Variant::SmpMeasureNoPoll
             | Variant::SmpChecks => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
@@ -1564,6 +1600,13 @@ impl Variant {
             Variant::SmpMeasure => "stafeto-smp-measure",
             Variant::SmpChecks => "stafeto-smp-checks",
             Variant::ReadyGap => "stafeto-ready-gap",
+            Variant::IdlePoll => "stafeto-idle-poll",
+            Variant::NoIdlePoll => "stafeto-no-idle-poll",
+            Variant::SmpMeasureNoPoll => "stafeto-smp-measure-no-poll",
+            Variant::IdleProbe => "stafeto-idle-probe",
+            Variant::IdleNoBell => "stafeto-idle-no-bell",
+            Variant::IdleNoDrain => "stafeto-idle-no-drain",
+            Variant::IdleNoIrq => "stafeto-idle-no-irq",
         }
     }
 }
@@ -1593,6 +1636,9 @@ commands:
             with --short, one round of them on TCG; with --short --icount, as
             ci runs it, under -icount, where the instructions of S5 stay under
             S5_ICOUNT_MAX; with --marks added, the segments of that path
+  smp-idle-bell  the probe of the bell and the poll of the idle loop (the last
+            part of smp-window): 20 000 pairs between idle CPUs, a timer in a
+            window, and the three kernels with a break
   rtbench-check [--same-guest OLD=NEW] SESSION... compare the base and head runs of
             at least four alternating sessions (each a directory with `order`,
             `base/`, `head/`, the files rtbench-hvf.txt and rtbench-vz.txt)
@@ -1923,6 +1969,7 @@ fn main() {
         Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
         Some("smp-window") => smp_window(),
+        Some("smp-idle-bell") => smp_idle_bell(),
         Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
         Some("smp-hvf") => smp_hvf(),
         Some("smp-measure") => smpmeasure::run(&args[1..]),
@@ -11110,7 +11157,90 @@ fn smp_window() -> Result<(), String> {
                 name.starts_with("smp_spawn_") && name.ends_with("_meanwhile_fails")
             })
         },
-    )
+    )?;
+    smp_idle_bell()
+}
+
+/// The pairs of the probe of the bell (tests/init/src/smp.rs, `idle_bell_pairs`).
+/// The line of the first test of the smp group.
+const SMP_FIRST_LINE: &str = "smp: 4 CPUs, threads ran together on every CPU";
+const IDLE_PAIRS_BEGIN: &str = "smp idle bell  pairs begin";
+const IDLE_PAIRS_DONE: &str = "smp idle bell  pairs done";
+const IDLE_IRQ_DONE: &str = "smp idle bell  interrupt rounds done";
+const IDLE_IRQ_LINE: &str = "idle poll  an interrupt was pending at the end of the window";
+/// The windows of the rounds of the test of the interrupt that may end with an interrupt pending in the
+/// kernel that reads ISR_EL1 every turn: it arrives in the last turn.
+const IDLE_IRQ_NOISE: usize = 2;
+
+/// The windows that ended with an interrupt pending while the test of the
+/// pairs and the interrupt ran (the probe kernel prints the line from the arm of the pairs to the end of the interrupt test).
+fn late_windows(lines: &[String]) -> usize {
+    lines.iter().filter(|l| *l == IDLE_IRQ_LINE).count()
+}
+
+/// The probe of the bell and the poll of the idle loop on four CPUs (kernel
+/// features `idle-probe` and the three `break-idle-*`): the kernel that
+/// polls with a window of 1 ms passes the whole test init, 20 000 pairs of
+/// requests and replies between idle CPUs among them, and ends the window
+/// at the interrupt of a timer; each kernel with a break is caught.
+fn smp_idle_bell() -> Result<(), String> {
+    init_tests_in(Variant::IdleProbe, &qemu::VIRT, false, SMP_CPUS)?;
+    let (bell, drain, irq) = (
+        Variant::IdleNoBell,
+        Variant::IdleNoDrain,
+        Variant::IdleNoIrq,
+    );
+    for (variant, what) in [
+        (bell, "the bell as one step with the look at POLLING"),
+        (drain, "the drain of the queues after a bell"),
+    ] {
+        let o = idle_probe_run(variant)?;
+        // A lost wake-up leaves a call for good: the run hangs until the cut,
+        // the kernel does not stop, the tests of the stage began, and the
+        // pairs did not end. A panic or an exit of init is another failure.
+        let began = o.lines.iter().any(|l| l == SMP_FIRST_LINE);
+        let done = o.lines.iter().any(|l| l == IDLE_PAIRS_DONE);
+        let stopped = o
+            .lines
+            .iter()
+            .any(|l| l.contains("KERNEL PANIC") || l.contains("init exited"));
+        if !(o.timed_out && began && !done && !stopped) {
+            return Err(format!(
+                "the kernel without {what} did not hang in a call: timed out {}, the smp tests began {began}, the pairs ended {done}, the kernel stopped {stopped}",
+                o.timed_out
+            ));
+        }
+        println!("smp idle bell: the kernel without {what} is caught: a call hangs");
+    }
+    let o = idle_probe_run(irq)?;
+    let late = late_windows(&o.lines);
+    if late <= IDLE_IRQ_NOISE {
+        return Err(format!(
+            "no probe caught the kernel without the look at ISR_EL1 in the window: {late} windows ended with an interrupt pending"
+        ));
+    }
+    println!(
+        "smp idle bell: the kernel without the look at ISR_EL1 is caught: {late} windows of the pairs and the rounds ended with an interrupt pending"
+    );
+    Ok(())
+}
+
+/// The kernel of `variant` with the test init on four CPUs; a run cut at
+/// 20 s after the pairs begin (a lost wake-up leaves the call for good).
+fn idle_probe_run(variant: Variant) -> Result<qemu::Outcome, String> {
+    let a = build(variant)?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let stage = qemu::Stage {
+        after: IDLE_PAIRS_BEGIN,
+        until: IDLE_PAIRS_DONE,
+        within: Duration::from_secs(20),
+    };
+    let o = qemu::run_until_staged(cmd, TEST_TIMEOUT, Some(IDLE_IRQ_DONE), Some(stage))?;
+    symbolize::backtrace(&o.lines, &a.elf);
+    Ok(o)
 }
 
 /// The probe kernel of `variant`, which lacks one check of the window probe,
@@ -11326,6 +11456,17 @@ fn init_tests_in(
         };
         if variant == Variant::AsidProbe {
             qemu::expect_line(&o, "smp asid  generation 16 of narrow ASIDs began")?;
+        }
+        if variant == Variant::IdleProbe {
+            for line in [IDLE_PAIRS_BEGIN, IDLE_PAIRS_DONE, IDLE_IRQ_DONE] {
+                qemu::expect_line(&o, line)?;
+            }
+            let late = late_windows(&o.lines);
+            if late > IDLE_IRQ_NOISE {
+                return Err(format!(
+                    "{late} windows of the poll of the probe kernel ended with an interrupt pending"
+                ));
+            }
         }
         if variant == Variant::WindowProbe {
             // CPU 1 came 20 ms late to its quiescent point: the suspension

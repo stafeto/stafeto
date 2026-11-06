@@ -281,7 +281,7 @@ unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
     };
     drop(q);
     if raised && at != cpu::this().index() {
-        crate::arch::gic::send_sgi(at, kcore::gic::SGI_CMD);
+        crate::idle::ring(at);
     }
 }
 

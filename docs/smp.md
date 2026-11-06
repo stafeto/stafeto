@@ -97,6 +97,7 @@ come from the single-CPU tests, waits and latencies from HVF.
 | S5x, target in WFI | 246 ticks | 310 ticks |
 | S5x, target behind a lower thread | 94 ticks | 199 ticks |
 | call to a service on another CPU | 347 ticks | 493 ticks |
+| call to a service on another CPU, back to back, poll in the idle loop on (since F2; 350 with it off) | 35 ticks | |
 | call to a service on this CPU | 12 ticks | 12 ticks |
 | S5 on CPU 0 under a call storm of the others | 21 ticks | 23 ticks |
 | local call under the storm | 111 ticks | 52 ticks |
@@ -161,6 +162,9 @@ kernel built with the feature, for the reason in the last column.
 | `break-one-section` | `smp-window` | The single section of a receive from its look at a queue to the take of the request | The kernel stops at the number of the section |
 | `break-alive-check` | `smp-window` | The second look at the life of a process after the portion of a mem_map RX | `smp_exec_map_of_a_process_killed_meanwhile_fails`, or the kernel stops on a process used after its space went |
 | `break-spawn-check` | `smp-window` | The second look at x3, x5 and the life of the caller of process_create after the gap between its sections | A `smp_spawn_*_meanwhile_fails` test fails, or the kernel stops on a handle that went the wrong way |
+| `break-idle-bell` | `smp-window` (`smp-idle-bell`) | One `fetch_or` of BELL by the sender, which sends the SGI only when POLLING was clear in the old value (the look and the write are two steps with a 2 ms wait between them) | A wake-up is lost, and the calls of the smp tests, the 20 000 pairs of `smp_idle_bell_loses_no_wake_up` among them, do not end |
+| `break-idle-drain` | `smp-window` (`smp-idle-bell`) | The drain of the queues after a bell ends the poll | The same |
+| `break-idle-irq` | `smp-window` (`smp-idle-bell`) | The read of ISR_EL1 in every turn of the poll | The probe kernel says that more than two windows of `smp_idle_poll_sees_an_interrupt_at_once` ended with an interrupt pending |
 | `break-asid-reserved` | `smp-asid` | The numbers a CPU runs stay out of a new generation | A test of the pages of processes across generations fails |
 | `break-asid-flush` | `smp-asid` | The deferred flush of the other CPUs after a generation | The same |
 | `break-asid-aside` | `smp-asid` | `aside1is` at the end of a process | `smp_asid_of_a_process_that_ended_is_clean_on_every_cpu` |

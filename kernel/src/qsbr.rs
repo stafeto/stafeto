@@ -212,7 +212,7 @@ pub fn passed(epoch: u64) -> bool {
 pub fn kick(epoch: u64) {
     let me = cpu::this().index();
     for other in (0..crate::smp::cpus()).filter(|&c| c != me && !GRACE.cpu_passed(c, epoch)) {
-        crate::arch::gic::send_sgi(other, kcore::gic::SGI_CMD);
+        crate::idle::ring(other);
     }
 }
 

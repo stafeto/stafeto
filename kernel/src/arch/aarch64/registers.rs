@@ -32,6 +32,11 @@ pub fn mpidr_el1() -> u64 {
     read_sysreg!("mpidr_el1")
 }
 
+/// The part and maker of this CPU (`kcore::idlepoll::enabled`).
+pub fn midr_el1() -> u64 {
+    read_sysreg!("midr_el1")
+}
+
 pub fn ttbr0_el1() -> u64 {
     read_sysreg!("ttbr0_el1")
 }
