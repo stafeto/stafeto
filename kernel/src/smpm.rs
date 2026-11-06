@@ -127,6 +127,27 @@ pub fn polled(window: u64, hit: bool, ticks: u64) {
     }
 }
 
+/// The counter at the last periodic print of the poll counters.
+static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
+
+/// CPU 0 prints the counters of the poll every 5 s, so that a run on a
+/// machine that cannot send the request to report (VZ) shows them in the
+/// kernel log: the counts are since the start of the kernel.
+pub fn periodic(now: u64) {
+    if cpu::this().index() != 0 {
+        return;
+    }
+    let last = LAST_PRINT.load(Relaxed);
+    if now.wrapping_sub(last) > 5 * crate::arch::timer::frequency() {
+        LAST_PRINT.store(now, Relaxed);
+        kprintln!(
+            "smp-measure poll at {} s",
+            now / crate::arch::timer::frequency()
+        );
+        report_poll();
+    }
+}
+
 /// This CPU rang another one; `sgi` when the SGI went too.
 pub fn rang(sgi: bool) {
     let which = if sgi { &row().sent } else { &row().saved };

@@ -959,6 +959,8 @@ fn sleep() {
     let woke = timer::now();
     #[cfg(feature = "smp-measure")]
     crate::smpm::polled(window, hit, woke.saturating_sub(began));
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::periodic(woke);
     #[cfg(not(feature = "smp-measure"))]
     let _ = hit;
     #[cfg(feature = "measure")]
