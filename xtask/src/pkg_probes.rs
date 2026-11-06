@@ -476,6 +476,18 @@ fn marked_in_image(image: &Path) -> Result<(BTreeSet<String>, bool), String> {
     Ok((found, stray))
 }
 
+/// The names of the packages whose files an image holds.
+fn package_names_in_image(image: &Path) -> Result<BTreeSet<String>, String> {
+    let bytes = std::fs::read(image).map_err(|e| format!("{}: {e}", image.display()))?;
+    let parsed = BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", image.display()))?;
+    let mut names = BTreeSet::new();
+    for f in parsed.files().filter(|f| f.name.ends_with(".stpkg")) {
+        let file = PackageFile::parse(f.data).map_err(|e| format!("{}: {e}", f.name))?;
+        names.insert(file.meta.name.to_string());
+    }
+    Ok(names)
+}
+
 /// The names under `LICENSES/packages/` of an archive, with their files.
 fn archive_notices(archive: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
     let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -587,7 +599,22 @@ pub fn dist_licenses() -> Result<(), String> {
         ));
     }
     say("boot-base.img holds no notice of F-Stack, boot-full.img only in f-stack and nginx-fast");
-    // 5: the marks stay in F-Stack's packages, and every package passes the policy.
+    // 5: the full image built without F-Stack holds no mark at all, and no
+    // package of F-Stack or that links it.
+    let without: &'static str = Box::leak(packages::without_image("f-stack").into_boxed_str());
+    let image = crate::base_image::rebuild_image(without)?;
+    let (in_without, stray) = marked_in_image(&image)?;
+    if !in_without.is_empty() || stray {
+        return Err(format!(
+            "dist-licenses: {without} holds marks of F-Stack ({in_without:?}, outside packages: {stray})"
+        ));
+    }
+    let names = package_names_in_image(&image)?;
+    if let Some(left) = FSTACK_PACKAGES.iter().find(|n| names.contains(**n)) {
+        return Err(format!("dist-licenses: {without} holds the package {left}"));
+    }
+    say("the full image without f-stack holds no notice of F-Stack and no package that links it");
+    // 6: the marks stay in F-Stack's packages, and every package passes the policy.
     let stray: Vec<_> = marked
         .iter()
         .filter(|n| !FSTACK_PACKAGES.contains(&n.as_str()))
@@ -607,7 +634,7 @@ pub fn dist_licenses() -> Result<(), String> {
             "dist-licenses: nginx-fast links F-Stack and carries none of its notices".into(),
         );
     }
-    // 6: the sources of the GPL packages.
+    // 7: the sources of the GPL packages.
     crate::run_cmd(
         Command::new("python3")
             .arg(crate::root().join("tools/pkg-source.py"))
