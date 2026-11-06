@@ -40,9 +40,11 @@ mod owner_lifetime;
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
 
+mod abi_fingerprint;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
+mod carry;
 mod ci;
 mod clock_probe;
 mod cpus_dialog;
@@ -94,6 +96,7 @@ mod pci_walk;
 mod pkg;
 mod pkg_probe;
 mod pkg_probes;
+mod pkg_sign;
 mod pkg_slot;
 mod pkg_states;
 mod posix_display;
@@ -1671,17 +1674,26 @@ commands:
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
   keys      the keys that sign packages: `keys root|release <name> [--dir D]`,
-            `keys certify --root R.key --key K.pub`, `keys show <file>` (docs/packages.md)
+            `keys certify --root R.key --key K.pub`, `keys revoke --root R.key (--init | --key N --since T|start)`,
+            `keys show <file>` (docs/packages.md)
   pkg-build [name...]  build the package files (.stpkg) in target/pkg; `--recipe` prints the inputs
-            of the fingerprints instead (docs/packages.md)
+            of the fingerprints instead; `--previous INDEX` carries the packages whose recipe did not
+            change from a published index (docs/packages.md)
   repo      build the package files and a signed repository of them in target/repo
             (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
-            in another directory, which must be empty or new, or under target/)
+            in another directory, which must be empty or new, or under target/; `--previous INDEX`
+            carries; `--from DIR [--storage NAME]` writes the index of the files of DIR without a
+            build; `--check --official` checks with the roots of keys/)
   pkg-identity  check that the flat images and the packages give the same bytes at the same
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they
             hold and no others (no notice of F-Stack in the archives without it)
-  pkg-ci    pkg-build, repo, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
+  pkg-sign  sign again with the release key the packages of a directory that the development key
+            signed (only the last page changes; `--key K.key --cert K.cert --dir D`)
+  image-repack IMAGE --packages D  put the package files of D into a boot image of the same layout
+  abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
+            `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
+  pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -2080,6 +2092,9 @@ fn main() {
         Some("pkg-identity") => pkg_probes::identity(),
         Some("dist-licenses") => pkg_probes::dist_licenses(),
         Some("pkg-ci") => pkg_probes::ci(),
+        Some("abi") => abi_fingerprint::command(&args[1..]),
+        Some("pkg-sign") => pkg_sign::sign_command(&args[1..]),
+        Some("image-repack") => pkg_sign::repack_command(&args[1..]),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),

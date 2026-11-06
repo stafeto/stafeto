@@ -278,11 +278,26 @@ the 256 bytes above in `<name>.cert`.
 | `cargo xtask keys root <name> [--dir D]` | a new root key pair, the name `...-root` or `...-root-N`; the private file is created with mode 0600 and never overwritten; only the public line is printed; `D` defaults to `$HOME/.stafeto-keys` |
 | `cargo xtask keys release <name> [--dir D]` | the same for a release key, `...-release` or `...-release-YYYY` |
 | `cargo xtask keys certify --root R.key --key K.pub [--purpose packages[,elf]] [--from YYYY-MM-DD] [--days N] [--out F]` | the certificate of `K` by the root `R`: purpose `packages`, start today at 00:00 UTC, 396 days, next to `K.pub` by default; the root must match `keys/<root name>.pub` when that file exists |
+| `cargo xtask keys revoke --root R.key --init [--out D]` | the first list of revocations: `serial 1`, no entry, signed by the root (a block of kind 3 without a certificate); refused when `D/revoked` is there |
+| `cargo xtask keys revoke --root R.key --key NAME --since T\|start [--list F] [--out D]` | adds a release key to the list `F` (`keys/revoked` by default) and signs it again with the serial one higher; `T` is `YYYY-MM-DDThh:mm:ssZ`, `start` is the start of the term of `keys/NAME.cert` (the time of the leak is unknown, every signature of the key falls); the list is read and its signature checked against the root first; a name twice, a root and a key of another root are refused |
 | `cargo xtask keys show <file>` | what a `.pub`, `.cert`, `.sig` or `.stpkg` file says; it never opens a `.key` file |
 
 A private key is never written into the working tree outside `target/keys/`
 (the directory of development keys): `--dir` inside the tree elsewhere is
 refused.
+
+A certificate names its purpose (`packages`, `elf`) and its term. The key to
+sign a release with is chosen by the tree: the certificate of `keys/*.cert`
+with the purpose `packages` whose term covers the present time and starts
+last (`keys::current_release_certificate`); `--key` without `--cert` takes
+that certificate when it vouches for the very key given. The roots of the
+official repository are `pkgfmt::OFFICIAL_ROOTS` (`keys::official_roots`),
+the roots baked into `pkg` and `pkgd`; a file that merely lies in `keys/` is
+trusted by nothing, and a test of `xtask` fails when the `.pub` files of
+`keys/` differ from that list. A new root enters by a change of the list, and
+after the first publication the root changes only with a new base. A
+certificate is accepted through the file `keys/<issuer>.pub`, and
+`repo --check --official` verifies with the roots and the list `keys/revoked`.
 
 ### Notices in the package
 
@@ -332,15 +347,81 @@ link programs (for a package with programs) and `build-depends <name>
   linked into it as their SHA-256 sums pin them, the files of the tree that the
   recipe names, and a README. `--check` verifies a directory: the signatures,
   the size and SHA-256 and `meta` of every package, the policy, the sources.
+- `cargo xtask pkg-build --previous INDEX` and `cargo xtask repo --previous
+  INDEX` carry packages from a published index (`INDEX` is the directory or
+  the `https://` address of `<series>/aarch64`, `carry.rs`). The list of
+  revocations and the index are verified with the roots of `keys/`
+  (and the development root for a directory). A package whose `recipe` equals
+  the entry of the index keeps its file byte for byte, its signature and the
+  `file` of the entry (a full address; a relative name stays as it is when the
+  index came from a directory), after the size, the SHA-256, the `meta` and
+  the signature were checked against the present list (the one next to the
+  index and the entries of `keys/revoked` of the tree; the list next to the
+  index may not be older than the tree's, an index that has expired is
+  refused, and so is one older than the serial in
+  `packages/published-serial.txt`, lines `<series> <serial>`). A package of a new
+  recipe takes `release` one above the entry of the same version, or 1 for a
+  new version or a new name; the `release` field of a description is a base
+  the plan replaces. No index (answer 404, no `INDEX` file) means every
+  package is new, unless `packages/abi.txt` says the series is frozen, which
+  is a failure of the place the index is served from; any other failure stops the build, and so does a damaged
+  file. A package signed by a revoked key is built again, which is how a
+  revocation without a known time ends in a rebuild. `repo` takes the serial of
+  the index plus one unless `--serial` is given. The carried files are copied
+  into the repository directory and listed in `carried.txt` (a name, the
+  address and the address of the source archive, separated by tabs; every
+  address is checked to be a location an index can hold). The downloads use
+  `curl -q` with https for every redirection and TLS 1.2 and above, as the
+  tool on the device does.
+- `cargo xtask repo --from DIR [--storage NAME]` writes `INDEX`, `INDEX.sig`,
+  `revoked` and `revoked.sig` next to the package files of `DIR`, from their
+  `meta`, without a build; with `--storage v0.3.0-aarch64` the new files and
+  their source archives get the address
+  `https://github.com/stafeto/packages/releases/download/NAME/<file>`, the
+  carried ones keep theirs; `--serial` is required. `repo --check --official` verifies with the roots
+  of `keys/` and `--official` takes `keys/revoked` and `keys/revoked.sig`
+  as the list.
+- `cargo xtask pkg-sign [--key K.key --cert K.cert] --dir D [--time T]` signs
+  again with the release key the packages of `D` that the development key
+  signed: only the last page changes, the length and the covered bytes are
+  checked, and the new signature is verified against `keys/revoked`. The
+  time of the new signature is the clock of the machine that signs (`--time`
+  is for the probes): the time decides which revocations reach a signature,
+  so the trailer the build wrote is not trusted for it, and a trailer from
+  the future is refused. A package signed by another key stays only if
+  `carried.txt` lists it, an official root vouches for the key and no
+  revocation reaches it; any other signer is refused. The tool trusts the
+  content of `D` as the build left it and guards against a leaked key. `cargo xtask image-repack IMAGE
+  --packages D` writes the files of `D` over the `.stpkg` files of a
+  boot image; the lengths are the same, and the tool checks that every other
+  file and every other byte of the image is as it was.
+- `cargo xtask abi [--check|--update|--freeze|--explain] [--release]` keeps the
+  fingerprint of the ABI in `packages/abi.txt` (`format 1`, `series`, `state`
+  and four SHA-256 sums). `libc` is the names `libc.so` exports (the size too
+  for the objects of data); `layouts` the table that `tools/abi-layouts.c`
+  writes when it is compiled for aarch64 with the headers of `libc.so` (sizes,
+  alignments, offsets, the values of the constants programs read, and
+  `<stafeto/display.h>` and `<stafeto/fast.h>`); `loader` the constants of
+  `proto/loader`; `protocols` the `VERSION` of each crate of `proto/` the POSIX
+  layer uses. `--explain` writes the lines of each part to `target/abi/`. In a
+  series that is `open` a change is printed and passes; after `--freeze` a
+  change in the series of the version of the workspace fails the check with
+  the part named, and the cure is the next minor version and `--update`. A
+  greater series is started by `--update` (open). `--release` wants a frozen
+  series equal to the series of the version. The check runs in `pkg-ci`.
 - `cargo xtask pkg-identity` checks that the shell, games and network images
   and the packages give the same bytes, modes and owners at the same paths
   (the notices excepted), that the repository is whole and that
   two builds of a package agree but for the time and the signature of the
-  trailer. `cargo xtask dist-licenses` builds the release files and the
+  trailer. It also carries: a published repository made of the packages of
+  the run (signed by a first probe key), a build with `--previous` and one
+  recipe changed on purpose on purpose, `pkg-sign` with a second probe key
+  and `image-repack` into the full image. `cargo xtask dist-licenses` builds the release files and the
   repository and checks that the archive of `aarch64-virt` carries the notices
   of the packages of the shell image and no others, that no archive without
   F-Stack holds a mark of F-Stack's notices and that the GPL packages come
-  with their sources. `cargo xtask pkg-ci` runs the four commands in a row;
+  with their sources. `cargo xtask pkg-ci` runs `pkg-build`, `repo`, `abi --check`,
+  `pkg-identity` and `dist-licenses` in a row;
   it is the job `pkg` of the CI.
 
 ## Add a package
@@ -802,7 +883,10 @@ certificate is signed by itself, the repository `games` with its own key (a pack
 official key in it is refused), `pkg upgrade` to `hello` 2.0 without a download of Doom, an index
 of the official repository signed by the key of `games`, then the restart with the settings and the
 packages in place, `pkg remove doom` (both packages and their notices gone), and a last boot that
-has only `hello` and the image. After each refusal `pkg check` and `pkg list` say the same as before.
+has only `hello` and the image, where the state `absolute` follows: the index holds full
+addresses in `file` (the second directory `/store/v0.0.0-aarch64/` of the mirror), one of them
+answers 302 to a third address (`--redirects` of the mirror), and `pkg install doom` puts Doom in
+again. After each refusal `pkg check` and `pkg list` say the same as before.
 
 ## What stays for subproject 5
 

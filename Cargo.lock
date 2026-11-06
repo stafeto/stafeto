@@ -1469,6 +1469,7 @@ dependencies = [
  "posix-fd",
  "posix-types",
  "proto-fs",
+ "proto-loader",
  "proto-net",
  "proto-pkg",
  "proto-wire",

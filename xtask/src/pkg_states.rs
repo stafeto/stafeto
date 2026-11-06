@@ -16,6 +16,7 @@
 //! | `foreign` (4) | `good` and `alien`, a package signed by a key nobody trusts |
 //! | `next` (5) | `good`, but `hello` 2.0 |
 //! | `stolen` (6) | `next`, signed by the key of the repository `games` |
+//! | `absolute` (7) | `next`, but the files of Doom are at full addresses in the `store` tree of the mirror (`/store/v0.0.0-aarch64/`), and the file of `doomgeneric` answers 302 to `/store/moved/` |
 //!
 //! `games` (serial 1, the key `games-1`): `hello-games` (exit 42) signed by that key and
 //! `sneaky`, signed by the release key of the official repository, which `games` does not trust.
@@ -77,8 +78,16 @@ pub struct States {
     pub foreign: PathBuf,
     pub next: PathBuf,
     pub stolen: PathBuf,
+    pub absolute: PathBuf,
     pub games: PathBuf,
+    /// The tree the mirror serves under `/store`: `v0.0.0-aarch64` and `moved`.
+    pub store: PathBuf,
+    /// The lines (`/from /to`) the mirror redirects by.
+    pub redirects: String,
 }
+
+/// The directory of the storage of the state `absolute` under `/store`.
+pub const STORAGE: &str = "v0.0.0-aarch64";
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -211,6 +220,10 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
 
 fn link_files(dir: &Path, recs: &[Rec]) -> Result<(), String> {
     for r in recs {
+        // A file at a full address is served from the store tree.
+        if r.file.starts_with("https://") {
+            continue;
+        }
         let to = dir.join(&r.file);
         let _ = std::fs::remove_file(&to);
         std::os::unix::fs::symlink(&r.path, &to).map_err(|e| format!("{}: {e}", to.display()))?;
@@ -251,7 +264,7 @@ pub fn key_file(name: &str, seed: u8) -> Result<String, String> {
 
 /// All the states, under `states/`. `doom` is the directory of a repository that holds the packages
 /// of Doom (`repo::make`), whose files the states link.
-pub fn make(states: &Path, doom: &Path) -> Result<States, String> {
+pub fn make(states: &Path, doom: &Path, origin: &str) -> Result<States, String> {
     let dev = keys::dev_keys(&crate::root())?;
     let dev_signer = Signer {
         seed: &dev.release_seed,
@@ -404,7 +417,44 @@ pub fn make(states: &Path, doom: &Path) -> Result<States, String> {
         },
         None,
     )?;
+    // The state `absolute`: the files of Doom at full addresses of the second directory of
+    // the mirror, one of them (`doomgeneric`) behind a redirect to a third.
+    let store = states.join("store");
+    for sub in [STORAGE, "moved"] {
+        let dir = store.join(sub);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut redirects = String::new();
+    let mut absolute_records = Vec::new();
+    for r in &next_records {
+        let mut r = r.clone();
+        if doom_records.iter().any(|d| d.name == r.name) {
+            let place = if r.name == "doomgeneric" {
+                redirects.push_str(&format!("/store/{STORAGE}/{0} /store/moved/{0}\n", r.file));
+                "moved"
+            } else {
+                STORAGE
+            };
+            let to = store.join(place).join(&r.file);
+            std::os::unix::fs::symlink(&r.path, &to)
+                .map_err(|e| format!("{}: {e}", to.display()))?;
+            r.file = format!("{origin}/store/{STORAGE}/{}", r.file);
+        }
+        absolute_records.push(r);
+    }
+    let absolute = compose(
+        &states.join("absolute"),
+        &absolute_records,
+        &official(7, t, t + 30 * DAY),
+        Some(doom),
+    )?;
     Ok(States {
+        absolute,
+        store,
+        redirects,
         good,
         tampered,
         long,

@@ -13,6 +13,11 @@ xtask to read:
 (the method, the path, the status, the length of the body that was announced).
 A server that is ready says `pkg-mirror: listening <port>`.
 
+A file given with --redirects holds lines `/from /to`; a request for `/from`
+is answered 302 with `Location: /to` (the file is read at each request, so
+xtask can change the table between two steps). The log line of such a request
+reads `pkg-mirror: GET /from 302 0`.
+
 The server follows symbolic links, so that xtask changes the state of the
 repository between two steps of the probe by changing one link. It takes
 TLS 1.2 and above. It runs until it is killed: xtask starts it for the length
@@ -31,9 +36,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     server_version = "pkg-mirror"
     sys_version = ""
 
-    def __init__(self, *args, **kwargs):
+    redirects = None
+
+    def __init__(self, *args, redirects=None, **kwargs):
         self.announced = "-"
+        self.redirect_file = redirects
         super().__init__(*args, **kwargs)
+
+    def redirect_target(self):
+        if not self.redirect_file:
+            return None
+        try:
+            with open(self.redirect_file, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == self.path:
+                        return parts[1]
+        except OSError:
+            pass
+        return None
+
+    def send_head(self):
+        target = self.redirect_target()
+        if target is None:
+            return super().send_head()
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return None
 
     def send_header(self, keyword, value):
         if keyword.lower() == "content-length":
@@ -71,8 +102,8 @@ class Server(http.server.ThreadingHTTPServer):
         pass
 
 
-def make(directory, port, cert, key, host="127.0.0.1"):
-    handler = functools.partial(Handler, directory=directory)
+def make(directory, port, cert, key, host="127.0.0.1", redirects=None):
+    handler = functools.partial(Handler, directory=directory, redirects=redirects)
     server = Server((host, port), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -87,8 +118,9 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument("--redirects")
     args = parser.parse_args()
-    server = make(args.dir, args.port, args.cert, args.key)
+    server = make(args.dir, args.port, args.cert, args.key, redirects=args.redirects)
     print(f"pkg-mirror: listening {args.port}", flush=True)
     try:
         server.serve_forever()

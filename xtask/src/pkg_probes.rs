@@ -59,7 +59,275 @@ fn options(names: Vec<String>, out: Option<PathBuf>) -> pkg::Options {
         out,
         recipe: false,
         replace: Vec::new(),
+        previous: None,
+        perturb: Vec::new(),
     }
+}
+
+/// A release key of the probe with a certificate of the development root: the files `.key` and
+/// `.cert` in `target/keys`, as `--key` and `--cert` take them.
+fn probe_key(tree: &Path, name: &str) -> Result<(PathBuf, PathBuf), String> {
+    use pkgfmt::cert::{Certificate, PURPOSE_PACKAGES};
+    const DAY: u64 = 86_400;
+    let dev = crate::keys::dev_keys(tree)?;
+    let dir = tree.join("target").join("keys");
+    let (_, key) = crate::keys::load_or_generate(crate::keys::Role::Release, name, &dir, tree)?;
+    let from = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        / DAY
+        * DAY;
+    let cert = Certificate::issue(
+        &dev.root_seed,
+        dev.root.name,
+        key.name,
+        key.public,
+        PURPOSE_PACKAGES,
+        from,
+        from + 396 * DAY,
+    );
+    let path = dir.join(format!("{name}.cert"));
+    std::fs::write(&path, cert.to_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((dir.join(format!("{name}.key")), path))
+}
+
+fn stpkg_names(dir: &Path) -> Result<BTreeSet<String>, String> {
+    Ok(std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".stpkg"))
+        .collect())
+}
+
+fn copy_files(from: &Path, to: &Path, keep: impl Fn(&str) -> bool) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_file() && keep(&name) {
+            std::fs::copy(entry.path(), to.join(&name)).map_err(|e| format!("{name}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sha_of(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = [0u8; 64];
+    Ok(pkgfmt::sha::hex(&pkgfmt::sha::sha256(&bytes), &mut buf).to_string())
+}
+
+/// Step 8 of `pkg-identity`: `built` is the repository of step 1 (development key).
+///
+/// A published repository is made from `built` by signing its packages with a first probe key.
+/// A build that carries from it with one recipe changed (`--perturb freedoom`) keeps the files
+/// of the others byte for byte at their addresses and gives the changed one the next release.
+/// Signing with a second probe key changes only the last page of the new package and leaves the
+/// carried ones. An image built from the files of the run takes the signed files over its own
+/// and keeps every other file.
+fn carry_over(built: &Path) -> Result<(), String> {
+    use crate::{keys, pkg_sign};
+    let tree = crate::root();
+    let dev = keys::dev_keys(&tree)?;
+    let work = crate::target_dir().join("carry-test");
+    let _ = std::fs::remove_dir_all(&work);
+    let (published, next, signed) = (
+        work.join("published"),
+        work.join("next"),
+        work.join("signed"),
+    );
+    // The published repository: the packages of step 1 signed by the first probe key.
+    copy_files(built, &published, |n| n.ends_with(".stpkg"))?;
+    let (key1, cert1) = probe_key(&tree, "stafeto-probe-release-1")?;
+    let first = keys::signing(Some(&key1), Some(&cert1), &tree)?;
+    let none = BTreeSet::new();
+    pkg_sign::sign_dir(
+        &published,
+        &first,
+        &pkg_sign::Setting {
+            development: dev.release.name,
+            roots: &[dev.root],
+            direct: &[],
+            revocations: &[],
+            carried: &none,
+            time: None,
+        },
+    )?;
+    repo::from_files(
+        &published,
+        &repo::Options {
+            key: Some(key1.clone()),
+            cert: Some(cert1.clone()),
+            ..repo::Options::default()
+        },
+    )?;
+    let old_text = std::fs::read_to_string(published.join("INDEX")).map_err(|e| e.to_string())?;
+    let old_index = pkgfmt::index::Index::parse(&old_text).map_err(|e| e.to_string())?;
+    let old: BTreeMap<String, (String, String, String)> = old_index
+        .entries()
+        .map(|e| {
+            (
+                e.name.to_string(),
+                (
+                    e.version.to_string(),
+                    e.file.to_string(),
+                    e.sha256.to_string(),
+                ),
+            )
+        })
+        .collect();
+    // The build that carries, with the recipe of one package changed.
+    let changed = "freedoom";
+    repo::run(&repo::Options {
+        sources: false,
+        dir: Some(next.clone()),
+        previous: Some(published.display().to_string()),
+        perturb: vec![changed.to_string()],
+        ..repo::Options::default()
+    })?;
+    let text = std::fs::read_to_string(next.join("INDEX")).map_err(|e| e.to_string())?;
+    let index = pkgfmt::index::Index::parse(&text).map_err(|e| e.to_string())?;
+    let mut carried = 0;
+    for e in index.entries() {
+        let (version, file, sha) = old
+            .get(e.name)
+            .ok_or_else(|| format!("pkg-identity: {} is not in the published index", e.name))?;
+        if e.name == changed {
+            let (v, r) = version
+                .rsplit_once('-')
+                .ok_or("version without a release")?;
+            let wanted = format!("{v}-{}", r.parse::<u64>().map_err(|e| e.to_string())? + 1);
+            if e.version != wanted || e.sha256 == sha || e.file.contains('/') {
+                return Err(format!(
+                    "pkg-identity: the changed package {changed} should be {wanted} with a file of its own: {e:?}"
+                ));
+            }
+        } else {
+            if e.version != *version || e.file != file || e.sha256 != *sha {
+                return Err(format!(
+                    "pkg-identity: {} should be carried unchanged with the file {file}: {e:?}",
+                    e.name
+                ));
+            }
+            let kept = std::fs::read(next.join(file)).map_err(|e| e.to_string())?;
+            if kept != std::fs::read(published.join(file)).map_err(|e| e.to_string())? {
+                return Err(format!(
+                    "pkg-identity: the carried file of {} differs",
+                    e.name
+                ));
+            }
+            carried += 1;
+        }
+    }
+    repo::check(&next, &[dev.root])?;
+    println!(
+        "pkg-identity: carried from the published index: {carried} packages with the same bytes and address, {changed} one release up"
+    );
+    // The second probe key signs again what the development key signed.
+    copy_files(&next, &signed, |n| {
+        n.ends_with(".stpkg") || n == repo::CARRIED
+    })?;
+    let (key2, cert2) = probe_key(&tree, "stafeto-probe-release-2")?;
+    let second = keys::signing(Some(&key2), Some(&cert2), &tree)?;
+    let listed: BTreeSet<String> = repo::read_carried(&signed)?.into_keys().collect();
+    let done = pkg_sign::sign_dir(
+        &signed,
+        &second,
+        &pkg_sign::Setting {
+            development: dev.release.name,
+            roots: &[dev.root],
+            direct: &[],
+            revocations: &[],
+            carried: &listed,
+            time: None,
+        },
+    )?;
+    let new_name = pkg::file_name(
+        packages::load()?
+            .iter()
+            .find(|p| p.name == changed)
+            .ok_or("no package freedoom")?,
+    );
+    if done.signed != [new_name.clone()] || done.kept.len() != carried {
+        return Err(format!(
+            "pkg-identity: pkg-sign should sign {new_name} alone and keep {carried}: {done:?}"
+        ));
+    }
+    for name in stpkg_names(&signed)? {
+        let (before, after) = (
+            std::fs::read(next.join(&name)).map_err(|e| e.to_string())?,
+            std::fs::read(signed.join(&name)).map_err(|e| e.to_string())?,
+        );
+        let page = pkgfmt::container::TRAILER_SIZE;
+        let same_body = before.len() == after.len()
+            && before[..before.len() - page] == after[..after.len() - page];
+        if !same_body || (name == new_name) == (before == after) {
+            return Err(format!(
+                "pkg-identity: pkg-sign changed {name} beyond its last page, or left the new package as it was"
+            ));
+        }
+        if name != new_name && before != after {
+            return Err(format!("pkg-identity: pkg-sign touched the carried {name}"));
+        }
+    }
+    repo::from_files(
+        &signed,
+        &repo::Options {
+            key: Some(key2),
+            cert: Some(cert2),
+            ..repo::Options::default()
+        },
+    )?;
+    repo::check(&signed, &[dev.root])?;
+    println!(
+        "pkg-identity: pkg-sign changed the last page of {new_name} and left {} carried files as they were",
+        done.kept.len()
+    );
+    // The image of this run holds the carried files and the new one; the signed files go in.
+    let image = crate::base_image::rebuild_image(crate::base_image::FULL_IMAGE)?;
+    let copy = work.join("boot-full.img");
+    std::fs::copy(&image, &copy).map_err(|e| format!("{}: {e}", image.display()))?;
+    let n = pkg_sign::repack(&copy, &signed)?;
+    let before = std::fs::read(&image).map_err(|e| e.to_string())?;
+    let after = std::fs::read(&copy).map_err(|e| e.to_string())?;
+    let (b, a) = (
+        BootImage::parse(&before).map_err(|e| e.to_string())?,
+        BootImage::parse(&after).map_err(|e| e.to_string())?,
+    );
+    let sha_of_bytes = |d: &[u8]| {
+        let mut buf = [0u8; 64];
+        pkgfmt::sha::hex(&pkgfmt::sha::sha256(d), &mut buf).to_string()
+    };
+    let names_of_image: BTreeSet<String> = a
+        .files()
+        .filter(|f| f.name.ends_with(".stpkg"))
+        .map(|f| f.name.to_string())
+        .collect();
+    if names_of_image != stpkg_names(&signed)? {
+        return Err(format!(
+            "pkg-identity: the image holds {names_of_image:?}, the signed directory {:?}",
+            stpkg_names(&signed)?
+        ));
+    }
+    for f in a.files() {
+        let before_file = b.files().find(|g| g.name == f.name);
+        if f.name.ends_with(".stpkg") {
+            if sha_of_bytes(f.data) != sha_of(&signed.join(f.name))? {
+                return Err(format!(
+                    "pkg-identity: {} of the image is not the signed file",
+                    f.name
+                ));
+            }
+        } else if before_file.map(|g| sha_of_bytes(g.data)) != Some(sha_of_bytes(f.data)) {
+            return Err(format!("pkg-identity: image-repack changed {}", f.name));
+        }
+    }
+    println!(
+        "pkg-identity: image-repack put {n} signed package files into boot-full.img, every other file of the image as it was"
+    );
+    crate::carry::set_releases(BTreeMap::new());
+    Ok(())
 }
 
 /// The notices of one package as files: path below
@@ -691,6 +959,8 @@ pub fn identity() -> Result<(), String> {
     println!(
         "pkg-identity: two builds of freedoom and busybox agree byte for byte but for the time and the signature"
     );
+    // 8: the packages of a published index are carried, signed again and put into an image.
+    carry_over(&dir)?;
     println!("pkg-identity: {:.0} s", started.elapsed().as_secs_f64());
     Ok(())
 }
@@ -699,6 +969,7 @@ pub fn ci() -> Result<(), String> {
     let started = std::time::Instant::now();
     pkg::command(&[])?;
     repo::command(&[])?;
+    crate::abi_fingerprint::command(&["--check".into()])?;
     identity()?;
     dist_licenses()?;
     println!("pkg-ci: {:.0} s", started.elapsed().as_secs_f64());
