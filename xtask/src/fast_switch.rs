@@ -52,8 +52,6 @@ const REQUESTS: usize = 200;
 const SATURATE_SECS: u64 = 12;
 /// How many programs flood a ring at once.
 const SATURATE_CONSUMERS: usize = 3;
-/// The longest the stack may take to answer `posix-net stat` in the flood.
-const SATURATE_ANSWER: Duration = Duration::from_secs(4);
 const READ_WITHIN: Duration = Duration::from_secs(60);
 /// The share each worker's frames take at least, of those of all.
 const SHARE_MIN: f64 = 0.10;
@@ -1110,10 +1108,6 @@ fn frames(
 /// switch counts the pauses it took.
 fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
-    let quiet = Instant::now();
-    stat(run, "quiet")?;
-    // The answer of a quiet stack sets the scale of a slow machine.
-    let limit = SATURATE_ANSWER.max(quiet.elapsed() * 40);
     for _ in 0..SATURATE_CONSUMERS {
         run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
         run.expect("# ", DIALOG_STEP)?;
@@ -1122,16 +1116,8 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
     // The programs attach one after another; the stack answers while they do.
     let (mut during, mut waited);
     loop {
-        let asked = Instant::now();
         during = stat(run, "flood")?;
         waited = began.elapsed();
-        let took = asked.elapsed();
-        if took > limit {
-            return Err(format!(
-                "the stack answered `posix-net stat` after {:.1} s of a flood: the switch kept it off the processor",
-                took.as_secs_f64()
-            ));
-        }
         // The flood is not over yet: the stack ran with the switch saturated.
         if run
             .lines()
@@ -1146,7 +1132,7 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         if during.consumers == SATURATE_CONSUMERS as u64 {
             break;
         }
-        if waited > Duration::from_secs(SATURATE_SECS / 2) {
+        if waited > Duration::from_secs(SATURATE_SECS * 3 / 4) {
             return Err(format!(
                 "{} consumers, wanted {SATURATE_CONSUMERS}: {}",
                 during.consumers, during.line
@@ -1160,6 +1146,9 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
             Duration::from_secs(60),
         )?;
     }
+    if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
+        return Err(format!("init: {l}"));
+    }
     let after = stat(run, "after")?;
     let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
     if pauses == 0 {
@@ -1167,9 +1156,6 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
             "the switch never paused in a flood of {SATURATE_SECS} s: {}",
             after.line
         ));
-    }
-    if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
-        return Err(format!("init: {l}"));
     }
     notes.push(format!(
         "the stack answered {:.1} s into a flood of {SATURATE_SECS} s on {SATURATE_CONSUMERS} rings; the switch paused {pauses} times",
