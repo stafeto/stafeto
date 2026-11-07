@@ -1409,6 +1409,8 @@ struct Prepared {
     /// The image of F1.
     fast_image: PathBuf,
     switch_image: PathBuf,
+    /// The workers of nginx-fast on F1s (1 except in `kill-watch`).
+    switch_workers: usize,
     /// The kernel and the image of S4o.
     old_kernel: PathBuf,
     old_image: PathBuf,
@@ -1772,6 +1774,17 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
             } else {
                 FAST_CONF
             };
+            // `kill-watch` runs F1s with several workers: a copy of the settings.
+            let conf = if switch && prep.switch_workers > 1 {
+                run.send(&format!(
+                    "sed 's/worker_processes 1;/worker_processes {};/' {conf} > /tmp/nginx-fast-n.conf",
+                    prep.switch_workers
+                ))?;
+                run.expect("# ", DIALOG_STEP)?;
+                "/tmp/nginx-fast-n.conf"
+            } else {
+                conf
+            };
             if std::env::var_os("NET_BENCH_FAST_STATS").is_some() {
                 // The stack says its counters on the console (the doorbells
                 // among them): the copy of the configuration passes the
@@ -1789,7 +1802,11 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 |l| l.contains("fast: the stack is up on "),
                 START_WITHIN,
             )?;
-            linux_guest::workers_up(&mut run, DIALOG_STEP, 1)?;
+            linux_guest::workers_up(
+                &mut run,
+                DIALOG_STEP,
+                if switch { prep.switch_workers } else { 1 },
+            )?;
             linux_guest::read_fingerprints_of(
                 &mut run,
                 &mut report,
@@ -1798,7 +1815,10 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
-            let wanted = if switch {
+            let wanted = if switch && prep.switch_workers > 1 {
+                // The copy differs from the file by the number of workers.
+                &report.config_digest.clone()
+            } else if switch {
                 &prep.switch_config
             } else if tls {
                 &prep.fast_config_tls
@@ -1916,7 +1936,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--quick] [--resume DIR] | tables DIR";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -3467,6 +3487,7 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         image,
         fast_image,
         switch_image,
+        switch_workers: 1,
         old_kernel,
         old_image,
         config,
@@ -3535,10 +3556,185 @@ fn run(args: &[String]) -> Result<(), String> {
     result
 }
 
+/// One request of `kill-watch`: when it started (since `t0`), how long the whole answer took, or
+/// why there is none.
+struct Probe {
+    at: Duration,
+    took: Result<Duration, String>,
+}
+
+/// A new connection and a GET of `/1k.bin`, read to the end, within `within`.
+fn one_request(address: SocketAddr, within: Duration) -> Result<Duration, String> {
+    use std::io::{Read, Write};
+    let began = Instant::now();
+    let mut c = std::net::TcpStream::connect_timeout(&address, within)
+        .map_err(|e| format!("connect: {e}"))?;
+    c.set_read_timeout(Some(within)).ok();
+    c.set_write_timeout(Some(within)).ok();
+    c.write_all(b"GET /1k.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    let mut got = Vec::new();
+    c.read_to_end(&mut got).map_err(|e| format!("read: {e}"))?;
+    // Headers (under 200 bytes) and the 1 024 bytes.
+    if got.len() < 1024 || !got.starts_with(b"HTTP/1.1 200") {
+        return Err(format!("a short or wrong answer of {} bytes", got.len()));
+    }
+    Ok(began.elapsed())
+}
+
+/// What `judge` found in the requests that started in a window after a kill.
+#[derive(Debug, PartialEq)]
+struct Judged {
+    requests: usize,
+    /// Connections that were not made (refused, timed out): none may be.
+    refused: usize,
+    /// Connections that were made and broke in flight: the worker that held one was the one killed.
+    broken: Vec<String>,
+    longest: Duration,
+}
+
+/// The requests that started in the `window` after `kill`. A request that broke after its
+/// connection was made held a connection of the killed worker (it was served when the kill came)
+/// and is told apart from one that found no worker to connect to.
+fn judge(probes: &[Probe], kill: Duration, window: Duration) -> Judged {
+    let mut j = Judged {
+        requests: 0,
+        refused: 0,
+        broken: Vec::new(),
+        longest: Duration::ZERO,
+    };
+    for p in probes
+        .iter()
+        .filter(|p| p.at >= kill && p.at < kill + window)
+    {
+        j.requests += 1;
+        match &p.took {
+            Ok(t) => j.longest = j.longest.max(*t),
+            Err(e) if e.starts_with("connect") => j.refused += 1,
+            Err(e) => j.broken.push(e.clone()),
+        }
+    }
+    j
+}
+
+/// `net-bench kill-watch [--workers N] [--kills K] [--bound MS]`: F1s with N workers (1 or 4), a
+/// client on the Mac that opens a new connection every 5 ms to `/1k.bin` with a term of 2 s, and
+/// `kill -9` of a worker K times, 2 s apart. Accepted when no request that started in the 2 s after a
+/// kill waited past the bound (100 ms) or failed. The clock is the Mac's; the time of each kill is
+/// the moment the command went to the console.
+fn kill_watch(args: &[String]) -> Result<(), String> {
+    let (mut workers, mut kills, mut bound_ms) = (1usize, 10usize, 100u64);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let v = it.next().and_then(|v| v.parse::<u64>().ok());
+        match (a.as_str(), v) {
+            ("--workers", Some(v)) if v >= 1 => workers = v as usize,
+            ("--kills", Some(v)) if v >= 1 => kills = v as usize,
+            ("--bound", Some(v)) => bound_ms = v,
+            _ => return Err(
+                "usage: cargo xtask net-bench kill-watch [--workers N] [--kills K] [--bound MS]"
+                    .to_owned(),
+            ),
+        }
+    }
+    let o = options(&["--systems".into(), "f1s".into()])?;
+    let mut prep = prepare(&o)?;
+    prep.switch_workers = workers;
+    let mut g = boot_stafeto(&prep, System::F1s, false)?;
+    let address = g.address;
+    let t0 = Instant::now();
+    let probes: std::sync::Arc<std::sync::Mutex<Vec<Probe>>> = Default::default();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client = {
+        let (probes, stop) = (probes.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut handles = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (probes, at) = (probes.clone(), t0.elapsed());
+                handles.push(std::thread::spawn(move || {
+                    let took = one_request(address, Duration::from_secs(2));
+                    probes.lock().unwrap().push(Probe { at, took });
+                }));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        })
+    };
+    let mut rows = Vec::new();
+    let mut result = Ok(());
+    std::thread::sleep(Duration::from_secs(1));
+    for k in 0..kills {
+        let (_, pids) =
+            crate::fast_nginx::master_and_workers(&mut g.run, &format!("kw{k}"), false)?;
+        if pids.len() != workers {
+            result = Err(format!(
+                "{} workers before kill {k}, wanted {workers}",
+                pids.len()
+            ));
+            break;
+        }
+        let at = t0.elapsed();
+        g.run.send(&format!("kill -9 {}", pids[k % pids.len()]))?;
+        std::thread::sleep(Duration::from_millis(2500));
+        rows.push(at);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = client.join();
+    let probes = probes.lock().unwrap();
+    let mut text = format!(
+        "### kill-watch: F1s, {workers} worker(s), {kills} kills, bound {bound_ms} ms\n\n| kill | at (s) | requests in 2 s | connections refused | broke in flight (the killed worker's) | longest ms |\n|---|---|---|---|---|---|\n"
+    );
+    let mut worst = Duration::ZERO;
+    let mut failed_all = 0;
+    for (i, at) in rows.iter().enumerate() {
+        let j = judge(&probes, *at, Duration::from_secs(2));
+        worst = worst.max(j.longest);
+        failed_all += j.refused;
+        text += &format!(
+            "| {} | {:.3} | {} | {} | {:?} | {:.1} |\n",
+            i + 1,
+            at.as_secs_f64(),
+            j.requests,
+            j.refused,
+            j.broken,
+            j.longest.as_secs_f64() * 1e3
+        );
+    }
+    let verdict = worst <= Duration::from_millis(bound_ms) && failed_all == 0;
+    text += &format!(
+        "\nlongest {:.1} ms, connections refused {failed_all}: {}\n",
+        worst.as_secs_f64() * 1e3,
+        if verdict { "accepted" } else { "NOT accepted" }
+    );
+    print!("{text}");
+    let _ = std::fs::write(
+        crate::target_dir().join(format!("kill-watch-{workers}.md")),
+        &text,
+    );
+    let lines = g.run.lines().to_vec();
+    drop(probes);
+    let _ = g.run.send("poweroff -f");
+    let _ = g.run.stop();
+    result?;
+    if lines.iter().any(|l| l.contains("net: device 1 back")) {
+        return Err("a reset of the device was said".to_owned());
+    }
+    if !verdict {
+        return Err(format!(
+            "kill-watch: longest {:.1} ms, {failed_all} failed",
+            worst.as_secs_f64() * 1e3
+        ));
+    }
+    Ok(())
+}
+
 /// `cargo xtask net-bench run|tables`.
 pub fn command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
+        Some("kill-watch") => kill_watch(&args[1..]),
         Some("tables") if args.len() == 2 => {
             let text = tables(Path::new(&args[1]))?;
             print!("{text}");
@@ -4333,6 +4529,29 @@ mod tests {
         );
         assert!(text.contains("| W1 | S4 with L4 | 1000 |"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_watch_judges_the_requests_that_started_in_the_window_after_a_kill() {
+        let ms = Duration::from_millis;
+        let probe = |at: u64, took: Result<u64, &str>| Probe {
+            at: ms(at),
+            took: took.map(ms).map_err(str::to_owned),
+        };
+        let probes = [
+            probe(900, Ok(900)),
+            probe(1000, Ok(40)),
+            probe(1200, Ok(180)),
+            probe(2999, Err("read: timed out")),
+            probe(3000, Ok(5000)),
+        ];
+        let j = judge(&probes, ms(1000), Duration::from_secs(2));
+        assert_eq!(
+            (j.requests, j.refused, j.broken.as_slice(), j.longest),
+            (3, 0, ["read: timed out".to_owned()].as_slice(), ms(180))
+        );
+        let refused = [probe(1500, Err("connect: refused"))];
+        assert_eq!(judge(&refused, ms(1000), Duration::from_secs(2)).refused, 1);
     }
 
     #[test]
