@@ -1,0 +1,1185 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Where a frame goes (note Sh4, table 3.4) and what a consumer may send
+//! (section 4). A frame of the wire, a frame of the stack and a frame a
+//! consumer sent for the shared address (the hairpin, R-2a) all go through
+//! `route`. The keys of the flows: `route` looks the flow up from the side
+//! of the receiver (peer = the frame's source, own port = its destination
+//! port), `check_tx` from the side of the sender (peer = the frame's
+//! destination, own port = its source port). Own address is one, so a
+//! frame from consumer A to a group with member B finds A's flow at the
+//! send check and B's flow at steering: the keys differ in the ports.
+
+use super::tables::{BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, Tables};
+use crate::ports::Proto;
+use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
+use virtio_net::frames::{
+    ETHERNET_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, IPV4_PROTO_ICMP, IPV4_PROTO_TCP,
+    IPV4_PROTO_UDP, packet,
+};
+
+/// Cells of FILL a member needs for a new connection.
+pub const MIN_FILL: u32 = 32;
+const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
+const RSTBIT: u8 = 0x04;
+const ACK: u8 = 0x10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Wire,
+    Stack,
+    Consumer(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// An ARP reply that names our own address as the sender.
+    Forged,
+    /// A frame of the wire whose source is our own address.
+    Spoofed,
+    /// Every member of the group is short of cells.
+    AllFull,
+    /// The flow table has no room for the connection.
+    FlowsFull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Stack,
+    Consumer {
+        consumer: u8,
+        flags: u16,
+    },
+    /// An ARP reply: the stack and a copy to every consumer.
+    ArpAll,
+    Drop(Why),
+}
+
+/// Why a frame of a consumer is refused; the counters are indexed by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    Length,
+    SrcMac,
+    DstMac,
+    ArpKind,
+    ArpSender,
+    ArpRate,
+    Ipv4,
+    Fragment,
+    SrcAddr,
+    DstAddr,
+    Tcp,
+    Udp,
+    Proto,
+    Flows,
+}
+
+impl Reason {
+    pub const COUNT: usize = Reason::Flows as usize + 1;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Send,
+    /// For the shared address: goes through `route` and never to the device.
+    Hairpin,
+    Refuse(Reason),
+}
+
+struct Ip<'a> {
+    proto: u8,
+    src: [u8; 4],
+    dst: [u8; 4],
+    part: &'a [u8],
+    fragment: bool,
+}
+
+fn ipv4(frame: &[u8]) -> Option<Ip<'_>> {
+    let p = packet(frame)?;
+    let ip = &frame[ETHERNET_HEADER..];
+    Some(Ip {
+        proto: p.protocol,
+        src: ip[12..16].try_into().ok()?,
+        dst: ip[16..20].try_into().ok()?,
+        part: &ip[p.header..p.end],
+        fragment: !p.first_fragment,
+    })
+}
+
+fn ports(part: &[u8]) -> (u16, u16) {
+    (
+        u16::from_be_bytes([part[0], part[1]]),
+        u16::from_be_bytes([part[2], part[3]]),
+    )
+}
+
+fn is_arp(frame: &[u8]) -> bool {
+    frame.len() >= ETHERNET_HEADER + 28 && frame[12..14] == ETHERTYPE_ARP
+}
+
+fn arp_oper(frame: &[u8]) -> u16 {
+    u16::from_be_bytes([frame[20], frame[21]])
+}
+
+/// Where a received frame goes.
+pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
+    t.guard.check();
+    if frame.len() >= ETHERNET_HEADER && frame[12..14] == ETHERTYPE_ARP {
+        if is_arp(frame) && arp_oper(frame) == 2 {
+            return if frame[28..32] == t.own.ip {
+                Decision::Drop(Why::Forged)
+            } else {
+                Decision::ArpAll
+            };
+        }
+        return Decision::Stack;
+    }
+    let Some(ip) = ipv4(frame) else {
+        return Decision::Stack;
+    };
+    if ip.fragment || t.own.ip == [0; 4] || ip.dst != t.own.ip {
+        return Decision::Stack;
+    }
+    if from == Source::Wire && ip.src == t.own.ip {
+        return Decision::Drop(Why::Spoofed);
+    }
+    match ip.proto {
+        IPV4_PROTO_ICMP => icmp(t, &ip),
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip),
+        _ => Decision::Stack,
+    }
+}
+
+fn to(consumer: u8, flags: u16) -> Decision {
+    Decision::Consumer { consumer, flags }
+}
+
+/// The owner of the ephemeral block a port-table value marks, when it is there.
+fn block_owner(t: &Tables, mark: u8) -> Option<u8> {
+    let c = mark.checked_sub(BLOCK_MARK)?;
+    t.consumers
+        .get(usize::from(c))
+        .and_then(Option::as_ref)
+        .filter(|x| !x.ring.is_broken())?;
+    Some(c)
+}
+
+enum Pick {
+    NoLive,
+    Full,
+    One(u8, u8),
+}
+
+/// A member of group `number` by `hash`, among the live ones with at least
+/// `min_fill` cells (and room for a flow when `flows` asks for one).
+fn pick(t: &Tables, number: u8, hash: u64, min_fill: u32, flows: bool) -> Pick {
+    let Some(g) = t.group(number) else {
+        return Pick::NoLive;
+    };
+    let limit = (t.flows.capacity() / 2) as u32;
+    let live = |m: &&(u8, u8)| t.live(m.0, m.1);
+    let fits = |m: &&(u8, u8)| {
+        let c = t.consumers[usize::from(m.0)].as_ref().expect("live");
+        c.ring.fill_avail() >= min_fill && !(flows && c.flows >= limit)
+    };
+    let n = g.members.iter().flatten().filter(live).filter(fits).count();
+    if n == 0 {
+        return if g.members.iter().flatten().any(|m| live(&m)) {
+            Pick::Full
+        } else {
+            Pick::NoLive
+        };
+    }
+    let m = g
+        .members
+        .iter()
+        .flatten()
+        .filter(live)
+        .filter(fits)
+        .nth((hash % n as u64) as usize);
+    m.map_or(Pick::NoLive, |m| Pick::One(m.0, m.1))
+}
+
+fn udp(t: &mut Tables, ip: &Ip) -> Decision {
+    let (sport, dport) = ports(ip.part);
+    if dport == 68 {
+        return Decision::Stack;
+    }
+    let mark = t.port(Proto::Udp, dport);
+    if let Some(c) = block_owner(t, mark) {
+        return to(c, 0);
+    }
+    let key = FlowKey {
+        peer: ip.src,
+        peer_port: sport,
+        own_port: dport,
+    };
+    match pick(t, mark, t.flows.hash(&key), 0, false) {
+        Pick::One(c, _) => to(c, 0),
+        _ => Decision::Stack,
+    }
+}
+
+fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
+    let (sport, dport) = ports(ip.part);
+    let flags = ip.part[13];
+    let syn = flags & (SYN | ACK) == SYN;
+    let mark = t.port(Proto::Tcp, dport);
+    let group = (1..=MAX_GROUPS as u8).contains(&mark);
+    if !group && block_owner(t, mark).is_none() {
+        return Decision::Stack;
+    }
+    let key = FlowKey {
+        peer: ip.src,
+        peer_port: sport,
+        own_port: dport,
+    };
+    let found = t.flows.find(&key);
+    if let Some(i) = found {
+        let f = *t.flows.get(i);
+        if t.live(f.consumer, f.generation) && !(f.closing() && syn) {
+            note(t, i, flags, FIN_IN);
+            return to(f.consumer, 0);
+        }
+    }
+    if !group || !syn {
+        return Decision::Stack;
+    }
+    let (c, generation) = match pick(t, mark, t.flows.hash(&key), MIN_FILL, true) {
+        Pick::NoLive => return Decision::Stack,
+        Pick::Full => return Decision::Drop(Why::AllFull),
+        Pick::One(c, g) => (c, g),
+    };
+    let now = t.now;
+    match found {
+        Some(i) => t.flows.reassign(i, c, generation, now),
+        None if t.flows.insert(&key, c, generation, now).is_none() => {
+            return Decision::Drop(Why::FlowsFull);
+        }
+        None => {}
+    }
+    if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+        x.flows += 1;
+    }
+    to(c, 0)
+}
+
+/// The time and the marks of a segment that belongs to flow `i`.
+fn note(t: &mut Tables, i: usize, flags: u8, fin: u16) {
+    let now = t.now;
+    let f = t.flows.get(i);
+    f.seen = now;
+    if flags & RSTBIT != 0 {
+        f.flags |= RST;
+    }
+    if flags & FIN != 0 {
+        f.flags |= fin;
+    }
+}
+
+/// An ICMP error goes to the owner of the flow or port the header it carries names.
+fn icmp(t: &mut Tables, ip: &Ip) -> Decision {
+    let part = ip.part;
+    if part.len() < 8 + 20 + 8 || !matches!(part[0], 3 | 11) {
+        return Decision::Stack;
+    }
+    let inner = &part[8..];
+    let ihl = usize::from(inner[0] & 15) * 4;
+    if inner[0] >> 4 != 4 || ihl < 20 || inner.len() < ihl + 8 || inner[12..16] != t.own.ip {
+        return Decision::Stack;
+    }
+    let (sport, dport) = ports(&inner[ihl..]);
+    let key = FlowKey {
+        peer: inner[16..20].try_into().expect("4 bytes"),
+        peer_port: dport,
+        own_port: sport,
+    };
+    match inner[9] {
+        IPV4_PROTO_TCP => match t.flows.find(&key) {
+            Some(i) => {
+                let f = *t.flows.get(i);
+                if t.live(f.consumer, f.generation) {
+                    to(f.consumer, DONE_ICMP_ERROR)
+                } else {
+                    Decision::Stack
+                }
+            }
+            None => Decision::Stack,
+        },
+        IPV4_PROTO_UDP => {
+            let mark = t.port(Proto::Udp, sport);
+            if let Some(c) = block_owner(t, mark) {
+                return to(c, DONE_ICMP_ERROR);
+            }
+            match pick(t, mark, t.flows.hash(&key), 0, false) {
+                Pick::One(c, _) => to(c, DONE_ICMP_ERROR),
+                _ => Decision::Stack,
+            }
+        }
+        _ => Decision::Stack,
+    }
+}
+
+/// Carries out a decision on the consumers: the frame goes into the rings
+/// it is for. True when the stack wants it too.
+pub fn deliver(t: &mut Tables, d: Decision, frame: &[u8]) -> bool {
+    match d {
+        Decision::Consumer { consumer, flags } => {
+            if let Some(c) = t.consumers[usize::from(consumer)].as_mut() {
+                c.ring.deliver(frame, flags);
+            }
+            false
+        }
+        Decision::ArpAll => {
+            for c in t
+                .consumers
+                .iter_mut()
+                .flatten()
+                .filter(|c| !c.ring.is_broken())
+            {
+                c.ring.deliver(frame, DONE_ARP_COPY);
+            }
+            true
+        }
+        Decision::Stack => true,
+        Decision::Drop(_) => false,
+    }
+}
+
+fn refuse(r: Reason) -> Verdict {
+    Verdict::Refuse(r)
+}
+
+/// Whether a consumer may send `frame` (a copy in the switch's buffer).
+pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    t.guard.check();
+    let v = verdict(t, c, frame);
+    if let Verdict::Refuse(r) = v {
+        t.refused[r as usize] += 1;
+        if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+            x.ring.refused = x.ring.refused.wrapping_add(1);
+        }
+    }
+    v
+}
+
+fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    if !(ETHERNET_HEADER..=FRAME_MAX).contains(&frame.len()) {
+        return refuse(Reason::Length);
+    }
+    if frame[6..12] != t.own.mac {
+        return refuse(Reason::SrcMac);
+    }
+    let broadcast = frame[..6] == [0xff; 6];
+    if frame[0] & 1 != 0 && !broadcast {
+        return refuse(Reason::DstMac);
+    }
+    if frame[12..14] == ETHERTYPE_ARP {
+        return arp_tx(t, c, frame);
+    }
+    if frame[12..14] != ETHERTYPE_IPV4 || broadcast {
+        return refuse(if broadcast {
+            Reason::DstMac
+        } else {
+            Reason::Proto
+        });
+    }
+    let Some(ip) = ipv4(frame) else {
+        return refuse(Reason::Ipv4);
+    };
+    if ip.fragment {
+        return refuse(Reason::Fragment);
+    }
+    if ip.src != t.own.ip {
+        return refuse(Reason::SrcAddr);
+    }
+    if ip.dst != t.own.ip && !unicast_elsewhere(t, ip.dst) {
+        return refuse(Reason::DstAddr);
+    }
+    let ok = match ip.proto {
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp_tx(t, c, &ip),
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp_tx(t, c, &ip),
+        IPV4_PROTO_TCP | IPV4_PROTO_UDP => Err(Reason::Ipv4),
+        _ => Err(Reason::Proto),
+    };
+    match ok {
+        Ok(()) if ip.dst == t.own.ip => Verdict::Hairpin,
+        Ok(()) => Verdict::Send,
+        Err(r) => refuse(r),
+    }
+}
+
+/// A destination that is no broadcast, multicast, loopback or "this host".
+fn unicast_elsewhere(t: &Tables, dst: [u8; 4]) -> bool {
+    let d = u32::from_be_bytes(dst);
+    let mask = u32::MAX
+        .checked_shl(32 - u32::from(t.own.prefix))
+        .unwrap_or(0);
+    let directed = t.own.prefix < 31 && d == u32::from_be_bytes(t.own.ip) | !mask;
+    !(dst[0] == 0 || dst[0] == 127 || dst[0] >= 224 || directed)
+}
+
+fn arp_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    if !is_arp(frame) || frame[14..20] != [0, 1, 8, 0, 6, 4] || arp_oper(frame) != 1 {
+        return refuse(Reason::ArpKind);
+    }
+    if frame[22..28] != t.own.mac || frame[28..32] != t.own.ip {
+        return refuse(Reason::ArpSender);
+    }
+    let now = t.now;
+    match t.consumers[usize::from(c)].as_mut() {
+        Some(x) => {
+            if x.arp_allowed(now) {
+                Verdict::Send
+            } else {
+                refuse(Reason::ArpRate)
+            }
+        }
+        None => refuse(Reason::ArpRate),
+    }
+}
+
+fn tcp_tx(t: &mut Tables, c: u8, ip: &Ip) -> Result<(), Reason> {
+    let (sport, dport) = ports(ip.part);
+    let flags = ip.part[13];
+    let syn = flags & (SYN | ACK) == SYN;
+    let Some(me) = t.consumers[usize::from(c)].as_ref() else {
+        return Err(Reason::Tcp);
+    };
+    let (generation, in_block, owned) = (me.generation, me.in_block(sport), me.flows);
+    let key = FlowKey {
+        peer: ip.dst,
+        peer_port: dport,
+        own_port: sport,
+    };
+    let now = t.now;
+    if let Some(i) = t.flows.find(&key) {
+        let f = *t.flows.get(i);
+        let mine = f.consumer == c && f.generation == generation;
+        if mine && !(f.closing() && syn) {
+            note(t, i, flags, FIN_OUT);
+            return Ok(());
+        }
+        let free = mine || !t.live(f.consumer, f.generation);
+        if !(syn && in_block && free) {
+            return Err(Reason::Tcp);
+        }
+        t.flows.reassign(i, c, generation, now);
+        if !mine {
+            t.consumers[usize::from(c)].as_mut().expect("there").flows += 1;
+        }
+        return Ok(());
+    }
+    if !(syn && in_block) {
+        return Err(Reason::Tcp);
+    }
+    if owned >= (t.flows.capacity() / 2) as u32
+        || t.flows.insert(&key, c, generation, now).is_none()
+    {
+        return Err(Reason::Flows);
+    }
+    t.consumers[usize::from(c)].as_mut().expect("there").flows += 1;
+    Ok(())
+}
+
+fn udp_tx(t: &mut Tables, c: u8, ip: &Ip) -> Result<(), Reason> {
+    let sport = ports(ip.part).0;
+    let mark = t.port(Proto::Udp, sport);
+    let member = t.group(mark).is_some_and(|g| {
+        g.proto == Proto::Udp
+            && g.members
+                .iter()
+                .flatten()
+                .any(|m| m.0 == c && t.live(m.0, m.1))
+    });
+    if member || mark == BLOCK_MARK + c {
+        Ok(())
+    } else {
+        Err(Reason::Udp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::switchlogic::ring::tests::Rig;
+    use crate::switchlogic::tables::tests::{OWN, with, with_flows};
+    use proto_net::switch as sw;
+
+    const PEER: [u8; 4] = [203, 0, 113, 9];
+    const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 9];
+    const OWN_IP: [u8; 4] = OWN.ip;
+
+    fn ip_frame(
+        src: ([u8; 6], [u8; 4]),
+        dst: ([u8; 6], [u8; 4]),
+        proto: u8,
+        part: &[u8],
+    ) -> Vec<u8> {
+        let mut f = [dst.0.as_slice(), &src.0, &[8, 0]].concat();
+        let total = (20 + part.len()) as u16;
+        f.extend([
+            0x45,
+            0,
+            (total >> 8) as u8,
+            total as u8,
+            0,
+            0,
+            0x40,
+            0,
+            64,
+            proto,
+            0,
+            0,
+        ]);
+        f.extend([src.1, dst.1].concat());
+        f.extend(part);
+        f
+    }
+
+    fn tcp_part(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        let mut p = [sport.to_be_bytes(), dport.to_be_bytes()].concat();
+        p.extend([0; 9]);
+        p.extend([flags, 0, 0, 0, 0, 0, 0]);
+        p
+    }
+
+    fn udp_part(sport: u16, dport: u16) -> Vec<u8> {
+        [
+            &sport.to_be_bytes()[..],
+            &dport.to_be_bytes(),
+            &[0, 12, 0, 0],
+            &[1, 2, 3, 4],
+        ]
+        .concat()
+    }
+
+    const ME: ([u8; 6], [u8; 4]) = (OWN.mac, OWN_IP);
+    const THEM: ([u8; 6], [u8; 4]) = (PEER_MAC, PEER);
+
+    fn wire_tcp(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        ip_frame(THEM, ME, 6, &tcp_part(sport, dport, flags))
+    }
+    fn wire_udp(sport: u16, dport: u16) -> Vec<u8> {
+        ip_frame(THEM, ME, 17, &udp_part(sport, dport))
+    }
+    fn out_tcp(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        ip_frame(ME, THEM, 6, &tcp_part(sport, dport, flags))
+    }
+    fn out_udp(sport: u16, dport: u16) -> Vec<u8> {
+        ip_frame(ME, THEM, 17, &udp_part(sport, dport))
+    }
+    fn hair_tcp(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        ip_frame(ME, ME, 6, &tcp_part(sport, dport, flags))
+    }
+    fn arp(oper: u8, sender_mac: [u8; 6], sender_ip: [u8; 4]) -> Vec<u8> {
+        let mut f = [
+            &[0xff; 6][..],
+            &sender_mac,
+            &[8, 6],
+            &[0, 1, 8, 0, 6, 4, 0, oper],
+        ]
+        .concat();
+        f.extend([sender_mac.as_slice(), &sender_ip, &[0; 6], &[10, 0, 2, 99]].concat());
+        f
+    }
+    fn icmp_error(
+        kind: u8,
+        proto: u8,
+        inner_src: [u8; 4],
+        inner_dst: [u8; 4],
+        sp: u16,
+        dp: u16,
+    ) -> Vec<u8> {
+        let inner = ip_frame(
+            ME,
+            THEM,
+            proto,
+            &[&sp.to_be_bytes()[..], &dp.to_be_bytes(), &[0; 4]].concat(),
+        );
+        let mut inner = inner[14..].to_vec();
+        inner[12..16].copy_from_slice(&inner_src);
+        inner[16..20].copy_from_slice(&inner_dst);
+        ip_frame(
+            THEM,
+            ME,
+            1,
+            &[&[kind, 1, 0, 0, 0, 0, 0, 0], inner.as_slice()].concat(),
+        )
+    }
+
+    const SYN: u8 = 2;
+    const SYN_ACK: u8 = 0x12;
+    const ACK_: u8 = 0x10;
+    const BLOCK0: u16 = 49152;
+    const BLOCK2: u16 = 50176;
+
+    fn who(d: Decision) -> u8 {
+        match d {
+            Decision::Consumer { consumer, .. } => consumer,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ----- table 3.4, one test for a row -----
+
+    #[test]
+    fn arp_request_goes_to_the_stack() {
+        with(|t, _| {
+            assert_eq!(
+                route(t, &arp(1, PEER_MAC, PEER), Source::Wire),
+                Decision::Stack
+            );
+        });
+    }
+
+    #[test]
+    fn arp_reply_goes_to_the_stack_and_a_copy_to_every_consumer() {
+        with(|t, rigs| {
+            let f = arp(2, PEER_MAC, PEER);
+            let d = route(t, &f, Source::Wire);
+            assert_eq!(d, Decision::ArpAll);
+            assert!(deliver(t, d, &f), "the stack takes it too");
+            for rig in rigs {
+                let (done, bytes) = rig.done(0);
+                assert_eq!((done.flags, bytes), (sw::DONE_ARP_COPY, f.clone()));
+            }
+            // A forgery with our own address as the sender is dropped.
+            assert_eq!(
+                route(t, &arp(2, PEER_MAC, OWN_IP), Source::Wire),
+                Decision::Drop(Why::Forged)
+            );
+        });
+    }
+
+    #[test]
+    fn what_is_not_for_the_shared_address_goes_to_the_stack() {
+        with(|t, _| {
+            let to_peer = ip_frame(THEM, THEM, 6, &tcp_part(1, 8080, SYN));
+            let dhcp = ip_frame(THEM, ([0xff; 6], [255; 4]), 17, &udp_part(67, 68));
+            let mut fragment = wire_tcp(1, 8080, SYN);
+            fragment[14 + 6] = 0x20;
+            let mut bad = wire_tcp(1, 8080, SYN);
+            bad[14] = 0x65;
+            for f in [
+                to_peer,
+                dhcp,
+                fragment,
+                bad,
+                wire_tcp(1, 8080, SYN)[..30].to_vec(),
+            ] {
+                assert_eq!(route(t, &f, Source::Wire), Decision::Stack);
+            }
+            assert!(t.flows.is_empty());
+            let spoofed = ip_frame(ME, ME, 6, &tcp_part(1, 8080, SYN));
+            assert_eq!(
+                route(t, &spoofed, Source::Wire),
+                Decision::Drop(Why::Spoofed)
+            );
+        });
+    }
+
+    #[test]
+    fn icmp_echo_and_errors_without_a_flow_go_to_the_stack() {
+        with(|t, _| {
+            let echo = ip_frame(THEM, ME, 1, &[8, 0, 0, 0, 0, 1, 0, 1]);
+            assert_eq!(route(t, &echo, Source::Wire), Decision::Stack);
+            let unknown = icmp_error(3, 6, OWN_IP, PEER, BLOCK0, 80);
+            assert_eq!(route(t, &unknown, Source::Wire), Decision::Stack);
+            let foreign_src = icmp_error(3, 6, PEER, OWN_IP, BLOCK0, 80);
+            assert_eq!(route(t, &foreign_src, Source::Wire), Decision::Stack);
+        });
+    }
+
+    #[test]
+    fn an_icmp_error_goes_to_the_owner_of_the_embedded_flow() {
+        with(|t, rigs| {
+            assert_eq!(check_tx(t, 2, &out_tcp(BLOCK2, 80, SYN)), Verdict::Send);
+            for kind in [3, 11] {
+                let f = icmp_error(kind, 6, OWN_IP, PEER, BLOCK2, 80);
+                let d = route(t, &f, Source::Wire);
+                assert_eq!(
+                    d,
+                    Decision::Consumer {
+                        consumer: 2,
+                        flags: sw::DONE_ICMP_ERROR
+                    }
+                );
+                deliver(t, d, &f);
+            }
+            assert_eq!(rigs[2].done(1).0.flags, sw::DONE_ICMP_ERROR);
+            // UDP: by the port of the sender, a block or a group.
+            let blocked = icmp_error(3, 17, OWN_IP, PEER, BLOCK2 + 7, 53);
+            assert_eq!(who(route(t, &blocked, Source::Wire)), 2);
+            let grouped = icmp_error(3, 17, OWN_IP, PEER, 5353, 53);
+            assert!(who(route(t, &grouped, Source::Wire)) < 2);
+        });
+    }
+
+    #[test]
+    fn udp_goes_to_a_member_by_hash_without_a_flow_and_else_to_the_stack() {
+        with(|t, _| {
+            assert_eq!(route(t, &wire_udp(67, 68), Source::Wire), Decision::Stack);
+            assert_eq!(
+                route(t, &wire_udp(1000, 9999), Source::Wire),
+                Decision::Stack
+            );
+            let mut seen = [0; 2];
+            for sport in 1000..1200 {
+                seen[usize::from(who(route(t, &wire_udp(sport, 5353), Source::Wire)))] += 1;
+            }
+            assert!(seen[0] > 40 && seen[1] > 40, "{seen:?}");
+            let again = route(t, &wire_udp(1000, 5353), Source::Wire);
+            assert_eq!(again, route(t, &wire_udp(1000, 5353), Source::Wire));
+            assert!(t.flows.is_empty());
+            assert_eq!(who(route(t, &wire_udp(53, BLOCK2 + 3), Source::Wire)), 2);
+        });
+    }
+
+    #[test]
+    fn tcp_without_a_group_goes_to_the_stack() {
+        with(|t, _| {
+            for flags in [SYN, ACK_] {
+                assert_eq!(
+                    route(t, &wire_tcp(1000, 22, flags), Source::Wire),
+                    Decision::Stack
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_syn_to_a_group_takes_a_member_by_hash_and_makes_the_flow() {
+        with(|t, _| {
+            let mut seen = [0; 2];
+            for sport in 1000..1100 {
+                let c = who(route(t, &wire_tcp(sport, 8080, SYN), Source::Wire));
+                seen[usize::from(c)] += 1;
+            }
+            assert!(seen[0] > 20 && seen[1] > 20, "{seen:?}");
+            assert_eq!(t.flows.len(), 100);
+            assert_eq!(
+                t.consumers[0].as_ref().unwrap().flows + t.consumers[1].as_ref().unwrap().flows,
+                100
+            );
+        });
+    }
+
+    #[test]
+    fn segments_follow_their_flow_and_a_non_syn_without_one_goes_to_the_stack() {
+        with(|t, _| {
+            let first = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            for flags in [ACK_, 0x18, 0x11] {
+                assert_eq!(
+                    who(route(t, &wire_tcp(1234, 8080, flags), Source::Wire)),
+                    first
+                );
+            }
+            assert_eq!(
+                route(t, &wire_tcp(1235, 8080, ACK_), Source::Wire),
+                Decision::Stack
+            );
+            assert_eq!(t.flows.len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_syn_skips_members_short_of_cells_and_waits_for_none_when_all_are() {
+        with(|t, rigs| {
+            for _ in 0..40 {
+                t.consumers[0].as_mut().unwrap().ring.deliver(b"x", 0);
+            }
+            assert!(t.consumers[0].as_ref().unwrap().ring.fill_avail() < MIN_FILL);
+            for sport in 1000..1050 {
+                assert_eq!(who(route(t, &wire_tcp(sport, 8080, SYN), Source::Wire)), 1);
+            }
+            // An old flow of the short member still gets its segments.
+            for _ in 0..40 {
+                t.consumers[1].as_mut().unwrap().ring.deliver(b"x", 0);
+            }
+            assert_eq!(
+                route(t, &wire_tcp(5000, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::AllFull)
+            );
+            rigs[1].fill(&[1; 40]);
+            t.poll_rings(|_, _| {});
+            assert_eq!(who(route(t, &wire_tcp(5000, 8080, SYN), Source::Wire)), 1);
+        });
+    }
+
+    #[test]
+    fn a_group_without_live_members_leaves_the_syn_to_the_stack() {
+        with(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            assert_eq!(
+                route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
+                Decision::Stack
+            );
+            t.join(1, 0);
+            t.detach(0);
+            assert_eq!(
+                route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
+                Decision::Stack
+            );
+        });
+    }
+
+    #[test]
+    fn a_dead_flow_is_replaced_by_the_next_syn_and_a_stale_one_gets_no_segments() {
+        with(|t, rigs| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let other = 1 - c;
+            // The member goes and comes back with a new generation: the old flow is dead.
+            t.detach(c);
+            assert!(t.attach(
+                c,
+                2,
+                rigs[usize::from(c)].ring(),
+                49152 + 512 * u16::from(c)
+            ));
+            assert_eq!(
+                route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire),
+                Decision::Stack
+            );
+            t.join(1, c);
+            rigs[usize::from(c)].fill(&[0; 40]);
+            t.poll_rings(|_, _| {});
+            let d = route(t, &wire_tcp(1234, 8080, SYN), Source::Wire);
+            assert!(who(d) == c || who(d) == other);
+            assert_eq!(
+                who(route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire)),
+                who(d)
+            );
+            assert_eq!(t.flows.len(), 1, "the entry is reused");
+        });
+    }
+
+    #[test]
+    fn tcp_on_a_block_port_follows_the_flow_or_goes_to_the_stack() {
+        with(|t, _| {
+            assert_eq!(
+                route(t, &wire_tcp(80, BLOCK2 + 9, SYN_ACK), Source::Wire),
+                Decision::Stack
+            );
+            assert_eq!(check_tx(t, 2, &out_tcp(BLOCK2 + 9, 80, SYN)), Verdict::Send);
+            assert_eq!(
+                who(route(t, &wire_tcp(80, BLOCK2 + 9, SYN_ACK), Source::Wire)),
+                2
+            );
+            assert_eq!(
+                route(t, &wire_tcp(81, BLOCK2 + 9, SYN_ACK), Source::Wire),
+                Decision::Stack
+            );
+        });
+    }
+
+    #[test]
+    fn rst_and_fin_from_both_sides_close_the_flow_and_a_syn_reuses_it() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let i = t
+                .flows
+                .find(&FlowKey {
+                    peer: PEER,
+                    peer_port: 1234,
+                    own_port: 8080,
+                })
+                .unwrap();
+            route(t, &wire_tcp(1234, 8080, 0x11), Source::Wire);
+            assert!(!t.flows.get(i).closing());
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x11)), Verdict::Send);
+            assert!(t.flows.get(i).closing());
+            assert!(who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire)) < 2);
+            assert!(!t.flows.get(i).closing(), "a SYN starts the flow again");
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            assert!(t.flows.get(i).closing());
+        });
+    }
+
+    #[test]
+    fn a_consumer_holds_at_most_half_of_the_flows_and_a_full_table_drops_the_syn() {
+        with_flows(64, |t, _| {
+            assert_eq!(t.flows.capacity(), 32);
+            let mut sent = 0;
+            for sport in 0..40 {
+                if check_tx(t, 2, &out_tcp(BLOCK2 + sport, 80, SYN)) == Verdict::Send {
+                    sent += 1;
+                }
+            }
+            assert_eq!(sent, 16);
+            assert_eq!(t.refused[Reason::Flows as usize], 24);
+            let mut taken = 0;
+            for sport in 0..40 {
+                taken += u32::from(matches!(
+                    route(t, &wire_tcp(sport, 8080, SYN), Source::Wire),
+                    Decision::Consumer { .. }
+                ));
+            }
+            assert!(
+                taken > 0 && taken <= 16,
+                "a member at its limit gets no new SYN: {taken}"
+            );
+        });
+    }
+
+    // ----- the send check, one test for a rule -----
+
+    fn refused(t: &mut Tables, c: u8, f: &[u8]) -> Reason {
+        match check_tx(t, c, f) {
+            Verdict::Refuse(r) => r,
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_1_length_and_ethernet() {
+        with(|t, _| {
+            let good = out_udp(BLOCK0, 53);
+            assert_eq!(check_tx(t, 0, &good), Verdict::Send);
+            assert_eq!(refused(t, 0, &good[..13]), Reason::Length);
+            assert_eq!(
+                refused(t, 0, &[good.clone(), vec![0; 1500]].concat()),
+                Reason::Length
+            );
+            let mut mac = good.clone();
+            mac[6] ^= 1;
+            assert_eq!(refused(t, 0, &mac), Reason::SrcMac);
+            let mut multi = good.clone();
+            multi[0] = 1;
+            assert_eq!(refused(t, 0, &multi), Reason::DstMac);
+            let mut broadcast = good;
+            broadcast[..6].fill(0xff);
+            assert_eq!(refused(t, 0, &broadcast), Reason::DstMac);
+            assert_eq!(t.consumers[0].as_ref().unwrap().ring.refused, 5);
+        });
+    }
+
+    #[test]
+    fn rule_2_arp_is_a_request_from_the_shared_mac_and_address_ten_a_second() {
+        with(|t, _| {
+            t.now = 5;
+            assert_eq!(check_tx(t, 0, &arp(1, OWN.mac, OWN_IP)), Verdict::Send);
+            assert_eq!(refused(t, 0, &arp(2, OWN.mac, OWN_IP)), Reason::ArpKind);
+            assert_eq!(
+                refused(t, 0, &arp(1, OWN.mac, [10, 0, 2, 77])),
+                Reason::ArpSender
+            );
+            let mut other_mac = arp(1, OWN.mac, OWN_IP);
+            other_mac[22] ^= 1;
+            assert_eq!(refused(t, 0, &other_mac), Reason::ArpSender);
+            for _ in 0..9 {
+                assert_eq!(check_tx(t, 0, &arp(1, OWN.mac, OWN_IP)), Verdict::Send);
+            }
+            assert_eq!(refused(t, 0, &arp(1, OWN.mac, OWN_IP)), Reason::ArpRate);
+            assert_eq!(
+                check_tx(t, 1, &arp(1, OWN.mac, OWN_IP)),
+                Verdict::Send,
+                "per consumer"
+            );
+            t.now = 6;
+            assert_eq!(check_tx(t, 0, &arp(1, OWN.mac, OWN_IP)), Verdict::Send);
+        });
+    }
+
+    #[test]
+    fn rule_3_ipv4_header_addresses_and_fragments() {
+        with(|t, _| {
+            let good = out_udp(BLOCK0, 53);
+            let mut v6 = good.clone();
+            v6[14] = 0x65;
+            assert_eq!(refused(t, 0, &v6), Reason::Ipv4);
+            let mut short = good.clone();
+            short[14 + 3] = 200;
+            assert_eq!(refused(t, 0, &short), Reason::Ipv4);
+            let mut frag = good.clone();
+            frag[14 + 6] = 0x20;
+            assert_eq!(refused(t, 0, &frag), Reason::Fragment);
+            let mut offset = good.clone();
+            offset[14 + 7] = 8;
+            assert_eq!(refused(t, 0, &offset), Reason::Fragment);
+            let mut spoof = good.clone();
+            spoof[14 + 12] = 9;
+            assert_eq!(refused(t, 0, &spoof), Reason::SrcAddr);
+            for dst in [
+                [255; 4],
+                [10, 0, 2, 255],
+                [224, 0, 0, 1],
+                [127, 0, 0, 1],
+                [0; 4],
+            ] {
+                let mut f = good.clone();
+                f[14 + 16..14 + 20].copy_from_slice(&dst);
+                assert_eq!(refused(t, 0, &f), Reason::DstAddr, "{dst:?}");
+            }
+            let mut dont_fragment = good;
+            dont_fragment[14 + 6] = 0x40;
+            assert_eq!(check_tx(t, 0, &dont_fragment), Verdict::Send);
+        });
+    }
+
+    #[test]
+    fn rule_3_the_shared_address_as_destination_is_a_hairpin() {
+        with(|t, _| {
+            assert_eq!(
+                check_tx(t, 0, &hair_tcp(BLOCK0, 9000, SYN)),
+                Verdict::Hairpin
+            );
+            let udp = ip_frame(ME, ME, 17, &udp_part(BLOCK0, 53));
+            assert_eq!(check_tx(t, 0, &udp), Verdict::Hairpin);
+        });
+    }
+
+    #[test]
+    fn rule_4_tcp_needs_an_owned_flow_or_a_syn_from_the_block() {
+        with(|t, _| {
+            // A SYN from the block makes the flow; its segments follow.
+            assert_eq!(check_tx(t, 2, &out_tcp(BLOCK2, 80, SYN)), Verdict::Send);
+            assert_eq!(check_tx(t, 2, &out_tcp(BLOCK2, 80, ACK_)), Verdict::Send);
+            assert_eq!(
+                check_tx(t, 2, &out_tcp(BLOCK2, 80, 0x04)),
+                Verdict::Send,
+                "its own RST"
+            );
+            // The other consumers cannot use the four, with a RST or without.
+            assert_eq!(refused(t, 1, &out_tcp(BLOCK2, 80, ACK_)), Reason::Tcp);
+            assert_eq!(refused(t, 1, &out_tcp(BLOCK2, 80, 0x04)), Reason::Tcp);
+            assert_eq!(
+                refused(t, 1, &out_tcp(BLOCK2, 80, SYN)),
+                Reason::Tcp,
+                "not from its block"
+            );
+            // An unknown four, a SYN|ACK, a SYN from outside the block.
+            assert_eq!(refused(t, 2, &out_tcp(BLOCK2, 81, ACK_)), Reason::Tcp);
+            assert_eq!(refused(t, 2, &out_tcp(BLOCK2, 81, SYN_ACK)), Reason::Tcp);
+            assert_eq!(refused(t, 2, &out_tcp(8080, 81, SYN)), Reason::Tcp);
+            // A member answers on the flow the switch made for it.
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, SYN_ACK)), Verdict::Send);
+            assert_eq!(refused(t, 1 - c, &out_tcp(8080, 1234, ACK_)), Reason::Tcp);
+            // A new generation does not inherit the flow.
+            t.detach(c);
+            let rig = Rig::new(sw::Layout::new(256, 64).unwrap());
+            t.attach(c, 2, rig.ring(), 49152 + 512 * u16::from(c));
+            assert_eq!(refused(t, c, &out_tcp(8080, 1234, ACK_)), Reason::Tcp);
+        });
+    }
+
+    #[test]
+    fn rule_5_udp_comes_from_a_group_of_the_member_or_its_block() {
+        with(|t, _| {
+            assert_eq!(check_tx(t, 0, &out_udp(5353, 9)), Verdict::Send);
+            assert_eq!(check_tx(t, 1, &out_udp(5353, 9)), Verdict::Send);
+            assert_eq!(
+                refused(t, 2, &out_udp(5353, 9)),
+                Reason::Udp,
+                "not a member"
+            );
+            assert_eq!(check_tx(t, 2, &out_udp(BLOCK2 + 100, 9)), Verdict::Send);
+            assert_eq!(
+                refused(t, 0, &out_udp(BLOCK2 + 100, 9)),
+                Reason::Udp,
+                "another's block"
+            );
+            assert_eq!(refused(t, 0, &out_udp(9000, 9)), Reason::Udp);
+            assert_eq!(
+                refused(t, 0, &out_udp(8080, 9)),
+                Reason::Udp,
+                "a TCP group's port"
+            );
+        });
+    }
+
+    #[test]
+    fn rule_6_everything_else_is_refused_and_counted() {
+        with(|t, _| {
+            let echo = ip_frame(ME, THEM, 1, &[8, 0, 0, 0, 0, 1, 0, 1]);
+            assert_eq!(refused(t, 0, &echo), Reason::Proto);
+            let ipv6 = [vec![0; 6], OWN.mac.to_vec(), vec![0x86, 0xdd], vec![0; 40]].concat();
+            assert_eq!(refused(t, 0, &ipv6), Reason::Proto);
+            assert_eq!(t.refused[Reason::Proto as usize], 2);
+            assert_eq!(refused(t, 0, &out_udp(1, 1)), Reason::Udp);
+        });
+    }
+
+    // ----- the hairpin of R-2a: four directions -----
+
+    #[test]
+    fn hairpin_a_program_of_the_guest_to_a_member() {
+        with(|t, _| {
+            let d = route(t, &hair_tcp(50000, 8080, SYN), Source::Stack);
+            let b = who(d);
+            let key = FlowKey {
+                peer: OWN_IP,
+                peer_port: 50000,
+                own_port: 8080,
+            };
+            let f = *t.flows.get(t.flows.find(&key).unwrap());
+            assert_eq!(f.consumer, b);
+            // The member's answer goes back through the switch to the stack.
+            assert_eq!(
+                check_tx(t, b, &hair_tcp(8080, 50000, SYN_ACK)),
+                Verdict::Hairpin
+            );
+            assert_eq!(
+                route(t, &hair_tcp(8080, 50000, SYN_ACK), Source::Consumer(b)),
+                Decision::Stack
+            );
+        });
+    }
+
+    #[test]
+    fn hairpin_a_member_to_a_service_on_a_socket_of_the_stack() {
+        with(|t, _| {
+            let syn = hair_tcp(BLOCK0 + 5, 9000, SYN);
+            assert_eq!(check_tx(t, 0, &syn), Verdict::Hairpin);
+            assert_eq!(route(t, &syn, Source::Consumer(0)), Decision::Stack);
+            // The service's reply comes from the stack to the consumer's block port.
+            let reply = hair_tcp(9000, BLOCK0 + 5, SYN_ACK);
+            assert_eq!(who(route(t, &reply, Source::Stack)), 0);
+        });
+    }
+
+    #[test]
+    fn hairpin_a_consumer_to_a_group_with_a_member_b_uses_two_keys() {
+        with(|t, _| {
+            let syn = hair_tcp(BLOCK2, 8080, SYN);
+            assert_eq!(check_tx(t, 2, &syn), Verdict::Hairpin);
+            let b = who(route(t, &syn, Source::Consumer(2)));
+            assert!(b < 2);
+            assert_eq!(t.flows.len(), 2, "one flow of A and one of B");
+            let a_key = FlowKey {
+                peer: OWN_IP,
+                peer_port: 8080,
+                own_port: BLOCK2,
+            };
+            let b_key = FlowKey {
+                peer: OWN_IP,
+                peer_port: BLOCK2,
+                own_port: 8080,
+            };
+            assert_eq!(t.flows.get(t.flows.find(&a_key).unwrap()).consumer, 2);
+            assert_eq!(t.flows.get(t.flows.find(&b_key).unwrap()).consumer, b);
+            // B's answer reaches A, and A's next segment reaches B.
+            let answer = hair_tcp(8080, BLOCK2, SYN_ACK);
+            assert_eq!(check_tx(t, b, &answer), Verdict::Hairpin);
+            assert_eq!(who(route(t, &answer, Source::Consumer(b))), 2);
+            let ack = hair_tcp(BLOCK2, 8080, ACK_);
+            assert_eq!(check_tx(t, 2, &ack), Verdict::Hairpin);
+            assert_eq!(who(route(t, &ack, Source::Consumer(2))), b);
+            assert_eq!(t.flows.len(), 2);
+        });
+    }
+
+    #[test]
+    fn hairpin_a_member_to_itself_through_the_group() {
+        with(|t, _| {
+            let syn = hair_tcp(BLOCK0, 8080, SYN);
+            assert_eq!(check_tx(t, 0, &syn), Verdict::Hairpin);
+            assert!(who(route(t, &syn, Source::Consumer(0))) < 2);
+        });
+    }
+}

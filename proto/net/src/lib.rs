@@ -46,6 +46,7 @@
 //! | CANCEL (27) | k (u64) | long: CANCELLED |
 //! | CONFIG (21) | the header alone (device 0), or a device (u32, 0 or 1) | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
 //! | CLAIM (26), CLAIM_MORE (36), KICK (37) | `fast` | `fast` |
+//! | PORT_HOLD (38), ATTACH (39), JOIN (40) | `switch` | `switch` |
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
 //! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address), 3 drops the next frame the stack sends to itself (a test of the timers); only a service built with the feature `probe` has it | status |
 //! | PING_WIRE (31) | as PING; the echo request carries 1 472 bytes, a frame of 1 514; only a service built with the feature `probe` has it | as PING |
@@ -59,6 +60,7 @@
 
 pub mod fast;
 pub mod sockets;
+pub mod switch;
 pub mod text;
 
 use abi::Error;
@@ -107,12 +109,15 @@ pub enum Method {
     CloseTake = 35,
     ClaimMore = 36,
     Kick = 37,
+    PortHold = 38,
+    Attach = 39,
+    Join = 40,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 39] = [
+    pub const ALL: [Method; 42] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -150,6 +155,9 @@ impl Method {
         Method::CloseTake,
         Method::ClaimMore,
         Method::Kick,
+        Method::PortHold,
+        Method::Attach,
+        Method::Join,
         Method::Ping,
         Method::Crash,
     ];
@@ -539,14 +547,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=37).collect();
+        let mut expected: Vec<u16> = (1..=40).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(38), None);
+        assert_eq!(Method::from_number(41), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
