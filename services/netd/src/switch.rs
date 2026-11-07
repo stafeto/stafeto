@@ -403,7 +403,7 @@ pub struct Switch {
     fifo_len: usize,
     inflight: [u16; MAX_CONSUMERS + 1],
     /// What each consumer's DONE index was when the switch last looked at waking it.
-    woken: [u32; MAX_CONSUMERS],
+    woken: netd::books::Woken,
     /// The `switch_idle` flags are set in the rings.
     idle_set: bool,
     /// The longest step so far, in ticks of the thread's own time.
@@ -475,7 +475,7 @@ impl Switch {
             fifo_head: 0,
             fifo_len: 0,
             inflight: [0; MAX_CONSUMERS + 1],
-            woken: [0; MAX_CONSUMERS],
+            woken: netd::books::Woken::new(),
             idle_set: false,
             #[cfg(feature = "steps")]
             longest: 0,
@@ -632,12 +632,20 @@ impl Switch {
             self.tx.book.release(word as u16);
         }
         let mut passed = 0;
+        let mut taken = 0;
         for _ in 0..SWITCH_TX {
             let Some(word) = INNER.tx_sub.pop() else {
                 break;
             };
             let (n, len) = unpack(word);
-            passed += self.stack_frame(n, usize::from(len));
+            let (to_stack, turned) = self.stack_frame(n, usize::from(len));
+            passed += to_stack;
+            // A frame turned into the tables costs a copy and a route as a frame of a consumer
+            // does: past the first few the step goes on only while it is short.
+            taken += usize::from(turned);
+            if turned && !netd::books::may_take(taken, SWITCH_BASE, self.over_soft()) {
+                break;
+            }
         }
         match self.tx.reclaim(RECLAIM_STEP) {
             Ok(count) => self.returned(count),
@@ -766,8 +774,19 @@ impl Switch {
         }
         self.idle_set = true;
         let t = self.tables.as_ref().expect("there");
-        let work = t.consumers.iter().flatten().any(|x| x.ring.tx_pending())
-            || !COMMANDS.to_switch.is_empty();
+        // A consumer whose frame waits for a buffer or its share of the queue is no work
+        // (the 1 ms timer and the returned buffers look at it again); counting it would
+        // make the switch run again at once, above the stack, and spin.
+        let (cap, free) = (self.consumer_cap(), self.tx.book.free());
+        let work = netd::books::has_work(
+            t.consumers.iter().enumerate().filter_map(|(c, x)| {
+                x.as_ref()
+                    .map(|x| (x.ring.tx_pending(), usize::from(self.inflight[c])))
+            }),
+            cap,
+            free,
+            !COMMANDS.to_switch.is_empty(),
+        );
         if work {
             self.clear_idle();
         }
@@ -784,8 +803,9 @@ impl Switch {
     }
 
     /// A frame of the stack: a turn to the shared address goes through the tables, any other
-    /// into the queue. The number of frames passed to the stack.
-    fn stack_frame(&mut self, n: u16, len: usize) -> usize {
+    /// into the queue. The number of frames passed to the stack, and whether the frame was
+    /// turned into the tables.
+    fn stack_frame(&mut self, n: u16, len: usize) -> (usize, bool) {
         // SAFETY: the stack gave the buffer up (it is in `tx_sub`), and the device does not
         // hold it.
         let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
@@ -794,11 +814,16 @@ impl Switch {
             && route::faces_own(t, frame)
         {
             INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
-            return match route::route(t, frame, Source::Stack) {
+            let passed = match route::route(t, frame, Source::Stack) {
                 // A stale byte of the stack's: the frame goes back, and the stack answers it.
+                // A full ring of frames for the stack drops it (TCP repeats it).
                 Decision::Stack => {
-                    must(&INNER.rx_ready, pack(n, len as u16));
-                    1
+                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                        1
+                    } else {
+                        self.tx.book.release(n);
+                        0
+                    }
                 }
                 Decision::Drop(why) => {
                     INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
@@ -816,6 +841,7 @@ impl Switch {
                     0
                 }
             };
+            return (passed, true);
         }
         #[cfg(feature = "probe")]
         if let Some(t) = self.tables.as_ref()
@@ -835,7 +861,7 @@ impl Switch {
             }
             Err(broken) => fail(broken.text(true)),
         }
-        0
+        (0, false)
     }
 
     /// Takes frames of the consumers' TX rings in turn, one from each in a round, up to
@@ -854,14 +880,14 @@ impl Switch {
                     break;
                 }
                 // Frames past the first few go on only while the step is short.
-                if taken >= SWITCH_BASE && self.over_soft() {
+                if !netd::books::may_take(taken, SWITCH_BASE, self.over_soft()) {
                     budget = 0;
                     break;
                 }
                 let c = (usize::from(self.next_c) + k) % MAX_CONSUMERS;
                 // A frame waits in its ring while this consumer holds its share of the
                 // queue, or no buffer is free.
-                if usize::from(self.inflight[c]) >= cap || self.tx.book.free() == 0 {
+                if netd::books::blocked(usize::from(self.inflight[c]), cap, self.tx.book.free()) {
                     blocked = true;
                     continue;
                 }
@@ -946,9 +972,12 @@ impl Switch {
                             // SAFETY: the buffer is free (just taken from the pool).
                             let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
                             slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
-                            must(&INNER.rx_ready, pack(n, len as u16));
-                            if INNER.stack_told.tell() {
-                                INNER.wake_stack(crate::RX);
+                            if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                                if INNER.stack_told.tell() {
+                                    INNER.wake_stack(crate::RX);
+                                }
+                            } else {
+                                self.tx.book.release(n);
                             }
                         }
                     }
@@ -971,12 +1000,10 @@ impl Switch {
             let Some(x) = slot else { continue };
             x.ring.publish();
             let head = x.ring.done_head();
-            if head != self.woken[c] {
-                self.woken[c] = head;
-                if x.wake != 0 && x.ring.consumer_idle() {
-                    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(x.wake));
-                    let _ = sys::notify(&channel, WAKE_RING);
-                }
+            // A new consumer on a number starts from nothing (`Woken` keys on the generation).
+            if self.woken.news(c, x.generation, head) && x.wake != 0 && x.ring.consumer_idle() {
+                let channel = Handle::<Channel>::borrowed(rt::abi::Handle(x.wake));
+                let _ = sys::notify(&channel, WAKE_RING);
             }
         }
         let st = &INNER.stats;
