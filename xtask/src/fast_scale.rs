@@ -362,6 +362,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 || !(l.contains("accept4() failed")
                     || l.contains("posix_memalign(")
                     || l.contains("malloc() failed")
+                    || l.contains("failed (12: Out of memory)")
                     || l.contains("writev() failed"))
         })
         .map(|(_, l)| l.clone())
