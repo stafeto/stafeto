@@ -84,11 +84,24 @@ impl Hold {
 /// handle) until the switch has said it is out of its tables.
 struct Entry {
     notify: Handle<Channel>,
-    /// The bytes of the ring object mapped for it.
+    /// The bytes of the ring object, and how many of them are mapped (the kernel's map
+    /// and unmap take about 140 ticks a page under -icount, so a ring of 1 288 pages is
+    /// mapped and unmapped `MAP_CHUNK` pages in a step).
     size: u64,
+    mapped: u64,
+    /// The ring object, until all of it is mapped.
+    ring: Option<Handle<Memory>>,
+    /// The command that gives the ring to the switch, once all of it is mapped.
+    pending: Option<Command>,
     /// The consumer left (its session went, or its ring broke) and the switch was told.
     leaving: bool,
+    /// The ring is being taken out of the map (the switch is done with it).
+    unmapping: bool,
 }
+
+/// The pages of a ring mapped or unmapped in one step of the stack (the bound of a step
+/// is 18 369 ticks; a page costs 140).
+const MAP_CHUNK: u64 = 64;
 
 /// The stack side's books of the switch.
 pub struct Side {
@@ -104,6 +117,11 @@ pub struct Side {
     /// The level the labelled copies' sessions run at.
     level: u8,
 }
+
+/// The priority of the sessions of the copies of the switch's channel that consumers hold: no
+/// higher than a ceiling of the processes of POSIX (31 in the tables), since the kernel hands
+/// a copy only to a holder whose ceiling covers its priority.
+pub const GATE_PRIORITY: u8 = 31;
 
 impl Side {
     pub fn new(max: u8, gate: Option<Handle<Channel>>, level: u8) -> Side {
@@ -140,6 +158,11 @@ impl Driver<'_> {
 
     /// ATTACH (the table of `proto_net::switch`).
     pub(crate) fn attach(&mut self, s: &mut Sess, r: &mut Request<'_>) -> Answer {
+        // A service with no switch (`switch 0`, the images of the second device) has no such
+        // method; the layer then claims the device as before.
+        if self.side.max == 0 {
+            return Answer::Status(Status::UnknownMethod);
+        }
         let layout = match sw::read_attach(r.body()) {
             Ok(layout) => layout,
             Err(status) => return Answer::Status(status),
@@ -155,10 +178,7 @@ impl Driver<'_> {
         else {
             return refuse(proto_net::INVALID);
         };
-        if self.side.max == 0
-            || s.data.consumer.is_some()
-            || self.side.blocks.in_use() >= usize::from(self.side.max)
-        {
+        if s.data.consumer.is_some() || self.side.blocks.in_use() >= usize::from(self.side.max) {
             return limit();
         }
         let Some(lease) = self.stack.lease else {
@@ -170,33 +190,35 @@ impl Driver<'_> {
             Ok(info) if info.size >= size && info.pages * PAGE as u64 >= size => {}
             _ => return refuse(proto_net::INVALID),
         }
-        let (Some(process), Some(gate)) = (self.net.process.as_deref(), self.side.gate.as_ref())
-        else {
+        let Some(gate) = self.side.gate.as_ref() else {
             return Answer::Status(Status::Kernel(Error::BadState));
         };
         let now = seconds();
         let mut both = Both(&mut self.net.tcp_ports, &mut self.net.udp_ports);
-        let Some((c, generation, block)) = self.side.blocks.alloc(&mut both, now) else {
+        let busy = (0..MAX_CONSUMERS).fold(0u8, |m, c| {
+            m | u8::from(self.side.entries[c].is_some()) << c
+        });
+        let Some((c, generation, block)) = self.side.blocks.alloc_except(&mut both, now, busy)
+        else {
             return limit();
         };
+
         let at = dma::consumer_at(usize::from(c));
         let giveup = |side: &mut Side| {
             side.blocks.release(c, now);
             let swept = side.blocks.swept_round();
             side.blocks.detached(c, swept);
         };
-        if let Err(error) = sys::mem_map(process, &ring, 0, size, at, Access::ReadWrite) {
-            giveup(&mut self.side);
-            return Answer::Status(Status::Kernel(error));
-        }
-        // The mapping keeps the object.
-        drop(ring);
         let label = GATE_LABEL | u64::from(c);
-        let copy = match sys::handle_label(gate, Rights::NOTIFY, label, self.side.level) {
+        let copy = match sys::handle_label(
+            gate,
+            Rights(Rights::NOTIFY.0 | Rights::TRANSFER.0),
+            label,
+            self.side.level,
+        ) {
             Ok(copy) => copy,
             Err(error) => {
-                // SAFETY: the switch has not been told of the ring.
-                let _ = unsafe { sys::mem_unmap(process, at, size) };
+                rt::println!("net: switch attach: labelling the gate: {error:?}");
                 giveup(&mut self.side);
                 return Answer::Status(Status::Kernel(error));
             }
@@ -210,12 +232,6 @@ impl Driver<'_> {
             block,
             wake: notify.raw().0,
         };
-        if !switch::command(attach) {
-            // SAFETY: the switch has not been told of the ring.
-            let _ = unsafe { sys::mem_unmap(process, at, size) };
-            giveup(&mut self.side);
-            return limit();
-        }
         let reply = Attached {
             consumer: u32::from(c),
             generation,
@@ -230,35 +246,132 @@ impl Driver<'_> {
             block_count: u32::from(BLOCK_PORTS),
         };
         if reply.write(r.reply()).is_err() {
-            // The switch has the ring: it goes the way of a consumer that left.
-            self.side.entries[usize::from(c)] = Some(Entry {
-                notify,
-                size,
-                leaving: false,
-            });
-            s.data.consumer = Some(c);
+            giveup(&mut self.side);
             return Answer::Status(Status::BadSize);
         }
+        // The ring is mapped in the steps that follow, and the switch is given it then: the
+        // consumer writes its FILL ring and waits for frames meanwhile.
         self.side.entries[usize::from(c)] = Some(Entry {
             notify,
             size,
+            mapped: 0,
+            ring: Some(ring),
+            pending: Some(attach),
             leaving: false,
+            unmapping: false,
         });
         s.data.consumer = Some(c);
+        self.tell(crate::BACK);
         Answer::Reply([copy.erase()].into())
+    }
+
+    /// One chunk of the mapping of each ring that is not mapped yet; when a ring is whole the
+    /// switch is given it. True when work is left.
+    fn map_step(&mut self) -> bool {
+        let Some(process) = self.net.process.as_deref() else {
+            return false;
+        };
+        let mut left = false;
+        let mut failed = 0u8;
+        for c in 0..MAX_CONSUMERS {
+            let Some(e) = self.side.entries[c].as_mut() else {
+                continue;
+            };
+            if e.leaving || e.unmapping {
+                continue;
+            }
+            if e.mapped < e.size {
+                let at = dma::consumer_at(c);
+                let Some(ring) = e.ring.as_ref() else {
+                    continue;
+                };
+                let len = (e.size - e.mapped).min(MAP_CHUNK * PAGE as u64);
+                if let Err(error) = sys::mem_map(
+                    process,
+                    ring,
+                    e.mapped,
+                    len,
+                    at + e.mapped as usize,
+                    Access::ReadWrite,
+                ) {
+                    rt::println!("net: switch attach: mapping the ring of {c}: {error:?}");
+                    let _ = sys::notify(&e.notify, sw::WAKE_BROKEN);
+                    e.pending = None;
+                    failed |= 1 << c;
+                    left = true;
+                    continue;
+                }
+                e.mapped += len;
+                left = true;
+                if e.mapped == e.size {
+                    // The mappings keep the object.
+                    e.ring = None;
+                }
+                continue;
+            }
+            if let Some(cmd) = e.pending
+                && switch::command(cmd)
+            {
+                e.pending = None;
+            } else if e.pending.is_some() {
+                left = true;
+            }
+        }
+        for c in 0..MAX_CONSUMERS as u8 {
+            if failed & (1 << c) != 0 {
+                self.leave(c);
+            }
+        }
+        left
+    }
+
+    /// One chunk of the unmapping of each ring the switch is done with. True when work is left.
+    fn unmap_step(&mut self) -> bool {
+        let Some(process) = self.net.process.as_deref() else {
+            return false;
+        };
+        let mut left = false;
+        for c in 0..MAX_CONSUMERS {
+            let Some(e) = self.side.entries[c].as_mut() else {
+                continue;
+            };
+            if !e.unmapping {
+                continue;
+            }
+            if e.mapped > 0 {
+                // The pieces go as they were mapped: the kernel unmaps inside one mapping.
+                let chunk = MAP_CHUNK * PAGE as u64;
+                let from = (e.mapped - 1) / chunk * chunk;
+                let len = e.mapped - from;
+                // SAFETY: the switch thread has said the ring is out of its tables (`Detached`
+                // or `Refused`) or never had it, and reads it no more.
+                if let Err(error) =
+                    unsafe { sys::mem_unmap(process, dma::consumer_at(c) + from as usize, len) }
+                {
+                    rt::println!("net: switch: unmapping the ring of {c}: {error:?}");
+                }
+                e.mapped = from;
+            }
+            if e.mapped > 0 {
+                left = true;
+            } else {
+                self.side.entries[c] = None;
+            }
+        }
+        left
     }
 
     /// PORT_HOLD (the table of `proto_net::switch`).
     pub(crate) fn port_hold(&mut self, s: &mut Sess, r: &mut Request<'_>) -> Answer {
+        if self.side.max == 0 {
+            return Answer::Status(Status::UnknownMethod);
+        }
         let hold = match sw::read_port_hold(r.body()) {
             Ok(hold) => hold,
             Err(status) => return Answer::Status(status),
         };
         if r.handles.len() != 1 {
             return Answer::Status(Status::BadSize);
-        }
-        if self.side.max == 0 {
-            return limit();
         }
         let Ok(identity) = r.handles.take::<Channel>(0) else {
             return refuse(proto_net::NOT_ALLOWED);
@@ -396,23 +509,28 @@ impl Driver<'_> {
             return;
         }
         self.side.blocks.release(c, seconds());
+        if e.pending.is_some() {
+            // The switch never had the ring: no flow of it, the number is free at once.
+            let swept = self.side.blocks.swept_round();
+            self.side.blocks.detached(c, swept);
+            self.start_unmap(c);
+            return;
+        }
         if !switch::command(Command::Detach { consumer: c }) {
             self.side.detach_due |= 1 << c;
             self.tell(crate::BACK);
         }
     }
 
-    /// Takes the ring of consumer `c` out of the service's map and closes its channel.
-    fn unmap(&mut self, c: u8) {
-        let Some(e) = self.side.entries[usize::from(c)].take() else {
-            return;
-        };
-        if let Some(process) = self.net.process.as_deref() {
-            // SAFETY: the switch thread has said the ring is out of its tables (`Detached` or
-            // `Refused`) and reads it no more.
-            let _ = unsafe { sys::mem_unmap(process, dma::consumer_at(usize::from(c)), e.size) };
+    /// The ring of consumer `c` goes out of the service's map in the steps that follow, and
+    /// its channel closes with its entry.
+    fn start_unmap(&mut self, c: u8) {
+        if let Some(Some(e)) = self.side.entries.get_mut(usize::from(c)) {
+            e.unmapping = true;
+            e.pending = None;
+            e.ring = None;
         }
-        drop(e);
+        self.tell(crate::BACK);
     }
 
     /// The step of the answers: what the switch thread told the stack, and the commands that
@@ -436,7 +554,9 @@ impl Driver<'_> {
             taken += 1;
             self.answer(back);
         }
-        if taken == 16 || self.side.detach_due != 0 {
+        let mapping = self.map_step();
+        let unmapping = self.unmap_step();
+        if taken == 16 || self.side.detach_due != 0 || mapping || unmapping {
             self.tell(crate::BACK);
         }
         let now = seconds();
@@ -450,7 +570,7 @@ impl Driver<'_> {
                 consumer, round, ..
             } => {
                 self.side.blocks.detached(consumer, round);
-                self.unmap(consumer);
+                self.start_unmap(consumer);
             }
             Back::Refused { consumer, .. } => {
                 // The switch never had the ring: the number is free at once.
@@ -460,7 +580,7 @@ impl Driver<'_> {
                 self.side.blocks.release(consumer, seconds());
                 let swept = self.side.blocks.swept_round();
                 self.side.blocks.detached(consumer, swept);
-                self.unmap(consumer);
+                self.start_unmap(consumer);
             }
             Back::Swept { round } => self.side.blocks.swept(round),
             Back::Broken {

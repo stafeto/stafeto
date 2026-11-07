@@ -1171,7 +1171,7 @@ mod tests {
             route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire);
             assert_ne!(flags_of(t, 1234) & RST, 0, "an ACK does not reopen it");
             t.now = 100;
-            (0..16).for_each(|_| t.sweep());
+            (0..128).for_each(|_| t.sweep());
             assert!(t.flows.is_empty(), "a closed flow goes after its rest");
         });
     }
@@ -1202,7 +1202,7 @@ mod tests {
             route(t, &wire_tcp(1234, 8080, 0x11), Source::Wire);
             assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x11)), Verdict::Send);
             t.now = 50;
-            (0..16).for_each(|_| t.sweep());
+            (0..128).for_each(|_| t.sweep());
             assert!(t.flows.is_empty() && t.group(1).is_none());
             assert_eq!((t.port(Proto::Tcp, 8080), t.freed), (0, 1));
             assert!(t.hold(5, Proto::Tcp, 8080, 1));

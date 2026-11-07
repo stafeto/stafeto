@@ -140,6 +140,8 @@ pub struct Stats {
     /// The frames of the wire for consumers, and the frames of consumers sent.
     pub rx_consumer: AtomicU32,
     pub tx_consumer: AtomicU32,
+    /// The frames of the wire each consumer got (the probe reads the share of each worker).
+    pub rx_by: [AtomicU32; 8],
 }
 
 impl Stats {
@@ -158,6 +160,7 @@ impl Stats {
             refused_by: [const { AtomicU32::new(0) }; Reason::COUNT],
             rx_consumer: AtomicU32::new(0),
             tx_consumer: AtomicU32::new(0),
+            rx_by: [const { AtomicU32::new(0) }; 8],
         }
     }
 }
@@ -383,6 +386,8 @@ pub struct Switch {
     timer: Handle<Timer>,
     _view: Handle<Channel>,
     armed: bool,
+    /// Frames of consumers wait for a buffer or a share (see `consumer_frames`).
+    blocked: bool,
     last_sweep: u64,
     /// Rounds of the sweep until which the timer runs on a quiet line (a consumer left).
     settle_until: u32,
@@ -458,6 +463,7 @@ impl Switch {
             timer,
             _view: view,
             armed: false,
+            blocked: false,
             last_sweep: 0,
             settle_until: 0,
             consumers_before: 0,
@@ -492,7 +498,9 @@ impl Switch {
     /// The buffers of sending the stack may have: all while it is alone, `STACK_SHARE` of
     /// them once consumers are attached (the rest is theirs).
     fn share(&self) -> usize {
-        if self.consumers() > 0 {
+        // The buffers the consumers will need are never lent: a stack that holds all of them
+        // would keep them while its consumers wait.
+        if self.tables.is_some() {
             STACK_SHARE
         } else {
             TX_SHARE
@@ -788,6 +796,11 @@ impl Switch {
                     0
                 }
                 d => {
+                    if let Decision::Consumer { consumer, .. } = d {
+                        INNER.stats.rx_consumer.fetch_add(1, Ordering::Relaxed);
+                        INNER.stats.rx_by[usize::from(consumer) % 8]
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     route::deliver(t, d, frame);
                     self.tx.book.release(n);
                     0
@@ -822,6 +835,7 @@ impl Switch {
         let cap = self.consumer_cap();
         let mut budget = SWITCH_CTX;
         let mut progressed = true;
+        let mut blocked = false;
         while budget > 0 && progressed {
             progressed = false;
             for k in 0..MAX_CONSUMERS {
@@ -832,6 +846,7 @@ impl Switch {
                 // A frame waits in its ring while this consumer holds its share of the
                 // queue, or no buffer is free.
                 if usize::from(self.inflight[c]) >= cap || self.tx.book.free() == 0 {
+                    blocked = true;
                     continue;
                 }
                 let Some(t) = self.tables.as_mut() else {
@@ -856,9 +871,19 @@ impl Switch {
             }
         }
         self.next_c = (self.next_c + 1) % MAX_CONSUMERS as u8;
-        self.tables
-            .as_ref()
-            .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()))
+        // Frames that wait for a buffer or a share of the queue do not make the switch run
+        // again at once (it would spin above the stack): the timer looks again in a
+        // millisecond, and the steps that return buffers go on as before.
+        self.blocked = blocked
+            && self
+                .tables
+                .as_ref()
+                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()));
+        budget == 0
+            && self
+                .tables
+                .as_ref()
+                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()))
     }
 
     /// The copy in `scratch` is checked and goes out, or turns back into the tables.
@@ -961,11 +986,18 @@ impl Switch {
         if !COMMANDS.to_stack.is_empty() {
             INNER.tell_back();
         }
-        let sweeping = count > 0
-            || !t.flows.is_empty()
-            || t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
-        if sweeping && !self.armed {
-            self.armed = sys::timer_set(&self.timer, now + SWEEP_IDLE_NS).is_ok();
+        // A consumer left lately: the rounds that return its number follow fast.
+        let settling = t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
+        let sweeping = count > 0 || !t.flows.is_empty() || settling;
+        if (sweeping || self.blocked) && !self.armed {
+            let after = if self.blocked {
+                1_000_000
+            } else if settling {
+                2_000_000
+            } else {
+                SWEEP_IDLE_NS
+            };
+            self.armed = sys::timer_set(&self.timer, now + after).is_ok();
         }
     }
 
@@ -1001,8 +1033,10 @@ impl Switch {
                             self.give(n);
                         }
                         d => {
-                            if matches!(d, Decision::Consumer { .. }) {
+                            if let Decision::Consumer { consumer, .. } = d {
                                 INNER.stats.rx_consumer.fetch_add(1, Ordering::Relaxed);
+                                INNER.stats.rx_by[usize::from(consumer) % 8]
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
                             if route::deliver(t, d, frame) {
                                 must(&INNER.rx_ready, pack(n, len as u16));

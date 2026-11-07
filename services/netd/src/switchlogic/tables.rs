@@ -41,7 +41,7 @@ pub const UNCONFIRMED: u16 = 8;
 pub const EMBRYO_AGE: u32 = 30;
 pub const CLOSING_AGE: u32 = 10;
 pub const IDLE_AGE: u32 = 7500;
-pub const SWEEP_STEP: usize = 256;
+pub const SWEEP_STEP: usize = 128;
 /// The flows one sweep step removes at most.
 pub const SWEEP_REMOVALS: usize = 32;
 const EMPTY: u8 = 0xff;
@@ -808,9 +808,29 @@ pub trait Registry {
     fn held(&self, port: u16) -> bool;
     fn hold(&mut self, port: u16);
     fn release(&mut self, port: u16);
+    /// Whether none of the `count` ports from `first` is held. The maps answer a run of the
+    /// ephemeral range a word of 64 ports at a time (a step of the service stays short).
+    fn free_run(&self, first: u16, count: u16) -> bool {
+        (0..count).all(|i| !self.held(first + i))
+    }
+    fn hold_run(&mut self, first: u16, count: u16) {
+        (0..count).for_each(|i| self.hold(first + i));
+    }
+    fn release_run(&mut self, first: u16, count: u16) {
+        (0..count).for_each(|i| self.release(first + i));
+    }
 }
 
 impl Registry for PortMap {
+    fn free_run(&self, first: u16, count: u16) -> bool {
+        PortMap::free_run(self, first, count)
+    }
+    fn hold_run(&mut self, first: u16, count: u16) {
+        PortMap::hold_run(self, first, count)
+    }
+    fn release_run(&mut self, first: u16, count: u16) {
+        PortMap::release_run(self, first, count)
+    }
     fn held(&self, port: u16) -> bool {
         PortMap::held(self, port)
     }
@@ -826,6 +846,17 @@ impl Registry for PortMap {
 pub struct Both<'a>(pub &'a mut PortMap, pub &'a mut PortMap);
 
 impl Registry for Both<'_> {
+    fn free_run(&self, first: u16, count: u16) -> bool {
+        self.0.free_run(first, count) && self.1.free_run(first, count)
+    }
+    fn hold_run(&mut self, first: u16, count: u16) {
+        self.0.hold_run(first, count);
+        self.1.hold_run(first, count);
+    }
+    fn release_run(&mut self, first: u16, count: u16) {
+        self.0.release_run(first, count);
+        self.1.release_run(first, count);
+    }
     fn held(&self, port: u16) -> bool {
         self.0.held(port) || self.1.held(port)
     }
@@ -878,16 +909,11 @@ impl Blocks {
         EPHEMERAL_FIRST + (b as u16) * BLOCK_PORTS
     }
 
-    fn ports(b: usize) -> impl Iterator<Item = u16> {
-        let first = Self::first(b);
-        (0..BLOCK_PORTS).map(move |i| first + i)
-    }
-
     /// Frees the blocks whose rest is over.
     pub fn expire(&mut self, map: &mut impl Registry, now: u32) {
         for (b, s) in self.state.iter_mut().enumerate() {
             if matches!(*s, Block::Rest(until) if now.wrapping_sub(until) < u32::MAX / 2) {
-                Self::ports(b).for_each(|p| map.release(p));
+                map.release_run(Self::first(b), BLOCK_PORTS);
                 *s = Block::Free;
             }
         }
@@ -904,12 +930,23 @@ impl Blocks {
 
     /// A consumer number, its new generation (never 0) and the first port of its block.
     pub fn alloc(&mut self, map: &mut impl Registry, now: u32) -> Option<(u8, u32, u16)> {
+        self.alloc_except(map, now, 0)
+    }
+
+    /// `alloc` without the numbers in the mask `busy` (the stack's ring of that consumer is
+    /// still mapped).
+    pub fn alloc_except(
+        &mut self,
+        map: &mut impl Registry,
+        now: u32,
+        busy: u8,
+    ) -> Option<(u8, u32, u16)> {
         self.expire(map, now);
-        let c = (0..MAX_CONSUMERS).find(|&c| self.usable(c))?;
+        let c = (0..MAX_CONSUMERS).find(|&c| busy & (1 << c) == 0 && self.usable(c))?;
         let b = (0..BLOCKS)
             .rev()
-            .find(|&b| self.state[b] == Block::Free && Self::ports(b).all(|p| !map.held(p)))?;
-        Self::ports(b).for_each(|p| map.hold(p));
+            .find(|&b| self.state[b] == Block::Free && map.free_run(Self::first(b), BLOCK_PORTS))?;
+        map.hold_run(Self::first(b), BLOCK_PORTS);
         self.state[b] = Block::Held;
         self.owner[c] = Some(b);
         self.number[c] = Number::Free;
@@ -1090,7 +1127,7 @@ pub(crate) mod tests {
         at(&mut f, 5, 2, 4, 20000); // a stale generation
         at(&mut f, 6, 3, 1, 20000); // a consumer that is not there
         at(&mut f, 7, 2, 5, 20000 - IDLE_AGE - 1);
-        for _ in 0..4 {
+        for _ in 0..8 {
             sweep(&mut f, 20011, &mut cs);
         }
         assert_eq!(f.len(), 2);

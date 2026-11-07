@@ -467,7 +467,7 @@ mod tests {
     fn the_sweep_rounds_are_told_with_the_detached_round() {
         with_flows(512, |t, _| {
             let q = Commands::new();
-            (0..2).for_each(|_| t.sweep());
+            (0..512 / crate::switchlogic::tables::SWEEP_STEP).for_each(|_| t.sweep());
             poll(t, &q);
             assert_eq!(q.to_stack.pop(), Some(Back::Swept { round: 1 }));
             poll(t, &q);

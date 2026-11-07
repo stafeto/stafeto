@@ -473,7 +473,7 @@ impl Net {
                     return self.readable(stack, r, place);
                 }
                 if name == opt::BUFFERS || name == opt::BUFFERED {
-                    #[cfg(feature = "profile")]
+                    #[cfg(any(feature = "profile", feature = "probe"))]
                     if name == opt::BUFFERED {
                         self.profile_due = true;
                     }
@@ -2052,7 +2052,7 @@ impl Net {
         }
         let mut child = Held::EMPTY;
         for &d in list {
-            let Some(place) = self.find(&s.data.held, d) else {
+            let Some(place) = self.find_any(&s.data.held, d) else {
                 return refuse(proto_net::BAD_FD);
             };
             child.add(place);
@@ -2104,7 +2104,7 @@ impl Net {
         };
         let mut added = Held::EMPTY;
         for &d in list {
-            let Some(p) = self.find(&s.data.held, d) else {
+            let Some(p) = self.find_any(&s.data.held, d) else {
                 return refuse(proto_net::BAD_FD);
             };
             added.add(p);

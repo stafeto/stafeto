@@ -445,7 +445,7 @@ fn main(_: u64) -> u64 {
         .then(|| {
             sys::handle_duplicate(
                 &switch_channel,
-                Rights(Rights::NOTIFY.0 | Rights::DUPLICATE.0),
+                Rights(Rights::NOTIFY.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
             )
             .ok()
         })
@@ -529,6 +529,7 @@ fn main(_: u64) -> u64 {
         mac,
         second,
         own_said: false,
+        switch_ip: ([0; 4], 0),
         told: 0,
         cleanup_due: false,
         armed: None,
@@ -539,7 +540,7 @@ fn main(_: u64) -> u64 {
         ask_at: None,
         resolv: Written::default(),
         owner: None,
-        side: consumers::Side::new(settings.consumers(), gate, level + 1),
+        side: consumers::Side::new(settings.consumers(), gate, consumers::GATE_PRIORITY),
         claimable: owner::Claimable {
             handover: settings.handover == Some(true),
             pci,
@@ -871,6 +872,9 @@ struct Maps {
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
+    /// The address the switch was last told (a renewal of the lease that changes nothing is
+    /// not told: consumers end their processes on a new address).
+    switch_ip: ([u8; 4], u8),
     device: NetDevice,
     stack: Stack<'static>,
     net: &'a mut Net,
@@ -1267,6 +1271,9 @@ impl Driver<'_> {
             .stack
             .lease
             .map_or(([0; 4], 0), |lease| (lease.address, lease.prefix.min(32)));
+        if core::mem::replace(&mut self.switch_ip, (ip, prefix)) == (ip, prefix) {
+            return;
+        }
         if !switch::command(netd::switchlogic::commands::Command::Address { ip, prefix }) {
             rt::println!("net: the switch's ring of commands is full (address)");
         }
@@ -1501,6 +1508,8 @@ impl Driver<'_> {
         let refused: [u32; netd::switchlogic::route::Reason::COUNT] =
             core::array::from_fn(|i| get(&st.refused_by[i]));
         rt::println!("net: switch dropped {drops:?} refused_by {refused:?}");
+        let by: [u32; 8] = core::array::from_fn(|i| get(&st.rx_by[i]));
+        rt::println!("net: switch rx_by {by:?}");
     }
 
     /// HOLD: the steps of the stack wait (1), go on (0), or every group of
@@ -1641,8 +1650,11 @@ impl Service<0> for Driver<'_> {
         };
         self.after_request();
         profile::call(method, began);
-        #[cfg(feature = "profile")]
+        #[cfg(any(feature = "profile", feature = "probe"))]
         if core::mem::take(&mut self.net.profile_due) {
+            #[cfg(feature = "probe")]
+            self.report_frames();
+            #[cfg(feature = "profile")]
             self.profile_snapshot();
         }
         answer

@@ -205,10 +205,25 @@ pub const FAST_SCALE_VZ_TABLE: &[Record] = &[
 /// device and a switch in place of the service with two (`cargo xtask fast-probe switch`,
 /// `net-vz --fast --switch`). The ring of a worker (1 288 pages, 5 MiB) is the worker's own
 /// memory, which `FAST_COMMAND_QUOTA` holds with the 8 to 17 MiB of the worker.
+/// Quotas of a command in the pool of the process service of the images of the switch: the
+/// shell, `httpd`, the master, four workers, the new worker of a reload, and two commands of a
+/// probe.
+const SWITCH_COMMANDS: u64 = 10;
+
+const SWITCH_PROCESS_SERVICE: Record = Record {
+    quota: FAST_PROCESS_SERVICE.quota + (SWITCH_COMMANDS - 5) * FAST_COMMAND_QUOTA,
+    ..FAST_PROCESS_SERVICE
+};
+
+const SWITCH_VZ_PROCESS_SERVICE: Record = Record {
+    quota: FAST_VZ_PROCESS_SERVICE.quota + (SWITCH_COMMANDS - 5) * FAST_COMMAND_QUOTA,
+    ..FAST_VZ_PROCESS_SERVICE
+};
+
 pub const FAST_SWITCH_TABLE: &[Record] = &[
     FAST_NGINX_TABLE[0],
     FAST_NGINX_TABLE[1],
-    FAST_NGINX_TABLE[2],
+    SWITCH_PROCESS_SERVICE,
     FAST_NGINX_TABLE[3],
     FAST_NGINX_TABLE[4],
     FAST_NGINX_TABLE[5],
@@ -221,7 +236,7 @@ pub const FAST_SWITCH_TABLE: &[Record] = &[
 pub const FAST_SWITCH_VZ_TABLE: &[Record] = &[
     FAST_NGINX_VZ_TABLE[0],
     FAST_NGINX_VZ_TABLE[1],
-    FAST_NGINX_VZ_TABLE[2],
+    SWITCH_VZ_PROCESS_SERVICE,
     FAST_NGINX_VZ_TABLE[3],
     FAST_NGINX_VZ_TABLE[4],
     FAST_NGINX_VZ_TABLE[5],
