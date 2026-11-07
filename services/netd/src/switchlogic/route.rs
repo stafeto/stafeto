@@ -178,7 +178,7 @@ fn block_owner(t: &Tables, mark: u8) -> Option<u8> {
 enum Pick {
     NoLive,
     Full,
-    One(u8, u8),
+    One(u8, u32),
 }
 
 /// A member of group `number` by `hash`, among the live ones with at least
@@ -188,8 +188,8 @@ fn pick(t: &Tables, number: u8, hash: u64, min_fill: u32, flows: bool) -> Pick {
         return Pick::NoLive;
     };
     let limit = (t.flows.capacity() / 2) as u32;
-    let live = |m: &&(u8, u8)| t.live(m.0, m.1);
-    let fits = |m: &&(u8, u8)| {
+    let live = |m: &&(u8, u32)| t.live(m.0, m.1);
+    let fits = |m: &&(u8, u32)| {
         let c = t.consumers[usize::from(m.0)].as_ref().expect("live");
         c.ring.fill_avail() >= min_fill && !(flows && c.flows >= limit)
     };
@@ -1197,6 +1197,33 @@ mod tests {
                 route(t, &wire_from([198, 51, 100, n], 5000, SYN), Source::Wire);
             }
             assert_eq!(t.group(1).unwrap().flows as usize, t.flows.len());
+        });
+    }
+
+    #[test]
+    fn a_flow_of_an_old_consumer_does_not_revive_after_many_attach_cycles_without_a_sweep() {
+        with(|t, rigs| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let rig = &rigs[usize::from(c)];
+            let block = 49152 + 512 * u16::from(c);
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, ACK_)), Verdict::Send);
+            let mut fresh = Vec::new();
+            for g in 2..=600u32 {
+                assert!(t.detach(c).is_some());
+                fresh.push(Rig::new(rig.layout));
+                fresh.last().unwrap().fill(&[0; 40]);
+                assert!(t.attach(c, g, fresh.last().unwrap().ring(), block));
+                t.poll_rings(|_, _| {});
+            }
+            t.join(1, c);
+            assert!(!t.live(c, 1) && t.live(c, 600));
+            assert_eq!(
+                route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire),
+                Decision::Stack,
+                "the old flow is not live"
+            );
+            assert_eq!(refused(t, c, &out_tcp(8080, 1234, ACK_)), Reason::Tcp);
+            assert_eq!(refused(t, c, &out_tcp(8080, 1234, 0x04)), Reason::Tcp);
         });
     }
 

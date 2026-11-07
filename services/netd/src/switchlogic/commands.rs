@@ -85,7 +85,7 @@ pub enum Command {
     /// ring object is mapped at `base` for `Layout::new(rx_slots, tx_slots).total()` bytes.
     Attach {
         consumer: u8,
-        generation: u8,
+        generation: u32,
         base: usize,
         rx_slots: u16,
         tx_slots: u16,
@@ -124,7 +124,16 @@ pub enum Command {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Back {
     /// The consumer is out of the tables (also an ATTACH that could not be carried out).
-    Detached { consumer: u8, generation: u8 },
+    /// `round` is the sweep's round counter at that moment: its flows are all gone when a
+    /// later `Swept` says `round + 2` (`Blocks::detached`).
+    Detached {
+        consumer: u8,
+        generation: u32,
+        round: u32,
+    },
+    /// The sweep finished a pass over the flow table; sent when the round counter moved
+    /// (it may skip numbers when the ring was full). The stack hands it to `Blocks::swept`.
+    Swept { round: u32 },
     /// The consumer broke a rule of its ring; the stack detaches it.
     Broken { consumer: u8, violation: Violation },
     /// The group is gone from the tables and its ports are free. Exactly one per group that
@@ -185,6 +194,7 @@ fn apply(t: &mut Tables, cmd: Command, back: &Queue<Back, RING>) {
                 back.push(Back::Detached {
                     consumer,
                     generation,
+                    round: t.flows.rounds(),
                 });
             }
         }
@@ -193,6 +203,7 @@ fn apply(t: &mut Tables, cmd: Command, back: &Queue<Back, RING>) {
                 back.push(Back::Detached {
                     consumer,
                     generation,
+                    round: t.flows.rounds(),
                 });
             }
         }
@@ -221,6 +232,10 @@ pub fn poll(t: &mut Tables, q: &Commands) {
             violation,
         });
     });
+    let round = t.flows.rounds();
+    if round != t.swept_told && q.to_stack.push(Back::Swept { round }) {
+        t.swept_told = round;
+    }
     // A bit stays until the stack's ring took the answer.
     for group in 1..=MAX_GROUPS as u8 {
         if t.freed & (1 << (group - 1)) != 0 && q.to_stack.push(Back::Freed { group }) {
@@ -233,7 +248,7 @@ pub fn poll(t: &mut Tables, q: &Commands) {
 mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
-    use crate::switchlogic::tables::tests::with;
+    use crate::switchlogic::tables::tests::{with, with_flows};
     use proto_net::switch as sw;
 
     #[test]
@@ -331,15 +346,18 @@ mod tests {
                 [
                     Back::Detached {
                         consumer: 5,
-                        generation: 9
+                        generation: 9,
+                        round: 0
                     },
                     Back::Detached {
                         consumer: 6,
-                        generation: 9
+                        generation: 9,
+                        round: 0
                     },
                     Back::Detached {
                         consumer: 5,
-                        generation: 9
+                        generation: 9,
+                        round: 0
                     },
                 ]
             );
@@ -380,6 +398,28 @@ mod tests {
                 1
             );
             assert_eq!(t.freed, 0);
+        });
+    }
+
+    #[test]
+    fn the_sweep_rounds_are_told_with_the_detached_round() {
+        with_flows(512, |t, _| {
+            let q = Commands::new();
+            (0..2).for_each(|_| t.sweep());
+            poll(t, &q);
+            assert_eq!(q.to_stack.pop(), Some(Back::Swept { round: 1 }));
+            poll(t, &q);
+            assert_eq!(q.to_stack.pop(), None, "told once");
+            q.to_switch.push(Command::Detach { consumer: 1 });
+            while drain(t, &q) > 0 {}
+            assert_eq!(
+                q.to_stack.pop(),
+                Some(Back::Detached {
+                    consumer: 1,
+                    generation: 1,
+                    round: 1
+                })
+            );
         });
     }
 

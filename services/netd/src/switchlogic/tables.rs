@@ -67,20 +67,20 @@ impl FlowKey {
 #[derive(Clone, Copy, Debug)]
 pub struct Flow {
     key: [u8; 8],
-    pub consumer: u8,
-    pub generation: u8,
-    pub flags: u16,
+    pub generation: u32,
     pub seen: u32,
+    pub flags: u16,
+    pub consumer: u8,
 }
-const _: () = assert!(core::mem::size_of::<Flow>() == 16);
+const _: () = assert!(core::mem::size_of::<Flow>() == 20);
 
 impl Flow {
     pub const EMPTY: Flow = Flow {
         key: [0; 8],
-        consumer: EMPTY,
         generation: 0,
-        flags: 0,
         seen: 0,
+        flags: 0,
+        consumer: EMPTY,
     };
     fn is_empty(&self) -> bool {
         self.consumer == EMPTY
@@ -106,6 +106,7 @@ pub struct Flows<'a> {
     used: usize,
     unconfirmed: usize,
     cursor: usize,
+    rounds: u32,
     /// Unconfirmed flows a newer SYN took the place of.
     pub evicted: u32,
     /// Unconfirmed flows the sweep removed after `EMBRYO_AGE`.
@@ -122,6 +123,7 @@ impl<'a> Flows<'a> {
             used: 0,
             unconfirmed: 0,
             cursor: 0,
+            rounds: 0,
             evicted: 0,
             expired: 0,
         }
@@ -188,7 +190,7 @@ impl<'a> Flows<'a> {
         &mut self,
         key: &FlowKey,
         consumer: u8,
-        generation: u8,
+        generation: u32,
         now: u32,
     ) -> Option<usize> {
         if self.used >= self.capacity() {
@@ -201,7 +203,7 @@ impl<'a> Flows<'a> {
         &mut self,
         key: &FlowKey,
         consumer: u8,
-        generation: u8,
+        generation: u32,
         now: u32,
         flags: u16,
     ) -> Option<usize> {
@@ -212,10 +214,10 @@ impl<'a> Flows<'a> {
             if self.slots[i].is_empty() {
                 self.slots[i] = Flow {
                     key,
-                    consumer,
                     generation,
-                    flags,
                     seen: now,
+                    flags,
+                    consumer,
                 };
                 self.used += 1;
                 self.unconfirmed += usize::from(flags & UNCONFIRMED != 0);
@@ -233,7 +235,7 @@ impl<'a> Flows<'a> {
         &mut self,
         key: &FlowKey,
         consumer: u8,
-        generation: u8,
+        generation: u32,
         now: u32,
     ) -> (Option<usize>, Option<Flow>) {
         let home = self.home(&key.bytes());
@@ -286,7 +288,7 @@ impl<'a> Flows<'a> {
 
     /// Gives the flow at `i` to a new owner (a SYN that finds a dead flow);
     /// `embryo` starts it unconfirmed.
-    pub fn reassign(&mut self, i: usize, consumer: u8, generation: u8, now: u32, embryo: bool) {
+    pub fn reassign(&mut self, i: usize, consumer: u8, generation: u32, now: u32, embryo: bool) {
         self.confirm(i);
         let f = &mut self.slots[i];
         let flags = f.flags & GROUPED | if embryo { UNCONFIRMED } else { 0 };
@@ -336,7 +338,14 @@ impl<'a> Flows<'a> {
                 }
             }
             self.cursor = (self.cursor + 1) % self.slots.len();
+            self.rounds = self.rounds.wrapping_add(u32::from(self.cursor == 0));
         }
+    }
+
+    /// Full passes of the sweep over the table so far. A flow that is dead when this
+    /// reads `r` is gone when it reads `r + 2`.
+    pub fn rounds(&self) -> u32 {
+        self.rounds
     }
 }
 
@@ -410,7 +419,7 @@ fn mark_ports(ports: &mut [u8], proto: Proto, first: u16, count: u16, v: u8) {
 
 pub struct Consumer {
     pub ring: ConsumerRing,
-    pub generation: u8,
+    pub generation: u32,
     pub block: u16,
     pub flows: u32,
     arp_second: u32,
@@ -444,7 +453,7 @@ pub struct Group {
     /// Flows of the group's port in the table (TCP).
     pub flows: u32,
     /// (consumer, generation)
-    pub members: [Option<(u8, u8)>; MAX_MEMBERS],
+    pub members: [Option<(u8, u32)>; MAX_MEMBERS],
 }
 
 /// The address of device 0, as the switch knows it.
@@ -483,6 +492,8 @@ pub struct Tables<'a> {
     /// Groups freed that the stack has not been told of (bit n - 1 is group n); `commands::poll`
     /// sends `Back::Freed` and clears the bit.
     pub freed: u32,
+    /// The last round of the sweep the stack was told (`commands::poll`).
+    pub swept_told: u32,
     pub guard: Guard,
 }
 
@@ -500,6 +511,7 @@ impl<'a> Tables<'a> {
             flows,
             refused: [0; Reason::COUNT],
             freed: 0,
+            swept_told: 0,
             guard: Guard { tag, owner: None },
         }
     }
@@ -528,14 +540,14 @@ impl<'a> Tables<'a> {
     }
 
     /// Whether consumer `c` of generation `g` is there and its ring whole.
-    pub fn live(&self, c: u8, g: u8) -> bool {
+    pub fn live(&self, c: u8, g: u32) -> bool {
         self.consumers
             .get(usize::from(c))
             .and_then(Option::as_ref)
             .is_some_and(|x| x.generation == g && !x.ring.is_broken())
     }
 
-    pub fn attach(&mut self, c: u8, generation: u8, ring: ConsumerRing, block: u16) -> bool {
+    pub fn attach(&mut self, c: u8, generation: u32, ring: ConsumerRing, block: u16) -> bool {
         self.guard.check();
         if u32::from(block) + u32::from(BLOCK_PORTS) > 65536 {
             return false;
@@ -558,7 +570,7 @@ impl<'a> Tables<'a> {
     }
 
     /// Takes the consumer out of its groups and its block; its flows die with its generation.
-    pub fn detach(&mut self, c: u8) -> Option<u8> {
+    pub fn detach(&mut self, c: u8) -> Option<u32> {
         self.guard.check();
         let gone = self.consumers.get_mut(usize::from(c))?.take()?;
         for g in self.groups.iter_mut().flatten() {
@@ -681,7 +693,13 @@ impl<'a> Tables<'a> {
 
     /// A new unconfirmed flow for a SYN to port-table value `mark`; false when there is no
     /// room. An evicted flow gives its owner and its group their count back.
-    pub fn insert_embryo(&mut self, key: &FlowKey, consumer: u8, generation: u8, mark: u8) -> bool {
+    pub fn insert_embryo(
+        &mut self,
+        key: &FlowKey,
+        consumer: u8,
+        generation: u32,
+        mark: u8,
+    ) -> bool {
         self.guard.check();
         let (slot, evicted) = self
             .flows
@@ -730,13 +748,29 @@ enum Block {
     Rest(u32),
 }
 
+/// Where a consumer number is on its way back to use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Number {
+    Free,
+    /// The consumer left; the switch has not said `Detached` yet.
+    Leaving,
+    /// Free again once the sweep reached this round (`Back::Swept`): by then no flow of the
+    /// old consumer is left in the table.
+    Until(u32),
+}
+
 /// The stack side's books of the consumer numbers, their generations and
 /// the 512-port blocks of the ephemeral range: a block is held in the
 /// port registry while it is in use and for `QUARANTINE` seconds after.
+/// A number is given out again only after the sweep has gone over the
+/// flow table twice since the switch detached it, and its generation
+/// (u32, never 0) is a new one each time.
 pub struct Blocks {
     state: [Block; BLOCKS],
     owner: [Option<usize>; MAX_CONSUMERS],
-    generation: [u8; MAX_CONSUMERS],
+    generation: [u32; MAX_CONSUMERS],
+    number: [Number; MAX_CONSUMERS],
+    swept: u32,
 }
 
 impl Blocks {
@@ -745,6 +779,8 @@ impl Blocks {
             state: [Block::Free; BLOCKS],
             owner: [None; MAX_CONSUMERS],
             generation: [0; MAX_CONSUMERS],
+            number: [Number::Free; MAX_CONSUMERS],
+            swept: 0,
         }
     }
 
@@ -767,25 +803,53 @@ impl Blocks {
         }
     }
 
+    fn usable(&self, c: usize) -> bool {
+        self.owner[c].is_none()
+            && match self.number[c] {
+                Number::Free => true,
+                Number::Leaving => false,
+                Number::Until(r) => self.swept.wrapping_sub(r) < u32::MAX / 2,
+            }
+    }
+
     /// A consumer number, its new generation (never 0) and the first port of its block.
-    pub fn alloc(&mut self, map: &mut PortMap, now: u32) -> Option<(u8, u8, u16)> {
+    pub fn alloc(&mut self, map: &mut PortMap, now: u32) -> Option<(u8, u32, u16)> {
         self.expire(map, now);
-        let c = self.owner.iter().position(Option::is_none)?;
+        let c = (0..MAX_CONSUMERS).find(|&c| self.usable(c))?;
         let b = (0..BLOCKS)
             .rev()
             .find(|&b| self.state[b] == Block::Free && Self::ports(b).all(|p| !map.held(p)))?;
         Self::ports(b).for_each(|p| map.hold(p));
         self.state[b] = Block::Held;
         self.owner[c] = Some(b);
+        self.number[c] = Number::Free;
         self.generation[c] = self.generation[c].checked_add(1).unwrap_or(1);
         Some((c as u8, self.generation[c], Self::first(b)))
     }
 
-    /// The consumer left: its number is free, its block rests.
+    /// The consumer left: its block rests and its number waits for the switch's answer.
     pub fn release(&mut self, c: u8, now: u32) {
         if let Some(b) = self.owner.get_mut(usize::from(c)).and_then(Option::take) {
             self.state[b] = Block::Rest(now + QUARANTINE);
+            self.number[usize::from(c)] = Number::Leaving;
         }
+    }
+
+    /// `Back::Detached { consumer, round, .. }`: the number may come back when the sweep has
+    /// gone over the table twice from `round` (a pass that was half done does not count).
+    pub fn detached(&mut self, c: u8, round: u32) {
+        if let Some(n) = self
+            .number
+            .get_mut(usize::from(c))
+            .filter(|n| **n == Number::Leaving)
+        {
+            *n = Number::Until(round.wrapping_add(2));
+        }
+    }
+
+    /// `Back::Swept { round }`.
+    pub fn swept(&mut self, round: u32) {
+        self.swept = round;
     }
 }
 
@@ -890,7 +954,7 @@ pub(crate) mod tests {
         assert!(f.len() <= 2048);
     }
 
-    fn consumers_with(c: u8, generation: u8) -> [Option<Consumer>; MAX_CONSUMERS] {
+    fn consumers_with(c: u8, generation: u32) -> [Option<Consumer>; MAX_CONSUMERS] {
         let rig = Rig::new(Layout::new(256, 64).unwrap());
         let mut t: [Option<Consumer>; MAX_CONSUMERS] = [const { None }; MAX_CONSUMERS];
         t[usize::from(c)] = Some(Consumer {
@@ -996,6 +1060,8 @@ pub(crate) mod tests {
         );
         assert!(map.held(firsts[0]) && map.held(firsts[0] + 511));
         b.release(2, 200);
+        b.detached(2, 0);
+        b.swept(2);
         let (c, g, first) = b.alloc(&mut map, 259).unwrap();
         assert_eq!(c, 2);
         assert_ne!(first, firsts[2], "the block rests until 260");
@@ -1004,7 +1070,53 @@ pub(crate) mod tests {
         b.release(c, 259);
         b.expire(&mut map, 260);
         assert!(!map.held(firsts[2]) && !map.held(firsts[2] + 511));
+        b.detached(c, 2);
+        b.swept(4);
         assert_eq!(b.alloc(&mut map, 260).map(|a| a.2), Some(firsts[2]));
+    }
+
+    #[test]
+    fn a_number_comes_back_only_after_two_rounds_of_the_sweep_since_its_detach() {
+        let (mut b, mut map) = (Blocks::new(), PortMap::new());
+        for _ in 0..8 {
+            b.alloc(&mut map, 0).unwrap();
+        }
+        b.release(5, 0);
+        assert!(
+            b.alloc(&mut map, 1000).is_none(),
+            "the switch has not answered"
+        );
+        b.detached(5, 7);
+        b.swept(8);
+        assert!(
+            b.alloc(&mut map, 1000).is_none(),
+            "half a round does not count"
+        );
+        b.swept(9);
+        assert_eq!(b.alloc(&mut map, 1000).map(|a| a.0), Some(5));
+        // A number that never left is not given twice, and an answer to nothing is ignored.
+        b.detached(5, 0);
+        b.detached(6, 0);
+        b.swept(100);
+        assert!(b.alloc(&mut map, 1000).is_none());
+    }
+
+    #[test]
+    fn generations_of_a_number_never_repeat_nor_are_zero() {
+        let (mut b, mut map) = (Blocks::new(), PortMap::new());
+        let mut last = 0;
+        for round in 0..1000u32 {
+            let (c, g, _) = b.alloc(&mut map, round * 100).unwrap();
+            assert_eq!((c, g), (0, last + 1));
+            last = g;
+            b.release(c, round * 100);
+            b.detached(c, round);
+            b.swept(round + 2);
+        }
+        b.generation[0] = u32::MAX;
+        b.swept(10_000);
+        b.number[0] = Number::Free;
+        assert_eq!(b.alloc(&mut map, 200_000).unwrap().1, 1, "wraps over 0");
     }
 
     #[test]
