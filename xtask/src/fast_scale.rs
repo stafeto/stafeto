@@ -71,7 +71,10 @@ const GRANT_BYTES: u64 = 32_768 * 4096;
 /// The connections of the stages, the data limit of the degradation step in
 /// KiB, and the places of the kernel's table the layer may hold.
 const STAGES: [usize; 3] = [100, 250, 400];
-const DEGRADE_KIB: u32 = 20_480;
+// The data limit of the degradation step. It counts the consumer's ring of the switch (645
+// pages since the rings follow their slots, 1 288 before), so it is lower by the 643 pages (2 572
+// KiB) the ring lost: the same room is left for the connections.
+const DEGRADE_KIB: u32 = 17_908;
 const DEGRADE_CONNS: usize = 700;
 /// The line nginx logs when its 32 KiB buffer finds the heap held full by the limit, and how
 /// many of them the step tolerates.
@@ -92,6 +95,11 @@ const POOL: u64 = 48 * 1024;
 const PLACES_MAX: u64 = 112;
 /// The memory per connection that stops the work (O3), in bytes.
 const SLOPE_MAX: u64 = 7 * 1024;
+/// What the quota used per connection may vary beyond the pool and `SLOPE_MAX`. The figure is the
+/// difference of pages the heap took between the stages, and a runner of GitHub gave 56 388 bytes
+/// where a quiet machine gives 55 514 (6 362 beyond the pool): 2 KiB leave room for that (it
+/// came 68 bytes over the limit) and still stop a connection that holds one more buffer of 4 KiB.
+const SLOPE_MARGIN: u64 = 2 * 1024;
 const HOLD: Duration = Duration::from_secs(30);
 const WAVE_WITHIN: Duration = Duration::from_secs(120);
 const LINE_WITHIN: Duration = Duration::from_secs(90);
@@ -465,10 +473,10 @@ fn scenario(
     // comes at once, so the chunks would show steps. 4 KiB for each page.
     let slope = (taken[2].saturating_sub(taken[0])) * 4096 / (STAGES[2] - STAGES[0]) as u64;
     notes.push(format!(
-        "the quota used per connection: {slope} bytes, {} beyond the pool at most (at most {SLOPE_MAX}); the zones of the stack hold {stack_share} bytes of it; {top} bytes used at the top, the room grew to {taken_room} pages", slope.saturating_sub(POOL)
+        "the quota used per connection: {slope} bytes, {} beyond the pool at most (at most {SLOPE_MAX}, with {SLOPE_MARGIN} of margin); the zones of the stack hold {stack_share} bytes of it; {top} bytes used at the top, the room grew to {taken_room} pages", slope.saturating_sub(POOL)
     ));
     let room = taken_room;
-    if slope < POOL || slope - POOL > SLOPE_MAX || room != 262_144 {
+    if slope < POOL || slope - POOL > SLOPE_MAX + SLOPE_MARGIN || room != 262_144 {
         return Err(format!(
             "{slope} bytes per connection (pool {POOL}), room {room} pages"
         ));

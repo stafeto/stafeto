@@ -24,7 +24,7 @@
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use proto_net::switch::{
     self as sw, CELL, CONSUMER_IDLE, COUNTERS, DONE_HEAD, DONE_TAIL, Done, FILL_HEAD, FILL_TAIL,
-    Layout, RX_CELLS, SWITCH_IDLE, TX_CELLS, TX_HEAD, TX_TAIL, TxEntry,
+    Layout, SWITCH_IDLE, TX_HEAD, TX_TAIL, TxEntry,
 };
 
 /// Cells of FILL below which the layer copies a frame and returns its
@@ -76,7 +76,7 @@ impl Port {
             tx_head: 0,
             tx_tail: 0,
         };
-        for cell in 0..layout.rx_slots.min(RX_CELLS) {
+        for cell in 0..layout.rx_slots {
             port.give(cell);
         }
         port.publish_fill();
@@ -102,7 +102,7 @@ impl Port {
 
     /// The cell of a frame the consumer is done with goes back to FILL.
     pub fn rx_return(&mut self, cell: u32) {
-        if cell < RX_CELLS {
+        if cell < self.layout.rx_slots {
             self.give(cell);
             self.publish_fill();
         }
@@ -137,7 +137,7 @@ impl Port {
                 chunk.copy_from_slice(&w.to_le_bytes());
             }
             let d = Done::from_bytes(raw);
-            if u32::from(d.cell) >= RX_CELLS || usize::from(d.len) > CELL {
+            if u32::from(d.cell) >= self.layout.rx_slots || usize::from(d.len) > CELL {
                 return Err(Broken);
             }
             // SAFETY: the cell is inside the object (checked above).
@@ -160,14 +160,14 @@ impl Port {
     /// The entries of TX the consumer may write: reads `tx_tail`.
     pub fn tx_room(&mut self) -> u32 {
         self.tx_tail = self.word(TX_TAIL).load(Ordering::Acquire);
-        let cap = self.layout.tx_slots.min(TX_CELLS);
+        let cap = self.layout.tx_slots;
         cap.saturating_sub(self.tx_next.wrapping_sub(self.tx_tail))
     }
 
     /// The cell the next frame is built in, or None when TX is full (after
     /// one look at `tx_tail`).
     pub fn tx_cell(&mut self) -> Option<*mut u8> {
-        let cap = self.layout.tx_slots.min(TX_CELLS);
+        let cap = self.layout.tx_slots;
         if self.tx_next.wrapping_sub(self.tx_tail) >= cap && self.tx_room() == 0 {
             return None;
         }
@@ -178,9 +178,18 @@ impl Port {
     /// The frame of `len` bytes in the cell `tx_cell` gave becomes an entry
     /// (flags and spare 0). It is published by `tx_flush`.
     pub fn tx_submit(&mut self, len: u32) {
+        self.tx_submit_flags(len, sw::TX_FLAGS);
+    }
+
+    /// `tx_submit` for a packet of the loopback network (`TX_LOOP`).
+    pub fn tx_submit_loop(&mut self, len: u32) {
+        self.tx_submit_flags(len, sw::TX_LOOP);
+    }
+
+    fn tx_submit_flags(&mut self, len: u32, flags: u16) {
         let raw = TxEntry {
             len: len as u16,
-            flags: sw::TX_FLAGS,
+            flags,
             spare: 0,
         }
         .to_bytes();
@@ -354,6 +363,14 @@ mod c {
         }
     }
 
+    /// The entry for the packet in the cell is one of the loopback network.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_tx_submit_loop(len: u32) {
+        if let Some(p) = port() {
+            p.tx_submit_loop(len);
+        }
+    }
+
     /// Publishes the entries written; 1 when the switch sleeps and the
     /// caller pokes it (`stafeto_fast_poke`).
     #[unsafe(no_mangle)]
@@ -456,10 +473,10 @@ mod tests {
     #[test]
     fn open_fills_fill_with_every_cell() {
         let (mut m, l, p) = rig();
-        assert_eq!(m.word(FILL_HEAD).load(Ordering::Relaxed), 2048);
+        assert_eq!(m.word(FILL_HEAD).load(Ordering::Relaxed), 1024);
         assert_eq!(m.word(l.fill_entry(0)).load(Ordering::Relaxed), 0);
-        assert_eq!(m.word(l.fill_entry(2047)).load(Ordering::Relaxed), 2047);
-        assert_eq!(p.fill_free(), 2048);
+        assert_eq!(m.word(l.fill_entry(1023)).load(Ordering::Relaxed), 1023);
+        assert_eq!(p.fill_free(), 1024);
     }
 
     #[test]
@@ -475,9 +492,9 @@ mod tests {
         assert_eq!(m.word(DONE_TAIL).load(Ordering::Relaxed), 2);
         assert!(!p.work());
         p.rx_return(7);
-        assert_eq!(m.word(FILL_HEAD).load(Ordering::Relaxed), 2049);
+        assert_eq!(m.word(FILL_HEAD).load(Ordering::Relaxed), 1025);
         assert_eq!(
-            m.word(l.fill_entry(2048)).load(Ordering::Relaxed),
+            m.word(l.fill_entry(1024)).load(Ordering::Relaxed),
             7,
             "the entry wraps"
         );
@@ -530,9 +547,9 @@ mod tests {
     }
 
     #[test]
-    fn tx_is_full_after_512_entries_until_tx_tail_moves() {
+    fn tx_is_full_after_256_entries_until_tx_tail_moves() {
         let (mut m, _l, mut p) = rig();
-        for _ in 0..512 {
+        for _ in 0..256 {
             assert!(p.tx_cell().is_some());
             p.tx_submit(60);
         }
@@ -540,6 +557,18 @@ mod tests {
         m.word(TX_TAIL).store(10, Ordering::Release);
         assert!(p.tx_cell().is_some());
         assert_eq!(p.tx_room(), 10);
+    }
+
+    #[test]
+    fn a_loop_entry_carries_its_flag_and_an_ordinary_one_has_none() {
+        let (mut m, l, mut p) = rig();
+        assert!(p.tx_cell().is_some());
+        p.tx_submit(60);
+        assert!(p.tx_cell().is_some());
+        p.tx_submit_loop(70);
+        let word0 = |m: &mut Mem, i: u32| m.word(l.tx_entry(i)).load(Ordering::Relaxed);
+        assert_eq!(word0(&mut m, 0), 60);
+        assert_eq!(word0(&mut m, 1), 70 | u32::from(sw::TX_LOOP) << 16);
     }
 
     #[test]

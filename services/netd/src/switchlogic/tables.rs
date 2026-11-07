@@ -46,6 +46,18 @@ pub const SWEEP_STEP: usize = 128;
 pub const SWEEP_REMOVALS: usize = 32;
 const EMPTY: u8 = 0xff;
 
+/// SYNs parked per group while no member is live (note Sh4, 3.4).
+pub const PARK_PER_GROUP: usize = 16;
+/// Bytes of a parked frame: a SYN has no data, so Ethernet, IP and TCP headers with options fit.
+pub const PARK_FRAME: usize = 128;
+/// Milliseconds a SYN waits for a member before it is dropped (the peer repeats it after 1 s).
+pub const PARK_MS: u32 = 500;
+/// Places the park needs.
+pub const PARK_SLOTS: usize = MAX_GROUPS * PARK_PER_GROUP;
+/// The least time between two looks at the park for SYNs past their term (ms): a look is a
+/// pass over every place, which does not belong in each step.
+pub const PARK_SCAN_MS: u32 = 16;
+
 /// What a flow is found by: the peer's address and port and our port (our
 /// address is the one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +68,7 @@ pub struct FlowKey {
 }
 
 impl FlowKey {
-    fn bytes(&self) -> [u8; 8] {
+    pub fn bytes(&self) -> [u8; 8] {
         let mut b = [0; 8];
         b[..4].copy_from_slice(&self.peer);
         b[4..6].copy_from_slice(&self.peer_port.to_le_bytes());
@@ -455,6 +467,25 @@ impl Consumer {
     }
 }
 
+/// A parked SYN: the flow key it names, when it came (ms) and its bytes.
+#[derive(Clone, Copy)]
+pub struct ParkSlot {
+    key: [u8; 8],
+    at: u32,
+    /// 0 for a free place.
+    len: u8,
+    frame: [u8; PARK_FRAME],
+}
+
+impl ParkSlot {
+    pub const EMPTY: ParkSlot = ParkSlot {
+        key: [0; 8],
+        at: 0,
+        len: 0,
+        frame: [0; PARK_FRAME],
+    };
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Group {
     pub proto: Proto,
@@ -498,7 +529,19 @@ pub struct Tables<'a> {
     pub own: Own,
     /// Seconds, set by the switch at each step.
     pub now: u32,
+    /// Milliseconds (wrapping), set with `now`; the park keeps its time in them.
+    pub now_ms: u32,
     ports: &'a mut [u8],
+    /// The park of SYNs: `PARK_PER_GROUP` places per group, empty when parking is off.
+    park: &'a mut [ParkSlot],
+    parked: u32,
+    /// SYNs waiting in each group, so that a step looks only at the groups that have some.
+    park_count: [u8; MAX_GROUPS],
+    park_scan_ms: u32,
+    pub park_expired: u32,
+    pub park_dropped: u32,
+    /// Memberships ended by LEAVE (not by a consumer's departure).
+    pub left: u32,
     pub groups: [Option<Group>; MAX_GROUPS],
     pub consumers: [Option<Consumer>; MAX_CONSUMERS],
     pub flows: Flows<'a>,
@@ -521,7 +564,15 @@ impl<'a> Tables<'a> {
         Tables {
             own,
             now: 0,
+            now_ms: 0,
             ports,
+            park: &mut [],
+            parked: 0,
+            park_count: [0; MAX_GROUPS],
+            park_scan_ms: 0,
+            park_expired: 0,
+            park_dropped: 0,
+            left: 0,
             groups: [None; MAX_GROUPS],
             consumers: [const { None }; MAX_CONSUMERS],
             flows,
@@ -531,6 +582,119 @@ impl<'a> Tables<'a> {
             owed: [None; 16],
             guard: Guard { tag, owner: None },
         }
+    }
+
+    /// Turns parking on with `slots` (`PARK_SLOTS` of them).
+    pub fn set_park(&mut self, slots: &'a mut [ParkSlot]) {
+        assert!(slots.len() == PARK_SLOTS);
+        slots.fill(ParkSlot::EMPTY);
+        self.park = slots;
+        self.parked = 0;
+        self.park_count = [0; MAX_GROUPS];
+    }
+
+    /// SYNs waiting now.
+    pub fn parked(&self) -> u32 {
+        self.parked
+    }
+
+    fn park_range(group: u8) -> core::ops::Range<usize> {
+        let at = (usize::from(group) - 1) * PARK_PER_GROUP;
+        at..at + PARK_PER_GROUP
+    }
+
+    /// Parks the SYN `frame` of `key` for group `group`: a repeat of the same key replaces the
+    /// earlier one, a full group takes the place of no one (false, the peer repeats the SYN).
+    pub fn park(&mut self, group: u8, key: &FlowKey, frame: &[u8]) -> bool {
+        self.guard.check();
+        if self.park.is_empty()
+            || frame.len() > PARK_FRAME
+            || !(1..=MAX_GROUPS as u8).contains(&group)
+        {
+            return false;
+        }
+        let (now, k) = (self.now_ms, key.bytes());
+        let range = Self::park_range(group);
+        let places = &mut self.park[range];
+        let at = places
+            .iter()
+            .position(|p| p.len != 0 && p.key == k)
+            .or_else(|| places.iter().position(|p| p.len == 0));
+        let Some(at) = at else {
+            self.park_dropped += 1;
+            return false;
+        };
+        if places[at].len == 0 {
+            self.parked += 1;
+            self.park_count[usize::from(group) - 1] += 1;
+        }
+        let p = &mut places[at];
+        p.key = k;
+        p.at = now;
+        p.len = frame.len() as u8;
+        p.frame[..frame.len()].copy_from_slice(frame);
+        true
+    }
+
+    /// Drops the SYNs that waited `PARK_MS`, looking at the places at most every `PARK_SCAN_MS`.
+    pub fn expire_parked(&mut self) {
+        self.guard.check();
+        if self.parked == 0 || self.now_ms.wrapping_sub(self.park_scan_ms) < PARK_SCAN_MS {
+            return;
+        }
+        self.park_scan_ms = self.now_ms;
+        for (i, p) in self.park.iter_mut().enumerate() {
+            if p.len != 0 && self.now_ms.wrapping_sub(p.at) >= PARK_MS {
+                p.len = 0;
+                self.parked -= 1;
+                self.park_count[i / PARK_PER_GROUP] -= 1;
+                self.park_expired += 1;
+            }
+        }
+    }
+
+    /// Whether group `number` has a member that is live and has room for a new connection (the
+    /// cells and the flows `route` asks of it), which a parked SYN can go to.
+    fn park_fits(&self, number: u8) -> bool {
+        let limit = (self.flows.capacity() / 2) as u32;
+        self.group(number).is_some_and(|g| {
+            !g.draining
+                && g.members.iter().flatten().any(|m| {
+                    self.live(m.0, m.1)
+                        && self.consumers[usize::from(m.0)].as_ref().is_some_and(|c| {
+                            c.ring.fill_avail() >= super::route::MIN_FILL && c.flows < limit
+                        })
+                })
+        })
+    }
+
+    /// Takes one parked SYN out, the lowest group number first, from a group that has a member
+    /// that can take it now (live, with cells and room for a flow: a SYN whose group is full
+    /// stays parked until its term, and is not routed to be dropped); its bytes go to `out` and
+    /// their count is returned.
+    pub fn park_take(&mut self, out: &mut [u8; PARK_FRAME]) -> Option<usize> {
+        self.guard.check();
+        if self.parked == 0 {
+            return None;
+        }
+        for number in 1..=MAX_GROUPS as u8 {
+            if self.park_count[usize::from(number) - 1] == 0 || !self.park_fits(number) {
+                continue;
+            }
+            // The one that waited longest.
+            let now = self.now_ms;
+            let at = Self::park_range(number)
+                .filter(|&i| self.park[i].len != 0)
+                .max_by_key(|&i| now.wrapping_sub(self.park[i].at))?;
+            let p = &mut self.park[at];
+            let n = usize::from(p.len);
+            out[..n].copy_from_slice(&p.frame[..n]);
+            p.len = 0;
+            self.parked -= 1;
+            self.park_count[usize::from(number) - 1] -= 1;
+            return Some(n);
+        }
+        None
     }
 
     /// The calling thread is the switch from now on.
@@ -695,13 +859,15 @@ impl<'a> Tables<'a> {
         true
     }
 
+    /// Consumer `c` stops being a member of group `number` (its description was closed): new
+    /// SYNs go to the others, or wait in the park. Flows it has go on.
     pub fn leave(&mut self, number: u8, c: u8) {
         self.guard.check();
         if let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) {
-            g.members
-                .iter_mut()
-                .filter(|m| m.is_some_and(|m| m.0 == c))
-                .for_each(|m| *m = None);
+            for m in g.members.iter_mut().filter(|m| m.is_some_and(|m| m.0 == c)) {
+                *m = None;
+                self.left += 1;
+            }
         }
     }
 

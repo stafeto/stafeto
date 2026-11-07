@@ -597,6 +597,15 @@ struct PortBytes(UnsafeCell<[u8; 2 * 65536]>);
 unsafe impl Sync for PortBytes {}
 static PORT_BYTES: PortBytes = PortBytes(UnsafeCell::new([0; 2 * 65536]));
 
+struct ParkBytes(
+    UnsafeCell<[netd::switchlogic::tables::ParkSlot; netd::switchlogic::tables::PARK_SLOTS]>,
+);
+// SAFETY: written by the switch thread alone after the start.
+unsafe impl Sync for ParkBytes {}
+static PARKED_SYNS: ParkBytes = ParkBytes(UnsafeCell::new(
+    [netd::switchlogic::tables::ParkSlot::EMPTY; netd::switchlogic::tables::PARK_SLOTS],
+));
+
 /// The tables of the switch (the port table, and the flow table in an object of its own
 /// that the service's quota pays for) and the timer of the sweep on the switch thread's
 /// channel; none without `switch N`.
@@ -658,7 +667,9 @@ fn make_switch_tables(
         mac,
         prefix: 0,
     };
-    let tables = Tables::new(own, ports, Flows::new(slots, &secret), switch::tag);
+    let mut tables = Tables::new(own, ports, Flows::new(slots, &secret), switch::tag);
+    // SAFETY: the park belongs to the tables from here.
+    tables.set_park(unsafe { &mut *PARKED_SYNS.0.get() });
     Ok((Some(tables), (timer, view)))
 }
 
@@ -1499,7 +1510,7 @@ impl Driver<'_> {
         let st = &switch::INNER.stats;
         let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
         rt::println!(
-            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {}",
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {}",
             get(&st.consumers),
             get(&st.flows),
             get(&st.unconfirmed),
@@ -1510,9 +1521,12 @@ impl Driver<'_> {
             get(&st.hairpin),
             get(&st.own_to_device),
             get(&st.rx_consumer),
-            get(&st.tx_consumer)
+            get(&st.tx_consumer),
+            get(&st.park_given),
+            get(&st.left),
+            get(&st.looped)
         );
-        let drops: [u32; 6] = core::array::from_fn(|i| get(&st.drops[i]));
+        let drops: [u32; 7] = core::array::from_fn(|i| get(&st.drops[i]));
         let refused: [u32; netd::switchlogic::route::Reason::COUNT] =
             core::array::from_fn(|i| get(&st.refused_by[i]));
         rt::println!("net: switch dropped {drops:?} refused_by {refused:?}");

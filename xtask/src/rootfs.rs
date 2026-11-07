@@ -258,7 +258,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 63] = [
+const SYSTEM_PATHS: [&str; 65] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -324,6 +324,8 @@ const SYSTEM_PATHS: [&str; 63] = [
     // runs the worker under nobody.
     "/etc/nginx/nginx-fast-nobody.conf",
     "/etc/nginx/nginx-fast-4.conf",
+    "/etc/nginx/nginx-fast-9.conf",
+    "/etc/nginx/nginx-fast-b.conf",
     "/etc/nginx/nginx-fast-sndbuf.conf",
     // ... and nginx's server of TLS with the key and the certificate the
     // probe CA made for it.
@@ -1436,6 +1438,18 @@ fn switch_files(image: &str) -> Vec<RootFile> {
         0o644,
         ROOT,
         Source::Bytes("nginx-fast-4.conf", crate::fast_switch::conf4().as_bytes()),
+    ));
+    files.push(of(
+        "/etc/nginx/nginx-fast-9.conf",
+        0o644,
+        ROOT,
+        Source::Bytes("nginx-fast-9.conf", crate::fast_switch::conf9().as_bytes()),
+    ));
+    files.push(of(
+        "/etc/nginx/nginx-fast-b.conf",
+        0o644,
+        ROOT,
+        Source::Bytes("nginx-fast-b.conf", crate::fast_switch::conf_b().as_bytes()),
     ));
     files
 }

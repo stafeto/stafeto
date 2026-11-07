@@ -12,8 +12,8 @@
 //!
 //! The ring object: page 0 holds lines of `LINE` bytes (the u32 of each at
 //! its start), then the FILL ring (u32 cells), the DONE ring (8 bytes), the
-//! TX ring (8 bytes), `RX_CELLS` cells to receive into and `TX_CELLS` to
-//! send from, `CELL` bytes each. Every index is a u32 that grows without
+//! TX ring (8 bytes), `rx_slots` cells to receive into and `tx_slots` to
+//! send from, `CELL` bytes each (a cell of FILL is a cell number below `rx_slots`). Every index is a u32 that grows without
 //! wrapping to the size; the entry of index `i` is `i % slots`.
 
 use crate::{Config, Method};
@@ -25,10 +25,11 @@ pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
 pub const CELL: usize = 2048;
 pub const FRAME_MAX: usize = 1514;
-pub const RX_CELLS: u32 = 2048;
-pub const TX_CELLS: u32 = 512;
-pub const RX_SLOTS: (u32, u32) = (256, 8192);
-pub const TX_SLOTS: (u32, u32) = (64, TX_CELLS);
+/// The bounds of the rings, in entries; each entry of the receiving ring and of the sending ring has
+/// a cell of its own, so the object (and the mappings of the service that hold it) is as large as
+/// the sizes the consumer asks for.
+pub const RX_SLOTS: (u32, u32) = (256, 4096);
+pub const TX_SLOTS: (u32, u32) = (64, 512);
 /// The most ports one PORT_HOLD names.
 pub const HOLD_MAX: u32 = 16;
 pub const REUSEPORT: u32 = 1;
@@ -47,13 +48,19 @@ pub const SWITCH_IDLE: usize = 8 * LINE;
 pub const COUNTERS: usize = 9 * LINE;
 
 /// DONE flags: a copy of an ARP reply sent to every consumer; an ICMP
-/// error steered by the header it carries. Bit 2 is reserved.
+/// error steered by the header it carries; a packet of 127.0.0.0/8 from
+/// another stack (Ethernet header, no sums): the consumer's stack takes it in
+/// at its loopback interface.
 pub const DONE_ARP_COPY: u16 = 1;
 pub const DONE_ICMP_ERROR: u16 = 2;
-pub const DONE_RESERVED_LOOP: u16 = 4;
-pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR;
-/// The TX flags must be 0.
+pub const DONE_LOOP: u16 = 4;
+pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP;
+/// The TX flags of an ordinary frame.
 pub const TX_FLAGS: u16 = 0;
+/// A packet of the loopback network of the consumer's stack for a port that is no port of
+/// that stack (both addresses in 127.0.0.0/8, else the ring breaks); the switch routes it by
+/// its port. The only flag a TX entry may have.
+pub const TX_LOOP: u16 = 4;
 
 /// The bits the switch notifies the consumer with.
 pub const WAKE_RING: u64 = 1;
@@ -73,9 +80,11 @@ const fn pages(bytes: usize) -> usize {
 }
 
 impl Layout {
+    /// 1 024 cells to receive into and 256 to send from: 645 pages, 11 chunks of 64 pages of
+    /// the service's mappings (eight consumers fit the budget of `RING_MAPPINGS`).
     pub const DEFAULT: Layout = Layout {
-        rx_slots: 2048,
-        tx_slots: 512,
+        rx_slots: 1024,
+        tx_slots: 256,
     };
 
     /// None unless the sizes are powers of two within their bounds.
@@ -114,21 +123,99 @@ impl Layout {
         self.rx_cells() + cell as usize * CELL
     }
     pub const fn tx_cells(&self) -> usize {
-        self.rx_cells() + RX_CELLS as usize * CELL
+        self.rx_cells() + self.rx_slots as usize * CELL
     }
-    /// The cell of TX entry `i`: `i % tx_slots` (`tx_slots` is at most `TX_CELLS`).
+    /// The cell of TX entry `i`: `i % tx_slots` (a cell for each entry).
     pub const fn tx_cell(&self, i: u32) -> usize {
         self.tx_cells() + (i % self.tx_slots) as usize * CELL
     }
     pub const fn total(&self) -> usize {
-        self.tx_cells() + TX_CELLS as usize * CELL
+        self.tx_cells() + self.tx_slots as usize * CELL
     }
 }
 
-const _: () = assert!(Layout::DEFAULT.total() == 1288 * PAGE);
-const _: () = assert!(Layout::DEFAULT.rx_cells() == 8 * PAGE);
-const _: () = assert!(Layout::DEFAULT.tx_cells() == 1032 * PAGE);
+const _: () = assert!(Layout::DEFAULT.total() == 645 * PAGE);
+const _: () = assert!(Layout::DEFAULT.rx_cells() == 5 * PAGE);
+const _: () = assert!(Layout::DEFAULT.tx_cells() == 517 * PAGE);
 const _: () = assert!(COUNTERS + 8 <= PAGE && FRAME_MAX <= CELL);
+
+/// The ports a consumer's stack owns: the ports its process holds with the switch (one entry
+/// for each description of a hold, the place's number) and the block of temporary ports of its
+/// ring. Words and no lock: the glue of the stack asks inside the layer's lock for every packet
+/// of its loopback interface. An entry goes with the last close of its description, so a port
+/// whose group the process left is no longer counted as its own.
+pub struct OwnPorts {
+    /// Entry `i` is `port + 1` of a hold, 0 for none.
+    ports: [core::sync::atomic::AtomicU32; OwnPorts::ENTRIES],
+    /// The description of entry `i`, plus one.
+    descriptions: [core::sync::atomic::AtomicU32; OwnPorts::ENTRIES],
+    /// The first port and the count of the block, `first << 16 | count` (0: none).
+    block: core::sync::atomic::AtomicU32,
+}
+
+impl OwnPorts {
+    pub const ENTRIES: usize = 32;
+
+    pub const fn new() -> OwnPorts {
+        OwnPorts {
+            ports: [const { core::sync::atomic::AtomicU32::new(0) }; OwnPorts::ENTRIES],
+            descriptions: [const { core::sync::atomic::AtomicU32::new(0) }; OwnPorts::ENTRIES],
+            block: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_block(&self, first: u16, count: u16) {
+        use core::sync::atomic::Ordering::Release;
+        self.block
+            .store(u32::from(first) << 16 | u32::from(count), Release);
+    }
+
+    /// The description `description` holds `port`. False when the table is full (the packet for
+    /// such a port goes to the switch, which hands it back to the stack when no one else holds
+    /// it: the way is longer and no wrong answer follows).
+    pub fn note(&self, port: u16, description: u32) -> bool {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        for (p, d) in self.ports.iter().zip(&self.descriptions) {
+            if p.load(Acquire) == 0
+                && d.compare_exchange(0, description.wrapping_add(1), AcqRel, Acquire)
+                    .is_ok()
+            {
+                p.store(u32::from(port) + 1, Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The last close of description `description`: its entries go.
+    pub fn forget(&self, description: u32) {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        for (p, d) in self.ports.iter().zip(&self.descriptions) {
+            if d.load(Acquire) == description.wrapping_add(1) {
+                p.store(0, Release);
+                d.store(0, Release);
+            }
+        }
+    }
+
+    /// Whether `port` is one of the block or of a hold that is still open.
+    pub fn owns(&self, port: u16) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+        let block = self.block.load(Acquire);
+        let (first, count) = ((block >> 16) as u16, block & 0xffff);
+        u32::from(port).wrapping_sub(u32::from(first)) < count
+            || self
+                .ports
+                .iter()
+                .any(|p| p.load(Acquire) == u32::from(port) + 1)
+    }
+}
+
+impl Default for OwnPorts {
+    fn default() -> OwnPorts {
+        OwnPorts::new()
+    }
+}
 
 /// An entry of DONE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,24 +416,25 @@ mod tests {
     };
 
     #[test]
-    fn the_default_ring_is_1288_pages() {
+    fn the_default_ring_is_645_pages_in_eleven_chunks() {
         let l = Layout::DEFAULT;
-        assert_eq!((l.fill(), l.done(), l.tx()), (PAGE, 3 * PAGE, 7 * PAGE));
-        assert_eq!(l.done_entry(2049), l.done() + 8);
-        assert_eq!(l.fill_entry(u32::MAX), PAGE + 2047 * 4);
-        assert_eq!(l.tx_cell(513), l.tx_cells() + CELL);
-        assert_eq!(l.rx_cell(RX_CELLS - 1) + CELL, l.tx_cells());
-        let big = Layout::new(8192, 512).unwrap();
+        assert_eq!((l.fill(), l.done(), l.tx()), (PAGE, 2 * PAGE, 4 * PAGE));
+        assert_eq!(l.done_entry(1025), l.done() + 8);
+        assert_eq!(l.fill_entry(u32::MAX), PAGE + 1023 * 4);
+        assert_eq!(l.tx_cell(257), l.tx_cells() + CELL);
+        assert_eq!(l.rx_cell(l.rx_slots - 1) + CELL, l.tx_cells());
+        assert_eq!(l.total().div_ceil(PAGE).div_ceil(64), 11);
+        let big = Layout::new(4096, 512).unwrap();
         assert_eq!(big.rx_cells() % PAGE, 0);
         assert!(big.tx_cell(u32::MAX) + CELL <= big.total());
     }
 
     #[test]
     fn sizes_are_powers_of_two_in_their_bounds() {
-        assert!(Layout::new(256, 64).is_some() && Layout::new(8192, 512).is_some());
+        assert!(Layout::new(256, 64).is_some() && Layout::new(4096, 512).is_some());
         for (rx, tx) in [
             (128, 64),
-            (16384, 64),
+            (8192, 64),
             (300, 64),
             (256, 32),
             (256, 1024),
@@ -354,6 +442,33 @@ mod tests {
         ] {
             assert_eq!(Layout::new(rx, tx), None, "{rx} {tx}");
         }
+    }
+
+    #[test]
+    fn a_port_is_own_while_a_description_of_its_hold_is_open() {
+        let own = OwnPorts::new();
+        own.set_block(49152, 512);
+        assert!(own.owns(49152) && own.owns(49663) && !own.owns(49664) && !own.owns(49151));
+        assert!(!own.owns(80));
+        assert!(own.note(80, 7));
+        // A second description of the same group (a fork's copy, a second socket).
+        assert!(own.note(80, 9));
+        assert!(own.owns(80));
+        own.forget(7);
+        assert!(own.owns(80), "one description of the group is still open");
+        own.forget(9);
+        assert!(!own.owns(80), "the last close takes the port out");
+        // A close of a description that holds nothing takes nothing out.
+        own.forget(1234);
+        assert!(own.owns(49200));
+        // The table of 32 entries fills and refuses the 33rd, and a close makes room.
+        for i in 0..OwnPorts::ENTRIES as u32 {
+            assert!(own.note(1000 + i as u16, i));
+        }
+        assert!(!own.note(2000, 99));
+        own.forget(3);
+        assert!(own.note(2000, 99));
+        assert!(own.owns(2000) && !own.owns(1003));
     }
 
     #[test]
@@ -370,7 +485,8 @@ mod tests {
             spare: 0,
         };
         assert_eq!(TxEntry::from_bytes(t.to_bytes()), t);
-        assert_eq!(DONE_FLAGS & DONE_RESERVED_LOOP, 0);
+        assert_eq!(DONE_FLAGS, DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP);
+        assert_eq!(DONE_LOOP, TX_LOOP);
     }
 
     #[test]

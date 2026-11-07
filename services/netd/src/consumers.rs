@@ -16,7 +16,9 @@ use crate::net::{Client, Net};
 use crate::switch;
 use crate::{Driver, dma};
 use abi::{Access, Error, Rights};
-use netd::books::{Chunks, Hold, Leave, Owners, hold_ports, leave_by, ports_free_of_blocks};
+use netd::books::{
+    Chunks, Hold, Leave, Mappings, Owners, hold_ports, leave_by, ports_free_of_blocks,
+};
 use netd::ports::{Binding, Proto, conflicts};
 use netd::switchlogic::commands::{Back, Command};
 use netd::switchlogic::tables::{BLOCK_PORTS, Blocks, Both, MAX_CONSUMERS};
@@ -43,6 +45,8 @@ struct Entry {
     /// and unmap take about 140 ticks a page under -icount, so a ring of 1 288 pages is
     /// mapped and unmapped `MAP_CHUNK` pages in a step).
     size: u64,
+    /// The mappings reserved for the ring (`Mappings`).
+    chunks: u32,
     mapped: u64,
     /// The ring object, until all of it is mapped.
     ring: Option<Handle<Memory>>,
@@ -159,8 +163,15 @@ impl Driver<'_> {
         let busy = (0..MAX_CONSUMERS).fold(0u8, |m, c| {
             m | u8::from(self.side.entries[c].is_some()) << c
         });
+        // The mappings of the ring are counted up front: a ring that does not fit the budget is
+        // refused here, and a late `mem_map` never fails a consumer that was told OK.
+        let chunks = Mappings::for_ring(size, PAGE as u64, MAP_CHUNK);
+        if !self.net.buffers.mappings().reserve(chunks) {
+            return limit();
+        }
         let Some((c, generation, block)) = self.side.blocks.alloc_except(&mut both, now, busy)
         else {
+            self.net.buffers.mappings().release(chunks);
             return limit();
         };
 
@@ -180,6 +191,7 @@ impl Driver<'_> {
             Ok(copy) => copy,
             Err(error) => {
                 rt::println!("net: switch attach: labelling the gate: {error:?}");
+                self.net.buffers.mappings().release(chunks);
                 giveup(&mut self.side);
                 return Answer::Status(Status::Kernel(error));
             }
@@ -207,6 +219,7 @@ impl Driver<'_> {
             block_count: u32::from(BLOCK_PORTS),
         };
         if reply.write(r.reply()).is_err() {
+            self.net.buffers.mappings().release(chunks);
             giveup(&mut self.side);
             return Answer::Status(Status::BadSize);
         }
@@ -215,6 +228,7 @@ impl Driver<'_> {
         self.side.entries[usize::from(c)] = Some(Entry {
             notify,
             size,
+            chunks,
             mapped: 0,
             ring: Some(ring),
             pending: Some(attach),
@@ -326,6 +340,8 @@ impl Driver<'_> {
             if e.mapped > 0 {
                 left = true;
             } else {
+                let chunks = e.chunks;
+                self.net.buffers.mappings().release(chunks);
                 self.side.entries[c] = None;
             }
         }
@@ -467,6 +483,9 @@ impl Driver<'_> {
         if group == 0 {
             return refuse(proto_net::BAD_FD);
         }
+        // A LEAVE this session owes for the group (it closed its last description a moment ago)
+        // would undo the join that follows it.
+        self.net.holds.cancel_leave(group, mine);
         if !switch::command(Command::Join { group, consumer: c }) {
             return refuse(proto_net::BUSY);
         }
@@ -594,8 +613,23 @@ impl Driver<'_> {
         }
     }
 
-    /// The descriptions of ports that closed: the switch is told, one holder each.
+    /// The descriptions of ports that closed: the switch is told, one holder each, and the
+    /// consumers that closed their last description of a group leave it.
     pub(crate) fn drain_releases(&mut self) {
+        while let Some((group, mine)) = self.net.holds.next_leave() {
+            // A consumer that is gone (or whose number is another's now) has nothing to leave.
+            let wanted = self.side.owners.is_current(mine) && self.net.holds.switch_has(group);
+            if wanted
+                && !switch::command(Command::Leave {
+                    group,
+                    consumer: mine.number,
+                })
+            {
+                self.tell(crate::BACK);
+                return;
+            }
+            self.net.holds.leave_told(group, mine);
+        }
         while let Some(group) = self.net.holds.next_due() {
             if self.net.holds.switch_has(group) && !switch::command(Command::Release { group }) {
                 self.tell(crate::BACK);

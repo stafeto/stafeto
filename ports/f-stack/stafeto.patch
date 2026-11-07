@@ -216,6 +216,76 @@
  	loop_copy = (pflags & RT_MAY_LOOP) != 0;
  
  	/*
+--- a/freebsd/net/if_loop.c
++++ b/freebsd/net/if_loop.c
+@@ -73,7 +73,13 @@
+ 
+ #include <security/mac/mac_framework.h>
+ 
+-#ifdef TINY_LOMTU
++#ifdef FF_STAFETO
++/*
++ * A packet of the loopback network may leave through the ring of the switch, whose
++ * frames hold 1514 bytes: the segments of TCP over 127.0.0.1 are sized for 1500.
++ */
++#define	LOMTU	1500
++#elif defined(TINY_LOMTU)
+ #define	LOMTU	(1024+512)
+ #elif defined(LARGE_LOMTU)
+ #define LOMTU	131072
+@@ -192,6 +198,11 @@
+ 
+ DECLARE_MODULE(if_lo, loop_mod, SI_SUB_PROTO_IFATTACHDOMAIN, SI_ORDER_ANY);
+ 
++#ifdef FF_STAFETO
++/* The glue of the host layer (ports/f-stack/ff_stafeto_if.c). */
++int ff_stafeto_loop_tx(void *m, int total);
++#endif
++
+ static int
+ looutput(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst,
+     struct route *ro)
+@@ -261,9 +272,40 @@
+ 		return (EAFNOSUPPORT);
+ 	}
+ #endif
++#ifdef FF_STAFETO
++	/*
++	 * A packet for a port that is no port of this stack goes out through the
++	 * ring of the switch: the network service routes it to the stack that
++	 * owns the port. The rest stays on this interface.
++	 */
++	if (af == AF_INET && ff_stafeto_loop_tx(m, m->m_pkthdr.len))
++		return (0);
++#endif
+ 	return (if_simloop(ifp, m, af, 0));
+ }
+ 
++#ifdef FF_STAFETO
++/*
++ * A packet of the loopback network that another stack sent through the
++ * switch, in `mbuf` with its Ethernet header: this interface takes it in as
++ * if it had come from a socket of this stack.
++ */
++void ff_stafeto_lo_input(void *mbuf);
++
++void
++ff_stafeto_lo_input(void *mbuf)
++{
++	struct mbuf *m = mbuf;
++
++	m_adj(m, 14);	/* the Ethernet header */
++	/* The sender left the sums unfilled, as the loopback does. */
++	m->m_pkthdr.csum_data = 0xffff;
++	m->m_pkthdr.csum_flags = LO_CSUM_SET;
++	m->m_pkthdr.csum_flags &= ~LO_CSUM_FEATURES;
++	(void)if_simloop(V_loif, m, AF_INET, 0);
++}
++#endif
++
+ /*
+  * if_simloop()
+  *
 --- a/freebsd/net/netisr.c
 +++ b/freebsd/net/netisr.c
 @@ -984,6 +984,50 @@

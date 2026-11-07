@@ -530,7 +530,11 @@ impl<const D: usize> NetDevice<D> {
             profile::add(Counter::SumN, 1);
             profile::add(Counter::SumBytes, length as u64);
             let began = profile::now();
-            let sums_hold = frames::verify_sums(frame);
+            // A packet of the loopback network that reaches this point came through the switch
+            // from a consumer's stack (the wire's never get here: `classify` and the switch
+            // drop them), and such a stack leaves its sums unfilled as the loopback does.
+            let sums_hold =
+                (frame[12..14] == [8, 0] && frames::martian(frame)) || frames::verify_sums(frame);
             profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
             if !sums_hold {
                 self.bad_sum += 1;

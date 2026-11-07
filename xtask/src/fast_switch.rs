@@ -16,7 +16,8 @@
 //!   reset of the device.
 //! * `switch kill`: under a stream of new connections `kill -9` of a worker
 //!   (one worker, then four): no connection fails, the first connection after
-//!   the kill is answered, the device is never reset.
+//!   the kill is answered, the device is never reset; with one worker the SYNs
+//!   of the gap wait in the park and the new worker gets them.
 //! * `switch idle`: a request after 2 s of rest, on an open connection and on
 //!   a new one, is answered within 50 ms (a lost wake would wait for a tick).
 //! * `switch steps`: the start and the first pages under -icount with the
@@ -38,6 +39,8 @@ use crate::{
 };
 
 const CONF4: &str = "/etc/nginx/nginx-fast-4.conf";
+const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
+const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 const READ_WITHIN: Duration = Duration::from_secs(60);
@@ -47,14 +50,49 @@ const IDLE_WITHIN: Duration = Duration::from_millis(50);
 /// The wire's frames the capture of the probe keeps.
 const PCAP: &str = "switch-probe.pcap";
 
-/// `nginx-fast.conf` of the switch with four workers.
+/// `nginx-fast.conf` of the switch with four workers, and two locations over the loopback
+/// network (R-2b): `/up/` goes to BusyBox's `httpd` of the service's stack on 127.0.0.1:8080 (a
+/// packet for a port of another stack), `/self/` to the worker's own listener on 127.0.0.1:80
+/// (a port of its own stack, which stays on its loopback interface).
 pub fn conf4() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let text = crate::nginx_probe::replaced(
+            fast_nginx::switch_conf(),
+            "worker_processes 1;",
+            "worker_processes 4;",
+        );
+        crate::nginx_probe::replaced(
+            &text,
+            "        location / { }\n",
+            "        location / { }\n        location /up/ { proxy_buffering off; proxy_pass http://127.0.0.1:8080/; }\n        location /up2/ { proxy_buffering off; proxy_pass http://127.0.0.1:8081/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
+        )
+    })
+}
+
+/// `nginx-fast.conf` of the switch with nine workers: the ring budget of the service holds eight.
+pub fn conf9() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
         crate::nginx_probe::replaced(
             fast_nginx::switch_conf(),
             "worker_processes 1;",
-            "worker_processes 4;",
+            "worker_processes 9;",
+        )
+    })
+}
+
+/// The settings of a second nginx-fast, a consumer of its own on port 8081 (`/up2/` of the first
+/// proxies to it over 127.0.0.1: a transfer between two stacks of consumers).
+pub fn conf_b() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let text =
+            crate::nginx_probe::replaced(fast_nginx::switch_conf(), "listen 80;", "listen 8081;");
+        crate::nginx_probe::replaced(
+            &text,
+            "pid /var/run/nginx-fast.pid;",
+            "pid /var/run/nginx-fast-b.pid;",
         )
     })
 }
@@ -64,9 +102,10 @@ pub fn command(args: &[String]) -> Result<(), String> {
         [] => probe(Scenario::Plain),
         [a] if a == "kill" => probe(Scenario::Kill),
         [a] if a == "idle" => probe(Scenario::Idle),
+        [a] if a == "attach" => probe(Scenario::Attach),
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
-        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|steps|frames]".to_owned()),
+        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames]".to_owned()),
     }
 }
 
@@ -75,6 +114,8 @@ pub enum Scenario {
     Plain,
     Kill,
     Idle,
+    /// `attach`: eight workers attach, the ninth is refused up front.
+    Attach,
     Steps,
     /// `switch-probe`.
     Frames,
@@ -92,6 +133,12 @@ struct Stat {
     hairpin: u64,
     own_to_device: u64,
     tx_refused: u64,
+    /// Parked SYNs given to a member that joined.
+    park_given: u64,
+    /// Packets of the loopback network routed through the tables.
+    looped: u64,
+    /// Memberships ended by LEAVE.
+    left: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
     refused_by: Vec<u64>,
     rx_by: Vec<u64>,
@@ -106,7 +153,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
     run.expect_line(
         "the counters of the switch",
         |l| l.contains("net: switch rx_by "),
-        Duration::from_secs(30),
+        Duration::from_secs(120),
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
@@ -151,6 +198,9 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
         hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
         own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
         tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
+        park_given: counter(&line, "park_given").ok_or("park_given")?,
+        looped: counter(&line, "looped").ok_or("looped")?,
+        left: counter(&line, "left").ok_or("left")?,
         rx_by,
         line,
     })
@@ -232,6 +282,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Plain => plain(&mut run, nginx, httpd, &mut notes),
         Scenario::Kill => kill(&mut run, nginx, &mut notes),
         Scenario::Idle => idle(&mut run, nginx, &mut notes),
+        Scenario::Attach => attach(&mut run, nginx, &mut notes),
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
     };
@@ -387,6 +438,114 @@ fn plain(
         "the guest's wget to the shared address came whole: {} frames turned, tx_refused {}",
         second.hairpin, second.tx_refused
     ));
+    loopback(run, nginx, second.looped, notes)
+}
+
+/// The loopback network between stacks (R-2b): a `wget` of the guest to nginx-fast on 127.0.0.1
+/// (the service's stack to a worker), nginx-fast as a proxy to `httpd` on 127.0.0.1:8080 (a worker
+/// to the service's stack), and a worker's own loopback (its own port stays in its stack). The
+/// packets of the first two go through the tables (`looped` grows), nothing of them reaches the
+/// device.
+fn loopback(
+    run: &mut qemu::Run,
+    nginx: SocketAddr,
+    looped0: u64,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(TINY)
+        .map_err(|e| e.to_string())?
+        .trim_end()
+        .to_owned();
+    run.send("wget -T 20 -q -O - http://127.0.0.1/tiny.txt; echo ngx-lo-end")?;
+    if let Err(why) = run.expect_line(
+        "the page by wget over 127.0.0.1",
+        |l| l.trim_end() == text,
+        Duration::from_secs(40),
+    ) {
+        let seen = stat(run, "lo")?.line;
+        return Err(format!("{why}; the service says {seen}"));
+    }
+    run.expect("ngx-lo-end", Duration::from_secs(40))?;
+    let after_wget = stat(run, "lo1")?;
+    if after_wget.looped <= looped0 {
+        return Err(format!(
+            "no packet of the loopback network went through the tables: {}",
+            after_wget.line
+        ));
+    }
+    if let Err(why) = requests(
+        "nginx-fast as a proxy to httpd over 127.0.0.1",
+        nginx,
+        "/up/index.html",
+        crate::rootfs::www_index(),
+        20,
+    ) {
+        let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
+        let drops: Vec<String> = run
+            .lines()
+            .iter()
+            .filter(|l| l.contains("net: switch dropped") || l.contains("net: bypass"))
+            .rev()
+            .take(2)
+            .cloned()
+            .collect();
+        return Err(format!("{why}; the service says {seen} {drops:?}"));
+    }
+    let after_proxy = stat(run, "lo2")?;
+    if after_proxy.looped <= after_wget.looped {
+        return Err(format!(
+            "the proxy's packets did not go through the tables: {}",
+            after_proxy.line
+        ));
+    }
+    requests("a worker's own loopback", nginx, "/self/tiny.txt", TINY, 20)?;
+    // A packet for a port of the worker's own stack stays on its loopback interface: the 20
+    // requests (and the proxy's own connections to port 80) leave nothing in the tables.
+    let after_self = stat(run, "lo3")?;
+    if after_self.looped != after_proxy.looped {
+        return Err(format!(
+            "the worker's own loopback went out through the ring: {} packets",
+            after_self.looped - after_proxy.looped
+        ));
+    }
+    if after_proxy.own_to_device != 0 || after_proxy.tx_refused != 0 {
+        return Err(format!(
+            "frames refused or sent to the device: {}",
+            after_proxy.line
+        ));
+    }
+    // Two consumers: a second nginx-fast holds port 8081, and the first proxies 1 MiB from it over
+    // 127.0.0.1. The segments are sized for 1500 (the loopback MTU of the stack), pass the ring of
+    // the first, the tables and the ring of the second, and the answers come back the same way.
+    run.send(&format!("nginx-fast -c {CONF_B} & M2=$!"))?;
+    run.expect_line(
+        "the stack of the second nginx-fast",
+        |l| l.contains("fast: the stack is up on "),
+        Duration::from_secs(60),
+    )?;
+    let before = stat(run, "lo4")?;
+    requests(
+        "a consumer to a consumer over 127.0.0.1",
+        nginx,
+        "/up2/1m.bin",
+        fast_nginx::one_mib(),
+        3,
+    )?;
+    let after_pair = stat(run, "lo5")?;
+    if after_pair.looped < before.looped + 3 * 700 {
+        return Err(format!(
+            "{} packets through the tables for 3 MiB between two consumers: {}",
+            after_pair.looped - before.looped,
+            after_pair.line
+        ));
+    }
+    if after_pair.tx_refused != 0 {
+        return Err(format!("packets refused: {}", after_pair.line));
+    }
+    notes.push(format!(
+        "loopback: wget over 127.0.0.1 and a proxy to httpd came whole, {} packets through the tables, a worker's own loopback answered",
+        after_proxy.looped - looped0
+    ));
     Ok(())
 }
 
@@ -455,6 +614,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
             std::thread::sleep(Duration::from_millis(50));
         }
         let before = stream.answered();
+        let given_before = stat(run, "kill")?.park_given;
         run.send(&format!("kill -9 {}", workers[0]))?;
         run.expect_line(
             "the new worker",
@@ -468,6 +628,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         }
         let after = stream.answered();
         let failures = stream.finish();
+        let given = stat(run, "kill")?.park_given - given_before;
         if !failures.is_empty() {
             return Err(format!(
                 "{count} workers: {} requests failed over the kill, the first {:?}",
@@ -480,16 +641,130 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
                 "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
             ));
         }
+        // With one worker no member is live between the kill and the new worker's JOIN: the
+        // stream's connections in that gap wait in the park and are given to it (the stream
+        // opens one every 20 ms, the restart takes far longer, also on TCG). Without the park
+        // each of them waits for the repeat of its SYN.
+        if count == 1 && given == 0 {
+            return Err(
+                "one worker: no SYN was parked over the kill and given to the new worker"
+                    .to_owned(),
+            );
+        }
         notes.push(format!(
-            "{count} worker(s): {before} answered before the kill, {after} in all, no failure"
+            "{count} worker(s): {before} answered before the kill, {after} in all, no failure, {given} parked SYN(s) given"
         ));
+        if count == 4 {
+            reload(run, nginx, notes)?;
+        }
         run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-q{count}-end"))?;
         run.expect(&format!("ngx-q{count}-end"), Duration::from_secs(30))?;
-        run.expect("# ", DIALOG_STEP)?;
+        run.expect("# ", Duration::from_secs(60))?;
         // The group of port 80 drains its closing flows (10 s) before the port is free for a
         // new master.
         std::thread::sleep(Duration::from_secs(20));
     }
+    Ok(())
+}
+
+/// `nginx -s reload` under a stream of new connections: each old worker closes its listening
+/// socket before it ends, which makes its consumer leave the group (LEAVE), so no new SYN goes
+/// to a socket nobody listens on (it would get no answer: the stack drops what it has no
+/// listener for). No connection fails, and the switch counts one LEAVE per old worker.
+fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    let (m, old) = fast_nginx::master_and_workers(run, "r4", false)?;
+    let left_before = stat(run, "reload")?.left;
+    let stream = Stream::start(nginx);
+    let until = Instant::now() + Duration::from_secs(60);
+    while stream.answered() < 5 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = stream.answered();
+    run.send(&format!("kill -HUP {m}"))?;
+    for _ in 0..old.len() {
+        run.expect_line(
+            "a new worker",
+            |l| l.contains("start worker process "),
+            Duration::from_secs(60),
+        )?;
+    }
+    let until = Instant::now() + Duration::from_secs(90);
+    while stream.answered() < before + 10 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = stream.answered();
+    let failures = stream.finish();
+    if !failures.is_empty() || after < before + 10 {
+        return Err(format!(
+            "reload: {} failed, {before} answered before and {after} after, the first failure {:?}",
+            failures.len(),
+            failures.first()
+        ));
+    }
+    let left = stat(run, "reload")?.left - left_before;
+    if left < old.len() as u64 {
+        return Err(format!(
+            "reload: {} old workers closed their listeners and the switch heard {left} LEAVE(s)",
+            old.len()
+        ));
+    }
+    notes.push(format!(
+        "reload under load: {before} answered before, {after} in all, no failure, {left} LEAVE(s) for {} old workers",
+        old.len()
+    ));
+    Ok(())
+}
+
+/// Nine workers over a service that has room for eight rings: eight attach and serve, the
+/// ninth is refused at ATTACH (LimitReached before any mapping) and ends with the code that
+/// stops nginx's master from starting it again, so the master starts nine workers in all and
+/// no loop of restarts follows.
+fn attach(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    start(run, CONF9)?;
+    // The ninth worker's end comes after its refusal; the master would start another at once
+    // if the end allowed it.
+    std::thread::sleep(Duration::from_secs(8));
+    let (m, workers) = fast_nginx::master_and_workers(run, "a9", false)?;
+    if workers.len() != 8 {
+        return Err(format!(
+            "{} workers over eight rings, wanted 8",
+            workers.len()
+        ));
+    }
+    let started = run
+        .lines()
+        .iter()
+        .filter(|l| l.contains("start worker process "))
+        .count();
+    if started != 9 {
+        return Err(format!(
+            "the master started {started} workers, wanted 9 (a loop of restarts follows a late failure)"
+        ));
+    }
+    if !run
+        .lines()
+        .iter()
+        .any(|l| l.contains("cannot be respawned"))
+    {
+        return Err(
+            "the refused worker did not end with the code that stops the respawn".to_owned(),
+        );
+    }
+    let st = stat(run, "attach")?;
+    if st.consumers != 8 {
+        return Err(format!(
+            "{} consumers attached, wanted 8: {}",
+            st.consumers, st.line
+        ));
+    }
+    requests("with eight consumers", nginx, "/tiny.txt", TINY, 20)?;
+    notes.push(
+        "eight workers attached and served, the ninth was refused at ATTACH and not respawned"
+            .to_owned(),
+    );
+    run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-a9-end"))?;
+    run.expect("ngx-a9-end", Duration::from_secs(60))?;
     Ok(())
 }
 
@@ -529,29 +804,21 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     booted(run)?;
     // Eight consumers attach at once: their rings map in chunks, one chunk of pages in all
     // for a step of the stack, and the longest step stays under the bound. The service maps
-    // at most 128 pieces (the kernel's limit), and a ring is 21 of them, so the ones past the
-    // fifth are refused cleanly (LimitReached) and the service goes on.
+    // at most 128 pieces (the kernel's limit); its budget for rings and buffers is 108 and a
+    // ring takes 11, so all eight fit.
+    let from = run.lines().len();
     run.send(
         "for p in 9001 9002 9003 9004 9005 9006 9007 9008; do switch-probe hold $p & done; wait; echo sw-eight-\"end\"",
     )?;
     run.expect("sw-eight-end", Duration::from_secs(600))?;
-    let joined = run
-        .lines()
-        .iter()
-        .filter(|l| l.contains("switch-probe: joined ok"))
-        .count();
-    if joined < 4 {
-        return Err(format!(
-            "{joined} of 8 simultaneous consumers attached and joined"
-        ));
-    }
+    let joined = eight_attached(&run.lines()[from..])?;
     run.expect("# ", DIALOG_STEP)?;
     // A hold inside the consumer's own block is refused.
     run.send("switch-probe hold-block")?;
     run.expect("switch-probe: hold-block ok", Duration::from_secs(120))?;
     run.expect("# ", DIALOG_STEP)?;
     notes.push(format!(
-        "{joined} of 8 consumers attached at once (the rest refused with LimitReached); a hold inside a block refused"
+        "{joined} of 8 programs attached at once (none refused by the switch); a hold inside a block refused"
     ));
     run.send("httpd -f -p 8080 -h /www &")?;
     run.expect("# ", DIALOG_STEP)?;
@@ -574,10 +841,125 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     )?;
     requests("after the kill", nginx, "/tiny.txt", TINY, 20)?;
     notes.push("a worker killed and replaced under -icount".to_owned());
+    parking_case(run, nginx, notes)
+}
+
+/// Every worker killed at once under connections that keep coming: the group has holders and no
+/// member, the SYNs wait in the park, and the new workers get them (at most `PARK_GIVE` in a
+/// step). The steps of the service, those of the switch among them, stay within the bound (the
+/// probe judges them at the end), and every connection is answered.
+/// The programs of the eight-at-once step that attached and joined. A refusal of the switch
+/// fails the step (`failed errno 16` is ATTACH answering `LimitReached`, and the service's line
+/// `switch attach: mapping the ring` is a late `mem_map` failure after OK); a program that did
+/// not load (the guest's shell says "Out of memory") is no business of the switch, and each
+/// miss must be matched by such a line.
+fn eight_attached(lines: &[String]) -> Result<usize, String> {
+    if let Some(l) = lines.iter().find(|l| {
+        l.contains("failed errno 16") || l.contains("net: switch attach: mapping the ring")
+    }) {
+        return Err(format!("the switch refused or failed an attach: {l:?}"));
+    }
+    let joined = lines
+        .iter()
+        .filter(|l| l.contains("switch-probe: joined ok"))
+        .count();
+    let no_memory = lines.iter().filter(|l| l.contains("Out of memory")).count();
+    if joined + no_memory < 8 {
+        return Err(format!(
+            "{joined} of 8 simultaneous consumers attached and joined, {no_memory} programs lacked memory"
+        ));
+    }
+    Ok(joined)
+}
+
+fn parking_case(
+    run: &mut qemu::Run,
+    nginx: SocketAddr,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let (_, workers) = fast_nginx::master_and_workers(run, "sp", false)?;
+    let attempts: Vec<_> = (0..16u64)
+        .map(|i| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150 * i));
+                Connection::open(nginx, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt"))
+            })
+        })
+        .collect();
+    let list: Vec<String> = workers.iter().map(u32::to_string).collect();
+    run.send(&format!("kill -9 {}", list.join(" ")))?;
+    let mut failed = Vec::new();
+    for a in attempts {
+        match a.join() {
+            Ok(Ok(body)) if body == TINY => {}
+            Ok(Ok(_)) => failed.push("a wrong page".to_owned()),
+            Ok(Err(e)) => failed.push(e),
+            Err(_) => failed.push("a thread panicked".to_owned()),
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of 16 connections over the loss of every worker failed: {:?}",
+            failed.len(),
+            failed.first()
+        ));
+    }
+    // The image of the steps has no `posix-net`, so the parked SYNs are not counted here (the
+    // probe `switch kill` counts them); the steps judged at the end include the handoffs.
+    notes.push("every worker killed under 16 connections: all answered".to_owned());
     Ok(())
 }
 
 /// The records of a capture: their lengths and bytes.
+/// A number of a consumer given again (review of Sh4b2, finding 1): `reuse-a` attaches, joins a
+/// group, breaks its ring and keeps its session; `reuse-b` attaches after it, gets the same
+/// number and joins the same group (the port is shared). When `reuse-a` then joins again and
+/// closes its description, its pair is the old one: the join is refused and no LEAVE reaches the
+/// switch (the counter of LEAVEs stays), so `reuse-b` stays a member.
+fn reuse(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    // The numbers of the consumers of the steps before come back after two rounds of the sweep:
+    // with them all free `reuse-a` takes the lowest, 0, and `reuse-b` takes it again after it.
+    std::thread::sleep(Duration::from_secs(8));
+    let before = stat(run, "u0")?.left;
+    let from = run.lines().len();
+    run.send(
+        "switch-probe reuse-a 9101 & sleep 3; switch-probe reuse-b 9101; wait; echo reuse-done",
+    )?;
+    run.expect("reuse-done", Duration::from_secs(120))?;
+    run.expect("# ", DIALOG_STEP)?;
+    let lines: Vec<String> = run.lines()[from..].to_vec();
+    let number = |l: &String| {
+        l.split("attached c ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .map(str::to_owned)
+    };
+    let numbers: Vec<String> = lines.iter().filter_map(number).collect();
+    if numbers.len() != 2 || numbers[0] != numbers[1] {
+        return Err(format!(
+            "the second consumer did not take the number of the first ({numbers:?}): the probe does not test its case; {lines:?}"
+        ));
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("reuse-a stale join refused"))
+    {
+        return Err(format!("the stale JOIN was not refused: {lines:?}"));
+    }
+    let after = stat(run, "u1")?.left;
+    if after != before {
+        return Err(format!(
+            "{} LEAVE(s) reached the switch from a session whose consumer was gone",
+            after - before
+        ));
+    }
+    notes.push(format!(
+        "number {} reused: the old session's JOIN refused and its close sent no LEAVE",
+        numbers[0]
+    ));
+    Ok(())
+}
+
 fn pcap_records(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut at = 24;
@@ -661,6 +1043,12 @@ fn frames(
     notes.push(
         "hold of a port below 1024 as nobody: refused; JOIN without a port: EBADF".to_owned(),
     );
+    // A hold at port 65535 (review of Sh4b2, finding 2): the end of the range does not wrap.
+    run.send("switch-probe hold-top")?;
+    run.expect("switch-probe: hold-top ok", Duration::from_secs(60))?;
+    run.expect("# ", Duration::from_secs(30))?;
+    notes.push("a hold at port 65535 is held or in use, and no wrapped port is held".to_owned());
+    reuse(run, notes)?;
     // A broken ring disables its consumer alone; the service goes on.
     for mode in ["broken-tx", "broken-fill"] {
         run.send(&format!("switch-probe {mode}"))?;
@@ -700,6 +1088,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_eight_at_once_step_allows_a_miss_only_for_a_program_that_lacked_memory() {
+        let v = |lines: &[&str]| {
+            eight_attached(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>())
+        };
+        let ok = "switch-probe: joined ok";
+        assert_eq!(v(&[ok; 8]), Ok(8));
+        assert_eq!(
+            v(&[&[ok; 7][..], &["ash: switch-probe: Out of memory"]].concat()),
+            Ok(7)
+        );
+        // A miss with no matching line, or a refusal of the switch, fails.
+        assert!(v(&[ok; 7]).is_err());
+        let refused = "switch-probe: stafeto_fast_attach(&claim) == 0 failed errno 16";
+        assert!(v(&[&[ok; 7][..], &[refused]].concat()).is_err());
+        assert!(
+            v(&[
+                &[ok; 8][..],
+                &["net: switch attach: mapping the ring of 3: LimitReached"]
+            ]
+            .concat())
+            .is_err()
+        );
+    }
+
+    #[test]
     fn the_images_and_the_lines_are_those_of_the_programs() {
         let init = |k| {
             fast_nginx::programs(k)
@@ -712,6 +1125,10 @@ mod tests {
         assert_eq!(init(Kind::SwitchSteps), &["table-fast-switch"]);
         assert_eq!(init(Kind::Scale), &["table-fast-switch-scale"]);
         assert!(conf4().contains("worker_processes 4;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:8080/;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:80/;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:8081/;"));
+        assert!(conf_b().contains("listen 8081;") && conf_b().contains("nginx-fast-b.pid"));
         assert!(conf4().contains("user nobody nobody;"));
         assert_eq!(fast_nginx::SWITCH_NETD_CONF, b"switch 8\nflows 16384\n");
         let netd =

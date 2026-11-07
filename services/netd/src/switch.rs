@@ -59,9 +59,9 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS, SWEEP_IDLE_NS,
-    SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
+    PARK_GIVE, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS,
+    SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX,
+    SWITCH_SOFT, SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use netd::switchlogic::commands::{self, Commands};
@@ -135,13 +135,19 @@ pub struct Stats {
     pub hairpin: AtomicU32,
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub own_to_device: AtomicU32,
-    pub drops: [AtomicU32; 6],
+    pub drops: [AtomicU32; 7],
     pub refused_by: [AtomicU32; Reason::COUNT],
     /// The frames of the wire for consumers, and the frames of consumers sent.
     pub rx_consumer: AtomicU32,
     pub tx_consumer: AtomicU32,
     /// The frames of the wire each consumer got (the probe reads the share of each worker).
     pub rx_by: [AtomicU32; 8],
+    /// Parked SYNs handed to a member that joined.
+    pub park_given: AtomicU32,
+    /// Packets of the loopback network routed through the tables (R-2b).
+    pub looped: AtomicU32,
+    /// Memberships ended by LEAVE.
+    pub left: AtomicU32,
 }
 
 impl Stats {
@@ -156,11 +162,14 @@ impl Stats {
             tx_refused: AtomicU32::new(0),
             hairpin: AtomicU32::new(0),
             own_to_device: AtomicU32::new(0),
-            drops: [const { AtomicU32::new(0) }; 6],
+            drops: [const { AtomicU32::new(0) }; 7],
             refused_by: [const { AtomicU32::new(0) }; Reason::COUNT],
             rx_consumer: AtomicU32::new(0),
             tx_consumer: AtomicU32::new(0),
             rx_by: [const { AtomicU32::new(0) }; 8],
+            park_given: AtomicU32::new(0),
+            looped: AtomicU32::new(0),
+            left: AtomicU32::new(0),
         }
     }
 }
@@ -195,7 +204,7 @@ pub fn turn_wanted(frame: &[u8]) -> bool {
         virtio_net::frames::IPV4_PROTO_UDP => 1,
         _ => return false,
     };
-    if !p.first_fragment || ip[16] == 127 || p.end < p.header + 4 {
+    if !p.first_fragment || p.end < p.header + 4 {
         return false;
     }
     let port = usize::from(u16::from_be_bytes([ip[p.header + 2], ip[p.header + 3]]));
@@ -364,7 +373,7 @@ pub static INNER: Inner = Inner::new();
 
 /// The owner of a buffer in the queue that is the stack's.
 const OWN_STACK: u8 = MAX_CONSUMERS as u8;
-const _: () = assert!(Why::FlowsFull as usize == 5);
+const _: () = assert!(Why::Parked as usize == 6);
 
 /// The switch: the device's transport and queues, the binding of its
 /// line, and (with consumers) the tables.
@@ -603,10 +612,24 @@ impl Switch {
         #[cfg(feature = "steps")]
         let began = self.ran();
         let mut more_c = false;
+        let mut more_park = false;
         if let Some(t) = self.tables.as_mut() {
             t.now = (now / 1_000_000_000) as u32;
+            t.now_ms = (now / 1_000_000) as u32;
             commands::drain(t, &COMMANDS);
             commands::poll(t, &COMMANDS);
+            // SYNs that waited for a member: members that joined get them (at most
+            // `PARK_GIVE` a step), the others expire.
+            let given = route::unpark(t, PARK_GIVE);
+            INNER
+                .stats
+                .rx_consumer
+                .fetch_add(given as u32, Ordering::Relaxed);
+            INNER
+                .stats
+                .park_given
+                .fetch_add(given as u32, Ordering::Relaxed);
+            more_park = given == PARK_GIVE;
         }
         #[cfg(feature = "steps")]
         self.part(0, self.ran().saturating_sub(began));
@@ -696,6 +719,7 @@ impl Switch {
         // left to wait (`ring::settle_interrupts`).
         let mut continued = more_rx
             || more_c
+            || more_park
             || !INNER.tx_sub.is_empty()
             || !INNER.rx_back.is_empty()
             || !INNER.tx_back.is_empty()
@@ -811,10 +835,16 @@ impl Switch {
         let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if let Some(t) = self.tables.as_mut()
-            && route::faces_own(t, frame)
+            && (route::faces_own(t, frame) || route::faces_loop(frame))
         {
-            INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
-            let passed = match route::route(t, frame, Source::Stack) {
+            let decision = if route::faces_loop(frame) {
+                INNER.stats.looped.fetch_add(1, Ordering::Relaxed);
+                route::route_loop(t, frame)
+            } else {
+                INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
+                route::route(t, frame, Source::Stack)
+            };
+            let passed = match decision {
                 // A stale byte of the stack's: the frame goes back, and the stack answers it.
                 // A full ring of frames for the stack drops it (TCP repeats it).
                 Decision::Stack => {
@@ -911,6 +941,12 @@ impl Switch {
                         taken += 1;
                         self.consumer_frame(c as u8, len);
                     }
+                    Tx::Loop(len) => {
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                        self.consumer_loop(c as u8, len);
+                    }
                 }
             }
         }
@@ -937,7 +973,9 @@ impl Switch {
         };
         let frame = &self.scratch[..len];
         match route::check_tx(t, c, frame) {
-            Verdict::Refuse(_) => {}
+            // `check_tx` never answers these (the entries flagged `TX_LOOP` go through
+            // `check_tx_loop`).
+            Verdict::Refuse(_) | Verdict::Loop | Verdict::Broke => {}
             Verdict::Send => {
                 let Some(n) = self.tx.book.alloc() else {
                     return;
@@ -989,6 +1027,44 @@ impl Switch {
         }
     }
 
+    /// A packet of the loopback network of consumer `c` (entry flagged `TX_LOOP`, copied into
+    /// `scratch`): checked, then routed by its port to the stack of the service or to a consumer
+    /// (R-2b).
+    fn consumer_loop(&mut self, c: u8, len: usize) {
+        let Some(t) = self.tables.as_mut() else {
+            return;
+        };
+        let frame = &self.scratch[..len];
+        if route::check_tx_loop(t, c, frame) != Verdict::Loop {
+            return;
+        }
+        INNER.stats.looped.fetch_add(1, Ordering::Relaxed);
+        match route::route_loop(t, frame) {
+            Decision::Drop(why) => {
+                INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+            }
+            // The stack gets a buffer of sending to read the packet in; it comes back through
+            // `rx_back` (`step`).
+            Decision::Stack | Decision::ArpAll => {
+                if let Some(n) = self.tx.book.alloc() {
+                    // SAFETY: the buffer is free (just taken from the pool).
+                    let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+                    slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
+                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                        if INNER.stack_told.tell() {
+                            INNER.wake_stack(crate::RX);
+                        }
+                    } else {
+                        self.tx.book.release(n);
+                    }
+                }
+            }
+            d => {
+                route::deliver(t, d, frame);
+            }
+        }
+    }
+
     /// The end of a step with tables: consumers with new frames are woken when they sleep,
     /// the counters and the indices are published, the stack hears what is owed it, and the
     /// timer of the sweep is set while there is something to sweep.
@@ -1018,6 +1094,7 @@ impl Switch {
             .store(t.flows.unconfirmed() as u32, Ordering::Relaxed);
         st.evicted.store(t.flows.evicted, Ordering::Relaxed);
         st.expired.store(t.flows.expired, Ordering::Relaxed);
+        st.left.store(t.left, Ordering::Relaxed);
         let (mut full, mut refused) = (0u32, 0u32);
         for x in t.consumers.iter().flatten() {
             full = full.wrapping_add(x.ring.rx_full);
@@ -1033,7 +1110,7 @@ impl Switch {
         }
         // A consumer left lately: the rounds that return its number follow fast.
         let settling = t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
-        let sweeping = count > 0 || !t.flows.is_empty() || settling;
+        let sweeping = count > 0 || !t.flows.is_empty() || settling || t.parked() > 0;
         if (sweeping || self.blocked) && !self.armed {
             let after = if self.blocked {
                 1_000_000

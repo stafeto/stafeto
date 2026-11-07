@@ -66,6 +66,7 @@ cargo xtask net-bench run                      # nat, sweep and rounds for L1, L
 cargo xtask net-bench run --systems l4,s4,f1 --phases sweep,rounds
 cargo xtask net-bench run --systems l4,s4,f1 --workloads w4 --phases sweep,rounds
 cargo xtask net-bench run --systems s4,l4 --workloads w1 --phases sweep
+cargo xtask net-bench run --systems f1,f1s,s4,s4o --old ../sh4b2-old/target --workloads w6,w7 --rounds 3 --max-rounds 3 --ceiling 15 --warm 3 --phases rounds
 cargo xtask net-bench run --quick --max-rate 2000   # a few minutes, to see that it works
 cargo xtask net-bench run --resume target/net-bench/<time>
 cargo xtask net-bench tables target/net-bench/<time>
@@ -78,3 +79,5 @@ A run keeps one file per step in `target/net-bench/<time>/results/`, the output 
 `tables` recomputes the walk and the bisection from the recorded steps under the present rule (where a rate the search asks for was never recorded it prints what the run recorded and says so) and reads the confirmation from the first run of each round: the highest rate with three passes in a row, else the rate with most passes, with "passes of runs" beside it. The retreat process itself cannot be replayed; a new run confirms.
 
 Two properties of the method. The Latin square is cyclic: it balances the places of the systems in the rounds and leaves their predecessors unbalanced (S4 follows L4 in rounds 1 and 2); every guest starts anew, so the effect is small. The lag of a request is counted from the schedule that the least late request sets (`lags` in `nginx_bench.rs`), the note says the first request; the difference keeps the lag from going below zero.
+
+A run of the rows of stafeto alone (F1, F1s, S4, S4o) needs no Linux guest: without `--phases` the phase `nat` (iperf3 with L4) is left out, and `--phases rounds` takes ceilings alone. The workloads W6 (`/s/0000.bin`) and W7 (`/1k.bin`) are one file over long connections, a ceiling by `wrk` in each round and no walk of rates. S4o is S4 from another build (`--old DIR` names its `target` with `stafeto.img` and `boot-net-bench.img`), the reference of a change of the network service. Table 5a pairs the ceilings by round (F1s over F1, S4 over S4o, F1s over S4) and checks the bounds 0.85 and 0.95 of the acceptance of the switch, in every round and by the median.

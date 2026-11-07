@@ -99,6 +99,57 @@ impl Chunks {
     }
 }
 
+/// The mappings of the network service that its shared buffers and the rings of its consumers
+/// draw on, one budget for both. The kernel gives a process 128 (`abi::MAX_MAPPINGS`); the service
+/// itself keeps fewer than 20 (the device, the tables, its stacks), so the other 108 are shared:
+/// a buffer of a session takes one, a ring one for each chunk of `MAP_CHUNK` pages (11 for
+/// `Layout::DEFAULT`, so eight rings take 88 and leave 20 buffers). A request that does not fit
+/// is refused up front (BUFFER with its table full, ATTACH with `LimitReached`), and no
+/// `mem_map` fails later for a caller that was told OK.
+pub const NETD_MAPPINGS: u32 = 108;
+const _: () = assert!(NETD_MAPPINGS + 20 <= abi::MAX_MAPPINGS);
+
+/// The mappings reserved from the budget: one for each buffer, one for each chunk of a ring.
+pub struct Mappings {
+    used: u32,
+}
+
+impl Mappings {
+    pub const fn new() -> Mappings {
+        Mappings { used: 0 }
+    }
+
+    /// The mappings a ring of `bytes` bytes takes when it is mapped `chunk_pages` pages at a time.
+    pub const fn for_ring(bytes: u64, page: u64, chunk_pages: u64) -> u32 {
+        bytes.div_ceil(page).div_ceil(chunk_pages) as u32
+    }
+
+    /// Takes `n` mappings, or none when the budget lacks them.
+    pub fn reserve(&mut self, n: u32) -> bool {
+        match self.used.checked_add(n) {
+            Some(sum) if sum <= NETD_MAPPINGS => {
+                self.used = sum;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn release(&mut self, n: u32) {
+        self.used = self.used.saturating_sub(n);
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used
+    }
+}
+
+impl Default for Mappings {
+    fn default() -> Mappings {
+        Mappings::new()
+    }
+}
+
 /// A group of ports the registry holds for the switch: from a PORT_HOLD to the switch's
 /// `Back::Freed`. All zeros is an unused slot.
 #[derive(Clone, Copy, Default)]
@@ -147,6 +198,10 @@ impl Hold {
 /// The groups, and the descriptions of ports that closed and whose group has not been told.
 pub struct Holds {
     pub list: [Hold; MAX_GROUPS],
+    /// LEAVEs owed to the switch, one place for each group and consumer number (the generation
+    /// of the consumer that owes it): a session closed its last description of a group. A place
+    /// cannot be lost to a full queue, and a number given again overwrites the old pair's.
+    leaves: [[Option<u32>; MAX_CONSUMERS]; MAX_GROUPS],
     /// A count for each group (u32: a flood of closes cannot saturate it).
     due: [u32; MAX_GROUPS],
 }
@@ -165,6 +220,64 @@ impl Holds {
                 failed: false,
             }; MAX_GROUPS],
             due: [0; MAX_GROUPS],
+            leaves: [[None; MAX_CONSUMERS]; MAX_GROUPS],
+        }
+    }
+
+    /// A session closed a description of group `group` (1-based): when none of the
+    /// descriptions it still holds (`still`, their groups) is of that group, its consumer has to
+    /// leave the group, or the switch goes on steering new connections to a socket nobody
+    /// listens on. Returns whether a LEAVE is owed now (false: more descriptions of the group
+    /// are held, or the session has no consumer). An owed LEAVE stays until it is sent.
+    pub fn closed_by(
+        &mut self,
+        group: u8,
+        mine: Option<Mine>,
+        mut still: impl Iterator<Item = u8>,
+    ) -> bool {
+        let Some(mine) = mine else { return false };
+        if group == 0 || usize::from(group) > MAX_GROUPS || still.any(|g| g == group) {
+            return false;
+        }
+        match self.leaves[usize::from(group) - 1].get_mut(usize::from(mine.number)) {
+            Some(place) => {
+                *place = Some(mine.generation);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A LEAVE owed, left in its place until `leave_told`.
+    pub fn next_leave(&self) -> Option<(u8, Mine)> {
+        self.leaves.iter().enumerate().find_map(|(g, row)| {
+            row.iter().enumerate().find_map(|(n, place)| {
+                place.map(|generation| {
+                    (
+                        g as u8 + 1,
+                        Mine {
+                            number: n as u8,
+                            generation,
+                        },
+                    )
+                })
+            })
+        })
+    }
+
+    pub fn leave_told(&mut self, group: u8, mine: Mine) {
+        self.cancel_leave(group, mine);
+    }
+
+    /// The consumer `mine` is to join `group` again: a LEAVE it owes for the group is void (it
+    /// would undo the join), unless it is a LEAVE of an older consumer of the number.
+    pub fn cancel_leave(&mut self, group: u8, mine: Mine) {
+        let place = usize::from(group)
+            .checked_sub(1)
+            .and_then(|g| self.leaves.get_mut(g))
+            .and_then(|row| row.get_mut(usize::from(mine.number)));
+        if let Some(place) = place.filter(|p| **p == Some(mine.generation)) {
+            *place = None;
         }
     }
 
@@ -375,6 +488,123 @@ pub const fn may_take(taken: usize, base: usize, over_soft: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eight_default_rings_take_88_of_the_108_and_the_tenth_is_refused() {
+        use proto_net::switch::{Layout, PAGE};
+        let n = Mappings::for_ring(Layout::DEFAULT.total() as u64, PAGE as u64, 64);
+        assert_eq!(n, 11);
+        let mut m = Mappings::new();
+        for _ in 0..8 {
+            assert!(m.reserve(n));
+        }
+        assert_eq!(m.used(), 88);
+        // The number of consumers is bound apart (`switch N`); the mappings allow nine.
+        assert!(m.reserve(n));
+        assert!(!m.reserve(n), "a refusal takes nothing");
+        assert_eq!(m.used(), 99);
+        m.release(n);
+        assert!(m.reserve(n));
+        // The biggest ring the layout allows takes three times what a default ring does:
+        // two fit an empty budget and the third is refused.
+        let big = Layout::new(4096, 512).unwrap();
+        let chunks = Mappings::for_ring(big.total() as u64, PAGE as u64, 64);
+        let mut m = Mappings::new();
+        assert!(m.reserve(chunks) && m.reserve(chunks));
+        assert!(!m.reserve(chunks));
+        assert!(!Mappings::new().reserve(NETD_MAPPINGS + 1));
+    }
+
+    #[test]
+    fn a_leave_is_owed_when_the_last_description_of_a_group_closes() {
+        let mine = Mine {
+            number: 2,
+            generation: 7,
+        };
+        let mut h = Holds::new();
+        // Another description of the group is still held: no leave.
+        assert!(!h.closed_by(3, Some(mine), [3u8, 1].into_iter()));
+        assert_eq!(h.next_leave(), None);
+        // Descriptions of other groups and plain sockets (0) do not count.
+        assert!(h.closed_by(3, Some(mine), [1u8, 0, 2].into_iter()));
+        assert_eq!(h.next_leave(), Some((3, mine)));
+        // The same pair twice is one leave.
+        assert!(h.closed_by(3, Some(mine), core::iter::empty()));
+        h.leave_told(3, mine);
+        assert_eq!(h.next_leave(), None);
+        // A session with no consumer, and a close of a plain socket, owe nothing.
+        assert!(!h.closed_by(3, None, core::iter::empty()));
+        assert!(!h.closed_by(0, Some(mine), core::iter::empty()));
+    }
+
+    #[test]
+    fn no_leave_is_lost_to_a_full_command_ring_however_many_are_owed() {
+        let mut h = Holds::new();
+        // Every group and every number owes one: 32 x 8, none dropped.
+        for g in 1..=32u8 {
+            for n in 0..8u8 {
+                let mine = Mine {
+                    number: n,
+                    generation: 1,
+                };
+                assert!(h.closed_by(g, Some(mine), core::iter::empty()));
+            }
+        }
+        // The command ring refuses (nothing is told); the owed stay, in the same order.
+        let first = h.next_leave();
+        assert_eq!(h.next_leave(), first);
+        let mut sent = 0;
+        while let Some((g, m)) = h.next_leave() {
+            h.leave_told(g, m);
+            sent += 1;
+        }
+        assert_eq!(sent, 32 * 8);
+    }
+
+    #[test]
+    fn a_number_given_again_replaces_the_owed_leave_of_the_old_pair() {
+        let mut h = Holds::new();
+        let old = Mine {
+            number: 2,
+            generation: 1,
+        };
+        let new = Mine {
+            number: 2,
+            generation: 2,
+        };
+        assert!(h.closed_by(5, Some(old), core::iter::empty()));
+        assert!(h.closed_by(5, Some(new), core::iter::empty()));
+        assert_eq!(h.next_leave(), Some((5, new)));
+        // Telling the old pair's leave does not void the new one's.
+        h.leave_told(5, old);
+        assert_eq!(h.next_leave(), Some((5, new)));
+    }
+
+    #[test]
+    fn a_join_after_the_close_voids_the_owed_leave_in_every_order() {
+        let mine = Mine {
+            number: 1,
+            generation: 4,
+        };
+        let mut h = Holds::new();
+        // close, hold again, join: the leave owed by the close is void.
+        assert!(h.closed_by(7, Some(mine), core::iter::empty()));
+        h.cancel_leave(7, mine);
+        assert_eq!(h.next_leave(), None);
+        // close, join, close again: the second close owes a leave again.
+        assert!(h.closed_by(7, Some(mine), core::iter::empty()));
+        assert_eq!(h.next_leave(), Some((7, mine)));
+        // A join of another group, or of another consumer, voids nothing.
+        h.cancel_leave(8, mine);
+        h.cancel_leave(
+            7,
+            Mine {
+                number: 1,
+                generation: 5,
+            },
+        );
+        assert_eq!(h.next_leave(), Some((7, mine)));
+    }
 
     #[test]
     fn a_group_at_port_65535_has_that_port_and_no_wrapped_ones() {

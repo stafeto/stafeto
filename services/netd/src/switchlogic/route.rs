@@ -12,10 +12,11 @@
 //! send check and B's flow at steering: the keys differ in the ports.
 
 use super::tables::{
-    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, RST_PEER, Tables, UNCONFIRMED,
+    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, PARK_FRAME, RST, RST_PEER, Tables,
+    UNCONFIRMED,
 };
 use crate::ports::Proto;
-use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
+use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, DONE_LOOP, FRAME_MAX};
 use virtio_net::frames::{
     ETHERNET_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, IPV4_PROTO_ICMP, IPV4_PROTO_TCP,
     IPV4_PROTO_UDP, packet,
@@ -46,11 +47,13 @@ pub enum Why {
     Bogus,
     /// Every member of the group is short of cells.
     AllFull,
-    /// The group has holders but no live member (until the park of SYNs exists the SYN is
-    /// dropped and the client repeats it, as when the listening queue of Linux waits).
+    /// The group has holders but no live member and the park is off or full: the SYN is
+    /// dropped and the client repeats it, as when the listening queue of Linux waits.
     NoMember,
     /// The flow table has no room for the connection.
     FlowsFull,
+    /// The group has holders but no live member: the SYN waits in the park for one.
+    Parked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +96,11 @@ pub enum Verdict {
     Send,
     /// For the shared address: goes through `route` and never to the device.
     Hairpin,
+    /// A packet of the loopback network for a port of another stack: goes through `route_loop`.
+    Loop,
     Refuse(Reason),
+    /// A packet flagged as loopback with an address outside 127.0.0.0/8: the ring is broken.
+    Broke,
 }
 
 struct Ip<'a> {
@@ -144,6 +151,65 @@ pub fn faces_own(t: &Tables, frame: &[u8]) -> bool {
     })
 }
 
+/// Whether a frame of the stack (or of a consumer) is a TCP or UDP packet between addresses of
+/// 127.0.0.0/8: the loopback network, which goes through the tables when its port is not the
+/// stack's own.
+pub fn faces_loop(frame: &[u8]) -> bool {
+    ipv4(frame).is_some_and(|ip| {
+        !ip.fragment
+            && ip.src[0] == 127
+            && ip.dst[0] == 127
+            && matches!(ip.proto, IPV4_PROTO_TCP | IPV4_PROTO_UDP)
+    })
+}
+
+/// Where a packet of the loopback network goes (R-2b): the port table decides as for a frame of
+/// the wire (the address is 127.0.0.1 or another of the block, the key of the flow takes it as
+/// the peer). A packet for a consumer carries `DONE_LOOP`, so that its stack takes it in at
+/// its own loopback interface; one for the stack of the service is a frame like any other,
+/// whose sums the stack does not check (`frames::verify_sums` skips 127.0.0.0/8).
+pub fn route_loop(t: &mut Tables, frame: &[u8]) -> Decision {
+    t.guard.check();
+    let Some(ip) = ipv4(frame) else {
+        return Decision::Stack;
+    };
+    if ip.fragment || ip.src[0] != 127 || ip.dst[0] != 127 {
+        return Decision::Stack;
+    }
+    let d = match ip.proto {
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame, false),
+        _ => Decision::Stack,
+    };
+    match d {
+        Decision::Consumer { consumer, .. } => to(consumer, DONE_LOOP),
+        other => other,
+    }
+}
+
+/// Gives members the SYNs that waited for them, at most `budget`: each goes through `route`
+/// again (the port table and the live members decide), so a group that was freed meanwhile
+/// sends none. Returns the number delivered.
+pub fn unpark(t: &mut Tables, budget: usize) -> usize {
+    t.expire_parked();
+    let mut given = 0;
+    for _ in 0..budget {
+        let mut buf = [0u8; PARK_FRAME];
+        let Some(n) = t.park_take(&mut buf) else {
+            break;
+        };
+        let frame = &buf[..n];
+        if let d @ Decision::Consumer { .. } = route(t, frame, Source::Wire) {
+            deliver(t, d, frame);
+            given += 1;
+        } else {
+            // The group went, or its member filled up between the choice and the routing.
+            t.park_dropped += 1;
+        }
+    }
+    given
+}
+
 /// Where a received frame goes.
 pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     t.guard.check();
@@ -172,7 +238,7 @@ pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     match ip.proto {
         IPV4_PROTO_ICMP => icmp(t, &ip),
         IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
-        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame, from == Source::Wire),
         _ => Decision::Stack,
     }
 }
@@ -247,7 +313,10 @@ fn udp(t: &mut Tables, ip: &Ip) -> Decision {
     }
 }
 
-fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
+/// `parkable`: a SYN with no member to go to may wait in the park (only a frame of the wire:
+/// a frame of the stack or of a consumer that waited would be handed on as one of the wire and
+/// lose its source).
+fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8], parkable: bool) -> Decision {
     let (sport, dport) = ports(ip.part);
     let flags = ip.part[13];
     let syn = flags & (SYN | ACK) == SYN;
@@ -276,7 +345,13 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
     }
     let (c, generation) = match pick(t, mark, t.flows.hash(&key), MIN_FILL, true) {
         Pick::NoLive if t.group(mark).is_some_and(|g| !g.draining && g.holders > 0) => {
-            return Decision::Drop(Why::NoMember);
+            // The SYN waits for a member (a worker restarting); the peer's repeat of it
+            // replaces it, and a full or absent park leaves the repeat to the peer.
+            return Decision::Drop(if parkable && t.park(mark, &key, frame) {
+                Why::Parked
+            } else {
+                Why::NoMember
+            });
         }
         Pick::NoLive => return Decision::Stack,
         Pick::Full => return Decision::Drop(Why::AllFull),
@@ -402,7 +477,7 @@ fn refuse(r: Reason) -> Verdict {
 /// Whether a consumer may send `frame` (a copy in the switch's buffer).
 pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     t.guard.check();
-    let v = verdict(t, c, frame);
+    let v = verdict(t, c, frame, false);
     if let Verdict::Refuse(r) = v {
         t.refused[r as usize] += 1;
         if let Some(x) = t.consumers[usize::from(c)].as_mut() {
@@ -412,12 +487,38 @@ pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     v
 }
 
-fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+/// `check_tx` for an entry flagged `TX_LOOP`: both addresses must be in 127.0.0.0/8 (else the
+/// ring breaks, the descriptor rule of section 5), and the rest of section 4 holds for the ports
+/// as for any frame of the consumer: it sends from a port of its own and only TCP or UDP.
+pub fn check_tx_loop(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    t.guard.check();
+    let v = verdict(t, c, frame, true);
+    match v {
+        Verdict::Refuse(r) => {
+            t.refused[r as usize] += 1;
+            if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+                x.ring.refused = x.ring.refused.wrapping_add(1);
+            }
+        }
+        Verdict::Broke => {
+            if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+                x.ring.break_with(super::ring::Violation::Loop);
+            }
+        }
+        _ => {}
+    }
+    v
+}
+
+fn verdict(t: &mut Tables, c: u8, frame: &[u8], looped: bool) -> Verdict {
     if !(ETHERNET_HEADER..=FRAME_MAX).contains(&frame.len()) {
         return refuse(Reason::Length);
     }
     if frame[6..12] != t.own.mac {
         return refuse(Reason::SrcMac);
+    }
+    if looped {
+        return verdict_loop(t, c, frame);
     }
     let broadcast = frame[..6] == [0xff; 6];
     if frame[0] & 1 != 0 && !broadcast {
@@ -466,6 +567,46 @@ fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
         }
         Ok(()) if ip.dst == t.own.ip => Verdict::Hairpin,
         Ok(()) => Verdict::Send,
+        Err(r) => refuse(r),
+    }
+}
+
+fn verdict_loop(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    if frame[12..14] != ETHERTYPE_IPV4 {
+        return refuse(Reason::Proto);
+    }
+    let Some(ip) = ipv4(frame) else {
+        return refuse(Reason::Ipv4);
+    };
+    if ip.fragment || ip.options {
+        return refuse(if ip.fragment {
+            Reason::Fragment
+        } else {
+            Reason::Ipv4
+        });
+    }
+    if ip.src[0] != 127 || ip.dst[0] != 127 {
+        return Verdict::Broke;
+    }
+    // The flow of a connection is keyed by the peer's address and ports, not by the sender's own
+    // address, so a consumer that wrote 127.0.0.2, 127.0.0.3 ... as its source would make a
+    // flow for each of them in the table of a group it does not own. The stack of a consumer
+    // sends from 127.0.0.1, or from the address it connected to.
+    if ip.src != [127, 0, 0, 1] && ip.src != ip.dst {
+        return refuse(Reason::SrcAddr);
+    }
+    // The ports of the service's DHCP client and its server side are not for a consumer's packet.
+    if ip.proto == IPV4_PROTO_UDP && ip.part.len() >= 8 && matches!(ports(ip.part).1, 67 | 68) {
+        return refuse(Reason::Udp);
+    }
+    let ok = match ip.proto {
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp_tx(t, c, &ip),
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp_tx(t, c, &ip),
+        IPV4_PROTO_TCP | IPV4_PROTO_UDP => Err(Reason::Ipv4),
+        _ => Err(Reason::Proto),
+    };
+    match ok {
+        Ok(()) => Verdict::Loop,
         Err(r) => refuse(r),
     }
 }
@@ -565,6 +706,7 @@ mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
     use crate::switchlogic::tables::tests::{OWN, Rng, with, with_flows};
+    use crate::switchlogic::tables::{PARK_MS, PARK_PER_GROUP, PARK_SCAN_MS, PARK_SLOTS, ParkSlot};
     use proto_net::switch as sw;
 
     const PEER: [u8; 4] = [203, 0, 113, 9];
@@ -883,6 +1025,386 @@ mod tests {
                 route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
                 Decision::Drop(Why::NoMember)
             );
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    fn parking<R>(f: impl FnOnce(&mut Tables, &[Rig]) -> R) -> R {
+        with(|t, rigs| {
+            let mut slots = vec![ParkSlot::EMPTY; PARK_SLOTS];
+            // SAFETY: `slots` outlives the call and the tables are not used after it.
+            let slots: &'static mut [_] = unsafe { &mut *(slots.as_mut_slice() as *mut [_]) };
+            t.set_park(slots);
+            f(t, rigs)
+        })
+    }
+
+    const LO: ([u8; 6], [u8; 4]) = (OWN.mac, [127, 0, 0, 1]);
+
+    fn lo_tcp(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        ip_frame(LO, LO, 6, &tcp_part(sport, dport, flags))
+    }
+
+    #[test]
+    fn a_loopback_syn_for_a_group_port_goes_to_a_member_with_the_loop_flag() {
+        with(|t, _| {
+            let d = route_loop(t, &lo_tcp(40000, 8080, SYN));
+            let c = who(d);
+            assert!(matches!(d, Decision::Consumer { flags, .. } if flags == sw::DONE_LOOP));
+            // The flow follows: its segments go to the same member.
+            let next = route_loop(t, &lo_tcp(40000, 8080, ACK_));
+            assert_eq!(who(next), c);
+            // A port nobody holds is the stack's.
+            assert_eq!(route_loop(t, &lo_tcp(40000, 25, SYN)), Decision::Stack);
+            // Only the loopback network: a frame of the wire with a loopback address is no
+            // business of this path, and other addresses are the stack's.
+            assert_eq!(route_loop(t, &wire_tcp(40000, 8080, SYN)), Decision::Stack);
+        });
+    }
+
+    #[test]
+    fn a_consumers_loopback_connection_to_the_stack_gets_its_reply_with_the_loop_flag() {
+        with(|t, _| {
+            // Consumer 0 connects from its block (49152) to a port the stack owns.
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 9000, SYN)),
+                Verdict::Loop
+            );
+            assert_eq!(route_loop(t, &lo_tcp(49200, 9000, SYN)), Decision::Stack);
+            // The stack's SYN-ACK finds the flow the consumer's SYN made.
+            let reply = ip_frame(LO, LO, 6, &tcp_part(9000, 49200, SYN_ACK));
+            let d = route_loop(t, &reply);
+            assert_eq!(who(d), 0);
+            assert!(matches!(d, Decision::Consumer { flags, .. } if flags == sw::DONE_LOOP));
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 9000, ACK_)),
+                Verdict::Loop
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_packet_between_two_consumers_keeps_the_keys_of_both_ends() {
+        with(|t, _| {
+            // Consumer 2 (block 50176) connects to the group of 8080, a member of 0 and 1.
+            assert_eq!(
+                check_tx_loop(t, 2, &lo_tcp(50200, 8080, SYN)),
+                Verdict::Loop
+            );
+            let member = who(route_loop(t, &lo_tcp(50200, 8080, SYN)));
+            assert!(member < 2);
+            // The member's answer from the group's port finds its own flow at the check, and
+            // consumer 2's flow at the steering.
+            assert_eq!(
+                check_tx_loop(t, member, &lo_tcp(8080, 50200, SYN_ACK)),
+                Verdict::Loop
+            );
+            assert_eq!(who(route_loop(t, &lo_tcp(8080, 50200, SYN_ACK))), 2);
+        });
+    }
+
+    #[test]
+    fn a_loopback_packet_from_a_port_that_is_not_the_senders_is_refused() {
+        with(|t, _| {
+            // Consumer 0 sends from consumer 1's block, and from a port of no one's.
+            for sport in [49152 + 512 + 3, 7000] {
+                assert_eq!(
+                    check_tx_loop(t, 0, &lo_tcp(sport, 9000, SYN)),
+                    Verdict::Refuse(Reason::Tcp)
+                );
+            }
+            assert_eq!(t.refused[Reason::Tcp as usize], 2);
+            // UDP from a port that is no member's.
+            let udp = ip_frame(LO, LO, 17, &udp_part(40000, 9000));
+            assert_eq!(check_tx_loop(t, 0, &udp), Verdict::Refuse(Reason::Udp));
+        });
+    }
+
+    #[test]
+    fn a_loop_flag_with_an_address_outside_127_breaks_the_ring() {
+        for (src, dst) in [
+            (OWN_IP, [127, 0, 0, 1]),
+            ([127, 0, 0, 1], OWN_IP),
+            (OWN_IP, PEER),
+            ([127, 0, 0, 1], [10, 0, 0, 1]),
+        ] {
+            with(|t, _| {
+                let f = ip_frame(
+                    (OWN.mac, src),
+                    (OWN.mac, dst),
+                    6,
+                    &tcp_part(49200, 9000, SYN),
+                );
+                assert_eq!(check_tx_loop(t, 0, &f), Verdict::Broke, "{src:?} {dst:?}");
+                let mut broke = None;
+                t.poll_rings(|c, v| broke = Some((c, v)));
+                assert_eq!(broke, Some((0, crate::switchlogic::ring::Violation::Loop)));
+                // The ring is out: nothing of it is routed, the others go on.
+                assert!(t.consumers[0].as_ref().unwrap().ring.is_broken());
+                assert!(!t.consumers[1].as_ref().unwrap().ring.is_broken());
+            });
+        }
+    }
+
+    #[test]
+    fn loopback_syns_from_other_sources_make_no_flows_and_the_cap_holds() {
+        with(|t, _| {
+            let before = t.flows.len();
+            // A flood of SYNs from 127.0.0.2 and up to a port of a group a consumer does not
+            // own (its sources are free to spoof; the key has no source address).
+            for i in 2..=200u8 {
+                let f = ip_frame(
+                    (OWN.mac, [127, 0, 0, i]),
+                    (OWN.mac, [127, 0, 0, 1]),
+                    6,
+                    &tcp_part(49200 + u16::from(i), 8080, SYN),
+                );
+                assert_eq!(
+                    check_tx_loop(t, 0, &f),
+                    Verdict::Refuse(Reason::SrcAddr),
+                    "127.0.0.{i}"
+                );
+            }
+            assert_eq!(t.flows.len(), before);
+            assert_eq!(t.refused[Reason::SrcAddr as usize], 199);
+            // 127.0.0.1 itself and a source equal to the destination are the stack's own.
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 8080, SYN)),
+                Verdict::Loop
+            );
+            let same = ip_frame(
+                (OWN.mac, [127, 0, 0, 9]),
+                (OWN.mac, [127, 0, 0, 9]),
+                6,
+                &tcp_part(49201, 8080, SYN),
+            );
+            assert_eq!(check_tx_loop(t, 0, &same), Verdict::Loop);
+            // The per-consumer cap still bounds what even those can make.
+            let limit = (t.flows.capacity() / 2) as u32;
+            t.consumers[0].as_mut().unwrap().flows = limit;
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49202, 8080, SYN)),
+                Verdict::Refuse(Reason::Flows)
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_udp_packet_for_the_dhcp_ports_is_refused() {
+        with(|t, _| {
+            for port in [67, 68] {
+                let f = ip_frame(LO, LO, 17, &udp_part(49200, port));
+                assert_eq!(check_tx_loop(t, 0, &f), Verdict::Refuse(Reason::Udp));
+            }
+        });
+    }
+
+    #[test]
+    fn a_loopback_packet_that_is_not_tcp_or_udp_or_whole_is_refused() {
+        with(|t, _| {
+            let icmp = ip_frame(LO, LO, 1, &[8, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(check_tx_loop(t, 0, &icmp), Verdict::Refuse(Reason::Proto));
+            let short = ip_frame(LO, LO, 6, &[0; 10]);
+            assert_eq!(check_tx_loop(t, 0, &short), Verdict::Refuse(Reason::Ipv4));
+            let mut foreign = lo_tcp(49200, 9000, SYN);
+            foreign[6] ^= 1;
+            assert_eq!(
+                check_tx_loop(t, 0, &foreign),
+                Verdict::Refuse(Reason::SrcMac)
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_syn_is_never_parked() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            assert_eq!(
+                route_loop(t, &lo_tcp(40000, 8080, SYN)),
+                Decision::Drop(Why::NoMember)
+            );
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    #[test]
+    fn a_member_that_left_the_group_gets_no_new_syn_but_keeps_its_flows() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let other = 1 - c;
+            t.leave(1, c);
+            assert_eq!(t.left, 1);
+            for sport in 2000..2040 {
+                assert_eq!(
+                    who(route(t, &wire_tcp(sport, 8080, SYN), Source::Wire)),
+                    other
+                );
+            }
+            // A second LEAVE of the same member counts nothing.
+            t.leave(1, c);
+            assert_eq!(t.left, 1);
+            // The flow it had goes on.
+            assert_eq!(who(route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire)), c);
+        });
+    }
+
+    #[test]
+    fn a_syn_with_no_live_member_is_parked_and_a_joining_member_gets_it() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for sport in 1..=3 {
+                assert_eq!(
+                    route(t, &wire_tcp(sport, 8080, SYN), Source::Wire),
+                    Decision::Drop(Why::Parked)
+                );
+            }
+            assert_eq!(t.parked(), 3);
+            // Nobody to give them to yet.
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!(t.parked(), 3);
+            assert!(t.join(1, 1));
+            let before = t.consumers[1].as_ref().unwrap().ring.done_head();
+            assert_eq!(unpark(t, 8), 3);
+            assert_eq!(t.parked(), 0);
+            assert_eq!(
+                t.consumers[1].as_ref().unwrap().ring.done_head() - before,
+                3
+            );
+            // They became flows of the member: their segments follow.
+            assert_eq!(who(route(t, &wire_tcp(2, 8080, ACK_), Source::Wire)), 1);
+        });
+    }
+
+    #[test]
+    fn a_repeat_of_a_parked_syn_replaces_it_and_the_group_holds_sixteen() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for _ in 0..5 {
+                route(t, &wire_tcp(7, 8080, SYN), Source::Wire);
+            }
+            assert_eq!(t.parked(), 1);
+            for sport in 100..115 {
+                assert_eq!(
+                    route(t, &wire_tcp(sport, 8080, SYN), Source::Wire),
+                    Decision::Drop(Why::Parked)
+                );
+            }
+            assert_eq!(t.parked(), PARK_PER_GROUP as u32);
+            assert_eq!(
+                route(t, &wire_tcp(200, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::NoMember)
+            );
+            assert_eq!(t.park_dropped, 1);
+            // A repeat of a parked one still fits.
+            assert_eq!(
+                route(t, &wire_tcp(100, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::Parked)
+            );
+        });
+    }
+
+    #[test]
+    fn a_hairpinned_syn_is_not_parked_and_a_wire_syn_is() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            // From the stack and from a consumer for the shared address: dropped as before, never
+            // parked (a handoff routes as a frame of the wire and would lose the source).
+            for from in [Source::Stack, Source::Consumer(2)] {
+                assert_eq!(
+                    route(t, &hair_tcp(5000, 8080, SYN), from),
+                    Decision::Drop(Why::NoMember)
+                );
+            }
+            assert_eq!(t.parked(), 0);
+            assert_eq!(
+                route(t, &wire_tcp(5000, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::Parked)
+            );
+            assert_eq!(t.parked(), 1);
+        });
+    }
+
+    #[test]
+    fn a_parked_syn_waits_while_the_member_has_no_cells_and_goes_when_it_has() {
+        parking(|t, rigs| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            // Member 0 joins with its FILL short of `MIN_FILL`: nothing is handed over or dropped.
+            for _ in 0..40 {
+                t.consumers[0].as_mut().unwrap().ring.deliver(b"x", 0);
+            }
+            assert!(t.consumers[0].as_ref().unwrap().ring.fill_avail() < MIN_FILL);
+            assert!(t.join(1, 0));
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!((t.parked(), t.park_dropped), (1, 0));
+            // Cells come back: the SYN goes.
+            rigs[0].fill(&[1; 40]);
+            t.poll_rings(|_, _| {});
+            assert_eq!(unpark(t, 8), 1);
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    #[test]
+    fn the_places_are_looked_at_for_expired_syns_at_most_every_sixteen_ms() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            t.now_ms = 1000;
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            t.now_ms = 1010;
+            route(t, &wire_tcp(2, 8080, SYN), Source::Wire);
+            // A look at 1000 + term: the first is gone, the second has 10 ms left.
+            t.now_ms = 1000 + PARK_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            // 10 ms later its term is over, but the last look was too near: not looked at.
+            t.now_ms += 10;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            t.now_ms += PARK_SCAN_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    #[test]
+    fn a_parked_syn_is_dropped_after_its_term() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            t.now_ms = 1000;
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            t.now_ms = 1000 + PARK_MS - 1;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            t.now_ms = 1000 + PARK_MS - 1 + PARK_SCAN_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 0);
+            assert_eq!(t.park_expired, 1);
+            t.join(1, 0);
+            let before = t.consumers[0].as_ref().unwrap().ring.done_head();
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!(t.consumers[0].as_ref().unwrap().ring.done_head(), before);
+        });
+    }
+
+    #[test]
+    fn at_most_the_budget_of_parked_syns_goes_in_a_call() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for sport in 1..=12 {
+                route(t, &wire_tcp(sport, 8080, SYN), Source::Wire);
+            }
+            t.join(1, 0);
+            assert_eq!(unpark(t, 8), 8);
+            assert_eq!(unpark(t, 8), 4);
         });
     }
 

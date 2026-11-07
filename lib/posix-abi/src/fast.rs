@@ -455,6 +455,10 @@ pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
         pause(crate::wait::now() + RETRY_NS, true)?;
     };
     CLAIMED.store(true, Ordering::Release);
+    OWN.set_block(
+        attached.block_first.min(0xffff) as u16,
+        attached.block_count.min(0xffff) as u16,
+    );
     SWITCH.store(switch.map_or(0, |h| h.into_raw().0), Ordering::Release);
     *out = FastClaim {
         kind: KIND_PORT,
@@ -490,6 +494,27 @@ pub fn port_hold(port: u16, reuseport: bool) -> Result<i32, i32> {
 /// JOIN with the port description `fd` (`stafeto_fast_port_join`).
 pub fn port_join(fd: i32) -> Result<(), i32> {
     crate::net::port_join(fd)
+}
+
+/// The ports this process's stack owns, which the glue of the stack asks for
+/// (`stafeto_fast_own_port`) to tell a packet of the loopback network for its own sockets from one
+/// for another stack (`proto_net::switch::OwnPorts`). A forked worker has the words as the master
+/// left them (the master holds the ports before it forks).
+static OWN: proto_net::switch::OwnPorts = proto_net::switch::OwnPorts::new();
+
+/// Remembers that the description `description` holds `port` for this process's stack.
+pub fn note_own_port(port: u16, description: u32) {
+    OWN.note(port, description);
+}
+
+/// The last close of `description` in this process: the ports it held are no longer own.
+pub fn forget_own_ports(description: u32) {
+    OWN.forget(description);
+}
+
+/// Whether `port` belongs to the stack of this process: a held port, or in its block.
+pub fn own_port(port: u16) -> bool {
+    OWN.owns(port)
 }
 
 /// Whether the process is a consumer of the switch (not an owner of a device).
