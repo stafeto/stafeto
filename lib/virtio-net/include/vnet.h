@@ -80,6 +80,56 @@ void *vnet_copy(void *dst, const void *src, size_t n);
 int vnet_bypass_push(const void *frame, size_t len);
 size_t vnet_bypass_pop(void *frame, size_t cap);
 
+/*
+ * The consumer side of the network service's switch (the ring of
+ * <proto_net::switch>): the program attached (stafeto_fast_attach) and the
+ * ring object is mapped at the address the attach gave. The functions are
+ * for one thread and make no call of the kernel: vnet_port_tx_flush says
+ * whether the switch sleeps, and the caller then pokes it
+ * (stafeto_fast_poke).
+ */
+
+/* A frame the switch delivered: its cell, its length, the DONE flags
+ * (1: a copy of an ARP reply for every consumer; 2: an ICMP error), and
+ * where it starts. */
+struct vnet_port_rx {
+    uint32_t cell, len, flags, pad;
+    void *frame;
+};
+
+/* Opens the consumer over the mapped ring: FILL gets every cell of
+ * receiving. 0, or -1 for sizes the layout does not allow. */
+int vnet_port_open(void *ring, uint32_t rx_slots, uint32_t tx_slots);
+
+/* Up to n (at most 32) delivered frames: the count, or -1 when the ring broke
+ * a rule. A frame's cell is the program's until vnet_port_rx_return. */
+int vnet_port_rx_burst(struct vnet_port_rx *out, int n);
+void vnet_port_rx_return(uint32_t cell);
+
+/* The cells of FILL the switch has not taken yet. */
+uint32_t vnet_port_fill_free(void);
+
+/* Where the next frame to send is built (NULL when TX is full), and the
+ * entry for it (the length, at most 1514; flags and spare are 0). The
+ * entries are published by vnet_port_tx_flush, which gives 1 when the
+ * switch sleeps and must be poked. */
+uint8_t *vnet_port_tx_cell(void);
+void vnet_port_tx_submit(uint32_t len);
+int vnet_port_tx_flush(void);
+
+/* 1 when DONE holds a frame. */
+int vnet_port_work(void);
+
+/* Before waiting: the idle flag, a full barrier, one more look at DONE (1
+ * when a frame is there and the flag is cleared). After the wait: clears
+ * the flag. */
+int vnet_port_sleep_begin(void);
+void vnet_port_sleep_end(void);
+
+/* The switch's counters: out[0] frames dropped for a full ring, out[1]
+ * frames of TX refused. */
+void vnet_port_counters(uint32_t *out);
+
 #ifdef __cplusplus
 }
 #endif

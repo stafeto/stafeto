@@ -195,6 +195,27 @@
  					goto out;
  				}
  				space -= resid - uio->uio_resid;
+--- a/freebsd/net/if_ethersubr.c
++++ b/freebsd/net/if_ethersubr.c
+@@ -350,10 +350,18 @@
+ 			return (error == EWOULDBLOCK ? 0 : error);
+ 	}
+ 
++#ifndef FF_STAFETO
++	/*
++	 * A frame to the interface's own address goes into the ring with the
++	 * interface's own MAC as the destination: the network service's
++	 * switch turns it round (the shared address belongs to every
++	 * consumer and to the service, so the frame may be for another).
++	 */
+ 	if ((pflags & RT_L2_ME) != 0) {
+ 		update_mbuf_csumflags(m, m);
+ 		return (if_simloop(ifp, m, RO_GET_FAMILY(ro, dst), 0));
+ 	}
++#endif
+ 	loop_copy = (pflags & RT_MAY_LOOP) != 0;
+ 
+ 	/*
 --- a/freebsd/net/netisr.c
 +++ b/freebsd/net/netisr.c
 @@ -984,6 +984,50 @@
@@ -248,6 +269,24 @@
  static int
  netisr_queue_workstream(struct netisr_workstream *nwsp, u_int proto,
      struct netisr_work *npwp, struct mbuf *m, int *dosignalp)
+--- a/freebsd/netinet/in.c
++++ b/freebsd/netinet/in.c
+@@ -963,6 +963,15 @@
+ {
+ 	struct ifnet *ifp = ia->ia_ifp;
+ 
++#ifdef FF_STAFETO
++	/*
++	 * No route to the interface's own address through lo0: the packet
++	 * takes the route of the network, leaves through the ring, and the
++	 * switch of the network service turns it round.
++	 */
++	return (false);
++#endif
++
+ 	/* Case 4: Skip loopback interfaces */
+ 	if ((ifp->if_flags & IFF_LOOPBACK) ||
+ 	    (ia->ia_addr.sin_addr.s_addr == INADDR_ANY))
 --- a/freebsd/vm/uma_core.c
 +++ b/freebsd/vm/uma_core.c
 @@ -1821,8 +1821,22 @@

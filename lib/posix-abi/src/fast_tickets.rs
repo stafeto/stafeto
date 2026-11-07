@@ -54,6 +54,8 @@ const BUFFER_DEFAULT: i32 = 65_536;
 /// `socket` of a ticket not made yet, and one the stack refused.
 pub const NOT_MADE: i32 = -1;
 pub const REFUSED: i32 = -2;
+/// `hold` of a ticket that holds no port with the switch.
+pub const NO_HOLD: i32 = -1;
 
 /// One ticket.
 #[derive(Clone, Copy)]
@@ -70,9 +72,19 @@ pub struct Ticket {
     /// before, `REFUSED` when the stack refused (then `error` is why).
     pub socket: i32,
     pub error: i32,
+    /// The descriptor of the process that holds the port of the bind with
+    /// the network service's switch (PORT_HOLD), `NO_HOLD` for none: the
+    /// stack's worker joins the group with it, and the descriptor goes with
+    /// the ticket.
+    pub hold: i32,
 }
 
 impl Ticket {
+    /// The ticket's SO_REUSEPORT.
+    pub fn reuseport(&self) -> bool {
+        self.options[REUSEPORT].is_some_and(|v| v != 0)
+    }
+
     const FREE: Ticket = Ticket {
         used: false,
         address: None,
@@ -82,6 +94,7 @@ impl Ticket {
         clofork: false,
         socket: NOT_MADE,
         error: 0,
+        hold: NO_HOLD,
     };
 
     fn option(&self, level: i32, name: i32) -> Option<i32> {

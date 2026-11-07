@@ -398,7 +398,10 @@ def build_vnet() -> Path:
 # The functions of vnet.h.
 VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "vnet_buf_ptr", "vnet_buf_free",
               "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost", "vnet_bells",
-              "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop"]
+              "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop",
+              "vnet_port_open", "vnet_port_rx_burst", "vnet_port_rx_return", "vnet_port_fill_free",
+              "vnet_port_tx_cell", "vnet_port_tx_submit", "vnet_port_tx_flush", "vnet_port_work",
+              "vnet_port_sleep_begin", "vnet_port_sleep_end", "vnet_port_counters"]
 
 
 def archive_names(archive: Path, *flags) -> set:
@@ -655,7 +658,7 @@ def compile_c(source: Path, output: Path, *flags, fpic=True) -> None:
 
 GOOD = ["so-hello", "so-image", "display-probe", "net-sock", "net-dns", "posix-net"]
 # Good programs linked with libvirtio_net.a as well.
-WITH_VNET = ["fast-echo"]
+WITH_VNET = ["fast-echo", "switch-probe"]
 BAD = ["bad-interp", "bad-copy", "bad-tls", "bad-needed", "bad-symbol", "bad-ifunc", "bad-pie"]
 PROBE_FILES = GOOD + WITH_VNET + BAD
 # bad program: (source, what makes it bad, check)

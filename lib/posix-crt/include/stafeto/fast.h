@@ -44,6 +44,13 @@ struct stafeto_fast_config {
 
 #define STAFETO_FAST_MMIO 1
 #define STAFETO_FAST_PCI 2
+/* An attach to the network service's switch (stafeto_fast_attach): there is
+ * no device. The fields of the claim hold: window, window_len: the ring
+ * object (the consumer's own, mapped read and write); snapshot[0..6]: the
+ * consumer's number, its generation, rx_slots, tx_slots, the first port of
+ * the block of ephemeral ports and how many there are; config: the shared
+ * address of the service's device (the MAC and the lease); the rest is 0. */
+#define STAFETO_FAST_PORT 3
 
 struct stafeto_fast_claim {
     uint32_t kind, pad;
@@ -96,6 +103,33 @@ _Static_assert(sizeof(struct stafeto_fast_claim) == 480, "the layout of the clai
  * objects are mapped) leaves the device with the process until the process
  * ends: another claim says EBUSY, fork and execve stay refused. */
 int stafeto_fast_claim(struct stafeto_fast_claim *out, unsigned flags);
+
+/* Attaches to the network service's switch: makes the ring object, sends
+ * ATTACH, maps the ring, and describes it in *out as a claim of kind
+ * STAFETO_FAST_PORT. The service notifies the calling thread's channel
+ * (stafeto_fast_wait; the bits are 1: frames in the ring, 2: the ring
+ * broke, 4: the address changed, 8 or 16: the service let go of the
+ * consumer). Waits while the service has no address (up to 20 s). 0, or -1
+ * with errno: EAGAIN the service has no switch (a build or a netd.conf
+ * without `switch N`): the caller may use stafeto_fast_claim; ENOMEM no
+ * room for the ring or the places of the switch are all taken (EBUSY);
+ * ENETDOWN, ENODEV, EBUSY (the process attached already), EIO. A process
+ * that attached cannot fork or exec, as with a claim. */
+int stafeto_fast_attach(struct stafeto_fast_claim *out);
+
+/* Holds TCP `port` with the switch (PORT_HOLD; below 1024 the process must
+ * be the superuser) and gives the descriptor of the hold; the programs of the
+ * stack do this through bind. -1 with errno: EADDRINUSE, EACCES, ENOMEM (no
+ * group), ENOSYS (no switch). stafeto_fast_port_join makes the attached
+ * consumer a member of the port's group (EBADF or EINVAL for a descriptor
+ * that holds no port, EINVAL without an attach). */
+int stafeto_fast_port_hold(unsigned port, int reuseport);
+int stafeto_fast_port_join(int fd);
+
+/* Tells the switch's thread that frames wait in the ring's TX (the switch
+ * sleeps: vnet_port_tx_flush gave 1). 0, or -1 with errno (EBADF without
+ * an attach). */
+int stafeto_fast_poke(void);
 
 /* Waits for the service's notification up to timeout_ns nanoseconds (0:
  * only looks) and gives its bits (several may come together). A bit that

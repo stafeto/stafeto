@@ -29,6 +29,7 @@ pub mod frames;
 pub mod host;
 pub mod mmio;
 pub mod open;
+pub mod port;
 pub mod rings;
 pub mod transport;
 
