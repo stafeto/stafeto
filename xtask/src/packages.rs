@@ -652,6 +652,7 @@ pub fn check() -> Result<(), String> {
         "boot-net-bench-cpu0.img",
         "boot-net-bench-fast.img",
         "boot-fast-nginx.img",
+        "boot-fast-scale.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -777,6 +778,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-fast-nginx-steps.img"
         | "boot-fast-nginx-vz.img"
         | "boot-fast-nginx-vz-steps.img"
+        | "boot-fast-scale.img"
         | "boot-net-bench-fast.img" => Ok(load()?
             .into_iter()
             .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))
@@ -1170,6 +1172,7 @@ files = [
             "boot-fast-nginx-steps.img",
             "boot-fast-nginx-vz.img",
             "boot-fast-nginx-vz-steps.img",
+            "boot-fast-scale.img",
             "boot-net-bench-fast.img",
         ] {
             let held = of_image(image).unwrap();

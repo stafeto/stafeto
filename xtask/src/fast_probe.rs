@@ -333,6 +333,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Some("crash") => return crash(&args[1..]),
         Some("layer") => return crate::fast_layer::command(&args[1..]),
         Some("nginx") => return crate::fast_nginx::command(&args[1..]),
+        Some("scale") => return crate::fast_scale::command(&args[1..]),
         _ => (false, args),
     };
     let machine = match rest {

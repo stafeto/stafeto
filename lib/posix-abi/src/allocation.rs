@@ -84,6 +84,10 @@ pub(crate) struct State {
     /// started by init maps its own segments, every program the clock's
     /// page and its record's. A guess that the kernel's refusals raise.
     hidden: usize,
+    /// How many chunks `grow` took and the longest time one took with the
+    /// heap's lock held, in counter ticks (`probe_heap`).
+    grows: u64,
+    grow_longest: u64,
     /// The pins of files whose last shared mapping went, until the caller
     /// lets go of them (`take_closed`).
     closed: [Closed; CLOSED_MAX],
@@ -132,6 +136,8 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     chunk: 0,
     compacted: 0,
     hidden: HIDDEN,
+    grows: 0,
+    grow_longest: 0,
     closed: [(0, 0, 0, false); CLOSED_MAX],
     closed_len: 0,
 }));
@@ -201,6 +207,28 @@ pub fn probe_own_pages() -> usize {
 /// guest probes.
 pub fn room_pages() -> usize {
     heap(|state| state.space.pages())
+}
+
+/// What the heap holds, for the probes and the glue of the stack: the pages
+/// of the room, those unbacked, free, taken from chunks and in objects of
+/// their own, the places of the map and the entries the map does not show,
+/// the chunks `grow` took and the longest time one held the lock, in
+/// nanoseconds.
+pub fn probe_heap() -> [u64; 9] {
+    heap(|state| {
+        let count = |page| state.space.count(page) as u64;
+        [
+            state.space.pages() as u64,
+            count(Page::Unbacked),
+            count(Page::Free),
+            count(Page::User),
+            count(Page::Own),
+            state.map.len() as u64,
+            state.hidden as u64,
+            state.grows,
+            rt::time::ticks_to_ns(state.grow_longest),
+        ]
+    })
 }
 
 /// Runs `run` holding the heap's lock, for the guest probes.
@@ -770,6 +798,14 @@ impl State {
     /// A new chunk of the heap with room for `needed` pages: twice the last
     /// one, 64 KiB to 64 MiB, or less when the room has no run so long.
     fn grow(&mut self, needed: usize) -> Result<(), i32> {
+        let began = rt::time::now();
+        let result = self.grow_chunk(needed);
+        self.grows += 1;
+        self.grow_longest = self.grow_longest.max(rt::time::now().wrapping_sub(began));
+        result
+    }
+
+    fn grow_chunk(&mut self, needed: usize) -> Result<(), i32> {
         // Twice the last chunk, but no more than a sixteenth of what the
         // process's quota has left: a small process does not pay for a big
         // chunk it never fills (it keeps 64 KiB chunks), and a process with

@@ -21,6 +21,180 @@
  
  #define	PCPU_GET(member)	(pcpup->pc_ ## member)
  #define	PCPU_ADD(member, value)	(pcpup->pc_ ## member += (value))
+--- a/freebsd/kern/kern_descrip.c
++++ b/freebsd/kern/kern_descrip.c
+@@ -108,6 +108,8 @@
+ static int	fd_first_free(struct filedesc *fdp, int low, int size);
+ static void	fdgrowtable(struct filedesc *fdp, int nfd);
+ static void	fdgrowtable_exp(struct filedesc *fdp, int nfd);
++static int	fdgrowtable_try(struct filedesc *fdp, int nfd, int mflag);
++static int	fdgrowtable_exp_try(struct filedesc *fdp, int nfd, int mflag);
+ static void	fdunused(struct filedesc *fdp, int fd);
+ static void	fdused(struct filedesc *fdp, int fd);
+ static int	fget_unlocked_seq(struct thread *td, int fd,
+@@ -1974,8 +1976,8 @@
+ 	    ("%s: ioctls without CAP_IOCTL", func));
+ }
+ 
+-static void
+-fdgrowtable_exp(struct filedesc *fdp, int nfd)
++static int
++fdgrowtable_exp_try(struct filedesc *fdp, int nfd, int mflag)
+ {
+ 	int nfd1;
+ 
+@@ -1984,14 +1986,21 @@
+ 	nfd1 = fdp->fd_nfiles * 2;
+ 	if (nfd1 < nfd)
+ 		nfd1 = nfd;
+-	fdgrowtable(fdp, nfd1);
++	return (fdgrowtable_try(fdp, nfd1, mflag));
++}
++
++static void
++fdgrowtable_exp(struct filedesc *fdp, int nfd)
++{
++
++	(void)fdgrowtable_exp_try(fdp, nfd, M_WAITOK);
+ }
+ 
+ /*
+  * Grow the file table to accommodate (at least) nfd descriptors.
+  */
+-static void
+-fdgrowtable(struct filedesc *fdp, int nfd)
++static int
++fdgrowtable_try(struct filedesc *fdp, int nfd, int mflag)
+ {
+ 	struct filedesc0 *fdp0;
+ 	struct freetable *ft;
+@@ -2011,7 +2020,7 @@
+ 	nnfiles = NDSLOTS(nfd) * NDENTRIES; /* round up */
+ 	if (nnfiles <= onfiles)
+ 		/* the table is already large enough */
+-		return;
++		return (0);
+ 
+ 	/*
+ 	 * Allocate a new table.  We need enough space for the number of
+@@ -2023,7 +2032,9 @@
+ 	ntable = malloc(offsetof(struct fdescenttbl, fdt_ofiles) +
+ 	    nnfiles * sizeof(ntable->fdt_ofiles[0]) +
+ 	    sizeof(struct freetable),
+-	    M_FILEDESC, M_ZERO | M_WAITOK);
++	    M_FILEDESC, M_ZERO | mflag);
++	if (ntable == NULL)
++		return (ENOMEM);
+ 	/* copy the old data */
+ 	ntable->fdt_nfiles = nnfiles;
+ 	memcpy(ntable->fdt_ofiles, otable->fdt_ofiles,
+@@ -2036,7 +2047,11 @@
+ 	 */
+ 	if (NDSLOTS(nnfiles) > NDSLOTS(onfiles)) {
+ 		nmap = malloc(NDSLOTS(nnfiles) * NDSLOTSIZE, M_FILEDESC,
+-		    M_ZERO | M_WAITOK);
++		    M_ZERO | mflag);
++		if (nmap == NULL) {
++			free(ntable, M_FILEDESC);
++			return (ENOMEM);
++		}
+ 		/* copy over the old data and update the pointer */
+ 		memcpy(nmap, omap, NDSLOTS(onfiles) * sizeof(*omap));
+ 		fdp->fd_map = nmap;
+@@ -2084,6 +2099,14 @@
+ 	 */
+ 	if (NDSLOTS(onfiles) > NDSLOTS(NDFILE))
+ 		free(omap, M_FILEDESC);
++	return (0);
++}
++
++static void
++fdgrowtable(struct filedesc *fdp, int nfd)
++{
++
++	(void)fdgrowtable_try(fdp, nfd, M_WAITOK);
+ }
+ 
+ /*
+@@ -2126,7 +2149,15 @@
+ 		 * fd is already equal to first free descriptor >= minfd, so
+ 		 * we only need to grow the table and we are done.
+ 		 */
++#ifdef FF_STAFETO
++		/* The table grows without a wait: a process at its quota
++		 * answers ENFILE, and accept() leaves the connection in the
++		 * queue of the listener. */
++		if (fdgrowtable_exp_try(fdp, allocfd, M_NOWAIT) != 0)
++			return (ENFILE);
++#else
+ 		fdgrowtable_exp(fdp, allocfd);
++#endif
+ 	}
+ 
+ 	/*
+@@ -2229,7 +2260,17 @@
+ 		}
+ 		return (ENFILE);
+ 	}
++#ifdef FF_STAFETO
++	/* The stack cannot wait for memory: a process at its quota refuses the
++	 * file, and accept() answers ENFILE. */
++	fp = uma_zalloc(file_zone, M_NOWAIT);
++	if (fp == NULL) {
++		atomic_subtract_int(&openfiles, 1);
++		return (ENFILE);
++	}
++#else
+ 	fp = uma_zalloc(file_zone, M_WAITOK);
++#endif
+ 	bzero(fp, sizeof(*fp));
+ 	refcount_init(&fp->f_count, n);
+ 	fp->f_cred = crhold(td->td_ucred);
+--- a/freebsd/kern/kern_event.c
++++ b/freebsd/kern/kern_event.c
+@@ -1444,7 +1444,13 @@
+ 			if (!kevp->filter)
+ 				continue;
+ 			kevp->flags &= ~EV_SYSFLAGS;
++#ifdef FF_STAFETO
++			/* No wait for memory (the stack's threads cannot sleep): a
++			 * process at its quota gets ENOMEM for the registration. */
++			error = kqueue_register(kq, kevp, td, M_NOWAIT);
++#else
+ 			error = kqueue_register(kq, kevp, td, M_WAITOK);
++#endif
+ 			if (error || (kevp->flags & EV_RECEIPT)) {
+ 				if (nevents == 0)
+ 					return (error);
+--- a/freebsd/kern/uipc_socket.c
++++ b/freebsd/kern/uipc_socket.c
+@@ -2487,12 +2487,26 @@
+ 					tls_rtype = TLS_RLTYPE_APP;
+ 				} else
+ #endif
++#ifdef FF_STAFETO
++					/* No wait for the mbufs of the answer: a
++					 * process at its quota gets ENOBUFS and
++					 * the caller closes the connection. */
++					top = m_uiotombuf(uio, M_NOWAIT, space,
++					    (atomic ? max_hdr : 0),
++					    (atomic ? M_PKTHDR : 0) |
++					    ((flags & MSG_EOR) ? M_EOR : 0));
++#else
+ 					top = m_uiotombuf(uio, M_WAITOK, space,
+ 					    (atomic ? max_hdr : 0),
+ 					    (atomic ? M_PKTHDR : 0) |
+ 					    ((flags & MSG_EOR) ? M_EOR : 0));
++#endif
+ 				if (top == NULL) {
++#ifdef FF_STAFETO
++					error = ENOBUFS;
++#else
+ 					error = EFAULT; /* only possible error */
++#endif
+ 					goto out;
+ 				}
+ 				space -= resid - uio->uio_resid;
 --- a/freebsd/net/netisr.c
 +++ b/freebsd/net/netisr.c
 @@ -984,6 +984,50 @@
@@ -74,6 +248,221 @@
  static int
  netisr_queue_workstream(struct netisr_workstream *nwsp, u_int proto,
      struct netisr_work *npwp, struct mbuf *m, int *dosignalp)
+--- a/freebsd/vm/uma_core.c
++++ b/freebsd/vm/uma_core.c
+@@ -1821,8 +1821,22 @@
+ 
+ 	if (keg->uk_flags & UMA_ZFLAG_VTOSLAB)
+ 		for (i = 0; i < keg->uk_ppera; i++)
++#ifdef FF_STAFETO
++			/* The entry of the page hash is taken without waiting: a
++			 * process at its quota gives the page back. */
++			if (vsetzoneslab((vm_offset_t)mem + (i * PAGE_SIZE),
++			    zone, slab) != 0) {
++				if (keg->uk_flags & UMA_ZFLAG_OFFPAGE)
++					zone_free_item(slabzone(keg->uk_ipers),
++					    slab_tohashslab(slab), NULL, SKIP_NONE);
++				keg->uk_freef(mem, size, sflags);
++				uma_total_dec(size);
++				goto fail;
++			}
++#else
+ 			vsetzoneslab((vm_offset_t)mem + (i * PAGE_SIZE),
+ 			    zone, slab);
++#endif
+ 
+ 	slab->us_freecount = keg->uk_ipers;
+ 	slab->us_flags = sflags;
+@@ -4043,6 +4057,22 @@
+ 	return (slab);
+ }
+ 
++#ifdef FF_STAFETO
++extern void ff_stafeto_exhausted(uint64_t size);
++
++/* A request that waits for a page the process cannot get tries again at
++ * once, and nothing frees a page meanwhile: after 1000 tries the program
++ * ends (a last defence; the requests that may fail get NULL). */
++static void
++fst_waited(uma_zone_t zone, int *tries)
++{
++	if (++*tries == 1000) {
++		printf("fst zone %s: no page after 1000 tries\n", zone->uz_name);
++		ff_stafeto_exhausted(PAGE_SIZE);
++	}
++}
++#endif
++
+ static uma_slab_t
+ keg_fetch_slab(uma_keg_t keg, uma_zone_t zone, int rdomain, const int flags)
+ {
+@@ -4050,6 +4080,9 @@
+ 	uma_slab_t slab;
+ 	int aflags, domain;
+ 	bool rr;
++#ifdef FF_STAFETO
++	int tries = 0;
++#endif
+ 
+ 	KASSERT((flags & (M_WAITOK | M_NOVM)) != (M_WAITOK | M_NOVM),
+ 	    ("%s: invalid flags %#x", __func__, flags));
+@@ -4101,9 +4134,15 @@
+ 			}
+ 			if ((flags & M_WAITOK) == 0)
+ 				break;
++#ifdef FF_STAFETO
++			fst_waited(zone, &tries);
++#endif
+ 			vm_wait_domain(domain);
+ 		} else if (vm_domainset_iter_policy(&di, &domain) != 0) {
+ 			if ((flags & M_WAITOK) != 0) {
++#ifdef FF_STAFETO
++				fst_waited(zone, &tries);
++#endif
+ 				vm_wait_doms(&keg->uk_dr.dr_policy->ds_mask, 0);
+ 				goto restart;
+ 			}
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -61,6 +61,10 @@
+ 
+ include ${TOPDIR}/mk/kern.pre.mk
+ 
++# stafeto: no DPDK. The host files compile against the C library of the
++# system (STAFETO_HOST_CFLAGS names its headers) and the host layer
++# ff_stafeto_if.c stands in for F-Stack's DPDK files.
++ifneq ($(HOST_OS),stafeto)
+ ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+ $(error "no installation of DPDK found, maybe you shuld export environment variable `PKG_CONFIG_PATH`")
+ endif
+@@ -68,6 +72,9 @@
+ PKGCONF ?= pkg-config
+ 
+ DPDK_CFLAGS= -Wall -Wextra -Wno-deprecated-declarations -Werror $(shell $(PKGCONF) --cflags libdpdk)
++else
++DPDK_CFLAGS= -Wall -DFF_STAFETO ${STAFETO_HOST_CFLAGS}
++endif
+ 
+ KERNPREINCLUDES:= ${INCLUDES}
+ INCLUDES= -I${OVERRIDE_INCLUDES_ROOT} ${KERNPREINCLUDES}
+@@ -81,7 +88,9 @@
+ HOST_INCLUDES+= -I/usr/local/include/libepoll-shim
+ endif
+ 
+-ifndef DEBUG
++ifeq ($(HOST_OS),stafeto)
++HOST_CFLAGS = -O2
++else ifndef DEBUG
+ HOST_CFLAGS = -O2 -frename-registers  -funswitch-loops -fweb -Wno-format-truncation
+ else
+ HOST_CFLAGS = ${DEBUG}
+@@ -155,6 +164,9 @@
+ ifdef FF_INET6
+ HOST_CFLAGS+= -DINET6
+ CFLAGS+= -DINET6
++ifeq ($(HOST_OS),stafeto)
++CFLAGS+= -DFF_INET6
++endif
+ endif
+ 
+ ifdef FF_TCPHPTS
+@@ -228,6 +240,13 @@
+ endif
+ 
+ CFLAGS+= -DFSTACK
++ifeq ($(HOST_OS),stafeto)
++# The stack runs on one thread of its process (no ff_thread.c), and the
++# loader of stafeto's dynamic programs takes no thread-local storage of a
++# program: the per-thread variables of the stack are plain ones.
++CFLAGS+= -DFF_STAFETO -D__thread= -Wno-keyword-macro
++HOST_CFLAGS+= -D__thread= -Wno-keyword-macro
++endif
+ 
+ # SMP makes MAXCPU 1024 so UMA/SMR per-cpu storage is sized for all stack
+ # threads; without it MAXCPU is 1 and every thread shares slot 0.
+@@ -306,6 +325,15 @@
+         ff_ngctl.c
+ endif
+ 
++ifeq ($(HOST_OS),stafeto)
++FF_HOST_SRCS+=              \
++	ff_host_interface.c \
++	ff_config.c         \
++	ff_ini_parser.c     \
++	ff_log.c            \
++	ff_init.c           \
++	ff_stafeto_if.c
++else
+ FF_HOST_SRCS+=              \
+ 	ff_host_interface.c \
+ 	ff_thread.c         \
+@@ -321,6 +349,7 @@
+ 	ff_epoll.c          \
+ 	ff_log.c            \
+ 	ff_init.c
++endif
+ 
+ ifdef FF_KNI
+ FF_HOST_SRCS+=              \
+@@ -406,7 +435,18 @@
+ KERN_MSRCS+=		\
+ 	linker_if.m
+ 
+-ifeq (${MACHINE_CPUARCH},arm64)
++ifeq (${MACHINE_CPUARCH}-$(HOST_OS),arm64-stafeto)
++# FreeBSD 15 has fls and flsl inline in sys/libkern.h, and gsb_crc32.c
++# takes the portable code under FSTACK.
++LIBKERN_SRCS+=		 \
++	bcd.c		 \
++	gsb_crc32.c	 \
++	inet_ntoa.c	 \
++	jenkins_hash.c   \
++	strlcpy.c	 \
++	strnlen.c	 \
++	strtoq.c
++else ifeq (${MACHINE_CPUARCH},arm64)
+ LIBKERN_SRCS+=		 \
+ 	bcd.c		 \
+ 	inet_ntoa.c	 \
+@@ -703,6 +743,30 @@
+ # Then, only the symbols that are part of the  API are made
+ # externally available.
+ #
++ifeq ($(HOST_OS),stafeto)
++# The machine headers are in place before any object compiles.
++${HOST_OBJS} ${ASM_OBJS} ${OBJS}: | machine_includes ${MHEADERS}
++
++# The host objects join the stack in a second incremental link, and then
++# every symbol is local but the API: ff_api.symlist, the ff_* names of the
++# host files (ff_init, ff_run, ...) and the names of the host layer
++# (ff_stafeto_*). The other names of the host files (panic, ini_parse)
++# cannot meet a program's.
++libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
++	${LD} -r -o $*.stack.ro ${ASM_OBJS} ${OBJS}
++	${NM} $*.stack.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
++	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.stack.ro
++	${OBJCOPY} --globalize-symbols=ff_api.symlist --wildcard --globalize-symbol='ff_stafeto_*' $*.stack.ro
++	${NM} -g --defined-only ${HOST_OBJS} | awk 'NF == 3 && $$3 ~ /^ff_/ && $$3 !~ /^ff_stafeto_/ { print $$3 }' > $*_host_api.tmp
++	${LD} -r -o $*.ro $*.stack.ro ${HOST_OBJS}
++	${NM} $*.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
++	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.ro
++	${OBJCOPY} --globalize-symbols=ff_api.symlist --globalize-symbols=$*_host_api.tmp --wildcard --globalize-symbol='ff_stafeto_*' $*.ro
++	rm $*_localize_list.tmp $*_host_api.tmp $*.stack.ro
++	rm -f $@
++	${AR} -cqs $@ $*.ro
++	rm -f $*.ro
++else
+ libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
+ 	${LD} -d -r -o $*.ro ${ASM_OBJS} ${OBJS}
+ 	nm $*.ro  | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
+@@ -712,6 +776,7 @@
+ 	rm -f $@
+ 	ar -cqs $@ $*.ro ${HOST_OBJS}
+ 	rm -f $*.ro
++endif
+ 
+ ${HOST_OBJS}: %.o: %.c
+ 	${HOST_C}
 --- a/lib/ff_compat.c
 +++ b/lib/ff_compat.c
 @@ -364,12 +364,31 @@
@@ -173,19 +562,32 @@
  /*
 --- a/lib/ff_glue.c
 +++ b/lib/ff_glue.c
-@@ -1031,7 +1031,20 @@
+@@ -1028,10 +1028,33 @@
+     panic("kproc_exit unsupported");
+ }
+ 
++#ifdef FF_STAFETO
++/* The requests that may fail (M_NOWAIT) the process refused, for the
++ * stack's statistics (ff_stafeto_glue.c). */
++unsigned long ff_stafeto_refused;
++#endif
++
  void *
  kmem_malloc(vm_size_t bytes, int flags)
  {
 +#ifdef FF_STAFETO
 +    /* A request that may fail (M_NOWAIT) gets NULL when the process has no
 +     * more memory: the socket, the frame or the cluster is refused and the
-+     * stack lives on. Any other request is made again by ff_mmap, which
-+     * ends the program on a refusal. */
++     * stack lives on. UMA asks for the pages of a request that waits with
++     * M_NOWAIT too and counts the tries itself (keg_fetch_slab). Any other
++     * request is made again by ff_mmap, which ends the program on a
++     * refusal. */
 +    void *alloc = ff_mmap_try(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
 +    if (alloc == (void *)-1) {
-+        if (flags & M_NOWAIT)
++        if (flags & M_NOWAIT) {
++            ff_stafeto_refused++;
 +            return (NULL);
++        }
 +        alloc = ff_mmap(NULL, bytes, ff_PROT_READ|ff_PROT_WRITE, ff_MAP_ANON|ff_MAP_PRIVATE, -1, 0);
 +    }
 +#else
@@ -194,6 +596,44 @@
      if ((flags & M_ZERO) && alloc != NULL)
          bzero(alloc, bytes);
      return (alloc);
+@@ -1067,12 +1090,22 @@
+ malloc(unsigned long size, struct malloc_type *type, int flags)
+ {
+     void *alloc;
++#ifdef FF_STAFETO
++    int tries = 0;
++#endif
+ 
+     do {
+         alloc = ff_malloc(size);
+         if (alloc || !(flags & M_WAITOK))
+             break;
+ 
++#ifdef FF_STAFETO
++        /* The wait below returns at once and nothing frees memory meanwhile:
++         * after 100 tries the process ends, as ff_mmap does, and its main
++         * process starts another. A last defence of the paths that wait. */
++        if (++tries == 100)
++            ff_stafeto_exhausted(size);
++#endif
+         pause("malloc", hz/100);
+     } while (alloc == NULL);
+ 
+@@ -1248,8 +1281,14 @@
+ int
+ vm_domainset_iter_policy(struct vm_domainset_iter *di, int *domain)
+ {
++#ifdef FF_STAFETO
++    /* One domain, as FreeBSD without NUMA: after the first try there is no
++     * other, and a request that may fail gets NULL. */
++    return (EJUSTRETURN);
++#else
+     //return (EJUSTRETURN);
+     return 0;
++#endif
+ }
+ 
+ void *
 --- a/lib/ff_host_interface.c
 +++ b/lib/ff_host_interface.c
 @@ -54,8 +54,12 @@
@@ -209,7 +649,7 @@
  
  #include "ff_host_interface.h"
  #include "ff_errno.h"
-@@ -65,6 +69,23 @@
+@@ -65,6 +69,31 @@
  extern void* ff_mem_get_page();
  extern int ff_mem_free_addr(void* p);
  
@@ -228,12 +668,20 @@
 +    if ((flags & ff_MAP_ANON) == ff_MAP_ANON)       host_flags |= MAP_ANON;
 +    return mmap(addr, len, host_prot, host_flags, fd, offset);
 +}
++
++/* The program ends: a request that cannot fail found no memory. */
++void
++ff_stafeto_exhausted(uint64_t size)
++{
++    ff_log(FF_LOG_ERR, FF_LOGTYPE_FSTACK_LIB, "fst malloc failed:%llu bytes\n", (unsigned long long)size);
++    exit(1);
++}
 +#endif
 +
  void *
  ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset)
  {
-@@ -206,7 +227,7 @@
+@@ -206,7 +235,7 @@
  }
  
  void
@@ -242,7 +690,7 @@
  {
      if (sec) {
          *sec = current_ts.tv_sec;
-@@ -229,7 +250,22 @@
+@@ -229,7 +258,22 @@
  {
      (void)reseed;
  
@@ -265,7 +713,7 @@
  }
  
  uint32_t
-@@ -566,7 +602,13 @@
+@@ -566,7 +610,13 @@
          case ff_ERANGE:      errno = ERANGE; break;
  
          /* case ff_EAGAIN:       same as EWOULDBLOCK */
@@ -281,18 +729,20 @@
          case ff_EALREADY:        errno = EALREADY; break;
 --- a/lib/ff_host_interface.h
 +++ b/lib/ff_host_interface.h
-@@ -41,6 +41,10 @@
+@@ -41,6 +41,12 @@
  #define ff_MAP_FAILED    ((void *)-1)
  
  void *ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
 +#ifdef FF_STAFETO
 +/* As ff_mmap; a refusal returns MAP_FAILED to the caller. */
 +void *ff_mmap_try(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
++/* Ends the program: an allocation that may not fail found no memory. */
++void ff_stafeto_exhausted(uint64_t size);
 +#endif
  int ff_munmap(void *addr, uint64_t len);
  
  void *ff_malloc(uint64_t size);
-@@ -72,6 +76,10 @@
+@@ -72,6 +78,10 @@
  char *ff_getenv(const char *name);
  
  void ff_os_errno(int error);
@@ -437,147 +887,41 @@
  
  #define PCPU_GET(member)         (ff_pcpu_get()->pc_ ## member)
  #define PCPU_ADD(member, val)    (ff_pcpu_get()->pc_ ## member += (val))
---- a/lib/Makefile
-+++ b/lib/Makefile
-@@ -61,6 +61,10 @@
+--- a/lib/include/vm/uma_int.h
++++ b/lib/include/vm/uma_int.h
+@@ -101,7 +101,7 @@
+     *zone = up->up_zone;
+ }
  
- include ${TOPDIR}/mk/kern.pre.mk
+-static __inline void
++static __inline int
+ vsetzoneslab(vm_offset_t va, uma_zone_t zone, uma_slab_t slab)
+ {
+     struct uma_page_head *hash_list;
+@@ -114,14 +114,22 @@
+     if (up != NULL) {
+         up->up_slab = slab;
+         up->up_zone = zone;
+-        return;
++        return (0);
+     }
  
-+# stafeto: no DPDK. The host files compile against the C library of the
-+# system (STAFETO_HOST_CFLAGS names its headers) and the host layer
-+# ff_stafeto_if.c stands in for F-Stack's DPDK files.
-+ifneq ($(HOST_OS),stafeto)
- ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
- $(error "no installation of DPDK found, maybe you shuld export environment variable `PKG_CONFIG_PATH`")
- endif
-@@ -68,6 +72,9 @@
- PKGCONF ?= pkg-config
++#ifdef FF_STAFETO
++    /* No wait: the caller gives the page back when the entry is refused. */
++    up = malloc(sizeof(*up), M_DEVBUF, M_NOWAIT);
++    if (up == NULL)
++        return (ENOMEM);
++#else
+     up = malloc(sizeof(*up), M_DEVBUF, M_WAITOK);
++#endif
+     up->up_va = va;
+     up->up_slab = slab;
+     up->up_zone = zone;
+     LIST_INSERT_HEAD(hash_list, up, list_entry);
++    return (0);
+ }
  
- DPDK_CFLAGS= -Wall -Wextra -Wno-deprecated-declarations -Werror $(shell $(PKGCONF) --cflags libdpdk)
-+else
-+DPDK_CFLAGS= -Wall -DFF_STAFETO ${STAFETO_HOST_CFLAGS}
-+endif
- 
- KERNPREINCLUDES:= ${INCLUDES}
- INCLUDES= -I${OVERRIDE_INCLUDES_ROOT} ${KERNPREINCLUDES}
-@@ -81,7 +88,9 @@
- HOST_INCLUDES+= -I/usr/local/include/libepoll-shim
- endif
- 
--ifndef DEBUG
-+ifeq ($(HOST_OS),stafeto)
-+HOST_CFLAGS = -O2
-+else ifndef DEBUG
- HOST_CFLAGS = -O2 -frename-registers  -funswitch-loops -fweb -Wno-format-truncation
- else
- HOST_CFLAGS = ${DEBUG}
-@@ -155,6 +164,9 @@
- ifdef FF_INET6
- HOST_CFLAGS+= -DINET6
- CFLAGS+= -DINET6
-+ifeq ($(HOST_OS),stafeto)
-+CFLAGS+= -DFF_INET6
-+endif
- endif
- 
- ifdef FF_TCPHPTS
-@@ -228,6 +240,13 @@
- endif
- 
- CFLAGS+= -DFSTACK
-+ifeq ($(HOST_OS),stafeto)
-+# The stack runs on one thread of its process (no ff_thread.c), and the
-+# loader of stafeto's dynamic programs takes no thread-local storage of a
-+# program: the per-thread variables of the stack are plain ones.
-+CFLAGS+= -DFF_STAFETO -D__thread= -Wno-keyword-macro
-+HOST_CFLAGS+= -D__thread= -Wno-keyword-macro
-+endif
- 
- # SMP makes MAXCPU 1024 so UMA/SMR per-cpu storage is sized for all stack
- # threads; without it MAXCPU is 1 and every thread shares slot 0.
-@@ -306,6 +325,15 @@
-         ff_ngctl.c
- endif
- 
-+ifeq ($(HOST_OS),stafeto)
-+FF_HOST_SRCS+=              \
-+	ff_host_interface.c \
-+	ff_config.c         \
-+	ff_ini_parser.c     \
-+	ff_log.c            \
-+	ff_init.c           \
-+	ff_stafeto_if.c
-+else
- FF_HOST_SRCS+=              \
- 	ff_host_interface.c \
- 	ff_thread.c         \
-@@ -321,6 +349,7 @@
- 	ff_epoll.c          \
- 	ff_log.c            \
- 	ff_init.c
-+endif
- 
- ifdef FF_KNI
- FF_HOST_SRCS+=              \
-@@ -406,7 +435,18 @@
- KERN_MSRCS+=		\
- 	linker_if.m
- 
--ifeq (${MACHINE_CPUARCH},arm64)
-+ifeq (${MACHINE_CPUARCH}-$(HOST_OS),arm64-stafeto)
-+# FreeBSD 15 has fls and flsl inline in sys/libkern.h, and gsb_crc32.c
-+# takes the portable code under FSTACK.
-+LIBKERN_SRCS+=		 \
-+	bcd.c		 \
-+	gsb_crc32.c	 \
-+	inet_ntoa.c	 \
-+	jenkins_hash.c   \
-+	strlcpy.c	 \
-+	strnlen.c	 \
-+	strtoq.c
-+else ifeq (${MACHINE_CPUARCH},arm64)
- LIBKERN_SRCS+=		 \
- 	bcd.c		 \
- 	inet_ntoa.c	 \
-@@ -703,6 +743,30 @@
- # Then, only the symbols that are part of the  API are made
- # externally available.
- #
-+ifeq ($(HOST_OS),stafeto)
-+# The machine headers are in place before any object compiles.
-+${HOST_OBJS} ${ASM_OBJS} ${OBJS}: | machine_includes ${MHEADERS}
-+
-+# The host objects join the stack in a second incremental link, and then
-+# every symbol is local but the API: ff_api.symlist, the ff_* names of the
-+# host files (ff_init, ff_run, ...) and the names of the host layer
-+# (ff_stafeto_*). The other names of the host files (panic, ini_parse)
-+# cannot meet a program's.
-+libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
-+	${LD} -r -o $*.stack.ro ${ASM_OBJS} ${OBJS}
-+	${NM} $*.stack.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
-+	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.stack.ro
-+	${OBJCOPY} --globalize-symbols=ff_api.symlist --wildcard --globalize-symbol='ff_stafeto_*' $*.stack.ro
-+	${NM} -g --defined-only ${HOST_OBJS} | awk 'NF == 3 && $$3 ~ /^ff_/ && $$3 !~ /^ff_stafeto_/ { print $$3 }' > $*_host_api.tmp
-+	${LD} -r -o $*.ro $*.stack.ro ${HOST_OBJS}
-+	${NM} $*.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
-+	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.ro
-+	${OBJCOPY} --globalize-symbols=ff_api.symlist --globalize-symbols=$*_host_api.tmp --wildcard --globalize-symbol='ff_stafeto_*' $*.ro
-+	rm $*_localize_list.tmp $*_host_api.tmp $*.stack.ro
-+	rm -f $@
-+	${AR} -cqs $@ $*.ro
-+	rm -f $*.ro
-+else
- libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
- 	${LD} -d -r -o $*.ro ${ASM_OBJS} ${OBJS}
- 	nm $*.ro  | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
-@@ -712,6 +776,7 @@
- 	rm -f $@
- 	ar -cqs $@ $*.ro ${HOST_OBJS}
- 	rm -f $*.ro
-+endif
- 
- ${HOST_OBJS}: %.o: %.c
- 	${HOST_C}
+ #endif    /* _FSTACK_VM_UMA_INT_H_ */
 --- a/lib/opt/opt_inet6.h
 +++ b/lib/opt/opt_inet6.h
 @@ -1 +1,3 @@
