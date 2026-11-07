@@ -41,6 +41,24 @@ use crate::{
     BOOT_PROFILE, Variant, build, build_boot_image, busybox_build, nano_build, net_probe, relibc,
 };
 
+/// When the probe began, for the budget of the whole run.
+static BEGAN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Says a line at once (a run that hangs must show where) and fails when the
+/// run has taken longer than its budget.
+fn say(what: &str) -> Result<(), String> {
+    let at = BEGAN.get_or_init(Instant::now).elapsed();
+    println!("fast-scale [{} s]: {what}", at.as_secs());
+    if at > RUN_WITHIN {
+        return Err(format!(
+            "the run took {} s, past {} s",
+            at.as_secs(),
+            RUN_WITHIN.as_secs()
+        ));
+    }
+    Ok(())
+}
+
 pub const IMAGE: &str = "boot-fast-scale.img";
 
 /// The grant's quota in the image (`SCALE_GRANTS` of init's table): 128 MiB.
@@ -169,6 +187,9 @@ fn raise_files() {
 /// guest does (the user network of QEMU gives the guest about 30 a second).
 fn open_more(address: SocketAddr, held: &mut Vec<TcpStream>, more: usize) -> Result<(), String> {
     for i in 0..more {
+        if i % 200 == 0 {
+            say(&format!("{} connections held", held.len()))?;
+        }
         let s = TcpStream::connect_timeout(&address, Duration::from_secs(20))
             .map_err(|e| format!("{i} of {more} connections opened ({e})"))?;
         held.push(s);
@@ -250,6 +271,7 @@ fn scale_line(run: &mut qemu::Run, tag: &str, sockets: u64) -> Result<String, St
     crate::nginx_probe::marker(run, tag, Duration::from_secs(30))?;
     let end = Instant::now() + STAGE_WITHIN;
     loop {
+        say(&format!("waiting for {sockets} sockets ({tag})"))?;
         let line = run.expect_line(
             "fast: scale",
             |l| l.contains("fast: scale "),
@@ -290,6 +312,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         guest: 80,
     }]));
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    BEGAN.get_or_init(Instant::now);
     let began = Instant::now();
     let mut notes: Vec<String> = Vec::new();
     let talked = scenario(&mut run, address, &mut notes);
