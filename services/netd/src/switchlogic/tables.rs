@@ -327,6 +327,7 @@ impl<'a> Tables<'a> {
     }
 
     fn mark(&mut self, proto: Proto, first: u16, count: u16, v: u8) {
+        assert!(u32::from(first) + u32::from(count) <= 65536);
         let at = Self::at(proto, first);
         self.ports[at..at + usize::from(count)].fill(v);
     }
@@ -347,6 +348,9 @@ impl<'a> Tables<'a> {
 
     pub fn attach(&mut self, c: u8, generation: u8, ring: ConsumerRing, block: u16) -> bool {
         self.guard.check();
+        if u32::from(block) + u32::from(BLOCK_PORTS) > 65536 {
+            return false;
+        }
         let Some(slot @ None) = self.consumers.get_mut(usize::from(c)) else {
             return false;
         };
@@ -383,6 +387,9 @@ impl<'a> Tables<'a> {
     /// Group `number` holds the ports, or one more holder when it holds them already.
     pub fn hold(&mut self, number: u8, proto: Proto, first: u16, count: u8) -> bool {
         self.guard.check();
+        if first == 0 || u32::from(first) + u32::from(count) > 65536 || count == 0 {
+            return false;
+        }
         let Some(slot) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
             return false;
         };
@@ -679,6 +686,9 @@ pub(crate) mod tests {
         assert!(!t.attach(3, 1, rig.ring(), 50176), "taken");
         assert_eq!(t.port(Proto::Udp, 50176 + 511), BLOCK_MARK + 3);
         assert_eq!(t.port(Proto::Tcp, 50176 + 512), 0);
+        assert!(!t.hold(3, Proto::Tcp, 65535, 2), "past the last port");
+        assert!(!t.hold(3, Proto::Tcp, 0, 1) && !t.hold(3, Proto::Tcp, 80, 0));
+        assert!(!t.attach(4, 1, rig.ring(), 65535), "a block past the last port");
         assert!(t.hold(1, Proto::Tcp, 8080, 2));
         assert!(t.hold(1, Proto::Tcp, 8080, 2), "a second holder");
         assert!(!t.hold(1, Proto::Tcp, 80, 1));

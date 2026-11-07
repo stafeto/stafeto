@@ -275,7 +275,9 @@ pub fn read_port_hold(mut body: Reader<'_>) -> Result<Hold, Status> {
         flags: body.u32()?,
     };
     body.finish()?;
-    let ports = h.first >= 1 && h.first + h.count.min(HOLD_MAX + 1) - 1 <= 65535;
+    // `checked_add` keeps hostile values from wrapping in any build profile.
+    let last = h.first.checked_add(h.count.wrapping_sub(1));
+    let ports = h.first >= 1 && last.is_some_and(|l| l <= 65535);
     if !matches!(h.protocol, 6 | 17) || !ports || !(1..=HOLD_MAX).contains(&h.count) {
         return Err(invalid());
     }
@@ -406,6 +408,27 @@ mod tests {
         );
         let down = proto_wire::reply(crate::code(crate::NET_DOWN));
         assert_eq!(Attached::read(&down), Err(crate::code(crate::NET_DOWN)));
+    }
+
+    #[test]
+    fn port_hold_refuses_ranges_that_overflow() {
+        for first in [u32::MAX, u32::MAX - 1, 65536] {
+            for count in [1, 2, 16] {
+                let h = Hold {
+                    protocol: 17,
+                    first,
+                    count,
+                    flags: 0,
+                };
+                let mut w = Writer::new();
+                write_port_hold(&h, &mut w).unwrap();
+                assert_eq!(
+                    read_port_hold(Reader::new(&w.as_bytes()[8..])),
+                    Err(invalid()),
+                    "{h:?}"
+                );
+            }
+        }
     }
 
     #[test]
