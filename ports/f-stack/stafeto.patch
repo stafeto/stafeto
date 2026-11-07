@@ -218,7 +218,22 @@
  	/*
 --- a/freebsd/net/if_loop.c
 +++ b/freebsd/net/if_loop.c
-@@ -192,6 +192,11 @@
+@@ -73,7 +73,13 @@
+ 
+ #include <security/mac/mac_framework.h>
+ 
+-#ifdef TINY_LOMTU
++#ifdef FF_STAFETO
++/*
++ * A packet of the loopback network may leave through the ring of the switch, whose
++ * frames hold 1514 bytes: the segments of TCP over 127.0.0.1 are sized for 1500.
++ */
++#define	LOMTU	1500
++#elif defined(TINY_LOMTU)
+ #define	LOMTU	(1024+512)
+ #elif defined(LARGE_LOMTU)
+ #define LOMTU	131072
+@@ -192,6 +198,11 @@
  
  DECLARE_MODULE(if_lo, loop_mod, SI_SUB_PROTO_IFATTACHDOMAIN, SI_ORDER_ANY);
  
@@ -230,7 +245,7 @@
  static int
  looutput(struct ifnet *ifp, struct mbuf *m, const struct sockaddr *dst,
      struct route *ro)
-@@ -261,9 +266,40 @@
+@@ -261,9 +272,40 @@
  		return (EAFNOSUPPORT);
  	}
  #endif

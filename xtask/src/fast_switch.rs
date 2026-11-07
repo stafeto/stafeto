@@ -40,6 +40,7 @@ use crate::{
 
 const CONF4: &str = "/etc/nginx/nginx-fast-4.conf";
 const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
+const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 const READ_WITHIN: Duration = Duration::from_secs(60);
@@ -64,7 +65,7 @@ pub fn conf4() -> &'static str {
         crate::nginx_probe::replaced(
             &text,
             "        location / { }\n",
-            "        location / { }\n        location /up/ { proxy_buffering off; proxy_pass http://127.0.0.1:8080/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
+            "        location / { }\n        location /up/ { proxy_buffering off; proxy_pass http://127.0.0.1:8080/; }\n        location /up2/ { proxy_buffering off; proxy_pass http://127.0.0.1:8081/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
         )
     })
 }
@@ -77,6 +78,21 @@ pub fn conf9() -> &'static str {
             fast_nginx::switch_conf(),
             "worker_processes 1;",
             "worker_processes 9;",
+        )
+    })
+}
+
+/// The settings of a second nginx-fast, a consumer of its own on port 8081 (`/up2/` of the first
+/// proxies to it over 127.0.0.1: a transfer between two stacks of consumers).
+pub fn conf_b() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let text =
+            crate::nginx_probe::replaced(fast_nginx::switch_conf(), "listen 80;", "listen 8081;");
+        crate::nginx_probe::replaced(
+            &text,
+            "pid /var/run/nginx-fast.pid;",
+            "pid /var/run/nginx-fast-b.pid;",
         )
     })
 }
@@ -497,6 +513,34 @@ fn loopback(
             "frames refused or sent to the device: {}",
             after_proxy.line
         ));
+    }
+    // Two consumers: a second nginx-fast holds port 8081, and the first proxies 1 MiB from it over
+    // 127.0.0.1. The segments are sized for 1500 (the loopback MTU of the stack), pass the ring of
+    // the first, the tables and the ring of the second, and the answers come back the same way.
+    run.send(&format!("nginx-fast -c {CONF_B} & M2=$!"))?;
+    run.expect_line(
+        "the stack of the second nginx-fast",
+        |l| l.contains("fast: the stack is up on "),
+        Duration::from_secs(60),
+    )?;
+    let before = stat(run, "lo4")?;
+    requests(
+        "a consumer to a consumer over 127.0.0.1",
+        nginx,
+        "/up2/1m.bin",
+        fast_nginx::one_mib(),
+        3,
+    )?;
+    let after_pair = stat(run, "lo5")?;
+    if after_pair.looped < before.looped + 3 * 700 {
+        return Err(format!(
+            "{} packets through the tables for 3 MiB between two consumers: {}",
+            after_pair.looped - before.looped,
+            after_pair.line
+        ));
+    }
+    if after_pair.tx_refused != 0 {
+        return Err(format!("packets refused: {}", after_pair.line));
     }
     notes.push(format!(
         "loopback: wget over 127.0.0.1 and a proxy to httpd came whole, {} packets through the tables, a worker's own loopback answered",
@@ -1000,6 +1044,8 @@ mod tests {
         assert!(conf4().contains("worker_processes 4;"));
         assert!(conf4().contains("proxy_pass http://127.0.0.1:8080/;"));
         assert!(conf4().contains("proxy_pass http://127.0.0.1:80/;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:8081/;"));
+        assert!(conf_b().contains("listen 8081;") && conf_b().contains("nginx-fast-b.pid"));
         assert!(conf4().contains("user nobody nobody;"));
         assert_eq!(fast_nginx::SWITCH_NETD_CONF, b"switch 8\nflows 16384\n");
         let netd =

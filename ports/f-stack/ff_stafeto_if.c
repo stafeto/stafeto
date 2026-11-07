@@ -613,7 +613,7 @@ ff_stafeto_loop_tx(void *m, int total)
     uint16_t dport;
     int off = ETH;
 
-    if (!port_on || dev_lost || total < 20 + 4 || total + ETH > FF_STAFETO_FRAME_MAX)
+    if (!port_on || dev_lost || total < 20 + 4)
         return 0;
     /* The headers lie in the first segment (the output path pulled them up). */
     ff_next_mbuf(&cur, &data, &len);
@@ -627,6 +627,14 @@ ff_stafeto_loop_tx(void *m, int total)
     dport = (uint16_t)(ip[header + 2] << 8 | ip[header + 3]);
     if (stafeto_fast_own_port(dport))
         return 0;
+    /* A packet for another stack that the ring cannot carry (the interface's MTU is 1500, so
+     * this is a stray) is dropped and counted: the loopback interface must not take it in
+     * for a port that is not this stack's. */
+    if (total + ETH > FF_STAFETO_FRAME_MAX) {
+        stats.tx_long++;
+        ff_mbuf_free(m);
+        return 1;
+    }
     to = vnet_port_tx_cell();
     if (to == NULL) {
         tx_flush();
