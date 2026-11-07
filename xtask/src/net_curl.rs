@@ -114,7 +114,7 @@ pub fn steps_programs() -> &'static [crate::ImageProgram] {
         let mut programs = net::programs().to_vec();
         for program in &mut programs {
             if program.0 == "netd" {
-                program.3 = &["steps"];
+                program.3 = &["steps", "probe"];
             }
         }
         programs
@@ -580,6 +580,10 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         return Err("the network image faulted".into());
     }
     if steps {
+        // The flood of the run is a burst: a doorbell serves several frames.
+        if crate::net_probe::bells_serve_frames(&output.lines)? == 0 {
+            return Err("the service printed no line of bells for the flood".to_owned());
+        }
         let rows = crate::net_probe::traffic_verdict(&output.lines)?;
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
         println!(
@@ -676,9 +680,9 @@ mod tests {
     }
 
     #[test]
-    fn the_steps_image_builds_the_service_with_the_counting_of_steps() {
+    fn the_steps_image_builds_the_service_with_the_counting_of_steps_and_the_probe() {
         let netd = steps_programs().iter().find(|p| p.0 == "netd").unwrap();
-        assert_eq!(netd.3, &["steps"]);
+        assert_eq!(netd.3, &["steps", "probe"]);
         assert!(steps_programs().iter().any(|p| p.0 == "ash-launcher"));
     }
 }

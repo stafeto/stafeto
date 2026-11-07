@@ -1103,11 +1103,31 @@ impl Registered {
 /// other rights), and BAD_SIZE for a reply out of the layout of
 /// proto_init::RegisterReply.
 pub fn register(parent: &Handle<Channel>, channel: &Handle<Channel>) -> Result<Registered, Status> {
+    register_with(parent, channel, None)
+}
+
+/// `register` with a second channel, `bound`, a thread of the service waits
+/// on: init binds the first interrupt line of the record through it (at the
+/// record's ceiling), so that the interrupts come to that thread directly.
+/// Only a record that declares it takes the second channel (init's
+/// `table::LINE_THREAD`; ACCESS_DENIED otherwise). The copy has the rights of
+/// the first.
+pub fn register_with(
+    parent: &Handle<Channel>,
+    channel: &Handle<Channel>,
+    bound: Option<&Handle<Channel>>,
+) -> Result<Registered, Status> {
     let rights = Rights::SEND | Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER;
     let copy = sys::handle_duplicate(channel, rights)?;
     let request = Method::Register.header().bytes();
-    let reply = sys::send_handles(parent, &request, [copy.erase()])
-        .map_err(|refused| Status::Kernel(refused.error))?;
+    let second = bound
+        .map(|bound| sys::handle_duplicate(bound, rights))
+        .transpose()?;
+    let reply = match second {
+        Some(second) => sys::send_handles(parent, &request, [copy.erase(), second.erase()]),
+        None => sys::send_handles(parent, &request, [copy.erase()]),
+    }
+    .map_err(|refused| Status::Kernel(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     let bytes = reply.bytes(&mut buffer);
     match Status::from_code(Reader::new(bytes).u32()?) {

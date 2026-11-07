@@ -825,6 +825,41 @@ pub fn binding_label(r: &Record, i: usize) -> Option<u64> {
     (r.bindings.len() > 1 && i < r.bindings.len()).then(|| proto_init::binding_label(i))
 }
 
+/// The services that may bring a second channel in REGISTER: a thread of
+/// their own waits on it for the interrupts of the first line (netd's switch
+/// thread, a level above the loop). The record's ceiling is above its
+/// priority, and init binds that line through the channel at the ceiling.
+pub const LINE_THREAD: &[&str] = &[NET_SERVICE];
+
+/// Whether `r` declares a thread of its own for its first line.
+pub fn line_thread(r: &Record) -> bool {
+    LINE_THREAD.contains(&r.name) && r.ceiling > r.priority && !r.bindings.is_empty()
+}
+
+/// Where init binds line `i` of `r` (serve.rs, `objects`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Through {
+    /// The second channel the service brought, at the record's ceiling.
+    Bound,
+    /// A session of the registered channel with this label.
+    Labelled(u64),
+    /// The registered channel itself.
+    Plain,
+}
+
+/// The route of line `i` of `r` when the service brought `bound` (a second
+/// channel): the first line of a record that declares a thread for it goes
+/// through that channel, the others as `binding_label` says.
+pub fn binding_route(r: &Record, i: usize, bound: bool) -> Through {
+    if bound && i == 0 && line_thread(r) {
+        return Through::Bound;
+    }
+    match binding_label(r, i) {
+        Some(label) => Through::Labelled(label),
+        None => Through::Plain,
+    }
+}
+
 /// The checks of one record by itself, from its levels on (`check`).
 fn check_record(r: &Record) -> Result<(), TableError<'static>> {
     let record = r.name;
@@ -2196,6 +2231,42 @@ mod tests {
             assert_eq!(binding_label(&record, 2), None);
         }
         assert!(!net::NETD_TWO.windows[0].duplicate);
+        // Only the network service declares a thread of its own for its first
+        // line, and its ceiling is above its priority; its first line goes
+        // through the second channel when one comes, the second line of a
+        // record of two devices keeps its label, and no other service gets
+        // the second channel.
+        for record in [net::NETD, net::NETD_VZ, net::NETD_VZ2, net::NETD_TWO] {
+            assert!(line_thread(&record), "{}", record.name);
+            assert!(record.ceiling > record.priority);
+            assert_eq!(binding_route(&record, 0, true), Through::Bound);
+            assert_eq!(
+                binding_route(&record, 0, false),
+                match binding_label(&record, 0) {
+                    Some(label) => Through::Labelled(label),
+                    None => Through::Plain,
+                }
+            );
+        }
+        assert_eq!(
+            binding_route(&net::NETD_TWO, 1, true),
+            Through::Labelled(proto_init::BINDING_LABEL | 1)
+        );
+        assert_eq!(binding_route(&net::NETD, 1, true), Through::Plain);
+        // Another service, or the same one with no room above its priority
+        // or with no line, has none.
+        assert!(!line_thread(&service("rng-like", 35, 36)));
+        let flat = Record {
+            ceiling: net::NETD.priority,
+            ..net::NETD
+        };
+        assert!(!line_thread(&flat));
+        let lineless = Record {
+            bindings: &[],
+            ..net::NETD
+        };
+        assert!(!line_thread(&lineless));
+        assert_eq!(binding_route(&flat, 0, true), Through::Plain);
         // The records of one device bind their line through the channel.
         for record in [net::NETD, net::NETD_VZ] {
             assert_eq!(binding_label(&record, 0), None);

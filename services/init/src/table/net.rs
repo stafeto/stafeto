@@ -76,7 +76,9 @@ pub const NETD: Record = Record {
         deadline_ns: 1000 * MS,
     }),
     priority: 35,
-    ceiling: 35,
+    // One above the priority: the switch thread of the service (netd/src/switch.rs)
+    // runs at 36, above the stack.
+    ceiling: 36,
     // What the kernel charges to this quota is the translation tables of the
     // service's mappings (segments, stack, DMA objects, windows, the clients'
     // buffers) and its kernel objects; init pays for the objects of `.data`,
