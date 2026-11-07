@@ -24,7 +24,7 @@
 //!   service counting its steps: every step, those of the switch among them
 //!   (kinds 67 to 70), is under 0.9 of term B.
 //! * `switch saturate`: three programs keep their rings full of entries the switch refuses for
-//!   12 s on four CPUs; the switch (a level above the stack and the services on its CPU) pauses
+//!   20 s on four CPUs; the switch (a level above the stack and the services on its CPU) pauses
 //!   in its runs, so the stack answers `posix-net stat` within seconds and init's watchdog
 //!   kills nothing (without the pauses the stack waits for the end of the flood, or init kills
 //!   the network service as silent).
@@ -50,9 +50,11 @@ const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 /// How long `saturate` floods the ring.
-const SATURATE_SECS: u64 = 12;
+const SATURATE_SECS: u64 = 20;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
-/// times the answer of the quiet stack, but not under `SATURATE_FLOOR`.
+/// times the answer of the quiet stack, but not under `SATURATE_FLOOR` nor under three fifths of
+/// the flood (a slow host spends seconds starting `posix-net` beside three programs at full
+/// speed; a stack the switch keeps off the processor answers after the flood or is killed).
 const SATURATE_SAMPLES: usize = 4;
 /// What the host's clock may add to the longest run of the switch.
 const SATURATE_JITTER: Duration = Duration::from_millis(40);
@@ -1124,7 +1126,9 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
     booted(run)?;
     let quiet = Instant::now();
     stat(run, "quiet")?;
-    let bound = SATURATE_FLOOR.max(quiet.elapsed() * SATURATE_BOUND);
+    let bound = SATURATE_FLOOR
+        .max(quiet.elapsed() * SATURATE_BOUND)
+        .max(Duration::from_secs(SATURATE_SECS * 3 / 5));
     for _ in 0..SATURATE_CONSUMERS {
         run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
         run.expect("# ", DIALOG_STEP)?;
