@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The probe of nginx on the stack at 10 000 connections (`cargo xtask
+//! The probe of nginx on the stack at 400 connections (`cargo xtask
 //! fast-probe scale`, stage P6b-4b of subproject 6, spec 6, 8.9), on QEMU
 //! with 1 GiB: the image of nginx on the stack with the grant of the process
 //! service (`table-fast-scale`: the worker's quota is 128 MiB), the settings
@@ -25,10 +25,14 @@
 //! 4. the worker is killed with `kill -9` three times, one more than the
 //!    grant has places: each new worker has the quota of the grant, so the
 //!    place came back with the zombie;
-//! 5. the data limit of the shell is 31 MiB (`ulimit -S -d`): of 250
-//!    connections that each ask for the page some are refused, the worker
-//!    lives or ends by the bounded retry (status 1 and the line `fst malloc
-//!    failed`), and once the connections close a new one gets its page.
+//! 5. the data limit of the shell is 29 MiB (`ulimit -S -d`) and nginx runs
+//!    with the usual pool per connection: of 250 connections that each ask
+//!    for the page some are refused by the stack (`refused` of `fast:
+//!    scale` above zero), the same worker lives (no `exited with code`
+//!    line in the whole run, the same PID before and after), and once the
+//!    connections close a new one gets its page. The settings of 2 to 4 are
+//!    the probe's alone: the image of the run on Apple VZ (P6b-4c) makes
+//!    its own settings without the pool of 16 KiB.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -67,7 +71,7 @@ const GRANT_BYTES: u64 = 32_768 * 4096;
 /// The connections of the stages, the data limit of the degradation step in
 /// KiB, and the places of the kernel's table the layer may hold.
 const STAGES: [usize; 3] = [100, 250, 400];
-const DEGRADE_KIB: u32 = 31_744;
+const DEGRADE_KIB: u32 = 29_696;
 const DEGRADE_CONNS: usize = 250;
 const DEGRADE_WITHIN: Duration = Duration::from_secs(150);
 const STAGE_WITHIN: Duration = Duration::from_secs(300);
@@ -87,6 +91,8 @@ const LINE_WITHIN: Duration = Duration::from_secs(90);
 const RUN_WITHIN: Duration = Duration::from_secs(900);
 const THREADS: usize = 50;
 const CONF: &str = "/etc/nginx/nginx-fast.conf";
+/// The settings of the step of the limit: those above with the usual pool.
+const LIMIT_CONF: &str = "/tmp/limit.conf";
 const REQUEST: &[u8] = b"GET /tiny.txt HTTP/1.1\r\nHost: scale\r\n\r\n";
 
 /// The settings of the stack for many connections: the sockets, the files
@@ -290,8 +296,8 @@ fn scale_line(run: &mut qemu::Run, tag: &str, sockets: u64) -> Result<String, St
     }
 }
 
-fn start_nginx(run: &mut qemu::Run) -> Result<String, String> {
-    crate::fast_nginx::started(run, CONF)?;
+fn start_nginx(run: &mut qemu::Run, settings: &str) -> Result<String, String> {
+    crate::fast_nginx::started(run, settings)?;
     run.expect_line("fast: start", |l| l.contains("fast: start "), LINE_WITHIN)
 }
 
@@ -328,15 +334,34 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         println!("fast-scale: {note}");
     }
     talked?;
-    // The refused connections of the last step make nginx say so, in
-    // `accept4` or when its own pool finds no memory.
-    let lines: Vec<String> = (output.lines.iter())
-        .filter(|l| {
-            !l.contains("accept4() failed")
-                && !l.contains("posix_memalign(")
-                && !l.contains("malloc() failed")
+    // No worker ended with a code but 0 (a quit), in the whole run: the kills
+    // are signals.
+    if let Some(line) = output.lines.iter().find(|l| {
+        (l.contains("exited with code") && !l.contains("exited with code 0"))
+            || l.contains("fst malloc failed")
+            || l.contains("fst zone ")
+    }) {
+        return Err(format!("a worker ended or waited for memory: {line}"));
+    }
+    // The refused connections of the step of the limit make nginx say so, in
+    // `accept4` or for its own memory; before it such a line is a fault.
+    let limit = output
+        .lines
+        .iter()
+        .position(|l| l.trim_end().ends_with("limit-set"))
+        .unwrap_or(output.lines.len());
+    let lines: Vec<String> = output
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(at, l)| {
+            *at < limit
+                || !(l.contains("accept4() failed")
+                    || l.contains("posix_memalign(")
+                    || l.contains("malloc() failed")
+                    || l.contains("writev() failed"))
         })
-        .cloned()
+        .map(|(_, l)| l.clone())
         .collect();
     crate::fast_nginx::verdict(&lines, 0)?;
     net_probe::placing_fault(&output.lines)?;
@@ -360,13 +385,17 @@ fn scenario(
 ) -> Result<(), String> {
     crate::fast_nginx::booted(run)?;
     run.send("export STAFETO_FAST_STATS=1")?;
-    let start = start_nginx(run)?;
+    let start = start_nginx(run, CONF)?;
     for (key, want) in [
         ("kern.ipc.maxsockets", 135_000),
         ("kern.maxfiles", 140_000),
         ("kern.maxfilesperproc", 135_000),
         ("net.inet.tcp.tcbhashsize", 65_536),
         ("kern.ncallout", 18_508),
+        ("net.inet.tcp.syncache.hashsize", 1_024),
+        ("net.inet.tcp.syncache.bucketlimit", 30),
+        ("kern.ipc.somaxconn", 4_096),
+        ("kern.ipc.nmbclusters", 65_536),
     ] {
         if field(&start, key) != Some(want) {
             return Err(format!("the stack took {key} other than {want}: {start}"));
@@ -378,6 +407,7 @@ fn scenario(
     let mut used = Vec::new();
     let mut taken = Vec::new();
     let mut taken_room = 0;
+    let mut stack_share = 0;
     for (i, target) in STAGES.iter().enumerate() {
         let more = target - held.len();
         let began = Instant::now();
@@ -390,6 +420,17 @@ fn scenario(
                 "{places} places of the table (at most {PLACES_MAX}), quota {quota}: {line}"
             ));
         }
+        // The stack's share of a connection by the sizes of its zones.
+        let share: u64 = ["socket", "tcp_inpcb", "Files", "KNOTE"]
+            .iter()
+            .map(|zone| field(&line, zone).unwrap_or(u64::MAX / 8))
+            .sum();
+        if share > SLOPE_MAX {
+            return Err(format!(
+                "the zones of a connection hold {share} bytes: {line}"
+            ));
+        }
+        stack_share = share;
         used.push(field(&line, "used").unwrap_or(0));
         taken.push(field(&line, "user").unwrap_or(0));
         taken_room = field(&line, "room").unwrap_or(0);
@@ -400,11 +441,11 @@ fn scenario(
         ));
     }
     let top = *used.last().unwrap_or(&0);
-    // The pages taken from the heap's chunks, not the chunks (a chunk of
-    // several MiB comes at once): 4 KiB for each page.
+    // Counts the pages taken from the heap's chunks: a chunk of several MiB
+    // comes at once, so the chunks would show steps. 4 KiB for each page.
     let slope = (taken[2].saturating_sub(taken[0])) * 4096 / (STAGES[2] - STAGES[0]) as u64;
     notes.push(format!(
-        "the quota used per connection: {slope} bytes, {} beyond the pool (at most {SLOPE_MAX}); {top} bytes used at the top, the room grew to {taken_room} pages", slope.saturating_sub(POOL)
+        "the quota used per connection: {slope} bytes, {} beyond the pool at most (at most {SLOPE_MAX}); the zones of the stack hold {stack_share} bytes of it; {top} bytes used at the top, the room grew to {taken_room} pages", slope.saturating_sub(POOL)
     ));
     let room = taken_room;
     if slope < POOL || slope - POOL > SLOPE_MAX || room != 262_144 {
@@ -445,48 +486,43 @@ fn scenario(
         }
     }
     notes.push("the worker killed 3 times: each new one has the quota of the grant".to_owned());
-    // 5.
+    // 5: the limit. The settings of this step leave the pool of a connection
+    // at its usual size, so that the stack reaches the limit before nginx's
+    // own pools do.
     crate::fast_nginx::quit(run, "quit")?;
-    run.send(&format!("ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""))?;
+    run.send(&format!(
+        "sed '/connection_pool_size/d;/large_client_header_buffers/d' {CONF} > {LIMIT_CONF} && ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""
+    ))?;
     run.expect_line(
         "limit-set",
         |l| l.trim_end().ends_with("limit-set"),
         LINE_WITHIN,
     )?;
-    start_nginx(run)?;
+    start_nginx(run, LIMIT_CONF)?;
+    let (_, before) = crate::fast_nginx::master_and_workers(run, "limit-before", true)?;
     let mut held: Vec<TcpStream> = Vec::new();
     open_more(address, &mut held, DEGRADE_CONNS)?;
     let ok = ask_some(&mut held, 1, DEGRADE_WITHIN);
+    let line = scale_line(run, "limit-line", 0)?;
+    let refused = field(&line, "refused").unwrap_or(0);
     notes.push(format!(
-        "5: {ok} of {DEGRADE_CONNS} connections answered under a data limit of {DEGRADE_KIB} KiB"
+        "5: {ok} of {DEGRADE_CONNS} connections answered under a data limit of {DEGRADE_KIB} KiB; the stack refused {refused} requests for memory"
     ));
-    if ok == 0 || ok >= DEGRADE_CONNS {
+    if ok == 0 || ok >= DEGRADE_CONNS || refused == 0 {
         return Err(format!(
-            "{ok} connections answered under the limit: some must be refused"
+            "{ok} connections answered under the limit, the stack refused {refused} requests: some connections must be refused by the stack"
         ));
     }
-    // At the limit a request of the stack that may not fail (a malloc of 4 KiB)
-    // is retried a bounded number of times and then ends the worker with
-    // status 1 and a line, and the main process starts another: no hang.
-    let ended = run.lines().iter().any(|l| l.contains("exited with code 1"));
-    let said = run.lines().iter().any(|l| l.contains("fst malloc failed"));
-    if ended != said {
-        return Err(
-            "a worker ended with code 1 without the line of the stack, or the reverse".to_owned(),
-        );
-    }
-    notes.push(format!(
-        "5: the worker {} at the limit",
-        if ended {
-            "ended with status 1 (bounded retry) and was started again"
-        } else {
-            "lived"
-        }
-    ));
     drop(held);
     std::thread::sleep(Duration::from_secs(10));
     crate::nginx_probe::first_page(address)?;
-    notes.push("5: after the connections closed a new one got its page".to_owned());
+    let (_, after) = crate::fast_nginx::master_and_workers(run, "limit-after", true)?;
+    if before != after {
+        return Err(format!(
+            "the worker was {before:?} before the limit and {after:?} after"
+        ));
+    }
+    notes.push("5: the same worker lived at the limit, and after the connections closed a new one got its page".to_owned());
     Ok(())
 }
 

@@ -49,6 +49,8 @@ _Static_assert(sizeof(struct kevent) == 64, "struct kevent of FreeBSD");
 
 /* The layer's counts of the process (libc.so, posix-platform). */
 extern void stafeto_probe_heap(uint64_t *out);
+/* The requests that may fail the process refused (stafeto.patch, ff_glue.c). */
+extern unsigned long ff_stafeto_refused;
 
 static long
 done(long r)
@@ -124,6 +126,7 @@ glue_limits(void)
     static const char *const names[] = {
         "kern.ipc.maxsockets", "kern.maxfiles", "kern.maxfilesperproc",
         "net.inet.tcp.tcbhashsize", "net.inet.tcp.syncache.hashsize",
+        "net.inet.tcp.syncache.bucketlimit",
         "kern.ipc.somaxconn", "kern.ipc.nmbclusters", "kern.ipc.nmbufs",
         "kern.ncallout", "net.inet.tcp.sendspace", "net.inet.tcp.recvspace",
     };
@@ -172,8 +175,8 @@ glue_scale(void)
         fprintf(stderr, " %s=%lld/%lld", zones[i], size, items);
     }
     fprintf(stderr,
-        " quota=%llu used=%llu room=%llu unbacked=%llu free=%llu user=%llu own=%llu places=%llu hidden=%llu grows=%llu grow_longest_us=%llu pass_longest_us=%llu gap_longest_us=%llu\n",
-        (unsigned long long)heap[10], (unsigned long long)heap[9],
+        " refused=%lu quota=%llu used=%llu room=%llu unbacked=%llu free=%llu user=%llu own=%llu places=%llu hidden=%llu grows=%llu grow_longest_us=%llu pass_longest_us=%llu gap_longest_us=%llu\n",
+        ff_stafeto_refused, (unsigned long long)heap[10], (unsigned long long)heap[9],
         (unsigned long long)heap[0], (unsigned long long)heap[1], (unsigned long long)heap[2],
         (unsigned long long)heap[3], (unsigned long long)heap[4], (unsigned long long)heap[5],
         (unsigned long long)heap[6], (unsigned long long)heap[7], (unsigned long long)(heap[8] / 1000),
