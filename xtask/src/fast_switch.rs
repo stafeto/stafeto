@@ -806,22 +806,12 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     // for a step of the stack, and the longest step stays under the bound. The service maps
     // at most 128 pieces (the kernel's limit); its budget for rings and buffers is 108 and a
     // ring takes 11, so all eight fit.
+    let from = run.lines().len();
     run.send(
         "for p in 9001 9002 9003 9004 9005 9006 9007 9008; do switch-probe hold $p & done; wait; echo sw-eight-\"end\"",
     )?;
     run.expect("sw-eight-end", Duration::from_secs(600))?;
-    let joined = run
-        .lines()
-        .iter()
-        .filter(|l| l.contains("switch-probe: joined ok"))
-        .count();
-    // All eight fit the service's budget; the guest's own process memory may not load one of
-    // eight programs at once ("Out of memory" of the shell), which is no business of the switch.
-    if joined < 6 {
-        return Err(format!(
-            "{joined} of 8 simultaneous consumers attached and joined"
-        ));
-    }
+    let joined = eight_attached(&run.lines()[from..])?;
     run.expect("# ", DIALOG_STEP)?;
     // A hold inside the consumer's own block is refused.
     run.send("switch-probe hold-block")?;
@@ -858,6 +848,30 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
 /// member, the SYNs wait in the park, and the new workers get them (at most `PARK_GIVE` in a
 /// step). The steps of the service, those of the switch among them, stay within the bound (the
 /// probe judges them at the end), and every connection is answered.
+/// The programs of the eight-at-once step that attached and joined. A refusal of the switch
+/// fails the step (`failed errno 16` is ATTACH answering `LimitReached`, and the service's line
+/// `switch attach: mapping the ring` is a late `mem_map` failure after OK); a program that did
+/// not load (the guest's shell says "Out of memory") is no business of the switch, and each
+/// miss must be matched by such a line.
+fn eight_attached(lines: &[String]) -> Result<usize, String> {
+    if let Some(l) = lines.iter().find(|l| {
+        l.contains("failed errno 16") || l.contains("net: switch attach: mapping the ring")
+    }) {
+        return Err(format!("the switch refused or failed an attach: {l:?}"));
+    }
+    let joined = lines
+        .iter()
+        .filter(|l| l.contains("switch-probe: joined ok"))
+        .count();
+    let no_memory = lines.iter().filter(|l| l.contains("Out of memory")).count();
+    if joined + no_memory < 8 {
+        return Err(format!(
+            "{joined} of 8 simultaneous consumers attached and joined, {no_memory} programs lacked memory"
+        ));
+    }
+    Ok(joined)
+}
+
 fn parking_case(
     run: &mut qemu::Run,
     nginx: SocketAddr,
@@ -1072,6 +1086,31 @@ fn frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_eight_at_once_step_allows_a_miss_only_for_a_program_that_lacked_memory() {
+        let v = |lines: &[&str]| {
+            eight_attached(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>())
+        };
+        let ok = "switch-probe: joined ok";
+        assert_eq!(v(&[ok; 8]), Ok(8));
+        assert_eq!(
+            v(&[&[ok; 7][..], &["ash: switch-probe: Out of memory"]].concat()),
+            Ok(7)
+        );
+        // A miss with no matching line, or a refusal of the switch, fails.
+        assert!(v(&[ok; 7]).is_err());
+        let refused = "switch-probe: stafeto_fast_attach(&claim) == 0 failed errno 16";
+        assert!(v(&[&[ok; 7][..], &[refused]].concat()).is_err());
+        assert!(
+            v(&[
+                &[ok; 8][..],
+                &["net: switch attach: mapping the ring of 3: LimitReached"]
+            ]
+            .concat())
+            .is_err()
+        );
+    }
 
     #[test]
     fn the_images_and_the_lines_are_those_of_the_programs() {
