@@ -32,3 +32,4 @@ pub mod resolv;
 pub mod reuse;
 pub mod ring;
 pub mod spsc;
+pub mod switchlogic;
