@@ -11220,7 +11220,7 @@ fn smp_idle_bell() -> Result<(), String> {
         (bell, "the bell as one step with the look at POLLING"),
         (drain, "the drain of the queues after a bell"),
     ] {
-        let o = idle_probe_run(variant)?;
+        let o = idle_probe_runs(variant)?;
         // A lost wake-up leaves a call for good: the run hangs until the cut,
         // the kernel does not stop, the tests of the stage began, and the
         // pairs did not end. A panic or an exit of init is another failure.
@@ -11238,7 +11238,7 @@ fn smp_idle_bell() -> Result<(), String> {
         }
         println!("smp idle bell: the kernel without {what} is caught: a call hangs");
     }
-    let o = idle_probe_run(irq)?;
+    let o = idle_probe_runs(irq)?;
     let late = late_windows(&o.lines);
     if late <= IDLE_IRQ_NOISE {
         return Err(format!(
@@ -11249,6 +11249,24 @@ fn smp_idle_bell() -> Result<(), String> {
         "smp idle bell: the kernel without the look at ISR_EL1 is caught: {late} windows of the pairs and the rounds ended with an interrupt pending"
     );
     Ok(())
+}
+
+/// The runs of the kernel of `variant` until one reaches the pairs: a run
+/// where the service of the pairs did not start in time (a loaded host held a
+/// virtual CPU) never armed the break and shows nothing about the kernel, so
+/// it is made again, up to three times.
+fn idle_probe_runs(variant: Variant) -> Result<qemu::Outcome, String> {
+    const RUNS: usize = 3;
+    for run in 1..=RUNS {
+        let o = idle_probe_run(variant)?;
+        if o.lines.iter().any(|l| l == IDLE_PAIRS_BEGIN) {
+            return Ok(o);
+        }
+        println!("smp idle bell: run {run} of {RUNS} never began the pairs, made again");
+    }
+    Err(format!(
+        "{variant:?} never began the pairs in {RUNS} runs: the service of the pairs did not start"
+    ))
 }
 
 /// The kernel of `variant` with the test init on four CPUs; a run cut at

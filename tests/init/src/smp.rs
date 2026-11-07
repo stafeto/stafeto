@@ -134,7 +134,12 @@ fn now() -> u64 {
 
 /// Spins until `done` or the time is up.
 fn wait_for(done: impl Fn() -> bool) -> bool {
-    let limit = now() + WAIT_NS;
+    wait_for_within(WAIT_NS, done)
+}
+
+/// Spins until `done` or `ns` have passed.
+fn wait_for_within(ns: u64, done: impl Fn() -> bool) -> bool {
+    let limit = now() + ns;
     while !done() {
         if now() > limit {
             return false;
@@ -2287,6 +2292,11 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
 /// two lines.
 const BELL_PAIRS: u64 = 20_000;
 
+/// The wait for the service of the pairs to start on CPU 1: a loaded host
+/// can leave a virtual CPU without time for longer than WAIT_NS, and a run
+/// that never reaches the pairs says nothing about the kernel.
+const PAIRS_START_NS: u64 = 30_000_000_000;
+
 fn idle_bell_pairs() -> Outcome {
     let n = cpus()?;
     if n < 2 {
@@ -2296,7 +2306,10 @@ fn idle_bell_pairs() -> Outcome {
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
     let server = spawn_on(0, 1, echo_service, 0, TEST_PRIORITY + 1)?;
-    check(wait_for(|| mark(0) == 1), "the service did not start")?;
+    check(
+        wait_for_within(PAIRS_START_NS, || mark(0) == 1),
+        "the service did not start",
+    )?;
     // The probe kernels with a deliberate break act from here on.
     let _ = sys::debug_write(&resource(), b"idle-probe arm");
     println!("smp idle bell  pairs begin");
