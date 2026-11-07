@@ -582,6 +582,17 @@ fn verdict_loop(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     if ip.src[0] != 127 || ip.dst[0] != 127 {
         return Verdict::Broke;
     }
+    // The flow of a connection is keyed by the peer's address and ports, not by the sender's own
+    // address, so a consumer that wrote 127.0.0.2, 127.0.0.3 ... as its source would make a
+    // flow for each of them in the table of a group it does not own. The stack of a consumer
+    // sends from 127.0.0.1, or from the address it connected to.
+    if ip.src != [127, 0, 0, 1] && ip.src != ip.dst {
+        return refuse(Reason::SrcAddr);
+    }
+    // The ports of the service's DHCP client and its server side are not for a consumer's packet.
+    if ip.proto == IPV4_PROTO_UDP && ip.part.len() >= 8 && matches!(ports(ip.part).1, 67 | 68) {
+        return refuse(Reason::Udp);
+    }
     let ok = match ip.proto {
         IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp_tx(t, c, &ip),
         IPV4_PROTO_UDP if ip.part.len() >= 8 => udp_tx(t, c, &ip),
@@ -1127,6 +1138,59 @@ mod tests {
                 assert!(!t.consumers[1].as_ref().unwrap().ring.is_broken());
             });
         }
+    }
+
+    #[test]
+    fn loopback_syns_from_other_sources_make_no_flows_and_the_cap_holds() {
+        with(|t, _| {
+            let before = t.flows.len();
+            // A flood of SYNs from 127.0.0.2 and up to a port of a group a consumer does not
+            // own (its sources are free to spoof; the key has no source address).
+            for i in 2..=200u8 {
+                let f = ip_frame(
+                    (OWN.mac, [127, 0, 0, i]),
+                    (OWN.mac, [127, 0, 0, 1]),
+                    6,
+                    &tcp_part(49200 + u16::from(i), 8080, SYN),
+                );
+                assert_eq!(
+                    check_tx_loop(t, 0, &f),
+                    Verdict::Refuse(Reason::SrcAddr),
+                    "127.0.0.{i}"
+                );
+            }
+            assert_eq!(t.flows.len(), before);
+            assert_eq!(t.refused[Reason::SrcAddr as usize], 199);
+            // 127.0.0.1 itself and a source equal to the destination are the stack's own.
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 8080, SYN)),
+                Verdict::Loop
+            );
+            let same = ip_frame(
+                (OWN.mac, [127, 0, 0, 9]),
+                (OWN.mac, [127, 0, 0, 9]),
+                6,
+                &tcp_part(49201, 8080, SYN),
+            );
+            assert_eq!(check_tx_loop(t, 0, &same), Verdict::Loop);
+            // The per-consumer cap still bounds what even those can make.
+            let limit = (t.flows.capacity() / 2) as u32;
+            t.consumers[0].as_mut().unwrap().flows = limit;
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49202, 8080, SYN)),
+                Verdict::Refuse(Reason::Flows)
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_udp_packet_for_the_dhcp_ports_is_refused() {
+        with(|t, _| {
+            for port in [67, 68] {
+                let f = ip_frame(LO, LO, 17, &udp_part(49200, port));
+                assert_eq!(check_tx_loop(t, 0, &f), Verdict::Refuse(Reason::Udp));
+            }
+        });
     }
 
     #[test]
