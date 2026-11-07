@@ -24,6 +24,9 @@
  *                                `hold-nobody ok` for the refusal (EACCES)
  *   switch-probe join-bad        JOIN with a descriptor that holds no port:
  *                                `join-bad ok` for the refusal
+ *   switch-probe saturate SECS   keep TX full of entries the switch refuses for SECS
+ *                                seconds, so that the switch has work at every step:
+ *                                `saturate ok N` (N entries written)
  *
  * Lines: `switch-probe: attached c N g G addr A/P mac M block F+C`,
  * `switch-probe: MODE refused K` (K frames refused by the switch since the
@@ -226,6 +229,45 @@ static void send_mode(const char *mode)
 	fflush(stdout);
 }
 
+/* Entries the switch refuses (flags it does not know), written as fast as TX has room,
+ * for `secs` seconds. The switch always finds the next entry waiting, so it never rests
+ * unless it stops by its own rule. */
+static void saturate(unsigned secs)
+{
+	struct timespec t0, t;
+	uint64_t entries = 0;
+	uint8_t f[64];
+
+	memset(f, 0, sizeof f);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		uint32_t tail = __atomic_load_n(word(TX_TAIL_AT), __ATOMIC_ACQUIRE);
+
+		if (sent - tail < TX_SLOTS) {
+			uint32_t i = sent;
+			volatile uint32_t *entry = word(TX_AT + (i % TX_SLOTS) * 8);
+
+			memcpy(ring + TX_CELLS_AT + (i % TX_SLOTS) * CELL, f, sizeof f);
+			entry[0] = (uint32_t)sizeof f | 1u << 16;
+			entry[1] = 0;
+			sent++;
+			entries++;
+			__atomic_store_n(word(TX_HEAD_AT), sent, __ATOMIC_RELEASE);
+			if ((entries & 31) == 1) {
+				__atomic_thread_fence(__ATOMIC_SEQ_CST);
+				stafeto_fast_poke();
+			}
+		}
+		if ((entries & 1023) == 0) {
+			clock_gettime(CLOCK_MONOTONIC, &t);
+			if (t.tv_sec - t0.tv_sec >= (time_t)secs)
+				break;
+		}
+	}
+	printf("switch-probe: saturate ok %llu\n", (unsigned long long)entries);
+	fflush(stdout);
+}
+
 static void counters(void)
 {
 	uint32_t c[2] = { 0, 0 };
@@ -301,6 +343,8 @@ int main(int argc, char **argv)
 		send_mode("long");
 		send_mode("flags");
 		counters();
+	} else if (!strcmp(mode, "saturate") && argc > 2) {
+		saturate((unsigned)atoi(argv[2]));
 	} else if (!strcmp(mode, "broken-tx") || !strcmp(mode, "broken-fill")) {
 		broken(mode[7] == 'f');
 	} else if (!strcmp(mode, "hold") && argc > 2) {

@@ -9363,6 +9363,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("fast-switch-steps", || {
             fast_switch::probe(fast_switch::Scenario::Steps)
         }),
+        // Three consumers keep their rings full for 12 s: the switch, a level above the stack
+        // and the services on its CPU, pauses so that they run (the stack answers, init's
+        // watchdog kills nothing).
+        job("fast-switch-saturate", || {
+            fast_switch::probe(fast_switch::Scenario::Saturate)
+        }),
         job("switch-probe", || {
             fast_switch::probe(fast_switch::Scenario::Frames)
         }),

@@ -128,6 +128,54 @@ pub const SWITCH_SOFT: u64 = 7_000;
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
+/// How long the switch thread may run without a rest before it pauses, how long it pauses, and
+/// the shortest wait that counts as a rest, in nanoseconds. The thread is a level above the
+/// stack, the services and the programs on its CPU and runs a step after another while the
+/// device and the consumers keep it supplied; when they do, the lower levels would never run
+/// (init's watchdog kills the service that was kept off the processor, the stack and the
+/// entropy service among them). The pause gives them `SWITCH_PAUSE_NS` of each
+/// `SWITCH_RUN_NS + SWITCH_PAUSE_NS`.
+pub const SWITCH_RUN_NS: u64 = 2_000_000;
+pub const SWITCH_PAUSE_NS: u64 = 100_000;
+pub const SWITCH_REST_NS: u64 = 500_000;
+
+/// When the switch thread's current run began: a run goes on through the waits that return at
+/// once (a notification was pending) and ends with a wait of `SWITCH_REST_NS` or more, or with
+/// a pause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunClock {
+    since: Option<u64>,
+}
+
+impl RunClock {
+    pub const fn new() -> RunClock {
+        RunClock { since: None }
+    }
+
+    /// The thread came back at `now` from a wait that lasted `waited`.
+    pub fn woke(&mut self, now: u64, waited: u64) {
+        if waited >= SWITCH_REST_NS || self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    /// The time since the run began.
+    pub fn ran(&self, now: u64) -> u64 {
+        self.since.map_or(0, |s| now.wrapping_sub(s))
+    }
+
+    /// Whether the run has lasted its time at `now` and the thread has to pause before the
+    /// next step.
+    pub fn pause_due(&self, now: u64) -> bool {
+        self.ran(now) >= SWITCH_RUN_NS
+    }
+
+    /// The pause ended at `now`: a new run begins.
+    pub fn rested(&mut self, now: u64) {
+        self.since = Some(now);
+    }
+}
+
 /// The frames the switch collects before its doorbell rings while the stack
 /// follows with steps (the stack's own queue rang after `BELL_TX`).
 pub const SWITCH_BELL: u32 = 32;
@@ -1050,5 +1098,68 @@ mod tests {
         assert_eq!(left.get(), 2);
         assert_eq!(abandon_portion(&mut one), (2, false));
         assert_eq!(abandon_portion(&mut one), (0, false));
+    }
+
+    /// The switch loop as a model: steps of `step` ns follow each other because the device and
+    /// the consumers keep the thread supplied (the wait between runs returns at once), for
+    /// `total` ns. Returns the longest stretch the lower levels were kept off the processor.
+    /// With `governed` the loop pauses as `switch::run` does.
+    fn longest_starvation(governed: bool, step: u64, total: u64) -> u64 {
+        let mut clock = RunClock::new();
+        let (mut now, mut since_others, mut worst) = (1_000_000u64, 0u64, 0u64);
+        let began = now;
+        clock.woke(now, 1_000);
+        while now - began < total {
+            now += step;
+            since_others += step;
+            worst = worst.max(since_others);
+            if governed && clock.pause_due(now) {
+                // The pause: lower levels run for SWITCH_PAUSE_NS.
+                now += SWITCH_PAUSE_NS;
+                since_others = 0;
+                clock.rested(now);
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn a_switch_that_never_rests_starves_the_levels_below_it() {
+        // Without the pause the stretch is the whole time the load lasts: the watchdog of
+        // init (1 s and a period) kills the stack and the services that were kept off.
+        let total = 3_000_000_000;
+        assert_eq!(longest_starvation(false, 5_000, total), total);
+    }
+
+    #[test]
+    fn the_pause_leaves_the_lower_levels_a_slot_every_run() {
+        let worst = longest_starvation(true, 5_000, 3_000_000_000);
+        assert!(
+            worst <= SWITCH_RUN_NS + 5_000,
+            "the lower levels waited {worst} ns"
+        );
+        // The watchdog of the network service counts in hundreds of milliseconds.
+        assert!(worst * 100 < 1_000_000_000);
+    }
+
+    #[test]
+    fn a_run_goes_on_through_waits_that_return_at_once_and_ends_with_a_rest() {
+        let mut clock = RunClock::new();
+        clock.woke(100, 0);
+        assert!(!clock.pause_due(100 + SWITCH_RUN_NS - 1));
+        // A wait that returned at once (a notification was pending) is no rest.
+        clock.woke(100 + SWITCH_RUN_NS - 1, SWITCH_REST_NS - 1);
+        assert!(clock.pause_due(100 + SWITCH_RUN_NS));
+        // A wait of `SWITCH_REST_NS` is one: the run begins anew.
+        clock.woke(100 + SWITCH_RUN_NS, SWITCH_REST_NS);
+        assert!(!clock.pause_due(100 + SWITCH_RUN_NS + 1));
+        assert_eq!(clock.ran(100 + SWITCH_RUN_NS + 7), 7);
+        clock.rested(1_000);
+        assert_eq!(clock.ran(1_500), 500);
+    }
+
+    #[test]
+    fn the_pause_costs_the_switch_under_a_twentieth_of_its_time() {
+        const { assert!(SWITCH_PAUSE_NS * 20 <= SWITCH_RUN_NS + SWITCH_PAUSE_NS) };
     }
 }
