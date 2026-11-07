@@ -557,9 +557,16 @@ fn ctl_fast(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<()
     match op {
         CTL_ADD | CTL_MOD => {
             let event = event.ok_or(EFAULT)?;
-            if event.events & bits::EXCLUSIVE != 0 {
+            // EPOLLEXCLUSIVE on a listener of the stack: the switch picks the worker of a
+            // new connection (by a hash of its four addresses), so the bit asks for what
+            // already happens and is taken on ADD; MOD with it is EINVAL as in Linux.
+            if event.events & bits::EXCLUSIVE != 0 && op == CTL_MOD {
                 return Err(EINVAL);
             }
+            let event = EpollEvent {
+                events: event.events & !bits::EXCLUSIVE,
+                data: event.data,
+            };
             let kq = ensure_kq(id)?;
             if op == CTL_MOD {
                 delete_filters(kq, n)?;

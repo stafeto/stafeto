@@ -321,6 +321,9 @@ pub fn ensure_stack() -> Result<(), i32> {
             Ok(())
         }
         Err(errno) => {
+            fast::dbg(format_args!(
+                "fast: the stack did not start (errno {errno})\n"
+            ));
             REFUSED.store(errno, Ordering::Release);
             STACK.store(3, Ordering::Release);
             Err(errno)
@@ -542,7 +545,12 @@ fn make_sockets(t: &FastTable, tickets: &mut Tickets) {
         let _guard = FAST_LOCK.lock();
         match make_socket(t, &ticket) {
             Ok(n) => tickets.slots[i].socket = n,
-            Err(errno) => tickets.refuse(i, errno),
+            Err(errno) => {
+                fast::dbg(format_args!(
+                    "fast: the socket of ticket {i} was refused (errno {errno})\n"
+                ));
+                tickets.refuse(i, errno)
+            }
         }
     }
 }
@@ -654,8 +662,15 @@ pub fn socket(kind: i32, protocol: i32) -> Result<i32, i32> {
 
 /// The CLOEXEC and CLOFORK bits of the descriptor that holds a port.
 fn held_flags(cloexec: bool, clofork: bool) -> i32 {
-    (if cloexec { crate::sockets::SOCK_CLOEXEC } else { 0 })
-        | (if clofork { crate::sockets::SOCK_CLOFORK } else { 0 })
+    (if cloexec {
+        crate::sockets::SOCK_CLOEXEC
+    } else {
+        0
+    }) | (if clofork {
+        crate::sockets::SOCK_CLOFORK
+    } else {
+        0
+    })
 }
 
 /// The ports the switch holds for sockets the stack made after it started
@@ -666,9 +681,10 @@ static HOLDS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 /// Remembers that the hold `fd` belongs to the stack's socket `n`.
 fn remember_hold(n: c_int, fd: i32) -> bool {
     let word = (n as u64) << 32 | (fd as u64 + 1);
-    HOLDS
-        .iter()
-        .any(|h| h.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    HOLDS.iter().any(|h| {
+        h.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
 }
 
 /// The stack's socket `n` closed: its hold, if it has one, closes.
@@ -677,7 +693,8 @@ fn forget_hold(n: c_int) {
         let word = h.load(Ordering::Acquire);
         if word != 0
             && (word >> 32) as c_int == n
-            && h.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            && h.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
             let _ = crate::close((word & 0xffff_ffff) as i32 - 1);
         }
@@ -720,7 +737,13 @@ pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
                 // after its `listen`).
                 let joined = bound
                     .and_then(|()| crate::net::port_join(hold))
-                    .and_then(|()| if remember_hold(n, hold) { Ok(()) } else { Err(ENOMEM) });
+                    .and_then(|()| {
+                        if remember_hold(n, hold) {
+                            Ok(())
+                        } else {
+                            Err(ENOMEM)
+                        }
+                    });
                 if joined.is_err() {
                     let _ = crate::close(hold);
                 }
@@ -772,6 +795,9 @@ fn join_tickets() {
             continue;
         }
         if let Err(errno) = crate::net::port_join(hold) {
+            fast::dbg(format_args!(
+                "fast: JOIN of ticket {i} failed (errno {errno})\n"
+            ));
             // SAFETY: the table's function.
             let _ = count(|t| unsafe { (t.close)(socket) as isize });
             tickets(|t| t.refuse(i, errno));

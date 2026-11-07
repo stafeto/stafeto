@@ -287,7 +287,9 @@ fn claim_with(out: &mut FastClaim, flags: u32, steady: bool) -> Result<(), i32> 
                 posix_sync::receiver::activate(label);
                 break got;
             }
-            Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
+            // No address yet, or no consumer number free yet (a worker that left gives its number
+            // back after the sweep has gone over the flows twice): wait and ask again.
+            Err((ENETDOWN | EBUSY, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
             Err((EBUSY, Some(_)))
                 if flags & ONCE == 0 && crate::wait::now() < started + BUSY_WAIT_NS => {}
             Err((errno, _)) => return Err(errno),
@@ -369,17 +371,10 @@ static SWITCH: AtomicU64 = AtomicU64::new(0);
 pub const NO_SWITCH: i32 = crate::constants::EAGAIN;
 
 /// The reply of an ATTACH and the switch's channel, or the errno with the status of a refusal.
-type Attach = Result<
-    (proto_net::switch::Attached, Option<Handle<Channel>>),
-    (i32, Option<Status>),
->;
+type Attach = Result<(proto_net::switch::Attached, Option<Handle<Channel>>), (i32, Option<Status>)>;
 
 /// One ATTACH.
-fn ask_attach(
-    service: &Handle<Channel>,
-    ring: &Handle<Memory>,
-    label: u64,
-) -> Attach {
+fn ask_attach(service: &Handle<Channel>, ring: &Handle<Memory>, label: u64) -> Attach {
     use proto_net::switch as sw;
     let notify = sys::handle_label(
         &channel(),
@@ -399,11 +394,17 @@ fn ask_attach(
     }
     let mut w = Writer::new();
     sw::write_attach(sw::Layout::DEFAULT, &mut w).map_err(|_| (EIO, None))?;
-    let mut reply = call(service, w.as_bytes(), handles).map_err(|e| (e, None))?;
+    let mut reply = call(service, w.as_bytes(), handles).map_err(|e| {
+        dbg(format_args!("fast: ATTACH call failed errno {e}\n"));
+        (e, None)
+    })?;
     let mut buffer = [0u8; MESSAGE_MAX];
     match sw::Attached::read(reply.bytes(&mut buffer)) {
         Ok(attached) => Ok((attached, reply.handles.take::<Channel>(0).ok())),
-        Err(status) => Err((attach_refusal(status), Some(status))),
+        Err(status) => {
+            dbg(format_args!("fast: ATTACH refused: {status:?}\n"));
+            Err((attach_refusal(status), Some(status)))
+        }
     }
 }
 
@@ -632,4 +633,21 @@ pub fn probe_crash() -> Result<(), i32> {
         .write(&mut w)
         .map_err(|_| EIO)?;
     call(&service, w.as_bytes(), rt::handle::Outgoing::new()).map(|_| ())
+}
+
+/// A line on standard error (a diagnostic of the start of the stack).
+pub(crate) fn dbg(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    struct Line([u8; 120], usize);
+    impl Write for Line {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut line = Line([0; 120], 0);
+    let _ = line.write_fmt(args);
+    let _ = crate::write(2, &line.0[..line.1]);
 }

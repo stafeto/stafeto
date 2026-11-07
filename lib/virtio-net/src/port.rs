@@ -96,7 +96,8 @@ impl Port {
     }
 
     fn publish_fill(&self) {
-        self.word(FILL_HEAD).store(self.fill_head, Ordering::Release);
+        self.word(FILL_HEAD)
+            .store(self.fill_head, Ordering::Release);
     }
 
     /// The cell of a frame the consumer is done with goes back to FILL.
@@ -150,7 +151,8 @@ impl Port {
             self.done_tail = self.done_tail.wrapping_add(1);
         }
         if n > 0 {
-            self.word(DONE_TAIL).store(self.done_tail, Ordering::Release);
+            self.word(DONE_TAIL)
+                .store(self.done_tail, Ordering::Release);
         }
         Ok(n)
     }

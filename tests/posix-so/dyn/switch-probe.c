@@ -20,6 +20,8 @@
  *   switch-probe broken-fill     the same with FILL
  *   switch-probe hold PORT       hold TCP PORT, join, and wait 2 s (the group
  *                                is live: `joined ok`)
+ *   switch-probe hold-nobody     drop to nobody (65534) and hold TCP 81:
+ *                                `hold-nobody ok` for the refusal (EACCES)
  *   switch-probe join-bad        JOIN with a descriptor that holds no port:
  *                                `join-bad ok` for the refusal
  *
@@ -308,6 +310,16 @@ int main(int argc, char **argv)
 		printf("switch-probe: joined ok\n");
 		fflush(stdout);
 		pause_ms(2000);
+	} else if (!strcmp(mode, "hold-nobody")) {
+		/* Below 1024 only the superuser holds a port: PORT_HOLD vouches for
+		 * the user the process has when it asks. */
+		REQUIRE(setuid(65534) == 0);
+		hold = stafeto_fast_port_hold(81, 1);
+		if (hold < 0 && errno == EACCES)
+			printf("switch-probe: hold-nobody ok\n");
+		else
+			printf("switch-probe: hold-nobody held %d errno %d\n", hold, errno);
+		fflush(stdout);
 	} else if (!strcmp(mode, "join-bad")) {
 		/* A socket of the service holds no port: JOIN with it is refused. */
 		int s = socket(AF_INET, SOCK_STREAM, 0);
