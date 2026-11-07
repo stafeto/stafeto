@@ -1510,7 +1510,7 @@ impl Driver<'_> {
         let st = &switch::INNER.stats;
         let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
         rt::println!(
-            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} pauses {} pause_failed {} run_max_us {}",
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} pauses {} pause_failed {} run_max_us {} budget_waits {}",
             get(&st.consumers),
             get(&st.flows),
             get(&st.unconfirmed),
@@ -1527,7 +1527,8 @@ impl Driver<'_> {
             get(&st.looped),
             get(&st.pauses),
             get(&st.pause_failed),
-            get(&st.run_max_us)
+            get(&st.run_max_us),
+            get(&st.budget_waits)
         );
         let drops: [u32; 7] = core::array::from_fn(|i| get(&st.drops[i]));
         let refused: [u32; netd::switchlogic::route::Reason::COUNT] =

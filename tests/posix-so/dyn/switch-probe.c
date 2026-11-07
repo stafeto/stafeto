@@ -26,7 +26,12 @@
  *                                `join-bad ok` for the refusal
  *   switch-probe saturate SECS   keep TX full of entries the switch refuses for SECS
  *                                seconds, so that the switch has work at every step:
- *                                `saturate ok N` (N entries written)
+ *                                `saturate ok N` (N entries written); it runs on CPUs 1 to 3
+ *   switch-probe spin SECS       count the iterations of a loop for SECS seconds on CPU 0, a
+ *                                level below the switch, and say them per 100 ms
+ *                                (`spin rate N`): the share of CPU 0 the levels below the
+ *                                switch get is this rate in a flood against the rate of a
+ *                                quiet system
  *
  * Lines: `switch-probe: attached c N g G addr A/P mac M block F+C`,
  * `switch-probe: MODE refused K` (K frames refused by the switch since the
@@ -35,7 +40,9 @@
  * errno N` and the exit code is 1. Built with -fno-builtin.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -229,9 +236,9 @@ static void send_mode(const char *mode)
 	fflush(stdout);
 }
 
-/* Entries the switch refuses (flags it does not know), written as fast as TX has room,
- * for `secs` seconds. The switch always finds the next entry waiting, so it never rests
- * unless it stops by its own rule. */
+/* Entries the switch refuses (flags it does not know), written as fast as TX has room, for
+ * `secs` seconds. The switch always finds the next entry waiting, so it never rests unless it
+ * stops by its own rule. */
 static void saturate(unsigned secs)
 {
 	struct timespec t0, t;
@@ -265,6 +272,43 @@ static void saturate(unsigned secs)
 		}
 	}
 	printf("switch-probe: saturate ok %llu\n", (unsigned long long)entries);
+	fflush(stdout);
+}
+
+/* The program runs on the CPUs of `mask` (bit n for CPU n). */
+static void pin(unsigned mask)
+{
+	cpu_set_t set;
+
+	CPU_ZERO(&set);
+	for (unsigned n = 0; n < 8; n++)
+		if (mask >> n & 1)
+			CPU_SET(n, &set);
+	if (sched_setaffinity(0, sizeof set, &set) != 0)
+		fail("sched_setaffinity");
+}
+
+/* A loop that counts its iterations for `secs` seconds on CPU 0; what it gets of that CPU
+ * is its rate. The clock is read every 4 096 iterations, so a starved loop takes longer than
+ * `secs` to end, and the rate is the iterations over the time they took. */
+static void spin(unsigned secs)
+{
+	struct timespec t0, t;
+	volatile uint64_t acc = 0;
+	uint64_t iterations = 0, ns;
+
+	pin(1);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		for (unsigned i = 0; i < 4096; i++)
+			acc += i;
+		iterations += 4096;
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		ns = (uint64_t)(t.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t.tv_nsec - t0.tv_nsec);
+		if (ns >= (uint64_t)secs * 1000000000ull)
+			break;
+	}
+	printf("switch-probe: spin rate %llu\n", (unsigned long long)(iterations * 100000000ull / ns));
 	fflush(stdout);
 }
 
@@ -320,6 +364,12 @@ int main(int argc, char **argv)
 	const struct stafeto_fast_config *c;
 	int hold = -1;
 
+	if (!strcmp(mode, "spin") && argc > 2) {
+		spin((unsigned)atoi(argv[2]));
+		return 0;
+	}
+	if (!strcmp(mode, "saturate"))
+		pin(0xe);
 	REQUIRE(stafeto_fast_attach(&claim) == 0);
 	REQUIRE(claim.kind == STAFETO_FAST_PORT);
 	c = &claim.config;

@@ -55,7 +55,14 @@ const SATURATE_SECS: u64 = 300;
 /// times the answer of the quiet stack, but not under `SATURATE_FLOOR` (a slow host spends seconds
 /// starting `posix-net` beside three programs at full speed, 6 s on the CI machine; a stack the
 /// switch keeps off the processor is killed by init).
-const SATURATE_SAMPLES: usize = 4;
+const SATURATE_SAMPLES: usize = 2;
+/// The seconds the loop on CPU 0 counts for, and the least share of its quiet rate the flood
+/// leaves it. Local TCG runs, two each: 12 and 13 % with neither budget nor pause (init kills the
+/// service later), 19 and 20 % with the pause alone (the build of 5 % on VZ), 20 and 26 % with the
+/// budget too. The budget does not bind in this flood (`budget_waits` 0) and a pause of 1 us gives
+/// 17 %, so TCG tells both from neither and does not tell the pause from the budget.
+const SPIN_SECS: u64 = 3;
+const SPIN_SHARE_MIN: u64 = 16;
 /// What the host's clock may add to the longest run of the switch.
 const SATURATE_JITTER: Duration = Duration::from_millis(40);
 const SATURATE_BOUND: u32 = 40;
@@ -1115,19 +1122,21 @@ fn frames(
 
 /// `saturate`: three consumers keep their TX rings full of entries the switch refuses, so that
 /// every step of the switch finds more to do. The switch is a level above the stack, the services
-/// and the programs on its CPU; it takes a budget of the consumers' entries in each millisecond
-/// and pauses after a run of `SWITCH_RUN_NS`, so that they run. Without both, the stack answers
-/// nothing until the flood ends and init's watchdog kills the service as silent.
+/// and the programs on its CPU; it budgets the consumers' time and pauses after a run of
+/// `SWITCH_RUN_NS`, so that they run.
 ///
-/// `posix-net stat` is asked `SATURATE_SAMPLES` times in the flood, each answer within its bound
-/// (`SATURATE_BOUND` times the answer of the quiet stack, at least `SATURATE_FLOOR`), and the
-/// longest run of the switch without a rest stays within a run, a step and the host's jitter.
-/// The programs flood until the probe has its samples and ends them.
+/// The share is measured: a loop on CPU 0 (below the switch) counts its iterations for
+/// `SPIN_SECS` seconds in a quiet system and again in the flood; the flood must leave it
+/// `SPIN_SHARE_MIN` per cent of the quiet rate (without the budget and the pause init kills the
+/// service as silent in a longer flood). `posix-net stat` is asked twice in the flood (the stack is alive),
+/// and the longest run of the switch without a rest stays within a run, a step and the host's
+/// jitter.
 fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
     let quiet = Instant::now();
     stat(run, "quiet")?;
     let bound = SATURATE_FLOOR.max(quiet.elapsed() * SATURATE_BOUND);
+    let base = spin_rate(run, "quiet")?;
     for _ in 0..SATURATE_CONSUMERS {
         run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
         run.expect("# ", DIALOG_STEP)?;
@@ -1154,7 +1163,9 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
             ));
         }
     }
-    // The programs flood for a long time; they are ended by the probe, which has its samples.
+    let flooded = spin_rate(run, "flood")?;
+    let share = flooded * 100 / base.max(1);
+    // The programs flood for a long time; they are ended by the probe, which has its numbers.
     run.send("kill %1 %2 %3")?;
     run.expect("# ", DIALOG_STEP)?;
     if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
@@ -1164,10 +1175,19 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
     let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
     let failed = counter(&after.line, "pause_failed").ok_or("no `pause_failed`")?;
     let longest = counter(&after.line, "run_max_us").ok_or("no `run_max_us`")?;
+    let waits = counter(&after.line, "budget_waits").ok_or("no `budget_waits`")?;
+    println!(
+        "fast-switch: the loop below the switch: {base} per 100 ms quiet, {flooded} in the flood, {share} %"
+    );
+    if share < SPIN_SHARE_MIN {
+        return Err(format!(
+            "the flood left the loop below the switch {share} % of its quiet rate ({flooded} of {base}), under {SPIN_SHARE_MIN} %: {}",
+            after.line
+        ));
+    }
     // A run and a step is the bound of the thread (the model test of `drive` holds it to that);
     // the clock is the host's wall clock, which a loaded TCG host stops for several milliseconds
-    // (9.4 ms seen), so the probe allows `SATURATE_JITTER` more. Without the pauses the run
-    // lasts as long as the flood.
+    // (9.4 ms seen), so the probe allows `SATURATE_JITTER` more.
     let limit = (SWITCH_RUN_NS + SWITCH_STEP_BOUND_NS + SATURATE_JITTER.as_nanos() as u64) / 1_000;
     if longest > limit {
         return Err(format!(
@@ -1179,9 +1199,24 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         return Err(format!("{failed} pauses did not happen: {}", after.line));
     }
     notes.push(format!(
-        "{SATURATE_SAMPLES} answers of the stack in a flood on {SATURATE_CONSUMERS} rings: {took:?} (bound {bound:?}); {pauses} pauses, the longest run {longest} us (limit {limit} us)"
+        "the loop below the switch kept {share} % of its rate in the flood ({flooded} of {base} per 100 ms); {} answers of the stack in it: {took:?} (bound {bound:?}); {pauses} pauses, {waits} steps with the budget spent, the longest run {longest} us (limit {limit} us)",
+        took.len()
     ));
     Ok(())
+}
+
+/// The iterations per 100 ms of `switch-probe spin` on CPU 0.
+fn spin_rate(run: &mut qemu::Run, what: &str) -> Result<u64, String> {
+    run.send(&format!("switch-probe spin {SPIN_SECS}"))?;
+    let line = run.expect_line(
+        what,
+        |l| l.contains("switch-probe: spin rate "),
+        Duration::from_secs(120),
+    )?;
+    line.split("spin rate ")
+        .nth(1)
+        .and_then(|r| r.trim().parse().ok())
+        .ok_or_else(|| format!("{what}: no rate in {line:?}"))
 }
 
 #[cfg(test)]

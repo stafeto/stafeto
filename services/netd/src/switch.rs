@@ -155,6 +155,8 @@ pub struct Stats {
     pub pause_failed: AtomicU32,
     /// The longest run without a rest, in microseconds.
     pub run_max_us: AtomicU32,
+    /// Steps that found a consumer's entries waiting for the next period (the budget spent).
+    pub budget_waits: AtomicU32,
 }
 
 impl Stats {
@@ -180,6 +182,7 @@ impl Stats {
             pauses: AtomicU32::new(0),
             pause_failed: AtomicU32::new(0),
             run_max_us: AtomicU32::new(0),
+            budget_waits: AtomicU32::new(0),
         }
     }
 }
@@ -1006,6 +1009,9 @@ impl Switch {
             }
         }
         self.budget_hit = spent;
+        if spent {
+            INNER.stats.budget_waits.fetch_add(1, Ordering::Relaxed);
+        }
         self.next_c = (self.next_c + 1) % MAX_CONSUMERS as u8;
         // Frames that wait for a buffer or a share of the queue do not make the switch run
         // again at once (it would spin above the stack): the timer looks again in a
