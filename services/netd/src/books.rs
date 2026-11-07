@@ -102,14 +102,17 @@ impl Chunks {
     }
 }
 
-/// The service's mappings the rings of consumers use. The kernel gives a process 128; the
-/// service itself uses fewer than 20 and the buffers of sessions up to 64, so the rings get
-/// `RING_MAPPINGS`: eight rings of `Layout::DEFAULT` (11 chunks of `MAP_CHUNK` pages each) fit,
-/// and a ring that would not is refused at ATTACH, up front, and not at a late `mem_map` (which
-/// would break the consumer after it had been told OK).
-pub const RING_MAPPINGS: u32 = 96;
+/// The mappings of the network service that its shared buffers and the rings of its consumers
+/// draw on, one budget for both. The kernel gives a process 128 (`abi::MAX_MAPPINGS`); the service
+/// itself keeps fewer than 20 (the device, the tables, its stacks), so the other 108 are shared:
+/// a buffer of a session takes one, a ring one for each chunk of `MAP_CHUNK` pages (11 for
+/// `Layout::DEFAULT`, so eight rings take 88 and leave 20 buffers). A request that does not fit
+/// is refused up front (BUFFER with its table full, ATTACH with `LimitReached`), and no
+/// `mem_map` fails later for a caller that was told OK.
+pub const NETD_MAPPINGS: u32 = 108;
+const _: () = assert!(NETD_MAPPINGS + 20 <= abi::MAX_MAPPINGS);
 
-/// The mappings of rings reserved, one per chunk of `chunk_pages` pages of each ring.
+/// The mappings reserved from the budget: one for each buffer, one for each chunk of a ring.
 pub struct Mappings {
     used: u32,
 }
@@ -127,7 +130,7 @@ impl Mappings {
     /// Takes `n` mappings, or none when the budget lacks them.
     pub fn reserve(&mut self, n: u32) -> bool {
         match self.used.checked_add(n) {
-            Some(sum) if sum <= RING_MAPPINGS => {
+            Some(sum) if sum <= NETD_MAPPINGS => {
                 self.used = sum;
                 true
             }
@@ -470,7 +473,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn eight_default_rings_fit_the_budget_and_a_ninth_does_not() {
+    fn eight_default_rings_take_88_of_the_108_and_the_tenth_is_refused() {
         use proto_net::switch::{Layout, PAGE};
         let n = Mappings::for_ring(Layout::DEFAULT.total() as u64, PAGE as u64, 64);
         assert_eq!(n, 11);
@@ -479,8 +482,10 @@ mod tests {
             assert!(m.reserve(n));
         }
         assert_eq!(m.used(), 88);
+        // The number of consumers is bound apart (`switch N`); the mappings allow nine.
+        assert!(m.reserve(n));
         assert!(!m.reserve(n), "a refusal takes nothing");
-        assert_eq!(m.used(), 88);
+        assert_eq!(m.used(), 99);
         m.release(n);
         assert!(m.reserve(n));
         // The biggest ring the layout allows takes three times what a default ring does:
@@ -490,7 +495,7 @@ mod tests {
         let mut m = Mappings::new();
         assert!(m.reserve(chunks) && m.reserve(chunks));
         assert!(!m.reserve(chunks));
-        assert!(!Mappings::new().reserve(RING_MAPPINGS + 1));
+        assert!(!Mappings::new().reserve(NETD_MAPPINGS + 1));
     }
 
     #[test]

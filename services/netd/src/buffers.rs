@@ -14,6 +14,8 @@
 //! the bytes go through a raw pointer, a portion of `ring::BUFFER_PORTION`
 //! at most in one request (`copy_portion`).
 
+use crate::books::Mappings;
+
 /// The entries of the table: sessions with a shared buffer at once.
 pub const BUFFER_SESSIONS: usize = 64;
 
@@ -40,6 +42,9 @@ pub struct Buffers {
     retired: u64,
     /// The limit of `netd.conf` (`buffers N`).
     limit: u16,
+    /// The mappings of the service: a buffer takes one while its entry is taken, and the rings of
+    /// consumers draw on the same budget (`books::NETD_MAPPINGS`).
+    maps: Mappings,
 }
 
 impl Default for Buffers {
@@ -57,12 +62,18 @@ impl Buffers {
             }; BUFFER_SESSIONS],
             used: 0,
             retired: 0,
+            maps: Mappings::new(),
             limit: if limit as usize > BUFFER_SESSIONS {
                 BUFFER_SESSIONS as u16
             } else {
                 limit
             },
         }
+    }
+
+    /// The budget of mappings, for the rings of consumers to draw on.
+    pub fn mappings(&mut self) -> &mut Mappings {
+        &mut self.maps
     }
 
     /// The entries taken now, retired ones among them.
@@ -80,7 +91,7 @@ impl Buffers {
             return Err(Refusal::Full);
         }
         let free = !self.used;
-        if free == 0 {
+        if free == 0 || !self.maps.reserve(1) {
             return Err(Refusal::Full);
         }
         let i = free.trailing_zeros() as usize;
@@ -97,6 +108,7 @@ impl Buffers {
         }
         self.used &= !(1 << i);
         self.retired &= !(1 << i);
+        self.maps.release(1);
         let e = &mut self.entries[i];
         e.label = 0;
         e.generation = e.generation.wrapping_add(1);
@@ -152,6 +164,51 @@ pub fn copy_portion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::books::NETD_MAPPINGS;
+
+    const RING: u32 = 11;
+
+    #[test]
+    fn forty_buffers_leave_room_for_six_rings_and_the_seventh_is_refused_up_front() {
+        let mut b = Buffers::new(64);
+        for k in 0..40 {
+            b.give(k).unwrap();
+        }
+        let mut rings = 0;
+        while b.mappings().reserve(RING) {
+            rings += 1;
+        }
+        assert_eq!(rings, (NETD_MAPPINGS - 40) / RING);
+        assert_eq!(rings, 6);
+    }
+
+    #[test]
+    fn eight_rings_leave_twenty_buffers_and_the_next_is_refused_up_front() {
+        let mut b = Buffers::new(64);
+        for _ in 0..8 {
+            assert!(b.mappings().reserve(RING));
+        }
+        let mut given = 0;
+        while b.give(given).is_ok() {
+            given += 1;
+        }
+        assert_eq!(given, u64::from(NETD_MAPPINGS - 8 * RING));
+        assert_eq!(given, 20);
+        // A buffer given back is a mapping a ring can take, and the other way round.
+        b.free(0);
+        assert!(!b.mappings().reserve(RING));
+        b.mappings().release(RING);
+        assert!(b.mappings().reserve(RING));
+    }
+
+    #[test]
+    fn a_failed_map_gives_its_mapping_back() {
+        let mut b = Buffers::new(64);
+        let i = b.give(1).unwrap();
+        let used = b.mappings().used();
+        b.free(i);
+        assert_eq!(b.mappings().used(), used - 1);
+    }
 
     #[test]
     fn the_table_gives_up_to_its_limit_and_takes_back() {

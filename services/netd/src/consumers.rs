@@ -73,8 +73,6 @@ pub struct Side {
     /// The generation of each consumer number in use: a session's pair that does not match
     /// names a consumer that has gone.
     pub owners: Owners,
-    /// The mappings the rings take (reserved at ATTACH, given back with the entry).
-    mappings: Mappings,
     /// Consumers whose DETACH did not fit in the ring of commands.
     detach_due: u8,
     /// A copy of the switch's channel with NOTIFY and DUPLICATE, which the copies for the
@@ -96,7 +94,6 @@ impl Side {
             blocks: Blocks::new(),
             entries: [const { None }; MAX_CONSUMERS],
             owners: Owners::new(),
-            mappings: Mappings::new(),
             detach_due: 0,
             gate,
             level,
@@ -169,18 +166,17 @@ impl Driver<'_> {
         // The mappings of the ring are counted up front: a ring that does not fit the budget is
         // refused here, and a late `mem_map` never fails a consumer that was told OK.
         let chunks = Mappings::for_ring(size, PAGE as u64, MAP_CHUNK);
-        if !self.side.mappings.reserve(chunks) {
+        if !self.net.buffers.mappings().reserve(chunks) {
             return limit();
         }
         let Some((c, generation, block)) = self.side.blocks.alloc_except(&mut both, now, busy)
         else {
-            self.side.mappings.release(chunks);
+            self.net.buffers.mappings().release(chunks);
             return limit();
         };
 
         let at = dma::consumer_at(usize::from(c));
         let giveup = |side: &mut Side| {
-            side.mappings.release(chunks);
             side.blocks.release(c, now);
             let swept = side.blocks.swept_round();
             side.blocks.detached(c, swept);
@@ -195,6 +191,7 @@ impl Driver<'_> {
             Ok(copy) => copy,
             Err(error) => {
                 rt::println!("net: switch attach: labelling the gate: {error:?}");
+                self.net.buffers.mappings().release(chunks);
                 giveup(&mut self.side);
                 return Answer::Status(Status::Kernel(error));
             }
@@ -222,6 +219,7 @@ impl Driver<'_> {
             block_count: u32::from(BLOCK_PORTS),
         };
         if reply.write(r.reply()).is_err() {
+            self.net.buffers.mappings().release(chunks);
             giveup(&mut self.side);
             return Answer::Status(Status::BadSize);
         }
@@ -342,7 +340,8 @@ impl Driver<'_> {
             if e.mapped > 0 {
                 left = true;
             } else {
-                self.side.mappings.release(e.chunks);
+                let chunks = e.chunks;
+                self.net.buffers.mappings().release(chunks);
                 self.side.entries[c] = None;
             }
         }
