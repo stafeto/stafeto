@@ -72,7 +72,11 @@ const GRANT_BYTES: u64 = 32_768 * 4096;
 /// KiB, and the places of the kernel's table the layer may hold.
 const STAGES: [usize; 3] = [100, 250, 400];
 const DEGRADE_KIB: u32 = 20_480;
-const DEGRADE_CONNS: usize = 600;
+const DEGRADE_CONNS: usize = 700;
+/// The line nginx logs when its 32 KiB buffer finds the heap held full by the limit, and how
+/// many of them the step tolerates.
+const OWN_MALLOC: &str = "malloc(32768) failed (12: Out of memory)";
+const OWN_MALLOC_MAX: usize = 8;
 const DEGRADE_WITHIN: Duration = Duration::from_secs(150);
 const STAGE_WITHIN: Duration = Duration::from_secs(300);
 /// Every this many connections of those held take the page after the hold.
@@ -353,6 +357,18 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         .iter()
         .position(|l| l.trim_end().ends_with("limit-set"))
         .unwrap_or(output.lines.len());
+    // nginx's own buffer of 32 KiB may fail at the limit, a few times (one for a request).
+    let own = output
+        .lines
+        .iter()
+        .skip(limit)
+        .filter(|l| l.contains(OWN_MALLOC))
+        .count();
+    if own > OWN_MALLOC_MAX {
+        return Err(format!(
+            "nginx's own malloc failed {own} times at the limit (at most {OWN_MALLOC_MAX})"
+        ));
+    }
     let lines: Vec<String> = output
         .lines
         .iter()
@@ -362,7 +378,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 || !(l.contains("accept4() failed")
                     || l.contains("posix_memalign(")
                     || l.contains("malloc() failed")
-                    || l.contains("failed (12: Out of memory)")
+                    || l.contains(OWN_MALLOC)
                     || l.contains("writev() failed"))
         })
         .map(|(_, l)| l.clone())
@@ -492,7 +508,7 @@ fn scenario(
     run.send("kill -QUIT $M; wait $M; echo ngx-\"quit\"-end")?;
     run.expect("ngx-quit-end", Duration::from_secs(30))?;
     run.send(&format!(
-        "sed '/connection_pool_size/d;/large_client_header_buffers/d' {CONF} > {LIMIT_CONF} && ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""
+        "sed '/connection_pool_size/d;/large_client_header_buffers/d;s/output_buffers 2 32k/output_buffers 2 4k/' {CONF} > {LIMIT_CONF} && ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""
     ))?;
     run.expect_line(
         "limit-set",
@@ -515,15 +531,10 @@ fn scenario(
         ));
     }
     drop(held);
-    // The connections close in the stack; whether a new one gets its page again is noted, not
-    // judged: with the rings of the switch outside the heap the data limit that makes the
-    // stack refuse is close to what nginx's own 32 KiB buffers need, and a worker whose heap
-    // the limit holds full answers again only when the limit is lifted.
+    // The connections close in the stack, and a new one gets its page again.
     std::thread::sleep(Duration::from_secs(15));
-    let again = crate::nginx_probe::first_page(address).is_ok();
-    notes.push(format!(
-        "5: a new connection got its page after the others closed: {again}"
-    ));
+    crate::nginx_probe::first_page(address)?;
+    notes.push("5: a new connection got its page after the others closed".to_owned());
     let (_, after) = crate::fast_nginx::master_and_workers(run, "limit-after", false)?;
     if before != after {
         return Err(format!(
