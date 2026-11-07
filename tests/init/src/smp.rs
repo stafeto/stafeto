@@ -300,6 +300,11 @@ extern "C" fn ask_once(_: u64) -> ! {
     sys::thread_exit()
 }
 
+/// The wait for the reply of the service across CPUs: a loaded host can leave
+/// a virtual CPU without time for longer than WAIT_NS, and a run that never
+/// gets the reply says nothing about the kernel.
+const SERVICE_NS: u64 = 30_000_000_000;
+
 /// A service at LEVEL on one CPU takes a request of a client at HIGH on
 /// another: while it works on it, it is at HIGH (the boost, spec 6.6, through
 /// a command to its CPU), and after the reply it is at LEVEL again.
@@ -315,13 +320,22 @@ fn service_across_cpus() -> Outcome {
     // The service reaches its receive on its CPU.
     pause(20_000_000);
     let client = spawn_on(1, 1, ask_once, 0, HIGH)?;
-    let done = wait_for(|| mark(1) != 0 && mark(3) != 0);
+    let began = now();
+    let done = wait_for_within(SERVICE_NS, || mark(1) != 0 && mark(3) != 0);
+    let waited = now().saturating_sub(began);
     let (during, replied, after) = (mark(0), mark(1), mark(2));
     let_run()?;
     for t in [server, client] {
         close_ended(t)?;
     }
     close(c)?;
+    if !(done && replied == 1) {
+        println!(
+            "smp: service across CPUs: done {done} after {waited} ns, send result {replied}, \
+             service ended {}",
+            mark(3)
+        );
+    }
     check(done && replied == 1, "the client did not get its reply")?;
     check(
         during == u64::from(HIGH),
