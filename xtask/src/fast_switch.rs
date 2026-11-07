@@ -527,10 +527,40 @@ fn idle(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
 
 fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
+    // Eight consumers attach at once: their rings map in chunks, one chunk of pages in all
+    // for a step of the stack, and the longest step stays under the bound. The service maps
+    // at most 128 pieces (the kernel's limit), and a ring is 21 of them, so the ones past the
+    // fifth are refused cleanly (LimitReached) and the service goes on.
+    run.send(
+        "for p in 9001 9002 9003 9004 9005 9006 9007 9008; do switch-probe hold $p & done; wait; echo sw-eight-\"end\"",
+    )?;
+    run.expect("sw-eight-end", Duration::from_secs(600))?;
+    let joined = run
+        .lines()
+        .iter()
+        .filter(|l| l.contains("switch-probe: joined ok"))
+        .count();
+    if joined < 4 {
+        return Err(format!(
+            "{joined} of 8 simultaneous consumers attached and joined"
+        ));
+    }
+    run.expect("# ", DIALOG_STEP)?;
+    // A hold inside the consumer's own block is refused.
+    run.send("switch-probe hold-block")?;
+    run.expect("switch-probe: hold-block ok", Duration::from_secs(120))?;
+    run.expect("# ", DIALOG_STEP)?;
+    notes.push(format!(
+        "{joined} of 8 consumers attached at once (the rest refused with LimitReached); a hold inside a block refused"
+    ));
     run.send("httpd -f -p 8080 -h /www &")?;
     run.expect("# ", DIALOG_STEP)?;
     start(run, CONF4)?;
     requests("the small page", nginx, "/tiny.txt", TINY, 20)?;
+    // A body of 256 KiB from the guest's stack to a worker on the shared address: large
+    // frames of the stack are turned into the tables, and the step stays bound.
+    run.send("dd if=/dev/zero of=/tmp/big bs=1k count=256 2>/dev/null; wget -q -O /dev/null --post-file=/tmp/big http://10.0.2.15/tiny.txt; echo ngx-post-\"end\"")?;
+    run.expect("ngx-post-end", Duration::from_secs(300))?;
     run.send("wget -q -O - http://10.0.2.15/tiny.txt; echo ngx-wget-end")?;
     run.expect("ngx-wget-end", Duration::from_secs(60))?;
     notes.push("20 pages and a wget of the guest to the shared address under -icount".to_owned());

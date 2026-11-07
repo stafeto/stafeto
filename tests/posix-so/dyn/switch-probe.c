@@ -310,6 +310,15 @@ int main(int argc, char **argv)
 		printf("switch-probe: joined ok\n");
 		fflush(stdout);
 		pause_ms(2000);
+	} else if (!strcmp(mode, "hold-block")) {
+		/* A port inside the block of this consumer's temporary ports is not for a
+		 * group: PORT_HOLD answers "in use" and leaves no group in the books. */
+		hold = stafeto_fast_port_hold(block_first + 10u, 1);
+		if (hold < 0 && errno == EADDRINUSE)
+			printf("switch-probe: hold-block ok\n");
+		else
+			printf("switch-probe: hold-block held %d errno %d\n", hold, errno);
+		fflush(stdout);
 	} else if (!strcmp(mode, "hold-nobody")) {
 		/* Below 1024 only the superuser holds a port: PORT_HOLD vouches for
 		 * the user the process has when it asks. */
