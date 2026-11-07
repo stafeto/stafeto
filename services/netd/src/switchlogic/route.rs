@@ -11,7 +11,7 @@
 //! frame from consumer A to a group with member B finds A's flow at the
 //! send check and B's flow at steering: the keys differ in the ports.
 
-use super::tables::{BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, Tables};
+use super::tables::{BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, Tables, UNCONFIRMED};
 use crate::ports::Proto;
 use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
 use virtio_net::frames::{
@@ -39,6 +39,9 @@ pub enum Why {
     Forged,
     /// A frame of the wire whose source is our own address.
     Spoofed,
+    /// A frame of the wire whose source no host on the wire has: "this host", loopback,
+    /// multicast and above, the broadcast of the subnet.
+    Bogus,
     /// Every member of the group is short of cells.
     AllFull,
     /// The flow table has no room for the connection.
@@ -144,6 +147,9 @@ pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     }
     if from == Source::Wire && ip.src == t.own.ip {
         return Decision::Drop(Why::Spoofed);
+    }
+    if from == Source::Wire && !unicast_elsewhere(t, ip.src) {
+        return Decision::Drop(Why::Bogus);
     }
     match ip.proto {
         IPV4_PROTO_ICMP => icmp(t, &ip),
@@ -255,8 +261,8 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
     };
     let now = t.now;
     match found {
-        Some(i) => t.flows.reassign(i, c, generation, now),
-        None if t.flows.insert(&key, c, generation, now).is_none() => {
+        Some(i) => t.flows.reassign(i, c, generation, now, true),
+        None if !t.insert_embryo(&key, c, generation) => {
             return Decision::Drop(Why::FlowsFull);
         }
         None => {}
@@ -269,9 +275,21 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
 
 /// The time and the marks of a segment that belongs to flow `i`.
 fn note(t: &mut Tables, i: usize, flags: u8, fin: u16) {
+    let peer = fin == FIN_IN;
+    let confirms = if peer {
+        flags & (SYN | ACK | RSTBIT) == ACK
+    } else {
+        flags & (SYN | ACK) != SYN | ACK
+    };
+    if confirms {
+        t.flows.confirm(i);
+    }
     let now = t.now;
     let f = t.flows.get(i);
-    f.seen = now;
+    // An unconfirmed flow ages from its SYN: repeating the SYN does not keep it.
+    if f.flags & UNCONFIRMED == 0 {
+        f.seen = now;
+    }
     if flags & RSTBIT != 0 {
         f.flags |= RST;
     }
@@ -467,7 +485,7 @@ fn tcp_tx(t: &mut Tables, c: u8, ip: &Ip) -> Result<(), Reason> {
         if !(syn && in_block && free) {
             return Err(Reason::Tcp);
         }
-        t.flows.reassign(i, c, generation, now);
+        t.flows.reassign(i, c, generation, now, false);
         if !mine {
             t.consumers[usize::from(c)].as_mut().expect("there").flows += 1;
         }
@@ -506,7 +524,7 @@ fn udp_tx(t: &mut Tables, c: u8, ip: &Ip) -> Result<(), Reason> {
 mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
-    use crate::switchlogic::tables::tests::{OWN, with, with_flows};
+    use crate::switchlogic::tables::tests::{OWN, Rng, with, with_flows};
     use proto_net::switch as sw;
 
     const PEER: [u8; 4] = [203, 0, 113, 9];
@@ -923,6 +941,122 @@ mod tests {
                 taken > 0 && taken <= 16,
                 "a member at its limit gets no new SYN: {taken}"
             );
+        });
+    }
+
+    fn wire_from(src: [u8; 4], sport: u16, flags: u8) -> Vec<u8> {
+        ip_frame((PEER_MAC, src), ME, 6, &tcp_part(sport, 8080, flags))
+    }
+
+    fn random_source(r: &mut Rng) -> [u8; 4] {
+        let v = r.next().to_le_bytes();
+        // A host of the wire: not 0/8, 10/8 (the subnet), 127/8 or 224/4 and above.
+        [1 + (v[0] % 9), v[1], v[2], v[3]]
+    }
+
+    #[test]
+    fn a_flood_of_syns_from_random_addresses_leaves_room_and_the_confirmed_flows() {
+        with_flows(256, |t, _| {
+            let (cap, limit) = (t.flows.capacity(), t.flows.unconfirmed_limit());
+            assert_eq!((cap, limit), (128, 32));
+            // Real connections: the SYN, then the ACK that ends the handshake.
+            let real: Vec<([u8; 4], u8)> = (0..6)
+                .map(|n| {
+                    let src = [198, 51, 100, n];
+                    let c = who(route(t, &wire_from(src, 5000, SYN), Source::Wire));
+                    assert_eq!(who(route(t, &wire_from(src, 5000, ACK_), Source::Wire)), c);
+                    (src, c)
+                })
+                .collect();
+            assert_eq!(t.flows.unconfirmed(), 0);
+            let mut rng = Rng(0x9e3779b97f4a7c15);
+            for _ in 0..10 * cap {
+                let (src, sport) = (random_source(&mut rng), rng.next() as u16);
+                route(t, &wire_from(src, sport, SYN), Source::Wire);
+                assert!(t.flows.unconfirmed() <= limit);
+                assert!(t.flows.len() <= cap);
+            }
+            assert!(t.flows.evicted > 0 && t.flows.unconfirmed() > 0);
+            for (src, c) in &real {
+                let d = route(t, &wire_from(*src, 5000, ACK_), Source::Wire);
+                assert_eq!(who(d), *c, "an established flow survives");
+            }
+            let honest = route(t, &wire_from([203, 0, 113, 77], 4000, SYN), Source::Wire);
+            assert!(matches!(honest, Decision::Consumer { .. }), "{honest:?}");
+            let honest_ack = wire_from([203, 0, 113, 77], 4000, ACK_);
+            assert_eq!(who(route(t, &honest_ack, Source::Wire)), who(honest));
+        });
+    }
+
+    #[test]
+    fn an_unconfirmed_flow_goes_after_thirty_seconds_and_a_repeated_syn_does_not_keep_it() {
+        with_flows(256, |t, _| {
+            t.now = 1000;
+            let syn = |t: &mut Tables, n: u8| {
+                route(t, &wire_from([198, 51, 100, n], 5000, SYN), Source::Wire)
+            };
+            syn(t, 1);
+            let c2 = who(syn(t, 2));
+            let ack = wire_from([198, 51, 100, 2], 5000, ACK_);
+            assert_eq!(who(route(t, &ack, Source::Wire)), c2);
+            t.now = 1020;
+            syn(t, 1);
+            assert_eq!(t.flows.unconfirmed(), 1);
+            t.now = 1029;
+            t.sweep();
+            assert_eq!(t.flows.unconfirmed(), 1, "not yet");
+            t.sweep_at(1031);
+            assert_eq!((t.flows.unconfirmed(), t.flows.len()), (0, 1));
+            assert_eq!(t.flows.expired, 1);
+            let owned = |t: &Tables| t.consumers.iter().flatten().map(|c| c.flows).sum::<u32>();
+            assert_eq!(
+                owned(t),
+                1,
+                "the owner of the expired flow has its count back"
+            );
+        });
+    }
+
+    #[test]
+    fn a_consumer_segment_but_a_syn_ack_confirms() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            assert_eq!(t.flows.unconfirmed(), 1);
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, SYN_ACK)), Verdict::Send);
+            assert_eq!(t.flows.unconfirmed(), 1, "the SYN-ACK does not");
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            route(t, &wire_tcp(1234, 8080, SYN), Source::Wire);
+            assert_eq!(
+                t.flows.unconfirmed(),
+                1,
+                "a RST or a SYN of the wire does not"
+            );
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x18)), Verdict::Send);
+            assert_eq!(t.flows.unconfirmed(), 0);
+        });
+    }
+
+    #[test]
+    fn syns_from_addresses_no_host_of_the_wire_has_make_no_flow() {
+        with(|t, _| {
+            for src in [
+                [127, 0, 0, 1],
+                [0, 0, 0, 0],
+                [0, 1, 2, 3],
+                [224, 0, 0, 5],
+                [240, 1, 1, 1],
+                [255; 4],
+                [10, 0, 2, 255],
+            ] {
+                assert_eq!(
+                    route(t, &wire_from(src, 5000, SYN), Source::Wire),
+                    Decision::Drop(Why::Bogus),
+                    "{src:?}"
+                );
+                let udp = ip_frame((PEER_MAC, src), ME, 17, &udp_part(1000, 5353));
+                assert_eq!(route(t, &udp, Source::Wire), Decision::Drop(Why::Bogus));
+            }
+            assert!(t.flows.is_empty());
         });
     }
 

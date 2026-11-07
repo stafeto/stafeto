@@ -28,6 +28,10 @@ pub const QUARANTINE: u32 = 60;
 pub const FIN_OUT: u16 = 1;
 pub const FIN_IN: u16 = 2;
 pub const RST: u16 = 4;
+/// The flow was made by a SYN nobody has confirmed yet (see `Flows`).
+pub const UNCONFIRMED: u16 = 8;
+/// Seconds an unconfirmed flow lives: shorter than the stack's SYN-ACK retries, longer than a round trip.
+pub const EMBRYO_AGE: u32 = 30;
 pub const CLOSING_AGE: u32 = 10;
 pub const IDLE_AGE: u32 = 7500;
 pub const SWEEP_STEP: usize = 256;
@@ -81,11 +85,24 @@ impl Flow {
 
 /// Open addressing with linear probing over caller-given places, at most
 /// half full, a chain of at most `PROBE_LIMIT`, SipHash-2-4 under a secret.
+///
+/// A flow made by a SYN of the wire or of the stack is unconfirmed: nobody
+/// has shown that the sender can read our answer. It is confirmed by the
+/// first segment of the peer that has ACK and no SYN, RST, or by any
+/// segment of the consumer but a SYN-ACK. Unconfirmed flows live
+/// `EMBRYO_AGE` seconds, are at most a quarter of the table, and a new SYN
+/// takes the place of the oldest one in its chain when the table, the
+/// share or the chain is full. Confirmed flows are never evicted.
 pub struct Flows<'a> {
     slots: &'a mut [Flow],
     keys: (u64, u64),
     used: usize,
+    unconfirmed: usize,
     cursor: usize,
+    /// Unconfirmed flows a newer SYN took the place of.
+    pub evicted: u32,
+    /// Unconfirmed flows the sweep removed after `EMBRYO_AGE`.
+    pub expired: u32,
 }
 
 impl<'a> Flows<'a> {
@@ -96,7 +113,10 @@ impl<'a> Flows<'a> {
             slots,
             keys: (k(&secret[..8]), k(&secret[8..])),
             used: 0,
+            unconfirmed: 0,
             cursor: 0,
+            evicted: 0,
+            expired: 0,
         }
     }
 
@@ -110,6 +130,16 @@ impl<'a> Flows<'a> {
 
     pub fn capacity(&self) -> usize {
         self.slots.len() / 2
+    }
+
+    /// Unconfirmed flows now.
+    pub fn unconfirmed(&self) -> usize {
+        self.unconfirmed
+    }
+
+    /// Most unconfirmed flows at once: a quarter of the table.
+    pub fn unconfirmed_limit(&self) -> usize {
+        self.capacity() / 4
     }
 
     #[allow(deprecated)]
@@ -157,6 +187,17 @@ impl<'a> Flows<'a> {
         if self.used >= self.capacity() {
             return None;
         }
+        self.place(key, consumer, generation, now, 0)
+    }
+
+    fn place(
+        &mut self,
+        key: &FlowKey,
+        consumer: u8,
+        generation: u8,
+        now: u32,
+        flags: u16,
+    ) -> Option<usize> {
         let (key, n) = (key.bytes(), self.slots.len());
         let home = self.home(&key);
         for d in 0..PROBE_LIMIT {
@@ -166,25 +207,90 @@ impl<'a> Flows<'a> {
                     key,
                     consumer,
                     generation,
-                    flags: 0,
+                    flags,
                     seen: now,
                 };
                 self.used += 1;
+                self.unconfirmed += usize::from(flags & UNCONFIRMED != 0);
                 return Some(i);
             }
         }
         None
     }
 
-    /// Gives the flow at `i` to a new owner (a SYN that finds a dead or closed flow).
-    pub fn reassign(&mut self, i: usize, consumer: u8, generation: u8, now: u32) {
+    /// A new unconfirmed flow. When the table, the unconfirmed share or the
+    /// chain is full the oldest unconfirmed flow of the chain goes first (it
+    /// is returned for the owner's books, also when the new flow found no
+    /// place after all). The first is None when nothing could be made.
+    pub fn insert_embryo(
+        &mut self,
+        key: &FlowKey,
+        consumer: u8,
+        generation: u8,
+        now: u32,
+    ) -> (Option<usize>, Option<Flow>) {
+        let home = self.home(&key.bytes());
+        let n = self.slots.len();
+        let chain_full = (0..PROBE_LIMIT).all(|d| !self.slots[(home + d) % n].is_empty());
+        let mut evicted = None;
+        if self.used >= self.capacity()
+            || self.unconfirmed >= self.unconfirmed_limit()
+            || chain_full
+        {
+            let Some(i) = self.oldest_embryo(home, now) else {
+                return (None, None);
+            };
+            evicted = Some(self.slots[i]);
+            self.remove_at(i);
+            self.evicted += 1;
+        }
+        (
+            self.place(key, consumer, generation, now, UNCONFIRMED),
+            evicted,
+        )
+    }
+
+    /// The oldest unconfirmed flow in the chain that starts at `home`.
+    fn oldest_embryo(&self, home: usize, now: u32) -> Option<usize> {
+        let n = self.slots.len();
+        let mut best: Option<(usize, u32)> = None;
+        for d in 0..PROBE_LIMIT {
+            let i = (home + d) % n;
+            let f = &self.slots[i];
+            if f.is_empty() {
+                break;
+            }
+            let age = now.wrapping_sub(f.seen);
+            if f.flags & UNCONFIRMED != 0 && best.is_none_or(|b| age > b.1) {
+                best = Some((i, age));
+            }
+        }
+        best.map(|b| b.0)
+    }
+
+    /// The peer or the consumer showed the flow is real.
+    pub fn confirm(&mut self, i: usize) {
         let f = &mut self.slots[i];
-        (f.consumer, f.generation, f.flags, f.seen) = (consumer, generation, 0, now);
+        if f.flags & UNCONFIRMED != 0 {
+            f.flags &= !UNCONFIRMED;
+            self.unconfirmed -= 1;
+        }
+    }
+
+    /// Gives the flow at `i` to a new owner (a SYN that finds a dead flow);
+    /// `embryo` starts it unconfirmed.
+    pub fn reassign(&mut self, i: usize, consumer: u8, generation: u8, now: u32, embryo: bool) {
+        self.confirm(i);
+        let f = &mut self.slots[i];
+        let flags = if embryo { UNCONFIRMED } else { 0 };
+        (f.consumer, f.generation, f.flags, f.seen) = (consumer, generation, flags, now);
+        self.unconfirmed += usize::from(embryo);
     }
 
     /// Takes the entry at `i` out, shifting back the chain behind it.
     pub fn remove_at(&mut self, i: usize) {
         let n = self.slots.len();
+        self.unconfirmed -= usize::from(self.slots[i].flags & UNCONFIRMED != 0);
         let (mut hole, mut j) = (i, i);
         loop {
             j = (j + 1) % n;
@@ -213,7 +319,10 @@ impl<'a> Flows<'a> {
                     .and_then(Option::as_mut)
                     .filter(|c| c.generation == f.generation);
                 let age = now.wrapping_sub(f.seen);
-                if owner.is_none() || (f.closing() && age > CLOSING_AGE) || age > IDLE_AGE {
+                let embryo = f.flags & UNCONFIRMED != 0 && age > EMBRYO_AGE;
+                if owner.is_none() || embryo || (f.closing() && age > CLOSING_AGE) || age > IDLE_AGE
+                {
+                    self.expired += u32::from(embryo);
                     if let Some(c) = owner {
                         c.flows = c.flows.saturating_sub(1);
                     }
@@ -465,9 +574,39 @@ impl<'a> Tables<'a> {
         }
     }
 
+    /// A new unconfirmed flow for a SYN; false when there is no room. The owner of a
+    /// flow it took the place of gets its count back.
+    pub fn insert_embryo(&mut self, key: &FlowKey, consumer: u8, generation: u8) -> bool {
+        self.guard.check();
+        let (slot, evicted) = self
+            .flows
+            .insert_embryo(key, consumer, generation, self.now);
+        if let Some(f) = evicted {
+            if let Some(c) = self
+                .consumers
+                .get_mut(usize::from(f.consumer))
+                .and_then(Option::as_mut)
+                .filter(|c| c.generation == f.generation)
+            {
+                c.flows = c.flows.saturating_sub(1);
+            }
+        }
+        slot.is_some()
+    }
+
+    /// One sweep step at the time the switch last set. The switch calls it
+    /// after each batch of frames; when no frames come it must be called
+    /// from an idle timer too (Sh4b2: every 100 ms, with `sweep_at`), or
+    /// unconfirmed and dead flows stay while the line is quiet.
     pub fn sweep(&mut self) {
         self.guard.check();
         self.flows.sweep(self.now, &mut self.consumers);
+    }
+
+    /// `sweep` at time `now`, for the idle timer.
+    pub fn sweep_at(&mut self, now: u32) {
+        self.now = now;
+        self.sweep();
     }
 }
 
@@ -589,6 +728,18 @@ pub(crate) mod tests {
         with_flows(4096, f)
     }
 
+    /// A fixed-seed xorshift for the tests that throw hostile values.
+    pub struct Rng(pub u64);
+
+    impl Rng {
+        pub fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
     pub fn key(n: u32) -> FlowKey {
         FlowKey {
             peer: [1, 2, 3, 4],
@@ -688,7 +839,10 @@ pub(crate) mod tests {
         assert_eq!(t.port(Proto::Tcp, 50176 + 512), 0);
         assert!(!t.hold(3, Proto::Tcp, 65535, 2), "past the last port");
         assert!(!t.hold(3, Proto::Tcp, 0, 1) && !t.hold(3, Proto::Tcp, 80, 0));
-        assert!(!t.attach(4, 1, rig.ring(), 65535), "a block past the last port");
+        assert!(
+            !t.attach(4, 1, rig.ring(), 65535),
+            "a block past the last port"
+        );
         assert!(t.hold(1, Proto::Tcp, 8080, 2));
         assert!(t.hold(1, Proto::Tcp, 8080, 2), "a second holder");
         assert!(!t.hold(1, Proto::Tcp, 80, 1));
