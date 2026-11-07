@@ -81,11 +81,13 @@ counters! {
     IsrTicks = "isr_ticks",
     ReopenN = "reopen_n",
     ReopenTicks = "reopen_ticks",
+    Pause = "pause",
     // The maxima: the counters from here on are not differences.
     RingMax = "ring_max",
     IsrMax = "isr_max",
     ReopenMax = "reopen_max",
     CallMax = "call_max",
+    RunMax = "run_max",
 }
 
 /// The counters that are sums; the rest are maxima.
@@ -317,7 +319,8 @@ mod tests {
         assert_eq!(NAMES.len(), COUNTERS);
         assert_eq!(NAMES[SUMS], "ring_max");
         assert_eq!(NAMES[Counter::CallMax as usize], "call_max");
-        assert_eq!(COUNTERS, Counter::CallMax as usize + 1);
+        assert_eq!(COUNTERS, Counter::RunMax as usize + 1);
+        assert_eq!(NAMES[Counter::RunMax as usize], "run_max");
     }
 
     #[test]

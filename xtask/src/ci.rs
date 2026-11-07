@@ -129,7 +129,7 @@ struct Split {
 /// The probes with this start of their name run in the group `net`.
 const NET_PREFIX: &str = "net-";
 /// The probes of the group `net` that do not start with the prefix.
-const NET_NAMED: [&str; 15] = [
+const NET_NAMED: [&str; 16] = [
     "posix-net",
     "fstack-probe",
     "fast-probe",
@@ -144,6 +144,7 @@ const NET_NAMED: [&str; 15] = [
     "fast-switch-kill",
     "fast-switch-idle",
     "fast-switch-steps",
+    "fast-switch-saturate",
     "switch-probe",
 ];
 
@@ -795,6 +796,7 @@ mod tests {
                 "fast-switch-kill",
                 "fast-switch-idle",
                 "fast-switch-steps",
+                "fast-switch-saturate",
                 "switch-probe"
             ]
         );

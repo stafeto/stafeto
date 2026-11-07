@@ -128,6 +128,159 @@ pub const SWITCH_SOFT: u64 = 7_000;
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
+/// The CPU the switch thread leaves to the levels below it, two parts.
+///
+/// The budget (`Period`): the thread spends at most `CONSUMER_BUDGET_NS` of each
+/// `CONSUMER_PERIOD_NS` on the entries of the consumers' TX rings (the time it measures around
+/// each entry, all consumers together); the rest waits for the end of the period. The wire's frames are not under it and stay at the high
+/// level. So the consumers hold 80 % of CPU 0 at most, and in a flood of entries the levels
+/// below the switch keep 20 % (the probe `fast-switch-saturate`). A smaller budget costs
+/// answers: 500 us took 10 % of the 10 KiB load with three workers on VZ, whose consumers need
+/// about 600 us of each millisecond; with the wire's frames (about 30 %) that load fills CPU 0 and
+/// only the backstop is left to the lower levels there. A count of entries would not do: a
+/// refused entry costs about 0.1 us and a frame sent about 1.5 us.
+///
+/// The backstop (`RunClock`): a run of `SWITCH_RUN_NS` without a rest (a wait of
+/// `SWITCH_REST_NS` or more) is followed by a pause of `SWITCH_PAUSE_NS`, so that the lower levels
+/// get a twentieth of the CPU whatever supplies the thread (a pause of 500 us, a fifth, took
+/// 20 % of the answers of the 10 KiB load with three workers, whose CPU 0 has no more to give).
+/// Without both, the device and the consumers keep the thread running for seconds and init's
+/// watchdog kills the service that was kept off the processor, the stack and the entropy service
+/// among them (stafeto-design#653).
+pub const SWITCH_RUN_NS: u64 = 2_000_000;
+pub const SWITCH_PAUSE_NS: u64 = 100_000;
+pub const SWITCH_REST_NS: u64 = 500_000;
+/// One step of the switch at its bound of 18 369 ticks of 41.67 ns, rounded up.
+pub const SWITCH_STEP_BOUND_NS: u64 = 770_000;
+pub const CONSUMER_PERIOD_NS: u64 = 1_000_000;
+pub const CONSUMER_BUDGET_NS: u64 = 800_000;
+
+/// The time spent on the consumers' entries in the present period of `CONSUMER_PERIOD_NS`. The
+/// consumers share it as the steps take their entries, one from each in turn, so a consumer with
+/// many entries cannot shut out the others.
+#[derive(Clone, Copy, Debug)]
+pub struct Period {
+    began: u64,
+    spent: u64,
+}
+
+impl Period {
+    pub const fn new() -> Period {
+        Period { began: 0, spent: 0 }
+    }
+
+    /// A new period begins when the present one has lasted its time. The periods lie on a
+    /// fixed grid (`began` moves by whole periods), so a late step does not stretch a window and
+    /// the consumers cannot take 1.6 ms of time in 1 ms.
+    pub fn refresh(&mut self, now: u64) {
+        let late = now.wrapping_sub(self.began);
+        if late >= CONSUMER_PERIOD_NS {
+            self.began = self
+                .began
+                .wrapping_add(late / CONSUMER_PERIOD_NS * CONSUMER_PERIOD_NS);
+            self.spent = 0;
+        }
+    }
+
+    /// The time left of the present period at `now`.
+    pub fn remaining(&self, now: u64) -> u64 {
+        CONSUMER_PERIOD_NS.saturating_sub(now.wrapping_sub(self.began))
+    }
+
+    /// Whether the consumers have time left in this period.
+    pub fn left(&self) -> bool {
+        self.spent < CONSUMER_BUDGET_NS
+    }
+
+    /// `ns` went on an entry of a consumer.
+    pub fn spend(&mut self, ns: u64) {
+        self.spent = self.spent.saturating_add(ns);
+    }
+}
+
+impl Default for Period {
+    fn default() -> Period {
+        Period::new()
+    }
+}
+
+/// When the switch thread's current run began: a run goes on through the waits that return at
+/// once (a notification was pending) and ends with a wait of `SWITCH_REST_NS` or more, or with
+/// a pause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunClock {
+    since: Option<u64>,
+}
+
+impl RunClock {
+    pub const fn new() -> RunClock {
+        RunClock { since: None }
+    }
+
+    /// The thread came back at `now` from a wait that lasted `waited`.
+    pub fn woke(&mut self, now: u64, waited: u64) {
+        if waited >= SWITCH_REST_NS || self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    /// The time since the run began.
+    pub fn ran(&self, now: u64) -> u64 {
+        self.since.map_or(0, |s| now.wrapping_sub(s))
+    }
+
+    /// Whether the run has lasted its time at `now` and the thread has to pause before the
+    /// next step.
+    pub fn pause_due(&self, now: u64) -> bool {
+        self.ran(now) >= SWITCH_RUN_NS
+    }
+
+    /// The pause ended at `now`: a new run begins.
+    pub fn rested(&mut self, now: u64) {
+        self.since = Some(now);
+    }
+}
+
+/// What the loop of steps of the switch thread needs of the switch (and of a model of it in the
+/// tests): `drive` is the loop the thread runs.
+pub trait Stepper {
+    fn now(&mut self) -> u64;
+    /// One step; true when another follows at once.
+    fn step(&mut self, interrupt: bool) -> bool;
+    /// The pause; true when the wait happened.
+    fn pause(&mut self) -> bool;
+    /// The longest run so far, when a step begins after a longer one.
+    fn longest(&mut self, ran: u64);
+}
+
+/// Steps while they follow one another, with the backstop pause once the run has lasted
+/// `SWITCH_RUN_NS`. `longest` holds the largest run seen, passed to `Stepper::longest` when it
+/// grows. The run is the thread's, so `clock` outlives the call. The run is read when a step
+/// begins, so the longest run it reports misses up to one step (the step that ends the run);
+/// the probe's margin for the host's clock covers that.
+pub fn drive<S: Stepper>(s: &mut S, clock: &mut RunClock, longest: &mut u64, mut interrupt: bool) {
+    loop {
+        let now = s.now();
+        let ran = clock.ran(now);
+        if ran > *longest {
+            *longest = ran;
+            s.longest(ran);
+        }
+        if clock.pause_due(now) {
+            // A pause that did not happen (the timer refused) still starts a new run, so that
+            // the failing call is not repeated at every step.
+            s.pause();
+            let after = s.now();
+            clock.rested(after);
+        }
+        let more = s.step(interrupt);
+        interrupt = false;
+        if !more {
+            break;
+        }
+    }
+}
+
 /// The frames the switch collects before its doorbell rings while the stack
 /// follows with steps (the stack's own queue rang after `BELL_TX`).
 pub const SWITCH_BELL: u32 = 32;
@@ -1050,5 +1203,147 @@ mod tests {
         assert_eq!(left.get(), 2);
         assert_eq!(abandon_portion(&mut one), (2, false));
         assert_eq!(abandon_portion(&mut one), (0, false));
+    }
+
+    /// A model of the switch for `drive`: every step costs `cost` ns of the thread's time and
+    /// is followed by another (the supply never ends); `pause` lets the lower levels run for
+    /// `SWITCH_PAUSE_NS`. `others` collects the longest stretch they were kept off.
+    struct Model {
+        now: u64,
+        cost: u64,
+        ends_at: u64,
+        pauses_work: bool,
+        since_others: u64,
+        worst: u64,
+        pauses: u32,
+        seen: u64,
+    }
+
+    impl Stepper for Model {
+        fn now(&mut self) -> u64 {
+            self.now
+        }
+        fn step(&mut self, _: bool) -> bool {
+            self.now += self.cost;
+            self.since_others += self.cost;
+            self.worst = self.worst.max(self.since_others);
+            self.now < self.ends_at
+        }
+        fn pause(&mut self) -> bool {
+            if !self.pauses_work {
+                return false;
+            }
+            self.now += SWITCH_PAUSE_NS;
+            self.since_others = 0;
+            self.pauses += 1;
+            true
+        }
+        fn longest(&mut self, ran: u64) {
+            self.seen = ran;
+        }
+    }
+
+    fn model(pauses_work: bool, total: u64) -> Model {
+        let mut m = Model {
+            now: 1_000_000,
+            cost: 5_000,
+            ends_at: 1_000_000 + total,
+            pauses_work,
+            since_others: 0,
+            worst: 0,
+            pauses: 0,
+            seen: 0,
+        };
+        let mut clock = RunClock::new();
+        clock.woke(m.now, 1_000);
+        let mut longest = 0;
+        drive(&mut m, &mut clock, &mut longest, true);
+        m
+    }
+
+    #[test]
+    fn a_switch_whose_pause_never_happens_starves_the_levels_below_it() {
+        // The loop of the thread with a pause that fails (a timer that refuses): the lower
+        // levels are kept off for the whole load, which is what init's watchdog kills for.
+        let total = 3_000_000_000;
+        let m = model(false, total);
+        assert!(m.worst >= total, "kept off {} ns", m.worst);
+    }
+
+    #[test]
+    fn the_loop_of_the_thread_leaves_the_lower_levels_a_slot_every_run() {
+        let m = model(true, 3_000_000_000);
+        // One run and one step at most between two slots, a fifth of the time for them.
+        assert!(m.worst <= SWITCH_RUN_NS + 5_000, "kept off {} ns", m.worst);
+        assert!(m.pauses as u64 >= 3_000_000_000 / (SWITCH_RUN_NS + SWITCH_PAUSE_NS) - 1);
+        assert!(
+            m.seen <= SWITCH_RUN_NS + 5_000,
+            "the longest run {}",
+            m.seen
+        );
+    }
+
+    #[test]
+    fn a_refused_pause_starts_a_new_run_and_is_not_repeated_at_every_step() {
+        let m = model(false, 100_000_000);
+        // 100 ms of 5 us steps: one attempt for each run of 2 ms.
+        assert!(
+            m.pauses == 0 && m.seen <= SWITCH_RUN_NS + 5_000,
+            "{}",
+            m.seen
+        );
+    }
+
+    #[test]
+    fn the_budget_of_a_period_stops_the_consumers_and_the_next_period_gives_it_back() {
+        let mut p = Period::new();
+        p.refresh(5_000_000);
+        let mut entries = 0;
+        while p.left() {
+            p.spend(1_000);
+            entries += 1;
+        }
+        assert_eq!(entries, CONSUMER_BUDGET_NS / 1_000);
+        assert!(!p.left(), "the budget is spent");
+        assert_eq!(
+            p.remaining(5_000_000 + 400_000),
+            CONSUMER_PERIOD_NS - 400_000
+        );
+        p.refresh(5_000_000 + CONSUMER_PERIOD_NS - 1);
+        assert!(!p.left(), "the period has not ended");
+        p.refresh(5_000_000 + CONSUMER_PERIOD_NS);
+        assert!(p.left());
+        // A late step does not move the grid: a step at 7.9 ms of the third period after the
+        // first finds a period that began on the grid, 100 us from its end.
+        p.spend(CONSUMER_BUDGET_NS);
+        p.refresh(5_000_000 + 2 * CONSUMER_PERIOD_NS + 900_000);
+        assert!(p.left(), "a new period");
+        assert_eq!(
+            p.remaining(5_000_000 + 2 * CONSUMER_PERIOD_NS + 900_000),
+            100_000
+        );
+        // The consumers together hold 80 % of the CPU at most.
+        const { assert!(CONSUMER_BUDGET_NS * 10 <= CONSUMER_PERIOD_NS * 8) };
+    }
+
+    #[test]
+    fn a_run_goes_on_through_waits_that_return_at_once_and_ends_with_a_rest() {
+        let mut clock = RunClock::new();
+        clock.woke(100, 0);
+        assert!(!clock.pause_due(100 + SWITCH_RUN_NS - 1));
+        // A wait that returned at once (a notification was pending) is no rest.
+        clock.woke(100 + SWITCH_RUN_NS - 1, SWITCH_REST_NS - 1);
+        assert!(clock.pause_due(100 + SWITCH_RUN_NS));
+        // A wait of `SWITCH_REST_NS` is one: the run begins anew.
+        clock.woke(100 + SWITCH_RUN_NS, SWITCH_REST_NS);
+        assert!(!clock.pause_due(100 + SWITCH_RUN_NS + 1));
+        assert_eq!(clock.ran(100 + SWITCH_RUN_NS + 7), 7);
+        clock.rested(1_000);
+        assert_eq!(clock.ran(1_500), 500);
+    }
+
+    #[test]
+    fn the_pause_leaves_the_lower_levels_a_fifth_of_the_time() {
+        const { assert!(SWITCH_PAUSE_NS * 5 <= SWITCH_RUN_NS + SWITCH_PAUSE_NS) };
     }
 }

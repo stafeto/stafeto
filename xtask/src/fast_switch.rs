@@ -23,6 +23,11 @@
 //! * `switch steps`: the start and the first pages under -icount with the
 //!   service counting its steps: every step, those of the switch among them
 //!   (kinds 67 to 70), is under 0.9 of term B.
+//! * `switch saturate`: three programs keep their rings full of entries the switch refuses, on
+//!   four CPUs, while the probe asks `posix-net stat` four times; the switch (a level above the
+//!   stack and the services on its CPU) budgets the consumers' time and pauses in its runs, so
+//!   the stack answers within seconds and init's watchdog kills nothing (without them init kills
+//!   the network service as silent).
 //! * `switch-probe`: the C program over the ring sends the frames the switch
 //!   refuses; each is counted by its reason, none reaches the wire (the
 //!   capture of the device), a broken ring disables its consumer alone.
@@ -43,6 +48,29 @@ const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
+/// How long `saturate` floods the ring.
+const SATURATE_SECS: u64 = 300;
+/// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
+/// times the answer of the quiet stack, but not under `SATURATE_FLOOR` (a slow host spends seconds
+/// starting `posix-net` beside three programs at full speed, 6 s on the CI machine; a stack the
+/// switch keeps off the processor is killed by init).
+const SATURATE_SAMPLES: usize = 3;
+/// The flood must last this long before the probe judges init's silence, and the samples lie
+/// this far apart.
+const SATURATE_LONG: Duration = Duration::from_secs(20);
+const SATURATE_APART: Duration = Duration::from_secs(2);
+/// The seconds the loop on CPU 0 counts for. Its share is logged only. Local TCG runs, two each:
+/// 12 and 13 % with neither budget nor pause, 19 and 20 % with the pause alone, 20 and 26 % with
+/// the budget too (the budget does not bind in this flood), so TCG does not tell the pause from
+/// the budget.
+const SPIN_SECS: u64 = 3;
+/// The longest run the probe accepts: a run of 2 000 us, a step of 770 us and 40 000 us of the
+/// host's clock. A number of its own, so that a build that moves the run does not move the limit.
+const SATURATE_RUN_LIMIT_US: u64 = 42_800;
+const SATURATE_BOUND: u32 = 40;
+const SATURATE_FLOOR: Duration = Duration::from_secs(12);
+/// How many programs flood a ring at once.
+const SATURATE_CONSUMERS: usize = 3;
 const READ_WITHIN: Duration = Duration::from_secs(60);
 /// The share each worker's frames take at least, of those of all.
 const SHARE_MIN: f64 = 0.10;
@@ -105,7 +133,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
         [a] if a == "attach" => probe(Scenario::Attach),
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
-        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames]".to_owned()),
+        [a] if a == "saturate" => probe(Scenario::Saturate),
+        _ => Err(
+            "usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames|saturate]"
+                .to_owned(),
+        ),
     }
 }
 
@@ -119,6 +151,8 @@ pub enum Scenario {
     Steps,
     /// `switch-probe`.
     Frames,
+    /// `saturate`: a consumer floods its TX ring; the stack and init's watchdog are checked.
+    Saturate,
 }
 
 /// A counter of a line of the service after `key`.
@@ -273,6 +307,10 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
     if scenario == Scenario::Steps {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
+    // The flood needs CPUs besides the switch's for the programs that make it.
+    if scenario == Scenario::Saturate {
+        cmd.args(["-smp", "4"]);
+    }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let began = Instant::now();
     let nginx: SocketAddr = ([127, 0, 0, 1], ports.0).into();
@@ -285,6 +323,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Attach => attach(&mut run, nginx, &mut notes),
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
+        Scenario::Saturate => saturate(&mut run, &mut notes),
     };
     let output = run.stop();
     crate::symbolize::backtrace(&output.lines, &kernel.elf);
@@ -1081,6 +1120,112 @@ fn frames(
         records.len()
     ));
     Ok(())
+}
+
+/// `saturate`: three consumers keep their TX rings full of entries the switch refuses, so that
+/// every step of the switch finds more to do. The switch is a level above the stack, the services
+/// and the programs on its CPU; it budgets the consumers' time and pauses after a run of
+/// `SWITCH_RUN_NS`, so that they run.
+///
+/// Checked: the longest run of the switch without a rest (`run_max_us`) stays within a run, a
+/// step and the host's jitter (the main check: without the budget and the pause it lasts as long
+/// as the flood); `pause_failed` is 0; the switch paused or spent a budget; at least
+/// `SATURATE_SAMPLES` answers of `posix-net stat` spread over a flood of `SATURATE_LONG`, each
+/// within `max(SATURATE_FLOOR, SATURATE_BOUND` times the quiet answer`)`; and, once the flood has
+/// lasted `SATURATE_LONG`, init has not called the network service silent. The share of CPU 0 a
+/// loop below the switch keeps is only logged (stafeto-design#655): TCG does not tell the pause
+/// from the budget.
+fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    let quiet = Instant::now();
+    stat(run, "quiet")?;
+    let bound = SATURATE_FLOOR.max(quiet.elapsed() * SATURATE_BOUND);
+    let base = spin_rate(run, "quiet")?;
+    for _ in 0..SATURATE_CONSUMERS {
+        run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
+        run.expect("# ", DIALOG_STEP)?;
+    }
+    let began = Instant::now();
+    let mut took = Vec::new();
+    // The programs attach one after another; the stack answers while they do.
+    while took.len() < SATURATE_SAMPLES || began.elapsed() < SATURATE_LONG {
+        let asked = Instant::now();
+        let s = stat(run, "flood")?;
+        let t = asked.elapsed();
+        if t > bound {
+            return Err(format!(
+                "sample {}: the stack answered `posix-net stat` after {t:?} of a flood (bound {bound:?}): the switch kept it off the processor",
+                took.len() + 1
+            ));
+        }
+        if s.consumers == SATURATE_CONSUMERS as u64 {
+            took.push(t);
+            // The samples lie apart, so that they spread over the flood.
+            std::thread::sleep(SATURATE_APART);
+        } else if began.elapsed() > bound * 2 {
+            return Err(format!(
+                "{} consumers, wanted {SATURATE_CONSUMERS}: {}",
+                s.consumers, s.line
+            ));
+        }
+    }
+    let flooded = spin_rate(run, "flood")?;
+    let share = flooded * 100 / base.max(1);
+    // The flood lasted long enough: init must have said nothing of the network service.
+    if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
+        return Err(format!("init: {l}"));
+    }
+    // The programs flood for a long time; they are ended by the probe, which has its numbers.
+    run.send("kill %1 %2 %3")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let after = stat(run, "after")?;
+    let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
+    let failed = counter(&after.line, "pause_failed").ok_or("no `pause_failed`")?;
+    let longest = counter(&after.line, "run_max_us").ok_or("no `run_max_us`")?;
+    let waits = counter(&after.line, "budget_waits").ok_or("no `budget_waits`")?;
+    println!(
+        "fast-switch: the loop below the switch: {base} per 100 ms quiet, {flooded} in the flood, {share} % (logged, no limit)"
+    );
+    // A run and a step is the bound of the thread (the model test of `drive` holds it to that);
+    // the run is read when a step begins, so it misses up to one step, and the clock is the
+    // host's wall clock, which a loaded TCG host stops for several milliseconds (9.4 ms seen):
+    // the margin of `SATURATE_RUN_LIMIT_US` covers both.
+    let limit = SATURATE_RUN_LIMIT_US;
+    if longest > limit {
+        return Err(format!(
+            "the longest run of the switch without a rest was {longest} us, over {limit} us: {}",
+            after.line
+        ));
+    }
+    if failed != 0 {
+        return Err(format!("{failed} pauses did not happen: {}", after.line));
+    }
+    if pauses + waits == 0 {
+        return Err(format!(
+            "the switch neither paused nor spent a budget in the flood: {}",
+            after.line
+        ));
+    }
+    notes.push(format!(
+        "the longest run {longest} us (limit {limit} us); {pauses} pauses, {waits} steps with the budget spent; {} answers of the stack in {:.0} s of flood: {took:?} (bound {bound:?}); the loop below the switch kept {share} % (logged)",
+        took.len(),
+        began.elapsed().as_secs_f64()
+    ));
+    Ok(())
+}
+
+/// The iterations per 100 ms of `switch-probe spin` on CPU 0.
+fn spin_rate(run: &mut qemu::Run, what: &str) -> Result<u64, String> {
+    run.send(&format!("switch-probe spin {SPIN_SECS}"))?;
+    let line = run.expect_line(
+        what,
+        |l| l.contains("switch-probe: spin rate "),
+        Duration::from_secs(120),
+    )?;
+    line.split("spin rate ")
+        .nth(1)
+        .and_then(|r| r.trim().parse().ok())
+        .ok_or_else(|| format!("{what}: no rate in {line:?}"))
 }
 
 #[cfg(test)]
