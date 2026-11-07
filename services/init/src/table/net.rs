@@ -386,6 +386,28 @@ pub const NETD_TWO: Record = Record {
     ..NETD
 };
 
+/// The pages the quota of the service grows by when it has a switch (`switch N` in
+/// `netd.conf`): the table of flows (`flows 16384`: 32 768 places of 20 bytes, 160 pages),
+/// the translation tables of up to eight rings of consumers of 1 288 pages each, and a
+/// reserve. The image of scale (`flows 131072`: 262 144 places, 1 280 pages) takes the second.
+pub const SWITCH_QUOTA_PAGES: u64 = 256;
+pub const SWITCH_SCALE_QUOTA_PAGES: u64 = 1536;
+
+const fn switch_quota(base: Record, pages: u64) -> Record {
+    Record {
+        quota: base.quota + pages * PAGE,
+        ..base
+    }
+}
+
+/// The service with one device on QEMU and a switch (the images of `nginx-fast` on the
+/// switch); the ring of a consumer is the consumer's own memory.
+pub const NETD_SWITCH: Record = switch_quota(NETD, SWITCH_QUOTA_PAGES);
+pub const NETD_SWITCH_SCALE: Record = switch_quota(NETD, SWITCH_SCALE_QUOTA_PAGES);
+/// The same on VZ.
+pub const NETD_VZ_SWITCH: Record = switch_quota(NETD_VZ, SWITCH_QUOTA_PAGES);
+pub const NETD_VZ_SWITCH_SCALE: Record = switch_quota(NETD_VZ, SWITCH_SCALE_QUOTA_PAGES);
+
 /// The roles of the probe (tests/net-probe): `c` the interface's address and
 /// 300 pings of the gateway, `b` the registry of ports and the sessions, `sN`
 /// N places of the table at once (the digits are N) and 50 pings, `e` the

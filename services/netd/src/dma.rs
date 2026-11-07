@@ -51,6 +51,29 @@ const _: () = assert!(
         && RING_AT + proto_net::fast::RING_PAGES as usize * PAGE <= BUFFERS_AT
 );
 
+/// Where the service maps the ring objects of the switch's consumers (`proto_net::switch`):
+/// consumer `c` at `CONSUMERS_AT + c * CONSUMER_SPAN`, above the shared buffers, and the
+/// table of flows after the last.
+pub const CONSUMERS_AT: usize = 0x12_0000_0000;
+pub const CONSUMER_SPAN: usize = 64 << 20;
+
+pub const fn consumer_at(c: usize) -> usize {
+    CONSUMERS_AT + c * CONSUMER_SPAN
+}
+
+/// Where the table of flows of the switch is mapped.
+pub const FLOWS_AT: usize = 0x13_0000_0000;
+
+const _: () = assert!(
+    proto_net::switch::Layout::DEFAULT.total() <= CONSUMER_SPAN
+        && proto_net::switch::Layout {
+            rx_slots: proto_net::switch::RX_SLOTS.1,
+            tx_slots: proto_net::switch::TX_SLOTS.1
+        }
+        .total()
+            <= CONSUMER_SPAN
+);
+
 /// Where the service maps the shared buffers of the sessions (BUFFER): entry
 /// `i` of `netd::buffers` at `BUFFERS_AT + i * BUFFER_SPAN`, above the
 /// windows and the objects of the devices.
@@ -62,6 +85,8 @@ pub const fn buffer_at(i: usize) -> usize {
 }
 
 const _: () = assert!(bar_at() + 0x1000_0000 <= BUFFERS_AT);
+const _: () = assert!(BUFFERS_AT + 64 * BUFFER_SPAN <= CONSUMERS_AT);
+const _: () = assert!(CONSUMERS_AT + 8 * CONSUMER_SPAN <= FLOWS_AT);
 const _: () = assert!(BUFFER_SPAN == 0x4_0000);
 
 /// Tells device `d` the physical addresses of its two objects, before the

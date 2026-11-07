@@ -28,7 +28,7 @@ pub const FRAME_MAX: usize = 1514;
 pub const RX_CELLS: u32 = 2048;
 pub const TX_CELLS: u32 = 512;
 pub const RX_SLOTS: (u32, u32) = (256, 8192);
-pub const TX_SLOTS: (u32, u32) = (64, 2048);
+pub const TX_SLOTS: (u32, u32) = (64, TX_CELLS);
 /// The most ports one PORT_HOLD names.
 pub const HOLD_MAX: u32 = 16;
 pub const REUSEPORT: u32 = 1;
@@ -116,9 +116,9 @@ impl Layout {
     pub const fn tx_cells(&self) -> usize {
         self.rx_cells() + RX_CELLS as usize * CELL
     }
-    /// The cell of TX entry `i`: `i % tx_slots`, folded into the cells there are.
+    /// The cell of TX entry `i`: `i % tx_slots` (`tx_slots` is at most `TX_CELLS`).
     pub const fn tx_cell(&self, i: u32) -> usize {
-        self.tx_cells() + ((i % self.tx_slots) % TX_CELLS) as usize * CELL
+        self.tx_cells() + (i % self.tx_slots) as usize * CELL
     }
     pub const fn total(&self) -> usize {
         self.tx_cells() + TX_CELLS as usize * CELL
@@ -336,20 +336,20 @@ mod tests {
         assert_eq!(l.fill_entry(u32::MAX), PAGE + 2047 * 4);
         assert_eq!(l.tx_cell(513), l.tx_cells() + CELL);
         assert_eq!(l.rx_cell(RX_CELLS - 1) + CELL, l.tx_cells());
-        let big = Layout::new(8192, 2048).unwrap();
+        let big = Layout::new(8192, 512).unwrap();
         assert_eq!(big.rx_cells() % PAGE, 0);
         assert!(big.tx_cell(u32::MAX) + CELL <= big.total());
     }
 
     #[test]
     fn sizes_are_powers_of_two_in_their_bounds() {
-        assert!(Layout::new(256, 64).is_some() && Layout::new(8192, 2048).is_some());
+        assert!(Layout::new(256, 64).is_some() && Layout::new(8192, 512).is_some());
         for (rx, tx) in [
             (128, 64),
             (16384, 64),
             (300, 64),
             (256, 32),
-            (256, 4096),
+            (256, 1024),
             (256, 100),
         ] {
             assert_eq!(Layout::new(rx, tx), None, "{rx} {tx}");

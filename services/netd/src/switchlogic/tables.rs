@@ -42,6 +42,8 @@ pub const EMBRYO_AGE: u32 = 30;
 pub const CLOSING_AGE: u32 = 10;
 pub const IDLE_AGE: u32 = 7500;
 pub const SWEEP_STEP: usize = 256;
+/// The flows one sweep step removes at most.
+pub const SWEEP_REMOVALS: usize = 32;
 const EMPTY: u8 = 0xff;
 
 /// What a flow is found by: the peer's address and port and our port (our
@@ -115,6 +117,7 @@ pub struct Flows<'a> {
 
 impl<'a> Flows<'a> {
     pub fn new(slots: &'a mut [Flow], secret: &[u8; 16]) -> Flows<'a> {
+        assert!(slots.len() >= 2, "a flow table has room for two flows");
         slots.fill(Flow::EMPTY);
         let k = |r: &[u8]| u64::from_le_bytes(r.try_into().expect("8 bytes"));
         Flows {
@@ -320,7 +323,12 @@ impl<'a> Flows<'a> {
     /// removes flows of dead consumers (the generation is not the live
     /// one), closing ones older than `CLOSING_AGE`, unconfirmed ones older
     /// than `EMBRYO_AGE` and idle ones.
+    ///
+    /// At most `SWEEP_REMOVALS` flows go in one call; each removal shifts the chain behind it
+    /// (at the half fill of the table about a dozen places, 24 at the most before a
+    /// lookup gives up), so the work of a call is bounded, and the walk goes on in the next.
     pub fn sweep(&mut self, now: u32, books: &mut Books) {
+        let mut removed = 0;
         for _ in 0..SWEEP_STEP {
             let f = self.slots[self.cursor];
             if !f.is_empty() {
@@ -334,6 +342,10 @@ impl<'a> Flows<'a> {
                     self.expired += u32::from(embryo);
                     books.gone(&f);
                     self.remove_at(self.cursor);
+                    removed += 1;
+                    if removed >= SWEEP_REMOVALS {
+                        return;
+                    }
                     continue;
                 }
             }
@@ -422,6 +434,8 @@ pub struct Consumer {
     pub generation: u32,
     pub block: u16,
     pub flows: u32,
+    /// The raw handle of the consumer's channel the switch wakes it with.
+    pub wake: u64,
     arp_second: u32,
     arp_count: u32,
 }
@@ -446,7 +460,7 @@ pub struct Group {
     pub proto: Proto,
     pub first: u16,
     pub count: u8,
-    pub holders: u16,
+    pub holders: u32,
     /// Every holder let go but flows of the port are still there: no new SYN comes in, the
     /// flows go on, and the group is freed when the last one is gone.
     pub draining: bool,
@@ -494,6 +508,8 @@ pub struct Tables<'a> {
     pub freed: u32,
     /// The last round of the sweep the stack was told (`commands::poll`).
     pub swept_told: u32,
+    /// Answers for the stack whose ring was full (`commands::send`).
+    pub owed: [Option<super::commands::Back>; 16],
     pub guard: Guard,
 }
 
@@ -512,6 +528,7 @@ impl<'a> Tables<'a> {
             refused: [0; Reason::COUNT],
             freed: 0,
             swept_told: 0,
+            owed: [None; 16],
             guard: Guard { tag, owner: None },
         }
     }
@@ -523,6 +540,12 @@ impl<'a> Tables<'a> {
 
     fn at(proto: Proto, port: u16) -> usize {
         usize::from(proto == Proto::Udp) * 65536 + usize::from(port)
+    }
+
+    /// The start of the port table (TCP then UDP, 65 536 bytes each), for the stack thread's
+    /// single-byte reads.
+    pub fn ports_ptr(&self) -> *const u8 {
+        self.ports.as_ptr()
     }
 
     pub fn port(&self, proto: Proto, port: u16) -> u8 {
@@ -560,6 +583,7 @@ impl<'a> Tables<'a> {
             generation,
             block,
             flows: 0,
+            wake: 0,
             arp_second: 0,
             arp_count: 0,
         });
@@ -682,6 +706,25 @@ impl<'a> Tables<'a> {
     }
 
     /// The one read of every ring's indices for this step; `broke` hears the rings that broke.
+    /// The address of device 0 changed: on a new lease the flows of every consumer end (their
+    /// generations move on, the sweep removes the entries), and the address is the new one.
+    pub fn set_address(&mut self, ip: [u8; 4], prefix: u8) {
+        self.guard.check();
+        assert!(prefix <= 32);
+        if self.own.ip != [0; 4] && self.own.ip != ip {
+            for (c, slot) in self.consumers.iter_mut().enumerate() {
+                let Some(x) = slot else { continue };
+                x.generation = x.generation.checked_add(1).unwrap_or(1);
+                for g in self.groups.iter_mut().flatten() {
+                    for m in g.members.iter_mut().flatten().filter(|m| m.0 == c as u8) {
+                        m.1 = x.generation;
+                    }
+                }
+            }
+        }
+        (self.own.ip, self.own.prefix) = (ip, prefix);
+    }
+
     pub fn poll_rings(&mut self, mut broke: impl FnMut(u8, Violation)) {
         self.guard.check();
         for (c, slot) in self.consumers.iter_mut().enumerate() {
@@ -759,6 +802,43 @@ enum Number {
     Until(u32),
 }
 
+/// The registry of ports the blocks are held in: one map, or the pair of maps (TCP and UDP)
+/// the service keeps.
+pub trait Registry {
+    fn held(&self, port: u16) -> bool;
+    fn hold(&mut self, port: u16);
+    fn release(&mut self, port: u16);
+}
+
+impl Registry for PortMap {
+    fn held(&self, port: u16) -> bool {
+        PortMap::held(self, port)
+    }
+    fn hold(&mut self, port: u16) {
+        PortMap::hold(self, port)
+    }
+    fn release(&mut self, port: u16) {
+        PortMap::release(self, port)
+    }
+}
+
+/// A block of ports is the same ports on TCP and on UDP.
+pub struct Both<'a>(pub &'a mut PortMap, pub &'a mut PortMap);
+
+impl Registry for Both<'_> {
+    fn held(&self, port: u16) -> bool {
+        self.0.held(port) || self.1.held(port)
+    }
+    fn hold(&mut self, port: u16) {
+        self.0.hold(port);
+        self.1.hold(port);
+    }
+    fn release(&mut self, port: u16) {
+        self.0.release(port);
+        self.1.release(port);
+    }
+}
+
 /// The stack side's books of the consumer numbers, their generations and
 /// the 512-port blocks of the ephemeral range: a block is held in the
 /// port registry while it is in use and for `QUARANTINE` seconds after.
@@ -784,6 +864,16 @@ impl Blocks {
         }
     }
 
+    /// Consumer numbers in use (a consumer that left and whose answer is awaited is not).
+    pub fn in_use(&self) -> usize {
+        self.owner.iter().flatten().count()
+    }
+
+    /// The number of the round of the sweep the stack last heard of.
+    pub fn swept_round(&self) -> u32 {
+        self.swept
+    }
+
     fn first(b: usize) -> u16 {
         EPHEMERAL_FIRST + (b as u16) * BLOCK_PORTS
     }
@@ -794,7 +884,7 @@ impl Blocks {
     }
 
     /// Frees the blocks whose rest is over.
-    pub fn expire(&mut self, map: &mut PortMap, now: u32) {
+    pub fn expire(&mut self, map: &mut impl Registry, now: u32) {
         for (b, s) in self.state.iter_mut().enumerate() {
             if matches!(*s, Block::Rest(until) if now.wrapping_sub(until) < u32::MAX / 2) {
                 Self::ports(b).for_each(|p| map.release(p));
@@ -813,7 +903,7 @@ impl Blocks {
     }
 
     /// A consumer number, its new generation (never 0) and the first port of its block.
-    pub fn alloc(&mut self, map: &mut PortMap, now: u32) -> Option<(u8, u32, u16)> {
+    pub fn alloc(&mut self, map: &mut impl Registry, now: u32) -> Option<(u8, u32, u16)> {
         self.expire(map, now);
         let c = (0..MAX_CONSUMERS).find(|&c| self.usable(c))?;
         let b = (0..BLOCKS)
@@ -965,6 +1055,7 @@ pub(crate) mod tests {
             generation,
             block: 49152,
             flows: 3,
+            wake: 0,
             arp_second: 0,
             arp_count: 0,
         });
@@ -1149,5 +1240,73 @@ pub(crate) mod tests {
             cfg!(debug_assertions),
             "a write from another thread panics in a debug build"
         );
+    }
+
+    #[test]
+    fn one_sweep_step_removes_at_most_its_cap() {
+        with_flows(512, |t, _| {
+            // Unconfirmed flows made at time 0 are all expired at time 100.
+            t.now = 0;
+            let mut made = 0;
+            for n in 0..128 {
+                made += usize::from(t.insert_embryo(&key(n), 0, 1, 1));
+            }
+            assert!(made > SWEEP_REMOVALS, "{made} flows");
+            t.now = 100;
+            let mut most = 0;
+            for _ in 0..64 {
+                let before = t.flows.len();
+                t.sweep();
+                most = most.max(before - t.flows.len());
+            }
+            assert!(most > 0 && most <= SWEEP_REMOVALS, "{most} at most");
+            assert_eq!(t.flows.len(), 0);
+        });
+    }
+
+    #[test]
+    fn a_new_address_ends_the_flows_of_every_consumer_and_a_first_one_does_not() {
+        with_flows(256, |t, _| {
+            let c = {
+                let k = key(1);
+                assert!(t.flows.insert(&k, 0, 1, 0).is_some());
+                0
+            };
+            assert!(t.live(c, 1));
+            t.set_address([10, 0, 2, 15], 24);
+            assert!(t.live(c, 1), "the same address changes nothing");
+            t.set_address([10, 0, 3, 7], 24);
+            assert!(!t.live(c, 1), "the old generation is dead");
+            assert!(t.live(c, 2));
+            assert!(
+                t.group(1)
+                    .unwrap()
+                    .members
+                    .iter()
+                    .flatten()
+                    .all(|m| m.1 == 2 || m.0 == 2)
+            );
+            let mut empty = Own { ip: [0; 4], ..OWN };
+            empty.prefix = 0;
+            t.own = empty;
+            t.set_address([10, 0, 3, 8], 24);
+            assert!(t.live(c, 2), "from no address nothing ends");
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_prefix_above_32_is_refused_by_the_tables() {
+        with_flows(256, |t, _| t.set_address([10, 0, 0, 1], 33));
+    }
+
+    #[test]
+    fn holders_are_counted_in_32_bits() {
+        with_flows(256, |t, _| {
+            for _ in 0..70_000 {
+                assert!(t.hold(1, Proto::Tcp, 8080, 1));
+            }
+            assert_eq!(t.group(1).unwrap().holders, 70_001);
+        });
     }
 }

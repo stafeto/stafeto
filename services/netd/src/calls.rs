@@ -563,7 +563,7 @@ impl Net {
         if linger > proto_net::sockets::CLOSE_MAY_WAIT {
             return refuse(proto_net::INVALID);
         }
-        let Some(place) = self.find(&s.data.held, description) else {
+        let Some(place) = self.find_any(&s.data.held, description) else {
             return refuse(proto_net::BAD_FD);
         };
         let waits = linger != 0 && self.close_may_linger(place);
@@ -643,7 +643,7 @@ impl Net {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        let Some(place) = self.find(&s.data.held, d) else {
+        let Some(place) = self.find_any(&s.data.held, d) else {
             return refuse(proto_net::BAD_FD);
         };
         let Ok(label) = self.passes.make(place, s.label()) else {

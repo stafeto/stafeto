@@ -7,7 +7,7 @@
 //! answers what the stack must know. One writer and one reader on each.
 
 use super::ring::{ConsumerRing, Mem, Violation};
-use super::tables::{MAX_GROUPS, Tables};
+use super::tables::{MAX_CONSUMERS, MAX_GROUPS, Tables};
 use crate::ports::Proto;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -55,6 +55,16 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         true
     }
 
+    pub fn len(&self) -> usize {
+        self.tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.head.load(Ordering::Acquire)) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
         if head == self.tail.load(Ordering::Acquire) {
@@ -90,6 +100,9 @@ pub enum Command {
         rx_slots: u16,
         tx_slots: u16,
         block: u16,
+        /// The raw handle of the consumer's channel (NOTIFY) in the stack's handle table; the
+        /// stack keeps it open until it hears `Back::Detached`.
+        wake: u64,
     },
     Detach {
         consumer: u8,
@@ -131,6 +144,11 @@ pub enum Back {
         generation: u32,
         round: u32,
     },
+    /// An ATTACH the switch could not carry out (bad ring memory, number in use): the stack
+    /// unmaps the object and gives the number back at once, since no flow was ever made.
+    Refused { consumer: u8, generation: u32 },
+    /// A HOLD or JOIN the tables refused (the stack's books and the tables disagree).
+    Failed { group: u8 },
     /// The sweep finished a pass over the flow table; sent when the round counter moved
     /// (it may skip numbers when the ring was full). The stack hands it to `Blocks::swept`.
     Swept { round: u32 },
@@ -142,6 +160,17 @@ pub enum Back {
     /// worker that closed its listening socket still serves its connections), and a new
     /// `bind` of the port before then would get their segments.
     Freed { group: u8 },
+}
+
+/// Answers to the stack: pushed, or kept in `Tables::owed` until the ring has room.
+fn send(t: &mut Tables, back: &Queue<Back, RING>, b: Back) {
+    if !back.push(b) {
+        match t.owed.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => *slot = Some(b),
+            // `drain` applies nothing while an answer is owed, and a ring breaks once.
+            None => debug_assert!(false, "more answers owed than there are places"),
+        }
+    }
 }
 
 pub struct Commands {
@@ -165,10 +194,13 @@ impl Default for Commands {
 }
 
 /// Applies at most `PER_STEP` commands; returns how many.
+///
+/// While an answer to the stack is owed (its ring was full) nothing is applied, so the
+/// owed answers stay few.
 pub fn drain(t: &mut Tables, q: &Commands) -> usize {
     t.guard.check();
     let mut n = 0;
-    while n < PER_STEP {
+    while n < PER_STEP && t.owed.iter().all(Option::is_none) {
         let Some(cmd) = q.to_switch.pop() else { break };
         apply(t, cmd, &q.to_stack);
         n += 1;
@@ -185,26 +217,37 @@ fn apply(t: &mut Tables, cmd: Command, back: &Queue<Back, RING>) {
             rx_slots,
             tx_slots,
             block,
+            wake,
         } => {
-            let ring = Layout::new(u32::from(rx_slots), u32::from(tx_slots)).map(|l| {
+            let ring = Layout::new(u32::from(rx_slots), u32::from(tx_slots)).and_then(|l| {
                 // SAFETY: the stack mapped the object at `base` for the whole layout, page aligned.
                 ConsumerRing::new(unsafe { Mem::new(base as *mut u8, l.total()) }, l)
             });
             if !ring.is_some_and(|r| t.attach(consumer, generation, r, block)) {
-                back.push(Back::Detached {
-                    consumer,
-                    generation,
-                    round: t.flows.rounds(),
-                });
+                send(
+                    t,
+                    back,
+                    Back::Refused {
+                        consumer,
+                        generation,
+                    },
+                );
+            } else if let Some(Some(c)) = t.consumers.get_mut(usize::from(consumer)) {
+                c.wake = wake;
             }
         }
         Command::Detach { consumer } => {
             if let Some(generation) = t.detach(consumer) {
-                back.push(Back::Detached {
-                    consumer,
-                    generation,
-                    round: t.flows.rounds(),
-                });
+                let round = t.flows.rounds();
+                send(
+                    t,
+                    back,
+                    Back::Detached {
+                        consumer,
+                        generation,
+                        round,
+                    },
+                );
             }
         }
         Command::Hold {
@@ -213,25 +256,45 @@ fn apply(t: &mut Tables, cmd: Command, back: &Queue<Back, RING>) {
             first,
             count,
         } => {
-            t.hold(group, proto, first, count);
+            if !t.hold(group, proto, first, count) {
+                send(t, back, Back::Failed { group });
+            }
         }
         Command::Release { group } => t.release(group),
         Command::Join { group, consumer } => {
-            t.join(group, consumer);
+            if !t.join(group, consumer) {
+                send(t, back, Back::Failed { group });
+            }
         }
         Command::Leave { group, consumer } => t.leave(group, consumer),
-        Command::Address { ip, prefix } => (t.own.ip, t.own.prefix) = (ip, prefix),
+        Command::Address { ip, prefix } => t.set_address(ip, prefix),
     }
 }
 
 /// Reads every ring's indices once and tells the stack of the rings that broke.
 pub fn poll(t: &mut Tables, q: &Commands) {
-    t.poll_rings(|consumer, violation| {
-        q.to_stack.push(Back::Broken {
-            consumer,
-            violation,
-        });
-    });
+    // Answers the stack's ring had no room for go first.
+    for slot in t.owed.iter_mut() {
+        if let Some(b) = *slot
+            && q.to_stack.push(b)
+        {
+            *slot = None;
+        }
+    }
+    let mut broke = [None; MAX_CONSUMERS];
+    t.poll_rings(|consumer, violation| broke[usize::from(consumer)] = Some(violation));
+    for (consumer, v) in broke.iter().enumerate() {
+        if let Some(violation) = *v {
+            send(
+                t,
+                &q.to_stack,
+                Back::Broken {
+                    consumer: consumer as u8,
+                    violation,
+                },
+            );
+        }
+    }
     let round = t.flows.rounds();
     if round != t.swept_told && q.to_stack.push(Back::Swept { round }) {
         t.swept_told = round;
@@ -333,6 +396,7 @@ mod tests {
                 rx_slots,
                 tx_slots: 512,
                 block,
+                wake: 0,
             };
             q.to_switch.push(attach(5, 52224, 2048));
             q.to_switch.push(attach(5, 52224, 2048));
@@ -344,15 +408,13 @@ mod tests {
             assert_eq!(
                 back,
                 [
-                    Back::Detached {
+                    Back::Refused {
                         consumer: 5,
-                        generation: 9,
-                        round: 0
+                        generation: 9
                     },
-                    Back::Detached {
+                    Back::Refused {
                         consumer: 6,
-                        generation: 9,
-                        round: 0
+                        generation: 9
                     },
                     Back::Detached {
                         consumer: 5,
@@ -439,6 +501,68 @@ mod tests {
             );
             assert_eq!(q.to_stack.pop(), None);
             assert!(!t.live(1, 1) && t.live(0, 1));
+        });
+    }
+
+    #[test]
+    fn answers_the_ring_could_not_take_are_kept_and_sent_later_and_nothing_applies_meanwhile() {
+        with(|t, _| {
+            let q = Commands::new();
+            // The stack's ring is full of answers.
+            for _ in 0..RING {
+                assert!(q.to_stack.push(Back::Swept { round: 0 }));
+            }
+            let rig = Rig::new(Layout::DEFAULT);
+            q.to_switch.push(Command::Attach {
+                consumer: 1,
+                generation: 4,
+                base: rig.buf.as_ptr() as usize,
+                rx_slots: 100,
+                tx_slots: 512,
+                block: 0,
+                wake: 0,
+            });
+            q.to_switch.push(Command::Hold {
+                group: 9,
+                proto: Proto::Tcp,
+                first: 99,
+                count: 1,
+            });
+            assert_eq!(drain(t, &q), 1);
+            assert!(t.owed.iter().any(Option::is_some), "the refusal is owed");
+            assert_eq!(drain(t, &q), 0, "nothing applies while an answer is owed");
+            while q.to_stack.pop().is_some() {}
+            poll(t, &q);
+            assert_eq!(
+                q.to_stack.pop(),
+                Some(Back::Refused {
+                    consumer: 1,
+                    generation: 4
+                })
+            );
+            assert_eq!(drain(t, &q), 1, "the hold goes now");
+            assert!(t.group(9).is_some());
+        });
+    }
+
+    #[test]
+    fn a_hold_on_a_taken_port_and_a_join_of_nobody_are_told_to_the_stack() {
+        with(|t, _| {
+            let q = Commands::new();
+            // 8080 is group 1's already.
+            q.to_switch.push(Command::Hold {
+                group: 9,
+                proto: Proto::Tcp,
+                first: 8080,
+                count: 1,
+            });
+            q.to_switch.push(Command::Join {
+                group: 31,
+                consumer: 0,
+            });
+            while drain(t, &q) > 0 {}
+            assert_eq!(q.to_stack.pop(), Some(Back::Failed { group: 9 }));
+            assert_eq!(q.to_stack.pop(), Some(Back::Failed { group: 31 }));
         });
     }
 }

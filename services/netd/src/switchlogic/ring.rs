@@ -7,7 +7,7 @@
 //! the layout is checked on those copies. A violation breaks the ring: it
 //! is told once and the ring takes and gives nothing after it.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use proto_net::switch::{self as sw, CELL, Layout, RX_CELLS};
 
 /// Memory the switch reads and writes: the mapped ring object.
@@ -99,14 +99,17 @@ pub struct ConsumerRing {
 
 impl ConsumerRing {
     /// The ring over `mem`; the sizes go to line 0 for whoever debugs.
-    pub fn new(mem: Mem, layout: Layout) -> ConsumerRing {
+    pub fn new(mem: Mem, layout: Layout) -> Option<ConsumerRing> {
+        if mem.len < layout.total() {
+            return None;
+        }
         for (i, v) in [sw::VERSION, layout.rx_slots, layout.tx_slots, CELL as u32]
             .into_iter()
             .enumerate()
         {
             mem.store(sw::SIZES + 4 * i, v);
         }
-        ConsumerRing {
+        Some(ConsumerRing {
             mem,
             layout,
             fill_tail: 0,
@@ -119,7 +122,12 @@ impl ConsumerRing {
             told: false,
             rx_full: 0,
             refused: 0,
-        }
+        })
+    }
+
+    /// The switch's own DONE index: frames delivered so far.
+    pub fn done_head(&self) -> u32 {
+        self.done_head
     }
 
     pub fn is_broken(&self) -> bool {
@@ -186,6 +194,7 @@ impl ConsumerRing {
         } else {
             None
         };
+        debug_assert!(frame.len() <= CELL);
         let Some(cell) = cell else {
             self.rx_full = self.rx_full.wrapping_add(1);
             return false;
@@ -208,9 +217,14 @@ impl ConsumerRing {
         if self.is_broken() || self.tx_head == self.tx_tail {
             return Tx::Empty;
         }
-        let mut raw = [0; 8];
-        self.mem.read(self.layout.tx_entry(self.tx_tail), &mut raw);
-        let e = sw::TxEntry::from_bytes(raw);
+        // Two atomic reads, so that the length checked is the length used.
+        let at = self.layout.tx_entry(self.tx_tail);
+        let (word0, word1) = (self.mem.load(at), self.mem.load(at + 4));
+        let e = sw::TxEntry {
+            len: word0 as u16,
+            flags: (word0 >> 16) as u16,
+            spare: word1,
+        };
         let cell = self.layout.tx_cell(self.tx_tail);
         self.tx_tail = self.tx_tail.wrapping_add(1);
         if e.flags != sw::TX_FLAGS || e.spare != 0 || usize::from(e.len) > CELL {
@@ -228,12 +242,32 @@ impl ConsumerRing {
         self.mem.store(sw::COUNTERS + 4, self.refused);
     }
 
+    /// Whether the TX index of this step's poll is ahead of the switch's.
+    pub fn tx_waiting(&self) -> bool {
+        !self.is_broken() && self.tx_head != self.tx_tail
+    }
+
+    /// Whether the consumer has put a frame in TX that the switch has not taken: a fresh read
+    /// of `tx_head`, for the last look before the switch sleeps.
+    pub fn tx_pending(&self) -> bool {
+        !self.is_broken() && self.mem.load(sw::TX_HEAD) != self.tx_tail
+    }
+
+    /// Whether the consumer sleeps. The sleep flags are a store-buffering pair: the switch
+    /// writes DONE_HEAD and reads `consumer_idle`, the consumer writes `consumer_idle` and
+    /// reads DONE_HEAD, and each needs a full barrier between its write and its read or both
+    /// may read the old value and the wake is lost. The consumer side (`vnet_port_*`) does
+    /// the same: `consumer_idle = 1`, full barrier, look at DONE again, then wait.
     pub fn consumer_idle(&self) -> bool {
+        fence(Ordering::SeqCst);
         self.mem.load(sw::CONSUMER_IDLE) != 0
     }
 
+    /// The switch's own flag; the full barrier follows the write, and the caller looks at
+    /// its inputs again after it.
     pub fn set_switch_idle(&self, idle: bool) {
         self.mem.store(sw::SWITCH_IDLE, u32::from(idle));
+        fence(Ordering::SeqCst);
     }
 }
 
@@ -260,7 +294,7 @@ pub(crate) mod tests {
             unsafe { Mem::new(self.buf.as_ptr() as *mut u8, self.layout.total()) }
         }
         pub fn ring(&self) -> ConsumerRing {
-            ConsumerRing::new(self.mem(), self.layout)
+            ConsumerRing::new(self.mem(), self.layout).expect("the rig is whole")
         }
         /// The consumer puts `cells` in FILL.
         pub fn fill(&self, cells: &[u32]) {
@@ -475,5 +509,57 @@ pub(crate) mod tests {
             };
             assert_eq!(ring.poll(), want, "{done_tail}");
         }
+    }
+
+    #[test]
+    fn a_sleeping_consumer_is_never_missed_with_the_barriers_of_both_sides() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as O};
+        use std::time::{Duration, Instant};
+        const N: u32 = 1_000_000;
+        let rig = Rig::new(Layout::DEFAULT);
+        let (mem, ring) = (rig.mem(), rig.ring());
+        let wake = Arc::new(AtomicBool::new(false));
+        let acked = Arc::new(AtomicU32::new(0));
+        let (w2, a2) = (wake.clone(), acked.clone());
+        let consumer = std::thread::spawn(move || {
+            for i in 1..=N {
+                loop {
+                    if mem.load(sw::DONE_HEAD) >= i {
+                        break;
+                    }
+                    mem.store(sw::CONSUMER_IDLE, 1);
+                    fence(Ordering::SeqCst);
+                    if mem.load(sw::DONE_HEAD) >= i {
+                        mem.store(sw::CONSUMER_IDLE, 0);
+                        break;
+                    }
+                    let began = Instant::now();
+                    while !w2.swap(false, O::AcqRel) {
+                        if began.elapsed() > Duration::from_secs(5) {
+                            return false;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    mem.store(sw::CONSUMER_IDLE, 0);
+                }
+                a2.store(i, O::Release);
+            }
+            true
+        });
+        for i in 1..=N {
+            while acked.load(O::Acquire) < i - 1 {
+                std::hint::spin_loop();
+                if consumer.is_finished() {
+                    assert!(consumer.join().unwrap(), "a wake was lost");
+                    return;
+                }
+            }
+            mem.store(sw::DONE_HEAD, i);
+            if ring.consumer_idle() {
+                wake.store(true, O::Release);
+            }
+        }
+        assert!(consumer.join().unwrap(), "a wake was lost");
     }
 }

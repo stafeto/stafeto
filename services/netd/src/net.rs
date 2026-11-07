@@ -110,6 +110,8 @@ pub struct Client {
     pub root: u64,
     /// The entry of the session's shared buffer (BUFFER) in `Net::buffers`.
     pub buffer: Option<u8>,
+    /// The consumer number of the switch the session attached (ATTACH).
+    pub consumer: Option<u8>,
 }
 
 pub use netd::births::Birth;
@@ -185,6 +187,9 @@ pub struct Sock {
     pub waiters: u128,
     /// When the last session let go of a stream.
     pub orphan_at: u64,
+    /// For a description of a port (PORT_HOLD): the number of its group (1 to 32). The
+    /// description has no smoltcp socket and answers no socket call.
+    pub hold: u8,
 }
 
 impl Sock {
@@ -223,6 +228,7 @@ impl Sock {
         member_count: 0,
         waiters: 0,
         orphan_at: 0,
+        hold: 0,
     };
 }
 
@@ -367,6 +373,12 @@ pub struct Net {
     /// An operation with a time limit was made since the loop last looked:
     /// the timer may need to be set earlier.
     pub deadline_new: bool,
+    /// The groups of ports of the switch (PORT_HOLD): what the registry compares a bind with,
+    /// until the switch says the group is gone (`Back::Freed`).
+    pub holds: [crate::consumers::Hold; netd::switchlogic::tables::MAX_GROUPS],
+    /// Descriptions of ports closed whose group has not been told to let go: a count for each
+    /// group (the driver sends `Command::Release`).
+    pub release_due: [u8; netd::switchlogic::tables::MAX_GROUPS],
     /// The SO_REUSEPORT groups.
     pub groups: Groups,
     /// The owners of the sets of places (queue sockets of the members of
@@ -716,6 +728,11 @@ impl Net {
         if sock.port_held {
             self.ports(sock.proto).release(sock.port);
         }
+        if sock.hold != 0 {
+            let due = &mut self.release_due[usize::from(sock.hold) - 1];
+            *due = due.saturating_add(1);
+            self.cleanup_wanted = true;
+        }
     }
 
     /// The socket of place `i` is no longer a socket of a queue: its set loses
@@ -776,6 +793,7 @@ impl Net {
         with_connected: bool,
     ) -> impl Iterator<Item = Binding> + '_ {
         let connected = with_connected.then(|| self.connected.chain(port));
+        let held = self.holds.iter().filter_map(move |h| h.binding(port));
         self.chains
             .chain(port)
             .chain(connected.into_iter().flatten())
@@ -792,6 +810,7 @@ impl Net {
                     share_uid: s.reuseport.then_some(s.uid),
                 })
             })
+            .chain(held)
     }
 
     /// Puts the bound place `i` in the chain of its port that its state asks
@@ -833,7 +852,26 @@ impl Net {
 
     /// The description `d` of a session that holds it.
     pub fn find(&self, held: &Held, d: u32) -> Option<usize> {
+        self.find_any(held, d).filter(|&i| self.socks[i].hold == 0)
+    }
+
+    /// As `find`, and a description of a port too (close, export).
+    pub fn find_any(&self, held: &Held, d: u32) -> Option<usize> {
         self.places.find(d).filter(|&i| held.has(i))
+    }
+
+    /// A place for a description of the ports of group `group`: no smoltcp socket.
+    pub fn hold_place(&mut self, proto: Proto, group: u8) -> Option<usize> {
+        if self.places.used() >= SOCKETS_LIMIT {
+            return None;
+        }
+        let i = self.places.allocate(State::Live)?;
+        self.socks[i] = Sock {
+            proto,
+            hold: group,
+            ..Sock::EMPTY
+        };
+        Some(i)
     }
 
     /// Lets a session go of place `i`: the last one closes the description.
