@@ -531,6 +531,7 @@ fn main(_: u64) -> u64 {
         own_said: false,
         switch_ip: netd::books::AddressSync::new(),
         told: 0,
+        bell: netd::ring::Hold::new(),
         cleanup_due: false,
         armed: None,
         last_step: 0,
@@ -907,6 +908,8 @@ struct Driver<'a> {
     own_said: bool,
     /// The bits of the notifications to itself that are on their way.
     told: u64,
+    /// The doorbell held for the work queued behind a step.
+    bell: netd::ring::Hold,
     /// A step of departure is due that no notification told.
     cleanup_due: bool,
     /// The deadline the timer is set for.
@@ -1029,6 +1032,7 @@ impl Driver<'_> {
         if core::mem::take(&mut self.net.deadline_new) {
             self.arm(now_ns());
         }
+        self.bell_release();
     }
 
     /// A departure is due.
@@ -1380,7 +1384,28 @@ impl Driver<'_> {
     /// switch rings once for the run, and takes the buffers of receiving back
     /// then.
     fn kick_switch(&mut self, more: bool) {
-        switch::INNER.kick(more);
+        let held = !more && self.bell_waits();
+        switch::INNER.kick(more || held);
+    }
+
+    /// Frames of the stack wait for the switch's doorbell and work stands
+    /// queued behind this event (a call of a program, a step told to the
+    /// service): the bell waits for it (`ring::Hold`), so that the frames of
+    /// the answers of calls that queue up behind one another go out with one
+    /// bell. A step goes ahead of the calls behind it, so without this each
+    /// call's frame rings a bell of its own.
+    fn bell_waits(&mut self) -> bool {
+        let queued = !switch::INNER.tx_sub.is_empty()
+            && sys::channel_info(&self.notify).is_ok_and(|info| info.queued > 0);
+        self.bell.waits(queued, now_ns())
+    }
+
+    /// The end of a call or a step: a held bell rings once the queue behind
+    /// it is empty or its time is up.
+    fn bell_release(&mut self) {
+        if self.bell.on() && !self.bell_waits() {
+            switch::INNER.kick(false);
+        }
     }
 
     /// Sets the timer for the stack's next work (`next`), the PING's
@@ -1728,6 +1753,10 @@ impl Service<0> for Driver<'_> {
             self.cleanup();
         }
         self.after_request();
+    }
+
+    fn between_notifications(&mut self, _: Notice) {
+        self.bell_release();
     }
 
     fn notification(&mut self, n: Notice) {

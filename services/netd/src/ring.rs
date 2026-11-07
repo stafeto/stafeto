@@ -80,6 +80,51 @@ pub const fn bell_due(limit: u32, pending: u32, waited: u32, more: bool) -> bool
     pending > 0 && (!more || pending >= limit || waited >= BELL_STEPS)
 }
 
+/// The longest a frame of the stack waits for the doorbell while work stands
+/// queued behind its step (`Hold`): a call of a program or a step of the
+/// service told to itself. Each such item is a step or a call of about 10 us,
+/// and a step is at most 18 369 ticks, so the end of the wait lies well inside
+/// one run of the switch (`SWITCH_RUN_NS`).
+pub const HOLD_NS: u64 = 100_000;
+
+/// The doorbell held for the work queued behind the stack's step. A program's
+/// call is a request in the service's queue, and the step it asks for is a
+/// notification that goes ahead of the calls behind it, so a step ends with
+/// calls still queued: the frames of the answers of those calls go out with one
+/// bell, when the queue is empty or after `HOLD_NS`, whichever is first.
+#[derive(Default)]
+pub struct Hold {
+    since: Option<u64>,
+}
+
+impl Hold {
+    pub const fn new() -> Hold {
+        Hold { since: None }
+    }
+
+    /// Frames wait for the bell and `queued` says whether work stands behind
+    /// the event that ended just now, at `now`: true while the bell waits.
+    /// False rings it (the queue is empty, or the wait reached `HOLD_NS`) and
+    /// the next hold starts anew.
+    pub fn waits(&mut self, queued: bool, now: u64) -> bool {
+        if !queued {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) >= HOLD_NS {
+            self.since = None;
+            return false;
+        }
+        true
+    }
+
+    /// The bell is being held.
+    pub const fn on(&self) -> bool {
+        self.since.is_some()
+    }
+}
+
 /// The frames the switch thread takes off the queue of receiving in one
 /// step, and the frames of sending it puts in the queue (the bound of a
 /// step, as `STEP_RX` and `STEP_TX` are for the stack): a frame costs the
@@ -888,6 +933,44 @@ mod tests {
             "one reply under a one-way flow of inbound frames waits at most BELL_STEPS steps"
         );
         assert!(!tx_bell_due(0, BELL_STEPS, true), "nothing to ring");
+    }
+
+    /// The bells for `calls` events of the stack, ten microseconds apart, each
+    /// of which leaves work queued behind it when `queued` says so.
+    fn bells_for(calls: u64, queued: impl Fn(u64) -> bool) -> u64 {
+        let mut hold = Hold::new();
+        let mut bells = 0;
+        for call in 0..calls {
+            if !hold.waits(queued(call), call * 10_000) {
+                bells += 1;
+            }
+        }
+        bells
+    }
+
+    #[test]
+    fn the_frames_of_queued_calls_share_a_bell() {
+        // Eight calls stand in the queue: the first seven events leave work
+        // behind, the eighth empties the queue.
+        assert_eq!(bells_for(8, |call| call < 7), 1);
+        // Two bursts of four, with the queue empty between them.
+        assert_eq!(bells_for(8, |call| call % 4 != 3), 2);
+        // Nothing queued: a bell for each frame, as an idle service rings.
+        assert_eq!(bells_for(8, |_| false), 8);
+    }
+
+    #[test]
+    fn a_frame_waits_no_longer_than_hold_ns_for_the_bell() {
+        let mut hold = Hold::new();
+        assert!(hold.waits(true, 1_000));
+        assert!(hold.on());
+        assert!(hold.waits(true, 1_000 + HOLD_NS - 1));
+        assert!(!hold.waits(true, 1_000 + HOLD_NS), "the bound rings");
+        assert!(!hold.on());
+        // A queue that never empties still rings every HOLD_NS or so.
+        let bells = bells_for(100, |_| true);
+        assert!((5..=10).contains(&bells), "{bells} bells for 1 ms of calls");
+        assert!(!hold.waits(false, 5));
     }
 
     #[test]
