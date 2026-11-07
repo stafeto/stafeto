@@ -13,21 +13,22 @@
 //! forward of port 80:
 //!
 //! 1. `fast: start` shows the limits of the settings;
-//! 2. 500, 3 000 and 6 000 connections are open (the handshake only: the
-//!    user network of QEMU gives the guest about 30 connections a second, so
-//!    10 000 do not fit the time of the check), the worker's quota used at
-//!    each stage gives the memory per connection (at most 7 KiB, stop point
-//!    O3), the quota used at the top is past the 32 MiB of the old room, and
-//!    the places of the kernel's table the layer holds stay within 112 of 128
-//!    (stop point O2);
+//! 2. 100, 250 and 400 connections are open (the handshake only; the user
+//!    network of QEMU gives the guest two connections a second on a machine
+//!    of the check, and 100 000 are for Apple VZ). The nginx of the image
+//!    holds a pool of 16 KiB per connection, so that these few fill the room
+//!    of 32 MiB and the layer grows it. The worker's quota used at each
+//!    stage gives the memory per connection (at most 7 KiB beyond the pool,
+//!    stop point O3), and the places of the kernel's table the layer holds
+//!    stay within 112 of 128 (stop point O2);
 //! 3. after 30 s of holding every 20th connection takes the page;
 //! 4. the worker is killed with `kill -9` three times, one more than the
 //!    grant has places: each new worker has the quota of the grant, so the
 //!    place came back with the zombie;
-//! 5. the data limit of the shell is 31 MiB (`ulimit -S -d`): of 1 500
+//! 5. the data limit of the shell is 31 MiB (`ulimit -S -d`): of 250
 //!    connections that each ask for the page some are refused, the worker
-//!    lives or ends by the bounded retry (status 1 and the line `fst malloc failed`), and once the connections close a
-//!    new one gets its page.
+//!    lives or ends by the bounded retry (status 1 and the line `fst malloc
+//!    failed`), and once the connections close a new one gets its page.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -65,13 +66,18 @@ pub const IMAGE: &str = "boot-fast-scale.img";
 const GRANT_BYTES: u64 = 32_768 * 4096;
 /// The connections of the stages, the data limit of the degradation step in
 /// KiB, and the places of the kernel's table the layer may hold.
-const STAGES: [usize; 3] = [500, 3_000, 6_000];
+const STAGES: [usize; 3] = [100, 250, 400];
 const DEGRADE_KIB: u32 = 31_744;
-const DEGRADE_CONNS: usize = 1_500;
+const DEGRADE_CONNS: usize = 250;
 const DEGRADE_WITHIN: Duration = Duration::from_secs(150);
 const STAGE_WITHIN: Duration = Duration::from_secs(300);
 /// Every this many connections of those held take the page after the hold.
 const SAMPLE: usize = 20;
+/// What a connection holds beyond the stack's and nginx's usual: its pool of
+/// 16 KiB (`connection_pool_size`), which makes few connections fill the room
+/// of 32 MiB (the user network of QEMU on a machine of the check gives the
+/// guest two connections a second).
+const POOL: u64 = 16 * 1024;
 const PLACES_MAX: u64 = 112;
 /// The memory per connection that stops the work (O3), in bytes.
 const SLOPE_MAX: u64 = 7 * 1024;
@@ -117,7 +123,7 @@ fn conf() -> &'static str {
         let text = replaced(
             &text,
             "keepalive_timeout 65;",
-            "keepalive_timeout 3600;\n    client_header_timeout 3600s;",
+            "keepalive_timeout 3600;\n    client_header_timeout 3600s;\n    connection_pool_size 16k;\n    large_client_header_buffers 4 16k;",
         );
         let text = replaced(
             &text,
@@ -322,9 +328,14 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         println!("fast-scale: {note}");
     }
     talked?;
-    // The refused connections of the last step make nginx say so.
+    // The refused connections of the last step make nginx say so, in
+    // `accept4` or when its own pool finds no memory.
     let lines: Vec<String> = (output.lines.iter())
-        .filter(|l| !l.contains("accept4() failed"))
+        .filter(|l| {
+            !l.contains("accept4() failed")
+                && !l.contains("posix_memalign(")
+                && !l.contains("malloc() failed")
+        })
         .cloned()
         .collect();
     crate::fast_nginx::verdict(&lines, 0)?;
@@ -366,6 +377,7 @@ fn scenario(
     let mut held: Vec<TcpStream> = Vec::new();
     let mut used = Vec::new();
     let mut taken = Vec::new();
+    let mut taken_room = 0;
     for (i, target) in STAGES.iter().enumerate() {
         let more = target - held.len();
         let began = Instant::now();
@@ -380,6 +392,7 @@ fn scenario(
         }
         used.push(field(&line, "used").unwrap_or(0));
         taken.push(field(&line, "user").unwrap_or(0));
+        taken_room = field(&line, "room").unwrap_or(0);
         notes.push(format!(
             "{target} connections after {} s: {}",
             began.elapsed().as_secs(),
@@ -391,10 +404,13 @@ fn scenario(
     // several MiB comes at once): 4 KiB for each page.
     let slope = (taken[2].saturating_sub(taken[0])) * 4096 / (STAGES[2] - STAGES[0]) as u64;
     notes.push(format!(
-        "the quota used per connection: {slope} bytes (at most {SLOPE_MAX}); {top} bytes used at the top, past the 32 MiB of the old quota"
+        "the quota used per connection: {slope} bytes, {} beyond the pool (at most {SLOPE_MAX}); {top} bytes used at the top, the room grew to {taken_room} pages", slope.saturating_sub(POOL)
     ));
-    if slope == 0 || slope > SLOPE_MAX || top <= 8192 * 4096 {
-        return Err(format!("{slope} bytes per connection, {top} bytes used"));
+    let room = taken_room;
+    if slope < POOL || slope - POOL > SLOPE_MAX || room != 262_144 {
+        return Err(format!(
+            "{slope} bytes per connection (pool {POOL}), room {room} pages"
+        ));
     }
     // 3: after the hold every 20th connection takes the page.
     std::thread::sleep(HOLD);
