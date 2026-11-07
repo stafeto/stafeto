@@ -92,7 +92,7 @@ pub const SWITCH_TX: usize = 16;
 pub const SWITCH_BACK: usize = 32;
 /// The buffers of receiving the stack gives back before it wakes the switch
 /// for them alone (with a frame to send or a held doorbell it wakes it anyway).
-pub const RX_BACK_LAZY: usize = 16;
+pub const RX_BACK_LAZY: usize = 64;
 /// The frames of the wire the switch leaves for the stack at most: more
 /// stay in the queue of the device until the stack gave buffers back.
 pub const RX_AHEAD: usize = 32;
@@ -101,6 +101,24 @@ pub const RX_AHEAD: usize = 32;
 /// `net-curl` where the device sends late, and a reply made in a step of
 /// receiving found no buffer).
 pub const TX_SHARE: usize = TX_BUFFERS;
+/// The buffers of sending the stack may hold (lent, queued by it, in the device's queue on
+/// its account) once consumers are attached; the rest of the 256 serves the consumers, who
+/// share it by their count (`switch::Switch::consumer_cap`).
+pub const STACK_SHARE: usize = 192;
+/// The frames of the wire the switch routes in a step when consumers are attached, and the
+/// frames of consumers it takes in a step: each costs a header parse, a hash and one or two
+/// copies of up to 1 514 bytes, about 1 500 ticks under -icount.
+pub const SWITCH_ROUTED: usize = 8;
+pub const SWITCH_CTX: usize = 8;
+/// The frames of each kind a step always takes, and the time in clock ticks beyond which it
+/// takes no more. Under -icount (the steps probes) a tick is an instruction-scale unit and the
+/// soft share holds a step under the bound; on a real clock a step never reaches it.
+pub const SWITCH_BASE: usize = 3;
+pub const SWITCH_SOFT: u64 = 7_000;
+/// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
+/// period of its timer when the line is quiet.
+pub const SWEEP_EVERY_NS: u64 = 1_000_000;
+pub const SWEEP_IDLE_NS: u64 = 100_000_000;
 /// The frames the switch collects before its doorbell rings while the stack
 /// follows with steps (the stack's own queue rang after `BELL_TX`).
 pub const SWITCH_BELL: u32 = 32;
@@ -117,6 +135,15 @@ const _: () = assert!(TX_SHARE <= TX_BUFFERS && RX_AHEAD <= RX_BUFFERS && SWITCH
 pub const SWITCH_STEP_REST: usize = 9_400;
 pub const SWITCH_STEP_RX_FRAME: usize = 210;
 const _: () = assert!(SWITCH_STEP_REST + SWITCH_RX * SWITCH_STEP_RX_FRAME <= 12_521);
+/// With consumers the step takes `SWITCH_BASE` frames of each kind whatever the time (about
+/// 1 500 and 1 800 ticks each), more only while it has used less than `SWITCH_SOFT` ticks,
+/// and then the sweep of a few places and some commands (about 3 000) on the measured rest of
+/// 3 300. The worst case is the soft share, one more frame, the base frames of the second
+/// kind and the tail.
+const _: () = assert!(
+    SWITCH_SOFT as usize + 1_800 + SWITCH_BASE * 1_500 + 3_000 <= 18_369
+        && 3_300 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
+);
 
 /// The end of a run of steps for the interrupts of receiving: while steps
 /// follow (`continued`) the device is asked for none; at the end it is asked

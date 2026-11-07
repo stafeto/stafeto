@@ -106,11 +106,13 @@ fn rounds_end(round: u32, rounds: u32, max_rounds: u32, all_done: bool) -> bool 
 }
 
 /// The pairs of rows whose ratios the tables print.
-const PAIRS: [(System, System); 4] = [
+const PAIRS: [(System, System); 6] = [
     (System::S4, System::L4),
     (System::F1, System::L4),
     (System::F1, System::S4),
     (System::F1, System::L1),
+    (System::F1s, System::F1),
+    (System::F1s, System::S4),
 ];
 const GRID_NEW: [u32; 6] = [100, 200, 300, 500, 700, 1000];
 const CONNECTIONS: u32 = 64;
@@ -226,10 +228,12 @@ enum System {
     L4,
     S4,
     F1,
+    /// nginx-fast on the switch of the first device (one device, worker as nobody).
+    F1s,
 }
 
 impl System {
-    const ALL: [System; 4] = [System::L1, System::L4, System::S4, System::F1];
+    const ALL: [System; 5] = [System::L1, System::L4, System::S4, System::F1, System::F1s];
 
     fn name(self) -> &'static str {
         match self {
@@ -237,6 +241,7 @@ impl System {
             System::L4 => "L4",
             System::S4 => "S4",
             System::F1 => "F1",
+            System::F1s => "F1s",
         }
     }
 
@@ -247,11 +252,11 @@ impl System {
     }
 
     fn linux(self) -> bool {
-        !matches!(self, System::S4 | System::F1)
+        !matches!(self, System::S4 | System::F1 | System::F1s)
     }
 
     fn workers(self) -> usize {
-        if matches!(self, System::L1 | System::F1) {
+        if matches!(self, System::L1 | System::F1 | System::F1s) {
             1
         } else {
             4
@@ -263,7 +268,7 @@ impl System {
     fn peer(self) -> Option<System> {
         match self {
             System::S4 => Some(System::L4),
-            System::F1 => Some(System::L1),
+            System::F1 | System::F1s => Some(System::L1),
             _ => None,
         }
     }
@@ -1384,7 +1389,9 @@ struct Prepared {
     image: PathBuf,
     /// The image of F1.
     fast_image: PathBuf,
+    switch_image: PathBuf,
     config: String,
+    switch_config: String,
     /// The fingerprint of the settings of F1 (its own file).
     fast_config: String,
     www: String,
@@ -1697,7 +1704,8 @@ fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> 
 }
 
 fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
-    let fast = sys == System::F1;
+    let switch = sys == System::F1s;
+    let fast = sys == System::F1 || switch;
     let suffix = vz::claim_suffix()?;
     let shell_cpus = prep.shell_cpus;
     let mut report = Report {
@@ -1705,8 +1713,14 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
         ..Report::default()
     };
     let (load_start, others_start) = (load_now(), nginx_bench::other_guests(0));
-    let image = if fast { &prep.fast_image } else { &prep.image };
-    let machine = linux_guest::machine_with(&suffix, if fast { 2 } else { 1 });
+    let image = if switch {
+        &prep.switch_image
+    } else if fast {
+        &prep.fast_image
+    } else {
+        &prep.image
+    };
+    let machine = linux_guest::machine_with(&suffix, if fast && !switch { 2 } else { 1 });
     let command = vz::command_on(&prep.kernel, image, machine)?;
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
     let result = (|| {
@@ -1760,15 +1774,22 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
-            let wanted = if tls {
+            let wanted = if switch {
+                &prep.switch_config
+            } else if tls {
                 &prep.fast_config_tls
             } else {
                 &prep.fast_config
             };
             linux_guest::verify(&report, wanted, &prep.www)?;
-            let address: Ipv4Addr = linux_guest::FAST_ADDRESS
-                .parse()
-                .map_err(|e| format!("{e}"))?;
+            // The switch shares the first device's address; F1 has the second device's.
+            let address: Ipv4Addr = if switch {
+                lease.address
+            } else {
+                linux_guest::FAST_ADDRESS
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
+            };
             expect_fetch((address, 80).into())?;
             if tls {
                 expect_tls(address)?;
@@ -3101,7 +3122,7 @@ impl Results {
             "### Table 4. At the rates of the walk both rows of a pair hold (R* of the walk under the present rule) (one run each, the length of a step of the walk)\n\n| load | pair | rate | p50 ms | p99 ms | p99.9 ms | the other row: p50 | p99 | p99.9 |\n|---|---|---|---|---|---|---|---|---|\n",
         );
         for wl in Workload::ALL {
-            for sys in [System::S4, System::F1] {
+            for sys in [System::S4, System::F1, System::F1s] {
                 let Some(peer) = sys.peer() else { continue };
                 let (Some(a), Some(b)) = (
                     self.search_of(sys, wl).and_then(|f| f.0.rstar),
@@ -3287,7 +3308,12 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     } else {
         linux_guest::linux_dir()
     };
-    let (mut kernel, mut image, mut fast_image) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
+    let (mut kernel, mut image, mut fast_image, mut switch_image) = (
+        PathBuf::new(),
+        PathBuf::new(),
+        PathBuf::new(),
+        PathBuf::new(),
+    );
     if o.systems.iter().any(|s| !s.linux()) {
         crate::busybox_build()?;
         crate::nano_build()?;
@@ -3303,6 +3329,9 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         if o.systems.contains(&System::F1) {
             fast_image = linux_guest::build_fast_image()?;
         }
+        if o.systems.contains(&System::F1s) {
+            switch_image = linux_guest::build_switch_image()?;
+        }
     }
     let (config, www) = linux_guest::expected()?;
     let (fast_config, _) = linux_guest::expected_fast();
@@ -3314,8 +3343,10 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         kernel,
         image,
         fast_image,
+        switch_image,
         config,
         fast_config,
+        switch_config: linux_guest::expected_switch(),
         www,
         shell_cpus: match o.image {
             ImageKind::Plain | ImageKind::Profile => {

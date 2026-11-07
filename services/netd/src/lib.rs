@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod births;
+pub mod books;
 pub mod buffers;
 pub mod bypass;
 pub mod chains;

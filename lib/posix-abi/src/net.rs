@@ -207,6 +207,95 @@ fn rpc(
     }
 }
 
+/// A request of the switch (PORT_HOLD, JOIN) that `Request` does not name:
+/// the bytes of its reply after the status, or the status of the refusal.
+/// `handle` goes with it.
+fn switch_call(
+    w: &Writer,
+    handle: Option<Handle<Channel>>,
+    out: &mut [u8; MESSAGE_MAX],
+) -> Result<usize, Status> {
+    let service = channel().map_err(|_| Status::Kernel(Error::PeerClosed))?;
+    let mut handle = handle;
+    let reply = loop {
+        let sent = match handle.take() {
+            Some(h) => rt::sys::send_handles(&service, w.as_bytes(), [h.erase()])
+                .map_err(|refused| refused.error),
+            None => rt::sys::send(&service, w.as_bytes()),
+        };
+        match sent {
+            Err(Error::Interrupted) => continue,
+            other => break other.map_err(Status::Kernel)?,
+        }
+    };
+    let bytes = reply.bytes(out);
+    let len = bytes.len();
+    let mut r = Reader::new(&out[..len]);
+    match Status::from_code(r.u32().map_err(|_| Status::BadSize)?) {
+        Status::Ok => {
+            let left = r.left();
+            out.copy_within(len - left..len, 0);
+            Ok(left)
+        }
+        status => Err(status),
+    }
+}
+
+/// The errno of a refusal of PORT_HOLD or JOIN.
+fn switch_errno(status: Status) -> i32 {
+    match status {
+        Status::Kernel(Error::PeerClosed) => ENETDOWN,
+        Status::Kernel(Error::LimitReached) => ENOMEM,
+        status => refusal(status).unwrap_or(EIO),
+    }
+}
+
+/// PORT_HOLD of TCP port `port` for the switch: the description of the
+/// right to the port, a descriptor of the process (`kept`: its CLOEXEC and
+/// CLOFORK bits, so that a fork carries it to the child and an exec closes
+/// it as the program's socket would). The service has the process service
+/// vouch for the superuser when the port is below 1024. `Ok(None)` when the
+/// service has no switch (it does not know the method). EADDRINUSE,
+/// EACCES, ENOMEM (no group) and the like from the service.
+pub(crate) fn port_hold(port: u16, reuseport: bool, kept: i32) -> Result<Option<i32>, i32> {
+    let hold = proto_net::switch::Hold {
+        protocol: 6,
+        first: u32::from(port),
+        count: 1,
+        flags: if reuseport {
+            proto_net::switch::REUSEPORT
+        } else {
+            0
+        },
+    };
+    let mut w = Writer::new();
+    proto_net::switch::write_port_hold(&hold, &mut w).map_err(|_| EIO)?;
+    let identity = crate::process::identity().and_then(|identity| {
+        rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
+    });
+    let mut out = [0u8; MESSAGE_MAX];
+    match switch_call(&w, identity, &mut out) {
+        Ok(n) => {
+            let place = Reader::new(&out[..n]).u32().map_err(|_| EIO)?;
+            publish(place, true, kept).map(Some)
+        }
+        Err(Status::UnknownMethod) => Ok(None),
+        Err(status) => Err(switch_errno(status)),
+    }
+}
+
+/// JOIN: the consumer of this session becomes a member of the group of the
+/// port description `fd`.
+pub(crate) fn port_join(fd: i32) -> Result<(), i32> {
+    with_socket(fd, |description| {
+        let mut w = Writer::new();
+        proto_net::switch::write_join(description, &mut w).map_err(|_| EIO)?;
+        switch_call(&w, None, &mut [0; MESSAGE_MAX])
+            .map(drop)
+            .map_err(switch_errno)
+    })
+}
+
 fn simple(request: &Request<'_>) -> Result<(), i32> {
     rpc(request, None, &mut [0; MESSAGE_MAX]).map(drop)
 }

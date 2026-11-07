@@ -403,7 +403,10 @@ check_calls(void)
     REFUSED(lseek(c, 0, SEEK_SET), ESPIPE);
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN | EPOLLEXCLUSIVE;
-    REFUSED(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev), EINVAL);
+    /* The switch picks the worker of a connection, so the bit is taken on ADD and refused on MOD. */
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev) == 0);
+    REFUSED(epoll_ctl(epfd, EPOLL_CTL_MOD, c, &ev), EINVAL);
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, c, NULL) == 0);
     REFUSED(fork(), EPERM);
     ok("refusals");
 
@@ -1311,7 +1314,9 @@ rules_stack(int t)
     REFUSED(accept(t, NULL, NULL), EAGAIN);
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN | EPOLLEXCLUSIVE;
-    REFUSED(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev), EINVAL);
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev) == 0);
+    REFUSED(epoll_ctl(epfd, EPOLL_CTL_MOD, c, &ev), EINVAL);
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, c, NULL) == 0);
     /* A new socket is a socket of the stack now, no ticket. */
     flag = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(flag >= FAST_BASE && flag < TICKET_BASE);

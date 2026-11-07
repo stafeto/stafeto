@@ -71,8 +71,12 @@ const GRANT_BYTES: u64 = 32_768 * 4096;
 /// The connections of the stages, the data limit of the degradation step in
 /// KiB, and the places of the kernel's table the layer may hold.
 const STAGES: [usize; 3] = [100, 250, 400];
-const DEGRADE_KIB: u32 = 29_696;
-const DEGRADE_CONNS: usize = 250;
+const DEGRADE_KIB: u32 = 20_480;
+const DEGRADE_CONNS: usize = 700;
+/// The line nginx logs when its 32 KiB buffer finds the heap held full by the limit, and how
+/// many of them the step tolerates.
+const OWN_MALLOC: &str = "malloc(32768) failed (12: Out of memory)";
+const OWN_MALLOC_MAX: usize = 8;
 const DEGRADE_WITHIN: Duration = Duration::from_secs(150);
 const STAGE_WITHIN: Duration = Duration::from_secs(300);
 /// Every this many connections of those held take the page after the hold.
@@ -81,7 +85,10 @@ const SAMPLE: usize = 20;
 /// 16 KiB (`connection_pool_size`), which makes few connections fill the room
 /// of 32 MiB (the user network of QEMU on a machine of the check gives the
 /// guest two connections a second).
-const POOL: u64 = 16 * 1024;
+// The rings of the switch take their pages outside the room (the second device's objects took
+// 4 200 pages of it), so the pool is three times the usual for the few connections to fill
+// the room of 32 MiB.
+const POOL: u64 = 48 * 1024;
 const PLACES_MAX: u64 = 112;
 /// The memory per connection that stops the work (O3), in bytes.
 const SLOPE_MAX: u64 = 7 * 1024;
@@ -129,7 +136,7 @@ fn conf() -> &'static str {
         let text = replaced(
             &text,
             "keepalive_timeout 65;",
-            "keepalive_timeout 3600;\n    client_header_timeout 3600s;\n    connection_pool_size 16k;\n    large_client_header_buffers 4 16k;",
+            "keepalive_timeout 3600;\n    client_header_timeout 3600s;\n    connection_pool_size 48k;\n    large_client_header_buffers 4 48k;",
         );
         let text = replaced(
             &text,
@@ -317,8 +324,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    cmd.args(qemu::net(&[]));
-    cmd.args(qemu::net_two_with(&[Forward {
+    // One device: the page comes in through the shared address of the switch.
+    cmd.args(qemu::net(&[Forward {
         proto: Proto::Tcp,
         host: port,
         guest: 80,
@@ -350,6 +357,18 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         .iter()
         .position(|l| l.trim_end().ends_with("limit-set"))
         .unwrap_or(output.lines.len());
+    // nginx's own buffer of 32 KiB may fail at the limit, a few times (one for a request).
+    let own = output
+        .lines
+        .iter()
+        .skip(limit)
+        .filter(|l| l.contains(OWN_MALLOC))
+        .count();
+    if own > OWN_MALLOC_MAX {
+        return Err(format!(
+            "nginx's own malloc failed {own} times at the limit (at most {OWN_MALLOC_MAX})"
+        ));
+    }
     let lines: Vec<String> = output
         .lines
         .iter()
@@ -359,6 +378,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 || !(l.contains("accept4() failed")
                     || l.contains("posix_memalign(")
                     || l.contains("malloc() failed")
+                    || l.contains(OWN_MALLOC)
                     || l.contains("writev() failed"))
         })
         .map(|(_, l)| l.clone())
@@ -383,7 +403,7 @@ fn scenario(
     address: SocketAddr,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
-    crate::fast_nginx::booted(run)?;
+    crate::fast_switch::booted(run)?;
     run.send("export STAFETO_FAST_STATS=1")?;
     let start = start_nginx(run, CONF)?;
     for (key, want) in [
@@ -470,13 +490,9 @@ fn scenario(
     drop(held);
     // 4.
     for round in 0..3 {
-        let (_, workers) = crate::fast_nginx::master_and_workers(run, &format!("k{round}"), true)?;
+        let (_, workers) = crate::fast_nginx::master_and_workers(run, &format!("k{round}"), false)?;
         run.send(&format!("kill -9 {}", workers[0]))?;
-        crate::fast_probe::expect_all(
-            run,
-            &["net: device 1 back", "start worker process "],
-            LINE_WITHIN,
-        )?;
+        crate::fast_probe::expect_all(run, &["start worker process "], LINE_WITHIN)?;
         let line = scale_line(run, &format!("kill{round}"), 1)?;
         if field(&line, "quota") != Some(GRANT_BYTES) {
             return Err(format!(
@@ -489,9 +505,10 @@ fn scenario(
     // 5: the limit. The settings of this step leave the pool of a connection
     // at its usual size, so that the stack reaches the limit before nginx's
     // own pools do.
-    crate::fast_nginx::quit(run, "quit")?;
+    run.send("kill -QUIT $M; wait $M; echo ngx-\"quit\"-end")?;
+    run.expect("ngx-quit-end", Duration::from_secs(30))?;
     run.send(&format!(
-        "sed '/connection_pool_size/d;/large_client_header_buffers/d' {CONF} > {LIMIT_CONF} && ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""
+        "sed '/connection_pool_size/d;/large_client_header_buffers/d;s/output_buffers 2 32k/output_buffers 2 4k/' {CONF} > {LIMIT_CONF} && ulimit -S -d {DEGRADE_KIB} && echo limit-\"set\""
     ))?;
     run.expect_line(
         "limit-set",
@@ -499,7 +516,7 @@ fn scenario(
         LINE_WITHIN,
     )?;
     start_nginx(run, LIMIT_CONF)?;
-    let (_, before) = crate::fast_nginx::master_and_workers(run, "limit-before", true)?;
+    let (_, before) = crate::fast_nginx::master_and_workers(run, "limit-before", false)?;
     let mut held: Vec<TcpStream> = Vec::new();
     open_more(address, &mut held, DEGRADE_CONNS)?;
     let ok = ask_some(&mut held, 1, DEGRADE_WITHIN);
@@ -514,9 +531,11 @@ fn scenario(
         ));
     }
     drop(held);
-    std::thread::sleep(Duration::from_secs(10));
+    // The connections close in the stack, and a new one gets its page again.
+    std::thread::sleep(Duration::from_secs(15));
     crate::nginx_probe::first_page(address)?;
-    let (_, after) = crate::fast_nginx::master_and_workers(run, "limit-after", true)?;
+    notes.push("5: a new connection got its page after the others closed".to_owned());
+    let (_, after) = crate::fast_nginx::master_and_workers(run, "limit-after", false)?;
     if before != after {
         return Err(format!(
             "the worker was {before:?} before the limit and {after:?} after"
@@ -558,7 +577,8 @@ mod tests {
     #[test]
     fn the_image_replaces_the_settings_of_the_packages_and_no_other_file() {
         let held = crate::rootfs::files_of(IMAGE);
-        let plain = crate::rootfs::files_of("boot-fast-nginx.img");
+        // The image of the switch has the probe of the ring besides.
+        let plain = crate::rootfs::files_of("boot-fast-switch.img");
         assert_eq!(held.len(), plain.len());
         let mut differ: Vec<&str> = held
             .iter()

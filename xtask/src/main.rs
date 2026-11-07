@@ -57,6 +57,7 @@ mod fast_layer;
 mod fast_nginx;
 mod fast_probe;
 mod fast_scale;
+mod fast_switch;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -9346,6 +9347,25 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // a worker killed (the place of the grant comes back), and the quota
         // ending: connections refused, the worker alive.
         job("fast-scale", || fast_scale::probe(&qemu::VIRT_1G)),
+        // nginx on the stack as a consumer of the network service's switch: four workers
+        // under nobody and httpd on one address, the guest's own turn to the shared address,
+        // a worker killed under a stream of new connections, the wake after rest, the steps
+        // of the switch, and the refusals of the checks on the ring. Also in the group `net`.
+        job("fast-switch", || {
+            fast_switch::probe(fast_switch::Scenario::Plain)
+        }),
+        job("fast-switch-kill", || {
+            fast_switch::probe(fast_switch::Scenario::Kill)
+        }),
+        job("fast-switch-idle", || {
+            fast_switch::probe(fast_switch::Scenario::Idle)
+        }),
+        job("fast-switch-steps", || {
+            fast_switch::probe(fast_switch::Scenario::Steps)
+        }),
+        job("switch-probe", || {
+            fast_switch::probe(fast_switch::Scenario::Frames)
+        }),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

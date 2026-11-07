@@ -112,6 +112,10 @@ pub fn ephemeral(offset: u32, counter: u32, map: &PortMap) -> Option<u16> {
 pub struct PortMap {
     held: [u16; 65536],
     used: [u64; EPHEMERAL_WORDS],
+    /// Blocks of the ephemeral range that consumers of the switch hold (a run aligned on
+    /// words): a bit each, apart from the counts, so that holding or letting go of a block
+    /// of 512 ports costs 8 words.
+    reserved: [u64; EPHEMERAL_WORDS],
 }
 
 const EPHEMERAL_WORDS: usize = EPHEMERAL_COUNT as usize / 64;
@@ -121,11 +125,75 @@ impl PortMap {
         PortMap {
             held: [0; 65536],
             used: [0; EPHEMERAL_WORDS],
+            reserved: [0; EPHEMERAL_WORDS],
         }
     }
 
     pub fn held(&self, port: u16) -> bool {
-        self.held[usize::from(port)] > 0
+        self.held[usize::from(port)] > 0 || self.is_reserved(port)
+    }
+
+    pub fn is_reserved(&self, port: u16) -> bool {
+        if port >= EPHEMERAL_FIRST && u32::from(port - EPHEMERAL_FIRST) < EPHEMERAL_COUNT {
+            let n = usize::from(port - EPHEMERAL_FIRST);
+            return self.reserved[n / 64] >> (n % 64) & 1 != 0;
+        }
+        false
+    }
+
+    /// Whether none of the `count` ports from `first` is held: a word of the bitmap of the
+    /// ephemeral range for each 64 of them when the run is aligned in it (the blocks of the
+    /// switch are), else port by port.
+    pub fn free_run(&self, first: u16, count: u16) -> bool {
+        if Self::aligned(first, count) {
+            let word = usize::from(first - EPHEMERAL_FIRST) / 64;
+            let words = word..word + usize::from(count) / 64;
+            return self.used[words.clone()]
+                .iter()
+                .zip(&self.reserved[words])
+                .all(|(u, r)| *u | *r == 0);
+        }
+        (0..count).all(|i| !self.held(first + i))
+    }
+
+    /// Whether a run is aligned in the ephemeral range on words of the bitmap.
+    fn aligned(first: u16, count: u16) -> bool {
+        first >= EPHEMERAL_FIRST
+            && u32::from(first - EPHEMERAL_FIRST) + u32::from(count) <= EPHEMERAL_COUNT
+            && (first - EPHEMERAL_FIRST).is_multiple_of(64)
+            && count.is_multiple_of(64)
+    }
+
+    /// `hold` for each of `count` ports from `first`. An aligned run of the ephemeral range
+    /// (the blocks of the switch hold 512 ports at once) is a few bits of `reserved`: the run
+    /// must have been free (`free_run`).
+    pub fn hold_run(&mut self, first: u16, count: u16) {
+        if count == 0 {
+            return;
+        }
+        if Self::aligned(first, count) {
+            let word = usize::from(first - EPHEMERAL_FIRST) / 64;
+            self.reserved[word..word + usize::from(count) / 64].fill(!0);
+            return;
+        }
+        for p in first..=first + (count - 1) {
+            self.hold(p);
+        }
+    }
+
+    /// `release` for each of `count` ports from `first` (a run `hold_run` took).
+    pub fn release_run(&mut self, first: u16, count: u16) {
+        if count == 0 {
+            return;
+        }
+        if Self::aligned(first, count) {
+            let word = usize::from(first - EPHEMERAL_FIRST) / 64;
+            self.reserved[word..word + usize::from(count) / 64].fill(0);
+            return;
+        }
+        for p in first..=first + (count - 1) {
+            self.release(p);
+        }
     }
 
     fn mark(&mut self, port: u16, on: bool) {
@@ -162,7 +230,7 @@ impl PortMap {
         let start = (from % EPHEMERAL_COUNT) as usize;
         for step in 0..=EPHEMERAL_WORDS {
             let word = (start / 64 + step) % EPHEMERAL_WORDS;
-            let mut free = !self.used[word];
+            let mut free = !(self.used[word] | self.reserved[word]);
             if step == 0 {
                 free &= !0u64 << (start % 64);
             } else if step == EPHEMERAL_WORDS {

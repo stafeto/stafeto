@@ -46,6 +46,9 @@ pub enum Why {
     Bogus,
     /// Every member of the group is short of cells.
     AllFull,
+    /// The group has holders but no live member (until the park of SYNs exists the SYN is
+    /// dropped and the client repeats it, as when the listening queue of Linux waits).
+    NoMember,
     /// The flow table has no room for the connection.
     FlowsFull,
 }
@@ -99,6 +102,8 @@ struct Ip<'a> {
     dst: [u8; 4],
     part: &'a [u8],
     fragment: bool,
+    /// The header has options (more than 20 bytes).
+    options: bool,
 }
 
 fn ipv4(frame: &[u8]) -> Option<Ip<'_>> {
@@ -110,6 +115,7 @@ fn ipv4(frame: &[u8]) -> Option<Ip<'_>> {
         dst: ip[16..20].try_into().ok()?,
         part: &ip[p.header..p.end],
         fragment: !p.first_fragment,
+        options: p.header != 20,
     })
 }
 
@@ -126,6 +132,16 @@ fn is_arp(frame: &[u8]) -> bool {
 
 fn arp_oper(frame: &[u8]) -> u16 {
     u16::from_be_bytes([frame[20], frame[21]])
+}
+
+/// Whether a frame of the stack is a turn: TCP or UDP, whole, to the shared address.
+pub fn faces_own(t: &Tables, frame: &[u8]) -> bool {
+    ipv4(frame).is_some_and(|ip| {
+        !ip.fragment
+            && ip.dst == t.own.ip
+            && t.own.ip != [0; 4]
+            && matches!(ip.proto, IPV4_PROTO_TCP | IPV4_PROTO_UDP)
+    })
 }
 
 /// Where a received frame goes.
@@ -259,6 +275,9 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
         return Decision::Stack;
     }
     let (c, generation) = match pick(t, mark, t.flows.hash(&key), MIN_FILL, true) {
+        Pick::NoLive if t.group(mark).is_some_and(|g| !g.draining && g.holders > 0) => {
+            return Decision::Drop(Why::NoMember);
+        }
         Pick::NoLive => return Decision::Stack,
         Pick::Full => return Decision::Drop(Why::AllFull),
         Pick::One(c, g) => (c, g),
@@ -420,7 +439,11 @@ fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     if ip.fragment {
         return refuse(Reason::Fragment);
     }
-    if ip.src != t.own.ip {
+    // Options (source routes, record route) are never sent by the stack of a consumer.
+    if ip.options {
+        return refuse(Reason::Ipv4);
+    }
+    if ip.src != t.own.ip || t.own.ip == [0; 4] {
         return refuse(Reason::SrcAddr);
     }
     if ip.dst != t.own.ip && !unicast_elsewhere(t, ip.dst) {
@@ -433,6 +456,14 @@ fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
         _ => Err(Reason::Proto),
     };
     match ok {
+        // A turn to the ports of the stack's DHCP client and its server side is refused.
+        Ok(())
+            if ip.dst == t.own.ip
+                && ip.proto == IPV4_PROTO_UDP
+                && matches!(ports(ip.part).1, 67 | 68) =>
+        {
+            refuse(Reason::Udp)
+        }
         Ok(()) if ip.dst == t.own.ip => Verdict::Hairpin,
         Ok(()) => Verdict::Send,
         Err(r) => refuse(r),
@@ -838,19 +869,19 @@ mod tests {
     }
 
     #[test]
-    fn a_group_without_live_members_leaves_the_syn_to_the_stack() {
+    fn a_group_without_live_members_drops_the_syn_while_it_has_holders() {
         with(|t, _| {
             t.leave(1, 0);
             t.leave(1, 1);
             assert_eq!(
                 route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
-                Decision::Stack
+                Decision::Drop(Why::NoMember)
             );
             t.join(1, 0);
             t.detach(0);
             assert_eq!(
                 route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
-                Decision::Stack
+                Decision::Drop(Why::NoMember)
             );
         });
     }
@@ -1140,7 +1171,7 @@ mod tests {
             route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire);
             assert_ne!(flags_of(t, 1234) & RST, 0, "an ACK does not reopen it");
             t.now = 100;
-            (0..16).for_each(|_| t.sweep());
+            (0..128).for_each(|_| t.sweep());
             assert!(t.flows.is_empty(), "a closed flow goes after its rest");
         });
     }
@@ -1171,7 +1202,7 @@ mod tests {
             route(t, &wire_tcp(1234, 8080, 0x11), Source::Wire);
             assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x11)), Verdict::Send);
             t.now = 50;
-            (0..16).for_each(|_| t.sweep());
+            (0..128).for_each(|_| t.sweep());
             assert!(t.flows.is_empty() && t.group(1).is_none());
             assert_eq!((t.port(Proto::Tcp, 8080), t.freed), (0, 1));
             assert!(t.hold(5, Proto::Tcp, 8080, 1));
@@ -1246,16 +1277,9 @@ mod tests {
             let c = who(route(t, &syn, Source::Wire));
             let ack = with_options(&wire_tcp(1234, 8080, ACK_), 4);
             assert_eq!(who(route(t, &ack, Source::Wire)), c);
+            // The consumer's own frames carry no options: refused whatever they hide.
             let tx = with_options(&out_tcp(8080, 1234, ACK_), 4);
-            assert_eq!(check_tx(t, c, &tx), Verdict::Send);
-            // The ports the 20-byte offset would show do not count: the options hide a
-            // frame of the consumer's own flow in front of a foreign four.
-            let mut fake = with_options(&out_tcp(8080, 9999, ACK_), 4);
-            fake[34..38].copy_from_slice(&[0x1f, 0x90, 0x04, 0xd2]);
-            assert_eq!(refused(t, c, &fake), Reason::Tcp);
-            let mut udp = with_options(&out_udp(9000, 53), 4);
-            udp[34..38].copy_from_slice(&5353u16.to_be_bytes().repeat(2));
-            assert_eq!(refused(t, 0, &udp), Reason::Udp);
+            assert_eq!(refused(t, c, &tx), Reason::Ipv4);
             // Options that run past the packet are no packet.
             let mut wire = with_options(&wire_tcp(1234, 8080, ACK_), 4);
             wire[14] = 0x4f;
@@ -1716,6 +1740,30 @@ mod tests {
             let syn = hair_tcp(BLOCK0, 8080, SYN);
             assert_eq!(check_tx(t, 0, &syn), Verdict::Hairpin);
             assert!(who(route(t, &syn, Source::Consumer(0))) < 2);
+        });
+    }
+
+    #[test]
+    fn a_turn_to_the_ports_of_dhcp_is_refused_and_no_frame_leaves_without_an_address() {
+        with(|t, _| {
+            let to_67 = ip_frame(ME, ME, 17, &udp_part(9000, 67));
+            assert_eq!(refused(t, 0, &to_67), Reason::Udp);
+            let own = t.own;
+            t.own.ip = [0; 4];
+            assert_eq!(refused(t, 0, &out_tcp(49152, 80, SYN)), Reason::SrcAddr);
+            t.own = own;
+        });
+    }
+
+    #[test]
+    fn the_stacks_turns_are_whole_tcp_or_udp_to_the_shared_address() {
+        with(|t, _| {
+            let f = out_tcp(8080, 1234, ACK_);
+            assert!(!faces_own(t, &f), "to another host");
+            let mut f = hair_tcp(8080, 1234, ACK_);
+            assert!(faces_own(t, &f));
+            f[23] = 1;
+            assert!(!faces_own(t, &f), "ICMP is the stack's own");
         });
     }
 }

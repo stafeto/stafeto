@@ -292,7 +292,14 @@ pub fn ensure_stack() -> Result<(), i32> {
     }
     // SAFETY: a `FastClaim` is plain numbers.
     let mut claim: FastClaim = unsafe { core::mem::zeroed() };
-    let started = match fast::claim_steady(&mut claim, 0) {
+    // The switch first: a consumer on the shared address needs no device.
+    // A service without a switch (the image of the second device) answers
+    // EAGAIN, and the claim of the device follows.
+    let taken = match fast::attach(&mut claim) {
+        Err(fast::NO_SWITCH) => fast::claim_steady(&mut claim, 0),
+        other => other,
+    };
+    let started = match taken {
         // SAFETY: the table's start, with the claim it asked for.
         Ok(()) => match unsafe { (t.start)(&claim) } {
             r if r < 0 => Err(-r),
@@ -308,9 +315,15 @@ pub fn ensure_stack() -> Result<(), i32> {
                 make_sockets(t, tickets);
                 STACK.store(2, Ordering::Release);
             });
+            if fast::port_mode() {
+                join_tickets();
+            }
             Ok(())
         }
         Err(errno) => {
+            fast::dbg(format_args!(
+                "fast: the stack did not start (errno {errno})\n"
+            ));
             REFUSED.store(errno, Ordering::Release);
             STACK.store(3, Ordering::Release);
             Err(errno)
@@ -532,7 +545,12 @@ fn make_sockets(t: &FastTable, tickets: &mut Tickets) {
         let _guard = FAST_LOCK.lock();
         match make_socket(t, &ticket) {
             Ok(n) => tickets.slots[i].socket = n,
-            Err(errno) => tickets.refuse(i, errno),
+            Err(errno) => {
+                fast::dbg(format_args!(
+                    "fast: the socket of ticket {i} was refused (errno {errno})\n"
+                ));
+                tickets.refuse(i, errno)
+            }
         }
     }
 }
@@ -642,17 +660,149 @@ pub fn socket(kind: i32, protocol: i32) -> Result<i32, i32> {
     publish(n)
 }
 
+/// The CLOEXEC and CLOFORK bits of the descriptor that holds a port.
+fn held_flags(cloexec: bool, clofork: bool) -> i32 {
+    (if cloexec {
+        crate::sockets::SOCK_CLOEXEC
+    } else {
+        0
+    }) | (if clofork {
+        crate::sockets::SOCK_CLOFORK
+    } else {
+        0
+    })
+}
+
+/// The ports the switch holds for sockets the stack made after it started
+/// (a ticket keeps its own): the socket and the descriptor of its hold,
+/// `socket << 32 | descriptor + 1`, 0 for a free place.
+static HOLDS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// Remembers that the hold `fd` belongs to the stack's socket `n`.
+fn remember_hold(n: c_int, fd: i32) -> bool {
+    let word = (n as u64) << 32 | (fd as u64 + 1);
+    HOLDS.iter().any(|h| {
+        h.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
+}
+
+/// The stack's socket `n` closed: its hold, if it has one, closes.
+fn forget_hold(n: c_int) {
+    for h in &HOLDS {
+        let word = h.load(Ordering::Acquire);
+        if word != 0
+            && (word >> 32) as c_int == n
+            && h.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let _ = crate::close((word & 0xffff_ffff) as i32 - 1);
+        }
+    }
+}
+
+/// The port of the address `address` (a sockaddr_in) held with the switch
+/// when the process is its consumer or may become one: the descriptor of
+/// the hold, `None` for port 0 or a service that has no switch. EADDRINUSE
+/// when the port is held, EACCES below 1024 without the superuser.
+fn hold_port(
+    address: &[u8; fast_events::SOCKADDR_IN],
+    reuseport: bool,
+    kept: i32,
+) -> Result<Option<i32>, i32> {
+    let port = u16::from_be_bytes([address[2], address[3]]);
+    if port == 0 {
+        return Ok(None);
+    }
+    crate::net::port_hold(port, reuseport, kept)
+}
+
 pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
     let address = fast_events::check_inet(raw)?;
-    with_route(
-        fd,
-        // SAFETY: the table's function; `address` is 16 readable bytes.
-        |n| {
-            count(|t| unsafe { (t.bind)(n, address.as_ptr(), address.len() as u32) as isize })
-                .map(drop)
-        },
-        |tickets, i| tickets.bind(i, address),
-    )
+    loop {
+        match route(fd)? {
+            Route::Stack(n) => {
+                let hold = if fast::port_mode() {
+                    hold_port(&address, true, 0)?
+                } else {
+                    None
+                };
+                // SAFETY: the table's function; `address` is 16 readable bytes.
+                let bound = count(|t| unsafe {
+                    (t.bind)(n, address.as_ptr(), address.len() as u32) as isize
+                })
+                .map(drop);
+                let Some(hold) = hold else { return bound };
+                // The stack's socket joins the group at once (a ticket does
+                // after its `listen`).
+                let joined = bound
+                    .and_then(|()| crate::net::port_join(hold))
+                    .and_then(|()| {
+                        if remember_hold(n, hold) {
+                            Ok(())
+                        } else {
+                            Err(ENOMEM)
+                        }
+                    });
+                if joined.is_err() {
+                    let _ = crate::close(hold);
+                }
+                return joined;
+            }
+            Route::Ticket(i) => {
+                let (clo, fork, reuse, bound) = tickets(|t| {
+                    let k = &t.slots[i];
+                    (k.cloexec, k.clofork, k.reuseport(), k.address.is_some())
+                });
+                if bound {
+                    return Err(EINVAL);
+                }
+                // The port is held outside the lock of the tickets.
+                let hold = if up() {
+                    None
+                } else {
+                    hold_port(&address, reuse, held_flags(clo, fork))?
+                };
+                match on_ticket(|t| {
+                    t.bind(i, address)?;
+                    t.slots[i].hold = hold.unwrap_or(fast_tickets::NO_HOLD);
+                    Ok(())
+                }) {
+                    Some(done) => {
+                        if let (Err(_), Some(hold)) = (&done, hold) {
+                            let _ = crate::close(hold);
+                        }
+                        return done;
+                    }
+                    None => {
+                        if let Some(hold) = hold {
+                            let _ = crate::close(hold);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// After the stack made the sockets of the tickets: each ticket with a hold
+/// joins the group of its port (the socket listens by now). A refusal marks
+/// the ticket refused and closes its socket.
+fn join_tickets() {
+    for i in 0..FAST_TICKETS as usize {
+        let (hold, socket) = tickets(|t| (t.slots[i].hold, t.slots[i].socket));
+        if hold < 0 || socket < 0 {
+            continue;
+        }
+        if let Err(errno) = crate::net::port_join(hold) {
+            fast::dbg(format_args!(
+                "fast: JOIN of ticket {i} failed (errno {errno})\n"
+            ));
+            // SAFETY: the table's function.
+            let _ = count(|t| unsafe { (t.close)(socket) as isize });
+            tickets(|t| t.refuse(i, errno));
+        }
+    }
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
@@ -798,10 +948,14 @@ pub fn close(fd: i32) -> Result<(), i32> {
                 return Err(EBADF);
             }
             if !up() {
+                let hold = tickets(|t| t.slots[i].hold);
                 if let Some(done) = on_ticket(|t| {
                     t.close(i);
                     Ok(())
                 }) {
+                    if hold >= 0 {
+                        let _ = crate::close(hold);
+                    }
                     return done;
                 }
                 continue;
@@ -812,13 +966,19 @@ pub fn close(fd: i32) -> Result<(), i32> {
             } else {
                 Ok(())
             };
+            let hold = tickets(|t| core::mem::replace(&mut t.slots[i].hold, fast_tickets::NO_HOLD));
             tickets(|t| t.close(i));
+            if hold >= 0 {
+                let _ = crate::close(hold);
+            }
             return closed;
         }
     }
     let n = number(fd)?;
     // SAFETY: the table's function.
-    count(|t| unsafe { (t.close)(n) as isize }).map(drop)
+    let closed = count(|t| unsafe { (t.close)(n) as isize }).map(drop);
+    forget_hold(n);
+    closed
 }
 
 pub fn read(fd: i32, out: &mut [u8]) -> Result<usize, i32> {

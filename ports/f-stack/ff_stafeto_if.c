@@ -31,6 +31,19 @@
  *   queue is looked at once more, and the thread waits on the network
  *   service's notification for at most the time to the next tick (10 ms at
  *   hz 100).
+ * - The switch: when the claim is of kind STAFETO_FAST_PORT the process
+ *   attached to the network service's switch instead of owning a device
+ *   (ff_stafeto_attach, <stafeto/fast.h>). The interface is a virtual device
+ *   over the ring of the consumer (vnet_port_*): frames of the wire come
+ *   from DONE in cells the process owns (the mbuf's storage is the cell, which
+ *   goes back to FILL when the mbuf is freed, as long as FILL holds
+ *   FF_STAFETO_PORT_RX_LOW cells; below that one copy), a frame goes out
+ *   with one copy into a cell of TX, the checksums are the stack's, the
+ *   address and the MAC are the shared ones of the attach. ARP and DHCP
+ *   belong to the service. The switch is poked only while it sleeps, and
+ *   the thread sleeps with consumer_idle set (full barrier on both sides).
+ *   A frame to the shared address goes into the ring like any other: the
+ *   switch turns it round (stafeto.patch keeps it off lo0).
  * - Settings: ff_load_config reads the file (the [dpdk] section only for
  *   its form); the interface of the device takes its address, mask,
  *   gateway and MAC from the claim, with no [port0] section.
@@ -66,6 +79,13 @@
  * buffers or more: the stack keeps a buffer as long as its data lies in a
  * socket's queue, and an empty queue of receiving drops frames silently. */
 #define FF_STAFETO_RX_LOW 1024
+/* The same threshold for the cells of the switch's FILL. */
+#define FF_STAFETO_PORT_RX_LOW 512
+/* The bits of the switch's notifications (proto_net::switch WAKE_*): the
+ * ring, a broken ring, a new address, the end of the consumer. */
+#define PORT_WAKE_BROKEN 2u
+#define PORT_WAKE_ADDRESS 4u
+#define PORT_WAKE_GONE 8u
 /* The longest frame of the wire the interface takes: header and MTU. */
 #define FF_STAFETO_FRAME_MAX 1514
 #define FF_STAFETO_FRAME_MIN 60
@@ -99,6 +119,8 @@ static uint64_t passes;
 static struct stafeto_fast_claim dev_claim;
 static int dev_on;
 static int dev_lost;
+/* The device is the switch's ring (the claim is of kind PORT). */
+static int port_on;
 static struct ff_dpdk_if_context *dev_ctx;
 static uint32_t notified;
 /* The service let go of its notifications (STAFETO_FAST_GONE): from then on
@@ -113,6 +135,7 @@ static struct ff_stafeto_device_stats stats;
 static uint64_t next_tick_ns;
 static uint64_t tick_ns;
 static volatile int stop_loop;
+#define dev_notify ff_stafeto_notify
 
 struct ff_dpdk_if_context {
     void *sc;
@@ -183,7 +206,16 @@ ff_stafeto_attach(const struct stafeto_fast_claim *claim)
         return -1;
     dev_claim = *claim;
     dev_on = 1;
+    port_on = claim->kind == STAFETO_FAST_PORT;
     return 0;
+}
+
+/* The cells of FILL the switch may still take, or the buffers of the pool
+ * that are free: what the threshold of the copy path measures. */
+static uint32_t
+rx_free(void)
+{
+    return port_on ? vnet_port_fill_free() : vnet_buf_free();
 }
 
 int
@@ -210,11 +242,34 @@ take_notifications(void)
 
     /* The service ends before init resets the device: the bit is kept until
      * the reset shows. */
-    if (service_gone && vnet_lost())
+    if (!port_on && service_gone && vnet_lost())
         dev_lost = 1;
     if (__atomic_load_n(&notified, __ATOMIC_RELAXED) == 0)
         return;
     bits = __atomic_exchange_n(&notified, 0, __ATOMIC_RELAXED);
+    if (port_on) {
+        /* A broken ring or a new address (the stack keeps its own address,
+         * so the worker ends and the master starts one that has the new
+         * address): status 1, which nginx's master answers with a new
+         * worker. The end of the consumer or of the service (the program's
+         * loop sees CLIENT_GONE itself): status 2, which it does not. */
+        if (bits & (PORT_WAKE_BROKEN | PORT_WAKE_ADDRESS)) {
+            fprintf(stderr, "f-stack: the switch says the ring %s; the process ends\n",
+                (bits & PORT_WAKE_BROKEN) ? "is broken" : "has a new address");
+            fflush(stderr);
+            exit(1);
+        }
+        if (bits & (PORT_WAKE_GONE | STAFETO_FAST_GONE)) {
+            service_gone = 1;
+            dev_lost = 1;
+            if (bits & PORT_WAKE_GONE) {
+                fprintf(stderr, "f-stack: the switch let the consumer go; the process ends\n");
+                fflush(stderr);
+                exit(2);
+            }
+        }
+        return;
+    }
     if (bits & STAFETO_FAST_GONE) {
         service_gone = 1;
         if (vnet_lost())
@@ -256,7 +311,20 @@ ff_dpdk_init(int argc, char **argv)
         return -1;
     }
     tick_ns = NSEC_PER_SEC / (uint64_t)ff_global_cfg.freebsd.hz;
-    if (dev_on) {
+    if (dev_on && port_on) {
+        uint64_t frequency;
+
+        /* The ring object is mapped at `window`; the sizes are in the
+         * words of the snapshot (<stafeto/fast.h>, kind PORT). */
+        if (vnet_port_open((void *)(uintptr_t)dev_claim.window, dev_claim.snapshot[2],
+                dev_claim.snapshot[3]) != 0) {
+            fprintf(stderr, "f-stack: vnet_port_open failed\n");
+            return -1;
+        }
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+        stats.ticks_per_second = frequency;
+        stats.free_low = vnet_port_fill_free();
+    } else if (dev_on) {
         int opened = vnet_open(&dev_claim);
 
         if (opened != 0) {
@@ -361,8 +429,17 @@ static void
 tx_flush(void)
 {
     if (tx_batch > 0) {
-        vnet_tx_kick();
-        stats.kicks++;
+        if (port_on) {
+            /* The entries are published; the switch is poked only while it
+             * sleeps (it checks the ring itself when it runs). */
+            if (vnet_port_tx_flush()) {
+                (void)stafeto_fast_poke();
+                stats.kicks++;
+            }
+        } else {
+            vnet_tx_kick();
+            stats.kicks++;
+        }
         tx_batch = 0;
     }
 }
@@ -441,6 +518,52 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
         ff_mbuf_free(m);
         return ff_EMSGSIZE;
     }
+    if (port_on) {
+        uint64_t until;
+
+        to = vnet_port_tx_cell();
+        if (to == NULL && !tx_stalled) {
+            /* TX is full: publish what waits and give the switch up to
+             * FF_STAFETO_TX_WAIT_US to take entries. */
+            until = counter() + stats.ticks_per_second * FF_STAFETO_TX_WAIT_US / 1000000;
+            tx_flush();
+            while ((to = vnet_port_tx_cell()) == NULL) {
+                if (counter() >= until) {
+                    tx_stalled = 1;
+                    break;
+                }
+            }
+            if (to != NULL)
+                stats.tx_waited++;
+        }
+        if (to == NULL) {
+            stats.tx_full++;
+            ff_mbuf_free(m);
+            return ff_ENOBUFS;
+        }
+        cur = m;
+        while (cur != NULL && off < total) {
+            void *data;
+            unsigned len;
+
+            ff_next_mbuf(&cur, &data, &len);
+            if (len > (unsigned)(total - off))
+                len = (unsigned)(total - off);
+            vnet_copy(to + off, data, len);
+            off += (int)len;
+        }
+        ff_mbuf_free(m);
+        if (off < FF_STAFETO_FRAME_MIN) {
+            memset(to + off, 0, FF_STAFETO_FRAME_MIN - off);
+            off = FF_STAFETO_FRAME_MIN;
+        }
+        vnet_port_tx_submit((uint32_t)off);
+        stats.tx_frames++;
+        if (++tx_batch >= FF_STAFETO_TX_BATCH)
+            tx_flush();
+        stats.tx_send_ticks += counter() - began;
+        return 0;
+    }
     buf = vnet_buf_take();
     if (buf == VNET_NONE) {
         /* No buffer: the frame is lost, and TCP sends it again. */
@@ -473,10 +596,14 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
 void
 ff_dpdk_pktmbuf_free(void *m)
 {
-    if ((uintptr_t)m & 1)
-        vnet_rx_return((uint32_t)((uintptr_t)m >> 1));
-    else
+    if ((uintptr_t)m & 1) {
+        if (port_on)
+            vnet_port_rx_return((uint32_t)((uintptr_t)m >> 1));
+        else
+            vnet_rx_return((uint32_t)((uintptr_t)m >> 1));
+    } else {
         free(m);
+    }
 }
 
 /* A frame for the network service through the bypass ring. */
@@ -581,6 +708,79 @@ rx_one(const struct vnet_buf *b)
     stats.rx_input_ticks += counter() - handed;
 }
 
+/* One frame of DONE, in the cell `r`: to the stack without a copy while
+ * FILL holds enough cells, or with one copy. The cell is the stack's until
+ * its mbuf is freed, or FILL's at once. An ARP reply (flag 1) is a frame
+ * like any other for the stack. */
+static void
+port_rx_one(const struct vnet_port_rx *r)
+{
+    const uint8_t *f = r->frame;
+    uint32_t len = r->len;
+    uint64_t began, handed;
+    void *hdr;
+
+    stats.rx_frames++;
+    if (len < ETH || len > FF_STAFETO_FRAME_MAX + 4) {
+        vnet_port_rx_return(r->cell);
+        return;
+    }
+    began = counter();
+    if (vnet_port_fill_free() >= FF_STAFETO_PORT_RX_LOW) {
+        hdr = ff_mbuf_gethdr((void *)(((uintptr_t)r->cell << 1) | 1), (uint16_t)len,
+            (void *)f, (uint16_t)len, 0);
+        if (hdr == NULL) {
+            stats.rx_no_mbuf++;
+            vnet_port_rx_return(r->cell);
+            return;
+        }
+        stats.rx_zero_copy++;
+    } else {
+        void *block = malloc(len);
+
+        if (block == NULL) {
+            stats.rx_no_mbuf++;
+            vnet_port_rx_return(r->cell);
+            return;
+        }
+        vnet_copy(block, f, len);
+        vnet_port_rx_return(r->cell);
+        hdr = ff_mbuf_gethdr(block, (uint16_t)len, block, (uint16_t)len, 0);
+        if (hdr == NULL) {
+            stats.rx_no_mbuf++;
+            free(block);
+            return;
+        }
+        stats.rx_copied++;
+    }
+    handed = counter();
+    stats.rx_layer_ticks += handed - began;
+    ff_veth_process_packet(dev_ctx->ifp, hdr);
+    stats.rx_input_ticks += counter() - handed;
+}
+
+/* Up to a burst of frames from DONE. The number taken. */
+static int
+port_rx_pass(void)
+{
+    struct vnet_port_rx got[FF_STAFETO_RX_BURST];
+    uint32_t free_now;
+    int n, i;
+
+    n = vnet_port_rx_burst(got, FF_STAFETO_RX_BURST);
+    if (n < 0) {
+        fprintf(stderr, "f-stack: the switch's ring broke its rules\n");
+        dev_lost = 1;
+        return 0;
+    }
+    for (i = 0; i < n; i++)
+        port_rx_one(&got[i]);
+    free_now = vnet_port_fill_free();
+    if (free_now < stats.free_low)
+        stats.free_low = free_now;
+    return n;
+}
+
 /* Up to a burst of frames from the queue of receiving. The number taken. */
 static int
 rx_pass(void)
@@ -677,7 +877,9 @@ ff_stafeto_pass(void)
         if (ticks > 0)
             look_at_channel();
         take_notifications();
-        if (!dev_lost) {
+        if (!dev_lost && port_on) {
+            received = port_rx_pass();
+        } else if (!dev_lost) {
             vnet_tx_reclaim();
             from_service();
             received = rx_pass();
@@ -696,6 +898,20 @@ ff_stafeto_next_tick_ns(void)
     uint64_t now = ff_get_tsc_ns();
 
     return now >= next_tick_ns ? 0 : next_tick_ns - now;
+}
+
+/* The wake flag of the device on (with a full barrier and a look at the
+ * ring) or off: the interrupts of the device, or `consumer_idle` of the
+ * switch's ring. */
+void
+ff_stafeto_notify(int on)
+{
+    if (!port_on)
+        vnet_notify(on);
+    else if (on)
+        (void)vnet_port_sleep_begin();
+    else
+        vnet_port_sleep_end();
 }
 
 int
@@ -717,11 +933,11 @@ ff_stafeto_sleep(uint64_t max_ns)
         return 0;
     }
     stats.sleeps++;
-    /* The interrupts on, then a look at the queue once more: a frame that
-     * came in between brings no interrupt. */
-    vnet_notify(1);
+    /* The interrupts (the idle flag of the ring) on, then a look at the
+     * queue once more: a frame that came in between brings no interrupt. */
+    dev_notify(1);
     if (ff_stafeto_pass() > 0 || __atomic_load_n(&notified, __ATOMIC_RELAXED) != 0) {
-        vnet_notify(0);
+        dev_notify(0);
         stats.sleeps_found_work++;
         return 1;
     }
@@ -729,12 +945,12 @@ ff_stafeto_sleep(uint64_t max_ns)
     if (wait > max_ns)
         wait = max_ns;
     if (wait == 0) {
-        vnet_notify(0);
+        dev_notify(0);
         return 1;
     }
     if (stafeto_fast_wait(wait, &bits) == 0)
         ff_stafeto_absorb(bits);
-    vnet_notify(0);
+    dev_notify(0);
     return 0;
 }
 
@@ -763,8 +979,8 @@ void
 ff_stafeto_device_stats(struct ff_stafeto_device_stats *out)
 {
     *out = stats;
-    out->free_now = dev_on ? vnet_buf_free() : 0;
-    if (dev_on) {
+    out->free_now = dev_on ? rx_free() : 0;
+    if (dev_on && !port_on) {
         uint64_t b[3] = { 0, 0, 0 };
 
         vnet_bells(b);

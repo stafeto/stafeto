@@ -57,6 +57,8 @@ pub enum BenchImage {
 /// second network device, the same one change of the CPUs
 /// (`init::table::bench::BENCH_FAST_VZ_TABLE`).
 pub const BENCH_FAST_IMAGE: &str = "boot-net-bench-fast.img";
+/// The image of F1s: nginx-fast on the switch of the one device.
+pub const BENCH_SWITCH_IMAGE: &str = "boot-net-bench-switch.img";
 /// The second device's address in the image of F1 (the static address of
 /// `netd.conf`: the NAT of VZ has no lease for a device that the stack owns).
 pub const FAST_ADDRESS: &str = "192.168.64.250";
@@ -150,6 +152,21 @@ pub fn bench_fast_programs() -> &'static [ImageProgram] {
     })
 }
 
+/// The programs of the image of F1s: the switch image on VZ with init's table of the
+/// measurement (`table-bench-fast-switch-vz`).
+pub fn bench_switch_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchVz).to_vec();
+        for program in &mut programs {
+            if program.0 == "init" {
+                program.3 = &["table-bench-fast-switch-vz"];
+            }
+        }
+        programs
+    })
+}
+
 /// Builds the image of the measurement (a step of ci, which can run
 /// neither HVF nor VZ).
 pub fn build_image() -> Result<PathBuf, String> {
@@ -161,6 +178,12 @@ pub fn build_image() -> Result<PathBuf, String> {
 pub fn build_fast_image() -> Result<PathBuf, String> {
     crate::probe_ca::ensure(false)?;
     build_boot_image(BENCH_FAST_IMAGE, bench_fast_programs(), BOOT_PROFILE)
+}
+
+/// Builds the image of F1s.
+pub fn build_switch_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
+    build_boot_image(BENCH_SWITCH_IMAGE, bench_switch_programs(), BOOT_PROFILE)
 }
 
 // What both guests carry -------------------------------------------------------
@@ -237,7 +260,7 @@ pub fn nginx_conf() -> &'static str {
 /// `nginx_conf` in the directives of the allowed list, in the types written
 /// in the file, and in the path of the pid file.
 pub fn nginx_fast_conf() -> &'static str {
-    crate::fast_nginx::NGINX_FAST_CONF
+    crate::fast_nginx::root_conf()
 }
 
 /// The path of the settings with the server of TLS in the guests of Linux
@@ -738,6 +761,13 @@ pub(crate) fn expected_fast() -> (String, String) {
         config_digest(&expected_fast_config_output(nginx_fast_conf())),
         www_digest(&www_files()),
     )
+}
+
+/// The fingerprint of the settings of F1s (the package's file, the worker as nobody).
+pub(crate) fn expected_switch() -> String {
+    config_digest(&expected_fast_config_output(
+        crate::fast_nginx::NGINX_FAST_CONF,
+    ))
 }
 
 /// Refuses a guest whose fingerprints are not the expected ones.

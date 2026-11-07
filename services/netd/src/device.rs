@@ -733,6 +733,12 @@ impl<const D: usize> TxToken<'_, D> {
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
+            // A frame for a port a consumer or a group of the switch holds goes to the switch,
+            // which turns it into their tables (R-2a); its sums are filled as for the wire.
+            if D == DEVICE && ring.drop_loop == 0 && switch::turn_wanted(frame) {
+                ring.submit(n, len);
+                return (result, true);
+            }
             // The frame stays inside, in its buffer, for the next reception.
             if ring.drop_loop > 0 {
                 ring.drop_loop -= 1;

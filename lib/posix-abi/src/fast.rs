@@ -287,7 +287,9 @@ fn claim_with(out: &mut FastClaim, flags: u32, steady: bool) -> Result<(), i32> 
                 posix_sync::receiver::activate(label);
                 break got;
             }
-            Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
+            // No address yet, or no consumer number free yet (a worker that left gives its number
+            // back after the sweep has gone over the flows twice): wait and ask again.
+            Err((ENETDOWN | EBUSY, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
             Err((EBUSY, Some(_)))
                 if flags & ONCE == 0 && crate::wait::now() < started + BUSY_WAIT_NS => {}
             Err((errno, _)) => return Err(errno),
@@ -359,6 +361,152 @@ fn claim_with(out: &mut FastClaim, flags: u32, steady: bool) -> Result<(), i32> 
         out.ring = state.map_fast(ring, RING_PAGES as usize, 0)? as u64;
         Ok(())
     })
+}
+
+/// `stafeto_fast_attach` kind of the claim it describes.
+pub const KIND_PORT: u32 = 3;
+/// The switch thread's channel (a copy with NOTIFY alone), raw; 0 before an attach.
+static SWITCH: AtomicU64 = AtomicU64::new(0);
+/// EAGAIN of `attach`: the service has no switch.
+pub const NO_SWITCH: i32 = crate::constants::EAGAIN;
+
+/// The reply of an ATTACH and the switch's channel, or the errno with the status of a refusal.
+type Attach = Result<(proto_net::switch::Attached, Option<Handle<Channel>>), (i32, Option<Status>)>;
+
+/// One ATTACH.
+fn ask_attach(service: &Handle<Channel>, ring: &Handle<Memory>, label: u64) -> Attach {
+    use proto_net::switch as sw;
+    let notify = sys::handle_label(
+        &channel(),
+        Rights::NOTIFY | Rights::TRANSFER,
+        label,
+        level(),
+    )
+    .map_err(|_| (EIO, None))?;
+    let copy = sys::handle_duplicate(
+        ring,
+        Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
+    )
+    .map_err(|_| (ENOMEM, None))?;
+    let mut handles = rt::handle::Outgoing::new();
+    for h in [copy.erase(), notify.erase()] {
+        handles.push(h).map_err(|_| (EIO, None))?;
+    }
+    let mut w = Writer::new();
+    sw::write_attach(sw::Layout::DEFAULT, &mut w).map_err(|_| (EIO, None))?;
+    let mut reply = call(service, w.as_bytes(), handles).map_err(|e| {
+        dbg(format_args!("fast: ATTACH call failed errno {e}\n"));
+        (e, None)
+    })?;
+    let mut buffer = [0u8; MESSAGE_MAX];
+    match sw::Attached::read(reply.bytes(&mut buffer)) {
+        Ok(attached) => Ok((attached, reply.handles.take::<Channel>(0).ok())),
+        Err(status) => {
+            dbg(format_args!("fast: ATTACH refused: {status:?}\n"));
+            Err((attach_refusal(status), Some(status)))
+        }
+    }
+}
+
+/// The errno of a refusal of ATTACH.
+fn attach_refusal(status: Status) -> i32 {
+    match status {
+        // A service without the method, or with `switch 0`.
+        Status::UnknownMethod => NO_SWITCH,
+        Status::Kernel(Error::LimitReached) => EBUSY,
+        _ => match status.code() {
+            proto_net::INVALID => NO_SWITCH,
+            proto_net::NET_DOWN => ENETDOWN,
+            _ => refusal(status),
+        },
+    }
+}
+
+/// `stafeto_fast_attach`: the consumer of the service's switch (spec Sh4).
+/// The ring object is the process's own (`Layout::DEFAULT`, about 5 MiB of
+/// its quota), mapped as a piece of kind `Fast` like the claim's. The
+/// channel the service notifies is the thread's, labelled as for a claim,
+/// so `wait`, the bank and `lost` serve both. Nothing but the switch's
+/// channel (for `poke`) is kept besides.
+pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
+    use proto_net::switch as sw;
+    if claimed() {
+        return Err(EBUSY);
+    }
+    let service = service()?;
+    CHANNEL.store(
+        threads::own_block().channel.load(Ordering::Relaxed),
+        Ordering::Release,
+    );
+    let layout = sw::Layout::DEFAULT;
+    let pages = layout.total() / PAGE;
+    let ring = sys::mem_create(layout.total() as u64).map_err(|_| ENOMEM)?;
+    let started = crate::wait::now();
+    let (attached, switch) = loop {
+        let label = FAST_LABEL | (TRY.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
+        match ask_attach(&service, &ring, label) {
+            Ok(got) => {
+                posix_sync::receiver::activate(label);
+                break got;
+            }
+            Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
+            Err((errno, _)) => return Err(errno),
+        }
+        pause(crate::wait::now() + RETRY_NS, true)?;
+    };
+    CLAIMED.store(true, Ordering::Release);
+    SWITCH.store(switch.map_or(0, |h| h.into_raw().0), Ordering::Release);
+    *out = FastClaim {
+        kind: KIND_PORT,
+        pad: 0,
+        window: 0,
+        window_len: layout.total() as u64,
+        objects: [FastObject::default(); wire::OBJECTS],
+        ring: 0,
+        bar_sizes: [0; 6],
+        snapshot: [0; wire::SNAPSHOT_WORDS],
+        config: config_of(&attached.config),
+    };
+    out.snapshot[..6].copy_from_slice(&[
+        attached.consumer,
+        attached.generation,
+        layout.rx_slots,
+        layout.tx_slots,
+        attached.block_first,
+        attached.block_count,
+    ]);
+    crate::allocation::heap(|state| -> Result<(), i32> {
+        out.window = state.map_fast(ring, pages, 0)? as u64;
+        Ok(())
+    })
+}
+
+/// PORT_HOLD of a TCP port for the probes of the switch (`stafeto_fast_port_hold`): the
+/// descriptor of the hold; ENOSYS when the service has no switch.
+pub fn port_hold(port: u16, reuseport: bool) -> Result<i32, i32> {
+    crate::net::port_hold(port, reuseport, 0)?.ok_or(crate::constants::ENOSYS)
+}
+
+/// JOIN with the port description `fd` (`stafeto_fast_port_join`).
+pub fn port_join(fd: i32) -> Result<(), i32> {
+    crate::net::port_join(fd)
+}
+
+/// Whether the process is a consumer of the switch (not an owner of a device).
+pub fn port_mode() -> bool {
+    SWITCH.load(Ordering::Acquire) != 0
+}
+
+/// `stafeto_fast_poke`: tells the switch's thread that frames wait in TX
+/// (bit 1 of its channel).
+pub fn poke() -> Result<(), i32> {
+    match SWITCH.load(Ordering::Acquire) {
+        0 => Err(EBADF),
+        raw => {
+            let channel = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+            sys::notify(&channel, 1).map_err(|_| EIO)
+        }
+    }
 }
 
 /// `stafeto_fast_wait`: the bits of the service's notifications that came,
@@ -485,4 +633,21 @@ pub fn probe_crash() -> Result<(), i32> {
         .write(&mut w)
         .map_err(|_| EIO)?;
     call(&service, w.as_bytes(), rt::handle::Outgoing::new()).map(|_| ())
+}
+
+/// A line on standard error (a diagnostic of the start of the stack).
+pub(crate) fn dbg(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    struct Line([u8; 120], usize);
+    impl Write for Line {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut line = Line([0; 120], 0);
+    let _ = line.write_fmt(args);
+    let _ = crate::write(2, &line.0[..line.1]);
 }

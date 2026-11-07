@@ -31,6 +31,16 @@
 //! the stack (`netd::gates::Run`), and the queue is looked at once more after
 //! the interrupts are asked for again.
 //!
+//! With consumers (`switch N` in `netd.conf`) the switch also routes the frames of the wire
+//! by the tables of `netd::switchlogic` (a consumer's frame is copied into its ring, the
+//! rest goes to the stack as before), takes the frames of the consumers' TX rings in turn,
+//! copies each into a buffer of its own, checks the copy, and sends it, or turns it back
+//! into the tables when it is for the shared address (the hairpin of R-2a). The stack
+//! thread asks for changes of the tables through `COMMANDS` and hears what happened in
+//! `Back` messages. The sleep flags `switch_idle` (the switch's, in every ring) and
+//! `consumer_idle` (the consumer's) follow the rule of `ConsumerRing::consumer_idle`: write
+//! the flag, full barrier, look at the inputs once more, then wait.
+//!
 //! The wakes between the two threads are one notification each, told once
 //! until the other thread saw it (`stack_told`, `switch_told`): the switch
 //! wakes the stack when it passed frames, the stack wakes the switch at the
@@ -42,16 +52,24 @@ use crate::device::{DEVICE, Queue, fail};
 use crate::dma::{Host, net_at};
 use core::cell::{RefCell, UnsafeCell};
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
-use netd::frames::{self, RxFrame};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
+use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, SWITCH_BACK, SWITCH_BELL, SWITCH_RX,
-    SWITCH_TX, TX_SHARE, bell_due,
+    RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS, SWEEP_IDLE_NS,
+    SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
+    SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
-use rt::handle::{Channel, Interrupt, Process, Thread};
+use netd::switchlogic::commands::{self, Commands};
+use netd::switchlogic::ring::Tx;
+use netd::switchlogic::route::{self, Decision, Reason, Source, Verdict, Why};
+use netd::switchlogic::tables::{MAX_CONSUMERS, Tables};
+use proto_net::switch::{CELL, WAKE_RING};
+use rt::handle::{Channel, Interrupt, Process, Thread, Timer};
 use rt::{Handle, Stack, sys};
 use virtio_drivers::transport::SomeTransport;
 use virtio_mmio::Isr;
@@ -94,6 +112,97 @@ pub struct Inner {
     bells_tx: AtomicU32,
     /// Frames of sending the switch put in the queue.
     frames_tx: AtomicU32,
+    /// The switch put an answer in `COMMANDS.to_stack` and the stack has not looked.
+    pub back_told: Told,
+    /// The start of the port table (the switch writes it, the stack reads single bytes), or 0
+    /// without a switch table.
+    ports_base: AtomicUsize,
+    /// What the switch counts, for the stack's report.
+    pub stats: Stats,
+}
+
+/// The counters of the switch the stack prints.
+pub struct Stats {
+    pub consumers: AtomicU32,
+    pub flows: AtomicU32,
+    pub unconfirmed: AtomicU32,
+    pub evicted: AtomicU32,
+    pub expired: AtomicU32,
+    pub rx_full: AtomicU32,
+    pub tx_refused: AtomicU32,
+    /// Frames turned back into the tables (the hairpin), and frames to the device whose
+    /// destination is the shared address (the turn takes them all: stays 0).
+    pub hairpin: AtomicU32,
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
+    pub own_to_device: AtomicU32,
+    pub drops: [AtomicU32; 6],
+    pub refused_by: [AtomicU32; Reason::COUNT],
+    /// The frames of the wire for consumers, and the frames of consumers sent.
+    pub rx_consumer: AtomicU32,
+    pub tx_consumer: AtomicU32,
+    /// The frames of the wire each consumer got (the probe reads the share of each worker).
+    pub rx_by: [AtomicU32; 8],
+}
+
+impl Stats {
+    const fn new() -> Stats {
+        Stats {
+            consumers: AtomicU32::new(0),
+            flows: AtomicU32::new(0),
+            unconfirmed: AtomicU32::new(0),
+            evicted: AtomicU32::new(0),
+            expired: AtomicU32::new(0),
+            rx_full: AtomicU32::new(0),
+            tx_refused: AtomicU32::new(0),
+            hairpin: AtomicU32::new(0),
+            own_to_device: AtomicU32::new(0),
+            drops: [const { AtomicU32::new(0) }; 6],
+            refused_by: [const { AtomicU32::new(0) }; Reason::COUNT],
+            rx_consumer: AtomicU32::new(0),
+            tx_consumer: AtomicU32::new(0),
+            rx_by: [const { AtomicU32::new(0) }; 8],
+        }
+    }
+}
+
+/// The commands the stack thread gives the switch and the answers it gets.
+pub static COMMANDS: Commands = Commands::new();
+
+/// Gives the switch a command and wakes it. False when the ring of commands is full.
+pub fn command(cmd: commands::Command) -> bool {
+    if !COMMANDS.to_switch.push(cmd) {
+        return false;
+    }
+    INNER.wake_for_command();
+    true
+}
+
+/// Whether a frame the stack built for its own address is for a port a group or a consumer
+/// holds: it then goes to the switch, which turns it back in (R-2a). One byte of the port
+/// table is read without a lock; a stale byte makes the switch hand the frame back to the
+/// stack, which answers with a RST as for a SYN that came before `bind`.
+pub fn turn_wanted(frame: &[u8]) -> bool {
+    let base = INNER.ports_base.load(Ordering::Acquire);
+    if base == 0 {
+        return false;
+    }
+    let Some(p) = virtio_net::frames::packet(frame) else {
+        return false;
+    };
+    let ip = &frame[virtio_net::frames::ETHERNET_HEADER..];
+    let proto = match p.protocol {
+        virtio_net::frames::IPV4_PROTO_TCP => 0,
+        virtio_net::frames::IPV4_PROTO_UDP => 1,
+        _ => return false,
+    };
+    if !p.first_fragment || ip[16] == 127 || p.end < p.header + 4 {
+        return false;
+    }
+    let port = usize::from(u16::from_be_bytes([ip[p.header + 2], ip[p.header + 3]]));
+    // SAFETY: `base` is the start of the port table of 2 x 65 536 bytes, which lives for the
+    // service's life; a byte is read atomically, and the switch thread writes bytes.
+    let byte = unsafe { AtomicU8::from_ptr((base + proto * 65536 + port) as *mut u8) };
+    byte.load(Ordering::Relaxed) != 0
 }
 
 /// Puts `word` in `ring`. Each ring holds as many words as there are
@@ -125,6 +234,33 @@ impl Inner {
             tx_dropped: AtomicU32::new(0),
             bells_tx: AtomicU32::new(0),
             frames_tx: AtomicU32::new(0),
+            back_told: Told::new(),
+            ports_base: AtomicUsize::new(0),
+            stats: Stats::new(),
+        }
+    }
+
+    /// A command is in the ring: the switch wakes unless it was told already.
+    fn wake_for_command(&self) {
+        if self.switch_told.tell() {
+            let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
+                self.switch_channel.load(Ordering::Acquire),
+            ));
+            if sys::notify(&channel, 1).is_err() {
+                self.switch_told.failed();
+            }
+        }
+    }
+
+    /// The switch tells the stack thread (`BACK`) that answers wait in `COMMANDS.to_stack`.
+    fn tell_back(&self) {
+        if self.back_told.tell() {
+            let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
+                self.stack_channel.load(Ordering::Acquire),
+            ));
+            if sys::notify(&channel, crate::BACK).is_err() {
+                self.back_told.failed();
+            }
         }
     }
 
@@ -190,7 +326,7 @@ impl Inner {
         fence(Ordering::SeqCst);
         let starved = self.starved.load(Ordering::SeqCst);
         let due = if more {
-            self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= RX_AHEAD || starved
+            self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= RX_BACK_LAZY || starved
         } else {
             // One read-modify-write ends the run and reads what the switch
             // held, so that neither misses the other.
@@ -226,8 +362,12 @@ impl Inner {
 
 pub static INNER: Inner = Inner::new();
 
-/// The switch: the device's transport and queues, and the binding of its
-/// line.
+/// The owner of a buffer in the queue that is the stack's.
+const OWN_STACK: u8 = MAX_CONSUMERS as u8;
+const _: () = assert!(Why::FlowsFull as usize == 5);
+
+/// The switch: the device's transport and queues, the binding of its
+/// line, and (with consumers) the tables.
 pub struct Switch {
     transport: SomeTransport<'static>,
     rx: virtio_net::RxRing<Host<DEVICE>>,
@@ -240,12 +380,49 @@ pub struct Switch {
     /// The first interrupt of the device came (and was said once).
     interrupted: bool,
     link: bool,
+    /// The tables of the consumers' side; none without `switch N`.
+    tables: Option<Tables<'static>>,
+    /// The timer of the sweep of the flow table, and the channel view it fires into.
+    timer: Handle<Timer>,
+    _view: Handle<Channel>,
+    armed: bool,
+    /// Frames of consumers wait for a buffer or a share (see `consumer_frames`).
+    blocked: bool,
+    last_sweep: u64,
+    /// Rounds of the sweep until which the timer runs on a quiet line (a consumer left).
+    settle_until: u32,
+    consumers_before: usize,
+    /// The consumer whose frames come first in the next step.
+    next_c: u8,
+    /// The frame of a consumer, copied out of its ring and checked here.
+    scratch: [u8; CELL],
+    /// Whose each buffer of the queue of sending is, in the order they went in: the device
+    /// returns them in order, so a count of reclaimed buffers pops the owners.
+    fifo: [u8; TX_BUFFERS],
+    fifo_head: usize,
+    fifo_len: usize,
+    inflight: [u16; MAX_CONSUMERS + 1],
+    /// What each consumer's DONE index was when the switch last looked at waking it.
+    woken: netd::books::Woken,
+    /// The `switch_idle` flags are set in the rings.
+    idle_set: bool,
     /// The longest step so far, in ticks of the thread's own time.
     #[cfg(feature = "steps")]
     longest: u64,
+    #[cfg(feature = "steps")]
+    own: Option<Handle<Thread>>,
+    /// The thread's own time at the start of the step.
+    step_began: u64,
+    /// The longest parts of a step with consumers: frames of consumers, the sweep, commands.
+    #[cfg(feature = "steps")]
+    longest_part: [u64; 3],
     /// The multiples of 500 frames the probe's line said.
     #[cfg(feature = "probe")]
     said: u64,
+}
+
+fn now_ns() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
 }
 
 impl Switch {
@@ -260,6 +437,7 @@ impl Switch {
         irq: Handle<Interrupt>,
         channel: Handle<Channel>,
         link: bool,
+        (tables, timer, view): (Option<Tables<'static>>, Handle<Timer>, Handle<Channel>),
     ) -> Switch {
         let mut rx = virtio_net::RxRing::new(rx_queue, net_at(DEVICE));
         if let Err(broken) = rx.fill(RX_BUFFERS) {
@@ -269,6 +447,11 @@ impl Switch {
         transport.finish_init();
         ring(&mut transport, RECEIVEQ);
         rx.rung();
+        if let Some(t) = tables.as_ref() {
+            INNER
+                .ports_base
+                .store(t.ports_ptr() as usize, Ordering::Release);
+        }
         let mut switch = Switch {
             transport,
             rx,
@@ -278,8 +461,29 @@ impl Switch {
             line_closed: false,
             interrupted: false,
             link,
+            tables,
+            timer,
+            _view: view,
+            armed: false,
+            blocked: false,
+            last_sweep: 0,
+            settle_until: 0,
+            consumers_before: 0,
+            next_c: 0,
+            scratch: [0; CELL],
+            fifo: [0; TX_BUFFERS],
+            fifo_head: 0,
+            fifo_len: 0,
+            inflight: [0; MAX_CONSUMERS + 1],
+            woken: netd::books::Woken::new(),
+            idle_set: false,
             #[cfg(feature = "steps")]
             longest: 0,
+            #[cfg(feature = "steps")]
+            own: None,
+            step_began: 0,
+            #[cfg(feature = "steps")]
+            longest_part: [0; 3],
             #[cfg(feature = "probe")]
             said: 0,
         };
@@ -287,16 +491,77 @@ impl Switch {
         switch
     }
 
+    /// The consumers attached now.
+    fn consumers(&self) -> usize {
+        self.tables
+            .as_ref()
+            .map_or(0, |t| t.consumers.iter().flatten().count())
+    }
+
+    /// The buffers of sending the stack may have: all while it is alone, `STACK_SHARE` of
+    /// them once consumers are attached (the rest is theirs).
+    fn share(&self) -> usize {
+        // The buffers the consumers will need are never lent: a stack that holds all of them
+        // would keep them while its consumers wait.
+        if self.tables.is_some() {
+            STACK_SHARE
+        } else {
+            TX_SHARE
+        }
+    }
+
+    /// The buffers of the queue of sending one consumer may have at a time.
+    fn consumer_cap(&self) -> usize {
+        ((TX_BUFFERS - STACK_SHARE) / self.consumers().max(1)).max(4)
+    }
+
     /// Lends the stack free buffers of sending up to its share. True when
     /// the stack was out of them and has some now.
     fn lend(&mut self) -> bool {
-        while INNER.tx_supply.len() < TX_SHARE {
-            let Some(n) = self.tx.book.alloc() else {
-                break;
-            };
-            must(&INNER.tx_supply, u32::from(n));
+        let share = self.share();
+        if share == TX_SHARE {
+            while INNER.tx_supply.len() < share {
+                let Some(n) = self.tx.book.alloc() else {
+                    break;
+                };
+                must(&INNER.tx_supply, u32::from(n));
+            }
+        } else {
+            // With consumers the stack's buffers are counted wherever they are: lent, waiting
+            // for the switch, and in the queue on its account.
+            loop {
+                let held = INNER.tx_supply.len()
+                    + INNER.tx_sub.len()
+                    + usize::from(self.inflight[usize::from(OWN_STACK)]);
+                if held >= share {
+                    break;
+                }
+                let Some(n) = self.tx.book.alloc() else {
+                    break;
+                };
+                must(&INNER.tx_supply, u32::from(n));
+            }
         }
         !INNER.tx_supply.is_empty() && INNER.starved.swap(false, Ordering::AcqRel)
+    }
+
+    /// A buffer went into the queue of sending on `owner`'s account.
+    fn queued(&mut self, owner: u8) {
+        if self.fifo_len < TX_BUFFERS {
+            self.fifo[(self.fifo_head + self.fifo_len) % TX_BUFFERS] = owner;
+            self.fifo_len += 1;
+            self.inflight[usize::from(owner)] += 1;
+        }
+    }
+
+    /// The device returned `count` buffers: their owners' accounts close.
+    fn returned(&mut self, count: usize) {
+        for _ in 0..count.min(self.fifo_len) {
+            let owner = usize::from(self.fifo[self.fifo_head]);
+            self.fifo_head = (self.fifo_head + 1) % TX_BUFFERS;
+            self.fifo_len -= 1;
+            self.inflight[owner] = self.inflight[owner].saturating_sub(1);
+        }
     }
 
     /// The change of the link (the interrupt's configuration bit).
@@ -311,12 +576,16 @@ impl Switch {
     }
 
     /// One step: the buffers and frames the stack passed go to the queues,
-    /// the sent buffers come back, the frames of the wire go to the stack,
-    /// and the doorbells ring when a run is over. True when another step
-    /// follows at once (frames left in the queue with room for them, or
-    /// frames of the stack left in its ring).
+    /// the sent buffers come back, the frames of the wire go to the stack or a
+    /// consumer, the frames of the consumers go out, and the doorbells ring when
+    /// a run is over. True when another step follows at once (frames left in
+    /// the queue with room for them, or frames of the stack or a consumer left
+    /// in their rings).
     fn step(&mut self, interrupt: bool) -> bool {
         profile::count(Counter::StepSwitch);
+        if self.idle_set {
+            self.clear_idle();
+        }
         if interrupt {
             self.line_closed = true;
             let began = profile::now();
@@ -329,6 +598,18 @@ impl Switch {
                 self.link_changed();
             }
         }
+        let now = now_ns();
+        self.step_began = rt::time::now();
+        #[cfg(feature = "steps")]
+        let began = self.ran();
+        let mut more_c = false;
+        if let Some(t) = self.tables.as_mut() {
+            t.now = (now / 1_000_000_000) as u32;
+            commands::drain(t, &COMMANDS);
+            commands::poll(t, &COMMANDS);
+        }
+        #[cfg(feature = "steps")]
+        self.part(0, self.ran().saturating_sub(began));
         // What the stack passed: buffers of receiving, buffers of sending
         // it did not use, then its frames to send.
         // At most `SWITCH_BACK` of each a step (the step is bound, and the
@@ -337,7 +618,10 @@ impl Switch {
             let Some(word) = INNER.rx_back.pop() else {
                 break;
             };
-            if let Err(broken) = self.rx.give(word as u16) {
+            // A frame the switch turned to the stack came in a buffer of sending.
+            if word as usize >= RX_BUFFERS {
+                self.tx.book.release(word as u16);
+            } else if let Err(broken) = self.rx.give(word as u16) {
                 fail(broken.text(false));
             }
         }
@@ -347,28 +631,55 @@ impl Switch {
             };
             self.tx.book.release(word as u16);
         }
+        let mut passed = 0;
+        let mut taken = 0;
         for _ in 0..SWITCH_TX {
             let Some(word) = INNER.tx_sub.pop() else {
                 break;
             };
             let (n, len) = unpack(word);
-            match self.tx.submit(n, usize::from(len)) {
-                Ok(Sent::Queued) => {
-                    INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(Sent::Dropped) => {
-                    INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(broken) => fail(broken.text(true)),
+            let (to_stack, turned) = self.stack_frame(n, usize::from(len));
+            passed += to_stack;
+            // A frame turned into the tables costs a copy and a route as a frame of a consumer
+            // does: past the first few the step goes on only while it is short.
+            taken += usize::from(turned);
+            if turned && !netd::books::may_take(taken, SWITCH_BASE, self.over_soft()) {
+                break;
             }
         }
-        if let Err(broken) = self.tx.reclaim(RECLAIM_STEP) {
-            fail(broken.text(true));
+        match self.tx.reclaim(RECLAIM_STEP) {
+            Ok(count) => self.returned(count),
+            Err(broken) => fail(broken.text(true)),
         }
         let lent = self.lend();
+        #[cfg(feature = "steps")]
+        let before_consumers = self.ran();
+        if self.tables.is_some() {
+            more_c = self.consumer_frames();
+        }
+        #[cfg(feature = "steps")]
+        self.part(1, self.ran().saturating_sub(before_consumers));
         // The frames of the wire.
         let room = RX_AHEAD.saturating_sub(INNER.rx_ready.len());
-        let passed = self.receive(room.min(SWITCH_RX));
+        let budget = if self.tables.is_some() {
+            SWITCH_ROUTED
+        } else {
+            SWITCH_RX
+        };
+        passed += self.receive(room.min(budget));
+        #[cfg(feature = "steps")]
+        let before_sweep = self.ran();
+        if let Some(t) = self.tables.as_mut()
+            && now.wrapping_sub(self.last_sweep) >= SWEEP_EVERY_NS
+        {
+            self.last_sweep = now;
+            t.sweep();
+        }
+        #[cfg(feature = "steps")]
+        self.part(2, self.ran().saturating_sub(before_sweep));
+        if self.tables.is_some() {
+            self.after_tables(now);
+        }
         if passed > 0 && INNER.stack_told.tell() {
             INNER.wake_stack(crate::RX);
         }
@@ -384,9 +695,15 @@ impl Switch {
         // more look at the queue, so that a frame that came between is not
         // left to wait (`ring::settle_interrupts`).
         let mut continued = more_rx
+            || more_c
             || !INNER.tx_sub.is_empty()
             || !INNER.rx_back.is_empty()
-            || !INNER.tx_back.is_empty();
+            || !INNER.tx_back.is_empty()
+            || !COMMANDS.to_switch.is_empty();
+        if !continued {
+            // The consumers' flags go up before the last look at their rings.
+            continued = self.go_idle();
+        }
         if !continued {
             continued = {
                 let queue = RefCell::new(&mut self.rx.queue);
@@ -397,6 +714,9 @@ impl Switch {
                     || queue.borrow().can_pop(),
                 )
             };
+            if continued {
+                self.clear_idle();
+            }
             if !continued && core::mem::take(&mut self.line_closed) {
                 let began = profile::now();
                 virtio_mmio::reopen(&self.irq);
@@ -412,14 +732,334 @@ impl Switch {
         continued
     }
 
+    /// The thread's own time in ticks (a thread of a higher level that runs in the middle
+    /// of a step does not lengthen it).
+    #[cfg(feature = "steps")]
+    fn ran(&self) -> u64 {
+        self.own
+            .as_ref()
+            .map_or(0, |t| sys::thread_ran(t).unwrap_or(0))
+    }
+
+    /// The step has used up its soft share of time: the frames past `SWITCH_BASE` wait for
+    /// the next step.
+    fn over_soft(&self) -> bool {
+        rt::time::now().saturating_sub(self.step_began) > SWITCH_SOFT
+    }
+
+    #[cfg(feature = "steps")]
+    fn part(&mut self, which: usize, ticks: u64) {
+        if ticks > self.longest_part[which] {
+            self.longest_part[which] = ticks;
+            rt::println!(
+                "service step: 14 kind {} {ticks} ticks detail 0",
+                68 + which
+            );
+        }
+    }
+
+    /// The last look before sleeping: every ring gets `switch_idle = 1`, a full barrier
+    /// follows, and a frame a consumer wrote meanwhile (or a command) cancels the sleep.
+    fn go_idle(&mut self) -> bool {
+        let Some(t) = self.tables.as_ref() else {
+            return false;
+        };
+        let mut any = false;
+        for x in t.consumers.iter().flatten() {
+            x.ring.set_switch_idle(true);
+            any = true;
+        }
+        if !any {
+            return false;
+        }
+        self.idle_set = true;
+        let t = self.tables.as_ref().expect("there");
+        // A consumer whose frame waits for a buffer or its share of the queue is no work
+        // (the 1 ms timer and the returned buffers look at it again); counting it would
+        // make the switch run again at once, above the stack, and spin.
+        let (cap, free) = (self.consumer_cap(), self.tx.book.free());
+        let work = netd::books::has_work(
+            t.consumers.iter().enumerate().filter_map(|(c, x)| {
+                x.as_ref()
+                    .map(|x| (x.ring.tx_pending(), usize::from(self.inflight[c])))
+            }),
+            cap,
+            free,
+            !COMMANDS.to_switch.is_empty(),
+        );
+        if work {
+            self.clear_idle();
+        }
+        work
+    }
+
+    fn clear_idle(&mut self) {
+        self.idle_set = false;
+        if let Some(t) = self.tables.as_ref() {
+            for x in t.consumers.iter().flatten() {
+                x.ring.set_switch_idle(false);
+            }
+        }
+    }
+
+    /// A frame of the stack: a turn to the shared address goes through the tables, any other
+    /// into the queue. The number of frames passed to the stack, and whether the frame was
+    /// turned into the tables.
+    fn stack_frame(&mut self, n: u16, len: usize) -> (usize, bool) {
+        // SAFETY: the stack gave the buffer up (it is in `tx_sub`), and the device does not
+        // hold it.
+        let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+        let frame = &slice[HDR_LEN..HDR_LEN + len];
+        if let Some(t) = self.tables.as_mut()
+            && route::faces_own(t, frame)
+        {
+            INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
+            let passed = match route::route(t, frame, Source::Stack) {
+                // A stale byte of the stack's: the frame goes back, and the stack answers it.
+                // A full ring of frames for the stack drops it (TCP repeats it).
+                Decision::Stack => {
+                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                        1
+                    } else {
+                        self.tx.book.release(n);
+                        0
+                    }
+                }
+                Decision::Drop(why) => {
+                    INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+                    self.tx.book.release(n);
+                    0
+                }
+                d => {
+                    if let Decision::Consumer { consumer, .. } = d {
+                        INNER.stats.rx_consumer.fetch_add(1, Ordering::Relaxed);
+                        INNER.stats.rx_by[usize::from(consumer) % 8]
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    route::deliver(t, d, frame);
+                    self.tx.book.release(n);
+                    0
+                }
+            };
+            return (passed, true);
+        }
+        #[cfg(feature = "probe")]
+        if let Some(t) = self.tables.as_ref()
+            && t.own.ip != [0; 4]
+            && frame.len() >= 34
+            && frame[30..34] == t.own.ip
+        {
+            INNER.stats.own_to_device.fetch_add(1, Ordering::Relaxed);
+        }
+        match self.tx.submit(n, len) {
+            Ok(Sent::Queued) => {
+                INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
+                self.queued(OWN_STACK);
+            }
+            Ok(Sent::Dropped) => {
+                INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(broken) => fail(broken.text(true)),
+        }
+        (0, false)
+    }
+
+    /// Takes frames of the consumers' TX rings in turn, one from each in a round, up to
+    /// `SWITCH_CTX`, and starts the next step with the next consumer. True when frames are
+    /// left.
+    fn consumer_frames(&mut self) -> bool {
+        let cap = self.consumer_cap();
+        let mut budget = SWITCH_CTX;
+        let mut taken = 0;
+        let mut progressed = true;
+        let mut blocked = false;
+        while budget > 0 && progressed {
+            progressed = false;
+            for k in 0..MAX_CONSUMERS {
+                if budget == 0 {
+                    break;
+                }
+                // Frames past the first few go on only while the step is short.
+                if !netd::books::may_take(taken, SWITCH_BASE, self.over_soft()) {
+                    budget = 0;
+                    break;
+                }
+                let c = (usize::from(self.next_c) + k) % MAX_CONSUMERS;
+                // A frame waits in its ring while this consumer holds its share of the
+                // queue, or no buffer is free.
+                if netd::books::blocked(usize::from(self.inflight[c]), cap, self.tx.book.free()) {
+                    blocked = true;
+                    continue;
+                }
+                let Some(t) = self.tables.as_mut() else {
+                    return false;
+                };
+                let Some(x) = t.consumers[c].as_mut() else {
+                    continue;
+                };
+                match x.ring.take_tx(&mut self.scratch) {
+                    Tx::Empty => {}
+                    Tx::Refused => {
+                        x.ring.refused = x.ring.refused.wrapping_add(1);
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                    }
+                    Tx::Frame(len) => {
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                        self.consumer_frame(c as u8, len);
+                    }
+                }
+            }
+        }
+        self.next_c = (self.next_c + 1) % MAX_CONSUMERS as u8;
+        // Frames that wait for a buffer or a share of the queue do not make the switch run
+        // again at once (it would spin above the stack): the timer looks again in a
+        // millisecond, and the steps that return buffers go on as before.
+        self.blocked = blocked
+            && self
+                .tables
+                .as_ref()
+                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()));
+        budget == 0
+            && self
+                .tables
+                .as_ref()
+                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()))
+    }
+
+    /// The copy in `scratch` is checked and goes out, or turns back into the tables.
+    fn consumer_frame(&mut self, c: u8, len: usize) {
+        let Some(t) = self.tables.as_mut() else {
+            return;
+        };
+        let frame = &self.scratch[..len];
+        match route::check_tx(t, c, frame) {
+            Verdict::Refuse(_) => {}
+            Verdict::Send => {
+                let Some(n) = self.tx.book.alloc() else {
+                    return;
+                };
+                // SAFETY: the buffer is free (just taken from the pool).
+                let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+                slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
+                match self.tx.submit(n, len) {
+                    Ok(Sent::Queued) => {
+                        INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
+                        INNER.stats.tx_consumer.fetch_add(1, Ordering::Relaxed);
+                        self.queued(c);
+                    }
+                    Ok(Sent::Dropped) => {
+                        INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(broken) => fail(broken.text(true)),
+                }
+            }
+            Verdict::Hairpin => {
+                INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
+                let d = route::route(t, frame, Source::Consumer(c));
+                match d {
+                    Decision::Drop(why) => {
+                        INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+                    }
+                    Decision::Stack | Decision::ArpAll => {
+                        route::deliver(t, d, frame);
+                        // The stack gets a buffer of sending to read the frame in; it comes
+                        // back through `rx_back` (`step`).
+                        if let Some(n) = self.tx.book.alloc() {
+                            // SAFETY: the buffer is free (just taken from the pool).
+                            let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+                            slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
+                            if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                                if INNER.stack_told.tell() {
+                                    INNER.wake_stack(crate::RX);
+                                }
+                            } else {
+                                self.tx.book.release(n);
+                            }
+                        }
+                    }
+                    d => {
+                        route::deliver(t, d, frame);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The end of a step with tables: consumers with new frames are woken when they sleep,
+    /// the counters and the indices are published, the stack hears what is owed it, and the
+    /// timer of the sweep is set while there is something to sweep.
+    fn after_tables(&mut self, now: u64) {
+        let Some(t) = self.tables.as_mut() else {
+            return;
+        };
+        for (c, slot) in t.consumers.iter().enumerate() {
+            let Some(x) = slot else { continue };
+            x.ring.publish();
+            let head = x.ring.done_head();
+            // A new consumer on a number starts from nothing (`Woken` keys on the generation).
+            if self.woken.news(c, x.generation, head) && x.wake != 0 && x.ring.consumer_idle() {
+                let channel = Handle::<Channel>::borrowed(rt::abi::Handle(x.wake));
+                let _ = sys::notify(&channel, WAKE_RING);
+            }
+        }
+        let st = &INNER.stats;
+        let count = t.consumers.iter().flatten().count();
+        if count < self.consumers_before {
+            self.settle_until = t.flows.rounds().wrapping_add(3);
+        }
+        self.consumers_before = count;
+        st.consumers.store(count as u32, Ordering::Relaxed);
+        st.flows.store(t.flows.len() as u32, Ordering::Relaxed);
+        st.unconfirmed
+            .store(t.flows.unconfirmed() as u32, Ordering::Relaxed);
+        st.evicted.store(t.flows.evicted, Ordering::Relaxed);
+        st.expired.store(t.flows.expired, Ordering::Relaxed);
+        let (mut full, mut refused) = (0u32, 0u32);
+        for x in t.consumers.iter().flatten() {
+            full = full.wrapping_add(x.ring.rx_full);
+            refused = refused.wrapping_add(x.ring.refused);
+        }
+        st.rx_full.store(full, Ordering::Relaxed);
+        st.tx_refused.store(refused, Ordering::Relaxed);
+        for (slot, v) in st.refused_by.iter().zip(t.refused.iter()) {
+            slot.store(*v, Ordering::Relaxed);
+        }
+        if !COMMANDS.to_stack.is_empty() {
+            INNER.tell_back();
+        }
+        // A consumer left lately: the rounds that return its number follow fast.
+        let settling = t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
+        let sweeping = count > 0 || !t.flows.is_empty() || settling;
+        if (sweeping || self.blocked) && !self.armed {
+            let after = if self.blocked {
+                1_000_000
+            } else if settling {
+                2_000_000
+            } else {
+                SWEEP_IDLE_NS
+            };
+            self.armed = sys::timer_set(&self.timer, now + after).is_ok();
+        }
+    }
+
     /// Takes up to `budget` used buffers off the queue of receiving, each
-    /// to the stack (its number and the length of its frame) or back to the
-    /// queue when it holds no frame or one the stack must not see. Every
-    /// buffer taken costs one unit of the share. The number of frames
-    /// passed.
+    /// to the stack (its number and the length of its frame), to a consumer
+    /// (copied into its ring, the buffer back in the queue), or back to the
+    /// queue when it holds no frame or one the tables drop. Every buffer
+    /// taken costs one unit of the share. The number of frames passed to the
+    /// stack.
     fn receive(&mut self, mut budget: usize) -> usize {
         let mut passed = 0;
+        let mut taken = 0;
         while budget > 0 {
+            if self.tables.is_some() && taken >= SWITCH_BASE && self.over_soft() {
+                break;
+            }
+            taken += 1;
             let (n, used) = match self.rx.pop() {
                 Ok(Some(popped)) => popped,
                 Ok(None) => break,
@@ -431,8 +1071,31 @@ impl Switch {
             let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
             match frames::classify(slice, used) {
                 RxFrame::Frame(len) => {
-                    must(&INNER.rx_ready, pack(n, len as u16));
-                    passed += 1;
+                    let Some(t) = self.tables.as_mut() else {
+                        must(&INNER.rx_ready, pack(n, len as u16));
+                        passed += 1;
+                        continue;
+                    };
+                    let frame = &slice[HDR_LEN..HDR_LEN + len];
+                    match route::route(t, frame, Source::Wire) {
+                        Decision::Drop(why) => {
+                            INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+                            self.give(n);
+                        }
+                        d => {
+                            if let Decision::Consumer { consumer, .. } = d {
+                                INNER.stats.rx_consumer.fetch_add(1, Ordering::Relaxed);
+                                INNER.stats.rx_by[usize::from(consumer) % 8]
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            if route::deliver(t, d, frame) {
+                                must(&INNER.rx_ready, pack(n, len as u16));
+                                passed += 1;
+                            } else {
+                                self.give(n);
+                            }
+                        }
+                    }
                 }
                 // A frame of the loopback network on the wire never reaches
                 // the stack (RFC 1122, 3.2.1.3).
@@ -512,6 +1175,15 @@ static STACK: Stack<STACK_BYTES> = Stack::new();
 /// The message buffer of the thread: the page after the main thread's.
 const BUFFER: usize = abi::INIT_MSGBUF as usize + 4096;
 
+/// A tag for the thread that runs: 1 on the switch thread's stack, 0 elsewhere (the guard of
+/// the tables checks that only the switch thread writes them).
+pub fn tag() -> u32 {
+    let here = 0u8;
+    let sp = core::ptr::addr_of!(here) as usize;
+    let top = STACK.top();
+    u32::from(sp <= top && top - sp < STACK_BYTES)
+}
+
 /// Why the thread did not start.
 pub struct NotStarted;
 
@@ -555,7 +1227,13 @@ extern "C" fn run(_: u64) -> ! {
     // is its only user.
     let switch = unsafe { (*SLOT.0.get()).assume_init_mut() };
     #[cfg(feature = "steps")]
-    let own = sys::self_thread().ok();
+    {
+        switch.own = sys::self_thread().ok();
+    }
+    // The tables are the switch thread's from here on.
+    if let Some(t) = switch.tables.as_mut() {
+        t.claim();
+    }
     // The line opens once the queues are up.
     virtio_mmio::reopen(&switch.irq);
     loop {
@@ -564,6 +1242,9 @@ extern "C" fn run(_: u64) -> ! {
                 // Seen before the rings are looked at: a word pushed after
                 // that tells again.
                 INNER.switch_told.seen();
+                if source == abi::Source::Timer {
+                    switch.armed = false;
+                }
                 source == abi::Source::Interrupt
             }
             Ok(_) => continue,
@@ -578,12 +1259,12 @@ extern "C" fn run(_: u64) -> ! {
         let mut interrupt = interrupt;
         loop {
             #[cfg(feature = "steps")]
-            let began = own.as_ref().map_or(0, |t| sys::thread_ran(t).unwrap_or(0));
+            let began = switch.ran();
             let more = switch.step(interrupt);
             interrupt = false;
             #[cfg(feature = "steps")]
-            if let Some(t) = own.as_ref() {
-                let ticks = sys::thread_ran(t).unwrap_or(0).saturating_sub(began);
+            {
+                let ticks = switch.ran().saturating_sub(began);
                 if ticks > switch.longest {
                     switch.longest = ticks;
                     rt::println!("service step: 14 kind 67 {ticks} ticks detail 0");

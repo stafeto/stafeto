@@ -1,0 +1,754 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The probes of the switch of the network service with nginx on the stack
+//! as its consumer (`cargo xtask fast-probe switch ...`, stage Sh4b2): the
+//! image with one network device (`boot-fast-switch.img`, init's table
+//! `table-fast-switch`, `netd.conf` with `switch 8` and `flows 16384`), and
+//! `nginx-fast` under nobody on the address of the lease.
+//!
+//! * `switch`: BusyBox `httpd` on 8080 and `nginx-fast` with four workers on
+//!   80 in one run; 200 requests from the host to each, byte for byte; the
+//!   counters of `posix-net stat` show four consumers, each with a share of
+//!   the frames, no frame to the device with the shared address as its
+//!   destination; a `wget` of the guest to nginx-fast on the shared address
+//!   (the turn of the switch) comes whole, and the turned frames count; no
+//!   reset of the device.
+//! * `switch kill`: under a stream of new connections `kill -9` of a worker
+//!   (one worker, then four): no connection fails, the first connection after
+//!   the kill is answered, the device is never reset.
+//! * `switch idle`: a request after 2 s of rest, on an open connection and on
+//!   a new one, is answered within 50 ms (a lost wake would wait for a tick).
+//! * `switch steps`: the start and the first pages under -icount with the
+//!   service counting its steps: every step, those of the switch among them
+//!   (kinds 67 to 70), is under 0.9 of term B.
+//! * `switch-probe`: the C program over the ring sends the frames the switch
+//!   refuses; each is counted by its reason, none reaches the wire (the
+//!   capture of the device), a broken ring disables its consumer alone.
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use crate::fast_nginx::{self, Kind, TINY};
+use crate::nginx_probe::{Connection, same};
+use crate::qemu::{self, Forward, Proto};
+use crate::{
+    BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, Variant, build, build_boot_image,
+    busybox_build, nano_build, net_probe, relibc,
+};
+
+const CONF4: &str = "/etc/nginx/nginx-fast-4.conf";
+const CONF1: &str = "/etc/nginx/nginx-fast.conf";
+const REQUESTS: usize = 200;
+const READ_WITHIN: Duration = Duration::from_secs(60);
+/// The share each worker's frames take at least, of those of all.
+const SHARE_MIN: f64 = 0.10;
+const IDLE_WITHIN: Duration = Duration::from_millis(50);
+/// The wire's frames the capture of the probe keeps.
+const PCAP: &str = "switch-probe.pcap";
+
+/// `nginx-fast.conf` of the switch with four workers.
+pub fn conf4() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        crate::nginx_probe::replaced(
+            fast_nginx::switch_conf(),
+            "worker_processes 1;",
+            "worker_processes 4;",
+        )
+    })
+}
+
+pub fn command(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => probe(Scenario::Plain),
+        [a] if a == "kill" => probe(Scenario::Kill),
+        [a] if a == "idle" => probe(Scenario::Idle),
+        [a] if a == "steps" => probe(Scenario::Steps),
+        [a] if a == "frames" => probe(Scenario::Frames),
+        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|steps|frames]".to_owned()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Scenario {
+    Plain,
+    Kill,
+    Idle,
+    Steps,
+    /// `switch-probe`.
+    Frames,
+}
+
+/// A counter of a line of the service after `key`.
+fn counter(line: &str, key: &str) -> Option<u64> {
+    let rest = line.split(&format!(" {key} ")).nth(1)?;
+    rest.split([' ', ',']).next()?.parse().ok()
+}
+
+/// What `posix-net stat` makes the service say: the last lines `net: switch`.
+struct Stat {
+    consumers: u64,
+    hairpin: u64,
+    own_to_device: u64,
+    tx_refused: u64,
+    /// The refusals by reason (cumulative, also of consumers that left).
+    refused_by: Vec<u64>,
+    rx_by: Vec<u64>,
+    line: String,
+}
+
+fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
+    let from = run.lines().len();
+    run.send("posix-net stat")?;
+    // The service prints its counters when the request is over, so they may come after the
+    // next prompt: the last line of them is waited for.
+    run.expect_line(
+        "the counters of the switch",
+        |l| l.contains("net: switch rx_by "),
+        Duration::from_secs(30),
+    )?;
+    let _ = tag;
+    let lines: Vec<String> = run.lines()[from..].to_vec();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("net: switch consumers "))
+        .cloned()
+        .ok_or_else(|| {
+            format!("no line `net: switch consumers` after posix-net stat: {lines:?}")
+        })?;
+    let by = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("net: switch rx_by "))
+        .ok_or("no line `net: switch rx_by`")?;
+    let inner = by
+        .split('[')
+        .nth(1)
+        .and_then(|r| r.split(']').next())
+        .ok_or("rx_by")?;
+    let rx_by: Vec<u64> = inner
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    let refused_by: Vec<u64> = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("refused_by ["))
+        .and_then(|l| l.split("refused_by [").nth(1))
+        .and_then(|r| r.split(']').next())
+        .map(|inner| {
+            inner
+                .split(',')
+                .filter_map(|n| n.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Stat {
+        refused_by,
+        consumers: counter(&line, "consumers").ok_or("consumers")?,
+        hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
+        own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
+        tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
+        rx_by,
+        line,
+    })
+}
+
+/// The shell prompt and the lease (one device).
+pub(crate) fn booted(run: &mut qemu::Run) -> Result<(), String> {
+    run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+    run.expect("net: lease 10.0.2.15/24", BOOT_TIMEOUT)?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("S=ok")?;
+    run.expect("# ", DIALOG_STEP)?;
+    Ok(())
+}
+
+fn kind_of(s: Scenario) -> Kind {
+    match s {
+        Scenario::Steps => Kind::SwitchSteps,
+        _ => Kind::Switch,
+    }
+}
+
+pub fn probe(scenario: Scenario) -> Result<(), String> {
+    let machine = &qemu::VIRT;
+    relibc()?;
+    busybox_build()?;
+    nano_build()?;
+    crate::net_build()?;
+    crate::probe_ca::ensure(false)?;
+    let kernel = build(Variant::Normal)?;
+    let kind = kind_of(scenario);
+    let (name, programs) = (
+        if kind == Kind::SwitchSteps {
+            fast_nginx::SWITCH_STEPS_IMAGE
+        } else {
+            fast_nginx::SWITCH_IMAGE
+        },
+        fast_nginx::programs(kind),
+    );
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let ports = (
+        crate::net_curl::free_tcp_port()?,
+        crate::net_curl::free_tcp_port()?,
+    );
+    let dir = crate::target_dir().join("fast-switch");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let pcap = dir.join(PCAP);
+    let _ = std::fs::remove_file(&pcap);
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut net = qemu::net(&[
+        Forward {
+            proto: Proto::Tcp,
+            host: ports.0,
+            guest: 80,
+        },
+        Forward {
+            proto: Proto::Tcp,
+            host: ports.1,
+            guest: 8080,
+        },
+    ]);
+    if scenario == Scenario::Frames {
+        net.extend([
+            "-object".to_owned(),
+            format!("filter-dump,id=f9,netdev=n0,file={}", pcap.display()),
+        ]);
+    }
+    cmd.args(net);
+    if scenario == Scenario::Steps {
+        cmd.args(["-icount", "shift=4,sleep=on"]);
+    }
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let began = Instant::now();
+    let nginx: SocketAddr = ([127, 0, 0, 1], ports.0).into();
+    let httpd: SocketAddr = ([127, 0, 0, 1], ports.1).into();
+    let mut notes: Vec<String> = Vec::new();
+    let talked = match scenario {
+        Scenario::Plain => plain(&mut run, nginx, httpd, &mut notes),
+        Scenario::Kill => kill(&mut run, nginx, &mut notes),
+        Scenario::Idle => idle(&mut run, nginx, &mut notes),
+        Scenario::Steps => steps(&mut run, nginx, &mut notes),
+        Scenario::Frames => frames(&mut run, &pcap, &mut notes),
+    };
+    let output = run.stop();
+    crate::symbolize::backtrace(&output.lines, &kernel.elf);
+    for note in &notes {
+        println!("fast-switch: {note}");
+    }
+    talked?;
+    // The workers killed by the probes end on signal 9.
+    fast_nginx::verdict(&output.lines, 0)?;
+    net_probe::placing_fault(&output.lines)?;
+    if let Some(line) = output
+        .lines
+        .iter()
+        .find(|l| l.contains("net: device 1 back") || l.contains("net: switch ring broken"))
+        && scenario != Scenario::Frames
+    {
+        return Err(format!("the service said {line:?}"));
+    }
+    if scenario == Scenario::Steps {
+        let rows = net_probe::longest_over_starts(&output.lines);
+        if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+            return Err(format!(
+                "the network service: a step past 0.9 of term B ({}): {row:?}",
+                net_probe::STEP_MAX
+            ));
+        }
+        for kind in [67, 68, 69, 70] {
+            if !rows.iter().any(|r| r.0 == kind) {
+                return Err(format!("no step of the switch of kind {kind}: {rows:?}"));
+            }
+        }
+        println!(
+            "fast-switch steps: every kind: {rows:?} (bound {})",
+            net_probe::STEP_MAX
+        );
+    }
+    println!(
+        "fast-switch {scenario:?} passed in {:.0} s",
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn start(run: &mut qemu::Run, conf: &str) -> Result<(), String> {
+    fast_nginx::started(run, conf).map(drop)
+}
+
+fn requests(
+    what: &str,
+    address: SocketAddr,
+    path: &str,
+    want: &[u8],
+    n: usize,
+) -> Result<(), String> {
+    for i in 0..n {
+        let body = Connection::open(address, READ_WITHIN)
+            .and_then(|mut c| c.get(path))
+            .map_err(|e| format!("{what}: request {i}: {e}"))?;
+        same(what, &body, want)?;
+    }
+    Ok(())
+}
+
+fn plain(
+    run: &mut qemu::Run,
+    nginx: SocketAddr,
+    httpd: SocketAddr,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    booted(run)?;
+    if std::env::var_os("FAST_SWITCH_NOHTTPD").is_none() {
+        run.send("httpd -f -p 8080 -h /www &")?;
+        run.expect("# ", DIALOG_STEP)?;
+    }
+    run.send("export STAFETO_FAST_STATS=1")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let conf4 = std::env::var_os("FAST_SWITCH_ONE").is_none();
+    start(run, if conf4 { CONF4 } else { CONF1 })?;
+    let (_, workers) = fast_nginx::master_and_workers(run, "w", false)?;
+    if workers.len() != if conf4 { 4 } else { 1 } {
+        return Err(format!("{} workers, wanted 4", workers.len()));
+    }
+    requests("nginx-fast /tiny.txt", nginx, "/tiny.txt", TINY, REQUESTS)?;
+    requests(
+        "httpd /index.html",
+        httpd,
+        "/index.html",
+        crate::rootfs::www_index(),
+        REQUESTS,
+    )?;
+    notes.push(format!(
+        "{REQUESTS} requests each to nginx-fast and httpd answered whole"
+    ));
+    let first = stat(run, "s1")?;
+    notes.push(first.line.clone());
+    if first.consumers != 4 {
+        return Err(format!(
+            "{} consumers, wanted 4: {}",
+            first.consumers, first.line
+        ));
+    }
+    let total: u64 = first.rx_by.iter().sum();
+    let shares: Vec<f64> = first
+        .rx_by
+        .iter()
+        .take(4)
+        .map(|n| *n as f64 / total.max(1) as f64)
+        .collect();
+    // The consumer numbers are those the switch gave; the four with frames.
+    let busy: Vec<f64> = first
+        .rx_by
+        .iter()
+        .filter(|n| **n > 0)
+        .map(|n| *n as f64 / total.max(1) as f64)
+        .collect();
+    if busy.len() != 4 || busy.iter().any(|s| *s < SHARE_MIN) {
+        return Err(format!(
+            "the frames of the workers {:?} (shares {shares:?}): each of four needs {SHARE_MIN}",
+            first.rx_by
+        ));
+    }
+    notes.push(format!("the shares of the workers: {busy:?}"));
+    // The guest to nginx-fast on the shared address: the turn of the switch.
+    run.send("wget -T 20 -q -O - http://10.0.2.15/tiny.txt; echo ngx-wget-end")?;
+    let text = std::str::from_utf8(TINY)
+        .map_err(|e| e.to_string())?
+        .trim_end()
+        .to_owned();
+    if let Err(why) = run.expect_line(
+        "the page by wget",
+        |l| l.trim_end() == text,
+        Duration::from_secs(40),
+    ) {
+        let seen = stat(run, "dbg").map(|s| s.line).unwrap_or_default();
+        return Err(format!("{why}; the service says {seen}"));
+    }
+    let second = stat(run, "s2")?;
+    if second.hairpin <= first.hairpin || second.hairpin == 0 {
+        return Err(format!(
+            "no frame turned at the shared address: {}",
+            second.line
+        ));
+    }
+    if second.own_to_device != 0 {
+        return Err(format!(
+            "frames to the device with the shared address as the destination: {}",
+            second.line
+        ));
+    }
+    notes.push(format!(
+        "the guest's wget to the shared address came whole: {} frames turned, tx_refused {}",
+        second.hairpin, second.tx_refused
+    ));
+    Ok(())
+}
+
+/// A stream of new connections from the host, each a GET of the small page,
+/// until `stop`; the failures and the number answered.
+struct Stream {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    failures: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stream {
+    fn start(address: SocketAddr) -> Stream {
+        use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::AtomicUsize};
+        let stop = Arc::new(AtomicBool::new(false));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let (s, a, f) = (stop.clone(), answered.clone(), failures.clone());
+        let thread = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            while !s.load(Relaxed) {
+                match Connection::open(address, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt")) {
+                    Ok(body) if body == TINY => {
+                        a.fetch_add(1, Relaxed);
+                    }
+                    Ok(_) => f.lock().unwrap().push("a wrong page".to_owned()),
+                    Err(e) => f.lock().unwrap().push(e),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Stream {
+            stop,
+            answered,
+            failures,
+            thread: Some(thread),
+        }
+    }
+
+    fn answered(&self) -> usize {
+        self.answered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        self.failures.lock().unwrap().clone()
+    }
+}
+
+fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    for (conf, count) in [(CONF1, 1usize), (CONF4, 4)] {
+        start(run, conf)?;
+        let (m, workers) = fast_nginx::master_and_workers(run, &format!("k{count}"), false)?;
+        if workers.len() != count {
+            return Err(format!("{} workers, wanted {count}", workers.len()));
+        }
+        requests("before the kill", nginx, "/tiny.txt", TINY, 10)?;
+        let stream = Stream::start(nginx);
+        let until = Instant::now() + Duration::from_secs(60);
+        while stream.answered() < 5 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let before = stream.answered();
+        run.send(&format!("kill -9 {}", workers[0]))?;
+        run.expect_line(
+            "the new worker",
+            |l| l.contains("start worker process "),
+            Duration::from_secs(60),
+        )?;
+        // Wait for answers that come after the kill.
+        let until = Instant::now() + Duration::from_secs(90);
+        while stream.answered() < before + 10 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let after = stream.answered();
+        let failures = stream.finish();
+        if !failures.is_empty() {
+            return Err(format!(
+                "{count} workers: {} requests failed over the kill, the first {:?}",
+                failures.len(),
+                failures.first()
+            ));
+        }
+        if after < before + 10 {
+            return Err(format!(
+                "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
+            ));
+        }
+        notes.push(format!(
+            "{count} worker(s): {before} answered before the kill, {after} in all, no failure"
+        ));
+        run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-q{count}-end"))?;
+        run.expect(&format!("ngx-q{count}-end"), Duration::from_secs(30))?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The group of port 80 drains its closing flows (10 s) before the port is free for a
+        // new master.
+        std::thread::sleep(Duration::from_secs(20));
+    }
+    Ok(())
+}
+
+fn idle(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    start(run, CONF1)?;
+    // Warm: a page, then rest.
+    requests("the first page", nginx, "/tiny.txt", TINY, 3)?;
+    let mut open = Connection::open(nginx, READ_WITHIN)?;
+    same("the page", &open.get("/tiny.txt")?, TINY)?;
+    let mut times = Vec::new();
+    for round in 0..3 {
+        std::thread::sleep(Duration::from_secs(2));
+        let at = Instant::now();
+        let body = open.get("/tiny.txt")?;
+        let on_open = at.elapsed();
+        same("the page after rest", &body, TINY)?;
+        std::thread::sleep(Duration::from_secs(2));
+        let at = Instant::now();
+        let body = Connection::open(nginx, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt"))?;
+        let on_new = at.elapsed();
+        same("the page of a new connection after rest", &body, TINY)?;
+        times.push((round, on_open, on_new));
+        if on_open > IDLE_WITHIN || on_new > IDLE_WITHIN {
+            return Err(format!(
+                "after 2 s of rest an answer took {on_open:?} (open connection) and {on_new:?} (new): over {IDLE_WITHIN:?}; a wake was lost"
+            ));
+        }
+    }
+    notes.push(format!(
+        "the answers after rest (round, open, new): {times:?}"
+    ));
+    Ok(())
+}
+
+fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    // Eight consumers attach at once: their rings map in chunks, one chunk of pages in all
+    // for a step of the stack, and the longest step stays under the bound. The service maps
+    // at most 128 pieces (the kernel's limit), and a ring is 21 of them, so the ones past the
+    // fifth are refused cleanly (LimitReached) and the service goes on.
+    run.send(
+        "for p in 9001 9002 9003 9004 9005 9006 9007 9008; do switch-probe hold $p & done; wait; echo sw-eight-\"end\"",
+    )?;
+    run.expect("sw-eight-end", Duration::from_secs(600))?;
+    let joined = run
+        .lines()
+        .iter()
+        .filter(|l| l.contains("switch-probe: joined ok"))
+        .count();
+    if joined < 4 {
+        return Err(format!(
+            "{joined} of 8 simultaneous consumers attached and joined"
+        ));
+    }
+    run.expect("# ", DIALOG_STEP)?;
+    // A hold inside the consumer's own block is refused.
+    run.send("switch-probe hold-block")?;
+    run.expect("switch-probe: hold-block ok", Duration::from_secs(120))?;
+    run.expect("# ", DIALOG_STEP)?;
+    notes.push(format!(
+        "{joined} of 8 consumers attached at once (the rest refused with LimitReached); a hold inside a block refused"
+    ));
+    run.send("httpd -f -p 8080 -h /www &")?;
+    run.expect("# ", DIALOG_STEP)?;
+    start(run, CONF4)?;
+    requests("the small page", nginx, "/tiny.txt", TINY, 20)?;
+    // A body of 256 KiB from the guest's stack to a worker on the shared address: large
+    // frames of the stack are turned into the tables, and the step stays bound.
+    run.send("dd if=/dev/zero of=/tmp/big bs=1k count=256 2>/dev/null; wget -q -O /dev/null --post-file=/tmp/big http://10.0.2.15/tiny.txt; echo ngx-post-\"end\"")?;
+    run.expect("ngx-post-end", Duration::from_secs(300))?;
+    run.send("wget -q -O - http://10.0.2.15/tiny.txt; echo ngx-wget-end")?;
+    run.expect("ngx-wget-end", Duration::from_secs(60))?;
+    notes.push("20 pages and a wget of the guest to the shared address under -icount".to_owned());
+    // A worker killed: its ring is detached and unmapped in steps, a new one attaches.
+    let (_, workers) = fast_nginx::master_and_workers(run, "sw", false)?;
+    run.send(&format!("kill -9 {}", workers[0]))?;
+    run.expect_line(
+        "the new worker",
+        |l| l.contains("start worker process "),
+        Duration::from_secs(120),
+    )?;
+    requests("after the kill", nginx, "/tiny.txt", TINY, 20)?;
+    notes.push("a worker killed and replaced under -icount".to_owned());
+    Ok(())
+}
+
+/// The records of a capture: their lengths and bytes.
+fn pcap_records(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut at = 24;
+    while at + 16 <= bytes.len() {
+        let len = u32::from_le_bytes([bytes[at + 8], bytes[at + 9], bytes[at + 10], bytes[at + 11]])
+            as usize;
+        if at + 16 + len > bytes.len() {
+            break;
+        }
+        out.push(&bytes[at + 16..at + 16 + len]);
+        at += 16 + len;
+    }
+    out
+}
+
+fn frames(
+    run: &mut qemu::Run,
+    pcap: &std::path::Path,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    booted(run)?;
+    // The service's own address and the probe's attach.
+    run.send("switch-probe attach")?;
+    run.expect("switch-probe: counters", Duration::from_secs(60))?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("switch-probe refuse")?;
+    let mut refused = Vec::new();
+    for mode in [
+        "foreign-sport",
+        "foreign-ip",
+        "foreign-mac",
+        "rst-foreign",
+        "icmp",
+        "fragment",
+        "syn-ok",
+        "long",
+        "flags",
+    ] {
+        let want = format!("switch-probe: {mode} refused ");
+        let line = run.expect_line(mode, |l| l.contains(&want), Duration::from_secs(60))?;
+        let n: u32 = line
+            .split(&want)
+            .nth(1)
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or(99);
+        refused.push((mode, n));
+        let wanted = u32::from(mode != "syn-ok");
+        if n != wanted {
+            let _ = run.expect("switch-probe: counters", Duration::from_secs(5));
+            let _ = run.expect("# ", Duration::from_secs(5));
+            let seen = stat(run, "dbg").map(|s| s.line).unwrap_or_default();
+            return Err(format!(
+                "{mode}: the switch refused {n} frames, wanted {wanted}; the service says {seen}"
+            ));
+        }
+    }
+    run.expect("switch-probe: counters", Duration::from_secs(30))?;
+    run.expect("# ", DIALOG_STEP)?;
+    notes.push(format!("refusals by mode: {refused:?}"));
+    // The stat of the service counts them by reason.
+    let after = stat(run, "r1")?;
+    let by_reason: u64 = after.refused_by.iter().sum();
+    if by_reason < 7 {
+        return Err(format!(
+            "{by_reason} refusals by reason after seven (the eighth, the flags, is the ring's): {} {:?}",
+            after.line, after.refused_by
+        ));
+    }
+    notes.push(format!("refusals by reason: {:?}", after.refused_by));
+    // A hold below 1024 as nobody is refused, a join with no port too.
+    run.send("switch-probe hold-nobody")?;
+    run.expect("switch-probe: hold-nobody ok", Duration::from_secs(60))?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("switch-probe join-bad")?;
+    run.expect_line(
+        "join-bad",
+        |l| l.contains("switch-probe: join-bad ok errno 9"),
+        Duration::from_secs(60),
+    )?;
+    run.expect("# ", DIALOG_STEP)?;
+    notes.push(
+        "hold of a port below 1024 as nobody: refused; JOIN without a port: EBADF".to_owned(),
+    );
+    // A broken ring disables its consumer alone; the service goes on.
+    for mode in ["broken-tx", "broken-fill"] {
+        run.send(&format!("switch-probe {mode}"))?;
+        run.expect("switch-probe: broken ok", Duration::from_secs(60))?;
+        run.expect("# ", DIALOG_STEP)?;
+    }
+    run.send("switch-probe attach")?;
+    run.expect("switch-probe: counters", Duration::from_secs(60))?;
+    run.expect("# ", DIALOG_STEP)?;
+    notes.push(
+        "a broken ring (TX, FILL) is told to its consumer; the service attached a new one after"
+            .to_owned(),
+    );
+    // The wire: none of the refused frames got out.
+    let bytes = std::fs::read(pcap).map_err(|e| format!("{}: {e}", pcap.display()))?;
+    let records = pcap_records(&bytes);
+    let other_mac = [2u8, 0, 0, 0, 0, 0x77];
+    let other_ip = [198u8, 51, 100, 7];
+    for (i, r) in records.iter().enumerate() {
+        let has = |needle: &[u8]| r.windows(needle.len()).any(|w| w == needle);
+        if r.len() == 1515 || has(&other_mac) || has(&other_ip) {
+            return Err(format!(
+                "capture record {i} ({} bytes) is a frame the switch refused",
+                r.len()
+            ));
+        }
+    }
+    notes.push(format!(
+        "the capture of the wire holds {} frames, none of them refused ones",
+        records.len()
+    ));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_images_and_the_lines_are_those_of_the_programs() {
+        let init = |k| {
+            fast_nginx::programs(k)
+                .iter()
+                .find(|p| p.0 == "init")
+                .unwrap()
+                .3
+        };
+        assert_eq!(init(Kind::Switch), &["table-fast-switch"]);
+        assert_eq!(init(Kind::SwitchSteps), &["table-fast-switch"]);
+        assert_eq!(init(Kind::Scale), &["table-fast-switch-scale"]);
+        assert!(conf4().contains("worker_processes 4;"));
+        assert!(conf4().contains("user nobody nobody;"));
+        assert_eq!(fast_nginx::SWITCH_NETD_CONF, b"switch 8\nflows 16384\n");
+        let netd =
+            std::fs::read_to_string(crate::root().join("services/netd/src/main.rs")).unwrap();
+        for line in [
+            "net: switch consumers ",
+            "net: switch rx_by ",
+            "refused_by {refused:?}",
+        ] {
+            assert!(netd.contains(line), "{line}");
+        }
+        let probe =
+            std::fs::read_to_string(crate::root().join("tests/posix-so/dyn/switch-probe.c"))
+                .unwrap();
+        for line in [
+            "hold-nobody ok",
+            "join-bad ok errno",
+            "broken ok",
+            " refused %u",
+        ] {
+            assert!(probe.contains(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_capture_is_read_by_its_records() {
+        let mut bytes = vec![0u8; 24];
+        for len in [60u32, 1515] {
+            let mut head = [0u8; 16];
+            head[8..12].copy_from_slice(&len.to_le_bytes());
+            bytes.extend(head);
+            bytes.extend(vec![0u8; len as usize]);
+        }
+        let records = pcap_records(&bytes);
+        assert_eq!(
+            records.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            [60, 1515]
+        );
+    }
+}

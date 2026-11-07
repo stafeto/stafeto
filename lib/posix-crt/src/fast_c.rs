@@ -36,6 +36,52 @@ pub unsafe extern "C" fn stafeto_fast_claim(out: *mut FastClaim, flags: c_uint) 
     }
 }
 
+/// Attaches to the network service's switch and describes the ring in `*out`.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_fast_claim`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_attach(out: *mut FastClaim) -> c_int {
+    // SAFETY: the caller's pointer, checked for null.
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return fail(posix_abi::constants::EINVAL);
+    };
+    match fast::attach(out) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Holds TCP port `port` with the switch: the descriptor of the hold.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_port_hold(port: c_uint, reuseport: c_int) -> c_int {
+    let Ok(port) = u16::try_from(port) else {
+        return fail(posix_abi::constants::EINVAL);
+    };
+    match fast::port_hold(port, reuseport != 0) {
+        Ok(fd) => fd,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Joins the group of the port description `fd` as the attached consumer.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_port_join(fd: c_int) -> c_int {
+    match fast::port_join(fd) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Tells the switch's thread that frames wait in the ring's TX.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_poke() -> c_int {
+    match fast::poke() {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
 /// Waits for the network service's notification.
 ///
 /// # Safety

@@ -129,7 +129,7 @@ struct Split {
 /// The probes with this start of their name run in the group `net`.
 const NET_PREFIX: &str = "net-";
 /// The probes of the group `net` that do not start with the prefix.
-const NET_NAMED: [&str; 10] = [
+const NET_NAMED: [&str; 15] = [
     "posix-net",
     "fstack-probe",
     "fast-probe",
@@ -140,6 +140,11 @@ const NET_NAMED: [&str; 10] = [
     "fast-nginx-crash",
     "fast-nginx-steps",
     "fast-scale",
+    "fast-switch",
+    "fast-switch-kill",
+    "fast-switch-idle",
+    "fast-switch-steps",
+    "switch-probe",
 ];
 
 /// Expected seconds of the probes, from a run on the CI machine. A probe
@@ -785,7 +790,12 @@ mod tests {
                 "fast-nginx",
                 "fast-nginx-crash",
                 "fast-nginx-steps",
-                "fast-scale"
+                "fast-scale",
+                "fast-switch",
+                "fast-switch-kill",
+                "fast-switch-idle",
+                "fast-switch-steps",
+                "switch-probe"
             ]
         );
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();

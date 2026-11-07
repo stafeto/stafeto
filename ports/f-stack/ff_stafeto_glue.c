@@ -104,6 +104,36 @@ sysctl_number(const char *name)
     return size == sizeof(value.i) ? value.i : size == sizeof(value.l) ? value.l : -1;
 }
 
+/* Sets a number of the stack's sysctl tree (an int); 0, or -1. */
+static int
+sysctl_set_int(const char *name, int value)
+{
+    int mib[24];
+    int query[2] = { 0, 3 };
+    size_t len = sizeof(mib);
+
+    if (ff_sysctl(query, 2, mib, &len, name, strlen(name)) != 0)
+        return -1;
+    return ff_sysctl(mib, (unsigned)(len / sizeof(int)), NULL, NULL, &value, sizeof(value));
+}
+
+/* The ephemeral ports of a consumer of the switch are the block its attach
+ * gave (the switch refuses a SYN from any other port): `first` then
+ * `last`, for the low and the high ranges both, so that the choice of a
+ * port of any program of the stack stays inside the block. */
+static int
+set_port_block(unsigned first, unsigned count)
+{
+    int bad = 0;
+    int last = (int)(first + count - 1);
+
+    bad |= sysctl_set_int("net.inet.ip.portrange.first", (int)first);
+    bad |= sysctl_set_int("net.inet.ip.portrange.last", last);
+    bad |= sysctl_set_int("net.inet.ip.portrange.hifirst", (int)first);
+    bad |= sysctl_set_int("net.inet.ip.portrange.hilast", last);
+    return bad;
+}
+
 static uint64_t
 monotonic_ns(void)
 {
@@ -224,6 +254,11 @@ glue_start(const struct stafeto_fast_claim *claim)
         return -EINVAL;
     if (ff_init(3, args) != 0)
         return -EIO;
+    if (claim->kind == STAFETO_FAST_PORT && set_port_block(claim->snapshot[4], claim->snapshot[5]) != 0) {
+        fprintf(stderr, "fast: the block of ephemeral ports %u+%u was not taken\n",
+            claim->snapshot[4], claim->snapshot[5]);
+        return -EIO;
+    }
     fprintf(stderr, "fast: the stack is up on %u.%u.%u.%u/%u\n", claim->config.address[0],
         claim->config.address[1], claim->config.address[2], claim->config.address[3],
         claim->config.prefix);
@@ -266,7 +301,7 @@ glue_next_tick_ns(void)
 static void
 glue_notify(int on)
 {
-    vnet_notify(on);
+    ff_stafeto_notify(on);
 }
 
 static void

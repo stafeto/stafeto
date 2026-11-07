@@ -1137,6 +1137,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-bench-pinned-vz") as usize
     + cfg!(feature = "table-bench-cpu0-vz") as usize
     + cfg!(feature = "table-bench-fast-vz") as usize
+    + cfg!(feature = "table-bench-fast-switch-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1149,6 +1150,10 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fast-nginx-vz") as usize
     + cfg!(feature = "table-fast-scale") as usize
     + cfg!(feature = "table-fast-scale-vz") as usize
+    + cfg!(feature = "table-fast-switch") as usize
+    + cfg!(feature = "table-fast-switch-vz") as usize
+    + cfg!(feature = "table-fast-switch-scale") as usize
+    + cfg!(feature = "table-fast-switch-scale-vz") as usize
     + cfg!(feature = "table-posix-map-big") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
@@ -1213,6 +1218,7 @@ const _: () = assert!(
     feature = "table-bench-pinned-vz",
     feature = "table-bench-cpu0-vz",
     feature = "table-bench-fast-vz",
+    feature = "table-bench-fast-switch-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1225,6 +1231,10 @@ const _: () = assert!(
     feature = "table-fast-nginx-vz",
     feature = "table-fast-scale",
     feature = "table-fast-scale-vz",
+    feature = "table-fast-switch",
+    feature = "table-fast-switch-vz",
+    feature = "table-fast-switch-scale",
+    feature = "table-fast-switch-scale-vz",
     feature = "table-posix-map-big"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
@@ -1324,6 +1334,8 @@ pub const TABLE: &[Record] = bench::BENCH_PINNED_VZ_TABLE;
 pub const TABLE: &[Record] = bench::BENCH_CPU0_VZ_TABLE;
 #[cfg(feature = "table-bench-fast-vz")]
 pub const TABLE: &[Record] = bench::BENCH_FAST_VZ_TABLE;
+#[cfg(feature = "table-bench-fast-switch-vz")]
+pub const TABLE: &[Record] = bench::BENCH_FAST_SWITCH_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -1360,6 +1372,14 @@ pub const TABLE: &[Record] = fstack::FAST_NGINX_VZ_TABLE;
 pub const TABLE: &[Record] = fstack::FAST_SCALE_TABLE;
 #[cfg(feature = "table-fast-scale-vz")]
 pub const TABLE: &[Record] = fstack::FAST_SCALE_VZ_TABLE;
+#[cfg(feature = "table-fast-switch")]
+pub const TABLE: &[Record] = fstack::FAST_SWITCH_TABLE;
+#[cfg(feature = "table-fast-switch-vz")]
+pub const TABLE: &[Record] = fstack::FAST_SWITCH_VZ_TABLE;
+#[cfg(feature = "table-fast-switch-scale")]
+pub const TABLE: &[Record] = fstack::FAST_SWITCH_SCALE_TABLE;
+#[cfg(feature = "table-fast-switch-scale-vz")]
+pub const TABLE: &[Record] = fstack::FAST_SWITCH_SCALE_VZ_TABLE;
 #[cfg(feature = "table-posix-map-big")]
 pub const TABLE: &[Record] = ramfs::POSIX_MAP_BIG_TABLE;
 
@@ -2628,6 +2648,10 @@ mod tests {
             fstack::FAST_NGINX_VZ_TABLE,
             fstack::FAST_SCALE_TABLE,
             fstack::FAST_SCALE_VZ_TABLE,
+            fstack::FAST_SWITCH_TABLE,
+            fstack::FAST_SWITCH_VZ_TABLE,
+            fstack::FAST_SWITCH_SCALE_TABLE,
+            fstack::FAST_SWITCH_SCALE_VZ_TABLE,
             ramfs::POSIX_MAP_BIG_TABLE,
             net::NET_TABLE,
             net::NET_TWO_TABLE,
@@ -2861,6 +2885,14 @@ mod tests {
             order_of(fstack::FAST_SCALE_VZ_TABLE),
             order_of(fstack::FAST_NGINX_VZ_TABLE)
         );
+        for (switch, one) in [
+            (fstack::FAST_SWITCH_TABLE, net::NET_TABLE),
+            (fstack::FAST_SWITCH_SCALE_TABLE, net::NET_TABLE),
+            (fstack::FAST_SWITCH_VZ_TABLE, net::NET_VZ_TABLE),
+            (fstack::FAST_SWITCH_SCALE_VZ_TABLE, net::NET_VZ_TABLE),
+        ] {
+            assert_eq!(order_of(switch), order_of(one));
+        }
         assert_eq!(
             order_of(ramfs::POSIX_MAP_BIG_TABLE),
             order_of(ramfs::POSIX_PROCS_TABLE)

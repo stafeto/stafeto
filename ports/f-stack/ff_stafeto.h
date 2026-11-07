@@ -21,7 +21,9 @@ struct stafeto_fast_claim;
  * (stafeto_fast_claim, <stafeto/fast.h>) before ff_init: the stack then has
  * that device as its interface, with the claim's address, and drives it
  * with libvirtio_net.a. Without a claim the stack has its loopback alone.
- * 0, or -1 (a second call).
+ * A claim of kind STAFETO_FAST_PORT is an attach to the service's switch:
+ * the interface is the consumer's ring (vnet_port_*) with the shared
+ * address. 0, or -1 (a second call).
  */
 int ff_stafeto_attach(const struct stafeto_fast_claim *claim);
 
@@ -50,6 +52,10 @@ int ff_stafeto_sleep(uint64_t max_ns);
  * claim's notifications to it the same way.
  */
 void ff_stafeto_absorb(uint32_t bits);
+
+/* The wake flag of the device on (full barrier inside) or off: the
+ * device's interrupts, or the idle flag of the switch's ring. */
+void ff_stafeto_notify(int on);
 
 /* 1 when the device was taken away: the layer stops using it, and
  * ff_run ends. */

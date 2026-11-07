@@ -585,7 +585,10 @@ fn a_ticket_the_stack_refused_still_closes() {
     let route = close.find("route(").unwrap_or(usize::MAX);
     assert!(ticket < route, "the ticket branch asks the route first");
     assert!(close.contains("tickets(|t| t.close(i))"));
-    assert!(!close.contains("number(fd)?;\n    // SAFETY: the table's function.\n    let closed"));
+    // The plain number closes through the stack and then forgets its hold; a ticket never
+    // reaches `number(fd)?` first.
+    assert!(close.contains("forget_hold(n)"));
+    assert!(!close.contains("number(fd)?;\n    // SAFETY: the table's function.\n    count"));
 }
 
 /// Both hangs of the lazy start are closed.

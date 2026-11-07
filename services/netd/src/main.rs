@@ -49,6 +49,7 @@
 
 mod calls;
 mod cells;
+mod consumers;
 mod device;
 mod dma;
 mod fast;
@@ -106,9 +107,13 @@ const RESOLV: u64 = 32;
 const RX1: u64 = 64;
 /// A step of the second device's return from its owner (owner.rs).
 const RETURN: u64 = 128;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN;
+/// The switch thread has answers for the stack (`switch::COMMANDS`).
+pub(crate) const BACK: u64 = 256;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
+/// The label of the sweep's timer on the switch thread's channel.
+const SWEEP_LABEL: u64 = 2;
 /// The objects of the second device in the start data of a record of two
 /// devices, after `dma` and `net`: the pages of its queues and four objects
 /// of 4 MiB of buffers.
@@ -298,6 +303,8 @@ fn main(_: u64) -> u64 {
     // The secret of the table of destinations: a hash of the key of the ports
     // and the rest of the key.
     let demux_key = demux_secret(&ports_key, &key[24..32]);
+    // The secret of the switch's table of flows, apart from the first.
+    let flows_key = demux_secret(&ports_key, b"switch-flows");
     posix_random::erase(&mut key);
     drop(entropy);
 
@@ -422,7 +429,36 @@ fn main(_: u64) -> u64 {
     } = tables;
     let mut device = NetDevice::new(RxRing::inner(), TxRing::inner(), mac);
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
-    let switch = switch::Switch::new(transport, rx_queue, tx_queue, irq, switch_channel, link);
+    // The switch's tables and the timer of their sweep, when the file asks for consumers.
+    let (switch_tables, sweep_timer) = match make_switch_tables(
+        &s.process,
+        &switch_channel,
+        mac,
+        flows_key,
+        &settings,
+        level + 1,
+    ) {
+        Ok(made) => made,
+        Err(code) => return code,
+    };
+    let gate = (settings.consumers() > 0)
+        .then(|| {
+            sys::handle_duplicate(
+                &switch_channel,
+                Rights(Rights::NOTIFY.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
+            )
+            .ok()
+        })
+        .flatten();
+    let switch = switch::Switch::new(
+        transport,
+        rx_queue,
+        tx_queue,
+        irq,
+        switch_channel,
+        link,
+        (switch_tables, sweep_timer.0, sweep_timer.1),
+    );
     if pci {
         rt::println!(
             "virtio-net: 1af4:1041 at {at:#x}, line {line}, status {status:#x}, mac {}",
@@ -493,6 +529,7 @@ fn main(_: u64) -> u64 {
         mac,
         second,
         own_said: false,
+        switch_ip: netd::books::AddressSync::new(),
         told: 0,
         cleanup_due: false,
         armed: None,
@@ -503,6 +540,7 @@ fn main(_: u64) -> u64 {
         ask_at: None,
         resolv: Written::default(),
         owner: None,
+        side: consumers::Side::new(settings.consumers(), gate, consumers::GATE_PRIORITY),
         claimable: owner::Claimable {
             handover: settings.handover == Some(true),
             pci,
@@ -527,6 +565,9 @@ fn main(_: u64) -> u64 {
             second: second_objects,
         },
     };
+    if driver.switch_address() {
+        driver.tell(BACK);
+    }
     // The static address names its servers at once; a lease does in its event.
     if driver.stack.lease.is_some() {
         driver.tell(RESOLV);
@@ -547,6 +588,78 @@ fn main(_: u64) -> u64 {
     };
     let _ = rt::service::run_in(&channel, &mut driver, config, sessions);
     STOPPED
+}
+
+/// The memory of the port table, 2 x 65 536 bytes of `.bss` the switch thread writes.
+struct PortBytes(UnsafeCell<[u8; 2 * 65536]>);
+// SAFETY: written by the switch thread alone after the start; the stack thread reads single
+// bytes (`switch::turn_wanted`).
+unsafe impl Sync for PortBytes {}
+static PORT_BYTES: PortBytes = PortBytes(UnsafeCell::new([0; 2 * 65536]));
+
+/// The tables of the switch (the port table, and the flow table in an object of its own
+/// that the service's quota pays for) and the timer of the sweep on the switch thread's
+/// channel; none without `switch N`.
+type SweepTimer = (Handle<Timer>, Handle<Channel>);
+fn make_switch_tables(
+    process: &Handle<Process>,
+    channel: &Handle<Channel>,
+    mac: [u8; 6],
+    secret: [u8; 16],
+    settings: &Settings,
+    level: u8,
+) -> Result<
+    (
+        Option<netd::switchlogic::tables::Tables<'static>>,
+        SweepTimer,
+    ),
+    u64,
+> {
+    use netd::switchlogic::tables::{Flow, Flows, Own, Tables};
+    let Ok(view) = sys::handle_label(channel, Rights::RECEIVE, SWEEP_LABEL, level) else {
+        return Err(NOT_REGISTERED);
+    };
+    let Ok(timer) = sys::timer_create(&view, level) else {
+        return Err(NOT_REGISTERED);
+    };
+    if settings.consumers() == 0 {
+        return Ok((None, (timer, view)));
+    }
+    let places = settings.flows() as usize * 2;
+    let bytes = (places * core::mem::size_of::<Flow>()).div_ceil(PAGE) * PAGE;
+    let Ok(object) = sys::mem_create(bytes as u64) else {
+        return Err(NOT_MAPPED);
+    };
+    if sys::mem_map(
+        process,
+        &object,
+        0,
+        bytes as u64,
+        dma::FLOWS_AT,
+        Access::ReadWrite,
+    )
+    .is_err()
+    {
+        return Err(NOT_MAPPED);
+    }
+    // The mapping keeps the object.
+    drop(object);
+    // SAFETY: the object is mapped read and write at FLOWS_AT for `places` flows, zeroed, and
+    // belongs to the tables from here; the port bytes are the table's alone (the stack
+    // thread reads single bytes of them).
+    let (slots, ports) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(dma::FLOWS_AT as *mut Flow, places),
+            &mut *PORT_BYTES.0.get(),
+        )
+    };
+    let own = Own {
+        ip: [0; 4],
+        mac,
+        prefix: 0,
+    };
+    let tables = Tables::new(own, ports, Flows::new(slots, &secret), switch::tag);
+    Ok((Some(tables), (timer, view)))
 }
 
 /// The device on `transport` reset, its features negotiated (WANTED), its MAC
@@ -761,6 +874,9 @@ struct Maps {
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
+    /// The address the switch was last told (a renewal of the lease that changes nothing is
+    /// not told: consumers end their processes on a new address).
+    switch_ip: netd::books::AddressSync,
     device: NetDevice,
     stack: Stack<'static>,
     net: &'a mut Net,
@@ -797,6 +913,8 @@ struct Driver<'a> {
     ask_at: Option<u64>,
     /// The text of `/etc/resolv.conf` as the service wrote it last.
     resolv: Written,
+    /// The consumers of the switch (`consumers.rs`).
+    side: consumers::Side,
     /// The program that owns the second device, and what a claim needs.
     owner: Option<owner::Owner>,
     claimable: owner::Claimable,
@@ -888,6 +1006,9 @@ impl Driver<'_> {
         }
         if core::mem::take(&mut self.net.wake_wanted) {
             self.tell(WAKE);
+        }
+        if self.side.max > 0 {
+            self.drain_releases();
         }
         if self.cleanup_due && self.tell(CLEANUP) {
             self.cleanup_due = false;
@@ -1140,6 +1261,31 @@ impl Driver<'_> {
         self.ask_due = true;
         self.asked = 0;
         self.net.step_due = true;
+        if self.switch_address() {
+            self.tell(BACK);
+        }
+    }
+
+    /// The switch and its consumers learn the address (the lease, or none). True when the
+    /// switch's ring of commands was full: the address stays due, and the step of the answers
+    /// tries again.
+    fn switch_address(&mut self) -> bool {
+        if self.side.max == 0 {
+            return false;
+        }
+        let (ip, prefix) = self
+            .stack
+            .lease
+            .map_or(([0; 4], 0), |lease| (lease.address, lease.prefix.min(32)));
+        if !self.switch_ip.due((ip, prefix)) {
+            return false;
+        }
+        if !switch::command(netd::switchlogic::commands::Command::Address { ip, prefix }) {
+            return true;
+        }
+        self.switch_ip.done((ip, prefix));
+        self.tell_consumers(proto_net::switch::WAKE_ADDRESS);
+        false
     }
 
     /// Asks the gateway and the name servers on the link for their hardware
@@ -1322,6 +1468,9 @@ impl Driver<'_> {
             switch::INNER.bells_tx(),
             tx.tx
         );
+        if self.side.max > 0 {
+            self.report_switch();
+        }
         let [first, all] = self.net.counters.buffers_used;
         if all != 0 {
             rt::println!("net: buffers 1 used {first} pages, 64 used {all} pages");
@@ -1339,6 +1488,36 @@ impl Driver<'_> {
             rt::println!("net: bypass refused {refused} lost {lost} broken {broken}");
         }
         split::report();
+    }
+
+    /// The switch's counters, one line (`posix-net stat`): consumers and flows, what the
+    /// rings dropped and refused, the frames turned back at the shared address (and the frames
+    /// to the device with that destination, which must stay 0).
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
+    fn report_switch(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let st = &switch::INNER.stats;
+        let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
+        rt::println!(
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {}",
+            get(&st.consumers),
+            get(&st.flows),
+            get(&st.unconfirmed),
+            get(&st.evicted),
+            get(&st.expired),
+            get(&st.rx_full),
+            get(&st.tx_refused),
+            get(&st.hairpin),
+            get(&st.own_to_device),
+            get(&st.rx_consumer),
+            get(&st.tx_consumer)
+        );
+        let drops: [u32; 6] = core::array::from_fn(|i| get(&st.drops[i]));
+        let refused: [u32; netd::switchlogic::route::Reason::COUNT] =
+            core::array::from_fn(|i| get(&st.refused_by[i]));
+        rt::println!("net: switch dropped {drops:?} refused_by {refused:?}");
+        let by: [u32; 8] = core::array::from_fn(|i| get(&st.rx_by[i]));
+        rt::println!("net: switch rx_by {by:?}");
     }
 
     /// HOLD: the steps of the stack wait (1), go on (0), or every group of
@@ -1436,12 +1615,12 @@ const SWEEP_NS: u64 = 1_000_000_000;
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 62, 63,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 32, 33, 34, 35, 36, 37,
+    27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1467,6 +1646,9 @@ impl Service<0> for Driver<'_> {
             Some(Method::Claim) => self.claim(s, r),
             Some(Method::ClaimMore) => self.claim_more(s, r),
             Some(Method::Kick) => self.kick(s, r),
+            Some(Method::PortHold) => self.port_hold(s, r),
+            Some(Method::Attach) => self.attach(s, r),
+            Some(Method::Join) => self.join(s, r),
             Some(method) => match sockets::Request::parse(method, r.body()) {
                 Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
                 Some(Err(status)) => Answer::Status(status),
@@ -1476,8 +1658,11 @@ impl Service<0> for Driver<'_> {
         };
         self.after_request();
         profile::call(method, began);
-        #[cfg(feature = "profile")]
+        #[cfg(any(feature = "profile", feature = "probe"))]
         if core::mem::take(&mut self.net.profile_due) {
+            #[cfg(feature = "probe")]
+            self.report_frames();
+            #[cfg(feature = "profile")]
             self.profile_snapshot();
         }
         answer
@@ -1489,6 +1674,7 @@ impl Service<0> for Driver<'_> {
         rt::service::step_own();
         // The owner of the second device went: the device comes back.
         self.owner_gone(s);
+        self.consumer_gone(s);
         let held = core::mem::take(&mut s.data.held);
         let long = core::mem::take(&mut s.data.long);
         // The shared buffer is unmapped by a step of departure.
@@ -1541,7 +1727,7 @@ impl Service<0> for Driver<'_> {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN];
+                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -1559,6 +1745,7 @@ impl Service<0> for Driver<'_> {
                         self.rx1_step(false);
                     }
                     RETURN => self.return_step(),
+                    BACK => self.back_step(),
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();

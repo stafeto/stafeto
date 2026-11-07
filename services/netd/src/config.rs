@@ -23,6 +23,10 @@
 //! * `buffers N`: how many sessions may hold a shared buffer (BUFFER) at
 //!   once, 0 to `BUFFERS_MAX`; 0 turns the path of the buffers off. Without
 //!   the line the limit is `BUFFERS_MAX`.
+//! * `switch N`: how many consumers (0 to 8) may attach to the switch; 0 or no line turns
+//!   the path off (ATTACH is refused and no table is made).
+//! * `flows N`: how many flows the switch's table holds, 256 to 131072 (the table has twice
+//!   as many places); 16384 without the line.
 //! * A key twice, an unknown key, a word more, a bad address: an error with
 //!   the line's number, counted from 1.
 //!
@@ -34,6 +38,10 @@ pub const LINE_MAX: usize = 128;
 
 /// The most sessions with a shared buffer, and the limit without a line.
 pub const BUFFERS_MAX: u16 = 64;
+/// The consumers of the switch at most, and the flows without a `flows` line.
+pub const SWITCH_MAX: u8 = 8;
+pub const FLOWS_DEFAULT: u32 = 16384;
+pub const FLOWS_RANGE: (u32, u32) = (256, 131_072);
 
 /// An IPv4 address with the length of its network prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,12 +62,24 @@ pub struct Settings {
     pub handover: Option<bool>,
     /// The line `buffers`, when the file has one (`Settings::buffers`).
     pub buffers_line: Option<u16>,
+    pub switch: Option<u8>,
+    pub flows_line: Option<u32>,
 }
 
 impl Settings {
     /// How many sessions may hold a shared buffer at once.
     pub fn buffers(&self) -> u16 {
         self.buffers_line.unwrap_or(BUFFERS_MAX)
+    }
+
+    /// The consumers of the switch; 0 is no switch.
+    pub fn consumers(&self) -> u8 {
+        self.switch.unwrap_or(0)
+    }
+
+    /// The flows the table of the switch holds.
+    pub fn flows(&self) -> u32 {
+        self.flows_line.unwrap_or(FLOWS_DEFAULT)
     }
 }
 
@@ -77,6 +97,8 @@ pub enum Reason {
     BadPrefix,
     BadHandover,
     BadBuffers,
+    BadSwitch,
+    BadFlows,
     NeedsAddress,
     GatewayOutside,
     NotUnicast,
@@ -98,6 +120,8 @@ impl Reason {
             Reason::BadPrefix => "bad prefix length",
             Reason::BadHandover => "handover is 0 or 1",
             Reason::BadBuffers => "buffers is a number from 0 to 64",
+            Reason::BadSwitch => "switch is a number from 0 to 8",
+            Reason::BadFlows => "flows is a number from 256 to 131072",
             Reason::NeedsAddress => "gateway and dns need an address line",
             Reason::GatewayOutside => "the gateway is outside the network of the address",
             Reason::NotUnicast => "not a unicast address (0.x.x.x, multicast or broadcast)",
@@ -214,7 +238,14 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
     let key = words.next().ok_or(Reason::NoValue)?;
     let known = matches!(
         key,
-        b"address" | b"address1" | b"gateway" | b"dns" | b"handover" | b"buffers"
+        b"address"
+            | b"address1"
+            | b"gateway"
+            | b"dns"
+            | b"handover"
+            | b"buffers"
+            | b"switch"
+            | b"flows"
     );
     if !known {
         return Err(Reason::UnknownKey);
@@ -249,6 +280,17 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
             }
             set(&mut settings.buffers_line, n)
         }
+        b"switch" => {
+            let n = number(value, u32::from(SWITCH_MAX)).ok_or(Reason::BadSwitch)?;
+            set(&mut settings.switch, n as u8)
+        }
+        b"flows" => {
+            let n = number(value, FLOWS_RANGE.1).ok_or(Reason::BadFlows)?;
+            if n < FLOWS_RANGE.0 {
+                return Err(Reason::BadFlows);
+            }
+            set(&mut settings.flows_line, n)
+        }
         _ => {
             let on = match value {
                 b"0" => false,
@@ -258,6 +300,17 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
             set(&mut settings.handover, on)
         }
     }
+}
+
+/// A decimal number of at most `max`, with no sign.
+fn number(value: &[u8], max: u32) -> Option<u32> {
+    if value.is_empty() || value.len() > 6 || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let n = value
+        .iter()
+        .fold(0u32, |n, &d| n * 10 + u32::from(d - b'0'));
+    (n <= max).then_some(n)
 }
 
 /// The settings in `file`, or the first fault with its line.
@@ -399,6 +452,22 @@ mod tests {
         let s = parse(b"address\t10.1.2.3/8   \r\n\tgateway  10.0.0.1").unwrap();
         assert_eq!(s.address.map(|a| a.prefix), Some(8));
         assert_eq!(s.gateway, Some([10, 0, 0, 1]));
+    }
+
+    #[test]
+    fn switch_and_flows_are_numbers_in_their_bounds() {
+        let s = parse(b"switch 8\nflows 131072").unwrap();
+        assert_eq!((s.consumers(), s.flows()), (8, 131_072));
+        assert_eq!(
+            (Settings::default().consumers(), Settings::default().flows()),
+            (0, FLOWS_DEFAULT)
+        );
+        assert_eq!(fault(b"switch 9"), (1, Reason::BadSwitch));
+        assert_eq!(fault(b"switch -1"), (1, Reason::BadSwitch));
+        assert_eq!(fault(b"flows 100"), (1, Reason::BadFlows));
+        assert_eq!(fault(b"flows 131073"), (1, Reason::BadFlows));
+        assert_eq!(fault(b"flows 1x"), (1, Reason::BadFlows));
+        assert_eq!(fault(b"switch 1\nswitch 2"), (2, Reason::KeyTwice));
     }
 
     #[test]
