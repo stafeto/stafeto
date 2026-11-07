@@ -928,6 +928,27 @@ mod tests {
     }
 
     #[test]
+    fn a_member_that_left_the_group_gets_no_new_syn_but_keeps_its_flows() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let other = 1 - c;
+            t.leave(1, c);
+            assert_eq!(t.left, 1);
+            for sport in 2000..2040 {
+                assert_eq!(
+                    who(route(t, &wire_tcp(sport, 8080, SYN), Source::Wire)),
+                    other
+                );
+            }
+            // A second LEAVE of the same member counts nothing.
+            t.leave(1, c);
+            assert_eq!(t.left, 1);
+            // The flow it had goes on.
+            assert_eq!(who(route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire)), c);
+        });
+    }
+
+    #[test]
     fn a_syn_with_no_live_member_is_parked_and_a_joining_member_gets_it() {
         parking(|t, _| {
             t.leave(1, 0);

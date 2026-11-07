@@ -8,7 +8,7 @@
 //! is told once and the ring takes and gives nothing after it.
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
-use proto_net::switch::{self as sw, CELL, Layout, RX_CELLS};
+use proto_net::switch::{self as sw, CELL, Layout};
 
 /// Memory the switch reads and writes: the mapped ring object.
 #[derive(Clone, Copy)]
@@ -177,7 +177,7 @@ impl ConsumerRing {
             return None;
         }
         let cell = self.mem.load(self.layout.fill_entry(self.fill_tail));
-        if cell >= RX_CELLS {
+        if cell >= self.layout.rx_slots {
             self.break_with(Violation::Cell);
             return None;
         }
@@ -357,7 +357,7 @@ pub(crate) mod tests {
         for _ in 0..256 {
             assert!(ring.deliver(b"a", 0));
         }
-        rig.fill(&[300]);
+        rig.fill(&[200]);
         ring.poll();
         assert!(!ring.deliver(b"a", 0));
         assert_eq!(ring.fill_avail(), 1, "the cell stays in FILL");
@@ -400,7 +400,7 @@ pub(crate) mod tests {
         }
         let rig = Rig::new(l);
         let mut ring = rig.ring();
-        rig.fill(&[RX_CELLS]);
+        rig.fill(&[l.rx_slots]);
         ring.poll();
         assert!(!ring.deliver(b"a", 0));
         assert_eq!(ring.poll(), Poll::Broke(Violation::Cell));

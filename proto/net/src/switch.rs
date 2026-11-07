@@ -12,8 +12,8 @@
 //!
 //! The ring object: page 0 holds lines of `LINE` bytes (the u32 of each at
 //! its start), then the FILL ring (u32 cells), the DONE ring (8 bytes), the
-//! TX ring (8 bytes), `RX_CELLS` cells to receive into and `TX_CELLS` to
-//! send from, `CELL` bytes each. Every index is a u32 that grows without
+//! TX ring (8 bytes), `rx_slots` cells to receive into and `tx_slots` to
+//! send from, `CELL` bytes each (a cell of FILL is a cell number below `rx_slots`). Every index is a u32 that grows without
 //! wrapping to the size; the entry of index `i` is `i % slots`.
 
 use crate::{Config, Method};
@@ -25,10 +25,11 @@ pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
 pub const CELL: usize = 2048;
 pub const FRAME_MAX: usize = 1514;
-pub const RX_CELLS: u32 = 2048;
-pub const TX_CELLS: u32 = 512;
-pub const RX_SLOTS: (u32, u32) = (256, 8192);
-pub const TX_SLOTS: (u32, u32) = (64, TX_CELLS);
+/// The bounds of the rings, in entries; each entry of the receiving ring and of the sending ring has
+/// a cell of its own, so the object (and the mappings of the service that hold it) is as large as
+/// the sizes the consumer asks for.
+pub const RX_SLOTS: (u32, u32) = (256, 4096);
+pub const TX_SLOTS: (u32, u32) = (64, 512);
 /// The most ports one PORT_HOLD names.
 pub const HOLD_MAX: u32 = 16;
 pub const REUSEPORT: u32 = 1;
@@ -73,9 +74,11 @@ const fn pages(bytes: usize) -> usize {
 }
 
 impl Layout {
+    /// 1 024 cells to receive into and 256 to send from: 645 pages, 11 chunks of 64 pages of
+    /// the service's mappings (eight consumers fit the budget of `RING_MAPPINGS`).
     pub const DEFAULT: Layout = Layout {
-        rx_slots: 2048,
-        tx_slots: 512,
+        rx_slots: 1024,
+        tx_slots: 256,
     };
 
     /// None unless the sizes are powers of two within their bounds.
@@ -114,20 +117,20 @@ impl Layout {
         self.rx_cells() + cell as usize * CELL
     }
     pub const fn tx_cells(&self) -> usize {
-        self.rx_cells() + RX_CELLS as usize * CELL
+        self.rx_cells() + self.rx_slots as usize * CELL
     }
-    /// The cell of TX entry `i`: `i % tx_slots` (`tx_slots` is at most `TX_CELLS`).
+    /// The cell of TX entry `i`: `i % tx_slots` (a cell for each entry).
     pub const fn tx_cell(&self, i: u32) -> usize {
         self.tx_cells() + (i % self.tx_slots) as usize * CELL
     }
     pub const fn total(&self) -> usize {
-        self.tx_cells() + TX_CELLS as usize * CELL
+        self.tx_cells() + self.tx_slots as usize * CELL
     }
 }
 
-const _: () = assert!(Layout::DEFAULT.total() == 1288 * PAGE);
-const _: () = assert!(Layout::DEFAULT.rx_cells() == 8 * PAGE);
-const _: () = assert!(Layout::DEFAULT.tx_cells() == 1032 * PAGE);
+const _: () = assert!(Layout::DEFAULT.total() == 645 * PAGE);
+const _: () = assert!(Layout::DEFAULT.rx_cells() == 5 * PAGE);
+const _: () = assert!(Layout::DEFAULT.tx_cells() == 517 * PAGE);
 const _: () = assert!(COUNTERS + 8 <= PAGE && FRAME_MAX <= CELL);
 
 /// An entry of DONE.
@@ -329,24 +332,25 @@ mod tests {
     };
 
     #[test]
-    fn the_default_ring_is_1288_pages() {
+    fn the_default_ring_is_645_pages_in_eleven_chunks() {
         let l = Layout::DEFAULT;
-        assert_eq!((l.fill(), l.done(), l.tx()), (PAGE, 3 * PAGE, 7 * PAGE));
-        assert_eq!(l.done_entry(2049), l.done() + 8);
-        assert_eq!(l.fill_entry(u32::MAX), PAGE + 2047 * 4);
-        assert_eq!(l.tx_cell(513), l.tx_cells() + CELL);
-        assert_eq!(l.rx_cell(RX_CELLS - 1) + CELL, l.tx_cells());
-        let big = Layout::new(8192, 512).unwrap();
+        assert_eq!((l.fill(), l.done(), l.tx()), (PAGE, 2 * PAGE, 4 * PAGE));
+        assert_eq!(l.done_entry(1025), l.done() + 8);
+        assert_eq!(l.fill_entry(u32::MAX), PAGE + 1023 * 4);
+        assert_eq!(l.tx_cell(257), l.tx_cells() + CELL);
+        assert_eq!(l.rx_cell(l.rx_slots - 1) + CELL, l.tx_cells());
+        assert_eq!(l.total().div_ceil(PAGE).div_ceil(64), 11);
+        let big = Layout::new(4096, 512).unwrap();
         assert_eq!(big.rx_cells() % PAGE, 0);
         assert!(big.tx_cell(u32::MAX) + CELL <= big.total());
     }
 
     #[test]
     fn sizes_are_powers_of_two_in_their_bounds() {
-        assert!(Layout::new(256, 64).is_some() && Layout::new(8192, 512).is_some());
+        assert!(Layout::new(256, 64).is_some() && Layout::new(4096, 512).is_some());
         for (rx, tx) in [
             (128, 64),
-            (16384, 64),
+            (8192, 64),
             (300, 64),
             (256, 32),
             (256, 1024),

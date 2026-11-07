@@ -567,7 +567,18 @@ impl Net {
             return refuse(proto_net::BAD_FD);
         };
         let waits = linger != 0 && self.close_may_linger(place);
+        let hold = self.socks[place].hold;
         s.data.held.remove(place);
+        if hold != 0 {
+            // The session closed a description of a group: when it was the last of that group in
+            // the session, its consumer leaves the group (the switch steers no more SYNs to it).
+            let mut groups = (0..).scan(0, |at, _| {
+                let p = s.data.held.next(*at)?;
+                *at = p + 1;
+                Some(self.socks[p].hold)
+            });
+            self.holds.closed_by(hold, s.data.consumer, &mut groups);
+        }
         self.interest.drop_place(place, Some(s.label()));
         self.release(stack, place);
         self.step_due = true;

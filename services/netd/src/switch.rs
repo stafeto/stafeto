@@ -144,6 +144,8 @@ pub struct Stats {
     pub rx_by: [AtomicU32; 8],
     /// Parked SYNs handed to a member that joined.
     pub park_given: AtomicU32,
+    /// Memberships ended by LEAVE.
+    pub left: AtomicU32,
 }
 
 impl Stats {
@@ -164,6 +166,7 @@ impl Stats {
             tx_consumer: AtomicU32::new(0),
             rx_by: [const { AtomicU32::new(0) }; 8],
             park_given: AtomicU32::new(0),
+            left: AtomicU32::new(0),
         }
     }
 }
@@ -1036,6 +1039,7 @@ impl Switch {
             .store(t.flows.unconfirmed() as u32, Ordering::Relaxed);
         st.evicted.store(t.flows.evicted, Ordering::Relaxed);
         st.expired.store(t.flows.expired, Ordering::Relaxed);
+        st.left.store(t.left, Ordering::Relaxed);
         let (mut full, mut refused) = (0u32, 0u32);
         for x in t.consumers.iter().flatten() {
             full = full.wrapping_add(x.ring.rx_full);

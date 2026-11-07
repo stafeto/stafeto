@@ -534,6 +534,8 @@ pub struct Tables<'a> {
     parked: u32,
     pub park_expired: u32,
     pub park_dropped: u32,
+    /// Memberships ended by LEAVE (not by a consumer's departure).
+    pub left: u32,
     pub groups: [Option<Group>; MAX_GROUPS],
     pub consumers: [Option<Consumer>; MAX_CONSUMERS],
     pub flows: Flows<'a>,
@@ -562,6 +564,7 @@ impl<'a> Tables<'a> {
             parked: 0,
             park_expired: 0,
             park_dropped: 0,
+            left: 0,
             groups: [None; MAX_GROUPS],
             consumers: [const { None }; MAX_CONSUMERS],
             flows,
@@ -833,13 +836,15 @@ impl<'a> Tables<'a> {
         true
     }
 
+    /// Consumer `c` stops being a member of group `number` (its description was closed): new
+    /// SYNs go to the others, or wait in the park. Flows it has go on.
     pub fn leave(&mut self, number: u8, c: u8) {
         self.guard.check();
         if let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) {
-            g.members
-                .iter_mut()
-                .filter(|m| m.is_some_and(|m| m.0 == c))
-                .for_each(|m| *m = None);
+            for m in g.members.iter_mut().filter(|m| m.is_some_and(|m| m.0 == c)) {
+                *m = None;
+                self.left += 1;
+            }
         }
     }
 

@@ -1437,6 +1437,12 @@ fn switch_files(image: &str) -> Vec<RootFile> {
         ROOT,
         Source::Bytes("nginx-fast-4.conf", crate::fast_switch::conf4().as_bytes()),
     ));
+    files.push(of(
+        "/etc/nginx/nginx-fast-9.conf",
+        0o644,
+        ROOT,
+        Source::Bytes("nginx-fast-9.conf", crate::fast_switch::conf9().as_bytes()),
+    ));
     files
 }
 

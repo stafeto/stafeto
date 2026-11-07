@@ -39,6 +39,7 @@ use crate::{
 };
 
 const CONF4: &str = "/etc/nginx/nginx-fast-4.conf";
+const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 const READ_WITHIN: Duration = Duration::from_secs(60);
@@ -60,14 +61,27 @@ pub fn conf4() -> &'static str {
     })
 }
 
+/// `nginx-fast.conf` of the switch with nine workers: the ring budget of the service holds eight.
+pub fn conf9() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        crate::nginx_probe::replaced(
+            fast_nginx::switch_conf(),
+            "worker_processes 1;",
+            "worker_processes 9;",
+        )
+    })
+}
+
 pub fn command(args: &[String]) -> Result<(), String> {
     match args {
         [] => probe(Scenario::Plain),
         [a] if a == "kill" => probe(Scenario::Kill),
         [a] if a == "idle" => probe(Scenario::Idle),
+        [a] if a == "attach" => probe(Scenario::Attach),
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
-        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|steps|frames]".to_owned()),
+        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames]".to_owned()),
     }
 }
 
@@ -76,6 +90,8 @@ pub enum Scenario {
     Plain,
     Kill,
     Idle,
+    /// `attach`: eight workers attach, the ninth is refused up front.
+    Attach,
     Steps,
     /// `switch-probe`.
     Frames,
@@ -95,6 +111,8 @@ struct Stat {
     tx_refused: u64,
     /// Parked SYNs given to a member that joined.
     park_given: u64,
+    /// Memberships ended by LEAVE.
+    left: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
     refused_by: Vec<u64>,
     rx_by: Vec<u64>,
@@ -155,6 +173,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
         own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
         tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
         park_given: counter(&line, "park_given").ok_or("park_given")?,
+        left: counter(&line, "left").ok_or("left")?,
         rx_by,
         line,
     })
@@ -236,6 +255,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Plain => plain(&mut run, nginx, httpd, &mut notes),
         Scenario::Kill => kill(&mut run, nginx, &mut notes),
         Scenario::Idle => idle(&mut run, nginx, &mut notes),
+        Scenario::Attach => attach(&mut run, nginx, &mut notes),
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
     };
@@ -499,13 +519,117 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         notes.push(format!(
             "{count} worker(s): {before} answered before the kill, {after} in all, no failure, {given} parked SYN(s) given"
         ));
+        if count == 4 {
+            reload(run, nginx, notes)?;
+        }
         run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-q{count}-end"))?;
         run.expect(&format!("ngx-q{count}-end"), Duration::from_secs(30))?;
-        run.expect("# ", DIALOG_STEP)?;
+        run.expect("# ", Duration::from_secs(60))?;
         // The group of port 80 drains its closing flows (10 s) before the port is free for a
         // new master.
         std::thread::sleep(Duration::from_secs(20));
     }
+    Ok(())
+}
+
+/// `nginx -s reload` under a stream of new connections: each old worker closes its listening
+/// socket before it ends, which makes its consumer leave the group (LEAVE), so no new SYN goes
+/// to a socket nobody listens on (it would get no answer: the stack drops what it has no
+/// listener for). No connection fails, and the switch counts one LEAVE per old worker.
+fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    let (m, old) = fast_nginx::master_and_workers(run, "r4", false)?;
+    let left_before = stat(run, "reload")?.left;
+    let stream = Stream::start(nginx);
+    let until = Instant::now() + Duration::from_secs(60);
+    while stream.answered() < 5 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = stream.answered();
+    run.send(&format!("kill -HUP {m}"))?;
+    for _ in 0..old.len() {
+        run.expect_line(
+            "a new worker",
+            |l| l.contains("start worker process "),
+            Duration::from_secs(60),
+        )?;
+    }
+    let until = Instant::now() + Duration::from_secs(90);
+    while stream.answered() < before + 10 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = stream.answered();
+    let failures = stream.finish();
+    if !failures.is_empty() || after < before + 10 {
+        return Err(format!(
+            "reload: {} failed, {before} answered before and {after} after, the first failure {:?}",
+            failures.len(),
+            failures.first()
+        ));
+    }
+    let left = stat(run, "reload")?.left - left_before;
+    if left < old.len() as u64 {
+        return Err(format!(
+            "reload: {} old workers closed their listeners and the switch heard {left} LEAVE(s)",
+            old.len()
+        ));
+    }
+    notes.push(format!(
+        "reload under load: {before} answered before, {after} in all, no failure, {left} LEAVE(s) for {} old workers",
+        old.len()
+    ));
+    Ok(())
+}
+
+/// Nine workers over a service that has room for eight rings: eight attach and serve, the
+/// ninth is refused at ATTACH (LimitReached before any mapping) and ends with the code that
+/// stops nginx's master from starting it again, so the master starts nine workers in all and
+/// no loop of restarts follows.
+fn attach(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    start(run, CONF9)?;
+    // The ninth worker's end comes after its refusal; the master would start another at once
+    // if the end allowed it.
+    std::thread::sleep(Duration::from_secs(8));
+    let (m, workers) = fast_nginx::master_and_workers(run, "a9", false)?;
+    if workers.len() != 8 {
+        return Err(format!(
+            "{} workers over eight rings, wanted 8",
+            workers.len()
+        ));
+    }
+    let started = run
+        .lines()
+        .iter()
+        .filter(|l| l.contains("start worker process "))
+        .count();
+    if started != 9 {
+        return Err(format!(
+            "the master started {started} workers, wanted 9 (a loop of restarts follows a late failure)"
+        ));
+    }
+    if !run
+        .lines()
+        .iter()
+        .any(|l| l.contains("cannot be respawned"))
+    {
+        return Err(
+            "the refused worker did not end with the code that stops the respawn".to_owned(),
+        );
+    }
+    let st = stat(run, "attach")?;
+    if st.consumers != 8 {
+        return Err(format!(
+            "{} consumers attached, wanted 8: {}",
+            st.consumers, st.line
+        ));
+    }
+    requests("with eight consumers", nginx, "/tiny.txt", TINY, 20)?;
+    notes.push(
+        "eight workers attached and served, the ninth was refused at ATTACH and not respawned"
+            .to_owned(),
+    );
+    run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-a9-end"))?;
+    run.expect("ngx-a9-end", Duration::from_secs(60))?;
     Ok(())
 }
 

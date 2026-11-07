@@ -10,6 +10,9 @@ use crate::ports::{Binding, PortMap, Proto};
 use crate::spsc::Spsc;
 use crate::switchlogic::tables::{MAX_CONSUMERS, MAX_GROUPS};
 
+/// The LEAVEs the stack can owe at once.
+const LEAVES: usize = 8;
+
 /// The ports of a group, `first` to `first + count - 1`, without a sum that can pass 65 535
 /// in 16 bits (`first` 65 535 and `count` 1 is a whole group).
 pub fn hold_ports(first: u16, count: u8) -> core::ops::RangeInclusive<u16> {
@@ -99,6 +102,54 @@ impl Chunks {
     }
 }
 
+/// The service's mappings the rings of consumers use. The kernel gives a process 128; the
+/// service itself uses fewer than 20 and the buffers of sessions up to 64, so the rings get
+/// `RING_MAPPINGS`: eight rings of `Layout::DEFAULT` (11 chunks of `MAP_CHUNK` pages each) fit,
+/// and a ring that would not is refused at ATTACH, up front, and not at a late `mem_map` (which
+/// would break the consumer after it had been told OK).
+pub const RING_MAPPINGS: u32 = 96;
+
+/// The mappings of rings reserved, one per chunk of `chunk_pages` pages of each ring.
+pub struct Mappings {
+    used: u32,
+}
+
+impl Mappings {
+    pub const fn new() -> Mappings {
+        Mappings { used: 0 }
+    }
+
+    /// The mappings a ring of `bytes` bytes takes when it is mapped `chunk_pages` pages at a time.
+    pub const fn for_ring(bytes: u64, page: u64, chunk_pages: u64) -> u32 {
+        bytes.div_ceil(page).div_ceil(chunk_pages) as u32
+    }
+
+    /// Takes `n` mappings, or none when the budget lacks them.
+    pub fn reserve(&mut self, n: u32) -> bool {
+        match self.used.checked_add(n) {
+            Some(sum) if sum <= RING_MAPPINGS => {
+                self.used = sum;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn release(&mut self, n: u32) {
+        self.used = self.used.saturating_sub(n);
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used
+    }
+}
+
+impl Default for Mappings {
+    fn default() -> Mappings {
+        Mappings::new()
+    }
+}
+
 /// A group of ports the registry holds for the switch: from a PORT_HOLD to the switch's
 /// `Back::Freed`. All zeros is an unused slot.
 #[derive(Clone, Copy, Default)]
@@ -147,6 +198,8 @@ impl Hold {
 /// The groups, and the descriptions of ports that closed and whose group has not been told.
 pub struct Holds {
     pub list: [Hold; MAX_GROUPS],
+    /// LEAVEs owed to the switch: a session closed its last description of a group.
+    leaves: [Option<(u8, Mine)>; LEAVES],
     /// A count for each group (u32: a flood of closes cannot saturate it).
     due: [u32; MAX_GROUPS],
 }
@@ -165,6 +218,46 @@ impl Holds {
                 failed: false,
             }; MAX_GROUPS],
             due: [0; MAX_GROUPS],
+            leaves: [None; LEAVES],
+        }
+    }
+
+    /// A session closed a description of group `group` (1-based): when none of the
+    /// descriptions it still holds (`still`, their groups) is of that group, its consumer has to
+    /// leave the group, or the switch goes on steering new connections to a socket nobody
+    /// listens on. Returns whether a LEAVE was queued (false: more descriptions of the group
+    /// are held, the session has no consumer, or the queue is full).
+    pub fn closed_by(
+        &mut self,
+        group: u8,
+        mine: Option<Mine>,
+        mut still: impl Iterator<Item = u8>,
+    ) -> bool {
+        let Some(mine) = mine else { return false };
+        if group == 0 || still.any(|g| g == group) {
+            return false;
+        }
+        let entry = (group, mine);
+        if self.leaves.contains(&Some(entry)) {
+            return true;
+        }
+        match self.leaves.iter_mut().find(|l| l.is_none()) {
+            Some(free) => {
+                *free = Some(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The oldest LEAVE owed, left in the queue until `leave_told`.
+    pub fn next_leave(&self) -> Option<(u8, Mine)> {
+        self.leaves.iter().flatten().next().copied()
+    }
+
+    pub fn leave_told(&mut self, group: u8, mine: Mine) {
+        if let Some(l) = self.leaves.iter_mut().find(|l| **l == Some((group, mine))) {
+            *l = None;
         }
     }
 
@@ -375,6 +468,72 @@ pub const fn may_take(taken: usize, base: usize, over_soft: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eight_default_rings_fit_the_budget_and_a_ninth_does_not() {
+        use proto_net::switch::{Layout, PAGE};
+        let n = Mappings::for_ring(Layout::DEFAULT.total() as u64, PAGE as u64, 64);
+        assert_eq!(n, 11);
+        let mut m = Mappings::new();
+        for _ in 0..8 {
+            assert!(m.reserve(n));
+        }
+        assert_eq!(m.used(), 88);
+        assert!(!m.reserve(n), "a refusal takes nothing");
+        assert_eq!(m.used(), 88);
+        m.release(n);
+        assert!(m.reserve(n));
+        // The biggest ring the layout allows takes three times what a default ring does:
+        // two fit an empty budget and the third is refused.
+        let big = Layout::new(4096, 512).unwrap();
+        let chunks = Mappings::for_ring(big.total() as u64, PAGE as u64, 64);
+        let mut m = Mappings::new();
+        assert!(m.reserve(chunks) && m.reserve(chunks));
+        assert!(!m.reserve(chunks));
+        assert!(!Mappings::new().reserve(RING_MAPPINGS + 1));
+    }
+
+    #[test]
+    fn a_leave_is_owed_when_the_last_description_of_a_group_closes() {
+        let mine = Mine {
+            number: 2,
+            generation: 7,
+        };
+        let mut h = Holds::new();
+        // Another description of the group is still held: no leave.
+        assert!(!h.closed_by(3, Some(mine), [3u8, 1].into_iter()));
+        assert_eq!(h.next_leave(), None);
+        // Descriptions of other groups and plain sockets (0) do not count.
+        assert!(h.closed_by(3, Some(mine), [1u8, 0, 2].into_iter()));
+        assert_eq!(h.next_leave(), Some((3, mine)));
+        // The same pair twice is one leave.
+        assert!(h.closed_by(3, Some(mine), core::iter::empty()));
+        h.leave_told(3, mine);
+        assert_eq!(h.next_leave(), None);
+        // A session with no consumer, and a close of a plain socket, owe nothing.
+        assert!(!h.closed_by(3, None, core::iter::empty()));
+        assert!(!h.closed_by(0, Some(mine), core::iter::empty()));
+    }
+
+    #[test]
+    fn leaves_wait_in_a_queue_of_eight_and_a_full_queue_refuses_the_ninth() {
+        let mut h = Holds::new();
+        for g in 1..=8u8 {
+            let mine = Mine {
+                number: g - 1,
+                generation: 1,
+            };
+            assert!(h.closed_by(g, Some(mine), core::iter::empty()));
+        }
+        let extra = Mine {
+            number: 0,
+            generation: 2,
+        };
+        assert!(!h.closed_by(9, Some(extra), core::iter::empty()));
+        let (g, m) = h.next_leave().unwrap();
+        h.leave_told(g, m);
+        assert!(h.closed_by(9, Some(extra), core::iter::empty()));
+    }
 
     #[test]
     fn a_group_at_port_65535_has_that_port_and_no_wrapped_ones() {
