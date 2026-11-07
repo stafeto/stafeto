@@ -112,6 +112,10 @@ pub trait Service<const K: usize> {
         let _ = notice;
     }
 
+    /// After every request the loop took, one the library refused for its
+    /// header or its session as well.
+    fn between_requests(&mut self) {}
+
     /// A notification other than CLIENT_GONE and the heartbeat's timer:
     /// an interrupt, the end of a child, a timer of the service, the bits
     /// of a client's notify.
@@ -462,6 +466,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     request(service, table, config.issued, label, bytes, handles, token);
                     steps::end(began, kind);
                 }
+                service.between_requests();
                 continue;
             }
             Ok(Received::Notification {

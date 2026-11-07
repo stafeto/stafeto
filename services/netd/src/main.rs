@@ -532,6 +532,8 @@ fn main(_: u64) -> u64 {
         switch_ip: netd::books::AddressSync::new(),
         told: 0,
         bell: netd::ring::Hold::new(),
+        bell_checked: false,
+        bell_timed: false,
         cleanup_due: false,
         armed: None,
         last_step: 0,
@@ -910,6 +912,10 @@ struct Driver<'a> {
     told: u64,
     /// The doorbell held for the work queued behind a step.
     bell: netd::ring::Hold,
+    /// The queue was looked at in the event that is on.
+    bell_checked: bool,
+    /// The timer is set for the bell that is held.
+    bell_timed: bool,
     /// A step of departure is due that no notification told.
     cleanup_due: bool,
     /// The deadline the timer is set for.
@@ -1395,15 +1401,46 @@ impl Driver<'_> {
     /// bell. A step goes ahead of the calls behind it, so without this each
     /// call's frame rings a bell of its own.
     fn bell_waits(&mut self) -> bool {
-        let queued = !switch::INNER.tx_sub.is_empty()
-            && sys::channel_info(&self.notify).is_ok_and(|info| info.queued > 0);
-        self.bell.waits(queued, now_ns())
+        // A large answer (half of what the switch takes at once) rings at
+        // once: the bell is already shared.
+        let frames = switch::INNER.tx_sub.len();
+        let mut own = false;
+        let mut queued = frames > 0 && frames < netd::ring::SWITCH_TX / 2;
+        if queued {
+            // Own bits told are steps in the queue, which come as events; the
+            // kernel is asked only for the calls behind them.
+            own = self.told & STEP_BITS != 0;
+            queued = own || sys::channel_info(&self.notify).is_ok_and(|info| info.queued > 0);
+        }
+        self.bell_checked = true;
+        let now = now_ns();
+        let held = self.bell.waits(queued, now);
+        if !held {
+            self.bell_timed = false;
+        } else if !own && !self.bell_timed {
+            // Only calls stand behind: one the kernel withdrew or the
+            // library refused makes no event, so the timer rings the bell in
+            // time. Steps told to itself always come as events.
+            self.bell_timed = true;
+            self.arm_bell(now);
+        }
+        held
     }
 
-    /// The end of a call or a step: a held bell rings once the queue behind
-    /// it is empty or its time is up.
+    /// The timer fires at `at` for a held bell, below the floor of `arm`.
+    fn arm_bell(&mut self, now: u64) {
+        let at = self.bell.deadline().unwrap_or(now + netd::ring::HOLD_NS);
+        if self.armed.is_none_or(|armed| at < armed || armed <= now) {
+            let _ = sys::timer_set(&self.timer, at);
+            self.armed = Some(at);
+        }
+    }
+
+    /// The end of an event: a held bell rings once the queue behind it is
+    /// empty or its time is up. The event's own step has looked at the queue
+    /// already (`bell_checked`).
     fn bell_release(&mut self) {
-        if self.bell.on() && !self.bell_waits() {
+        if self.bell.on() && !self.bell_checked && !self.bell_waits() {
             switch::INNER.kick(false);
         }
     }
@@ -1757,6 +1794,12 @@ impl Service<0> for Driver<'_> {
 
     fn between_notifications(&mut self, _: Notice) {
         self.bell_release();
+        self.bell_checked = false;
+    }
+
+    fn between_requests(&mut self) {
+        self.bell_release();
+        self.bell_checked = false;
     }
 
     fn notification(&mut self, n: Notice) {
