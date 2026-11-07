@@ -789,6 +789,52 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
 }
 
 /// The records of a capture: their lengths and bytes.
+/// A number of a consumer given again (review of Sh4b2, finding 1): `reuse-a` attaches, joins a
+/// group, breaks its ring and keeps its session; `reuse-b` attaches after it, gets the same
+/// number and joins the same group (the port is shared). When `reuse-a` then joins again and
+/// closes its description, its pair is the old one: the join is refused and no LEAVE reaches the
+/// switch (the counter of LEAVEs stays), so `reuse-b` stays a member.
+fn reuse(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    let before = stat(run, "u0")?.left;
+    let from = run.lines().len();
+    run.send(
+        "switch-probe reuse-a 9101 & sleep 3; switch-probe reuse-b 9101; wait; echo reuse-done",
+    )?;
+    run.expect("reuse-done", Duration::from_secs(120))?;
+    run.expect("# ", DIALOG_STEP)?;
+    let lines: Vec<String> = run.lines()[from..].to_vec();
+    let number = |l: &String| {
+        l.split("attached c ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .map(str::to_owned)
+    };
+    let numbers: Vec<String> = lines.iter().filter_map(number).collect();
+    if numbers.len() != 2 || numbers[0] != numbers[1] {
+        return Err(format!(
+            "the second consumer did not take the number of the first ({numbers:?}): the probe does not test its case; {lines:?}"
+        ));
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("reuse-a stale join refused"))
+    {
+        return Err(format!("the stale JOIN was not refused: {lines:?}"));
+    }
+    let after = stat(run, "u1")?.left;
+    if after != before {
+        return Err(format!(
+            "{} LEAVE(s) reached the switch from a session whose consumer was gone",
+            after - before
+        ));
+    }
+    notes.push(format!(
+        "number {} reused: the old session's JOIN refused and its close sent no LEAVE",
+        numbers[0]
+    ));
+    Ok(())
+}
+
 fn pcap_records(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut at = 24;
@@ -872,6 +918,12 @@ fn frames(
     notes.push(
         "hold of a port below 1024 as nobody: refused; JOIN without a port: EBADF".to_owned(),
     );
+    // A group at port 65535 is held and joined (the end of the range does not wrap).
+    run.send("switch-probe hold 65535")?;
+    run.expect("switch-probe: joined ok", Duration::from_secs(60))?;
+    run.expect("# ", Duration::from_secs(30))?;
+    notes.push("a hold and a JOIN at port 65535 answered".to_owned());
+    reuse(run, notes)?;
     // A broken ring disables its consumer alone; the service goes on.
     for mode in ["broken-tx", "broken-fill"] {
         run.send(&format!("switch-probe {mode}"))?;

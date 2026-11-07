@@ -310,6 +310,30 @@ int main(int argc, char **argv)
 		printf("switch-probe: joined ok\n");
 		fflush(stdout);
 		pause_ms(2000);
+	} else if (!strcmp(mode, "reuse-a") && argc > 2) {
+		/* A consumer whose ring broke keeps its session. Once its number is a new
+		 * consumer's (reuse-b), its JOIN and its close of the description (LEAVE)
+		 * reach nothing of the new one. */
+		hold = stafeto_fast_port_hold((unsigned)atoi(argv[2]), 1);
+		REQUIRE(hold >= 0);
+		REQUIRE(stafeto_fast_port_join(hold) == 0);
+		broken(0);
+		pause_ms(6000);
+		if (stafeto_fast_port_join(hold) != 0)
+			printf("switch-probe: reuse-a stale join refused errno %d\n", errno);
+		else
+			printf("switch-probe: reuse-a stale join accepted\n");
+		close(hold);
+		printf("switch-probe: reuse-a closed\n");
+		fflush(stdout);
+		pause_ms(1000);
+	} else if (!strcmp(mode, "reuse-b") && argc > 2) {
+		hold = stafeto_fast_port_hold((unsigned)atoi(argv[2]), 1);
+		REQUIRE(hold >= 0);
+		REQUIRE(stafeto_fast_port_join(hold) == 0);
+		printf("switch-probe: reuse-b joined\n");
+		fflush(stdout);
+		pause_ms(5000);
 	} else if (!strcmp(mode, "hold-block")) {
 		/* A port inside the block of this consumer's temporary ports is not for a
 		 * group: PORT_HOLD answers "in use" and leaves no group in the books. */
