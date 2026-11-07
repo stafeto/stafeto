@@ -1062,13 +1062,12 @@ mod tests {
     /// timer of the service leaves the hold's timer marked as set.
     fn rung_after_the_stack_timer(forget: bool) -> Option<u64> {
         let mut hold = Hold::new();
-        let mut timer = None;
         let v = hold.decide(1, false, || true, 0);
         assert!(v.held);
-        timer = v.arm.or(timer);
+        assert_eq!(v.arm, Some(HOLD_NS));
         // The stack's own timer fires at 50 us and takes the armed one with
         // it; the step that follows asks again, the call still queued.
-        timer = None;
+        let mut timer = None;
         if forget {
             hold.timer_gone();
         }
