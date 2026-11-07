@@ -2306,7 +2306,10 @@ fn idle_bell_pairs() -> Outcome {
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
     let server = spawn_on(0, 1, echo_service, 0, TEST_PRIORITY + 1)?;
-    check(wait_for_within(PAIRS_START_NS, || mark(0) == 1), "the service did not start")?;
+    check(
+        wait_for_within(PAIRS_START_NS, || mark(0) == 1),
+        "the service did not start",
+    )?;
     // The probe kernels with a deliberate break act from here on.
     let _ = sys::debug_write(&resource(), b"idle-probe arm");
     println!("smp idle bell  pairs begin");
