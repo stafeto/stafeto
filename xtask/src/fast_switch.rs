@@ -918,11 +918,11 @@ fn frames(
     notes.push(
         "hold of a port below 1024 as nobody: refused; JOIN without a port: EBADF".to_owned(),
     );
-    // A group at port 65535 is held and joined (the end of the range does not wrap).
-    run.send("switch-probe hold 65535")?;
-    run.expect("switch-probe: joined ok", Duration::from_secs(60))?;
+    // A hold at port 65535 (review of Sh4b2, finding 2): the end of the range does not wrap.
+    run.send("switch-probe hold-top")?;
+    run.expect("switch-probe: hold-top ok", Duration::from_secs(60))?;
     run.expect("# ", Duration::from_secs(30))?;
-    notes.push("a hold and a JOIN at port 65535 answered".to_owned());
+    notes.push("a hold at port 65535 is held or in use, and no wrapped port is held".to_owned());
     reuse(run, notes)?;
     // A broken ring disables its consumer alone; the service goes on.
     for mode in ["broken-tx", "broken-fill"] {

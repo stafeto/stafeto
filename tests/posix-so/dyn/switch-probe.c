@@ -44,16 +44,16 @@
 
 #define ETH 14
 #define PAGE 4096u
-/* The layout of proto_net::switch with the default sizes (2048 and 512). */
+/* The layout of proto_net::switch with the default sizes (1024 and 256). */
 #define LINE 64u
 #define TX_HEAD_AT (5 * LINE)
 #define TX_TAIL_AT (6 * LINE)
 #define FILL_HEAD_AT (1 * LINE)
 #define FILL_TAIL_AT (2 * LINE)
-#define TX_AT (7 * PAGE)
-#define TX_CELLS_AT (1032u * PAGE)
+#define TX_AT (4 * PAGE)
+#define TX_CELLS_AT (517u * PAGE)
 #define CELL 2048u
-#define TX_SLOTS 512u
+#define TX_SLOTS 256u
 #define WAKE_BROKEN 2u
 
 static struct stafeto_fast_claim claim;
@@ -310,6 +310,23 @@ int main(int argc, char **argv)
 		printf("switch-probe: joined ok\n");
 		fflush(stdout);
 		pause_ms(2000);
+	} else if (!strcmp(mode, "hold-top")) {
+		/* The last port of the range: the blocks of temporary ports sit at the top, so a
+		 * block over it makes the hold "in use"; with none, the hold is made. Either way
+		 * no wrapped port is held (port 2080 is still free after it). */
+		int top = stafeto_fast_port_hold(65535, 0);
+		int e = errno;
+
+		if (top < 0 && e != EADDRINUSE) {
+			printf("switch-probe: hold-top failed errno %d\n", e);
+		} else {
+			hold = stafeto_fast_port_hold(2080, 0);
+			if (hold >= 0 && stafeto_fast_port_join(hold) == 0)
+				printf("switch-probe: hold-top ok %s\n", top < 0 ? "in use" : "held");
+			else
+				printf("switch-probe: hold-top then 2080 failed errno %d\n", errno);
+		}
+		fflush(stdout);
 	} else if (!strcmp(mode, "reuse-a") && argc > 2) {
 		/* A consumer whose ring broke keeps its session. Once its number is a new
 		 * consumer's (reuse-b), its JOIN and its close of the description (LEAVE)
