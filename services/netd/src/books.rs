@@ -10,9 +10,6 @@ use crate::ports::{Binding, PortMap, Proto};
 use crate::spsc::Spsc;
 use crate::switchlogic::tables::{MAX_CONSUMERS, MAX_GROUPS};
 
-/// The LEAVEs the stack can owe at once.
-const LEAVES: usize = 8;
-
 /// The ports of a group, `first` to `first + count - 1`, without a sum that can pass 65 535
 /// in 16 bits (`first` 65 535 and `count` 1 is a whole group).
 pub fn hold_ports(first: u16, count: u8) -> core::ops::RangeInclusive<u16> {
@@ -201,8 +198,10 @@ impl Hold {
 /// The groups, and the descriptions of ports that closed and whose group has not been told.
 pub struct Holds {
     pub list: [Hold; MAX_GROUPS],
-    /// LEAVEs owed to the switch: a session closed its last description of a group.
-    leaves: [Option<(u8, Mine)>; LEAVES],
+    /// LEAVEs owed to the switch, one place for each group and consumer number (the generation
+    /// of the consumer that owes it): a session closed its last description of a group. A place
+    /// cannot be lost to a full queue, and a number given again overwrites the old pair's.
+    leaves: [[Option<u32>; MAX_CONSUMERS]; MAX_GROUPS],
     /// A count for each group (u32: a flood of closes cannot saturate it).
     due: [u32; MAX_GROUPS],
 }
@@ -221,15 +220,15 @@ impl Holds {
                 failed: false,
             }; MAX_GROUPS],
             due: [0; MAX_GROUPS],
-            leaves: [None; LEAVES],
+            leaves: [[None; MAX_CONSUMERS]; MAX_GROUPS],
         }
     }
 
     /// A session closed a description of group `group` (1-based): when none of the
     /// descriptions it still holds (`still`, their groups) is of that group, its consumer has to
     /// leave the group, or the switch goes on steering new connections to a socket nobody
-    /// listens on. Returns whether a LEAVE was queued (false: more descriptions of the group
-    /// are held, the session has no consumer, or the queue is full).
+    /// listens on. Returns whether a LEAVE is owed now (false: more descriptions of the group
+    /// are held, or the session has no consumer). An owed LEAVE stays until it is sent.
     pub fn closed_by(
         &mut self,
         group: u8,
@@ -237,30 +236,48 @@ impl Holds {
         mut still: impl Iterator<Item = u8>,
     ) -> bool {
         let Some(mine) = mine else { return false };
-        if group == 0 || still.any(|g| g == group) {
+        if group == 0 || usize::from(group) > MAX_GROUPS || still.any(|g| g == group) {
             return false;
         }
-        let entry = (group, mine);
-        if self.leaves.contains(&Some(entry)) {
-            return true;
-        }
-        match self.leaves.iter_mut().find(|l| l.is_none()) {
-            Some(free) => {
-                *free = Some(entry);
+        match self.leaves[usize::from(group) - 1].get_mut(usize::from(mine.number)) {
+            Some(place) => {
+                *place = Some(mine.generation);
                 true
             }
             None => false,
         }
     }
 
-    /// The oldest LEAVE owed, left in the queue until `leave_told`.
+    /// A LEAVE owed, left in its place until `leave_told`.
     pub fn next_leave(&self) -> Option<(u8, Mine)> {
-        self.leaves.iter().flatten().next().copied()
+        self.leaves.iter().enumerate().find_map(|(g, row)| {
+            row.iter().enumerate().find_map(|(n, place)| {
+                place.map(|generation| {
+                    (
+                        g as u8 + 1,
+                        Mine {
+                            number: n as u8,
+                            generation,
+                        },
+                    )
+                })
+            })
+        })
     }
 
     pub fn leave_told(&mut self, group: u8, mine: Mine) {
-        if let Some(l) = self.leaves.iter_mut().find(|l| **l == Some((group, mine))) {
-            *l = None;
+        self.cancel_leave(group, mine);
+    }
+
+    /// The consumer `mine` is to join `group` again: a LEAVE it owes for the group is void (it
+    /// would undo the join), unless it is a LEAVE of an older consumer of the number.
+    pub fn cancel_leave(&mut self, group: u8, mine: Mine) {
+        let place = usize::from(group)
+            .checked_sub(1)
+            .and_then(|g| self.leaves.get_mut(g))
+            .and_then(|row| row.get_mut(usize::from(mine.number)));
+        if let Some(place) = place.filter(|p| **p == Some(mine.generation)) {
+            *place = None;
         }
     }
 
@@ -521,23 +538,72 @@ mod tests {
     }
 
     #[test]
-    fn leaves_wait_in_a_queue_of_eight_and_a_full_queue_refuses_the_ninth() {
+    fn no_leave_is_lost_to_a_full_command_ring_however_many_are_owed() {
         let mut h = Holds::new();
-        for g in 1..=8u8 {
-            let mine = Mine {
-                number: g - 1,
-                generation: 1,
-            };
-            assert!(h.closed_by(g, Some(mine), core::iter::empty()));
+        // Every group and every number owes one: 32 x 8, none dropped.
+        for g in 1..=32u8 {
+            for n in 0..8u8 {
+                let mine = Mine {
+                    number: n,
+                    generation: 1,
+                };
+                assert!(h.closed_by(g, Some(mine), core::iter::empty()));
+            }
         }
-        let extra = Mine {
-            number: 0,
+        // The command ring refuses (nothing is told); the owed stay, in the same order.
+        let first = h.next_leave();
+        assert_eq!(h.next_leave(), first);
+        let mut sent = 0;
+        while let Some((g, m)) = h.next_leave() {
+            h.leave_told(g, m);
+            sent += 1;
+        }
+        assert_eq!(sent, 32 * 8);
+    }
+
+    #[test]
+    fn a_number_given_again_replaces_the_owed_leave_of_the_old_pair() {
+        let mut h = Holds::new();
+        let old = Mine {
+            number: 2,
+            generation: 1,
+        };
+        let new = Mine {
+            number: 2,
             generation: 2,
         };
-        assert!(!h.closed_by(9, Some(extra), core::iter::empty()));
-        let (g, m) = h.next_leave().unwrap();
-        h.leave_told(g, m);
-        assert!(h.closed_by(9, Some(extra), core::iter::empty()));
+        assert!(h.closed_by(5, Some(old), core::iter::empty()));
+        assert!(h.closed_by(5, Some(new), core::iter::empty()));
+        assert_eq!(h.next_leave(), Some((5, new)));
+        // Telling the old pair's leave does not void the new one's.
+        h.leave_told(5, old);
+        assert_eq!(h.next_leave(), Some((5, new)));
+    }
+
+    #[test]
+    fn a_join_after_the_close_voids_the_owed_leave_in_every_order() {
+        let mine = Mine {
+            number: 1,
+            generation: 4,
+        };
+        let mut h = Holds::new();
+        // close, hold again, join: the leave owed by the close is void.
+        assert!(h.closed_by(7, Some(mine), core::iter::empty()));
+        h.cancel_leave(7, mine);
+        assert_eq!(h.next_leave(), None);
+        // close, join, close again: the second close owes a leave again.
+        assert!(h.closed_by(7, Some(mine), core::iter::empty()));
+        assert_eq!(h.next_leave(), Some((7, mine)));
+        // A join of another group, or of another consumer, voids nothing.
+        h.cancel_leave(8, mine);
+        h.cancel_leave(
+            7,
+            Mine {
+                number: 1,
+                generation: 5,
+            },
+        );
+        assert_eq!(h.next_leave(), Some((7, mine)));
     }
 
     #[test]

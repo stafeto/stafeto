@@ -483,6 +483,9 @@ impl Driver<'_> {
         if group == 0 {
             return refuse(proto_net::BAD_FD);
         }
+        // A LEAVE this session owes for the group (it closed its last description a moment ago)
+        // would undo the join that follows it.
+        self.net.holds.cancel_leave(group, mine);
         if !switch::command(Command::Join { group, consumer: c }) {
             return refuse(proto_net::BUSY);
         }
