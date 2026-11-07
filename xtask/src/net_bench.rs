@@ -131,15 +131,22 @@ enum Workload {
     W3,
     W4,
     W5,
+    /// One file of the set (`/s/0000.bin`, 10 KiB) over long connections: a ceiling by `wrk`
+    /// alone, no walk of rates.
+    W6,
+    /// `/1k.bin` over long connections: the same, for the smallest answer.
+    W7,
 }
 
 impl Workload {
-    const ALL: [Workload; 5] = [
+    const ALL: [Workload; 7] = [
         Workload::W1,
         Workload::W2,
         Workload::W3,
         Workload::W4,
         Workload::W5,
+        Workload::W6,
+        Workload::W7,
     ];
     /// The loads of HTTP; W4 and W5 (TLS) are asked for by name.
     const DEFAULT: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
@@ -151,6 +158,8 @@ impl Workload {
             Workload::W3 => "w3",
             Workload::W4 => "w4",
             Workload::W5 => "w5",
+            Workload::W6 => "w6",
+            Workload::W7 => "w7",
         }
     }
 
@@ -176,13 +185,18 @@ impl Workload {
             Workload::W2 => (0..linux_guest::W2_FILES)
                 .map(|n| format!("/l/{n:02}.bin"))
                 .collect(),
+            Workload::W6 => vec!["/s/0000.bin".to_owned()],
+            Workload::W7 => vec!["/1k.bin".to_owned()],
         }
     }
 
     fn length(self) -> usize {
         match self {
-            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 => linux_guest::W1_LEN,
+            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 | Workload::W6 => {
+                linux_guest::W1_LEN
+            }
             Workload::W2 => linux_guest::W2_LEN,
+            Workload::W7 => 1024,
         }
     }
 
@@ -230,6 +244,9 @@ enum System {
     F1,
     /// nginx-fast on the switch of the first device (one device, worker as nobody).
     F1s,
+    /// S4 from another build (`--old DIR`: its `stafeto.img` and `boot-net-bench.img`), the
+    /// reference of a change of the network service (the pair S4 over S4o).
+    S4o,
 }
 
 impl System {
@@ -242,17 +259,19 @@ impl System {
             System::S4 => "S4",
             System::F1 => "F1",
             System::F1s => "F1s",
+            System::S4o => "S4o",
         }
     }
 
     fn of(name: &str) -> Option<System> {
         System::ALL
             .into_iter()
+            .chain([System::S4o])
             .find(|s| s.name().eq_ignore_ascii_case(name))
     }
 
     fn linux(self) -> bool {
-        !matches!(self, System::S4 | System::F1 | System::F1s)
+        !matches!(self, System::S4 | System::F1 | System::F1s | System::S4o)
     }
 
     fn workers(self) -> usize {
@@ -1390,6 +1409,9 @@ struct Prepared {
     /// The image of F1.
     fast_image: PathBuf,
     switch_image: PathBuf,
+    /// The kernel and the image of S4o.
+    old_kernel: PathBuf,
+    old_image: PathBuf,
     config: String,
     switch_config: String,
     /// The fingerprint of the settings of F1 (its own file).
@@ -1713,15 +1735,17 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
         ..Report::default()
     };
     let (load_start, others_start) = (load_now(), nginx_bench::other_guests(0));
-    let image = if switch {
-        &prep.switch_image
+    let (kernel, image) = if sys == System::S4o {
+        (&prep.old_kernel, &prep.old_image)
+    } else if switch {
+        (&prep.kernel, &prep.switch_image)
     } else if fast {
-        &prep.fast_image
+        (&prep.kernel, &prep.fast_image)
     } else {
-        &prep.image
+        (&prep.kernel, &prep.image)
     };
     let machine = linux_guest::machine_with(&suffix, if fast && !switch { 2 } else { 1 });
-    let command = vz::command_on(&prep.kernel, image, machine)?;
+    let command = vz::command_on(kernel, image, machine)?;
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -1872,6 +1896,9 @@ struct Options {
     nat: u32,
     max_rate: Option<u32>,
     resume: Option<PathBuf>,
+    /// The build the rows S4o come from: a `target` directory with `stafeto.img` and
+    /// `boot-net-bench.img`.
+    old: Option<PathBuf>,
     /// The image of S4: the plain one, the one with the profile's counters of
     /// the network service, or that one with the shell's processes on CPUs 1
     /// to 3.
@@ -1889,7 +1916,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--quick] [--resume DIR] | tables DIR";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--quick] [--resume DIR] | tables DIR";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -1908,8 +1935,10 @@ fn options(args: &[String]) -> Result<Options, String> {
         nat: 30,
         max_rate: None,
         resume: None,
+        old: None,
         image: ImageKind::Plain,
     };
+    let mut phases_given = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |name: &str| {
@@ -1926,14 +1955,15 @@ fn options(args: &[String]) -> Result<Options, String> {
                 o.systems = value(arg)?
                     .split(',')
                     .map(|s| {
-                        System::of(s).ok_or_else(|| format!("no system {s:?} (l1, l4, s4, f1)"))
+                        System::of(s)
+                            .ok_or_else(|| format!("no system {s:?} (l1, l4, s4, f1, f1s, s4o)"))
                     })
                     .collect::<Result<_, _>>()?
             }
             "--workloads" => {
                 o.workloads = value(arg)?
                     .split(',')
-                    .map(|s| Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1 to w5)")))
+                    .map(|s| Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1 to w7)")))
                     .collect::<Result<_, _>>()?
             }
             "--image" => {
@@ -1947,7 +1977,11 @@ fn options(args: &[String]) -> Result<Options, String> {
                     }
                 }
             }
-            "--phases" => o.phases = value(arg)?.split(',').map(str::to_owned).collect(),
+            "--phases" => {
+                o.phases = value(arg)?.split(',').map(str::to_owned).collect();
+                phases_given = true;
+            }
+            "--old" => o.old = Some(PathBuf::from(value(arg)?)),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
             "--max-rounds" => o.max_rounds = number(value(arg)?, arg)?,
             "--warm" => o.warm = number(value(arg)?, arg)?,
@@ -1966,6 +2000,16 @@ fn options(args: &[String]) -> Result<Options, String> {
             }
             other => return Err(format!("{other}: {USAGE}")),
         }
+    }
+    // The limit of the NAT is measured against Linux guests (`iperf3` with L4): a run of the
+    // rows of stafeto alone has none, and takes no Linux guest to its start.
+    if !phases_given && !o.systems.iter().any(|s| s.linux()) {
+        o.phases.retain(|p| p != "nat");
+    }
+    if o.systems.contains(&System::S4o) && o.old.is_none() {
+        return Err(format!(
+            "S4o needs --old DIR (a build to compare with); {USAGE}"
+        ));
     }
     if let Some(bad) = o
         .phases
@@ -3177,6 +3221,72 @@ impl Results {
         t
     }
 
+    /// The ceilings paired by round (the rows were measured one after the other in the same
+    /// session): the ratio of two rows in each round, its median, and the bound of the
+    /// acceptance of the switch (F1s over F1 at least 0.85, S4 over the S4 of the build before
+    /// the split of the service's threads, S4o, at least 0.95).
+    fn table_ceiling_pairs(&self) -> String {
+        const BOUNDS: [(System, System, f64); 3] = [
+            (System::F1s, System::F1, 0.85),
+            (System::S4, System::S4o, 0.95),
+            (System::F1s, System::S4, 0.0),
+        ];
+        let mut t = String::from(
+            "### Table 5a. Ceilings paired by round (ratio of the requests a second of two rows)\n\n| pair | load | connections | ratio by round | median | bound | every round | median |\n|---|---|---|---|---|---|---|---|\n",
+        );
+        for (a, b, bound) in BOUNDS {
+            for wl in Workload::ALL {
+                for c in [CONNECTIONS, wl.criterion()] {
+                    let mut ratios = Vec::new();
+                    for round in 1..=MAX_ROUNDS {
+                        let rps = |sys: System| {
+                            self.num(
+                                &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
+                                "per_second",
+                            )
+                        };
+                        if let (Some(x), Some(y)) = (rps(a), rps(b))
+                            && y > 0.0
+                        {
+                            ratios.push(x / y);
+                        }
+                    }
+                    if ratios.is_empty() {
+                        continue;
+                    }
+                    let list: Vec<String> = ratios.iter().map(|r| format!("{r:.3}")).collect();
+                    let mut sorted = ratios.clone();
+                    sorted.sort_by(|p, q| p.total_cmp(q));
+                    let median = if sorted.len() % 2 == 1 {
+                        sorted[sorted.len() / 2]
+                    } else {
+                        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+                    };
+                    let verdict = |ok: bool| match (bound, ok) {
+                        (0.0, _) => "-",
+                        (_, true) => "yes",
+                        (_, false) => "NO",
+                    };
+                    t += &format!(
+                        "| {} over {} | {} | {c} | {} | {median:.3} | {} | {} | {} |\n",
+                        a.name(),
+                        b.name(),
+                        wl.name().to_uppercase(),
+                        list.join(" / "),
+                        if bound == 0.0 {
+                            "-".to_owned()
+                        } else {
+                            format!("{bound}")
+                        },
+                        verdict(ratios.iter().all(|r| *r >= bound)),
+                        verdict(median >= bound),
+                    );
+                }
+            }
+        }
+        t
+    }
+
     fn table_floor(&self) -> String {
         let mut t = String::from(
             "### Table 6. The floor of the Mac at the rates of each round (Homebrew's nginx on the loopback)\n\n| key | p50 ms | p99 ms | p99.9 ms | p99 of lag ms | Mac load |\n|---|---|---|---|---|---|\n",
@@ -3264,6 +3374,7 @@ fn tables(dir: &Path) -> Result<String, String> {
         r.table_ratios(),
         r.table_common(),
         r.table_ceilings(),
+        r.table_ceiling_pairs(),
         r.table_floor(),
         r.table_conditions(),
         r.table_w3(),
@@ -3314,7 +3425,7 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         PathBuf::new(),
         PathBuf::new(),
     );
-    if o.systems.iter().any(|s| !s.linux()) {
+    if o.systems.iter().any(|s| !s.linux() && *s != System::S4o) {
         crate::busybox_build()?;
         crate::nano_build()?;
         kernel = build(Variant::Normal)?.image;
@@ -3333,6 +3444,18 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             switch_image = linux_guest::build_switch_image()?;
         }
     }
+    let (mut old_kernel, mut old_image) = (PathBuf::new(), PathBuf::new());
+    if let Some(dir) = o.old.as_ref().filter(|_| o.systems.contains(&System::S4o)) {
+        let dir = std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        (old_kernel, old_image) = (dir.join("stafeto.img"), dir.join("boot-net-bench.img"));
+        for f in [&old_kernel, &old_image] {
+            if !f.is_file() {
+                return Err(format!("--old: no {}", f.display()));
+            }
+        }
+        // The programs of the guest (`vz-run`) come from this build.
+        crate::busybox_build()?;
+    }
     let (config, www) = linux_guest::expected()?;
     let (fast_config, _) = linux_guest::expected_fast();
     let (config_tls, fast_config_tls) = linux_guest::expected_tls()?;
@@ -3344,6 +3467,8 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         image,
         fast_image,
         switch_image,
+        old_kernel,
+        old_image,
         config,
         fast_config,
         switch_config: linux_guest::expected_switch(),
@@ -4208,6 +4333,67 @@ mod tests {
         );
         assert!(text.contains("| W1 | S4 with L4 | 1000 |"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ceilings_are_paired_by_round_with_the_bounds_of_the_acceptance() {
+        let dir = std::env::temp_dir().join(format!("net-bench-pairs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("results")).unwrap();
+        let put = |key: &str, rps: f64| {
+            let mut r = Rec::new();
+            r.insert("per_second".into(), format!("{rps}"));
+            std::fs::write(dir.join("results").join(format!("{key}.rec")), rec_text(&r)).unwrap()
+        };
+        // F1s over F1: 0.9, 0.84, 0.9 (one round under the bound, the median over it);
+        // S4 over S4o: 0.96 in all three.
+        for (round, f1s, s4) in [(1, 90.0, 96.0), (2, 84.0, 96.0), (3, 90.0, 96.0)] {
+            put(&format!("ceiling.r{round}.F1.w7.c64"), 100.0);
+            put(&format!("ceiling.r{round}.F1s.w7.c64"), f1s);
+            put(&format!("ceiling.r{round}.S4o.w7.c64"), 100.0);
+            put(&format!("ceiling.r{round}.S4.w7.c64"), s4);
+        }
+        let text = tables(&dir).unwrap();
+        assert!(
+            text.contains(
+                "| F1s over F1 | W7 | 64 | 0.900 / 0.840 / 0.900 | 0.900 | 0.85 | NO | yes |"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "| S4 over S4o | W7 | 64 | 0.960 / 0.960 / 0.960 | 0.960 | 0.95 | yes | yes |"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_of_stafeto_rows_alone_skips_the_nat_phase_and_s4o_needs_its_build() {
+        let o = options(&["--systems".into(), "f1s,f1,s4".into()]).unwrap();
+        assert_eq!(o.phases, ["sweep", "rounds"]);
+        let o = options(&[
+            "--systems".into(),
+            "f1s".into(),
+            "--phases".into(),
+            "nat".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.phases, ["nat"]);
+        assert!(options(&["--systems".into(), "s4,s4o".into()]).is_err());
+        let o = options(&[
+            "--systems".into(),
+            "s4,s4o".into(),
+            "--old".into(),
+            "x".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.systems, [System::S4, System::S4o]);
+        assert_eq!(Workload::W6.paths(), ["/s/0000.bin"]);
+        assert_eq!(Workload::W7.paths(), ["/1k.bin"]);
+        // Linux rows keep the nat phase.
+        assert_eq!(options(&[]).unwrap().phases, ["nat", "sweep", "rounds"]);
     }
 
     #[test]
