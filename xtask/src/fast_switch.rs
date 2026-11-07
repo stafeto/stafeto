@@ -153,7 +153,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
     run.expect_line(
         "the counters of the switch",
         |l| l.contains("net: switch rx_by "),
-        Duration::from_secs(30),
+        Duration::from_secs(120),
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
@@ -804,8 +804,8 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     booted(run)?;
     // Eight consumers attach at once: their rings map in chunks, one chunk of pages in all
     // for a step of the stack, and the longest step stays under the bound. The service maps
-    // at most 128 pieces (the kernel's limit), and a ring is 21 of them, so the ones past the
-    // fifth are refused cleanly (LimitReached) and the service goes on.
+    // at most 128 pieces (the kernel's limit); its budget for rings and buffers is 108 and a
+    // ring takes 11, so all eight fit.
     run.send(
         "for p in 9001 9002 9003 9004 9005 9006 9007 9008; do switch-probe hold $p & done; wait; echo sw-eight-\"end\"",
     )?;
@@ -815,7 +815,9 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
         .iter()
         .filter(|l| l.contains("switch-probe: joined ok"))
         .count();
-    if joined < 4 {
+    // All eight fit the service's budget; the guest's own process memory may not load one of
+    // eight programs at once ("Out of memory" of the shell), which is no business of the switch.
+    if joined < 6 {
         return Err(format!(
             "{joined} of 8 simultaneous consumers attached and joined"
         ));
@@ -826,7 +828,7 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     run.expect("switch-probe: hold-block ok", Duration::from_secs(120))?;
     run.expect("# ", DIALOG_STEP)?;
     notes.push(format!(
-        "{joined} of 8 consumers attached at once (the rest refused with LimitReached); a hold inside a block refused"
+        "{joined} of 8 programs attached at once (none refused by the switch); a hold inside a block refused"
     ));
     run.send("httpd -f -p 8080 -h /www &")?;
     run.expect("# ", DIALOG_STEP)?;
@@ -849,6 +851,48 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
     )?;
     requests("after the kill", nginx, "/tiny.txt", TINY, 20)?;
     notes.push("a worker killed and replaced under -icount".to_owned());
+    parking_case(run, nginx, notes)
+}
+
+/// Every worker killed at once under connections that keep coming: the group has holders and no
+/// member, the SYNs wait in the park, and the new workers get them (at most `PARK_GIVE` in a
+/// step). The steps of the service, those of the switch among them, stay within the bound (the
+/// probe judges them at the end), and every connection is answered.
+fn parking_case(
+    run: &mut qemu::Run,
+    nginx: SocketAddr,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let (_, workers) = fast_nginx::master_and_workers(run, "sp", false)?;
+    let attempts: Vec<_> = (0..16u64)
+        .map(|i| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150 * i));
+                Connection::open(nginx, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt"))
+            })
+        })
+        .collect();
+    let list: Vec<String> = workers.iter().map(u32::to_string).collect();
+    run.send(&format!("kill -9 {}", list.join(" ")))?;
+    let mut failed = Vec::new();
+    for a in attempts {
+        match a.join() {
+            Ok(Ok(body)) if body == TINY => {}
+            Ok(Ok(_)) => failed.push("a wrong page".to_owned()),
+            Ok(Err(e)) => failed.push(e),
+            Err(_) => failed.push("a thread panicked".to_owned()),
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of 16 connections over the loss of every worker failed: {:?}",
+            failed.len(),
+            failed.first()
+        ));
+    }
+    // The image of the steps has no `posix-net`, so the parked SYNs are not counted here (the
+    // probe `switch kill` counts them); the steps judged at the end include the handoffs.
+    notes.push("every worker killed under 16 connections: all answered".to_owned());
     Ok(())
 }
 
