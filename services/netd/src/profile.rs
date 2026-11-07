@@ -81,6 +81,7 @@ counters! {
     IsrTicks = "isr_ticks",
     ReopenN = "reopen_n",
     ReopenTicks = "reopen_ticks",
+    Pause = "pause",
     // The maxima: the counters from here on are not differences.
     RingMax = "ring_max",
     IsrMax = "isr_max",

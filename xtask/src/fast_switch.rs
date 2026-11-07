@@ -23,6 +23,11 @@
 //! * `switch steps`: the start and the first pages under -icount with the
 //!   service counting its steps: every step, those of the switch among them
 //!   (kinds 67 to 70), is under 0.9 of term B.
+//! * `switch saturate`: three programs keep their rings full of entries the switch refuses for
+//!   12 s on four CPUs; the switch (a level above the stack and the services on its CPU) pauses
+//!   in its runs, so the stack answers `posix-net stat` within seconds and init's watchdog
+//!   kills nothing (without the pauses the stack waits for the end of the flood, or init kills
+//!   the network service as silent).
 //! * `switch-probe`: the C program over the ring sends the frames the switch
 //!   refuses; each is counted by its reason, none reaches the wire (the
 //!   capture of the device), a broken ring disables its consumer alone.
@@ -43,6 +48,12 @@ const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
+/// How long `saturate` floods the ring.
+const SATURATE_SECS: u64 = 12;
+/// How many programs flood a ring at once.
+const SATURATE_CONSUMERS: usize = 3;
+/// The longest the stack may take to answer `posix-net stat` in the flood.
+const SATURATE_ANSWER: Duration = Duration::from_secs(4);
 const READ_WITHIN: Duration = Duration::from_secs(60);
 /// The share each worker's frames take at least, of those of all.
 const SHARE_MIN: f64 = 0.10;
@@ -105,6 +116,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         [a] if a == "attach" => probe(Scenario::Attach),
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
+        [a] if a == "saturate" => probe(Scenario::Saturate),
         _ => Err("usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames]".to_owned()),
     }
 }
@@ -119,6 +131,8 @@ pub enum Scenario {
     Steps,
     /// `switch-probe`.
     Frames,
+    /// `saturate`: a consumer floods its TX ring; the stack and init's watchdog are checked.
+    Saturate,
 }
 
 /// A counter of a line of the service after `key`.
@@ -273,6 +287,10 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
     if scenario == Scenario::Steps {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
+    // The flood needs CPUs besides the switch's for the programs that make it.
+    if scenario == Scenario::Saturate {
+        cmd.args(["-smp", "4"]);
+    }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let began = Instant::now();
     let nginx: SocketAddr = ([127, 0, 0, 1], ports.0).into();
@@ -285,6 +303,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Attach => attach(&mut run, nginx, &mut notes),
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
+        Scenario::Saturate => saturate(&mut run, &mut notes),
     };
     let output = run.stop();
     crate::symbolize::backtrace(&output.lines, &kernel.elf);
@@ -1079,6 +1098,82 @@ fn frames(
     notes.push(format!(
         "the capture of the wire holds {} frames, none of them refused ones",
         records.len()
+    ));
+    Ok(())
+}
+
+/// `saturate`: three consumers keep their TX rings full of entries the switch refuses, so that
+/// every step of the switch finds more to do and its run never ends by itself. The switch is a
+/// level above the stack, the services and the programs on its CPU: without a pause of its own
+/// they would starve (the stack answers nothing, init's watchdog kills the service that was kept
+/// off the processor). The stack answers `posix-net stat` while the flood goes on, and the
+/// switch counts the pauses it took.
+fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    let quiet = Instant::now();
+    stat(run, "quiet")?;
+    // The answer of a quiet stack sets the scale of a slow machine.
+    let limit = SATURATE_ANSWER.max(quiet.elapsed() * 40);
+    for _ in 0..SATURATE_CONSUMERS {
+        run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
+        run.expect("# ", DIALOG_STEP)?;
+    }
+    let began = Instant::now();
+    // The programs attach one after another; the stack answers while they do.
+    let (mut during, mut waited);
+    loop {
+        let asked = Instant::now();
+        during = stat(run, "flood")?;
+        waited = began.elapsed();
+        let took = asked.elapsed();
+        if took > limit {
+            return Err(format!(
+                "the stack answered `posix-net stat` after {:.1} s of a flood: the switch kept it off the processor",
+                took.as_secs_f64()
+            ));
+        }
+        // The flood is not over yet: the stack ran with the switch saturated.
+        if run
+            .lines()
+            .iter()
+            .any(|l| l.contains("switch-probe: saturate ok "))
+        {
+            return Err(format!(
+                "the stack answered {:.1} s after the flood began, after the flood ended: the switch kept it off the processor",
+                waited.as_secs_f64()
+            ));
+        }
+        if during.consumers == SATURATE_CONSUMERS as u64 {
+            break;
+        }
+        if waited > Duration::from_secs(SATURATE_SECS / 2) {
+            return Err(format!(
+                "{} consumers, wanted {SATURATE_CONSUMERS}: {}",
+                during.consumers, during.line
+            ));
+        }
+    }
+    for _ in 0..SATURATE_CONSUMERS {
+        run.expect_line(
+            "the flood ends",
+            |l| l.contains("switch-probe: saturate ok "),
+            Duration::from_secs(60),
+        )?;
+    }
+    let after = stat(run, "after")?;
+    let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
+    if pauses == 0 {
+        return Err(format!(
+            "the switch never paused in a flood of {SATURATE_SECS} s: {}",
+            after.line
+        ));
+    }
+    if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
+        return Err(format!("init: {l}"));
+    }
+    notes.push(format!(
+        "the stack answered {:.1} s into a flood of {SATURATE_SECS} s on {SATURATE_CONSUMERS} rings; the switch paused {pauses} times",
+        waited.as_secs_f64()
     ));
     Ok(())
 }

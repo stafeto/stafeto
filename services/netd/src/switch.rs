@@ -59,9 +59,10 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    PARK_GIVE, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS,
-    SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX,
-    SWITCH_SOFT, SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
+    PARK_GIVE, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
+    SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
+    SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, TX_BUFFERS, TX_SHARE,
+    bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use netd::switchlogic::commands::{self, Commands};
@@ -148,6 +149,8 @@ pub struct Stats {
     pub looped: AtomicU32,
     /// Memberships ended by LEAVE.
     pub left: AtomicU32,
+    /// Pauses the thread took to leave the lower levels the processor (`SWITCH_RUN_NS`).
+    pub pauses: AtomicU32,
 }
 
 impl Stats {
@@ -170,6 +173,7 @@ impl Stats {
             park_given: AtomicU32::new(0),
             looped: AtomicU32::new(0),
             left: AtomicU32::new(0),
+            pauses: AtomicU32::new(0),
         }
     }
 }
@@ -415,6 +419,9 @@ pub struct Switch {
     woken: netd::books::Woken,
     /// The `switch_idle` flags are set in the rings.
     idle_set: bool,
+    /// Where the run of steps stands (`run`), and the channel and timer of its pauses.
+    clock: RunClock,
+    pause: Option<(Handle<Channel>, Handle<Timer>)>,
     /// The longest step so far, in ticks of the thread's own time.
     #[cfg(feature = "steps")]
     longest: u64,
@@ -486,6 +493,8 @@ impl Switch {
             inflight: [0; MAX_CONSUMERS + 1],
             woken: netd::books::Woken::new(),
             idle_set: false,
+            clock: RunClock::new(),
+            pause: None,
             #[cfg(feature = "steps")]
             longest: 0,
             #[cfg(feature = "steps")]
@@ -582,6 +591,19 @@ impl Switch {
             self.link = up;
             rt::println!("virtio-net: link {}", if up { "up" } else { "down" });
         }
+    }
+
+    /// Gives the levels below the processor for `SWITCH_PAUSE_NS`: the thread waits on a timer of
+    /// its own (a wait on its channel would return at once while a notification is pending).
+    fn pause(&mut self) {
+        INNER.stats.pauses.fetch_add(1, Ordering::Relaxed);
+        profile::count(Counter::Pause);
+        if let Some((channel, timer)) = &self.pause
+            && sys::timer_set(timer, now_ns() + SWITCH_PAUSE_NS).is_ok()
+        {
+            let _ = sys::receive(channel);
+        }
+        self.clock.rested(now_ns());
     }
 
     /// One step: the buffers and frames the stack passed go to the queues,
@@ -1270,11 +1292,16 @@ pub struct NotStarted;
 /// copy with NOTIFY and `wake` the switch's, both for the life of the
 /// service.
 pub fn start(
-    switch: Switch,
+    mut switch: Switch,
     process: &Handle<Process>,
     priority: u8,
     (stack, wake): (&Handle<Channel>, &Handle<Channel>),
 ) -> Result<Handle<Thread>, NotStarted> {
+    // The channel and timer of the pauses: a wait channel, so that the pause lends no priority.
+    let pause = sys::channel_create_wait(priority)
+        .and_then(|channel| sys::timer_create(&channel, priority).map(|timer| (channel, timer)))
+        .map_err(|_| NotStarted)?;
+    switch.pause = Some(pause);
     INNER.set_stack_channel(stack.raw().0);
     INNER.switch_channel.store(wake.raw().0, Ordering::Release);
     // SAFETY: the slot is empty and the thread that reads it does not exist
@@ -1314,6 +1341,7 @@ extern "C" fn run(_: u64) -> ! {
     // The line opens once the queues are up.
     virtio_mmio::reopen(&switch.irq);
     loop {
+        let waiting = now_ns();
         let interrupt = match sys::receive(&switch.channel) {
             Ok(sys::Received::Notification { source, .. }) => {
                 // Seen before the rings are looked at: a word pushed after
@@ -1334,7 +1362,15 @@ extern "C" fn run(_: u64) -> ! {
             profile::count(Counter::Irq);
         }
         let mut interrupt = interrupt;
+        let woke = now_ns();
+        switch.clock.woke(woke, woke.wrapping_sub(waiting));
         loop {
+            // The device and the consumers may supply steps without end, with waits that
+            // return at once between runs: the levels below this thread get a slot every
+            // run (`SWITCH_RUN_NS`).
+            if switch.clock.pause_due(now_ns()) {
+                switch.pause();
+            }
             #[cfg(feature = "steps")]
             let began = switch.ran();
             let more = switch.step(interrupt);
