@@ -19,7 +19,7 @@
 //! stack on VZ (`fstack::FAST_NGINX_VZ_TABLE`, both network devices) with the
 //! same one change: the launcher of the shell on the four CPUs.
 
-use super::fstack::FAST_NGINX_VZ_TABLE;
+use super::fstack::{FAST_NGINX_VZ_TABLE, FAST_SWITCH_VZ_TABLE};
 use super::net::{NET_LAUNCHER, NET_VZ_TABLE};
 use super::{BENCH_CPUS, BENCH_PINNED_CPUS, Record};
 
@@ -88,6 +88,7 @@ const TABLE: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_CPUS);
 const PINNED: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_PINNED_CPUS);
 const CPU0: [Record; 10] = on_cpu_0(with_launcher(NET_VZ_TABLE, BENCH_CPUS));
 const FAST_TABLE: [Record; 10] = with_launcher(FAST_NGINX_VZ_TABLE, BENCH_CPUS);
+const FAST_SWITCH_TABLE: [Record; 10] = with_launcher(FAST_SWITCH_VZ_TABLE, BENCH_CPUS);
 
 /// The image of the shell with the network service on VZ, with the shell's
 /// processes on all four CPUs: the record of `NET_LAUNCHER` by name, so that
@@ -106,3 +107,6 @@ pub const BENCH_CPU0_VZ_TABLE: &[Record] = &CPU0;
 /// The image of nginx on the stack on VZ with the shell's processes on all
 /// four CPUs (the row F1).
 pub const BENCH_FAST_VZ_TABLE: &[Record] = &FAST_TABLE;
+
+/// The same on the switch: one device, the shell's processes on all four CPUs (the row F1s).
+pub const BENCH_FAST_SWITCH_VZ_TABLE: &[Record] = &FAST_SWITCH_TABLE;

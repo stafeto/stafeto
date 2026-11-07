@@ -108,8 +108,13 @@ pub const STACK_SHARE: usize = 192;
 /// The frames of the wire the switch routes in a step when consumers are attached, and the
 /// frames of consumers it takes in a step: each costs a header parse, a hash and one or two
 /// copies of up to 1 514 bytes, about 1 500 ticks under -icount.
-pub const SWITCH_ROUTED: usize = 3;
-pub const SWITCH_CTX: usize = 3;
+pub const SWITCH_ROUTED: usize = 8;
+pub const SWITCH_CTX: usize = 8;
+/// The frames of each kind a step always takes, and the time in clock ticks beyond which it
+/// takes no more. Under -icount (the steps probes) a tick is an instruction-scale unit and the
+/// soft share holds a step under the bound; on a real clock a step never reaches it.
+pub const SWITCH_BASE: usize = 3;
+pub const SWITCH_SOFT: u64 = 7_000;
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;
@@ -130,10 +135,15 @@ const _: () = assert!(TX_SHARE <= TX_BUFFERS && RX_AHEAD <= RX_BUFFERS && SWITCH
 pub const SWITCH_STEP_REST: usize = 9_400;
 pub const SWITCH_STEP_RX_FRAME: usize = 210;
 const _: () = assert!(SWITCH_STEP_REST + SWITCH_RX * SWITCH_STEP_RX_FRAME <= 12_521);
-/// With consumers the step adds `SWITCH_ROUTED` routed frames and `SWITCH_CTX` frames of
-/// consumers (about 1 500 and 1 800 ticks), a sweep of 256 places and a few commands, on
-/// the measured rest of 3 300.
-const _: () = assert!(3_300 + SWITCH_ROUTED * 1_500 + SWITCH_CTX * 1_800 + 3_000 <= 18_369);
+/// With consumers the step takes `SWITCH_BASE` frames of each kind whatever the time (about
+/// 1 500 and 1 800 ticks each), more only while it has used less than `SWITCH_SOFT` ticks,
+/// and then the sweep of a few places and some commands (about 3 000) on the measured rest of
+/// 3 300. The worst case is the soft share, one more frame, the base frames of the second
+/// kind and the tail.
+const _: () = assert!(
+    SWITCH_SOFT as usize + 1_800 + SWITCH_BASE * 1_500 + 3_000 <= 18_369
+        && 3_300 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
+);
 
 /// The end of a run of steps for the interrupts of receiving: while steps
 /// follow (`continued`) the device is asked for none; at the end it is asked

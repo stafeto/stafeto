@@ -1849,6 +1849,30 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             }
             files
         }
+        // The row F1s: the files of S4's image, with the package's settings (the worker
+        // runs as nobody) and the switch's `netd.conf`; the stack shares the first
+        // device's address.
+        "boot-net-bench-switch.img" => {
+            let mut files = net_bench_files(name);
+            for (path, label, bytes) in [
+                (
+                    "/etc/nginx/nginx-fast.conf",
+                    "nginx-fast.conf",
+                    crate::fast_nginx::NGINX_FAST_CONF.as_bytes(),
+                ),
+                (
+                    "/etc/netd.conf",
+                    "netd-switch.conf",
+                    crate::fast_nginx::SWITCH_NETD_CONF,
+                ),
+            ] {
+                match files.iter_mut().find(|f| f.path == path) {
+                    Some(f) => f.source = Some(Source::Bytes(label, bytes)),
+                    None => files.push(of(path, 0o644, ROOT, Source::Bytes(label, bytes))),
+                }
+            }
+            files
+        }
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
@@ -2707,6 +2731,7 @@ mod tests {
                 "boot-fast-switch-steps.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchSteps)
                 }
+                "boot-net-bench-switch.img" => crate::linux_guest::bench_switch_programs(),
                 "boot-fast-switch-vz.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchVz)
                 }

@@ -60,8 +60,8 @@ use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
     RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS, SWEEP_IDLE_NS,
-    SWITCH_BACK, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_TX, TX_BUFFERS,
-    TX_SHARE, bell_due,
+    SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
+    SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use netd::switchlogic::commands::{self, Commands};
@@ -411,6 +411,8 @@ pub struct Switch {
     longest: u64,
     #[cfg(feature = "steps")]
     own: Option<Handle<Thread>>,
+    /// The thread's own time at the start of the step.
+    step_began: u64,
     /// The longest parts of a step with consumers: frames of consumers, the sweep, commands.
     #[cfg(feature = "steps")]
     longest_part: [u64; 3],
@@ -479,6 +481,7 @@ impl Switch {
             longest: 0,
             #[cfg(feature = "steps")]
             own: None,
+            step_began: 0,
             #[cfg(feature = "steps")]
             longest_part: [0; 3],
             #[cfg(feature = "probe")]
@@ -596,6 +599,7 @@ impl Switch {
             }
         }
         let now = now_ns();
+        self.step_began = rt::time::now();
         #[cfg(feature = "steps")]
         let began = self.ran();
         let mut more_c = false;
@@ -729,6 +733,12 @@ impl Switch {
             .map_or(0, |t| sys::thread_ran(t).unwrap_or(0))
     }
 
+    /// The step has used up its soft share of time: the frames past `SWITCH_BASE` wait for
+    /// the next step.
+    fn over_soft(&self) -> bool {
+        rt::time::now().saturating_sub(self.step_began) > SWITCH_SOFT
+    }
+
     #[cfg(feature = "steps")]
     fn part(&mut self, which: usize, ticks: u64) {
         if ticks > self.longest_part[which] {
@@ -834,12 +844,18 @@ impl Switch {
     fn consumer_frames(&mut self) -> bool {
         let cap = self.consumer_cap();
         let mut budget = SWITCH_CTX;
+        let mut taken = 0;
         let mut progressed = true;
         let mut blocked = false;
         while budget > 0 && progressed {
             progressed = false;
             for k in 0..MAX_CONSUMERS {
                 if budget == 0 {
+                    break;
+                }
+                // Frames past the first few go on only while the step is short.
+                if taken >= SWITCH_BASE && self.over_soft() {
+                    budget = 0;
                     break;
                 }
                 let c = (usize::from(self.next_c) + k) % MAX_CONSUMERS;
@@ -861,10 +877,12 @@ impl Switch {
                         x.ring.refused = x.ring.refused.wrapping_add(1);
                         progressed = true;
                         budget -= 1;
+                        taken += 1;
                     }
                     Tx::Frame(len) => {
                         progressed = true;
                         budget -= 1;
+                        taken += 1;
                         self.consumer_frame(c as u8, len);
                     }
                 }
@@ -1009,7 +1027,12 @@ impl Switch {
     /// stack.
     fn receive(&mut self, mut budget: usize) -> usize {
         let mut passed = 0;
+        let mut taken = 0;
         while budget > 0 {
+            if self.tables.is_some() && taken >= SWITCH_BASE && self.over_soft() {
+                break;
+            }
+            taken += 1;
             let (n, used) = match self.rx.pop() {
                 Ok(Some(popped)) => popped,
                 Ok(None) => break,

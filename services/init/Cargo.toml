@@ -135,6 +135,7 @@ table-bench-cpu0-vz = []
 # The same for the row F1: nginx on the stack on VZ, both network devices
 # (table/bench.rs).
 table-bench-fast-vz = []
+table-bench-fast-switch-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.
