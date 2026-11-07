@@ -12,7 +12,8 @@
 //! send check and B's flow at steering: the keys differ in the ports.
 
 use super::tables::{
-    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, RST_PEER, Tables, UNCONFIRMED,
+    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, PARK_FRAME, RST, RST_PEER, Tables,
+    UNCONFIRMED,
 };
 use crate::ports::Proto;
 use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
@@ -46,11 +47,13 @@ pub enum Why {
     Bogus,
     /// Every member of the group is short of cells.
     AllFull,
-    /// The group has holders but no live member (until the park of SYNs exists the SYN is
-    /// dropped and the client repeats it, as when the listening queue of Linux waits).
+    /// The group has holders but no live member and the park is off or full: the SYN is
+    /// dropped and the client repeats it, as when the listening queue of Linux waits.
     NoMember,
     /// The flow table has no room for the connection.
     FlowsFull,
+    /// The group has holders but no live member: the SYN waits in the park for one.
+    Parked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +147,26 @@ pub fn faces_own(t: &Tables, frame: &[u8]) -> bool {
     })
 }
 
+/// Gives members the SYNs that waited for them, at most `budget`: each goes through `route`
+/// again (the port table and the live members decide), so a group that was freed meanwhile
+/// sends none. Returns the number delivered.
+pub fn unpark(t: &mut Tables, budget: usize) -> usize {
+    t.expire_parked();
+    let mut given = 0;
+    for _ in 0..budget {
+        let mut buf = [0u8; PARK_FRAME];
+        let Some(n) = t.park_take(&mut buf) else {
+            break;
+        };
+        let frame = &buf[..n];
+        if let d @ Decision::Consumer { .. } = route(t, frame, Source::Wire) {
+            deliver(t, d, frame);
+            given += 1;
+        }
+    }
+    given
+}
+
 /// Where a received frame goes.
 pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     t.guard.check();
@@ -172,7 +195,7 @@ pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     match ip.proto {
         IPV4_PROTO_ICMP => icmp(t, &ip),
         IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
-        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame),
         _ => Decision::Stack,
     }
 }
@@ -247,7 +270,7 @@ fn udp(t: &mut Tables, ip: &Ip) -> Decision {
     }
 }
 
-fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
+fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8]) -> Decision {
     let (sport, dport) = ports(ip.part);
     let flags = ip.part[13];
     let syn = flags & (SYN | ACK) == SYN;
@@ -276,7 +299,13 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
     }
     let (c, generation) = match pick(t, mark, t.flows.hash(&key), MIN_FILL, true) {
         Pick::NoLive if t.group(mark).is_some_and(|g| !g.draining && g.holders > 0) => {
-            return Decision::Drop(Why::NoMember);
+            // The SYN waits for a member (a worker restarting); the peer's repeat of it
+            // replaces it, and a full or absent park leaves the repeat to the peer.
+            return Decision::Drop(if t.park(mark, &key, frame) {
+                Why::Parked
+            } else {
+                Why::NoMember
+            });
         }
         Pick::NoLive => return Decision::Stack,
         Pick::Full => return Decision::Drop(Why::AllFull),
@@ -565,6 +594,7 @@ mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
     use crate::switchlogic::tables::tests::{OWN, Rng, with, with_flows};
+    use crate::switchlogic::tables::{PARK_MS, PARK_PER_GROUP, PARK_SLOTS, ParkSlot};
     use proto_net::switch as sw;
 
     const PEER: [u8; 4] = [203, 0, 113, 9];
@@ -883,6 +913,109 @@ mod tests {
                 route(t, &wire_tcp(1, 8080, SYN), Source::Wire),
                 Decision::Drop(Why::NoMember)
             );
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    fn parking<R>(f: impl FnOnce(&mut Tables, &[Rig]) -> R) -> R {
+        with(|t, rigs| {
+            let mut slots = vec![ParkSlot::EMPTY; PARK_SLOTS];
+            // SAFETY: `slots` outlives the call and the tables are not used after it.
+            let slots: &'static mut [_] = unsafe { &mut *(slots.as_mut_slice() as *mut [_]) };
+            t.set_park(slots);
+            f(t, rigs)
+        })
+    }
+
+    #[test]
+    fn a_syn_with_no_live_member_is_parked_and_a_joining_member_gets_it() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for sport in 1..=3 {
+                assert_eq!(
+                    route(t, &wire_tcp(sport, 8080, SYN), Source::Wire),
+                    Decision::Drop(Why::Parked)
+                );
+            }
+            assert_eq!(t.parked(), 3);
+            // Nobody to give them to yet.
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!(t.parked(), 3);
+            assert!(t.join(1, 1));
+            let before = t.consumers[1].as_ref().unwrap().ring.done_head();
+            assert_eq!(unpark(t, 8), 3);
+            assert_eq!(t.parked(), 0);
+            assert_eq!(
+                t.consumers[1].as_ref().unwrap().ring.done_head() - before,
+                3
+            );
+            // They became flows of the member: their segments follow.
+            assert_eq!(who(route(t, &wire_tcp(2, 8080, ACK_), Source::Wire)), 1);
+        });
+    }
+
+    #[test]
+    fn a_repeat_of_a_parked_syn_replaces_it_and_the_group_holds_sixteen() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for _ in 0..5 {
+                route(t, &wire_tcp(7, 8080, SYN), Source::Wire);
+            }
+            assert_eq!(t.parked(), 1);
+            for sport in 100..115 {
+                assert_eq!(
+                    route(t, &wire_tcp(sport, 8080, SYN), Source::Wire),
+                    Decision::Drop(Why::Parked)
+                );
+            }
+            assert_eq!(t.parked(), PARK_PER_GROUP as u32);
+            assert_eq!(
+                route(t, &wire_tcp(200, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::NoMember)
+            );
+            assert_eq!(t.park_dropped, 1);
+            // A repeat of a parked one still fits.
+            assert_eq!(
+                route(t, &wire_tcp(100, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::Parked)
+            );
+        });
+    }
+
+    #[test]
+    fn a_parked_syn_is_dropped_after_its_term() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            t.now_ms = 1000;
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            t.now_ms = 1000 + PARK_MS - 1;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            t.now_ms = 1000 + PARK_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 0);
+            assert_eq!(t.park_expired, 1);
+            t.join(1, 0);
+            let before = t.consumers[0].as_ref().unwrap().ring.done_head();
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!(t.consumers[0].as_ref().unwrap().ring.done_head(), before);
+        });
+    }
+
+    #[test]
+    fn at_most_the_budget_of_parked_syns_goes_in_a_call() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            for sport in 1..=12 {
+                route(t, &wire_tcp(sport, 8080, SYN), Source::Wire);
+            }
+            t.join(1, 0);
+            assert_eq!(unpark(t, 8), 8);
+            assert_eq!(unpark(t, 8), 4);
         });
     }
 

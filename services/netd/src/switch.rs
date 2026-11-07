@@ -59,9 +59,9 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS, SWEEP_IDLE_NS,
-    SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
+    PARK_GIVE, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, STACK_SHARE, SWEEP_EVERY_NS,
+    SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX,
+    SWITCH_SOFT, SWITCH_TX, TX_BUFFERS, TX_SHARE, bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use netd::switchlogic::commands::{self, Commands};
@@ -135,7 +135,7 @@ pub struct Stats {
     pub hairpin: AtomicU32,
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub own_to_device: AtomicU32,
-    pub drops: [AtomicU32; 6],
+    pub drops: [AtomicU32; 7],
     pub refused_by: [AtomicU32; Reason::COUNT],
     /// The frames of the wire for consumers, and the frames of consumers sent.
     pub rx_consumer: AtomicU32,
@@ -156,7 +156,7 @@ impl Stats {
             tx_refused: AtomicU32::new(0),
             hairpin: AtomicU32::new(0),
             own_to_device: AtomicU32::new(0),
-            drops: [const { AtomicU32::new(0) }; 6],
+            drops: [const { AtomicU32::new(0) }; 7],
             refused_by: [const { AtomicU32::new(0) }; Reason::COUNT],
             rx_consumer: AtomicU32::new(0),
             tx_consumer: AtomicU32::new(0),
@@ -364,7 +364,7 @@ pub static INNER: Inner = Inner::new();
 
 /// The owner of a buffer in the queue that is the stack's.
 const OWN_STACK: u8 = MAX_CONSUMERS as u8;
-const _: () = assert!(Why::FlowsFull as usize == 5);
+const _: () = assert!(Why::Parked as usize == 6);
 
 /// The switch: the device's transport and queues, the binding of its
 /// line, and (with consumers) the tables.
@@ -603,10 +603,20 @@ impl Switch {
         #[cfg(feature = "steps")]
         let began = self.ran();
         let mut more_c = false;
+        let mut more_park = false;
         if let Some(t) = self.tables.as_mut() {
             t.now = (now / 1_000_000_000) as u32;
+            t.now_ms = (now / 1_000_000) as u32;
             commands::drain(t, &COMMANDS);
             commands::poll(t, &COMMANDS);
+            // SYNs that waited for a member: members that joined get them (at most
+            // `PARK_GIVE` a step), the others expire.
+            let given = route::unpark(t, PARK_GIVE);
+            INNER
+                .stats
+                .rx_consumer
+                .fetch_add(given as u32, Ordering::Relaxed);
+            more_park = given == PARK_GIVE;
         }
         #[cfg(feature = "steps")]
         self.part(0, self.ran().saturating_sub(began));
@@ -696,6 +706,7 @@ impl Switch {
         // left to wait (`ring::settle_interrupts`).
         let mut continued = more_rx
             || more_c
+            || more_park
             || !INNER.tx_sub.is_empty()
             || !INNER.rx_back.is_empty()
             || !INNER.tx_back.is_empty()
@@ -1033,7 +1044,7 @@ impl Switch {
         }
         // A consumer left lately: the rounds that return its number follow fast.
         let settling = t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
-        let sweeping = count > 0 || !t.flows.is_empty() || settling;
+        let sweeping = count > 0 || !t.flows.is_empty() || settling || t.parked() > 0;
         if (sweeping || self.blocked) && !self.armed {
             let after = if self.blocked {
                 1_000_000
