@@ -72,8 +72,8 @@ pub const NETD: Record = Record {
     name: NET_SERVICE,
     program: "netd",
     kind: Kind::Service(Watch {
-        period_ns: 250 * MS,
-        deadline_ns: 1000 * MS,
+        period_ns: 30_000 * MS,
+        deadline_ns: 120_000 * MS,
     }),
     priority: 35,
     // One above the priority: the switch thread of the service (netd/src/switch.rs)

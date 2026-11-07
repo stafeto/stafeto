@@ -52,6 +52,8 @@ limit-1280 = []
 # once a second, for the measurement of where the time of a request goes.
 profile = ["split"]
 steps = ["rt/step-stats"]
+# Throwaway probe of the offload features (not for merge).
+offload-probe = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

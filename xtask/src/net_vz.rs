@@ -458,6 +458,38 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let result = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
         let services_at = started.elapsed();
+        if std::env::var("OFFLOAD_MODE").as_deref() != Ok("normal") {
+            run.expect("OFFLOAD responder ready", Duration::from_secs(120))?;
+            use std::io::Write;
+            let mut sent = 0usize;
+            let mut how = String::from("no connection");
+            for _ in 0..4 {
+                match std::net::TcpStream::connect_timeout(
+                    &(Ipv4Addr::new(192, 168, 64, 77), 9000).into(),
+                    Duration::from_secs(8),
+                ) {
+                    Ok(mut c) => {
+                        let _ = c.set_write_timeout(Some(Duration::from_secs(10)));
+                        let chunk = vec![0x5au8; 65536];
+                        for _ in 0..16 {
+                            if let Err(e) = c.write_all(&chunk) {
+                                how = format!("write error {e}");
+                                break;
+                            }
+                            sent += chunk.len();
+                        }
+                        if sent == 16 * 65536 {
+                            how = "all written".into();
+                        }
+                        break;
+                    }
+                    Err(e) => how = format!("connect error {e}"),
+                }
+            }
+            println!("net-vz: OFFLOAD pushed {sent} bytes to the responder: {how}");
+            run.expect("OFFLOAD probe done", Duration::from_secs(90))?;
+            return Ok(());
+        }
         let first = first_device(&mut run, started, services_at, &macs[0])?;
         let guest = first.address;
         if let Err(why) = closed_port(guest) {
@@ -480,6 +512,26 @@ pub fn command(args: &[String]) -> Result<(), String> {
         } else {
             run.send("httpd -f -p 80 -h /www & H=$!")?;
             run.expect("# ", DIALOG_STEP)?;
+            run.send("nc -l -p 9000 > /dev/null &")?;
+            run.expect("# ", DIALOG_STEP)?;
+            {
+                use std::io::Write;
+                let mut sent = 0usize;
+                if let Ok(mut c) = std::net::TcpStream::connect_timeout(
+                    &(guest, 9000).into(),
+                    Duration::from_secs(3),
+                ) {
+                    let _ = c.set_write_timeout(Some(Duration::from_secs(8)));
+                    let chunk = vec![0x5au8; 65536];
+                    for _ in 0..16 {
+                        if c.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        sent += chunk.len();
+                    }
+                }
+                println!("net-vz: OFFLOAD pushed {sent} bytes to guest port 9000");
+            }
             Some(net_curl::requests(http(guest), Instant::now())?)
         };
         // The guest has talked to the Mac: its address must be ours by the
@@ -530,6 +582,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Ok::<(), String>(())
     })();
     let output = run.stop();
+    for line in output.lines.iter().filter(|l| l.contains("OFFLOAD") || l.contains("virtio-net")) {
+        println!("{line}");
+    }
     vz::stop_hint(result).map_err(|e| format!("net on VZ: {e}"))?;
     if output.lines.iter().any(|line| {
         line.contains("process fault:")

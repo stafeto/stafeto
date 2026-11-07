@@ -43,7 +43,7 @@ pub fn programs() -> &'static [ImageProgram] {
     LIST.get_or_init(|| {
         let mut programs = shell_programs().to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-net"]);
-        programs.push(("netd", "netd", NETD_STACK_SIZE, &[]));
+        programs.push(("netd", "netd", NETD_STACK_SIZE, &["offload-probe"]));
         let net: Vec<packages::Package> = packages::of_image(IMAGE)
             .unwrap_or_else(|e| panic!("{IMAGE}: {e}"))
             .into_iter()

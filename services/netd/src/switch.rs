@@ -467,6 +467,10 @@ impl Switch {
         link: bool,
         (tables, timer, view): (Option<Tables<'static>>, Handle<Timer>, Handle<Channel>),
     ) -> Switch {
+        #[cfg(feature = "offload-probe")]
+        if option_env!("OFFLOAD_MODE") != Some("normal") {
+            crate::offload_probe::probe_all(&mut transport, rx_queue, tx_queue);
+        }
         let mut rx = virtio_net::RxRing::new(rx_queue, net_at(DEVICE));
         if let Err(broken) = rx.fill(RX_BUFFERS) {
             fail(broken.text(false));
@@ -1216,6 +1220,8 @@ impl Switch {
             // SAFETY: the device returned the buffer (it is used), and the
             // switch holds no other reference to it.
             let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
+            #[cfg(feature = "offload-probe")]
+            crate::offload_probe::rx_seen(slice, used);
             match frames::classify(slice, used) {
                 RxFrame::Frame(len) => {
                     let Some(t) = self.tables.as_mut() else {

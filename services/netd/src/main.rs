@@ -55,6 +55,8 @@ mod dma;
 mod fast;
 mod files;
 mod net;
+#[cfg(feature = "offload-probe")]
+mod offload_probe;
 mod owner;
 mod second;
 mod seed;
@@ -393,11 +395,17 @@ fn main(_: u64) -> u64 {
         Ok(found) => found,
         Err(code) => return code,
     };
-    let opened = match start_device(&mut transport, "virtio-net") {
+    #[cfg(feature = "offload-probe")]
+    let extra = offload_probe::survey(&mut transport);
+    #[cfg(not(feature = "offload-probe"))]
+    let extra = 0u64;
+    let opened = match start_device(&mut transport, "virtio-net", extra) {
         Ok(opened) => opened,
         Err(code) => return code,
     };
     let (mac, link) = (opened.mac, opened.link);
+    #[cfg(feature = "offload-probe")]
+    offload_probe::remember(extra, mac);
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
     let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
         return NOT_STARTED;
@@ -676,8 +684,12 @@ fn make_switch_tables(
 /// The device on `transport` reset, its features negotiated (WANTED), its MAC
 /// address and link status read (`virtio_net::open`); says why on failure
 /// and gives the code the service ends with.
-fn start_device(transport: &mut SomeTransport<'static>, tag: &str) -> Result<Opened, u64> {
-    match virtio_net::open(transport, WANTED) {
+fn start_device(
+    transport: &mut SomeTransport<'static>,
+    tag: &str,
+    extra: u64,
+) -> Result<Opened, u64> {
+    match virtio_net::open(transport, WANTED | extra) {
         Ok(opened) => Ok(opened),
         Err(OpenFailure::Reset | OpenFailure::Config) => Err(NOT_STARTED),
         Err(OpenFailure::Features { offered }) => {
