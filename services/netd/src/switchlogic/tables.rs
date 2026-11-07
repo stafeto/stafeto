@@ -915,6 +915,9 @@ pub(crate) mod tests {
             self.0 ^= self.0 << 17;
             self.0
         }
+        pub fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
     }
 
     pub fn key(n: u32) -> FlowKey {

@@ -1227,6 +1227,228 @@ mod tests {
         });
     }
 
+    // ----- hostile values -----
+
+    /// The frame with `n` bytes of IPv4 options (NOPs) after the 20-byte header.
+    fn with_options(f: &[u8], n: usize) -> Vec<u8> {
+        let mut f = f.to_vec();
+        f[14] = 0x45 + (n / 4) as u8;
+        let total = u16::from_be_bytes([f[16], f[17]]) + n as u16;
+        f[16..18].copy_from_slice(&total.to_be_bytes());
+        f.splice(34..34, vec![1; n]);
+        f
+    }
+
+    #[test]
+    fn ipv4_options_move_the_transport_part_in_both_directions() {
+        with(|t, _| {
+            let syn = with_options(&wire_tcp(1234, 8080, SYN), 8);
+            let c = who(route(t, &syn, Source::Wire));
+            let ack = with_options(&wire_tcp(1234, 8080, ACK_), 4);
+            assert_eq!(who(route(t, &ack, Source::Wire)), c);
+            let tx = with_options(&out_tcp(8080, 1234, ACK_), 4);
+            assert_eq!(check_tx(t, c, &tx), Verdict::Send);
+            // The ports the 20-byte offset would show do not count: the options hide a
+            // frame of the consumer's own flow in front of a foreign four.
+            let mut fake = with_options(&out_tcp(8080, 9999, ACK_), 4);
+            fake[34..38].copy_from_slice(&[0x1f, 0x90, 0x04, 0xd2]);
+            assert_eq!(refused(t, c, &fake), Reason::Tcp);
+            let mut udp = with_options(&out_udp(9000, 53), 4);
+            udp[34..38].copy_from_slice(&5353u16.to_be_bytes().repeat(2));
+            assert_eq!(refused(t, 0, &udp), Reason::Udp);
+            // Options that run past the packet are no packet.
+            let mut wire = with_options(&wire_tcp(1234, 8080, ACK_), 4);
+            wire[14] = 0x4f;
+            assert_eq!(route(t, &wire, Source::Wire), Decision::Stack);
+            let mut long = with_options(&out_tcp(8080, 1234, ACK_), 4);
+            long[14] = 0x4f;
+            assert_eq!(refused(t, c, &long), Reason::Ipv4);
+        });
+    }
+
+    #[test]
+    fn a_vlan_tag_makes_a_frame_no_ipv4_and_an_icmp_with_a_short_inner_header_goes_to_the_stack() {
+        with(|t, _| {
+            let mut tagged = out_tcp(BLOCK0, 80, SYN);
+            tagged[12..14].copy_from_slice(&[0x81, 0x00]);
+            assert_eq!(refused(t, 0, &tagged), Reason::Proto);
+            let mut wire = wire_tcp(1234, 8080, SYN);
+            wire[12..14].copy_from_slice(&[0x81, 0x00]);
+            assert_eq!(route(t, &wire, Source::Wire), Decision::Stack);
+            assert!(t.flows.is_empty());
+            assert_eq!(check_tx(t, 2, &out_tcp(BLOCK2, 80, SYN)), Verdict::Send);
+            let good = icmp_error(3, 6, OWN_IP, PEER, BLOCK2, 80);
+            assert_eq!(who(route(t, &good, Source::Wire)), 2);
+            // The embedded header claims options the packet does not carry, or ends in
+            // fewer than 8 bytes after its own header.
+            let mut long_ihl = good.clone();
+            long_ihl[14 + 20 + 8] = 0x4f;
+            assert_eq!(route(t, &long_ihl, Source::Wire), Decision::Stack);
+            for cut in 1..=8 {
+                let mut short = good.clone();
+                short.truncate(good.len() - cut);
+                let total = (short.len() - 14) as u16;
+                short[16..18].copy_from_slice(&total.to_be_bytes());
+                assert_eq!(route(t, &short, Source::Wire), Decision::Stack, "{cut}");
+            }
+        });
+    }
+
+    #[test]
+    fn blind_rsts_at_random_four_tuples_make_no_flow_and_leave_the_established_ones() {
+        with(|t, _| {
+            let real: Vec<([u8; 4], u8)> = (0..10)
+                .map(|n| {
+                    let src = [198, 51, 100, n];
+                    let c = who(route(t, &wire_from(src, 5000, SYN), Source::Wire));
+                    route(t, &wire_from(src, 5000, ACK_), Source::Wire);
+                    (src, c)
+                })
+                .collect();
+            let mut rng = Rng(0x2545f4914f6cdd1d);
+            for _ in 0..20_000 {
+                let (src, sport) = (random_source(&mut rng), rng.next() as u16);
+                let rst = rng.below(3) as u8 * 0x10 + 4;
+                route(t, &wire_from(src, sport, rst), Source::Wire);
+            }
+            assert_eq!(t.flows.len(), real.len());
+            for (src, c) in real {
+                assert_eq!(who(route(t, &wire_from(src, 5000, ACK_), Source::Wire)), c);
+            }
+        });
+    }
+
+    fn samples() -> Vec<Vec<u8>> {
+        vec![
+            wire_tcp(1234, 8080, SYN),
+            wire_tcp(1234, 8080, ACK_),
+            wire_udp(1000, 5353),
+            out_tcp(BLOCK2, 80, SYN),
+            out_tcp(8080, 1234, SYN_ACK),
+            out_udp(5353, 9),
+            hair_tcp(BLOCK2, 8080, SYN),
+            icmp_error(3, 6, OWN_IP, PEER, BLOCK2, 80),
+            icmp_error(11, 17, OWN_IP, PEER, 5353, 53),
+            arp(2, PEER_MAC, PEER),
+            arp(1, OWN.mac, OWN_IP),
+        ]
+    }
+
+    /// A sample with up to six bytes spoilt, cut short or stretched.
+    fn mutant(rng: &mut Rng, samples: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = samples[rng.below(samples.len())].clone();
+        for _ in 0..rng.below(7) {
+            // Half of the hits land in the Ethernet and IP headers and the first transport bytes.
+            let span = if rng.below(2) == 0 {
+                48.min(f.len())
+            } else {
+                f.len()
+            };
+            let at = rng.below(span);
+            f[at] = match rng.below(4) {
+                0 => 0,
+                1 => 0xff,
+                _ => rng.next() as u8,
+            };
+        }
+        match rng.below(4) {
+            0 => f.truncate(rng.below(f.len() + 1)),
+            1 => {
+                let more = rng.below(1700);
+                f.extend((0..more).map(|_| rng.next() as u8));
+            }
+            _ => {}
+        }
+        f
+    }
+
+    #[test]
+    fn route_deliver_and_check_tx_hold_their_invariants_on_hostile_frames() {
+        let samples = samples();
+        with_flows(1024, |t, rigs| {
+            let mut rng = Rng(0x853c49e6748fea9b);
+            let mut sent = [0u32; 3];
+            for round in 0..60_000u32 {
+                if round % 50 == 0 {
+                    for (c, rig) in rigs.iter().enumerate() {
+                        let done = rig.mem().load(sw::DONE_HEAD);
+                        rig.mem().store(sw::DONE_TAIL, done);
+                        let avail = t.consumers[c].as_ref().unwrap().ring.fill_avail();
+                        rig.fill(&vec![0; 64 - avail as usize]);
+                    }
+                    t.poll_rings(|_, _| panic!("a ring broke"));
+                    t.now = round / 50;
+                    t.sweep();
+                }
+                let f = mutant(&mut rng, &samples);
+                for from in [Source::Wire, Source::Stack, Source::Consumer(1)] {
+                    let d = route(t, &f, from);
+                    if let (Decision::Consumer { consumer, .. }, Some(ip)) = (d, ipv4(&f)) {
+                        assert!(usize::from(consumer) < 3);
+                        assert!(!ip.fragment && ip.dst == OWN_IP);
+                        if from == Source::Wire {
+                            assert!(ip.src != OWN_IP, "a wire frame with our address");
+                            assert!(unicast_elsewhere(t, ip.src), "{:?}", ip.src);
+                        }
+                    }
+                    if matches!(d, Decision::Consumer { .. }) && ipv4(&f).is_none() {
+                        panic!("a frame that is no IPv4 went to a consumer: {f:?}");
+                    }
+                    deliver(t, d, &f);
+                }
+                for c in 0..3u8 {
+                    let v = check_tx(t, c, &f);
+                    if !matches!(v, Verdict::Send | Verdict::Hairpin) {
+                        continue;
+                    }
+                    sent[usize::from(c)] += 1;
+                    assert!((14..=sw::FRAME_MAX).contains(&f.len()));
+                    assert_eq!(f[6..12], OWN.mac, "a foreign source MAC");
+                    assert!(f[0] & 1 == 0 || f[..6] == [0xff; 6]);
+                    if f[12..14] == ETHERTYPE_ARP {
+                        assert!(is_arp(&f) && arp_oper(&f) == 1);
+                        assert!(f[22..28] == OWN.mac && f[28..32] == OWN_IP);
+                        continue;
+                    }
+                    let ip = ipv4(&f).expect("only IPv4 and ARP leave");
+                    assert!(!ip.fragment, "a fragment left");
+                    assert_eq!(ip.src, OWN_IP, "a foreign source address");
+                    assert!(matches!(ip.proto, 6 | 17));
+                    assert_eq!(v == Verdict::Hairpin, ip.dst == OWN_IP);
+                    assert!(ip.dst == OWN_IP || unicast_elsewhere(t, ip.dst));
+                }
+            }
+            assert!(
+                sent.iter().all(|n| *n > 0),
+                "the samples get through now and then: {sent:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn flood_of_hostile_syns_and_rsts_keeps_the_tables_whole() {
+        with_flows(512, |t, _| {
+            let mut rng = Rng(0xda942042e4dd58b5);
+            for n in 0..30_000u32 {
+                let (src, sport) = (random_source(&mut rng), rng.next() as u16);
+                let flags = [SYN, SYN, ACK_, 0x04, 0x11, 0x12][rng.below(6)];
+                t.now = n / 100;
+                route(t, &wire_from(src, sport, flags), Source::Wire);
+                if n % 100 == 0 {
+                    t.sweep();
+                }
+                assert!(t.flows.len() <= t.flows.capacity());
+                assert!(t.flows.unconfirmed() <= t.flows.unconfirmed_limit());
+            }
+            let owned: u32 = t.consumers.iter().flatten().map(|c| c.flows).sum();
+            let grouped = t.group(1).unwrap().flows;
+            assert_eq!(
+                (owned, grouped),
+                (t.flows.len() as u32, t.flows.len() as u32)
+            );
+        });
+    }
+
     // ----- the send check, one test for a rule -----
 
     fn refused(t: &mut Tables, c: u8, f: &[u8]) -> Reason {
@@ -1234,6 +1456,19 @@ mod tests {
             Verdict::Refuse(r) => r,
             v => panic!("{v:?}"),
         }
+    }
+
+    #[test]
+    fn rule_1_frames_from_1515_bytes_up_are_refused() {
+        with(|t, _| {
+            let good = out_udp(BLOCK0, 53);
+            for len in [1514, 1515, 1600, 2048, 2049, 4000] {
+                let mut f = good.clone();
+                f.resize(len, 0);
+                let v = check_tx(t, 0, &f);
+                assert_eq!(v == Verdict::Send, len == 1514, "{len}");
+            }
+        });
     }
 
     #[test]

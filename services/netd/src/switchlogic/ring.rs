@@ -407,4 +407,73 @@ pub(crate) mod tests {
         assert_eq!(ring.take_tx(&mut out), Tx::Frame(5));
         assert_eq!(ring.take_tx(&mut out), Tx::Empty);
     }
+
+    /// An entry of TX as a hostile consumer writes it: any length, flags and spare.
+    fn raw_tx(rig: &Rig, len: u16, flags: u16, spare: u32) {
+        let m = rig.mem();
+        let head = m.load(sw::TX_HEAD);
+        let e = TxEntry { len, flags, spare };
+        m.write(rig.layout.tx_entry(head), &e.to_bytes());
+        m.store(sw::TX_HEAD, head.wrapping_add(1));
+    }
+
+    #[test]
+    fn tx_entries_with_odd_lengths_spares_and_flags_are_taken_or_refused_by_the_rules() {
+        let rig = Rig::new(Layout::new(256, 64).unwrap());
+        let mut ring = rig.ring();
+        let mut out = [0; CELL];
+        for (len, flags, spare, taken) in [
+            (1514, 0, 0, true),
+            (1515, 0, 0, true),
+            (2047, 0, 0, true),
+            (2048, 0, 0, true),
+            (2049, 0, 0, false),
+            (u16::MAX, 0, 0, false),
+            (100, 0, 1, false),
+            (100, 0, u32::MAX, false),
+            (100, 1, 0, false),
+            (0, 0, 0, true),
+        ] {
+            raw_tx(&rig, len, flags, spare);
+            ring.poll();
+            let want = if taken {
+                Tx::Frame(usize::from(len))
+            } else {
+                Tx::Refused
+            };
+            assert_eq!(ring.take_tx(&mut out), want, "{len} {flags} {spare}");
+        }
+        assert_eq!(ring.poll(), Poll::Live);
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+    }
+
+    #[test]
+    fn a_tx_head_behind_the_tail_and_a_done_tail_ahead_of_the_head_break_the_ring() {
+        let l = Layout::new(256, 64).unwrap();
+        let rig = Rig::new(l);
+        let mut ring = rig.ring();
+        let mut out = [0; CELL];
+        for _ in 0..5 {
+            rig.send(b"x", 0);
+        }
+        ring.poll();
+        while ring.take_tx(&mut out) != Tx::Empty {}
+        rig.mem().store(sw::TX_HEAD, 2);
+        assert_eq!(ring.poll(), Poll::Broke(Violation::Tx));
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty, "nothing after the break");
+        for (done_tail, live) in [(0, true), (1, true), (2, false), (3, false), (1000, false)] {
+            let rig = Rig::new(l);
+            let mut ring = rig.ring();
+            rig.fill(&[1, 2]);
+            ring.poll();
+            ring.deliver(b"a", 0);
+            rig.mem().store(sw::DONE_TAIL, done_tail);
+            let want = if live {
+                Poll::Live
+            } else {
+                Poll::Broke(Violation::Done)
+            };
+            assert_eq!(ring.poll(), want, "{done_tail}");
+        }
+    }
 }
