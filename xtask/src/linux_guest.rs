@@ -186,6 +186,31 @@ pub fn build_switch_image() -> Result<PathBuf, String> {
     build_boot_image(BENCH_SWITCH_IMAGE, bench_switch_programs(), BOOT_PROFILE)
 }
 
+/// The programs of the image of F1s with the counters of the network service (`netd` built
+/// with the feature `profile`), written to the file of the image of F1s.
+pub fn bench_switch_profile_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = bench_switch_programs().to_vec();
+        for program in &mut programs {
+            if program.0 == "netd" {
+                program.3 = &["profile"];
+            }
+        }
+        programs
+    })
+}
+
+/// Builds the image of F1s with the profile (the same file as `build_switch_image`).
+pub fn build_switch_profile_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
+    build_boot_image(
+        BENCH_SWITCH_IMAGE,
+        bench_switch_profile_programs(),
+        BOOT_PROFILE,
+    )
+}
+
 // What both guests carry -------------------------------------------------------
 
 /// The files of the load of the measurement: W1, 900 files of 10 KiB under

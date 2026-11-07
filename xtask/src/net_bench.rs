@@ -1411,6 +1411,8 @@ struct Prepared {
     switch_image: PathBuf,
     /// The workers of nginx-fast on F1s (1 except in `kill-watch`).
     switch_workers: usize,
+    /// The worker lines of `worker_cpu_affinity` for F1s, when its workers are pinned.
+    switch_affinity: Option<String>,
     /// The kernel and the image of S4o.
     old_kernel: PathBuf,
     old_image: PathBuf,
@@ -1775,9 +1777,13 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 FAST_CONF
             };
             // `kill-watch` runs F1s with several workers: a copy of the settings.
-            let conf = if switch && prep.switch_workers > 1 {
+            let conf = if switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()) {
+                let pin = prep
+                    .switch_affinity
+                    .as_ref()
+                    .map_or(String::new(), |m| format!(" worker_cpu_affinity {m};"));
                 run.send(&format!(
-                    "sed 's/worker_processes 1;/worker_processes {};/' {conf} > /tmp/nginx-fast-n.conf",
+                    "sed 's/worker_processes 1;/worker_processes {};{pin}/' {conf} > /tmp/nginx-fast-n.conf",
                     prep.switch_workers
                 ))?;
                 run.expect("# ", DIALOG_STEP)?;
@@ -1815,7 +1821,7 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
-            let wanted = if switch && prep.switch_workers > 1 {
+            let wanted = if switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()) {
                 // The copy differs from the file by the number of workers.
                 &report.config_digest.clone()
             } else if switch {
@@ -1923,6 +1929,13 @@ struct Options {
     /// the network service, or that one with the shell's processes on CPUs 1
     /// to 3.
     image: ImageKind,
+    /// The workers of nginx-fast on F1s (F1 has the one device, so one worker).
+    switch_workers: usize,
+    /// The workers of F1s stand on CPUs 1 to 3 (`worker_cpu_affinity`), away from `netd`'s CPU 0.
+    switch_pin: bool,
+    /// Seconds after which a run stops cleanly between two systems, to be resumed (a
+    /// foreground command may not run for long).
+    pause_after: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1936,7 +1949,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -1957,6 +1970,9 @@ fn options(args: &[String]) -> Result<Options, String> {
         resume: None,
         old: None,
         image: ImageKind::Plain,
+        switch_workers: 1,
+        switch_pin: false,
+        pause_after: None,
     };
     let mut phases_given = false;
     let mut it = args.iter();
@@ -2002,6 +2018,9 @@ fn options(args: &[String]) -> Result<Options, String> {
                 phases_given = true;
             }
             "--old" => o.old = Some(PathBuf::from(value(arg)?)),
+            "--switch-pin" => o.switch_pin = true,
+            "--switch-workers" => o.switch_workers = number(value(arg)?, arg)? as usize,
+            "--pause-after" => o.pause_after = Some(u64::from(number(value(arg)?, arg)?)),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
             "--max-rounds" => o.max_rounds = number(value(arg)?, arg)?,
             "--warm" => o.warm = number(value(arg)?, arg)?,
@@ -2034,9 +2053,9 @@ fn options(args: &[String]) -> Result<Options, String> {
     if let Some(bad) = o
         .phases
         .iter()
-        .find(|p| !["nat", "sweep", "rounds"].contains(&p.as_str()))
+        .find(|p| !["nat", "sweep", "rounds", "idle"].contains(&p.as_str()))
     {
-        return Err(format!("no phase {bad:?} (nat, sweep, rounds)"));
+        return Err(format!("no phase {bad:?} (nat, sweep, rounds, idle)"));
     }
     if o.rounds == 0 {
         return Err("--rounds 0".to_owned());
@@ -2046,6 +2065,12 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--max-rounds {} is below --rounds {} or above {MAX_ROUNDS}",
             o.max_rounds, o.rounds
         ));
+    }
+    if o.switch_workers == 0 {
+        return Err("--switch-workers 0".to_owned());
+    }
+    if matches!(o.image, ImageKind::Pinned | ImageKind::Cpu0) && o.systems.contains(&System::F1s) {
+        return Err("--image pinned and cpu0 have no variant of F1s".to_owned());
     }
     if o.image != ImageKind::Plain && o.systems.contains(&System::F1) {
         return Err(
@@ -2065,6 +2090,7 @@ struct Bench {
     floor: Option<Floor>,
     guest: Option<Guest>,
     phase: String,
+    began: Instant,
 }
 
 fn say(text: String) {
@@ -2072,6 +2098,15 @@ fn say(text: String) {
 }
 
 impl Bench {
+    /// Whether the guest of `sys` carries the counters of the network service.
+    fn profiled(&self, sys: System) -> bool {
+        match sys {
+            System::S4 => self.opts.image != ImageKind::Plain,
+            System::F1s => self.opts.image == ImageKind::Profile,
+            _ => false,
+        }
+    }
+
     fn get(&self, key: &str) -> Option<Rec> {
         std::fs::read_to_string(self.results.join(format!("{key}.rec")))
             .ok()
@@ -2176,7 +2211,7 @@ impl Bench {
         }
         self.boot(sys, wl.tls())?;
         let raw = self.raw.clone();
-        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
+        let profiled = self.profiled(sys);
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
             let base = if wl.tls() {
@@ -2384,7 +2419,7 @@ impl Bench {
         }
         self.boot(sys, wl.tls())?;
         let (raw, secs) = (self.raw.clone(), self.opts.ceiling);
-        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
+        let profiled = self.profiled(sys);
         let script = raw.join(format!("wrk-{}.lua", wl.name()));
         std::fs::write(&script, wrk_script(&wl.paths(), wl.keep_alive()))
             .map_err(|e| format!("{}: {e}", script.display()))?;
@@ -2555,6 +2590,15 @@ impl Bench {
         for round in 1..=self.opts.max_rounds {
             self.phase = format!("round {round}");
             for sys in order(&self.opts.systems.clone(), round) {
+                if let Some(limit) = self.opts.pause_after
+                    && self.began.elapsed().as_secs() > limit
+                {
+                    return Err(format!(
+                        "paused after {limit} s before {} of round {round}: --resume {}",
+                        sys.name(),
+                        self.dir.display()
+                    ));
+                }
                 // The ceilings of every load of the system come first, with
                 // or without an R* (a row that holds no 1 ms, S4 on W2 or F1,
                 // has its ceiling and its CPU time all the same).
@@ -2620,6 +2664,58 @@ impl Bench {
             let all_done = states.values().all(|(_, c)| c.done());
             if rounds_end(round, self.opts.rounds, self.opts.max_rounds, all_done) {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The phase `idle`: each stafeto system comes up, stands 20 s with no load while the
+    /// counters of its network service (an image with the profile) and `/proc/stat` are read
+    /// around the wait, and the change is recorded as `idle.<system>.<n>` (CPU time in
+    /// microseconds over the whole wait, since the count of answers is 1).
+    fn idle(&mut self) -> Result<(), String> {
+        for n in 1..=self.opts.rounds {
+            for sys in order(&self.opts.systems.clone(), n) {
+                if sys.linux() {
+                    continue;
+                }
+                let key = format!("idle.{}.{n}", sys.name());
+                if self.get(&key).is_some() {
+                    continue;
+                }
+                self.phase = format!("idle {n}");
+                self.boot(sys, false)?;
+                let profiled = self.profiled(sys);
+                let g = self.guest.as_mut().ok_or("no guest")?;
+                // A short rest after the first request of the boot.
+                let quiet = Instant::now();
+                while quiet.elapsed() < Duration::from_secs(5) {
+                    let _ = g.run.expect_seen("\u{0}pump", Duration::from_millis(100));
+                }
+                let before = g.open_window(profiled)?;
+                let from = Instant::now();
+                while from.elapsed() < Duration::from_secs(20) {
+                    let _ = g.run.expect_seen("\u{0}pump", Duration::from_millis(100));
+                }
+                let seconds = from.elapsed().as_secs_f64();
+                let cpu = g.close_window(&before, 1)?;
+                let mut rec = Rec::new();
+                rec.insert("seconds".into(), format!("{seconds:.2}"));
+                rec.insert("cpu_known".into(), cpu.known.to_string());
+                rec.insert("cpu_busy_us".into(), format!("{:.0}", cpu.busy_us));
+                rec.insert("cpu_procs".into(), procs_text(&cpu.procs));
+                rec.insert("cpu_profile".into(), procs_text(&cpu.profile));
+                rec.insert(
+                    "cpu_idle".into(),
+                    cpu.idle
+                        .iter()
+                        .map(|i| format!("{i:.1}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                self.put(&key, &rec);
+                say(format!("{key}: {seconds:.1} s, busy {:.0} us", cpu.busy_us));
+                self.release();
             }
         }
         Ok(())
@@ -3461,7 +3557,11 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             fast_image = linux_guest::build_fast_image()?;
         }
         if o.systems.contains(&System::F1s) {
-            switch_image = linux_guest::build_switch_image()?;
+            switch_image = if o.image == ImageKind::Profile {
+                linux_guest::build_switch_profile_image()?
+            } else {
+                linux_guest::build_switch_image()?
+            };
         }
     }
     let (mut old_kernel, mut old_image) = (PathBuf::new(), PathBuf::new());
@@ -3487,7 +3587,14 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         image,
         fast_image,
         switch_image,
-        switch_workers: 1,
+        switch_workers: o.switch_workers,
+        switch_affinity: o.switch_pin.then(|| {
+            // Masks of CPUs 1, 2 and 3 in turn (the rightmost bit is CPU 0).
+            (0..o.switch_workers)
+                .map(|n| ["0010", "0100", "1000"][n % 3])
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
         old_kernel,
         old_image,
         config,
@@ -3534,6 +3641,7 @@ fn run(args: &[String]) -> Result<(), String> {
         floor: Some(floor),
         guest: None,
         phase: String::new(),
+        began: Instant::now(),
     };
     let phases = bench.opts.phases.clone();
     let result = (|| {
@@ -3541,6 +3649,7 @@ fn run(args: &[String]) -> Result<(), String> {
             match phase.as_str() {
                 "nat" => bench.nat()?,
                 "sweep" => bench.sweeps()?,
+                "idle" => bench.idle()?,
                 _ => bench.rounds()?,
             }
         }
@@ -4613,6 +4722,34 @@ mod tests {
         assert_eq!(Workload::W7.paths(), ["/1k.bin"]);
         // Linux rows keep the nat phase.
         assert_eq!(options(&[]).unwrap().phases, ["nat", "sweep", "rounds"]);
+    }
+
+    #[test]
+    fn the_switch_workers_the_pin_the_pause_and_the_idle_phase_are_options() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = options(&args(&[
+            "--systems",
+            "f1s",
+            "--switch-workers",
+            "3",
+            "--switch-pin",
+            "--pause-after",
+            "420",
+            "--phases",
+            "idle",
+        ]))
+        .unwrap();
+        assert_eq!((o.switch_workers, o.switch_pin), (3, true));
+        assert_eq!(o.pause_after, Some(420));
+        assert_eq!(o.phases, ["idle"]);
+        let o = options(&[]).unwrap();
+        assert_eq!(
+            (o.switch_workers, o.switch_pin, o.pause_after),
+            (1, false, None)
+        );
+        assert!(options(&args(&["--switch-workers", "0"])).is_err());
+        assert!(options(&args(&["--systems", "f1s", "--image", "pinned"])).is_err());
+        assert!(options(&args(&["--systems", "f1s", "--image", "profile"])).is_ok());
     }
 
     #[test]
