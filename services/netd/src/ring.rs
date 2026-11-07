@@ -169,10 +169,15 @@ impl Period {
         Period { began: 0, spent: 0 }
     }
 
-    /// A new period begins when the present one has lasted its time.
+    /// A new period begins when the present one has lasted its time. The periods lie on a
+    /// fixed grid (`began` moves by whole periods), so a late step does not stretch a window and
+    /// the consumers cannot take 1.6 ms of time in 1 ms.
     pub fn refresh(&mut self, now: u64) {
-        if now.wrapping_sub(self.began) >= CONSUMER_PERIOD_NS {
-            self.began = now;
+        let late = now.wrapping_sub(self.began);
+        if late >= CONSUMER_PERIOD_NS {
+            self.began = self
+                .began
+                .wrapping_add(late / CONSUMER_PERIOD_NS * CONSUMER_PERIOD_NS);
             self.spent = 0;
         }
     }
@@ -250,7 +255,9 @@ pub trait Stepper {
 
 /// Steps while they follow one another, with the backstop pause once the run has lasted
 /// `SWITCH_RUN_NS`. `longest` holds the largest run seen, passed to `Stepper::longest` when it
-/// grows. The run is the thread's, so `clock` outlives the call.
+/// grows. The run is the thread's, so `clock` outlives the call. The run is read when a step
+/// begins, so the longest run it reports misses up to one step (the step that ends the run);
+/// the probe's margin for the host's clock covers that.
 pub fn drive<S: Stepper>(s: &mut S, clock: &mut RunClock, longest: &mut u64, mut interrupt: bool) {
     loop {
         let now = s.now();
@@ -1306,6 +1313,15 @@ mod tests {
         assert!(!p.left(), "the period has not ended");
         p.refresh(5_000_000 + CONSUMER_PERIOD_NS);
         assert!(p.left());
+        // A late step does not move the grid: a step at 7.9 ms of the third period after the
+        // first finds a period that began on the grid, 100 us from its end.
+        p.spend(CONSUMER_BUDGET_NS);
+        p.refresh(5_000_000 + 2 * CONSUMER_PERIOD_NS + 900_000);
+        assert!(p.left(), "a new period");
+        assert_eq!(
+            p.remaining(5_000_000 + 2 * CONSUMER_PERIOD_NS + 900_000),
+            100_000
+        );
         // The consumers together hold 80 % of the CPU at most.
         const { assert!(CONSUMER_BUDGET_NS * 10 <= CONSUMER_PERIOD_NS * 8) };
     }
