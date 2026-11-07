@@ -42,7 +42,7 @@ bounded, and how to measure them.
 | `OBJ_HOLD_MAX` | 4 000 | longest hold of `OBJ`, instructions (icount) |
 | `B4_MAX` | 32 000 | B_4, below |
 | `S5_ICOUNT_MAX` | 3 063 | S5 on one CPU, instructions |
-| `S5X_HVF_MAX` | 294 / 101 (GICv3), 340 / 216 (GICv2) | median of S5x on HVF, ticks of 16 ns: target in WFI / behind a lower thread; the guard of a regression |
+| `S5X_HVF_MAX` | 294 / 101 (GICv3), 340 / 216 (GICv2) | median of S5x on HVF, ticks of 41.67 ns (24 MHz): target in WFI / behind a lower thread; the guard of a regression |
 
 `S5X_HVF_MAX` is the guard of a regression: it bounds the median, which a host
 that preempts a vCPU leaves alone. The real-time limit of S5x bounds the longest
