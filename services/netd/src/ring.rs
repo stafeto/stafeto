@@ -130,49 +130,50 @@ pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
 /// The CPU the switch thread leaves to the levels below it, two parts.
 ///
-/// The budget (`Period`): the thread takes at most `CONSUMER_ENTRIES` entries of the consumers'
-/// TX rings in each `CONSUMER_PERIOD_NS`, shared by the consumers attached; the rest waits for the
-/// 1 ms timer (the one `blocked` frames use). The wire's frames are not under it and stay at the
-/// high level. An entry costs the thread about 1.5 us on VZ (a copy of up to 1 514 bytes, the
-/// check, a descriptor), so the consumers' share of a period is at most 770 us of 1 000; the wire's
-/// frames are not counted, and the 20 % the lower levels get in the worst case come from the
-/// backstop below.
+/// The budget (`Period`): the thread spends at most `CONSUMER_BUDGET_NS` of each
+/// `CONSUMER_PERIOD_NS` on the entries of the consumers' TX rings (the time it measures around
+/// each entry, all consumers together); the rest waits for the end of the period. The wire's frames are not under it and stay at the high
+/// level. So the consumers hold 80 % of CPU 0 at most, and in a flood of entries the levels
+/// below the switch keep 20 % (the probe `fast-switch-saturate`). A smaller budget costs
+/// answers: 500 us took 10 % of the 10 KiB load with three workers on VZ, whose consumers need
+/// about 600 us of each millisecond; with the wire's frames (about 30 %) that load fills CPU 0 and
+/// only the backstop is left to the lower levels there. A count of entries would not do: a
+/// refused entry costs about 0.1 us and a frame sent about 1.5 us.
 ///
 /// The backstop (`RunClock`): a run of `SWITCH_RUN_NS` without a rest (a wait of
 /// `SWITCH_REST_NS` or more) is followed by a pause of `SWITCH_PAUSE_NS`, so that the lower levels
-/// get a fifth of the CPU whatever supplies the thread. Without both, the device and the
-/// consumers keep the thread running for seconds and init's watchdog kills the service that was
-/// kept off the processor, the stack and the entropy service among them (stafeto-design#653).
+/// get a twentieth of the CPU whatever supplies the thread (a pause of 500 us, a fifth, took
+/// 20 % of the answers of the 10 KiB load with three workers, whose CPU 0 has no more to give).
+/// Without both, the device and the consumers keep the thread running for seconds and init's
+/// watchdog kills the service that was kept off the processor, the stack and the entropy service
+/// among them (stafeto-design#653).
 pub const SWITCH_RUN_NS: u64 = 2_000_000;
 pub const SWITCH_PAUSE_NS: u64 = 100_000;
-pub const SWITCH_REST_NS: u64 = 100_000;
+pub const SWITCH_REST_NS: u64 = 500_000;
 /// One step of the switch at its bound of 18 369 ticks of 41.67 ns, rounded up.
 pub const SWITCH_STEP_BOUND_NS: u64 = 770_000;
 pub const CONSUMER_PERIOD_NS: u64 = 1_000_000;
-pub const CONSUMER_ENTRIES: usize = 480;
-/// The least entries per period a consumer gets however many share the budget.
-pub const CONSUMER_ENTRIES_MIN: usize = 16;
+pub const CONSUMER_BUDGET_NS: u64 = 800_000;
 
-/// The consumers' entries taken in the present period of `CONSUMER_PERIOD_NS`.
+/// The time spent on the consumers' entries in the present period of `CONSUMER_PERIOD_NS`. The
+/// consumers share it as the steps take their entries, one from each in turn, so a consumer with
+/// many entries cannot shut out the others.
 #[derive(Clone, Copy, Debug)]
 pub struct Period {
     began: u64,
-    taken: [u16; 8],
+    spent: u64,
 }
 
 impl Period {
     pub const fn new() -> Period {
-        Period {
-            began: 0,
-            taken: [0; 8],
-        }
+        Period { began: 0, spent: 0 }
     }
 
     /// A new period begins when the present one has lasted its time.
     pub fn refresh(&mut self, now: u64) {
         if now.wrapping_sub(self.began) >= CONSUMER_PERIOD_NS {
             self.began = now;
-            self.taken = [0; 8];
+            self.spent = 0;
         }
     }
 
@@ -181,25 +182,14 @@ impl Period {
         CONSUMER_PERIOD_NS.saturating_sub(now.wrapping_sub(self.began))
     }
 
-    /// The entries each of `consumers` may take in a period.
-    pub const fn share(consumers: usize) -> usize {
-        let n = if consumers == 0 { 1 } else { consumers };
-        let each = CONSUMER_ENTRIES / n;
-        if each < CONSUMER_ENTRIES_MIN {
-            CONSUMER_ENTRIES_MIN
-        } else {
-            each
-        }
+    /// Whether the consumers have time left in this period.
+    pub fn left(&self) -> bool {
+        self.spent < CONSUMER_BUDGET_NS
     }
 
-    /// Whether consumer `c` may take another entry in this period.
-    pub fn left(&self, c: usize, consumers: usize) -> bool {
-        usize::from(self.taken[c % 8]) < Period::share(consumers)
-    }
-
-    pub fn took(&mut self, c: usize) {
-        let t = &mut self.taken[c % 8];
-        *t = t.saturating_add(1);
+    /// `ns` went on an entry of a consumer.
+    pub fn spend(&mut self, ns: u64) {
+        self.spent = self.spent.saturating_add(ns);
     }
 }
 
@@ -1289,7 +1279,7 @@ mod tests {
     #[test]
     fn a_refused_pause_starts_a_new_run_and_is_not_repeated_at_every_step() {
         let m = model(false, 100_000_000);
-        // 100 ms of 5 us steps: one attempt per run of 2 ms, not one per step.
+        // 100 ms of 5 us steps: one attempt for each run of 2 ms.
         assert!(
             m.pauses == 0 && m.seen <= SWITCH_RUN_NS + 5_000,
             "{}",
@@ -1298,26 +1288,26 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_of_a_period_stops_a_consumer_and_the_next_period_gives_it_back() {
+    fn the_budget_of_a_period_stops_the_consumers_and_the_next_period_gives_it_back() {
         let mut p = Period::new();
         p.refresh(5_000_000);
-        let each = Period::share(3);
-        assert_eq!(each, CONSUMER_ENTRIES / 3);
-        for _ in 0..each {
-            assert!(p.left(1, 3));
-            p.took(1);
+        let mut entries = 0;
+        while p.left() {
+            p.spend(1_000);
+            entries += 1;
         }
-        assert!(!p.left(1, 3), "the share is spent");
-        assert!(p.left(0, 3), "the others keep theirs");
+        assert_eq!(entries, CONSUMER_BUDGET_NS / 1_000);
+        assert!(!p.left(), "the budget is spent");
+        assert_eq!(
+            p.remaining(5_000_000 + 400_000),
+            CONSUMER_PERIOD_NS - 400_000
+        );
         p.refresh(5_000_000 + CONSUMER_PERIOD_NS - 1);
-        assert!(!p.left(1, 3), "the period has not ended");
+        assert!(!p.left(), "the period has not ended");
         p.refresh(5_000_000 + CONSUMER_PERIOD_NS);
-        assert!(p.left(1, 3));
-        // Many consumers still get the least share; one gets the whole budget.
-        assert_eq!(Period::share(8), CONSUMER_ENTRIES / 8);
-        assert_eq!(Period::share(1), CONSUMER_ENTRIES);
-        assert_eq!(Period::share(0), CONSUMER_ENTRIES);
-        const { assert!(CONSUMER_ENTRIES / 8 >= CONSUMER_ENTRIES_MIN) };
+        assert!(p.left());
+        // The consumers together hold 80 % of the CPU at most.
+        const { assert!(CONSUMER_BUDGET_NS * 10 <= CONSUMER_PERIOD_NS * 8) };
     }
 
     #[test]

@@ -828,12 +828,10 @@ impl Switch {
             return false;
         };
         let mut any = false;
-        let n = self.consumers();
-        for (c, x) in t.consumers.iter().enumerate() {
-            let Some(x) = x else { continue };
+        for x in t.consumers.iter().flatten() {
             // A consumer that spent its budget does not poke the switch: its entries wait for
             // the timer of the next period.
-            x.ring.set_switch_idle(self.period.left(c, n));
+            x.ring.set_switch_idle(self.period.left());
             any = true;
         }
         if !any {
@@ -849,7 +847,7 @@ impl Switch {
             t.consumers.iter().enumerate().filter_map(|(c, x)| {
                 x.as_ref().map(|x| {
                     (
-                        x.ring.tx_pending() && self.period.left(c, n),
+                        x.ring.tx_pending() && self.period.left(),
                         usize::from(self.inflight[c]),
                     )
                 })
@@ -946,7 +944,6 @@ impl Switch {
     /// left.
     fn consumer_frames(&mut self) -> bool {
         let cap = self.consumer_cap();
-        let consumers = self.consumers();
         self.period.refresh(now_ns());
         let mut budget = SWITCH_CTX;
         let mut taken = 0;
@@ -972,7 +969,7 @@ impl Switch {
                     continue;
                 }
                 // The consumer spent its entries of this period: the rest waits for the timer.
-                if !self.period.left(c, consumers) {
+                if !self.period.left() {
                     blocked = true;
                     spent = true;
                     continue;
@@ -983,30 +980,29 @@ impl Switch {
                 let Some(x) = t.consumers[c].as_mut() else {
                     continue;
                 };
+                let began = now_ns();
                 match x.ring.take_tx(&mut self.scratch) {
                     Tx::Empty => {}
                     Tx::Refused => {
                         x.ring.refused = x.ring.refused.wrapping_add(1);
-                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
                     }
                     Tx::Frame(len) => {
-                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
                         self.consumer_frame(c as u8, len);
                     }
                     Tx::Loop(len) => {
-                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
                         self.consumer_loop(c as u8, len);
                     }
                 }
+                self.period.spend(now_ns().wrapping_sub(began));
             }
         }
         self.budget_hit = spent;
@@ -1022,10 +1018,10 @@ impl Switch {
         // More follows at once only for entries that may still be taken.
         budget == 0
             && self.tables.as_ref().is_some_and(|t| {
-                t.consumers.iter().enumerate().any(|(c, x)| {
-                    x.as_ref()
-                        .is_some_and(|x| x.ring.tx_waiting() && self.period.left(c, consumers))
-                })
+                t.consumers
+                    .iter()
+                    .flatten()
+                    .any(|x| x.ring.tx_waiting() && self.period.left())
             })
     }
 
