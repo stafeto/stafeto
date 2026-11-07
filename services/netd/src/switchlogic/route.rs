@@ -184,7 +184,7 @@ enum Pick {
 /// A member of group `number` by `hash`, among the live ones with at least
 /// `min_fill` cells (and room for a flow when `flows` asks for one).
 fn pick(t: &Tables, number: u8, hash: u64, min_fill: u32, flows: bool) -> Pick {
-    let Some(g) = t.group(number) else {
+    let Some(g) = t.group(number).filter(|g| !g.draining) else {
         return Pick::NoLive;
     };
     let limit = (t.flows.capacity() / 2) as u32;
@@ -266,7 +266,7 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
     let now = t.now;
     match found {
         Some(i) => t.flows.reassign(i, c, generation, now, true),
-        None if !t.insert_embryo(&key, c, generation) => {
+        None if !t.insert_embryo(&key, c, generation, mark) => {
             return Decision::Drop(Why::FlowsFull);
         }
         None => {}
@@ -1142,6 +1142,61 @@ mod tests {
             t.now = 100;
             (0..16).for_each(|_| t.sweep());
             assert!(t.flows.is_empty(), "a closed flow goes after its rest");
+        });
+    }
+
+    #[test]
+    fn a_released_group_drains_its_flows_and_is_freed_when_the_last_is_gone() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire);
+            assert_eq!(t.group(1).unwrap().flows, 1);
+            t.release(1);
+            assert!(t.group(1).unwrap().draining);
+            assert_eq!(
+                (t.port(Proto::Tcp, 8080), t.freed),
+                (1, 0),
+                "the port stays"
+            );
+            // The flow goes on; a new SYN is the stack's (RST); nothing can join or hold.
+            assert_eq!(who(route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire)), c);
+            assert_eq!(
+                route(t, &wire_tcp(1300, 8080, SYN), Source::Wire),
+                Decision::Stack
+            );
+            assert!(!t.join(1, 2) && !t.hold(1, Proto::Tcp, 8080, 1));
+            assert!(!t.hold(5, Proto::Tcp, 8080, 1), "the port is not free yet");
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, ACK_)), Verdict::Send);
+            // The flow ends: both FINs, a rest, the sweep.
+            route(t, &wire_tcp(1234, 8080, 0x11), Source::Wire);
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x11)), Verdict::Send);
+            t.now = 50;
+            (0..16).for_each(|_| t.sweep());
+            assert!(t.flows.is_empty() && t.group(1).is_none());
+            assert_eq!((t.port(Proto::Tcp, 8080), t.freed), (0, 1));
+            assert!(t.hold(5, Proto::Tcp, 8080, 1));
+        });
+    }
+
+    #[test]
+    fn a_released_group_without_flows_is_freed_at_once_and_a_udp_group_always() {
+        with(|t, _| {
+            t.release(1);
+            assert!(t.group(1).is_none() && t.freed == 1);
+            route(t, &wire_udp(1000, 5353), Source::Wire);
+            t.release(2);
+            assert!(t.group(2).is_none() && t.freed == 3);
+            assert_eq!(t.port(Proto::Udp, 5353), 0);
+        });
+    }
+
+    #[test]
+    fn an_evicted_flow_leaves_its_group_count() {
+        with_flows(64, |t, _| {
+            for n in 0..40 {
+                route(t, &wire_from([198, 51, 100, n], 5000, SYN), Source::Wire);
+            }
+            assert_eq!(t.group(1).unwrap().flows as usize, t.flows.len());
         });
     }
 

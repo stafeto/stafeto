@@ -33,6 +33,8 @@ pub const RST: u16 = 4;
 /// cannot tell a blind RST (RFC 5961 makes the stack ignore it) from a true one; the next
 /// segment of the flow in either direction takes the mark off, a true RST has none after it.
 pub const RST_PEER: u16 = 16;
+/// The flow is counted in `Group::flows` of the group that owns its port.
+pub const GROUPED: u16 = 32;
 /// The flow was made by a SYN nobody has confirmed yet (see `Flows`).
 pub const UNCONFIRMED: u16 = 8;
 /// Seconds an unconfirmed flow lives: shorter than the stack's SYN-ACK retries, longer than a round trip.
@@ -287,7 +289,7 @@ impl<'a> Flows<'a> {
     pub fn reassign(&mut self, i: usize, consumer: u8, generation: u8, now: u32, embryo: bool) {
         self.confirm(i);
         let f = &mut self.slots[i];
-        let flags = if embryo { UNCONFIRMED } else { 0 };
+        let flags = f.flags & GROUPED | if embryo { UNCONFIRMED } else { 0 };
         (f.consumer, f.generation, f.flags, f.seen) = (consumer, generation, flags, now);
         self.unconfirmed += usize::from(embryo);
     }
@@ -314,23 +316,21 @@ impl<'a> Flows<'a> {
 
     /// Looks at `SWEEP_STEP` places from where the last call stopped and
     /// removes flows of dead consumers (the generation is not the live
-    /// one), closing ones older than `CLOSING_AGE` and idle ones.
-    pub fn sweep(&mut self, now: u32, consumers: &mut [Option<Consumer>; MAX_CONSUMERS]) {
+    /// one), closing ones older than `CLOSING_AGE`, unconfirmed ones older
+    /// than `EMBRYO_AGE` and idle ones.
+    pub fn sweep(&mut self, now: u32, books: &mut Books) {
         for _ in 0..SWEEP_STEP {
             let f = self.slots[self.cursor];
             if !f.is_empty() {
-                let owner = consumers
-                    .get_mut(usize::from(f.consumer))
-                    .and_then(Option::as_mut)
-                    .filter(|c| c.generation == f.generation);
                 let age = now.wrapping_sub(f.seen);
                 let embryo = f.flags & UNCONFIRMED != 0 && age > EMBRYO_AGE;
-                if owner.is_none() || embryo || (f.closing() && age > CLOSING_AGE) || age > IDLE_AGE
+                if !books.owner_live(&f)
+                    || embryo
+                    || (f.closing() && age > CLOSING_AGE)
+                    || age > IDLE_AGE
                 {
                     self.expired += u32::from(embryo);
-                    if let Some(c) = owner {
-                        c.flows = c.flows.saturating_sub(1);
-                    }
+                    books.gone(&f);
                     self.remove_at(self.cursor);
                     continue;
                 }
@@ -338,6 +338,74 @@ impl<'a> Flows<'a> {
             self.cursor = (self.cursor + 1) % self.slots.len();
         }
     }
+}
+
+/// What the removal of a flow touches: the books of its owner and its group.
+pub struct Books<'b> {
+    consumers: &'b mut [Option<Consumer>; MAX_CONSUMERS],
+    groups: &'b mut [Option<Group>; MAX_GROUPS],
+    ports: &'b mut [u8],
+    freed: &'b mut u32,
+}
+
+impl Books<'_> {
+    fn owner_live(&self, f: &Flow) -> bool {
+        self.consumers
+            .get(usize::from(f.consumer))
+            .and_then(Option::as_ref)
+            .is_some_and(|c| c.generation == f.generation)
+    }
+
+    /// The flow is leaving the table: its owner and its group have one flow less, and a
+    /// draining group that has none left is freed.
+    fn gone(&mut self, f: &Flow) {
+        if let Some(c) = self
+            .consumers
+            .get_mut(usize::from(f.consumer))
+            .and_then(Option::as_mut)
+            .filter(|c| c.generation == f.generation)
+        {
+            c.flows = c.flows.saturating_sub(1);
+        }
+        if f.flags & GROUPED == 0 {
+            return;
+        }
+        let own_port = u16::from_le_bytes([f.key[6], f.key[7]]);
+        let number = self.ports[Tables::at(Proto::Tcp, own_port)];
+        let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
+            return;
+        };
+        g.flows = g.flows.saturating_sub(1);
+        if g.draining && g.flows == 0 {
+            self.free(number);
+        }
+    }
+
+    /// Takes the group and its ports, and tells the stack (`Tables::freed`).
+    fn free(&mut self, number: u8) {
+        if let Some(g) = self.groups[usize::from(number) - 1].take() {
+            mark_ports(self.ports, g.proto, g.first, u16::from(g.count), 0);
+            *self.freed |= 1 << (number - 1);
+        }
+    }
+}
+
+/// The books of a `Tables` borrowed without its flows.
+macro_rules! books {
+    ($t:expr) => {
+        Books {
+            consumers: &mut $t.consumers,
+            groups: &mut $t.groups,
+            ports: &mut *$t.ports,
+            freed: &mut $t.freed,
+        }
+    };
+}
+
+fn mark_ports(ports: &mut [u8], proto: Proto, first: u16, count: u16, v: u8) {
+    assert!(u32::from(first) + u32::from(count) <= 65536);
+    let at = Tables::at(proto, first);
+    ports[at..at + usize::from(count)].fill(v);
 }
 
 pub struct Consumer {
@@ -370,6 +438,11 @@ pub struct Group {
     pub first: u16,
     pub count: u8,
     pub holders: u16,
+    /// Every holder let go but flows of the port are still there: no new SYN comes in, the
+    /// flows go on, and the group is freed when the last one is gone.
+    pub draining: bool,
+    /// Flows of the group's port in the table (TCP).
+    pub flows: u32,
     /// (consumer, generation)
     pub members: [Option<(u8, u8)>; MAX_MEMBERS],
 }
@@ -407,6 +480,9 @@ pub struct Tables<'a> {
     pub consumers: [Option<Consumer>; MAX_CONSUMERS],
     pub flows: Flows<'a>,
     pub refused: [u32; Reason::COUNT],
+    /// Groups freed that the stack has not been told of (bit n - 1 is group n); `commands::poll`
+    /// sends `Back::Freed` and clears the bit.
+    pub freed: u32,
     pub guard: Guard,
 }
 
@@ -423,6 +499,7 @@ impl<'a> Tables<'a> {
             consumers: [const { None }; MAX_CONSUMERS],
             flows,
             refused: [0; Reason::COUNT],
+            freed: 0,
             guard: Guard { tag, owner: None },
         }
     }
@@ -441,9 +518,7 @@ impl<'a> Tables<'a> {
     }
 
     fn mark(&mut self, proto: Proto, first: u16, count: u16, v: u8) {
-        assert!(u32::from(first) + u32::from(count) <= 65536);
-        let at = Self::at(proto, first);
-        self.ports[at..at + usize::from(count)].fill(v);
+        mark_ports(self.ports, proto, first, count, v);
     }
 
     pub fn group(&self, number: u8) -> Option<&Group> {
@@ -508,14 +583,29 @@ impl<'a> Tables<'a> {
             return false;
         };
         match slot {
-            Some(g) if (g.proto, g.first, g.count) == (proto, first, count) => g.holders += 1,
+            Some(g) if g.draining => return false,
+            Some(g) if (g.proto, g.first, g.count) == (proto, first, count) => {
+                let Some(h) = g.holders.checked_add(1) else {
+                    return false;
+                };
+                g.holders = h;
+            }
             Some(_) => return false,
             None => {
+                let at = Self::at(proto, first);
+                if self.ports[at..at + usize::from(count)]
+                    .iter()
+                    .any(|&b| b != 0)
+                {
+                    return false;
+                }
                 *slot = Some(Group {
                     proto,
                     first,
                     count,
                     holders: 1,
+                    draining: false,
+                    flows: 0,
                     members: [None; MAX_MEMBERS],
                 });
                 self.mark(proto, first, u16::from(count), number);
@@ -524,19 +614,26 @@ impl<'a> Tables<'a> {
         true
     }
 
-    /// One holder less; the last one takes the group and its ports.
+    /// One holder less. The last one ends the group: at once when no flow of its port is
+    /// there, else the group drains (see `Group::draining`). Either way `freed` says when
+    /// the stack may let go of the port.
     pub fn release(&mut self, number: u8) {
         self.guard.check();
-        let Some(slot) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
+        let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
             return;
         };
-        if let Some(g) = slot {
-            g.holders -= 1;
-            if g.holders == 0 {
-                let (proto, first, count) = (g.proto, g.first, u16::from(g.count));
-                *slot = None;
-                self.mark(proto, first, count, 0);
-            }
+        if g.draining {
+            return;
+        }
+        g.holders = g.holders.saturating_sub(1);
+        if g.holders > 0 {
+            return;
+        }
+        if g.flows == 0 {
+            books!(self).free(number);
+        } else {
+            g.draining = true;
+            g.members = [None; MAX_MEMBERS];
         }
     }
 
@@ -549,6 +646,9 @@ impl<'a> Tables<'a> {
         let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
             return false;
         };
+        if g.draining {
+            return false;
+        }
         if g.members.iter().flatten().any(|m| m.0 == c) {
             return true;
         }
@@ -579,24 +679,31 @@ impl<'a> Tables<'a> {
         }
     }
 
-    /// A new unconfirmed flow for a SYN; false when there is no room. The owner of a
-    /// flow it took the place of gets its count back.
-    pub fn insert_embryo(&mut self, key: &FlowKey, consumer: u8, generation: u8) -> bool {
+    /// A new unconfirmed flow for a SYN to port-table value `mark`; false when there is no
+    /// room. An evicted flow gives its owner and its group their count back.
+    pub fn insert_embryo(&mut self, key: &FlowKey, consumer: u8, generation: u8, mark: u8) -> bool {
         self.guard.check();
         let (slot, evicted) = self
             .flows
             .insert_embryo(key, consumer, generation, self.now);
         if let Some(f) = evicted {
-            if let Some(c) = self
-                .consumers
-                .get_mut(usize::from(f.consumer))
-                .and_then(Option::as_mut)
-                .filter(|c| c.generation == f.generation)
-            {
-                c.flows = c.flows.saturating_sub(1);
-            }
+            books!(self).gone(&f);
+        }
+        if let Some(i) = slot {
+            self.tag_group(i, mark);
         }
         slot.is_some()
+    }
+
+    /// The flow at `i` belongs to the group `mark` names (if it names one): counted once.
+    pub fn tag_group(&mut self, i: usize, mark: u8) {
+        let f = self.flows.get(i);
+        if f.flags & GROUPED == 0
+            && let Some(Some(g)) = self.groups.get_mut(usize::from(mark).wrapping_sub(1))
+        {
+            f.flags |= GROUPED;
+            g.flows += 1;
+        }
     }
 
     /// One sweep step at the time the switch last set. The switch calls it
@@ -605,7 +712,8 @@ impl<'a> Tables<'a> {
     /// unconfirmed and dead flows stay while the line is quiet.
     pub fn sweep(&mut self) {
         self.guard.check();
-        self.flows.sweep(self.now, &mut self.consumers);
+        let mut books = books!(self);
+        self.flows.sweep(self.now, &mut books);
     }
 
     /// `sweep` at time `now`, for the idle timer.
@@ -797,6 +905,17 @@ pub(crate) mod tests {
         t
     }
 
+    fn sweep(f: &mut Flows, now: u32, cs: &mut [Option<Consumer>; MAX_CONSUMERS]) {
+        let (mut groups, mut ports, mut freed) = ([None; MAX_GROUPS], vec![0u8; 131072], 0);
+        let mut books = Books {
+            consumers: cs,
+            groups: &mut groups,
+            ports: &mut ports,
+            freed: &mut freed,
+        };
+        f.sweep(now, &mut books);
+    }
+
     #[test]
     fn the_sweep_removes_closing_dead_and_idle_flows_in_steps() {
         let mut mem = vec![Flow::EMPTY; 1024];
@@ -814,7 +933,7 @@ pub(crate) mod tests {
         at(&mut f, 6, 3, 1, 20000); // a consumer that is not there
         at(&mut f, 7, 2, 5, 20000 - IDLE_AGE - 1);
         for _ in 0..4 {
-            f.sweep(20011, &mut cs);
+            sweep(&mut f, 20011, &mut cs);
         }
         assert_eq!(f.len(), 2);
         assert!(f.find(&key(1)).is_some() && f.find(&key(4)).is_some());
@@ -823,12 +942,12 @@ pub(crate) mod tests {
             0,
             "closing, reset and idle left the count"
         );
-        // Closing flows rest 10 s: not yet removed at 1010.
+        // Closing flows rest 10 s: not yet removed at 20,010 (age 10).
         let mut g = Flows::new(&mut mem, &SECRET);
         let i = g.insert(&key(8), 2, 5, 20000).unwrap();
         g.get(i).flags = RST;
         for _ in 0..8 {
-            g.sweep(20010, &mut cs);
+            sweep(&mut g, 20010, &mut cs);
         }
         assert_eq!(g.len(), 1);
     }

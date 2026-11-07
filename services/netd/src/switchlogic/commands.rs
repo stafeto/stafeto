@@ -7,7 +7,7 @@
 //! answers what the stack must know. One writer and one reader on each.
 
 use super::ring::{ConsumerRing, Mem, Violation};
-use super::tables::Tables;
+use super::tables::{MAX_GROUPS, Tables};
 use crate::ports::Proto;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -101,6 +101,8 @@ pub enum Command {
         first: u16,
         count: u8,
     },
+    /// One holder less. When the last lets go, the group ends (at once, or after its flows
+    /// when it has some) and the switch answers with `Back::Freed`.
     Release {
         group: u8,
     },
@@ -125,6 +127,12 @@ pub enum Back {
     Detached { consumer: u8, generation: u8 },
     /// The consumer broke a rule of its ring; the stack detaches it.
     Broken { consumer: u8, violation: Violation },
+    /// The group is gone from the tables and its ports are free. Exactly one per group that
+    /// lost its last holder. The stack keeps the group number and the entry of its port
+    /// registry until it hears this: flows of the port can outlive the last holder (a
+    /// worker that closed its listening socket still serves its connections), and a new
+    /// `bind` of the port before then would get their segments.
+    Freed { group: u8 },
 }
 
 pub struct Commands {
@@ -213,6 +221,12 @@ pub fn poll(t: &mut Tables, q: &Commands) {
             violation,
         });
     });
+    // A bit stays until the stack's ring took the answer.
+    for group in 1..=MAX_GROUPS as u8 {
+        if t.freed & (1 << (group - 1)) != 0 && q.to_stack.push(Back::Freed { group }) {
+            t.freed &= !(1 << (group - 1));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +348,38 @@ mod tests {
                 2048,
                 "the sizes are on line 0"
             );
+        });
+    }
+
+    #[test]
+    fn a_freed_group_is_told_once_and_kept_until_the_ring_has_room() {
+        with(|t, _| {
+            let q = Commands::new();
+            q.to_switch.push(Command::Release { group: 1 });
+            q.to_switch.push(Command::Release { group: 2 });
+            while drain(t, &q) > 0 {}
+            for _ in 0..RING - 1 {
+                assert!(q.to_stack.push(Back::Freed { group: 9 }));
+            }
+            poll(t, &q);
+            assert_eq!(t.freed, 0b10, "the second does not fit");
+            assert_eq!(q.to_stack.pop(), Some(Back::Freed { group: 9 }));
+            poll(t, &q);
+            poll(t, &q);
+            let back: Vec<Back> = core::iter::from_fn(|| q.to_stack.pop()).collect();
+            assert_eq!(
+                back.iter()
+                    .filter(|b| **b == Back::Freed { group: 1 })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                back.iter()
+                    .filter(|b| **b == Back::Freed { group: 2 })
+                    .count(),
+                1
+            );
+            assert_eq!(t.freed, 0);
         });
     }
 
