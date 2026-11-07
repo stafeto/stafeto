@@ -23,10 +23,10 @@
 //! * `switch steps`: the start and the first pages under -icount with the
 //!   service counting its steps: every step, those of the switch among them
 //!   (kinds 67 to 70), is under 0.9 of term B.
-//! * `switch saturate`: three programs keep their rings full of entries the switch refuses for
-//!   20 s on four CPUs; the switch (a level above the stack and the services on its CPU) pauses
-//!   in its runs, so the stack answers `posix-net stat` within seconds and init's watchdog
-//!   kills nothing (without the pauses the stack waits for the end of the flood, or init kills
+//! * `switch saturate`: three programs keep their rings full of entries the switch refuses, on
+//!   four CPUs, while the probe asks `posix-net stat` four times; the switch (a level above the
+//!   stack and the services on its CPU) budgets the consumers' time and pauses in its runs, so
+//!   the stack answers within seconds and init's watchdog kills nothing (without them init kills
 //!   the network service as silent).
 //! * `switch-probe`: the C program over the ring sends the frames the switch
 //!   refuses; each is counted by its reason, none reaches the wire (the
@@ -50,16 +50,16 @@ const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 /// How long `saturate` floods the ring.
-const SATURATE_SECS: u64 = 20;
+const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
-/// times the answer of the quiet stack, but not under `SATURATE_FLOOR` nor under three fifths of
-/// the flood (a slow host spends seconds starting `posix-net` beside three programs at full
-/// speed; a stack the switch keeps off the processor answers after the flood or is killed).
+/// times the answer of the quiet stack, but not under `SATURATE_FLOOR` (a slow host spends seconds
+/// starting `posix-net` beside three programs at full speed, 6 s on the CI machine; a stack the
+/// switch keeps off the processor is killed by init).
 const SATURATE_SAMPLES: usize = 4;
 /// What the host's clock may add to the longest run of the switch.
 const SATURATE_JITTER: Duration = Duration::from_millis(40);
 const SATURATE_BOUND: u32 = 40;
-const SATURATE_FLOOR: Duration = Duration::from_millis(4_000);
+const SATURATE_FLOOR: Duration = Duration::from_secs(12);
 /// How many programs flood a ring at once.
 const SATURATE_CONSUMERS: usize = 3;
 const READ_WITHIN: Duration = Duration::from_secs(60);
@@ -1121,14 +1121,13 @@ fn frames(
 ///
 /// `posix-net stat` is asked `SATURATE_SAMPLES` times in the flood, each answer within its bound
 /// (`SATURATE_BOUND` times the answer of the quiet stack, at least `SATURATE_FLOOR`), and the
-/// longest run of the switch without a rest stays within a run and two steps.
+/// longest run of the switch without a rest stays within a run, a step and the host's jitter.
+/// The programs flood until the probe has its samples and ends them.
 fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
     let quiet = Instant::now();
     stat(run, "quiet")?;
-    let bound = SATURATE_FLOOR
-        .max(quiet.elapsed() * SATURATE_BOUND)
-        .max(Duration::from_secs(SATURATE_SECS * 3 / 5));
+    let bound = SATURATE_FLOOR.max(quiet.elapsed() * SATURATE_BOUND);
     for _ in 0..SATURATE_CONSUMERS {
         run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
         run.expect("# ", DIALOG_STEP)?;
@@ -1140,16 +1139,6 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         let asked = Instant::now();
         let s = stat(run, "flood")?;
         let t = asked.elapsed();
-        if run
-            .lines()
-            .iter()
-            .any(|l| l.contains("switch-probe: saturate ok "))
-        {
-            return Err(format!(
-                "the flood ended before sample {} was answered ({t:?}): the switch kept the stack off the processor",
-                took.len() + 1
-            ));
-        }
         if t > bound {
             return Err(format!(
                 "sample {}: the stack answered `posix-net stat` after {t:?} of a flood (bound {bound:?}): the switch kept it off the processor",
@@ -1158,20 +1147,16 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         }
         if s.consumers == SATURATE_CONSUMERS as u64 {
             took.push(t);
-        } else if began.elapsed() > Duration::from_secs(SATURATE_SECS * 3 / 4) {
+        } else if began.elapsed() > bound * 2 {
             return Err(format!(
                 "{} consumers, wanted {SATURATE_CONSUMERS}: {}",
                 s.consumers, s.line
             ));
         }
     }
-    for _ in 0..SATURATE_CONSUMERS {
-        run.expect_line(
-            "the flood ends",
-            |l| l.contains("switch-probe: saturate ok "),
-            Duration::from_secs(60),
-        )?;
-    }
+    // The programs flood for a long time; they are ended by the probe, which has its samples.
+    run.send("kill %1 %2 %3")?;
+    run.expect("# ", DIALOG_STEP)?;
     if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
         return Err(format!("init: {l}"));
     }
@@ -1194,7 +1179,7 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         return Err(format!("{failed} pauses did not happen: {}", after.line));
     }
     notes.push(format!(
-        "{SATURATE_SAMPLES} answers of the stack in a flood of {SATURATE_SECS} s on {SATURATE_CONSUMERS} rings: {took:?} (bound {bound:?}); {pauses} pauses, the longest run {longest} us (limit {limit} us)"
+        "{SATURATE_SAMPLES} answers of the stack in a flood on {SATURATE_CONSUMERS} rings: {took:?} (bound {bound:?}); {pauses} pauses, the longest run {longest} us (limit {limit} us)"
     ));
     Ok(())
 }
