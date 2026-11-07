@@ -815,6 +815,9 @@ fn steps(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Res
 /// closes its description, its pair is the old one: the join is refused and no LEAVE reaches the
 /// switch (the counter of LEAVEs stays), so `reuse-b` stays a member.
 fn reuse(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    // The numbers of the consumers of the steps before come back after two rounds of the sweep:
+    // with them all free `reuse-a` takes the lowest, 0, and `reuse-b` takes it again after it.
+    std::thread::sleep(Duration::from_secs(8));
     let before = stat(run, "u0")?.left;
     let from = run.lines().len();
     run.send(
