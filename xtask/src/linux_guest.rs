@@ -59,6 +59,9 @@ pub enum BenchImage {
 pub const BENCH_FAST_IMAGE: &str = "boot-net-bench-fast.img";
 /// The image of F1s: nginx-fast on the switch of the one device.
 pub const BENCH_SWITCH_IMAGE: &str = "boot-net-bench-switch.img";
+/// The image of F1s with the counters of the network service: a file of its own, so that a build
+/// of one never replaces the other.
+pub const BENCH_SWITCH_PROFILE_IMAGE: &str = "boot-net-bench-switch-profile.img";
 /// The second device's address in the image of F1 (the static address of
 /// `netd.conf`: the NAT of VZ has no lease for a device that the stack owns).
 pub const FAST_ADDRESS: &str = "192.168.64.250";
@@ -187,7 +190,7 @@ pub fn build_switch_image() -> Result<PathBuf, String> {
 }
 
 /// The programs of the image of F1s with the counters of the network service (`netd` built
-/// with the feature `profile`), written to the file of the image of F1s.
+/// with the feature `profile`).
 pub fn bench_switch_profile_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
@@ -201,11 +204,11 @@ pub fn bench_switch_profile_programs() -> &'static [ImageProgram] {
     })
 }
 
-/// Builds the image of F1s with the profile (the same file as `build_switch_image`).
+/// Builds the image of F1s with the profile.
 pub fn build_switch_profile_image() -> Result<PathBuf, String> {
     crate::probe_ca::ensure(false)?;
     build_boot_image(
-        BENCH_SWITCH_IMAGE,
+        BENCH_SWITCH_PROFILE_IMAGE,
         bench_switch_profile_programs(),
         BOOT_PROFILE,
     )

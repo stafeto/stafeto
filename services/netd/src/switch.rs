@@ -59,10 +59,10 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    PARK_GIVE, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
+    PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
     SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
-    SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, TX_BUFFERS, TX_SHARE,
-    bell_due,
+    SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TX_BUFFERS,
+    TX_SHARE, bell_due, drive,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use netd::switchlogic::commands::{self, Commands};
@@ -149,8 +149,12 @@ pub struct Stats {
     pub looped: AtomicU32,
     /// Memberships ended by LEAVE.
     pub left: AtomicU32,
-    /// Pauses the thread took to leave the lower levels the processor (`SWITCH_RUN_NS`).
+    /// Pauses the thread took to leave the lower levels the processor (`SWITCH_RUN_NS`), and
+    /// the pauses that did not happen (the timer or the wait refused).
     pub pauses: AtomicU32,
+    pub pause_failed: AtomicU32,
+    /// The longest run without a rest, in microseconds.
+    pub run_max_us: AtomicU32,
 }
 
 impl Stats {
@@ -174,6 +178,8 @@ impl Stats {
             looped: AtomicU32::new(0),
             left: AtomicU32::new(0),
             pauses: AtomicU32::new(0),
+            pause_failed: AtomicU32::new(0),
+            run_max_us: AtomicU32::new(0),
         }
     }
 }
@@ -419,9 +425,12 @@ pub struct Switch {
     woken: netd::books::Woken,
     /// The `switch_idle` flags are set in the rings.
     idle_set: bool,
-    /// Where the run of steps stands (`run`), and the channel and timer of its pauses.
-    clock: RunClock,
+    /// The channel and timer of the pauses.
     pause: Option<(Handle<Channel>, Handle<Timer>)>,
+    /// The consumers' entries taken in this period (`Period`), and whether a consumer spent its
+    /// share and waits for the next one.
+    period: Period,
+    budget_hit: bool,
     /// The longest step so far, in ticks of the thread's own time.
     #[cfg(feature = "steps")]
     longest: u64,
@@ -493,8 +502,9 @@ impl Switch {
             inflight: [0; MAX_CONSUMERS + 1],
             woken: netd::books::Woken::new(),
             idle_set: false,
-            clock: RunClock::new(),
             pause: None,
+            period: Period::new(),
+            budget_hit: false,
             #[cfg(feature = "steps")]
             longest: 0,
             #[cfg(feature = "steps")]
@@ -594,16 +604,23 @@ impl Switch {
     }
 
     /// Gives the levels below the processor for `SWITCH_PAUSE_NS`: the thread waits on a timer of
-    /// its own (a wait on its channel would return at once while a notification is pending).
-    fn pause(&mut self) {
-        INNER.stats.pauses.fetch_add(1, Ordering::Relaxed);
-        profile::count(Counter::Pause);
-        if let Some((channel, timer)) = &self.pause
-            && sys::timer_set(timer, now_ns() + SWITCH_PAUSE_NS).is_ok()
-        {
-            let _ = sys::receive(channel);
+    /// its own (a wait on its main channel returns at once while a notification is pending). True
+    /// when the wait happened; a refusal of the timer or of the wait is counted apart.
+    fn pause(&mut self) -> bool {
+        let waited = match &self.pause {
+            Some((channel, timer)) => {
+                sys::timer_set(timer, now_ns() + SWITCH_PAUSE_NS).is_ok()
+                    && sys::receive(channel).is_ok()
+            }
+            None => false,
+        };
+        if waited {
+            INNER.stats.pauses.fetch_add(1, Ordering::Relaxed);
+            profile::count(Counter::Pause);
+        } else {
+            INNER.stats.pause_failed.fetch_add(1, Ordering::Relaxed);
         }
-        self.clock.rested(now_ns());
+        waited
     }
 
     /// One step: the buffers and frames the stack passed go to the queues,
@@ -811,8 +828,12 @@ impl Switch {
             return false;
         };
         let mut any = false;
-        for x in t.consumers.iter().flatten() {
-            x.ring.set_switch_idle(true);
+        let n = self.consumers();
+        for (c, x) in t.consumers.iter().enumerate() {
+            let Some(x) = x else { continue };
+            // A consumer that spent its budget does not poke the switch: its entries wait for
+            // the timer of the next period.
+            x.ring.set_switch_idle(self.period.left(c, n));
             any = true;
         }
         if !any {
@@ -826,8 +847,12 @@ impl Switch {
         let (cap, free) = (self.consumer_cap(), self.tx.book.free());
         let work = netd::books::has_work(
             t.consumers.iter().enumerate().filter_map(|(c, x)| {
-                x.as_ref()
-                    .map(|x| (x.ring.tx_pending(), usize::from(self.inflight[c])))
+                x.as_ref().map(|x| {
+                    (
+                        x.ring.tx_pending() && self.period.left(c, n),
+                        usize::from(self.inflight[c]),
+                    )
+                })
             }),
             cap,
             free,
@@ -921,10 +946,13 @@ impl Switch {
     /// left.
     fn consumer_frames(&mut self) -> bool {
         let cap = self.consumer_cap();
+        let consumers = self.consumers();
+        self.period.refresh(now_ns());
         let mut budget = SWITCH_CTX;
         let mut taken = 0;
         let mut progressed = true;
         let mut blocked = false;
+        let mut spent = false;
         while budget > 0 && progressed {
             progressed = false;
             for k in 0..MAX_CONSUMERS {
@@ -943,6 +971,12 @@ impl Switch {
                     blocked = true;
                     continue;
                 }
+                // The consumer spent its entries of this period: the rest waits for the timer.
+                if !self.period.left(c, consumers) {
+                    blocked = true;
+                    spent = true;
+                    continue;
+                }
                 let Some(t) = self.tables.as_mut() else {
                     return false;
                 };
@@ -953,17 +987,20 @@ impl Switch {
                     Tx::Empty => {}
                     Tx::Refused => {
                         x.ring.refused = x.ring.refused.wrapping_add(1);
+                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
                     }
                     Tx::Frame(len) => {
+                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
                         self.consumer_frame(c as u8, len);
                     }
                     Tx::Loop(len) => {
+                        self.period.took(c);
                         progressed = true;
                         budget -= 1;
                         taken += 1;
@@ -972,6 +1009,7 @@ impl Switch {
                 }
             }
         }
+        self.budget_hit = spent;
         self.next_c = (self.next_c + 1) % MAX_CONSUMERS as u8;
         // Frames that wait for a buffer or a share of the queue do not make the switch run
         // again at once (it would spin above the stack): the timer looks again in a
@@ -981,11 +1019,14 @@ impl Switch {
                 .tables
                 .as_ref()
                 .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()));
+        // More follows at once only for entries that may still be taken.
         budget == 0
-            && self
-                .tables
-                .as_ref()
-                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()))
+            && self.tables.as_ref().is_some_and(|t| {
+                t.consumers.iter().enumerate().any(|(c, x)| {
+                    x.as_ref()
+                        .is_some_and(|x| x.ring.tx_waiting() && self.period.left(c, consumers))
+                })
+            })
     }
 
     /// The copy in `scratch` is checked and goes out, or turns back into the tables.
@@ -1133,8 +1174,13 @@ impl Switch {
         // A consumer left lately: the rounds that return its number follow fast.
         let settling = t.flows.rounds().wrapping_sub(self.settle_until) >= u32::MAX / 2;
         let sweeping = count > 0 || !t.flows.is_empty() || settling || t.parked() > 0;
-        if (sweeping || self.blocked) && !self.armed {
-            let after = if self.blocked {
+        // A budget spent moves a timer armed for later (the sweep's) to the end of the period.
+        let waits_for_period = self.blocked && self.budget_hit;
+        if (sweeping || self.blocked) && (!self.armed || waits_for_period) {
+            let after = if self.blocked && self.budget_hit {
+                // The entries wait for the next period.
+                self.period.remaining(now_ns()).max(20_000)
+            } else if self.blocked {
                 1_000_000
             } else if settling {
                 2_000_000
@@ -1262,6 +1308,34 @@ impl Switch {
 }
 
 /// The switch's place in `.bss`, and its stack and message buffer.
+impl Stepper for Switch {
+    fn now(&mut self) -> u64 {
+        now_ns()
+    }
+    fn step(&mut self, interrupt: bool) -> bool {
+        #[cfg(feature = "steps")]
+        let began = self.ran();
+        let more = Switch::step(self, interrupt);
+        #[cfg(feature = "steps")]
+        {
+            let ticks = self.ran().saturating_sub(began);
+            if ticks > self.longest {
+                self.longest = ticks;
+                rt::println!("service step: 14 kind 67 {ticks} ticks detail 0");
+            }
+        }
+        more
+    }
+    fn pause(&mut self) -> bool {
+        Switch::pause(self)
+    }
+    fn longest(&mut self, ran: u64) {
+        let us = (ran / 1_000).min(u64::from(u32::MAX)) as u32;
+        INNER.stats.run_max_us.fetch_max(us, Ordering::Relaxed);
+        profile::max(Counter::RunMax, u64::from(us));
+    }
+}
+
 struct Slot(UnsafeCell<MaybeUninit<Switch>>);
 
 // SAFETY: written once by the main thread before the switch thread starts,
@@ -1340,6 +1414,7 @@ extern "C" fn run(_: u64) -> ! {
     }
     // The line opens once the queues are up.
     virtio_mmio::reopen(&switch.irq);
+    let (mut clock, mut longest) = (RunClock::new(), 0);
     loop {
         let waiting = now_ns();
         let interrupt = match sys::receive(&switch.channel) {
@@ -1361,32 +1436,9 @@ extern "C" fn run(_: u64) -> ! {
         if interrupt {
             profile::count(Counter::Irq);
         }
-        let mut interrupt = interrupt;
         let woke = now_ns();
-        switch.clock.woke(woke, woke.wrapping_sub(waiting));
-        loop {
-            // The device and the consumers may supply steps without end, with waits that
-            // return at once between runs: the levels below this thread get a slot every
-            // run (`SWITCH_RUN_NS`).
-            if switch.clock.pause_due(now_ns()) {
-                switch.pause();
-            }
-            #[cfg(feature = "steps")]
-            let began = switch.ran();
-            let more = switch.step(interrupt);
-            interrupt = false;
-            #[cfg(feature = "steps")]
-            {
-                let ticks = switch.ran().saturating_sub(began);
-                if ticks > switch.longest {
-                    switch.longest = ticks;
-                    rt::println!("service step: 14 kind 67 {ticks} ticks detail 0");
-                }
-            }
-            if !more {
-                break;
-            }
-        }
+        clock.woke(woke, woke.wrapping_sub(waiting));
+        drive(switch, &mut clock, &mut longest, interrupt);
         // The probe's line, for the check that a doorbell serves many frames
         // of a burst (xtask `net_probe::bells_serve_frames`): every 500 frames.
         #[cfg(feature = "probe")]

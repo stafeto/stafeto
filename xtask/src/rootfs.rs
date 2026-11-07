@@ -1866,7 +1866,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The row F1s: the files of S4's image, with the package's settings (the worker
         // runs as nobody) and the switch's `netd.conf`; the stack shares the first
         // device's address.
-        "boot-net-bench-switch.img" => {
+        "boot-net-bench-switch.img" | "boot-net-bench-switch-profile.img" => {
             let mut files = net_bench_files(name);
             for (path, label, bytes) in [
                 (
@@ -2746,6 +2746,9 @@ mod tests {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchSteps)
                 }
                 "boot-net-bench-switch.img" => crate::linux_guest::bench_switch_programs(),
+                "boot-net-bench-switch-profile.img" => {
+                    crate::linux_guest::bench_switch_profile_programs()
+                }
                 "boot-fast-switch-vz.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchVz)
                 }

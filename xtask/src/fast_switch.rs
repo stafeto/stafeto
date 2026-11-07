@@ -42,6 +42,7 @@ use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, Variant, build, build_boot_image,
     busybox_build, nano_build, net_probe, relibc,
 };
+use netd::ring::{SWITCH_RUN_NS, SWITCH_STEP_BOUND_NS};
 
 const CONF4: &str = "/etc/nginx/nginx-fast-4.conf";
 const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
@@ -50,6 +51,13 @@ const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 12;
+/// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
+/// times the answer of the quiet stack, but not under `SATURATE_FLOOR`.
+const SATURATE_SAMPLES: usize = 4;
+/// What the host's clock may add to the longest run of the switch.
+const SATURATE_JITTER: Duration = Duration::from_millis(40);
+const SATURATE_BOUND: u32 = 40;
+const SATURATE_FLOOR: Duration = Duration::from_millis(4_000);
 /// How many programs flood a ring at once.
 const SATURATE_CONSUMERS: usize = 3;
 const READ_WITHIN: Duration = Duration::from_secs(60);
@@ -115,7 +123,10 @@ pub fn command(args: &[String]) -> Result<(), String> {
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
         [a] if a == "saturate" => probe(Scenario::Saturate),
-        _ => Err("usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames]".to_owned()),
+        _ => Err(
+            "usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames|saturate]"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1101,41 +1112,52 @@ fn frames(
 }
 
 /// `saturate`: three consumers keep their TX rings full of entries the switch refuses, so that
-/// every step of the switch finds more to do and its run never ends by itself. The switch is a
-/// level above the stack, the services and the programs on its CPU: without a pause of its own
-/// they would starve (the stack answers nothing, init's watchdog kills the service that was kept
-/// off the processor). The stack answers `posix-net stat` while the flood goes on, and the
-/// switch counts the pauses it took.
+/// every step of the switch finds more to do. The switch is a level above the stack, the services
+/// and the programs on its CPU; it takes a budget of the consumers' entries in each millisecond
+/// and pauses after a run of `SWITCH_RUN_NS`, so that they run. Without both, the stack answers
+/// nothing until the flood ends and init's watchdog kills the service as silent.
+///
+/// `posix-net stat` is asked `SATURATE_SAMPLES` times in the flood, each answer within its bound
+/// (`SATURATE_BOUND` times the answer of the quiet stack, at least `SATURATE_FLOOR`), and the
+/// longest run of the switch without a rest stays within a run and two steps.
 fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
+    let quiet = Instant::now();
+    stat(run, "quiet")?;
+    let bound = SATURATE_FLOOR.max(quiet.elapsed() * SATURATE_BOUND);
     for _ in 0..SATURATE_CONSUMERS {
         run.send(&format!("switch-probe saturate {SATURATE_SECS} &"))?;
         run.expect("# ", DIALOG_STEP)?;
     }
     let began = Instant::now();
+    let mut took = Vec::new();
     // The programs attach one after another; the stack answers while they do.
-    let (mut during, mut waited);
-    loop {
-        during = stat(run, "flood")?;
-        waited = began.elapsed();
-        // The flood is not over yet: the stack ran with the switch saturated.
+    while took.len() < SATURATE_SAMPLES {
+        let asked = Instant::now();
+        let s = stat(run, "flood")?;
+        let t = asked.elapsed();
         if run
             .lines()
             .iter()
             .any(|l| l.contains("switch-probe: saturate ok "))
         {
             return Err(format!(
-                "the stack answered {:.1} s after the flood began, after the flood ended: the switch kept it off the processor",
-                waited.as_secs_f64()
+                "the flood ended before sample {} was answered ({t:?}): the switch kept the stack off the processor",
+                took.len() + 1
             ));
         }
-        if during.consumers == SATURATE_CONSUMERS as u64 {
-            break;
+        if t > bound {
+            return Err(format!(
+                "sample {}: the stack answered `posix-net stat` after {t:?} of a flood (bound {bound:?}): the switch kept it off the processor",
+                took.len() + 1
+            ));
         }
-        if waited > Duration::from_secs(SATURATE_SECS * 3 / 4) {
+        if s.consumers == SATURATE_CONSUMERS as u64 {
+            took.push(t);
+        } else if began.elapsed() > Duration::from_secs(SATURATE_SECS * 3 / 4) {
             return Err(format!(
                 "{} consumers, wanted {SATURATE_CONSUMERS}: {}",
-                during.consumers, during.line
+                s.consumers, s.line
             ));
         }
     }
@@ -1151,15 +1173,24 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
     }
     let after = stat(run, "after")?;
     let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
-    if pauses == 0 {
+    let failed = counter(&after.line, "pause_failed").ok_or("no `pause_failed`")?;
+    let longest = counter(&after.line, "run_max_us").ok_or("no `run_max_us`")?;
+    // A run and a step is the bound of the thread (the model test of `drive` holds it to that);
+    // the clock is the host's wall clock, which a loaded TCG host stops for several milliseconds
+    // (9.4 ms seen), so the probe allows `SATURATE_JITTER` more. Without the pauses the run
+    // lasts as long as the flood.
+    let limit = (SWITCH_RUN_NS + SWITCH_STEP_BOUND_NS + SATURATE_JITTER.as_nanos() as u64) / 1_000;
+    if longest > limit {
         return Err(format!(
-            "the switch never paused in a flood of {SATURATE_SECS} s: {}",
+            "the longest run of the switch without a rest was {longest} us, over {limit} us: {}",
             after.line
         ));
     }
+    if failed != 0 {
+        return Err(format!("{failed} pauses did not happen: {}", after.line));
+    }
     notes.push(format!(
-        "the stack answered {:.1} s into a flood of {SATURATE_SECS} s on {SATURATE_CONSUMERS} rings; the switch paused {pauses} times",
-        waited.as_secs_f64()
+        "{SATURATE_SAMPLES} answers of the stack in a flood of {SATURATE_SECS} s on {SATURATE_CONSUMERS} rings: {took:?} (bound {bound:?}); {pauses} pauses, the longest run {longest} us (limit {limit} us)"
     ));
     Ok(())
 }
