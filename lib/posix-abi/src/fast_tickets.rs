@@ -76,11 +76,13 @@ pub struct Ticket {
     /// the network service's switch (PORT_HOLD), `NO_HOLD` for none: the
     /// stack's worker joins the group with it, and the descriptor goes with
     /// the ticket.
+    #[allow(dead_code)] // read by fastnet.rs, which the host tests of xtask do not build
     pub hold: i32,
 }
 
 impl Ticket {
     /// The ticket's SO_REUSEPORT.
+    #[allow(dead_code)] // used by fastnet.rs
     pub fn reuseport(&self) -> bool {
         self.options[REUSEPORT].is_some_and(|v| v != 0)
     }
