@@ -334,6 +334,10 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Some("layer") => return crate::fast_layer::command(&args[1..]),
         Some("nginx") => return crate::fast_nginx::command(&args[1..]),
         Some("scale") => return crate::fast_scale::command(&args[1..]),
+        Some("switch") => return crate::fast_switch::command(&args[1..]),
+        Some("switch-probe") => {
+            return crate::fast_switch::probe(crate::fast_switch::Scenario::Frames);
+        }
         _ => (false, args),
     };
     let machine = match rest {

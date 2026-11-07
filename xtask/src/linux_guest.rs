@@ -237,7 +237,7 @@ pub fn nginx_conf() -> &'static str {
 /// `nginx_conf` in the directives of the allowed list, in the types written
 /// in the file, and in the path of the pid file.
 pub fn nginx_fast_conf() -> &'static str {
-    crate::fast_nginx::NGINX_FAST_CONF
+    crate::fast_nginx::root_conf()
 }
 
 /// The path of the settings with the server of TLS in the guests of Linux

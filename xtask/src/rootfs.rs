@@ -258,7 +258,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 61] = [
+const SYSTEM_PATHS: [&str; 63] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -306,6 +306,8 @@ const SYSTEM_PATHS: [&str; 61] = [
     "/bin/posix-net",
     // The image of the probe of the second network device's owner.
     "/bin/fast-echo",
+    // The image of the switch's probe.
+    "/bin/switch-probe",
     // The image of the probe of F-Stack on its loopback.
     "/bin/fstack-probe",
     // The probe of the layer's sockets over the stack in a process.
@@ -321,6 +323,7 @@ const SYSTEM_PATHS: [&str; 61] = [
     // The images of nginx on the stack: the variant of its settings that
     // runs the worker under nobody.
     "/etc/nginx/nginx-fast-nobody.conf",
+    "/etc/nginx/nginx-fast-4.conf",
     "/etc/nginx/nginx-fast-sndbuf.conf",
     // ... and nginx's server of TLS with the key and the certificate the
     // probe CA made for it.
@@ -394,7 +397,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 15] = [
+pub const SHARED: [(&str, &str); 16] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -410,6 +413,7 @@ pub const SHARED: [(&str, &str); 15] = [
     ("net-dns", "probes/net-dns"),
     ("posix-net", "probes/posix-net"),
     ("fast-echo", "probes/fast-echo"),
+    ("switch-probe", "probes/switch-probe"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -432,7 +436,10 @@ fn shared_files() -> Vec<RootFile> {
     let mut files = Vec::new();
     // The owner of the second network device goes into the image of its
     // probe alone (fast_probe.rs).
-    for (name, _) in SHARED[1..].iter().filter(|(n, _)| *n != "fast-echo") {
+    for (name, _) in SHARED[1..]
+        .iter()
+        .filter(|(n, _)| !matches!(*n, "fast-echo" | "switch-probe"))
+    {
         let path: &'static str = match *name {
             "so-hello" => "/bin/so-hello",
             "so-image" => "/bin/so-image",
@@ -1400,6 +1407,39 @@ fn fast_nginx_files(image: &str) -> Vec<RootFile> {
     files
 }
 
+/// The files of the images of the switch: those of the images of nginx on
+/// the stack with the settings under nobody, `netd.conf` with the switch (and
+/// the address of the lease, no second device), and the probe of the ring.
+fn switch_files(image: &str) -> Vec<RootFile> {
+    let mut files = fast_nginx_files(image);
+    for (path, name, bytes) in [
+        (
+            "/etc/nginx/nginx-fast.conf",
+            "nginx-fast-switch.conf",
+            crate::fast_nginx::switch_conf().as_bytes(),
+        ),
+        (
+            "/etc/netd.conf",
+            "netd-switch.conf",
+            crate::fast_nginx::SWITCH_NETD_CONF,
+        ),
+    ] {
+        let file = files
+            .iter_mut()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{image}: no {path}"));
+        file.source = Some(Source::Bytes(name, bytes));
+    }
+    files.push(file("/bin/switch-probe", 0o755, ROOT, "switch-probe"));
+    files.push(of(
+        "/etc/nginx/nginx-fast-4.conf",
+        0o644,
+        ROOT,
+        Source::Bytes("nginx-fast-4.conf", crate::fast_switch::conf4().as_bytes()),
+    ));
+    files
+}
+
 /// The files of the images of nginx's measurement (`nginx-bench`): those of
 /// the shell with the network (nginx with the package's settings among
 /// them), the variant of the settings with one listening socket, the files
@@ -1558,6 +1598,9 @@ pub const IMAGES: &[&str] = &[
     "boot-fast-nginx-vz.img",
     "boot-fast-nginx-vz-steps.img",
     "boot-fast-scale.img",
+    "boot-fast-switch.img",
+    "boot-fast-switch-steps.img",
+    "boot-fast-switch-vz.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1772,7 +1815,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             }
             files
         }
-        "boot-fast-scale.img" => crate::fast_scale::files(fast_nginx_files(name)),
+        "boot-fast-scale.img" => crate::fast_scale::files(switch_files(name)),
+        "boot-fast-switch.img" | "boot-fast-switch-steps.img" | "boot-fast-switch-vz.img" => {
+            switch_files(name)
+        }
         "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
@@ -1791,6 +1837,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 ROOT,
                 Source::Bytes("netd.conf", crate::fast_probe::NETD_CONF_VZ_STATIC),
             ));
+            // The second device is claimed by the superuser (CLAIM).
+            if let Some(f) = files
+                .iter_mut()
+                .find(|f| f.path == "/etc/nginx/nginx-fast.conf")
+            {
+                f.source = Some(Source::Bytes(
+                    "nginx-fast-root.conf",
+                    crate::fast_nginx::root_conf().as_bytes(),
+                ));
+            }
             files
         }
         // The images on Apple VZ: the network service writes `resolv.conf`
@@ -2644,6 +2700,15 @@ mod tests {
                 }
                 "boot-fast-scale.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::Scale)
+                }
+                "boot-fast-switch.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Switch)
+                }
+                "boot-fast-switch-steps.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchSteps)
+                }
+                "boot-fast-switch-vz.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchVz)
                 }
                 "boot-nginx-probe.img" => crate::nginx_probe::programs(),
                 "boot-nginx-probe-steps.img" => crate::nginx_probe::steps_programs(),

@@ -72,6 +72,10 @@ pub const CRASH_IMAGE: &str = "boot-fast-nginx-crash.img";
 pub const STEPS_IMAGE: &str = "boot-fast-nginx-steps.img";
 pub const VZ_IMAGE: &str = "boot-fast-nginx-vz.img";
 pub const VZ_STEPS_IMAGE: &str = "boot-fast-nginx-vz-steps.img";
+/// The images of the switch: one device, nginx-fast under nobody on the shared address.
+pub const SWITCH_IMAGE: &str = "boot-fast-switch.img";
+pub const SWITCH_STEPS_IMAGE: &str = "boot-fast-switch-steps.img";
+pub const SWITCH_VZ_IMAGE: &str = "boot-fast-switch-vz.img";
 
 /// The settings of the package.
 pub const NGINX_FAST_CONF: &str = include_str!("../../tools/nginx/nginx-fast.conf");
@@ -153,14 +157,38 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(1);
 const FATAL_WITHIN: Duration = Duration::from_secs(2);
 const RUN_WITHIN: Duration = Duration::from_secs(300);
 
-/// The probe's settings: the package's with the server of TLS and the
-/// variable of the stack's counters (nginx drops the environment but for what
-/// `env` names).
-pub fn probe_conf() -> &'static str {
+/// `/etc/netd.conf` of the images of the switch: eight consumers, 16 384 flows.
+pub const SWITCH_NETD_CONF: &[u8] = b"switch 8\nflows 16384\n";
+
+/// The package's settings with the worker under root: the images of the
+/// second device (CLAIM wants the superuser) run these until the second
+/// device goes (stage Sh4d).
+pub fn root_conf() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
+        crate::nginx_probe::replaced(NGINX_FAST_CONF, "user nobody nobody;", "user root;")
+    })
+}
+
+/// The probe's settings of the second-device images: the package's under
+/// root with the server of TLS and the variable of the stack's counters
+/// (nginx drops the environment but for what `env` names).
+pub fn probe_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(root_conf()))
+}
+
+/// The probe's settings of the images of the switch: the package's under
+/// nobody, with the same additions.
+pub fn switch_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(NGINX_FAST_CONF))
+}
+
+fn with_tls(base: &str) -> String {
+    {
         let text = crate::nginx_probe::replaced(
-            NGINX_FAST_CONF,
+            base,
             "worker_shutdown_timeout 5s;\n",
             "worker_shutdown_timeout 5s;\nenv STAFETO_FAST_STATS;\n",
         );
@@ -172,7 +200,7 @@ pub fn probe_conf() -> &'static str {
                 crate::nginx_probe::TLS_CONF_PATH
             ),
         )
-    })
+    }
 }
 
 /// The probe's settings with the worker under nobody.
@@ -210,14 +238,24 @@ pub enum Kind {
     Vz,
     /// Apple VZ, the service counting its steps.
     VzSteps,
-    /// The image of scale on QEMU (`fast-probe scale`).
+    /// The image of scale on QEMU (`fast-probe scale`): on the switch.
     Scale,
+    /// The switch on QEMU (`fast-probe switch`): one device, the service built for the probe.
+    Switch,
+    /// The switch, the service counting its steps.
+    SwitchSteps,
+    /// The switch on Apple VZ (the measurement of F1 through the switch builds it).
+    #[allow(dead_code)]
+    SwitchVz,
 }
 
 /// The programs of the image: those of the image with the network and both
 /// devices, init's table for the program, and `nginx-fast`.
 pub fn programs(kind: Kind) -> &'static [ImageProgram] {
-    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 6] = [
+    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 9] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
@@ -232,26 +270,31 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
         Kind::Vz => 3,
         Kind::VzSteps => 4,
         Kind::Scale => 5,
+        Kind::Switch => 6,
+        Kind::SwitchSteps => 7,
+        Kind::SwitchVz => 8,
     };
     LISTS[at].get_or_init(|| {
-        let vz = matches!(kind, Kind::Vz | Kind::VzSteps);
+        let vz = matches!(kind, Kind::Vz | Kind::VzSteps | Kind::SwitchVz);
         let mut programs = match kind {
             Kind::Vz => net::vz_programs(true).to_vec(),
+            Kind::SwitchVz => net::vz_programs(false).to_vec(),
             Kind::VzSteps => net::vz_steps_programs(true).to_vec(),
             _ => net::programs().to_vec(),
         };
-        let table: &'static [&'static str] = if vz {
-            &["table-fast-nginx-vz"]
-        } else if kind == Kind::Scale {
-            &["table-fast-scale"]
-        } else {
-            &["table-fast-nginx"]
+        let table: &'static [&'static str] = match kind {
+            Kind::SwitchVz => &["table-fast-switch-vz"],
+            Kind::Switch | Kind::SwitchSteps => &["table-fast-switch"],
+            Kind::Scale => &["table-fast-switch-scale"],
+            _ if vz => &["table-fast-nginx-vz"],
+            _ => &["table-fast-nginx"],
         };
         for program in &mut programs {
             match (program.0, kind) {
                 ("init", _) => program.3 = table,
                 ("netd", Kind::Crash) => program.3 = &["probe"],
-                ("netd", Kind::Steps) => program.3 = &["steps"],
+                ("netd", Kind::Steps | Kind::SwitchSteps) => program.3 = &["steps"],
+                ("netd", Kind::Switch | Kind::Scale) => program.3 = &["probe"],
                 _ => {}
             }
         }
@@ -298,6 +341,9 @@ fn image_of(kind: Kind) -> &'static str {
         Kind::Vz => VZ_IMAGE,
         Kind::VzSteps => VZ_STEPS_IMAGE,
         Kind::Scale => crate::fast_scale::IMAGE,
+        Kind::Switch => SWITCH_IMAGE,
+        Kind::SwitchSteps => SWITCH_STEPS_IMAGE,
+        Kind::SwitchVz => SWITCH_VZ_IMAGE,
     }
 }
 
@@ -1410,7 +1456,9 @@ mod tests {
     #[test]
     fn the_settings_are_those_the_scenarios_need() {
         let package = NGINX_FAST_CONF;
-        assert!(package.contains("user root;"));
+        assert!(package.contains("user nobody nobody;"));
+        assert!(root_conf().contains("user root;"));
+        assert!(switch_conf().contains("user nobody nobody;"));
         assert!(package.contains("worker_processes 1;"));
         assert!(package.contains("worker_shutdown_timeout 5s;"));
         assert!(package.contains("listen 80;"));
