@@ -142,6 +142,8 @@ pub struct Stats {
     pub tx_consumer: AtomicU32,
     /// The frames of the wire each consumer got (the probe reads the share of each worker).
     pub rx_by: [AtomicU32; 8],
+    /// Parked SYNs handed to a member that joined.
+    pub park_given: AtomicU32,
 }
 
 impl Stats {
@@ -161,6 +163,7 @@ impl Stats {
             rx_consumer: AtomicU32::new(0),
             tx_consumer: AtomicU32::new(0),
             rx_by: [const { AtomicU32::new(0) }; 8],
+            park_given: AtomicU32::new(0),
         }
     }
 }
@@ -615,6 +618,10 @@ impl Switch {
             INNER
                 .stats
                 .rx_consumer
+                .fetch_add(given as u32, Ordering::Relaxed);
+            INNER
+                .stats
+                .park_given
                 .fetch_add(given as u32, Ordering::Relaxed);
             more_park = given == PARK_GIVE;
         }

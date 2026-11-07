@@ -16,7 +16,8 @@
 //!   reset of the device.
 //! * `switch kill`: under a stream of new connections `kill -9` of a worker
 //!   (one worker, then four): no connection fails, the first connection after
-//!   the kill is answered, the device is never reset.
+//!   the kill is answered, the device is never reset; with one worker the SYNs
+//!   of the gap wait in the park and the new worker gets them.
 //! * `switch idle`: a request after 2 s of rest, on an open connection and on
 //!   a new one, is answered within 50 ms (a lost wake would wait for a tick).
 //! * `switch steps`: the start and the first pages under -icount with the
@@ -92,6 +93,8 @@ struct Stat {
     hairpin: u64,
     own_to_device: u64,
     tx_refused: u64,
+    /// Parked SYNs given to a member that joined.
+    park_given: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
     refused_by: Vec<u64>,
     rx_by: Vec<u64>,
@@ -151,6 +154,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
         hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
         own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
         tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
+        park_given: counter(&line, "park_given").ok_or("park_given")?,
         rx_by,
         line,
     })
@@ -455,6 +459,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
             std::thread::sleep(Duration::from_millis(50));
         }
         let before = stream.answered();
+        let given_before = stat(run, "kill")?.park_given;
         run.send(&format!("kill -9 {}", workers[0]))?;
         run.expect_line(
             "the new worker",
@@ -468,6 +473,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         }
         let after = stream.answered();
         let failures = stream.finish();
+        let given = stat(run, "kill")?.park_given - given_before;
         if !failures.is_empty() {
             return Err(format!(
                 "{count} workers: {} requests failed over the kill, the first {:?}",
@@ -480,8 +486,18 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
                 "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
             ));
         }
+        // With one worker no member is live between the kill and the new worker's JOIN: the
+        // stream's connections in that gap wait in the park and are given to it (the stream
+        // opens one every 20 ms, the restart takes far longer, also on TCG). Without the park
+        // each of them waits for the repeat of its SYN.
+        if count == 1 && given == 0 {
+            return Err(
+                "one worker: no SYN was parked over the kill and given to the new worker"
+                    .to_owned(),
+            );
+        }
         notes.push(format!(
-            "{count} worker(s): {before} answered before the kill, {after} in all, no failure"
+            "{count} worker(s): {before} answered before the kill, {after} in all, no failure, {given} parked SYN(s) given"
         ));
         run.send(&format!("kill -QUIT {m}; wait {m}; echo ngx-q{count}-end"))?;
         run.expect(&format!("ngx-q{count}-end"), Duration::from_secs(30))?;
