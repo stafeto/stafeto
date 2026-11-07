@@ -111,7 +111,7 @@ pub struct Client {
     /// The entry of the session's shared buffer (BUFFER) in `Net::buffers`.
     pub buffer: Option<u8>,
     /// The consumer number of the switch the session attached (ATTACH).
-    pub consumer: Option<u8>,
+    pub consumer: Option<netd::books::Mine>,
 }
 
 pub use netd::births::Birth;
@@ -375,10 +375,7 @@ pub struct Net {
     pub deadline_new: bool,
     /// The groups of ports of the switch (PORT_HOLD): what the registry compares a bind with,
     /// until the switch says the group is gone (`Back::Freed`).
-    pub holds: [crate::consumers::Hold; netd::switchlogic::tables::MAX_GROUPS],
-    /// Descriptions of ports closed whose group has not been told to let go: a count for each
-    /// group (the driver sends `Command::Release`).
-    pub release_due: [u8; netd::switchlogic::tables::MAX_GROUPS],
+    pub holds: netd::books::Holds,
     /// The SO_REUSEPORT groups.
     pub groups: Groups,
     /// The owners of the sets of places (queue sockets of the members of
@@ -729,8 +726,7 @@ impl Net {
             self.ports(sock.proto).release(sock.port);
         }
         if sock.hold != 0 {
-            let due = &mut self.release_due[usize::from(sock.hold) - 1];
-            *due = due.saturating_add(1);
+            self.holds.closed(sock.hold);
             self.cleanup_wanted = true;
         }
     }
@@ -793,7 +789,7 @@ impl Net {
         with_connected: bool,
     ) -> impl Iterator<Item = Binding> + '_ {
         let connected = with_connected.then(|| self.connected.chain(port));
-        let held = self.holds.iter().filter_map(move |h| h.binding(port));
+        let held = self.holds.list.iter().filter_map(move |h| h.binding(port));
         self.chains
             .chain(port)
             .chain(connected.into_iter().flatten())

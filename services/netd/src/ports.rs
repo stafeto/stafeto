@@ -133,7 +133,7 @@ impl PortMap {
         self.held[usize::from(port)] > 0 || self.is_reserved(port)
     }
 
-    fn is_reserved(&self, port: u16) -> bool {
+    pub fn is_reserved(&self, port: u16) -> bool {
         if port >= EPHEMERAL_FIRST && u32::from(port - EPHEMERAL_FIRST) < EPHEMERAL_COUNT {
             let n = usize::from(port - EPHEMERAL_FIRST);
             return self.reserved[n / 64] >> (n % 64) & 1 != 0;

@@ -12,13 +12,14 @@
 //! frames, and what it sends is checked by the switch. PORT_HOLD takes the superuser for
 //! ports below 1024, once, at the call, as BIND does.
 
-use crate::net::Client;
+use crate::net::{Client, Net};
 use crate::switch;
 use crate::{Driver, dma};
 use abi::{Access, Error, Rights};
+use netd::books::{Chunks, Hold, Leave, Owners, hold_ports, leave_by, ports_free_of_blocks};
 use netd::ports::{Binding, Proto, conflicts};
 use netd::switchlogic::commands::{Back, Command};
-use netd::switchlogic::tables::{BLOCK_PORTS, Blocks, Both, MAX_CONSUMERS, MAX_GROUPS};
+use netd::switchlogic::tables::{BLOCK_PORTS, Blocks, Both, MAX_CONSUMERS};
 use proto_net::switch::{self as sw, Attached};
 use proto_net::{Config, code};
 use proto_wire::Status;
@@ -34,52 +35,6 @@ const RING_NEEDS: Rights = Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0);
 /// The label of the copies of the switch's channel consumers get (their number is added).
 const GATE_LABEL: u64 = 0x5357_0000;
 
-/// A group of ports the registry holds for the switch: from a PORT_HOLD to the switch's
-/// `Back::Freed`. All zeros is an unused slot.
-#[derive(Clone, Copy)]
-pub struct Hold {
-    used: bool,
-    /// 6 or 17.
-    proto: u8,
-    count: u8,
-    first: u16,
-    /// Both holders set SO_REUSEPORT, and the effective user that did.
-    shared: bool,
-    uid: u32,
-    /// Descriptions that hold the group (places); the last one letting go ends it.
-    holders: u32,
-}
-
-impl Hold {
-    /// What the registry compares a bind to `port` with: the group is a listening socket on
-    /// every address.
-    pub fn binding(&self, port: u16) -> Option<Binding> {
-        let inside =
-            port >= self.first && u32::from(port) < u32::from(self.first) + u32::from(self.count);
-        (self.used && inside).then_some(Binding {
-            proto: if self.proto == 6 {
-                Proto::Tcp
-            } else {
-                Proto::Udp
-            },
-            address: [0; 4],
-            port,
-            listening: true,
-            connected: false,
-            reuse: false,
-            share_uid: self.shared.then_some(self.uid),
-        })
-    }
-
-    fn proto(&self) -> Proto {
-        if self.proto == 6 {
-            Proto::Tcp
-        } else {
-            Proto::Udp
-        }
-    }
-}
-
 /// A consumer the stack thread keeps: its channel (the switch wakes it with a copy of the raw
 /// handle) until the switch has said it is out of its tables.
 struct Entry {
@@ -93,6 +48,8 @@ struct Entry {
     ring: Option<Handle<Memory>>,
     /// The command that gives the ring to the switch, once all of it is mapped.
     pending: Option<Command>,
+    /// The switch has the ring (the command went into its ring of commands).
+    given: bool,
     /// The consumer left (its session went, or its ring broke) and the switch was told.
     leaving: bool,
     /// The ring is being taken out of the map (the switch is done with it).
@@ -109,6 +66,9 @@ pub struct Side {
     pub max: u8,
     pub blocks: Blocks,
     entries: [Option<Entry>; MAX_CONSUMERS],
+    /// The generation of each consumer number in use: a session's pair that does not match
+    /// names a consumer that has gone.
+    pub owners: Owners,
     /// Consumers whose DETACH did not fit in the ring of commands.
     detach_due: u8,
     /// A copy of the switch's channel with NOTIFY and DUPLICATE, which the copies for the
@@ -129,6 +89,7 @@ impl Side {
             max,
             blocks: Blocks::new(),
             entries: [const { None }; MAX_CONSUMERS],
+            owners: Owners::new(),
             detach_due: 0,
             gate,
             level,
@@ -257,17 +218,18 @@ impl Driver<'_> {
             mapped: 0,
             ring: Some(ring),
             pending: Some(attach),
+            given: false,
             leaving: false,
             unmapping: false,
         });
-        s.data.consumer = Some(c);
+        s.data.consumer = Some(self.side.owners.give(c, generation));
         self.tell(crate::BACK);
         Answer::Reply([copy.erase()].into())
     }
 
     /// One chunk of the mapping of each ring that is not mapped yet; when a ring is whole the
     /// switch is given it. True when work is left.
-    fn map_step(&mut self) -> bool {
+    fn map_step(&mut self, step: &mut Chunks) -> bool {
         let Some(process) = self.net.process.as_deref() else {
             return false;
         };
@@ -286,6 +248,11 @@ impl Driver<'_> {
                     continue;
                 };
                 let len = (e.size - e.mapped).min(MAP_CHUNK * PAGE as u64);
+                // One chunk in all the rings in a step: a ring that finds it spent waits.
+                if !step.take(len / PAGE as u64) {
+                    left = true;
+                    continue;
+                }
                 if let Err(error) = sys::mem_map(
                     process,
                     ring,
@@ -296,7 +263,6 @@ impl Driver<'_> {
                 ) {
                     rt::println!("net: switch attach: mapping the ring of {c}: {error:?}");
                     let _ = sys::notify(&e.notify, sw::WAKE_BROKEN);
-                    e.pending = None;
                     failed |= 1 << c;
                     left = true;
                     continue;
@@ -313,6 +279,7 @@ impl Driver<'_> {
                 && switch::command(cmd)
             {
                 e.pending = None;
+                e.given = true;
             } else if e.pending.is_some() {
                 left = true;
             }
@@ -326,7 +293,7 @@ impl Driver<'_> {
     }
 
     /// One chunk of the unmapping of each ring the switch is done with. True when work is left.
-    fn unmap_step(&mut self) -> bool {
+    fn unmap_step(&mut self, step: &mut Chunks) -> bool {
         let Some(process) = self.net.process.as_deref() else {
             return false;
         };
@@ -343,6 +310,10 @@ impl Driver<'_> {
                 let chunk = MAP_CHUNK * PAGE as u64;
                 let from = (e.mapped - 1) / chunk * chunk;
                 let len = e.mapped - from;
+                if !step.take(len / PAGE as u64) {
+                    left = true;
+                    continue;
+                }
                 // SAFETY: the switch thread has said the ring is out of its tables (`Detached`
                 // or `Refused`) or never had it, and reads it no more.
                 if let Err(error) =
@@ -394,16 +365,17 @@ impl Driver<'_> {
         let (first, count) = (hold.first as u16, hold.count as u8);
         let shared = hold.flags & sw::REUSEPORT != 0;
         // The group of the same ports whose holder shares them with this user.
-        let same = self.net.holds.iter().position(|h| {
-            h.used
-                && h.holders > 0
-                && (h.proto, h.first, h.count) == (hold.protocol as u8, first, count)
-                && shared
-                && h.shared
-                && h.uid == uid
-        });
+        let same = self
+            .net
+            .holds
+            .same(hold.protocol as u8, first, count, shared, uid);
         if same.is_none() {
-            for port in first..first + u16::from(count) {
+            // Ports inside the block of a consumer's temporary ports are not for a group:
+            // the switch would refuse them and the group would stay in the books.
+            if !ports_free_of_blocks(self.net.ports(proto), first, count) {
+                return refuse(proto_net::IN_USE);
+            }
+            for port in hold_ports(first, count) {
                 let new = Binding {
                     proto,
                     address: [0; 4],
@@ -420,7 +392,7 @@ impl Driver<'_> {
         }
         let group = match same {
             Some(g) => g,
-            None => match self.net.holds.iter().position(|h| !h.used) {
+            None => match self.net.holds.free_slot() {
                 Some(g) => g,
                 None => return limit(),
             },
@@ -440,23 +412,29 @@ impl Driver<'_> {
             self.net.socks[place] = crate::net::Sock::EMPTY;
             return limit();
         }
-        let book = &mut self.net.holds[usize::from(group) - 1];
-        if book.used {
-            book.holders += 1;
-        } else {
-            *book = Hold {
-                used: true,
-                proto: hold.protocol as u8,
-                count,
-                first,
-                shared,
-                uid,
-                holders: 1,
-            };
-            for port in first..first + u16::from(count) {
-                self.net.ports(proto).hold(port);
-            }
-        }
+        let book = Hold {
+            proto: hold.protocol as u8,
+            count,
+            first,
+            shared,
+            uid,
+            ..Hold::default()
+        };
+        let Net {
+            holds,
+            tcp_ports,
+            udp_ports,
+            ..
+        } = &mut *self.net;
+        holds.add(
+            group,
+            book,
+            if proto == Proto::Tcp {
+                tcp_ports
+            } else {
+                udp_ports
+            },
+        );
         self.net.places.hold(place);
         s.data.held.add(place);
         match sw::write_place_reply(self.net.places.name(place), r.reply()) {
@@ -476,9 +454,12 @@ impl Driver<'_> {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        let Some(c) = s.data.consumer else {
+        // The pair of the session names the consumer it attached; once that one is gone the
+        // session has none, whoever holds the number now.
+        let Some(mine) = s.data.consumer.filter(|m| self.side.owners.is_current(*m)) else {
             return refuse(proto_net::INVALID);
         };
+        let c = mine.number;
         let Some(i) = self.net.find_any(&s.data.held, place) else {
             return refuse(proto_net::BAD_FD);
         };
@@ -494,8 +475,10 @@ impl Driver<'_> {
 
     /// The session of a consumer went: the consumer leaves the switch.
     pub(crate) fn consumer_gone(&mut self, s: &mut Sess) {
-        if let Some(c) = s.data.consumer.take() {
-            self.leave(c);
+        if let Some(mine) = s.data.consumer.take()
+            && self.side.owners.is_current(mine)
+        {
+            self.leave(mine.number);
         }
     }
 
@@ -508,8 +491,9 @@ impl Driver<'_> {
         if core::mem::replace(&mut e.leaving, true) {
             return;
         }
+        self.side.owners.drop_number(c);
         self.side.blocks.release(c, seconds());
-        if e.pending.is_some() {
+        if leave_by(e.given) == Leave::Free {
             // The switch never had the ring: no flow of it, the number is free at once.
             let swept = self.side.blocks.swept_round();
             self.side.blocks.detached(c, swept);
@@ -554,9 +538,12 @@ impl Driver<'_> {
             taken += 1;
             self.answer(back);
         }
-        let mapping = self.map_step();
-        let unmapping = self.unmap_step();
-        if taken == 16 || self.side.detach_due != 0 || mapping || unmapping {
+        // One chunk of pages in all in a step, to map or to unmap.
+        let mut chunks = Chunks::new(MAP_CHUNK);
+        let mapping = self.map_step(&mut chunks);
+        let unmapping = self.unmap_step(&mut chunks);
+        let address = self.switch_address();
+        if taken == 16 || self.side.detach_due != 0 || mapping || unmapping || address {
             self.tell(crate::BACK);
         }
         let now = seconds();
@@ -594,41 +581,27 @@ impl Driver<'_> {
                 self.leave(consumer);
             }
             Back::Freed { group } => {
-                let book = &mut self.net.holds[usize::from(group) - 1];
-                if book.used {
-                    let (proto, first, count) = (book.proto(), book.first, book.count);
-                    *book = Hold {
-                        used: false,
-                        proto: 0,
-                        count: 0,
-                        first: 0,
-                        shared: false,
-                        uid: 0,
-                        holders: 0,
-                    };
-                    for port in first..first + u16::from(count) {
-                        self.net.ports(proto).release(port);
-                    }
-                }
+                let net = &mut *self.net;
+                net.holds
+                    .freed(group, &mut net.tcp_ports, &mut net.udp_ports);
             }
             Back::Failed { group } => {
                 rt::println!("net: switch refused a command for group {group}");
+                let net = &mut *self.net;
+                net.holds
+                    .failed(group, &mut net.tcp_ports, &mut net.udp_ports);
             }
         }
     }
 
     /// The descriptions of ports that closed: the switch is told, one holder each.
     pub(crate) fn drain_releases(&mut self) {
-        for g in 0..MAX_GROUPS {
-            while self.net.release_due[g] > 0 {
-                if !switch::command(Command::Release { group: g as u8 + 1 }) {
-                    self.tell(crate::BACK);
-                    return;
-                }
-                self.net.release_due[g] -= 1;
-                let h = &mut self.net.holds[g];
-                h.holders = h.holders.saturating_sub(1);
+        while let Some(group) = self.net.holds.next_due() {
+            if self.net.holds.switch_has(group) && !switch::command(Command::Release { group }) {
+                self.tell(crate::BACK);
+                return;
             }
+            self.net.holds.told(group);
         }
     }
 }

@@ -529,7 +529,7 @@ fn main(_: u64) -> u64 {
         mac,
         second,
         own_said: false,
-        switch_ip: ([0; 4], 0),
+        switch_ip: netd::books::AddressSync::new(),
         told: 0,
         cleanup_due: false,
         armed: None,
@@ -565,7 +565,9 @@ fn main(_: u64) -> u64 {
             second: second_objects,
         },
     };
-    driver.switch_address();
+    if driver.switch_address() {
+        driver.tell(BACK);
+    }
     // The static address names its servers at once; a lease does in its event.
     if driver.stack.lease.is_some() {
         driver.tell(RESOLV);
@@ -874,7 +876,7 @@ struct Maps {
 struct Driver<'a> {
     /// The address the switch was last told (a renewal of the lease that changes nothing is
     /// not told: consumers end their processes on a new address).
-    switch_ip: ([u8; 4], u8),
+    switch_ip: netd::books::AddressSync,
     device: NetDevice,
     stack: Stack<'static>,
     net: &'a mut Net,
@@ -1259,25 +1261,31 @@ impl Driver<'_> {
         self.ask_due = true;
         self.asked = 0;
         self.net.step_due = true;
-        self.switch_address();
+        if self.switch_address() {
+            self.tell(BACK);
+        }
     }
 
-    /// The switch and its consumers learn the address (the lease, or none).
-    fn switch_address(&mut self) {
+    /// The switch and its consumers learn the address (the lease, or none). True when the
+    /// switch's ring of commands was full: the address stays due, and the step of the answers
+    /// tries again.
+    fn switch_address(&mut self) -> bool {
         if self.side.max == 0 {
-            return;
+            return false;
         }
         let (ip, prefix) = self
             .stack
             .lease
             .map_or(([0; 4], 0), |lease| (lease.address, lease.prefix.min(32)));
-        if core::mem::replace(&mut self.switch_ip, (ip, prefix)) == (ip, prefix) {
-            return;
+        if !self.switch_ip.due((ip, prefix)) {
+            return false;
         }
         if !switch::command(netd::switchlogic::commands::Command::Address { ip, prefix }) {
-            rt::println!("net: the switch's ring of commands is full (address)");
+            return true;
         }
+        self.switch_ip.done((ip, prefix));
         self.tell_consumers(proto_net::switch::WAKE_ADDRESS);
+        false
     }
 
     /// Asks the gateway and the name servers on the link for their hardware
