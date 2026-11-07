@@ -280,7 +280,7 @@ pub(crate) fn port_hold(port: u16, reuseport: bool, kept: i32) -> Result<Option<
             let held = publish(place, true, kept).map(Some)?;
             // The stack of this process (and of the workers it forks) owns the port: a
             // packet of the loopback network for it stays inside (`fast::own_port`).
-            crate::fast::note_own_port(port);
+            crate::fast::note_own_port(port, place);
             Ok(held)
         }
         Err(Status::UnknownMethod) => Ok(None),
@@ -357,6 +357,8 @@ pub(crate) fn epoll_drop(set: u32) {
 /// CLOSE of a description, the hook of the last close of a descriptor. A
 /// service that ended holds nothing: the close succeeds.
 fn close_description(description: u32) {
+    // The ports a hold description named are no longer this process's own.
+    crate::fast::forget_own_ports(description);
     // The reply is a long one: READY at once, or WAIT k while a stream with a
     // linger time has data the peer has not acknowledged. A signal or the end
     // of the service ends the wait, and the close is done all the same.

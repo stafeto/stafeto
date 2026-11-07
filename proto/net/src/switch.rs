@@ -139,6 +139,84 @@ const _: () = assert!(Layout::DEFAULT.rx_cells() == 5 * PAGE);
 const _: () = assert!(Layout::DEFAULT.tx_cells() == 517 * PAGE);
 const _: () = assert!(COUNTERS + 8 <= PAGE && FRAME_MAX <= CELL);
 
+/// The ports a consumer's stack owns: the ports its process holds with the switch (one entry
+/// for each description of a hold, the place's number) and the block of temporary ports of its
+/// ring. Words and no lock: the glue of the stack asks inside the layer's lock for every packet
+/// of its loopback interface. An entry goes with the last close of its description, so a port
+/// whose group the process left is no longer counted as its own.
+pub struct OwnPorts {
+    /// Entry `i` is `port + 1` of a hold, 0 for none.
+    ports: [core::sync::atomic::AtomicU32; OwnPorts::ENTRIES],
+    /// The description of entry `i`, plus one.
+    descriptions: [core::sync::atomic::AtomicU32; OwnPorts::ENTRIES],
+    /// The first port and the count of the block, `first << 16 | count` (0: none).
+    block: core::sync::atomic::AtomicU32,
+}
+
+impl OwnPorts {
+    pub const ENTRIES: usize = 32;
+
+    pub const fn new() -> OwnPorts {
+        OwnPorts {
+            ports: [const { core::sync::atomic::AtomicU32::new(0) }; OwnPorts::ENTRIES],
+            descriptions: [const { core::sync::atomic::AtomicU32::new(0) }; OwnPorts::ENTRIES],
+            block: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_block(&self, first: u16, count: u16) {
+        use core::sync::atomic::Ordering::Release;
+        self.block
+            .store(u32::from(first) << 16 | u32::from(count), Release);
+    }
+
+    /// The description `description` holds `port`. False when the table is full (the packet for
+    /// such a port goes to the switch, which hands it back to the stack when no one else holds
+    /// it: the way is longer and no wrong answer follows).
+    pub fn note(&self, port: u16, description: u32) -> bool {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        for (p, d) in self.ports.iter().zip(&self.descriptions) {
+            if p.load(Acquire) == 0
+                && d.compare_exchange(0, description.wrapping_add(1), AcqRel, Acquire)
+                    .is_ok()
+            {
+                p.store(u32::from(port) + 1, Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The last close of description `description`: its entries go.
+    pub fn forget(&self, description: u32) {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        for (p, d) in self.ports.iter().zip(&self.descriptions) {
+            if d.load(Acquire) == description.wrapping_add(1) {
+                p.store(0, Release);
+                d.store(0, Release);
+            }
+        }
+    }
+
+    /// Whether `port` is one of the block or of a hold that is still open.
+    pub fn owns(&self, port: u16) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+        let block = self.block.load(Acquire);
+        let (first, count) = ((block >> 16) as u16, block & 0xffff);
+        u32::from(port).wrapping_sub(u32::from(first)) < count
+            || self
+                .ports
+                .iter()
+                .any(|p| p.load(Acquire) == u32::from(port) + 1)
+    }
+}
+
+impl Default for OwnPorts {
+    fn default() -> OwnPorts {
+        OwnPorts::new()
+    }
+}
+
 /// An entry of DONE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Done {
@@ -364,6 +442,33 @@ mod tests {
         ] {
             assert_eq!(Layout::new(rx, tx), None, "{rx} {tx}");
         }
+    }
+
+    #[test]
+    fn a_port_is_own_while_a_description_of_its_hold_is_open() {
+        let own = OwnPorts::new();
+        own.set_block(49152, 512);
+        assert!(own.owns(49152) && own.owns(49663) && !own.owns(49664) && !own.owns(49151));
+        assert!(!own.owns(80));
+        assert!(own.note(80, 7));
+        // A second description of the same group (a fork's copy, a second socket).
+        assert!(own.note(80, 9));
+        assert!(own.owns(80));
+        own.forget(7);
+        assert!(own.owns(80), "one description of the group is still open");
+        own.forget(9);
+        assert!(!own.owns(80), "the last close takes the port out");
+        // A close of a description that holds nothing takes nothing out.
+        own.forget(1234);
+        assert!(own.owns(49200));
+        // The table of 32 entries fills and refuses the 33rd, and a close makes room.
+        for i in 0..OwnPorts::ENTRIES as u32 {
+            assert!(own.note(1000 + i as u16, i));
+        }
+        assert!(!own.note(2000, 99));
+        own.forget(3);
+        assert!(own.note(2000, 99));
+        assert!(own.owns(2000) && !own.owns(1003));
     }
 
     #[test]

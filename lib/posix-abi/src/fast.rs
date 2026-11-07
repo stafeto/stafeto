@@ -28,7 +28,7 @@
 
 use crate::constants::{EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EPERM, ETIMEDOUT};
 use crate::threads;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use posix_sync::fast_bank::CLIENT_GONE;
 pub use posix_sync::fast_bank::{FAST_LABEL, FAST_MASK, GONE};
 use proto_net::fast::{self as wire, Claimed, RING_PAGES};
@@ -455,9 +455,9 @@ pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
         pause(crate::wait::now() + RETRY_NS, true)?;
     };
     CLAIMED.store(true, Ordering::Release);
-    BLOCK.store(
-        u64::from(attached.block_first) << 16 | u64::from(attached.block_count.min(0xffff)),
-        Ordering::Release,
+    OWN.set_block(
+        attached.block_first.min(0xffff) as u16,
+        attached.block_count.min(0xffff) as u16,
     );
     SWITCH.store(switch.map_or(0, |h| h.into_raw().0), Ordering::Release);
     *out = FastClaim {
@@ -496,38 +496,25 @@ pub fn port_join(fd: i32) -> Result<(), i32> {
     crate::net::port_join(fd)
 }
 
-/// The ports this process holds (PORT_HOLD) and the block of ephemeral ports of its consumer,
-/// which the glue of the stack asks for (`stafeto_fast_own_port`) to tell a packet of the
-/// loopback network for its own sockets from one for another stack. Words, not a lock: the
-/// glue asks inside the layer's lock on the path of every such packet. A forked worker has the
-/// words as the master left them (the master holds the ports before it forks).
-const OWN_PORTS: usize = 32;
-static OWN: [AtomicU32; OWN_PORTS] = [const { AtomicU32::new(0) }; OWN_PORTS];
-/// The first port and the count of the consumer's block, `first << 16 | count` (0: none).
-static BLOCK: AtomicU64 = AtomicU64::new(0);
+/// The ports this process's stack owns, which the glue of the stack asks for
+/// (`stafeto_fast_own_port`) to tell a packet of the loopback network for its own sockets from one
+/// for another stack (`proto_net::switch::OwnPorts`). A forked worker has the words as the master
+/// left them (the master holds the ports before it forks).
+static OWN: proto_net::switch::OwnPorts = proto_net::switch::OwnPorts::new();
 
-/// Remembers that this process's stack owns `port` (the 33rd and later are not kept: the
-/// packet for such a port goes to the switch, which hands it back to the stack when no one
-/// else holds it; the loop is longer, and no wrong answer follows).
-pub fn note_own_port(port: u16) {
-    let word = u32::from(port) + 1;
-    for w in &OWN {
-        match w.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(held) if held == word => return,
-            Err(_) => {}
-        }
-    }
+/// Remembers that the description `description` holds `port` for this process's stack.
+pub fn note_own_port(port: u16, description: u32) {
+    OWN.note(port, description);
+}
+
+/// The last close of `description` in this process: the ports it held are no longer own.
+pub fn forget_own_ports(description: u32) {
+    OWN.forget(description);
 }
 
 /// Whether `port` belongs to the stack of this process: a held port, or in its block.
 pub fn own_port(port: u16) -> bool {
-    let block = BLOCK.load(Ordering::Acquire);
-    let (first, count) = ((block >> 16) as u16, (block & 0xffff) as u32);
-    u32::from(port).wrapping_sub(u32::from(first)) < count
-        || OWN
-            .iter()
-            .any(|w| w.load(Ordering::Acquire) == u32::from(port) + 1)
+    OWN.owns(port)
 }
 
 /// Whether the process is a consumer of the switch (not an owner of a device).
