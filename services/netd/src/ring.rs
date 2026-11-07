@@ -1160,6 +1160,6 @@ mod tests {
 
     #[test]
     fn the_pause_costs_the_switch_under_a_twentieth_of_its_time() {
-        assert!(SWITCH_PAUSE_NS * 20 <= SWITCH_RUN_NS + SWITCH_PAUSE_NS);
+        const { assert!(SWITCH_PAUSE_NS * 20 <= SWITCH_RUN_NS + SWITCH_PAUSE_NS) };
     }
 }
