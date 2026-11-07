@@ -178,7 +178,7 @@ pub fn route_loop(t: &mut Tables, frame: &[u8]) -> Decision {
     }
     let d = match ip.proto {
         IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
-        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame, false),
         _ => Decision::Stack,
     };
     match d {
@@ -202,6 +202,9 @@ pub fn unpark(t: &mut Tables, budget: usize) -> usize {
         if let d @ Decision::Consumer { .. } = route(t, frame, Source::Wire) {
             deliver(t, d, frame);
             given += 1;
+        } else {
+            // The group went, or its member filled up between the choice and the routing.
+            t.park_dropped += 1;
         }
     }
     given
@@ -235,7 +238,7 @@ pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     match ip.proto {
         IPV4_PROTO_ICMP => icmp(t, &ip),
         IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
-        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame, from == Source::Wire),
         _ => Decision::Stack,
     }
 }
@@ -310,7 +313,10 @@ fn udp(t: &mut Tables, ip: &Ip) -> Decision {
     }
 }
 
-fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8]) -> Decision {
+/// `parkable`: a SYN with no member to go to may wait in the park (only a frame of the wire:
+/// a frame of the stack or of a consumer that waited would be handed on as one of the wire and
+/// lose its source).
+fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8], parkable: bool) -> Decision {
     let (sport, dport) = ports(ip.part);
     let flags = ip.part[13];
     let syn = flags & (SYN | ACK) == SYN;
@@ -341,7 +347,7 @@ fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8]) -> Decision {
         Pick::NoLive if t.group(mark).is_some_and(|g| !g.draining && g.holders > 0) => {
             // The SYN waits for a member (a worker restarting); the peer's repeat of it
             // replaces it, and a full or absent park leaves the repeat to the peer.
-            return Decision::Drop(if ip.dst[0] != 127 && t.park(mark, &key, frame) {
+            return Decision::Drop(if parkable && t.park(mark, &key, frame) {
                 Why::Parked
             } else {
                 Why::NoMember
@@ -700,7 +706,7 @@ mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
     use crate::switchlogic::tables::tests::{OWN, Rng, with, with_flows};
-    use crate::switchlogic::tables::{PARK_MS, PARK_PER_GROUP, PARK_SLOTS, ParkSlot};
+    use crate::switchlogic::tables::{PARK_MS, PARK_PER_GROUP, PARK_SCAN_MS, PARK_SLOTS, ParkSlot};
     use proto_net::switch as sw;
 
     const PEER: [u8; 4] = [203, 0, 113, 9];
@@ -1301,6 +1307,73 @@ mod tests {
     }
 
     #[test]
+    fn a_hairpinned_syn_is_not_parked_and_a_wire_syn_is() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            // From the stack and from a consumer for the shared address: dropped as before, never
+            // parked (a handoff routes as a frame of the wire and would lose the source).
+            for from in [Source::Stack, Source::Consumer(2)] {
+                assert_eq!(
+                    route(t, &hair_tcp(5000, 8080, SYN), from),
+                    Decision::Drop(Why::NoMember)
+                );
+            }
+            assert_eq!(t.parked(), 0);
+            assert_eq!(
+                route(t, &wire_tcp(5000, 8080, SYN), Source::Wire),
+                Decision::Drop(Why::Parked)
+            );
+            assert_eq!(t.parked(), 1);
+        });
+    }
+
+    #[test]
+    fn a_parked_syn_waits_while_the_member_has_no_cells_and_goes_when_it_has() {
+        parking(|t, rigs| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            // Member 0 joins with its FILL short of `MIN_FILL`: nothing is handed over or dropped.
+            for _ in 0..40 {
+                t.consumers[0].as_mut().unwrap().ring.deliver(b"x", 0);
+            }
+            assert!(t.consumers[0].as_ref().unwrap().ring.fill_avail() < MIN_FILL);
+            assert!(t.join(1, 0));
+            assert_eq!(unpark(t, 8), 0);
+            assert_eq!((t.parked(), t.park_dropped), (1, 0));
+            // Cells come back: the SYN goes.
+            rigs[0].fill(&[1; 40]);
+            t.poll_rings(|_, _| {});
+            assert_eq!(unpark(t, 8), 1);
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    #[test]
+    fn the_places_are_looked_at_for_expired_syns_at_most_every_sixteen_ms() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            t.now_ms = 1000;
+            route(t, &wire_tcp(1, 8080, SYN), Source::Wire);
+            t.now_ms = 1010;
+            route(t, &wire_tcp(2, 8080, SYN), Source::Wire);
+            // A look at 1000 + term: the first is gone, the second has 10 ms left.
+            t.now_ms = 1000 + PARK_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            // 10 ms later its term is over, but the last look was too near: not looked at.
+            t.now_ms += 10;
+            t.expire_parked();
+            assert_eq!(t.parked(), 1);
+            t.now_ms += PARK_SCAN_MS;
+            t.expire_parked();
+            assert_eq!(t.parked(), 0);
+        });
+    }
+
+    #[test]
     fn a_parked_syn_is_dropped_after_its_term() {
         parking(|t, _| {
             t.leave(1, 0);
@@ -1310,7 +1383,7 @@ mod tests {
             t.now_ms = 1000 + PARK_MS - 1;
             t.expire_parked();
             assert_eq!(t.parked(), 1);
-            t.now_ms = 1000 + PARK_MS;
+            t.now_ms = 1000 + PARK_MS - 1 + PARK_SCAN_MS;
             t.expire_parked();
             assert_eq!(t.parked(), 0);
             assert_eq!(t.park_expired, 1);

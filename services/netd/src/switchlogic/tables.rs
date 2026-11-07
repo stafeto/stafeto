@@ -54,6 +54,9 @@ pub const PARK_FRAME: usize = 128;
 pub const PARK_MS: u32 = 500;
 /// Places the park needs.
 pub const PARK_SLOTS: usize = MAX_GROUPS * PARK_PER_GROUP;
+/// The least time between two looks at the park for SYNs past their term (ms): a look is a
+/// pass over every place, which does not belong in each step.
+pub const PARK_SCAN_MS: u32 = 16;
 
 /// What a flow is found by: the peer's address and port and our port (our
 /// address is the one).
@@ -532,6 +535,9 @@ pub struct Tables<'a> {
     /// The park of SYNs: `PARK_PER_GROUP` places per group, empty when parking is off.
     park: &'a mut [ParkSlot],
     parked: u32,
+    /// SYNs waiting in each group, so that a step looks only at the groups that have some.
+    park_count: [u8; MAX_GROUPS],
+    park_scan_ms: u32,
     pub park_expired: u32,
     pub park_dropped: u32,
     /// Memberships ended by LEAVE (not by a consumer's departure).
@@ -562,6 +568,8 @@ impl<'a> Tables<'a> {
             ports,
             park: &mut [],
             parked: 0,
+            park_count: [0; MAX_GROUPS],
+            park_scan_ms: 0,
             park_expired: 0,
             park_dropped: 0,
             left: 0,
@@ -582,6 +590,7 @@ impl<'a> Tables<'a> {
         slots.fill(ParkSlot::EMPTY);
         self.park = slots;
         self.parked = 0;
+        self.park_count = [0; MAX_GROUPS];
     }
 
     /// SYNs waiting now.
@@ -617,6 +626,7 @@ impl<'a> Tables<'a> {
         };
         if places[at].len == 0 {
             self.parked += 1;
+            self.park_count[usize::from(group) - 1] += 1;
         }
         let p = &mut places[at];
         p.key = k;
@@ -626,42 +636,54 @@ impl<'a> Tables<'a> {
         true
     }
 
-    /// Drops the SYNs that waited `PARK_MS`.
+    /// Drops the SYNs that waited `PARK_MS`, looking at the places at most every `PARK_SCAN_MS`.
     pub fn expire_parked(&mut self) {
         self.guard.check();
-        if self.parked == 0 {
+        if self.parked == 0 || self.now_ms.wrapping_sub(self.park_scan_ms) < PARK_SCAN_MS {
             return;
         }
-        for p in self.park.iter_mut().filter(|p| p.len != 0) {
-            if self.now_ms.wrapping_sub(p.at) >= PARK_MS {
+        self.park_scan_ms = self.now_ms;
+        for (i, p) in self.park.iter_mut().enumerate() {
+            if p.len != 0 && self.now_ms.wrapping_sub(p.at) >= PARK_MS {
                 p.len = 0;
                 self.parked -= 1;
+                self.park_count[i / PARK_PER_GROUP] -= 1;
                 self.park_expired += 1;
             }
         }
     }
 
-    /// Takes one parked SYN out, oldest group number first, from a group that has a live
-    /// member now; its bytes go to `out` and their count is returned.
+    /// Whether group `number` has a member that is live and has room for a new connection (the
+    /// cells and the flows `route` asks of it), which a parked SYN can go to.
+    fn park_fits(&self, number: u8) -> bool {
+        let limit = (self.flows.capacity() / 2) as u32;
+        self.group(number).is_some_and(|g| {
+            !g.draining
+                && g.members.iter().flatten().any(|m| {
+                    self.live(m.0, m.1)
+                        && self.consumers[usize::from(m.0)].as_ref().is_some_and(|c| {
+                            c.ring.fill_avail() >= super::route::MIN_FILL && c.flows < limit
+                        })
+                })
+        })
+    }
+
+    /// Takes one parked SYN out, the lowest group number first, from a group that has a member
+    /// that can take it now (live, with cells and room for a flow: a SYN whose group is full
+    /// stays parked until its term, and is not routed to be dropped); its bytes go to `out` and
+    /// their count is returned.
     pub fn park_take(&mut self, out: &mut [u8; PARK_FRAME]) -> Option<usize> {
         self.guard.check();
         if self.parked == 0 {
             return None;
         }
         for number in 1..=MAX_GROUPS as u8 {
-            let range = Self::park_range(number);
-            if self.park[range.clone()].iter().all(|p| p.len == 0) {
-                continue;
-            }
-            let live = self.group(number).is_some_and(|g| {
-                !g.draining && g.members.iter().flatten().any(|m| self.live(m.0, m.1))
-            });
-            if !live {
+            if self.park_count[usize::from(number) - 1] == 0 || !self.park_fits(number) {
                 continue;
             }
             // The one that waited longest.
             let now = self.now_ms;
-            let at = range
+            let at = Self::park_range(number)
                 .filter(|&i| self.park[i].len != 0)
                 .max_by_key(|&i| now.wrapping_sub(self.park[i].at))?;
             let p = &mut self.park[at];
@@ -669,6 +691,7 @@ impl<'a> Tables<'a> {
             out[..n].copy_from_slice(&p.frame[..n]);
             p.len = 0;
             self.parked -= 1;
+            self.park_count[usize::from(number) - 1] -= 1;
             return Some(n);
         }
         None

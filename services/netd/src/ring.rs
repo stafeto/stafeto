@@ -110,8 +110,15 @@ pub const STACK_SHARE: usize = 192;
 /// copies of up to 1 514 bytes, about 1 500 ticks under -icount.
 pub const SWITCH_ROUTED: usize = 8;
 pub const SWITCH_CTX: usize = 8;
-/// The parked SYNs a step gives to members that joined (a part of the step of its own).
-pub const PARK_GIVE: usize = 8;
+/// The parked SYNs a step gives to members that joined.
+pub const PARK_GIVE: usize = 2;
+// A handoff is a small frame through `route` and a copy of at most 128 bytes (about 900 ticks):
+// two of them stay within the frames a step takes whatever its time (`SWITCH_BASE`), and the worst
+// step, the base frames of every kind and the tail, still fits the bound.
+const _: () = assert!(
+    PARK_GIVE <= SWITCH_BASE
+        && 3_300 + PARK_GIVE * 900 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
+);
 /// The frames of each kind a step always takes, and the time in clock ticks beyond which it
 /// takes no more. Under -icount (the steps probes) a tick is an instruction-scale unit and the
 /// soft share holds a step under the bound; on a real clock a step never reaches it.
