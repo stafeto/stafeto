@@ -64,7 +64,7 @@ pub fn conf4() -> &'static str {
         crate::nginx_probe::replaced(
             &text,
             "        location / { }\n",
-            "        location / { }\n        location /up/ { proxy_pass http://127.0.0.1:8080/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
+            "        location / { }\n        location /up/ { proxy_buffering off; proxy_pass http://127.0.0.1:8080/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
         )
     })
 }
@@ -457,13 +457,24 @@ fn loopback(
             after_wget.line
         ));
     }
-    requests(
+    if let Err(why) = requests(
         "nginx-fast as a proxy to httpd over 127.0.0.1",
         nginx,
         "/up/index.html",
         crate::rootfs::www_index(),
         20,
-    )?;
+    ) {
+        let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
+        let drops: Vec<String> = run
+            .lines()
+            .iter()
+            .filter(|l| l.contains("net: switch dropped") || l.contains("net: bypass"))
+            .rev()
+            .take(2)
+            .cloned()
+            .collect();
+        return Err(format!("{why}; the service says {seen} {drops:?}"));
+    }
     let after_proxy = stat(run, "lo2")?;
     if after_proxy.looped <= after_wget.looped {
         return Err(format!(
@@ -472,6 +483,15 @@ fn loopback(
         ));
     }
     requests("a worker's own loopback", nginx, "/self/tiny.txt", TINY, 20)?;
+    // A packet for a port of the worker's own stack stays on its loopback interface: the 20
+    // requests (and the proxy's own connections to port 80) leave nothing in the tables.
+    let after_self = stat(run, "lo3")?;
+    if after_self.looped != after_proxy.looped {
+        return Err(format!(
+            "the worker's own loopback went out through the ring: {} packets",
+            after_self.looped - after_proxy.looped
+        ));
+    }
     if after_proxy.own_to_device != 0 || after_proxy.tx_refused != 0 {
         return Err(format!(
             "frames refused or sent to the device: {}",
