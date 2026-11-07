@@ -11,7 +11,9 @@
 //! frame from consumer A to a group with member B finds A's flow at the
 //! send check and B's flow at steering: the keys differ in the ports.
 
-use super::tables::{BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, Tables, UNCONFIRMED};
+use super::tables::{
+    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, RST, RST_PEER, Tables, UNCONFIRMED,
+};
 use crate::ports::Proto;
 use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
 use virtio_net::frames::{
@@ -246,7 +248,9 @@ fn tcp(t: &mut Tables, ip: &Ip) -> Decision {
     let found = t.flows.find(&key);
     if let Some(i) = found {
         let f = *t.flows.get(i);
-        if t.live(f.consumer, f.generation) && !(f.closing() && syn) {
+        // A live owner keeps the flow, a SYN included: it is a member of the group, and a
+        // forged SYN must not hand the connection to another one.
+        if t.live(f.consumer, f.generation) {
             note(t, i, flags, FIN_IN);
             return to(f.consumer, 0);
         }
@@ -290,8 +294,13 @@ fn note(t: &mut Tables, i: usize, flags: u8, fin: u16) {
     if f.flags & UNCONFIRMED == 0 {
         f.seen = now;
     }
+    if flags & (SYN | ACK) == SYN && peer {
+        f.flags &= !(RST | RST_PEER | FIN_IN | FIN_OUT);
+    }
     if flags & RSTBIT != 0 {
-        f.flags |= RST;
+        f.flags |= if peer { RST_PEER } else { RST };
+    } else {
+        f.flags &= !RST_PEER;
     }
     if flags & FIN != 0 {
         f.flags |= fin;
@@ -911,7 +920,7 @@ mod tests {
             assert!(!t.flows.get(i).closing());
             assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x11)), Verdict::Send);
             assert!(t.flows.get(i).closing());
-            assert!(who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire)) < 2);
+            assert_eq!(who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire)), c);
             assert!(!t.flows.get(i).closing(), "a SYN starts the flow again");
             route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
             assert!(t.flows.get(i).closing());
@@ -1057,6 +1066,82 @@ mod tests {
                 assert_eq!(route(t, &udp, Source::Wire), Decision::Drop(Why::Bogus));
             }
             assert!(t.flows.is_empty());
+        });
+    }
+
+    fn flags_of(t: &mut Tables, sport: u16) -> u16 {
+        let key = FlowKey {
+            peer: PEER,
+            peer_port: sport,
+            own_port: 8080,
+        };
+        let i = t.flows.find(&key).unwrap();
+        t.flows.get(i).flags
+    }
+
+    #[test]
+    fn a_rst_of_the_wire_is_cleared_by_the_next_segment_of_either_side() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, SYN_ACK)), Verdict::Send);
+            route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire);
+            // A blind RST, then the stack's challenge ACK and the peer's real segment.
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            assert_ne!(flags_of(t, 1234) & RST_PEER, 0);
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, ACK_)), Verdict::Send);
+            assert_eq!(
+                flags_of(t, 1234) & (RST | RST_PEER),
+                0,
+                "the consumer's ACK"
+            );
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            assert_eq!(who(route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire)), c);
+            assert_eq!(flags_of(t, 1234) & (RST | RST_PEER), 0, "the peer's ACK");
+            // Two RSTs in a row stay marked.
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            assert!(
+                t.flows
+                    .get(
+                        t.flows
+                            .find(&FlowKey {
+                                peer: PEER,
+                                peer_port: 1234,
+                                own_port: 8080
+                            })
+                            .unwrap()
+                    )
+                    .closing()
+            );
+        });
+    }
+
+    #[test]
+    fn a_syn_after_a_rst_keeps_the_owner_and_the_count() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            let before = t.consumers[usize::from(c)].as_ref().unwrap().flows;
+            route(t, &wire_tcp(1234, 8080, 0x04), Source::Wire);
+            for _ in 0..5 {
+                assert_eq!(who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire)), c);
+            }
+            assert_eq!(t.consumers[usize::from(c)].as_ref().unwrap().flows, before);
+            assert_eq!(t.flows.len(), 1);
+            assert_eq!(flags_of(t, 1234) & (RST | RST_PEER), 0);
+        });
+    }
+
+    #[test]
+    fn a_rst_of_the_consumer_closes_the_flow_for_good() {
+        with(|t, _| {
+            let c = who(route(t, &wire_tcp(1234, 8080, SYN), Source::Wire));
+            assert_eq!(check_tx(t, c, &out_tcp(8080, 1234, 0x04)), Verdict::Send);
+            assert_ne!(flags_of(t, 1234) & RST, 0);
+            route(t, &wire_tcp(1234, 8080, ACK_), Source::Wire);
+            assert_ne!(flags_of(t, 1234) & RST, 0, "an ACK does not reopen it");
+            t.now = 100;
+            (0..16).for_each(|_| t.sweep());
+            assert!(t.flows.is_empty(), "a closed flow goes after its rest");
         });
     }
 

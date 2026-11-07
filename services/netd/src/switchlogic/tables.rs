@@ -27,7 +27,12 @@ pub const QUARANTINE: u32 = 60;
 
 pub const FIN_OUT: u16 = 1;
 pub const FIN_IN: u16 = 2;
+/// A RST the consumer sent: the connection is over.
 pub const RST: u16 = 4;
+/// A RST that came for the consumer's flow. The switch sees no sequence numbers, so it
+/// cannot tell a blind RST (RFC 5961 makes the stack ignore it) from a true one; the next
+/// segment of the flow in either direction takes the mark off, a true RST has none after it.
+pub const RST_PEER: u16 = 16;
 /// The flow was made by a SYN nobody has confirmed yet (see `Flows`).
 pub const UNCONFIRMED: u16 = 8;
 /// Seconds an unconfirmed flow lives: shorter than the stack's SYN-ACK retries, longer than a round trip.
@@ -79,7 +84,7 @@ impl Flow {
         self.consumer == EMPTY
     }
     pub fn closing(&self) -> bool {
-        self.flags & RST != 0 || self.flags & (FIN_OUT | FIN_IN) == FIN_OUT | FIN_IN
+        self.flags & (RST | RST_PEER) != 0 || self.flags & (FIN_OUT | FIN_IN) == FIN_OUT | FIN_IN
     }
 }
 
