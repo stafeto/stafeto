@@ -64,6 +64,14 @@ pub extern "C" fn stafeto_fast_port_hold(port: c_uint, reuseport: c_int) -> c_in
     }
 }
 
+/// Whether `port` belongs to this process's own stack (a port it holds, or one of the block of
+/// its consumer's temporary ports): 1 or 0. The glue of the stack asks it for each packet of the
+/// loopback network that its own loopback interface sends out.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_own_port(port: c_uint) -> c_int {
+    u16::try_from(port).is_ok_and(fast::own_port).into()
+}
+
 /// Joins the group of the port description `fd` as the attached consumer.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fast_port_join(fd: c_int) -> c_int {

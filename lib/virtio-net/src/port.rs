@@ -178,9 +178,18 @@ impl Port {
     /// The frame of `len` bytes in the cell `tx_cell` gave becomes an entry
     /// (flags and spare 0). It is published by `tx_flush`.
     pub fn tx_submit(&mut self, len: u32) {
+        self.tx_submit_flags(len, sw::TX_FLAGS);
+    }
+
+    /// `tx_submit` for a packet of the loopback network (`TX_LOOP`).
+    pub fn tx_submit_loop(&mut self, len: u32) {
+        self.tx_submit_flags(len, sw::TX_LOOP);
+    }
+
+    fn tx_submit_flags(&mut self, len: u32, flags: u16) {
         let raw = TxEntry {
             len: len as u16,
-            flags: sw::TX_FLAGS,
+            flags,
             spare: 0,
         }
         .to_bytes();
@@ -351,6 +360,14 @@ mod c {
     pub extern "C" fn vnet_port_tx_submit(len: u32) {
         if let Some(p) = port() {
             p.tx_submit(len);
+        }
+    }
+
+    /// The entry for the packet in the cell is one of the loopback network.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_tx_submit_loop(len: u32) {
+        if let Some(p) = port() {
+            p.tx_submit_loop(len);
         }
     }
 
@@ -540,6 +557,18 @@ mod tests {
         m.word(TX_TAIL).store(10, Ordering::Release);
         assert!(p.tx_cell().is_some());
         assert_eq!(p.tx_room(), 10);
+    }
+
+    #[test]
+    fn a_loop_entry_carries_its_flag_and_an_ordinary_one_has_none() {
+        let (mut m, l, mut p) = rig();
+        assert!(p.tx_cell().is_some());
+        p.tx_submit(60);
+        assert!(p.tx_cell().is_some());
+        p.tx_submit_loop(70);
+        let word0 = |m: &mut Mem, i: u32| m.word(l.tx_entry(i)).load(Ordering::Relaxed);
+        assert_eq!(word0(&mut m, 0), 60);
+        assert_eq!(word0(&mut m, 1), 70 | u32::from(sw::TX_LOOP) << 16);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use super::tables::{
     UNCONFIRMED,
 };
 use crate::ports::Proto;
-use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, FRAME_MAX};
+use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, DONE_LOOP, FRAME_MAX};
 use virtio_net::frames::{
     ETHERNET_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, IPV4_PROTO_ICMP, IPV4_PROTO_TCP,
     IPV4_PROTO_UDP, packet,
@@ -96,7 +96,11 @@ pub enum Verdict {
     Send,
     /// For the shared address: goes through `route` and never to the device.
     Hairpin,
+    /// A packet of the loopback network for a port of another stack: goes through `route_loop`.
+    Loop,
     Refuse(Reason),
+    /// A packet flagged as loopback with an address outside 127.0.0.0/8: the ring is broken.
+    Broke,
 }
 
 struct Ip<'a> {
@@ -145,6 +149,42 @@ pub fn faces_own(t: &Tables, frame: &[u8]) -> bool {
             && t.own.ip != [0; 4]
             && matches!(ip.proto, IPV4_PROTO_TCP | IPV4_PROTO_UDP)
     })
+}
+
+/// Whether a frame of the stack (or of a consumer) is a TCP or UDP packet between addresses of
+/// 127.0.0.0/8: the loopback network, which goes through the tables when its port is not the
+/// stack's own.
+pub fn faces_loop(frame: &[u8]) -> bool {
+    ipv4(frame).is_some_and(|ip| {
+        !ip.fragment
+            && ip.src[0] == 127
+            && ip.dst[0] == 127
+            && matches!(ip.proto, IPV4_PROTO_TCP | IPV4_PROTO_UDP)
+    })
+}
+
+/// Where a packet of the loopback network goes (R-2b): the port table decides as for a frame of
+/// the wire (the address is 127.0.0.1 or another of the block, the key of the flow takes it as
+/// the peer). A packet for a consumer carries `DONE_LOOP`, so that its stack takes it in at
+/// its own loopback interface; one for the stack of the service is a frame like any other,
+/// whose sums the stack does not check (`frames::verify_sums` skips 127.0.0.0/8).
+pub fn route_loop(t: &mut Tables, frame: &[u8]) -> Decision {
+    t.guard.check();
+    let Some(ip) = ipv4(frame) else {
+        return Decision::Stack;
+    };
+    if ip.fragment || ip.src[0] != 127 || ip.dst[0] != 127 {
+        return Decision::Stack;
+    }
+    let d = match ip.proto {
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp(t, &ip),
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp(t, &ip, frame),
+        _ => Decision::Stack,
+    };
+    match d {
+        Decision::Consumer { consumer, .. } => to(consumer, DONE_LOOP),
+        other => other,
+    }
 }
 
 /// Gives members the SYNs that waited for them, at most `budget`: each goes through `route`
@@ -301,7 +341,7 @@ fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8]) -> Decision {
         Pick::NoLive if t.group(mark).is_some_and(|g| !g.draining && g.holders > 0) => {
             // The SYN waits for a member (a worker restarting); the peer's repeat of it
             // replaces it, and a full or absent park leaves the repeat to the peer.
-            return Decision::Drop(if t.park(mark, &key, frame) {
+            return Decision::Drop(if ip.dst[0] != 127 && t.park(mark, &key, frame) {
                 Why::Parked
             } else {
                 Why::NoMember
@@ -431,7 +471,7 @@ fn refuse(r: Reason) -> Verdict {
 /// Whether a consumer may send `frame` (a copy in the switch's buffer).
 pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     t.guard.check();
-    let v = verdict(t, c, frame);
+    let v = verdict(t, c, frame, false);
     if let Verdict::Refuse(r) = v {
         t.refused[r as usize] += 1;
         if let Some(x) = t.consumers[usize::from(c)].as_mut() {
@@ -441,12 +481,38 @@ pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     v
 }
 
-fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+/// `check_tx` for an entry flagged `TX_LOOP`: both addresses must be in 127.0.0.0/8 (else the
+/// ring breaks, the descriptor rule of section 5), and the rest of section 4 holds for the ports
+/// as for any frame of the consumer: it sends from a port of its own and only TCP or UDP.
+pub fn check_tx_loop(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    t.guard.check();
+    let v = verdict(t, c, frame, true);
+    match v {
+        Verdict::Refuse(r) => {
+            t.refused[r as usize] += 1;
+            if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+                x.ring.refused = x.ring.refused.wrapping_add(1);
+            }
+        }
+        Verdict::Broke => {
+            if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+                x.ring.break_with(super::ring::Violation::Loop);
+            }
+        }
+        _ => {}
+    }
+    v
+}
+
+fn verdict(t: &mut Tables, c: u8, frame: &[u8], looped: bool) -> Verdict {
     if !(ETHERNET_HEADER..=FRAME_MAX).contains(&frame.len()) {
         return refuse(Reason::Length);
     }
     if frame[6..12] != t.own.mac {
         return refuse(Reason::SrcMac);
+    }
+    if looped {
+        return verdict_loop(t, c, frame);
     }
     let broadcast = frame[..6] == [0xff; 6];
     if frame[0] & 1 != 0 && !broadcast {
@@ -495,6 +561,35 @@ fn verdict(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
         }
         Ok(()) if ip.dst == t.own.ip => Verdict::Hairpin,
         Ok(()) => Verdict::Send,
+        Err(r) => refuse(r),
+    }
+}
+
+fn verdict_loop(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
+    if frame[12..14] != ETHERTYPE_IPV4 {
+        return refuse(Reason::Proto);
+    }
+    let Some(ip) = ipv4(frame) else {
+        return refuse(Reason::Ipv4);
+    };
+    if ip.fragment || ip.options {
+        return refuse(if ip.fragment {
+            Reason::Fragment
+        } else {
+            Reason::Ipv4
+        });
+    }
+    if ip.src[0] != 127 || ip.dst[0] != 127 {
+        return Verdict::Broke;
+    }
+    let ok = match ip.proto {
+        IPV4_PROTO_TCP if ip.part.len() >= 20 => tcp_tx(t, c, &ip),
+        IPV4_PROTO_UDP if ip.part.len() >= 8 => udp_tx(t, c, &ip),
+        IPV4_PROTO_TCP | IPV4_PROTO_UDP => Err(Reason::Ipv4),
+        _ => Err(Reason::Proto),
+    };
+    match ok {
+        Ok(()) => Verdict::Loop,
         Err(r) => refuse(r),
     }
 }
@@ -925,6 +1020,142 @@ mod tests {
             t.set_park(slots);
             f(t, rigs)
         })
+    }
+
+    const LO: ([u8; 6], [u8; 4]) = (OWN.mac, [127, 0, 0, 1]);
+
+    fn lo_tcp(sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        ip_frame(LO, LO, 6, &tcp_part(sport, dport, flags))
+    }
+
+    #[test]
+    fn a_loopback_syn_for_a_group_port_goes_to_a_member_with_the_loop_flag() {
+        with(|t, _| {
+            let d = route_loop(t, &lo_tcp(40000, 8080, SYN));
+            let c = who(d);
+            assert!(matches!(d, Decision::Consumer { flags, .. } if flags == sw::DONE_LOOP));
+            // The flow follows: its segments go to the same member.
+            let next = route_loop(t, &lo_tcp(40000, 8080, ACK_));
+            assert_eq!(who(next), c);
+            // A port nobody holds is the stack's.
+            assert_eq!(route_loop(t, &lo_tcp(40000, 25, SYN)), Decision::Stack);
+            // Only the loopback network: a frame of the wire with a loopback address is no
+            // business of this path, and other addresses are the stack's.
+            assert_eq!(route_loop(t, &wire_tcp(40000, 8080, SYN)), Decision::Stack);
+        });
+    }
+
+    #[test]
+    fn a_consumers_loopback_connection_to_the_stack_gets_its_reply_with_the_loop_flag() {
+        with(|t, _| {
+            // Consumer 0 connects from its block (49152) to a port the stack owns.
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 9000, SYN)),
+                Verdict::Loop
+            );
+            assert_eq!(route_loop(t, &lo_tcp(49200, 9000, SYN)), Decision::Stack);
+            // The stack's SYN-ACK finds the flow the consumer's SYN made.
+            let reply = ip_frame(LO, LO, 6, &tcp_part(9000, 49200, SYN_ACK));
+            let d = route_loop(t, &reply);
+            assert_eq!(who(d), 0);
+            assert!(matches!(d, Decision::Consumer { flags, .. } if flags == sw::DONE_LOOP));
+            assert_eq!(
+                check_tx_loop(t, 0, &lo_tcp(49200, 9000, ACK_)),
+                Verdict::Loop
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_packet_between_two_consumers_keeps_the_keys_of_both_ends() {
+        with(|t, _| {
+            // Consumer 2 (block 50176) connects to the group of 8080, a member of 0 and 1.
+            assert_eq!(
+                check_tx_loop(t, 2, &lo_tcp(50200, 8080, SYN)),
+                Verdict::Loop
+            );
+            let member = who(route_loop(t, &lo_tcp(50200, 8080, SYN)));
+            assert!(member < 2);
+            // The member's answer from the group's port finds its own flow at the check, and
+            // consumer 2's flow at the steering.
+            assert_eq!(
+                check_tx_loop(t, member, &lo_tcp(8080, 50200, SYN_ACK)),
+                Verdict::Loop
+            );
+            assert_eq!(who(route_loop(t, &lo_tcp(8080, 50200, SYN_ACK))), 2);
+        });
+    }
+
+    #[test]
+    fn a_loopback_packet_from_a_port_that_is_not_the_senders_is_refused() {
+        with(|t, _| {
+            // Consumer 0 sends from consumer 1's block, and from a port of no one's.
+            for sport in [49152 + 512 + 3, 7000] {
+                assert_eq!(
+                    check_tx_loop(t, 0, &lo_tcp(sport, 9000, SYN)),
+                    Verdict::Refuse(Reason::Tcp)
+                );
+            }
+            assert_eq!(t.refused[Reason::Tcp as usize], 2);
+            // UDP from a port that is no member's.
+            let udp = ip_frame(LO, LO, 17, &udp_part(40000, 9000));
+            assert_eq!(check_tx_loop(t, 0, &udp), Verdict::Refuse(Reason::Udp));
+        });
+    }
+
+    #[test]
+    fn a_loop_flag_with_an_address_outside_127_breaks_the_ring() {
+        for (src, dst) in [
+            (OWN_IP, [127, 0, 0, 1]),
+            ([127, 0, 0, 1], OWN_IP),
+            (OWN_IP, PEER),
+            ([127, 0, 0, 1], [10, 0, 0, 1]),
+        ] {
+            with(|t, _| {
+                let f = ip_frame(
+                    (OWN.mac, src),
+                    (OWN.mac, dst),
+                    6,
+                    &tcp_part(49200, 9000, SYN),
+                );
+                assert_eq!(check_tx_loop(t, 0, &f), Verdict::Broke, "{src:?} {dst:?}");
+                let mut broke = None;
+                t.poll_rings(|c, v| broke = Some((c, v)));
+                assert_eq!(broke, Some((0, crate::switchlogic::ring::Violation::Loop)));
+                // The ring is out: nothing of it is routed, the others go on.
+                assert!(t.consumers[0].as_ref().unwrap().ring.is_broken());
+                assert!(!t.consumers[1].as_ref().unwrap().ring.is_broken());
+            });
+        }
+    }
+
+    #[test]
+    fn a_loopback_packet_that_is_not_tcp_or_udp_or_whole_is_refused() {
+        with(|t, _| {
+            let icmp = ip_frame(LO, LO, 1, &[8, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(check_tx_loop(t, 0, &icmp), Verdict::Refuse(Reason::Proto));
+            let short = ip_frame(LO, LO, 6, &[0; 10]);
+            assert_eq!(check_tx_loop(t, 0, &short), Verdict::Refuse(Reason::Ipv4));
+            let mut foreign = lo_tcp(49200, 9000, SYN);
+            foreign[6] ^= 1;
+            assert_eq!(
+                check_tx_loop(t, 0, &foreign),
+                Verdict::Refuse(Reason::SrcMac)
+            );
+        });
+    }
+
+    #[test]
+    fn a_loopback_syn_is_never_parked() {
+        parking(|t, _| {
+            t.leave(1, 0);
+            t.leave(1, 1);
+            assert_eq!(
+                route_loop(t, &lo_tcp(40000, 8080, SYN)),
+                Decision::Drop(Why::NoMember)
+            );
+            assert_eq!(t.parked(), 0);
+        });
     }
 
     #[test]

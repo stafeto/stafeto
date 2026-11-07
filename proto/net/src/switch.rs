@@ -48,13 +48,19 @@ pub const SWITCH_IDLE: usize = 8 * LINE;
 pub const COUNTERS: usize = 9 * LINE;
 
 /// DONE flags: a copy of an ARP reply sent to every consumer; an ICMP
-/// error steered by the header it carries. Bit 2 is reserved.
+/// error steered by the header it carries; a packet of 127.0.0.0/8 from
+/// another stack (Ethernet header, no sums): the consumer's stack takes it in
+/// at its loopback interface.
 pub const DONE_ARP_COPY: u16 = 1;
 pub const DONE_ICMP_ERROR: u16 = 2;
-pub const DONE_RESERVED_LOOP: u16 = 4;
-pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR;
-/// The TX flags must be 0.
+pub const DONE_LOOP: u16 = 4;
+pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP;
+/// The TX flags of an ordinary frame.
 pub const TX_FLAGS: u16 = 0;
+/// A packet of the loopback network of the consumer's stack for a port that is no port of
+/// that stack (both addresses in 127.0.0.0/8, else the ring breaks); the switch routes it by
+/// its port. The only flag a TX entry may have.
+pub const TX_LOOP: u16 = 4;
 
 /// The bits the switch notifies the consumer with.
 pub const WAKE_RING: u64 = 1;
@@ -374,7 +380,8 @@ mod tests {
             spare: 0,
         };
         assert_eq!(TxEntry::from_bytes(t.to_bytes()), t);
-        assert_eq!(DONE_FLAGS & DONE_RESERVED_LOOP, 0);
+        assert_eq!(DONE_FLAGS, DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP);
+        assert_eq!(DONE_LOOP, TX_LOOP);
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub enum Violation {
     Done,
     Tx,
     Cell,
+    /// A packet of the loopback network with an address outside 127.0.0.0/8.
+    Loop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +80,8 @@ pub enum Tx {
     Empty,
     /// A frame of this length is in the buffer.
     Frame(usize),
+    /// A packet of the loopback network of this length (`TX_LOOP`).
+    Loop(usize),
     /// An entry with flags or a spare or a length the cell cannot hold: dropped.
     Refused,
 }
@@ -134,7 +138,9 @@ impl ConsumerRing {
         self.broken.is_some()
     }
 
-    fn break_with(&mut self, v: Violation) {
+    /// The consumer broke a rule of the layout the entry's content shows (the checks of the
+    /// indices break the ring in `poll`): the ring is disabled, as for a bad index.
+    pub fn break_with(&mut self, v: Violation) {
         self.broken.get_or_insert(v);
     }
 
@@ -227,11 +233,18 @@ impl ConsumerRing {
         };
         let cell = self.layout.tx_cell(self.tx_tail);
         self.tx_tail = self.tx_tail.wrapping_add(1);
-        if e.flags != sw::TX_FLAGS || e.spare != 0 || usize::from(e.len) > CELL {
+        if (e.flags != sw::TX_FLAGS && e.flags != sw::TX_LOOP)
+            || e.spare != 0
+            || usize::from(e.len) > CELL
+        {
             return Tx::Refused;
         }
         self.mem.read(cell, &mut out[..usize::from(e.len)]);
-        Tx::Frame(usize::from(e.len))
+        if e.flags == sw::TX_LOOP {
+            Tx::Loop(usize::from(e.len))
+        } else {
+            Tx::Frame(usize::from(e.len))
+        }
     }
 
     /// The switch's indices and counters, for the consumer's eyes.
@@ -466,14 +479,23 @@ pub(crate) mod tests {
             (100, 0, 1, false),
             (100, 0, u32::MAX, false),
             (100, 1, 0, false),
+            (100, 2, 0, false),
+            (100, 8, 0, false),
+            (100, 5, 0, false),
             (0, 0, 0, true),
+            (100, 4, 0, true),
+            (2048, 4, 0, true),
+            (2049, 4, 0, false),
+            (100, 4, 7, false),
         ] {
             raw_tx(&rig, len, flags, spare);
             ring.poll();
-            let want = if taken {
-                Tx::Frame(usize::from(len))
-            } else {
+            let want = if !taken {
                 Tx::Refused
+            } else if flags == 4 {
+                Tx::Loop(usize::from(len))
+            } else {
+                Tx::Frame(usize::from(len))
             };
             assert_eq!(ring.take_tx(&mut out), want, "{len} {flags} {spare}");
         }

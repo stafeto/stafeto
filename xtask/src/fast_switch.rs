@@ -49,14 +49,22 @@ const IDLE_WITHIN: Duration = Duration::from_millis(50);
 /// The wire's frames the capture of the probe keeps.
 const PCAP: &str = "switch-probe.pcap";
 
-/// `nginx-fast.conf` of the switch with four workers.
+/// `nginx-fast.conf` of the switch with four workers, and two locations over the loopback
+/// network (R-2b): `/up/` goes to BusyBox's `httpd` of the service's stack on 127.0.0.1:8080 (a
+/// packet for a port of another stack), `/self/` to the worker's own listener on 127.0.0.1:80
+/// (a port of its own stack, which stays on its loopback interface).
 pub fn conf4() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
-        crate::nginx_probe::replaced(
+        let text = crate::nginx_probe::replaced(
             fast_nginx::switch_conf(),
             "worker_processes 1;",
             "worker_processes 4;",
+        );
+        crate::nginx_probe::replaced(
+            &text,
+            "        location / { }\n",
+            "        location / { }\n        location /up/ { proxy_pass http://127.0.0.1:8080/; }\n        location /self/ { proxy_pass http://127.0.0.1:80/; }\n",
         )
     })
 }
@@ -111,6 +119,8 @@ struct Stat {
     tx_refused: u64,
     /// Parked SYNs given to a member that joined.
     park_given: u64,
+    /// Packets of the loopback network routed through the tables.
+    looped: u64,
     /// Memberships ended by LEAVE.
     left: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
@@ -173,6 +183,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
         own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
         tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
         park_given: counter(&line, "park_given").ok_or("park_given")?,
+        looped: counter(&line, "looped").ok_or("looped")?,
         left: counter(&line, "left").ok_or("left")?,
         rx_by,
         line,
@@ -410,6 +421,66 @@ fn plain(
     notes.push(format!(
         "the guest's wget to the shared address came whole: {} frames turned, tx_refused {}",
         second.hairpin, second.tx_refused
+    ));
+    loopback(run, nginx, second.looped, notes)
+}
+
+/// The loopback network between stacks (R-2b): a `wget` of the guest to nginx-fast on 127.0.0.1
+/// (the service's stack to a worker), nginx-fast as a proxy to `httpd` on 127.0.0.1:8080 (a worker
+/// to the service's stack), and a worker's own loopback (its own port stays in its stack). The
+/// packets of the first two go through the tables (`looped` grows), nothing of them reaches the
+/// device.
+fn loopback(
+    run: &mut qemu::Run,
+    nginx: SocketAddr,
+    looped0: u64,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(TINY)
+        .map_err(|e| e.to_string())?
+        .trim_end()
+        .to_owned();
+    run.send("wget -T 20 -q -O - http://127.0.0.1/tiny.txt; echo ngx-lo-end")?;
+    if let Err(why) = run.expect_line(
+        "the page by wget over 127.0.0.1",
+        |l| l.trim_end() == text,
+        Duration::from_secs(40),
+    ) {
+        let seen = stat(run, "lo")?.line;
+        return Err(format!("{why}; the service says {seen}"));
+    }
+    run.expect("ngx-lo-end", Duration::from_secs(40))?;
+    let after_wget = stat(run, "lo1")?;
+    if after_wget.looped <= looped0 {
+        return Err(format!(
+            "no packet of the loopback network went through the tables: {}",
+            after_wget.line
+        ));
+    }
+    requests(
+        "nginx-fast as a proxy to httpd over 127.0.0.1",
+        nginx,
+        "/up/index.html",
+        crate::rootfs::www_index(),
+        20,
+    )?;
+    let after_proxy = stat(run, "lo2")?;
+    if after_proxy.looped <= after_wget.looped {
+        return Err(format!(
+            "the proxy's packets did not go through the tables: {}",
+            after_proxy.line
+        ));
+    }
+    requests("a worker's own loopback", nginx, "/self/tiny.txt", TINY, 20)?;
+    if after_proxy.own_to_device != 0 || after_proxy.tx_refused != 0 {
+        return Err(format!(
+            "frames refused or sent to the device: {}",
+            after_proxy.line
+        ));
+    }
+    notes.push(format!(
+        "loopback: wget over 127.0.0.1 and a proxy to httpd came whole, {} packets through the tables, a worker's own loopback answered",
+        after_proxy.looped - looped0
     ));
     Ok(())
 }
@@ -852,6 +923,8 @@ mod tests {
         assert_eq!(init(Kind::SwitchSteps), &["table-fast-switch"]);
         assert_eq!(init(Kind::Scale), &["table-fast-switch-scale"]);
         assert!(conf4().contains("worker_processes 4;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:8080/;"));
+        assert!(conf4().contains("proxy_pass http://127.0.0.1:80/;"));
         assert!(conf4().contains("user nobody nobody;"));
         assert_eq!(fast_nginx::SWITCH_NETD_CONF, b"switch 8\nflows 16384\n");
         let netd =

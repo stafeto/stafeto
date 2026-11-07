@@ -124,6 +124,11 @@ int stafeto_fast_attach(struct stafeto_fast_claim *out);
  * consumer a member of the port's group (EBADF or EINVAL for a descriptor
  * that holds no port, EINVAL without an attach). */
 int stafeto_fast_port_hold(unsigned port, int reuseport);
+
+/* 1 when `port` belongs to this process's own stack: a port it holds with the switch, or one
+ * of its consumer's block of temporary ports; else 0. A packet of the loopback network for a
+ * port that is not its own goes out through the ring (the switch routes it). */
+int stafeto_fast_own_port(unsigned port);
 int stafeto_fast_port_join(int fd);
 
 /* Tells the switch's thread that frames wait in the ring's TX (the switch

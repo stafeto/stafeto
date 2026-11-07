@@ -90,7 +90,8 @@ size_t vnet_bypass_pop(void *frame, size_t cap);
  */
 
 /* A frame the switch delivered: its cell, its length, the DONE flags
- * (1: a copy of an ARP reply for every consumer; 2: an ICMP error), and
+ * (1: a copy of an ARP reply for every consumer; 2: an ICMP error; 4: a packet of the
+ * loopback network from another stack, to be taken in at lo0), and
  * where it starts. */
 struct vnet_port_rx {
     uint32_t cell, len, flags, pad;
@@ -116,6 +117,10 @@ uint32_t vnet_port_fill_free(void);
 uint8_t *vnet_port_tx_cell(void);
 void vnet_port_tx_submit(uint32_t len);
 int vnet_port_tx_flush(void);
+
+/* The entry for the packet in the cell is a packet of the loopback network (flag 4): both its
+ * addresses are in 127.0.0.0/8 and its port is no port of this stack's; the switch routes it. */
+void vnet_port_tx_submit_loop(uint32_t len);
 
 /* 1 when DONE holds a frame. */
 int vnet_port_work(void);

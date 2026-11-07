@@ -144,6 +144,8 @@ pub struct Stats {
     pub rx_by: [AtomicU32; 8],
     /// Parked SYNs handed to a member that joined.
     pub park_given: AtomicU32,
+    /// Packets of the loopback network routed through the tables (R-2b).
+    pub looped: AtomicU32,
     /// Memberships ended by LEAVE.
     pub left: AtomicU32,
 }
@@ -166,6 +168,7 @@ impl Stats {
             tx_consumer: AtomicU32::new(0),
             rx_by: [const { AtomicU32::new(0) }; 8],
             park_given: AtomicU32::new(0),
+            looped: AtomicU32::new(0),
             left: AtomicU32::new(0),
         }
     }
@@ -201,7 +204,7 @@ pub fn turn_wanted(frame: &[u8]) -> bool {
         virtio_net::frames::IPV4_PROTO_UDP => 1,
         _ => return false,
     };
-    if !p.first_fragment || ip[16] == 127 || p.end < p.header + 4 {
+    if !p.first_fragment || p.end < p.header + 4 {
         return false;
     }
     let port = usize::from(u16::from_be_bytes([ip[p.header + 2], ip[p.header + 3]]));
@@ -832,10 +835,16 @@ impl Switch {
         let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if let Some(t) = self.tables.as_mut()
-            && route::faces_own(t, frame)
+            && (route::faces_own(t, frame) || route::faces_loop(frame))
         {
-            INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
-            let passed = match route::route(t, frame, Source::Stack) {
+            let decision = if route::faces_loop(frame) {
+                INNER.stats.looped.fetch_add(1, Ordering::Relaxed);
+                route::route_loop(t, frame)
+            } else {
+                INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
+                route::route(t, frame, Source::Stack)
+            };
+            let passed = match decision {
                 // A stale byte of the stack's: the frame goes back, and the stack answers it.
                 // A full ring of frames for the stack drops it (TCP repeats it).
                 Decision::Stack => {
@@ -932,6 +941,12 @@ impl Switch {
                         taken += 1;
                         self.consumer_frame(c as u8, len);
                     }
+                    Tx::Loop(len) => {
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                        self.consumer_loop(c as u8, len);
+                    }
                 }
             }
         }
@@ -958,7 +973,9 @@ impl Switch {
         };
         let frame = &self.scratch[..len];
         match route::check_tx(t, c, frame) {
-            Verdict::Refuse(_) => {}
+            // `check_tx` never answers these (the entries flagged `TX_LOOP` go through
+            // `check_tx_loop`).
+            Verdict::Refuse(_) | Verdict::Loop | Verdict::Broke => {}
             Verdict::Send => {
                 let Some(n) = self.tx.book.alloc() else {
                     return;
@@ -1006,6 +1023,44 @@ impl Switch {
                         route::deliver(t, d, frame);
                     }
                 }
+            }
+        }
+    }
+
+    /// A packet of the loopback network of consumer `c` (entry flagged `TX_LOOP`, copied into
+    /// `scratch`): checked, then routed by its port to the stack of the service or to a consumer
+    /// (R-2b).
+    fn consumer_loop(&mut self, c: u8, len: usize) {
+        let Some(t) = self.tables.as_mut() else {
+            return;
+        };
+        let frame = &self.scratch[..len];
+        if route::check_tx_loop(t, c, frame) != Verdict::Loop {
+            return;
+        }
+        INNER.stats.looped.fetch_add(1, Ordering::Relaxed);
+        match route::route_loop(t, frame) {
+            Decision::Drop(why) => {
+                INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+            }
+            // The stack gets a buffer of sending to read the packet in; it comes back through
+            // `rx_back` (`step`).
+            Decision::Stack | Decision::ArpAll => {
+                if let Some(n) = self.tx.book.alloc() {
+                    // SAFETY: the buffer is free (just taken from the pool).
+                    let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+                    slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
+                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                        if INNER.stack_told.tell() {
+                            INNER.wake_stack(crate::RX);
+                        }
+                    } else {
+                        self.tx.book.release(n);
+                    }
+                }
+            }
+            d => {
+                route::deliver(t, d, frame);
             }
         }
     }

@@ -277,7 +277,11 @@ pub(crate) fn port_hold(port: u16, reuseport: bool, kept: i32) -> Result<Option<
     match switch_call(&w, identity, &mut out) {
         Ok(n) => {
             let place = Reader::new(&out[..n]).u32().map_err(|_| EIO)?;
-            publish(place, true, kept).map(Some)
+            let held = publish(place, true, kept).map(Some)?;
+            // The stack of this process (and of the workers it forks) owns the port: a
+            // packet of the loopback network for it stays inside (`fast::own_port`).
+            crate::fast::note_own_port(port);
+            Ok(held)
         }
         Err(Status::UnknownMethod) => Ok(None),
         Err(status) => Err(switch_errno(status)),

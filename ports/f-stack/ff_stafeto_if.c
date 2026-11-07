@@ -98,6 +98,10 @@ extern void ff_hardclock(void);
  * (freebsd/net/netisr.c, FF_STAFETO). */
 extern unsigned long ff_stafeto_netisr_runs;
 extern int ff_stafeto_netisr_pending(void);
+/* The loopback interface takes in a packet of the loopback network that
+ * came through the switch (freebsd/net/if_loop.c, FF_STAFETO). */
+extern void ff_stafeto_lo_input(void *mbuf);
+#define VNET_PORT_DONE_LOOP 4
 struct ff_flow_key;
 
 /* The log of ff_stafeto_rte.h: everything to stderr, a type's messages up
@@ -590,6 +594,73 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     return sent == 0 ? 0 : ff_ENOBUFS;
 }
 
+/* looutput of the loopback interface offers the packet in `m` (total bytes of
+ * IPv4, no Ethernet header): a TCP or UDP packet between addresses of
+ * 127.0.0.0/8 for a port that is no port of this stack goes out in the ring
+ * as a packet of the loopback network (flag 4) behind an Ethernet header of
+ * the interface's own MAC, which the switch checks and routes by the port.
+ * 1 when the packet went (or was dropped for want of room, as a frame the
+ * wire loses; TCP sends it again), 0 when the loopback interface keeps it. */
+int
+ff_stafeto_loop_tx(void *m, int total)
+{
+    uint8_t *to;
+    uint8_t *ip;
+    void *cur = m;
+    void *data;
+    unsigned len;
+    unsigned header;
+    uint16_t dport;
+    int off = ETH;
+
+    if (!port_on || dev_lost || total < 20 + 4 || total + ETH > FF_STAFETO_FRAME_MAX)
+        return 0;
+    /* The headers lie in the first segment (the output path pulled them up). */
+    ff_next_mbuf(&cur, &data, &len);
+    ip = data;
+    if (len < 20 || ip[0] >> 4 != 4)
+        return 0;
+    header = (unsigned)(ip[0] & 15) * 4;
+    if (header < 20 || len < header + 4 || ip[12] != 127 || ip[16] != 127 ||
+        (ip[9] != 6 && ip[9] != 17))
+        return 0;
+    dport = (uint16_t)(ip[header + 2] << 8 | ip[header + 3]);
+    if (stafeto_fast_own_port(dport))
+        return 0;
+    to = vnet_port_tx_cell();
+    if (to == NULL) {
+        tx_flush();
+        to = vnet_port_tx_cell();
+    }
+    if (to == NULL) {
+        stats.tx_full++;
+        ff_mbuf_free(m);
+        return 1;
+    }
+    memcpy(to, dev_claim.config.mac, 6);
+    memcpy(to + 6, dev_claim.config.mac, 6);
+    to[12] = 0x08;
+    to[13] = 0x00;
+    cur = m;
+    while (cur != NULL && off < total + ETH) {
+        ff_next_mbuf(&cur, &data, &len);
+        if (len > (unsigned)(total + ETH - off))
+            len = (unsigned)(total + ETH - off);
+        vnet_copy(to + off, data, len);
+        off += (int)len;
+    }
+    ff_mbuf_free(m);
+    if (off < FF_STAFETO_FRAME_MIN) {
+        memset(to + off, 0, FF_STAFETO_FRAME_MIN - off);
+        off = FF_STAFETO_FRAME_MIN;
+    }
+    vnet_port_tx_submit_loop((uint32_t)off);
+    stats.tx_frames++;
+    if (++tx_batch >= FF_STAFETO_TX_BATCH)
+        tx_flush();
+    return 1;
+}
+
 /* A buffer of the pool, or a block of the copy path, is free: the tag in
  * the mbuf's argument tells which (the low bit is set for a buffer, whose
  * number is in the rest). */
@@ -711,7 +782,9 @@ rx_one(const struct vnet_buf *b)
 /* One frame of DONE, in the cell `r`: to the stack without a copy while
  * FILL holds enough cells, or with one copy. The cell is the stack's until
  * its mbuf is freed, or FILL's at once. An ARP reply (flag 1) is a frame
- * like any other for the stack. */
+ * like any other for the stack. A packet of the loopback network (flag 4,
+ * from another stack) goes to the loopback interface instead of the
+ * Ethernet one (freebsd/net/if_loop.c, ff_stafeto_lo_input). */
 static void
 port_rx_one(const struct vnet_port_rx *r)
 {
@@ -755,7 +828,10 @@ port_rx_one(const struct vnet_port_rx *r)
     }
     handed = counter();
     stats.rx_layer_ticks += handed - began;
-    ff_veth_process_packet(dev_ctx->ifp, hdr);
+    if (r->flags & VNET_PORT_DONE_LOOP)
+        ff_stafeto_lo_input(hdr);
+    else
+        ff_veth_process_packet(dev_ctx->ifp, hdr);
     stats.rx_input_ticks += counter() - handed;
 }
 
