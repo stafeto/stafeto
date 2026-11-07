@@ -99,11 +99,25 @@ pub const HOLD_NS: u64 = 100_000;
 #[derive(Default)]
 pub struct Hold {
     since: Option<u64>,
+    /// A timer is set for the deadline of this hold.
+    timed: bool,
+}
+
+/// What `Hold::decide` tells the service at the end of an event.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verdict {
+    /// The bell waits (the switch is not woken for the frames).
+    pub held: bool,
+    /// The timer is to be set for this time.
+    pub arm: Option<u64>,
 }
 
 impl Hold {
     pub const fn new() -> Hold {
-        Hold { since: None }
+        Hold {
+            since: None,
+            timed: false,
+        }
     }
 
     /// Frames wait for the bell and `queued` says whether work stands behind
@@ -113,14 +127,47 @@ impl Hold {
     pub fn waits(&mut self, queued: bool, now: u64) -> bool {
         if !queued {
             self.since = None;
+            self.timed = false;
             return false;
         }
         let since = *self.since.get_or_insert(now);
         if now.saturating_sub(since) >= HOLD_NS {
             self.since = None;
+            self.timed = false;
             return false;
         }
         true
+    }
+
+    /// The decision at the end of an event, at `now`. `frames` of the stack
+    /// wait for the bell; `own` says the service has steps told to itself
+    /// (they come as events); `calls` asks the kernel whether anything stands
+    /// in the queue (called only when no step is told). A large answer
+    /// (`SWITCH_TX / 2` frames) rings at once. A hold with only calls behind
+    /// it gets a timer for its deadline, since a call the kernel withdrew or
+    /// the library refused makes no event.
+    pub fn decide(
+        &mut self,
+        frames: usize,
+        own: bool,
+        calls: impl FnOnce() -> bool,
+        now: u64,
+    ) -> Verdict {
+        let queued = frames > 0 && frames < SWITCH_TX / 2 && (own || calls());
+        let held = self.waits(queued, now);
+        let arm = if held && !own && !self.timed {
+            self.timed = true;
+            self.deadline()
+        } else {
+            None
+        };
+        Verdict { held, arm }
+    }
+
+    /// The service's timer fired, or could not be set: no timer is set for
+    /// this hold any longer, and the next decision sets one again.
+    pub fn timer_gone(&mut self) {
+        self.timed = false;
     }
 
     /// The bell is being held.
@@ -992,6 +1039,57 @@ mod tests {
             now += 1_000;
         }
         None
+    }
+
+    /// Eight calls queue up behind one another, one frame each: events end
+    /// with `calls` queued behind them for all but the last.
+    #[test]
+    fn eight_queued_calls_give_one_kick() {
+        let mut hold = Hold::new();
+        let mut kicks = 0;
+        for call in 0..8u64 {
+            let v = hold.decide(1, false, || call < 7, call * 10_000);
+            if !v.held {
+                kicks += 1;
+            }
+        }
+        assert_eq!(kicks, 1, "one bell for the burst of calls");
+    }
+
+    /// The service's own timer fires inside the hold window, and then the call
+    /// that was queued is withdrawn: no event comes, and the bell must ring
+    /// within `HOLD_NS` of the start of the hold. `forget` is false when the
+    /// timer of the service leaves the hold's timer marked as set.
+    fn rung_after_the_stack_timer(forget: bool) -> Option<u64> {
+        let mut hold = Hold::new();
+        let mut timer = None;
+        let v = hold.decide(1, false, || true, 0);
+        assert!(v.held);
+        timer = v.arm.or(timer);
+        // The stack's own timer fires at 50 us and takes the armed one with
+        // it; the step that follows asks again, the call still queued.
+        timer = None;
+        if forget {
+            hold.timer_gone();
+        }
+        let v = hold.decide(1, false, || true, 50_000);
+        assert!(v.held);
+        timer = v.arm.or(timer);
+        // The call is withdrawn: only the timer can ring the bell.
+        let at = timer?;
+        let v = hold.decide(1, false, || false, at);
+        (!v.held).then_some(at)
+    }
+
+    #[test]
+    fn the_stack_timer_inside_the_window_does_not_strand_a_lost_call() {
+        let at = rung_after_the_stack_timer(true).expect("the hold sets its timer again");
+        assert!(at <= HOLD_NS, "rang at {at} ns");
+        assert_eq!(
+            rung_after_the_stack_timer(false),
+            None,
+            "a timer that stays marked as set is never set again"
+        );
     }
 
     #[test]

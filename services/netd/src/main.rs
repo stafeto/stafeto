@@ -533,7 +533,6 @@ fn main(_: u64) -> u64 {
         told: 0,
         bell: netd::ring::Hold::new(),
         bell_checked: false,
-        bell_timed: false,
         cleanup_due: false,
         armed: None,
         last_step: 0,
@@ -914,8 +913,6 @@ struct Driver<'a> {
     bell: netd::ring::Hold,
     /// The queue was looked at in the event that is on.
     bell_checked: bool,
-    /// The timer is set for the bell that is held.
-    bell_timed: bool,
     /// A step of departure is due that no notification told.
     cleanup_due: bool,
     /// The deadline the timer is set for.
@@ -1401,37 +1398,28 @@ impl Driver<'_> {
     /// bell. A step goes ahead of the calls behind it, so without this each
     /// call's frame rings a bell of its own.
     fn bell_waits(&mut self) -> bool {
-        // A large answer (half of what the switch takes at once) rings at
-        // once: the bell is already shared.
-        let frames = switch::INNER.tx_sub.len();
-        let mut own = false;
-        let mut queued = frames > 0 && frames < netd::ring::SWITCH_TX / 2;
-        if queued {
-            // Own bits told are steps in the queue, which come as events; the
-            // kernel is asked only for the calls behind them.
-            own = self.told & STEP_BITS != 0;
-            queued = own || sys::channel_info(&self.notify).is_ok_and(|info| info.queued > 0);
-        }
+        let own = self.told & STEP_BITS != 0;
+        let notify = &self.notify;
+        let verdict = self.bell.decide(
+            switch::INNER.tx_sub.len(),
+            own,
+            || sys::channel_info(notify).is_ok_and(|info| info.queued > 0),
+            now_ns(),
+        );
         self.bell_checked = true;
-        let now = now_ns();
-        let held = self.bell.waits(queued, now);
-        if !held {
-            self.bell_timed = false;
-        } else if !own && !self.bell_timed {
-            // Only calls stand behind: one the kernel withdrew or the
-            // library refused makes no event, so the timer rings the bell in
-            // time. Steps told to itself always come as events.
-            self.bell_timed = true;
-            self.arm_bell(now);
+        if let Some(at) = verdict.arm {
+            self.arm_bell(at, now_ns());
         }
-        held
+        verdict.held
     }
 
     /// The timer fires at `at` for a held bell, below the floor of `arm`.
-    fn arm_bell(&mut self, now: u64) {
-        let at = self.bell.deadline().unwrap_or(now + netd::ring::HOLD_NS);
+    fn arm_bell(&mut self, at: u64, now: u64) {
         if self.armed.is_none_or(|armed| at < armed || armed <= now) {
-            let _ = sys::timer_set(&self.timer, at);
+            if sys::timer_set(&self.timer, at).is_err() {
+                self.bell.timer_gone();
+                return;
+            }
             self.armed = Some(at);
         }
     }
@@ -1884,6 +1872,7 @@ impl Service<0> for Driver<'_> {
             Source::Timer if n.label == TIMER_LABEL => {
                 profile::count(Counter::StepTimer);
                 self.armed = None;
+                self.bell.timer_gone();
                 let now = now_ns();
                 self.net.expire(now);
                 if self
