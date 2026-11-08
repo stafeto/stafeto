@@ -324,10 +324,14 @@ impl<const D: usize> TxRing<D> {
         let slice = unsafe { buffer_at::<D>(n) };
         let frame = &mut slice[HDR_LEN..HDR_LEN + len];
         let began = profile::now();
-        // The switch completes the sum of a segment of TCP (the device does, or the switch
-        // does it in software); the other frames of the first device and all those of the
-        // second go out with their sums whole.
-        let partial = matches!(self.port, TxPort::Inner) && frames::fill_partial(frame).is_some();
+        // The switch has the device complete the sum of a segment of TCP when the device offers
+        // it; the other frames of the first device and all those of the second go out with their
+        // sums whole.
+        // Without the offload the stack makes the sum whole here, as the second device does:
+        // the switch's step would pay for it otherwise.
+        let partial = matches!(self.port, TxPort::Inner)
+            && switch::INNER.offload()
+            && frames::fill_partial(frame).is_some();
         if !partial {
             frames::fill_sums(frame);
         }

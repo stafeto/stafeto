@@ -11,9 +11,9 @@
 //! for, where a frame of the stack goes, and what never reaches the wire.
 
 pub use virtio_net::frames::{
-    BUFFER_LEN, Csum, HDR_LEN, Header, MAX_FRAME, NUM_BUFFERS_AT, checksum, complete, fill_partial,
-    fill_sums, ipv4_ends, is_tcp, parse_header, partial_place, rx_frame, sum_checked, tx_prepare,
-    verify_header, verify_sums,
+    BUFFER_LEN, Csum, HDR_LEN, Header, MAX_FRAME, NUM_BUFFERS_AT, checksum, complete,
+    complete_received, fill_partial, fill_sums, ipv4_ends, is_tcp, parse_header, partial_place,
+    rx_frame, sum_checked, tx_prepare, verify_header, verify_sums,
 };
 use virtio_net::frames::{
     ETHERNET_HEADER, ETHERTYPE_ARP, IPV4_PROTO_ICMP, IPV4_PROTO_TCP, IPV4_PROTO_UDP, packet,

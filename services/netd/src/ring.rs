@@ -231,6 +231,15 @@ const _: () = assert!(
 /// takes no more. Under -icount (the steps probes) a tick is an instruction-scale unit and the
 /// soft share holds a step under the bound; on a real clock a step never reaches it.
 pub const SWITCH_BASE: usize = 3;
+/// A frame whose sum the switch completes in software (a consumer's `TX_SUM` frame on a device
+/// without the offload, a received packet the device left partial that is no TCP) costs one pass
+/// over up to 1 514 bytes more, about `SUM_TICKS` under -icount, and counts as `SUM_WEIGHT`
+/// frames of its kind in the step: past the base frames the step takes fewer of them, and the
+/// worst case of the asserts below holds as it stands (the heavy frame is dearer by no more than
+/// the second frame it stands for).
+pub const SUM_TICKS: usize = 1_300;
+pub const SUM_WEIGHT: usize = 2;
+const _: () = assert!(1_800 + SUM_TICKS <= SUM_WEIGHT * 1_800 && SUM_WEIGHT <= SWITCH_BASE);
 pub const SWITCH_SOFT: u64 = 7_000;
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.

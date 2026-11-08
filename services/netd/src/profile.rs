@@ -82,6 +82,16 @@ counters! {
     ReopenN = "reopen_n",
     ReopenTicks = "reopen_ticks",
     Pause = "pause",
+    // The checksum offload of the switch: frames of the wire taken and those whose sum the device
+    // vouched for, frames sent and those the device completes the sum of, and sums the switch
+    // completed in software.
+    WireRx = "wire_rx",
+    // Frames of the wire whose header has any flag (the device said something of the sum).
+    RxFlagged = "rx_flagged",
+    SumRx = "sum_rx",
+    WireTx = "wire_tx",
+    SumTx = "sum_tx",
+    SumSoft = "sum_soft",
     // The maxima: the counters from here on are not differences.
     RingMax = "ring_max",
     IsrMax = "isr_max",

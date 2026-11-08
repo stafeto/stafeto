@@ -333,6 +333,31 @@ pub fn complete(frame: &mut [u8], csum: Csum) {
     frame[at..at + 2].copy_from_slice(&sum.to_be_bytes());
 }
 
+/// The device may leave the sum of any received packet partial once `GUEST_CSUM` is
+/// negotiated (`NEEDS_CSUM`, Virtio 1.2, 5.1.6.4.1): the field holds the sum of the
+/// pseudo-header and `csum_start` and `csum_offset` say where the sum goes. Completes it in
+/// `frame` (the frame after the header, `header` the header's fields). False, and the frame
+/// untouched, when the header does not say `NEEDS_CSUM` or the place lies outside the frame (the
+/// header is the device's word, and `hdr_len` and the rest are not relied on, 5.1.6.4.2).
+pub fn complete_received(frame: &mut [u8], header: &Header) -> bool {
+    let (start, at) = (
+        usize::from(header.csum_start),
+        usize::from(header.csum_start) + usize::from(header.csum_offset),
+    );
+    if header.flags & NEEDS_CSUM == 0 || start >= frame.len() || at + 2 > frame.len() || at < start
+    {
+        return false;
+    }
+    complete(
+        frame,
+        Csum {
+            start: header.csum_start,
+            offset: header.csum_offset,
+        },
+    );
+    true
+}
+
 /// Whether the frame is TCP in IPv4 (a first fragment or not is `packet`'s).
 pub fn is_tcp(frame: &[u8]) -> bool {
     frame.len() >= ETHERNET_HEADER + 20
@@ -736,5 +761,84 @@ mod tests {
         assert!(!verify_header(&f));
         assert!(verify_header(&arp_request([10, 0, 2, 2])));
         assert!(is_tcp(&f) && !is_tcp(&udp_frame(b"x")));
+    }
+
+    #[test]
+    fn a_received_udp_packet_with_a_partial_sum_is_completed_where_the_header_says() {
+        for len in [0usize, 1, 18, 400, 1472] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 5) as u8).collect();
+            let mut whole = udp_frame(&payload);
+            fill_sums(&mut whole);
+            // The device left the field as the sum of the pseudo-header.
+            let mut partial = whole.clone();
+            let mut head = [0u8; 12];
+            head[..4].copy_from_slice(&partial[26..30]);
+            head[4..8].copy_from_slice(&partial[30..34]);
+            head[9] = IPV4_PROTO_UDP;
+            head[10..12].copy_from_slice(&((8 + len) as u16).to_be_bytes());
+            partial[40..42].copy_from_slice(&fold(add(0, &head)).to_be_bytes());
+            let header = Header {
+                flags: NEEDS_CSUM,
+                gso_type: 0,
+                hdr_len: 0,
+                gso_size: 0,
+                csum_start: 34,
+                csum_offset: 6,
+                num_buffers: 1,
+            };
+            assert!(complete_received(&mut partial, &header));
+            assert_eq!(partial, whole, "length {len}");
+        }
+    }
+
+    #[test]
+    fn a_received_partial_sum_outside_the_frame_or_without_the_flag_is_left_alone() {
+        let mut f = udp_frame(b"abc");
+        fill_sums(&mut f);
+        let before = f.clone();
+        let base = Header {
+            flags: NEEDS_CSUM,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 34,
+            csum_offset: 6,
+            num_buffers: 1,
+        };
+        let cases = [
+            Header {
+                flags: DATA_VALID,
+                ..base
+            },
+            Header { flags: 0, ..base },
+            Header {
+                csum_start: f.len() as u16,
+                ..base
+            },
+            Header {
+                csum_start: u16::MAX,
+                ..base
+            },
+            Header {
+                csum_offset: u16::MAX,
+                ..base
+            },
+            Header {
+                csum_start: (f.len() - 2) as u16,
+                csum_offset: 1,
+                ..base
+            },
+        ];
+        for h in cases {
+            assert!(!complete_received(&mut f, &h), "{h:?}");
+            assert_eq!(f, before);
+        }
+        // The last two bytes of the frame are the furthest place that is taken.
+        let h = Header {
+            csum_start: (f.len() - 2) as u16,
+            csum_offset: 0,
+            ..base
+        };
+        assert!(complete_received(&mut f, &h));
     }
 }

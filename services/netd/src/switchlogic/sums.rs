@@ -10,7 +10,7 @@
 
 use super::route::Decision;
 use proto_net::switch::DONE_SUM_OK;
-use virtio_net::frames::{Csum, fill_pseudo, is_tcp, verify_header};
+use virtio_net::frames::{Csum, ETHERNET_HEADER, fill_pseudo, is_tcp, packet, verify_header};
 
 /// Whether a frame from the wire has a good sum of its segment without a
 /// check by the stack that gets it: the device checked it or sent it partial
@@ -43,6 +43,13 @@ pub fn prepare_tx(frame: &mut [u8]) -> Option<Csum> {
     fill_pseudo(frame)
 }
 
+/// The length a frame with `TX_SUM` goes out with: the Ethernet header and the IP packet, without
+/// the bytes the consumer left after it (the device sums to the end of the frame, and the
+/// padding of F-Stack is zeros, but a trailer would change the sum).
+pub fn wire_len(frame: &[u8]) -> usize {
+    packet(frame).map_or(frame.len(), |p| frame.len().min(ETHERNET_HEADER + p.end))
+}
+
 /// How the sum of a frame with a partial sum goes out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -67,7 +74,7 @@ pub fn finish(offload: bool, csum: Option<Csum>) -> Finish {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use virtio_net::frames::{ETHERNET_HEADER, complete, fill_sums};
+    use virtio_net::frames::{complete, fill_sums};
 
     fn tcp(payload: usize) -> Vec<u8> {
         let tcp_len = 20 + payload;
@@ -138,6 +145,18 @@ mod tests {
             complete(&mut f, csum);
             assert_eq!(f, whole);
         }
+    }
+
+    #[test]
+    fn a_frame_with_a_trailer_goes_out_without_it() {
+        let mut f = tcp(100);
+        let whole = f.len();
+        assert_eq!(wire_len(&f), whole);
+        f.extend_from_slice(&[0xAA; 6]);
+        assert_eq!(wire_len(&f), whole, "the padding is cut");
+        f.truncate(whole - 1);
+        assert_eq!(wire_len(&f), whole - 1, "a short frame stays as it is");
+        assert_eq!(wire_len(&[1, 2, 3]), 3);
     }
 
     #[test]
