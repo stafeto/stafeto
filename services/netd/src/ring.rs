@@ -80,6 +80,114 @@ pub const fn bell_due(limit: u32, pending: u32, waited: u32, more: bool) -> bool
     pending > 0 && (!more || pending >= limit || waited >= BELL_STEPS)
 }
 
+/// The longest the bell is held for the work queued behind the stack's step
+/// (`Hold`): a call of a program or a step of the service told to itself. A
+/// timer set when the hold starts rings it at `HOLD_NS`, wherever the queue
+/// stands then (a call that the kernel withdrew or the library refused makes
+/// no event of its own). The frame then waits `HOLD_NS`, plus the event in
+/// progress when the timer fires (a step is at most 18 369 ticks, about 765 us
+/// at 24 MHz), plus the time a level above the stack takes from it (the
+/// switch's run, `SWITCH_RUN_NS`): about 2.9 ms in the worst case, 100 us and
+/// a few events in the usual one.
+pub const HOLD_NS: u64 = 100_000;
+
+/// The doorbell held for the work queued behind the stack's step. A program's
+/// call is a request in the service's queue, and the step it asks for is a
+/// notification that goes ahead of the calls behind it, so a step ends with
+/// calls still queued: the frames of the answers of those calls go out with one
+/// bell, when the queue is empty or after `HOLD_NS`, whichever is first.
+#[derive(Default)]
+pub struct Hold {
+    since: Option<u64>,
+    /// A timer is set for the deadline of this hold.
+    timed: bool,
+}
+
+/// What `Hold::decide` tells the service at the end of an event.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verdict {
+    /// The bell waits (the switch is not woken for the frames).
+    pub held: bool,
+    /// The timer is to be set for this time.
+    pub arm: Option<u64>,
+}
+
+impl Hold {
+    pub const fn new() -> Hold {
+        Hold {
+            since: None,
+            timed: false,
+        }
+    }
+
+    /// Frames wait for the bell and `queued` says whether work stands behind
+    /// the event that ended just now, at `now`: true while the bell waits.
+    /// False rings it (the queue is empty, or the wait reached `HOLD_NS`) and
+    /// the next hold starts anew.
+    pub fn waits(&mut self, queued: bool, now: u64) -> bool {
+        if !queued {
+            self.since = None;
+            self.timed = false;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) >= HOLD_NS {
+            self.since = None;
+            self.timed = false;
+            return false;
+        }
+        true
+    }
+
+    /// The decision at the end of an event, at `now`. `frames` of the stack
+    /// wait for the bell; `own` says the service has steps told to itself
+    /// (they come as events); `calls` asks the kernel whether anything stands
+    /// in the queue (called only when no step is told). A large answer
+    /// (`SWITCH_TX / 2` frames) rings at once. A hold with only calls behind
+    /// it gets a timer for its deadline, since a call the kernel withdrew or
+    /// the library refused makes no event.
+    pub fn decide(
+        &mut self,
+        frames: usize,
+        own: bool,
+        calls: impl FnOnce() -> bool,
+        now: u64,
+    ) -> Verdict {
+        let queued = frames > 0 && frames < SWITCH_TX / 2 && (own || calls());
+        let held = self.waits(queued, now);
+        let arm = if held && !own && !self.timed {
+            self.timed = true;
+            self.deadline()
+        } else {
+            None
+        };
+        Verdict { held, arm }
+    }
+
+    /// The service's timer fired, or could not be set: no timer is set for
+    /// this hold any longer, and the next decision sets one again.
+    pub fn timer_gone(&mut self) {
+        self.timed = false;
+    }
+
+    /// The bell is being held.
+    pub const fn on(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// When the timer rings a held bell, if one is held.
+    pub fn deadline(&self) -> Option<u64> {
+        self.since.map(|since| since + HOLD_NS)
+    }
+
+    /// The end of an event with a bell that may be held: true when the bell
+    /// is to ring now (it was held and the work behind is gone or its time is
+    /// up), which is when `kick(false)` is due.
+    pub fn release(&mut self, queued: bool, now: u64) -> bool {
+        self.on() && !self.waits(queued, now)
+    }
+}
+
 /// The frames the switch thread takes off the queue of receiving in one
 /// step, and the frames of sending it puts in the queue (the bound of a
 /// step, as `STEP_RX` and `STEP_TX` are for the stack): a frame costs the
@@ -888,6 +996,124 @@ mod tests {
             "one reply under a one-way flow of inbound frames waits at most BELL_STEPS steps"
         );
         assert!(!tx_bell_due(0, BELL_STEPS, true), "nothing to ring");
+    }
+
+    /// The bells for `calls` events of the stack, ten microseconds apart, each
+    /// of which leaves work queued behind it when `queued` says so.
+    fn bells_for(calls: u64, queued: impl Fn(u64) -> bool) -> u64 {
+        let mut hold = Hold::new();
+        let mut bells = 0;
+        for call in 0..calls {
+            if !hold.waits(queued(call), call * 10_000) {
+                bells += 1;
+            }
+        }
+        bells
+    }
+
+    #[test]
+    fn the_frames_of_queued_calls_share_a_bell() {
+        // Eight calls stand in the queue: the first seven events leave work
+        // behind, the eighth empties the queue.
+        assert_eq!(bells_for(8, |call| call < 7), 1);
+        // Two bursts of four, with the queue empty between them.
+        assert_eq!(bells_for(8, |call| call % 4 != 3), 2);
+        // Nothing queued: a bell for each frame, as an idle service rings.
+        assert_eq!(bells_for(8, |_| false), 8);
+    }
+
+    /// A hold that ends with a request nobody handled (the library refused it
+    /// or the kernel withdrew the call): no event follows, and only the timer
+    /// at `deadline` can ring the bell. `timer` says whether the model has it.
+    fn rung_after_a_lost_request(timer: bool) -> Option<u64> {
+        let mut hold = Hold::new();
+        // A step ends at t = 0 with a call queued behind it: the bell is held.
+        assert!(hold.waits(true, 0));
+        // The call is withdrawn at t = 10 us: no event, the queue is empty.
+        let mut now = 10_000;
+        while now <= 4 * HOLD_NS {
+            let fired = timer && hold.deadline().is_some_and(|at| now >= at);
+            if fired && hold.release(false, now) {
+                return Some(now);
+            }
+            now += 1_000;
+        }
+        None
+    }
+
+    /// Eight calls queue up behind one another, one frame each: events end
+    /// with `calls` queued behind them for all but the last.
+    #[test]
+    fn eight_queued_calls_give_one_kick() {
+        let mut hold = Hold::new();
+        let mut kicks = 0;
+        for call in 0..8u64 {
+            let v = hold.decide(1, false, || call < 7, call * 10_000);
+            if !v.held {
+                kicks += 1;
+            }
+        }
+        assert_eq!(kicks, 1, "one bell for the burst of calls");
+    }
+
+    /// The service's own timer fires inside the hold window, and then the call
+    /// that was queued is withdrawn: no event comes, and the bell must ring
+    /// within `HOLD_NS` of the start of the hold. `forget` is false when the
+    /// timer of the service leaves the hold's timer marked as set.
+    fn rung_after_the_stack_timer(forget: bool) -> Option<u64> {
+        let mut hold = Hold::new();
+        let v = hold.decide(1, false, || true, 0);
+        assert!(v.held);
+        assert_eq!(v.arm, Some(HOLD_NS));
+        // The stack's own timer fires at 50 us and takes the armed one with
+        // it; the step that follows asks again, the call still queued.
+        let mut timer = None;
+        if forget {
+            hold.timer_gone();
+        }
+        let v = hold.decide(1, false, || true, 50_000);
+        assert!(v.held);
+        timer = v.arm.or(timer);
+        // The call is withdrawn: only the timer can ring the bell.
+        let at = timer?;
+        let v = hold.decide(1, false, || false, at);
+        (!v.held).then_some(at)
+    }
+
+    #[test]
+    fn the_stack_timer_inside_the_window_does_not_strand_a_lost_call() {
+        let at = rung_after_the_stack_timer(true).expect("the hold sets its timer again");
+        assert!(at <= HOLD_NS, "rang at {at} ns");
+        assert_eq!(
+            rung_after_the_stack_timer(false),
+            None,
+            "a timer that stays marked as set is never set again"
+        );
+    }
+
+    #[test]
+    fn a_lost_request_does_not_strand_a_held_bell() {
+        let rang = rung_after_a_lost_request(true).expect("the timer rings the bell");
+        assert!(rang <= HOLD_NS + 1_000, "rang at {rang} ns");
+        assert_eq!(
+            rung_after_a_lost_request(false),
+            None,
+            "without the timer the bell waits for the next event"
+        );
+    }
+
+    #[test]
+    fn a_frame_waits_no_longer_than_hold_ns_for_the_bell() {
+        let mut hold = Hold::new();
+        assert!(hold.waits(true, 1_000));
+        assert!(hold.on());
+        assert!(hold.waits(true, 1_000 + HOLD_NS - 1));
+        assert!(!hold.waits(true, 1_000 + HOLD_NS), "the bound rings");
+        assert!(!hold.on());
+        // A queue that never empties still rings every HOLD_NS or so.
+        let bells = bells_for(100, |_| true);
+        assert!((5..=10).contains(&bells), "{bells} bells for 1 ms of calls");
+        assert!(!hold.waits(false, 5));
     }
 
     #[test]
