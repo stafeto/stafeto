@@ -1344,8 +1344,9 @@ impl Net {
                     remote,
                     remote_port,
                 };
-                // A new SYN on the four of a stream in TIME-WAIT that no session
-                // holds ends that stream and goes to the listening description
+                // A new SYN on the four of a stream that no session holds and
+                // that is in TIME-WAIT or closed (and waits for the sweep to
+                // free it) ends that stream and goes to the listening description
                 // as any other (RFC 1122, 4.2.2.13 allows a new connection on
                 // the four when its sequence number is higher; smoltcp does
                 // not give the service the next number the orphan expects, so
@@ -1353,7 +1354,7 @@ impl Net {
                 // a queue takes the SYN.
                 let existing = self.demux.find(&conn);
                 let orphan = match existing {
-                    Some(place) if syn && self.time_wait_orphan(stack, place) => Some(place),
+                    Some(place) if syn && self.reusable_orphan(stack, place) => Some(place),
                     Some(place) => return Some(place),
                     None => None,
                 };
@@ -1404,13 +1405,19 @@ impl Net {
         }
     }
 
-    /// Whether place `i` is a stream that no session holds and that waits
-    /// out TIME-WAIT.
-    fn time_wait_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
+    /// Whether place `i` is a stream that no session holds and that is over:
+    /// it waits out TIME-WAIT, or it has closed and only waits for the sweep to
+    /// free its place (a stream whose peer reset it, or whose last
+    /// acknowledgement just came). A new SYN on its four starts a new stream.
+    fn reusable_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
         self.places.state(i) == State::Orphan
             && self.socks[i]
                 .handle
-                .is_some_and(|h| stack.tcp(h).state() == tcp::State::TimeWait)
+                .is_some_and(|h| match stack.tcp(h).state() {
+                    tcp::State::TimeWait => true,
+                    tcp::State::Closed => !self.socks[i].rst_pending,
+                    _ => false,
+                })
     }
 
     /// The first socket of the queue of listening place `listener` that

@@ -48,6 +48,11 @@ const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
+/// The requests through the proxy to `httpd` on 127.0.0.1:8080. A stream of the service that
+/// has closed holds its four until the sweep frees it, and a worker's next connection may pick
+/// the same source port. Twenty requests met that once in ci; the service now lets such a SYN
+/// start a new stream, and this many requests meet it in nearly every run without that.
+const PROXY_REQUESTS: usize = 300;
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
@@ -517,7 +522,7 @@ fn loopback(
         nginx,
         "/up/index.html",
         crate::rootfs::www_index(),
-        20,
+        PROXY_REQUESTS,
     ) {
         let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
         let drops: Vec<String> = run
