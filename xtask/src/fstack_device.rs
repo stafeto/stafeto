@@ -592,6 +592,22 @@ mod tests {
         assert_eq!(NETD_CONF_DHCP, b"handover 1\n");
     }
 
+    /// A burst of connections reaches a stack that has not yet learned its
+    /// gateway: the answers wait for the ARP reply in the entry's hold queue,
+    /// which keeps one packet unless the setting is wide.
+    #[test]
+    fn the_arp_hold_queue_fits_a_burst_of_answers() {
+        let ini = include_str!("../../ports/f-stack/fstack.ini");
+        let hold: usize = ini
+            .lines()
+            .find_map(|l| l.strip_prefix("net.link.ether.inet.maxhold="))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(hold >= HOLD_CONNECTIONS);
+    }
+
     /// The page's pattern is the program's.
     #[test]
     fn the_page_is_the_programs() {

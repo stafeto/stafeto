@@ -48,6 +48,14 @@ const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
+/// The requests through the proxy to `httpd` on 127.0.0.1:8080. A stream of the service that
+/// has closed holds its four until the sweep frees it, and a worker's next connection may pick
+/// the same source port. Twenty requests met that once in ci; the service now lets such a SYN
+/// start a new stream and counts it (`orphan_reused`), and this many requests meet it in every
+/// run: 300 requests met it 3 to 8 times, and once not at all in 11 runs.
+const PROXY_REQUESTS: usize = 600;
+/// The requests to nginx-fast's own port 80 through the proxy of the same worker.
+const SELF_REQUESTS: usize = 20;
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
@@ -173,6 +181,8 @@ struct Stat {
     looped: u64,
     /// Memberships ended by LEAVE.
     left: u64,
+    /// Closed streams whose four a new SYN took over before the sweep.
+    orphan_reused: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
     refused_by: Vec<u64>,
     rx_by: Vec<u64>,
@@ -226,7 +236,14 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let orphan_reused = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("net: frames rx "))
+        .and_then(|l| counter(l, "orphan_reused"))
+        .ok_or("no orphan_reused in the line `net: frames rx`")?;
     Ok(Stat {
+        orphan_reused,
         refused_by,
         consumers: counter(&line, "consumers").ok_or("consumers")?,
         hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
@@ -517,7 +534,7 @@ fn loopback(
         nginx,
         "/up/index.html",
         crate::rootfs::www_index(),
-        20,
+        PROXY_REQUESTS,
     ) {
         let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
         let drops: Vec<String> = run
@@ -530,18 +547,44 @@ fn loopback(
             .collect();
         return Err(format!("{why}; the service says {seen} {drops:?}"));
     }
-    let after_proxy = stat(run, "lo2")?;
+    // The last proxied connection is still closing: its final packets count in `looped` until
+    // two readings agree.
+    let mut after_proxy = stat(run, "lo2")?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        let again = stat(run, "lo2")?;
+        let settled = again.looped == after_proxy.looped;
+        after_proxy = again;
+        if settled {
+            break;
+        }
+    }
     if after_proxy.looped <= after_wget.looped {
         return Err(format!(
             "the proxy's packets did not go through the tables: {}",
             after_proxy.line
         ));
     }
-    requests("a worker's own loopback", nginx, "/self/tiny.txt", TINY, 20)?;
+    if after_proxy.orphan_reused == 0 {
+        return Err(format!(
+            "no SYN of {PROXY_REQUESTS} proxied requests met a closed stream on its four: the probe does not reach the case: {}",
+            after_proxy.line
+        ));
+    }
+    requests(
+        "a worker's own loopback",
+        nginx,
+        "/self/tiny.txt",
+        TINY,
+        SELF_REQUESTS,
+    )?;
     // A packet for a port of the worker's own stack stays on its loopback interface: the 20
-    // requests (and the proxy's own connections to port 80) leave nothing in the tables.
+    // requests (and the proxy's own connections to port 80) leave nothing in the tables. The
+    // streams of the proxy that closed earlier may still send a stray packet of their end
+    // (a late ACK or RST), so a few are allowed; a request that went through the ring is a
+    // dozen packets.
     let after_self = stat(run, "lo3")?;
-    if after_self.looped != after_proxy.looped {
+    if after_self.looped - after_proxy.looped >= SELF_REQUESTS as u64 {
         return Err(format!(
             "the worker's own loopback went out through the ring: {} packets",
             after_self.looped - after_proxy.looped
@@ -588,12 +631,20 @@ fn loopback(
     Ok(())
 }
 
+/// A request of the stream that failed: when it began and ended, and why.
+#[derive(Clone)]
+struct Failure {
+    began: Instant,
+    ended: Instant,
+    why: String,
+}
+
 /// A stream of new connections from the host, each a GET of the small page,
 /// until `stop`; the failures and the number answered.
 struct Stream {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    failures: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    failures: std::sync::Arc<std::sync::Mutex<Vec<Failure>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -607,12 +658,18 @@ impl Stream {
         let thread = std::thread::spawn(move || {
             use std::sync::atomic::Ordering::Relaxed;
             while !s.load(Relaxed) {
+                let began = Instant::now();
+                let failed = |why: String| Failure {
+                    began,
+                    ended: Instant::now(),
+                    why,
+                };
                 match Connection::open(address, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt")) {
                     Ok(body) if body == TINY => {
                         a.fetch_add(1, Relaxed);
                     }
-                    Ok(_) => f.lock().unwrap().push("a wrong page".to_owned()),
-                    Err(e) => f.lock().unwrap().push(e),
+                    Ok(_) => f.lock().unwrap().push(failed("a wrong page".to_owned())),
+                    Err(e) => f.lock().unwrap().push(failed(e)),
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -629,12 +686,93 @@ impl Stream {
         self.answered.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Failure> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
         self.failures.lock().unwrap().clone()
+    }
+}
+
+/// How long after `kill -9` was sent a request may still begin on a socket of the dying worker:
+/// the line crosses the console, the shell runs `kill`, and TCG may be slow.
+const KILL_SLACK: Duration = Duration::from_secs(2);
+/// How long after the kill the service may take to reset the connection of the worker that died
+/// (1.3 s seen on TCG); a read that timed out takes `READ_WITHIN`.
+const KILL_RESET_WITHIN: Duration = Duration::from_secs(10);
+
+/// The requests of the stream that failed over the kill of a worker. The stream asks one at a
+/// time, so the kill meets at most one request in flight, and a request that a killed worker
+/// had accepted and not answered ends in a reset or an end of the stream on a connection that was
+/// up: that one is expected, and the service ends it within `KILL_RESET_WITHIN` of the kill (it
+/// took 1.3 s on TCG, after the new worker's stack was up). Every other request (a timeout, a
+/// refused connection, one that began after the worker was gone) must have been answered. The number of requests the kill reset, or what went wrong.
+fn over_the_kill(failures: &[Failure], killed: Instant) -> Result<usize, String> {
+    let offset = |t: Instant| -> i128 {
+        if t >= killed {
+            t.duration_since(killed).as_millis() as i128
+        } else {
+            -(killed.duration_since(t).as_millis() as i128)
+        }
+    };
+    let seen: Vec<String> = failures
+        .iter()
+        .map(|f| {
+            format!(
+                "{} ms to {} ms from the kill: {}",
+                offset(f.began),
+                offset(f.ended),
+                f.why
+            )
+        })
+        .collect();
+    let reset = |why: &str| {
+        why.contains("closed with") || why.contains("reset") || why.contains("Broken pipe")
+    };
+    if failures.len() > 1
+        || failures.iter().any(|f| {
+            f.began > killed + KILL_SLACK || f.ended > killed + KILL_RESET_WITHIN || !reset(&f.why)
+        })
+    {
+        return Err(format!(
+            "{} requests failed over the kill, one in flight may, as a reset or an end of the stream within {} s of the kill: {seen:?}",
+            failures.len(),
+            KILL_RESET_WITHIN.as_secs()
+        ));
+    }
+    Ok(failures.len())
+}
+
+/// Connections opened every 10 ms while a worker is gone: each sends a GET and is held until
+/// `finish`, which returns how many were opened.
+struct Gap {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<usize>,
+}
+
+impl Gap {
+    fn start(address: SocketAddr) -> Gap {
+        use std::io::Write;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut c) = std::net::TcpStream::connect(address) {
+                    let _ = c.write_all(b"GET /tiny.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+                    held.push(c);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            held.len()
+        });
+        Gap { stop, thread }
+    }
+
+    fn finish(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap_or(0)
     }
 }
 
@@ -654,12 +792,24 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         }
         let before = stream.answered();
         let given_before = stat(run, "kill")?.park_given;
+        // With one worker no member is live between the kill and the new worker's JOIN. The
+        // stream may be held by a request in flight then, so a second thread opens a
+        // connection every 10 ms from the kill until the new worker's stack is up: their SYNs
+        // are the ones the park must keep and give.
+        let gap = (count == 1).then(|| Gap::start(nginx));
+        let killed = Instant::now();
         run.send(&format!("kill -9 {}", workers[0]))?;
         run.expect_line(
             "the new worker",
             |l| l.contains("start worker process "),
             Duration::from_secs(60),
         )?;
+        run.expect_line(
+            "the stack of the new worker",
+            |l| l.contains("fast: the stack is up on "),
+            Duration::from_secs(60),
+        )?;
+        let opened = gap.map_or(0, Gap::finish);
         // Wait for answers that come after the kill.
         let until = Instant::now() + Duration::from_secs(90);
         while stream.answered() < before + 10 && Instant::now() < until {
@@ -668,30 +818,23 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         let after = stream.answered();
         let failures = stream.finish();
         let given = stat(run, "kill")?.park_given - given_before;
-        if !failures.is_empty() {
-            return Err(format!(
-                "{count} workers: {} requests failed over the kill, the first {:?}",
-                failures.len(),
-                failures.first()
-            ));
-        }
+        let reset =
+            over_the_kill(&failures, killed).map_err(|why| format!("{count} workers: {why}"))?;
         if after < before + 10 {
             return Err(format!(
                 "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
             ));
         }
-        // With one worker no member is live between the kill and the new worker's JOIN: the
-        // stream's connections in that gap wait in the park and are given to it (the stream
-        // opens one every 20 ms, the restart takes far longer, also on TCG). Without the park
-        // each of them waits for the repeat of its SYN.
+        // The connections of the gap wait in the park and are given to the new worker; without
+        // the park each of them waits for the repeat of its SYN.
         if count == 1 && given == 0 {
-            return Err(
-                "one worker: no SYN was parked over the kill and given to the new worker"
-                    .to_owned(),
-            );
+            return Err(format!(
+                "one worker: none of the {opened} SYNs opened in the gap was parked and given to the new worker"
+            ));
         }
         notes.push(format!(
-            "{count} worker(s): {before} answered before the kill, {after} in all, no failure, {given} parked SYN(s) given"
+            "{count} worker(s): {before} answered before the kill, {after} in all, {} request in flight at the kill, {opened} connection(s) opened in the gap, {given} parked SYN(s) given",
+            if reset > 0 { "a" } else { "no" }
         ));
         if count == 4 {
             reload(run, nginx, notes)?;
@@ -737,7 +880,7 @@ fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Re
         return Err(format!(
             "reload: {} failed, {before} answered before and {after} after, the first failure {:?}",
             failures.len(),
-            failures.first()
+            failures.first().map(|f| &f.why)
         ));
     }
     let left = stat(run, "reload")?.left - left_before;
@@ -1255,6 +1398,55 @@ mod tests {
             .concat())
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_kill_resets_the_request_in_flight_and_no_other() {
+        let killed = Instant::now() + Duration::from_secs(10);
+        let at = |ms: i64| {
+            if ms < 0 {
+                killed - Duration::from_millis(-ms as u64)
+            } else {
+                killed + Duration::from_millis(ms as u64)
+            }
+        };
+        let failure = |began: i64, ended: i64, why: &str| Failure {
+            began: at(began),
+            ended: at(ended),
+            why: why.to_owned(),
+        };
+        let eof = "the connection closed with 0 bytes pending";
+        assert_eq!(over_the_kill(&[], killed), Ok(0));
+        assert_eq!(over_the_kill(&[failure(-3, 1300, eof)], killed), Ok(1));
+        assert_eq!(
+            over_the_kill(
+                &[failure(
+                    5,
+                    900,
+                    "read after 0 bytes: Connection reset by peer (os error 54)"
+                )],
+                killed
+            ),
+            Ok(1)
+        );
+        // Two failed requests: the stream asks one at a time.
+        assert!(over_the_kill(&[failure(-30, -10, eof), failure(5, 90, eof)], killed).is_err());
+        // A request that began after the worker was gone.
+        assert!(over_the_kill(&[failure(2_500, 2_600, eof)], killed).is_err());
+        // A timeout is no reset.
+        assert!(
+            over_the_kill(
+                &[failure(
+                    5,
+                    900,
+                    "read after 0 bytes: Resource temporarily unavailable"
+                )],
+                killed
+            )
+            .is_err()
+        );
+        // A connection that hung until the read timed out.
+        assert!(over_the_kill(&[failure(5, 60_000, eof)], killed).is_err());
     }
 
     #[test]

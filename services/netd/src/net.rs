@@ -21,7 +21,7 @@ use netd::frames::Dest;
 use netd::interest::Interests;
 use netd::owners::Owners;
 use netd::passes::Passes;
-use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
+use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State, orphan_is_over};
 use netd::ports::{Binding, PortMap, Proto};
 use netd::reuse::{Groups, NO_GROUP};
 use netd::ring::{OrphanQueue, WakeBudget};
@@ -330,6 +330,8 @@ pub struct Counters {
     /// SYNs taken by a queue socket of a listening description other than
     /// the one chosen. Stays 0.
     pub syn_stray: u64,
+    /// Closed streams no session held whose four a new SYN took over before the sweep.
+    pub orphan_reused: u64,
     /// The pages charged to the service when the first and the sixty-fourth
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
@@ -1344,8 +1346,9 @@ impl Net {
                     remote,
                     remote_port,
                 };
-                // A new SYN on the four of a stream in TIME-WAIT that no session
-                // holds ends that stream and goes to the listening description
+                // A new SYN on the four of a stream that no session holds and
+                // that is in TIME-WAIT or closed (and waits for the sweep to
+                // free it) ends that stream and goes to the listening description
                 // as any other (RFC 1122, 4.2.2.13 allows a new connection on
                 // the four when its sequence number is higher; smoltcp does
                 // not give the service the next number the orphan expects, so
@@ -1353,7 +1356,7 @@ impl Net {
                 // a queue takes the SYN.
                 let existing = self.demux.find(&conn);
                 let orphan = match existing {
-                    Some(place) if syn && self.time_wait_orphan(stack, place) => Some(place),
+                    Some(place) if syn && self.reusable_orphan(stack, place) => Some(place),
                     Some(place) => return Some(place),
                     None => None,
                 };
@@ -1378,6 +1381,12 @@ impl Net {
                     return None;
                 };
                 if let Some(place) = orphan {
+                    if self.socks[place]
+                        .handle
+                        .is_some_and(|h| stack.tcp(h).state() == tcp::State::Closed)
+                    {
+                        self.counters.orphan_reused += 1;
+                    }
                     self.release_place(stack, place);
                 }
                 self.syn_member = Some((member, listener));
@@ -1404,13 +1413,23 @@ impl Net {
         }
     }
 
-    /// Whether place `i` is a stream that no session holds and that waits
-    /// out TIME-WAIT.
-    fn time_wait_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
-        self.places.state(i) == State::Orphan
-            && self.socks[i]
-                .handle
-                .is_some_and(|h| stack.tcp(h).state() == tcp::State::TimeWait)
+    /// Whether place `i` is a stream that no session holds and that is over:
+    /// it waits out TIME-WAIT, or it has closed and only waits for the sweep to
+    /// free its place (a stream whose peer reset it, or whose last
+    /// acknowledgement just came). A new SYN on its four starts a new stream.
+    fn reusable_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
+        if self.places.state(i) != State::Orphan {
+            return false;
+        }
+        let Some(handle) = self.socks[i].handle else {
+            return false;
+        };
+        let state = stack.tcp(handle).state();
+        orphan_is_over(
+            state == tcp::State::TimeWait,
+            state == tcp::State::Closed,
+            self.socks[i].rst_pending,
+        )
     }
 
     /// The first socket of the queue of listening place `listener` that
