@@ -20,7 +20,7 @@ use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::{is_dhcp_client_frame, second_device_takes};
 use netd::profile::{self, Counter};
 use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RECLAIM_STEP, RX_BUFFERS, offset};
-use netd::spsc::{pack, unpack};
+use netd::spsc::{pack_frame, unpack_frame};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
@@ -170,12 +170,13 @@ impl<const D: usize> RxRing<D> {
         }
     }
 
-    /// Takes the next used buffer: its number and the length of its frame,
+    /// Takes the next used buffer: its number, the length of its frame and
+    /// whether the sum of its TCP segment is good already (the switch says so),
     /// dropping (and returning to the queue) the buffers that hold none or a
     /// frame that must not reach the stack. Every buffer taken, good or not,
     /// costs one unit of the step's share of receiving: a flood of frames
     /// that are dropped cannot hold a step.
-    pub(crate) fn pop(&mut self) -> Option<(u16, usize)> {
+    pub(crate) fn pop(&mut self) -> Option<(u16, usize, bool)> {
         loop {
             if self.budget.rx_left() == 0 {
                 return None;
@@ -191,10 +192,10 @@ impl<const D: usize> RxRing<D> {
                 // frame's.
                 RxPort::Inner => {
                     let word = switch::INNER.rx_ready.pop()?;
-                    let (n, len) = unpack(word);
+                    let (n, len, sum) = unpack_frame(word);
                     self.budget.take_rx();
                     self.frames += 1;
-                    return Some((n, usize::from(len)));
+                    return Some((n, usize::from(len), sum));
                 }
             };
             self.budget.take_rx();
@@ -209,7 +210,7 @@ impl<const D: usize> RxRing<D> {
                 }
                 frames::RxFrame::Frame(len) => {
                     self.frames += 1;
-                    return Some((n, len));
+                    return Some((n, len, false));
                 }
                 frames::RxFrame::Invalid => {
                     self.dropped += 1;
@@ -323,7 +324,17 @@ impl<const D: usize> TxRing<D> {
         let slice = unsafe { buffer_at::<D>(n) };
         let frame = &mut slice[HDR_LEN..HDR_LEN + len];
         let began = profile::now();
-        frames::fill_sums(frame);
+        // The switch has the device complete the sum of a segment of TCP when the device offers
+        // it; the other frames of the first device and all those of the second go out with their
+        // sums whole.
+        // Without the offload the stack makes the sum whole here, as the second device does:
+        // the switch's step would pay for it otherwise.
+        let partial = matches!(self.port, TxPort::Inner)
+            && switch::INNER.offload()
+            && frames::fill_partial(frame).is_some();
+        if !partial {
+            frames::fill_sums(frame);
+        }
         profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
         profile::add(Counter::SumN, 1);
         profile::add(Counter::SumBytes, len as u64);
@@ -341,7 +352,7 @@ impl<const D: usize> TxRing<D> {
             // The ring holds as many words as there are buffers, and the
             // pool lent this one.
             TxPort::Inner => {
-                switch::must(&switch::INNER.tx_sub, pack(n, len as u16));
+                switch::must(&switch::INNER.tx_sub, pack_frame(n, len as u16, partial));
                 profile::count(Counter::FramesTx);
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);
@@ -514,7 +525,7 @@ impl<const D: usize> NetDevice<D> {
                 self.held = Some(Held::Loop { buffer, length });
                 return Some(dest);
             }
-            let (buffer, length) = self.rx.pop()?;
+            let (buffer, length, checked) = self.rx.pop()?;
             // SAFETY: the buffer was popped and goes back below or when the
             // token drops.
             let slice = unsafe { buffer_at::<D>(buffer) };
@@ -533,8 +544,15 @@ impl<const D: usize> NetDevice<D> {
             // A packet of the loopback network that reaches this point came through the switch
             // from a consumer's stack (the wire's never get here: `classify` and the switch
             // drop them), and such a stack leaves its sums unfilled as the loopback does.
-            let sums_hold =
-                (frame[12..14] == [8, 0] && frames::martian(frame)) || frames::verify_sums(frame);
+            // A segment of TCP whose sum the switch vouches for (the device checked it, or it
+            // is partial and its data never left the service) keeps its header's sum to
+            // check.
+            let sums_hold = (frame[12..14] == [8, 0] && frames::martian(frame))
+                || if checked {
+                    frames::verify_header(frame)
+                } else {
+                    frames::verify_sums(frame)
+                };
             profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
             if !sums_hold {
                 self.bad_sum += 1;
@@ -821,7 +839,9 @@ impl<const D: usize> phy::Device for NetDevice<D> {
         caps.medium = Medium::Ethernet;
         // The frames of the loopback never leave the service, so smoltcp
         // computes and checks no sum; the frames of the wire get theirs in
-        // `fill_sums` and lose them in `verify_sums`.
+        // `fill_sums` (a segment of TCP gets the sum of its pseudo-header in
+        // `fill_partial`, and the switch completes it) and lose them in
+        // `verify_sums` (`verify_header` alone for a segment the switch vouches for).
         caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps.max_transmission_unit = MAX_FRAME;
         caps

@@ -6,7 +6,7 @@
 //!
 //! | Method | Request | Reply |
 //! |---|---|---|
-//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached`; one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
+//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached` (the last word says whether the device offloads the TCP sums: only then may a TX entry say `TX_SUM`); one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
 //! | PORT_HOLD (38) | protocol (u32, 6 or 17), first port, count (1..=`HOLD_MAX`), flags (u32, `REUSEPORT`); a handle: a copy of the identity session | status, place (u32, as SOCKET's description). NOT_ALLOWED (below 1024 without the superuser), IN_USE (the port is held), LIMIT_REACHED (no group) |
 //! | JOIN (40) | place (u32) | status. INVALID (the session has no consumer, or no such place) |
 //!
@@ -19,7 +19,7 @@
 use crate::{Config, Method};
 use proto_wire::{Reader, Status, Writer};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const PAGE: usize = 4096;
 pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
@@ -54,12 +54,22 @@ pub const COUNTERS: usize = 9 * LINE;
 pub const DONE_ARP_COPY: u16 = 1;
 pub const DONE_ICMP_ERROR: u16 = 2;
 pub const DONE_LOOP: u16 = 4;
-pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP;
+/// The sum of the TCP segment is good: the device checked it, or the frame comes from a stack
+/// that left it partial (the switch put the pseudo-header sum in it), or never left the
+/// service's memory. The consumer's stack does not check the segment's sum then; without the
+/// flag it does.
+pub const DONE_SUM_OK: u16 = 0x100;
+pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP | DONE_SUM_OK;
 /// The TX flags of an ordinary frame.
 pub const TX_FLAGS: u16 = 0;
+/// A frame of TCP in IPv4 whose sum the stack did not compute: the switch writes the sum of
+/// the pseudo-header from the frame it checked, and the device (or the switch, for a device
+/// without the offload) completes the sum over the segment. The flag stands alone: with
+/// `TX_LOOP` or on a frame that is no TCP the entry is refused.
+pub const TX_SUM: u16 = 1;
 /// A packet of the loopback network of the consumer's stack for a port that is no port of
 /// that stack (both addresses in 127.0.0.0/8, else the ring breaks); the switch routes it by
-/// its port. The only flag a TX entry may have.
+/// its port. `TX_FLAGS`, `TX_SUM` and `TX_LOOP` are the values the flags of a TX entry may have.
 pub const TX_LOOP: u16 = 4;
 
 /// The bits the switch notifies the consumer with.
@@ -298,6 +308,9 @@ pub struct Attached {
     pub config: Config,
     pub block_first: u32,
     pub block_count: u32,
+    /// The device completes the sums of TCP: only then may an entry say `TX_SUM` (else it is
+    /// refused). The consumer sums its own segments otherwise.
+    pub offload: bool,
 }
 
 impl Attached {
@@ -307,7 +320,8 @@ impl Attached {
         w.u32(self.generation)?;
         self.config.write_fields(w)?;
         w.u32(self.block_first)?;
-        w.u32(self.block_count)
+        w.u32(self.block_count)?;
+        w.u32(u32::from(self.offload))
     }
 
     /// A refusal is its status alone and comes back as the error.
@@ -324,6 +338,7 @@ impl Attached {
         let (consumer, generation) = (r.u32()?, r.u32()?);
         let config = Config::read_fields(&mut r)?;
         let (block_first, block_count) = (r.u32()?, r.u32()?);
+        let offload = r.u32()? != 0;
         r.finish()?;
         Ok(Attached {
             consumer,
@@ -331,6 +346,7 @@ impl Attached {
             config,
             block_first,
             block_count,
+            offload,
         })
     }
 }
@@ -485,7 +501,16 @@ mod tests {
             spare: 0,
         };
         assert_eq!(TxEntry::from_bytes(t.to_bytes()), t);
-        assert_eq!(DONE_FLAGS, DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP);
+        assert_eq!(
+            DONE_FLAGS,
+            DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP | DONE_SUM_OK
+        );
+        assert_eq!(DONE_SUM_OK, 1 << 8);
+        assert_eq!(TX_SUM, 1);
+        assert_eq!(
+            DONE_SUM_OK & (DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP),
+            0
+        );
         assert_eq!(DONE_LOOP, TX_LOOP);
     }
 
@@ -497,9 +522,12 @@ mod tests {
         assert_eq!(Header::read(&mut r).unwrap(), Method::Attach.header());
         assert_eq!(read_attach(r), Ok(Layout::DEFAULT));
         let mut bad = w.as_bytes()[8..].to_vec();
-        bad[0] = 2;
-        assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
-        bad[0] = 1;
+        // A consumer of the version before TX_SUM and DONE_SUM_OK, and one of the next.
+        for foreign in [VERSION - 1, VERSION + 1] {
+            bad[0] = foreign as u8;
+            assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
+        }
+        bad[0] = VERSION as u8;
         bad[12] = 3;
         assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
         assert_eq!(read_attach(Reader::new(&bad[..15])), Err(Status::BadSize));
@@ -513,11 +541,19 @@ mod tests {
             config: CONFIG,
             block_first: 49152,
             block_count: 512,
+            offload: true,
         };
         let mut w = Writer::new();
         a.write(&mut w).unwrap();
         assert!(w.as_bytes().len() <= abi::MESSAGE_MAX);
         assert_eq!(Attached::read(w.as_bytes()), Ok(a));
+        let off = Attached {
+            offload: false,
+            ..a
+        };
+        let mut w = Writer::new();
+        off.write(&mut w).unwrap();
+        assert_eq!(Attached::read(w.as_bytes()), Ok(off));
         assert_eq!(
             Attached::read(&w.as_bytes()[..w.as_bytes().len() - 1]),
             Err(Status::BadSize)

@@ -38,7 +38,10 @@
  *   from DONE in cells the process owns (the mbuf's storage is the cell, which
  *   goes back to FILL when the mbuf is freed, as long as FILL holds
  *   FF_STAFETO_PORT_RX_LOW cells; below that one copy), a frame goes out
- *   with one copy into a cell of TX, the checksums are the stack's, the
+ *   with one copy into a cell of TX, the sum of a TCP segment is the
+ *   switch's to complete (entry flag TX_SUM; the stack leaves the sum of its
+ *   pseudo-header) and a received segment whose sum is good comes with
+ *   DONE_SUM_OK; the other sums are the stack's, the
  *   address and the MAC are the shared ones of the attach. ARP and DHCP
  *   belong to the service. The switch is poked only while it sleeps, and
  *   the thread sleeps with consumer_idle set (full barrier on both sides).
@@ -102,6 +105,9 @@ extern int ff_stafeto_netisr_pending(void);
  * came through the switch (freebsd/net/if_loop.c, FF_STAFETO). */
 extern void ff_stafeto_lo_input(void *mbuf);
 #define VNET_PORT_DONE_LOOP 4
+/* The sum of the TCP segment is good (the device checked it, or the frame never left the
+ * service); the stack does not check it. */
+#define VNET_PORT_DONE_SUM_OK 0x100
 struct ff_flow_key;
 
 /* The log of ff_stafeto_rte.h: everything to stderr, a type's messages up
@@ -359,9 +365,13 @@ ff_dpdk_if_up(void)
     ff_update_current_ts();
     if (dev_on) {
         /* The interface of the device: the address, mask, broadcast and
-         * gateway of the claim as the strings F-Stack's attach reads. A
-         * checksum is the stack's to make and to check (no feature of the
-         * device is negotiated). */
+         * gateway of the claim as the strings F-Stack's attach reads. On the
+         * device of the second claim a checksum is the stack's to make and to
+         * check (no feature of the device is negotiated); on the switch's ring
+         * the switch completes the sum of a TCP segment (TX_SUM) and says when a
+         * received segment's sum is good (DONE_SUM_OK), the sums of UDP stay
+         * the layer's (ff_dpdk_if_send) and the stack's own header sum of IPv4
+         * is made and checked here (tx_csum_ip stays 0). */
         const struct stafeto_fast_config *c = &dev_claim.config;
         struct ff_port_cfg cfg;
         char addr[16], mask[16], bcast[16], gateway[16];
@@ -382,6 +392,12 @@ ff_dpdk_if_up(void)
         cfg.netmask = mask;
         cfg.broadcast = bcast;
         cfg.gateway = gateway;
+        if (port_on) {
+            cfg.hw_features.rx_csum = 1;
+            /* Only a device that completes the sums (snapshot[6]) takes
+             * segments without them; else the stack sums its own. */
+            cfg.hw_features.tx_csum_l4 = dev_claim.snapshot[6] != 0;
+        }
         dev_ctx = ff_veth_attach(&cfg);
         if (dev_ctx == NULL) {
             fprintf(stderr, "f-stack: the interface of the device did not attach\n");
@@ -509,7 +525,9 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     uint8_t *to;
     void *cur;
     int off = 0, sent;
+    struct ff_tx_offload offload;
 
+    memset(&offload, 0, sizeof(offload));
     if (!dev_on || ctx != dev_ctx || dev_lost) {
         /* No device to send on: the frame is dropped and counted. */
         tx_dropped++;
@@ -556,12 +574,25 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
             vnet_copy(to + off, data, len);
             off += (int)len;
         }
+        ff_mbuf_tx_offload(m, &offload);
         ff_mbuf_free(m);
         if (off < FF_STAFETO_FRAME_MIN) {
             memset(to + off, 0, FF_STAFETO_FRAME_MIN - off);
             off = FF_STAFETO_FRAME_MIN;
         }
-        vnet_port_tx_submit((uint32_t)off);
+        if (offload.tcp_csum) {
+            /* The switch writes the sum of the pseudo-header and has the device
+             * complete the segment's sum. */
+            vnet_port_tx_submit_sum((uint32_t)off);
+            stats.tx_sum++;
+        } else {
+            /* UDP has the sum of its pseudo-header in the field (the interface
+             * offers CSUM_DELAY_DATA, which names UDP too): the layer completes
+             * it. */
+            if (offload.udp_csum || offload.ip_csum)
+                vnet_fill_sums(to, (size_t)off);
+            vnet_port_tx_submit((uint32_t)off);
+        }
         stats.tx_frames++;
         if (++tx_batch >= FF_STAFETO_TX_BATCH)
             tx_flush();
@@ -800,16 +831,19 @@ port_rx_one(const struct vnet_port_rx *r)
     uint32_t len = r->len;
     uint64_t began, handed;
     void *hdr;
+    uint8_t sum_ok = (r->flags & VNET_PORT_DONE_SUM_OK) != 0;
 
     stats.rx_frames++;
     if (len < ETH || len > FF_STAFETO_FRAME_MAX + 4) {
         vnet_port_rx_return(r->cell);
         return;
     }
+    if (sum_ok)
+        stats.rx_sum_ok++;
     began = counter();
     if (vnet_port_fill_free() >= FF_STAFETO_PORT_RX_LOW) {
         hdr = ff_mbuf_gethdr((void *)(((uintptr_t)r->cell << 1) | 1), (uint16_t)len,
-            (void *)f, (uint16_t)len, 0);
+            (void *)f, (uint16_t)len, sum_ok);
         if (hdr == NULL) {
             stats.rx_no_mbuf++;
             vnet_port_rx_return(r->cell);
@@ -826,7 +860,7 @@ port_rx_one(const struct vnet_port_rx *r)
         }
         vnet_copy(block, f, len);
         vnet_port_rx_return(r->cell);
-        hdr = ff_mbuf_gethdr(block, (uint16_t)len, block, (uint16_t)len, 0);
+        hdr = ff_mbuf_gethdr(block, (uint16_t)len, block, (uint16_t)len, sum_ok);
         if (hdr == NULL) {
             stats.rx_no_mbuf++;
             free(block);

@@ -60,14 +60,15 @@ use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
     PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
-    SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
+    SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
     SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TX_BUFFERS,
     TX_SHARE, bell_due, drive,
 };
-use netd::spsc::{Spsc, pack, unpack};
+use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
 use netd::switchlogic::ring::Tx;
 use netd::switchlogic::route::{self, Decision, Reason, Source, Verdict, Why};
+use netd::switchlogic::sums;
 use netd::switchlogic::tables::{MAX_CONSUMERS, Tables};
 use proto_net::switch::{CELL, WAKE_RING};
 use rt::handle::{Channel, Interrupt, Process, Thread, Timer};
@@ -82,11 +83,11 @@ const TRANSMITQ: u16 = 1;
 
 /// The rings between the threads, and what they tell each other.
 pub struct Inner {
-    /// Switch to stack: a frame of the wire, `pack(buffer, length)`.
+    /// Switch to stack: a frame, `pack_frame(buffer, length, sum good)`.
     pub rx_ready: Spsc<256>,
     /// Stack to switch: a buffer of receiving that is free again.
     pub rx_back: Spsc<256>,
-    /// Stack to switch: a frame to send, `pack(buffer, length)`.
+    /// Stack to switch: a frame to send, `pack_frame(buffer, length, sum partial)`.
     pub tx_sub: Spsc<256>,
     /// Switch to stack: a free buffer of sending.
     pub tx_supply: Spsc<256>,
@@ -115,6 +116,8 @@ pub struct Inner {
     frames_tx: AtomicU32,
     /// The switch put an answer in `COMMANDS.to_stack` and the stack has not looked.
     pub back_told: Told,
+    /// The device completes the sums of TCP (set when the switch starts, before the stack runs).
+    offload: AtomicBool,
     /// The start of the port table (the switch writes it, the stack reads single bytes), or 0
     /// without a switch table.
     ports_base: AtomicUsize,
@@ -157,6 +160,12 @@ pub struct Stats {
     pub run_max_us: AtomicU32,
     /// Steps that found a consumer's entries waiting for the next period (the budget spent).
     pub budget_waits: AtomicU32,
+    /// Frames of TCP the device completes the sum of, frames of the wire whose sum the device
+    /// checked (and the stack or consumer need not), and frames whose sum the switch completed
+    /// in software for a device without the offload.
+    pub sum_tx: AtomicU32,
+    pub sum_rx: AtomicU32,
+    pub sum_soft: AtomicU32,
 }
 
 impl Stats {
@@ -183,6 +192,9 @@ impl Stats {
             pause_failed: AtomicU32::new(0),
             run_max_us: AtomicU32::new(0),
             budget_waits: AtomicU32::new(0),
+            sum_tx: AtomicU32::new(0),
+            sum_rx: AtomicU32::new(0),
+            sum_soft: AtomicU32::new(0),
         }
     }
 }
@@ -257,6 +269,7 @@ impl Inner {
             bells_tx: AtomicU32::new(0),
             frames_tx: AtomicU32::new(0),
             back_told: Told::new(),
+            offload: AtomicBool::new(false),
             ports_base: AtomicUsize::new(0),
             stats: Stats::new(),
         }
@@ -284,6 +297,11 @@ impl Inner {
                 self.back_told.failed();
             }
         }
+    }
+
+    /// Whether the device completes the sums of TCP.
+    pub fn offload(&self) -> bool {
+        self.offload.load(Ordering::Relaxed)
     }
 
     /// Frames the switch dropped (no frame) and the martian ones.
@@ -418,6 +436,9 @@ pub struct Switch {
     next_c: u8,
     /// The frame of a consumer, copied out of its ring and checked here.
     scratch: [u8; CELL],
+    /// The device completes the sums of TCP and checks them on frames it receives
+    /// (`CSUM` and `GUEST_CSUM` negotiated); without it the switch completes them.
+    offload: bool,
     /// Whose each buffer of the queue of sending is, in the order they went in: the device
     /// returns them in order, so a count of reclaimed buffers pops the owners.
     fifo: [u8; TX_BUFFERS],
@@ -449,6 +470,14 @@ pub struct Switch {
     said: u64,
 }
 
+/// Adds one to a counter only the switch thread writes (no read-modify-write instruction).
+fn bump(counter: &AtomicU32) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
 fn now_ns() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -458,6 +487,7 @@ impl Switch {
     /// seen yet: the buffers of receiving go in, the device is told they
     /// did (`finish_init`), and the buffers of sending are lent to the
     /// stack.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut transport: SomeTransport<'static>,
         rx_queue: Queue<DEVICE>,
@@ -465,12 +495,14 @@ impl Switch {
         irq: Handle<Interrupt>,
         channel: Handle<Channel>,
         link: bool,
+        offload: bool,
         (tables, timer, view): (Option<Tables<'static>>, Handle<Timer>, Handle<Channel>),
     ) -> Switch {
         let mut rx = virtio_net::RxRing::new(rx_queue, net_at(DEVICE));
         if let Err(broken) = rx.fill(RX_BUFFERS) {
             fail(broken.text(false));
         }
+        INNER.offload.store(offload, Ordering::Release);
         use virtio_drivers::transport::Transport;
         transport.finish_init();
         ring(&mut transport, RECEIVEQ);
@@ -499,6 +531,7 @@ impl Switch {
             consumers_before: 0,
             next_c: 0,
             scratch: [0; CELL],
+            offload,
             fifo: [0; TX_BUFFERS],
             fifo_head: 0,
             fifo_len: 0,
@@ -702,8 +735,8 @@ impl Switch {
             let Some(word) = INNER.tx_sub.pop() else {
                 break;
             };
-            let (n, len) = unpack(word);
-            let (to_stack, turned) = self.stack_frame(n, usize::from(len));
+            let (n, len, partial) = unpack_frame(word);
+            let (to_stack, turned) = self.stack_frame(n, usize::from(len), partial);
             passed += to_stack;
             // A frame turned into the tables costs a copy and a route as a frame of a consumer
             // does: past the first few the step goes on only while it is short.
@@ -877,7 +910,8 @@ impl Switch {
     /// A frame of the stack: a turn to the shared address goes through the tables, any other
     /// into the queue. The number of frames passed to the stack, and whether the frame was
     /// turned into the tables.
-    fn stack_frame(&mut self, n: u16, len: usize) -> (usize, bool) {
+    /// `partial`: the stack left the sum of a segment of TCP partial (`TxRing::submit`).
+    fn stack_frame(&mut self, n: u16, len: usize, partial: bool) -> (usize, bool) {
         // SAFETY: the stack gave the buffer up (it is in `tx_sub`), and the device does not
         // hold it.
         let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
@@ -896,7 +930,7 @@ impl Switch {
                 // A stale byte of the stack's: the frame goes back, and the stack answers it.
                 // A full ring of frames for the stack drops it (TCP repeats it).
                 Decision::Stack => {
-                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                    if netd::books::offer(&INNER.rx_ready, pack_frame(n, len as u16, partial)) {
                         1
                     } else {
                         self.tx.book.release(n);
@@ -914,7 +948,8 @@ impl Switch {
                         INNER.stats.rx_by[usize::from(consumer) % 8]
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    route::deliver(t, d, frame);
+                    // The frame never reaches the device: a partial sum is good as it is.
+                    route::deliver(t, sums::mark(d, partial), frame);
                     self.tx.book.release(n);
                     0
                 }
@@ -929,7 +964,14 @@ impl Switch {
         {
             INNER.stats.own_to_device.fetch_add(1, Ordering::Relaxed);
         }
-        match self.tx.submit(n, len) {
+        let csum = if partial {
+            // SAFETY: as above, the stack gave the buffer up.
+            let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+            frames::partial_place(&slice[HDR_LEN..HDR_LEN + len])
+        } else {
+            None
+        };
+        match Self::send(&mut self.tx, self.offload, n, len, csum) {
             Ok(Sent::Queued) => {
                 INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
                 self.queued(OWN_STACK);
@@ -996,7 +1038,17 @@ impl Switch {
                         progressed = true;
                         budget -= 1;
                         taken += 1;
-                        self.consumer_frame(c as u8, len);
+                        self.consumer_frame(c as u8, len, false);
+                    }
+                    Tx::Sum(len) => {
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                        if self.consumer_frame(c as u8, len, true) {
+                            // The sum made here counts as another frame (`SUM_WEIGHT`).
+                            budget = budget.saturating_sub(SUM_WEIGHT - 1);
+                            taken += SUM_WEIGHT - 1;
+                        }
                     }
                     Tx::Loop(len) => {
                         progressed = true;
@@ -1031,24 +1083,50 @@ impl Switch {
             })
     }
 
-    /// The copy in `scratch` is checked and goes out, or turns back into the tables.
-    fn consumer_frame(&mut self, c: u8, len: usize) {
+    /// The copy in `scratch` is checked and goes out, or turns back into the tables. `sum`: the
+    /// entry said `TX_SUM`, the segment's sum is not computed; the copy gets the sum of the
+    /// pseudo-header, and a frame that is no whole segment of TCP is refused.
+    fn consumer_frame(&mut self, c: u8, len: usize, sum: bool) -> bool {
         let Some(t) = self.tables.as_mut() else {
-            return;
+            return false;
+        };
+        // The consumer was told at ATTACH whether the device offloads: an entry with `TX_SUM`
+        // on a device without it is refused and counted.
+        if let Err(reason) = sums::admit(self.offload, sum) {
+            route::refuse_tx(t, c, reason);
+            return false;
+        }
+        let frame = &mut self.scratch[..len];
+        let verdict = route::check_tx(t, c, frame);
+        let mut csum = None;
+        if sum && matches!(verdict, Verdict::Send | Verdict::Hairpin) {
+            csum = sums::prepare_tx(frame);
+            if csum.is_none() {
+                route::refuse_tx(t, c, Reason::Proto);
+                return false;
+            }
+        }
+        // The bytes after the IP packet do not go out: the device sums to the end of the frame.
+        let len = if csum.is_some() {
+            sums::wire_len(&self.scratch[..len])
+        } else {
+            len
         };
         let frame = &self.scratch[..len];
-        match route::check_tx(t, c, frame) {
+        // The switch completes the sum itself: a heavy frame (`SUM_WEIGHT`).
+        let heavy = csum.is_some() && !self.offload && matches!(verdict, Verdict::Send);
+        match verdict {
             // `check_tx` never answers these (the entries flagged `TX_LOOP` go through
             // `check_tx_loop`).
             Verdict::Refuse(_) | Verdict::Loop | Verdict::Broke => {}
             Verdict::Send => {
                 let Some(n) = self.tx.book.alloc() else {
-                    return;
+                    return false;
                 };
                 // SAFETY: the buffer is free (just taken from the pool).
                 let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
                 slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
-                match self.tx.submit(n, len) {
+                match Self::send(&mut self.tx, self.offload, n, len, csum) {
                     Ok(Sent::Queued) => {
                         INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
                         INNER.stats.tx_consumer.fetch_add(1, Ordering::Relaxed);
@@ -1070,12 +1148,13 @@ impl Switch {
                     Decision::Stack | Decision::ArpAll => {
                         route::deliver(t, d, frame);
                         // The stack gets a buffer of sending to read the frame in; it comes
-                        // back through `rx_back` (`step`).
+                        // back through `rx_back` (`step`). The frame never reaches the device:
+                        // the sum left partial is good as it is.
                         if let Some(n) = self.tx.book.alloc() {
                             // SAFETY: the buffer is free (just taken from the pool).
                             let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
                             slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
-                            if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                            if netd::books::offer(&INNER.rx_ready, pack_frame(n, len as u16, sum)) {
                                 if INNER.stack_told.tell() {
                                     INNER.wake_stack(crate::RX);
                                 }
@@ -1085,11 +1164,43 @@ impl Switch {
                         }
                     }
                     d => {
-                        route::deliver(t, d, frame);
+                        route::deliver(t, sums::mark(d, sum), frame);
                     }
                 }
             }
         }
+        heavy
+    }
+
+    /// The frame in buffer `n` goes in the queue of sending. A frame whose sum of TCP is
+    /// partial (`csum`) goes with the header that has the device complete it, or, when the
+    /// device has no offload, is completed here first (`sums::finish`).
+    fn send(
+        tx: &mut virtio_net::TxRing<Host<DEVICE>>,
+        offload: bool,
+        n: u16,
+        len: usize,
+        csum: Option<frames::Csum>,
+    ) -> Result<Sent, virtio_net::rings::Broken> {
+        let mut header = None;
+        match sums::finish(offload, csum) {
+            sums::Finish::Whole => {}
+            sums::Finish::Device(c) => {
+                bump(&INNER.stats.sum_tx);
+                profile::count(Counter::SumTx);
+                header = Some(c);
+            }
+            sums::Finish::Software(c) => {
+                // SAFETY: the buffer is the switch's (it was just taken from the pool, or the
+                // stack gave it up), and the device does not hold it.
+                let slice = unsafe { virtio_net::rings::buffer_at(tx.base(), n) };
+                frames::complete(&mut slice[HDR_LEN..HDR_LEN + len], c);
+                bump(&INNER.stats.sum_soft);
+                profile::count(Counter::SumSoft);
+            }
+        }
+        profile::count(Counter::WireTx);
+        tx.submit_with(n, len, header)
     }
 
     /// A packet of the loopback network of consumer `c` (entry flagged `TX_LOOP`, copied into
@@ -1115,7 +1226,8 @@ impl Switch {
                     // SAFETY: the buffer is free (just taken from the pool).
                     let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
                     slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
-                    if netd::books::offer(&INNER.rx_ready, pack(n, len as u16)) {
+                    // No sums are on the loopback, and none is checked.
+                    if netd::books::offer(&INNER.rx_ready, pack_frame(n, len as u16, true)) {
                         if INNER.stack_told.tell() {
                             INNER.wake_stack(crate::RX);
                         }
@@ -1218,12 +1330,37 @@ impl Switch {
             let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
             match frames::classify(slice, used) {
                 RxFrame::Frame(len) => {
+                    profile::count(Counter::WireRx);
+                    if slice[0] != 0 {
+                        profile::count(Counter::RxFlagged);
+                    }
+                    // A packet that is no TCP may come with its sum partial (`NEEDS_CSUM`): it is
+                    // completed here, and counts as `SUM_WEIGHT` frames of the step.
+                    if self.offload
+                        && let Some(h) = frames::parse_header(slice)
+                        && h.flags & virtio_net::frames::NEEDS_CSUM != 0
+                        && !frames::is_tcp(&slice[HDR_LEN..HDR_LEN + len])
+                        && frames::complete_received(&mut slice[HDR_LEN..HDR_LEN + len], &h)
+                    {
+                        budget = budget.saturating_sub(SUM_WEIGHT - 1);
+                        taken += SUM_WEIGHT - 1;
+                        bump(&INNER.stats.sum_soft);
+                        profile::count(Counter::SumSoft);
+                    }
+                    let frame = &slice[HDR_LEN..HDR_LEN + len];
+                    // The device checked the segment's sum (or it is partial and good), and
+                    // the header's sum holds: the stack that gets the frame does not check
+                    // the segment.
+                    let sum = self.offload && sums::wire_sum_ok(frames::sum_checked(slice), frame);
+                    if sum {
+                        bump(&INNER.stats.sum_rx);
+                        profile::count(Counter::SumRx);
+                    }
                     let Some(t) = self.tables.as_mut() else {
-                        must(&INNER.rx_ready, pack(n, len as u16));
+                        must(&INNER.rx_ready, pack_frame(n, len as u16, sum));
                         passed += 1;
                         continue;
                     };
-                    let frame = &slice[HDR_LEN..HDR_LEN + len];
                     match route::route(t, frame, Source::Wire) {
                         Decision::Drop(why) => {
                             INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
@@ -1235,8 +1372,8 @@ impl Switch {
                                 INNER.stats.rx_by[usize::from(consumer) % 8]
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                            if route::deliver(t, d, frame) {
-                                must(&INNER.rx_ready, pack(n, len as u16));
+                            if route::deliver(t, sums::mark(d, sum), frame) {
+                                must(&INNER.rx_ready, pack_frame(n, len as u16, sum));
                                 passed += 1;
                             } else {
                                 self.give(n);

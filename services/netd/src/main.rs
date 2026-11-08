@@ -87,7 +87,7 @@ use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::SomeTransport;
 use virtio_mmio::PAGE;
-use virtio_net::open::{MAC, MTU, STATUS};
+use virtio_net::open::{MAC, MTU, OFFLOAD, STATUS};
 use virtio_net::transport::{self, Function, OpenError};
 use virtio_net::{OpenFailure, Opened};
 
@@ -123,7 +123,8 @@ const RECEIVEQ: u16 = 0;
 const TRANSMITQ: u16 = 1;
 /// The features the service asks for (`virtio_net::open`):
 /// `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
-/// `VIRTIO_NET_F_STATUS`. No checksum offload, no segmentation offload, no
+/// `VIRTIO_NET_F_STATUS`. The checksum offload is added by `start_device` when
+/// the device takes it (`virtio_net::open_offload`); no segmentation offload, no
 /// merged buffers, no control queue (Virtio 1.2, 5.1.3). Apple's device
 /// clears `FEATURES_OK` for any set without MTU.
 const WANTED: u64 = MTU | MAC | STATUS;
@@ -393,11 +394,17 @@ fn main(_: u64) -> u64 {
         Ok(found) => found,
         Err(code) => return code,
     };
-    let opened = match start_device(&mut transport, "virtio-net") {
+    let opened = match start_device(&mut transport, "virtio-net", true) {
         Ok(opened) => opened,
         Err(code) => return code,
     };
     let (mac, link) = (opened.mac, opened.link);
+    let offload = opened.features & OFFLOAD == OFFLOAD;
+    rt::println!(
+        "net-offload: features {:#x}, checksum offload {}",
+        opened.features,
+        if offload { "on" } else { "off" }
+    );
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
     let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
         return NOT_STARTED;
@@ -457,6 +464,7 @@ fn main(_: u64) -> u64 {
         irq,
         switch_channel,
         link,
+        offload,
         (switch_tables, sweep_timer.0, sweep_timer.1),
     );
     if pci {
@@ -678,8 +686,21 @@ fn make_switch_tables(
 /// The device on `transport` reset, its features negotiated (WANTED), its MAC
 /// address and link status read (`virtio_net::open`); says why on failure
 /// and gives the code the service ends with.
-fn start_device(transport: &mut SomeTransport<'static>, tag: &str) -> Result<Opened, u64> {
-    match virtio_net::open(transport, WANTED) {
+///
+/// With `offload` the checksum offload is asked for and kept when the device takes it
+/// (`virtio_net::open_offload`); the second device and its owner's frames keep their sums
+/// in software.
+fn start_device(
+    transport: &mut SomeTransport<'static>,
+    tag: &str,
+    offload: bool,
+) -> Result<Opened, u64> {
+    let started = if offload {
+        virtio_net::open_offload(transport, WANTED)
+    } else {
+        virtio_net::open(transport, WANTED)
+    };
+    match started {
         Ok(opened) => Ok(opened),
         Err(OpenFailure::Reset | OpenFailure::Config) => Err(NOT_STARTED),
         Err(OpenFailure::Features { offered }) => {
@@ -1560,7 +1581,7 @@ impl Driver<'_> {
         let st = &switch::INNER.stats;
         let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
         rt::println!(
-            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} pauses {} pause_failed {} run_max_us {} budget_waits {}",
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} pauses {} pause_failed {} run_max_us {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
             get(&st.consumers),
             get(&st.flows),
             get(&st.unconfirmed),
@@ -1578,7 +1599,10 @@ impl Driver<'_> {
             get(&st.pauses),
             get(&st.pause_failed),
             get(&st.run_max_us),
-            get(&st.budget_waits)
+            get(&st.budget_waits),
+            get(&st.sum_tx),
+            get(&st.sum_rx),
+            get(&st.sum_soft)
         );
         let drops: [u32; 7] = core::array::from_fn(|i| get(&st.drops[i]));
         let refused: [u32; netd::switchlogic::route::Reason::COUNT] =

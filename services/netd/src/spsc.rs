@@ -86,6 +86,23 @@ pub const fn unpack(word: u32) -> (u16, u16) {
     (word as u16, (word >> 16) as u16)
 }
 
+/// The bit of the length of a frame (a frame is at most 1514 bytes) that says
+/// the sum of its TCP segment is good (received: the device checked it, or
+/// the frame never left the service's memory) or partial (sent: the switch
+/// completes it).
+pub const SUM_BIT: u16 = 1 << 15;
+
+/// `pack` for a frame, with `sum` in the bit above its length.
+pub const fn pack_frame(buffer: u16, length: u16, sum: bool) -> u32 {
+    pack(buffer, length | if sum { SUM_BIT } else { 0 })
+}
+
+/// The buffer number, the length and the sum bit of a word `pack_frame` made.
+pub const fn unpack_frame(word: u32) -> (u16, u16, bool) {
+    let (buffer, length) = unpack(word);
+    (buffer, length & !SUM_BIT, length & SUM_BIT != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +153,18 @@ mod tests {
     fn a_word_carries_a_buffer_and_a_length() {
         assert_eq!(unpack(pack(511, 1514)), (511, 1514));
         assert_eq!(unpack(pack(0, 0)), (0, 0));
+    }
+
+    #[test]
+    fn a_frame_word_carries_the_sum_bit_apart_from_the_length() {
+        for sum in [false, true] {
+            for len in [0u16, 1, 60, 1514, 0x7FFF] {
+                assert_eq!(unpack_frame(pack_frame(511, len, sum)), (511, len, sum));
+            }
+        }
+        assert_eq!(pack_frame(5, 60, false), pack(5, 60));
+        assert_eq!(unpack_frame(pack(5, 60)), (5, 60, false));
+        assert_eq!(unpack(pack_frame(5, 60, true)).1, 60 | SUM_BIT);
     }
 
     #[test]

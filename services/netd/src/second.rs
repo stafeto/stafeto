@@ -178,7 +178,7 @@ impl Second {
         objects: (u64, u64),
     ) -> Result<(), u64> {
         let (pci, function, status) = place;
-        let opened = crate::start_device(&mut transport, "virtio-net1")?;
+        let opened = crate::start_device(&mut transport, "virtio-net1", false)?;
         let mac = opened.mac;
         if !crate::mtu_fits(&opened, "virtio-net1") {
             return Err(NOT_STARTED);
@@ -473,7 +473,7 @@ impl Second {
                 self.mode = Mode::Back(Back::Open);
             }
             Back::Open => {
-                let opened = match crate::start_device(&mut self.transport, "virtio-net1") {
+                let opened = match crate::start_device(&mut self.transport, "virtio-net1", false) {
                     Ok(opened) => opened,
                     Err(_) => return Returned::Failed,
                 };

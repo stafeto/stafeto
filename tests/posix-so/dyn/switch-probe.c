@@ -230,7 +230,7 @@ static void send_mode(const char *mode)
 	uint32_t before = refused_count();
 	unsigned len = build(mode, f);
 
-	send_frame(f, len, !strcmp(mode, "flags") ? 1 : 0);
+	send_frame(f, len, !strcmp(mode, "flags") ? 2 : 0);
 	pause_ms(150);
 	printf("switch-probe: %s refused %u\n", mode, refused_count() - before);
 	fflush(stdout);
@@ -255,7 +255,7 @@ static void saturate(unsigned secs)
 			volatile uint32_t *entry = word(TX_AT + (i % TX_SLOTS) * 8);
 
 			memcpy(ring + TX_CELLS_AT + (i % TX_SLOTS) * CELL, f, sizeof f);
-			entry[0] = (uint32_t)sizeof f | 1u << 16;
+			entry[0] = (uint32_t)sizeof f | 2u << 16;
 			entry[1] = 0;
 			sent++;
 			entries++;

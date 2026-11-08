@@ -209,6 +209,55 @@ fn summary(times: &mut [Duration]) -> (u128, u128) {
     (median, largest)
 }
 
+/// The size of the file `httpd` of the steps run sends from the stack's own
+/// socket to the wire.
+const BULK_KIB: usize = 2048;
+
+/// A bulk transfer from the stack's own `httpd` (no consumer ring, no
+/// offload under QEMU): a file of `BULK_KIB` KiB made in the guest and read
+/// whole through the forwarded port.
+fn bulk(run: &mut qemu::Run, tcp: u16) -> Result<(), String> {
+    run.send("kill $H2; wait $H2")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // The image has no /dev/zero: the file is the page, repeated.
+    let repeats = BULK_KIB * 1024 / rootfs::WWW_INDEX_LEN;
+    run.send(&format!(
+        "mkdir -p /tmp/bulk && i=0 && while [ $i -lt {repeats} ]; do cat /www/index.html; i=$((i+1)); done > /tmp/bulk/big; echo bulk-made-$?"
+    ))?;
+    run.expect("bulk-made-0", Duration::from_secs(120))?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("httpd -f -p 80 -h /tmp/bulk &")?;
+    run.expect("# ", DIALOG_STEP)?;
+    std::thread::sleep(Duration::from_millis(500));
+    let within = Duration::from_secs(300);
+    let started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&local(tcp), within)
+        .map_err(|e| format!("bulk connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(within))
+        .map_err(|e| format!("bulk timeout: {e}"))?;
+    stream
+        .write_all(b"GET /big HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .map_err(|e| format!("bulk request: {e}"))?;
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .map_err(|e| format!("bulk response after {} bytes: {e}", answer.len()))?;
+    let body = body_of(&answer)?;
+    if body.len() != BULK_KIB * 1024 {
+        return Err(format!(
+            "the bulk body is {} bytes, not {}",
+            body.len(),
+            BULK_KIB * 1024
+        ));
+    }
+    println!(
+        "net-curl: bulk of {BULK_KIB} KiB from the stack's own httpd read in {} ms",
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 /// The requests of the run: twenty in a row, eight at once.
 pub fn requests(address: SocketAddr, started: Instant) -> Result<(u128, u128), String> {
     // The first request waits for `httpd` to listen. A SYN that comes before
@@ -554,7 +603,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         // start that finds the port in use ends, and starts again.
         let mut answered = None;
         for _ in 0..10 {
-            run.send("httpd -f -p 80 -h /www &")?;
+            run.send("httpd -f -p 80 -h /www & H2=$!")?;
             run.expect("# ", DIALOG_STEP)?;
             std::thread::sleep(Duration::from_millis(300));
             if let Ok(answer) = get_within(local(tcp), Duration::from_secs(2)) {
@@ -565,6 +614,9 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         let (body, _) = answered.ok_or("the new httpd never answered on the port")?;
         check_body(&body).map_err(|e| format!("the new httpd: {e}"))?;
         println!("net-curl: a new httpd on the same port ok");
+        if steps {
+            bulk(&mut run, tcp)?;
+        }
         reported = Some(timing);
         Ok::<(), String>(())
     })();

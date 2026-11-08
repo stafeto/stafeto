@@ -5,7 +5,9 @@
 //! of 12 bytes that a device with `VIRTIO_F_VERSION_1` puts before every
 //! frame it receives and wants before every frame it sends, then the
 //! Ethernet frame itself; and the checksums of the frames of the wire
-//! (RFC 1071), which a driver without checksum offload fills and checks.
+//! (RFC 1071), which a driver fills and checks (`fill_sums`, `verify_sums`),
+//! or, with the checksum offload (`CSUM` and `GUEST_CSUM`), leaves in part to
+//! the device (`fill_partial`, `tx_prepare_with`, `sum_checked`).
 
 /// The bytes of `struct virtio_net_hdr` under `VIRTIO_F_VERSION_1`: flags,
 /// gso_type, hdr_len, gso_size, csum_start, csum_offset and num_buffers
@@ -25,22 +27,47 @@ pub const BUFFER_LEN: usize = 2048;
 const _: () = assert!(HDR_LEN + MAX_FRAME <= BUFFER_LEN);
 const _: () = assert!(NUM_BUFFERS_AT + 2 == HDR_LEN);
 
-/// The fields of the header of a received frame that a driver looks at.
+/// `flags` of the header: on a frame to send, the sum in the frame is partial
+/// and the device completes it (`NEEDS_CSUM`); on a received frame, the device
+/// has checked the sum of the data (`DATA_VALID`), or the sum is partial and
+/// the data is good (`NEEDS_CSUM`) (Virtio 1.2, 5.1.6.2 and 5.1.6.4).
+pub const NEEDS_CSUM: u8 = 1;
+pub const DATA_VALID: u8 = 2;
+
+/// The fields of the header of a received frame that a driver looks at, and
+/// those of a frame to send that the checksum offload fills.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub flags: u8,
     pub gso_type: u8,
+    pub hdr_len: u16,
+    pub gso_size: u16,
+    pub csum_start: u16,
+    pub csum_offset: u16,
     pub num_buffers: u16,
 }
 
 /// The header at the start of `buffer`; None when fewer than HDR_LEN bytes.
 pub fn parse_header(buffer: &[u8]) -> Option<Header> {
     let head = buffer.get(..HDR_LEN)?;
+    let word = |at: usize| u16::from_le_bytes([head[at], head[at + 1]]);
     Some(Header {
         flags: head[0],
         gso_type: head[1],
-        num_buffers: u16::from_le_bytes([head[NUM_BUFFERS_AT], head[NUM_BUFFERS_AT + 1]]),
+        hdr_len: word(2),
+        gso_size: word(4),
+        csum_start: word(6),
+        csum_offset: word(8),
+        num_buffers: word(NUM_BUFFERS_AT),
     })
+}
+
+/// Whether the device checked the sum of the transport part of the frame in
+/// `buffer` (a received one) or sent it with a partial sum and good data.
+pub fn sum_checked(buffer: &[u8]) -> bool {
+    buffer
+        .first()
+        .is_some_and(|flags| flags & (DATA_VALID | NEEDS_CSUM) != 0)
 }
 
 /// The Ethernet frame in a buffer the device filled with `used` bytes (the
@@ -68,6 +95,27 @@ pub fn tx_prepare(buffer: &mut [u8], frame_len: usize) -> Option<usize> {
     }
     buffer[..HDR_LEN].fill(0);
     Some(HDR_LEN + frame_len)
+}
+
+/// Where the device completes the sum of a frame to send: the offset of the
+/// transport part in the frame and of the sum in that part
+/// (`csum_start` and `csum_offset`, Virtio 1.2, 5.1.6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Csum {
+    pub start: u16,
+    pub offset: u16,
+}
+
+/// `tx_prepare` for a frame whose sum the device completes: the header says
+/// `NEEDS_CSUM` with the place of the sum. With None it is `tx_prepare`.
+pub fn tx_prepare_with(buffer: &mut [u8], frame_len: usize, csum: Option<Csum>) -> Option<usize> {
+    let total = tx_prepare(buffer, frame_len)?;
+    if let Some(c) = csum {
+        buffer[0] = NEEDS_CSUM;
+        buffer[6..8].copy_from_slice(&c.start.to_le_bytes());
+        buffer[8..10].copy_from_slice(&c.offset.to_le_bytes());
+    }
+    Some(total)
 }
 
 /// The EtherTypes of IPv4 and ARP, and the bytes of an Ethernet header.
@@ -123,6 +171,9 @@ pub fn checksum(data: &[u8]) -> u16 {
     !fold(add(0, data))
 }
 
+/// The offset of the sum in a TCP header.
+const TCP_SUM_AT: usize = 16;
+
 pub const IPV4_PROTO_ICMP: u8 = 1;
 pub const IPV4_PROTO_TCP: u8 = 6;
 pub const IPV4_PROTO_UDP: u8 = 17;
@@ -161,7 +212,7 @@ pub fn packet(frame: &[u8]) -> Option<Packet> {
 /// checksum covers the pseudo-header (RFC 793, 3.1; RFC 768; RFC 792).
 fn transport_sum(protocol: u8) -> Option<(usize, bool)> {
     match protocol {
-        IPV4_PROTO_TCP => Some((16, true)),
+        IPV4_PROTO_TCP => Some((TCP_SUM_AT, true)),
         IPV4_PROTO_UDP => Some((6, true)),
         IPV4_PROTO_ICMP => Some((2, false)),
         _ => None,
@@ -208,6 +259,120 @@ pub fn fill_sums(frame: &mut [u8]) {
         sum = 0xFFFF;
     }
     ip[field..field + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// Prepares a frame of TCP over IPv4 for a device that completes the sum of
+/// the segment (Virtio 1.2, 5.1.6.2): the IPv4 header gets its whole sum and
+/// the field of the segment's sum the sum of the pseudo-header, folded and not
+/// complemented, which the device continues over the segment and complements.
+/// Gives the place of the sum for the header; None (and the frame untouched)
+/// for a frame that is no first fragment of TCP in IPv4 whole in the buffer.
+pub fn fill_partial(frame: &mut [u8]) -> Option<Csum> {
+    let (p, csum) = partial_parts(frame)?;
+    let ip = &mut frame[ETHERNET_HEADER..];
+    ip[10] = 0;
+    ip[11] = 0;
+    let header = checksum(&ip[..p.header]);
+    ip[10..12].copy_from_slice(&header.to_be_bytes());
+    put_pseudo(ip, &p);
+    Some(csum)
+}
+
+/// `fill_partial` without the IPv4 header's sum, for a frame whose header has
+/// its sum already (the frame of a stack that makes it, as FreeBSD does).
+pub fn fill_pseudo(frame: &mut [u8]) -> Option<Csum> {
+    let (p, csum) = partial_parts(frame)?;
+    put_pseudo(&mut frame[ETHERNET_HEADER..], &p);
+    Some(csum)
+}
+
+/// Writes the sum of the pseudo-header, folded, in the field of the segment's
+/// sum, over the IPv4 packet `ip`.
+fn put_pseudo(ip: &mut [u8], p: &Packet) {
+    let mut head = [0u8; 12];
+    head[..4].copy_from_slice(&ip[12..16]);
+    head[4..8].copy_from_slice(&ip[16..20]);
+    head[9] = p.protocol;
+    head[10..12].copy_from_slice(&((p.end - p.header) as u16).to_be_bytes());
+    let field = p.header + TCP_SUM_AT;
+    ip[field..field + 2].copy_from_slice(&fold(add(0, &head)).to_be_bytes());
+}
+
+/// The place of the segment's sum in a first fragment of TCP in IPv4 that
+/// lies whole in the frame (what `fill_partial` accepts), for the header of
+/// a frame that has a partial sum already.
+pub fn partial_place(frame: &[u8]) -> Option<Csum> {
+    partial_parts(frame).map(|(_, csum)| csum)
+}
+
+fn partial_parts(frame: &[u8]) -> Option<(Packet, Csum)> {
+    let p = packet(frame)?;
+    if p.protocol != IPV4_PROTO_TCP || !p.first_fragment || p.end < p.header + TCP_SUM_AT + 2 {
+        return None;
+    }
+    let csum = Csum {
+        start: (ETHERNET_HEADER + p.header) as u16,
+        offset: TCP_SUM_AT as u16,
+    };
+    Some((p, csum))
+}
+
+/// What the device does with a frame whose header says `NEEDS_CSUM`: the sum
+/// of everything from `start` to the end of the frame, the field's own value
+/// as the start of the sum, complemented into the field (a model of the
+/// device, for tests and for a driver that has none).
+pub fn complete(frame: &mut [u8], csum: Csum) {
+    let (start, at) = (
+        usize::from(csum.start),
+        usize::from(csum.start + csum.offset),
+    );
+    let seed = u64::from(u16::from_be_bytes([frame[at], frame[at + 1]]));
+    frame[at] = 0;
+    frame[at + 1] = 0;
+    let sum = !fold(add(seed, &frame[start..]));
+    frame[at..at + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// The device may leave the sum of any received packet partial once `GUEST_CSUM` is
+/// negotiated (`NEEDS_CSUM`, Virtio 1.2, 5.1.6.4.1): the field holds the sum of the
+/// pseudo-header and `csum_start` and `csum_offset` say where the sum goes. Completes it in
+/// `frame` (the frame after the header, `header` the header's fields). False, and the frame
+/// untouched, when the header does not say `NEEDS_CSUM` or the place lies outside the frame (the
+/// header is the device's word, and `hdr_len` and the rest are not relied on, 5.1.6.4.2).
+pub fn complete_received(frame: &mut [u8], header: &Header) -> bool {
+    let (start, at) = (
+        usize::from(header.csum_start),
+        usize::from(header.csum_start) + usize::from(header.csum_offset),
+    );
+    if header.flags & NEEDS_CSUM == 0 || start >= frame.len() || at + 2 > frame.len() || at < start
+    {
+        return false;
+    }
+    complete(
+        frame,
+        Csum {
+            start: header.csum_start,
+            offset: header.csum_offset,
+        },
+    );
+    true
+}
+
+/// Whether the frame is TCP in IPv4 (a first fragment or not is `packet`'s).
+pub fn is_tcp(frame: &[u8]) -> bool {
+    frame.len() >= ETHERNET_HEADER + 20
+        && frame[12..14] == ETHERTYPE_IPV4
+        && frame[ETHERNET_HEADER + 9] == IPV4_PROTO_TCP
+}
+
+/// Whether the sum of the IPv4 header of the frame holds; a frame that is no
+/// IPv4 passes, one whose lengths do not fit it does not.
+pub fn verify_header(frame: &[u8]) -> bool {
+    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
+        return true;
+    }
+    let Some(p) = packet(frame) else { return false };
+    fold(add(0, &frame[ETHERNET_HEADER..ETHERNET_HEADER + p.header])) == 0xFFFF
 }
 
 /// Whether the checksums of the frame hold: the IPv4 header's and the
@@ -439,5 +604,241 @@ mod tests {
         fill_sums(&mut f);
         f[16] = 0xFF;
         assert!(!verify_sums(&f));
+    }
+
+    /// A generator of bytes, fixed so that the tests repeat.
+    struct Lcg(u32);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0 >> 8
+        }
+    }
+
+    /// A TCP frame with random addresses, ports, header length (options
+    /// make `doff` 5 to 15), IPv4 options and payload.
+    fn random_tcp(g: &mut Lcg) -> Vec<u8> {
+        let ihl = 5 + (g.next() % 3) as usize;
+        let doff = 5 + (g.next() % 4) as usize;
+        let payload = (g.next() % 1400) as usize;
+        let tcp_len = doff * 4 + payload;
+        let mut f = vec![0u8; 14 + ihl * 4 + tcp_len];
+        for b in f.iter_mut() {
+            *b = g.next() as u8;
+        }
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x40 | ihl as u8;
+        let total = (ihl * 4 + tcp_len) as u16;
+        f[16..18].copy_from_slice(&total.to_be_bytes());
+        f[20..22].copy_from_slice(&[0, 0]);
+        f[23] = IPV4_PROTO_TCP;
+        let tcp = 14 + ihl * 4;
+        f[tcp + 12] = (doff as u8) << 4;
+        f
+    }
+
+    #[test]
+    fn a_partial_sum_completed_by_the_device_equals_the_whole_sum() {
+        let mut g = Lcg(7);
+        for round in 0..10_000 {
+            let mut whole = random_tcp(&mut g);
+            let mut partial = whole.clone();
+            fill_sums(&mut whole);
+            let csum = fill_partial(&mut partial).expect("TCP in IPv4");
+            let tcp = 14 + usize::from(whole[14] & 15) * 4;
+            assert_eq!(
+                csum,
+                Csum {
+                    start: tcp as u16,
+                    offset: 16
+                }
+            );
+            // The IPv4 header is whole already, the segment's sum is not.
+            assert_eq!(partial[14..tcp], whole[14..tcp], "round {round}");
+            assert_ne!(partial[tcp + 16..tcp + 18], whole[tcp + 16..tcp + 18]);
+            complete(&mut partial, csum);
+            assert_eq!(partial, whole, "round {round}");
+            assert!(verify_sums(&partial));
+        }
+    }
+
+    #[test]
+    fn the_field_of_a_partial_sum_is_the_pseudo_header_without_the_complement() {
+        let mut f = tcp_frame(&[1, 2, 3, 4]);
+        f[26..30].copy_from_slice(&[10, 0, 0, 1]);
+        f[30..34].copy_from_slice(&[10, 0, 0, 2]);
+        f[50..52].copy_from_slice(&[0xAB, 0xCD]);
+        fill_partial(&mut f).unwrap();
+        // 0x0A00 + 0x0001 + 0x0A00 + 0x0002 + 6 + 24 (the segment's length).
+        assert_eq!(
+            f[50..52],
+            (0x0A00u16 + 1 + 0x0A00 + 2 + 6 + 24).to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn only_a_whole_first_segment_of_tcp_gets_a_partial_sum() {
+        let mut udp = udp_frame(b"abc");
+        let before = udp.clone();
+        assert_eq!(fill_partial(&mut udp), None);
+        assert_eq!(udp, before, "a frame refused stays as it was");
+        let mut arp = arp_request([10, 0, 2, 2]);
+        assert_eq!(fill_partial(&mut arp), None);
+        let mut cut = tcp_frame(b"data");
+        cut.truncate(cut.len() - 1);
+        assert_eq!(fill_partial(&mut cut), None, "shorter than its IP length");
+        let mut later = tcp_frame(b"data");
+        later[20..22].copy_from_slice(&[0, 5]);
+        assert_eq!(fill_partial(&mut later), None, "no transport header");
+        let mut short = tcp_frame(b"");
+        short[16..18].copy_from_slice(&(20u16 + 10).to_be_bytes());
+        assert_eq!(fill_partial(&mut short), None, "no room for the sum");
+    }
+
+    #[test]
+    fn a_frame_padded_to_the_minimum_completes_to_the_whole_sum() {
+        // The sum of zeros past the end of the IP packet changes nothing.
+        let mut whole = tcp_frame(b"");
+        fill_sums(&mut whole);
+        let mut partial = tcp_frame(b"");
+        let csum = fill_partial(&mut partial).unwrap();
+        partial.resize(60, 0);
+        complete(&mut partial, csum);
+        partial.truncate(whole.len());
+        assert_eq!(partial, whole);
+    }
+
+    #[test]
+    fn the_header_of_a_frame_to_send_names_the_sum() {
+        let mut b = vec![0xFF; BUFFER_LEN];
+        let c = Csum {
+            start: 34,
+            offset: 16,
+        };
+        assert_eq!(tx_prepare_with(&mut b, 60, Some(c)), Some(HDR_LEN + 60));
+        let h = parse_header(&b).unwrap();
+        assert_eq!(
+            h,
+            Header {
+                flags: NEEDS_CSUM,
+                gso_type: 0,
+                hdr_len: 0,
+                gso_size: 0,
+                csum_start: 34,
+                csum_offset: 16,
+                num_buffers: 0
+            }
+        );
+        // The offsets sit where the standard puts them: little-endian, after
+        // flags, gso_type, hdr_len and gso_size.
+        assert_eq!(b[6..10], [34, 0, 16, 0]);
+        assert_eq!(tx_prepare_with(&mut b, 60, None), Some(HDR_LEN + 60));
+        assert!(b[..HDR_LEN].iter().all(|&x| x == 0));
+        assert_eq!(tx_prepare_with(&mut b, 0, Some(c)), None);
+    }
+
+    #[test]
+    fn a_received_frame_is_checked_by_the_device_when_the_header_says_so() {
+        let mut b = frame_buffer(1, &[0; 60]);
+        assert!(!sum_checked(&b));
+        b[0] = DATA_VALID;
+        assert!(sum_checked(&b));
+        b[0] = NEEDS_CSUM;
+        assert!(sum_checked(&b));
+        b[0] = 0x4;
+        assert!(!sum_checked(&b), "RSC_INFO alone says nothing of sums");
+        assert!(!sum_checked(&[]));
+    }
+
+    #[test]
+    fn the_header_sum_is_checked_alone() {
+        let mut f = tcp_frame(b"data");
+        // Nothing filled: the header's sum is 0 and does not hold.
+        assert!(!verify_header(&f));
+        fill_partial(&mut f).unwrap();
+        assert!(verify_header(&f), "the segment's sum is not looked at");
+        f[14 + 12] ^= 1;
+        assert!(!verify_header(&f));
+        assert!(verify_header(&arp_request([10, 0, 2, 2])));
+        assert!(is_tcp(&f) && !is_tcp(&udp_frame(b"x")));
+    }
+
+    #[test]
+    fn a_received_udp_packet_with_a_partial_sum_is_completed_where_the_header_says() {
+        for len in [0usize, 1, 18, 400, 1472] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 5) as u8).collect();
+            let mut whole = udp_frame(&payload);
+            fill_sums(&mut whole);
+            // The device left the field as the sum of the pseudo-header.
+            let mut partial = whole.clone();
+            let mut head = [0u8; 12];
+            head[..4].copy_from_slice(&partial[26..30]);
+            head[4..8].copy_from_slice(&partial[30..34]);
+            head[9] = IPV4_PROTO_UDP;
+            head[10..12].copy_from_slice(&((8 + len) as u16).to_be_bytes());
+            partial[40..42].copy_from_slice(&fold(add(0, &head)).to_be_bytes());
+            let header = Header {
+                flags: NEEDS_CSUM,
+                gso_type: 0,
+                hdr_len: 0,
+                gso_size: 0,
+                csum_start: 34,
+                csum_offset: 6,
+                num_buffers: 1,
+            };
+            assert!(complete_received(&mut partial, &header));
+            assert_eq!(partial, whole, "length {len}");
+        }
+    }
+
+    #[test]
+    fn a_received_partial_sum_outside_the_frame_or_without_the_flag_is_left_alone() {
+        let mut f = udp_frame(b"abc");
+        fill_sums(&mut f);
+        let before = f.clone();
+        let base = Header {
+            flags: NEEDS_CSUM,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 34,
+            csum_offset: 6,
+            num_buffers: 1,
+        };
+        let cases = [
+            Header {
+                flags: DATA_VALID,
+                ..base
+            },
+            Header { flags: 0, ..base },
+            Header {
+                csum_start: f.len() as u16,
+                ..base
+            },
+            Header {
+                csum_start: u16::MAX,
+                ..base
+            },
+            Header {
+                csum_offset: u16::MAX,
+                ..base
+            },
+            Header {
+                csum_start: (f.len() - 2) as u16,
+                csum_offset: 1,
+                ..base
+            },
+        ];
+        for h in cases {
+            assert!(!complete_received(&mut f, &h), "{h:?}");
+            assert_eq!(f, before);
+        }
+        // The last two bytes of the frame are the furthest place that is taken.
+        let h = Header {
+            csum_start: (f.len() - 2) as u16,
+            csum_offset: 0,
+            ..base
+        };
+        assert!(complete_received(&mut f, &h));
     }
 }

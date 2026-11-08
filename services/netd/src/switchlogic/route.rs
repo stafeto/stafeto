@@ -85,10 +85,12 @@ pub enum Reason {
     Udp,
     Proto,
     Flows,
+    /// An entry with `TX_SUM` on a device without the offload (ATTACH said so).
+    Sum,
 }
 
 impl Reason {
-    pub const COUNT: usize = Reason::Flows as usize + 1;
+    pub const COUNT: usize = Reason::Sum as usize + 1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,6 +487,15 @@ pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
         }
     }
     v
+}
+
+/// An entry of consumer `c` the switch refuses after `check_tx` passed it (a `TX_SUM` on a
+/// frame that is no whole segment of TCP): counted as `check_tx` counts its own.
+pub fn refuse_tx(t: &mut Tables, c: u8, r: Reason) {
+    t.refused[r as usize] += 1;
+    if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+        x.ring.refused = x.ring.refused.wrapping_add(1);
+    }
 }
 
 /// `check_tx` for an entry flagged `TX_LOOP`: both addresses must be in 127.0.0.0/8 (else the
