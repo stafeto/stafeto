@@ -487,6 +487,7 @@ impl Switch {
     /// seen yet: the buffers of receiving go in, the device is told they
     /// did (`finish_init`), and the buffers of sending are lent to the
     /// stack.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut transport: SomeTransport<'static>,
         rx_queue: Queue<DEVICE>,
