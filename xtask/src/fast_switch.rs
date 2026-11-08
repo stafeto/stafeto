@@ -593,12 +593,20 @@ fn loopback(
     Ok(())
 }
 
+/// A request of the stream that failed: when it began and ended, and why.
+#[derive(Clone)]
+struct Failure {
+    began: Instant,
+    ended: Instant,
+    why: String,
+}
+
 /// A stream of new connections from the host, each a GET of the small page,
 /// until `stop`; the failures and the number answered.
 struct Stream {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    failures: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    failures: std::sync::Arc<std::sync::Mutex<Vec<Failure>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -612,12 +620,18 @@ impl Stream {
         let thread = std::thread::spawn(move || {
             use std::sync::atomic::Ordering::Relaxed;
             while !s.load(Relaxed) {
+                let began = Instant::now();
+                let failed = |why: String| Failure {
+                    began,
+                    ended: Instant::now(),
+                    why,
+                };
                 match Connection::open(address, READ_WITHIN).and_then(|mut c| c.get("/tiny.txt")) {
                     Ok(body) if body == TINY => {
                         a.fetch_add(1, Relaxed);
                     }
-                    Ok(_) => f.lock().unwrap().push("a wrong page".to_owned()),
-                    Err(e) => f.lock().unwrap().push(e),
+                    Ok(_) => f.lock().unwrap().push(failed("a wrong page".to_owned())),
+                    Err(e) => f.lock().unwrap().push(failed(e)),
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -634,13 +648,50 @@ impl Stream {
         self.answered.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Failure> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
         self.failures.lock().unwrap().clone()
     }
+}
+
+/// How long after `kill -9` was sent a request may still begin on a socket of the dying worker:
+/// the line crosses the console and the shell runs `kill`.
+const KILL_SLACK: Duration = Duration::from_millis(500);
+
+/// The requests of the stream that failed over the kill of a worker. The stream asks one at a
+/// time, so the kill meets at most one request in flight, and a request that a killed worker
+/// had accepted and not answered ends in a reset: that one is expected. Every other request,
+/// and any that began after the worker was gone, must have been answered. The number of
+/// requests the kill reset, or what went wrong.
+fn over_the_kill(failures: &[Failure], killed: Instant) -> Result<usize, String> {
+    let offset = |t: Instant| -> i128 {
+        if t >= killed {
+            t.duration_since(killed).as_millis() as i128
+        } else {
+            -(killed.duration_since(t).as_millis() as i128)
+        }
+    };
+    let seen: Vec<String> = failures
+        .iter()
+        .map(|f| {
+            format!(
+                "{} ms to {} ms from the kill: {}",
+                offset(f.began),
+                offset(f.ended),
+                f.why
+            )
+        })
+        .collect();
+    if failures.len() > 1 || failures.iter().any(|f| f.began > killed + KILL_SLACK) {
+        return Err(format!(
+            "{} requests failed over the kill, one in flight may: {seen:?}",
+            failures.len()
+        ));
+    }
+    Ok(failures.len())
 }
 
 fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
@@ -659,6 +710,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         }
         let before = stream.answered();
         let given_before = stat(run, "kill")?.park_given;
+        let killed = Instant::now();
         run.send(&format!("kill -9 {}", workers[0]))?;
         run.expect_line(
             "the new worker",
@@ -673,13 +725,8 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         let after = stream.answered();
         let failures = stream.finish();
         let given = stat(run, "kill")?.park_given - given_before;
-        if !failures.is_empty() {
-            return Err(format!(
-                "{count} workers: {} requests failed over the kill, the first {:?}",
-                failures.len(),
-                failures.first()
-            ));
-        }
+        let reset =
+            over_the_kill(&failures, killed).map_err(|why| format!("{count} workers: {why}"))?;
         if after < before + 10 {
             return Err(format!(
                 "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
@@ -696,7 +743,7 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
             );
         }
         notes.push(format!(
-            "{count} worker(s): {before} answered before the kill, {after} in all, no failure, {given} parked SYN(s) given"
+            "{count} worker(s): {before} answered before the kill, {after} in all, {reset} request(s) in flight reset by the kill, {given} parked SYN(s) given"
         ));
         if count == 4 {
             reload(run, nginx, notes)?;
@@ -742,7 +789,7 @@ fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Re
         return Err(format!(
             "reload: {} failed, {before} answered before and {after} after, the first failure {:?}",
             failures.len(),
-            failures.first()
+            failures.first().map(|f| &f.why)
         ));
     }
     let left = stat(run, "reload")?.left - left_before;
@@ -1260,6 +1307,27 @@ mod tests {
             .concat())
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_kill_resets_the_request_in_flight_and_no_other() {
+        let killed = Instant::now() + Duration::from_secs(10);
+        let failure = |began_ms: i64, why: &str| Failure {
+            began: if began_ms < 0 {
+                killed - Duration::from_millis(-began_ms as u64)
+            } else {
+                killed + Duration::from_millis(began_ms as u64)
+            },
+            ended: killed + Duration::from_millis(1300),
+            why: why.to_owned(),
+        };
+        assert_eq!(over_the_kill(&[], killed), Ok(0));
+        assert_eq!(over_the_kill(&[failure(-3, "reset")], killed), Ok(1));
+        assert_eq!(over_the_kill(&[failure(5, "reset")], killed), Ok(1));
+        // Two failed requests: the stream asks one at a time.
+        assert!(over_the_kill(&[failure(-30, "a"), failure(5, "b")], killed).is_err());
+        // A request that began after the worker was gone.
+        assert!(over_the_kill(&[failure(2_000, "late")], killed).is_err());
     }
 
     #[test]
