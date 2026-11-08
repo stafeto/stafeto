@@ -535,7 +535,18 @@ fn loopback(
             .collect();
         return Err(format!("{why}; the service says {seen} {drops:?}"));
     }
-    let after_proxy = stat(run, "lo2")?;
+    // The last proxied connection is still closing: its final packets count in `looped` until
+    // two readings agree.
+    let mut after_proxy = stat(run, "lo2")?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        let again = stat(run, "lo2")?;
+        let settled = again.looped == after_proxy.looped;
+        after_proxy = again;
+        if settled {
+            break;
+        }
+    }
     if after_proxy.looped <= after_wget.looped {
         return Err(format!(
             "the proxy's packets did not go through the tables: {}",
