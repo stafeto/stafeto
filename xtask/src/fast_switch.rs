@@ -744,6 +744,38 @@ fn over_the_kill(failures: &[Failure], killed: Instant) -> Result<usize, String>
     Ok(failures.len())
 }
 
+/// Connections opened every 10 ms while a worker is gone: each sends a GET and is held until
+/// `finish`, which returns how many were opened.
+struct Gap {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<usize>,
+}
+
+impl Gap {
+    fn start(address: SocketAddr) -> Gap {
+        use std::io::Write;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut c) = std::net::TcpStream::connect(address) {
+                    let _ = c.write_all(b"GET /tiny.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+                    held.push(c);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            held.len()
+        });
+        Gap { stop, thread }
+    }
+
+    fn finish(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap_or(0)
+    }
+}
+
 fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
     for (conf, count) in [(CONF1, 1usize), (CONF4, 4)] {
@@ -760,6 +792,11 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         }
         let before = stream.answered();
         let given_before = stat(run, "kill")?.park_given;
+        // With one worker no member is live between the kill and the new worker's JOIN. The
+        // stream may be held by a request in flight then, so a second thread opens a
+        // connection every 10 ms from the kill until the new worker's stack is up: their SYNs
+        // are the ones the park must keep and give.
+        let gap = (count == 1).then(|| Gap::start(nginx));
         let killed = Instant::now();
         run.send(&format!("kill -9 {}", workers[0]))?;
         run.expect_line(
@@ -767,6 +804,12 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
             |l| l.contains("start worker process "),
             Duration::from_secs(60),
         )?;
+        run.expect_line(
+            "the stack of the new worker",
+            |l| l.contains("fast: the stack is up on "),
+            Duration::from_secs(60),
+        )?;
+        let opened = gap.map_or(0, Gap::finish);
         // Wait for answers that come after the kill.
         let until = Instant::now() + Duration::from_secs(90);
         while stream.answered() < before + 10 && Instant::now() < until {
@@ -782,20 +825,16 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
                 "{count} workers: {before} answered before the kill and {after} after: the new connections were not answered"
             ));
         }
-        // With one worker no member is live between the kill and the new worker's JOIN: the
-        // stream's connections in that gap wait in the park and are given to it (the stream
-        // opens one every 20 ms, the restart takes far longer, also on TCG). Without the park
-        // each of them waits for the repeat of its SYN.
-        // A request in flight at the kill holds the stream (the service resets it 1.3 s later on
-        // TCG), so the stream may open none in the gap: then there is nothing to park.
-        if count == 1 && given == 0 && reset == 0 {
-            return Err(
-                "one worker: no SYN was parked over the kill and given to the new worker"
-                    .to_owned(),
-            );
+        // The connections of the gap wait in the park and are given to the new worker; without
+        // the park each of them waits for the repeat of its SYN.
+        if count == 1 && given == 0 {
+            return Err(format!(
+                "one worker: none of the {opened} SYNs opened in the gap was parked and given to the new worker"
+            ));
         }
         notes.push(format!(
-            "{count} worker(s): {before} answered before the kill, {after} in all, {reset} request(s) in flight reset by the kill, {given} parked SYN(s) given"
+            "{count} worker(s): {before} answered before the kill, {after} in all, {} request in flight at the kill, {opened} connection(s) opened in the gap, {given} parked SYN(s) given",
+            if reset > 0 { "a" } else { "no" }
         ));
         if count == 4 {
             reload(run, nginx, notes)?;
