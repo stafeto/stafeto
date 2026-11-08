@@ -80,6 +80,8 @@ pub enum Tx {
     Empty,
     /// A frame of this length is in the buffer.
     Frame(usize),
+    /// A frame of this length whose TCP sum is not computed (`TX_SUM`).
+    Sum(usize),
     /// A packet of the loopback network of this length (`TX_LOOP`).
     Loop(usize),
     /// An entry with flags or a spare or a length the cell cannot hold: dropped.
@@ -233,17 +235,17 @@ impl ConsumerRing {
         };
         let cell = self.layout.tx_cell(self.tx_tail);
         self.tx_tail = self.tx_tail.wrapping_add(1);
-        if (e.flags != sw::TX_FLAGS && e.flags != sw::TX_LOOP)
+        if !matches!(e.flags, sw::TX_FLAGS | sw::TX_SUM | sw::TX_LOOP)
             || e.spare != 0
             || usize::from(e.len) > CELL
         {
             return Tx::Refused;
         }
         self.mem.read(cell, &mut out[..usize::from(e.len)]);
-        if e.flags == sw::TX_LOOP {
-            Tx::Loop(usize::from(e.len))
-        } else {
-            Tx::Frame(usize::from(e.len))
+        match e.flags {
+            sw::TX_LOOP => Tx::Loop(usize::from(e.len)),
+            sw::TX_SUM => Tx::Sum(usize::from(e.len)),
+            _ => Tx::Frame(usize::from(e.len)),
         }
     }
 
@@ -445,13 +447,16 @@ pub(crate) mod tests {
         let mut out = [0; CELL];
         assert_eq!(ring.take_tx(&mut out), Tx::Empty);
         rig.send(b"one", 0);
-        rig.send(b"two", 1);
+        rig.send(b"two", 2);
         rig.send(b"three", 0);
+        rig.send(b"four", sw::TX_SUM);
         ring.poll();
         assert_eq!(ring.take_tx(&mut out), Tx::Frame(3));
         assert_eq!(&out[..3], b"one");
         assert_eq!(ring.take_tx(&mut out), Tx::Refused);
         assert_eq!(ring.take_tx(&mut out), Tx::Frame(5));
+        assert_eq!(ring.take_tx(&mut out), Tx::Sum(4));
+        assert_eq!(&out[..4], b"four");
         assert_eq!(ring.take_tx(&mut out), Tx::Empty);
     }
 
@@ -478,10 +483,17 @@ pub(crate) mod tests {
             (u16::MAX, 0, 0, false),
             (100, 0, 1, false),
             (100, 0, u32::MAX, false),
-            (100, 1, 0, false),
+            (100, 1, 0, true),
+            (2048, 1, 0, true),
+            (2049, 1, 0, false),
+            (100, 1, 7, false),
             (100, 2, 0, false),
             (100, 8, 0, false),
             (100, 5, 0, false),
+            (100, 3, 0, false),
+            (100, 0x100, 0, false),
+            (100, 0x101, 0, false),
+            (100, 0x104, 0, false),
             (0, 0, 0, true),
             (100, 4, 0, true),
             (2048, 4, 0, true),
@@ -492,8 +504,10 @@ pub(crate) mod tests {
             ring.poll();
             let want = if !taken {
                 Tx::Refused
-            } else if flags == 4 {
+            } else if flags == sw::TX_LOOP {
                 Tx::Loop(usize::from(len))
+            } else if flags == sw::TX_SUM {
+                Tx::Sum(usize::from(len))
             } else {
                 Tx::Frame(usize::from(len))
             };

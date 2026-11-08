@@ -34,5 +34,5 @@ pub mod rings;
 pub mod transport;
 
 pub use host::{Host, Region};
-pub use open::{OpenFailure, Opened, open};
+pub use open::{OpenFailure, Opened, open, open_offload};
 pub use rings::{RxRing, TxRing};

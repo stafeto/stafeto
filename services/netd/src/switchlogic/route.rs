@@ -487,6 +487,15 @@ pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
     v
 }
 
+/// An entry of consumer `c` the switch refuses after `check_tx` passed it (a `TX_SUM` on a
+/// frame that is no whole segment of TCP): counted as `check_tx` counts its own.
+pub fn refuse_tx(t: &mut Tables, c: u8, r: Reason) {
+    t.refused[r as usize] += 1;
+    if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+        x.ring.refused = x.ring.refused.wrapping_add(1);
+    }
+}
+
 /// `check_tx` for an entry flagged `TX_LOOP`: both addresses must be in 127.0.0.0/8 (else the
 /// ring breaks, the descriptor rule of section 5), and the rest of section 4 holds for the ports
 /// as for any frame of the consumer: it sends from a port of its own and only TCP or UDP.

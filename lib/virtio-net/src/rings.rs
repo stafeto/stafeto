@@ -16,7 +16,7 @@
 
 use crate::barrier;
 use crate::books::{QUEUE_SIZE, RxBook, TxBook, offset};
-use crate::frames::{BUFFER_LEN, HDR_LEN, tx_prepare};
+use crate::frames::{BUFFER_LEN, Csum, HDR_LEN, tx_prepare_with};
 use virtio_drivers::Hal;
 use virtio_drivers::queue::VirtQueue;
 
@@ -302,9 +302,17 @@ impl<H: Hal> TxRing<H> {
     /// no segmentation. The frame has its sums already.
     #[inline]
     pub fn submit(&mut self, n: u16, len: usize) -> Result<Sent, Broken> {
+        self.submit_with(n, len, None)
+    }
+
+    /// `submit` for a frame whose sum the device completes: the header says
+    /// where (`frames::tx_prepare_with`). The device must have accepted
+    /// `VIRTIO_NET_F_CSUM` (Virtio 1.2, 5.1.6.2.1).
+    #[inline]
+    pub fn submit_with(&mut self, n: u16, len: usize, csum: Option<Csum>) -> Result<Sent, Broken> {
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer_at(self.base, n) };
-        let Some(total) = tx_prepare(slice, len) else {
+        let Some(total) = tx_prepare_with(slice, len, csum) else {
             self.book.release(n);
             return Ok(Sent::Dropped);
         };

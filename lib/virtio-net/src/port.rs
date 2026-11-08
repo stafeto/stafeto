@@ -181,6 +181,12 @@ impl Port {
         self.tx_submit_flags(len, sw::TX_FLAGS);
     }
 
+    /// `tx_submit` for a frame of TCP whose sum is not computed (`TX_SUM`): the switch writes
+    /// the sum of the pseudo-header and has the device complete the rest.
+    pub fn tx_submit_sum(&mut self, len: u32) {
+        self.tx_submit_flags(len, sw::TX_SUM);
+    }
+
     /// `tx_submit` for a packet of the loopback network (`TX_LOOP`).
     pub fn tx_submit_loop(&mut self, len: u32) {
         self.tx_submit_flags(len, sw::TX_LOOP);
@@ -360,6 +366,14 @@ mod c {
     pub extern "C" fn vnet_port_tx_submit(len: u32) {
         if let Some(p) = port() {
             p.tx_submit(len);
+        }
+    }
+
+    /// The entry for the frame in the cell is a segment of TCP without its sum (`TX_SUM`).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_tx_submit_sum(len: u32) {
+        if let Some(p) = port() {
+            p.tx_submit_sum(len);
         }
     }
 
@@ -569,6 +583,20 @@ mod tests {
         let word0 = |m: &mut Mem, i: u32| m.word(l.tx_entry(i)).load(Ordering::Relaxed);
         assert_eq!(word0(&mut m, 0), 60);
         assert_eq!(word0(&mut m, 1), 70 | u32::from(sw::TX_LOOP) << 16);
+    }
+
+    #[test]
+    fn a_sum_entry_carries_tx_sum_and_a_delivered_frame_its_done_flag() {
+        let (mut m, l, mut p) = rig();
+        assert!(p.tx_cell().is_some());
+        p.tx_submit_sum(60);
+        let word0 = m.word(l.tx_entry(0)).load(Ordering::Relaxed);
+        assert_eq!(word0, 60 | u32::from(sw::TX_SUM) << 16);
+        assert_eq!(m.word(l.tx_entry(0) + 4).load(Ordering::Relaxed), 0);
+        m.deliver(l, 0, 3, 60, sw::DONE_SUM_OK | sw::DONE_LOOP);
+        let mut out = empty();
+        assert_eq!(p.rx_burst(&mut out), Ok(1));
+        assert_eq!(out[0].flags, u32::from(sw::DONE_SUM_OK | sw::DONE_LOOP));
     }
 
     #[test]

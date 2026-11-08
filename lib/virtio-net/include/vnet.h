@@ -91,8 +91,9 @@ size_t vnet_bypass_pop(void *frame, size_t cap);
 
 /* A frame the switch delivered: its cell, its length, the DONE flags
  * (1: a copy of an ARP reply for every consumer; 2: an ICMP error; 4: a packet of the
- * loopback network from another stack, to be taken in at lo0), and
- * where it starts. */
+ * loopback network from another stack, to be taken in at lo0; 0x100: the sum of the TCP
+ * segment is good, the device checked it or the frame never left the service, so the
+ * stack need not), and where it starts. */
 struct vnet_port_rx {
     uint32_t cell, len, flags, pad;
     void *frame;
@@ -117,6 +118,12 @@ uint32_t vnet_port_fill_free(void);
 uint8_t *vnet_port_tx_cell(void);
 void vnet_port_tx_submit(uint32_t len);
 int vnet_port_tx_flush(void);
+
+/* The entry for the frame in the cell is a segment of TCP in IPv4 whose sum is not
+ * computed (flag 1): the switch writes the sum of the pseudo-header from the frame it
+ * checked and has the device complete the rest (UDP, ICMP and the header of IPv4 keep
+ * their software sums). */
+void vnet_port_tx_submit_sum(uint32_t len);
 
 /* The entry for the packet in the cell is a packet of the loopback network (flag 4): both its
  * addresses are in 127.0.0.0/8 and its port is no port of this stack's; the switch routes it. */

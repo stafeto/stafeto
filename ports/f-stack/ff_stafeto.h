@@ -71,6 +71,9 @@ struct ff_stafeto_device_stats {
     uint64_t kicks, sleeps, sleeps_found_work, notifications;
     uint32_t free_low, free_now;
     uint64_t bell_rx_passes, bell_rx, bell_tx;
+    /* TCP segments sent without their sum (TX_SUM), and frames received whose sum the
+     * switch said was good (DONE_SUM_OK). */
+    uint64_t tx_sum, rx_sum_ok;
 };
 void ff_stafeto_device_stats(struct ff_stafeto_device_stats *out);
 

@@ -19,7 +19,7 @@
 use crate::{Config, Method};
 use proto_wire::{Reader, Status, Writer};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const PAGE: usize = 4096;
 pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
@@ -54,12 +54,22 @@ pub const COUNTERS: usize = 9 * LINE;
 pub const DONE_ARP_COPY: u16 = 1;
 pub const DONE_ICMP_ERROR: u16 = 2;
 pub const DONE_LOOP: u16 = 4;
-pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP;
+/// The sum of the TCP segment is good: the device checked it, or the frame comes from a stack
+/// that left it partial (the switch put the pseudo-header sum in it), or never left the
+/// service's memory. The consumer's stack does not check the segment's sum then; without the
+/// flag it does.
+pub const DONE_SUM_OK: u16 = 0x100;
+pub const DONE_FLAGS: u16 = DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP | DONE_SUM_OK;
 /// The TX flags of an ordinary frame.
 pub const TX_FLAGS: u16 = 0;
+/// A frame of TCP in IPv4 whose sum the stack did not compute: the switch writes the sum of
+/// the pseudo-header from the frame it checked, and the device (or the switch, for a device
+/// without the offload) completes the sum over the segment. The flag stands alone: with
+/// `TX_LOOP` or on a frame that is no TCP the entry is refused.
+pub const TX_SUM: u16 = 1;
 /// A packet of the loopback network of the consumer's stack for a port that is no port of
 /// that stack (both addresses in 127.0.0.0/8, else the ring breaks); the switch routes it by
-/// its port. The only flag a TX entry may have.
+/// its port. `TX_FLAGS`, `TX_SUM` and `TX_LOOP` are the values the flags of a TX entry may have.
 pub const TX_LOOP: u16 = 4;
 
 /// The bits the switch notifies the consumer with.
@@ -485,7 +495,16 @@ mod tests {
             spare: 0,
         };
         assert_eq!(TxEntry::from_bytes(t.to_bytes()), t);
-        assert_eq!(DONE_FLAGS, DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP);
+        assert_eq!(
+            DONE_FLAGS,
+            DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP | DONE_SUM_OK
+        );
+        assert_eq!(DONE_SUM_OK, 1 << 8);
+        assert_eq!(TX_SUM, 1);
+        assert_eq!(
+            DONE_SUM_OK & (DONE_ARP_COPY | DONE_ICMP_ERROR | DONE_LOOP),
+            0
+        );
         assert_eq!(DONE_LOOP, TX_LOOP);
     }
 
@@ -497,9 +516,12 @@ mod tests {
         assert_eq!(Header::read(&mut r).unwrap(), Method::Attach.header());
         assert_eq!(read_attach(r), Ok(Layout::DEFAULT));
         let mut bad = w.as_bytes()[8..].to_vec();
-        bad[0] = 2;
-        assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
-        bad[0] = 1;
+        // A consumer of the version before TX_SUM and DONE_SUM_OK, and one of the next.
+        for foreign in [VERSION - 1, VERSION + 1] {
+            bad[0] = foreign as u8;
+            assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
+        }
+        bad[0] = VERSION as u8;
         bad[12] = 3;
         assert_eq!(read_attach(Reader::new(&bad)), Err(invalid()));
         assert_eq!(read_attach(Reader::new(&bad[..15])), Err(Status::BadSize));

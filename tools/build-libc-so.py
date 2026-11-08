@@ -400,7 +400,7 @@ VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "
               "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost", "vnet_bells",
               "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop",
               "vnet_port_open", "vnet_port_rx_burst", "vnet_port_rx_return", "vnet_port_fill_free",
-              "vnet_port_tx_cell", "vnet_port_tx_submit", "vnet_port_tx_submit_loop", "vnet_port_tx_flush", "vnet_port_work",
+              "vnet_port_tx_cell", "vnet_port_tx_submit", "vnet_port_tx_submit_loop", "vnet_port_tx_submit_sum", "vnet_port_tx_flush", "vnet_port_work",
               "vnet_port_sleep_begin", "vnet_port_sleep_end", "vnet_port_counters"]
 
 
