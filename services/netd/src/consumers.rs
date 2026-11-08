@@ -217,6 +217,7 @@ impl Driver<'_> {
             },
             block_first: u32::from(block),
             block_count: u32::from(BLOCK_PORTS),
+            offload: switch::INNER.offload(),
         };
         if reply.write(r.reply()).is_err() {
             self.net.buffers.mappings().release(chunks);

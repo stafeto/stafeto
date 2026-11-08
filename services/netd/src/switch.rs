@@ -1090,6 +1090,12 @@ impl Switch {
         let Some(t) = self.tables.as_mut() else {
             return false;
         };
+        // The consumer was told at ATTACH whether the device offloads: an entry with `TX_SUM`
+        // on a device without it is refused and counted.
+        if let Err(reason) = sums::admit(self.offload, sum) {
+            route::refuse_tx(t, c, reason);
+            return false;
+        }
         let frame = &mut self.scratch[..len];
         let verdict = route::check_tx(t, c, frame);
         let mut csum = None;

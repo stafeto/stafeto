@@ -6,7 +6,7 @@
 //!
 //! | Method | Request | Reply |
 //! |---|---|---|
-//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached`; one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
+//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached` (the last word says whether the device offloads the TCP sums: only then may a TX entry say `TX_SUM`); one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
 //! | PORT_HOLD (38) | protocol (u32, 6 or 17), first port, count (1..=`HOLD_MAX`), flags (u32, `REUSEPORT`); a handle: a copy of the identity session | status, place (u32, as SOCKET's description). NOT_ALLOWED (below 1024 without the superuser), IN_USE (the port is held), LIMIT_REACHED (no group) |
 //! | JOIN (40) | place (u32) | status. INVALID (the session has no consumer, or no such place) |
 //!
@@ -308,6 +308,9 @@ pub struct Attached {
     pub config: Config,
     pub block_first: u32,
     pub block_count: u32,
+    /// The device completes the sums of TCP: only then may an entry say `TX_SUM` (else it is
+    /// refused). The consumer sums its own segments otherwise.
+    pub offload: bool,
 }
 
 impl Attached {
@@ -317,7 +320,8 @@ impl Attached {
         w.u32(self.generation)?;
         self.config.write_fields(w)?;
         w.u32(self.block_first)?;
-        w.u32(self.block_count)
+        w.u32(self.block_count)?;
+        w.u32(u32::from(self.offload))
     }
 
     /// A refusal is its status alone and comes back as the error.
@@ -334,6 +338,7 @@ impl Attached {
         let (consumer, generation) = (r.u32()?, r.u32()?);
         let config = Config::read_fields(&mut r)?;
         let (block_first, block_count) = (r.u32()?, r.u32()?);
+        let offload = r.u32()? != 0;
         r.finish()?;
         Ok(Attached {
             consumer,
@@ -341,6 +346,7 @@ impl Attached {
             config,
             block_first,
             block_count,
+            offload,
         })
     }
 }
@@ -535,11 +541,19 @@ mod tests {
             config: CONFIG,
             block_first: 49152,
             block_count: 512,
+            offload: true,
         };
         let mut w = Writer::new();
         a.write(&mut w).unwrap();
         assert!(w.as_bytes().len() <= abi::MESSAGE_MAX);
         assert_eq!(Attached::read(w.as_bytes()), Ok(a));
+        let off = Attached {
+            offload: false,
+            ..a
+        };
+        let mut w = Writer::new();
+        off.write(&mut w).unwrap();
+        assert_eq!(Attached::read(w.as_bytes()), Ok(off));
         assert_eq!(
             Attached::read(&w.as_bytes()[..w.as_bytes().len() - 1]),
             Err(Status::BadSize)

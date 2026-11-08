@@ -394,7 +394,9 @@ ff_dpdk_if_up(void)
         cfg.gateway = gateway;
         if (port_on) {
             cfg.hw_features.rx_csum = 1;
-            cfg.hw_features.tx_csum_l4 = 1;
+            /* Only a device that completes the sums (snapshot[6]) takes
+             * segments without them; else the stack sums its own. */
+            cfg.hw_features.tx_csum_l4 = dev_claim.snapshot[6] != 0;
         }
         dev_ctx = ff_veth_attach(&cfg);
         if (dev_ctx == NULL) {

@@ -85,10 +85,12 @@ pub enum Reason {
     Udp,
     Proto,
     Flows,
+    /// An entry with `TX_SUM` on a device without the offload (ATTACH said so).
+    Sum,
 }
 
 impl Reason {
-    pub const COUNT: usize = Reason::Flows as usize + 1;
+    pub const COUNT: usize = Reason::Sum as usize + 1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

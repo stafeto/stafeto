@@ -471,13 +471,14 @@ pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
         snapshot: [0; wire::SNAPSHOT_WORDS],
         config: config_of(&attached.config),
     };
-    out.snapshot[..6].copy_from_slice(&[
+    out.snapshot[..7].copy_from_slice(&[
         attached.consumer,
         attached.generation,
         layout.rx_slots,
         layout.tx_slots,
         attached.block_first,
         attached.block_count,
+        u32::from(attached.offload),
     ]);
     crate::allocation::heap(|state| -> Result<(), i32> {
         out.window = state.map_fast(ring, pages, 0)? as u64;

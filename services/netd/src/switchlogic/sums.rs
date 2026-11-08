@@ -8,7 +8,7 @@
 //! their software sums (the header's is checked here on every frame the device
 //! vouches for).
 
-use super::route::Decision;
+use super::route::{Decision, Reason};
 use proto_net::switch::DONE_SUM_OK;
 use virtio_net::frames::{Csum, ETHERNET_HEADER, fill_pseudo, is_tcp, packet, verify_header};
 
@@ -41,6 +41,17 @@ pub fn mark(decision: Decision, ok: bool) -> Decision {
 /// first segment of TCP (the entry is refused).
 pub fn prepare_tx(frame: &mut [u8]) -> Option<Csum> {
     fill_pseudo(frame)
+}
+
+/// Whether an entry of a consumer may say `TX_SUM`: only on a device with the offload, which
+/// ATTACH told the consumer. Without it the consumer sums its own segments, and the switch's
+/// step does not pay for the pass over the segment.
+pub fn admit(offload: bool, sum: bool) -> Result<(), Reason> {
+    if sum && !offload {
+        Err(Reason::Sum)
+    } else {
+        Ok(())
+    }
 }
 
 /// The length a frame with `TX_SUM` goes out with: the Ethernet header and the IP packet, without
@@ -157,6 +168,14 @@ mod tests {
         f.truncate(whole - 1);
         assert_eq!(wire_len(&f), whole - 1, "a short frame stays as it is");
         assert_eq!(wire_len(&[1, 2, 3]), 3);
+    }
+
+    #[test]
+    fn an_entry_with_tx_sum_is_admitted_on_a_device_with_the_offload_only() {
+        assert_eq!(admit(true, true), Ok(()));
+        assert_eq!(admit(true, false), Ok(()));
+        assert_eq!(admit(false, false), Ok(()));
+        assert_eq!(admit(false, true), Err(Reason::Sum));
     }
 
     #[test]

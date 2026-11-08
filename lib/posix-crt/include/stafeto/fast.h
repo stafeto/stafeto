@@ -46,9 +46,10 @@ struct stafeto_fast_config {
 #define STAFETO_FAST_PCI 2
 /* An attach to the network service's switch (stafeto_fast_attach): there is
  * no device. The fields of the claim hold: window, window_len: the ring
- * object (the consumer's own, mapped read and write); snapshot[0..6]: the
+ * object (the consumer's own, mapped read and write); snapshot[0..7]: the
  * consumer's number, its generation, rx_slots, tx_slots, the first port of
- * the block of ephemeral ports and how many there are; config: the shared
+ * the block of ephemeral ports, how many there are, and 1 when the device
+ * completes the TCP sums (the stack may then send segments with TX_SUM), else 0; config: the shared
  * address of the service's device (the MAC and the lease); the rest is 0. */
 #define STAFETO_FAST_PORT 3
 
