@@ -299,12 +299,12 @@ impl Inner {
         }
     }
 
-    /// Frames the switch dropped (no frame) and the martian ones.
     /// Whether the device completes the sums of TCP.
     pub fn offload(&self) -> bool {
         self.offload.load(Ordering::Relaxed)
     }
 
+    /// Frames the switch dropped (no frame) and the martian ones.
     pub fn rx_counts(&self) -> (u64, u64) {
         (
             u64::from(self.dropped.load(Ordering::Relaxed)),

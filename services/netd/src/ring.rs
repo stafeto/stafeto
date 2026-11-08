@@ -234,12 +234,16 @@ pub const SWITCH_BASE: usize = 3;
 /// A frame whose sum the switch completes in software (a consumer's `TX_SUM` frame on a device
 /// without the offload, a received packet the device left partial that is no TCP) costs one pass
 /// over up to 1 514 bytes more, about `SUM_TICKS` under -icount, and counts as `SUM_WEIGHT`
-/// frames of its kind in the step: past the base frames the step takes fewer of them, and the
-/// worst case of the asserts below holds as it stands (the heavy frame is dearer by no more than
-/// the second frame it stands for).
+/// frames of its kind in the step. It weighs the whole base share, so the frames a step always
+/// takes hold at most one heavy frame, and the base cost of the asserts above bounds it: the
+/// `taken < SWITCH_BASE` check comes before each frame, and a lighter weight would let two heavy
+/// frames into the base share (2 x 3 100 ticks against the 5 400 the asserts count).
 pub const SUM_TICKS: usize = 1_300;
-pub const SUM_WEIGHT: usize = 2;
-const _: () = assert!(1_800 + SUM_TICKS <= SUM_WEIGHT * 1_800 && SUM_WEIGHT <= SWITCH_BASE);
+pub const SUM_WEIGHT: usize = SWITCH_BASE;
+const _: () = assert!(
+    SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_800 + SUM_TICKS) <= SWITCH_BASE * 1_800
+        && SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_500 + SUM_TICKS) <= SWITCH_BASE * 1_500
+);
 pub const SWITCH_SOFT: u64 = 7_000;
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.
