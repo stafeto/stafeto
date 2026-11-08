@@ -21,7 +21,7 @@ use netd::frames::Dest;
 use netd::interest::Interests;
 use netd::owners::Owners;
 use netd::passes::Passes;
-use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
+use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State, orphan_is_over};
 use netd::ports::{Binding, PortMap, Proto};
 use netd::reuse::{Groups, NO_GROUP};
 use netd::ring::{OrphanQueue, WakeBudget};
@@ -330,6 +330,8 @@ pub struct Counters {
     /// SYNs taken by a queue socket of a listening description other than
     /// the one chosen. Stays 0.
     pub syn_stray: u64,
+    /// Closed streams no session held whose four a new SYN took over before the sweep.
+    pub orphan_reused: u64,
     /// The pages charged to the service when the first and the sixty-fourth
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
@@ -1379,6 +1381,12 @@ impl Net {
                     return None;
                 };
                 if let Some(place) = orphan {
+                    if self.socks[place]
+                        .handle
+                        .is_some_and(|h| stack.tcp(h).state() == tcp::State::Closed)
+                    {
+                        self.counters.orphan_reused += 1;
+                    }
                     self.release_place(stack, place);
                 }
                 self.syn_member = Some((member, listener));
@@ -1410,14 +1418,18 @@ impl Net {
     /// free its place (a stream whose peer reset it, or whose last
     /// acknowledgement just came). A new SYN on its four starts a new stream.
     fn reusable_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
-        self.places.state(i) == State::Orphan
-            && self.socks[i]
-                .handle
-                .is_some_and(|h| match stack.tcp(h).state() {
-                    tcp::State::TimeWait => true,
-                    tcp::State::Closed => !self.socks[i].rst_pending,
-                    _ => false,
-                })
+        if self.places.state(i) != State::Orphan {
+            return false;
+        }
+        let Some(handle) = self.socks[i].handle else {
+            return false;
+        };
+        let state = stack.tcp(handle).state();
+        orphan_is_over(
+            state == tcp::State::TimeWait,
+            state == tcp::State::Closed,
+            self.socks[i].rst_pending,
+        )
     }
 
     /// The first socket of the queue of listening place `listener` that

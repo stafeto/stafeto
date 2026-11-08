@@ -264,8 +264,25 @@ impl Held {
     }
 }
 
+/// Whether a stream no session holds is over, so that a new SYN on its four starts a new stream:
+/// it waits out TIME-WAIT, or it has closed with no RST of ours still on the way and only waits
+/// for the sweep to free its place.
+pub fn orphan_is_over(time_wait: bool, closed: bool, rst_pending: bool) -> bool {
+    time_wait || (closed && !rst_pending)
+}
+
 #[cfg(test)]
 mod tests {
+    /// A closed stream waiting for the sweep gives its four to a new SYN as one in TIME-WAIT does;
+    /// one whose RST is still on the way, and a stream that is still open, does not.
+    #[test]
+    fn a_closed_orphan_is_over_unless_its_reset_is_on_the_way() {
+        assert!(orphan_is_over(false, true, false));
+        assert!(orphan_is_over(true, false, false));
+        assert!(!orphan_is_over(false, true, true));
+        assert!(!orphan_is_over(false, false, false));
+    }
+
     use super::*;
 
     #[test]

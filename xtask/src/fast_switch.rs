@@ -51,8 +51,11 @@ const REQUESTS: usize = 200;
 /// The requests through the proxy to `httpd` on 127.0.0.1:8080. A stream of the service that
 /// has closed holds its four until the sweep frees it, and a worker's next connection may pick
 /// the same source port. Twenty requests met that once in ci; the service now lets such a SYN
-/// start a new stream, and this many requests meet it in nearly every run without that.
-const PROXY_REQUESTS: usize = 300;
+/// start a new stream and counts it (`orphan_reused`), and this many requests meet it in every
+/// run: 300 requests met it 3 to 8 times, and once not at all in 11 runs.
+const PROXY_REQUESTS: usize = 600;
+/// The requests to nginx-fast's own port 80 through the proxy of the same worker.
+const SELF_REQUESTS: usize = 20;
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
@@ -178,6 +181,8 @@ struct Stat {
     looped: u64,
     /// Memberships ended by LEAVE.
     left: u64,
+    /// Closed streams whose four a new SYN took over before the sweep.
+    orphan_reused: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
     refused_by: Vec<u64>,
     rx_by: Vec<u64>,
@@ -231,7 +236,14 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let orphan_reused = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("net: frames rx "))
+        .and_then(|l| counter(l, "orphan_reused"))
+        .ok_or("no orphan_reused in the line `net: frames rx`")?;
     Ok(Stat {
+        orphan_reused,
         refused_by,
         consumers: counter(&line, "consumers").ok_or("consumers")?,
         hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
@@ -553,11 +565,26 @@ fn loopback(
             after_proxy.line
         ));
     }
-    requests("a worker's own loopback", nginx, "/self/tiny.txt", TINY, 20)?;
+    if after_proxy.orphan_reused == 0 {
+        return Err(format!(
+            "no SYN of {PROXY_REQUESTS} proxied requests met a closed stream on its four: the probe does not reach the case: {}",
+            after_proxy.line
+        ));
+    }
+    requests(
+        "a worker's own loopback",
+        nginx,
+        "/self/tiny.txt",
+        TINY,
+        SELF_REQUESTS,
+    )?;
     // A packet for a port of the worker's own stack stays on its loopback interface: the 20
-    // requests (and the proxy's own connections to port 80) leave nothing in the tables.
+    // requests (and the proxy's own connections to port 80) leave nothing in the tables. The
+    // streams of the proxy that closed earlier may still send a stray packet of their end
+    // (a late ACK or RST), so a few are allowed; a request that went through the ring is a
+    // dozen packets.
     let after_self = stat(run, "lo3")?;
-    if after_self.looped != after_proxy.looped {
+    if after_self.looped - after_proxy.looped >= SELF_REQUESTS as u64 {
         return Err(format!(
             "the worker's own loopback went out through the ring: {} packets",
             after_self.looped - after_proxy.looped
@@ -669,14 +696,18 @@ impl Stream {
 }
 
 /// How long after `kill -9` was sent a request may still begin on a socket of the dying worker:
-/// the line crosses the console and the shell runs `kill`.
-const KILL_SLACK: Duration = Duration::from_millis(500);
+/// the line crosses the console, the shell runs `kill`, and TCG may be slow.
+const KILL_SLACK: Duration = Duration::from_secs(2);
+/// How long after the kill the service may take to reset the connection of the worker that died
+/// (1.3 s seen on TCG); a read that timed out takes `READ_WITHIN`.
+const KILL_RESET_WITHIN: Duration = Duration::from_secs(10);
 
 /// The requests of the stream that failed over the kill of a worker. The stream asks one at a
 /// time, so the kill meets at most one request in flight, and a request that a killed worker
-/// had accepted and not answered ends in a reset: that one is expected. Every other request,
-/// and any that began after the worker was gone, must have been answered. The number of
-/// requests the kill reset, or what went wrong.
+/// had accepted and not answered ends in a reset or an end of the stream on a connection that was
+/// up: that one is expected, and the service ends it within `KILL_RESET_WITHIN` of the kill (it
+/// took 1.3 s on TCG, after the new worker's stack was up). Every other request (a timeout, a
+/// refused connection, one that began after the worker was gone) must have been answered. The number of requests the kill reset, or what went wrong.
 fn over_the_kill(failures: &[Failure], killed: Instant) -> Result<usize, String> {
     let offset = |t: Instant| -> i128 {
         if t >= killed {
@@ -696,10 +727,18 @@ fn over_the_kill(failures: &[Failure], killed: Instant) -> Result<usize, String>
             )
         })
         .collect();
-    if failures.len() > 1 || failures.iter().any(|f| f.began > killed + KILL_SLACK) {
+    let reset = |why: &str| {
+        why.contains("closed with") || why.contains("reset") || why.contains("Broken pipe")
+    };
+    if failures.len() > 1
+        || failures.iter().any(|f| {
+            f.began > killed + KILL_SLACK || f.ended > killed + KILL_RESET_WITHIN || !reset(&f.why)
+        })
+    {
         return Err(format!(
-            "{} requests failed over the kill, one in flight may: {seen:?}",
-            failures.len()
+            "{} requests failed over the kill, one in flight may, as a reset or an end of the stream within {} s of the kill: {seen:?}",
+            failures.len(),
+            KILL_RESET_WITHIN.as_secs()
         ));
     }
     Ok(failures.len())
@@ -747,7 +786,9 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
         // stream's connections in that gap wait in the park and are given to it (the stream
         // opens one every 20 ms, the restart takes far longer, also on TCG). Without the park
         // each of them waits for the repeat of its SYN.
-        if count == 1 && given == 0 {
+        // A request in flight at the kill holds the stream (the service resets it 1.3 s later on
+        // TCG), so the stream may open none in the gap: then there is nothing to park.
+        if count == 1 && given == 0 && reset == 0 {
             return Err(
                 "one worker: no SYN was parked over the kill and given to the new worker"
                     .to_owned(),
@@ -1323,22 +1364,50 @@ mod tests {
     #[test]
     fn the_kill_resets_the_request_in_flight_and_no_other() {
         let killed = Instant::now() + Duration::from_secs(10);
-        let failure = |began_ms: i64, why: &str| Failure {
-            began: if began_ms < 0 {
-                killed - Duration::from_millis(-began_ms as u64)
+        let at = |ms: i64| {
+            if ms < 0 {
+                killed - Duration::from_millis(-ms as u64)
             } else {
-                killed + Duration::from_millis(began_ms as u64)
-            },
-            ended: killed + Duration::from_millis(1300),
+                killed + Duration::from_millis(ms as u64)
+            }
+        };
+        let failure = |began: i64, ended: i64, why: &str| Failure {
+            began: at(began),
+            ended: at(ended),
             why: why.to_owned(),
         };
+        let eof = "the connection closed with 0 bytes pending";
         assert_eq!(over_the_kill(&[], killed), Ok(0));
-        assert_eq!(over_the_kill(&[failure(-3, "reset")], killed), Ok(1));
-        assert_eq!(over_the_kill(&[failure(5, "reset")], killed), Ok(1));
+        assert_eq!(over_the_kill(&[failure(-3, 1300, eof)], killed), Ok(1));
+        assert_eq!(
+            over_the_kill(
+                &[failure(
+                    5,
+                    900,
+                    "read after 0 bytes: Connection reset by peer (os error 54)"
+                )],
+                killed
+            ),
+            Ok(1)
+        );
         // Two failed requests: the stream asks one at a time.
-        assert!(over_the_kill(&[failure(-30, "a"), failure(5, "b")], killed).is_err());
+        assert!(over_the_kill(&[failure(-30, -10, eof), failure(5, 90, eof)], killed).is_err());
         // A request that began after the worker was gone.
-        assert!(over_the_kill(&[failure(2_000, "late")], killed).is_err());
+        assert!(over_the_kill(&[failure(2_500, 2_600, eof)], killed).is_err());
+        // A timeout is no reset.
+        assert!(
+            over_the_kill(
+                &[failure(
+                    5,
+                    900,
+                    "read after 0 bytes: Resource temporarily unavailable"
+                )],
+                killed
+            )
+            .is_err()
+        );
+        // A connection that hung until the read timed out.
+        assert!(over_the_kill(&[failure(5, 60_000, eof)], killed).is_err());
     }
 
     #[test]
