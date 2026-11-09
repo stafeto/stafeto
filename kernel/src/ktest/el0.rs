@@ -598,6 +598,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         start: start_interrupt_path,
         done: done_interrupt_path,
     },
+    El0Test {
+        name: "lpi_path_is_measured",
+        start: start_lpi_path,
+        done: done_lpi_path,
+    },
 ];
 
 const ROUND_TRIP_TESTS: &[El0Test] = &[El0Test {
@@ -4820,9 +4825,73 @@ fn pend(thread: NonNull<Thread>) {
         }
     }
     // SAFETY: the running thread is alive.
-    let line = unsafe { thread.as_ref() }.regs.x[0] as u32;
+    let line = unsafe { thread.as_ref() }.regs.x[0];
     FIXTURE.lock().kept[0] = timer::now();
-    gic::set_pending(line);
+    // An event of an MSI device (lpi_path_is_measured): the ITS raises its
+    // LPI by the command INT [G46].
+    if line & LPI_PEND != 0 {
+        let (device, event) = ((line >> 8) as u32 & 0xFFFF, line as u32 & 0xFF);
+        let pos = arch::its::send(&[kcore::its::Command::int(device, event)]);
+        arch::its::wait(pos, "INT");
+        return;
+    }
+    gic::set_pending(line as u32);
+}
+
+/// The mark of svc #SVC_PEND's x0 that names an event of an MSI device,
+/// its DeviceID in bits 23:8 and the event in bits 7:0, in place of a line.
+const LPI_PEND: u64 = 1 << 32;
+/// The function lpi_path_is_measured makes its MSI device for: msi-map is
+/// the identity on QEMU, so it is the DeviceID too.
+const LPI_RID: u64 = 0xF00;
+
+/// The path of an LPI to its driver (decision K3, section 5; spec 15.3),
+/// as interrupt_path_is_measured measures a line's: the driver in slot 0
+/// waits in receive at DRIVER on a channel with the binding of event 0 of
+/// an MSI device, a thread of another process in slot 1 notes the counter
+/// and has the ITS raise the event (INT, svc #SVC_PEND), and the driver's
+/// first instruction after receive reads the counter again. The device and
+/// the binding are made by the calls, so their commands go through the
+/// queue as a driver's do. The judge prints `interrupt path ticks: lpi=…`
+/// and `its command ticks: max=… long=… commands=…`: the longest segment
+/// of a wait for the ITS so far, the waits of more than one segment, and the
+/// commands sent (arch::its::stats). Without an ITS the driver ends at once.
+fn start_lpi_path(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    if !arch::its::present() {
+        sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY, FIFO)?;
+        return Ok(());
+    }
+    let driver = sched_thread(f, 0, &raw const el0_receive_then_count, DRIVER, FIFO)?;
+    let (_, h) = kept_channel(f)?;
+    let r = keep(f, Object::Resource, Rights::DEVICE)?;
+    let p = f.processes[0].expect("the test's process");
+    let aux =
+        thread::create(p, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+    f.crowd[0] = Some(aux);
+    let m = call(aux, Call::MsiCreate.number(), &[r, LPI_RID, 1]).map_err(|_| "no MSI device")?;
+    let bind = [m, 0, h, DRIVER.into(), 0, 0];
+    call(aux, Call::IrqBind.number(), &bind).map_err(|_| "irq_bind of an event failed")?;
+    set_args(driver, &[h, 0]);
+    spawn(f, 1, &raw const el0_pend, LPI_PEND | LPI_RID << 8)?;
+    Ok(())
+}
+
+fn done_lpi_path(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    if f.slot(t) == 1 {
+        return check(t.regs.x[0] == 0, "svc #SVC_PEND failed");
+    }
+    let lpi = t.regs.x[12].saturating_sub(f.kept[0]);
+    let (max, long, commands) = arch::its::stats();
+    kprintln!("interrupt path ticks: lpi={lpi}");
+    kprintln!("its command ticks: max={max} long={long} commands={commands}");
+    check(
+        t.regs.x[0] == 0 && t.regs.x[1] >> abi::SOURCE_SHIFT == Source::Interrupt.code(),
+        "the driver did not take the LPI's notification",
+    )
 }
 
 /// Call `number` for `t`, which has not run, with `args` in x0 and up:

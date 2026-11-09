@@ -123,7 +123,14 @@ fn irq_bind_checks_its_arguments() -> Outcome {
     let no_device = copy(&resource(), Rights::DEBUG)?;
     let console = sys::irq_bind(&resource(), CONSOLE_LINE, &notify, QUIET, false).map(close);
     let (resource, line) = (resource().raw().0, u64::from(EDGE_LINE));
-    let good = [resource, line, notify.raw().0, QUIET.into(), TRIGGER_EDGE];
+    let good = [
+        resource,
+        line,
+        notify.raw().0,
+        QUIET.into(),
+        TRIGGER_EDGE,
+        0,
+    ];
     let with = |i: usize, value: u64| {
         let mut x = good;
         x[i] = value;
@@ -133,7 +140,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
         .map(|l| with(1, l))
         .into_iter()
         .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
-        .chain([[gone, 31, gone, 0, 2]])
+        .chain([[gone, 31, gone, 0, 2, 0]])
         .all(|x| x0_alone::<N>(&x, Error::InvalidArgs.code()));
     let refused = [
         (with(0, gone), Error::BadHandle),
@@ -146,7 +153,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
     .iter()
     .all(|(x, e)| x0_alone::<N>(x, e.code()));
     let mut x = marked();
-    x[..5].copy_from_slice(&good);
+    x[..6].copy_from_slice(&good);
     // SAFETY: irq_bind only reads its registers.
     let after = unsafe { sys::raw::<N>(x) };
     let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
@@ -235,6 +242,7 @@ fn a_line_takes_one_binding() -> Outcome {
             h.raw().0,
             QUIET.into(),
             TRIGGER_EDGE,
+            0,
         ]
     };
     let refused = [&c, &other, &notify]

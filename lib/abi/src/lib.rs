@@ -372,8 +372,7 @@ impl Call {
         match number {
             1..=28 => Some(Self::ALL[number as usize - 1]),
             30..=34 => Some(Self::ALL[number as usize - 2]),
-            36 => Some(Self::ProcessControl),
-            37 => Some(Self::MsiCreate),
+            36..=37 => Some(Self::ALL[number as usize - 3]),
             _ => None,
         }
     }

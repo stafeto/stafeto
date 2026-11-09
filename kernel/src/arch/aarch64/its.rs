@@ -26,6 +26,12 @@ use kcore::sync::{SetOnce, Ticket};
 /// Reads of GITS_CREADR in one segment of a wait: a segment is what the
 /// kernel spends outside `OBJ` between two looks at the system (spec 8.1).
 const POLLS: u32 = 1000;
+/// With the feature `its-slow`: the reads of GITS_CREADR a wait makes past
+/// the one that shows the commands done, five segments.
+#[cfg(feature = "its-slow")]
+const SLOW_READS: u32 = 5 * POLLS;
+#[cfg(all(feature = "its-slow", not(feature = "ktest")))]
+compile_error!("its-slow is a deliberate breakage for the kernel tests alone");
 /// The wait for commands, in seconds of the counter, before the ITS is
 /// taken for stopped (Linux gives it the same second).
 const STALL_SECONDS: u64 = 1;
@@ -380,10 +386,18 @@ fn reached(pos: Position) -> bool {
 pub fn wait(pos: Position, what: &str) {
     let limit = timer::frequency() * STALL_SECONDS;
     let began = timer::now();
+    #[cfg(feature = "its-slow")]
+    let mut slow = SLOW_READS;
     loop {
         #[cfg(feature = "ktest")]
         let segment = timer::now();
         for _ in 0..POLLS {
+            #[cfg(feature = "its-slow")]
+            if slow > 0 {
+                slow -= 1;
+                let _ = reached(pos);
+                continue;
+            }
             if reached(pos) {
                 #[cfg(feature = "ktest")]
                 let took = timer::now() - segment;

@@ -1092,7 +1092,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// image of the kernel tests (`Variant::el0_half`) must have run.
 const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
 const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
-const ICOUNT_TESTS: [&str; 17] = [
+const ICOUNT_TESTS: [&str; 18] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -1106,6 +1106,7 @@ const ICOUNT_TESTS: [&str; 17] = [
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
+    "lpi_path_is_measured",
     "device_windows_are_measured",
     "upcall_calls_are_measured",
     "process_kill_with_a_level_is_measured",
@@ -10627,6 +10628,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         }
         check_obj_hold(m.name, &lines)?;
         check_cleanup_sections(m.name, &lines)?;
+        check_its_segment(m.name, &lines)?;
         let (margin, to_term) = b_margin(m.name, &measured, &lines)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
@@ -11017,9 +11019,13 @@ fn rows_of(rows: &[&str], ticks: &[u64]) -> String {
 /// `rows` in that order: an error when no line has them all.
 fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, String> {
     let prefix = format!("{what} ticks: ");
+    // Another line of the same prefix with other rows (`interrupt path
+    // ticks: lpi=`) is not this one.
+    let first = rows.first().map_or(String::new(), |row| format!("{row}="));
     let line = lines
         .iter()
-        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .filter_map(|l| l.strip_prefix(prefix.as_str()))
+        .find(|rest| rest.starts_with(first.as_str()))
         .ok_or_else(|| format!("the kernel printed no {what} ticks"))?;
     let fields: Vec<_> = line.split_whitespace().collect();
     if fields.len() != rows.len() {
@@ -11035,6 +11041,44 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
                 .ok_or_else(|| format!("{field:?} is no {row} row of the {what} line"))
         })
         .collect()
+}
+
+/// The longest segment of a wait for the ITS, in instructions under -icount
+/// (`its command ticks: max=`, lpi_path_is_measured): POLLS = 1000 reads of
+/// GITS_CREADR, each a look at the register and the queue's arithmetic, and
+/// no more, since the kernel waits in segments (decision K3, section 5). A
+/// wait that runs to its end in one loop measures the whole wait; the
+/// kernel built with `its-slow` makes every wait five segments long, which
+/// that breakage shows past this bound.
+const ITS_SEGMENT_MAX: u64 = 20_000;
+
+/// The ITS line of the icount run, on a machine with an ITS: the longest
+/// segment of a wait at most ITS_SEGMENT_MAX. The LPI's path is printed.
+fn check_its_segment(machine: &str, lines: &[String]) -> Result<(), String> {
+    if let Some(lpi) = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("interrupt path ticks: lpi="))
+    {
+        println!("LPI path on {machine}: {lpi} ticks");
+    }
+    let Some(line) = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("its command ticks: "))
+    else {
+        return Ok(());
+    };
+    let max = line
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("max="))
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| format!("the its command line {line:?} has no max"))?;
+    println!("ITS on {machine}: {line}, segment bound {ITS_SEGMENT_MAX}");
+    if max > ITS_SEGMENT_MAX {
+        return Err(format!(
+            "a wait for the ITS ran {max} ticks without a segment's end, past ITS_SEGMENT_MAX {ITS_SEGMENT_MAX}"
+        ));
+    }
+    Ok(())
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
@@ -13710,6 +13754,27 @@ mod tests {
         }
     }
 
+    /// The LPI's line shares the prefix of the line's path and is passed
+    /// over; the ITS line passes below its bound and fails above it.
+    #[test]
+    fn the_lpi_and_its_lines_are_read_apart() {
+        let lines = [
+            "interrupt path ticks: lpi=900",
+            "interrupt path ticks: driver=1 bind=2 ack=3 portion=4",
+            "its command ticks: max=1200 long=0 commands=9",
+        ]
+        .map(String::from);
+        let ticks = ticks_of(&lines, "interrupt path", &INTERRUPT_PATH_ROWS);
+        assert_eq!(ticks, Ok(vec![1, 2, 3, 4]));
+        assert_eq!(check_its_segment("m", &lines), Ok(()));
+        assert_eq!(check_its_segment("m", &lines[..2]), Ok(()));
+        let long = [format!(
+            "its command ticks: max={} long=5 commands=9",
+            ITS_SEGMENT_MAX + 1
+        )];
+        assert!(check_its_segment("m", &long).is_err());
+    }
+
     /// The round trip's line gives its six rows in order, and nothing else
     /// passes for it.
     #[test]
@@ -14156,7 +14221,11 @@ mod tests {
 
     #[test]
     fn locks_of_the_kernel_are_the_ones_the_order_names() {
-        const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
+        // DEVICES and LPI_MAP: the MSI devices by DeviceID and the free LPIs
+        // (msi.rs, irq.rs).
+        const GUARDED: [&str; 7] = [
+            "FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS", "DEVICES", "LPI_MAP",
+        ];
         let mut found = Vec::new();
         let mut guarded = Vec::new();
         for (name, text) in texts(&["kernel/src"]) {
@@ -14171,7 +14240,14 @@ mod tests {
                 // The second lock of the order: the ticket of a CPU's cleanup
                 // queue (obj.rs).
                 let queue_lock = name == "kernel/src/local.rs" && line.contains("queue_spin");
-                if name != "kernel/src/obj.rs" && line.contains("Ticket") && !queue_lock {
+                // The third: ITS_LOCK of the ITS command queue, never taken
+                // with OBJ (arch/aarch64/its.rs, obj.rs).
+                let its_lock = name == "kernel/src/arch/aarch64/its.rs";
+                if name != "kernel/src/obj.rs"
+                    && line.contains("Ticket")
+                    && !queue_lock
+                    && !its_lock
+                {
                     found.push(format!("{at}: a ticket outside obj.rs"));
                 }
                 if name != "kernel/src/local.rs" && line.contains("Own<") {
