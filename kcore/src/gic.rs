@@ -127,7 +127,15 @@ pub const fn sgi1r(mpidr: u64, intid: u32) -> u64 {
 /// GICC_IAR reads 1020..=1023 when there is nothing to acknowledge.
 pub const FIRST_SPURIOUS: u32 = 1020;
 
+/// GICv2 GICC_IAR: the INTID is bits [9:0], bits [12:10] name the CPU
+/// interface that sent an SGI [G26].
 const INTID_MASK: u32 = 0x3FF;
+/// GICv3 ICC_IAR1_EL1: the INTID is bits [23:0], wide enough for LPIs
+/// (INTID 8192 and up); the 10-bit mask of a GICv2 would turn the first LPI
+/// into SPI 0 [G40].
+pub const INTID_MASK_V3: u32 = 0xFF_FFFF;
+/// The first LPI [G40].
+pub const FIRST_LPI: u32 = 8192;
 
 /// Number of interrupt lines, from GICD_TYPER.ITLinesNumber.
 pub fn lines(typer: u32) -> u32 {
@@ -254,16 +262,31 @@ pub fn cfg(intid: u32) -> (usize, u32) {
 /// An acknowledged interrupt: the GICC_IAR value, which goes back to
 /// GICC_EOIR unchanged. Not `Copy`, so one acknowledgement gets one EOI.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Ack(u32);
+pub struct Ack(u32, u32);
 
 impl Ack {
-    /// None for a spurious IAR (INTID 1020..=1023): it needs no EOI.
+    /// None for a spurious GICv2 IAR (INTID 1020..=1023): it needs no EOI.
     pub fn from_iar(iar: u32) -> Option<Ack> {
-        (iar & INTID_MASK < FIRST_SPURIOUS).then_some(Ack(iar))
+        Self::with_mask(iar, INTID_MASK)
+    }
+
+    /// The same for a GICv3 ICC_IAR1_EL1, whose INTID is 24 bits wide.
+    pub fn from_iar_v3(iar: u32) -> Option<Ack> {
+        Self::with_mask(iar, INTID_MASK_V3)
+    }
+
+    fn with_mask(iar: u32, mask: u32) -> Option<Ack> {
+        let intid = iar & mask;
+        (!(FIRST_SPURIOUS..FIRST_SPURIOUS + 4).contains(&intid)).then_some(Ack(iar, mask))
     }
 
     pub fn intid(&self) -> u32 {
-        self.0 & INTID_MASK
+        self.0 & self.1
+    }
+
+    /// Whether the interrupt is an LPI.
+    pub fn is_lpi(&self) -> bool {
+        self.intid() >= FIRST_LPI
     }
 
     /// The CPU interface that sent an SGI, GICC_IAR [12:10] (GICv2 only:
@@ -381,6 +404,20 @@ mod tests {
         let sgi = Ack::from_iar((3 << 10) | 1).unwrap();
         assert_eq!(sgi.intid(), 1);
         assert_eq!(sgi.eoi_value(), (3 << 10) | 1);
+    }
+
+    #[test]
+    fn a_gicv3_iar_keeps_all_24_bits_of_an_lpi() {
+        let ack = Ack::from_iar_v3(FIRST_LPI).unwrap();
+        assert_eq!(ack.intid(), FIRST_LPI);
+        assert!(ack.is_lpi());
+        assert_eq!(ack.eoi_value(), FIRST_LPI);
+        // The 10-bit mask of a GICv2 would read SPI 0.
+        assert_eq!(Ack::from_iar(FIRST_LPI).unwrap().intid(), 0);
+        assert_eq!(Ack::from_iar_v3(0xFF_FFFC).unwrap().intid(), 0xFF_FFFC);
+        assert!(Ack::from_iar_v3(1023).is_none());
+        assert!(Ack::from_iar_v3(1020).is_none());
+        assert!(!Ack::from_iar_v3(1019).unwrap().is_lpi());
     }
 
     #[test]

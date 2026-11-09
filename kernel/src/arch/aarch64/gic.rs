@@ -404,8 +404,8 @@ fn acknowledge_v2() -> u32 {
 /// EOI.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
 pub fn acknowledge() -> Option<Ack> {
-    let iar = match kind() {
-        GicVersion::V2 => acknowledge_v2(),
+    match kind() {
+        GicVersion::V2 => Ack::from_iar(acknowledge_v2()),
         GicVersion::V3 => {
             let iar: u64;
             // SAFETY: reading ICC_IAR1_EL1 acknowledges the interrupt, as
@@ -414,10 +414,10 @@ pub fn acknowledge() -> Option<Ack> {
             unsafe {
                 asm!("mrs {}, icc_iar1_el1", "dsb sy", out(reg) iar, options(nostack, preserves_flags))
             };
-            iar as u32
+            // The INTID is 24 bits wide: an LPI is 8192 and up [G40].
+            Ack::from_iar_v3(iar as u32)
         }
-    };
-    Ack::from_iar(iar)
+    }
 }
 
 /// EOI: ends an acknowledged interrupt, its priority drop and its

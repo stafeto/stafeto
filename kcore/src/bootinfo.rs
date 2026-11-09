@@ -126,6 +126,47 @@ impl Gic {
     }
 }
 
+/// The ITS node (`arm,gic-v3-its`) under a GICv3 (spec 9): its register
+/// frames, the control frame and the translation frame after it, and its
+/// `phandle`, which the `msi-map` of a PCI host names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Its {
+    pub regs: Region,
+    pub phandle: Option<u32>,
+}
+
+/// The `msi-map` entries of the PCI hosts the kernel keeps, at most.
+pub const MSI_MAP_ENTRIES: usize = 8;
+
+/// One entry of a PCI host's `msi-map`: the requester IDs
+/// `rid_base..rid_base + length` of PCI segment `segment` reach the MSI
+/// controller `phandle` as DeviceIDs from `msi_base` on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsiMapEntry {
+    pub segment: u32,
+    pub rid_base: u32,
+    pub phandle: u32,
+    pub msi_base: u32,
+    pub length: u32,
+}
+
+impl MsiMapEntry {
+    const EMPTY: MsiMapEntry = MsiMapEntry {
+        segment: 0,
+        rid_base: 0,
+        phandle: 0,
+        msi_base: 0,
+        length: 0,
+    };
+
+    /// The DeviceID of the requester ID `rid` (16 bits) of `segment`, when
+    /// this entry maps it.
+    pub fn device_id(&self, segment: u32, rid: u32) -> Option<u32> {
+        let at = rid.checked_sub(self.rid_base)?;
+        (self.segment == segment && at < self.length).then(|| self.msi_base + at)
+    }
+}
+
 /// The CPUs the kernel starts at most (`CpuList`).
 pub const MAX_CPUS: usize = 8;
 
@@ -179,6 +220,37 @@ pub struct BootInfo {
     pub gic: Option<Gic>,
     pub psci: PsciConduit,
     pub cpus: CpuList,
+    /// The first enabled ITS node (spec 9).
+    pub its: Option<Its>,
+    msi_map: [MsiMapEntry; MSI_MAP_ENTRIES],
+    msi_entries: usize,
+}
+
+impl BootInfo {
+    /// The `msi-map` entries that name the ITS, in the tree's order.
+    pub fn msi_map(&self) -> impl Iterator<Item = &MsiMapEntry> {
+        let phandle = self.its.and_then(|its| its.phandle);
+        self.msi_map[..self.msi_entries]
+            .iter()
+            .filter(move |e| Some(e.phandle) == phandle)
+    }
+
+    /// The DeviceID the ITS sees for the requester ID `rid`, PCI segment
+    /// in bits 31..16 and bus, device, function below, from the `msi-map`
+    /// (spec 9). None when no entry maps it.
+    pub fn device_id(&self, rid: u32) -> Option<u32> {
+        self.msi_map()
+            .find_map(|e| e.device_id(rid >> 16, rid & 0xFFFF))
+    }
+
+    /// The largest DeviceID any entry can give, the size of the flat table
+    /// of devices the ITS needs.
+    pub fn max_device_id(&self) -> Option<u32> {
+        self.msi_map()
+            .filter(|e| e.length > 0)
+            .map(|e| e.msi_base + (e.length - 1))
+            .max()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,6 +275,9 @@ struct Node<'a> {
     device_type: &'a [u8],
     status: &'a [u8],
     method: &'a [u8],
+    phandle: Option<u32>,
+    msi_map: &'a [u8],
+    pci_domain: u32,
     initrd_start: Option<u64>,
     initrd_end: Option<u64>,
     no_map: bool,
@@ -218,6 +293,9 @@ impl<'a> Node<'a> {
             device_type: &[],
             status: &[],
             method: &[],
+            phandle: None,
+            msi_map: &[],
+            pci_domain: 0,
             initrd_start: None,
             initrd_end: None,
             no_map: false,
@@ -379,6 +457,33 @@ fn classify(
         }
         info.gic = Some(Gic { version, regs });
     }
+    if info.its.is_none() && node.is_compatible("arm,gic-v3-its") {
+        info.its = RegIter::new(node.reg, cells)?
+            .next()
+            .transpose()?
+            .map(|regs| Its {
+                regs,
+                phandle: node.phandle,
+            });
+    }
+    // Four cells an entry: the RID base, the controller's phandle, the
+    // first DeviceID and the length (`#msi-cells` 1).
+    if !node.msi_map.len().is_multiple_of(16) {
+        return Err(BootInfoError::BadReg);
+    }
+    for entry in node.msi_map.as_chunks::<16>().0 {
+        if info.msi_entries == MSI_MAP_ENTRIES {
+            return Err(BootInfoError::TooManyRegions);
+        }
+        info.msi_map[info.msi_entries] = MsiMapEntry {
+            segment: node.pci_domain,
+            rid_base: be32(entry, 0)?,
+            phandle: be32(entry, 4)?,
+            msi_base: be32(entry, 8)?,
+            length: be32(entry, 12)?,
+        };
+        info.msi_entries += 1;
+    }
     Ok(())
 }
 
@@ -394,6 +499,9 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
         gic: None,
         psci: PsciConduit::None,
         cpus: CpuList::new(),
+        its: None,
+        msi_map: [MsiMapEntry::EMPTY; MSI_MAP_ENTRIES],
+        msi_entries: 0,
     };
     let mut stack = [Node::new(""); MAX_DEPTH + 1];
     let mut depth = 0usize;
@@ -421,6 +529,9 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
                     "device_type" => node.device_type = value,
                     "status" => node.status = value,
                     "method" => node.method = value,
+                    "phandle" | "linux,phandle" => node.phandle = number(value).map(|p| p as u32),
+                    "msi-map" => node.msi_map = value,
+                    "linux,pci-domain" => node.pci_domain = be32(value, 0).unwrap_or(0),
                     "linux,initrd-start" => node.initrd_start = number(value),
                     "linux,initrd-end" => node.initrd_end = number(value),
                     "no-map" => node.no_map = true,
@@ -463,6 +574,7 @@ mod tests {
 
     const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
     const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
+    const VIRT_ITS: &[u8] = include_bytes!("../tests/fixtures/virt-its.dtb");
     // Captured from an arm64 guest of Apple Virtualization.framework.
     const APPLE_VZ: &[u8] = include_bytes!("../tests/fixtures/apple-vz.dtb");
     const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
@@ -654,6 +766,49 @@ mod tests {
         let tree = tree_with_gic("arm,cortex-a15-gic", &gic, v2m);
         let v2m = info(&tree).unwrap().gic.unwrap();
         assert_eq!(v2m.regs.as_slice(), gic.map(|(b, s)| region(b, s)));
+    }
+
+    #[test]
+    fn its_node_and_msi_map_of_qemu() {
+        let i = info(VIRT_ITS).unwrap();
+        let its = i.its.unwrap();
+        assert_eq!(its.regs, region(0x0808_0000, 0x2_0000));
+        assert_eq!(its.phandle, Some(0x8006));
+        assert_eq!(i.msi_map().count(), 1);
+        // The map of QEMU is the identity over 16 bits of requester ID.
+        assert_eq!(i.device_id(0x0018), Some(0x18));
+        assert_eq!(i.device_id(0xFFFF), Some(0xFFFF));
+        assert_eq!(i.max_device_id(), Some(0xFFFF));
+        // Another PCI segment has no entry.
+        assert_eq!(i.device_id(0x1_0018), None);
+    }
+
+    #[test]
+    fn a_tree_without_an_its_or_a_map_gives_none() {
+        for blob in [VIRT, VIRT_GICV3, APPLE_VZ, A64] {
+            let i = info(blob).unwrap();
+            assert_eq!(i.msi_map().count(), 0, "{:?}", i.its);
+            assert_eq!(i.device_id(0x18), None);
+            assert_eq!(i.max_device_id(), None);
+        }
+        assert!(info(VIRT_GICV3).unwrap().its.is_some());
+        assert!(info(APPLE_VZ).unwrap().its.is_none());
+    }
+
+    #[test]
+    fn an_msi_map_entry_translates_inside_its_range() {
+        let e = MsiMapEntry {
+            segment: 0,
+            rid_base: 0x100,
+            phandle: 1,
+            msi_base: 0x8000,
+            length: 0x10,
+        };
+        assert_eq!(e.device_id(0, 0x100), Some(0x8000));
+        assert_eq!(e.device_id(0, 0x10F), Some(0x800F));
+        assert_eq!(e.device_id(0, 0x110), None);
+        assert_eq!(e.device_id(0, 0xFF), None);
+        assert_eq!(e.device_id(1, 0x100), None);
     }
 
     #[test]

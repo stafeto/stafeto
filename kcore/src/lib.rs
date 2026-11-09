@@ -22,6 +22,7 @@ pub mod frames;
 pub mod gic;
 pub mod handles;
 pub mod idlepoll;
+pub mod its;
 pub mod layout;
 pub mod log;
 pub mod maps;
