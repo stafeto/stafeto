@@ -95,6 +95,11 @@ impl CpuBlock {
 static CPUS: [CpuBlock; MAX_CPUS] = [const { CpuBlock::new() }; MAX_CPUS];
 
 /// The block of CPU `index`.
+/// Whether CPU `index` has set itself up and runs (spec 8).
+pub fn is_up(index: usize) -> bool {
+    index < MAX_CPUS && CPUS[index].state.load(Ordering::Acquire) == UP
+}
+
 pub fn block(index: usize) -> &'static CpuBlock {
     &CPUS[index]
 }

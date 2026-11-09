@@ -333,6 +333,16 @@ impl<'a> Node<'a> {
     }
 }
 
+/// Cell `i` of a four-cell entry of a property.
+fn word(entry: &[u8; 16], i: usize) -> u32 {
+    u32::from_be_bytes([
+        entry[4 * i],
+        entry[4 * i + 1],
+        entry[4 * i + 2],
+        entry[4 * i + 3],
+    ])
+}
+
 /// A 32- or 64-bit property value.
 fn number(value: &[u8]) -> Option<u64> {
     match value.len() {
@@ -477,10 +487,10 @@ fn classify(
         }
         info.msi_map[info.msi_entries] = MsiMapEntry {
             segment: node.pci_domain,
-            rid_base: be32(entry, 0)?,
-            phandle: be32(entry, 4)?,
-            msi_base: be32(entry, 8)?,
-            length: be32(entry, 12)?,
+            rid_base: word(entry, 0),
+            phandle: word(entry, 1),
+            msi_base: word(entry, 2),
+            length: word(entry, 3),
         };
         info.msi_entries += 1;
     }

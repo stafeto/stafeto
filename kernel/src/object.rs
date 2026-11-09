@@ -18,6 +18,7 @@ use crate::memory::{self, Memory};
 use crate::mm::pages::KernelPages;
 #[cfg(feature = "ktest")]
 use crate::mm::pages::POISON;
+use crate::msi::{self, Msi};
 use crate::process::{self, Process};
 use crate::session::{self, Session};
 use crate::thread::{self, Thread};
@@ -43,6 +44,8 @@ pub enum Object {
     Memory(NonNull<Memory>),
     /// An interrupt binding (spec 9).
     Irq(NonNull<Irq>),
+    /// The MSI device of a PCI function (spec 9).
+    Msi(NonNull<Msi>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -114,6 +117,14 @@ impl Object {
         }
     }
 
+    /// The MSI device, for a lookup that needs one.
+    pub fn msi(&self) -> Option<NonNull<Msi>> {
+        match *self {
+            Object::Msi(m) => Some(m),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
@@ -131,6 +142,7 @@ impl Object {
             Object::Memory(m) if memory::is_window(*m) => ObjectKind::DeviceWindow,
             Object::Memory(_) => ObjectKind::Memory,
             Object::Irq(_) => ObjectKind::Interrupt,
+            Object::Msi(_) => ObjectKind::MsiDevice,
             Object::Resource => ObjectKind::Resource,
         }
     }
@@ -274,6 +286,7 @@ pub fn retain(object: Object, rights: Rights) {
         Object::Timer(t) => timer::retain(t),
         Object::Memory(m) => memory::retain(m),
         Object::Irq(b) => irq::retain_handle(b),
+        Object::Msi(m) => msi::retain(m),
         Object::Resource => {}
     }
 }
@@ -298,6 +311,7 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Timer(t) => timer::release(t, cause),
             Object::Memory(m) => memory::release(m, cause),
             Object::Irq(b) => irq::release_handle(b, cause),
+            Object::Msi(m) => msi::release(m, cause),
             Object::Resource => {}
         }
     }

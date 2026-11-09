@@ -315,11 +315,16 @@ pub enum Call {
     /// x0 process with MANAGE, x1 action (0 suspend, 1 continue), x2 level.
     /// Level 0 uses the caller priority; 1-63 stays at or below it.
     ProcessControl = 36,
+    /// x0 system resource with DEVICE, x1 requester ID (segment << 16 | bus
+    /// << 8 | device and function), x2 events 1..=MAX_MSI_EVENTS: makes the
+    /// MSI device of the function; x1 returns a handle to it with
+    /// OWNER_RIGHTS (spec 9, 11).
+    MsiCreate = 37,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 34] = [
+    pub const ALL: [Call; 35] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -354,6 +359,7 @@ impl Call {
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
         Call::ProcessControl,
+        Call::MsiCreate,
     ];
 
     pub const fn number(self) -> u16 {
@@ -367,16 +373,17 @@ impl Call {
             1..=28 => Some(Self::ALL[number as usize - 1]),
             30..=34 => Some(Self::ALL[number as usize - 2]),
             36 => Some(Self::ProcessControl),
+            37 => Some(Self::MsiCreate),
             _ => None,
         }
     }
 
     /// The highest number of a call.
-    pub const HIGHEST: u16 = Call::ProcessControl.number();
+    pub const HIGHEST: u16 = Call::MsiCreate.number();
 }
 
 /// Numbers of calls that went, never given again (spec 11): 29,
-/// console_poll, and 35, request_identity. The next new call takes 37.
+/// console_poll, and 35, request_identity. The next new call takes 38.
 pub const RETIRED_CALLS: [u16; 2] = [29, 35];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
@@ -466,6 +473,8 @@ pub enum ObjectKind {
     Interrupt,
     /// A window on the registers of a device (milestone 1.3e).
     DeviceWindow,
+    /// The MSI device of a PCI function (spec 9).
+    MsiDevice,
     /// A kind this abi does not know, which a later kernel may give: its
     /// code.
     Unknown(u8),
@@ -483,6 +492,7 @@ impl ObjectKind {
             ObjectKind::Memory => 6,
             ObjectKind::Interrupt => 7,
             ObjectKind::DeviceWindow => 8,
+            ObjectKind::MsiDevice => 9,
             ObjectKind::Unknown(code) => code,
         }
     }
@@ -499,6 +509,7 @@ impl ObjectKind {
             6 => ObjectKind::Memory,
             7 => ObjectKind::Interrupt,
             8 => ObjectKind::DeviceWindow,
+            9 => ObjectKind::MsiDevice,
             _ => ObjectKind::Unknown(code),
         }
     }
@@ -818,6 +829,9 @@ pub const INFO_CPU: u64 = 15;
 /// timers, and in x7 1 when the process pays from a share of its own, 0
 /// when it pays from the share of its creator (spec 7.5, #354).
 pub const INFO_PROCESS_SHARES: u64 = 16;
+/// MSI_DEVICE takes an MSI device's handle, with no right needed, and
+/// returns `MsiInfo::to_words` in x1-x3.
+pub const INFO_MSI_DEVICE: u64 = 17;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -890,6 +904,10 @@ pub const CHANNEL_WAIT: u64 = 1;
 /// edge-triggered; without it, level-triggered. The other bits are
 /// reserved.
 pub const TRIGGER_EDGE: u64 = 1;
+
+/// The most events a device of `msi_create` has (spec 9, 11): ENA gives a
+/// function up to 33 vectors.
+pub const MAX_MSI_EVENTS: u64 = 64;
 
 /// A process's memory quota (spec 7.5), in bytes: the limit its parent
 /// gave it, what is charged to it now, and what went back to the parent.
@@ -998,27 +1016,91 @@ impl MemoryInfo {
 }
 
 /// An interrupt binding (spec 9, 11): its line, whether the line is masked
-/// until `irq_ack`, and whether it is edge-triggered.
+/// until `irq_ack`, whether it is edge-triggered, its kind, the CPU its
+/// interrupts go to, and for an LPI its number and the MSI address and data
+/// a device writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IrqInfo {
+    /// The line of a shared peripheral interrupt, the INTID of an LPI.
     pub line: u64,
     pub masked: bool,
     pub edge: bool,
+    /// The binding is an event of an MSI device (an LPI).
+    pub lpi: bool,
+    pub cpu: u64,
+    /// The LPI's INTID, 0 for a line.
+    pub lpi_number: u64,
+    /// The physical address of GITS_TRANSLATER and the EventID, 0 for a
+    /// line.
+    pub msi_address: u64,
+    pub msi_data: u64,
 }
 
 impl IrqInfo {
-    /// The words `object_info` returns in x1-x3: the line, 1 when masked,
-    /// 1 when edge-triggered.
-    pub const fn to_words(self) -> [u64; 3] {
-        [self.line, self.masked as u64, self.edge as u64]
+    /// The info of a binding to a shared line, which goes to CPU `cpu`.
+    pub const fn line(line: u64, masked: bool, edge: bool, cpu: u64) -> IrqInfo {
+        IrqInfo {
+            line,
+            masked,
+            edge,
+            lpi: false,
+            cpu,
+            lpi_number: 0,
+            msi_address: 0,
+            msi_data: 0,
+        }
     }
 
-    /// The binding from x1-x3 of `object_info`.
-    pub const fn from_words(words: [u64; 3]) -> IrqInfo {
+    /// The words `object_info` returns in x1-x8: the line, 1 when masked,
+    /// 1 when edge-triggered, the kind (0 line, 1 LPI), the CPU, the LPI
+    /// number, the MSI address and data.
+    pub const fn to_words(self) -> [u64; 8] {
+        [
+            self.line,
+            self.masked as u64,
+            self.edge as u64,
+            self.lpi as u64,
+            self.cpu,
+            self.lpi_number,
+            self.msi_address,
+            self.msi_data,
+        ]
+    }
+
+    /// The binding from x1-x8 of `object_info`.
+    pub const fn from_words(words: [u64; 8]) -> IrqInfo {
         IrqInfo {
             line: words[0],
             masked: words[1] != 0,
             edge: words[2] != 0,
+            lpi: words[3] != 0,
+            cpu: words[4],
+            lpi_number: words[5],
+            msi_address: words[6],
+            msi_data: words[7],
+        }
+    }
+}
+
+/// An MSI device (spec 9, 11): its DeviceID, its number of events and how
+/// many of them are bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsiInfo {
+    pub device_id: u64,
+    pub events: u64,
+    pub bound: u64,
+}
+
+impl MsiInfo {
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.device_id, self.events, self.bound]
+    }
+
+    pub const fn from_words(words: [u64; 3]) -> MsiInfo {
+        MsiInfo {
+            device_id: words[0],
+            events: words[1],
+            bound: words[2],
         }
     }
 }
@@ -1514,7 +1596,7 @@ mod tests {
         assert_eq!((INFO_PROCESS_TIME, POLICY_TAIL), (14, 256));
         assert_eq!(INFO_LABEL, 11);
         assert_eq!(Call::ObjectInfo.number(), 27);
-        assert_eq!(Call::ALL.len(), 34);
+        assert_eq!(Call::ALL.len(), 35);
     }
 
     #[test]
@@ -1578,7 +1660,7 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one_but_the_retired() {
-        assert_eq!(Call::ALL.len(), 34);
+        assert_eq!(Call::ALL.len(), 35);
         let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
         for (call, n) in Call::ALL.iter().zip(numbers) {
             assert_eq!(call.number(), n);
@@ -1589,14 +1671,14 @@ mod tests {
             0,
             29,
             35,
-            37,
+            38,
             0xFEFF,
             *TEST_CALLS.start(),
             *TEST_CALLS.end(),
         ] {
             assert_eq!(Call::from_number(n), None);
         }
-        assert_eq!(KERNEL_CALL_SLOTS, 37);
+        assert_eq!(KERNEL_CALL_SLOTS, 38);
     }
 
     #[test]
@@ -1727,7 +1809,7 @@ mod tests {
             parse_info(word),
             (ObjectKind::Channel, Rights::SEND | Rights::TRANSFER)
         );
-        for code in 1..=8 {
+        for code in 1..=9 {
             let kind = ObjectKind::from_code(code);
             assert_ne!(kind, ObjectKind::Unknown(code));
             assert_eq!(kind.code(), code);
@@ -1735,8 +1817,8 @@ mod tests {
         }
         assert_eq!(ObjectKind::from_code(0), ObjectKind::Unknown(0));
         assert_eq!(
-            parse_info(9 << 32 | 0b100),
-            (ObjectKind::Unknown(9), Rights::SEND)
+            parse_info(10 << 32 | 0b100),
+            (ObjectKind::Unknown(10), Rights::SEND)
         );
     }
 
@@ -1909,19 +1991,34 @@ mod tests {
     #[test]
     fn irq_info_round_trips() {
         assert_eq!((INFO_IRQ, TRIGGER_EDGE), (8, 1));
-        let info = IrqInfo {
-            line: 48,
-            masked: true,
-            edge: false,
-        };
-        assert_eq!(info.to_words(), [48, 1, 0]);
+        let info = IrqInfo::line(48, true, false, 0);
+        assert_eq!(info.to_words(), [48, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(IrqInfo::from_words(info.to_words()), info);
-        let edge = IrqInfo {
-            line: 34,
+        let edge = IrqInfo::line(34, false, true, 2);
+        assert_eq!(IrqInfo::from_words(edge.to_words()), edge);
+        let lpi = IrqInfo {
+            line: 8193,
             masked: false,
             edge: true,
+            lpi: true,
+            cpu: 1,
+            lpi_number: 8193,
+            msi_address: 0x0809_0040,
+            msi_data: 3,
         };
-        assert_eq!(IrqInfo::from_words(edge.to_words()), edge);
+        assert_eq!(lpi.to_words(), [8193, 0, 1, 1, 1, 8193, 0x0809_0040, 3]);
+        assert_eq!(IrqInfo::from_words(lpi.to_words()), lpi);
+        assert_eq!((INFO_MSI_DEVICE, MAX_MSI_EVENTS), (17, 64));
+        let msi = MsiInfo {
+            device_id: 8,
+            events: 3,
+            bound: 2,
+        };
+        assert_eq!(MsiInfo::from_words(msi.to_words()), msi);
+        assert_eq!(
+            ObjectKind::from_code(ObjectKind::MsiDevice.code()),
+            ObjectKind::MsiDevice
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod ktest;
 mod local;
 mod memory;
 mod mm;
+mod msi;
 mod obj;
 mod object;
 mod panicking;
@@ -156,14 +157,6 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
                 c.base
             ),
         }
-    }
-    if arch::its::present() {
-        kprintln!(
-            "its        {:#x}, ITT entry {} bytes, DeviceIDs up to {:#x}",
-            info.its.map_or(0, |its| its.regs.base),
-            arch::its::itt_entry(),
-            arch::its::max_device_id()
-        );
     }
     kprintln!("psci       {:?}", info.psci);
     smp::report();

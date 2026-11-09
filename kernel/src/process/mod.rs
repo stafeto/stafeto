@@ -40,6 +40,7 @@ use crate::irq::Irq;
 use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
+use crate::msi::Msi;
 use crate::obj::Guarded;
 use crate::object::{self, Block, Chunks, Handles, Live, Moving, Object, Refs};
 use crate::sched;
@@ -270,6 +271,8 @@ pub struct Pools {
     memories: Pool<Memory>,
     /// The interrupt bindings it made (spec 9).
     irqs: Pool<Irq>,
+    /// The MSI devices it made (spec 9).
+    msis: Pool<Msi>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -413,6 +416,7 @@ fn create(
             timers: Pool::new(),
             memories: Pool::new(),
             irqs: Pool::new(),
+            msis: Pool::new(),
         },
         ceiling,
         cpu_ticks: 0,
@@ -511,6 +515,12 @@ impl Paid for Memory {
 impl Paid for Irq {
     fn pool(pools: &mut Pools) -> &mut Pool<Irq> {
         &mut pools.irqs
+    }
+}
+
+impl Paid for Msi {
+    fn pool(pools: &mut Pools) -> &mut Pool<Msi> {
+        &mut pools.msis
     }
 }
 

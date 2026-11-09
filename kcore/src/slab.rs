@@ -38,8 +38,8 @@ struct FreeSlot {
 
 pub struct Pool<T> {
     free: Option<NonNull<FreeSlot>>,
-    in_use: usize,
-    pages: usize,
+    in_use: u32,
+    pages: u32,
     _objects: PhantomData<T>,
 }
 
@@ -88,11 +88,11 @@ impl<T> Pool<T> {
     }
 
     pub fn in_use(&self) -> usize {
-        self.in_use
+        self.in_use as usize
     }
 
     pub fn pages(&self) -> usize {
-        self.pages
+        self.pages as usize
     }
 
     /// Makes sure the next `alloc` takes no page: takes one from `src` now

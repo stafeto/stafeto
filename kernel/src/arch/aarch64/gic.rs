@@ -377,6 +377,30 @@ pub fn mask(intid: u32) {
     }
 }
 
+/// Sends the shared line `intid` to CPU `cpu`, which is up (spec 9):
+/// its byte of GICD_ITARGETSR with the CPU's interface bit on a GICv2, its
+/// GICD_IROUTER with the CPU's affinity on a GICv3. The line is masked
+/// meanwhile.
+pub fn set_route(intid: u32, cpu: usize) {
+    let dist = base(&DIST);
+    let block = cpu::block(cpu);
+    match kind() {
+        GicVersion::V2 => {
+            let (offset, shift) = gic::byte(GICD_ITARGETSR, intid);
+            let bit = (block.gic.load(Ordering::Relaxed) as u32 & 0xFF) << shift;
+            write(
+                dist + offset,
+                (read(dist + offset) & !(0xFF << shift)) | bit,
+            );
+        }
+        GicVersion::V3 => {
+            let at = dist + GICD_IROUTER + 8 * intid as usize;
+            // SAFETY: GICD_IROUTER is a 64-bit register of the distributor.
+            unsafe { mmio::write64(at, gic::irouter(block.mpidr.load(Ordering::Relaxed))) };
+        }
+    }
+}
+
 /// Makes the line edge-triggered, or level-triggered, in GICD_ICFGR
 /// [G25]; the line is masked meanwhile (spec 9).
 pub fn set_trigger(intid: u32, edge: bool) {

@@ -18,7 +18,8 @@
 //! of the program and panics (spec 5.4); `raw` returns it as it is.
 
 use crate::handle::{
-    Channel, Handle, Incoming, Interrupt, Memory, Outgoing, Process, Resource, Thread, Timer,
+    Channel, Handle, Incoming, Interrupt, Memory, MsiDevice, Outgoing, Process, Resource, Thread,
+    Timer,
 };
 use crate::msgbuf;
 use abi::{
@@ -753,7 +754,69 @@ pub fn copy_label(own: &Handle<Channel>, copy: &Handle<Channel>) -> Result<u64, 
 pub fn irq_info(irq: &Handle<Interrupt>) -> Result<IrqInfo, Error> {
     let args = [irq.raw().0, abi::INFO_IRQ, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
-    Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
+    Ok(IrqInfo::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+    ]))
+}
+
+/// object_info(MSI_DEVICE): the DeviceID, the events and how many of them
+/// are bound.
+pub fn msi_info(device: &Handle<MsiDevice>) -> Result<abi::MsiInfo, Error> {
+    let args = [device.raw().0, abi::INFO_MSI_DEVICE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(abi::MsiInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// msi_create through the system resource with DEVICE: the MSI device of
+/// the PCI function with requester ID `rid` (segment << 16 | bus << 8 |
+/// device and function), with `events` events (1..=abi::MAX_MSI_EVENTS).
+/// The kernel maps the function in the ITS with its own table of events,
+/// paid by the caller's quota. The handle carries abi::OWNER_RIGHTS.
+pub fn msi_create(
+    resource: &Handle<Resource>,
+    rid: u32,
+    events: u32,
+) -> Result<Handle<MsiDevice>, Error> {
+    let x = call::<{ Call::MsiCreate.number() }>(&[resource.raw().0, rid.into(), events.into()])?;
+    Ok(returned(&x))
+}
+
+/// The binding of one event of an MSI device.
+pub struct MsiBinding {
+    pub binding: Handle<Interrupt>,
+    /// The address and data the device writes: the MSI-X table entry of the
+    /// event.
+    pub address: u64,
+    pub data: u64,
+}
+
+/// irq_bind of `event` of `device`, a handle with MANAGE: the LPI of the
+/// event comes as notifications of `channel` (NOTIFY), bit 0 into a slot of
+/// `priority`, on `cpu`. The LPI is edge-triggered and the kernel masks
+/// nothing: the device or the vector's mask in its MSI-X table keeps it
+/// quiet until the driver serves it. Returns the binding and the MSI
+/// address and data for the device's table.
+pub fn irq_bind_event(
+    device: &Handle<MsiDevice>,
+    event: u32,
+    channel: &Handle<Channel>,
+    priority: u8,
+    cpu: u32,
+) -> Result<MsiBinding, Error> {
+    let args = [
+        device.raw().0,
+        event.into(),
+        channel.raw().0,
+        priority.into(),
+        0,
+        cpu.into(),
+    ];
+    let x = call::<{ Call::IrqBind.number() }>(&args)?;
+    Ok(MsiBinding {
+        binding: returned(&x),
+        address: x[2],
+        data: x[3],
+    })
 }
 
 /// device_window_create through the system resource with DEVICE: a device
@@ -785,6 +848,18 @@ pub fn irq_bind(
     priority: u8,
     edge: bool,
 ) -> Result<Handle<Interrupt>, Error> {
+    irq_bind_on(resource, line, channel, priority, edge, 0)
+}
+
+/// irq_bind as above, with the interrupts routed to CPU `cpu` (spec 9).
+pub fn irq_bind_on(
+    resource: &Handle<Resource>,
+    line: u32,
+    channel: &Handle<Channel>,
+    priority: u8,
+    edge: bool,
+    cpu: u32,
+) -> Result<Handle<Interrupt>, Error> {
     let flags = if edge { TRIGGER_EDGE } else { 0 };
     let args = [
         resource.raw().0,
@@ -792,6 +867,7 @@ pub fn irq_bind(
         channel.raw().0,
         priority.into(),
         flags,
+        cpu.into(),
     ];
     let x = call::<{ Call::IrqBind.number() }>(&args)?;
     Ok(returned(&x))

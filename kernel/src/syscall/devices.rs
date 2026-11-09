@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The calls of devices (spec 9, 11): device_window_create, irq_bind and irq_ack.
+//! The calls of devices (spec 9, 11): device_window_create, msi_create,
+//! irq_bind and irq_ack.
 
 use super::{Args, Values, caller, caller_ceiling, cause, lookup};
 use crate::memory;
+use crate::msi::{self, Job};
 use crate::object::Object;
 use crate::process;
 use crate::thread::Thread;
 use crate::{arch, channel, irq, session};
 use abi::{Error, OWNER_RIGHTS, Rights, WINDOW_RIGHTS};
 use core::ptr::NonNull;
-use kcore::args::{line_arg, priority_arg, trigger_arg, under_ceilings};
+use kcore::args::{cpu_arg, event_flags_arg, line_arg, priority_arg, trigger_arg, under_ceilings};
 
 /// device_window_create(x0 system resource with DEVICE, x1 address, x2
 /// length): a device window, a memory object over the physical range
@@ -63,13 +65,34 @@ pub(super) fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<
 /// goes again, and its line with it.
 #[inline(never)]
 pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let cpu = cpu_arg(a[5], arch::cpu::MAX_CPUS)?;
+    // The kind of x0 picks the call: an MSI device binds an event, the
+    // system resource a line; a handle that is neither goes the way of the
+    // line, whose checks give its errors.
+    let device = lookup(thread, a[0], Rights::MANAGE, Object::msi);
+    let event = !matches!(device, Err(Error::WrongType | Error::BadHandle));
+    let mut job = Job::None;
+    let result = super::objects(|| {
+        if event {
+            irq_bind_event(thread, a, cpu, device, &mut job)
+        } else {
+            irq_bind_line(thread, a, cpu)
+        }
+    });
+    // The ITS commands of an event go outside the section, and the call
+    // returns when they ran (spec 8.1).
+    job.run();
+    result
+}
+
+/// The part of irq_bind that binds a shared line (see `irq_bind`).
+fn irq_bind_line(thread: NonNull<Thread>, a: &Args, cpu: u32) -> Result<Values, Error> {
     let line = line_arg(a[1], arch::gic::lines())?;
     let priority = priority_arg(a[3])?;
     let edge = trigger_arg(a[4])?;
+    check_cpu(cpu)?;
     lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
-    let (c, label) = lookup(thread, a[2], Rights::NOTIFY, |o| {
-        Some((o.channel()?, o.session().map_or(0, session::label)))
-    })?;
+    let (c, label) = notify_channel(thread, a[2])?;
     under_ceilings(priority, &[caller_ceiling(thread)])?;
     if irq::is_bound(line) {
         return Err(Error::BadState);
@@ -78,12 +101,105 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
         return Err(Error::PeerClosed);
     }
     process::handle_room(caller(thread))?;
-    let b = irq::bind(caller(thread), c, label, line, priority, edge)?;
+    let b = irq::bind(caller(thread), c, label, line, priority, edge, cpu)?;
     let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
     // SAFETY: the reference `bind` handed out goes; the handle, if it went
     // in, holds the binding, and without it the binding and its line go.
     unsafe { irq::release_handle(b, cause(thread)) };
     Ok(Values::new(&[h?.0]))
+}
+
+/// The part of irq_bind that binds an event of an MSI device (spec 9): x0
+/// a device with MANAGE, x1 the event, x2 a channel with NOTIFY, x3 the
+/// priority, x4 flags, which are 0 (an LPI is always edge-triggered), x5
+/// the CPU. The checks in the order of spec 11: priority, flags and CPU
+/// outside the values (INVALID_ARGS); x0 (WRONG_TYPE, ACCESS_DENIED without
+/// MANAGE), the event past the device's (INVALID_ARGS), x2 (BAD_HANDLE,
+/// WRONG_TYPE, ACCESS_DENIED without NOTIFY); the priority above the
+/// caller's ceiling (ACCESS_DENIED); an event with a binding (BAD_STATE), a
+/// closed channel (PEER_CLOSED); then the resources: room in the caller's
+/// table (LIMIT_REACHED), a slot of the channel and a free LPI
+/// (LIMIT_REACHED), a page of the caller's pool of bindings and a block of
+/// its table (NO_MEMORY). Returns x1 the binding, x2 the MSI address, x3
+/// the MSI data, and the job of the ITS.
+fn irq_bind_event(
+    thread: NonNull<Thread>,
+    a: &Args,
+    cpu: u32,
+    device: Result<NonNull<msi::Msi>, Error>,
+    job: &mut Job,
+) -> Result<Values, Error> {
+    let priority = priority_arg(a[3])?;
+    event_flags_arg(a[4])?;
+    check_cpu(cpu)?;
+    let device = device?;
+    let event = msi::claim(device, a[1])?;
+    let (c, label) = notify_channel(thread, a[2])?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let (b, work) = irq::bind_event(caller(thread), c, label, device, event, priority, cpu)?;
+    *job = work;
+    let info = irq::info(b);
+    let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
+    // SAFETY: the reference `bind_event` handed out goes; the handle, if it
+    // went in, holds the binding, and without it the binding and its event
+    // go with it.
+    unsafe { irq::release_handle(b, cause(thread)) };
+    let h = h?;
+    Ok(Values::new(&[h.0, info.msi_address, info.msi_data]))
+}
+
+/// The channel of handle `h` with NOTIFY, and the label of the handle.
+#[inline(never)]
+fn notify_channel(
+    thread: NonNull<Thread>,
+    h: u64,
+) -> Result<(NonNull<channel::Channel>, u64), Error> {
+    lookup(thread, h, Rights::NOTIFY, |o| {
+        Some((o.channel()?, o.session().map_or(0, session::label)))
+    })
+}
+
+/// INVALID_ARGS for a CPU that is not up.
+fn check_cpu(cpu: u32) -> Result<(), Error> {
+    if arch::cpu::is_up(cpu as usize) {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
+/// msi_create(x0 system resource with DEVICE, x1 requester ID, x2 events):
+/// the MSI device of a PCI function (spec 9); x1 returns a handle to it with
+/// abi::OWNER_RIGHTS. The checks in the order of spec 11: the values (events
+/// outside 1..=abi::MAX_MSI_EVENTS, a requester ID the device tree's
+/// `msi-map` does not name, a DeviceID past the device table, no ITS:
+/// INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without
+/// DEVICE); a DeviceID that has a device (BAD_STATE); then the resources:
+/// room in the caller's table, a place in DEVICES (LIMIT_REACHED), a place
+/// in the pool of devices of the caller, which grows by a page the quota
+/// pays for (NO_MEMORY). The ITS maps the device after the section
+/// (MAPD, SYNC), and the call returns once they ran (spec 8.1).
+#[inline(never)]
+pub(super) fn msi_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let device_id = msi::check(a[1], a[2])?;
+    let mut job = Job::None;
+    let result = super::objects(|| {
+        lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
+        process::handle_room(caller(thread))?;
+        let (m, work) = msi::create(caller(thread), device_id, a[2] as u32)?;
+        job = work;
+        let h = process::insert_handle(caller(thread), Object::Msi(m), OWNER_RIGHTS);
+        // SAFETY: the reference `create` handed out goes; the handle, if it
+        // went in, holds the device, and without it the device goes.
+        unsafe { msi::release(m, cause(thread)) };
+        Ok(Values::new(&[h?.0]))
+    });
+    job.run();
+    result
 }
 
 /// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens

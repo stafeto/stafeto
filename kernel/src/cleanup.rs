@@ -421,11 +421,22 @@ pub fn portion() {
                 crate::memory::clean(m, level)
             }
             Work::Object(Object::Irq(b)) => {
+                // The ITS commands of an event go before the section, and
+                // the wait for them too (spec 8.1).
+                crate::irq::unmap(b);
                 crate::obj::serving(crate::obj::CLEAN_IRQ);
                 #[cfg(all(feature = "ktest", obj_checks))]
                 crate::obj::cleanup_seen(crate::obj::CLEAN_IRQ);
                 let _section = crate::obj::lock();
                 crate::irq::clean(b, level)
+            }
+            Work::Object(Object::Msi(m)) => {
+                crate::msi::unmap(m);
+                crate::obj::serving(crate::obj::CLEAN_MSI);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_MSI);
+                let _section = crate::obj::lock();
+                crate::msi::clean(m, level)
             }
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")

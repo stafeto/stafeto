@@ -10,8 +10,6 @@
 //! Programs never reach the registers or the tables: the ITS maps events of
 //! a device to LPIs on behalf of the kernel alone.
 
-#![allow(dead_code)]
-
 use super::cpu;
 use super::mmio;
 use super::{cache, timer};
@@ -23,7 +21,7 @@ use kcore::bootinfo::BootInfo;
 use kcore::its::{self, Command};
 use kcore::layout::LINEAR_BASE;
 use kcore::quota::Account;
-use kcore::sync::Ticket;
+use kcore::sync::{SetOnce, Ticket};
 
 /// Reads of GITS_CREADR in one segment of a wait: a segment is what the
 /// kernel spends outside `OBJ` between two looks at the system (spec 8.1).
@@ -50,9 +48,12 @@ static PROP_PA: AtomicU64 = AtomicU64::new(0);
 /// The pending table of each CPU, physical addresses.
 static PEND_PA: [AtomicU64; cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; cpu::MAX_CPUS];
 /// The longest segment of a wait, in counter ticks (`its command ticks`).
+#[cfg(feature = "ktest")]
 static LONGEST: AtomicU64 = AtomicU64::new(0);
 /// A wait that took more than one segment, and the commands that went.
+#[cfg(feature = "ktest")]
 static LONG_WAITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ktest")]
 static COMMANDS: AtomicU64 = AtomicU64::new(0);
 
 /// The queue: its virtual address and the offset the next command goes
@@ -74,6 +75,16 @@ static QUEUE: Guarded = Guarded(UnsafeCell::new(Queue { va: 0, write: 0 }));
 /// `wait` waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position(usize);
+
+/// The device tree's `msi-map`, which msi_create translates requester IDs
+/// with, and the tree it came from.
+static TREE: SetOnce<BootInfo> = SetOnce::new();
+
+/// The DeviceID the ITS sees for the requester ID `rid` (spec 9), from the
+/// `msi-map` of the tree.
+pub fn device_id(rid: u32) -> Option<u32> {
+    TREE.get()?.device_id(rid)
+}
 
 /// Whether the machine has an ITS the kernel drives.
 pub fn present() -> bool {
@@ -123,6 +134,7 @@ fn write64(at: usize, value: u64) {
 /// A block of 2^`order` frames from the allocator, outside every quota:
 /// the boot reserve (spec 7.8) never goes back. The pointer is its virtual
 /// address in the linear map, zeroed.
+#[inline(never)]
 fn boot_block(order: u8) -> (usize, u64) {
     let mut account = Account::new(u64::MAX / 2);
     let frame = phys::alloc_zeroed(order, &mut account).expect("no frame for the ITS tables");
@@ -156,6 +168,7 @@ fn publish(va: usize, len: usize) {
 /// tables of devices and collections; GITS_CTLR.Enabled. `redistributor`
 /// is the first RD_base frame, whose registers tell the shareability the
 /// GIC implements. Does nothing without an ITS in the tree.
+#[inline(never)]
 pub fn init(info: &BootInfo, redistributor: usize) {
     let Some(node) = info.its else {
         return;
@@ -163,6 +176,7 @@ pub fn init(info: &BootInfo, redistributor: usize) {
     let Some(max_device) = info.max_device_id() else {
         return;
     };
+    assert!(TREE.set(*info).is_ok(), "its::init runs once");
     BASE.store(LINEAR_BASE + node.regs.base as usize, Ordering::Relaxed);
     TRANSLATER.store(node.regs.base + its::GITS_TRANSLATER, Ordering::Relaxed);
     let typer = read64(its::GITS_TYPER);
@@ -256,6 +270,7 @@ pub fn init(info: &BootInfo, redistributor: usize) {
 /// This CPU's part of the LPIs, called by `gic::init_v3_cpu` once the
 /// redistributor at `rd` is awake: the tables, EnableLPIs, and the CPU's
 /// collection (ICID = the CPU's number) mapped to it (spec 9).
+#[inline(never)]
 pub fn init_cpu(rd: usize) {
     if !present() {
         return;
@@ -313,6 +328,7 @@ pub fn rdbase(cpu: usize) -> u64 {
 /// longer (spec 8.1). The caller holds no `OBJ`, and `wait`s for the
 /// position.
 #[must_use = "the commands run when `wait` has seen them done"]
+#[inline(never)]
 pub fn send(commands: &[Command]) -> Position {
     crate::obj::assert_not_held();
     assert!(commands.len() <= its::MAX_BATCH, "too many ITS commands");
@@ -338,16 +354,12 @@ pub fn send(commands: &[Command]) -> Position {
     // write that tells the ITS.
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     write64(its::GITS_CWRITER, queue.write as u64);
-    LAST.store(commands.last().map_or(0, |c| c.0[0]), Ordering::Relaxed);
+    #[cfg(feature = "ktest")]
     COMMANDS.fetch_add(commands.len() as u64, Ordering::Relaxed);
     let end = queue.write;
     ITS_LOCK.unlock(ticket);
     Position(end)
 }
-
-/// The opcode and device of the command last written, for the message of
-/// a stalled ITS.
-static LAST: AtomicU64 = AtomicU64::new(0);
 
 /// True once the ITS has read up to `pos`: the commands before it ran.
 fn reached(pos: Position) -> bool {
@@ -364,28 +376,31 @@ fn reached(pos: Position) -> bool {
 /// GITS_CREADR; the longest segment is counted (`longest`). A queue that
 /// does not move for STALL_SECONDS is a stopped ITS: the kernel stops,
 /// naming the command (`what`).
+#[inline(never)]
 pub fn wait(pos: Position, what: &str) {
     let limit = timer::frequency() * STALL_SECONDS;
     let began = timer::now();
     loop {
+        #[cfg(feature = "ktest")]
         let segment = timer::now();
         for _ in 0..POLLS {
             if reached(pos) {
+                #[cfg(feature = "ktest")]
                 let took = timer::now() - segment;
+                #[cfg(feature = "ktest")]
                 LONGEST.fetch_max(took, Ordering::Relaxed);
                 return;
             }
         }
+        #[cfg(feature = "ktest")]
         let took = timer::now() - segment;
-        LONGEST.fetch_max(took, Ordering::Relaxed);
-        LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "ktest")]
+        {
+            LONGEST.fetch_max(took, Ordering::Relaxed);
+            LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+        }
         if timer::now() - began > limit {
-            panic!(
-                "the ITS stopped at {what}: GITS_CREADR {:#x}, CWRITER {:#x}, last opcode {:#x}",
-                read64(its::GITS_CREADR),
-                read64(its::GITS_CWRITER),
-                LAST.load(Ordering::Relaxed) & 0xFF
-            );
+            panic!("the ITS stopped at {what}");
         }
     }
 }
@@ -412,16 +427,11 @@ pub fn publish_itt(va: usize, len: usize) {
 
 /// The longest segment of a wait, the waits that took more than one, and
 /// the commands sent: the `its command ticks` line of the probe.
+#[cfg(feature = "ktest")]
 pub fn stats() -> (u64, u64, u64) {
     (
         LONGEST.load(Ordering::Relaxed),
         LONG_WAITS.load(Ordering::Relaxed),
         COMMANDS.load(Ordering::Relaxed),
     )
-}
-
-/// The physical address of a kernel address in the linear map, for the ITT
-/// and the queue the ITS reads.
-pub fn pa(va: usize) -> u64 {
-    (va - LINEAR_BASE) as u64
 }

@@ -4701,7 +4701,7 @@ fn kept_channel(f: &mut Fixture) -> Result<(NonNull<Channel>, u64), &'static str
 /// for, its slot at DRIVER, with a handle the teardown closes.
 fn kept_binding(f: &mut Fixture, c: NonNull<Channel>, line: u32) -> Result<(), &'static str> {
     let p = f.processes[0].expect("the test's process");
-    let b = irq::bind(p, c, 0, line, DRIVER, false).map_err(|_| "no binding")?;
+    let b = irq::bind(p, c, 0, line, DRIVER, false, 0).map_err(|_| "no binding")?;
     let h = keep(f, Object::Irq(b), OWNER_RIGHTS);
     // SAFETY: the reference `bind` handed out goes; the handle, if it went
     // in, holds the binding.
@@ -4780,7 +4780,7 @@ fn start_interrupt_path(f: &mut Fixture) -> Result<(), &'static str> {
     // went in, holds the channel.
     unsafe { channel::release(other, Rights::NONE, CAUSE) };
     let ch = ch.map_err(|_| "a handle did not go in")?;
-    let bind = [r.0, OTHER_LINE.into(), ch.0, DRIVER.into(), 0];
+    let bind = [r.0, OTHER_LINE.into(), ch.0, DRIVER.into(), 0, 0];
     let start = timer::now();
     let made = call(aux, Call::IrqBind.number(), &bind);
     f.measured[0] = timer::now() - start;

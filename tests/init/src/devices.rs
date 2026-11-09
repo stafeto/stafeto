@@ -287,16 +287,8 @@ fn irq_info_reports_line_mask_and_trigger() -> Outcome {
     check(
         infos
             == (
-                Ok(IrqInfo {
-                    line: EDGE_LINE.into(),
-                    masked: false,
-                    edge: true,
-                }),
-                Ok(IrqInfo {
-                    line: RTC_LINE.into(),
-                    masked: false,
-                    edge: false,
-                }),
+                Ok(IrqInfo::line(EDGE_LINE.into(), false, true, 0)),
+                Ok(IrqInfo::line(RTC_LINE.into(), false, false, 0)),
             ),
         "IRQ does not report the line, the open mask and the trigger of a new binding",
     )
@@ -1028,11 +1020,7 @@ fn interrupt(count: u32) -> Received {
 
 /// What IRQ says of init's binding of the PL031.
 fn rtc_line(masked: bool) -> Result<IrqInfo, Error> {
-    Ok(IrqInfo {
-        line: RTC_LINE.into(),
-        masked,
-        edge: false,
-    })
+    Ok(IrqInfo::line(RTC_LINE.into(), masked, false, 0))
 }
 
 /// Spec 15.2 (devices), 9, 13.5: the PL031's alarm comes as a notification
