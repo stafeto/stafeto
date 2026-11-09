@@ -69,11 +69,12 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     // The kind of x0 picks the call: an MSI device binds an event, the
     // system resource a line; a handle that is neither goes the way of the
     // line, whose checks give its errors.
-    let device = lookup(thread, a[0], Rights::MANAGE, Object::msi);
-    let event = !matches!(device, Err(Error::WrongType | Error::BadHandle));
+    // The lookup is inside the section: the pointer it gives holds no
+    // reference, and another CPU may close the device meanwhile.
     let mut job = Job::None;
     let result = super::objects(|| {
-        if event {
+        let device = lookup(thread, a[0], Rights::MANAGE, Object::msi);
+        if !matches!(device, Err(Error::WrongType | Error::BadHandle)) {
             irq_bind_event(thread, a, cpu, device, &mut job)
         } else {
             irq_bind_line(thread, a, cpu)
