@@ -159,7 +159,8 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
         }
         let info = &boot.info;
         let gic = info.gic.as_ref().map(Gic::mapped).into_iter().flatten();
-        for dev in info.uart_pl011.into_iter().chain(gic) {
+        let its = info.its.map(|its| its.regs);
+        for dev in info.uart_pl011.into_iter().chain(gic).chain(its) {
             let (base, size) = pages(dev);
             map(
                 &mut pt,

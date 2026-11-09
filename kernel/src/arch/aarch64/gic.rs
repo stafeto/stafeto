@@ -128,7 +128,7 @@ pub fn init(info: &BootInfo) {
     DIST.store(LINEAR_BASE + dist.base as usize, Ordering::Relaxed);
     match gic.version {
         GicVersion::V2 => init_v2(cpu),
-        GicVersion::V3 => init_v3(cpu),
+        GicVersion::V3 => init_v3(cpu, info),
     }
     enable_ipi();
 }
@@ -190,7 +190,7 @@ fn enable_cpu_interface_v2() {
 /// affinity in `redistributors`, the first REDISTRIBUTOR_WINDOW bytes of
 /// the first redistributor region, and woken; then the CPU interface
 /// through its system registers, which head.S opened at EL2.
-fn init_v3(redistributors: Region) {
+fn init_v3(redistributors: Region, info: &BootInfo) {
     let dist = base(&DIST);
     write(dist + GICD_CTLR, 0);
     wait_clear(dist + GICD_CTLR, GICD_CTLR_RWP, "GICD_CTLR.RWP");
@@ -215,14 +215,16 @@ fn init_v3(redistributors: Region) {
         Ordering::Relaxed,
     );
     WINDOW_SIZE.store(redistributors.size as usize, Ordering::Relaxed);
-    init_v3_cpu();
+    init_v3_cpu(Some(info));
 }
 
 /// This CPU's part of the GICv3: its redistributor, found by its
 /// affinity in the window over the redistributors, woken, its SGIs and
 /// PPIs reset; then the CPU interface through its system registers, which
-/// head.S opened at EL2.
-fn init_v3_cpu() {
+/// head.S opened at EL2. The boot CPU passes the device tree: it sets the
+/// ITS up (its::init) before its own LPIs and collection; every CPU then
+/// turns its LPIs on (its::init_cpu).
+fn init_v3_cpu(boot: Option<&BootInfo>) {
     let window = WINDOW.load(Ordering::Relaxed);
     let size = WINDOW_SIZE.load(Ordering::Relaxed) as u64;
     let mpidr = registers::mpidr_el1();
@@ -248,6 +250,10 @@ fn init_v3_cpu() {
     write(rd + SGI_FRAME + GICD_IGROUPR, u32::MAX);
     reset_lines(rd + SGI_FRAME, 0..FIRST_SPI);
     wait_clear(rd + GICR_CTLR, GICR_CTLR_RWP, "GICR_CTLR.RWP");
+    if let Some(info) = boot {
+        super::its::init(info, rd);
+    }
+    super::its::init_cpu(rd);
     let sre = read_sysreg!("icc_sre_el1");
     write_icc!("icc_sre_el1", sre | ICC_SRE_SRE);
     assert!(
@@ -280,7 +286,7 @@ pub fn init_secondary() {
             own_interface();
             enable_cpu_interface_v2();
         }
-        GicVersion::V3 => init_v3_cpu(),
+        GicVersion::V3 => init_v3_cpu(None),
     }
     enable_ipi();
 }

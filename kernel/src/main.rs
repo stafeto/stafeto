@@ -157,6 +157,14 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
             ),
         }
     }
+    if arch::its::present() {
+        kprintln!(
+            "its        {:#x}, ITT entry {} bytes, DeviceIDs up to {:#x}",
+            info.its.map_or(0, |its| its.regs.base),
+            arch::its::itt_entry(),
+            arch::its::max_device_id()
+        );
+    }
     kprintln!("psci       {:?}", info.psci);
     smp::report();
     kprintln!("timer      {} Hz", clock.hz());
