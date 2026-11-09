@@ -13684,6 +13684,8 @@ mod tests {
             "str {v:w}, [{a}]",
             "ldrb {v:w}, [{a}]",
             "strb {v:w}, [{a}]",
+            "ldrh {v:w}, [{a}]",
+            "strh {v:w}, [{a}]",
             "ldr {v}, [{a}]",
             "str {v}, [{a}]",
             "dmb oshst",
