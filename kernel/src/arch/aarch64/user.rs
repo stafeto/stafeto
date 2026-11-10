@@ -31,12 +31,12 @@ pub struct UserRegs {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<UserRegs>() == 288);
-    assert!(core::mem::offset_of!(UserRegs, sp) == 248);
-    assert!(core::mem::offset_of!(UserRegs, elr) == 256);
-    assert!(core::mem::offset_of!(UserRegs, spsr) == 264);
-    assert!(core::mem::offset_of!(UserRegs, tpidr) == 272);
-    assert!(core::mem::offset_of!(UserRegs, tpidrro) == 280);
+    ::core::assert!(core::mem::size_of::<UserRegs>() == 288);
+    ::core::assert!(core::mem::offset_of!(UserRegs, sp) == 248);
+    ::core::assert!(core::mem::offset_of!(UserRegs, elr) == 256);
+    ::core::assert!(core::mem::offset_of!(UserRegs, spsr) == 264);
+    ::core::assert!(core::mem::offset_of!(UserRegs, tpidr) == 272);
+    ::core::assert!(core::mem::offset_of!(UserRegs, tpidrro) == 280);
 };
 
 impl UserRegs {
@@ -67,9 +67,9 @@ pub struct FpRegs {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<FpRegs>() == 528);
-    assert!(core::mem::offset_of!(FpRegs, fpcr) == 512);
-    assert!(core::mem::offset_of!(FpRegs, fpsr) == 520);
+    ::core::assert!(core::mem::size_of::<FpRegs>() == 528);
+    ::core::assert!(core::mem::offset_of!(FpRegs, fpcr) == 512);
+    ::core::assert!(core::mem::offset_of!(FpRegs, fpsr) == 520);
 };
 
 impl FpRegs {

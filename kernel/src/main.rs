@@ -15,6 +15,8 @@
 #![cfg_attr(feature = "ktest", allow(dead_code, unused_imports))]
 
 #[macro_use]
+mod failure;
+#[macro_use]
 mod console;
 #[macro_use]
 mod log;
@@ -56,6 +58,7 @@ use bootimg::Program;
 use kcore::PAGE_SIZE;
 use kcore::bootinfo::GicVersion;
 use kcore::layout::KERNEL_VIRT;
+use kcore::must::Must;
 use kcore::time::Clock;
 
 #[unsafe(no_mangle)]
@@ -103,7 +106,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
 #[cfg(not(feature = "ktest"))]
 fn finish(boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
-    let image = boot.info.initrd.expect("init came from the boot image");
+    let image = boot.info.initrd.must("init came from the boot image");
     init::start(program, image)
 }
 

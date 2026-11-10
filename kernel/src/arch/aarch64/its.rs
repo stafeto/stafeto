@@ -20,6 +20,7 @@ use kcore::PAGE_SIZE;
 use kcore::bootinfo::BootInfo;
 use kcore::its::{self, Command};
 use kcore::layout::LINEAR_BASE;
+use kcore::must::Must;
 use kcore::quota::Account;
 use kcore::sync::{SetOnce, Ticket};
 
@@ -249,7 +250,7 @@ pub fn init(info: &BootInfo, redistributor: usize) {
                 let top = (16 * PAGE_SIZE / entry - 1) as u32;
                 let max_device = max_device.min(top);
                 MAX_DEVICE_ID.store(max_device, Ordering::Relaxed);
-                its::device_table_pages(max_device, entry, 16).expect("a table of 16 pages")
+                its::device_table_pages(max_device, entry, 16).must("a table of 16 pages")
             }
             its::BASER_TYPE_COLLECTION => {
                 if its::typer_hcc(typer) >= cpus as u64 {
@@ -414,7 +415,7 @@ pub fn wait(pos: Position, what: &str) {
             LONG_WAITS.fetch_add(1, Ordering::Relaxed);
         }
         if timer::now() - began > limit {
-            panic!("the ITS stopped at {what}");
+            ::core::panic!("the ITS stopped at {what}");
         }
     }
 }

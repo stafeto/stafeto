@@ -4,6 +4,7 @@
 //! Requests and their replies (spec 6.1, 6.3, 6.4, 6.6, 6.8): `Via`, `Wait`, receive, send with its fast path, reply, and the end of a wait.
 
 use super::*;
+use kcore::must::Must;
 
 /// What a request went through (spec 5.3, 6.1): a handle to the channel
 /// with no label, or one with a label, which names a session of the
@@ -384,7 +385,7 @@ fn receiver_of(c: NonNull<Channel>, k: &mut Locked<'_>) -> Option<NonNull<Thread
     unsafe {
         let q = queue(c, k.s);
         q.has_receivers()
-            .then(|| thread_of(q.head().expect("a receiver")))
+            .then(|| thread_of(q.head().must("a receiver")))
     }
 }
 
@@ -808,7 +809,7 @@ pub unsafe fn raise(w: Wait) {
     // in the cleanup queue at its stage Close.
     unsafe {
         let p = c.as_ptr();
-        let top = sched::locked(|k| queue(c, k.s).top()).expect("the thread's slot is queued");
+        let top = sched::locked(|k| queue(c, k.s).top()).must("the thread's slot is queued");
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
         cleanup::raise_above(item, top.max((*p).cause));
     }

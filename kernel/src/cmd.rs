@@ -120,7 +120,7 @@ pub fn take_exit(t: NonNull<Thread>) -> u16 {
 
 /// Places in a queue: every thread of the system, once.
 const RING: usize = 1024;
-const _: () = assert!(THREADS <= RING);
+const _: () = ::core::assert!(THREADS <= RING);
 
 #[repr(align(64))]
 struct Line(AtomicU32);

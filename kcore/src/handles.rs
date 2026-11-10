@@ -9,6 +9,7 @@
 //! The table goes a few entries at a time (`release_step`), a chunk in
 //! several steps, the directory last.
 
+use crate::must::Must;
 use abi::{Error, Handle, Rights};
 use core::ptr::NonNull;
 
@@ -167,17 +168,17 @@ impl<T> HandleTable<T> {
 
     /// The directory's slot for chunk `c`.
     fn chunk_slot(&mut self, c: usize) -> &mut Option<NonNull<Chunk<T>>> {
-        let directory = self.directory.expect("a directory");
+        let directory = self.directory.must("a directory");
         // SAFETY: the directory is initialised and owned by the table, and
         // `&mut self` makes the access exclusive.
         unsafe { &mut (*directory.as_ptr()).chunks[c] }
     }
 
     fn chunk(&self, index: u32) -> NonNull<Chunk<T>> {
-        let directory = self.directory.expect("a directory");
+        let directory = self.directory.must("a directory");
         // SAFETY: the directory is initialised and owned by the table.
         let chunk = unsafe { (*directory.as_ptr()).chunks[index as usize / CHUNK] };
-        chunk.expect("an initialised chunk")
+        chunk.must("an initialised chunk")
     }
 
     fn entry(&self, index: u32) -> &Entry<T> {
@@ -394,7 +395,7 @@ impl<T> HandleTable<T> {
             self.free_head = NO_ENTRY;
             // From the first part of a chunk on, no handle reaches it.
             self.used = self.used.min((c * CHUNK) as u32);
-            let chunk = (*self.chunk_slot(c)).expect("an initialised chunk");
+            let chunk = (*self.chunk_slot(c)).must("an initialised chunk");
             let from = self.released;
             let to = from + n.min(CHUNK - from);
             // SAFETY: the chunk's entries are initialised; each object is

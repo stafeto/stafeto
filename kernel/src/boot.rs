@@ -35,23 +35,28 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
         panic!("no device tree in x0: boot the arm64 Image");
     }
     if !dtb_gib_is_mappable(dtb_pa as u64) {
-        panic!("device tree pointer {dtb_pa:#x} is outside the RAM the boot page tables map");
+        ::core::panic!(
+            "device tree pointer {dtb_pa:#x} is outside the RAM the boot page tables map"
+        );
     }
     let dtb = (LINEAR_BASE + dtb_pa) as *const u8;
     if !fits_in_one_gib(dtb_pa as u64, fdt::HEADER_SIZE as u64) {
-        panic!("device tree header at {dtb_pa:#x} crosses a GiB boundary");
+        ::core::panic!("device tree header at {dtb_pa:#x} crosses a GiB boundary");
     }
     // SAFETY: head.S mapped the GiB holding the device tree; the header lies in it.
     let header = unsafe { core::slice::from_raw_parts(dtb, fdt::HEADER_SIZE) };
     let total = fdt::total_size_from_header(header)
-        .unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
+        .unwrap_or_else(|e| ::core::panic!("device tree at {dtb_pa:#x}: {e:?}"));
     if !fits_in_one_gib(dtb_pa as u64, total as u64) {
-        panic!("device tree at {dtb_pa:#x} crosses a GiB boundary; only its first GiB is mapped");
+        ::core::panic!(
+            "device tree at {dtb_pa:#x} crosses a GiB boundary; only its first GiB is mapped"
+        );
     }
     // SAFETY: the whole blob lies in the mapped GiB, and nothing writes to it.
     let blob = unsafe { core::slice::from_raw_parts(dtb, total) };
-    let fdt = Fdt::new(blob).unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
-    let info = bootinfo::parse(&fdt).unwrap_or_else(|e| panic!("device tree: {e:?}"));
+    let fdt =
+        Fdt::new(blob).unwrap_or_else(|e| ::core::panic!("device tree at {dtb_pa:#x}: {e:?}"));
+    let info = bootinfo::parse(&fdt).unwrap_or_else(|e| ::core::panic!("device tree: {e:?}"));
 
     let image = symbols::image();
     let kernel_image = Region {
@@ -71,10 +76,10 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
     {
         taken
             .push(r)
-            .unwrap_or_else(|e| panic!("boot reservations: {e:?}"));
+            .unwrap_or_else(|e| ::core::panic!("boot reservations: {e:?}"));
     }
     let usable = memmap::usable(info.memory.as_slice(), taken.as_slice())
-        .unwrap_or_else(|e| panic!("memory map: {e:?}"));
+        .unwrap_or_else(|e| ::core::panic!("memory map: {e:?}"));
     let boot = Boot {
         info,
         kernel_pa: kernel_pa as u64,
@@ -105,7 +110,7 @@ pub fn init_program(boot: &Boot) -> Program<'static> {
         boot.kernel_image,
         boot.dtb,
     )
-    .unwrap_or_else(|e| panic!("boot image {:#x}..{:#x} {e}", r.base, r.end()));
+    .unwrap_or_else(|e| ::core::panic!("boot image {:#x}..{:#x} {e}", r.base, r.end()));
     // SAFETY: the image lies in RAM the linear map covers, apart from the
     // kernel and the device tree, and the allocator never gets its frames,
     // so nothing writes to it.
@@ -115,10 +120,12 @@ pub fn init_program(boot: &Boot) -> Program<'static> {
             r.size as usize,
         )
     };
-    let image = BootImage::parse(bytes).unwrap_or_else(|e| panic!("boot image: {e}"));
+    let image = BootImage::parse(bytes).unwrap_or_else(|e| ::core::panic!("boot image: {e}"));
     if !r.size.is_multiple_of(kcore::PAGE_SIZE) {
         panic!("boot image: not whole pages");
     }
-    let init = image.init().unwrap_or_else(|e| panic!("boot image: {e}"));
-    Program::parse(init).unwrap_or_else(|e| panic!("boot image: init: {e}"))
+    let init = image
+        .init()
+        .unwrap_or_else(|e| ::core::panic!("boot image: {e}"));
+    Program::parse(init).unwrap_or_else(|e| ::core::panic!("boot image: init: {e}"))
 }

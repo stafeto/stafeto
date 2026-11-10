@@ -29,6 +29,7 @@ use core::ptr::NonNull;
 #[cfg(feature = "ktest")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
+use kcore::must::Must;
 use kcore::slab::{PaidPages, Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +180,7 @@ impl Refs {
         crate::obj::assert_held();
         self.check();
         assert!(self.0 > 0, "an object nobody refers to is retained");
-        self.0 = self.0.checked_add(1).expect("references overflow");
+        self.0 = self.0.checked_add(1).must("references overflow");
     }
 
     /// Adds a reference with no check of the count: the cleanup queue's
@@ -189,7 +190,7 @@ impl Refs {
     pub fn take(&mut self) {
         crate::obj::assert_held();
         self.check();
-        self.0 = self.0.checked_add(1).expect("references overflow");
+        self.0 = self.0.checked_add(1).must("references overflow");
     }
 
     /// Drops a reference; true when it was the last.
@@ -200,7 +201,7 @@ impl Refs {
         self.0 = self
             .0
             .checked_sub(1)
-            .expect("an object is released once too often");
+            .must("an object is released once too often");
         self.0 == 0
     }
 
@@ -213,7 +214,7 @@ impl Refs {
             .0
             .checked_sub(n)
             .filter(|&left| left > 0)
-            .expect("the last reference went with others");
+            .must("the last reference went with others");
     }
 
     /// The count.
@@ -333,7 +334,7 @@ pub unsafe fn release_moving(moving: Moving, cause: u8) {
 /// one pool of the table's owner holds both, two to a page (spec 7.8).
 pub type Block = MaybeUninit<Chunk<Object>>;
 
-const _: () = assert!(
+const _: () = ::core::assert!(
     size_of::<Directory<Object>>() <= size_of::<Block>()
         && align_of::<Directory<Object>>() <= align_of::<Block>()
         && size_of::<Block>() == 2048

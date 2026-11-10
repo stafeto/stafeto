@@ -28,7 +28,7 @@ const PRIORITY: u8 = 63;
 
 // The boot image aligns files and segments to its own page (spec 13.1),
 // and the kernel maps them in its pages: the two must be one size.
-const _: () = assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
+const _: () = ::core::assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
 
 /// Makes init from `program` and the boot image `image`, whole pages
 /// (boot::init_program), and leaves the kernel for it. Init's end ends
@@ -46,7 +46,7 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     let p = {
         let _section = crate::obj::lock();
         process::create_init(kcore::handles::MAX_HANDLES, PRIORITY)
-            .unwrap_or_else(|e| panic!("init: no process: {e:?}"))
+            .unwrap_or_else(|e| ::core::panic!("init: no process: {e:?}"))
     };
     process::set_init(p);
     match load(p, program) {
@@ -57,18 +57,18 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
             error,
             made: false,
         }) => {
-            panic!("init: no memory object for its {what} of {size:#x} bytes ({error:?})")
+            ::core::panic!("init: no memory object for its {what} of {size:#x} bytes ({error:?})")
         }
         Err(Failure {
             what, size, error, ..
         }) => {
-            panic!("init: its {what} of {size:#x} bytes did not map ({error:?})")
+            ::core::panic!("init: its {what} of {size:#x} bytes did not map ({error:?})")
         }
     }
     let pages = (image.size / PAGE_SIZE) as usize;
     let section = crate::obj::lock();
     let boot = memory::create_boot(p, image.base, pages)
-        .unwrap_or_else(|e| panic!("init: no memory object for the boot image: {e:?}"));
+        .unwrap_or_else(|e| ::core::panic!("init: no memory object for the boot image: {e:?}"));
     let t = thread::create(
         p,
         program.entry as usize,
@@ -77,11 +77,12 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
         PRIORITY,
         Policy::Fifo,
     )
-    .unwrap_or_else(|e| panic!("init: no thread: {e:?}"));
+    .unwrap_or_else(|e| ::core::panic!("init: no thread: {e:?}"));
     thread::give_buffer(t, abi::INIT_MSGBUF as usize)
-        .unwrap_or_else(|e| panic!("init: no message buffer: {e:?}"));
-    process::install_init_handles(p, t, boot).unwrap_or_else(|e| panic!("init: no handles: {e:?}"));
-    thread::start(t).unwrap_or_else(|e| panic!("init: its thread did not start: {e:?}"));
+        .unwrap_or_else(|e| ::core::panic!("init: no message buffer: {e:?}"));
+    process::install_init_handles(p, t, boot)
+        .unwrap_or_else(|e| ::core::panic!("init: no handles: {e:?}"));
+    thread::start(t).unwrap_or_else(|e| ::core::panic!("init: its thread did not start: {e:?}"));
     // SAFETY: the references `create`, `create_boot` and `create_init` handed
     // out go; init's handles, its thread and the scheduler hold init from
     // now on, and its handle holds the boot image, so none is the last and

@@ -130,10 +130,11 @@ const SVC_PEND: u16 = 0xFF06;
 const SVC_SUSPEND_SEND: u16 = 0xFF07;
 const SVC_CONTINUE_CROWD: u16 = 0xFF08;
 
-const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
+const _: () =
+    ::core::assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
 
 // el0.S makes these calls by number and knows these values.
-const _: () = assert!(
+const _: () = ::core::assert!(
     Call::HandleClose.number() == 1
         && Call::Send.number() == 4
         && Call::Receive.number() == 5
@@ -150,8 +151,8 @@ const _: () = assert!(
         && Call::Yield.number() == 19
         && Call::ObjectInfo.number() == 27
 );
-const _: () = assert!(Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
-const _: () = assert!(Access::Read.raw() == 1 && Access::ReadWrite.raw() == 3);
+const _: () = ::core::assert!(Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
+const _: () = ::core::assert!(Access::Read.raw() == 1 && Access::ReadWrite.raw() == 3);
 
 /// Where the test processes see their pages: the programs at TEXT_VA, and
 /// one page of data at DATA_VA with the register pattern at its start and
@@ -1334,12 +1335,12 @@ struct Pattern {
 }
 
 const _: () = {
-    assert!(core::mem::offset_of!(Pattern, sp) == 248);
-    assert!(core::mem::offset_of!(Pattern, nzcv) == 256);
-    assert!(core::mem::offset_of!(Pattern, tpidr) == 264);
-    assert!(core::mem::offset_of!(Pattern, fpcr) == 272);
-    assert!(core::mem::offset_of!(Pattern, fpsr) == 280);
-    assert!(core::mem::offset_of!(Pattern, v) == 288);
+    ::core::assert!(core::mem::offset_of!(Pattern, sp) == 248);
+    ::core::assert!(core::mem::offset_of!(Pattern, nzcv) == 256);
+    ::core::assert!(core::mem::offset_of!(Pattern, tpidr) == 264);
+    ::core::assert!(core::mem::offset_of!(Pattern, fpcr) == 272);
+    ::core::assert!(core::mem::offset_of!(Pattern, fpsr) == 280);
+    ::core::assert!(core::mem::offset_of!(Pattern, v) == 288);
 };
 
 /// SplitMix64: a different, well-mixed value on every call.

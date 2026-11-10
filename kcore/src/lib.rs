@@ -27,6 +27,7 @@ pub mod layout;
 pub mod log;
 pub mod maps;
 pub mod memmap;
+pub mod must;
 pub mod notify;
 pub mod pagelist;
 pub mod paging;

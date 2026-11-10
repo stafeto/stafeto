@@ -9,6 +9,7 @@
 //! the last thing charged to it, goes (`return_rest`). Together they make
 //! the limit, and neither comes before the memory is free.
 
+use crate::must::Must;
 use abi::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,7 @@ impl Account {
         self.used = self
             .used
             .checked_sub(bytes)
-            .expect("a refund of more than the quota holds");
+            .must("a refund of more than the quota holds");
     }
 
     /// The first part back to the parent: everything not charged now. The
@@ -155,7 +156,7 @@ impl Share {
     pub fn refund(&mut self, n: u32) {
         self.used = u32::from(self.used)
             .checked_sub(n)
-            .expect("a refund of more than the share holds") as u16;
+            .must("a refund of more than the share holds") as u16;
     }
 
     /// The first part back to the creator, as `Account::return_free`.

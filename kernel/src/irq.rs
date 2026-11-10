@@ -527,7 +527,7 @@ unsafe fn reclaim(d: NonNull<Deferred>) {
 }
 
 // The poison of a binding that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Irq, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Irq, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{bound, in_use, payer};

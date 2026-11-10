@@ -50,9 +50,9 @@ pub struct Msi {
     cleanup: Item,
 }
 
-const _: () = assert!(core::mem::align_of::<Msi>() == ITT_ALIGN);
+const _: () = ::core::assert!(core::mem::align_of::<Msi>() == ITT_ALIGN);
 // The poison of a device that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Msi, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Msi, refs) >= 8);
 
 // SAFETY: devices are reached under the kernel's rules (spec 8.1).
 unsafe impl Send for Msi {}

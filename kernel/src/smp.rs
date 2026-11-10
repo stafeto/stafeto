@@ -41,10 +41,10 @@ struct StartBlock {
 }
 
 const _: () = {
-    assert!(core::mem::offset_of!(StartBlock, ttbr0_identity) == 16);
-    assert!(core::mem::offset_of!(StartBlock, ttbr0_kernel) == 32);
-    assert!(core::mem::offset_of!(StartBlock, cpu_block) == 48);
-    assert!(core::mem::size_of::<StartBlock>() == 64);
+    ::core::assert!(core::mem::offset_of!(StartBlock, ttbr0_identity) == 16);
+    ::core::assert!(core::mem::offset_of!(StartBlock, ttbr0_kernel) == 32);
+    ::core::assert!(core::mem::offset_of!(StartBlock, cpu_block) == 48);
+    ::core::assert!(core::mem::size_of::<StartBlock>() == 64);
 };
 
 struct StartBlocks(UnsafeCell<[StartBlock; MAX_CPUS]>);
@@ -164,7 +164,7 @@ fn start_one(boot: &Boot, index: usize, mpidr: u64) -> bool {
     let limit = timer::now() + WAIT_SECONDS * timer::frequency();
     while block.state.load(Ordering::Acquire) != UP {
         if timer::now() > limit {
-            panic!("CPU {index} (MPIDR {mpidr:#x}) did not come up");
+            ::core::panic!("CPU {index} (MPIDR {mpidr:#x}) did not come up");
         }
         core::hint::spin_loop();
     }
@@ -308,13 +308,13 @@ pub fn sgi_probe() {
             .find(|&(to, from)| to != from && GOT_PONG.at(to, from).load(Ordering::Relaxed) == 0);
         let Some((to, from)) = missing else { break };
         if timer::now() > limit {
-            panic!("SGI probe: the ping of CPU {to} to CPU {from} got no pong");
+            ::core::panic!("SGI probe: the ping of CPU {to} to CPU {from} got no pong");
         }
     }
     for to in 0..cpus {
         for from in (0..cpus).filter(|&f| f != to) {
             if GOT_PING.at(to, from).load(Ordering::Relaxed) == 0 {
-                panic!("SGI probe: CPU {to} never saw the ping of CPU {from}");
+                ::core::panic!("SGI probe: CPU {to} never saw the ping of CPU {from}");
             }
         }
     }
@@ -407,7 +407,7 @@ pub fn lock_probe() {
     // SAFETY: every CPU finished its sections.
     let counter = unsafe { COUNTER.0.get().read_volatile() };
     let expected = LOCK_ROUNDS * cpus as u64;
-    assert!(
+    ::core::assert!(
         counter == expected,
         "lock probe: {counter} of {expected} additions survived: OBJ does not exclude"
     );
@@ -451,7 +451,7 @@ pub fn qsbr_probe() {
     let limit = began + WAIT_SECONDS * timer::frequency();
     while PROBE_DONE.load(Ordering::Acquire) == 0 {
         if timer::now() > limit {
-            panic!("qsbr probe: no period ended with {cpus} CPUs up");
+            ::core::panic!("qsbr probe: no period ended with {cpus} CPUs up");
         }
         crate::qsbr::quiesce();
         core::hint::spin_loop();

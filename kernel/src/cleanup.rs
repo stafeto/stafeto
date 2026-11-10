@@ -25,6 +25,7 @@ use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
+use kcore::must::Must;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::time::stretch;
 
@@ -347,7 +348,7 @@ pub fn portion() {
         let Some(level) = q.items.top() else {
             return;
         };
-        let item = q.items.first(level).expect("a level with its bit set");
+        let item = q.items.first(level).must("a level with its bit set");
         // SAFETY: a queued item is alive and in this queue; its work is
         // taken in the same hold, so that an item that is not queued has no
         // work either (`remove` says false then).
@@ -356,7 +357,7 @@ pub fn portion() {
             (*item.as_ptr()).work.take()
         };
         q.len -= 1;
-        (work.expect("queued work"), level)
+        (work.must("queued work"), level)
     };
     crate::testpoint::portion_taken();
     // The way out of the kernel marks its CPU at a quiescent point before

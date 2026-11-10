@@ -35,6 +35,7 @@
 //! | priority unchanged | stays | kept; new when FIFO becomes round robin |
 //! | effective priority lowered (base, the end of a boost) | head of the new level | keeps the rest |
 
+use crate::must::Must;
 use abi::{Error, PRIORITY_LEVELS, Policy};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -184,7 +185,7 @@ impl<T: Linked> ParkedList<T> {
                 "a parked link is occupied"
             );
             if let Some(h) = self.head {
-                let tail = link(h).prev.expect("a parked ring");
+                let tail = link(h).prev.must("a parked ring");
                 l.prev = Some(tail);
                 l.next = Some(h);
                 link(tail).next = Some(t);
@@ -206,8 +207,8 @@ impl<T: Linked> ParkedList<T> {
             // Checked in the host tests of kcore only: the kernel is built
             // without debug assertions.
             debug_assert!(!l.is_queued(), "a parked link is in a ready queue");
-            let prev = l.prev.take().expect("a parked ring");
-            let next = l.next.take().expect("a parked ring");
+            let prev = l.prev.take().must("a parked ring");
+            let next = l.next.take().must("a parked ring");
             if next == t {
                 self.head = None;
             } else {
@@ -485,7 +486,7 @@ impl<T: Linked> ReadyQueue<T> {
                 self.mask.store(self.mask() | 1 << level, Ordering::Relaxed);
                 return;
             };
-            let tail = link(head).prev.expect("a ring");
+            let tail = link(head).prev.must("a ring");
             l.prev = Some(tail);
             l.next = Some(head);
             link(tail).next = Some(t);
@@ -506,9 +507,9 @@ impl<T: Linked> ReadyQueue<T> {
             assert!(l.is_queued(), "an item leaves a queue it is not in");
             l.queued &= !QUEUED;
             gap(level);
-            let prev = l.prev.take().expect("a ring");
+            let prev = l.prev.take().must("a ring");
             gap(level);
-            let next = l.next.take().expect("a ring");
+            let next = l.next.take().must("a ring");
             if next == t {
                 self.heads[level] = None;
                 self.mask
@@ -696,7 +697,7 @@ impl<T: Schedulable> Scheduler<T> {
         let Some(top) = top else {
             return Decision::Idle;
         };
-        let next = self.ready.first(top).expect("a level with its bit set");
+        let next = self.ready.first(top).must("a level with its bit set");
         // SAFETY: a ready thread is alive and in the queue.
         unsafe {
             self.ready.remove(next);
@@ -949,7 +950,7 @@ impl<T: Schedulable> Scheduler<T> {
     /// # Safety
     /// As for `pick`.
     pub unsafe fn block(&mut self, now: u64) -> NonNull<T> {
-        let r = self.running.take().expect("no thread runs to wait");
+        let r = self.running.take().must("no thread runs to wait");
         // SAFETY: the running thread is alive.
         unsafe {
             Self::charge(r, now);

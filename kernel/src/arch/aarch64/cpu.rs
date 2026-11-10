@@ -60,10 +60,10 @@ pub struct CpuBlock {
 }
 
 const _: () = {
-    assert!(core::mem::offset_of!(CpuBlock, regs) == 0);
-    assert!(core::mem::offset_of!(CpuBlock, stack_top) == 16);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, regs) == 0);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, stack_top) == 16);
     // The header is one line, and what the CPU owns starts on the next.
-    assert!(core::mem::offset_of!(CpuBlock, local) == 64);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, local) == 64);
 };
 
 impl CpuBlock {

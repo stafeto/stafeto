@@ -25,6 +25,7 @@ use kcore::gic::{
     WAKER_PROCESSOR_SLEEP,
 };
 use kcore::layout::LINEAR_BASE;
+use kcore::must::Must;
 
 /// Whether `init` found a GICv3 in the device tree.
 static V3: AtomicBool = AtomicBool::new(false);
@@ -90,7 +91,7 @@ fn wait_clear(at: usize, bits: u32, what: &str) {
             return;
         }
     }
-    panic!("the GIC keeps {what} set");
+    ::core::panic!("the GIC keeps {what} set");
 }
 
 /// The base of this CPU's own registers: the CPU interface of a GICv2, the
@@ -121,7 +122,7 @@ fn block(intid: u32) -> usize {
 /// lines go to this CPU; the priority mask lets DEFAULT_PRIORITY through.
 /// Runs once, at boot.
 pub fn init(info: &BootInfo) {
-    let gic = info.gic.expect("no GIC in the device tree");
+    let gic = info.gic.must("no GIC in the device tree");
     let [dist, cpu] = gic.mapped();
     assert!(DIST.load(Ordering::Relaxed) == 0, "gic::init runs once");
     V3.store(gic.version == GicVersion::V3, Ordering::Relaxed);
@@ -235,7 +236,7 @@ fn init_v3_cpu(boot: Option<&BootInfo>) {
     };
     let affinity = gic::redistributor_affinity(mpidr);
     let rd = gic::find_redistributor(typer, size, affinity)
-        .expect("no redistributor for this CPU in the window");
+        .must("no redistributor for this CPU in the window");
     let rd = window + rd as usize;
     cpu::this().gic.store(rd, Ordering::Relaxed);
     write(

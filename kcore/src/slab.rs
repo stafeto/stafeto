@@ -9,6 +9,7 @@
 //! `PageLog`; the pages go back when the payer's shell goes.
 
 use crate::PAGE_SIZE;
+use crate::must::Must;
 use crate::quota::Account;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -121,7 +122,7 @@ impl<T> Pool<T> {
         if !self.reserve(src) {
             return Err(value);
         }
-        let slot = self.free.expect("a free slot after growing");
+        let slot = self.free.must("a free slot after growing");
         // SAFETY: slot is a free slot of this pool, large and aligned enough for T.
         unsafe {
             self.free = slot.as_ref().next;
@@ -236,7 +237,7 @@ impl PageLog {
         if self.pages < INLINE_PAGES {
             self.inline[self.pages] = Some(page);
         } else {
-            let list = self.list.expect("a list page for the address");
+            let list = self.list.must("a list page for the address");
             let i = self.in_list();
             // SAFETY: the list page is the log's, and entry i lies in it.
             unsafe { (&raw mut (*list.as_ptr()).entries[i]).write(Some(page)) };
@@ -325,7 +326,7 @@ impl<'a, F: PageSource> PaidPages<'a, F> {
     fn take(&mut self) -> Option<NonNull<u8>> {
         self.quota.charge(PAGE_SIZE).ok()?;
         let page = self.frames.alloc_page();
-        Some(page.expect("a charge that passed found no frame (spec 7.8)"))
+        Some(page.must("a charge that passed found no frame (spec 7.8)"))
     }
 }
 

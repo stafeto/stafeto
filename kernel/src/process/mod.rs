@@ -51,6 +51,7 @@ use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU8;
 use kcore::PAGE_SIZE;
+use kcore::must::Must;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
@@ -246,7 +247,7 @@ pub struct Process {
 }
 
 // Three shells to a page of a pool (spec 7.8).
-const _: () = assert!(Pool::<Process>::PER_PAGE >= 3);
+const _: () = ::core::assert!(Pool::<Process>::PER_PAGE >= 3);
 
 /// The pools of what a process pays for by the page (spec 7.5, 7.8): a
 /// page is charged when a pool grows, a slot that goes back refunds
@@ -299,7 +300,7 @@ impl Process {
     fn space(&mut self) -> &mut AddressSpace {
         self.space
             .as_mut()
-            .expect("a process is used after its address space went")
+            .must("a process is used after its address space went")
     }
 
     /// Destroys the address space (AddressSpace::destroy) unless it went
@@ -837,7 +838,7 @@ pub fn retain_shell(process: NonNull<Process>) {
         (*p).shell_refs = (*p)
             .shell_refs
             .checked_add(1)
-            .expect("shell references overflow");
+            .must("shell references overflow");
     }
 }
 
@@ -857,7 +858,7 @@ pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
         (*p).shell_refs = (*p)
             .shell_refs
             .checked_sub(1)
-            .expect("a shell is released once too often");
+            .must("a shell is released once too often");
         if (*p).shell_refs == 0 && refs == 0 && (*p).stage == Stage::Shell {
             queue_shell(process, cause);
         }
@@ -870,7 +871,7 @@ pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
 /// `child` is alive and in the list; nothing else borrows its links.
 unsafe fn child_links<'a>(child: NonNull<Process>) -> &'a mut ChildLinks {
     // SAFETY: the caller's promise.
-    unsafe { (*child.as_ptr()).child_siblings.as_mut() }.expect("a child in the list")
+    unsafe { (*child.as_ptr()).child_siblings.as_mut() }.must("a child in the list")
 }
 
 /// Makes `child`, a process `create` just made with a quota the parent
@@ -889,7 +890,7 @@ fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
             (*p).stage == Stage::Whole && (*c).parent.is_none(),
             "a child of a process that ended, or with a parent already"
         );
-        (*p).shell_refs = (*p).shell_refs.checked_add(1).expect("children overflow");
+        (*p).shell_refs = (*p).shell_refs.checked_add(1).must("children overflow");
         (*c).parent = Some(parent);
         let old = (*p).children;
         (*c).child_siblings = Some(ChildLinks {
@@ -904,7 +905,7 @@ fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
 }
 
 // The poison of a shell that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Process, refs) >= 8);
 
 /// Ends `process` with `reason` unless it ended before, when the first
 /// reason stays: process_exit, process_kill, a fault at EL0 and the stage
@@ -1031,11 +1032,11 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
 fn init_ended(state: ProcessState) -> ! {
     crate::testpoint::init_ended();
     match state {
-        ProcessState::Exited { code } => panic!("init exited with code {code}"),
+        ProcessState::Exited { code } => ::core::panic!("init exited with code {code}"),
         ProcessState::Fault { esr, far, elr } => {
-            panic!("init terminated by a fault: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
+            ::core::panic!("init terminated by a fault: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
         }
-        other => panic!("init terminated: {other:?}"),
+        other => ::core::panic!("init terminated: {other:?}"),
     }
 }
 
@@ -1146,7 +1147,7 @@ pub unsafe fn accepted(
 /// `t` is alive and in the list; nothing else borrows its links.
 unsafe fn sibling<'a>(t: NonNull<Thread>) -> &'a mut Siblings {
     // SAFETY: the caller's promise.
-    unsafe { (*t.as_ptr()).siblings.as_mut() }.expect("a thread in the list")
+    unsafe { (*t.as_ptr()).siblings.as_mut() }.must("a thread in the list")
 }
 
 /// Maps the frame at `pa` at page `va` of the process with `attrs`; the

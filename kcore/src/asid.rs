@@ -18,6 +18,7 @@
 //! does not depend on the number of ASIDs.
 
 use crate::bootinfo::MAX_CPUS;
+use crate::must::Must;
 use crate::paging::TTBR_ROOT_MASK;
 use core::sync::atomic::{
     AtomicU32, AtomicU64,
@@ -378,7 +379,7 @@ impl AsidAllocator {
         let i = self
             .first_free(self.next, limit)
             .or_else(|| self.first_free(1, self.next))
-            .expect("a free ASID when the count says so");
+            .must("a free ASID when the count says so");
         self.set(i);
         self.next = if i + 1 == limit { 1 } else { i + 1 };
         i as u16
