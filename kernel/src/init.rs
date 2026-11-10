@@ -37,6 +37,13 @@ const _: () = ::core::assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
 /// (process::create_init), and everything else of it is charged to it as
 /// to any process, its memory objects too; it has no parent to give the
 /// quota back to.
+/// A step of the start of init that failed, one panic for the steps: the
+/// text of the step and the error.
+#[cfg(not(feature = "ktest"))]
+fn failed(what: &str, error: abi::Error) -> ! {
+    ::core::panic!("init: {what}: {error:?}")
+}
+
 #[cfg(not(feature = "ktest"))]
 pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     use crate::thread;
@@ -46,7 +53,7 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     let p = {
         let _section = crate::obj::lock();
         process::create_init(kcore::handles::MAX_HANDLES, PRIORITY)
-            .unwrap_or_else(|e| ::core::panic!("init: no process: {e:?}"))
+            .unwrap_or_else(|e| failed("no process", e))
     };
     process::set_init(p);
     match load(p, program) {
@@ -68,7 +75,7 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     let pages = (image.size / PAGE_SIZE) as usize;
     let section = crate::obj::lock();
     let boot = memory::create_boot(p, image.base, pages)
-        .unwrap_or_else(|e| ::core::panic!("init: no memory object for the boot image: {e:?}"));
+        .unwrap_or_else(|e| failed("no memory object for the boot image", e));
     let t = thread::create(
         p,
         program.entry as usize,
@@ -77,12 +84,11 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
         PRIORITY,
         Policy::Fifo,
     )
-    .unwrap_or_else(|e| ::core::panic!("init: no thread: {e:?}"));
+    .unwrap_or_else(|e| failed("no thread", e));
     thread::give_buffer(t, abi::INIT_MSGBUF as usize)
-        .unwrap_or_else(|e| ::core::panic!("init: no message buffer: {e:?}"));
-    process::install_init_handles(p, t, boot)
-        .unwrap_or_else(|e| ::core::panic!("init: no handles: {e:?}"));
-    thread::start(t).unwrap_or_else(|e| ::core::panic!("init: its thread did not start: {e:?}"));
+        .unwrap_or_else(|e| failed("no message buffer", e));
+    process::install_init_handles(p, t, boot).unwrap_or_else(|e| failed("no handles", e));
+    thread::start(t).unwrap_or_else(|e| failed("its thread did not start", e));
     // SAFETY: the references `create`, `create_boot` and `create_init` handed
     // out go; init's handles, its thread and the scheduler hold init from
     // now on, and its handle holds the boot image, so none is the last and

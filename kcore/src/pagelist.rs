@@ -86,7 +86,7 @@ pub struct PageList {
 impl PageList {
     /// A list of `pages` pages, 1 to MAX_PAGES, that holds no frame yet.
     pub const fn new(pages: usize) -> PageList {
-        assert!(
+        ::core::assert!(
             pages > 0 && pages <= MAX_PAGES,
             "a page list of no page or past its bound"
         );

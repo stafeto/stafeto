@@ -4,7 +4,6 @@
 //! The sources of notifications of a channel and their slots (spec 6.5): `Owner`, `Source`, `notify` and `post`.
 
 use super::*;
-use kcore::must::Must;
 
 /// Whose slot it is (spec 6.5), which gives the source and the label that
 /// `receive` reports. The slot of label 0 is the channel's own; the slot of
@@ -138,7 +137,9 @@ impl Source {
     }
 
     fn own_slot(&self) -> &Slot<Owner> {
-        self.slot.as_ref().must("an attached source")
+        self.slot
+            .as_ref()
+            .unwrap_or_else(|| kcore::fail_here!("an attached source"))
     }
 
     /// The priority of the source's slot.
@@ -162,7 +163,12 @@ impl Source {
         // and the slot stays in place with its object.
         unsafe {
             let c = (*this.as_ptr()).channel;
-            let slot = NonNull::from((*this.as_ptr()).slot.as_mut().must("an attached source"));
+            let slot = NonNull::from(
+                (*this.as_ptr())
+                    .slot
+                    .as_mut()
+                    .unwrap_or_else(|| kcore::fail_here!("an attached source")),
+            );
             post(c, slot, bits, cause)
         }
     }

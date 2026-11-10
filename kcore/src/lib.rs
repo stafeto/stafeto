@@ -11,6 +11,8 @@
 pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
+#[macro_use]
+pub mod must;
 pub mod args;
 pub mod asid;
 pub mod backtrace;
@@ -27,7 +29,6 @@ pub mod layout;
 pub mod log;
 pub mod maps;
 pub mod memmap;
-pub mod must;
 pub mod notify;
 pub mod pagelist;
 pub mod paging;

@@ -11,7 +11,6 @@ use super::phys::FRAMES;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kcore::layout::LINEAR_BASE;
-use kcore::must::Must;
 use kcore::slab::PageSource;
 
 pub struct KernelPages;
@@ -52,7 +51,11 @@ pub fn scrub(_page: NonNull<u8>) {
 /// `page` came from KernelPages, and nothing uses it afterwards.
 pub unsafe fn give_back(page: NonNull<u8>) {
     let pa = (page.as_ptr() as usize - LINEAR_BASE) as u64;
-    FRAMES.lock().as_mut().must("frame allocator").free(pa, 0);
+    FRAMES
+        .lock()
+        .as_mut()
+        .unwrap_or_else(|| kcore::fail_here!("frame allocator"))
+        .free(pa, 0);
     TAKEN.fetch_sub(1, Ordering::Relaxed);
 }
 

@@ -70,7 +70,7 @@ impl<T> Pool<T> {
     /// assert_eq!(kcore::slab::Pool::<[u8; 5000]>::PER_PAGE, 0);
     /// ```
     pub const PER_PAGE: usize = {
-        assert!(
+        ::core::assert!(
             Self::SLOT <= PAGE_SIZE as usize && Self::ALIGN <= PAGE_SIZE as usize,
             "objects of this type do not fit a pool page"
         );
@@ -79,7 +79,7 @@ impl<T> Pool<T> {
 
     pub const fn new() -> Self {
         // Evaluating PER_PAGE checks that T fits a page.
-        const { assert!(Self::PER_PAGE > 0) };
+        const { ::core::assert!(Self::PER_PAGE > 0) };
         Self {
             free: None,
             in_use: 0,
@@ -168,7 +168,7 @@ struct ListPage {
     next: Option<NonNull<ListPage>>,
 }
 
-const _: () = assert!(size_of::<ListPage>() == PAGE_SIZE as usize);
+const _: () = ::core::assert!(size_of::<ListPage>() == PAGE_SIZE as usize);
 
 /// The pages the pools of one payer took (spec 7.8), and the list pages
 /// that name them: the first INLINE_PAGES addresses in the log itself,

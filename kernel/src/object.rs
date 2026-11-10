@@ -155,6 +155,28 @@ impl Object {
 /// (`Live::gone`), and every use of the count stops on the poison.
 pub struct Refs(u32);
 
+// Each way out of the counts of references below has a function of its own
+// that takes no argument: the counts are inlined into hundreds of places, and
+// a call that names its message would stand in each of them.
+
+#[cold]
+#[inline(never)]
+fn retained_dead() -> ! {
+    crate::failure::fail("an object nobody refers to is retained")
+}
+
+#[cold]
+#[inline(never)]
+fn overflow() -> ! {
+    crate::failure::fail("references overflow")
+}
+
+#[cold]
+#[inline(never)]
+fn released_too_often() -> ! {
+    crate::failure::fail("an object is released once too often")
+}
+
 impl Refs {
     /// The first reference, which the object's `create` hands out.
     pub const fn one() -> Refs {
@@ -163,7 +185,6 @@ impl Refs {
 
     /// Stops test builds on an object that went: the poison of its place
     /// reached the count. Nothing in the build that ships.
-    #[track_caller]
     pub fn check(&self) {
         #[cfg(feature = "ktest")]
         assert!(
@@ -175,38 +196,36 @@ impl Refs {
     /// Adds a reference to an object someone refers to. An object nobody
     /// refers to waits for its portion of cleanup, and taking it back from
     /// the queue would free it twice.
-    #[track_caller]
     pub fn retain(&mut self) {
         crate::obj::assert_held();
         self.check();
-        assert!(self.0 > 0, "an object nobody refers to is retained");
-        self.0 = self.0.checked_add(1).must("references overflow");
+        if self.0 == 0 {
+            retained_dead();
+        }
+        self.0 = self.0.checked_add(1).unwrap_or_else(|| overflow());
     }
 
     /// Adds a reference with no check of the count: the cleanup queue's
     /// own, which it takes when the last reference just went, or one that
     /// a reference of the caller keeps.
-    #[track_caller]
     pub fn take(&mut self) {
         crate::obj::assert_held();
         self.check();
-        self.0 = self.0.checked_add(1).must("references overflow");
+        self.0 = self.0.checked_add(1).unwrap_or_else(|| overflow());
     }
 
     /// Drops a reference; true when it was the last.
-    #[track_caller]
     pub fn release(&mut self) -> bool {
         crate::obj::assert_held();
         self.check();
         self.0 = self
             .0
             .checked_sub(1)
-            .must("an object is released once too often");
+            .unwrap_or_else(|| released_too_often());
         self.0 == 0
     }
 
     /// Drops `n` references, none of them the last.
-    #[track_caller]
     pub fn release_many(&mut self, n: u32) {
         crate::obj::assert_held();
         self.check();
@@ -218,7 +237,6 @@ impl Refs {
     }
 
     /// The count.
-    #[track_caller]
     pub fn get(&self) -> u32 {
         self.check();
         self.0
