@@ -460,7 +460,7 @@ pub struct Net {
     pub step_due: bool,
     /// A request asked for the profile's totals (`GETOPT BUFFERED`, which
     /// `posix-net stat` makes); the service prints them after the request.
-    #[cfg(any(feature = "profile", feature = "probe"))]
+    #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
     pub profile_due: bool,
     /// A request is being handled (builds with the feature `probe`: the step of
     /// waking is the one that tells the waits of a set, never a request).
@@ -517,7 +517,7 @@ impl Net {
             Demux::initialize_at(addr_of_mut!((*at).demux), &demux_key);
             addr_of_mut!((*at).parent).write(Some(Handle::borrowed(parent.raw())));
             addr_of_mut!((*at).notary).write(None);
-            #[cfg(any(feature = "profile", feature = "probe"))]
+            #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
             addr_of_mut!((*at).profile_due).write(false);
             addr_of_mut!((*at).channel).write(Handle::borrowed(channel.raw()));
             addr_of_mut!((*at).external).write(None);

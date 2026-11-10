@@ -1511,7 +1511,7 @@ impl Guest {
         let mut used = cpu_use(
             &before.stat,
             &parse_stat(&lines),
-            linux_guest::CPUS,
+            linux_guest::cpus(),
             answers,
         );
         let (irq, soft) = parse_irq(&lines);
@@ -1526,6 +1526,49 @@ impl Guest {
             used.profile = profile_change(a, b);
         }
         Ok(used)
+    }
+
+    /// The rings of time stamps (an image of `--trace`): the network service prints its ring
+    /// when `posix-net stat` asks, the workers print theirs as they exit (a QUIT to nginx), and
+    /// the lines `tr ...` stay in the console log that `net-trace` reads. The guest is of no
+    /// further use afterwards.
+    fn trace_flush(&mut self) -> Result<(), String> {
+        let wait = Duration::from_secs(300);
+        // The lines come at the pace of the console: each ring is waited for until no line of it
+        // came for 5 s (the service first, then the workers as they exit).
+        // The console is read while the shell answers a command: `sleep 1` pumps it.
+        let settle = |run: &mut qemu::Run, what: &str, prefix: &str| -> Result<(), String> {
+            let began = Instant::now();
+            let count =
+                |run: &qemu::Run| run.text().iter().filter(|l| l.starts_with(prefix)).count();
+            let mut last = (count(run), Instant::now());
+            while last.1.elapsed() < Duration::from_secs(5) {
+                crate::net_tls::capture(run, "sleep 1", "pump", wait)?;
+                let now = count(run);
+                if now != last.0 {
+                    last = (now, Instant::now());
+                }
+            }
+            say(format!(
+                "trace: {} lines of {what} ({} s)",
+                last.0,
+                began.elapsed().as_secs()
+            ));
+            Ok(())
+        };
+        // Each `posix-net stat` gives the next part of the service's ring (it is killed if it is
+        // silent for long); the line `tr n done` ends it.
+        for _ in 0..80 {
+            crate::net_tls::capture(&mut self.run, "posix-net stat", "trace-n", wait)?;
+            crate::net_tls::capture(&mut self.run, "sleep 1", "pump", wait)?;
+            if self.run.text().iter().any(|l| l.trim() == "tr n done") {
+                break;
+            }
+        }
+        settle(&mut self.run, "the service", "tr n ")?;
+        crate::net_tls::capture(&mut self.run, "kill -QUIT $M", "trace-q", wait)?;
+        settle(&mut self.run, "the service and the workers", "tr ")?;
+        Ok(())
     }
 
     /// The counters of the system: `ListenDrops` of Linux, `posix-net stat`
@@ -1669,12 +1712,12 @@ fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> 
                 &mut run,
                 &mut report,
                 false,
-                linux_guest::CPUS,
+                linux_guest::cpus(),
                 "nginx",
                 &format!("nginx -T -c {conf}"),
             )?;
         } else {
-            linux_guest::read_fingerprints(&mut run, &mut report, false, linux_guest::CPUS)?;
+            linux_guest::read_fingerprints(&mut run, &mut report, false, linux_guest::cpus())?;
         }
         let wanted = if tls { &prep.config_tls } else { &prep.config };
         linux_guest::verify(&report, wanted, &prep.www)?;
@@ -1817,7 +1860,7 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 &mut run,
                 &mut report,
                 false,
-                linux_guest::CPUS,
+                linux_guest::cpus(),
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
@@ -1933,6 +1976,17 @@ struct Options {
     switch_workers: usize,
     /// The workers of F1s stand on CPUs 1 to 3 (`worker_cpu_affinity`), away from `netd`'s CPU 0.
     switch_pin: bool,
+    /// The workers of F1s stand on CPU 0, next to `netd` (`worker_cpu_affinity 0001`).
+    switch_cpu0: bool,
+    /// The CPUs of the guests (the machine; `--cpus`).
+    cpus: usize,
+    /// The images with the time stamps along the packet path (`cargo xtask net-trace`;
+    /// needs the variable STAFETO_TRACE=1): the guest dumps its rings after each ceiling, and
+    /// each ceiling has its own guest.
+    trace: bool,
+    /// Only the 64 connections of the ceilings (`--c64`), and the rates of the phase `at`.
+    c64: bool,
+    rates: Vec<u32>,
     /// Seconds after which a run stops cleanly between two systems, to be resumed (a
     /// foreground command may not run for long).
     pause_after: Option<u64>,
@@ -1949,7 +2003,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -1972,6 +2026,11 @@ fn options(args: &[String]) -> Result<Options, String> {
         image: ImageKind::Plain,
         switch_workers: 1,
         switch_pin: false,
+        switch_cpu0: false,
+        cpus: linux_guest::CPUS,
+        trace: false,
+        c64: false,
+        rates: Vec::new(),
         pause_after: None,
     };
     let mut phases_given = false;
@@ -2019,6 +2078,16 @@ fn options(args: &[String]) -> Result<Options, String> {
             }
             "--old" => o.old = Some(PathBuf::from(value(arg)?)),
             "--switch-pin" => o.switch_pin = true,
+            "--switch-cpu0" => o.switch_cpu0 = true,
+            "--cpus" => o.cpus = number(value(arg)?, arg)? as usize,
+            "--trace" => o.trace = true,
+            "--c64" => o.c64 = true,
+            "--rates" => {
+                o.rates = value(arg)?
+                    .split(',')
+                    .map(|r| number(r.to_owned(), arg))
+                    .collect::<Result<_, _>>()?
+            }
             "--switch-workers" => o.switch_workers = number(value(arg)?, arg)? as usize,
             "--pause-after" => o.pause_after = Some(u64::from(number(value(arg)?, arg)?)),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
@@ -2053,9 +2122,11 @@ fn options(args: &[String]) -> Result<Options, String> {
     if let Some(bad) = o
         .phases
         .iter()
-        .find(|p| !["nat", "sweep", "rounds", "idle"].contains(&p.as_str()))
+        .find(|p| !["nat", "sweep", "rounds", "idle", "latency", "at"].contains(&p.as_str()))
     {
-        return Err(format!("no phase {bad:?} (nat, sweep, rounds, idle)"));
+        return Err(format!(
+            "no phase {bad:?} (nat, sweep, rounds, idle, latency, at)"
+        ));
     }
     if o.rounds == 0 {
         return Err("--rounds 0".to_owned());
@@ -2069,6 +2140,19 @@ fn options(args: &[String]) -> Result<Options, String> {
     if o.switch_workers == 0 {
         return Err("--switch-workers 0".to_owned());
     }
+    if o.cpus == 0 || o.cpus > linux_guest::CPUS {
+        return Err(format!("--cpus {} (1 to {})", o.cpus, linux_guest::CPUS));
+    }
+    if o.switch_cpu0 && o.switch_pin {
+        return Err("--switch-pin and --switch-cpu0 together".to_owned());
+    }
+    if o.trace && std::env::var_os("STAFETO_TRACE").is_none() {
+        return Err(
+            "--trace needs STAFETO_TRACE=1 in the environment (the packages build with the points)"
+                .to_owned(),
+        );
+    }
+    linux_guest::set_cpus(o.cpus);
     if matches!(o.image, ImageKind::Pinned | ImageKind::Cpu0) && o.systems.contains(&System::F1s) {
         return Err("--image pinned and cpu0 have no variant of F1s".to_owned());
     }
@@ -2212,6 +2296,7 @@ impl Bench {
         self.boot(sys, wl.tls())?;
         let raw = self.raw.clone();
         let profiled = self.profiled(sys);
+        let trace = self.opts.trace;
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
             let base = if wl.tls() {
@@ -2259,6 +2344,9 @@ impl Bench {
             m.load = load_now();
             if counters {
                 m.counters = g.counters()?;
+            }
+            if trace {
+                g.trace_flush()?;
             }
             g.warmed = Some((wl, Instant::now()));
             Ok::<Measured, String>(m)
@@ -2420,6 +2508,7 @@ impl Bench {
         self.boot(sys, wl.tls())?;
         let (raw, secs) = (self.raw.clone(), self.opts.ceiling);
         let profiled = self.profiled(sys);
+        let trace = self.opts.trace;
         let script = raw.join(format!("wrk-{}.lua", wl.name()));
         std::fs::write(&script, wrk_script(&wl.paths(), wl.keep_alive()))
             .map_err(|e| format!("{}: {e}", script.display()))?;
@@ -2471,6 +2560,9 @@ impl Bench {
             }
             .ok_or_else(|| format!("{program} printed no rate: {text}"))?;
             let cpu = g.close_window(&before, wrk.requests as usize)?;
+            if trace {
+                g.trace_flush()?;
+            }
             let mut found = alerts(&log);
             found.extend(seen);
             Ok::<(Wrk, CpuUse, Option<String>), String>((wrk, cpu, found.first().cloned()))
@@ -2516,6 +2608,9 @@ impl Bench {
             }
         }
         self.put(key, &rec);
+        if trace {
+            self.release();
+        }
         Ok(())
     }
 
@@ -2606,7 +2701,12 @@ impl Bench {
                 // closed loop that `h2load` runs.
                 let loads = ceiling_loads(&self.opts.workloads, round, self.opts.rounds);
                 for wl in loads {
-                    for c in [CONNECTIONS, wl.criterion()] {
+                    let ladder = if self.opts.trace || self.opts.c64 {
+                        vec![CONNECTIONS]
+                    } else {
+                        vec![CONNECTIONS, wl.criterion()]
+                    };
+                    for c in ladder {
                         self.ceiling(
                             &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
                             sys,
@@ -2721,6 +2821,105 @@ impl Bench {
         Ok(())
     }
 
+    /// The phase `at`: each system and load at each of `--rates` (open loop, `--stage` seconds
+    /// after `--warm`), with the rings of `--trace` dumped after each (one guest each): the
+    /// slow requests of the low rates (stafeto-design #625, #619, #611).
+    fn at(&mut self) -> Result<(), String> {
+        for sys in self.opts.systems.clone() {
+            for wl in self.opts.workloads.clone() {
+                for rate in self.opts.rates.clone() {
+                    self.phase = format!("at {rate}");
+                    let key = format!("at.{}.{}.{rate}", sys.name(), wl.name());
+                    let (secs, warm) = (self.opts.stage, self.opts.warm);
+                    self.stage(&key, sys, wl, rate, secs, warm, false, false)?;
+                    self.release();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The phase `latency`: the path of the hypervisor with no load. From the Mac, to each system
+    /// in turn (it comes up, nothing else runs): `ping -c 1000 -i 0.001` (root, without a
+    /// password), a TCP echo (BusyBox `nc -ll -e cat` in the guest, 1 byte each way, 3 000 round
+    /// trips), and one connection of `wrk` to `/1k.bin` for 10 s. Median, p90 and p99 in
+    /// microseconds, recorded as `latency.<system>.<n>`; F1 has no echo (the second device is the
+    /// stack's alone).
+    fn latency(&mut self) -> Result<(), String> {
+        for n in 1..=self.opts.rounds {
+            for sys in order(&self.opts.systems.clone(), n) {
+                let key = format!("latency.{}.{n}", sys.name());
+                if self.get(&key).is_some() {
+                    continue;
+                }
+                self.phase = format!("latency {n}");
+                self.boot(sys, false)?;
+                let g = self.guest.as_mut().ok_or("no guest")?;
+                let address = g.address;
+                let mut rec = Rec::new();
+                let ping = std::process::Command::new("sudo")
+                    .args([
+                        "-n",
+                        "ping",
+                        "-c",
+                        "1000",
+                        "-i",
+                        "0.001",
+                        &address.ip().to_string(),
+                    ])
+                    .output()
+                    .map_err(|e| format!("ping: {e}"))?;
+                let text = String::from_utf8_lossy(&ping.stdout);
+                let times: Vec<f64> = text
+                    .lines()
+                    .filter_map(|l| {
+                        l.split("time=")
+                            .nth(1)?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<f64>()
+                            .ok()
+                    })
+                    .map(|ms| ms * 1000.0)
+                    .collect();
+                rec.insert("ping".into(), latency_text(&times));
+                if sys != System::F1 {
+                    g.run.send("nc -ll -p 7777 -e cat &")?;
+                    g.run.expect("# ", DIALOG_STEP)?;
+                    let echo = echo_round_trips(SocketAddr::new(address.ip(), 7777), 3000);
+                    rec.insert("echo".into(), latency_text(&echo?));
+                }
+                let wrk = std::process::Command::new("wrk")
+                    .args([
+                        "-t1",
+                        "-c1",
+                        "-d10s",
+                        "--latency",
+                        &format!("http://{address}/1k.bin"),
+                    ])
+                    .output()
+                    .map_err(|e| format!("wrk: {e}"))?;
+                let _ = std::fs::write(
+                    self.raw.join(format!("latency-wrk-{}-{n}.txt", sys.name())),
+                    &wrk.stdout,
+                );
+                rec.insert(
+                    "http".into(),
+                    wrk_distribution(&String::from_utf8_lossy(&wrk.stdout)),
+                );
+                self.put(&key, &rec);
+                say(format!(
+                    "{key}: ping {}; echo {}; http {}",
+                    rec["ping"],
+                    rec.get("echo").map_or("-", |s| s.as_str()),
+                    rec["http"]
+                ));
+                self.release();
+            }
+        }
+        Ok(())
+    }
+
     /// The confirmation run of a round at `rate`: one run, whose verdict the
     /// confirmation takes as it stands.
     fn confirm_run(
@@ -2826,6 +3025,66 @@ fn ms_opt(ns: Option<u64>) -> String {
 
 /// `median [least; greatest]` of `values` (`-` for none, the one value for
 /// a single one).
+/// "median/p90/p99 us (n)" of microsecond values.
+fn latency_text(values: &[f64]) -> String {
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+    if v.is_empty() {
+        return "none".to_owned();
+    }
+    format!(
+        "{:.0}/{:.0}/{:.0} us ({})",
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        v.len()
+    )
+}
+
+/// The round trips of one byte over a TCP connection to an echo, in microseconds (the first 200
+/// are not counted).
+fn echo_round_trips(address: SocketAddr, count: usize) -> Result<Vec<f64>, String> {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|e| format!("echo {address}: {e}"))?;
+    c.set_nodelay(true).map_err(|e| format!("{e}"))?;
+    c.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("{e}"))?;
+    let mut out = Vec::with_capacity(count);
+    let mut byte = [0u8; 1];
+    for i in 0..count + 200 {
+        let began = Instant::now();
+        c.write_all(b"x").map_err(|e| format!("echo write: {e}"))?;
+        c.read_exact(&mut byte)
+            .map_err(|e| format!("echo read: {e}"))?;
+        if i >= 200 {
+            out.push(began.elapsed().as_nanos() as f64 / 1000.0);
+        }
+    }
+    Ok(out)
+}
+
+/// The latency distribution of `wrk --latency` as "median/p90/p99 us".
+fn wrk_distribution(text: &str) -> String {
+    let value = |label: &str| -> Option<f64> {
+        let line = text.lines().find(|l| l.trim_start().starts_with(label))?;
+        let v = line.split_whitespace().nth(1)?;
+        let (num, scale) = if let Some(n) = v.strip_suffix("us") {
+            (n, 1.0)
+        } else if let Some(n) = v.strip_suffix("ms") {
+            (n, 1000.0)
+        } else {
+            (v.strip_suffix('s')?, 1e6)
+        };
+        Some(num.parse::<f64>().ok()? * scale)
+    };
+    match (value("50%"), value("90%"), value("99%")) {
+        (Some(a), Some(b), Some(c)) => format!("{a:.0}/{b:.0}/{c:.0} us"),
+        _ => "none".to_owned(),
+    }
+}
+
 fn spread(values: &[f64], digits: usize) -> String {
     let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
     if v.is_empty() {
@@ -3116,7 +3375,7 @@ impl Results {
                 .filter(|c| c.known)
                 .map(|c| c.idle.clone())
                 .collect();
-            let idle_each: Vec<f64> = (0..linux_guest::CPUS)
+            let idle_each: Vec<f64> = (0..linux_guest::cpus())
                 .filter_map(|i| {
                     let v: Vec<f64> = cpu_idle.iter().filter_map(|c| c.get(i).copied()).collect();
                     (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
@@ -3547,6 +3806,10 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         kernel = build(Variant::Normal)?.image;
         if o.systems.contains(&System::S4) {
             image = match o.image {
+                _ if o.trace => linux_guest::build_trace_image(
+                    linux_guest::TRACE_IMAGE,
+                    linux_guest::bench_programs(),
+                )?,
                 ImageKind::Plain => linux_guest::build_image()?,
                 ImageKind::Profile => linux_guest::build_variant(linux_guest::BenchImage::Profile)?,
                 ImageKind::Pinned => linux_guest::build_variant(linux_guest::BenchImage::Pinned)?,
@@ -3554,10 +3817,22 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             };
         }
         if o.systems.contains(&System::F1) {
-            fast_image = linux_guest::build_fast_image()?;
+            fast_image = if o.trace {
+                linux_guest::build_trace_image(
+                    linux_guest::TRACE_FAST_IMAGE,
+                    linux_guest::bench_fast_programs(),
+                )?
+            } else {
+                linux_guest::build_fast_image()?
+            };
         }
         if o.systems.contains(&System::F1s) {
-            switch_image = if o.image == ImageKind::Profile {
+            switch_image = if o.trace {
+                linux_guest::build_trace_image(
+                    linux_guest::TRACE_SWITCH_IMAGE,
+                    linux_guest::bench_switch_programs(),
+                )?
+            } else if o.image == ImageKind::Profile {
                 linux_guest::build_switch_profile_image()?
             } else {
                 linux_guest::build_switch_image()?
@@ -3588,13 +3863,17 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         fast_image,
         switch_image,
         switch_workers: o.switch_workers,
-        switch_affinity: o.switch_pin.then(|| {
-            // Masks of CPUs 1, 2 and 3 in turn (the rightmost bit is CPU 0).
-            (0..o.switch_workers)
-                .map(|n| ["0010", "0100", "1000"][n % 3])
-                .collect::<Vec<_>>()
-                .join(" ")
-        }),
+        switch_affinity: if o.switch_cpu0 {
+            Some(vec!["0001"; o.switch_workers].join(" "))
+        } else {
+            o.switch_pin.then(|| {
+                // Masks of CPUs 1, 2 and 3 in turn (the rightmost bit is CPU 0).
+                (0..o.switch_workers)
+                    .map(|n| ["0010", "0100", "1000"][n % 3])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        },
         old_kernel,
         old_image,
         config,
@@ -3607,7 +3886,8 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             }
             ImageKind::Pinned => linux_guest::shell_cpus(linux_guest::BenchImage::Pinned),
             ImageKind::Cpu0 => linux_guest::shell_cpus(linux_guest::BenchImage::Cpu0),
-        },
+        }
+        .min(o.cpus),
     })
 }
 
@@ -3650,6 +3930,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 "nat" => bench.nat()?,
                 "sweep" => bench.sweeps()?,
                 "idle" => bench.idle()?,
+                "latency" => bench.latency()?,
+                "at" => bench.at()?,
                 _ => bench.rounds()?,
             }
         }

@@ -71,6 +71,25 @@
 #include "ff_stafeto_rte.h"
 #include "ff_veth.h"
 
+/* Time stamps along the packet path (lib/trace; the build of the measurement
+ * `cargo xtask net-trace` defines STAFETO_TRACE): the points of the worker, the numbers
+ * of lib/trace's `P_W_*`. Without the definition they are empty. */
+#ifdef STAFETO_TRACE
+extern void stafeto_trace_point(unsigned id, unsigned key);
+extern void stafeto_trace_frame(unsigned id, const void *frame, unsigned len, int from_client);
+#define TRACE_POINT(id, key) stafeto_trace_point((id), (key))
+#define TRACE_FRAME(id, frame, len, from_client) stafeto_trace_frame((id), (frame), (len), (from_client))
+#else
+#define TRACE_POINT(id, key) ((void)0)
+#define TRACE_FRAME(id, frame, len, from_client) ((void)0)
+#endif
+#define TP_WAKE 32
+#define TP_RX 33
+#define TP_TX 34
+#define TP_KICK 35
+#define TP_SLEEP 36
+#define TP_FOUND 37
+
 /* At most this many clock ticks in one pass, when the loop was late. */
 #define FF_STAFETO_MAX_TICKS 10
 #define NSEC_PER_SEC 1000000000ULL
@@ -452,13 +471,17 @@ tx_flush(void)
         if (port_on) {
             /* The entries are published; the switch is poked only while it
              * sleeps (it checks the ring itself when it runs). */
-            if (vnet_port_tx_flush()) {
+            int poked = vnet_port_tx_flush();
+
+            if (poked) {
                 (void)stafeto_fast_poke();
                 stats.kicks++;
             }
+            TRACE_POINT(TP_KICK, poked);
         } else {
             vnet_tx_kick();
             stats.kicks++;
+            TRACE_POINT(TP_KICK, 2);
         }
         tx_batch = 0;
     }
@@ -500,6 +523,7 @@ tx_queue(uint32_t buf, uint32_t len)
         }
         stats.tx_waited++;
     }
+    TRACE_FRAME(TP_TX, to, len, 0);
     stats.tx_frames++;
     if (++tx_batch >= FF_STAFETO_TX_BATCH)
         tx_flush();
@@ -580,6 +604,7 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
             memset(to + off, 0, FF_STAFETO_FRAME_MIN - off);
             off = FF_STAFETO_FRAME_MIN;
         }
+        TRACE_FRAME(TP_TX, to, off, 0);
         if (offload.tcp_csum) {
             /* The switch writes the sum of the pseudo-header and has the device
              * complete the segment's sum. */
@@ -777,6 +802,7 @@ rx_one(const struct vnet_buf *b)
         vnet_rx_return(b->buf);
         return;
     }
+    TRACE_FRAME(TP_RX, f, len, 1);
     began = counter();
     if (dhcp_for_service(f, ipv4(f, len))) {
         bypass_push(f, len);
@@ -840,6 +866,7 @@ port_rx_one(const struct vnet_port_rx *r)
     }
     if (sum_ok)
         stats.rx_sum_ok++;
+    TRACE_FRAME(TP_RX, f, len, 1);
     began = counter();
     if (vnet_port_fill_free() >= FF_STAFETO_PORT_RX_LOW) {
         hdr = ff_mbuf_gethdr((void *)(((uintptr_t)r->cell << 1) | 1), (uint16_t)len,
@@ -1051,11 +1078,13 @@ ff_stafeto_sleep(uint64_t max_ns)
         return 0;
     }
     stats.sleeps++;
+    TRACE_POINT(TP_SLEEP, 0);
     /* The interrupts (the idle flag of the ring) on, then a look at the
      * queue once more: a frame that came in between brings no interrupt. */
     dev_notify(1);
     if (ff_stafeto_pass() > 0 || __atomic_load_n(&notified, __ATOMIC_RELAXED) != 0) {
         dev_notify(0);
+        TRACE_POINT(TP_FOUND, 0);
         stats.sleeps_found_work++;
         return 1;
     }
@@ -1066,8 +1095,12 @@ ff_stafeto_sleep(uint64_t max_ns)
         dev_notify(0);
         return 1;
     }
-    if (stafeto_fast_wait(wait, &bits) == 0)
+    if (stafeto_fast_wait(wait, &bits) == 0) {
+        TRACE_POINT(TP_WAKE, bits);
         ff_stafeto_absorb(bits);
+    } else {
+        TRACE_POINT(TP_WAKE, 0xffffffffu);
+    }
     dev_notify(0);
     return 0;
 }

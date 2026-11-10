@@ -70,6 +70,41 @@ use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
 use netd::lines::Mac;
 use netd::profile::{self, Counter};
+
+/// The points of the packet path (lib/trace, the feature `trace`): without the feature `netd`
+/// does not link the crate and every call below is empty, so the normal image has no trace.
+#[cfg(feature = "trace")]
+pub(crate) use ::trace;
+#[cfg(not(feature = "trace"))]
+pub(crate) mod trace {
+    macro_rules! points {
+        ($($n:ident),*) => {$(pub const $n: u8 = 0;)*};
+    }
+    points!(
+        P_N_BELL,
+        P_N_BELL_SKIP,
+        P_N_CSKIP,
+        P_N_CWAKE,
+        P_N_RX,
+        P_N_STEP,
+        P_N_STK_TX,
+        P_N_TO_CONSUMER,
+        P_N_TO_STACK,
+        P_N_TX_SEEN,
+        P_N_TX_SUBMIT,
+        P_N_WAKE,
+        P_N_WAKE_STACK,
+        P_N_REQ_BEGIN,
+        P_N_REQ_END,
+        P_N_STK_BEGIN,
+        P_N_STK_END
+    );
+    #[inline(always)]
+    pub fn point(_: u8, _: u32) {}
+    #[inline(always)]
+    pub fn frame(_: u8, _: &[u8], _: bool) {}
+}
+use crate::trace::{P_N_REQ_BEGIN, P_N_REQ_END, P_N_STK_BEGIN, P_N_STK_END};
 use netd::resolv::{Text, Written};
 use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
@@ -1724,6 +1759,7 @@ impl Service<0> for Driver<'_> {
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        trace::point(P_N_REQ_BEGIN, u32::from(method));
         self.net.claim(s, r.label());
         let answer = match Method::from_number(r.method()) {
             Some(Method::Config) => self.config(r),
@@ -1750,13 +1786,16 @@ impl Service<0> for Driver<'_> {
             None => Answer::Status(Status::UnknownMethod),
         };
         self.after_request();
+        trace::point(P_N_REQ_END, u32::from(method));
         profile::call(method, began);
-        #[cfg(any(feature = "profile", feature = "probe"))]
+        #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
         if core::mem::take(&mut self.net.profile_due) {
             #[cfg(feature = "probe")]
             self.report_frames();
             #[cfg(feature = "profile")]
             self.profile_snapshot();
+            #[cfg(feature = "trace")]
+            trace_dump();
         }
         answer
     }
@@ -1842,6 +1881,7 @@ impl Service<0> for Driver<'_> {
                     self.cleanup_due |= rest & CLEANUP != 0;
                 }
                 let began = profile::now();
+                trace::point(P_N_STK_BEGIN, bit as u32);
                 match bit {
                     RX => self.rx_step(),
                     RX1 => {
@@ -1892,6 +1932,7 @@ impl Service<0> for Driver<'_> {
                     _ => Counter::StepOtherTicks,
                 };
                 profile::add(kind, profile::now().saturating_sub(began));
+                trace::point(P_N_STK_END, bit as u32);
                 self.after_request();
             }
             Source::Timer if n.label == TIMER_LABEL => {
@@ -1936,4 +1977,38 @@ fn crash(r: &Request<'_>) -> Answer {
         )
     };
     Answer::Status(Status::Kernel(abi::Error::BadState))
+}
+
+/// A part of the ring of time stamps to the console (each `posix-net stat` gives the next part,
+/// and the line `tr n done` ends the dump), as `tr n ...` lines packed into records of the kernel's
+/// log (64 bytes each). The console's service takes 64 records of the log every 50 ms and loses the
+/// rest, so the dump writes 60 records, then waits 52 ms (it runs after the load: the wait costs
+/// only its time; the wait yields, the service may stand on this CPU). A part is at most 1 500
+/// lines, about half a second: init kills a service that stays silent for longer.
+#[cfg(feature = "trace")]
+fn trace_dump() {
+    let (mut buf, mut len, mut records) = ([0u8; 64], 0, 0u32);
+    let mut write = |bytes: &[u8]| {
+        let _ = rt::console::write(bytes);
+        records += 1;
+        if records % 60 == 0 {
+            let began = rt::time::now();
+            while rt::time::now().wrapping_sub(began) < 52 * 24_000 {
+                let _ = rt::sys::yield_now();
+            }
+        }
+    };
+    let done = trace::dump_part("n", 1_500, trace::RECORDS, |line| {
+        if len + line.len() + 1 > buf.len() {
+            write(&buf[..len]);
+            len = 0;
+        }
+        buf[len..len + line.len()].copy_from_slice(line.as_bytes());
+        buf[len + line.len()] = b'\n';
+        len += line.len() + 1;
+    });
+    write(&buf[..len]);
+    if done {
+        rt::println!("tr n done");
+    }
 }

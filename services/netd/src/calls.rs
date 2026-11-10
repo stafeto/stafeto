@@ -473,7 +473,7 @@ impl Net {
                     return self.readable(stack, r, place);
                 }
                 if name == opt::BUFFERS || name == opt::BUFFERED {
-                    #[cfg(any(feature = "profile", feature = "probe"))]
+                    #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
                     if name == opt::BUFFERED {
                         self.profile_due = true;
                     }
