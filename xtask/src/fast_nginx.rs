@@ -295,6 +295,8 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
                 ("netd", Kind::Crash) => program.3 = &["probe"],
                 ("netd", Kind::Steps | Kind::SwitchSteps) => program.3 = &["steps"],
                 ("netd", Kind::Switch | Kind::Scale) => program.3 = &["probe"],
+                // The calls of the file service are counted and printed (step 3, `calls`).
+                ("ramfs", Kind::Plain) => program.3 = &["profile"],
                 _ => {}
             }
         }
@@ -1013,6 +1015,9 @@ fn scenario(
         "3: {REQUESTS} requests over {CONNECTIONS} connections in {} ms",
         at.elapsed().as_millis()
     ));
+    if kind == Kind::Plain {
+        notes.push(format!("3: {}", calls(run, address)?));
+    }
     if kind != Kind::Steps {
         let (opened, answered) = wide(address, WIDE)?;
         notes.push(format!(
@@ -1101,6 +1106,57 @@ fn scenario(
     // 10.
     notes.push(format!("10: {}", nobody(run)?));
     Ok(())
+}
+
+/// The last record of the file service's counters on the console: calls, reads, snapshots.
+fn ramfs_record(run: &qemu::Run) -> Option<(u64, u64, u64, u64)> {
+    let line = run
+        .text()
+        .into_iter()
+        .rfind(|l| l.contains("ramfs: prof "))?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let at = words.iter().position(|w| *w == "prof")?;
+    let number = |name: &str| -> Option<u64> {
+        let i = words.iter().position(|w| *w == name)?;
+        words.get(i + 1)?.parse().ok()
+    };
+    Some((
+        words.get(at + 1)?.parse().ok()?,
+        number("calls")?,
+        number("reads")?,
+        number("snaps")?,
+    ))
+}
+
+/// The last record after the console has been read for `settle`: the record of the counters is
+/// printed at most every 100 ms while calls come and at each notification of the service
+/// after, so what the service has counted shows within a heartbeat. The console is read by
+/// waiting for a line that never comes, which makes no call of the file service.
+fn settled_record(run: &mut qemu::Run, settle: Duration) -> Result<(u64, u64, u64, u64), String> {
+    let _ = run.expect_seen("calls: the line that never comes", settle);
+    ramfs_record(run).ok_or_else(|| "the file service printed no record of its calls".to_owned())
+}
+
+/// Step 3, `calls`: 100 requests of a file the worker has served before make no read call
+/// to the file service (the worker reads from the copy it holds), the counters of the service
+/// being those of its profile records. Without the copy (`STAFETO_FILE_CACHE=0`) each answer
+/// reads the file from the service.
+fn calls(run: &mut qemu::Run, address: SocketAddr) -> Result<String, String> {
+    // The first pages fill the copies and the cache of open files.
+    pages(address, 50, 4)?;
+    let before = settled_record(run, Duration::from_secs(2))?;
+    pages(address, 100, 4)?;
+    let after = settled_record(run, Duration::from_secs(2))?;
+    let (calls, reads, snaps) = (after.1 - before.1, after.2 - before.2, after.3 - before.3);
+    let note = format!(
+        "100 requests made {calls} calls to the file service, {reads} of them reads and {snaps} snapshots"
+    );
+    if reads != 0 {
+        return Err(format!(
+            "{note}: the worker reads the file from the service"
+        ));
+    }
+    Ok(note)
 }
 
 /// `fast-probe nginx crash`.

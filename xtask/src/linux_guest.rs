@@ -120,6 +120,7 @@ fn variant_programs(table: &'static [&'static str]) -> Vec<ImageProgram> {
         match program.0 {
             "init" => program.3 = table,
             "netd" => program.3 = &["profile"],
+            "ramfs" => program.3 = &["profile"],
             _ => {}
         }
     }
@@ -206,7 +207,7 @@ pub fn bench_switch_profile_programs() -> &'static [ImageProgram] {
     LIST.get_or_init(|| {
         let mut programs = bench_switch_programs().to_vec();
         for program in &mut programs {
-            if program.0 == "netd" {
+            if matches!(program.0, "netd" | "ramfs") {
                 program.3 = &["profile"];
             }
         }
@@ -1575,7 +1576,7 @@ mod tests {
             for (variant, base) in programs.iter().zip(plain) {
                 match variant.0 {
                     "init" => assert_eq!(variant.3, &[table]),
-                    "netd" => assert_eq!(variant.3, &["profile"]),
+                    "netd" | "ramfs" => assert_eq!(variant.3, &["profile"]),
                     _ => assert_eq!(variant, base),
                 }
             }

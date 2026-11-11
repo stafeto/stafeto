@@ -27,6 +27,10 @@ image-info-probe = ["auth-probe"]
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
+# The calls of the service (all, the reads among them, and SNAPSHOT_FD) printed as records
+# `ramfs: prof <id> calls <n> reads <n> snaps <n>` at most ten times a second while they
+# change: the measurement of the calls a response of a server makes to the file service.
+profile = []
 # The diagnostic of the layer probe: the number of mappings the service holds (0xfff0).
 layer-probe = []
 # Full dispatch samples in the dedicated filled-lock measurement image.
