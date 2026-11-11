@@ -128,6 +128,21 @@ impl AsidCpus {
         }
     }
 
+    /// The state `new` has before the generation starts: all zero, so that a
+    /// static of it lives in .bss. `begin` must run before any other call.
+    pub const fn unstarted() -> AsidCpus {
+        AsidCpus {
+            generation: AtomicU64::new(0),
+            flush_pending: AtomicU32::new(0),
+            active: [const { Line(AtomicU64::new(0)) }; MAX_CPUS],
+        }
+    }
+
+    /// Sets the generation of `new` on an `unstarted` state.
+    pub fn begin(&self) {
+        self.generation.store(1, Relaxed);
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Relaxed)
     }

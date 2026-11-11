@@ -76,13 +76,13 @@ unsafe extern "C" {
 /// enough to stop a machine that lost a CPU.
 const WAIT_SECONDS: u64 = 2;
 
-/// The CPUs that are up, CPU 0 among them: one until `start` brings the
-/// others.
-static UP_COUNT: AtomicU32 = AtomicU32::new(1);
+/// The CPUs that are up besides CPU 0: none until `start` brings them (zero
+/// keeps the counter in .bss).
+static UP_OTHERS: AtomicU32 = AtomicU32::new(0);
 
 /// The number of CPUs that are up.
 pub fn cpus() -> usize {
-    UP_COUNT.load(Ordering::Relaxed) as usize
+    UP_OTHERS.load(Ordering::Relaxed) as usize + 1
 }
 
 /// Starts every other CPU the device tree lists, up to MAX_CPUS in all,
@@ -116,7 +116,7 @@ pub fn start(boot: &Boot) {
             up += 1;
         }
     }
-    UP_COUNT.store(up as u32, Ordering::Relaxed);
+    UP_OTHERS.store(up as u32 - 1, Ordering::Relaxed);
 }
 
 /// Starts the CPU of `mpidr` as CPU `index`; false when PSCI refuses (CPU

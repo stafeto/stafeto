@@ -32,7 +32,7 @@ use kcore::tlb::{self, Mmu};
 /// lock, which the switch of address space on its fast path reads and
 /// writes with a compare-and-swap, and what `OBJ` guards, which a new
 /// ASID, a new generation or the release of an ASID changes.
-static CPUS: AsidCpus = AsidCpus::new();
+static CPUS: AsidCpus = AsidCpus::unstarted();
 static ASIDS: Guarded<Option<AsidAllocator>> = Guarded::new(None);
 
 /// Physical address of head.S's empty root table; zero until `init`.
@@ -55,6 +55,12 @@ unsafe fn set_ttbr0(ttbr: u64) {
     TTBR0_SEEN[crate::arch::cpu::this().index()].store(ttbr, Ordering::Relaxed);
     // SAFETY: the caller's promise.
     unsafe { mmu::set_ttbr0(ttbr) }
+}
+
+/// Starts the generation of the ASID state, which lives in .bss (spec 3.4);
+/// CPU 0 calls it first of all.
+pub fn begin() {
+    CPUS.begin();
 }
 
 /// Starts the ASID allocator with the width the CPU allows (head.S set

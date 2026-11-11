@@ -65,6 +65,8 @@ use kcore::time::Clock;
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::cpu::init_boot();
     arch::exceptions::init();
+    qsbr::init();
+    mm::aspace::begin();
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
