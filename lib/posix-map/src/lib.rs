@@ -24,6 +24,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod cache;
 pub mod space;
 
 use abi::{Access, MAX_MAPPINGS};
@@ -240,6 +241,9 @@ pub enum Kind {
     /// The buffer of the large reads of files: the memory object the file service fills in
     /// one step of a read (`READ_FD_INTO`), writable, never shared with a child.
     FileBuffer,
+    /// A piece of the arena of copies of immutable files (`posix-abi` `filecache`): up to eight
+    /// of them, each a memory object of the process's own, writable, never shared with a child.
+    FileCache,
     /// The window, the objects and the bypass ring of the second network
     /// device that the process claimed (spec 6, 3.9): several pieces, which
     /// stay until the process ends; `fork` and `exec` are refused while
@@ -495,7 +499,7 @@ impl<H> Map<H> {
     }
 
     /// Whether some page of the range lies in a piece of the layer's own (the display, network
-    /// buffer or file buffer piece).
+    /// buffer, file buffer or file cache piece).
     pub fn meets_special(&self, address: usize, pages: usize) -> bool {
         self.walk(address, pages)
             .any(|(i, ..)| self.object(self.piece(i).object()).special())
@@ -515,6 +519,13 @@ impl<H> Map<H> {
     pub fn kind_piece(&self, kind: Kind) -> Option<(usize, usize)> {
         self.iter()
             .find(|piece| self.object(piece.object()).kind == kind)
+            .map(|piece| (piece.address, piece.pages()))
+    }
+
+    /// The first address and the pages of every piece of `kind`.
+    pub fn kind_pieces(&self, kind: Kind) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.iter()
+            .filter(move |piece| self.object(piece.object()).kind == kind)
             .map(|piece| (piece.address, piece.pages()))
     }
 

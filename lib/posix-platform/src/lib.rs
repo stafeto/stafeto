@@ -929,6 +929,33 @@ pub extern "C" fn stafeto_probe_file_reads() -> u64 {
     posix_abi::probe_file_reads()
 }
 
+/// The counters of the cache of the copies of immutable files into `out[0..4]`: copies served
+/// from memory, files copied in, SNAPSHOT_FD calls, and the `pread` calls that went to the file
+/// service; then the pieces of the arena and the pages taken in them into `out[4..6]`
+/// (posix_abi::filecache).
+///
+/// # Safety
+/// `out` is writable for six words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_file_cache(out: *mut u64) {
+    let counters = posix_abi::filecache::probe_counters();
+    let (pieces, pages) = posix_abi::filecache::probe_arena();
+    for (i, value) in counters
+        .into_iter()
+        .chain([pieces as u64, pages as u64])
+        .enumerate()
+    {
+        // SAFETY: the caller's contract.
+        unsafe { out.add(i).write(value) };
+    }
+}
+
+/// Sets the budget of the cache of copies to `kib` KiB (posix_abi::filecache::probe_budget).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_file_cache_budget(kib: usize) {
+    posix_abi::filecache::probe_budget(kib);
+}
+
 /// Where the last fork of the process was refused (posix_abi::fork::
 /// probe_refusal): `step | sub << 8 | status << 16`.
 #[unsafe(no_mangle)]

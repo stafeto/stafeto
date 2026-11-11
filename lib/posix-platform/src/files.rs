@@ -243,7 +243,7 @@ pub(crate) enum Place {
 fn at_offset(
     place: Place,
     offset: i64,
-    run: impl FnOnce(Transport, u32, u64) -> Result<usize, posix_fs::FsError>,
+    run: impl FnOnce(Transport, posix_fs::RamTarget, u64) -> Result<usize, posix_fs::FsError>,
 ) -> isize {
     let body = |transport, target| {
         // The console has no offset: ESPIPE.
@@ -251,7 +251,7 @@ fn at_offset(
             return Err(ESPIPE);
         };
         let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
-        run(transport, fd.fd(), offset).map_err(posix_abi::error)
+        run(transport, fd, offset).map_err(posix_abi::error)
     };
     let result = match place {
         Place::Fd(fd) => number(fd).and_then(|fd| posix_abi::shared::held(fd, body)),
@@ -315,11 +315,18 @@ pub(crate) unsafe fn read_at(
         let size = out.len() - done;
         let at = offset.saturating_add(done as i64);
         let rest = &mut out[done..];
-        let got = at_offset(place, at, |files, fd, at| {
-            buffered
-                .then(|| posix_abi::pread_file_large(&files, fd, at, rest))
-                .flatten()
-                .unwrap_or_else(|| files.read_at(fd, at, rest))
+        let got = at_offset(place, at, |files, target, at| {
+            // A file that cannot change reads from the process's copy of it; the fill of a
+            // mapping takes a copy that is there and makes none.
+            if let Some(read) = posix_abi::filecache::pread(&files, target, at, rest, buffered) {
+                return read;
+            }
+            posix_abi::filecache::note_service_read();
+            let fd = target.fd();
+            if buffered && let Some(read) = posix_abi::pread_file_large(&files, fd, at, rest) {
+                return read;
+            }
+            files.read_at(fd, at, rest)
         });
         if full_portion(got, size) {
             done += got as usize;
@@ -363,7 +370,9 @@ pub(crate) unsafe fn write_at(place: Place, buf: *const u8, len: usize, offset: 
     loop {
         let rest = &bytes[done..];
         let at = offset.saturating_add(done as i64);
-        let got = at_offset(place, at, |files, fd, at| files.write_at(fd, at, rest));
+        let got = at_offset(place, at, |files, target, at| {
+            files.write_at(target.fd(), at, rest)
+        });
         if got == extent as isize && rest.len() > extent {
             done += extent;
             continue;

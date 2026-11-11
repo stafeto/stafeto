@@ -419,6 +419,218 @@ static void table_full(void) {
     }));
 }
 
+/* The copies of immutable files (the layer's file cache): a pread of a file of the image (it
+ * can change through no description) copies from the process's own memory after the first one,
+ * with no call of the file service; a file that can change never gets a copy. The counters are
+ * the layer's: copies served, files copied in, SNAPSHOT_FD calls, and the preads that went to
+ * the service, then the pieces of the arena and the pages taken. */
+void stafeto_probe_file_cache(unsigned long long *out);
+void stafeto_probe_file_cache_budget(unsigned long kib);
+
+struct fcache { unsigned long long hits, fills, snaps, service, pieces, pages; };
+
+static struct fcache fc_now(void) {
+    unsigned long long w[6];
+    stafeto_probe_file_cache(w);
+    struct fcache c = {w[0], w[1], w[2], w[3], w[4], w[5]};
+    return c;
+}
+
+/* What the file holds, read the old way (read goes by the service). */
+static int fc_slurp(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, cap);
+    close(fd);
+    return (int)n;
+}
+
+static const char *fc_files[] = {"/etc/motd", "/bin/data", "/bin/script", "/bin/setid-junk"};
+
+/* The first pread asks the service once and copies the file in; a hundred more of every size
+ * and offset come from memory with no call. */
+static void fc_hundred(void) {
+    char want[512], got[512];
+    int n = fc_slurp("/etc/motd", want, sizeof want);
+    check("cache: the motd", n > 0);
+    int fd = open("/etc/motd", O_RDONLY);
+    check("cache: open", fd >= 0);
+    struct fcache a = fc_now();
+    check("cache: the first pread", pread(fd, got, (size_t)n, 0) == n && memcmp(got, want, (size_t)n) == 0);
+    struct fcache b = fc_now();
+    check("cache: one snapshot and one copy", b.snaps == a.snaps + 1 && b.fills == a.fills + 1);
+    int wrong = 0;
+    for (int i = 0; i < 100; i++) {
+        size_t off = (size_t)(i % (n + 2));
+        size_t len = (size_t)((i * 7) % (n + 5));
+        ssize_t expect = off >= (size_t)n ? 0 : (ssize_t)((len < (size_t)n - off) ? len : (size_t)n - off);
+        memset(got, 0x55, sizeof got);
+        if (pread(fd, got, len, (off_t)off) != expect) wrong++;
+        else if (expect > 0 && memcmp(got, want + off, (size_t)expect) != 0) wrong++;
+        else if ((size_t)expect < len && got[expect] != 0x55) wrong++;
+    }
+    struct fcache c = fc_now();
+    check("cache: a hundred preads read right", wrong == 0);
+    check("cache: a hundred preads made no call of the service",
+          c.service == b.service && c.snaps == b.snaps && c.fills == b.fills && c.hits >= b.hits + 100);
+    /* dup shares the description, so the copy: no new ask, and the copy outlives the first number. */
+    int copy = dup(fd);
+    check("cache: dup", copy >= 0);
+    check("cache: the close of one number", close(fd) == 0);
+    struct fcache d = fc_now();
+    check("cache: pread by the other number", pread(copy, got, (size_t)n, 0) == n && memcmp(got, want, (size_t)n) == 0);
+    struct fcache e = fc_now();
+    check("cache: dup shares the entry", e.snaps == d.snaps && e.fills == d.fills && e.service == d.service);
+    close(copy);
+}
+
+/* A file a description can change never takes a copy: a write through another description is
+ * seen by the next pread (XSH 2.9.7). */
+static void fc_mutable(void) {
+    char got[16];
+    int w = open("/tmp/posix-map-cache", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    check("cache: /tmp file", w >= 0 && write(w, "aaaaaaaa", 8) == 8);
+    int r = open("/tmp/posix-map-cache", O_RDONLY);
+    struct fcache a = fc_now();
+    check("cache: first read of /tmp", pread(r, got, 8, 0) == 8 && memcmp(got, "aaaaaaaa", 8) == 0);
+    check("cache: pwrite", pwrite(w, "bbbb", 4, 2) == 4);
+    check("cache: the write is seen", pread(r, got, 8, 0) == 8 && memcmp(got, "aabbbbaa", 8) == 0);
+    check("cache: write at the end is seen", pwrite(w, "cc", 2, 8) == 2 && pread(r, got, 16, 6) == 4
+          && memcmp(got, "aacc", 4) == 0);
+    struct fcache b = fc_now();
+    check("cache: no copy of a file that can change", b.fills == a.fills && b.hits == a.hits);
+    close(r);
+    close(w);
+    unlink("/tmp/posix-map-cache");
+}
+
+/* A number closed and opened again is another description: the new file is read. */
+static void fc_reopen(void) {
+    char want[512], got[512];
+    int n1 = fc_slurp("/bin/data", want, sizeof want);
+    int fd = open("/etc/motd", O_RDONLY);
+    int n0 = fc_slurp("/etc/motd", got, sizeof got);
+    check("cache: reopen reads", fd >= 0 && n0 > 0 && n1 > 0 && pread(fd, got, sizeof got, 0) == n0);
+    close(fd);
+    int again = open("/bin/data", O_RDONLY);
+    check("cache: the number comes again", again == fd);
+    ssize_t n = pread(again, got, sizeof got, 0);
+    check("cache: the new file is read", n == n1 && memcmp(got, want, (size_t)n1) == 0);
+    close(again);
+}
+
+/* A forked child starts with no copies: it asks and copies for itself, and reads right. */
+static void fc_forked(void) {
+    char want[512], got[512];
+    int n = fc_slurp("/etc/motd", want, sizeof want);
+    int fd = open("/etc/motd", O_RDONLY);
+    check("cache: fork open", fd >= 0 && pread(fd, got, (size_t)n, 0) == n);
+    struct fcache a = fc_now();
+    check("cache: the parent has an arena", a.pieces >= 1 && a.pages >= 1);
+    pid_t child = fork();
+    if (child < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; close(fd); return; }
+    if (child == 0) {
+        struct fcache c0 = fc_now();
+        int bad = 0;
+        if (c0.pieces != 0 || c0.pages != 0) bad |= 1;
+        if (pread(fd, got, (size_t)n, 0) != n || memcmp(got, want, (size_t)n) != 0) bad |= 2;
+        struct fcache c1 = fc_now();
+        if (c1.snaps != c0.snaps + 1 || c1.fills != c0.fills + 1 || c1.pieces != 1) bad |= 4;
+        if (pread(fd, got, (size_t)n, 0) != n || fc_now().service != c1.service) bad |= 8;
+        _exit(bad);
+    }
+    int status = 0;
+    check("cache: fork wait", waitpid(child, &status, 0) == child);
+    check("cache: the child read right from an empty cache", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: cache child bits %d\n", WEXITSTATUS(status));
+    struct fcache b = fc_now();
+    check("cache: the parent still hits", pread(fd, got, (size_t)n, 0) == n && fc_now().service == b.service);
+    close(fd);
+}
+
+/* A small budget: two pages hold two of the four files at a time. A file read twice in a row
+ * is copied by the first and served by the second; 600 descriptions read right, and the arena
+ * stays within its budget and its pieces. */
+static void fc_budget(void) {
+    static char want[4][512];
+    int n[4];
+    for (int i = 0; i < 4; i++) {
+        n[i] = fc_slurp(fc_files[i], want[i], sizeof want[i]);
+        check("cache: budget file", n[i] > 0);
+    }
+    stafeto_probe_file_cache_budget(8);
+    char got[512];
+    int served = 0;
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 4; i++) {
+            int fd = open(fc_files[i], O_RDONLY);
+            if (fd < 0 || pread(fd, got, sizeof got, 0) != n[i] || memcmp(got, want[i], (size_t)n[i])) { check("cache: budget read", 0); continue; }
+            struct fcache a = fc_now();
+            if (pread(fd, got, sizeof got, 0) != n[i] || memcmp(got, want[i], (size_t)n[i])) check("cache: budget reread", 0);
+            struct fcache b = fc_now();
+            if (b.service == a.service) served++;
+            check("cache: within the budget", b.pages <= 2 && b.pieces <= 8);
+            close(fd);
+        }
+    }
+    check("cache: every file was served from memory once copied", served == 12);
+    static int fds[600];
+    int wrong = 0;
+    for (int i = 0; i < 600; i++) {
+        fds[i] = open(fc_files[i % 4], O_RDONLY);
+        if (fds[i] < 0) { wrong++; continue; }
+        if (pread(fds[i], got, sizeof got, 0) != n[i % 4] || memcmp(got, want[i % 4], (size_t)n[i % 4])) wrong++;
+        struct fcache c = fc_now();
+        if (c.pages > 2 || c.pieces > 8) wrong++;
+    }
+    check("cache: 600 descriptions read right within the budget", wrong == 0);
+    for (int i = 0; i < 600; i++) if (fds[i] >= 0) close(fds[i]);
+    stafeto_probe_file_cache_budget(2048);
+}
+
+/* The fill of a private mapping takes the bytes of a copy that is there. */
+static void fc_mapping(void) {
+    char want[512], got[512];
+    int n = fc_slurp("/etc/motd", want, sizeof want);
+    int fd = open("/etc/motd", O_RDONLY);
+    check("cache: map open", fd >= 0 && pread(fd, got, (size_t)n, 0) == n);
+    struct fcache a = fc_now();
+    char *p = mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    check("cache: mmap", p != MAP_FAILED);
+    if (p != MAP_FAILED) {
+        struct fcache b = fc_now();
+        check("cache: the mapping shows the file", memcmp(p, want, (size_t)n) == 0 && p[n] == 0);
+        check("cache: the fill made no call of the service", b.service == a.service && b.hits > a.hits);
+        munmap(p, PAGE);
+    }
+    close(fd);
+}
+
+static void file_cache(void) {
+    fc_hundred();
+    fc_mutable();
+    fc_reopen();
+    fc_forked();
+    fc_mapping();
+    fc_budget();
+    if (!failures) printf("posix-map: file cache ok\n");
+}
+
+/* The arena of the cache takes places of the table of mappings for good, which the probes of a
+ * full table count on: the cache runs in a child. */
+static void file_cache_in_child(void) {
+    pid_t child = fork();
+    if (child < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; return; }
+    if (child == 0) {
+        file_cache();
+        _exit(failures ? 1 : 0);
+    }
+    int status = 0;
+    check("cache: the child ran", waitpid(child, &status, 0) == child);
+    check("cache: the child's checks held", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 /* A forked child has the parent's pages, the pages without access, and
  * its own copy. */
 static void forked(void) {
@@ -2320,6 +2532,7 @@ int main(int argc, char **argv) {
     }
     struct sigaction action = {.sa_handler = on_fault};
     sigaction(SIGSEGV, &action, NULL);
+    file_cache_in_child();
     time_functions();
     table_full();
     protect_whole(PAGE, "small");

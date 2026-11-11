@@ -360,8 +360,20 @@ pub unsafe fn after_fork(
     let display = state.map.display_piece();
     let network = state.map.kind_piece(posix_map::Kind::NetBuffer);
     let files = state.map.kind_piece(posix_map::Kind::FileBuffer);
+    // The arena of the file cache: up to eight pieces (filecache::PIECES_MAX).
+    let mut cache = [(0usize, 0usize); 8];
+    for (slot, piece) in cache
+        .iter_mut()
+        .zip(state.map.kind_pieces(posix_map::Kind::FileCache))
+    {
+        *slot = piece;
+    }
     state.map.forget();
-    for (address, pages) in [display, network, files].into_iter().flatten() {
+    for (address, pages) in [display, network, files]
+        .into_iter()
+        .flatten()
+        .chain(cache.into_iter().filter(|piece| piece.1 != 0))
+    {
         state.space.set(address, pages, Page::Unbacked);
     }
     let mut last = None;
@@ -643,6 +655,16 @@ impl State {
         if self.map.kind_piece(kind).is_some() {
             return Err(EBUSY);
         }
+        self.map_special_more(handle, pages, kind)
+    }
+
+    /// As `map_special`, for a kind that has several pieces (the arena of the file cache).
+    pub(crate) fn map_special_more(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+        kind: posix_map::Kind,
+    ) -> Result<usize, i32> {
         self.within_data(pages)?;
         let source = Source {
             existing: Some(handle),
