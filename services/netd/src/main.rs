@@ -245,6 +245,8 @@ fn demux_secret(ports_key: &[u8; 16], tail: &[u8]) -> [u8; 16] {
 }
 
 fn main(_: u64) -> u64 {
+    #[cfg(feature = "trace")]
+    ::trace::set_frequency(rt::time::frequency());
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -1994,7 +1996,7 @@ fn trace_dump() {
         records += 1;
         if records % 60 == 0 {
             let began = rt::time::now();
-            while rt::time::now().wrapping_sub(began) < 52 * 24_000 {
+            while rt::time::now().wrapping_sub(began) < 52 * rt::time::frequency() / 1000 {
                 let _ = rt::sys::yield_now();
             }
         }

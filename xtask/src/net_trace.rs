@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage: cargo xtask net-trace run [net-bench run options] | show [--worst N] [--from-us T --to-us T] FILE|DIR...";
-/// The generic counter of VZ: 24 MHz, ticks per microsecond.
-const TICKS_PER_US: f64 = 24.0;
+/// The counter of the archived logs that do not give its frequency in the point-0 line: the generic
+/// counter of VZ, 24 MHz, in ticks per microsecond.
+const DEFAULT_TICKS_PER_US: f64 = 24.0;
+/// How far before its first keyed point a loose point at the start of a path may lie.
+const LOOK_BACK_US: f64 = 1000.0;
 
 // The points, as in lib/trace.
 const N_WAKE: u8 = 1;
@@ -54,8 +57,10 @@ struct Ev {
     label: String,
 }
 
-/// The records of the lines `tr ...` of a console log, in time order.
-fn parse(text: &str) -> Vec<Ev> {
+/// The records of the lines `tr ...` of a console log, in time order, and the ticks per
+/// microsecond: the counter's frequency in Hz is the fifth field of a point-0 line.
+fn parse(text: &str) -> (Vec<Ev>, f64) {
+    let mut ticks_per_us = DEFAULT_TICKS_PER_US;
     let mut out: Vec<Ev> = text
         .lines()
         .filter_map(|line| {
@@ -65,11 +70,40 @@ fn parse(text: &str) -> Vec<Ev> {
             let id = u8::from_str_radix(w.next()?, 16).ok()?;
             let t = u64::from_str_radix(w.next()?, 16).ok()?;
             let key = u32::from_str_radix(w.next()?, 16).ok()?;
+            if id == 0
+                && let Some(hz) = w.next().and_then(|v| u64::from_str_radix(v, 16).ok())
+                && hz > 0
+            {
+                ticks_per_us = hz as f64 / 1e6;
+            }
             Some(Ev { t, id, key, label })
         })
         .collect();
     out.sort_by_key(|e| e.t);
-    out
+    (out, ticks_per_us)
+}
+
+/// The records of the frames, which carry the key of a segment: the span of these records is the
+/// load of a run (a ring also holds what its component did before and after the load).
+const FRAME_POINTS: [u8; 8] = [
+    N_RX,
+    N_TO_CONSUMER,
+    N_TO_STACK,
+    N_TX_SEEN,
+    N_STK_TX,
+    N_TX_SUBMIT,
+    W_RX,
+    W_TX,
+];
+
+/// The load window of a run: from the first to the last keyed record of a frame in any ring.
+fn load_window(events: &[Ev]) -> Option<(u64, u64)> {
+    let mut times = events
+        .iter()
+        .filter(|e| e.key != 0 && FRAME_POINTS.contains(&e.id))
+        .map(|e| e.t);
+    let first = times.next()?;
+    Some(times.fold((first, first), |(lo, hi), t| (lo.min(t), hi.max(t))))
 }
 
 /// A point of a chain: the first record of a point with the key of the request, or the first
@@ -124,31 +158,54 @@ fn stats(values: &mut [f64]) -> (usize, f64, f64, f64) {
 /// A point of a chain being built: its name, its time if keyed, the points it may be.
 type Point = (&'static str, Option<u64>, Option<&'static [u8]>);
 
-/// The chain of every request that has all its keyed points: the points with their times.
-fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
+/// The loose records of a point in time order: of `worker` for the points of workers.
+fn loose_of<'a>(
+    all: &'a HashMap<u8, Vec<u64>>,
+    by_label: &'a HashMap<u8, HashMap<&str, Vec<u64>>>,
+    id: u8,
+    worker: Option<&str>,
+) -> &'a [u64] {
+    let list = match worker {
+        Some(w) if id >= W_WAKE => by_label.get(&id).and_then(|m| m.get(w)),
+        _ => all.get(&id),
+    };
+    list.map_or(&[][..], Vec::as_slice)
+}
+
+/// The chain of every request that has all its keyed points: the points with their times. A
+/// loose point of a worker (a wake-up, a poke) belongs to the chain only when the worker that
+/// took the frame recorded it; the first loose point of a path lies at most `LOOK_BACK_US` before
+/// the first keyed point.
+fn chains(events: &[Ev], path: &[Step], ticks_per_us: f64) -> Vec<Vec<(&'static str, u64)>> {
     let mut keyed: HashMap<u32, Vec<&Ev>> = HashMap::new();
-    let mut loose: HashMap<u8, Vec<u64>> = HashMap::new();
+    let mut all: HashMap<u8, Vec<u64>> = HashMap::new();
+    let mut by_label: HashMap<u8, HashMap<&str, Vec<u64>>> = HashMap::new();
     for e in events {
         if e.key != 0 || e.id == N_WAKE {
             keyed.entry(e.key).or_default().push(e);
         }
-        loose.entry(e.id).or_default().push(e.t);
+        all.entry(e.id).or_default().push(e.t);
+        by_label
+            .entry(e.id)
+            .or_default()
+            .entry(e.label.as_str())
+            .or_default()
+            .push(e.t);
     }
-    let first_after = |ids: &[u8], from: u64, before: u64| -> Option<u64> {
-        ids.iter()
-            .filter_map(|id| {
-                let times = loose.get(id)?;
-                let at = times.partition_point(|t| *t <= from);
-                times.get(at).copied().filter(|t| *t < before)
-            })
-            .min()
-    };
+    let look_back = (LOOK_BACK_US * ticks_per_us) as u64;
+    let of = |id: u8, worker: Option<&str>| loose_of(&all, &by_label, id, worker);
     let mut out = Vec::new();
     for (key, list) in keyed {
         if key == 0 {
             continue;
         }
         let find = |id: u8| list.iter().filter(|e| e.id == id).map(|e| e.t).min();
+        // The worker that took the frame.
+        let worker = list
+            .iter()
+            .filter(|e| e.id == W_RX)
+            .min_by_key(|e| e.t)
+            .map(|e| e.label.as_str());
         let mut points: Vec<Point> = Vec::new();
         for step in path {
             match *step {
@@ -178,17 +235,25 @@ fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
                 }
                 (None, Some(ids)) => {
                     let next = points[i + 1..].iter().find_map(|p| p.1).unwrap_or(u64::MAX);
-                    // At the start of a path the point is the last one before the first keyed point.
                     let found = if chain.is_empty() {
+                        // At the start of a path the point is the last one before the first
+                        // keyed point, not older than the look-back.
                         ids.iter()
                             .filter_map(|id| {
-                                let times = loose.get(id)?;
+                                let times = of(*id, worker);
                                 let at = times.partition_point(|t| *t < next);
                                 at.checked_sub(1).map(|i| times[i])
                             })
                             .max()
+                            .filter(|t| next == u64::MAX || next - t <= look_back)
                     } else {
-                        first_after(ids, last, next)
+                        ids.iter()
+                            .filter_map(|id| {
+                                let times = of(*id, worker);
+                                let at = times.partition_point(|t| *t <= last);
+                                times.get(at).copied().filter(|t| *t < next)
+                            })
+                            .min()
                     };
                     if let Some(t) = found {
                         last = t;
@@ -207,13 +272,19 @@ fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
 
 /// The table of a path: each segment between consecutive points present, over all requests,
 /// with its share of the median round trip.
-fn path_table(name: &str, chains: &[Vec<(&'static str, u64)>], worst: usize, out: &mut String) {
+fn path_table(
+    name: &str,
+    chains: &[Vec<(&'static str, u64)>],
+    worst: usize,
+    tpu: f64,
+    out: &mut String,
+) {
     if chains.is_empty() {
         return;
     }
     let mut totals: Vec<f64> = chains
         .iter()
-        .map(|c| (c[c.len() - 1].1 - c[0].1) as f64 / TICKS_PER_US)
+        .map(|c| (c[c.len() - 1].1 - c[0].1) as f64 / tpu)
         .collect();
     let (n, med, p90, p99) = stats(&mut totals);
     out.push_str(&format!(
@@ -224,7 +295,7 @@ fn path_table(name: &str, chains: &[Vec<(&'static str, u64)>], worst: usize, out
     for c in chains {
         for pair in c.windows(2) {
             let key = (pair[0].0, pair[1].0);
-            let us = (pair[1].1 - pair[0].1) as f64 / TICKS_PER_US;
+            let us = (pair[1].1 - pair[0].1) as f64 / tpu;
             match segments.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, v)) => v.push(us),
                 None => segments.push((key, vec![us])),
@@ -248,7 +319,7 @@ fn path_table(name: &str, chains: &[Vec<(&'static str, u64)>], worst: usize, out
             let t0 = c[0].1;
             let line: Vec<String> = c
                 .iter()
-                .map(|(n, t)| format!("{n} {:.0}", (*t - t0) as f64 / TICKS_PER_US))
+                .map(|(n, t)| format!("{n} {:.0}", (*t - t0) as f64 / tpu))
                 .collect();
             out.push_str(&format!("* {}\n", line.join(", ")));
         }
@@ -290,12 +361,13 @@ fn counts(events: &[Ev], requests: usize, out: &mut String) {
 }
 
 /// Durations between a begin and an end of the same thread or component: the calls of a
-/// socket (sent to returned, per worker), the requests of the service, the steps of the stack.
-fn durations(events: &[Ev], begin: u8, end: u8, label: Option<&str>) -> Vec<f64> {
+/// socket (sent to returned, per worker), the requests of the service, the steps of the stack,
+/// within the load window (a ring also holds the idle time before and after the load).
+fn durations(events: &[Ev], begin: u8, end: u8, window: Option<(u64, u64)>, tpu: f64) -> Vec<f64> {
     let mut open: HashMap<&str, u64> = HashMap::new();
     let mut out = Vec::new();
     for e in events {
-        if label.is_some_and(|l| e.label != l) {
+        if window.is_some_and(|(from, to)| e.t < from || e.t > to) {
             continue;
         }
         if e.id == begin {
@@ -303,7 +375,7 @@ fn durations(events: &[Ev], begin: u8, end: u8, label: Option<&str>) -> Vec<f64>
         } else if e.id == end
             && let Some(t) = open.remove(e.label.as_str())
         {
-            out.push((e.t - t) as f64 / TICKS_PER_US);
+            out.push((e.t - t) as f64 / tpu);
         }
     }
     out
@@ -349,7 +421,7 @@ fn point_name(id: u8) -> String {
 /// The silences of each component of more than 20 ms (a point `0xff` has the length, the
 /// `0xfe` after it the record that ended it): the longest, with the time since the first
 /// record of the ring.
-fn silences(events: &[Ev], out: &mut String) {
+fn silences(events: &[Ev], tpu: f64, out: &mut String) {
     let Some(t0) = events.iter().map(|e| e.t).min() else {
         return;
     };
@@ -366,8 +438,8 @@ fn silences(events: &[Ev], out: &mut String) {
                 )
             });
         rows.push((
-            f64::from(e.key) / TICKS_PER_US / 1000.0,
-            (e.t - t0) as f64 / TICKS_PER_US / 1000.0,
+            f64::from(e.key) / tpu / 1000.0,
+            (e.t - t0) as f64 / tpu / 1000.0,
             e.label.clone(),
             after,
         ));
@@ -385,7 +457,7 @@ fn silences(events: &[Ev], out: &mut String) {
 /// The share of the time that each worker slept, from its first to its last record of a frame
 /// taken (sleep: the point `W_SLEEP` to the next `W_WAKE` or `W_FOUND` of the worker), and the
 /// frames that came twice with the same key more than a millisecond apart (TCP repeating them).
-fn sleeps_and_repeats(events: &[Ev], out: &mut String) {
+fn sleeps_and_repeats(events: &[Ev], tpu: f64, out: &mut String) {
     let mut labels: Vec<&str> = events
         .iter()
         .filter(|e| e.id == W_RX)
@@ -405,7 +477,7 @@ fn sleeps_and_repeats(events: &[Ev], out: &mut String) {
                 W_WAKE | W_FOUND => {
                     if let Some(s) = since.take() {
                         asleep += e.t - s;
-                        slept.push((e.t - s) as f64 / TICKS_PER_US);
+                        slept.push((e.t - s) as f64 / tpu);
                     }
                 }
                 _ => {}
@@ -428,9 +500,9 @@ fn sleeps_and_repeats(events: &[Ev], out: &mut String) {
         .filter(|e| (e.id == N_RX || e.id == W_RX) && e.key != 0)
     {
         if let Some(before) = seen.insert((e.id, e.key), e.t)
-            && e.t - before > 24_000
+            && (e.t - before) as f64 > tpu * 1000.0
         {
-            gaps.push((e.t - before) as f64 / TICKS_PER_US / 1000.0);
+            gaps.push((e.t - before) as f64 / tpu / 1000.0);
         }
     }
     let (n, m, _, p99) = stats(&mut gaps);
@@ -441,7 +513,8 @@ fn sleeps_and_repeats(events: &[Ev], out: &mut String) {
     }
 }
 
-fn duration_rows(events: &[Ev], out: &mut String) {
+fn duration_rows(events: &[Ev], tpu: f64, out: &mut String) {
+    let window = load_window(events);
     let mut rows = String::new();
     let items: [(&str, u8, u8); 4] = [
         (
@@ -458,7 +531,7 @@ fn duration_rows(events: &[Ev], out: &mut String) {
         ("step of the stack thread", N_STK_BEGIN, N_STK_END),
     ];
     for (name, b, e) in items {
-        let mut v = durations(events, b, e, None);
+        let mut v = durations(events, b, e, window, tpu);
         if !v.is_empty() {
             let (n, m, p90, p99) = stats(&mut v);
             rows.push_str(&format!(
@@ -467,19 +540,19 @@ fn duration_rows(events: &[Ev], out: &mut String) {
         }
     }
     if !rows.is_empty() {
-        out.push_str("\n### Durations of calls and steps\n\n| what | count | median us | p90 us | p99 us |\n|---|---|---|---|---|\n");
+        out.push_str("\n### Durations of calls and steps (within the load window)\n\n| what | count | median us | p90 us | p99 us |\n|---|---|---|---|---|\n");
         out.push_str(&rows);
     }
 }
 
 /// The report of one console log: the paths that its records make.
 fn report(name: &str, text: &str, worst: usize, window: Option<(f64, f64)>) -> String {
-    let mut events = parse(text);
+    let (mut events, tpu) = parse(text);
     if let Some((from, to)) = window
         && let Some(t0) = events.first().map(|e| e.t)
     {
         events.retain(|e| {
-            let us = (e.t - t0) as f64 / TICKS_PER_US;
+            let us = (e.t - t0) as f64 / tpu;
             us >= from && us <= to
         });
     }
@@ -507,15 +580,15 @@ fn report(name: &str, text: &str, worst: usize, window: Option<(f64, f64)>) -> S
         ),
     ] {
         if wanted {
-            let c = chains(&events, path);
+            let c = chains(&events, path, tpu);
             requests = requests.max(c.len());
-            path_table(title, &c, worst, &mut out);
+            path_table(title, &c, worst, tpu, &mut out);
         }
     }
     counts(&events, requests, &mut out);
-    sleeps_and_repeats(&events, &mut out);
-    silences(&events, &mut out);
-    duration_rows(&events, &mut out);
+    sleeps_and_repeats(&events, tpu, &mut out);
+    silences(&events, tpu, &mut out);
+    duration_rows(&events, tpu, &mut out);
     out
 }
 
@@ -628,8 +701,8 @@ mod tests {
 
     #[test]
     fn a_request_through_the_switch_has_its_segments() {
-        let events = parse(&log());
-        let c = chains(&events, SWITCH_PATH);
+        let (events, tpu) = parse(&log());
+        let c = chains(&events, SWITCH_PATH, tpu);
         assert_eq!(c.len(), 1);
         let names: Vec<&str> = c[0].iter().map(|p| p.0).collect();
         assert_eq!(
@@ -644,6 +717,98 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("| wrx to wtx |"), "{text}");
+    }
+
+    /// A line of the log: label, point, ticks and key (decimal here, hexadecimal in the line).
+    fn line(label: &str, id: u8, t: u64, key: u32) -> String {
+        format!("tr {label} {id:x} {t:x} {key:x}")
+    }
+
+    #[test]
+    fn two_workers_do_not_mix_their_wakes_and_pokes() {
+        // The frames of A and B go to the workers w1 and w2. The wake-up and the poke of w2 lie
+        // between the points of w1, and the chain of A takes only those of w1.
+        let log = [
+            line("n", N_RX, 1000, 0xa),
+            line("n", N_TO_CONSUMER, 1010, 0xa),
+            line("n", N_RX, 1020, 0xb),
+            line("n", N_TO_CONSUMER, 1030, 0xb),
+            line("n", N_CWAKE, 1035, 0),
+            line("w2", W_WAKE, 1050, 0),
+            line("w2", W_RX, 1060, 0xb),
+            line("w2", W_TX, 1070, 0xb),
+            line("w1", W_WAKE, 1100, 0),
+            line("w1", W_RX, 1110, 0xa),
+            line("w1", W_TX, 1140, 0xa),
+            line("w2", W_KICK, 1150, 0),
+            line("w1", W_KICK, 1200, 0),
+            line("n", N_WAKE, 1250, 1),
+            line("n", N_TX_SEEN, 1300, 0xa),
+            line("n", N_TX_SUBMIT, 1310, 0xa),
+            line("n", N_TX_SEEN, 1320, 0xb),
+            line("n", N_TX_SUBMIT, 1330, 0xb),
+            line("n", N_BELL, 1400, 0),
+        ]
+        .join("\n");
+        let (events, tpu) = parse(&log);
+        let chains = chains(&events, SWITCH_PATH, tpu);
+        let a = chains
+            .iter()
+            .find(|c| c[0].1 == 1000)
+            .expect("the chain of A");
+        let at = |name: &str| a.iter().find(|p| p.0 == name).map(|p| p.1);
+        assert_eq!(at("wwake"), Some(1100), "{a:?}");
+        assert_eq!(at("wrx"), Some(1110));
+        assert_eq!(at("kick"), Some(1200), "{a:?}");
+    }
+
+    #[test]
+    fn a_wake_long_before_the_frame_is_not_its_wake() {
+        let log = [
+            line("w1", W_WAKE, 1000, 0),
+            line("w1", W_RX, 1000 + 24 * 5000, 0xa),
+            line("w1", W_TX, 1010 + 24 * 5000, 0xa),
+        ]
+        .join("\n");
+        let (events, tpu) = parse(&log);
+        let c = chains(&events, OWN_PATH, tpu);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].iter().all(|p| p.0 != "wake"), "{c:?}");
+    }
+
+    #[test]
+    fn durations_count_only_the_load_window() {
+        // A call of 2 us during the load (the frames of 1000 to 1200 ticks) and a wait of 4 ms
+        // after it, in the same ring: only the first enters the table.
+        let log = [
+            line("w1", C_SEND, 900, 8),
+            line("w1", C_RET, 948, 8),
+            line("w1", W_RX, 1000, 0xa),
+            line("w1", W_TX, 1200, 0xa),
+            line("w1", C_SEND, 1100, 8),
+            line("w1", C_RET, 1148, 8),
+            line("w1", C_SEND, 50_000, 8),
+            line("w1", C_RET, 146_000, 8),
+        ]
+        .join("\n");
+        let (events, tpu) = parse(&log);
+        let mut text = String::new();
+        duration_rows(&events, tpu, &mut text);
+        assert!(
+            text.contains(
+                "| call of a socket in the layer (sent to returned) | 1 | 2.0 | 2.0 | 2.0 |"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_counter_frequency_comes_from_the_first_line() {
+        let log = "tr n 0 1000 10 2faf080\ntr n 3 1000 1\n";
+        let (_, tpu) = parse(log);
+        assert_eq!(tpu, 50.0);
+        let (_, tpu) = parse("tr n 0 1000 10\n");
+        assert_eq!(tpu, 24.0);
     }
 
     #[test]

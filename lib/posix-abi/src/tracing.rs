@@ -53,6 +53,7 @@ mod on {
 
     pub fn point(id: u8, key: u32) {
         if !REGISTERED.swap(true, Relaxed) {
+            trace::set_frequency(rt::time::frequency());
             // SAFETY: plain calls of the C library; the ring lives for ever. A process that
             // makes no record (a shell) takes no memory for it.
             unsafe {
