@@ -1036,7 +1036,7 @@ fn init_ended(state: ProcessState) -> ! {
         ProcessState::Fault { esr, far, elr } => {
             ::core::panic!("init terminated by a fault: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
         }
-        ProcessState::Killed => panic!("init was killed"),
+        ProcessState::Killed => ::core::panic!("init terminated: Killed"),
         _ => panic!("init ended in a state that a process cannot end in"),
     }
 }
