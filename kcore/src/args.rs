@@ -281,7 +281,7 @@ pub fn mask_tail(words: &mut [u64], len: usize) {
 }
 
 // The largest memory object is the largest list of pages.
-const _: () = assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
+const _: () = ::core::assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
 
 /// The access of a mapping from a register (spec 7.4): R, RW or RX
 /// (abi::Access). INVALID_ARGS for any other value, write and execute

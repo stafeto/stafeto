@@ -14,7 +14,6 @@ use kcore::bootinfo::{Gic, MAX_CPUS, Region};
 use kcore::frames::PhysMem;
 use kcore::layout::{LINEAR_BASE, image_pa};
 use kcore::memmap;
-use kcore::must::Must;
 use kcore::paging::{Attrs, PageTable, TableMemory};
 
 /// Tables from the frame allocator, reached through the linear map.
@@ -86,7 +85,9 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
     let root = {
         let mut guard = phys::FRAMES.lock();
         let mut mem = FrameTables {
-            frames: guard.as_mut().must("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         };
         let mut pt = PageTable::new(&mut mem).expect("no frame for the root table");
         let image = symbols::image_layout();

@@ -434,7 +434,7 @@ impl<T: Linked> ReadyQueue<T> {
     unsafe fn level(t: NonNull<T>) -> usize {
         // SAFETY: the caller's promise.
         let level = unsafe { link(t) }.level;
-        assert!(
+        ::core::assert!(
             (1..PRIORITY_LEVELS).contains(&level),
             "an item at level {level} is queued; level 0 goes to nothing"
         );
@@ -486,7 +486,9 @@ impl<T: Linked> ReadyQueue<T> {
                 self.mask.store(self.mask() | 1 << level, Ordering::Relaxed);
                 return;
             };
-            let tail = link(head).prev.must("a ring");
+            let tail = link(head)
+                .prev
+                .unwrap_or_else(|| crate::fail_here!("a ring"));
             l.prev = Some(tail);
             l.next = Some(head);
             link(tail).next = Some(t);
@@ -507,9 +509,9 @@ impl<T: Linked> ReadyQueue<T> {
             assert!(l.is_queued(), "an item leaves a queue it is not in");
             l.queued &= !QUEUED;
             gap(level);
-            let prev = l.prev.take().must("a ring");
+            let prev = l.prev.take().unwrap_or_else(|| crate::fail_here!("a ring"));
             gap(level);
-            let next = l.next.take().must("a ring");
+            let next = l.next.take().unwrap_or_else(|| crate::fail_here!("a ring"));
             if next == t {
                 self.heads[level] = None;
                 self.mask

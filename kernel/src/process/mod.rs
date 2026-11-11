@@ -838,7 +838,7 @@ pub fn retain_shell(process: NonNull<Process>) {
         (*p).shell_refs = (*p)
             .shell_refs
             .checked_add(1)
-            .must("shell references overflow");
+            .unwrap_or_else(|| kcore::fail_here!("shell references overflow"));
     }
 }
 
@@ -858,7 +858,7 @@ pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
         (*p).shell_refs = (*p)
             .shell_refs
             .checked_sub(1)
-            .must("a shell is released once too often");
+            .unwrap_or_else(|| kcore::fail_here!("a shell is released once too often"));
         if (*p).shell_refs == 0 && refs == 0 && (*p).stage == Stage::Shell {
             queue_shell(process, cause);
         }
@@ -1036,7 +1036,8 @@ fn init_ended(state: ProcessState) -> ! {
         ProcessState::Fault { esr, far, elr } => {
             ::core::panic!("init terminated by a fault: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
         }
-        other => ::core::panic!("init terminated: {other:?}"),
+        ProcessState::Killed => panic!("init was killed"),
+        _ => panic!("init ended in a state that a process cannot end in"),
     }
 }
 

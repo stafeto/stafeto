@@ -193,7 +193,12 @@ pub fn alloc_zeroed(order: u8, quota: &mut Account) -> Result<Frame, Error> {
 pub fn alloc(order: u8, quota: &mut Account) -> Result<Frame, Error> {
     let size = PAGE_SIZE << order;
     quota.charge(size)?;
-    let Some(pa) = FRAMES.lock().as_mut().must("frame allocator").alloc(order) else {
+    let Some(pa) = FRAMES
+        .lock()
+        .as_mut()
+        .unwrap_or_else(|| kcore::fail_here!("frame allocator"))
+        .alloc(order)
+    else {
         // A block may miss while its frames are free apart; a single frame
         // may not.
         assert!(order > 0, "a charge that passed found no frame (spec 7.8)");
@@ -334,7 +339,7 @@ pub unsafe fn free(frame: Frame, quota: &mut Account) {
     FRAMES
         .lock()
         .as_mut()
-        .must("frame allocator")
+        .unwrap_or_else(|| kcore::fail_here!("frame allocator"))
         .free(frame.pa, frame.order);
     quota.refund(PAGE_SIZE << frame.order);
     core::mem::forget(frame);
@@ -349,7 +354,9 @@ pub unsafe fn free(frame: Frame, quota: &mut Account) {
 /// As for `free`, for each frame; each is of order 0 and the caller's.
 pub unsafe fn free_singles(pas: &[u64], quota: &mut Account) {
     let mut guard = FRAMES.lock();
-    let frames = guard.as_mut().must("frame allocator");
+    let frames = guard
+        .as_mut()
+        .unwrap_or_else(|| kcore::fail_here!("frame allocator"));
     for &pa in pas {
         frames.free(pa, 0);
         quota.refund(PAGE_SIZE);
@@ -432,7 +439,9 @@ pub fn free_frames() -> u64 {
 /// Hands more RAM to the allocator.
 pub fn add(regions: &[Region]) {
     let mut guard = FRAMES.lock();
-    let frames = guard.as_mut().must("frame allocator");
+    let frames = guard
+        .as_mut()
+        .unwrap_or_else(|| kcore::fail_here!("frame allocator"));
     for r in regions {
         frames.add_region(r.base, r.end());
     }

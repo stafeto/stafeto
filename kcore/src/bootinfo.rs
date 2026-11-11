@@ -59,7 +59,9 @@ impl<const N: usize> RegionList<N> {
     }
 
     pub fn push(&mut self, r: Region) -> Result<(), BootInfoError> {
-        if self.len == N {
+        // `>=` lets the compiler see the index in range: no check of its own
+        // in the nine places `push` is inlined.
+        if self.len >= N {
             return Err(BootInfoError::TooManyRegions);
         }
         self.items[self.len] = r;
@@ -114,7 +116,9 @@ impl Gic {
     /// CPU interface of a GICv2 or the first REDISTRIBUTOR_WINDOW bytes of
     /// the first redistributor region of a GICv3.
     pub fn mapped(&self) -> [Region; 2] {
-        let [dist, second] = [self.regs.as_slice()[0], self.regs.as_slice()[1]];
+        let &[dist, second, ..] = self.regs.as_slice() else {
+            crate::fail_here!("a GIC node has its distributor and a second block");
+        };
         let cpu = match self.version {
             GicVersion::V2 => second,
             GicVersion::V3 => Region {

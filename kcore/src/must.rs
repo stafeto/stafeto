@@ -18,6 +18,52 @@ pub fn fail(msg: &'static str) -> ! {
     panic!("{msg}")
 }
 
+/// The panic of a check that failed, through a cold function of its own
+/// that takes no argument: for a check inside code that is inlined into many
+/// places, where a call that names the message would stand in each of them.
+#[macro_export]
+macro_rules! fail_here {
+    ($msg:literal) => {{
+        #[cold]
+        #[inline(never)]
+        fn fail_here() -> ! {
+            $crate::must::fail($msg)
+        }
+        fail_here()
+    }};
+}
+
+// The kernel build of this crate checks with `fail`, as the kernel does
+// (kernel/src/failure.rs); the host tests keep the macros of `core`, whose
+// messages name the values of a comparison. A check with arguments to
+// format, and a check in a const item, keep the macros of `core` either way.
+#[cfg(not(test))]
+macro_rules! assert {
+    ($cond:expr $(,)?) => {
+        if !$cond {
+            $crate::must::fail(concat!("assertion failed: ", stringify!($cond)))
+        }
+    };
+    ($cond:expr, $msg:literal $(,)?) => {
+        if !$cond {
+            $crate::must::fail($msg)
+        }
+    };
+    ($($arg:tt)+) => {
+        ::core::assert!($($arg)+)
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! panic {
+    ($msg:literal $(,)?) => {
+        $crate::must::fail($msg)
+    };
+    ($($arg:tt)*) => {
+        ::core::panic!($($arg)*)
+    };
+}
+
 /// `expect` for an `Option` with a message that is a literal.
 pub trait Must<T> {
     fn must(self, msg: &'static str) -> T;

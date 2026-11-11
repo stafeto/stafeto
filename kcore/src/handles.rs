@@ -20,7 +20,7 @@ pub const MAX_CHUNKS: usize = 256;
 pub const MAX_HANDLES: u32 = (CHUNK * MAX_CHUNKS) as u32;
 const NO_ENTRY: u32 = u32::MAX;
 
-const _: () = assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
+const _: () = ::core::assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
 
 struct Entry<T> {
     object: Option<T>,
@@ -32,6 +32,14 @@ struct Entry<T> {
 /// Storage for CHUNK entries.
 pub struct Chunk<T> {
     entries: [Entry<T>; CHUNK],
+}
+
+/// The panic of a table whose directory or chunk is missing for an entry
+/// that is in use.
+#[cold]
+#[inline(never)]
+fn no_chunk() -> ! {
+    crate::must::fail("a handle table has an initialised chunk for each entry in use")
 }
 
 /// Where the chunks of a table lie, in the order of their entries.
@@ -175,10 +183,22 @@ impl<T> HandleTable<T> {
     }
 
     fn chunk(&self, index: u32) -> NonNull<Chunk<T>> {
-        let directory = self.directory.must("a directory");
-        // SAFETY: the directory is initialised and owned by the table.
-        let chunk = unsafe { (*directory.as_ptr()).chunks[index as usize / CHUNK] };
-        chunk.must("an initialised chunk")
+        // One way out for a missing directory, a chunk past it and a chunk
+        // that was never made: this runs in every lookup of every call, and
+        // each way of its own would stand in all its inlined copies.
+        let found = self.directory.and_then(|directory| {
+            // SAFETY: the directory is initialised and owned by the table.
+            unsafe {
+                (*directory.as_ptr())
+                    .chunks
+                    .get(index as usize / CHUNK)
+                    .copied()
+            }
+        });
+        match found.flatten() {
+            Some(chunk) => chunk,
+            None => no_chunk(),
+        }
     }
 
     fn entry(&self, index: u32) -> &Entry<T> {

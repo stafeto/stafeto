@@ -127,7 +127,9 @@ fn with_asids<R>(f: impl FnOnce(&mut AsidAllocator) -> R) -> R {
 fn with_tables<R>(f: impl FnOnce(&mut FrameTables<'_>) -> R) -> R {
     let mut guard = FRAMES.lock();
     f(&mut FrameTables {
-        frames: guard.as_mut().must("frame allocator"),
+        frames: guard
+            .as_mut()
+            .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
     })
 }
 
@@ -167,7 +169,9 @@ fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -
     let mut guard = FRAMES.lock();
     f(&mut Charged {
         tables: FrameTables {
-            frames: guard.as_mut().must("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         },
         quota,
     })
@@ -245,7 +249,9 @@ fn with_prepaid<R>(left: &mut u64, f: impl FnOnce(&mut Prepaid<'_>) -> R) -> R {
     let mut guard = FRAMES.lock();
     f(&mut Prepaid {
         tables: FrameTables {
-            frames: guard.as_mut().must("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         },
         left,
     })

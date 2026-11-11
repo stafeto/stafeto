@@ -367,7 +367,7 @@ impl AsidAllocator {
 
     fn unset(&mut self, i: usize) {
         let (w, bit) = (i / 64, 1 << (i % 64));
-        assert!(self.used.0[w] & bit != 0, "ASID {i} released while free");
+        ::core::assert!(self.used.0[w] & bit != 0, "ASID {i} released while free");
         self.used.0[w] &= !bit;
         self.full[w / 64] &= !(1 << (w % 64));
         self.free += 1;
