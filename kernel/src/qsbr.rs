@@ -18,9 +18,17 @@ use crate::arch::cpu::{self, MAX_CPUS};
 use crate::local::local;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use kcore::must::Must;
 use kcore::qsbr::Grace;
 
-static GRACE: Grace<MAX_CPUS> = Grace::new();
+static GRACE: Grace<MAX_CPUS> = Grace::unstarted();
+
+/// Starts the epoch counter, on CPU 0 before any other call of this module:
+/// the counter lives in .bss, which keeps .data, and with it a page of the
+/// image, out of the kernel (spec 3.4).
+pub fn init() {
+    GRACE.begin();
+}
 
 /// Objects retired and not freed yet, on all CPUs: the way out of the kernel
 /// looks at it first, so that the check costs it one load.
@@ -173,7 +181,7 @@ pub fn reclaim() -> bool {
         // SAFETY: the period passed, so no CPU reads the object any more;
         // `retire` set `reclaim`.
         unsafe {
-            let reclaim = (*freed.as_ptr()).reclaim.take().expect("a retired node");
+            let reclaim = (*freed.as_ptr()).reclaim.take().must("a retired node");
             reclaim(freed);
         }
     }

@@ -42,6 +42,8 @@ pub enum Resource {}
 pub enum Memory {}
 /// An interrupt binding (spec 9).
 pub enum Interrupt {}
+/// The MSI device of a PCI function (spec 9).
+pub enum MsiDevice {}
 /// An object of any kind.
 pub enum Any {}
 
@@ -70,6 +72,7 @@ kinds! {
     Resource => Resource;
     Memory => Memory | DeviceWindow;
     Interrupt => Interrupt;
+    MsiDevice => MsiDevice;
 }
 
 impl Kind for Any {

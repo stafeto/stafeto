@@ -55,6 +55,13 @@ impl Machine {
         }
     }
 
+    /// Whether the machine has an ITS and its network device raises MSI-X
+    /// (VIRT_ITS): the images then carry init's feature `net-its` and the
+    /// device is a virtio-net-pci (`net_on`).
+    pub fn msi(&self) -> bool {
+        self.machine.contains("its=on")
+    }
+
     /// `memory` in bytes: a count of MiB with `M` or of GiB with `G`.
     pub fn ram(&self) -> u64 {
         let (count, unit) = self.memory.split_at(self.memory.len() - 1);
@@ -153,8 +160,20 @@ pub const HVF_V2: Machine = Machine {
     accel: "hvf,kernel-irqchip=off",
 };
 
+/// The GICv3 machine with its ITS named (QEMU's default with GICv3, written
+/// so that the machine says it): the network service drives a
+/// virtio-net-pci with a vector of MSI-X a queue through the kernel's ITS
+/// and LPIs (`net_on`; init's record `NETD_ITS`).
+pub const VIRT_ITS: Machine = Machine {
+    name: "ITS",
+    machine: "virt,gic-version=3,its=on,highmem-ecam=off",
+    cpu: "cortex-a72",
+    memory: "512M",
+    accel: "tcg",
+};
+
 /// The machines a command may name by their `name`.
-pub const MACHINES: [&Machine; 7] = [
+pub const MACHINES: [&Machine; 8] = [
     &VIRT,
     &VIRT_EL2,
     &VIRT_2G,
@@ -162,6 +181,7 @@ pub const MACHINES: [&Machine; 7] = [
     &VIRT_EL2_V3,
     &HVF_V3,
     &HVF_V2,
+    &VIRT_ITS,
 ];
 
 /// The machine of MACHINES named `name`, VIRT when there is no name.
@@ -243,6 +263,29 @@ pub const NET_MAC: &str = "52:54:00:12:34:56";
 /// variable STAFETO_PCAP names a file for a capture of every frame of the
 /// guest's device. The images that run the service add these arguments.
 pub fn net(forwards: &[Forward]) -> Vec<String> {
+    net_with(
+        format!("virtio-net-device,netdev=n0,bus=virtio-mmio-bus.7,mac={NET_MAC}"),
+        forwards,
+    )
+}
+
+/// The network device of the service on machine `m`: `net`'s, or on a
+/// machine with an ITS a modern virtio-net-pci at device 2 of bus 0
+/// (`virtio_pci::qemu::NET`) with three vectors of MSI-X, one a queue and
+/// one for the configuration, on the same user network.
+pub fn net_on(m: &Machine, forwards: &[Forward]) -> Vec<String> {
+    if !m.msi() {
+        return net(forwards);
+    }
+    net_with(
+        format!(
+            "virtio-net-pci,netdev=n0,bus=pcie.0,addr=0x2,disable-legacy=on,disable-modern=off,vectors=3,mac={NET_MAC}"
+        ),
+        forwards,
+    )
+}
+
+fn net_with(device: String, forwards: &[Forward]) -> Vec<String> {
     let mut netdev = String::from("user,id=n0");
     for f in forwards {
         netdev += &format!(
@@ -252,12 +295,7 @@ pub fn net(forwards: &[Forward]) -> Vec<String> {
             f.guest
         );
     }
-    let mut a = vec![
-        "-netdev".to_owned(),
-        netdev,
-        "-device".to_owned(),
-        format!("virtio-net-device,netdev=n0,bus=virtio-mmio-bus.7,mac={NET_MAC}"),
-    ];
+    let mut a = vec!["-netdev".to_owned(), netdev, "-device".to_owned(), device];
     if let Some(file) = std::env::var_os("STAFETO_PCAP").filter(|f| !f.is_empty()) {
         a.push("-object".to_owned());
         a.push(format!(
@@ -1047,7 +1085,7 @@ fn elr_in_panic(lines: &[String]) -> Option<u64> {
 }
 
 /// Addresses on backtrace frame lines (`kcore::backtrace`'s `  #N  0x...`).
-fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
+pub fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
     lines
         .iter()
         .filter(|l| l.trim_start().starts_with('#'))
@@ -1352,6 +1390,18 @@ mod tests {
         for m in MACHINES {
             assert!(m.machine.contains("highmem-ecam=off"), "{}", m.name);
         }
+    }
+
+    #[test]
+    fn the_its_machine_has_a_network_function_with_msix() {
+        assert!(VIRT_ITS.msi() && !VIRT_V3.msi() && !VIRT.msi());
+        assert_eq!(
+            machine(Some(&"ITS".to_owned())).map(|m| m.machine),
+            Ok(VIRT_ITS.machine)
+        );
+        let on = net_on(&VIRT_ITS, &[]).join(" ");
+        assert!(on.contains("-device virtio-net-pci,netdev=n0,bus=pcie.0,addr=0x2,disable-legacy=on,disable-modern=off,vectors=3,mac=52:54:00:12:34:56"));
+        assert_eq!(net_on(&VIRT, &[]), net(&[]));
     }
 
     #[test]

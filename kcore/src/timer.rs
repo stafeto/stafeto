@@ -12,6 +12,7 @@
 //! with the nearest deadline of the levels whose firing is not queued
 //! yet, and `Firing` takes one portion of a level's expired timers.
 
+use crate::must::Must;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,7 +141,7 @@ impl<T: HeapNode> Heap<T> {
             } else {
                 l.right
             };
-            t = next.expect("a timer where the count puts one");
+            t = next.must("a timer where the count puts one");
         }
         Some(t)
     }
@@ -165,7 +166,7 @@ impl<T: HeapNode> Heap<T> {
             if position == 1 {
                 self.root = Some(t);
             } else {
-                let parent = self.at(position / 2).expect("the parent's place");
+                let parent = self.at(position / 2).must("the parent's place");
                 link(t).parent = Some(parent);
                 let p = link(parent);
                 if position.is_multiple_of(2) {
@@ -189,7 +190,7 @@ impl<T: HeapNode> Heap<T> {
         // and every borrow of a link ends before another of the same link.
         unsafe {
             assert!(link(t).linked, "a timer leaves a heap it is not in");
-            let last = self.at(self.len).expect("the last node");
+            let last = self.at(self.len).must("the last node");
             match link(last).parent {
                 None => self.root = None,
                 Some(p) => {
@@ -280,7 +281,7 @@ impl<T: HeapNode> Heap<T> {
         unsafe {
             let (parent, left, right) = {
                 let l = link(t);
-                (l.parent.expect("a parent"), l.left, l.right)
+                (l.parent.must("a parent"), l.left, l.right)
             };
             let (grandparent, p_left, p_right) = {
                 let l = link(parent);

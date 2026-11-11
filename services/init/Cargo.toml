@@ -86,6 +86,10 @@ table-gpu = []
 # The network service in the image of the shell, and the image of its probe
 # (xtask net-probe).
 table-net = []
+# With table-net or table-net-probe: the network service on QEMU's machine
+# with an ITS, a virtio-net-pci with a vector of MSI-X a queue (table/net.rs,
+# NETD_ITS; xtask's machine ITS).
+net-its = []
 table-net-probe = []
 # The probe's image with both network devices on QEMU.
 table-net-probe-two = []

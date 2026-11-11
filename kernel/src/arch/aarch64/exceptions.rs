@@ -34,7 +34,7 @@ pub struct TrapFrame {
     pub frame_record: [u64; 2],
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 304);
+const _: () = ::core::assert!(core::mem::size_of::<TrapFrame>() == 304);
 
 const VECTOR_NAMES: [&str; 16] = [
     "EL1t sync",
@@ -286,7 +286,7 @@ fn stop(index: u64, syndrome: u64, far: u64, elr: u64) -> ! {
             None => kprintln!("abort: {}, FAR={far:#x}", esr::fault_status_name(syndrome)),
         }
     }
-    panic!(
+    ::core::panic!(
         "unexpected exception {}: {} (EC {class:#x}) ESR={syndrome:#x} ELR={elr:#x} FAR={far:#x}",
         VECTOR_NAMES[(index & 15) as usize],
         esr::class_name(class),

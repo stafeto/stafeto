@@ -12,7 +12,8 @@
 //! (of a segment from the client) or acknowledges (of a segment from the
 //! server). The ring is dumped as lines `tr <label> <point> <ticks> <key>`
 //! (hexadecimal) when the component is asked, and `cargo xtask net-trace`
-//! reads them from the console.
+//! reads them from the console. The first line of a dump (point 0) ends with the counter's
+//! frequency in Hz (`set_frequency`; the analysis assumes 24 MHz when a log has none).
 
 #![no_std]
 
@@ -129,6 +130,9 @@ mod on {
         PTR.store(words.cast(), Relaxed);
     }
 
+    /// The virtual counter, read as `rt::time::now` reads it. On the Allwinner
+    /// A64 this read needs the counter erratum workaround (spec 10), so the
+    /// place is listed in `COUNTER_READ_SITES` of xtask.
     #[inline(always)]
     pub fn ticks() -> u64 {
         #[cfg(target_arch = "aarch64")]
@@ -155,9 +159,21 @@ mod on {
         ring[at + 1].store(VALID | u64::from(id) << 32 | u64::from(key), Relaxed);
     }
 
-    /// Silences: gaps of more than `GAP` ticks (20 ms) between two records of the component, the
+    /// The frequency of the counter in Hz (the default: 24 MHz of VZ).
+    static HZ: AtomicU64 = AtomicU64::new(24_000_000);
+
+    pub fn set_frequency(hz: u64) {
+        if hz != 0 {
+            HZ.store(hz, Relaxed);
+        }
+    }
+
+    pub fn frequency() -> u64 {
+        HZ.load(Relaxed)
+    }
+
+    /// Silences: gaps of more than 20 ms between two records of the component, the
     /// last `GAPS` of them: the end of the gap, its length and the record that ended it.
-    const GAP: u64 = 480_000;
     const GAPS: usize = 256;
     static LAST: AtomicU64 = AtomicU64::new(0);
     static GAPN: AtomicUsize = AtomicUsize::new(0);
@@ -165,7 +181,7 @@ mod on {
 
     fn silence(now: u64, id: u8, key: u32) {
         let last = LAST.swap(now, Relaxed);
-        if last != 0 && now.wrapping_sub(last) > GAP {
+        if last != 0 && now.wrapping_sub(last) > HZ.load(Relaxed) / 50 {
             let at = (GAPN.fetch_add(1, Relaxed) % GAPS) * 2;
             GAP_LOG[at].store(now, Relaxed);
             GAP_LOG[at + 1].store(
@@ -207,6 +223,15 @@ mod on {
         FROM.store(if stop >= to { usize::MAX } else { stop }, Relaxed);
         stop >= to
     }
+}
+
+/// Tells the frequency of the counter in Hz (CNTFRQ_EL0): the silences are of 20 ms, and the
+/// first line of a dump carries it for the analysis.
+pub fn set_frequency(hz: u64) {
+    #[cfg(feature = "on")]
+    on::set_frequency(hz);
+    #[cfg(not(feature = "on"))]
+    let _ = hz;
 }
 
 /// Gives the ring its storage: `RECORDS * 2` zeroed words that live for ever (a build without
@@ -269,7 +294,8 @@ impl core::fmt::Write for Line {
 /// Gives the records of the ring, oldest first, to `emit` as lines `tr <label> <point> <ticks>
 /// <key>` (hexadecimal, no line end), at most `max` of them in this call; a later call goes on from
 /// where this one stopped (`tail`: of the last records at most, when a dump starts). True when the last record has gone (the next call starts a new dump).
-/// The first line of a dump is point 0 with the time of the dump and the number of records made.
+/// The first line of a dump is point 0 with the time of the dump, the number of records made and
+/// the frequency of the counter in Hz.
 #[allow(clippy::needless_return)]
 pub fn dump_part(label: &str, max: usize, tail: usize, mut emit: impl FnMut(&str)) -> bool {
     #[cfg(feature = "on")]
@@ -279,10 +305,17 @@ pub fn dump_part(label: &str, max: usize, tail: usize, mut emit: impl FnMut(&str
                 bytes: [0; 80],
                 len: 0,
             };
-            let _ = core::fmt::Write::write_fmt(
-                &mut line,
-                format_args!("tr {label} {id:x} {ticks:x} {key:x}"),
-            );
+            let _ = if id == 0 {
+                core::fmt::Write::write_fmt(
+                    &mut line,
+                    format_args!("tr {label} {id:x} {ticks:x} {key:x} {:x}", on::frequency()),
+                )
+            } else {
+                core::fmt::Write::write_fmt(
+                    &mut line,
+                    format_args!("tr {label} {id:x} {ticks:x} {key:x}"),
+                )
+            };
             if let Ok(text) = core::str::from_utf8(&line.bytes[..line.len]) {
                 emit(text);
             }
@@ -330,6 +363,26 @@ mod tests {
         // The request of 0x20 bytes ends at 0x0001_fff0 + 0x20 = 0x0002_0010: the answer acknowledges it.
         assert_eq!(frame_key(&segment(true, 0x20), true), Some(0xc0de_0010));
         assert_eq!(frame_key(&segment(false, 100), false), Some(0xc0de_0010));
+    }
+
+    #[cfg(all(feature = "on", not(feature = "bss")))]
+    #[test]
+    fn the_first_line_of_a_dump_carries_the_frequency() {
+        extern crate std;
+        let ring = std::vec![0u64; RECORDS * 2].leak();
+        install(ring.as_mut_ptr());
+        set_frequency(50_000_000);
+        point(P_N_RX, 7);
+        let mut lines = std::vec::Vec::new();
+        dump("n", 10, |l| lines.push(std::string::String::from(l)));
+        assert!(
+            lines[0].starts_with("tr n 0 ") && lines[0].ends_with(" 2faf080"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("tr n 3 ") && lines[1].ends_with(" 7"),
+            "{lines:?}"
+        );
     }
 
     #[test]

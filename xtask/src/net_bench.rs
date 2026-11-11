@@ -1388,7 +1388,12 @@ impl Floor {
         Ok(floor)
     }
 
-    fn stop(mut self) {
+    /// Asks the master of nginx to quit and, if it stays, kills it: only the child this value
+    /// started.
+    fn shutdown(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
         let _ = Command::new("kill")
             .args(["-QUIT", &self.child.id().to_string()])
             .status();
@@ -1400,10 +1405,22 @@ impl Floor {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    fn stop(mut self) {
+        self.shutdown();
         let _ = std::fs::copy(
             self.root.join("nginx.conf"),
             self.root.join("../floor-nginx.conf"),
         );
+    }
+}
+
+impl Drop for Floor {
+    /// An error before `stop` (the start that times out) and a run that ends early leave no nginx
+    /// of the floor behind.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -2135,6 +2152,9 @@ fn options(args: &[String]) -> Result<Options, String> {
     if !phases_given && !o.systems.iter().any(|s| s.linux()) {
         o.phases.retain(|p| p != "nat");
     }
+    if o.trace && !phases_given {
+        o.phases = vec!["rounds".to_owned()];
+    }
     if o.systems.contains(&System::S4o) && o.old.is_none() {
         return Err(format!(
             "S4o needs --old DIR (a build to compare with); {USAGE}"
@@ -2166,6 +2186,22 @@ fn options(args: &[String]) -> Result<Options, String> {
     }
     if o.switch_cpu0 && o.switch_pin {
         return Err("--switch-pin and --switch-cpu0 together".to_owned());
+    }
+    if o.switch_pin && o.cpus < 4 {
+        return Err(format!(
+            "--switch-pin pins the switch to a CPU of its own and needs --cpus 4 (got {})",
+            o.cpus
+        ));
+    }
+    if o.trace
+        && let Some(bad) = o
+            .phases
+            .iter()
+            .find(|p| !["rounds", "at"].contains(&p.as_str()))
+    {
+        return Err(format!(
+            "--trace dumps the rings after a ceiling (phase rounds) or after a rate of the phase at; the phase {bad:?} does not run with it"
+        ));
     }
     if o.trace && std::env::var_os("STAFETO_TRACE").is_none() {
         return Err(
@@ -2366,7 +2402,7 @@ impl Bench {
             if counters {
                 m.counters = g.counters()?;
             }
-            if trace {
+            if trace && !sys.linux() {
                 g.trace_flush()?;
             }
             g.warmed = Some((wl, Instant::now()));
@@ -2388,6 +2424,10 @@ impl Bench {
             }
         };
         self.put(key, &m.rec());
+        if trace && !sys.linux() {
+            // The flush ended nginx: the next stage starts a guest of its own.
+            self.release();
+        }
         if m.alert.is_some() {
             // `watched` ended nginx at the alert: the next step starts anew.
             self.release();
@@ -2584,7 +2624,7 @@ impl Bench {
             }
             .ok_or_else(|| format!("{program} printed no rate: {text}"))?;
             let cpu = g.close_window(&before, wrk.requests as usize)?;
-            if trace {
+            if trace && !sys.linux() {
                 g.trace_flush()?;
             }
             let mut found = alerts(&log);
@@ -2738,6 +2778,11 @@ impl Bench {
                             c,
                         )?;
                     }
+                }
+                if self.opts.trace {
+                    // The ceilings only: a guest that dumped its rings has no nginx left.
+                    self.release();
+                    continue;
                 }
                 let pairs: Vec<Workload> = self
                     .opts
@@ -5030,6 +5075,16 @@ mod tests {
         assert_eq!(Workload::W7.paths(), ["/1k.bin"]);
         // Linux rows keep the nat phase.
         assert_eq!(options(&[]).unwrap().phases, ["nat", "sweep", "rounds"]);
+    }
+
+    #[test]
+    fn the_pin_needs_four_cpus_and_the_trace_two_phases() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let why = options(&args(&["--systems", "f1s", "--switch-pin", "--cpus", "2"])).unwrap_err();
+        assert!(why.contains("--cpus 4"), "{why}");
+        // The phases are checked before the environment: a run of the tests has no STAFETO_TRACE.
+        let why = options(&args(&["--trace", "--phases", "sweep"])).unwrap_err();
+        assert!(why.contains("\"sweep\""), "{why}");
     }
 
     #[test]

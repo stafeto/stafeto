@@ -32,10 +32,10 @@ pub struct Record {
     text: [u8; LOG_TEXT],
 }
 
-const _: () = assert!(core::mem::size_of::<Record>() == LOG_RECORD);
-const _: () = assert!(core::mem::offset_of!(Record, kind) == LOG_KIND_AT);
-const _: () = assert!(core::mem::offset_of!(Record, len) == LOG_LEN_AT);
-const _: () = assert!(core::mem::offset_of!(Record, text) == LOG_TEXT_AT);
+const _: () = ::core::assert!(core::mem::size_of::<Record>() == LOG_RECORD);
+const _: () = ::core::assert!(core::mem::offset_of!(Record, kind) == LOG_KIND_AT);
+const _: () = ::core::assert!(core::mem::offset_of!(Record, len) == LOG_LEN_AT);
+const _: () = ::core::assert!(core::mem::offset_of!(Record, text) == LOG_TEXT_AT);
 
 impl Record {
     /// A place never written: all zeros, so a ring lies in .bss.

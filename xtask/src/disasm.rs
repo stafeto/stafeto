@@ -428,14 +428,16 @@ pub fn counter_read_sites(root: &Path) -> Result<Vec<(String, usize)>, String> {
 
 /// The places allowed to read the counter, with the number of reads in each.
 /// The shipping code: the kernel's `timer::now` and the three reads of
-/// user space. The rest are tests and benchmarks that time themselves.
-pub const COUNTER_READ_SITES: [(&str, usize); 10] = [
+/// user space. The rest are tests and benchmarks that time themselves, and
+/// the time stamps of `lib/trace`, which only measurement images build.
+pub const COUNTER_READ_SITES: [(&str, usize); 11] = [
     ("kernel/src/arch/aarch64/timer.rs", 1),
     ("kernel/src/ktest.rs", 2),
     ("kernel/src/ktest/el0.S", 8),
     ("lib/posix-abi/src/signals.rs", 1),
     ("lib/rt/src/sys.rs", 1),
     ("lib/rt/src/time.rs", 1),
+    ("lib/trace/src/lib.rs", 1),
     ("tests/init/src/main.rs", 2),
     ("tests/posix-so/dyn/so-hello.c", 1),
     ("tests/posix-so/so.c", 1),

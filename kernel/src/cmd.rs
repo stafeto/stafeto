@@ -120,7 +120,7 @@ pub fn take_exit(t: NonNull<Thread>) -> u16 {
 
 /// Places in a queue: every thread of the system, once.
 const RING: usize = 1024;
-const _: () = assert!(THREADS <= RING);
+const _: () = ::core::assert!(THREADS <= RING);
 
 #[repr(align(64))]
 struct Line(AtomicU32);
@@ -238,10 +238,9 @@ pub fn kick(to: usize) {
 /// Puts an item in the outbox: a thread with its flags, or a CPU with 0.
 fn add(what: usize, flag: u8) {
     let mut o = local().outbox.lock();
-    assert!(
-        o.n < OUTBOX,
-        "a section posts more commands than the outbox holds"
-    );
+    if o.n >= OUTBOX {
+        kcore::fail_here!("a section posts more commands than the outbox holds");
+    }
     let n = o.n;
     o.items[n] = (what, flag);
     o.n += 1;

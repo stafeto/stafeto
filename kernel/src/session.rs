@@ -27,6 +27,7 @@ use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{CLIENT_GONE, Error, Rights};
 use core::ptr::NonNull;
+use kcore::must::Must;
 
 pub struct Session {
     /// Its source of notifications, with its slot, its label and its
@@ -127,7 +128,7 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
     unsafe {
         refs(s).retain();
         let p = s.as_ptr();
-        (*p).copies = (*p).copies.checked_add(1).expect("session copies overflow");
+        (*p).copies = (*p).copies.checked_add(1).must("session copies overflow");
         if rights.contains(Rights::RECEIVE) {
             channel::retain(channel(s), Rights::RECEIVE);
         }
@@ -156,7 +157,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
         (*p).copies = (*p)
             .copies
             .checked_sub(1)
-            .expect("a session's handle is released once too often");
+            .must("a session's handle is released once too often");
         if (*p).copies == 0 {
             // PEER_CLOSED: the session goes at once (spec 5.3).
             let _ = Source::post(source(s), CLIENT_GONE, cause);
@@ -224,7 +225,7 @@ pub unsafe fn clean(s: NonNull<Session>, level: u8) {
 }
 
 // The poison of a session that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Session, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Session, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{in_use, payer, priority};

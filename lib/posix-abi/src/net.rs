@@ -677,10 +677,15 @@ fn run<'a>(
             make(Some(key)).write(w)
         }
     };
+    // The key of the time stamps: the call number of the request. Without the
+    // feature the stamps are empty and the request bytes are not read here.
+    #[cfg(feature = "trace")]
     let call = start
         .as_bytes()
         .first_chunk::<4>()
         .map_or(0, |b| u32::from_le_bytes(*b));
+    #[cfg(not(feature = "trace"))]
+    let call = 0u32;
     crate::tracing::point(trace::P_C_SEND, call);
     let result = if restart {
         long::run_with(&service, start.as_bytes(), keyed, out, &refusal)

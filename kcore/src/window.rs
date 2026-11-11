@@ -3,8 +3,8 @@
 
 //! Device windows (spec 7.3, 9): the physical range device_window_create
 //! gives a memory object, rounded out to whole pages, and the check that
-//! it touches no page the kernel keeps for itself: RAM and every region of
-//! the GIC's node. A page shared with any of them is refused, so no window
+//! it touches no page the kernel keeps for itself: RAM, every region of
+//! the GIC's node and the ITS's registers. A page shared with any of them is refused, so no window
 //! reaches a register of the kernel's devices. The console's port is no
 //! such device: a window over its page takes the port from the kernel
 //! while it lives (spec 3.2, kcore::console::covers).
@@ -19,7 +19,7 @@ pub const OUTPUT_END: u64 = 1 << 48;
 /// What a window may not touch: the RAM regions of the device tree
 /// (MEMORY_REGIONS, at most) and the regions of the GIC's node
 /// (GIC_REGIONS, at most).
-pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS }>;
+pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS + 1 }>;
 
 /// The range of `len` bytes from `addr` rounded out to whole pages: its
 /// first page and its count of pages. INVALID_ARGS for a length of 0, a
@@ -43,7 +43,8 @@ pub fn round_out(addr: u64, len: u64) -> Result<(u64, u64), Error> {
 pub fn forbidden(info: &BootInfo) -> Forbidden {
     let mut list = Forbidden::new();
     let gic = info.gic.as_ref().map_or(&[][..], |g| g.regs.as_slice());
-    for &r in info.memory.as_slice().iter().chain(gic) {
+    let its = info.its.as_ref().map(|its| its.regs);
+    for &r in info.memory.as_slice().iter().chain(gic).chain(&its) {
         list.push(r).expect("room for the RAM and the GIC");
     }
     list
@@ -227,13 +228,21 @@ mod tests {
         );
     }
 
-    /// The ITS of QEMU's GICv3 is a child node of the GIC: init may give it
-    /// out as it gives any device (spec 9).
+    /// The ITS of QEMU's GICv3 is a child node of the GIC, and its registers
+    /// are the kernel's: the command queue of the machine (spec 9). The frame
+    /// next to it stays open.
     #[test]
-    fn window_over_a_gic_child_is_allowed() {
+    fn window_over_the_its_is_refused() {
+        for addr in [0x0808_0000, 0x0808_0040, 0x0809_0040, 0x0809_F000] {
+            assert_eq!(
+                window_on(VIRT_GICV3, addr, 0x1000),
+                Err(Error::InvalidArgs),
+                "{addr:#x}"
+            );
+        }
         assert_eq!(
-            window_on(VIRT_GICV3, 0x0808_0000, 0x2_0000),
-            Ok((0x0808_0000, 32))
+            window_on(VIRT_GICV3, 0x0807_F000, 0x1000),
+            Ok((0x0807_F000, 1))
         );
     }
 }

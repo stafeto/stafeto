@@ -98,7 +98,7 @@ pub struct State {
     /// come first).
     faulted: bool,
 }
-const _: () = assert!(core::mem::size_of::<State>() <= 80);
+const _: () = ::core::assert!(core::mem::size_of::<State>() <= 80);
 
 /// The values `thread_upcall_control` returns in x1 and up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +110,7 @@ impl Reply {
     /// The values `values` (at most five), the rest zero.
     #[inline(always)]
     pub const fn new<const N: usize>(values: [u64; N]) -> Self {
-        const { assert!(N <= 5) };
+        const { ::core::assert!(N <= 5) };
         let mut all = [0; 5];
         let mut i = 0;
         while i < N {

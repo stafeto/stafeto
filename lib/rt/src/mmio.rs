@@ -37,6 +37,32 @@ pub unsafe fn write8(addr: usize, value: u8) {
     };
 }
 
+/// Reads the 16-bit register at `addr`.
+///
+/// # Safety
+///
+/// As for `read8`.
+pub unsafe fn read16(addr: usize) -> u16 {
+    let value: u16;
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("ldrh {v:w}, [{a}]", a = in(reg) addr, v = out(reg) value, options(nostack, preserves_flags))
+    };
+    value
+}
+
+/// Writes the 16-bit register at `addr`.
+///
+/// # Safety
+///
+/// As for `read8`.
+pub unsafe fn write16(addr: usize, value: u16) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("strh {v:w}, [{a}]", a = in(reg) addr, v = in(reg) value, options(nostack, preserves_flags))
+    };
+}
+
 /// Reads the 32-bit register at `addr`.
 ///
 /// # Safety

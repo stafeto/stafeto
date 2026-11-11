@@ -47,6 +47,7 @@ use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::bootinfo::BootInfo;
 use kcore::frames::PhysMem;
+use kcore::must::Must;
 use kcore::pagelist::{self, FRAMES_PER_SECTION, ListMemory, PageList};
 use kcore::paging::Attrs;
 use kcore::quota::Account;
@@ -376,7 +377,7 @@ pub fn forbid(info: &BootInfo) {
 /// (spec 9): device_window_create checks its range against the objects
 /// the kernel keeps. O(16): kcore::window::Forbidden.
 pub fn check_window(base: u64, pages: u64) -> Result<(), Error> {
-    let forbidden = FORBIDDEN.get().expect("memory::forbid ran at boot");
+    let forbidden = FORBIDDEN.get().must("memory::forbid ran at boot");
     window::check(base, pages, forbidden.as_slice())
 }
 
@@ -653,7 +654,7 @@ pub fn is_whole(m: NonNull<Memory>) -> bool {
 }
 
 // The poison of an object that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Memory, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Memory, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{filled, in_use, payer};

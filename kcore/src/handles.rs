@@ -9,6 +9,7 @@
 //! The table goes a few entries at a time (`release_step`), a chunk in
 //! several steps, the directory last.
 
+use crate::must::Must;
 use abi::{Error, Handle, Rights};
 use core::ptr::NonNull;
 
@@ -19,7 +20,7 @@ pub const MAX_CHUNKS: usize = 256;
 pub const MAX_HANDLES: u32 = (CHUNK * MAX_CHUNKS) as u32;
 const NO_ENTRY: u32 = u32::MAX;
 
-const _: () = assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
+const _: () = ::core::assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
 
 struct Entry<T> {
     object: Option<T>,
@@ -31,6 +32,14 @@ struct Entry<T> {
 /// Storage for CHUNK entries.
 pub struct Chunk<T> {
     entries: [Entry<T>; CHUNK],
+}
+
+/// The panic of a table whose directory or chunk is missing for an entry
+/// that is in use.
+#[cold]
+#[inline(never)]
+fn no_chunk() -> ! {
+    crate::must::fail("a handle table has an initialised chunk for each entry in use")
 }
 
 /// Where the chunks of a table lie, in the order of their entries.
@@ -167,17 +176,29 @@ impl<T> HandleTable<T> {
 
     /// The directory's slot for chunk `c`.
     fn chunk_slot(&mut self, c: usize) -> &mut Option<NonNull<Chunk<T>>> {
-        let directory = self.directory.expect("a directory");
+        let directory = self.directory.must("a directory");
         // SAFETY: the directory is initialised and owned by the table, and
         // `&mut self` makes the access exclusive.
         unsafe { &mut (*directory.as_ptr()).chunks[c] }
     }
 
     fn chunk(&self, index: u32) -> NonNull<Chunk<T>> {
-        let directory = self.directory.expect("a directory");
-        // SAFETY: the directory is initialised and owned by the table.
-        let chunk = unsafe { (*directory.as_ptr()).chunks[index as usize / CHUNK] };
-        chunk.expect("an initialised chunk")
+        // One way out for a missing directory, a chunk past it and a chunk
+        // that was never made: this runs in every lookup of every call, and
+        // each way of its own would stand in all its inlined copies.
+        let found = self.directory.and_then(|directory| {
+            // SAFETY: the directory is initialised and owned by the table.
+            unsafe {
+                (*directory.as_ptr())
+                    .chunks
+                    .get(index as usize / CHUNK)
+                    .copied()
+            }
+        });
+        match found.flatten() {
+            Some(chunk) => chunk,
+            None => no_chunk(),
+        }
     }
 
     fn entry(&self, index: u32) -> &Entry<T> {
@@ -394,7 +415,7 @@ impl<T> HandleTable<T> {
             self.free_head = NO_ENTRY;
             // From the first part of a chunk on, no handle reaches it.
             self.used = self.used.min((c * CHUNK) as u32);
-            let chunk = (*self.chunk_slot(c)).expect("an initialised chunk");
+            let chunk = (*self.chunk_slot(c)).must("an initialised chunk");
             let from = self.released;
             let to = from + n.min(CHUNK - from);
             // SAFETY: the chunk's entries are initialised; each object is

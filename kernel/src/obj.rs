@@ -10,7 +10,9 @@
 //!
 //! The order of locks is this module's: `OBJ` first, then the ticket lock
 //! of a CPU's cleanup queue (`Local::queue_spin`), the only other lock CPUs
-//! share, which a section may take and whose holder takes nothing. What a
+//! share, which a section may take and whose holder takes nothing. A third,
+//! `ITS_LOCK` (arch/aarch64/its.rs), guards the ITS command queue: it is
+//! never taken inside a section, and its holder takes nothing. What a
 //! CPU alone owns (its scheduler, timers and log ring, `local`) has no
 //! lock, since nothing but that CPU reaches it, and a section under `OBJ`
 //! reaches it freely. The rules that keep it so:
@@ -66,7 +68,7 @@ static BY_KIND: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 /// The kinds: calls by number (below 40), then the entries other than a
 /// call, as `serving` names them.
 #[cfg(feature = "measure")]
-pub const KINDS: usize = 56;
+pub const KINDS: usize = 57;
 pub const ENTRY_INTERRUPT: u64 = 40;
 pub const ENTRY_CLEANUP: u64 = 41;
 pub const ENTRY_FAULT: u64 = 42;
@@ -86,6 +88,8 @@ pub const CLEAN_PROCESS: u64 = 53;
 pub const ENTRY_RECLAIM: u64 = 54;
 /// The service of the commands other CPUs posted (cmd::serve_batch).
 pub const ENTRY_DRAIN: u64 = 55;
+/// The cleanup of an MSI device (cleanup.rs).
+pub const CLEAN_MSI: u64 = 56;
 
 /// Names what the section being entered serves, for the longest hold's
 /// report: only the images that measure keep it. A section that is not
