@@ -28,6 +28,9 @@ el0-half = ["ktest"]
 # believes it (arch/aarch64/its.rs), so that a wait spans several segments.
 its-slow = []
 fault-probe = []
+# CPU 1 fails a check right after it is up: the report of the panic must carry
+# a backtrace of CPU 1's own stack (xtask smp-cpu-check).
+cpu1-check-probe = []
 overflow-probe = []
 # The kernel acts as if PSCI refused CPU_ON for the third CPU (xtask smp-cpu-on).
 cpu-on-refused = []

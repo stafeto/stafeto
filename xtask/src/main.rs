@@ -1392,6 +1392,8 @@ enum Variant {
     OverflowProbe,
     /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
     CpuOnRefused,
+    /// CPU 1 fails a check right after it is up (`smp_cpu_check`).
+    CpuCheckProbe,
     /// A window between the post of a command and its flush, and the end of
     /// a thread inside it (`smp_window`).
     WindowProbe,
@@ -1446,7 +1448,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 31] = [
+    const ALL: [Variant; 32] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1456,6 +1458,7 @@ impl Variant {
         Variant::FaultProbe,
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
+        Variant::CpuCheckProbe,
         Variant::WindowProbe,
         Variant::WindowNoBlockCheck,
         Variant::WindowBreakOneSection,
@@ -1495,6 +1498,7 @@ impl Variant {
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
+            Variant::CpuCheckProbe => Some("cpu1-check-probe"),
             Variant::WindowProbe => Some("window-probe"),
             Variant::WindowNoBlockCheck => Some("break-block-check"),
             Variant::WindowBreakOneSection => Some("break-one-section"),
@@ -1528,6 +1532,7 @@ impl Variant {
             | Variant::FaultProbe
             | Variant::OverflowProbe
             | Variant::CpuOnRefused
+            | Variant::CpuCheckProbe
             | Variant::WindowProbe
             | Variant::WindowNoBlockCheck
             | Variant::WindowBreakOneSection
@@ -1588,6 +1593,7 @@ impl Variant {
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
+            Variant::CpuCheckProbe => "stafeto-cpu-check",
             Variant::WindowProbe => "stafeto-window",
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
             Variant::WindowBreakOneSection => "stafeto-window-split",
@@ -1971,6 +1977,7 @@ fn main() {
         Some("smp-boot") => smp_boots(),
         Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
+        Some("smp-cpu-check") => smp_cpu_check(),
         Some("smp-window") => smp_window(),
         Some("smp-idle-bell") => smp_idle_bell(),
         Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
@@ -9190,6 +9197,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("init fault", init_fault_stops_the_machine),
         job("panic log", panic_prints_the_log_nobody_showed),
         job("fault report", fault_report),
+        job("smp 4 cpu check", smp_cpu_check),
         job("stack overflow", stack_overflow_report),
         job("test build symbols", test_build_carries_test_symbols),
         job("strict panic", strict_panic_only_in_checked_programs),
@@ -11180,6 +11188,32 @@ fn smp_cpu_on() -> Result<(), String> {
         return Err("the SGI probe did not run on three CPUs".into());
     }
     println!("smp boot with CPU_ON refused for one CPU: three CPUs, ok");
+    Ok(())
+}
+
+/// A check that fails on CPU 1 (a kernel built with `cpu1-check-probe`) must
+/// say so with the backtrace of CPU 1's own stack: the report of a check names
+/// no place of its own, so the frames are all the place there is.
+fn smp_cpu_check() -> Result<(), String> {
+    let a = build(Variant::CpuCheckProbe)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
+    qemu::expect_not_timed_out(&o)?;
+    qemu::expect_marker(&o, "KERNEL PANIC: probe: a check fails on CPU 1 (line ")?;
+    let frames = qemu::backtrace_addresses(&o.lines);
+    if frames.len() < 2 {
+        return Err(format!(
+            "the backtrace of CPU 1 has {} frames, wanted 2 or more: {:?}",
+            frames.len(),
+            o.lines
+        ));
+    }
+    println!(
+        "check failure on CPU 1: {} frames of its own stack, ok",
+        frames.len()
+    );
     Ok(())
 }
 

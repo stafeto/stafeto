@@ -22,22 +22,30 @@ pub fn fail(msg: &'static str) -> ! {
     ::core::panic!("{msg}")
 }
 
+/// The panic of a check that failed at line `line` of its file: the line is
+/// the one place the report names, besides the backtrace.
+#[cold]
+#[inline(never)]
+pub fn fail_at(msg: &'static str, line: u32) -> ! {
+    ::core::panic!("{msg} (line {line})")
+}
+
 /// The panic of `unreachable!`.
 #[cold]
 #[inline(never)]
-pub fn unreachable(msg: &'static str) -> ! {
-    ::core::panic!("internal error: entered unreachable code: {msg}")
+pub fn unreachable(msg: &'static str, line: u32) -> ! {
+    ::core::panic!("internal error: entered unreachable code: {msg} (line {line})")
 }
 
 macro_rules! assert {
     ($cond:expr $(,)?) => {
         if !$cond {
-            $crate::failure::fail(concat!("assertion failed: ", stringify!($cond)))
+            $crate::failure::fail_at(concat!("assertion failed: ", stringify!($cond)), line!())
         }
     };
     ($cond:expr, $msg:literal $(,)?) => {
         if !$cond {
-            $crate::failure::fail($msg)
+            $crate::failure::fail_at($msg, line!())
         }
     };
     ($($arg:tt)+) => {
@@ -47,7 +55,7 @@ macro_rules! assert {
 
 macro_rules! panic {
     ($msg:literal $(,)?) => {
-        $crate::failure::fail($msg)
+        $crate::failure::fail_at($msg, line!())
     };
     ($($arg:tt)*) => {
         ::core::panic!($($arg)*)
@@ -56,7 +64,7 @@ macro_rules! panic {
 
 macro_rules! unreachable {
     ($msg:literal $(,)?) => {
-        $crate::failure::unreachable($msg)
+        $crate::failure::unreachable($msg, line!())
     };
     ($($arg:tt)*) => {
         ::core::unreachable!($($arg)*)

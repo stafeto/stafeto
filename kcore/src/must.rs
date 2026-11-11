@@ -18,6 +18,13 @@ pub fn fail(msg: &'static str) -> ! {
     panic!("{msg}")
 }
 
+/// The panic of a check of the macros below, with the line of the check.
+#[cold]
+#[inline(never)]
+pub fn fail_at(msg: &'static str, line: u32) -> ! {
+    panic!("{msg} (line {line})")
+}
+
 /// The panic of a check that failed, through a cold function of its own
 /// that takes no argument: for a check inside code that is inlined into many
 /// places, where a call that names the message would stand in each of them.
@@ -41,12 +48,12 @@ macro_rules! fail_here {
 macro_rules! assert {
     ($cond:expr $(,)?) => {
         if !$cond {
-            $crate::must::fail(concat!("assertion failed: ", stringify!($cond)))
+            $crate::must::fail_at(concat!("assertion failed: ", stringify!($cond)), line!())
         }
     };
     ($cond:expr, $msg:literal $(,)?) => {
         if !$cond {
-            $crate::must::fail($msg)
+            $crate::must::fail_at($msg, line!())
         }
     };
     ($($arg:tt)+) => {
@@ -57,7 +64,7 @@ macro_rules! assert {
 #[cfg(not(test))]
 macro_rules! panic {
     ($msg:literal $(,)?) => {
-        $crate::must::fail($msg)
+        $crate::must::fail_at($msg, line!())
     };
     ($($arg:tt)*) => {
         ::core::panic!($($arg)*)

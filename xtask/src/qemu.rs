@@ -1085,7 +1085,7 @@ fn elr_in_panic(lines: &[String]) -> Option<u64> {
 }
 
 /// Addresses on backtrace frame lines (`kcore::backtrace`'s `  #N  0x...`).
-fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
+pub fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
     lines
         .iter()
         .filter(|l| l.trim_start().starts_with('#'))

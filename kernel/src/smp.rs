@@ -209,6 +209,11 @@ extern "C" fn secondary_main(block: &'static CpuBlock) -> ! {
     block.timer_ok.store(timer_ok as u32, Ordering::Relaxed);
     crate::sched::init_cpu();
     block.state.store(UP, Ordering::Release);
+    #[cfg(feature = "cpu1-check-probe")]
+    assert!(
+        cpu::this().index() != 1 || core::hint::black_box(false),
+        "probe: a check fails on CPU 1"
+    );
     // From here the CPU schedules the threads that are placed on it.
     crate::sched::resume()
 }

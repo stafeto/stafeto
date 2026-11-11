@@ -30,13 +30,6 @@ const PRIORITY: u8 = 63;
 // and the kernel maps them in its pages: the two must be one size.
 const _: () = ::core::assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
 
-/// Makes init from `program` and the boot image `image`, whole pages
-/// (boot::init_program), and leaves the kernel for it. Init's end ends
-/// the run (process::set_init). Its shell takes the page the kernel keeps
-/// outside every quota; its quota is every frame free after that
-/// (process::create_init), and everything else of it is charged to it as
-/// to any process, its memory objects too; it has no parent to give the
-/// quota back to.
 /// A step of the start of init that failed, one panic for the steps: the
 /// text of the step and the error.
 #[cfg(not(feature = "ktest"))]
@@ -44,6 +37,13 @@ fn failed(what: &str, error: abi::Error) -> ! {
     ::core::panic!("init: {what}: {error:?}")
 }
 
+/// Makes init from `program` and the boot image `image`, whole pages
+/// (boot::init_program), and leaves the kernel for it. Init's end ends
+/// the run (process::set_init). Its shell takes the page the kernel keeps
+/// outside every quota; its quota is every frame free after that
+/// (process::create_init), and everything else of it is charged to it as
+/// to any process, its memory objects too; it has no parent to give the
+/// quota back to.
 #[cfg(not(feature = "ktest"))]
 pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     use crate::thread;
