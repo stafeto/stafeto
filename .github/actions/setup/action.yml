@@ -33,11 +33,9 @@ runs:
         # A mirror that stops answering has to fail this step within minutes.
         # Left alone, apt retries until the time limit of the job and writes
         # gigabytes of warnings into the log.
-        apt_get() {
-          sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 "$@"
-        }
-        apt_get update
-        apt_get install -y --no-install-recommends \
+        bounded="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+        sudo timeout 300 apt-get $bounded update
+        sudo timeout 300 apt-get install $bounded -y --no-install-recommends \
           "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION" make python3 git curl \
           ca-certificates bzip2 xz-utils patch gawk ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison \
           nghttp2-client
