@@ -1520,6 +1520,9 @@ impl Guest {
     /// feature `profile`): `posix-net stat` makes the service print its
     /// records, which reach the console a moment later.
     fn profile(&mut self) -> Result<Vec<(String, u64)>, String> {
+        if self.sys == System::F1 {
+            return self.fs_profile();
+        }
         let last = parse_profile(&self.run.text()).map_or(0, |(id, _)| id);
         crate::net_tls::capture(&mut self.run, "posix-net stat", "profile", DIALOG_STEP)?;
         for _ in 0..20 {
@@ -1534,6 +1537,20 @@ impl Guest {
             crate::net_tls::capture(&mut self.run, "sleep 1", "profwait", DIALOG_STEP)?;
         }
         Err("the network service printed no whole profile".to_owned())
+    }
+
+    /// The counters of the file service alone (the image of F1): the console is read for two
+    /// seconds, by a command that makes no call of the file service, so that the last record
+    /// of a service that has been quiet shows.
+    fn fs_profile(&mut self) -> Result<Vec<(String, u64)>, String> {
+        crate::net_tls::capture(&mut self.run, "sleep 2", "fsprof", DIALOG_STEP)?;
+        // A service that made no call has printed nothing: its counters are zero.
+        Ok(parse_fs_profile(&self.run.text()).unwrap_or_else(|| {
+            ["fs_calls", "fs_reads", "fs_snaps"]
+                .iter()
+                .map(|n| ((*n).to_owned(), 0))
+                .collect()
+        }))
     }
 
     /// The readings before a run, in the order that keeps the reads of the
@@ -2263,6 +2280,9 @@ impl Bench {
         match sys {
             System::S4 => self.opts.image != ImageKind::Plain,
             System::F1s => self.opts.image == ImageKind::Profile,
+            // The image of F1 has no network service profile; its file service's counters
+            // are read.
+            System::F1 => true,
             _ => false,
         }
     }

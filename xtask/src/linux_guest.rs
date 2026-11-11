@@ -158,8 +158,12 @@ pub fn bench_fast_programs() -> &'static [ImageProgram] {
     LIST.get_or_init(|| {
         let mut programs = crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz).to_vec();
         for program in &mut programs {
-            if program.0 == "init" {
-                program.3 = &["table-bench-fast-vz"];
+            match program.0 {
+                "init" => program.3 = &["table-bench-fast-vz"],
+                // The calls of the file service per answer (a worker that reads from its own
+                // copy makes none, and the service prints nothing then).
+                "ramfs" => program.3 = &["profile"],
+                _ => {}
             }
         }
         programs
