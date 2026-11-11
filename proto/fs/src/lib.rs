@@ -156,6 +156,47 @@ pub const READ_INTO_MAX: usize = 12 * 1024;
 /// portion would pass it, the copy being most of the step.
 pub const READ_PORTION: usize = READ_INTO_MAX;
 
+/// The bit of `SnapshotReply::flags` that says the file of the description cannot change.
+pub const SNAPSHOT_IMMUTABLE: u32 = 1;
+
+/// The reply of SNAPSHOT_FD after its status: the flags, the length of the file and the key of
+/// its node. The key of a description that is not immutable is zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotReply {
+    pub flags: u32,
+    pub length: u64,
+    pub key: u64,
+}
+
+impl SnapshotReply {
+    pub fn immutable(self) -> bool {
+        self.flags & SNAPSHOT_IMMUTABLE != 0
+    }
+
+    /// The body of the reply, status first.
+    pub fn write(self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        w.u32(0)?;
+        w.u32(self.flags)?;
+        w.u64(self.length)?;
+        w.u64(self.key)
+    }
+
+    /// Reads the body after the status; an unknown flag bit or a key of a mutable file
+    /// is a malformed reply.
+    pub fn read(mut r: proto_wire::Reader<'_>) -> Result<Self, Status> {
+        let value = Self {
+            flags: r.u32()?,
+            length: r.u64()?,
+            key: r.u64()?,
+        };
+        r.finish()?;
+        if value.flags & !SNAPSHOT_IMMUTABLE != 0 || (!value.immutable() && value.key != 0) {
+            return Err(Status::BadSize);
+        }
+        Ok(value)
+    }
+}
+
 pub const READ_ONLY: u32 = 0;
 pub const WRITE_ONLY: u32 = 1;
 pub const READ_WRITE: u32 = 2;
@@ -487,6 +528,14 @@ pub enum Method {
     /// fd u32, offset u64, count u32, place u64 and one memory handle: READ_AT of at most
     /// `READ_PORTION` bytes into the object, the position of the description staying.
     ReadAtFdInto = 68,
+    /// fd u32. Whether the open description of an ordinary session is immutable: its file can
+    /// change through no description (only the files of the boot image and of package layers,
+    /// and the fixed motd, which every write and truncation refuses). Reply: status, flags u32
+    /// (`SNAPSHOT_IMMUTABLE`), length u64, key u64 (the place and generation of the node, equal
+    /// for the descriptions of one file and different after a layer takes the place again). A
+    /// client may keep a copy of the bytes of an immutable file for as long as it holds the
+    /// description. No handles; one step of the service, O(1) in the description.
+    SnapshotFd = 69,
 }
 
 impl Method {
@@ -560,6 +609,7 @@ impl Method {
             63 => Some(Self::IpcJobs),
             67 => Some(Self::ReadFdInto),
             68 => Some(Self::ReadAtFdInto),
+            69 => Some(Self::SnapshotFd),
             _ => None,
         }
     }
@@ -568,7 +618,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68, 69,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -646,6 +696,42 @@ mod tests {
         for number in 64..=66 {
             assert_eq!(Method::from_number(number), None);
         }
+    }
+
+    #[test]
+    fn snapshot_fd_is_listed_and_its_reply_round_trips() {
+        assert_eq!(Method::from_number(69), Some(Method::SnapshotFd));
+        assert!(METHODS.contains(&69));
+        let reply = SnapshotReply {
+            flags: SNAPSHOT_IMMUTABLE,
+            length: 1 << 40,
+            key: 0x0000_0003_0000_0007,
+        };
+        let mut w = proto_wire::Writer::new();
+        reply.write(&mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        assert_eq!(r.u32(), Ok(0));
+        assert_eq!(SnapshotReply::read(r), Ok(reply));
+        let bad = SnapshotReply {
+            flags: 2,
+            length: 0,
+            key: 0,
+        };
+        let mut w = proto_wire::Writer::new();
+        bad.write(&mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        let _ = r.u32();
+        assert!(SnapshotReply::read(r).is_err());
+        let loose = SnapshotReply {
+            flags: 0,
+            length: 3,
+            key: 9,
+        };
+        let mut w = proto_wire::Writer::new();
+        loose.write(&mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        let _ = r.u32();
+        assert!(SnapshotReply::read(r).is_err());
     }
 
     #[test]

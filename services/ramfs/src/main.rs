@@ -3163,6 +3163,23 @@ impl Service<0> for Fs {
                 }
             }
             Some(Method::ReadFdInto | Method::ReadAtFdInto) => self.read_portion(s, r),
+            Some(Method::SnapshotFd) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                match self.ram.snapshot(&s.data, fd) {
+                    Ok(reply) => {
+                        if reply.write(r.reply()).is_err() {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::Write) => {
                 if let Err(code) = self.authenticate(&mut s.data, r.label()) {
                     return status(code);
