@@ -994,25 +994,32 @@ fn round_once(
 /// The stack's clock tick and the longest sleep of the loop.
 const TICK_NS: u64 = 10_000_000;
 
-/// What woke the loop's sleeps (`wake_counts`): the sleeps, the wakes by a
-/// notification of the service, the wakes by the deadline (the stack's tick or
-/// the call's timeout, no notification), and the wakes by the deadline whose
-/// first look found events: a frame sat in the ring and nothing told the
-/// thread, the lost wake-up that the deadline only makes good.
+/// What ended the loop's sleeps (`wake_counts`), counted for the sleeps the
+/// thread really entered (a sleep given up at the look after the interrupts
+/// went on is no sleep): a notification of the service (a late one counts
+/// here as well: the counters rule out a lost wake-up and say nothing of a
+/// slow one), the deadline (the stack's tick or the call's timeout, no
+/// notification and no event), or an event of another descriptor.
 static SLEEPS: AtomicU64 = AtomicU64::new(0);
 static WOKEN_BY_BELL: AtomicU64 = AtomicU64::new(0);
 static WOKEN_BY_DEADLINE: AtomicU64 = AtomicU64::new(0);
-static DEADLINE_FOUND: AtomicU64 = AtomicU64::new(0);
+static WOKEN_BY_OTHER: AtomicU64 = AtomicU64::new(0);
 
-/// The four counters of the sleeps of the loop, in the order above.
+/// The counters of the sleeps of the loop: sleeps, wakes by a notification,
+/// wakes by the deadline, wakes by another descriptor.
 pub fn wake_counts() -> [u64; 4] {
     [
         SLEEPS.load(Ordering::Relaxed),
         WOKEN_BY_BELL.load(Ordering::Relaxed),
         WOKEN_BY_DEADLINE.load(Ordering::Relaxed),
-        DEADLINE_FOUND.load(Ordering::Relaxed),
+        WOKEN_BY_OTHER.load(Ordering::Relaxed),
     ]
 }
+
+/// The word that `fastnet::absorb` takes for "the sleep ended by its deadline":
+/// the stack looks at its ring at once (before the interrupts go off) and
+/// counts the frames that waited through the sleep.
+pub const DEADLINE_MARK: u32 = 0x8000_0000;
 
 /// The wake test of the loop's sleep: bits of the service's notifications
 /// wait in the bank, or the service let go.
@@ -1212,9 +1219,6 @@ fn fast_round(
 ) -> Result<usize, i32> {
     let block = crate::threads::own_block();
     let mut events = [Kevent::default(); 64];
-    // The last sleep ended by its deadline: the first look after it says
-    // whether a frame had been waiting.
-    let mut deadline_wake = false;
     loop {
         if posix_sync::receiver::lost() {
             fastnet::exit_if_lost();
@@ -1234,9 +1238,6 @@ fn fast_round(
         let keep = usize::from(due && out.len() > 1);
         let room = out.len() - keep;
         let (work, mut filled) = look(kq, &mut events, &mut out[..room])?;
-        if core::mem::take(&mut deadline_wake) && filled > 0 {
-            DEADLINE_FOUND.fetch_add(1, Ordering::Relaxed);
-        }
         if due && filled < out.len() {
             let at = wait::now();
             set_shared_at(id, at);
@@ -1278,7 +1279,6 @@ fn fast_round(
         // The interrupts on (a full barrier inside), then one more look: a
         // frame that came before the interrupts were on raised none.
         crate::tracing::point(trace::P_W_SLEEP, 0);
-        SLEEPS.fetch_add(1, Ordering::Relaxed);
         fastnet::notify(true);
         let looked = look(kq, &mut events, out);
         match looked {
@@ -1297,6 +1297,7 @@ fn fast_round(
         // the timer, and the notification of the device. The wake test is
         // asked before each receive; a notification that lands in between
         // ends the receive at once.
+        SLEEPS.fetch_add(1, Ordering::Relaxed);
         let tick = fastnet::next_tick_ns().min(TICK_NS);
         let wake_at = wait::now().saturating_add(tick);
         let sleep_until = until.map_or(wake_at, |deadline| deadline.min(wake_at));
@@ -1309,15 +1310,23 @@ fn fast_round(
             Some(fast_wake),
         );
         crate::tracing::point(trace::P_W_WAKE, 0);
-        fastnet::notify(false);
-        set_shared_at(id, wait::now());
         let bits = posix_sync::receiver::take_pending();
         if bits != 0 {
             WOKEN_BY_BELL.fetch_add(1, Ordering::Relaxed);
+        } else if let Ok(events) = &slept {
+            if *events == 0 {
+                WOKEN_BY_DEADLINE.fetch_add(1, Ordering::Relaxed);
+                // The ring is looked at before the interrupts go off: a
+                // frame there waited through the sleep.
+                fastnet::absorb(DEADLINE_MARK);
+            } else {
+                WOKEN_BY_OTHER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fastnet::notify(false);
+        set_shared_at(id, wait::now());
+        if bits != 0 {
             fastnet::absorb(bits);
-        } else if slept.is_ok() {
-            WOKEN_BY_DEADLINE.fetch_add(1, Ordering::Relaxed);
-            deadline_wake = true;
         }
         let filled = slept?;
         if filled > 0 {

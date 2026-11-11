@@ -110,7 +110,7 @@ pub unsafe extern "C" fn stafeto_fast_wait(timeout_ns: u64, bits: *mut u32) -> c
 
 /// The counters of the sleeps of the program's loop: `out[0]` sleeps, `out[1]`
 /// wakes by a notification of the service, `out[2]` wakes by the deadline,
-/// `out[3]` wakes by the deadline whose first look found events.
+/// `out[3]` wakes by an event of another descriptor.
 ///
 /// # Safety
 /// `out` is null or points to four writable `uint64_t`.

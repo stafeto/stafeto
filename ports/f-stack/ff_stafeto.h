@@ -69,6 +69,9 @@ struct ff_stafeto_device_stats {
     uint64_t tx_frames, tx_no_buffer, tx_full, tx_long, tx_bypass, tx_foreign, tx_waited;
     uint64_t rx_layer_ticks, rx_input_ticks, tx_send_ticks;
     uint64_t kicks, sleeps, sleeps_found_work, notifications;
+    /* Sleeps of the program's loop that ended by the deadline with a frame in the ring
+     * already when they ended (the frame waited through the sleep). */
+    uint64_t deadline_found;
     uint32_t free_low, free_now;
     uint64_t bell_rx_passes, bell_rx, bell_tx;
     /* TCP segments sent without their sum (TX_SUM), and frames received whose sum the

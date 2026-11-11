@@ -98,6 +98,7 @@ pub(crate) mod trace {
         P_N_WAKE_STACK,
         P_N_REQ_BEGIN,
         P_N_REQ_END,
+        P_N_IRQ1,
         P_N_STK_BEGIN,
         P_N_STK_END
     );
@@ -106,7 +107,7 @@ pub(crate) mod trace {
     #[inline(always)]
     pub fn frame(_: u8, _: &[u8], _: bool) {}
 }
-use crate::trace::{P_N_REQ_BEGIN, P_N_REQ_END, P_N_STK_BEGIN, P_N_STK_END};
+use crate::trace::{P_N_IRQ1, P_N_REQ_BEGIN, P_N_REQ_END, P_N_STK_BEGIN, P_N_STK_END};
 use netd::resolv::{Text, Written};
 use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
@@ -1490,14 +1491,17 @@ impl Driver<'_> {
     }
 
     /// Frames of the stack wait for the switch's doorbell and a call of a
-    /// program stands queued behind this event: the bell waits for it (`ring::Hold`), so that the frames of
-    /// the answers of calls that queue up behind one another go out with one
-    /// bell. A step goes ahead of the calls behind it, so without this each
-    /// call's frame rings a bell of its own.
+    /// program stands queued behind this event: the bell waits for it
+    /// (`ring::Hold`), so that the frames of the answers of calls that queue up
+    /// behind one another go out with one bell. A step goes ahead of the calls
+    /// behind it, so without this each call's frame rings a bell of its own.
+    /// A step told to the service itself holds nothing.
     fn bell_waits(&mut self) -> bool {
+        let own = self.told & STEP_BITS != 0;
         let notify = &self.notify;
         let verdict = self.bell.decide(
             switch::INNER.tx_sub.len(),
+            own,
             || sys::channel_info(notify).is_ok_and(|info| info.queued > 0),
             now_ns(),
         );
@@ -1900,6 +1904,7 @@ impl Service<0> for Driver<'_> {
             // is, and the step reads that device's status alone.
             Source::Interrupt if n.label == proto_init::binding_label(1) => {
                 profile::count(Counter::Irq);
+                trace::point(P_N_IRQ1, 0);
                 self.rx1_step(true);
             }
             // The first line's interrupts come to the switch thread.

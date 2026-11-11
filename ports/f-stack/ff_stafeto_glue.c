@@ -87,6 +87,16 @@ flags_of(int linux_flags)
 static int stats_on;
 static uint64_t stats_said;
 
+/*
+ * With STAFETO_FAST_WAKES in the environment the process says every 100 ticks
+ * (1 s) one line of the totals of its sleeps by what ended them (`fast:
+ * wakes`, in the layer's order and the stack's count of the sleeps that ended
+ * by the deadline with a frame waiting). It prints nothing else: the probe
+ * reads two lines and subtracts them.
+ */
+static int wakes_on;
+static uint64_t wakes_said;
+
 /* A number of the stack's sysctl tree (4 or 8 bytes), -1 when it has none. */
 static long long
 sysctl_number(const char *name)
@@ -226,18 +236,13 @@ static void
 glue_stats(void)
 {
     struct ff_stafeto_device_stats st;
-    uint64_t dropped, ticks, passes, wakes[4];
+    uint64_t dropped, ticks, passes;
 
     ff_stafeto_counters(&dropped, &ticks, &passes);
     if (ticks < stats_said + 500)
         return;
     stats_said = ticks;
     ff_stafeto_device_stats(&st);
-    stafeto_fast_wake_counts(wakes);
-    fprintf(stderr,
-        "fast: wakes sleeps=%llu bell=%llu deadline=%llu deadline_found=%llu\n",
-        (unsigned long long)wakes[0], (unsigned long long)wakes[1],
-        (unsigned long long)wakes[2], (unsigned long long)wakes[3]);
     fprintf(stderr,
         "fast: stats ticks=%llu notifications=%llu kicks=%llu sleeps=%llu found_work=%llu passes=%llu rx=%llu tx=%llu bell_rx_passes=%llu bell_rx=%llu bell_tx=%llu sum_tx=%llu sum_rx=%llu\n",
         (unsigned long long)ticks, (unsigned long long)st.notifications,
@@ -249,6 +254,25 @@ glue_stats(void)
         (unsigned long long)st.rx_sum_ok);
     glue_scale();
     fflush(stderr);
+}
+
+static void
+glue_wakes(void)
+{
+    struct ff_stafeto_device_stats st;
+    uint64_t dropped, ticks, passes, wakes[4];
+
+    ff_stafeto_counters(&dropped, &ticks, &passes);
+    if (ticks < wakes_said + 100)
+        return;
+    wakes_said = ticks;
+    ff_stafeto_device_stats(&st);
+    stafeto_fast_wake_counts(wakes);
+    fprintf(stderr,
+        "fast: wakes sleeps=%llu bell=%llu deadline=%llu other=%llu deadline_found=%llu\n",
+        (unsigned long long)wakes[0], (unsigned long long)wakes[1],
+        (unsigned long long)wakes[2], (unsigned long long)wakes[3],
+        (unsigned long long)st.deadline_found);
 }
 
 static int
@@ -271,6 +295,7 @@ glue_start(const struct stafeto_fast_claim *claim)
     fflush(stderr);
     glue_limits();
     stats_on = getenv("STAFETO_FAST_STATS") != NULL;
+    wakes_on = getenv("STAFETO_FAST_WAKES") != NULL;
     if (getenv("STAFETO_FAST_EXIT_IN_PASS") != NULL)
         exit_in_pass = atol(getenv("STAFETO_FAST_EXIT_IN_PASS"));
     return 0;
@@ -295,6 +320,8 @@ glue_pass(void)
         exit(1);
     if (stats_on)
         glue_stats();
+    if (wakes_on)
+        glue_wakes();
     return work;
 }
 
