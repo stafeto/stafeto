@@ -253,11 +253,21 @@ ff_stafeto_device_lost(void)
     return dev_lost;
 }
 
+/* The word the program's loop gives ff_stafeto_absorb when its sleep ended by the
+ * deadline (no notification, no event): the ring is looked at now, before the
+ * interrupts go off, and a frame in it waited through the sleep. */
+#define FF_STAFETO_DEADLINE_MARK 0x80000000u
+
 void
 ff_stafeto_absorb(uint32_t bits)
 {
     if (bits == 0)
         return;
+    if (bits == FF_STAFETO_DEADLINE_MARK) {
+        if (port_on ? vnet_port_rx_pending() : vnet_rx_pending())
+            stats.deadline_found++;
+        return;
+    }
     __atomic_fetch_or(&notified, bits, __ATOMIC_RELAXED);
     stats.notifications++;
 }

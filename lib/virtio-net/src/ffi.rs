@@ -493,6 +493,12 @@ pub extern "C" fn vnet_notify(on: c_int) {
     }
 }
 
+/// 1 when the queue of receiving holds a frame now (a look, nothing taken).
+#[unsafe(no_mangle)]
+pub extern "C" fn vnet_rx_pending() -> c_int {
+    state().map_or(0, |s| c_int::from(s.rx.can_pop()))
+}
+
 /// 1 when the device was reset under the program (its status lacks
 /// DRIVER_OK): the network service ended and init stopped the device.
 #[unsafe(no_mangle)]
