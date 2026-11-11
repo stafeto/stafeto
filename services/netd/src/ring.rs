@@ -1078,7 +1078,10 @@ mod tests {
     fn a_step_told_to_itself_does_not_hold_the_bell() {
         let mut hold = Hold::new();
         let v = hold.decide(1, true, || false, 0);
-        assert!(!v.held, "steps told, no call queued: the bell rings at once");
+        assert!(
+            !v.held,
+            "steps told, no call queued: the bell rings at once"
+        );
         assert_eq!(v.arm, None);
         assert!(!hold.on());
         // A call queued holds it, with or without a told step; a timer is set

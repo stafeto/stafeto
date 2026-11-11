@@ -1324,7 +1324,10 @@ const WAKES_MIN: u64 = 30;
 const WAKES_ALLOWED: u64 = 2;
 pub fn check_wakes(w: &Wakes) -> Result<(), String> {
     if w.sleeps < WAKES_MIN {
-        return Err(format!("the worker slept {} times, wanted {WAKES_MIN}", w.sleeps));
+        return Err(format!(
+            "the worker slept {} times, wanted {WAKES_MIN}",
+            w.sleeps
+        ));
     }
     let with_frames = w.bell + w.deadline_found;
     if w.deadline_found > WAKES_ALLOWED && w.deadline_found * 4 > with_frames {
@@ -1575,7 +1578,10 @@ mod tests {
         let b = parse_wakes("fast: wakes sleeps=560 bell=538 deadline=17 other=5 deadline_found=9")
             .unwrap();
         let d = b.since(&a);
-        assert_eq!((d.sleeps, d.bell, d.deadline, d.deadline_found), (60, 58, 2, 0));
+        assert_eq!(
+            (d.sleeps, d.bell, d.deadline, d.deadline_found),
+            (60, 58, 2, 0)
+        );
         assert!(check_wakes(&d).is_ok());
     }
 
