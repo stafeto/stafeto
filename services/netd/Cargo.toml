@@ -52,6 +52,10 @@ limit-1280 = []
 # once a second, for the measurement of where the time of a request goes.
 profile = ["split"]
 steps = ["rt/step-stats"]
+# `trace`: the ring of time stamps along the packet path (lib/trace), dumped to
+# the console with the profile's totals, for the measurement of where the time of a
+# request goes. Off in every normal and ci image.
+trace = ["dep:trace", "trace/bss"]
 
 [dependencies]
 abi = { path = "../../lib/abi" }
@@ -63,6 +67,7 @@ virtio-mmio = { path = "../../lib/virtio-mmio" }
 # The driver of the two devices: frames, books, rings, DMA, transports.
 virtio-net = { path = "../../lib/virtio-net" }
 virtio-pci = { path = "../../lib/virtio-pci" }
+trace = { path = "../../lib/trace", optional = true }
 
 # The numbers of the neighbours on VZ's bus that the BARs of `pci` go past.
 [dev-dependencies]

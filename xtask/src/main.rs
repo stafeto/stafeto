@@ -84,6 +84,7 @@ mod net_bench;
 mod net_curl;
 mod net_probe;
 mod net_tls;
+mod net_trace;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
@@ -1917,6 +1918,11 @@ commands:
             rounds that alternate the systems, the floor of the Mac, the CPUs
             of the guest; one file per step in target/net-bench/<time>/,
             `--resume DIR` repeats nothing done; see docs/net-bench.md
+  net-trace run [net-bench run options] | show [--worst N] FILE|DIR...
+            where the time of a request goes: `run` is `net-bench run --trace` (needs
+            STAFETO_TRACE=1 for the build of the images with the time stamps along the packet
+            path, lib/trace) and the table of each path's segments (median, p90, p99, share
+            of the round trip) from the console logs; `show` reads logs already taken
   linux-guest build|run|check  the Linux guest of the measurement of the
             network (stage P7; Alpine 3.24 packages pinned in
             tools/linux-guest/alpine.lock, built on this Mac and never
@@ -2225,6 +2231,7 @@ fn main() {
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
         Some("net-bench") => net_bench::command(&args[1..]),
+        Some("net-trace") => net_trace::command(&args[1..]),
         Some("linux-guest") => linux_guest::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
@@ -12314,6 +12321,19 @@ fn ci_lints() -> Result<(), String> {
         "pkgd",
         "--package",
         "netd",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]));
+    // The code of the shared library's layer (the feature `shared`) is not in the list above.
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "posix-crt",
+        "--features",
+        "shared",
         "--lib",
         "--tests",
         "--",

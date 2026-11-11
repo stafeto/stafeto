@@ -532,9 +532,9 @@ fn loaded_main() -> u64 {
                     2 * proto_loader::AUXV_PAIRS,
                 )
             };
-            for pair in auxv.chunks_exact_mut(2) {
-                if pair[0] == proto_loader::auxv::AT_SECURE as usize {
-                    pair[1] = 1;
+            for [key, value] in auxv.as_chunks_mut::<2>().0 {
+                if *key == proto_loader::auxv::AT_SECURE as usize {
+                    *value = 1;
                 }
             }
         }

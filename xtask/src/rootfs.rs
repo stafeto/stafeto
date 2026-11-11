@@ -1846,10 +1846,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-net-bench.img"
         | "boot-net-bench-profile.img"
         | "boot-net-bench-pinned.img"
-        | "boot-net-bench-cpu0.img" => net_bench_files(name),
+        | "boot-net-bench-cpu0.img"
+        | "boot-net-bench-trace.img" => net_bench_files(name),
         // The row F1: the files of S4's image and the static address of the
         // second device, the one the stack owns.
-        "boot-net-bench-fast.img" => {
+        "boot-net-bench-fast.img" | "boot-net-bench-trace-fast.img" => {
             let mut files = net_bench_files(name);
             files.push(of(
                 "/etc/netd.conf",
@@ -1872,7 +1873,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The row F1s: the files of S4's image, with the package's settings (the worker
         // runs as nobody) and the switch's `netd.conf`; the stack shares the first
         // device's address.
-        "boot-net-bench-switch.img" | "boot-net-bench-switch-profile.img" => {
+        "boot-net-bench-switch.img"
+        | "boot-net-bench-switch-profile.img"
+        | "boot-net-bench-trace-switch.img" => {
             let mut files = net_bench_files(name);
             for (path, label, bytes) in [
                 (
@@ -2751,7 +2754,11 @@ mod tests {
                 "boot-fast-switch-steps.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchSteps)
                 }
-                "boot-net-bench-switch.img" => crate::linux_guest::bench_switch_programs(),
+                "boot-net-bench-switch.img" | "boot-net-bench-trace-switch.img" => {
+                    crate::linux_guest::bench_switch_programs()
+                }
+                "boot-net-bench-trace.img" => crate::linux_guest::bench_programs(),
+                "boot-net-bench-trace-fast.img" => crate::linux_guest::bench_fast_programs(),
                 "boot-net-bench-switch-profile.img" => {
                     crate::linux_guest::bench_switch_profile_programs()
                 }

@@ -55,6 +55,9 @@ WORK = ROOT / "target" / "f-stack"
 SOURCE = WORK / "source"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
 PORT = ROOT / "ports" / "f-stack"
+# The build of the measurement of the packet path (STAFETO_TRACE=1): the host layer
+# with the time stamps (ports/f-stack/ff_stafeto_if.c), for `cargo xtask net-trace`.
+TRACE = bool(os.environ.get("STAFETO_TRACE"))
 FAST_INCLUDE = ROOT / "lib" / "posix-crt" / "include"
 VNET_INCLUDE = ROOT / "lib" / "virtio-net" / "include"
 PATCH = PORT / "stafeto.patch"
@@ -141,7 +144,8 @@ def stamp_text() -> str:
                           for name in (*OWN, "stafeto.patch", "fstack.ini")))
     own.update(b"".join(source.read_bytes() for source in PROBE_SOURCES))
     own.update(GLUE_SOURCE.read_bytes() + LAYER_SOURCE.read_bytes())
-    return f"{VERSION} {SHA256} {script} {own.hexdigest()} relibc {relibc_commit()}\n"
+    return (f"{VERSION} {SHA256} {script} {own.hexdigest()} relibc {relibc_commit()}"
+            f"{' trace' if TRACE else ''}\n")
 
 
 def patched_files() -> list[str]:
@@ -207,6 +211,8 @@ def build(log: Path, jobs: int) -> None:
     # (<stafeto/fast.h>) and the library of its driver (vnet.h).
     host = " ".join(("-O2", "-nostdinc", f"-isystem {RELIBC / 'include'}",
                      f"-isystem {FAST_INCLUDE}", f"-isystem {VNET_INCLUDE}", "-Wno-error"))
+    if TRACE:
+        host += " -DSTAFETO_TRACE"
     variables = [f"{option}=" for option in OPTIONS_OFF]
     variables += [
         "HOST_OS=stafeto", "TGT_OS=stafeto", "MACHINE_CPUARCH=arm64", "COMPILER_TYPE=clang",

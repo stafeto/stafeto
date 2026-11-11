@@ -829,6 +829,21 @@ pub fn pwait(
     timeout: Option<u64>,
     mask: Option<u64>,
 ) -> Result<usize, i32> {
+    crate::tracing::point(trace::P_C_EPOLL, 0);
+    let result = pwait_inner(epfd, out, timeout, mask);
+    crate::tracing::point(
+        trace::P_C_EPOLL_RET,
+        result.as_ref().map_or(u32::MAX, |n| *n as u32),
+    );
+    result
+}
+
+fn pwait_inner(
+    epfd: i32,
+    out: &mut [EpollEvent],
+    timeout: Option<u64>,
+    mask: Option<u64>,
+) -> Result<usize, i32> {
     if out.is_empty() {
         return Err(EINVAL);
     }
@@ -1236,11 +1251,13 @@ fn fast_round(
         }
         // The interrupts on (a full barrier inside), then one more look: a
         // frame that came before the interrupts were on raised none.
+        crate::tracing::point(trace::P_W_SLEEP, 0);
         fastnet::notify(true);
         let looked = look(kq, &mut events, out);
         match looked {
             Ok((work, filled)) if work == 0 && filled == 0 && !posix_sync::receiver::waiting() => {}
             other => {
+                crate::tracing::point(trace::P_W_FOUND, 0);
                 fastnet::notify(false);
                 let (_, filled) = other?;
                 if filled > 0 {
@@ -1264,6 +1281,7 @@ fn fast_round(
             consumed,
             Some(fast_wake),
         );
+        crate::tracing::point(trace::P_W_WAKE, 0);
         fastnet::notify(false);
         set_shared_at(id, wait::now());
         let bits = posix_sync::receiver::take_pending();
