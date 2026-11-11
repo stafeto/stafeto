@@ -1239,37 +1239,51 @@ fn attack(
     } else {
         write_targets(&targets, base, &wl.paths())?;
     }
-    let mut go =
-        |name: &str, seconds: u32, out: &Path| -> Result<(Option<String>, usize), String> {
-            let args = if wl.tls() {
-                h2load_args(&targets, rate, seconds, keep_alive, out)
-            } else {
-                vegeta_args(&targets, rate, seconds, keep_alive, out)
-            };
-            match guest.as_deref_mut() {
-                Some(run) => {
-                    let mut server = Server::Guest(run);
-                    let mark = server.mark()?;
-                    let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
-                    let log = server.log_since(mark)?;
-                    let mut found = alerts(&log);
-                    found.extend(seen);
-                    Ok((found.first().cloned(), malloc_failures(&log)))
-                }
-                None => {
-                    run_tool(raw, name, program, &args)?;
-                    Ok((None, 0))
-                }
-            }
+    let mut go = |name: &str,
+                  seconds: u32,
+                  out: &Path,
+                  last: bool|
+     -> Result<(Option<String>, usize), String> {
+        let args = if wl.tls() {
+            h2load_args(&targets, rate, seconds, keep_alive, out)
+        } else {
+            vegeta_args(&targets, rate, seconds, keep_alive, out)
         };
+        match guest.as_deref_mut() {
+            Some(run) => {
+                let mut server = Server::Guest(run);
+                let mark = server.mark()?;
+                let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
+                if last
+                    && FREEZE_AFTER_LOAD.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Server::Guest(run) = &mut server
+                {
+                    crate::net_tls::capture(
+                        run,
+                        "posix-net stat",
+                        "trace-f",
+                        Duration::from_secs(300),
+                    )?;
+                }
+                let log = server.log_since(mark)?;
+                let mut found = alerts(&log);
+                found.extend(seen);
+                Ok((found.first().cloned(), malloc_failures(&log)))
+            }
+            None => {
+                run_tool(raw, name, program, &args)?;
+                Ok((None, 0))
+            }
+        }
+    };
     if warm > 0 {
         let out = raw.join(format!("{tag}-warm.{extension}"));
-        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out)?;
+        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out, false)?;
         let _ = std::fs::remove_file(&out);
         stop_on(&format!("{key} (warm-up)"), &Vec::from_iter(alert))?;
     }
     let results = raw.join(format!("{tag}.{extension}"));
-    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results)?;
+    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results, true)?;
     let samples = if wl.tls() {
         parse_h2load_log(
             &std::fs::read_to_string(&results)
@@ -1293,6 +1307,12 @@ fn attack(
     let _ = Command::new("gzip").arg("-f").arg(&results).status();
     Ok(m)
 }
+
+/// Whether the guest of a step of the time stamps is told to stop its rings the moment the load
+/// ends (`posix-net stat`, whose first part freezes the rings of the service and of the kernel),
+/// so that the idle CPUs do not write over what the load made while the host is busy with the
+/// results. Set by `stage` for a stafeto guest of `--trace`.
+static FREEZE_AFTER_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Homebrew's nginx on the loopback with stafeto's settings and the files
 /// of both guests: the floor of the Mac.
@@ -2379,7 +2399,8 @@ impl Bench {
             } else {
                 None
             };
-            let mut m = attack(
+            FREEZE_AFTER_LOAD.store(trace && !sys.linux(), std::sync::atomic::Ordering::Relaxed);
+            let attacked = attack(
                 &raw,
                 Some(&mut g.run),
                 key,
@@ -2389,7 +2410,9 @@ impl Bench {
                 secs,
                 warm,
                 wl.keep_alive(),
-            )?;
+            );
+            FREEZE_AFTER_LOAD.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut m = attacked?;
             if let Some(before) = before {
                 m.cpu = Some(g.close_window(&before, m.ok)?);
             }

@@ -771,7 +771,7 @@ fn split(kernel: &[Kev], from: u64, to: u64, start: u8) -> Split {
                         && k.t >= sent.t
                         && k.t <= got.t
                 });
-                run_after(got.t).map(|run| {
+                run_after(got.t).inspect(|&run| {
                     s.post += sent.t - r.t;
                     match out.filter(|_| !cfg!(feature = "break-stamps-split")) {
                         Some(out) => {
@@ -782,13 +782,11 @@ fn split(kernel: &[Kev], from: u64, to: u64, start: u8) -> Split {
                     }
                     s.queue += run - got.t;
                     s.sgis += 1;
-                    run
                 })
             }
             // On the CPU of its own, or on a polling CPU that took the bell alone.
-            _ => run_after(r.t).map(|run| {
+            _ => run_after(r.t).inspect(|&run| {
                 s.queue += run - r.t;
-                run
             }),
         };
         let Some(run) = arrived else { break };
