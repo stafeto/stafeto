@@ -221,12 +221,18 @@ const AT: DeviceFunction = DeviceFunction {
 /// word without the type bits, and the high word for a 64-bit memory BAR
 /// (PCI Local Bus 3.0, 6.2.5.1).
 pub fn bar0_address<C: ConfigurationAccess>(access: &C) -> u64 {
-    let low = access.read_word(AT, BAR0_WORD as u8 * 4);
+    bar_address(access, 0)
+}
+
+/// The address BAR `index` of `access` holds, as `bar0_address` reads BAR 0.
+pub fn bar_address<C: ConfigurationAccess>(access: &C, index: u8) -> u64 {
+    let register = (BAR0_WORD as u8 + index) * 4;
+    let low = access.read_word(AT, register);
     if low & 1 != 0 {
         return u64::from(low & !0b11);
     }
     let high = if low & 0b110 == 0b100 {
-        access.read_word(AT, (BAR0_WORD as u8 + 1) * 4)
+        access.read_word(AT, register + 4)
     } else {
         0
     };
@@ -245,7 +251,17 @@ pub fn pci_transport<const D: usize, C: ConfigurationAccess>(
     access: C,
     bar: Region,
 ) -> Result<(PciTransport, u32), Failure> {
-    if bar0_address(&access) != bar.pa {
+    pci_transport_in::<D, C>(access, 0, bar)
+}
+
+/// `pci_transport` for a function whose Virtio structures lie in BAR
+/// `index`: QEMU's modern devices keep them in BAR 4.
+pub fn pci_transport_in<const D: usize, C: ConfigurationAccess>(
+    access: C,
+    index: u8,
+    bar: Region,
+) -> Result<(PciTransport, u32), Failure> {
+    if bar_address(&access, index) != bar.pa {
         return Err(Failure::BarElsewhere);
     }
     if !host::attach_bar(D, bar) {
@@ -398,5 +414,15 @@ mod tests {
         assert_eq!(bar0_address(&Snapshot::new(words, [0; 6])), 0x5003_0000);
         words[4] = 0xc001;
         assert_eq!(bar0_address(&Snapshot::new(words, [0; 6])), 0xc000);
+        // QEMU's modern device: the 32-bit BAR 1 of MSI-X and the 64-bit
+        // BAR 4 of the structures, each read by its index.
+        let mut words = [0u32; 64];
+        words[5] = 0x1001_4000;
+        words[8] = 0x1001_000c;
+        words[9] = 1;
+        let qemu = Snapshot::new(words, [0; 6]);
+        assert_eq!(bar_address(&qemu, 1), 0x1001_4000);
+        assert_eq!(bar_address(&qemu, 4), 0x1_1001_0000);
+        assert_eq!(bar0_address(&qemu), 0);
     }
 }

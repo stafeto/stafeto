@@ -63,7 +63,7 @@ impl Account {
         self.used = self
             .used
             .checked_sub(bytes)
-            .expect("a refund of more than the quota holds");
+            .unwrap_or_else(|| crate::fail_here!("a refund of more than the quota holds"));
     }
 
     /// The first part back to the parent: everything not charged now. The
@@ -83,7 +83,7 @@ impl Account {
     /// The rest back to the parent, when the last charge was refunded: the
     /// two parts add up to the limit.
     pub fn return_rest(&mut self) -> u64 {
-        assert!(
+        ::core::assert!(
             self.used == 0,
             "the rest of a quota goes back while {} bytes are charged",
             self.used
@@ -115,7 +115,7 @@ impl Share {
 
     /// A share of `limit`, at most `MAX`, with nothing charged.
     pub const fn new(limit: u32) -> Share {
-        assert!(limit <= Self::MAX, "a share above what 16 bits hold");
+        ::core::assert!(limit <= Self::MAX, "a share above what 16 bits hold");
         Share {
             limit: limit as u16,
             used: 0,
@@ -155,7 +155,8 @@ impl Share {
     pub fn refund(&mut self, n: u32) {
         self.used = u32::from(self.used)
             .checked_sub(n)
-            .expect("a refund of more than the share holds") as u16;
+            .unwrap_or_else(|| crate::fail_here!("a refund of more than the share holds"))
+            as u16;
     }
 
     /// The first part back to the creator, as `Account::return_free`.
@@ -172,7 +173,7 @@ impl Share {
     /// The rest back to the creator, as `Account::return_rest`: stops
     /// while a number or a place is still charged.
     pub fn return_rest(&mut self) -> u32 {
-        assert!(
+        ::core::assert!(
             self.used == 0,
             "the rest of a share goes back while {} are charged",
             self.used

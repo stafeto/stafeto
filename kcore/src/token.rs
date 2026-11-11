@@ -84,7 +84,7 @@ unsafe impl<T: Send, const N: usize> Send for Table<T, N> {}
 impl<T, const N: usize> Table<T, N> {
     /// A table with every number free and every count at 0.
     pub const fn new() -> Self {
-        const { assert!(N <= 1 << INDEX_BITS, "a number takes 16 bits") };
+        const { ::core::assert!(N <= 1 << INDEX_BITS, "a number takes 16 bits") };
         Table {
             entries: [const {
                 Entry {

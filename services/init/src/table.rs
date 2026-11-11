@@ -163,13 +163,50 @@ pub struct Window {
 }
 
 /// An interrupt binding init makes for a service through its registered
-/// channel and gives it in the reply to its REGISTER, under `name`.
+/// channel and gives it in the reply to its REGISTER, under `name`. `line`
+/// is a shared line, or an event of the MSI device of a PCI function
+/// (`Binding::msi`): init makes that device once a record (msi_create on
+/// the function's RID, as many events as the record binds) and binds the
+/// event, whose LPI is edge-triggered and has no mask in the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Binding {
     pub name: &'static str,
     pub line: u32,
     /// Edge-triggered; level-triggered otherwise.
     pub edge: bool,
+}
+
+/// The mark of a `line` that names an MSI event: the RID of the function
+/// in bits 23:8 and the event in bits 7:0.
+pub const MSI_EVENT: u32 = 1 << 31;
+
+impl Binding {
+    /// The binding `name` of event `event` of the function `rid`.
+    pub const fn msi(name: &'static str, rid: u32, event: u32) -> Binding {
+        assert!(rid <= 0xFFFF && event < abi::MAX_MSI_EVENTS as u32);
+        Binding {
+            name,
+            line: MSI_EVENT | rid << 8 | event,
+            edge: false,
+        }
+    }
+
+    /// The function's RID and the event, for a binding of an MSI event.
+    /// Bits 30:24 are clear and the event below abi::MAX_MSI_EVENTS.
+    pub const fn event(&self) -> Option<(u32, u32)> {
+        let event = self.line & 0xFF;
+        if self.line & 0xFF00_0000 != MSI_EVENT || event as u64 >= abi::MAX_MSI_EVENTS {
+            return None;
+        }
+        Some(((self.line >> 8) & 0xFFFF, event))
+    }
+}
+
+/// The events of the MSI device of function `rid` that `r` binds: the
+/// count msi_create takes.
+pub fn msi_events(r: &Record, rid: u32) -> u32 {
+    let of_rid = |b: &&Binding| b.event().is_some_and(|(at, _)| at == rid);
+    r.bindings.iter().filter(of_rid).count() as u32
 }
 
 /// A contiguous DMA object init makes for each instance of a driver (spec
@@ -841,6 +878,8 @@ pub fn line_thread(r: &Record) -> bool {
 pub enum Through {
     /// The second channel the service brought, at the record's ceiling.
     Bound,
+    /// A session of the second channel with this label, at the ceiling.
+    BoundLabelled(u64),
     /// A session of the registered channel with this label.
     Labelled(u64),
     /// The registered channel itself.
@@ -851,6 +890,11 @@ pub enum Through {
 /// channel): the first line of a record that declares a thread for it goes
 /// through that channel, the others as `binding_label` says.
 pub fn binding_route(r: &Record, i: usize, bound: bool) -> Through {
+    // Every event of an MSI device goes to that thread, each with the label
+    // of its binding, so that the thread tells its vectors apart.
+    if bound && line_thread(r) && r.bindings.get(i).is_some_and(|b| b.event().is_some()) {
+        return Through::BoundLabelled(proto_init::binding_label(i));
+    }
     if bound && i == 0 && line_thread(r) {
         return Through::Bound;
     }
@@ -913,7 +957,7 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
         }
     }
     for b in r.bindings {
-        if !SHARED_LINES.contains(&b.line) {
+        if !SHARED_LINES.contains(&b.line) && b.event().is_none() {
             return Err(TableError::Line {
                 record,
                 line: b.line,
@@ -2273,6 +2317,41 @@ mod tests {
             Through::Labelled(proto_init::BINDING_LABEL | 1)
         );
         assert_eq!(binding_route(&net::NETD, 1, true), Through::Plain);
+        // An event of an MSI device reads back from its line; a line, or
+        // a word with other high bits, names none.
+        let rx = Binding::msi("irq", 0x10, 0);
+        assert_eq!(rx.event(), Some((0x10, 0)));
+        assert_eq!(
+            Binding::msi("irqtx", 0xFFFF, 63).event(),
+            Some((0xFFFF, 63))
+        );
+        assert_eq!(net::NETD.bindings[0].event(), None);
+        let odd = Binding {
+            line: MSI_EVENT | 0x4000_0000,
+            ..rx
+        };
+        assert_eq!(odd.event(), None);
+        assert_eq!(
+            Binding {
+                line: MSI_EVENT | 64,
+                ..rx
+            }
+            .event(),
+            None
+        );
+        assert_eq!(msi_events(&net::NETD_ITS, 0x10), 2);
+        assert_eq!(msi_events(&net::NETD_ITS, 0x18), 0);
+        assert_eq!(msi_events(&net::NETD, 0x10), 0);
+        assert_eq!(check_record(&net::NETD_ITS), Ok(()));
+        // The record of MSI-X binds both events through the second channel,
+        // each with its label.
+        assert!(line_thread(&net::NETD_ITS));
+        for i in 0..2 {
+            assert_eq!(
+                binding_route(&net::NETD_ITS, i, true),
+                Through::BoundLabelled(proto_init::binding_label(i))
+            );
+        }
         // Another service, or the same one with no room above its priority
         // or with no line, has none.
         assert!(!line_thread(&service("rng-like", 35, 36)));

@@ -21,7 +21,14 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         park()
     }
     take_console();
-    kprintln!("\nKERNEL PANIC: {info}");
+    // A check of `failure` has no place of its own to name: its message
+    // stands alone and the backtrace gives the place.
+    match info.location() {
+        Some(at) if at.file() == crate::failure::FILE || at.file() == kcore::must::FILE => {
+            kprintln!("\nKERNEL PANIC: {}", info.message());
+        }
+        _ => kprintln!("\nKERNEL PANIC: {info}"),
+    }
     crate::arch::backtrace::print();
     stop()
 }

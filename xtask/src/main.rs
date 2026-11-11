@@ -1092,7 +1092,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// image of the kernel tests (`Variant::el0_half`) must have run.
 const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
 const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
-const ICOUNT_TESTS: [&str; 17] = [
+const ICOUNT_TESTS: [&str; 18] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -1106,6 +1106,7 @@ const ICOUNT_TESTS: [&str; 17] = [
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
+    "lpi_path_is_measured",
     "device_windows_are_measured",
     "upcall_calls_are_measured",
     "process_kill_with_a_level_is_measured",
@@ -1391,6 +1392,8 @@ enum Variant {
     OverflowProbe,
     /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
     CpuOnRefused,
+    /// CPU 1 fails a check right after it is up (`smp_cpu_check`).
+    CpuCheckProbe,
     /// A window between the post of a command and its flush, and the end of
     /// a thread inside it (`smp_window`).
     WindowProbe,
@@ -1445,7 +1448,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 31] = [
+    const ALL: [Variant; 32] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1455,6 +1458,7 @@ impl Variant {
         Variant::FaultProbe,
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
+        Variant::CpuCheckProbe,
         Variant::WindowProbe,
         Variant::WindowNoBlockCheck,
         Variant::WindowBreakOneSection,
@@ -1494,6 +1498,7 @@ impl Variant {
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
+            Variant::CpuCheckProbe => Some("cpu1-check-probe"),
             Variant::WindowProbe => Some("window-probe"),
             Variant::WindowNoBlockCheck => Some("break-block-check"),
             Variant::WindowBreakOneSection => Some("break-one-section"),
@@ -1527,6 +1532,7 @@ impl Variant {
             | Variant::FaultProbe
             | Variant::OverflowProbe
             | Variant::CpuOnRefused
+            | Variant::CpuCheckProbe
             | Variant::WindowProbe
             | Variant::WindowNoBlockCheck
             | Variant::WindowBreakOneSection
@@ -1587,6 +1593,7 @@ impl Variant {
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
+            Variant::CpuCheckProbe => "stafeto-cpu-check",
             Variant::WindowProbe => "stafeto-window",
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
             Variant::WindowBreakOneSection => "stafeto-window-split",
@@ -1970,6 +1977,7 @@ fn main() {
         Some("smp-boot") => smp_boots(),
         Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
+        Some("smp-cpu-check") => smp_cpu_check(),
         Some("smp-window") => smp_window(),
         Some("smp-idle-bell") => smp_idle_bell(),
         Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
@@ -9189,6 +9197,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("init fault", init_fault_stops_the_machine),
         job("panic log", panic_prints_the_log_nobody_showed),
         job("fault report", fault_report),
+        job("smp 4 cpu check", smp_cpu_check),
         job("stack overflow", stack_overflow_report),
         job("test build symbols", test_build_carries_test_symbols),
         job("strict panic", strict_panic_only_in_checked_programs),
@@ -10627,6 +10636,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         }
         check_obj_hold(m.name, &lines)?;
         check_cleanup_sections(m.name, &lines)?;
+        check_its_segment(m.name, &lines)?;
         let (margin, to_term) = b_margin(m.name, &measured, &lines)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
@@ -11017,9 +11027,13 @@ fn rows_of(rows: &[&str], ticks: &[u64]) -> String {
 /// `rows` in that order: an error when no line has them all.
 fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, String> {
     let prefix = format!("{what} ticks: ");
+    // Another line of the same prefix with other rows (`interrupt path
+    // ticks: lpi=`) is not this one.
+    let first = rows.first().map_or(String::new(), |row| format!("{row}="));
     let line = lines
         .iter()
-        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .filter_map(|l| l.strip_prefix(prefix.as_str()))
+        .find(|rest| rest.starts_with(first.as_str()))
         .ok_or_else(|| format!("the kernel printed no {what} ticks"))?;
     let fields: Vec<_> = line.split_whitespace().collect();
     if fields.len() != rows.len() {
@@ -11035,6 +11049,44 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
                 .ok_or_else(|| format!("{field:?} is no {row} row of the {what} line"))
         })
         .collect()
+}
+
+/// The longest segment of a wait for the ITS, in instructions under -icount
+/// (`its command ticks: max=`, lpi_path_is_measured): POLLS = 1000 reads of
+/// GITS_CREADR, each a look at the register and the queue's arithmetic, and
+/// no more, since the kernel waits in segments (decision K3, section 5). A
+/// wait that runs to its end in one loop measures the whole wait; the
+/// kernel built with `its-slow` makes every wait five segments long, which
+/// that breakage shows past this bound.
+const ITS_SEGMENT_MAX: u64 = 20_000;
+
+/// The ITS line of the icount run, on a machine with an ITS: the longest
+/// segment of a wait at most ITS_SEGMENT_MAX. The LPI's path is printed.
+fn check_its_segment(machine: &str, lines: &[String]) -> Result<(), String> {
+    if let Some(lpi) = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("interrupt path ticks: lpi="))
+    {
+        println!("LPI path on {machine}: {lpi} ticks");
+    }
+    let Some(line) = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("its command ticks: "))
+    else {
+        return Ok(());
+    };
+    let max = line
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("max="))
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| format!("the its command line {line:?} has no max"))?;
+    println!("ITS on {machine}: {line}, segment bound {ITS_SEGMENT_MAX}");
+    if max > ITS_SEGMENT_MAX {
+        return Err(format!(
+            "a wait for the ITS ran {max} ticks without a segment's end, past ITS_SEGMENT_MAX {ITS_SEGMENT_MAX}"
+        ));
+    }
+    Ok(())
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
@@ -11136,6 +11188,32 @@ fn smp_cpu_on() -> Result<(), String> {
         return Err("the SGI probe did not run on three CPUs".into());
     }
     println!("smp boot with CPU_ON refused for one CPU: three CPUs, ok");
+    Ok(())
+}
+
+/// A check that fails on CPU 1 (a kernel built with `cpu1-check-probe`) must
+/// say so with the backtrace of CPU 1's own stack: the report of a check names
+/// no place of its own, so the frames are all the place there is.
+fn smp_cpu_check() -> Result<(), String> {
+    let a = build(Variant::CpuCheckProbe)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
+    qemu::expect_not_timed_out(&o)?;
+    qemu::expect_marker(&o, "KERNEL PANIC: probe: a check fails on CPU 1 (line ")?;
+    let frames = qemu::backtrace_addresses(&o.lines);
+    if frames.len() < 2 {
+        return Err(format!(
+            "the backtrace of CPU 1 has {} frames, wanted 2 or more: {:?}",
+            frames.len(),
+            o.lines
+        ));
+    }
+    println!(
+        "check failure on CPU 1: {} frames of its own stack, ok",
+        frames.len()
+    );
     Ok(())
 }
 
@@ -13684,6 +13762,8 @@ mod tests {
             "str {v:w}, [{a}]",
             "ldrb {v:w}, [{a}]",
             "strb {v:w}, [{a}]",
+            "ldrh {v:w}, [{a}]",
+            "strh {v:w}, [{a}]",
             "ldr {v}, [{a}]",
             "str {v}, [{a}]",
             "dmb oshst",
@@ -13706,6 +13786,27 @@ mod tests {
             }
             assert!(accesses > 0, "{file} has no access");
         }
+    }
+
+    /// The LPI's line shares the prefix of the line's path and is passed
+    /// over; the ITS line passes below its bound and fails above it.
+    #[test]
+    fn the_lpi_and_its_lines_are_read_apart() {
+        let lines = [
+            "interrupt path ticks: lpi=900",
+            "interrupt path ticks: driver=1 bind=2 ack=3 portion=4",
+            "its command ticks: max=1200 long=0 commands=9",
+        ]
+        .map(String::from);
+        let ticks = ticks_of(&lines, "interrupt path", &INTERRUPT_PATH_ROWS);
+        assert_eq!(ticks, Ok(vec![1, 2, 3, 4]));
+        assert_eq!(check_its_segment("m", &lines), Ok(()));
+        assert_eq!(check_its_segment("m", &lines[..2]), Ok(()));
+        let long = [format!(
+            "its command ticks: max={} long=5 commands=9",
+            ITS_SEGMENT_MAX + 1
+        )];
+        assert!(check_its_segment("m", &long).is_err());
     }
 
     /// The round trip's line gives its six rows in order, and nothing else
@@ -14154,7 +14255,11 @@ mod tests {
 
     #[test]
     fn locks_of_the_kernel_are_the_ones_the_order_names() {
-        const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
+        // DEVICES and LPI_MAP: the MSI devices by DeviceID and the free LPIs
+        // (msi.rs, irq.rs).
+        const GUARDED: [&str; 7] = [
+            "FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS", "DEVICES", "LPI_MAP",
+        ];
         let mut found = Vec::new();
         let mut guarded = Vec::new();
         for (name, text) in texts(&["kernel/src"]) {
@@ -14169,7 +14274,14 @@ mod tests {
                 // The second lock of the order: the ticket of a CPU's cleanup
                 // queue (obj.rs).
                 let queue_lock = name == "kernel/src/local.rs" && line.contains("queue_spin");
-                if name != "kernel/src/obj.rs" && line.contains("Ticket") && !queue_lock {
+                // The third: ITS_LOCK of the ITS command queue, never taken
+                // with OBJ (arch/aarch64/its.rs, obj.rs).
+                let its_lock = name == "kernel/src/arch/aarch64/its.rs";
+                if name != "kernel/src/obj.rs"
+                    && line.contains("Ticket")
+                    && !queue_lock
+                    && !its_lock
+                {
                     found.push(format!("{at}: a ticket outside obj.rs"));
                 }
                 if name != "kernel/src/local.rs" && line.contains("Own<") {

@@ -12,6 +12,7 @@ use super::{
     payer_of, refs, refund, release, release_shell, remove_thread, sched, thread,
 };
 use crate::syscall;
+use kcore::must::Must;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7):
 /// each goes back to the frame allocator, FRAME_UNITS units of work, in one
@@ -43,13 +44,13 @@ const BUFFERS_PORTION: usize = 8;
 /// thread (its frame, the handles of its request and its long call) has to
 /// fit alone, or the stage would never end (the long call is one unit more,
 /// hence the strict comparison).
-const _: () = assert!(FRAME_UNITS + abi::MESSAGE_HANDLES < BUFFERS_PORTION);
+const _: () = ::core::assert!(FRAME_UNITS + abi::MESSAGE_HANDLES < BUFFERS_PORTION);
 
 /// Handle table entries a portion of the stage Handles releases, at most
 /// (spec 7.7): an eighth of a chunk, in one section under OBJ, each last
 /// copy of a session telling its receiver the client is gone.
 const HANDLES_PORTION: usize = 8;
-const _: () = assert!(kcore::handles::CHUNK.is_multiple_of(HANDLES_PORTION));
+const _: () = ::core::assert!(kcore::handles::CHUNK.is_multiple_of(HANDLES_PORTION));
 
 /// The units of work of a frame that goes back to the frame allocator
 /// (spec 7.7): its free may merge blocks up to kcore::frames::MAX_ORDER.
@@ -163,7 +164,7 @@ const STAGES: [Stage; 11] = [
 const _: () = {
     let mut i = 0;
     while i < STAGES.len() {
-        assert!(STAGES[i] as usize == i + 1);
+        ::core::assert!(STAGES[i] as usize == i + 1);
         i += 1;
     }
 };
@@ -637,7 +638,7 @@ unsafe fn release_space(p: *mut Process, table: Option<u64>) -> bool {
     // SAFETY: the caller's promise; only the fields are borrowed.
     let (space, retired, quota) = unsafe { (&mut (*p).space, &mut (*p).retired, &mut (*p).quota) };
     let Some(release) = retired.as_mut() else {
-        let space = space.take().expect("a space at the stage Space");
+        let space = space.take().must("a space at the stage Space");
         let release = retired.insert(space.retire_quiet());
         // With this CPU the only one up, the TTBR0 it just left is the only
         // one that held the tables: no period to wait for.
@@ -673,7 +674,7 @@ unsafe fn reclaim_asid(d: NonNull<crate::qsbr::Deferred>) {
         let p = d.as_ptr().byte_sub(offset).cast::<Process>();
         (*p).retired
             .as_mut()
-            .expect("a retired space waits for its period")
+            .must("a retired space waits for its period")
             .drop_asid();
     }
 }
@@ -749,7 +750,7 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
         let ChildLinks { prev, next } = (*p)
             .child_siblings
             .take()
-            .expect("a child in its parent's list until its stage Quota");
+            .must("a child in its parent's list until its stage Quota");
         // The cursor of the parent's stage Stop never names a child that
         // left: O(1), since no child joins a process that ended.
         if (*parent.as_ptr()).stop_next == Some(process) {
@@ -933,7 +934,7 @@ pub fn exit_label(process: NonNull<Process>) -> u64 {
         (*process.as_ptr())
             .exit
             .as_ref()
-            .expect("an exit slot")
+            .must("an exit slot")
             .label()
     }
 }

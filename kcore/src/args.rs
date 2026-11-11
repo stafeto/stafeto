@@ -48,6 +48,27 @@ pub fn trigger_arg(raw: u64) -> Result<bool, Error> {
     }
 }
 
+/// The flags of `irq_bind` of an event of an MSI device (spec 9): only 0,
+/// since an LPI is always edge-triggered; abi::TRIGGER_EDGE and every other
+/// bit are INVALID_ARGS, so that no two values mean the same.
+pub fn event_flags_arg(raw: u64) -> Result<(), Error> {
+    if raw == 0 {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
+/// The CPU of `irq_bind` from a register (spec 9): a number below `limit`,
+/// the CPUs the kernel can start; INVALID_ARGS otherwise. Whether the CPU
+/// is up is the kernel's to say.
+pub fn cpu_arg(raw: u64, limit: usize) -> Result<u32, Error> {
+    match u32::try_from(raw) {
+        Ok(cpu) if (cpu as usize) < limit => Ok(cpu),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
 /// A policy from a register: INVALID_ARGS for a value abi::Policy lacks.
 pub fn policy_arg(raw: u64) -> Result<Policy, Error> {
     Policy::from_raw(raw).ok_or(Error::InvalidArgs)
@@ -260,7 +281,7 @@ pub fn mask_tail(words: &mut [u64], len: usize) {
 }
 
 // The largest memory object is the largest list of pages.
-const _: () = assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
+const _: () = ::core::assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
 
 /// The access of a mapping from a register (spec 7.4): R, RW or RX
 /// (abi::Access). INVALID_ARGS for any other value, write and execute
@@ -368,6 +389,17 @@ mod tests {
     use super::*;
 
     const TOP: u64 = USER_END as u64;
+
+    #[test]
+    fn event_flags_and_cpu_of_irq_bind() {
+        assert_eq!(event_flags_arg(0), Ok(()));
+        assert_eq!(event_flags_arg(TRIGGER_EDGE), Err(Error::InvalidArgs));
+        assert_eq!(event_flags_arg(2), Err(Error::InvalidArgs));
+        assert_eq!(cpu_arg(0, 4), Ok(0));
+        assert_eq!(cpu_arg(3, 4), Ok(3));
+        assert_eq!(cpu_arg(4, 4), Err(Error::InvalidArgs));
+        assert_eq!(cpu_arg(1 << 32, 4), Err(Error::InvalidArgs));
+    }
 
     #[test]
     fn priority_arguments() {

@@ -236,6 +236,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("smp 4 probes EL2 GICv2", 25),
     ("smp 4 probes EL2 GICv3", 25),
     ("smp 4 checks", 25),
+    ("smp 4 cpu check", 5),
     ("console dialog 512M", 2),
     ("trace dialog 512M", 4),
     ("console dialog GICv3", 6),

@@ -104,6 +104,13 @@ impl Bar64 {
             (COMMAND, command | MEMORY),
         ]
     }
+
+    /// `set_up` with one more BAR register written while decoding is off:
+    /// `(offset, value)`, the 32-bit BAR of the function's MSI-X table.
+    pub fn set_up_with(&self, command: u32, also: (usize, u32)) -> [(usize, u32); 5] {
+        let [off, low, high, on] = self.set_up(command);
+        [off, low, high, also, on]
+    }
 }
 
 /// QEMU's `virt` machine with `highmem-ecam=off` (xtask sets it on every
@@ -151,11 +158,33 @@ pub mod qemu {
     pub const DISK_FUNCTION: u64 = function(DISK_DEVICE);
     pub const DISK_LINE: u32 = intx(DISK_DEVICE, 1);
 
+    /// The network device of the machine with an ITS (xtask's `VIRT_ITS`):
+    /// device 2, modern virtio-net-pci with MSI-X. BAR 4 of 16 KiB lies past
+    /// the disk's, and BAR 1, the 4 KiB of the MSI-X table and its pending
+    /// bits, right after it, so that one window holds both.
+    pub const NET_DEVICE: u64 = 2;
+    pub const NET: Bar64 = Bar64 {
+        id: 0x1041_1af4,
+        index: 4,
+        bar: MMIO32 + 0x1_0000,
+        len: 0x4000,
+    };
+    pub const NET_MSIX_BAR: u8 = 1;
+    pub const NET_MSIX: u64 = NET.bar + NET.len;
+    pub const NET_MSIX_LEN: u64 = 0x1000;
+    pub const NET_FUNCTION: u64 = function(NET_DEVICE);
+    /// The requester ID of the function (bus 0, device 2, function 0),
+    /// which the kernel turns into the ITS's DeviceID through `msi-map`.
+    pub const NET_RID: u32 = (NET_DEVICE as u32) << 3;
+
     const _: () = {
         assert!(DISK.bar.is_multiple_of(DISK.len));
         assert!(DISK.bar + DISK.len <= MMIO32 + MMIO32_LEN);
         assert!(DISK_FUNCTION + PAGE <= ECAM + ECAM_LEN);
         assert!(DISK_LINE >= INTX_FIRST && DISK_LINE <= INTX_FIRST + 3);
+        assert!(NET.bar >= DISK.bar + DISK.len && NET.bar.is_multiple_of(NET.len));
+        assert!(NET_MSIX.is_multiple_of(NET_MSIX_LEN));
+        assert!(NET_MSIX + NET_MSIX_LEN <= MMIO32 + MMIO32_LEN);
     };
 }
 
@@ -163,6 +192,29 @@ pub mod qemu {
 /// and the interrupt let through.
 pub fn bus_master(command: u32) -> u32 {
     (command & 0xFFFF & !INTX_DISABLE) | MEMORY | BUS_MASTER
+}
+
+/// The offset of the first capability of the function's list, from
+/// `read`, the 32-bit registers of the configuration space, whose first
+/// word `wanted` takes. None when the list holds none or does not end: a
+/// next pointer below 0x40 or off a word ends the list, as `virtio-drivers`
+/// reads it.
+fn capability(read: &mut impl FnMut(usize) -> u32, wanted: impl Fn(u32) -> bool) -> Option<usize> {
+    let mut at = (read(CAPABILITIES) & 0xFC) as usize;
+    if at < FIRST_CAPABILITY {
+        return None;
+    }
+    for _ in 0..MOST_CAPABILITIES {
+        let head = read(at);
+        if wanted(head) {
+            return Some(at);
+        }
+        at = ((head >> 8) & 0xFF) as usize;
+        if at < FIRST_CAPABILITY || at & 3 != 0 {
+            return None;
+        }
+    }
+    None
 }
 
 /// Where the function's capability list puts the Virtio common
@@ -176,23 +228,77 @@ pub fn bus_master(command: u32) -> u32 {
 /// VZ), so a driver starts only where the structure lies at offset 0 of
 /// BAR 0.
 pub fn common_config(mut read: impl FnMut(usize) -> u32) -> Option<(u8, u32)> {
-    let mut at = (read(CAPABILITIES) & 0xFC) as usize;
-    if at < FIRST_CAPABILITY {
-        return None;
+    // cap_vndr, cap_next, cap_len, cfg_type; then bar; then offset.
+    let at = capability(&mut read, |head| {
+        head & 0xFF == VENDOR_CAPABILITY && (head >> 16) & 0xFF >= 16 && head >> 24 == COMMON_CONFIG
+    })?;
+    Some((read(at + 4) as u8, read(at + 8)))
+}
+
+/// The MSI-X capability (PCI Local Bus 3.0, 6.8.2): its ID, and the bits of
+/// its first word, whose upper half is Message Control: MSI-X Enable (15),
+/// Function Mask (14) and the table's size less one (10:0).
+pub const MSIX_CAPABILITY: u32 = 0x11;
+pub const MSIX_ENABLE: u32 = 1 << 31;
+pub const MSIX_FUNCTION_MASK: u32 = 1 << 30;
+/// An entry of the table: 16 bytes, the address (low, high), the data and
+/// Vector Control, whose bit 0 masks the vector.
+pub const MSIX_ENTRY: usize = 16;
+pub const MSIX_MASKED: u32 = 1;
+/// The fields of the Virtio common configuration that tie a queue to an
+/// MSI-X vector (Virtio 1.2, 4.1.4.3), 16 bits each, and the value of no
+/// vector.
+pub const MSIX_CONFIG: usize = 0x10;
+pub const QUEUE_SELECT: usize = 0x16;
+pub const QUEUE_MSIX_VECTOR: usize = 0x1A;
+pub const NO_VECTOR: u16 = 0xFFFF;
+
+/// The function's MSI-X capability: where it lies in the configuration
+/// space, the vectors of its table, and the table's BAR and offset there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msix {
+    pub at: usize,
+    pub vectors: u16,
+    pub bar: u8,
+    pub offset: u32,
+}
+
+impl Msix {
+    /// The first word of the capability with MSI-X on and no function
+    /// mask, from the word `head` read there; the ID and next pointer are
+    /// read-only, and the table size too.
+    pub const fn enabled(head: u32) -> u32 {
+        (head | MSIX_ENABLE) & !MSIX_FUNCTION_MASK
     }
-    for _ in 0..MOST_CAPABILITIES {
-        // cap_vndr, cap_next, cap_len, cfg_type; then bar; then offset.
-        let head = read(at);
-        let len = (head >> 16) & 0xFF;
-        if head & 0xFF == VENDOR_CAPABILITY && len >= 16 && head >> 24 == COMMON_CONFIG {
-            return Some((read(at + 4) as u8, read(at + 8)));
-        }
-        at = ((head >> 8) & 0xFF) as usize;
-        if at < FIRST_CAPABILITY || at & 3 != 0 {
-            return None;
+
+    /// The four words of the table entry of a vector that writes `data` to
+    /// `address`, unmasked.
+    pub const fn entry(address: u64, data: u32) -> [u32; 4] {
+        [address as u32, (address >> 32) as u32, data, 0]
+    }
+
+    /// The vector of queue `queue`: queue i takes vector i while the table
+    /// has one, and none past it (a driver then polls that queue).
+    pub const fn queue_vector(&self, queue: u16) -> u16 {
+        if queue < self.vectors {
+            queue
+        } else {
+            NO_VECTOR
         }
     }
-    None
+}
+
+/// The function's MSI-X capability, from `read` as `common_config` takes
+/// it; None without one.
+pub fn msix(mut read: impl FnMut(usize) -> u32) -> Option<Msix> {
+    let at = capability(&mut read, |head| head & 0xFF == MSIX_CAPABILITY)?;
+    let table = read(at + 4);
+    Some(Msix {
+        at,
+        vectors: ((read(at) >> 16) & 0x7FF) as u16 + 1,
+        bar: (table & 0b111) as u8,
+        offset: table & !0b111,
+    })
 }
 
 #[cfg(test)]
@@ -367,5 +473,91 @@ mod tests {
             (0x52, 0x0110_0009),
         ];
         assert_eq!(common_config(space(&unaligned)), None);
+    }
+
+    /// A list shaped as that of QEMU's virtio-net-pci with three vectors:
+    /// MSI-X at 0x98 with its table at offset 0 of BAR 1, then the common
+    /// configuration at offset 0 of BAR 4.
+    const NET_SPACE: [(usize, u32); 6] = [
+        (CAPABILITIES, 0x98),
+        (0x98, 0x0002_8411),
+        (0x9C, 0x0000_0001),
+        (0x84, 0x0110_7009),
+        (0x88, 4),
+        (0x8C, 0),
+    ];
+
+    #[test]
+    fn msix_is_found_through_the_list() {
+        let found = msix(space(&NET_SPACE)).unwrap();
+        assert_eq!(
+            found,
+            Msix {
+                at: 0x98,
+                vectors: 3,
+                bar: 1,
+                offset: 0
+            }
+        );
+        // The common configuration behind it is still found.
+        assert_eq!(common_config(space(&NET_SPACE)), Some((4, 0)));
+        // A table at 0x800 of BAR 2.
+        let mut moved = NET_SPACE;
+        moved[2].1 = 0x802;
+        assert_eq!(
+            msix(space(&moved)).map(|m| (m.bar, m.offset)),
+            Some((2, 0x800))
+        );
+        // No MSI-X: VZ's list without it, or a list that loops.
+        assert_eq!(
+            msix(space(&[(CAPABILITIES, 0x50), (0x50, 0x0214_0009)])),
+            None
+        );
+        let looped = [(CAPABILITIES, 0x40), (0x40, 0x0000_4009)];
+        assert_eq!(msix(space(&looped)), None);
+    }
+
+    #[test]
+    fn msix_is_enabled_unmasked_and_one_vector_a_queue() {
+        // Enable set and the function mask cleared; the ID, the pointer
+        // and the size kept.
+        assert_eq!(Msix::enabled(0x4002_8411), 0x8002_8411);
+        assert_eq!(Msix::enabled(0x8002_8411), 0x8002_8411);
+        assert_eq!(
+            Msix::entry(0x0808_0040, 7),
+            [0x0808_0040, 0, 7, 0],
+            "the address of GITS_TRANSLATER [G43], the EventID, unmasked"
+        );
+        assert_eq!(Msix::entry(0x1_2345_6780, 1)[..2], [0x2345_6780, 1]);
+        assert_eq!(Msix::entry(0, 0)[3] & MSIX_MASKED, 0);
+        let three = msix(space(&NET_SPACE)).unwrap();
+        assert_eq!(
+            [0, 1, 2, 3].map(|q| three.queue_vector(q)),
+            [0, 1, 2, NO_VECTOR]
+        );
+        let one = Msix {
+            vectors: 1,
+            ..three
+        };
+        assert_eq!(one.queue_vector(1), NO_VECTOR);
+        assert_eq!(MSIX_ENTRY * 3, 48);
+    }
+
+    #[test]
+    fn the_network_device_of_the_its_machine_has_one_window_for_its_bars() {
+        let writes = qemu::NET.set_up_with(0x0010_0407, (0x14, qemu::NET_MSIX as u32));
+        assert_eq!(
+            writes,
+            [
+                (COMMAND, 0x0000),
+                (0x20, 0x1001_000C),
+                (0x24, 0),
+                (0x14, 0x1001_4000),
+                (COMMAND, 0x0003),
+            ]
+        );
+        assert_eq!(qemu::NET_FUNCTION, 0x3f01_0000);
+        assert_eq!(qemu::NET_RID, 0x10);
+        assert_eq!(qemu::NET_MSIX, qemu::NET.bar + qemu::NET.len);
     }
 }

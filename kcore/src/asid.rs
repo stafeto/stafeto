@@ -18,6 +18,7 @@
 //! does not depend on the number of ASIDs.
 
 use crate::bootinfo::MAX_CPUS;
+use crate::must::Must;
 use crate::paging::TTBR_ROOT_MASK;
 use core::sync::atomic::{
     AtomicU32, AtomicU64,
@@ -125,6 +126,21 @@ impl AsidCpus {
             flush_pending: AtomicU32::new(0),
             active: [const { Line(AtomicU64::new(0)) }; MAX_CPUS],
         }
+    }
+
+    /// The state `new` has before the generation starts: all zero, so that a
+    /// static of it lives in .bss. `begin` must run before any other call.
+    pub const fn unstarted() -> AsidCpus {
+        AsidCpus {
+            generation: AtomicU64::new(0),
+            flush_pending: AtomicU32::new(0),
+            active: [const { Line(AtomicU64::new(0)) }; MAX_CPUS],
+        }
+    }
+
+    /// Sets the generation of `new` on an `unstarted` state.
+    pub fn begin(&self) {
+        self.generation.store(1, Relaxed);
     }
 
     pub fn generation(&self) -> u64 {
@@ -366,7 +382,7 @@ impl AsidAllocator {
 
     fn unset(&mut self, i: usize) {
         let (w, bit) = (i / 64, 1 << (i % 64));
-        assert!(self.used.0[w] & bit != 0, "ASID {i} released while free");
+        ::core::assert!(self.used.0[w] & bit != 0, "ASID {i} released while free");
         self.used.0[w] &= !bit;
         self.full[w / 64] &= !(1 << (w % 64));
         self.free += 1;
@@ -378,7 +394,7 @@ impl AsidAllocator {
         let i = self
             .first_free(self.next, limit)
             .or_else(|| self.first_free(1, self.next))
-            .expect("a free ASID when the count says so");
+            .must("a free ASID when the count says so");
         self.set(i);
         self.next = if i + 1 == limit { 1 } else { i + 1 };
         i as u16

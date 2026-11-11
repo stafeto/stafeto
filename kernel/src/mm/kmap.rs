@@ -70,7 +70,7 @@ fn map(
         return;
     }
     pt.map(mem, va as u64, pa, size, attrs)
-        .unwrap_or_else(|e| panic!("mapping {what} at {va:#x}: {e:?}"));
+        .unwrap_or_else(|e| ::core::panic!("mapping {what} at {va:#x}: {e:?}"));
 }
 
 /// A device region widened to whole pages.
@@ -85,7 +85,9 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
     let root = {
         let mut guard = phys::FRAMES.lock();
         let mut mem = FrameTables {
-            frames: guard.as_mut().expect("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         };
         let mut pt = PageTable::new(&mut mem).expect("no frame for the root table");
         let image = symbols::image_layout();
@@ -159,7 +161,8 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
         }
         let info = &boot.info;
         let gic = info.gic.as_ref().map(Gic::mapped).into_iter().flatten();
-        for dev in info.uart_pl011.into_iter().chain(gic) {
+        let its = info.its.map(|its| its.regs);
+        for dev in info.uart_pl011.into_iter().chain(gic).chain(its) {
             let (base, size) = pages(dev);
             map(
                 &mut pt,

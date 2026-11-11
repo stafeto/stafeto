@@ -60,10 +60,10 @@ pub struct CpuBlock {
 }
 
 const _: () = {
-    assert!(core::mem::offset_of!(CpuBlock, regs) == 0);
-    assert!(core::mem::offset_of!(CpuBlock, stack_top) == 16);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, regs) == 0);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, stack_top) == 16);
     // The header is one line, and what the CPU owns starts on the next.
-    assert!(core::mem::offset_of!(CpuBlock, local) == 64);
+    ::core::assert!(core::mem::offset_of!(CpuBlock, local) == 64);
 };
 
 impl CpuBlock {
@@ -95,6 +95,11 @@ impl CpuBlock {
 static CPUS: [CpuBlock; MAX_CPUS] = [const { CpuBlock::new() }; MAX_CPUS];
 
 /// The block of CPU `index`.
+/// Whether CPU `index` has set itself up and runs (spec 8).
+pub fn is_up(index: usize) -> bool {
+    index < MAX_CPUS && CPUS[index].state.load(Ordering::Acquire) == UP
+}
+
 pub fn block(index: usize) -> &'static CpuBlock {
     &CPUS[index]
 }
