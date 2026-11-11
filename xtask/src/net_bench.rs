@@ -1834,10 +1834,15 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 FAST_CONF
             };
             // `kill-watch` runs F1s with several workers: a copy of the settings.
-            let conf = if switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()) {
-                let pin = prep
-                    .switch_affinity
-                    .as_ref()
+            // Bench only: F1 with its worker pinned (NET_BENCH_F1_PIN=0010 is CPU 1).
+            let f1_pin = std::env::var("NET_BENCH_F1_PIN").ok().filter(|_| !switch);
+            let conf = if f1_pin.is_some()
+                || (switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()))
+            {
+                let pin = f1_pin
+                    .iter()
+                    .chain(prep.switch_affinity.as_ref())
+                    .next()
                     .map_or(String::new(), |m| format!(" worker_cpu_affinity {m};"));
                 run.send(&format!(
                     "sed 's/worker_processes 1;/worker_processes {};{pin}/' {conf} > /tmp/nginx-fast-n.conf",
@@ -1878,7 +1883,9 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
-            let wanted = if switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()) {
+            let wanted = if f1_pin.is_some()
+                || (switch && (prep.switch_workers > 1 || prep.switch_affinity.is_some()))
+            {
                 // The copy differs from the file by the number of workers.
                 &report.config_digest.clone()
             } else if switch {
