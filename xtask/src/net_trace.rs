@@ -59,7 +59,7 @@ fn parse(text: &str) -> Vec<Ev> {
     let mut out: Vec<Ev> = text
         .lines()
         .filter_map(|line| {
-            let mut w = line.trim().split_whitespace();
+            let mut w = line.split_whitespace();
             (w.next()? == "tr").then_some(())?;
             let label = w.next()?.to_owned();
             let id = u8::from_str_radix(w.next()?, 16).ok()?;
@@ -121,6 +121,9 @@ fn stats(values: &mut [f64]) -> (usize, f64, f64, f64) {
     (values.len(), at(0.5), at(0.9), at(0.99))
 }
 
+/// A point of a chain being built: its name, its time if keyed, the points it may be.
+type Point = (&'static str, Option<u64>, Option<&'static [u8]>);
+
 /// The chain of every request that has all its keyed points: the points with their times.
 fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
     let mut keyed: HashMap<u32, Vec<&Ev>> = HashMap::new();
@@ -146,7 +149,7 @@ fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
             continue;
         }
         let find = |id: u8| list.iter().filter(|e| e.id == id).map(|e| e.t).min();
-        let mut points: Vec<(&'static str, Option<u64>, Option<&'static [u8]>)> = Vec::new();
+        let mut points: Vec<Point> = Vec::new();
         for step in path {
             match *step {
                 Step::Key(id, name) => points.push((name, find(id), None)),
@@ -175,7 +178,19 @@ fn chains(events: &[Ev], path: &[Step]) -> Vec<Vec<(&'static str, u64)>> {
                 }
                 (None, Some(ids)) => {
                     let next = points[i + 1..].iter().find_map(|p| p.1).unwrap_or(u64::MAX);
-                    if let Some(t) = first_after(ids, last, next) {
+                    // At the start of a path the point is the last one before the first keyed point.
+                    let found = if chain.is_empty() {
+                        ids.iter()
+                            .filter_map(|id| {
+                                let times = loose.get(id)?;
+                                let at = times.partition_point(|t| *t < next);
+                                at.checked_sub(1).map(|i| times[i])
+                            })
+                            .max()
+                    } else {
+                        first_after(ids, last, next)
+                    };
+                    if let Some(t) = found {
                         last = t;
                         chain.push((name, t));
                     }

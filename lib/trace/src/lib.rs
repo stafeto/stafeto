@@ -155,11 +155,6 @@ mod on {
         ring[at + 1].store(VALID | u64::from(id) << 32 | u64::from(key), Relaxed);
     }
 
-    /// The records made so far (the ring keeps the last `RECORDS`).
-    pub fn made() -> usize {
-        NEXT.load(Relaxed)
-    }
-
     /// Silences: gaps of more than `GAP` ticks (20 ms) between two records of the component, the
     /// last `GAPS` of them: the end of the gap, its length and the record that ended it.
     const GAP: u64 = 480_000;
@@ -275,6 +270,7 @@ impl core::fmt::Write for Line {
 /// <key>` (hexadecimal, no line end), at most `max` of them in this call; a later call goes on from
 /// where this one stopped (`tail`: of the last records at most, when a dump starts). True when the last record has gone (the next call starts a new dump).
 /// The first line of a dump is point 0 with the time of the dump and the number of records made.
+#[allow(clippy::needless_return)]
 pub fn dump_part(label: &str, max: usize, tail: usize, mut emit: impl FnMut(&str)) -> bool {
     #[cfg(feature = "on")]
     {

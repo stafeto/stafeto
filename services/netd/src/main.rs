@@ -76,6 +76,7 @@ use netd::profile::{self, Counter};
 #[cfg(feature = "trace")]
 pub(crate) use ::trace;
 #[cfg(not(feature = "trace"))]
+#[allow(dead_code)]
 pub(crate) mod trace {
     macro_rules! points {
         ($($n:ident),*) => {$(pub const $n: u8 = 0;)*};

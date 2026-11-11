@@ -1556,6 +1556,10 @@ impl Guest {
             ));
             Ok(())
         };
+        // The workers first: their rings keep filling with the records of the idle loop. They
+        // write their lines as they exit (a QUIT to nginx).
+        crate::net_tls::capture(&mut self.run, "kill -QUIT $M", "trace-q", wait)?;
+        settle(&mut self.run, "the workers", "tr w")?;
         // Each `posix-net stat` gives the next part of the service's ring (it is killed if it is
         // silent for long); the line `tr n done` ends it.
         for _ in 0..80 {
@@ -1566,8 +1570,6 @@ impl Guest {
             }
         }
         settle(&mut self.run, "the service", "tr n ")?;
-        crate::net_tls::capture(&mut self.run, "kill -QUIT $M", "trace-q", wait)?;
-        settle(&mut self.run, "the service and the workers", "tr ")?;
         Ok(())
     }
 
@@ -2505,6 +2507,9 @@ impl Bench {
         if self.get(key).is_some() {
             return Ok(());
         }
+        if self.opts.trace {
+            self.phase = format!("ceiling {}", wl.name());
+        }
         self.boot(sys, wl.tls())?;
         let (raw, secs) = (self.raw.clone(), self.opts.ceiling);
         let profiled = self.profiled(sys);
@@ -2828,7 +2833,7 @@ impl Bench {
         for sys in self.opts.systems.clone() {
             for wl in self.opts.workloads.clone() {
                 for rate in self.opts.rates.clone() {
-                    self.phase = format!("at {rate}");
+                    self.phase = format!("at {} {rate}", wl.name());
                     let key = format!("at.{}.{}.{rate}", sys.name(), wl.name());
                     let (secs, warm) = (self.opts.stage, self.opts.warm);
                     self.stage(&key, sys, wl, rate, secs, warm, false, false)?;
