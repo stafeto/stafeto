@@ -145,6 +145,12 @@ int stafeto_fast_poke(void);
  * EBADF (no claim). */
 int stafeto_fast_wait(uint64_t timeout_ns, uint32_t *bits);
 
+/* The counters of the sleeps of the loop of epoll_pwait: out[0] sleeps, out[1]
+ * wakes by a notification of the service, out[2] wakes by the deadline (no
+ * notification), out[3] wakes by the deadline whose first look found events
+ * (a frame waited and nothing told the thread). */
+void stafeto_fast_wake_counts(uint64_t out[4]);
+
 /* Tells the service that `count` frames (1 to 16) wait in the bypass ring
  * to it: the frames it took in this step, or -1 with errno: EPROTO when the
  * service found the ring's indices broken (it takes nothing from the ring

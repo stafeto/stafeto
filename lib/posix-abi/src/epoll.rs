@@ -994,6 +994,26 @@ fn round_once(
 /// The stack's clock tick and the longest sleep of the loop.
 const TICK_NS: u64 = 10_000_000;
 
+/// What woke the loop's sleeps (`wake_counts`): the sleeps, the wakes by a
+/// notification of the service, the wakes by the deadline (the stack's tick or
+/// the call's timeout, no notification), and the wakes by the deadline whose
+/// first look found events: a frame sat in the ring and nothing told the
+/// thread, the lost wake-up that the deadline only makes good.
+static SLEEPS: AtomicU64 = AtomicU64::new(0);
+static WOKEN_BY_BELL: AtomicU64 = AtomicU64::new(0);
+static WOKEN_BY_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static DEADLINE_FOUND: AtomicU64 = AtomicU64::new(0);
+
+/// The four counters of the sleeps of the loop, in the order above.
+pub fn wake_counts() -> [u64; 4] {
+    [
+        SLEEPS.load(Ordering::Relaxed),
+        WOKEN_BY_BELL.load(Ordering::Relaxed),
+        WOKEN_BY_DEADLINE.load(Ordering::Relaxed),
+        DEADLINE_FOUND.load(Ordering::Relaxed),
+    ]
+}
+
 /// The wake test of the loop's sleep: bits of the service's notifications
 /// wait in the bank, or the service let go.
 fn fast_wake() -> bool {
@@ -1192,6 +1212,9 @@ fn fast_round(
 ) -> Result<usize, i32> {
     let block = crate::threads::own_block();
     let mut events = [Kevent::default(); 64];
+    // The last sleep ended by its deadline: the first look after it says
+    // whether a frame had been waiting.
+    let mut deadline_wake = false;
     loop {
         if posix_sync::receiver::lost() {
             fastnet::exit_if_lost();
@@ -1211,6 +1234,9 @@ fn fast_round(
         let keep = usize::from(due && out.len() > 1);
         let room = out.len() - keep;
         let (work, mut filled) = look(kq, &mut events, &mut out[..room])?;
+        if core::mem::take(&mut deadline_wake) && filled > 0 {
+            DEADLINE_FOUND.fetch_add(1, Ordering::Relaxed);
+        }
         if due && filled < out.len() {
             let at = wait::now();
             set_shared_at(id, at);
@@ -1252,6 +1278,7 @@ fn fast_round(
         // The interrupts on (a full barrier inside), then one more look: a
         // frame that came before the interrupts were on raised none.
         crate::tracing::point(trace::P_W_SLEEP, 0);
+        SLEEPS.fetch_add(1, Ordering::Relaxed);
         fastnet::notify(true);
         let looked = look(kq, &mut events, out);
         match looked {
@@ -1286,7 +1313,11 @@ fn fast_round(
         set_shared_at(id, wait::now());
         let bits = posix_sync::receiver::take_pending();
         if bits != 0 {
+            WOKEN_BY_BELL.fetch_add(1, Ordering::Relaxed);
             fastnet::absorb(bits);
+        } else if slept.is_ok() {
+            WOKEN_BY_DEADLINE.fetch_add(1, Ordering::Relaxed);
+            deadline_wake = true;
         }
         let filled = slept?;
         if filled > 0 {

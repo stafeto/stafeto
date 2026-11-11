@@ -226,13 +226,18 @@ static void
 glue_stats(void)
 {
     struct ff_stafeto_device_stats st;
-    uint64_t dropped, ticks, passes;
+    uint64_t dropped, ticks, passes, wakes[4];
 
     ff_stafeto_counters(&dropped, &ticks, &passes);
     if (ticks < stats_said + 500)
         return;
     stats_said = ticks;
     ff_stafeto_device_stats(&st);
+    stafeto_fast_wake_counts(wakes);
+    fprintf(stderr,
+        "fast: wakes sleeps=%llu bell=%llu deadline=%llu deadline_found=%llu\n",
+        (unsigned long long)wakes[0], (unsigned long long)wakes[1],
+        (unsigned long long)wakes[2], (unsigned long long)wakes[3]);
     fprintf(stderr,
         "fast: stats ticks=%llu notifications=%llu kicks=%llu sleeps=%llu found_work=%llu passes=%llu rx=%llu tx=%llu bell_rx_passes=%llu bell_rx=%llu bell_tx=%llu sum_tx=%llu sum_rx=%llu\n",
         (unsigned long long)ticks, (unsigned long long)st.notifications,
