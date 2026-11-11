@@ -1450,18 +1450,15 @@ impl Driver<'_> {
         switch::INNER.kick(more || held);
     }
 
-    /// Frames of the stack wait for the switch's doorbell and work stands
-    /// queued behind this event (a call of a program, a step told to the
-    /// service): the bell waits for it (`ring::Hold`), so that the frames of
+    /// Frames of the stack wait for the switch's doorbell and a call of a
+    /// program stands queued behind this event: the bell waits for it (`ring::Hold`), so that the frames of
     /// the answers of calls that queue up behind one another go out with one
     /// bell. A step goes ahead of the calls behind it, so without this each
     /// call's frame rings a bell of its own.
     fn bell_waits(&mut self) -> bool {
-        let own = self.told & STEP_BITS != 0;
         let notify = &self.notify;
         let verdict = self.bell.decide(
             switch::INNER.tx_sub.len(),
-            own,
             || sys::channel_info(notify).is_ok_and(|info| info.queued > 0),
             now_ns(),
         );

@@ -81,7 +81,7 @@ pub const fn bell_due(limit: u32, pending: u32, waited: u32, more: bool) -> bool
 }
 
 /// The longest the bell is held for the work queued behind the stack's step
-/// (`Hold`): a call of a program or a step of the service told to itself. A
+/// (`Hold`): a call of a program. A
 /// timer set when the hold starts rings it at `HOLD_NS`, wherever the queue
 /// stands then (a call that the kernel withdrew or the library refused makes
 /// no event of its own). The frame then waits `HOLD_NS`, plus the event in
@@ -140,22 +140,17 @@ impl Hold {
     }
 
     /// The decision at the end of an event, at `now`. `frames` of the stack
-    /// wait for the bell; `own` says the service has steps told to itself
-    /// (they come as events); `calls` asks the kernel whether anything stands
-    /// in the queue (called only when no step is told). A large answer
-    /// (`SWITCH_TX / 2` frames) rings at once. A hold with only calls behind
-    /// it gets a timer for its deadline, since a call the kernel withdrew or
-    /// the library refused makes no event.
-    pub fn decide(
-        &mut self,
-        frames: usize,
-        own: bool,
-        calls: impl FnOnce() -> bool,
-        now: u64,
-    ) -> Verdict {
-        let queued = frames > 0 && frames < SWITCH_TX / 2 && (own || calls());
+    /// wait for the bell; `calls` asks the kernel whether a call of a program
+    /// stands in the queue. The bell waits only for calls: with none queued
+    /// it rings at once, whatever steps the service told itself (they are
+    /// short, and the frame has waited for the event that is ending). A large
+    /// answer (`SWITCH_TX / 2` frames) rings at once. A hold gets a timer for
+    /// its deadline, since a call the kernel withdrew or the library refused
+    /// makes no event.
+    pub fn decide(&mut self, frames: usize, calls: impl FnOnce() -> bool, now: u64) -> Verdict {
+        let queued = frames > 0 && frames < SWITCH_TX / 2 && calls();
         let held = self.waits(queued, now);
-        let arm = if held && !own && !self.timed {
+        let arm = if held && !self.timed {
             self.timed = true;
             self.deadline()
         } else {
@@ -1061,12 +1056,32 @@ mod tests {
         let mut hold = Hold::new();
         let mut kicks = 0;
         for call in 0..8u64 {
-            let v = hold.decide(1, false, || call < 7, call * 10_000);
+            let v = hold.decide(1, || call < 7, call * 10_000);
             if !v.held {
                 kicks += 1;
             }
         }
         assert_eq!(kicks, 1, "one bell for the burst of calls");
+    }
+
+    /// A step the service told itself is no reason to hold the bell: with no
+    /// call queued the frame rings at once (the old rule held it for the step
+    /// and rang a hold later, 169 us at 300 requests a second on S4).
+    #[test]
+    fn a_step_told_to_itself_does_not_hold_the_bell() {
+        let mut hold = Hold::new();
+        let v = hold.decide(1, || false, 0);
+        assert!(!v.held, "no call is queued: the bell rings at once");
+        assert_eq!(v.arm, None);
+        assert!(!hold.on());
+        // With a call queued the bell waits, and a timer is set for its deadline.
+        let v = hold.decide(1, || true, 1_000);
+        assert!(v.held);
+        assert_eq!(v.arm, Some(1_000 + HOLD_NS));
+        // The queue empties: it rings at once, before the deadline.
+        let v = hold.decide(1, || false, 20_000);
+        assert!(!v.held);
+        assert!(!hold.on());
     }
 
     /// The service's own timer fires inside the hold window, and then the call
@@ -1075,7 +1090,7 @@ mod tests {
     /// timer of the service leaves the hold's timer marked as set.
     fn rung_after_the_stack_timer(forget: bool) -> Option<u64> {
         let mut hold = Hold::new();
-        let v = hold.decide(1, false, || true, 0);
+        let v = hold.decide(1, || true, 0);
         assert!(v.held);
         assert_eq!(v.arm, Some(HOLD_NS));
         // The stack's own timer fires at 50 us and takes the armed one with
@@ -1084,12 +1099,12 @@ mod tests {
         if forget {
             hold.timer_gone();
         }
-        let v = hold.decide(1, false, || true, 50_000);
+        let v = hold.decide(1, || true, 50_000);
         assert!(v.held);
         timer = v.arm.or(timer);
         // The call is withdrawn: only the timer can ring the bell.
         let at = timer?;
-        let v = hold.decide(1, false, || false, at);
+        let v = hold.decide(1, || false, at);
         (!v.held).then_some(at)
     }
 
