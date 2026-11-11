@@ -1310,23 +1310,27 @@ pub fn parse_wakes(line: &str) -> Option<Wakes> {
 }
 
 /// What the worker did during the paused requests (the change of the counters
-/// over step 5 alone): the sleeps that ended by the deadline with a frame
-/// already in the ring (the frame waited through the sleep and nothing woke
-/// the thread) are at most 1 % of the sleeps, and at least `WAKES_ALLOWED` of
-/// them pass whatever the count (a small number of sleeps must not fail the
-/// probe by one frame). The interrupt of the device wakes the idle loop and the
-/// deadline is only the backstop; a late notification counts as a wake by the
-/// notification, so this rules out a lost wake-up and says nothing of a slow one.
+/// over step 5 alone). A sleep that ended by the deadline with a frame already
+/// in the ring may be a lost wake-up or a notification still on its way (the
+/// ring is looked at the instant the sleep ends), so the probe judges the
+/// share of the wakes that had a frame: `deadline_found` of `bell + deadline_found`
+/// stays at most a quarter (about 5 % on QEMU's TCG with the interrupt working,
+/// half with it switched off in every second sleep) and at least
+/// `WAKES_ALLOWED` of them pass whatever the count. The interrupt of the device
+/// wakes the idle loop and the deadline is only the backstop; the counters rule
+/// out a lost wake-up and say nothing of a slow one. The sleeps seen must reach
+/// `WAKES_MIN`.
 const WAKES_MIN: u64 = 30;
 const WAKES_ALLOWED: u64 = 2;
 pub fn check_wakes(w: &Wakes) -> Result<(), String> {
     if w.sleeps < WAKES_MIN {
         return Err(format!("the worker slept {} times, wanted {WAKES_MIN}", w.sleeps));
     }
-    if w.deadline_found > WAKES_ALLOWED && w.deadline_found * 100 > w.sleeps {
+    let with_frames = w.bell + w.deadline_found;
+    if w.deadline_found > WAKES_ALLOWED && w.deadline_found * 4 > with_frames {
         return Err(format!(
-            "{} of {} sleeps ended by the deadline with a frame waiting in the ring (at most 1 %): the interrupt did not wake the loop",
-            w.deadline_found, w.sleeps
+            "{} of {with_frames} wakes with a frame in the ring ended by the deadline (at most a quarter): the interrupt did not wake the loop",
+            w.deadline_found
         ));
     }
     Ok(())
@@ -1522,7 +1526,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_wakes_bound_is_one_percent_of_the_sleeps() {
+    fn the_wakes_bound_is_a_quarter_of_the_wakes_with_a_frame() {
         let line = "fast: wakes sleeps=1000 bell=980 deadline=15 other=5 deadline_found=10";
         let w = parse_wakes(line).unwrap();
         assert_eq!(
@@ -1536,15 +1540,18 @@ mod tests {
             }
         );
         assert!(check_wakes(&w).is_ok());
-        let lost = Wakes {
-            deadline_found: 11,
+        // More than a quarter of the wakes that had a frame fails.
+        let slow = Wakes {
+            bell: 29,
+            deadline_found: 10,
             ..w
         };
-        assert!(check_wakes(&lost).is_err());
+        assert!(check_wakes(&slow).is_err());
+        assert!(check_wakes(&Wakes { bell: 30, ..slow }).is_ok());
         // A small number of sleeps tolerates the allowance and no more.
         let few = |found| Wakes {
             sleeps: 100,
-            bell: 100,
+            bell: 4,
             deadline: 0,
             other: 0,
             deadline_found: found,
