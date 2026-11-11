@@ -34,6 +34,7 @@ use abi::{Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf}
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use kcore::must::Must;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
@@ -208,17 +209,17 @@ struct Buffer {
     frame: Frame,
 }
 
-const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
+const _: () = ::core::assert!(core::mem::offset_of!(Thread, regs) == 0);
 // The cold tail of the path of a signal (S5, p99) follows the layout of
 // the thread: a field that grows it moves the fields behind it.
-const _: () = assert!(core::mem::size_of::<Numbers>() == 8);
-const _: () = assert!(core::mem::size_of::<Thread>() == 1360);
-const _: () = assert!(
+const _: () = ::core::assert!(core::mem::size_of::<Numbers>() == 8);
+const _: () = ::core::assert!(core::mem::size_of::<Thread>() == 1360);
+const _: () = ::core::assert!(
     core::mem::size_of::<UserRegs>() + core::mem::size_of::<FpRegs>() == abi::UPCALL_CONTEXT_SIZE
 );
 
 // Three threads to a page of a pool (spec 7.8).
-const _: () = assert!(kcore::slab::Pool::<Thread>::PER_PAGE >= 3);
+const _: () = ::core::assert!(kcore::slab::Pool::<Thread>::PER_PAGE >= 3);
 
 // SAFETY: threads are reached under the kernel's rules (spec 8.1): one
 // CPU, interrupts masked inside the kernel.
@@ -435,7 +436,7 @@ pub fn exit_label(t: NonNull<Thread>) -> u64 {
     // SAFETY: the slot is being taken, and it holds the thread; only the
     // field is read.
     unsafe { (*t.as_ptr()).exit.as_ref() }
-        .expect("a thread with an exit slot")
+        .must("a thread with an exit slot")
         .label()
 }
 
@@ -450,7 +451,7 @@ pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
 /// has not ended holds.
 pub fn index(t: NonNull<Thread>) -> u16 {
     // SAFETY: the caller holds the thread; only the field is read.
-    try_index(t).expect("a thread that has not ended holds its number")
+    try_index(t).must("a thread that has not ended holds its number")
 }
 
 /// The number of `t`, if it holds one.
@@ -1141,7 +1142,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
 }
 
 // The poison of a thread that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Thread, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Thread, refs) >= 8);
 
 /// The thread whose registers, FP registers and address space are live:
 /// the running one, or while the kernel idles the one that ran last.

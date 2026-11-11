@@ -1324,6 +1324,10 @@ impl Init {
         // tells its lines apart. The session goes right after; the binding
         // keeps its label. The exception is the first line of a record that
         // declares a thread for it (`table::binding_route`).
+        // The MSI device of the record's function, made at its first event;
+        // each binding of an event keeps it, so init's handle goes after the
+        // loop.
+        let mut msi = None;
         for (i, b) in record.bindings.iter().enumerate() {
             let (through, priority, session) =
                 match (table::binding_route(record, i, bound.is_some()), bound) {
@@ -1331,6 +1335,11 @@ impl Init {
                     // goes through the second channel, at the record's ceiling:
                     // the interrupts reach a thread of that level on their own.
                     (table::Through::Bound, Some(bound)) => (bound, record.ceiling, None),
+                    (table::Through::BoundLabelled(label), Some(bound)) => {
+                        let session =
+                            sys::handle_label(bound, Rights::NOTIFY, label, record.ceiling)?;
+                        (bound, record.ceiling, Some(session))
+                    }
                     (table::Through::Labelled(label), _) => {
                         let session =
                             sys::handle_label(channel, Rights::NOTIFY, label, record.priority)?;
@@ -1339,7 +1348,22 @@ impl Init {
                     _ => (channel, record.priority, None),
                 };
             let through = session.as_ref().unwrap_or(through);
-            let bound = sys::irq_bind(&self.resource, b.line, through, priority, b.edge)?;
+            let bound = match b.event() {
+                // The event's LPI goes to the first CPU of the record.
+                Some((rid, event)) => {
+                    let device = match msi.as_ref() {
+                        Some(device) => device,
+                        None => msi.insert(sys::msi_create(
+                            &self.resource,
+                            rid,
+                            table::msi_events(record, rid),
+                        )?),
+                    };
+                    let cpu = record.cpus.trailing_zeros();
+                    sys::irq_bind_event(device, event, through, priority, cpu)?.binding
+                }
+                None => sys::irq_bind(&self.resource, b.line, through, priority, b.edge)?,
+            };
             drop(session);
             let only = sys::handle_duplicate(&bound, Rights::MANAGE | Rights::TRANSFER)?;
             drop(bound);

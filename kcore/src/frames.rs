@@ -45,7 +45,7 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
     /// An allocator without free frames, for frames from `base` on; `meta`
     /// holds one byte per frame it may ever manage.
     pub fn new(mem: M, base: u64, meta: &'m mut [u8]) -> Self {
-        assert!(
+        ::core::assert!(
             base.is_multiple_of(PAGE_SIZE),
             "allocator base {base:#x} is not page-aligned"
         );
@@ -76,7 +76,7 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
         if first >= last {
             return;
         }
-        assert!(
+        ::core::assert!(
             first >= self.base_pfn && last <= self.base_pfn + self.meta.len() as u64,
             "region {base:#x}..{end:#x} outside the allocator's span"
         );
@@ -86,7 +86,7 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
             while order > 0 && (!pfn.is_multiple_of(1 << order) || pfn + (1 << order) > last) {
                 order -= 1;
             }
-            assert!(
+            ::core::assert!(
                 !self.overlaps_a_block(pfn, order),
                 "region {base:#x}..{end:#x} overlaps frames already added"
             );
@@ -120,29 +120,29 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
 
     /// Returns a block from `alloc(order)`.
     pub fn free(&mut self, pa: u64, order: u8) {
-        assert!(
+        ::core::assert!(
             order <= MAX_ORDER,
             "free of order {order} above {MAX_ORDER}"
         );
-        assert!(
+        ::core::assert!(
             pa.is_multiple_of(PAGE_SIZE << order),
             "free of misaligned block {pa:#x}"
         );
         let pfn = pa >> PAGE_SHIFT;
-        assert!(
+        ::core::assert!(
             self.in_range(pfn, order),
             "free of {pa:#x} outside the allocator"
         );
         if self.meta_at(pfn) != (ALLOCATED | order) {
-            assert!(!self.in_free_block(pfn), "double free of frame {pa:#x}");
-            panic!("free of frame {pa:#x} that was not allocated with order {order}");
+            ::core::assert!(!self.in_free_block(pfn), "double free of frame {pa:#x}");
+            ::core::panic!("free of frame {pa:#x} that was not allocated with order {order}");
         }
         self.set_meta(pfn, NOT_FREE);
         self.free_block(pfn, order);
     }
 
     fn free_block(&mut self, pfn: u64, order: u8) {
-        assert!(
+        ::core::assert!(
             !self.in_free_block(pfn),
             "double free of frame {:#x}",
             pfn << PAGE_SHIFT

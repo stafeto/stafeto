@@ -424,6 +424,10 @@ pub struct Switch {
     line_closed: bool,
     /// The first interrupt of the device came (and was said once).
     interrupted: bool,
+    /// Under MSI-X (`vectors`): the binding of the vector of sending, which
+    /// lives as long as the switch, and the interrupts of each vector.
+    msi: Option<Handle<Interrupt>>,
+    per_vector: [u32; 2],
     link: bool,
     /// The tables of the consumers' side; none without `switch N`.
     tables: Option<Tables<'static>>,
@@ -525,6 +529,8 @@ impl Switch {
             channel,
             line_closed: false,
             interrupted: false,
+            msi: None,
+            per_vector: [0; 2],
             link,
             tables,
             timer,
@@ -558,6 +564,26 @@ impl Switch {
         };
         switch.lend();
         switch
+    }
+
+    /// The device raises MSI-X, a vector a queue (msix.rs): `irq` is the
+    /// vector of receiving and `irq_tx` that of sending. A notification of
+    /// either asks for a whole step, which polls both queues; the ISR is not
+    /// read (an MSI-X vector says it was the queue's).
+    pub fn vectors(&mut self, irq_tx: Handle<Interrupt>) {
+        self.msi = Some(irq_tx);
+    }
+
+    /// Counts an interrupt of the vector whose binding has `label` (init
+    /// labels them with `proto_init::binding_label`), and says the count at
+    /// 1, 4, 16, ... so that the log shows both vectors at work.
+    fn count_vector(&mut self, label: u64) {
+        let vector = usize::from(label == proto_init::binding_label(1));
+        let count = &mut self.per_vector[vector];
+        *count += 1;
+        if count.is_power_of_two() && count.trailing_zeros().is_multiple_of(2) {
+            rt::println!("virtio-net: vector {vector} interrupts {count}");
+        }
     }
 
     /// The consumers attached now.
@@ -676,7 +702,12 @@ impl Switch {
         if self.idle_set {
             self.clear_idle();
         }
-        if interrupt {
+        if interrupt && self.msi.is_some() {
+            self.line_closed = true;
+            if !core::mem::replace(&mut self.interrupted, true) {
+                rt::println!("virtio-net: first interrupt");
+            }
+        } else if interrupt {
             self.line_closed = true;
             let began = profile::now();
             let isr = Isr::read(&mut self.transport);
@@ -1594,12 +1625,15 @@ extern "C" fn run(_: u64) -> ! {
     loop {
         let waiting = now_ns();
         let interrupt = match sys::receive(&switch.channel) {
-            Ok(sys::Received::Notification { source, .. }) => {
+            Ok(sys::Received::Notification { source, label, .. }) => {
                 // Seen before the rings are looked at: a word pushed after
                 // that tells again.
                 INNER.switch_told.seen();
                 if source == abi::Source::Timer {
                     switch.armed = false;
+                }
+                if source == abi::Source::Interrupt && switch.msi.is_some() {
+                    switch.count_vector(label);
                 }
                 source == abi::Source::Interrupt
             }

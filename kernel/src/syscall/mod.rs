@@ -46,7 +46,7 @@ mod proc;
 mod time;
 mod upcall;
 
-use devices::{device_window_create, irq_ack, irq_bind};
+use devices::{device_window_create, irq_ack, irq_bind, msi_create};
 use handles::{handle_close, handle_duplicate};
 use info::{debug_write, object_info};
 use mem::{change, change_map, go_on, mem_create, mem_protect, mem_unmap};
@@ -266,7 +266,8 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadUpcallReturn) => return thread_upcall_return(thread),
         Some(Call::Yield) => yield_now(),
         Some(Call::DeviceWindowCreate) => objects(|| device_window_create(thread, &args)),
-        Some(Call::IrqBind) => objects(|| irq_bind(thread, &args)),
+        Some(Call::IrqBind) => irq_bind(thread, &args),
+        Some(Call::MsiCreate) => msi_create(thread, &args),
         Some(Call::IrqAck) => objects(|| irq_ack(thread, &args)),
         Some(Call::ClockNow) => clock_now(),
         Some(Call::TimerCreate) => {
@@ -292,7 +293,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
 /// takes its section itself and hands it to `sched::resume_from` or
 /// `thread::run_from`.
 #[inline(always)]
-fn objects<R>(call: impl FnOnce() -> R) -> R {
+pub(super) fn objects<R>(call: impl FnOnce() -> R) -> R {
     let _section = crate::obj::lock();
     call()
 }

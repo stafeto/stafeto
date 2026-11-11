@@ -9,6 +9,7 @@
 
 use super::gic;
 use kcore::gic::{DEFAULT_PRIORITY, VIRTUAL_TIMER_INTID};
+use kcore::must::Must;
 use kcore::sync::SetOnce;
 use kcore::time::Clock;
 
@@ -38,7 +39,7 @@ static CLOCK: SetOnce<Clock> = SetOnce::new();
 /// The clock of the counter's frequency; `init` sets it up before
 /// anything reads the time.
 pub fn clock() -> Clock {
-    *CLOCK.get().expect("the timer is set up at boot")
+    *CLOCK.get().must("the timer is set up at boot")
 }
 
 /// The virtual counter, read after all earlier instructions. The kernel
@@ -133,7 +134,7 @@ pub fn init() -> Clock {
     disarm();
     gic::set_priority(INTID, DEFAULT_PRIORITY);
     gic::unmask(INTID);
-    let clock = Clock::new(frequency()).expect("CNTFRQ_EL0 is zero");
+    let clock = Clock::new(frequency()).must("CNTFRQ_EL0 is zero");
     // A second init keeps the clock of the first: the frequency is fixed.
     let _ = CLOCK.set(clock);
     clock

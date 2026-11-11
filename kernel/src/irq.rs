@@ -24,22 +24,32 @@
 //! gives the channel's slot and reference back and lets the payer's shell
 //! go.
 
-use crate::arch::gic;
+use crate::arch::{gic, its};
 use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item};
+use crate::msi::{self, Job, Msi};
+use crate::obj::Guarded;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use crate::qsbr::{self, Deferred};
 use abi::{Error, IrqInfo};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
-use kcore::gic::{FIRST_SPI, FIRST_SPURIOUS};
+use kcore::gic::{FIRST_LPI, FIRST_SPI, FIRST_SPURIOUS};
+use kcore::its::{Command, LpiMap, MAX_LPIS};
 
 /// The bits of an interrupt (spec 6.5): bit 0 at each delivery.
 const IRQ_BITS: u64 = 1;
 
 /// The shared lines a binding may take: INTID 32-1019.
 const LINE_COUNT: usize = (FIRST_SPURIOUS - FIRST_SPI) as usize;
+
+/// The event of an MSI device a binding stands for.
+#[derive(Clone, Copy)]
+struct Event {
+    device: NonNull<Msi>,
+    id: u32,
+}
 
 pub struct Irq {
     /// Its source of notifications: the slot of its interrupts, the label
@@ -52,8 +62,14 @@ pub struct Irq {
     /// Its handles and the reference `bind` hands out: the references
     /// that keep its line.
     handles: u32,
-    /// Its line, an INTID of 32-1019.
+    /// Its line, an INTID of 32-1019; for an event of an MSI device its LPI
+    /// (`event`), an INTID of 8192 and up.
     line: u32,
+    /// The CPU its interrupts go to.
+    cpu: u32,
+    /// The event this binding is, with the device it belongs to, which it
+    /// holds with a counted reference; None for a binding of a line.
+    event: Option<Event>,
     /// The line is edge-triggered; otherwise level-triggered.
     edge: bool,
     /// An interrupt masked the line, and no irq_ack opened it since.
@@ -72,6 +88,34 @@ pub struct Irq {
     deferred: Deferred,
 }
 
+impl Irq {
+    /// A binding of `line` (an LPI for an `event`) with one reference and
+    /// one handle, not yet attached to its channel.
+    fn new(
+        c: NonNull<Channel>,
+        payer: NonNull<Process>,
+        line: u32,
+        cpu: u32,
+        event: Option<Event>,
+        edge: bool,
+    ) -> Irq {
+        Irq {
+            source: Source::new(c),
+            refs: Refs::one(),
+            handles: 1,
+            line,
+            cpu,
+            event,
+            edge,
+            masked: false,
+            payer,
+            level: 0,
+            cleanup: Item::new(),
+            deferred: Deferred::new(),
+        }
+    }
+}
+
 // SAFETY: bindings are reached under the kernel's rules (spec 8.1): one
 // CPU, interrupts masked inside the kernel.
 unsafe impl Send for Irq {}
@@ -84,6 +128,17 @@ unsafe impl Send for Irq {}
 /// CPU passed a quiescent point after it left the table (qsbr).
 static LINES: [AtomicPtr<Irq>; LINE_COUNT] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; LINE_COUNT];
+
+/// The binding of each LPI the kernel hands out, the first for INTID
+/// 8192: 1 024 entries of 8 bytes, outside every quota (spec 7.8), `.bss`.
+/// Written under `OBJ` with release, read without a lock with acquire
+/// (`lpi_binding`), as LINES is.
+static LPIS: [AtomicPtr<Irq>; MAX_LPIS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_LPIS];
+
+/// The LPIs taken (spec 7.8): a number goes back when the period after its
+/// binding left LPIS has passed (`reclaim`). Under `OBJ`.
+static LPI_MAP: Guarded<LpiMap> = Guarded::new(LpiMap::new());
 
 /// Bindings whose places have not gone back.
 static LIVE: Live = Live::new();
@@ -122,20 +177,10 @@ pub fn bind(
     line: u32,
     priority: u8,
     edge: bool,
+    cpu: u32,
 ) -> Result<NonNull<Irq>, Error> {
     channel::reserve_source(c)?;
-    let irq = Irq {
-        source: Source::new(c),
-        refs: Refs::one(),
-        handles: 1,
-        line,
-        edge,
-        masked: false,
-        payer,
-        level: 0,
-        cleanup: Item::new(),
-        deferred: Deferred::new(),
-    };
+    let irq = Irq::new(c, payer, line, cpu, None, edge);
     let b = process::paid_alloc(payer, irq).inspect_err(|_| channel::remove_source(c))?;
     // SAFETY: the binding was just made, and nothing else refers to it.
     unsafe { (*b.as_ptr()).source.attach(Owner::Irq(b), priority, label) };
@@ -143,8 +188,59 @@ pub fn bind(
     LIVE.made();
     LINES[entry(line)].store(b.as_ptr(), Ordering::Release);
     gic::set_trigger(line, edge);
+    gic::set_route(line, cpu as usize);
     gic::unmask(line);
     Ok(b)
+}
+
+/// A binding of `event` of `device`, an MSI device with MANAGE, to `c`, an
+/// open channel, as irq_bind checked them (spec 9): its slot has
+/// `priority` and `label`, and its interrupts go to CPU `cpu`. It takes one
+/// of the channel's slots, then a free LPI (LIMIT_REACHED when all
+/// MAX_LPIS are taken), then a place in the pool of bindings of `payer`
+/// (NO_MEMORY when the quota falls short); nothing changes on either. The
+/// binding goes into LPIS and holds the device and the payer's shell. The
+/// LPI is edge-triggered and the kernel masks nothing (spec 9): the
+/// caller runs the returned job, the property byte and the ITS commands,
+/// once its section ended. The caller gets the first reference, which
+/// counts as a handle.
+pub fn bind_event(
+    payer: NonNull<Process>,
+    c: NonNull<Channel>,
+    label: u64,
+    device: NonNull<Msi>,
+    event: u32,
+    priority: u8,
+    cpu: u32,
+) -> Result<(NonNull<Irq>, Job), Error> {
+    channel::reserve_source(c)?;
+    let Some(lpi) = LPI_MAP.lock().take() else {
+        channel::remove_source(c);
+        return Err(Error::LimitReached);
+    };
+    let irq = Irq::new(c, payer, lpi, cpu, Some(Event { device, id: event }), true);
+    let b = match process::paid_alloc(payer, irq) {
+        Ok(b) => b,
+        Err(e) => {
+            LPI_MAP.lock().give(lpi);
+            channel::remove_source(c);
+            return Err(e);
+        }
+    };
+    // SAFETY: the binding was just made, and nothing else refers to it.
+    unsafe { (*b.as_ptr()).source.attach(Owner::Irq(b), priority, label) };
+    process::retain_shell(payer);
+    msi::retain(device);
+    msi::take(device, event);
+    LIVE.made();
+    LPIS[(lpi - FIRST_LPI) as usize].store(b.as_ptr(), Ordering::Release);
+    let job = Job::MapEvent {
+        device_id: msi::device_id(device),
+        event,
+        lpi,
+        cpu,
+    };
+    Ok((b, job))
 }
 
 /// The count of references to `b`, through the raw pointer.
@@ -221,8 +317,17 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
         let p = b.as_ptr();
         (*p).handles -= 1;
         if (*p).handles == 0 {
-            gic::mask((*p).line);
-            LINES[entry((*p).line)].store(core::ptr::null_mut(), Ordering::Release);
+            if (*p).event.is_some() {
+                // An LPI has no mask in the GIC: no interrupt finds the
+                // binding, and its enable byte goes; DISCARD follows in the
+                // portion that takes the binding apart.
+                LPIS[((*p).line - FIRST_LPI) as usize]
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                its::set_property((*p).line, None);
+            } else {
+                gic::mask((*p).line);
+                LINES[entry((*p).line)].store(core::ptr::null_mut(), Ordering::Release);
+            }
         }
         release(b, cause);
     }
@@ -253,13 +358,18 @@ pub fn ack(b: NonNull<Irq>) -> Result<(), Error> {
 pub fn info(b: NonNull<Irq>) -> IrqInfo {
     // SAFETY: the caller holds a reference to the binding; only the fields
     // are read.
-    let (line, masked, edge) =
-        unsafe { ((*b.as_ptr()).line, (*b.as_ptr()).masked, (*b.as_ptr()).edge) };
-    IrqInfo {
-        line: line.into(),
-        masked,
-        edge,
+    let (line, masked, edge, cpu, event) = unsafe {
+        let p = b.as_ptr();
+        ((*p).line, (*p).masked, (*p).edge, (*p).cpu, (*p).event)
+    };
+    let mut info = IrqInfo::line(line.into(), masked, edge, cpu.into());
+    if let Some(event) = event {
+        info.lpi = true;
+        info.lpi_number = line.into();
+        info.msi_address = its::translater();
+        info.msi_data = event.id.into();
     }
+    info
 }
 
 /// An interrupt of `line`, acknowledged at the GIC, before its EOI
@@ -300,6 +410,67 @@ pub fn deliver(line: u32) -> bool {
     true
 }
 
+/// An interrupt of the LPI `lpi`, acknowledged at the GIC, before its EOI
+/// (interrupt::handle, spec 9): false when no binding holds the LPI, which
+/// the EOI then ends all the same. An LPI has no active state and no mask in
+/// the GIC: notifications that come before the driver serves the device
+/// merge in its slot, and bit 0 goes into the slot at the slot's priority,
+/// the level of whatever the post lets go (spec 7.7); a closed channel takes
+/// nothing. O(1).
+pub fn deliver_lpi(lpi: u32) -> bool {
+    let Some(index) = lpi
+        .checked_sub(FIRST_LPI)
+        .filter(|&i| (i as usize) < MAX_LPIS)
+    else {
+        return false;
+    };
+    // The lookup takes no lock: the binding stays in place until this CPU
+    // passes a quiescent point, which it does not before this returns.
+    let Some(b) = NonNull::new(LPIS[index as usize].load(Ordering::Acquire)) else {
+        return false;
+    };
+    crate::testpoint::line_read(lpi);
+    let _section = crate::obj::lock();
+    // The binding may have been unbound meanwhile, by a CPU that held `OBJ`.
+    if NonNull::new(LPIS[index as usize].load(Ordering::Acquire)) != Some(b) {
+        return false;
+    }
+    // SAFETY: LPIS names the binding still, under OBJ, so handles to it are
+    // left, each with its reference, and none goes during the post: the
+    // binding and its attached source live until it returns.
+    unsafe {
+        let priority = (*b.as_ptr()).source.priority();
+        let _ = Source::post(source(b), IRQ_BITS, priority);
+    }
+    true
+}
+
+/// The ITS side of the portion of a binding nothing refers to
+/// (cleanup::portion), outside `OBJ` (spec 8.1): for an event of an MSI
+/// device, INV of its disabled property byte, DISCARD of its mapping and
+/// SYNC, which the portion waits for before its own section. Nothing for a
+/// binding of a line.
+///
+/// # Safety
+/// Nothing refers to the binding, and it is in no queue.
+#[inline(never)]
+pub unsafe fn unmap(b: NonNull<Irq>) {
+    // SAFETY: the caller's promise; only the fields are read, and the device
+    // lives while the binding holds its reference.
+    let Some(event) = (unsafe { (*b.as_ptr()).event }) else {
+        return;
+    };
+    let device_id = msi::device_id(event.device);
+    // SAFETY: as above.
+    let cpu = unsafe { (*b.as_ptr()).cpu };
+    let pos = its::send(&[
+        Command::inv(device_id, event.id),
+        Command::discard(device_id, event.id),
+        Command::sync(its::rdbase(cpu as usize)),
+    ]);
+    its::wait(pos, "DISCARD");
+}
+
 /// The portion of a binding nothing refers to (cleanup::portion), at
 /// `level`: its source goes, which gives its slot in the channel back and
 /// lets the channel go (Source::detach), its place goes back to the
@@ -317,6 +488,12 @@ pub unsafe fn clean(b: NonNull<Irq>, level: u8) {
     unsafe {
         (*b.as_ptr()).source.detach(level);
         (*b.as_ptr()).level = level;
+        // DISCARD ran (`unmap`): the event is free for a new binding, and
+        // the device may go once nothing else holds it.
+        if let Some(event) = (*b.as_ptr()).event {
+            msi::give(event.device, event.id);
+            msi::release(event.device, level);
+        }
         // Another CPU may read the binding from LINES as long as no period
         // passed since the line let go of it.
         qsbr::retire(NonNull::from(&mut (*b.as_ptr()).deferred), reclaim);
@@ -336,14 +513,21 @@ unsafe fn reclaim(d: NonNull<Deferred>) {
     unsafe {
         let b = NonNull::new_unchecked(d.as_ptr().byte_sub(offset).cast::<Irq>());
         let (payer, level) = ((*b.as_ptr()).payer, (*b.as_ptr()).level);
+        let event = (*b.as_ptr()).event;
+        let lpi = (*b.as_ptr()).line;
         process::paid_free(payer, b);
         LIVE.gone(b);
+        if event.is_some() {
+            // No CPU reads the binding from LPIS any more: its number may
+            // be taken again.
+            LPI_MAP.lock().give(lpi);
+        }
         process::release_shell(payer, level);
     }
 }
 
 // The poison of a binding that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Irq, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Irq, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{bound, in_use, payer};

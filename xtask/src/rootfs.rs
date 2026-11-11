@@ -1625,6 +1625,9 @@ pub const IMAGES: &[&str] = &[
     "boot-fast-vz-steps.img",
     "boot-net-probe.img",
     "boot-net-probe-static.img",
+    "boot-net-probe-its.img",
+    "boot-net-probe-its-static.img",
+    "boot-net-its.img",
     "boot-net-steps.img",
     "boot-net-probe-two.img",
     "boot-net-steps-two.img",
@@ -1788,7 +1791,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             }
             files
         }
-        "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
+        "boot-net.img"
+        | "boot-net-its.img"
+        | "boot-net-curl-steps.img"
+        | "boot-posix-net-steps.img" => net_files(name),
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
             let mut files = dialog(name);
@@ -1975,7 +1981,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.push(file("/bin/fast-echo", 0o755, ROOT, "fast-echo"));
             files
         }
-        "boot-net-probe-static.img" => vec![of(
+        "boot-net-probe-static.img" | "boot-net-probe-its-static.img" => vec![of(
             "/etc/netd.conf",
             0o644,
             ROOT,
@@ -2769,6 +2775,10 @@ mod tests {
                 }
                 "boot-posix-net-steps.img" => crate::posix_net::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
+                "boot-net-probe-its.img" | "boot-net-probe-its-static.img" => {
+                    &crate::net_probe::ITS_PROGRAMS
+                }
+                "boot-net-its.img" => crate::net::its_programs(),
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,
                 "boot-net-probe-two.img" => &crate::net_probe::TWO_PROGRAMS,
                 "boot-net-steps-two.img" => &crate::net_probe::TWO_STEPS_PROGRAMS,

@@ -106,6 +106,17 @@ pub fn attach(d: usize, dma_pa: u64, net_pa: u64) -> bool {
     virtio_net::host::attach(d, queues, &[buffers])
 }
 
+/// BAR 4 of the network function of QEMU's machine with an ITS, where the
+/// window `bar` maps it (the MSI-X table's BAR follows it there).
+pub fn qemu_bar() -> Region {
+    let net = virtio_pci::qemu::NET;
+    Region {
+        va: bar_at(),
+        pa: net.bar,
+        len: net.len as usize,
+    }
+}
+
 /// BAR 0 of the PCI device `d` of VZ: where the window `bar` maps it, and
 /// where it lies for the device.
 pub fn bar(d: usize) -> Region {

@@ -12,6 +12,7 @@
 //! constant MAX_MAPPINGS.
 
 use crate::PAGE_SHIFT;
+use crate::must::Must;
 use abi::{Error, Rights};
 
 /// Mappings of one process, at most.
@@ -189,9 +190,7 @@ impl<T: Copy> Maps<T> {
 
     /// The mapping at `index`, which is in the table.
     pub fn get(&self, index: usize) -> &Mapping<T> {
-        self.entries[index]
-            .as_ref()
-            .expect("a mapping at the index")
+        self.entries[index].as_ref().must("a mapping at the index")
     }
 
     /// Marks the mapping at `index` busy while a long call works on it, or
@@ -199,7 +198,7 @@ impl<T: Copy> Maps<T> {
     pub fn set_busy(&mut self, index: usize, busy: bool) {
         self.entries[index]
             .as_mut()
-            .expect("a mapping at the index")
+            .must("a mapping at the index")
             .busy = busy;
     }
 
@@ -217,9 +216,7 @@ impl<T: Copy> Maps<T> {
     /// fewer than that many places are free; nothing changes then. The
     /// table is walked once.
     pub fn split(&mut self, index: usize, start: u64, pages: u64) -> Result<u32, Error> {
-        let m = *self.entries[index]
-            .as_ref()
-            .expect("a mapping at the index");
+        let m = *self.entries[index].as_ref().must("a mapping at the index");
         let end = start
             .checked_add(pages << PAGE_SHIFT)
             .filter(|_| pages != 0 && pages <= u64::from(m.pages))
@@ -252,11 +249,11 @@ impl<T: Copy> Maps<T> {
             ..m
         };
         if before != 0 {
-            let at = places.next().expect("a place for the left edge");
+            let at = places.next().must("a place for the left edge");
             self.entries[at] = Some(Mapping { pages: before, ..m });
         }
         if after != 0 {
-            let at = places.next().expect("a place for the right edge");
+            let at = places.next().must("a place for the right edge");
             self.entries[at] = Some(Mapping {
                 start: end,
                 pages: after,
@@ -273,9 +270,7 @@ impl<T: Copy> Maps<T> {
     /// none it leaves the table, and its object comes back for its
     /// reference to go.
     pub fn shrink_to(&mut self, index: usize, pages: u32) -> Option<T> {
-        let m = self.entries[index]
-            .as_mut()
-            .expect("a mapping at the index");
+        let m = self.entries[index].as_mut().must("a mapping at the index");
         assert!(pages <= m.pages, "a mapping shrinks past its end");
         if pages == 0 {
             return Some(self.remove(index).object);
@@ -290,9 +285,7 @@ impl<T: Copy> Maps<T> {
     /// none left it leaves the table, and its object comes back for its
     /// reference to go.
     pub fn drop_prefix(&mut self, index: usize, pages: u32) -> Option<T> {
-        let m = self.entries[index]
-            .as_mut()
-            .expect("a mapping at the index");
+        let m = self.entries[index].as_mut().must("a mapping at the index");
         assert!(pages <= m.pages, "a mapping loses more than it has");
         if pages == m.pages {
             return Some(self.remove(index).object);
@@ -306,7 +299,7 @@ impl<T: Copy> Maps<T> {
 
     /// Takes the mapping at `index` out of the table.
     pub fn remove(&mut self, index: usize) -> Mapping<T> {
-        self.entries[index].take().expect("a mapping at the index")
+        self.entries[index].take().must("a mapping at the index")
     }
 
     /// Takes up to `n` mappings out of the table, busy or not, and hands

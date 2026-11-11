@@ -23,15 +23,23 @@ const ELF: &str = "target/stafeto-overflow.elf";
 const ELF: &str = "target/stafeto.elf";
 
 pub fn print() {
-    let stacks = [symbols::emergency_stack(), symbols::boot_stack()];
+    // The stacks of this CPU: every CPU's stack has the layout of the boot
+    // stack (kernel.ld), the guard page and the emergency stack below it.
+    let boot = symbols::boot_stack();
+    let emergency = symbols::emergency_stack();
+    let top = super::cpu::this().stack_top();
+    let (size, guard) = (boot.end - boot.start, boot.start - emergency.end);
+    let kernel = top - size..top;
+    let alternate = kernel.start - guard - (emergency.end - emergency.start)..kernel.start - guard;
+    let stacks = [alternate, kernel];
     let fp: usize;
     // SAFETY: reading x29 has no side effects.
     unsafe {
         core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
     };
     kprintln!("backtrace (look up: lldb -b -o 'image lookup -a ADDR' {ELF}):");
-    // SAFETY: the walk reads only words of records inside the two stacks,
-    // and both are mapped.
+    // SAFETY: the walk reads only words of records inside the two stacks of
+    // this CPU, and both are mapped.
     let read = |addr: usize| unsafe { *(addr as *const usize) };
     let mut depth = 0;
     kcore::backtrace::walk(fp, &stacks, MAX_FRAMES, read, |lr| {
