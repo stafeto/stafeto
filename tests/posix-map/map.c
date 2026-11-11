@@ -462,7 +462,7 @@ static void fc_hundred(void) {
     int wrong = 0;
     for (int i = 0; i < 100; i++) {
         size_t off = (size_t)(i % (n + 2));
-        size_t len = (size_t)((i * 7) % (n + 5));
+        size_t len = (size_t)(1 + (i * 7) % (n + 4));
         ssize_t expect = off >= (size_t)n ? 0 : (ssize_t)((len < (size_t)n - off) ? len : (size_t)n - off);
         memset(got, 0x55, sizeof got);
         if (pread(fd, got, len, (off_t)off) != expect) wrong++;
@@ -473,6 +473,12 @@ static void fc_hundred(void) {
     check("cache: a hundred preads read right", wrong == 0);
     check("cache: a hundred preads made no call of the service",
           c.service == b.service && c.snaps == b.snaps && c.fills == b.fills && c.hits >= b.hits + 100);
+    /* A read of no bytes asks the cache for nothing: no snapshot and no copy. */
+    int fresh = open("/bin/data", O_RDONLY);
+    struct fcache z = fc_now();
+    check("cache: a pread of no bytes asks nothing", fresh >= 0 && pread(fresh, got, 0, 0) == 0
+          && fc_now().snaps == z.snaps && fc_now().fills == z.fills);
+    close(fresh);
     /* dup shares the description, so the copy: no new ask, and the copy outlives the first number. */
     int copy = dup(fd);
     check("cache: dup", copy >= 0);
@@ -607,11 +613,47 @@ static void fc_mapping(void) {
     close(fd);
 }
 
+/* A fork from deep in the stack: the child runs on a copy of that stack, so the layer's reset of
+ * the cache after the fork may not make a temporary of the size of its state (45 KiB; a child that
+ * does runs off a stack that has less left). A process has a stack of 64 KiB; this one has used
+ * 12 KiB more of it when it forks, which leaves the fork itself room and a temporary of 45 KiB
+ * not. The child then reads a file through its own, empty cache. */
+static volatile int fc_deep_fd = -1, fc_deep_length, fc_deep_result = -1;
+
+static int fc_deep_fork(int depth) {
+    volatile char pad[1024];
+    memset((void *)pad, depth, sizeof pad);
+    if (depth > 0) return fc_deep_fork(depth - 1) + pad[depth];
+    int fd = fc_deep_fd, length = fc_deep_length;
+    pid_t child = fork();
+    if (child == 0) {
+        char got[64];
+        _exit(pread(fd, got, (size_t)length, 0) == length ? 0 : 2);
+    }
+    int status = 0;
+    fc_deep_result = (child > 0 && waitpid(child, &status, 0) == child) ? (WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status)) : 99;
+    return 0;
+}
+
+static void fc_deep(void) {
+    char got[512];
+    int n = fc_slurp("/etc/motd", got, sizeof got);
+    int fd = open("/etc/motd", O_RDONLY);
+    check("cache: deep open", n > 0 && fd >= 0 && pread(fd, got, (size_t)n, 0) == n);
+    fc_deep_fd = fd;
+    fc_deep_length = n;
+    fc_deep_fork(11);
+    check("cache: a fork 12 KiB deep in a stack of 64 KiB, and a cached read in the child", fc_deep_result == 0);
+    if (fc_deep_result) printf("posix-map: cache deep fork child result %d\n", fc_deep_result);
+    close(fd);
+}
+
 static void file_cache(void) {
     fc_hundred();
     fc_mutable();
     fc_reopen();
     fc_forked();
+    fc_deep();
     fc_mapping();
     fc_budget();
     if (!failures) printf("posix-map: file cache ok\n");

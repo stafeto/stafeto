@@ -10,10 +10,11 @@
 //!   the old path for the life of the description; so does every file when the service does not
 //!   know the method.
 //! * The copy of an immutable file of `FILE_MAX` (256 KiB) or less goes into the arena: up to
-//!   `PIECES_MAX` memory objects of `PIECE_BYTES` made as they are needed, with the process's own
-//!   quota, mapped as pieces of the kind `posix_map::Kind::FileCache` (a forked child has none).
-//!   A file takes a run of whole pages of one piece; the pages are filled with READ_AT_FD_INTO in
-//!   portions of `READ_PORTION`, a step of the service each.
+//!   `PIECES_MAX` memory objects made as they are needed, outside the lock, with the process's own
+//!   quota (the first of 64 KiB, the others of 256 KiB: `PIECE_SIZES`), mapped as pieces of
+//!   the kind `posix_map::Kind::FileCache` (a forked child has none). A file takes a run of whole
+//!   pages of one piece; the pages are filled with READ_AT_FD_INTO in portions of `READ_PORTION`,
+//!   a step of the service each. Pieces are never given back.
 //! * An entry (the copy) is named by the node key of the service, so the descriptions of one file
 //!   share it and a place a layer takes again gets a new copy. A description names its entry by
 //!   (slot, generation) of the description, never by the number: a number closed and opened
@@ -22,20 +23,23 @@
 //! * The arena holds `budget` bytes of pages (default 2 MiB, `STAFETO_FILE_CACHE`: 0 turns the
 //!   cache off, a number is the budget in KiB). A copy that needs pages evicts entries by the
 //!   clock, those no description names first; an entry a read is copying from is never evicted.
-//! * Every state is behind one lock the cache only tries: a call that finds it taken (another
-//!   thread, or a handler the lock's holder was interrupted by) goes by the service as before,
-//!   and so does every call the cache cannot serve. The copy out of the arena runs outside the
-//!   lock, with the entry pinned by a reader count.
-//! * `fork` leaves the child with no state (the arena is not inherited), `exec` starts a new
+//! * Every state is behind one lock that is only tried (at most `TRIES` tries where a call has a
+//!   way out): a call that finds it taken goes by the service as before, so no thread waits for
+//!   the holder of a lower level. The sections under the lock are bounded by the constants of the
+//!   state and make no call of the system; the piece is made before the lock is taken, and a
+//!   filler that finds the lock taken after its fill leaves its verdict for the next holder. The
+//!   copy out of the arena runs outside the lock, with the entry pinned by a reader count.
+//! * `fork` leaves the child with no state (the arena is not inherited; the reset is in place and
+//!   makes no temporary, since the child runs on a copy of the caller's stack), `exec` starts a new
 //!   image. `read` and `lseek` are untouched: the position of a description lives in the service.
 
 use core::cell::UnsafeCell;
 use core::ffi::c_char;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use posix_fs::{FsError, RamTarget, Transport};
 use posix_map::PAGE;
 use posix_map::cache::{
-    BUDGET_PAGES, Cache, ENTRIES, FILE_MAX, Know, NONE, PIECE_BYTES, Phase, Plan, budget_from,
+    BUDGET_PAGES, Cache, FILE_MAX, Know, NONE, Phase, Plan, Shared, budget_from,
 };
 use proto_fs::READ_PORTION;
 use rt::handle::{Handle, Memory};
@@ -43,13 +47,20 @@ use rt::sys;
 
 const _: () = assert!(READ_PORTION.is_multiple_of(PAGE));
 
-// The state, its lock and the reader counts.
-struct Shared(UnsafeCell<Cache>);
+/// The tries of a wait for the lock that has a way out: a lock held by a thread of a lower level
+/// that a higher one preempted is not waited for, the call goes by the service. Every section
+/// under the lock is bounded by the constants of the state (at most 1,040 visits of entries by
+/// the clock, 8 pieces of 64 pages for a run, 520 entries for a key) and makes no call of the
+/// system.
+const TRIES: u32 = 64;
+
+// The state and its lock; the words the readers use without the lock are `SHARED`.
+struct Held(UnsafeCell<Cache>);
 // SAFETY: every access to the cell holds LOCK.
-unsafe impl Sync for Shared {}
-static CACHE: Shared = Shared(UnsafeCell::new(Cache::new()));
+unsafe impl Sync for Held {}
+static CACHE: Held = Held(UnsafeCell::new(Cache::new()));
 static LOCK: AtomicBool = AtomicBool::new(false);
-static READERS: [AtomicU16; ENTRIES] = [const { AtomicU16::new(0) }; ENTRIES];
+static SHARED: Shared = Shared::new();
 
 /// 0 not read yet, 1 on, 2 off.
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -84,12 +95,8 @@ pub fn probe_budget(kib: usize) {
         return;
     }
     let pages = kib.div_ceil(PAGE / 1024).clamp(1, BUDGET_PAGES);
-    loop {
-        if let Some(mut guard) = Guard::try_new() {
-            guard.budget_pages = pages;
-            return;
-        }
-        core::hint::spin_loop();
+    if let Some(mut guard) = Guard::waiting() {
+        guard.budget_pages = pages;
     }
 }
 
@@ -101,6 +108,17 @@ pub fn note_service_read() {
 struct Guard(&'static mut Cache);
 
 impl Guard {
+    /// The lock after at most `TRIES` tries.
+    fn waiting() -> Option<Self> {
+        for _ in 0..TRIES {
+            if let Some(guard) = Self::try_new() {
+                return Some(guard);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
     fn try_new() -> Option<Self> {
         if LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -150,11 +168,10 @@ fn active() -> bool {
             });
             match budget_from(text) {
                 Some(pages) => {
-                    if let Some(mut guard) = Guard::try_new() {
-                        guard.budget_pages = pages;
-                    } else {
+                    let Some(mut guard) = Guard::waiting() else {
                         return false;
-                    }
+                    };
+                    guard.budget_pages = pages;
                     posix_fs::set_ram_closed(closed);
                     MODE.store(1, Ordering::Release);
                     true
@@ -168,15 +185,29 @@ fn active() -> bool {
     }
 }
 
-/// A memory object of `PIECE_BYTES` mapped as a piece of the arena: its base and handle.
-fn new_piece() -> Option<(usize, u64)> {
-    let object = sys::mem_create(PIECE_BYTES as u64).ok()?;
-    let raw = object.raw().0;
-    let base = crate::allocation::heap(|state| {
-        state.map_special_more(object, PIECE_BYTES / PAGE, posix_map::Kind::FileCache)
-    })
-    .ok()?;
-    Some((base, raw))
+/// Makes a piece of `pages` pages (a memory object of the process's own, mapped as a piece of
+/// the arena) outside the lock and offers it to the next holder. One thread makes it; the
+/// others, and a call that finds a piece waiting, look again. The system's refusal is final.
+fn make_piece(pages: usize) {
+    if SHARED.spare_base.load(Ordering::Acquire) != 0 || SHARED.making.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let made = sys::mem_create((pages * PAGE) as u64)
+        .ok()
+        .and_then(|object| {
+            let raw = object.raw().0;
+            crate::allocation::heap(|state| {
+                state.map_special_more(object, pages, posix_map::Kind::FileCache)
+            })
+            .ok()
+            .map(|base| (base, raw))
+        });
+    match made {
+        Some((base, handle)) => SHARED.offer(base, handle, pages),
+        None => SHARED.refused.store(true, Ordering::Release),
+    }
+    SHARED.making.store(false, Ordering::Release);
 }
 
 /// A read of the description `target` of the service for the bytes of `out` at `offset`, from
@@ -191,15 +222,24 @@ pub fn pread(
     out: &mut [u8],
     create: bool,
 ) -> Option<Result<usize, FsError>> {
-    if !active() || target.kind() != Ok(posix_fs::FileKind::Regular) {
+    // A read of no bytes asks nothing of the cache: the service answers it as before.
+    if out.is_empty() || !active() || target.kind() != Ok(posix_fs::FileKind::Regular) {
         return None;
     }
     let (slot, generation) = (target.description_slot(), target.generation());
-    let mut asked = false;
+    let (mut asked, mut pieces) = (false, 0);
     let (at, len, entry) = loop {
         let mut guard = Guard::try_new()?;
-        match guard.plan(slot, generation, create, &READERS, &mut new_piece) {
+        match guard.plan(slot, generation, create, &SHARED) {
             Plan::Direct => return None,
+            Plan::NeedPiece { pages } => {
+                drop(guard);
+                pieces += 1;
+                if pieces > 2 {
+                    return None;
+                }
+                make_piece(pages);
+            }
             Plan::Ask if asked => return None,
             Plan::Ask => {
                 drop(guard);
@@ -235,30 +275,43 @@ pub fn pread(
                 };
                 drop(guard);
                 let filled = fill(transport, target.fd(), handle, first, len);
-                // The entry is this call's until it is published: wait for the lock.
-                let mut guard = loop {
-                    if let Some(guard) = Guard::try_new() {
-                        break guard;
-                    }
-                    core::hint::spin_loop();
-                };
+                // The entry is this call's until it is published. A lock that stays taken is not
+                // waited for: the verdict goes to the next holder, which applies it.
+                let held = Guard::waiting();
                 match filled {
                     Ok(()) => {
                         FILLS.fetch_add(1, Ordering::Relaxed);
-                        let place = Cache::index(slot);
-                        // The description may have gone meanwhile (a close, or another one took
-                        // its place): the copy stays for whoever asks for the key.
-                        if guard.desc_of(slot, generation) == Some(place) {
-                            guard.filled(entry, place);
-                        } else {
-                            guard.entries[usize::from(entry)].phase = Phase::Ready;
+                        match held {
+                            Some(mut guard) => {
+                                let place = Cache::index(slot);
+                                // The description may have gone meanwhile (a close, or another
+                                // one took its place): the copy stays for whoever asks for the key.
+                                if guard.desc_of(slot, generation) == Some(place) {
+                                    guard.filled(entry, place);
+                                } else {
+                                    guard.entries[usize::from(entry)].phase = Phase::Ready;
+                                }
+                            }
+                            None => verdict(entry, 1),
                         }
                         break (base + first * PAGE, len, entry);
                     }
                     Err(error) => {
-                        guard.failed(entry, &READERS);
-                        if error == Some(FsError::Io) {
-                            guard.clear(&READERS);
+                        match held {
+                            Some(mut guard) => {
+                                guard.failed(entry, &SHARED);
+                                if error == Some(FsError::Io) {
+                                    guard.clear(&SHARED);
+                                } else if error.is_none() {
+                                    // The service cannot give this copy: the description keeps the
+                                    // old path instead of trying again at each read.
+                                    guard.put(slot, generation, Know::Direct, 0, 0);
+                                }
+                            }
+                            None => {
+                                SHARED.readers[usize::from(entry)].store(0, Ordering::Release);
+                                verdict(entry, 2);
+                            }
                         }
                         return error.map(Err);
                     }
@@ -279,18 +332,24 @@ pub fn pread(
         out[..n].copy_from_slice(from);
     }
     if entry != NONE {
-        READERS[usize::from(entry)].fetch_sub(1, Ordering::AcqRel);
+        SHARED.readers[usize::from(entry)].fetch_sub(1, Ordering::AcqRel);
     }
     Some(Ok(n))
+}
+
+/// The verdict of a fill whose filler found the lock taken: the next holder applies it.
+fn verdict(entry: u16, code: u8) {
+    SHARED.pending[usize::from(entry)].store(code, Ordering::Release);
+    SHARED.due.store(true, Ordering::Release);
 }
 
 /// The service answered a call of the cache with a failure of the session (the service is
 /// gone): the copies go, so that a read gives the error the path of messages gives.
 fn lost(error: FsError) {
     if error == FsError::Io
-        && let Some(mut guard) = Guard::try_new()
+        && let Some(mut guard) = Guard::waiting()
     {
-        guard.clear(&READERS);
+        guard.clear(&SHARED);
     }
 }
 
@@ -326,27 +385,25 @@ pub fn closed(target: RamTarget) {
         return;
     }
     let (slot, generation) = (target.description_slot(), target.generation());
-    // A short wait for a lock held for a few steps; a stale place costs nothing but a count.
-    for _ in 0..64 {
-        if let Some(mut guard) = Guard::try_new() {
-            if let Some(at) = guard.desc_of(slot, generation) {
-                guard.forget(at);
-            }
-            return;
-        }
-        core::hint::spin_loop();
+    // A stale place costs nothing but a count, so a lock that stays taken is not waited for.
+    if let Some(mut guard) = Guard::waiting()
+        && let Some(at) = guard.desc_of(slot, generation)
+    {
+        guard.forget(at);
     }
 }
 
-/// A forked child has no copies: the pieces are the parent's.
+/// A forked child has no copies: the pieces are the parent's. The reset is in place: the child
+/// runs on a copy of the caller's stack, which may be a handler's alternate stack of a few KiB,
+/// so no value of the size of the state is made here.
 pub(crate) fn after_fork() {
+    // A process that never used the cache has nothing to reset (and its pages stay untouched).
+    if MODE.load(Ordering::Acquire) != 1 {
+        return;
+    }
     LOCK.store(false, Ordering::Release);
     // SAFETY: the child has one thread and the lock is released above.
     let cache = unsafe { &mut *CACHE.0.get() };
-    let budget = cache.budget_pages;
-    *cache = Cache::new();
-    cache.budget_pages = budget;
-    for r in &READERS {
-        r.store(0, Ordering::Release);
-    }
+    cache.reset();
+    SHARED.reset();
 }

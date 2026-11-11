@@ -488,11 +488,14 @@ mod calls {
         }
     }
 
-    /// The record of the counters when they changed since the last one (the service's
-    /// notifications, the heartbeat among them, call it, so an idle service shows its last
-    /// counters within a heartbeat).
+    /// The record of the counters when they changed since the last one and 100 ms have passed
+    /// (the service's notifications, the heartbeat among them, call it, so an idle service shows
+    /// its last counters within a heartbeat).
     pub fn flush() {
-        report(rt::time::now());
+        let now = rt::time::now();
+        if now >= NEXT.load(Ordering::Relaxed) {
+            report(now);
+        }
     }
 
     fn report(now: u64) {
