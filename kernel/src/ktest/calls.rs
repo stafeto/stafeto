@@ -668,6 +668,76 @@ pub fn object_info_cpu_reads_the_time_of_a_cpu(_: &Boot) -> Result<(), &'static 
     })
 }
 
+/// object_info STAMPS (abi::INFO_STAMPS) belongs to the build with the
+/// feature `stamps`: any other kernel does not know the kind and answers
+/// INVALID_ARGS whatever the handle is. The stamps build answers a handle
+/// without KSTATS with ACCESS_DENIED and a CPU that is not up with
+/// INVALID_ARGS, has a ring on every CPU that is up, and gives back the record
+/// of a point that was just made, with its key, point and CPU.
+pub fn object_info_stamps_exists_only_in_the_stamps_build(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ObjectInfo.number();
+        let stats = c.insert(Object::Resource, Rights::KSTATS)?;
+        let plain = c.insert(Object::Resource, Rights::NONE)?;
+        let cpus = crate::smp::cpus() as u64;
+        let past = cpus << abi::STAMPS_CPU_SHIFT;
+        let result = (|| {
+            if cfg!(feature = "stamps") {
+                c.fails(n, &[plain.0, abi::INFO_STAMPS, 0], Error::AccessDenied)?;
+                c.fails(n, &[stats.0, abi::INFO_STAMPS, past], Error::InvalidArgs)?;
+                // The caller has no message buffer: the records have no place to go.
+                c.fails(n, &[stats.0, abi::INFO_STAMPS, 0], Error::InvalidArgs)?;
+                stamps_cases(cpus as usize)
+            } else {
+                for args in [[stats.0, abi::INFO_STAMPS, 0], [0, abi::INFO_STAMPS, past]] {
+                    c.fails(n, &args, Error::InvalidArgs)?;
+                }
+                Ok(())
+            }
+        })();
+        c.close(stats)?;
+        c.close(plain)?;
+        result
+    })
+}
+
+#[cfg(feature = "stamps")]
+fn stamps_cases(cpus: usize) -> Result<(), &'static str> {
+    for cpu in 0..cpus {
+        check(
+            crate::stamps::read(cpu, 0, |_, _| {}).is_some(),
+            "a CPU that is up has no ring of stamps",
+        )?;
+    }
+    let here = arch::cpu::this().index();
+    let before = crate::stamps::read(here, 0, |_, _| {})
+        .ok_or("no ring on this CPU")?
+        .head;
+    crate::stamps::irq(0x1234);
+    let mut got = [0u64; 2];
+    let b = crate::stamps::read(here, before, |_, w| got = w).ok_or("no ring on this CPU")?;
+    check(
+        b.head == before + 1 && b.count == 1 && b.next == before + 1 && b.torn == 0,
+        "the point did not make exactly one record",
+    )?;
+    check(
+        got[1] == kcore::stamps::pack(0, abi::STAMP_IRQ, here as u8, 0x1234)[1]
+            && got[0] <= timer::now(),
+        "the record of the point has the wrong key, point or CPU",
+    )?;
+    // A cursor at the head gives nothing and stays.
+    let b = crate::stamps::read(here, b.head, |_, _| {}).ok_or("no ring on this CPU")?;
+    check(
+        b.count == 0 && b.next == b.head,
+        "a cursor at the head gave records",
+    )
+}
+
+#[cfg(not(feature = "stamps"))]
+fn stamps_cases(_: usize) -> Result<(), &'static str> {
+    Ok(())
+}
+
 /// A handle holds its object: the last close queues a thread and a
 /// process for cleanup at the level of the caller, 10, and their portions
 /// let them go back to their pools; a closed handle is bad from then on.

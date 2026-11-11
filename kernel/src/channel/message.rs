@@ -264,7 +264,7 @@ unsafe fn take_request(
         if let Err(e) = fit {
             (*client.as_ptr()).waits = None;
             syscall::set_result(client, Err(e));
-            sched::wake(k, client);
+            sched::wake(k, client, abi::WAKE_REPLY);
             syscall::restart(t);
             return Taken::Request(via, Some(client));
         }
@@ -356,7 +356,7 @@ pub fn send(
             let r = meet(k, t, via, desc, crate::arch::timer::now(), mark);
             assert!(r == receiver, "the receiver of a request changed");
             if let Some(r) = r {
-                sched::wake(k, r);
+                sched::wake(k, r, abi::WAKE_REQUEST);
             }
             Ok(r.is_some())
         }
@@ -623,7 +623,7 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
                 Ok(()) => deliver(client, t, desc),
                 Err(e) => syscall::set_result(client, Err(e)),
             }
-            sched::wake(k, client);
+            sched::wake(k, client, abi::WAKE_REPLY);
         }
     });
     if fit.is_err() {

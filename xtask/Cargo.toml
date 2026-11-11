@@ -7,6 +7,13 @@ repository.workspace = true
 license = "GPL-3.0-or-later"
 publish = false
 
+# Deliberate breaks of the analysis of the kernel's time stamps (net_trace.rs), for the tests that
+# must catch them: records of the kernel and of the programs not put in time order, and the exit
+# from `wfi` counted in the flight of an SGI.
+[features]
+break-stamps-merge = []
+break-stamps-split = []
+
 [dependencies]
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }

@@ -405,7 +405,9 @@ pub fn deliver(line: u32) -> bool {
         gic::mask(line);
         (*p).masked = true;
         let priority = (*p).source.priority();
+        crate::stamps::origin(abi::WAKE_IRQ);
         let _ = Source::post(source(b), IRQ_BITS, priority);
+        crate::stamps::origin(0);
     }
     true
 }
@@ -440,7 +442,9 @@ pub fn deliver_lpi(lpi: u32) -> bool {
     // binding and its attached source live until it returns.
     unsafe {
         let priority = (*b.as_ptr()).source.priority();
+        crate::stamps::origin(abi::WAKE_IRQ);
         let _ = Source::post(source(b), IRQ_BITS, priority);
+        crate::stamps::origin(0);
     }
     true
 }

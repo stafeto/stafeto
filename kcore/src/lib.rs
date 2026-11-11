@@ -37,6 +37,7 @@ pub mod qsbr;
 pub mod quota;
 pub mod sched;
 pub mod slab;
+pub mod stamps;
 pub mod sync;
 pub mod sysreg;
 pub mod time;

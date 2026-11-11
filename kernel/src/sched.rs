@@ -284,12 +284,13 @@ pub fn is_local(t: NonNull<Thread>) -> bool {
 
 /// The end of a wait of `t`, which the section took out of its queue:
 /// ready on its own CPU, at once when that is this one, by a command
-/// otherwise (cmd::WAKE).
+/// otherwise (cmd::WAKE). `cause` (abi::WAKE_*) is for the time stamps.
 ///
 /// # Safety
 /// As for `Scheduler::wake`.
 #[inline(always)]
-pub unsafe fn wake(k: &mut Locked<'_>, t: NonNull<Thread>) {
+pub unsafe fn wake(k: &mut Locked<'_>, t: NonNull<Thread>, cause: u8) {
+    crate::stamps::ready(t, cause);
     if is_local(t) {
         // SAFETY: the caller's promise.
         unsafe { k.s.wake(t) };
@@ -389,6 +390,7 @@ pub fn serve_wake(t: NonNull<Thread>) {
     if !thread::is_held(t) {
         return;
     }
+    crate::stamps::ready(t, abi::WAKE_COMMAND);
     // SAFETY: as above; the section that asked took the thread out of its
     // queue.
     unsafe { local().sched.lock().s.wake(t) };
@@ -617,7 +619,7 @@ unsafe fn interrupt_if(
             ));
             let waited = channel::withdraw(t, k);
             syscall::set_result(t, Err(Error::Interrupted));
-            wake(k, t);
+            wake(k, t, abi::WAKE_OTHER);
             Ok::<_, Error>(Some(waited))
         }
     })?;

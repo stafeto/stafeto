@@ -1573,20 +1573,30 @@ impl Guest {
             ));
             Ok(())
         };
-        // The workers first: their rings keep filling with the records of the idle loop. They
+        // The first part of the service's dump stops the rings of the kernel, which the idle CPUs
+        // would wear out during the long dump that follows.
+        crate::net_tls::capture(&mut self.run, "posix-net stat", "trace-n", wait)?;
+        // The workers next: their rings keep filling with the records of the idle loop. They
         // write their lines as they exit (a QUIT to nginx).
         crate::net_tls::capture(&mut self.run, "kill -QUIT $M", "trace-q", wait)?;
         settle(&mut self.run, "the workers", "tr w")?;
         // Each `posix-net stat` gives the next part of the service's ring (it is killed if it is
-        // silent for long); the line `tr n done` ends it.
-        for _ in 0..80 {
+        // silent for long); the line `tr n done` ends it, and then the rings of the kernel follow
+        // in parts of their own, which the line `tr k done` (or `tr k none`, for a kernel that has
+        // no stamps) ends.
+        for _ in 0..160 {
             crate::net_tls::capture(&mut self.run, "posix-net stat", "trace-n", wait)?;
             crate::net_tls::capture(&mut self.run, "sleep 1", "pump", wait)?;
-            if self.run.text().iter().any(|l| l.trim() == "tr n done") {
+            let text = self.run.text();
+            if text
+                .iter()
+                .any(|l| matches!(l.trim(), "tr k done" | "tr k none"))
+            {
                 break;
             }
         }
         settle(&mut self.run, "the service", "tr n ")?;
+        settle(&mut self.run, "the kernel", "tr k")?;
         Ok(())
     }
 
@@ -2003,6 +2013,9 @@ struct Options {
     /// needs the variable STAFETO_TRACE=1): the guest dumps its rings after each ceiling, and
     /// each ceiling has its own guest.
     trace: bool,
+    /// The kernel with its time stamps (feature `stamps`) under the plain images (`--stamps`):
+    /// the cost of the stamps in the rows. `--trace` has the kernel's stamps as well.
+    stamps: bool,
     /// Only the 64 connections of the ceilings (`--c64`), and the rates of the phase `at`.
     c64: bool,
     rates: Vec<u32>,
@@ -2022,7 +2035,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace | --stamps] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -2048,6 +2061,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         switch_cpu0: false,
         cpus: linux_guest::CPUS,
         trace: false,
+        stamps: false,
         c64: false,
         rates: Vec::new(),
         pause_after: None,
@@ -2100,6 +2114,7 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--switch-cpu0" => o.switch_cpu0 = true,
             "--cpus" => o.cpus = number(value(arg)?, arg)? as usize,
             "--trace" => o.trace = true,
+            "--stamps" => o.stamps = true,
             "--c64" => o.c64 = true,
             "--rates" => {
                 o.rates = value(arg)?
@@ -3853,7 +3868,14 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     if o.systems.iter().any(|s| !s.linux() && *s != System::S4o) {
         crate::busybox_build()?;
         crate::nano_build()?;
-        kernel = build(Variant::Normal)?.image;
+        // The kernel of the images of the time stamps has its own (feature `stamps`), and so
+        // has the kernel of the measure of what those stamps cost.
+        kernel = build(if o.trace || o.stamps {
+            Variant::Stamps
+        } else {
+            Variant::Normal
+        })?
+        .image;
         if o.systems.contains(&System::S4) {
             image = match o.image {
                 _ if o.trace => linux_guest::build_trace_image(

@@ -73,6 +73,8 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_LOG => log_info(thread, a),
         abi::INFO_CPU => cpu_info(thread, a),
         abi::INFO_PROCESS_SHARES => process_shares(thread, a),
+        #[cfg(feature = "stamps")]
+        abi::INFO_STAMPS => stamps_info(thread, a),
         _ => Err(Error::InvalidArgs),
     }
 }
@@ -237,6 +239,27 @@ fn log_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         let [count, lost, left] = batch.to_words();
         Ok(Values::new(&[count, lost, left, next + 1]))
     }
+}
+
+/// STAMPS (the feature `stamps`): x2 is the CPU in the bits from
+/// abi::STAMPS_CPU_SHIFT and the first record wanted below them
+/// (abi::INFO_STAMPS). INVALID_ARGS for a CPU that is not up or has no ring.
+#[cfg(feature = "stamps")]
+fn stamps_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+    if thread::buffer_page(thread).is_none() {
+        return Err(Error::InvalidArgs);
+    }
+    let cpu = usize::try_from(a[2] >> abi::STAMPS_CPU_SHIFT).map_err(|_| Error::InvalidArgs)?;
+    if a[2] & abi::STAMPS_FREEZE != 0 {
+        crate::stamps::freeze();
+    }
+    let first = a[2] & (abi::STAMPS_FREEZE - 1);
+    let b = crate::stamps::read(cpu, first, |i, words| {
+        thread::write_words(thread, i * abi::STAMPS_RECORD, &words)
+    })
+    .ok_or(Error::InvalidArgs)?;
+    Ok(Values::new(&[b.count, b.next, b.head, b.torn]))
 }
 
 /// CPU: x0 and x1's reserved word are 0 and x2 is a CPU that is up; its

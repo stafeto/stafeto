@@ -2517,6 +2517,8 @@ mod tests {
         );
     }
 
+    // The images of the time stamps give the network service one more resource.
+    #[cfg(not(feature = "bench-stamps"))]
     #[test]
     fn the_bench_image_differs_from_the_network_image_of_vz_in_the_launcher_alone() {
         assert_eq!(order_of(bench::BENCH_VZ_TABLE), order_of(net::NET_VZ_TABLE));
@@ -2644,6 +2646,8 @@ mod tests {
 
     /// The image of the row F1 is the image of nginx on the stack on VZ with
     /// the launcher of the shell on all four CPUs and nothing else changed.
+    // The images of the time stamps give the network service one more resource.
+    #[cfg(not(feature = "bench-stamps"))]
     #[test]
     fn the_fast_bench_image_differs_from_the_image_of_nginx_on_vz_in_the_launcher_alone() {
         assert_eq!(

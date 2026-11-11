@@ -831,6 +831,57 @@ pub const INFO_PROCESS_SHARES: u64 = 16;
 /// MSI_DEVICE takes an MSI device's handle, with no right needed, and
 /// returns `MsiInfo::to_words` in x1-x3.
 pub const INFO_MSI_DEVICE: u64 = 17;
+/// STAMPS takes the system resource with KSTATS and reads, without changing
+/// it, the ring of time stamps of one CPU (the kernel feature `stamps`, a
+/// debug build; any other kernel answers INVALID_ARGS, as for an unknown
+/// kind). x2 holds the number of the CPU from `STAMPS_CPU_SHIFT` up, `STAMPS_FREEZE`, and the
+/// number of the first record wanted below. Up to `STAMPS_BATCH` records of
+/// `STAMPS_RECORD` bytes go into the start of the caller's message buffer,
+/// each as two words: the counter ticks (CNTVCT_EL0), then the key in bits
+/// 0-31, the point in bits 32-39 and the CPU in bits 40-47. The reply has
+/// in x1 the records given, in x2 the number of the next record, in x3 the
+/// number of records the ring has made, and in x4 the leading records among
+/// those given that the owner wrote over during the read (the caller drops
+/// them). A first record older than the ring holds starts at the oldest one.
+/// INVALID_ARGS for a CPU that is not up or whose ring has no memory.
+pub const INFO_STAMPS: u64 = 18;
+/// object_info STAMPS x2: the CPU number goes in the bits from this one up.
+pub const STAMPS_CPU_SHIFT: u32 = 48;
+/// object_info STAMPS x2: with this bit set, every ring stops taking records
+/// for good before the read (a dump that takes long, so that the idle CPUs
+/// do not write over what the load made); the first record wanted is below
+/// it.
+pub const STAMPS_FREEZE: u64 = 1 << 47;
+/// The bytes of one stamp as the message buffer takes it.
+pub const STAMPS_RECORD: usize = 16;
+/// The stamps one object_info(STAMPS) gives at most: 960 bytes of the buffer.
+pub const STAMPS_BATCH: usize = 60;
+/// The points of the kernel's time stamps (the `point` field of a record).
+/// An interrupt came in (key: the line).
+pub const STAMP_IRQ: u8 = 1;
+/// A thread became ready (key: the thread number in bits 0-15, the cause in
+/// bits 16-23, the CPU of the thread in bits 24-31).
+pub const STAMP_READY: u8 = 2;
+/// A thread got the CPU (key: the thread number).
+pub const STAMP_RUN: u8 = 3;
+/// An SGI of the commands was sent (key: the target CPU).
+pub const STAMP_SGI_SENT: u8 = 4;
+/// An SGI was received (key: its number).
+pub const STAMP_SGI_GOT: u8 = 5;
+/// The CPU went to `wfi` (key 0) and came out of it (key 1).
+pub const STAMP_WFI: u8 = 6;
+/// The causes of `STAMP_READY`: a notification, the reply of a call, a
+/// request that reached a waiting receiver, the close of a channel or the
+/// end of a call by an interrupt, a command from another CPU, a timer, a
+/// device interrupt.
+pub const WAKE_NOTIFY: u8 = 1;
+pub const WAKE_REPLY: u8 = 2;
+pub const WAKE_REQUEST: u8 = 3;
+pub const WAKE_OTHER: u8 = 4;
+pub const WAKE_COMMAND: u8 = 5;
+pub const WAKE_TIMER: u8 = 6;
+pub const WAKE_IRQ: u8 = 7;
+const _: () = assert!(STAMPS_RECORD * STAMPS_BATCH <= MESSAGE_MAX);
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -2008,6 +2059,7 @@ mod tests {
         assert_eq!(lpi.to_words(), [8193, 0, 1, 1, 1, 8193, 0x0809_0040, 3]);
         assert_eq!(IrqInfo::from_words(lpi.to_words()), lpi);
         assert_eq!((INFO_MSI_DEVICE, MAX_MSI_EVENTS), (17, 64));
+        assert_eq!((INFO_STAMPS, STAMPS_RECORD, STAMPS_BATCH), (18, 16, 60));
         let msi = MsiInfo {
             device_id: 8,
             events: 3,

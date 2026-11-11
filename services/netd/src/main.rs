@@ -54,6 +54,8 @@ mod device;
 mod dma;
 mod fast;
 mod files;
+#[cfg(feature = "trace")]
+mod kdump;
 mod msix;
 mod net;
 mod owner;
@@ -255,6 +257,8 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
+    #[cfg(feature = "trace")]
+    let kernel_stamps = s.take::<Resource>("trace").ok();
     let (Ok(dma_object), Ok(net_object)) = (s.take::<Memory>("dma"), s.take::<Memory>("net"))
     else {
         return NO_START_DATA;
@@ -589,6 +593,8 @@ fn main(_: u64) -> u64 {
         return NOT_STARTED;
     };
     let mut driver = Driver {
+        #[cfg(feature = "trace")]
+        kernel_stamps: kdump::KernelDump::new(kernel_stamps),
         device,
         stack,
         net,
@@ -985,6 +991,9 @@ struct Maps {
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
+    /// The dump of the time stamps of the kernel (kdump.rs).
+    #[cfg(feature = "trace")]
+    kernel_stamps: kdump::KernelDump,
     /// The address the switch was last told (a renewal of the lease that changes nothing is
     /// not told: consumers end their processes on a new address).
     switch_ip: netd::books::AddressSync,
@@ -1837,7 +1846,7 @@ impl Service<0> for Driver<'_> {
             #[cfg(feature = "profile")]
             self.profile_snapshot();
             #[cfg(feature = "trace")]
-            trace_dump();
+            trace_dump(&mut self.kernel_stamps);
         }
         answer
     }
@@ -2026,9 +2035,12 @@ fn crash(r: &Request<'_>) -> Answer {
 /// log (64 bytes each). The console's service takes 64 records of the log every 50 ms and loses the
 /// rest, so the dump writes 60 records, then waits 52 ms (it runs after the load: the wait costs
 /// only its time; the wait yields, the service may stand on this CPU). A part is at most 1 500
-/// lines, about half a second: init kills a service that stays silent for longer.
+/// lines, about half a second: init kills a service that stays silent for longer. The first part
+/// freezes the rings of the kernel, and once the ring of the service has gone the parts that
+/// follow give those of the kernel (kdump.rs; `tr k done` ends them).
 #[cfg(feature = "trace")]
-fn trace_dump() {
+fn trace_dump(kernel: &mut kdump::KernelDump) {
+    kernel.freeze();
     let (mut buf, mut len, mut records) = ([0u8; 64], 0, 0u32);
     let mut write = |bytes: &[u8]| {
         let _ = rt::console::write(bytes);
@@ -2040,7 +2052,7 @@ fn trace_dump() {
             }
         }
     };
-    let done = trace::dump_part("n", 1_500, trace::RECORDS, |line| {
+    let mut emit = |line: &str| {
         if len + line.len() + 1 > buf.len() {
             write(&buf[..len]);
             len = 0;
@@ -2048,9 +2060,20 @@ fn trace_dump() {
         buf[len..len + line.len()].copy_from_slice(line.as_bytes());
         buf[len + line.len()] = b'\n';
         len += line.len() + 1;
-    });
+    };
+    if kernel.is_open() && NET_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+        kernel.part(1_500, &mut emit);
+        write(&buf[..len]);
+        return;
+    }
+    let done = trace::dump_part("n", 1_500, trace::RECORDS, &mut emit);
     write(&buf[..len]);
     if done {
+        NET_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
         rt::println!("tr n done");
     }
 }
+
+/// The ring of the service has gone: the parts that follow are the kernel's.
+#[cfg(feature = "trace")]
+static NET_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
