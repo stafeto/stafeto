@@ -62,7 +62,10 @@ PAGE = 4096
 CHAIN_LIMIT = 32
 LAYER_TARGET = "aarch64-unknown-none"
 TOOLCHAIN = "nightly-2026-05-24"
-LAYER_FEATURES = "shared,procfs"
+# The build of the measurement of the packet path (STAFETO_TRACE=1) adds the time stamps of
+# the layer and the points of the stack's glue (`cargo xtask net-trace`).
+TRACE = bool(os.environ.get("STAFETO_TRACE"))
+LAYER_FEATURES = "shared,procfs" + (",trace" if TRACE else "")
 LAYER_RUSTFLAGS = ("-C relocation-model=pic -C target-feature=+fix-cortex-a53-835769"
                    " -C llvm-args=--enable-machine-outliner=never")
 
@@ -71,6 +74,9 @@ LAYER_RUSTFLAGS = ("-C relocation-model=pic -C target-feature=+fix-cortex-a53-83
 EXTRA = {
     "environ": "programs declare it; relibc's headers lack it",
 }
+if TRACE:
+    EXTRA["stafeto_trace_point"] = "the glue of the stack's time stamps"
+    EXTRA["stafeto_trace_frame"] = "the glue of the stack's time stamps"
 # libc.so's one entry and the probe hook of the layer (3.12.3).
 ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image", "stafeto_fast_probe_crash",
                "stafeto_probe_watch_builds", "stafeto_probe_heap"]

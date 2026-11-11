@@ -24,6 +24,8 @@ procfs = ["posix-abi/procfs", "posix-platform/procfs"]
 # `stafeto_start(area, main)` replaces the program's `main` symbol and
 # `__ehdr_start`; the loader writes the auxiliary vector (spec 2, 3.12.3).
 shared = []
+# The points of the packet path for the C glue of a stack (`stafeto_trace_*`).
+trace = ["posix-abi/trace"]
 
 [dependencies]
 entries = { path = "../entries" }

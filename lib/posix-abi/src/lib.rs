@@ -70,6 +70,7 @@ pub mod terminal;
 pub mod threads;
 pub mod timers;
 pub mod tls;
+pub mod tracing;
 pub mod wait;
 
 use constants::*;

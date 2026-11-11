@@ -280,10 +280,12 @@ fn every_routed_call_has_its_branch() {
         }
     }
     // The wait of epoll drives the stack for an instance with fast records.
+    // `pwait` is the entry with the two trace points around `pwait_inner`.
     let epoll = text("lib/posix-abi/src/epoll.rs");
-    assert!(body(&epoll, "pub fn pwait(").contains("pwait_fast"));
+    assert!(body(&epoll, "pub fn pwait(").contains("pwait_inner(epfd, out, timeout, mask)"));
+    assert!(body(&epoll, "fn pwait_inner(").contains("pwait_fast"));
     // Both waits return the events they hold when the boundary says EINTR.
-    assert!(body(&epoll, "pub fn pwait(").contains("Err(EINTR) if held > 0"));
+    assert!(body(&epoll, "fn pwait_inner(").contains("Err(EINTR) if held > 0"));
     assert!(body(&epoll, "fn pwait_fast(").contains("Err(EINTR) if held > 0"));
 }
 
