@@ -130,6 +130,9 @@ mod on {
         PTR.store(words.cast(), Relaxed);
     }
 
+    /// The virtual counter, read as `rt::time::now` reads it. On the Allwinner
+    /// A64 this read needs the counter erratum workaround (spec 10), so the
+    /// place is listed in `COUNTER_READ_SITES` of xtask.
     #[inline(always)]
     pub fn ticks() -> u64 {
         #[cfg(target_arch = "aarch64")]
