@@ -171,3 +171,31 @@ pub extern "C" fn stafeto_fast_take_pending() -> u32 {
 pub extern "C" fn stafeto_fast_lost() -> c_int {
     c_int::from(fast::lost())
 }
+
+/// A record of the packet path's time stamps (feature `trace`).
+#[cfg(feature = "trace")]
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_trace_point(id: c_uint, key: c_uint) {
+    posix_abi::tracing::point(id as u8, key);
+}
+
+/// A record keyed by the segment of TCP in the Ethernet frame `frame` of
+/// `len` bytes (nothing for a frame without data); `from_client`: it came from
+/// the client.
+///
+/// # Safety
+/// `frame` points to `len` readable bytes.
+#[cfg(feature = "trace")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_trace_frame(
+    id: c_uint,
+    frame: *const u8,
+    len: c_uint,
+    from_client: c_int,
+) {
+    if !frame.is_null() {
+        // SAFETY: the caller's bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(frame, len as usize) };
+        posix_abi::tracing::frame(id as u8, bytes, from_client != 0);
+    }
+}

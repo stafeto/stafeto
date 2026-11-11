@@ -50,6 +50,10 @@
 
 use crate::device::{DEVICE, Queue, fail};
 use crate::dma::{Host, net_at};
+use crate::trace::{
+    self, P_N_BELL, P_N_BELL_SKIP, P_N_RX, P_N_STEP, P_N_STK_TX, P_N_TO_STACK, P_N_TX_SEEN,
+    P_N_TX_SUBMIT, P_N_WAKE, P_N_WAKE_STACK,
+};
 use core::cell::{RefCell, UnsafeCell};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{
@@ -391,6 +395,7 @@ impl Inner {
     fn wake_stack(&self, bits: u64) {
         self.run.begin();
         profile::count(Counter::WakeStack);
+        trace::point(P_N_WAKE_STACK, bits as u32);
         let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
             self.stack_channel.load(Ordering::Acquire),
         ));
@@ -667,6 +672,7 @@ impl Switch {
     /// in their rings).
     fn step(&mut self, interrupt: bool) -> bool {
         profile::count(Counter::StepSwitch);
+        trace::point(P_N_STEP, 0);
         if self.idle_set {
             self.clear_idle();
         }
@@ -971,8 +977,10 @@ impl Switch {
         } else {
             None
         };
+        trace::frame(P_N_STK_TX, frame, false);
         match Self::send(&mut self.tx, self.offload, n, len, csum) {
             Ok(Sent::Queued) => {
+                trace::frame(P_N_TX_SUBMIT, frame, false);
                 INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
                 self.queued(OWN_STACK);
             }
@@ -1097,6 +1105,7 @@ impl Switch {
             return false;
         }
         let frame = &mut self.scratch[..len];
+        trace::frame(P_N_TX_SEEN, frame, false);
         let verdict = route::check_tx(t, c, frame);
         let mut csum = None;
         if sum && matches!(verdict, Verdict::Send | Verdict::Hairpin) {
@@ -1128,6 +1137,7 @@ impl Switch {
                 slice[HDR_LEN..HDR_LEN + len].copy_from_slice(frame);
                 match Self::send(&mut self.tx, self.offload, n, len, csum) {
                     Ok(Sent::Queued) => {
+                        trace::frame(P_N_TX_SUBMIT, frame, false);
                         INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
                         INNER.stats.tx_consumer.fetch_add(1, Ordering::Relaxed);
                         self.queued(c);
@@ -1254,6 +1264,19 @@ impl Switch {
             x.ring.publish();
             let head = x.ring.done_head();
             // A new consumer on a number starts from nothing (`Woken` keys on the generation).
+            // The build with the trace also notes the consumer that was not woken.
+            #[cfg(feature = "trace")]
+            {
+                let news = self.woken.news(c, x.generation, head) && x.wake != 0;
+                if news && x.ring.consumer_idle() {
+                    ::trace::point(::trace::P_N_CWAKE, c as u32);
+                    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(x.wake));
+                    let _ = sys::notify(&channel, WAKE_RING);
+                } else if news {
+                    ::trace::point(::trace::P_N_CSKIP, c as u32);
+                }
+            }
+            #[cfg(not(feature = "trace"))]
             if self.woken.news(c, x.generation, head) && x.wake != 0 && x.ring.consumer_idle() {
                 let channel = Handle::<Channel>::borrowed(rt::abi::Handle(x.wake));
                 let _ = sys::notify(&channel, WAKE_RING);
@@ -1348,6 +1371,7 @@ impl Switch {
                         profile::count(Counter::SumSoft);
                     }
                     let frame = &slice[HDR_LEN..HDR_LEN + len];
+                    trace::frame(P_N_RX, frame, true);
                     // The device checked the segment's sum (or it is partial and good), and
                     // the header's sum holds: the stack that gets the frame does not check
                     // the segment.
@@ -1357,6 +1381,7 @@ impl Switch {
                         profile::count(Counter::SumRx);
                     }
                     let Some(t) = self.tables.as_mut() else {
+                        trace::frame(P_N_TO_STACK, frame, true);
                         must(&INNER.rx_ready, pack_frame(n, len as u16, sum));
                         passed += 1;
                         continue;
@@ -1372,6 +1397,16 @@ impl Switch {
                                 INNER.stats.rx_by[usize::from(consumer) % 8]
                                     .fetch_add(1, Ordering::Relaxed);
                             }
+                            #[cfg(feature = "trace")]
+                            trace::frame(
+                                if matches!(d, Decision::Consumer { .. }) {
+                                    ::trace::P_N_TO_CONSUMER
+                                } else {
+                                    P_N_TO_STACK
+                                },
+                                frame,
+                                true,
+                            );
                             if route::deliver(t, sums::mark(d, sum), frame) {
                                 must(&INNER.rx_ready, pack_frame(n, len as u16, sum));
                                 passed += 1;
@@ -1439,8 +1474,10 @@ impl Switch {
                 ring(&mut self.transport, TRANSMITQ);
                 profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
                 profile::count(Counter::BellTx);
+                trace::point(P_N_BELL, 0);
             } else {
                 profile::count(Counter::Skipped);
+                trace::point(P_N_BELL_SKIP, 0);
             }
         }
     }
@@ -1575,6 +1612,7 @@ extern "C" fn run(_: u64) -> ! {
         if interrupt {
             profile::count(Counter::Irq);
         }
+        trace::point(P_N_WAKE, 1 + u32::from(!interrupt));
         let woke = now_ns();
         clock.woke(woke, woke.wrapping_sub(waiting));
         drive(switch, &mut clock, &mut longest, interrupt);

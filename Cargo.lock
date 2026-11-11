@@ -378,6 +378,7 @@ dependencies = [
  "proto-wire",
  "rt",
  "smoltcp",
+ "trace",
  "virtio-console",
  "virtio-drivers",
  "virtio-mmio",
@@ -507,6 +508,7 @@ dependencies = [
  "proto-uart",
  "proto-wire",
  "rt",
+ "trace",
 ]
 
 [[package]]
@@ -1298,6 +1300,10 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "trace"
+version = "0.1.0"
 
 [[package]]
 name = "tty"

@@ -35,8 +35,13 @@ close-probe = []
 lock-probe = []
 # Real WAIT phase coordination in the dedicated lifetime image only.
 wait-probe = []
+# Time stamps along the packet path (lib/trace) at the calls of the sockets and
+# `epoll_pwait`, and the dump of the ring to the console when the process exits
+# (the image of the measurement, `cargo xtask net-trace`).
+trace = ["trace/on"]
 
 [dependencies]
+trace = { path = "../trace" }
 posix-fd = { path = "../posix-fd" }
 posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }

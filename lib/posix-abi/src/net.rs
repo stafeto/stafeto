@@ -677,11 +677,17 @@ fn run<'a>(
             make(Some(key)).write(w)
         }
     };
+    let call = start
+        .as_bytes()
+        .first_chunk::<4>()
+        .map_or(0, |b| u32::from_le_bytes(*b));
+    crate::tracing::point(trace::P_C_SEND, call);
     let result = if restart {
         long::run_with(&service, start.as_bytes(), keyed, out, &refusal)
     } else {
         long::run_no_restart(&service, start.as_bytes(), keyed, out, &refusal)
     };
+    crate::tracing::point(trace::P_C_RET, call);
     result.map_err(long_errno)
 }
 
