@@ -2040,6 +2040,9 @@ fn crash(r: &Request<'_>) -> Answer {
 /// follow give those of the kernel (kdump.rs; `tr k done` ends them).
 #[cfg(feature = "trace")]
 fn trace_dump(kernel: &mut kdump::KernelDump) {
+    // The first part stops the rings of the service and of the kernel: the long dump that follows
+    // would otherwise read records of the idle loop in the places of the load's.
+    trace::freeze();
     kernel.freeze();
     let (mut buf, mut len, mut records) = ([0u8; 64], 0, 0u32);
     // The kernel's part goes slower still: a record lost on the console breaks a chain of the
