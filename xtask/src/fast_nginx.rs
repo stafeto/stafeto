@@ -988,6 +988,8 @@ fn scenario(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     booted(run)?;
+    run.send("export STAFETO_FAST_STATS=1")?;
+    run.expect("# ", DIALOG_STEP)?;
     // 1.
     let up = started(run, CONF)?;
     let (master, workers) = master_and_workers(run, "start", true)?;
@@ -1055,6 +1057,21 @@ fn scenario(
                 WAKE_SLOW.as_micros()
             ));
         }
+        // The totals the worker says every 5 s of its clock, the first after
+        // the pauses.
+        run.send("echo wakes-mark")?;
+        run.expect("wakes-mark", DIALOG_STEP)?;
+        let line = run.expect_line(
+            "the counters of the sleeps",
+            |l| l.contains("fast: wakes "),
+            Duration::from_secs(12),
+        )?;
+        let wakes = parse_wakes(&line).ok_or_else(|| format!("no counters in {line:?}"))?;
+        check_wakes(&wakes)?;
+        notes.push(format!(
+            "5: {} sleeps of the worker, {} woken by the device, {} by the deadline, {} of those with a frame waiting (at most 1 %)",
+            wakes.sleeps, wakes.bell, wakes.deadline, wakes.deadline_found
+        ));
         // 6.
         notes.push(format!("6: {}", reload(run, address)?));
         tls_streams(tls, "after the reload")?;
@@ -1258,6 +1275,50 @@ pub fn parse_stats(line: &str) -> Option<Stats> {
     })
 }
 
+/// The sleeps of the worker's loop by what woke them, from a line of the glue.
+#[derive(Debug, PartialEq)]
+pub struct Wakes {
+    pub sleeps: u64,
+    pub bell: u64,
+    pub deadline: u64,
+    pub deadline_found: u64,
+}
+
+/// `fast: wakes sleeps=N bell=N deadline=N deadline_found=N`.
+pub fn parse_wakes(line: &str) -> Option<Wakes> {
+    let rest = line.split("fast: wakes ").nth(1)?;
+    let field = |name: &str| -> Option<u64> {
+        rest.split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(Wakes {
+        sleeps: field("sleeps")?,
+        bell: field("bell")?,
+        deadline: field("deadline")?,
+        deadline_found: field("deadline_found")?,
+    })
+}
+
+/// The share of the worker's sleeps that ended by the deadline with a frame
+/// waiting in the ring (nothing told the thread of it) is at most 1 %, over
+/// at least `WAKES_MIN` sleeps: the interrupt of the device wakes the idle
+/// loop and the deadline is only the backstop.
+const WAKES_MIN: u64 = 30;
+pub fn check_wakes(w: &Wakes) -> Result<(), String> {
+    if w.sleeps < WAKES_MIN {
+        return Err(format!("the worker slept {} times, wanted {WAKES_MIN}", w.sleeps));
+    }
+    if w.deadline_found * 100 > w.sleeps {
+        return Err(format!(
+            "{} of {} sleeps ended by the deadline with a frame waiting in the ring (at most 1 %): the interrupt did not wake the loop",
+            w.deadline_found, w.sleeps
+        ));
+    }
+    Ok(())
+}
+
 /// `wrk -t2 -c200 -d<seconds>s URL` run on the Mac.
 fn wrk(url: &str, seconds: u64) -> Result<Wrk, String> {
     let output = std::process::Command::new("wrk")
@@ -1434,6 +1495,37 @@ pub fn vz_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wakes_bound_is_one_percent_of_the_sleeps() {
+        let line = "fast: wakes sleeps=1000 bell=980 deadline=20 deadline_found=10";
+        let w = parse_wakes(line).unwrap();
+        assert_eq!(
+            w,
+            Wakes {
+                sleeps: 1000,
+                bell: 980,
+                deadline: 20,
+                deadline_found: 10
+            }
+        );
+        assert!(check_wakes(&w).is_ok());
+        let lost = Wakes {
+            deadline_found: 11,
+            ..w
+        };
+        assert!(check_wakes(&lost).is_err());
+        assert!(
+            check_wakes(&Wakes {
+                sleeps: 5,
+                bell: 5,
+                deadline: 0,
+                deadline_found: 0
+            })
+            .is_err()
+        );
+        assert_eq!(parse_wakes("fast: stats ticks=1"), None);
+    }
 
     #[test]
     fn the_images_have_the_table_and_the_program() {
