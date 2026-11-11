@@ -869,7 +869,9 @@ fn kernel_cover(kernel: &[Kev], given: &[(u8, u64, u64)]) -> Option<(u64, u64)> 
     for cpu in cpus {
         let mine: Vec<&Kev> = kernel.iter().filter(|k| k.cpu == cpu).collect();
         let made = given.iter().find(|g| g.0 == cpu).map_or(0, |g| g.1);
-        if mine.len() >= KERNEL_RING || made > KERNEL_RING as u64 {
+        // The console loses a few records of a dump: a ring with nine tenths of its records, or one
+        // that says it made more than it holds, has written over its older ones.
+        if mine.len() * 10 >= KERNEL_RING * 9 || made > KERNEL_RING as u64 {
             from = from.max(mine[0].t);
         }
     }
