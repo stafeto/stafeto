@@ -136,10 +136,15 @@ enum Workload {
     W6,
     /// `/1k.bin` over long connections: the same, for the smallest answer.
     W7,
+    /// `/mem1k` over long connections: 1,024 bytes the server makes up in memory (F1 only).
+    W8,
+    /// `/s/x1000.bin` over long connections: a file of 1,000 bytes, one message of the file
+    /// service.
+    W9,
 }
 
 impl Workload {
-    const ALL: [Workload; 7] = [
+    const ALL: [Workload; 9] = [
         Workload::W1,
         Workload::W2,
         Workload::W3,
@@ -147,6 +152,8 @@ impl Workload {
         Workload::W5,
         Workload::W6,
         Workload::W7,
+        Workload::W8,
+        Workload::W9,
     ];
     /// The loads of HTTP; W4 and W5 (TLS) are asked for by name.
     const DEFAULT: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
@@ -160,6 +167,8 @@ impl Workload {
             Workload::W5 => "w5",
             Workload::W6 => "w6",
             Workload::W7 => "w7",
+            Workload::W8 => "w8",
+            Workload::W9 => "w9",
         }
     }
 
@@ -187,6 +196,8 @@ impl Workload {
                 .collect(),
             Workload::W6 => vec!["/s/0000.bin".to_owned()],
             Workload::W7 => vec!["/1k.bin".to_owned()],
+            Workload::W8 => vec!["/mem1k".to_owned()],
+            Workload::W9 => vec!["/s/x1000.bin".to_owned()],
         }
     }
 
@@ -196,7 +207,8 @@ impl Workload {
                 linux_guest::W1_LEN
             }
             Workload::W2 => linux_guest::W2_LEN,
-            Workload::W7 => 1024,
+            Workload::W7 | Workload::W8 => 1024,
+            Workload::W9 => 1000,
         }
     }
 

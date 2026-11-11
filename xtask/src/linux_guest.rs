@@ -285,6 +285,8 @@ fn sets() -> &'static [(&'static str, Vec<u8>)] {
                 W2_LEN,
             );
         }
+        // Bench only: a file that fits one message of the file service (workload w9).
+        add("/www/s/x1000.bin".to_owned(), 0x5be0_cd19_137e_2179, 1000);
         files
     })
 }
@@ -1357,10 +1359,10 @@ mod tests {
     fn the_sources_of_both_guests_are_one_set_of_files() {
         let files = www_files();
         let paths: Vec<&str> = files.iter().map(|f| f.0).collect();
-        assert_eq!(paths.len(), 4 + W1_FILES + W2_FILES);
+        assert_eq!(paths.len(), 4 + W1_FILES + W2_FILES + 1);
         // The check takes every file by HTTP: the files fetched are all the files carried.
         assert_eq!(fetched_files().len(), paths.len());
-        assert_eq!(fetched_files().len(), 4 + 900 + 64);
+        assert_eq!(fetched_files().len(), 4 + 900 + 64 + 1);
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted);
