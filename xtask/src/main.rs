@@ -12249,6 +12249,19 @@ fn ci_lints() -> Result<(), String> {
         "-D",
         "warnings",
     ]));
+    // The code of the shared library's layer (the feature `shared`) is not in the list above.
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "posix-crt",
+        "--features",
+        "shared",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]));
     failed.lint(cargo().args([
         "clippy",
         "--package",
