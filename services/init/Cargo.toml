@@ -136,8 +136,8 @@ table-bench-cpu0-vz = []
 # (table/bench.rs).
 table-bench-fast-vz = []
 table-bench-fast-switch-vz = []
-# Bench only: the row F1 with the file service on CPU 1, where the worker runs.
-table-bench-fast-ramfs1-vz = []
+# Bench only: the row F1 with the file service on CPU 3, where the pinned worker runs.
+table-bench-fast-ramfs3-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.

@@ -792,7 +792,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-net-bench-switch-profile.img"
         | "boot-net-bench-trace-fast.img"
         | "boot-net-bench-trace-switch.img"
-        | "boot-net-bench-fast-ramfs1.img"
+        | "boot-net-bench-fast-ramfs3.img"
         | "boot-net-bench-fast.img" => Ok(load()?
             .into_iter()
             .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))

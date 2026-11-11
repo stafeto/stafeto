@@ -57,8 +57,8 @@ pub enum BenchImage {
 /// second network device, the same one change of the CPUs
 /// (`init::table::bench::BENCH_FAST_VZ_TABLE`).
 pub const BENCH_FAST_IMAGE: &str = "boot-net-bench-fast.img";
-/// Bench only: F1 with the file service on CPU 1.
-pub const BENCH_FAST_RAMFS1_IMAGE: &str = "boot-net-bench-fast-ramfs1.img";
+/// Bench only: F1 with the file service on CPU 3.
+pub const BENCH_FAST_RAMFS3_IMAGE: &str = "boot-net-bench-fast-ramfs3.img";
 /// The image of F1s: nginx-fast on the switch of the one device.
 pub const BENCH_SWITCH_IMAGE: &str = "boot-net-bench-switch.img";
 /// The image of F1s with the counters of the network service: a file of its own, so that a build
@@ -167,26 +167,26 @@ pub fn bench_fast_programs() -> &'static [ImageProgram] {
     })
 }
 
-/// Bench only: the programs of F1 with init's table that puts the file service on CPU 1.
-pub fn bench_fast_ramfs1_programs() -> &'static [ImageProgram] {
+/// Bench only: the programs of F1 with init's table that puts the file service on CPU 3.
+pub fn bench_fast_ramfs3_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let mut programs = bench_fast_programs().to_vec();
         for program in &mut programs {
             if program.0 == "init" {
-                program.3 = &["table-bench-fast-ramfs1-vz"];
+                program.3 = &["table-bench-fast-ramfs3-vz"];
             }
         }
         programs
     })
 }
 
-/// Builds the image of F1 with the file service on CPU 1.
-pub fn build_fast_ramfs1_image() -> Result<PathBuf, String> {
+/// Builds the image of F1 with the file service on CPU 3.
+pub fn build_fast_ramfs3_image() -> Result<PathBuf, String> {
     crate::probe_ca::ensure(false)?;
     build_boot_image(
-        BENCH_FAST_RAMFS1_IMAGE,
-        bench_fast_ramfs1_programs(),
+        BENCH_FAST_RAMFS3_IMAGE,
+        bench_fast_ramfs3_programs(),
         BOOT_PROFILE,
     )
 }

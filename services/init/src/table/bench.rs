@@ -88,15 +88,15 @@ const TABLE: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_CPUS);
 const PINNED: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_PINNED_CPUS);
 const CPU0: [Record; 10] = on_cpu_0(with_launcher(NET_VZ_TABLE, BENCH_CPUS));
 const FAST_TABLE: [Record; 10] = with_launcher(FAST_NGINX_VZ_TABLE, BENCH_CPUS);
-/// The table of F1 with the file service (the record by position 1) on CPU 1.
-const fn ramfs_on_cpu_1(table: [Record; 10]) -> [Record; 10] {
+/// The table of F1 with the file service (the record by position 1) on CPU 3.
+const fn ramfs_on_cpu_3(table: [Record; 10]) -> [Record; 10] {
     let mut out = table;
     assert!(str_eq(out[1].name, "ramfs"));
-    out[1].cpus = 0b0010;
+    out[1].cpus = 0b1000;
     out
 }
 
-const FAST_RAMFS1_TABLE: [Record; 10] = ramfs_on_cpu_1(FAST_TABLE);
+const FAST_RAMFS3_TABLE: [Record; 10] = ramfs_on_cpu_3(FAST_TABLE);
 const FAST_SWITCH_TABLE: [Record; 10] = with_launcher(FAST_SWITCH_VZ_TABLE, BENCH_CPUS);
 
 /// The image of the shell with the network service on VZ, with the shell's
@@ -117,8 +117,8 @@ pub const BENCH_CPU0_VZ_TABLE: &[Record] = &CPU0;
 /// four CPUs (the row F1).
 pub const BENCH_FAST_VZ_TABLE: &[Record] = &FAST_TABLE;
 
-/// Bench only: the image of F1 with the file service on CPU 1.
-pub const BENCH_FAST_RAMFS1_VZ_TABLE: &[Record] = &FAST_RAMFS1_TABLE;
+/// Bench only: the image of F1 with the file service on CPU 3.
+pub const BENCH_FAST_RAMFS3_VZ_TABLE: &[Record] = &FAST_RAMFS3_TABLE;
 
 /// The same on the switch: one device, the shell's processes on all four CPUs (the row F1s).
 pub const BENCH_FAST_SWITCH_VZ_TABLE: &[Record] = &FAST_SWITCH_TABLE;

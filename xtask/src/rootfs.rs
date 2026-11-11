@@ -1845,7 +1845,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The row F1: the files of S4's image and the static address of the
         // second device, the one the stack owns.
         "boot-net-bench-fast.img"
-        | "boot-net-bench-fast-ramfs1.img"
+        | "boot-net-bench-fast-ramfs3.img"
         | "boot-net-bench-trace-fast.img" => {
             let mut files = net_bench_files(name);
             files.push(of(

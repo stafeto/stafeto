@@ -3846,8 +3846,8 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
                     linux_guest::TRACE_FAST_IMAGE,
                     linux_guest::bench_fast_programs(),
                 )?
-            } else if std::env::var_os("NET_BENCH_RAMFS_CPU1").is_some() {
-                linux_guest::build_fast_ramfs1_image()?
+            } else if std::env::var_os("NET_BENCH_RAMFS_CPU3").is_some() {
+                linux_guest::build_fast_ramfs3_image()?
             } else {
                 linux_guest::build_fast_image()?
             };
