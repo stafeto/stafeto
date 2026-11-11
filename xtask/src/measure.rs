@@ -40,7 +40,9 @@ fn measured_line(line: &str) -> bool {
         "process kill ticks:",
         "abandon change ticks:",
         "timer portions ticks:",
+        // Also the LPI's line (`interrupt path ticks: lpi=`).
         "interrupt path ticks:",
+        "its command ticks:",
         "device window ticks:",
         "dma portions ticks:",
         "KERNEL_STATS:",

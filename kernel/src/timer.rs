@@ -519,7 +519,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
 }
 
 // The poison of a timer that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Timer, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Timer, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{deadline, in_use, payer, posted, reset_longest_firing};

@@ -42,6 +42,7 @@ use super::{
 };
 use crate::PAGE;
 use crate::watch::Watch;
+use virtio_pci::qemu;
 
 const MS: u64 = 1_000_000;
 /// The virtio-mmio transport of the device on QEMU and its line.
@@ -174,22 +175,28 @@ const fn vz_args<const N: usize>() -> [u8; 16] {
 /// command word 0 (VZ stops the machine at a byte write to the
 /// configuration space; the word's status half reads back what it holds).
 const fn vz_stop(i: usize) -> [Write; 2] {
+    pci_stop(vz_bar_offset(i), vz_ecam_offset(i))
+}
+
+/// The stop of a Virtio PCI function whose common configuration lies at
+/// `bar` of the window `bar` and whose page at `ecam` of the window `ecam`.
+const fn pci_stop(bar: u64, ecam: u64) -> [Write; 2] {
     [
         Write {
             window: "bar",
-            offset: vz_bar_offset(i) + DEVICE_STATUS,
+            offset: bar + DEVICE_STATUS,
             bits: 8,
             value: 0,
             settled: 0xFF,
             only_if: Some(Gate {
                 window: "ecam",
-                offset: vz_ecam_offset(i) + COMMAND,
+                offset: ecam + COMMAND,
                 bits: MEMORY,
             }),
         },
         Write {
             window: "ecam",
-            offset: vz_ecam_offset(i) + COMMAND,
+            offset: ecam + COMMAND,
             bits: 32,
             value: 0,
             settled: 0xFFFF,
@@ -310,6 +317,49 @@ pub const NETD_VZ2: Record = Record {
     quiesce: &VZ2_STOP,
     dma: DMA_TWO,
     ..NETD
+};
+
+/// The service on QEMU's machine with an ITS (xtask's `VIRT_ITS`, init's
+/// feature `net-its`): the network device is the modern virtio-net-pci at
+/// device 2 of bus 0 (`virtio_pci::qemu::NET`) with MSI-X. init makes the
+/// MSI device of the function (RID 0x10) and binds event 0, the vector of
+/// receiving (`irq`), and event 1, that of sending (`irqtx`), both through
+/// the switch thread's channel; the service writes the address and data of
+/// each binding into the MSI-X table and turns MSI-X on (services/netd,
+/// msix.rs). The window `ecam` is the function's page and `bar` holds BAR 4
+/// and, after it, BAR 1 of the table. init stops the device as on VZ.
+pub const NETD_ITS: Record = Record {
+    windows: &[
+        Window {
+            name: "ecam",
+            base: qemu::NET_FUNCTION,
+            len: PAGE,
+            duplicate: false,
+        },
+        Window {
+            name: "bar",
+            base: qemu::NET.bar,
+            len: qemu::NET.len + qemu::NET_MSIX_LEN,
+            duplicate: false,
+        },
+    ],
+    bindings: &[
+        Binding::msi("irq", qemu::NET_RID, 0),
+        Binding::msi("irqtx", qemu::NET_RID, 1),
+    ],
+    args: &qemu::NET_FUNCTION.to_le_bytes(),
+    quiesce: &ITS_STOP,
+    ..NETD
+};
+
+static ITS_STOP: [Write; 2] = pci_stop(0, 0);
+
+/// The record of the network service in the images of QEMU: `NETD_ITS` with
+/// the feature `net-its`, `NETD` otherwise.
+pub const NETD_QEMU: Record = if cfg!(feature = "net-its") {
+    NETD_ITS
+} else {
+    NETD
 };
 
 /// The second virtio-mmio transport of QEMU's `virt` for the image of two
@@ -576,7 +626,7 @@ pub const NET_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[6],
     super::ramfs::BUSYBOX_DIALOG_TABLE[7],
     super::ramfs::BUSYBOX_DIALOG_TABLE[8],
-    NETD,
+    NETD_QEMU,
 ];
 
 /// The image of the shell with both network devices on QEMU (`cargo xtask
@@ -664,7 +714,7 @@ pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-passes") {
         super::ramfs::RAM_LEGACY,
         super::entropy::RNG,
         super::entropy::ENTROPY,
-        NETD,
+        NETD_QEMU,
         PROBE,
     ]
 };

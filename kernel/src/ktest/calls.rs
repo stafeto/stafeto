@@ -5703,7 +5703,9 @@ fn irq_info_of(c: &Caller, b: Handle) -> Result<IrqInfo, &'static str> {
     if x[0] != 0 {
         return Err("object_info IRQ failed");
     }
-    Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
+    Ok(IrqInfo::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+    ]))
 }
 
 /// Runs `body` with a caller that holds the system resource with DEVICE,
@@ -5727,7 +5729,7 @@ fn with_binding(
         let flags = if edge { TRIGGER_EDGE } else { 0 };
         let made = c.created(
             Call::IrqBind.number(),
-            &[r.0, line.into(), copy.0, 20, flags],
+            &[r.0, line.into(), copy.0, 20, flags, 0],
         );
         let result = made.and_then(|b| {
             let result = body(c, h, b);
@@ -5871,7 +5873,7 @@ pub fn released_binding_masks_and_frees_its_line(_: &Boot) -> Result<(), &'stati
             "the binding gave its slot back before its portion",
         )?;
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
-        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0, 0]);
         if let Ok(again) = again {
             c.close(again)?;
         }
@@ -5963,7 +5965,10 @@ pub fn last_shell_reference_comes_with_the_binding_reclaim(_: &Boot) -> Result<(
             Call::HandleDuplicate.number(),
             &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
         )?;
-        let b = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), copy.0, 20, 0])?;
+        let b = c.created(
+            Call::IrqBind.number(),
+            &[r.0, LINE.into(), copy.0, 20, 0, 0],
+        )?;
         for handle in [b, copy, h, r] {
             c.close(handle)?;
         }
@@ -6059,7 +6064,7 @@ pub fn queued_notice_does_not_hold_the_line(_: &Boot) -> Result<(), &'static str
             "a queued notification kept the line open or bound",
         )?;
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
-        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0, 0]);
         if let Ok(again) = again {
             c.close(again)?;
         }
@@ -6147,7 +6152,11 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
     let full = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let refused = fill_slots(c, full).and_then(|()| {
         with_used_quota(c, || {
-            c.fails(n, &[r.0, LINE.into(), full.0, 20, 0], Error::LimitReached)
+            c.fails(
+                n,
+                &[r.0, LINE.into(), full.0, 20, 0, 0],
+                Error::LimitReached,
+            )
         })
     });
     c.close(full)?;
@@ -6158,8 +6167,8 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
         let theirs = owner.created(Call::CreateChannel.number(), &[10, 0])?;
         let ch = channel_of(&owner, theirs)?;
         let h = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
-        let args = [r.0, LINE.into(), h.0, 20, 0];
-        c.fails(n, &[r.0, LINE.into(), h.0, 31, 0], Error::AccessDenied)?;
+        let args = [r.0, LINE.into(), h.0, 20, 0, 0];
+        c.fails(n, &[r.0, LINE.into(), h.0, 31, 0, 0], Error::AccessDenied)?;
         let bindings = irq::in_use();
         with_used_quota(c, || {
             c.fails(n, &args, Error::NoMemory)?;
@@ -6170,7 +6179,7 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
             "a binding that did not fit stayed",
         )?;
         let used = process::quota(c.process).used();
-        let b = c.created(n, &[r.0, LINE.into(), h.0, 30, 0])?;
+        let b = c.created(n, &[r.0, LINE.into(), h.0, 30, 0, 0])?;
         let paid = irq_of(c, b).map(|i| {
             irq::payer(i) == c.process && process::quota(c.process).used() == used + PAGE_SIZE
         });
@@ -6196,7 +6205,7 @@ pub fn irq_bind_refuses_lines_past_the_distributor(_: &Boot) -> Result<(), &'sta
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
         let past = c.fails(
             Call::IrqBind.number(),
-            &[r.0, lines.into(), h.0, 20, 0],
+            &[r.0, lines.into(), h.0, 20, 0, 0],
             Error::InvalidArgs,
         );
         c.close(r)?;
@@ -6213,7 +6222,7 @@ fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {
     for _ in 2..CHUNK {
         c.insert(Object::Resource, Rights::NONE)?;
     }
-    let args = [r.0, LINE.into(), h.0, 20, 0];
+    let args = [r.0, LINE.into(), h.0, 20, 0, 0];
     with_quota_left(c, PAGE_SIZE, || {
         c.fails(Call::IrqBind.number(), &args, Error::NoMemory)
     })?;
@@ -8669,5 +8678,417 @@ pub fn thread_create_keeps_to_the_cpu_mask_of_the_target(_: &Boot) -> Result<(),
         low.release();
         high.release();
         result
+    })
+}
+
+// MSI devices and the events of their functions (spec 9, 11).
+
+/// The requester ID of the function the tests' devices stand for: device 1
+/// of bus 0, where QEMU puts its first PCI device; the `msi-map` of QEMU
+/// sends it to DeviceID `RID`.
+const RID: u64 = 8;
+
+/// The system resource with DEVICE, a channel, and a copy of it with
+/// NOTIFY, as `with_binding` makes them, for the tests of events.
+fn resource_and_channel(c: &Caller) -> Result<(Handle, Handle, Handle), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
+    let copy = c.created(
+        Call::HandleDuplicate.number(),
+        &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
+    )?;
+    Ok((r, h, copy))
+}
+
+/// What MSI_DEVICE reports for the caller's device `m`.
+fn msi_info_of(c: &Caller, m: Handle) -> Result<abi::MsiInfo, &'static str> {
+    let x = c.call(Call::ObjectInfo.number(), &[m.0, abi::INFO_MSI_DEVICE, 0]);
+    if x[0] != 0 {
+        return Err("object_info MSI_DEVICE failed");
+    }
+    Ok(abi::MsiInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// msi_create (spec 9, 11) checks its arguments in the order of spec 11
+/// (values, then x0, then the state of the DeviceID, then the resources),
+/// makes a device that reports its DeviceID and events, takes one device a
+/// DeviceID, and gives its place back with its last handle. Without an ITS
+/// in the tree every call fails with INVALID_ARGS.
+pub fn msi_create_checks_in_order(_: &Boot) -> Result<(), &'static str> {
+    let n = Call::MsiCreate.number();
+    with_caller(|c| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let plain = c.insert(Object::Resource, Rights::NONE)?;
+        if !arch::its::present() {
+            c.fails(n, &[r.0, RID, 4], Error::InvalidArgs)?;
+            return c.close(r).and_then(|()| c.close(plain));
+        }
+        let devices = crate::msi::in_use();
+        // Values come first: a bad handle does not hide them.
+        c.fails(n, &[0, RID, 0], Error::InvalidArgs)?;
+        c.fails(n, &[0, RID, 65], Error::InvalidArgs)?;
+        c.fails(n, &[r.0, (1 << 16) | RID, 4], Error::InvalidArgs)?;
+        c.fails(n, &[r.0, 0xFFFF, 4], Error::InvalidArgs)?;
+        c.fails(n, &[r.0, 1 << 32, 4], Error::InvalidArgs)?;
+        c.fails(n, &[0x7777, RID, 4], Error::BadHandle)?;
+        let ch = c.created(Call::CreateChannel.number(), &[10, 0])?;
+        c.fails(n, &[ch.0, RID, 4], Error::WrongType)?;
+        c.fails(n, &[plain.0, RID, 4], Error::AccessDenied)?;
+        let m = c.created(n, &[r.0, RID, 4])?;
+        check(
+            msi_info_of(c, m)?
+                == abi::MsiInfo {
+                    device_id: RID,
+                    events: 4,
+                    bound: 0,
+                },
+            "MSI_DEVICE does not report the device",
+        )?;
+        c.fails(n, &[r.0, RID, 4], Error::BadState)?;
+        check(
+            crate::msi::in_use() == devices + 1,
+            "the device was not counted",
+        )?;
+        c.close(m)?;
+        c.close(ch)?;
+        cleanup::drain();
+        check(
+            crate::msi::in_use() == devices,
+            "the device stayed in its pool",
+        )?;
+        // Its DeviceID is free again, and so is its ITT.
+        let again = c.created(n, &[r.0, RID, 64])?;
+        check(
+            msi_info_of(c, again)?.events == 64,
+            "a device made again has the wrong events",
+        )?;
+        c.close(again)?;
+        c.close(r)?;
+        c.close(plain)?;
+        cleanup::drain();
+        check(crate::msi::in_use() == devices, "the second device stayed")
+    })
+}
+
+/// irq_bind of an event (spec 9, 11): the value checks (an event past the
+/// device's, TRIGGER_EDGE, a CPU that is not up), then MANAGE, then the
+/// state (an event with a binding); a good bind returns the binding, the
+/// address of GITS_TRANSLATER and the EventID, and IRQ reports an LPI on
+/// the CPU with that address and data.
+pub fn irq_bind_event_checks_and_reports(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    let n = Call::IrqBind.number();
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 4])?;
+        let weak = c
+            .created(
+                Call::HandleDuplicate.number(),
+                &[m.0, Rights::DEVICE.0.into(), 0, 10],
+            )
+            .ok();
+        c.fails(n, &[m.0, 4, copy.0, 20, 0, 0], Error::InvalidArgs)?;
+        c.fails(
+            n,
+            &[m.0, 0, copy.0, 20, TRIGGER_EDGE, 0],
+            Error::InvalidArgs,
+        )?;
+        c.fails(n, &[m.0, 0, copy.0, 20, 0, 7], Error::InvalidArgs)?;
+        c.fails(n, &[m.0, 0, copy.0, 0, 0, 0], Error::InvalidArgs)?;
+        if let Some(weak) = weak {
+            c.fails(n, &[weak.0, 0, copy.0, 20, 0, 0], Error::AccessDenied)?;
+            c.close(weak)?;
+        }
+        let x = c.call(n, &[m.0, 2, copy.0, 20, 0, 0]);
+        check(x[0] == 0 && x[1] != 0, "irq_bind of an event failed")?;
+        let b = Handle(x[1]);
+        check(
+            x[2] == arch::its::translater() && x[3] == 2,
+            "irq_bind does not return the MSI address and the EventID",
+        )?;
+        let info = irq_info_of(c, b)?;
+        check(
+            info.lpi
+                && info.cpu == 0
+                && info.lpi_number == info.line
+                && info.line >= 8192
+                && info.msi_address == x[2]
+                && info.msi_data == 2
+                && info.edge
+                && !info.masked,
+            "IRQ does not report the event's LPI",
+        )?;
+        check(
+            msi_info_of(c, m)?.bound == 1,
+            "the event is not counted as bound",
+        )?;
+        c.fails(n, &[m.0, 2, copy.0, 20, 0, 0], Error::BadState)?;
+        // The LPI is edge-triggered and unmasked: a second bind of another
+        // event gets the next LPI.
+        let y = c.call(n, &[m.0, 3, copy.0, 20, 0, 0]);
+        check(
+            y[0] == 0 && irq_info_of(c, Handle(y[1]))?.lpi_number == info.lpi_number + 1,
+            "the second event did not get the next LPI",
+        )?;
+        for handle in [Handle(y[1]), b, m, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        Ok(())
+    })
+}
+
+/// An LPI raised by INT (the ITS acts as if the device had written the
+/// event) reaches the CPU of the binding as one notification of the
+/// binding's label, with no mask: the LPI is not active, IRQ reports the
+/// binding open, and a second INT gives a second delivery without irq_ack.
+/// After the last handle closed, the enable byte is off and an LPI that was
+/// in flight finds no binding and delivers nothing (spec 9).
+pub fn lpi_is_delivered_and_a_late_one_is_ended(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 2])?;
+        let x = c.call(Call::IrqBind.number(), &[m.0, 1, copy.0, 20, 0, 0]);
+        check(x[0] == 0, "irq_bind of an event failed")?;
+        let b = Handle(x[1]);
+        let lpi = irq_info_of(c, b)?.lpi_number as u32;
+        let raise = || {
+            let pos = arch::its::send(&[kcore::its::Command::int(RID as u32, 1)]);
+            arch::its::wait(pos, "INT");
+        };
+        raise();
+        take_line(lpi)?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        check(!irq_info_of(c, b)?.masked, "an LPI left its binding masked")?;
+        // No irq_ack between the two: the LPI has no mask.
+        raise();
+        take_line(lpi)?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        // The last handle closes; the mapping lives until the portion.
+        c.close(b)?;
+        // The enable byte went with the binding, so the GIC raises nothing
+        // more; an LPI that was in flight finds no binding and delivers
+        // nothing.
+        raise();
+        check(
+            gic::acknowledge().is_none(),
+            "a disabled LPI reached the CPU",
+        )?;
+        check(!irq::deliver_lpi(lpi), "a late LPI found a binding")?;
+        c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
+        for handle in [m, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        Ok(())
+    })
+}
+
+/// 1 024 LPIs are the most the kernel hands out: the 1 025th irq_bind of
+/// an event fails with LIMIT_REACHED and takes nothing, and once the
+/// bindings are gone, their portions have run and a quiescent period has
+/// passed, the numbers, the devices and their ITTs are free again.
+pub fn lpis_run_out_and_come_back(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    let devices = crate::msi::in_use();
+    let bindings = irq::in_use();
+    let c = Caller::with_limit(2400, CEILING)?;
+    let result = (|| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let ch = [
+            c.created(Call::CreateChannel.number(), &[10, 0])?,
+            c.created(Call::CreateChannel.number(), &[10, 0])?,
+        ];
+        let mut copies = [Handle(0); 2];
+        for (copy, h) in copies.iter_mut().zip(ch) {
+            *copy = c.created(
+                Call::HandleDuplicate.number(),
+                &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
+            )?;
+        }
+        let mut taken = 0u32;
+        let mut full = None;
+        'devices: for d in 0..17u64 {
+            let m = c.created(Call::MsiCreate.number(), &[r.0, RID + 8 * d, 64])?;
+            for event in 0..64u64 {
+                let copy = copies[(taken / 1000) as usize % 2];
+                let x = c.call(Call::IrqBind.number(), &[m.0, event, copy.0, 20, 0, 0]);
+                if x[0] == Error::LimitReached.code() {
+                    full = Some(taken);
+                    break 'devices;
+                }
+                check(x[0] == 0, "an event did not bind before the LPIs ran out")?;
+                taken += 1;
+            }
+        }
+        check(
+            full == Some(kcore::its::MAX_LPIS as u32),
+            "the 1025th event did not fail with LIMIT_REACHED",
+        )?;
+        // Everything the caller holds goes: handles in table order.
+        for handle in 1..=(taken + 17 + 8) {
+            let _ = process::close_handle(c.process, Handle(u64::from(handle)), CAUSE);
+        }
+        Ok(())
+    })();
+    c.release();
+    cleanup::drain();
+    quiesce_every_cpu()?;
+    result?;
+    check(
+        crate::msi::in_use() == devices && irq::in_use() == bindings,
+        "devices or bindings stayed after the owner went",
+    )?;
+    // The first number is free again.
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 1])?;
+        let x = c.call(Call::IrqBind.number(), &[m.0, 0, copy.0, 20, 0, 0]);
+        check(
+            x[0] == 0 && irq_info_of(c, Handle(x[1]))?.lpi_number == 8192,
+            "the first LPI did not come back",
+        )?;
+        for handle in [Handle(x[1]), m, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        quiesce_every_cpu()
+    })
+}
+
+/// irq_bind of a shared line takes the CPU in x5 (spec 9): a CPU that is
+/// not up, or past the CPUs the kernel starts, is INVALID_ARGS; CPU 0 routes
+/// the line to the boot CPU (its GICD_IROUTER or GICD_ITARGETSR), as a call
+/// that leaves x5 zero always did, and the binding reports the CPU.
+pub fn irq_bind_takes_the_cpu_of_a_line(_: &Boot) -> Result<(), &'static str> {
+    let n = Call::IrqBind.number();
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let down = (0..kcore::bootinfo::MAX_CPUS as u64).find(|&i| !arch::cpu::is_up(i as usize));
+        if let Some(down) = down {
+            c.fails(
+                n,
+                &[r.0, LINE.into(), copy.0, 20, 0, down],
+                Error::InvalidArgs,
+            )?;
+        }
+        c.fails(
+            n,
+            &[
+                r.0,
+                LINE.into(),
+                copy.0,
+                20,
+                0,
+                kcore::bootinfo::MAX_CPUS as u64,
+            ],
+            Error::InvalidArgs,
+        )?;
+        let before = gic::route(LINE);
+        let b = c.created(n, &[r.0, LINE.into(), copy.0, 20, 0, 0])?;
+        check(
+            gic::route(LINE) == before && irq_info_of(c, b)?.cpu == 0,
+            "a bind on CPU 0 changed the route or reports another CPU",
+        )?;
+        for handle in [b, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        Ok(())
+    })
+}
+
+/// An event bound with CPU 1 in x5 goes to the collection of CPU 1: the
+/// LPI the ITS raises is pending at that CPU's redistributor and not at the
+/// caller's, and IRQ reports CPU 1. Runs where a second CPU is up.
+pub fn lpi_goes_to_the_cpu_of_its_binding(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() || !arch::cpu::is_up(1) {
+        return Ok(());
+    }
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 2])?;
+        let x = c.call(Call::IrqBind.number(), &[m.0, 0, copy.0, 20, 0, 1]);
+        check(x[0] == 0, "irq_bind of an event on CPU 1 failed")?;
+        let b = Handle(x[1]);
+        check(irq_info_of(c, b)?.cpu == 1, "IRQ does not report CPU 1")?;
+        let pos = arch::its::send(&[kcore::its::Command::int(RID as u32, 0)]);
+        arch::its::wait(pos, "INT");
+        check(
+            gic::acknowledge().is_none(),
+            "an LPI bound to CPU 1 reached CPU 0",
+        )?;
+        for handle in [b, m, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        Ok(())
+    })
+}
+
+/// DISCARD of an unbound event (spec 9): once the binding of an event is
+/// gone, its portion has run and a quiescent period has passed, its LPI
+/// number goes to the next binding, another device's event. INT of the old
+/// event then raises nothing: without the DISCARD the ITS would still map
+/// it to that LPI and the interrupt would land in the new binding.
+pub fn a_discarded_event_raises_nothing(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let a = c.created(Call::MsiCreate.number(), &[r.0, RID, 1])?;
+        let first = c.call(Call::IrqBind.number(), &[a.0, 0, copy.0, 20, 0, 0]);
+        check(first[0] == 0, "irq_bind of the old event failed")?;
+        let lpi = irq_info_of(c, Handle(first[1]))?.lpi_number;
+        c.close(Handle(first[1]))?;
+        while cleanup::len() > 0 {
+            cleanup::portion();
+        }
+        let other = c.created(Call::MsiCreate.number(), &[r.0, RID + 8, 1])?;
+        // The portion ran, but no quiescent period has passed since the LPI
+        // left LPIS: a CPU may still hold the old binding, so the number is
+        // not handed out yet.
+        let early = c.call(Call::IrqBind.number(), &[other.0, 0, copy.0, 20, 0, 0]);
+        check(early[0] == 0, "irq_bind before the period failed")?;
+        check(
+            irq_info_of(c, Handle(early[1]))?.lpi_number != lpi,
+            "an LPI number came back before the quiescent period",
+        )?;
+        c.close(Handle(early[1]))?;
+        cleanup::drain();
+        quiesce_every_cpu()?;
+        let second = c.call(Call::IrqBind.number(), &[other.0, 0, copy.0, 20, 0, 0]);
+        check(second[0] == 0, "irq_bind of the new event failed")?;
+        check(
+            irq_info_of(c, Handle(second[1]))?.lpi_number == lpi,
+            "the new binding did not take the number that came back",
+        )?;
+        let pos = arch::its::send(&[kcore::its::Command::int(RID as u32, 0)]);
+        arch::its::wait(pos, "INT");
+        check(
+            gic::acknowledge().is_none(),
+            "an event that was discarded raised an LPI",
+        )?;
+        for handle in [Handle(second[1]), other, a, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        quiesce_every_cpu()
     })
 }

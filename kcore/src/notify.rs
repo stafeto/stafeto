@@ -12,6 +12,7 @@
 //! a queue of 64 levels (`ReadyQueue`), the order of arrival within a
 //! level. Nothing here allocates, and every operation takes constant time.
 
+use crate::must::Must;
 use crate::sched::{Link, Linked, ReadyQueue};
 use core::ptr::NonNull;
 
@@ -266,7 +267,7 @@ impl<O: Copy> Queue<O> {
     /// The head of the top level, out of the queue.
     fn take_head(&mut self) -> Option<NonNull<Slot<O>>> {
         let top = self.items.top()?;
-        let item = self.items.first(top).expect("a level with its bit set");
+        let item = self.items.first(top).must("a level with its bit set");
         self.len -= 1;
         // SAFETY: the item is in this queue, and a queued item is alive
         // (`post`, `send`, `wait`).

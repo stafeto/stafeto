@@ -37,6 +37,11 @@ pub fn handle(ack: Ack) {
             sched::timer_fired();
             crate::testpoint::timer_fired();
         }
+    } else if ack.is_lpi() {
+        // An LPI has no line to mask and no active state: the EOI below
+        // ends it, delivered or not (spec 9).
+        crate::obj::serving(crate::obj::ENTRY_INTERRUPT);
+        let _ = irq::deliver_lpi(intid);
     } else {
         // `deliver` looks the line up without a lock and enters the section
         // of its own for the post (irq.rs).

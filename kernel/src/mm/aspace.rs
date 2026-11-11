@@ -23,6 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
 use kcore::asid::{self, AsidAllocator, AsidCpus, AsidTag};
 use kcore::layout::image_pa;
+use kcore::must::Must;
 use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK, TableMemory};
 use kcore::quota::Account;
 use kcore::tlb::{self, Mmu};
@@ -31,7 +32,7 @@ use kcore::tlb::{self, Mmu};
 /// lock, which the switch of address space on its fast path reads and
 /// writes with a compare-and-swap, and what `OBJ` guards, which a new
 /// ASID, a new generation or the release of an ASID changes.
-static CPUS: AsidCpus = AsidCpus::new();
+static CPUS: AsidCpus = AsidCpus::unstarted();
 static ASIDS: Guarded<Option<AsidAllocator>> = Guarded::new(None);
 
 /// Physical address of head.S's empty root table; zero until `init`.
@@ -54,6 +55,12 @@ unsafe fn set_ttbr0(ttbr: u64) {
     TTBR0_SEEN[crate::arch::cpu::this().index()].store(ttbr, Ordering::Relaxed);
     // SAFETY: the caller's promise.
     unsafe { mmu::set_ttbr0(ttbr) }
+}
+
+/// Starts the generation of the ASID state, which lives in .bss (spec 3.4);
+/// CPU 0 calls it first of all.
+pub fn begin() {
+    CPUS.begin();
 }
 
 /// Starts the ASID allocator with the width the CPU allows (head.S set
@@ -120,13 +127,15 @@ fn zero_map(words: &mut [u64]) {
 }
 
 fn with_asids<R>(f: impl FnOnce(&mut AsidAllocator) -> R) -> R {
-    f(ASIDS.lock().as_mut().expect("ASID allocator"))
+    f(ASIDS.lock().as_mut().must("ASID allocator"))
 }
 
 fn with_tables<R>(f: impl FnOnce(&mut FrameTables<'_>) -> R) -> R {
     let mut guard = FRAMES.lock();
     f(&mut FrameTables {
-        frames: guard.as_mut().expect("frame allocator"),
+        frames: guard
+            .as_mut()
+            .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
     })
 }
 
@@ -144,7 +153,7 @@ unsafe impl TableMemory for Charged<'_> {
     fn alloc_table(&mut self) -> Option<u64> {
         self.quota.charge(PAGE_SIZE).ok()?;
         let table = self.tables.alloc_table();
-        Some(table.expect("a charge that passed found no frame (spec 7.8)"))
+        Some(table.must("a charge that passed found no frame (spec 7.8)"))
     }
 
     fn free_table(&mut self, pa: u64) {
@@ -166,7 +175,9 @@ fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -
     let mut guard = FRAMES.lock();
     f(&mut Charged {
         tables: FrameTables {
-            frames: guard.as_mut().expect("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         },
         quota,
     })
@@ -221,9 +232,9 @@ unsafe impl TableMemory for Prepaid<'_> {
         *self.left = self
             .left
             .checked_sub(PAGE_SIZE)
-            .expect("a mapping takes more tables than it paid for");
+            .must("a mapping takes more tables than it paid for");
         let table = self.tables.alloc_table();
-        Some(table.expect("a charge that passed found no frame (spec 7.8)"))
+        Some(table.must("a charge that passed found no frame (spec 7.8)"))
     }
 
     fn free_table(&mut self, _: u64) {
@@ -244,7 +255,9 @@ fn with_prepaid<R>(left: &mut u64, f: impl FnOnce(&mut Prepaid<'_>) -> R) -> R {
     let mut guard = FRAMES.lock();
     f(&mut Prepaid {
         tables: FrameTables {
-            frames: guard.as_mut().expect("frame allocator"),
+            frames: guard
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("frame allocator")),
         },
         left,
     })
@@ -514,7 +527,9 @@ impl SpaceRelease {
         for (cpu, seen) in TTBR0_SEEN.iter().enumerate() {
             let held = seen.load(Ordering::Relaxed) & TTBR_ROOT_MASK == self.root;
             if held {
-                panic!("smp asid  CPU {cpu} still holds the tables of a space whose ASID goes");
+                ::core::panic!(
+                    "smp asid  CPU {cpu} still holds the tables of a space whose ASID goes"
+                );
             }
         }
         with_asids(|a| tlb::retire_asid(a, &CPUS, &mut self.tag, &mut Cpu));

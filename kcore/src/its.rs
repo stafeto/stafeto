@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The GICv3 ITS and LPIs (spec 9, [G40]-[G48]): register layout, the
+//! 32-byte commands of the command queue, the sizes of the tables the
+//! kernel gives the ITS, and the map of the LPI numbers it hands out.
+//! Pure arithmetic; the driver that writes the registers and the queue
+//! lives in the kernel.
+
+use crate::gic::FIRST_LPI;
+
+// Registers of the ITS control frame [G43].
+pub const GITS_CTLR: usize = 0x000;
+pub const GITS_TYPER: usize = 0x008;
+pub const GITS_CBASER: usize = 0x080;
+pub const GITS_CWRITER: usize = 0x088;
+pub const GITS_CREADR: usize = 0x090;
+pub const GITS_BASER: usize = 0x100;
+/// The translation frame follows the control frame, and GITS_TRANSLATER is
+/// at +0x40 in it: the address a device writes the EventID to.
+pub const TRANSLATION_FRAME: u64 = 0x1_0000;
+pub const GITS_TRANSLATER: u64 = TRANSLATION_FRAME + 0x40;
+/// The GITS_BASER registers there are.
+pub const BASER_COUNT: usize = 8;
+
+/// GITS_CTLR.Enabled and .Quiescent.
+pub const CTLR_ENABLED: u32 = 1;
+pub const CTLR_QUIESCENT: u32 = 1 << 31;
+
+// Registers of the redistributor's RD_base frame [G41].
+pub const GICR_PROPBASER: usize = 0x070;
+pub const GICR_PENDBASER: usize = 0x078;
+/// GICR_CTLR.EnableLPIs.
+pub const GICR_CTLR_ENABLE_LPIS: u32 = 1;
+/// GICR_TYPER.PLPIS, Processor_Number [23:8].
+pub const GICR_TYPER_PLPIS: u64 = 1;
+pub const fn processor_number(typer: u64) -> u64 {
+    (typer >> 8) & 0xFFFF
+}
+
+/// The INTID bits the kernel gives the redistributors: 14, INTIDs below
+/// 16384 [G42].
+pub const ID_BITS: u32 = 14;
+/// The first INTID past the LPIs the redistributors cover.
+pub const LPI_END: u32 = 1 << ID_BITS;
+/// The LPIs the kernel hands out, INTID 8192 on (spec 7.8).
+pub const MAX_LPIS: usize = 1024;
+/// The property table: a byte for each LPI of the range, from INTID 8192
+/// [G42]. Bit 0 enables the LPI, bit 1 is RES1 (Group 1).
+pub const PROP_TABLE_BYTES: usize = (LPI_END - FIRST_LPI) as usize;
+pub const PROP_ENABLE: u8 = 1;
+pub const PROP_GROUP1: u8 = 2;
+/// The pending table of a redistributor: a bit for each INTID below
+/// LPI_END, aligned to 64 KiB [G42].
+pub const PEND_TABLE_BYTES: usize = (LPI_END / 8) as usize;
+pub const PEND_ALIGN: usize = 0x1_0000;
+/// The index of an LPI's byte in the property table.
+pub const fn prop_index(intid: u32) -> usize {
+    (intid - FIRST_LPI) as usize
+}
+/// The property byte of an enabled LPI of `priority` (the low bits of the
+/// priority byte are the flags).
+pub const fn prop_byte(priority: u8) -> u8 {
+    (priority & 0xFC) | PROP_GROUP1 | PROP_ENABLE
+}
+
+/// Cacheability field values of the *BASER registers [G41].
+pub const CACHE_NC: u64 = 1;
+pub const CACHE_RAWAWB: u64 = 7;
+/// Shareability field values: non-shareable, inner shareable.
+pub const SHARE_NON: u64 = 0;
+pub const SHARE_INNER: u64 = 1;
+
+/// GICR_PROPBASER [G41]: the table at `pa` (4 KiB aligned), IDbits - 1 in
+/// the low field.
+pub const fn propbaser(pa: u64, id_bits: u32, share: u64, cache: u64) -> u64 {
+    (pa & 0x000F_FFFF_FFFF_F000) | (cache << 7) | (share << 10) | (id_bits as u64 - 1)
+}
+
+/// GICR_PENDBASER [G41]: the table at `pa` (64 KiB aligned), PTZ set
+/// (the table is zero).
+pub const fn pendbaser(pa: u64, share: u64, cache: u64) -> u64 {
+    (pa & 0x000F_FFFF_FFFF_0000) | (cache << 7) | (share << 10) | (1 << 62)
+}
+
+/// GITS_CBASER [G44]: `pages` pages of 4 KiB at `pa`, valid.
+pub const fn cbaser(pa: u64, pages: u32, share: u64, cache: u64) -> u64 {
+    (pa & 0x000F_FFFF_FFFF_F000) | (cache << 59) | (share << 10) | (pages as u64 - 1) | (1 << 63)
+}
+
+/// The GITS_BASER fields the kernel reads [G45].
+pub const BASER_TYPE_DEVICE: u64 = 1;
+pub const BASER_TYPE_COLLECTION: u64 = 4;
+pub const fn baser_type(baser: u64) -> u64 {
+    (baser >> 56) & 7
+}
+pub const fn baser_entry_size(baser: u64) -> u64 {
+    ((baser >> 48) & 0x1F) + 1
+}
+/// The page size the register holds, in bytes: 4 KiB, 16 KiB, 64 KiB.
+pub const fn baser_page_size(baser: u64) -> u64 {
+    match (baser >> 8) & 3 {
+        0 => 0x1000,
+        1 => 0x4000,
+        _ => 0x1_0000,
+    }
+}
+/// A GITS_BASER value for a flat table of `pages` pages of 4 KiB at `pa`,
+/// of the type and entry size `old` read back, valid [G45].
+pub const fn baser(old: u64, pa: u64, pages: u32, share: u64, cache: u64) -> u64 {
+    (old & (0x1F << 48 | 7 << 56))
+        | (pa & 0x000F_FFFF_FFFF_F000)
+        | (cache << 59)
+        | (share << 10)
+        | (pages as u64 - 1)
+        | (1 << 63)
+}
+
+/// GITS_TYPER fields [G43].
+pub const fn typer_itt_entry_size(typer: u64) -> u64 {
+    ((typer >> 4) & 0xF) + 1
+}
+pub const fn typer_device_bits(typer: u64) -> u32 {
+    (((typer >> 13) & 0x1F) + 1) as u32
+}
+pub const fn typer_event_bits(typer: u64) -> u32 {
+    (((typer >> 8) & 0x1F) + 1) as u32
+}
+/// PTA: the target of a collection is a physical address.
+pub const fn typer_pta(typer: u64) -> bool {
+    typer & (1 << 19) != 0
+}
+/// HCC, the collections the ITS keeps without a table.
+pub const fn typer_hcc(typer: u64) -> u64 {
+    (typer >> 24) & 0xFF
+}
+
+/// The pages of 4 KiB a flat device table needs for DeviceIDs up to
+/// `max_device_id`, of `entry_size`-byte entries; None past `limit_pages`.
+pub fn device_table_pages(max_device_id: u32, entry_size: u64, limit_pages: u32) -> Option<u32> {
+    let bytes = (u64::from(max_device_id) + 1) * entry_size;
+    let pages = u32::try_from(bytes.div_ceil(0x1000)).ok()?;
+    (pages <= limit_pages).then_some(pages)
+}
+
+/// The pages of a collection table for `cpus` collections.
+pub fn collection_table_pages(cpus: usize, entry_size: u64) -> u32 {
+    (cpus as u64 * entry_size).div_ceil(0x1000).max(1) as u32
+}
+
+/// The most events a device of `msi_create` has (spec 9).
+pub const MAX_MSI_EVENTS: u64 = 64;
+/// The largest ITT of a device: 64 events of an entry up to 16 bytes.
+pub const ITT_MAX_BYTES: usize = 1024;
+pub const ITT_ALIGN: usize = 256;
+
+/// The EventID bits of a device with `events` events: its ITT has
+/// 2^bits entries, at least 2 (a MAPD Size field holds bits - 1 [G46]).
+pub const fn event_bits(events: u64) -> u32 {
+    let events = if events < 2 { 2 } else { events };
+    64 - (events - 1).leading_zeros()
+}
+
+/// The bytes of an ITT for `events` events of `entry_size`-byte entries
+/// [G47]; None when it would not fit ITT_MAX_BYTES.
+pub fn itt_bytes(events: u64, entry_size: u64) -> Option<usize> {
+    let bytes = (1usize << event_bits(events)).checked_mul(entry_size as usize)?;
+    (bytes <= ITT_MAX_BYTES).then_some(bytes)
+}
+
+// The commands [G46].
+pub const CMD_INT: u64 = 0x03;
+pub const CMD_SYNC: u64 = 0x05;
+pub const CMD_MAPD: u64 = 0x08;
+pub const CMD_MAPC: u64 = 0x09;
+pub const CMD_MAPTI: u64 = 0x0A;
+pub const CMD_INV: u64 = 0x0C;
+pub const CMD_INVALL: u64 = 0x0D;
+pub const CMD_DISCARD: u64 = 0x0F;
+
+/// A command of the queue, four doublewords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Command(pub [u64; 4]);
+
+/// Bytes a command takes in the queue.
+pub const COMMAND_BYTES: usize = 32;
+/// The queue is one page.
+pub const QUEUE_BYTES: usize = 4096;
+pub const QUEUE_SLOTS: usize = QUEUE_BYTES / COMMAND_BYTES;
+/// The commands one call of the kernel puts in the queue before it waits
+/// for them (spec 8.1).
+pub const MAX_BATCH: usize = 4;
+
+impl Command {
+    /// The name of the command in a panic message.
+    pub fn name(&self) -> &'static str {
+        match self.0[0] & 0xFF {
+            CMD_INT => "INT",
+            CMD_SYNC => "SYNC",
+            CMD_MAPD => "MAPD",
+            CMD_MAPC => "MAPC",
+            CMD_MAPTI => "MAPTI",
+            CMD_INV => "INV",
+            CMD_INVALL => "INVALL",
+            CMD_DISCARD => "DISCARD",
+            _ => "an unknown command",
+        }
+    }
+
+    fn with_device(op: u64, device_id: u32) -> Command {
+        Command([op | (u64::from(device_id) << 32), 0, 0, 0])
+    }
+
+    /// MAPD: DeviceID `device_id` gets the ITT at `itt` (256-byte aligned)
+    /// of 2^`event_bits` entries; `valid` false unmaps it.
+    pub fn mapd(device_id: u32, itt: u64, event_bits: u32, valid: bool) -> Command {
+        let mut c = Self::with_device(CMD_MAPD, device_id);
+        c.0[1] = u64::from(event_bits - 1) & 0x1F;
+        c.0[2] = (itt & 0x000F_FFFF_FFFF_FF00) | (u64::from(valid) << 63);
+        c
+    }
+
+    /// MAPC: collection `icid` goes to the redistributor `rdbase` (a
+    /// processor number << 16, or a physical address with PTA).
+    pub fn mapc(icid: u16, rdbase: u64, valid: bool) -> Command {
+        Command([
+            CMD_MAPC,
+            0,
+            (rdbase & 0x000F_FFFF_FFFF_0000) | u64::from(icid) | (u64::from(valid) << 63),
+            0,
+        ])
+    }
+
+    /// MAPTI: (`device_id`, `event_id`) becomes LPI `intid` in collection
+    /// `icid`.
+    pub fn mapti(device_id: u32, event_id: u32, intid: u32, icid: u16) -> Command {
+        let mut c = Self::with_device(CMD_MAPTI, device_id);
+        c.0[1] = u64::from(event_id) | (u64::from(intid) << 32);
+        c.0[2] = u64::from(icid);
+        c
+    }
+
+    fn with_event(op: u64, device_id: u32, event_id: u32) -> Command {
+        let mut c = Self::with_device(op, device_id);
+        c.0[1] = u64::from(event_id);
+        c
+    }
+
+    /// INV: the redistributor rereads the property byte of the event's LPI.
+    pub fn inv(device_id: u32, event_id: u32) -> Command {
+        Self::with_event(CMD_INV, device_id, event_id)
+    }
+
+    /// DISCARD: drops the mapping of the event and clears its pending LPI.
+    pub fn discard(device_id: u32, event_id: u32) -> Command {
+        Self::with_event(CMD_DISCARD, device_id, event_id)
+    }
+
+    /// INT: the ITS acts as if the device had written the event.
+    pub fn int(device_id: u32, event_id: u32) -> Command {
+        Self::with_event(CMD_INT, device_id, event_id)
+    }
+
+    /// SYNC: completes the commands before it for the redistributor
+    /// `rdbase`.
+    pub fn sync(rdbase: u64) -> Command {
+        Command([CMD_SYNC, 0, rdbase & 0x000F_FFFF_FFFF_0000, 0])
+    }
+
+    /// INVALL: the redistributor rereads every LPI of collection `icid`.
+    pub fn invall(icid: u16) -> Command {
+        Command([CMD_INVALL, 0, u64::from(icid), 0])
+    }
+}
+
+/// The slots of the queue free for the writer at byte offset `cwriter`
+/// when the ITS has read up to `creadr` (both multiples of 32 below
+/// QUEUE_BYTES): one slot stays empty, so that a full queue differs from
+/// an empty one.
+pub const fn free_slots(creadr: usize, cwriter: usize) -> usize {
+    (creadr + QUEUE_BYTES - cwriter - COMMAND_BYTES) % QUEUE_BYTES / COMMAND_BYTES
+}
+
+/// The offset after `at` in the queue, wrapping.
+pub const fn next_offset(at: usize) -> usize {
+    (at + COMMAND_BYTES) % QUEUE_BYTES
+}
+
+/// The commands the ITS has still to read when the writer is at `cwriter`
+/// and the reader at `creadr`.
+pub const fn pending(creadr: usize, cwriter: usize) -> usize {
+    (cwriter + QUEUE_BYTES - creadr) % QUEUE_BYTES / COMMAND_BYTES
+}
+
+/// GITS_CREADR and CWRITER hold the byte offset in bits [19:5] [G44].
+pub const OFFSET_MASK: u64 = 0xF_FFE0;
+
+/// The LPI numbers of the kernel: a bit for each of MAX_LPIS, set when the
+/// LPI is taken. O(MAX_LPIS / 64) to take one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LpiMap {
+    taken: [u64; MAX_LPIS / 64],
+}
+
+impl LpiMap {
+    pub const fn new() -> LpiMap {
+        LpiMap {
+            taken: [0; MAX_LPIS / 64],
+        }
+    }
+
+    /// The lowest free LPI, taken; None when all MAX_LPIS are in use.
+    pub fn take(&mut self) -> Option<u32> {
+        for (i, word) in self.taken.iter_mut().enumerate() {
+            if *word != u64::MAX {
+                let bit = (!*word).trailing_zeros();
+                *word |= 1 << bit;
+                return Some(FIRST_LPI + (i as u32) * 64 + bit);
+            }
+        }
+        None
+    }
+
+    /// Gives `intid` back.
+    pub fn give(&mut self, intid: u32) {
+        let n = intid - FIRST_LPI;
+        assert!((n as usize) < MAX_LPIS, "not an LPI of the kernel");
+        let (i, bit) = ((n / 64) as usize, n % 64);
+        assert!(self.taken[i] & 1 << bit != 0, "an LPI given back twice");
+        self.taken[i] &= !(1 << bit);
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.taken.iter().map(|w| w.count_ones() as usize).sum()
+    }
+}
+
+impl Default for LpiMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translater_is_in_the_translation_frame() {
+        assert_eq!(GITS_TRANSLATER, 0x1_0040);
+    }
+
+    #[test]
+    fn table_sizes_follow_the_id_bits() {
+        assert_eq!(PROP_TABLE_BYTES, 8192);
+        assert_eq!(PEND_TABLE_BYTES, 2048);
+        assert_eq!(prop_index(FIRST_LPI), 0);
+        assert_eq!(prop_index(LPI_END - 1), PROP_TABLE_BYTES - 1);
+    }
+
+    #[test]
+    fn property_byte_enables_group_1() {
+        assert_eq!(prop_byte(0xA0), 0xA3);
+        assert_eq!(prop_byte(0xA3), 0xA3);
+    }
+
+    #[test]
+    fn redistributor_bases_take_the_fields_of_g41() {
+        let p = propbaser(0x4800_0000, ID_BITS, SHARE_INNER, CACHE_RAWAWB);
+        assert_eq!(p & 0x1F, 13);
+        assert_eq!((p >> 7) & 7, 7);
+        assert_eq!((p >> 10) & 3, 1);
+        assert_eq!(p & !0xFFF & 0x000F_FFFF_FFFF_F000, 0x4800_0000);
+        let q = pendbaser(0x4801_0000, SHARE_NON, CACHE_NC);
+        assert_eq!(q >> 62 & 1, 1);
+        assert_eq!(q & 0x000F_FFFF_FFFF_0000, 0x4801_0000);
+        assert_eq!((q >> 7) & 7, 1);
+    }
+
+    #[test]
+    fn queue_and_table_registers() {
+        let c = cbaser(0x4802_0000, 1, SHARE_INNER, CACHE_RAWAWB);
+        assert_eq!(c & 0xFF, 0);
+        assert_eq!(c >> 63, 1);
+        assert_eq!((c >> 59) & 7, 7);
+        let old = (BASER_TYPE_DEVICE << 56) | (7 << 48) | (2 << 8);
+        let b = baser(old, 0x4803_0000, 2, SHARE_INNER, CACHE_RAWAWB);
+        assert_eq!(baser_type(b), BASER_TYPE_DEVICE);
+        assert_eq!(baser_entry_size(b), 8);
+        assert_eq!(b & 0xFF, 1);
+        assert_eq!(b >> 63, 1);
+        // The page size field is the caller's to set; the helper leaves 4 KiB.
+        assert_eq!(baser_page_size(b), 0x1000);
+        assert_eq!(baser_page_size(old), 0x1_0000);
+    }
+
+    #[test]
+    fn typer_fields_of_qemu() {
+        // QEMU 11: ITT entry 12 bytes, 16 EventID bits, 16 DeviceID bits [G47].
+        let typer = 1 | (11 << 4) | (15 << 8) | (15 << 13) | (1 << 36);
+        assert_eq!(typer_itt_entry_size(typer), 12);
+        assert_eq!(typer_event_bits(typer), 16);
+        assert_eq!(typer_device_bits(typer), 16);
+        assert!(!typer_pta(typer));
+        assert_eq!(typer_hcc(typer), 0);
+        assert_eq!(processor_number(3 << 8), 3);
+    }
+
+    #[test]
+    fn device_table_for_a_flat_msi_map() {
+        // 64 K DeviceIDs of 8 bytes need 128 pages: past a 64 KiB table.
+        assert_eq!(device_table_pages(0xFFFF, 8, 16), None);
+        assert_eq!(device_table_pages(0x1FF, 8, 16), Some(1));
+        assert_eq!(device_table_pages(0x200, 8, 16), Some(2));
+        assert_eq!(device_table_pages(0x1FFF, 8, 16), Some(16));
+        assert_eq!(collection_table_pages(8, 8), 1);
+    }
+
+    #[test]
+    fn itt_sizes_follow_the_events() {
+        assert_eq!(event_bits(1), 1);
+        assert_eq!(event_bits(2), 1);
+        assert_eq!(event_bits(3), 2);
+        assert_eq!(event_bits(64), 6);
+        assert_eq!(itt_bytes(64, 12), Some(768));
+        assert_eq!(itt_bytes(64, 16), Some(1024));
+        assert_eq!(itt_bytes(64, 17), None);
+        assert_eq!(itt_bytes(65, 8), Some(1024));
+        assert_eq!(itt_bytes(65, 12), None);
+    }
+
+    #[test]
+    fn commands_encode_as_g46() {
+        let c = Command::mapd(0x1234, 0x4800_0100, 6, true);
+        assert_eq!(c.0[0], 0x08 | (0x1234 << 32));
+        assert_eq!(c.0[1], 5);
+        assert_eq!(c.0[2], 0x4800_0100 | 1 << 63);
+        assert_eq!(Command::mapd(1, 0x100, 1, false).0[2] >> 63, 0);
+        let c = Command::mapc(3, 3 << 16, true);
+        assert_eq!(c.0, [0x09, 0, 3 | (3 << 16) | 1 << 63, 0]);
+        let c = Command::mapti(0x10, 2, 8193, 1);
+        assert_eq!(c.0, [0x0A | (0x10 << 32), 2 | (8193 << 32), 1, 0]);
+        assert_eq!(Command::inv(7, 1).0, [0x0C | (7 << 32), 1, 0, 0]);
+        assert_eq!(Command::discard(7, 1).0, [0x0F | (7 << 32), 1, 0, 0]);
+        assert_eq!(Command::int(7, 1).0, [0x03 | (7 << 32), 1, 0, 0]);
+        assert_eq!(Command::sync(2 << 16).0, [0x05, 0, 2 << 16, 0]);
+        assert_eq!(Command::invall(4).0, [0x0D, 0, 4, 0]);
+        assert_eq!(Command::discard(0, 0).name(), "DISCARD");
+    }
+
+    #[test]
+    fn queue_arithmetic_wraps_and_keeps_a_slot_empty() {
+        assert_eq!(QUEUE_SLOTS, 128);
+        assert_eq!(free_slots(0, 0), 127);
+        assert_eq!(free_slots(0, 127 * 32), 0);
+        assert_eq!(next_offset(127 * 32), 0);
+        assert_eq!(pending(0, 4 * 32), 4);
+        assert_eq!(pending(126 * 32, 2 * 32), 4);
+        assert_eq!(free_slots(10 * 32, 9 * 32), 0);
+        assert_eq!(free_slots(10 * 32, 10 * 32), 127);
+    }
+
+    #[test]
+    fn lpi_map_hands_out_the_lowest_and_runs_dry() {
+        let mut m = LpiMap::new();
+        assert_eq!(m.take(), Some(8192));
+        assert_eq!(m.take(), Some(8193));
+        m.give(8192);
+        assert_eq!(m.take(), Some(8192));
+        for _ in 2..MAX_LPIS {
+            assert!(m.take().is_some());
+        }
+        assert_eq!(m.take(), None);
+        assert_eq!(m.in_use(), MAX_LPIS);
+        m.give(8192 + 1023);
+        assert_eq!(m.take(), Some(8192 + 1023));
+    }
+
+    #[test]
+    #[should_panic(expected = "twice")]
+    fn an_lpi_given_back_twice_stops() {
+        let mut m = LpiMap::new();
+        let n = m.take().unwrap();
+        m.give(n);
+        m.give(n);
+    }
+}

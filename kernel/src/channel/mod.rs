@@ -45,6 +45,7 @@ use crate::{arch, testpoint};
 use abi::{ChannelInfo, Error, INLINE_MAX, MAX_SLOTS, Notification, Rights};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
+use kcore::must::Must;
 use kcore::notify::{Post, Queue, Slot};
 use kcore::sched::Scheduler;
 
@@ -97,7 +98,7 @@ pub struct Channel {
 unsafe impl Send for Channel {}
 
 // Six channels to a page of a pool (spec 7.8).
-const _: () = assert!(core::mem::size_of::<Channel>() <= 1024);
+const _: () = ::core::assert!(core::mem::size_of::<Channel>() <= 1024);
 
 /// Channels whose slots have not gone back.
 static LIVE: Live = Live::new();
@@ -174,7 +175,7 @@ pub fn retain(c: NonNull<Channel>, rights: Rights) {
             (*p).receivers = (*p)
                 .receivers
                 .checked_add(1)
-                .expect("channel receivers overflow");
+                .must("channel receivers overflow");
         }
     }
 }
@@ -195,7 +196,7 @@ pub unsafe fn release(c: NonNull<Channel>, rights: Rights, cause: u8) {
             (*p).receivers = (*p)
                 .receivers
                 .checked_sub(1)
-                .expect("a handle with RECEIVE is released once too often");
+                .must("a handle with RECEIVE is released once too often");
             if (*p).receivers == 0 {
                 close(c, cause);
             }
@@ -263,7 +264,7 @@ pub fn remove_source(c: NonNull<Channel>) {
     *sources = sources
         .checked_sub(1)
         .filter(|&n| n > 0)
-        .expect("a source gave back a slot it did not take");
+        .must("a source gave back a slot it did not take");
 }
 
 /// The last handle with RECEIVE went (spec 6.1, 6.8): the channel is closed
@@ -468,7 +469,7 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
 }
 
 // The poison of a channel that went (Live::gone) reaches its count.
-const _: () = assert!(core::mem::offset_of!(Channel, refs) >= 8);
+const _: () = ::core::assert!(core::mem::offset_of!(Channel, refs) >= 8);
 
 #[cfg(feature = "ktest")]
 pub use test_access::{in_use, payer, sources};

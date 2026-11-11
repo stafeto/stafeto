@@ -3,6 +3,8 @@
 
 //! Virtual address layout shared by the boot code and the kernel.
 
+use crate::must::Must;
+
 /// Start of the linear map: virtual address `LINEAR_BASE + pa` reaches physical address `pa`.
 pub const LINEAR_BASE: usize = 0xFFFF_0000_0000_0000;
 
@@ -17,7 +19,7 @@ pub const USER_END: usize = 1 << 48;
 pub fn image_pa(kernel_pa: u64, va: usize) -> u64 {
     let offset = va
         .checked_sub(KERNEL_VIRT)
-        .expect("address below the kernel image");
+        .must("address below the kernel image");
     kernel_pa + offset as u64
 }
 

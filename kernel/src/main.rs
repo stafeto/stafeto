@@ -15,6 +15,8 @@
 #![cfg_attr(feature = "ktest", allow(dead_code, unused_imports))]
 
 #[macro_use]
+mod failure;
+#[macro_use]
 mod console;
 #[macro_use]
 mod log;
@@ -32,6 +34,7 @@ mod ktest;
 mod local;
 mod memory;
 mod mm;
+mod msi;
 mod obj;
 mod object;
 mod panicking;
@@ -55,12 +58,15 @@ use bootimg::Program;
 use kcore::PAGE_SIZE;
 use kcore::bootinfo::GicVersion;
 use kcore::layout::KERNEL_VIRT;
+use kcore::must::Must;
 use kcore::time::Clock;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::cpu::init_boot();
     arch::exceptions::init();
+    qsbr::init();
+    mm::aspace::begin();
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
@@ -102,7 +108,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
 #[cfg(not(feature = "ktest"))]
 fn finish(boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
-    let image = boot.info.initrd.expect("init came from the boot image");
+    let image = boot.info.initrd.must("init came from the boot image");
     init::start(program, image)
 }
 
@@ -156,6 +162,14 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
                 c.base
             ),
         }
+    }
+    if arch::its::present() {
+        kprintln!(
+            "its        {:#x}, ITT entry {} bytes, DeviceIDs up to {:#x}",
+            info.its.map_or(0, |its| its.regs.base),
+            arch::its::itt_entry(),
+            arch::its::max_device_id()
+        );
     }
     kprintln!("psci       {:?}", info.psci);
     smp::report();

@@ -54,6 +54,7 @@ mod device;
 mod dma;
 mod fast;
 mod files;
+mod msix;
 mod net;
 mod owner;
 mod second;
@@ -126,6 +127,7 @@ use virtio_mmio::PAGE;
 use virtio_net::open::{MAC, MTU, OFFLOAD, STATUS};
 use virtio_net::transport::{self, Function, OpenError};
 use virtio_net::{OpenFailure, Opened};
+use virtio_pci::qemu;
 
 rt::entry!(main);
 
@@ -155,8 +157,8 @@ const SWEEP_LABEL: u64 = 2;
 /// of 4 MiB of buffers.
 const SECOND_OBJECTS: [&str; 5] = ["dma1", "net1a", "net1b", "net1c", "net1d"];
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
-const RECEIVEQ: u16 = 0;
-const TRANSMITQ: u16 = 1;
+pub(crate) const RECEIVEQ: u16 = 0;
+pub(crate) const TRANSMITQ: u16 = 1;
 /// The features the service asks for (`virtio_net::open`):
 /// `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
 /// `VIRTIO_NET_F_STATUS`. The checksum offload is added by `start_device` when
@@ -369,8 +371,13 @@ fn main(_: u64) -> u64 {
     let Ok(irq) = got.take::<Interrupt>("irq") else {
         return NOT_REGISTERED;
     };
-    // The record of two devices has a second binding.
+    // The record of two devices has a second binding; the record of QEMU's
+    // machine with an ITS has one binding a queue, `irq` for receiving and
+    // `irqtx` for sending, each an event of the function's MSI device
+    // (init's table, `NETD_ITS`).
     let irq1 = got.take::<Interrupt>("irq1").ok();
+    let irq_tx = got.take::<Interrupt>("irqtx").ok();
+    let msi = irq_tx.is_some();
     let devices = 1 + usize::from(irq1.is_some());
     let rw = Access::ReadWrite;
     let page = PAGE as u64;
@@ -395,8 +402,14 @@ fn main(_: u64) -> u64 {
         let (Ok(ecam), Ok(bar)) = (got.take::<Memory>("ecam"), got.take::<Memory>("bar")) else {
             return NOT_REGISTERED;
         };
-        let (_, ecam_len) = netd::pci::ecam_window(devices);
-        let (_, bar_len) = netd::pci::bar_window(devices);
+        let (ecam_len, bar_len) = if msi {
+            (page, qemu::NET.len + qemu::NET_MSIX_LEN)
+        } else {
+            (
+                netd::pci::ecam_window(devices).1,
+                netd::pci::bar_window(devices).1,
+            )
+        };
         if sys::mem_map(&s.process, &ecam, 0, ecam_len, dma::ecam_at(), rw).is_err()
             || sys::mem_map(&s.process, &bar, 0, bar_len, dma::bar_at(), rw).is_err()
         {
@@ -428,7 +441,7 @@ fn main(_: u64) -> u64 {
             return NOT_MAPPED;
         }
     }
-    let (mut transport, status) = match open_device(pci, DEVICE, at) {
+    let (mut transport, status) = match open_device(pci, msi, DEVICE, at) {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -450,6 +463,12 @@ fn main(_: u64) -> u64 {
     let Ok(tx_queue) = Q::new(&mut transport, TRANSMITQ, false, false) else {
         return NOT_STARTED;
     };
+    if let Some(irq_tx) = &irq_tx
+        && let Err(why) = msix::set_up([&irq, irq_tx])
+    {
+        rt::println!("virtio-net: MSI-X: {why}");
+        return NOT_STARTED;
+    }
     // SAFETY: only this thread reaches TABLES, here once; the pointer is to
     // zeroed memory of the static.
     let tables = unsafe {
@@ -495,7 +514,7 @@ fn main(_: u64) -> u64 {
             .ok()
         })
         .flatten();
-    let switch = switch::Switch::new(
+    let mut switch = switch::Switch::new(
         transport,
         rx_queue,
         tx_queue,
@@ -505,7 +524,13 @@ fn main(_: u64) -> u64 {
         offload,
         (switch_tables, sweep_timer.0, sweep_timer.1),
     );
-    if pci {
+    if let Some(irq_tx) = irq_tx {
+        switch.vectors(irq_tx);
+        rt::println!(
+            "virtio-net: 1af4:1041 at {at:#x}, msi-x 2 vectors, status {status:#x}, mac {}",
+            Mac(mac)
+        );
+    } else if pci {
         rt::println!(
             "virtio-net: 1af4:1041 at {at:#x}, line {line}, status {status:#x}, mac {}",
             Mac(mac)
@@ -771,7 +796,12 @@ fn mtu_fits(opened: &Opened, tag: &str) -> bool {
 /// The transport of the network device `device` (0 or 1) at `at`, with the
 /// status it had before the service's reset; says why on failure and gives
 /// the code the service ends with.
-fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'static>, u32), u64> {
+fn open_device(
+    pci: bool,
+    msi: bool,
+    device: usize,
+    at: u64,
+) -> Result<(SomeTransport<'static>, u32), u64> {
     let tag = if device == DEVICE {
         "virtio-net"
     } else {
@@ -779,8 +809,8 @@ fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'stat
     };
     if pci {
         let opened = match device {
-            DEVICE => pci_transport::<DEVICE>(),
-            _ => pci_transport::<1>(),
+            DEVICE => pci_transport::<DEVICE>(msi),
+            _ => pci_transport::<1>(false),
         };
         return match opened {
             Ok((transport, status)) => Ok((transport.into(), status)),
@@ -823,9 +853,11 @@ fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'stat
 /// device reset (`virtio_net::transport::pci_transport`), and bus mastering
 /// on only then (Virtio 1.2, 2.4.1, 3.1.1). Every access to the
 /// configuration space is 32 bits wide, as VZ stops the machine at a byte
-/// write there.
-fn pci_transport<const D: usize>()
--> Result<(virtio_drivers::transport::pci::PciTransport, u32), Option<transport::Failure>> {
+/// write there. With `msi` the function is QEMU's (`virtio_pci::qemu::NET`):
+/// the structures in BAR 4, and BAR 1 of the MSI-X table placed after it.
+fn pci_transport<const D: usize>(
+    msi: bool,
+) -> Result<(virtio_drivers::transport::pci::PciTransport, u32), Option<transport::Failure>> {
     let place = &netd::pci::PLACES[D];
     let page = dma::ecam_at() + netd::pci::ecam_offset(D) as usize;
     let read = |offset: usize| {
@@ -839,17 +871,24 @@ fn pci_transport<const D: usize>()
     };
     // The record names the function of the network device; one that holds
     // something else ends the service before it writes there.
-    if read(virtio_pci::ID) != place.id {
+    let found = read(virtio_pci::COMMAND) & 0xFFFF;
+    let (id, index, writes, bar) = if msi {
+        let msix = (virtio_pci::BAR0 + 4, qemu::NET_MSIX as u32);
+        let writes = qemu::NET.set_up_with(found, msix);
+        (qemu::NET.id, qemu::NET.index as u8, writes, dma::qemu_bar())
+    } else {
+        (place.id, 0, place.set_up(found), dma::bar(D))
+    };
+    if read(virtio_pci::ID) != id {
         return Err(Some(transport::Failure::NoDevice));
     }
-    if virtio_pci::common_config(read) != Some((0, 0)) {
+    if virtio_pci::common_config(read) != Some((index, 0)) {
         return Err(None);
     }
-    let found = read(virtio_pci::COMMAND) & 0xFFFF;
-    for (offset, value) in place.set_up(found) {
+    for (offset, value) in writes {
         write(offset, value);
     }
-    let opened = transport::pci_transport::<D, _>(Function(page), dma::bar(D)).map_err(Some)?;
+    let opened = transport::pci_transport_in::<D, _>(Function(page), index, bar).map_err(Some)?;
     write(
         virtio_pci::COMMAND,
         virtio_pci::bus_master(read(virtio_pci::COMMAND)),
@@ -869,7 +908,7 @@ fn start_second<'a>(
     seed: u64,
     objects: (u64, u64),
 ) -> Result<&'a mut Second, u64> {
-    let (transport, status) = open_device(pci, 1, at1)?;
+    let (transport, status) = open_device(pci, false, 1, at1)?;
     // SAFETY: the slot is exclusive and empty, the storage is the one
     // socket's and used nowhere else; the device is up when `start_at`
     // returns Ok.

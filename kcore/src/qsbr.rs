@@ -46,6 +46,20 @@ impl<const N: usize> Grace<N> {
         }
     }
 
+    /// The state `new` has before the epoch counter starts: all zero, so that
+    /// a static of it lives in .bss. `begin` must run before any other call.
+    pub const fn unstarted() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            seen: [const { AtomicU64::new(0) }; N],
+        }
+    }
+
+    /// Sets the epoch of `new` on an `unstarted` counter.
+    pub fn begin(&self) {
+        self.epoch.store(1, Ordering::SeqCst);
+    }
+
     /// The epoch of an object that was just unlinked: the counter moves on,
     /// so that every quiescent point after this call writes it or more.
     pub fn retire(&self) -> u64 {

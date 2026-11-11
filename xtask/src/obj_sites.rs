@@ -22,10 +22,15 @@ use std::path::Path;
 pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/arch/aarch64/exceptions.rs", 1),
     ("kernel/src/channel/mod.rs", 1),
-    ("kernel/src/cleanup.rs", 4),
+    // The portions of a binding and of an MSI device take it after their
+    // ITS commands (decision K3, section 5): one take a portion, whichever
+    // kind it serves (`wcet bound`: portion of cleanup k = 1).
+    ("kernel/src/cleanup.rs", 5),
     ("kernel/src/cmd.rs", 1),
     ("kernel/src/init.rs", 3),
-    ("kernel/src/irq.rs", 1),
+    // The delivery of a line and that of an LPI, one take an interrupt
+    // (`wcet bound`: interrupt of a device k = 1).
+    ("kernel/src/irq.rs", 2),
     ("kernel/src/main.rs", 1),
     ("kernel/src/memory.rs", 3),
     ("kernel/src/mm/aspace.rs", 1),

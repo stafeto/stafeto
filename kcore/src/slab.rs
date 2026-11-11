@@ -9,6 +9,7 @@
 //! `PageLog`; the pages go back when the payer's shell goes.
 
 use crate::PAGE_SIZE;
+use crate::must::Must;
 use crate::quota::Account;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -38,8 +39,8 @@ struct FreeSlot {
 
 pub struct Pool<T> {
     free: Option<NonNull<FreeSlot>>,
-    in_use: usize,
-    pages: usize,
+    in_use: u32,
+    pages: u32,
     _objects: PhantomData<T>,
 }
 
@@ -69,7 +70,7 @@ impl<T> Pool<T> {
     /// assert_eq!(kcore::slab::Pool::<[u8; 5000]>::PER_PAGE, 0);
     /// ```
     pub const PER_PAGE: usize = {
-        assert!(
+        ::core::assert!(
             Self::SLOT <= PAGE_SIZE as usize && Self::ALIGN <= PAGE_SIZE as usize,
             "objects of this type do not fit a pool page"
         );
@@ -78,7 +79,7 @@ impl<T> Pool<T> {
 
     pub const fn new() -> Self {
         // Evaluating PER_PAGE checks that T fits a page.
-        const { assert!(Self::PER_PAGE > 0) };
+        const { ::core::assert!(Self::PER_PAGE > 0) };
         Self {
             free: None,
             in_use: 0,
@@ -88,11 +89,11 @@ impl<T> Pool<T> {
     }
 
     pub fn in_use(&self) -> usize {
-        self.in_use
+        self.in_use as usize
     }
 
     pub fn pages(&self) -> usize {
-        self.pages
+        self.pages as usize
     }
 
     /// Makes sure the next `alloc` takes no page: takes one from `src` now
@@ -121,7 +122,7 @@ impl<T> Pool<T> {
         if !self.reserve(src) {
             return Err(value);
         }
-        let slot = self.free.expect("a free slot after growing");
+        let slot = self.free.must("a free slot after growing");
         // SAFETY: slot is a free slot of this pool, large and aligned enough for T.
         unsafe {
             self.free = slot.as_ref().next;
@@ -167,7 +168,7 @@ struct ListPage {
     next: Option<NonNull<ListPage>>,
 }
 
-const _: () = assert!(size_of::<ListPage>() == PAGE_SIZE as usize);
+const _: () = ::core::assert!(size_of::<ListPage>() == PAGE_SIZE as usize);
 
 /// The pages the pools of one payer took (spec 7.8), and the list pages
 /// that name them: the first INLINE_PAGES addresses in the log itself,
@@ -236,7 +237,7 @@ impl PageLog {
         if self.pages < INLINE_PAGES {
             self.inline[self.pages] = Some(page);
         } else {
-            let list = self.list.expect("a list page for the address");
+            let list = self.list.must("a list page for the address");
             let i = self.in_list();
             // SAFETY: the list page is the log's, and entry i lies in it.
             unsafe { (&raw mut (*list.as_ptr()).entries[i]).write(Some(page)) };
@@ -325,7 +326,7 @@ impl<'a, F: PageSource> PaidPages<'a, F> {
     fn take(&mut self) -> Option<NonNull<u8>> {
         self.quota.charge(PAGE_SIZE).ok()?;
         let page = self.frames.alloc_page();
-        Some(page.expect("a charge that passed found no frame (spec 7.8)"))
+        Some(page.must("a charge that passed found no frame (spec 7.8)"))
     }
 }
 

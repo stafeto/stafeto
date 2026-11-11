@@ -12,6 +12,8 @@ use super::*;
 
 /// The image of the shell with the network.
 pub const IMAGE: &str = "boot-net.img";
+/// The same on the machine with an ITS (qemu::VIRT_ITS).
+pub const ITS_IMAGE: &str = "boot-net-its.img";
 /// The stack of the network service. The frame of `main` holds the two
 /// queues of the device's crate (about 8 KiB each), the rings' books, the
 /// stack's interface and sockets, and the buffers of the start (the key, the
@@ -50,6 +52,17 @@ pub fn programs() -> &'static [ImageProgram] {
             .filter(|p| p.group() == packages::Group::Net)
             .collect();
         programs.extend(package_programs(&net));
+        programs
+    })
+}
+
+/// The programs of the image on the machine with an ITS: init's table with
+/// the record of the service on MSI-X (feature `net-its`).
+pub fn its_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = programs().to_vec();
+        programs[0].3 = &["table-net", "net-its"];
         programs
     })
 }
