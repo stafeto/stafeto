@@ -653,6 +653,9 @@ pub fn check() -> Result<(), String> {
         "boot-net-bench-fast.img",
         "boot-net-bench-switch.img",
         "boot-net-bench-switch-profile.img",
+        "boot-net-bench-trace.img",
+        "boot-net-bench-trace-fast.img",
+        "boot-net-bench-trace-switch.img",
         "boot-fast-nginx.img",
         "boot-fast-scale.img",
         "boot-fast-switch.img",
@@ -787,6 +790,8 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-fast-switch-vz.img"
         | "boot-net-bench-switch.img"
         | "boot-net-bench-switch-profile.img"
+        | "boot-net-bench-trace-fast.img"
+        | "boot-net-bench-trace-switch.img"
         | "boot-net-bench-fast.img" => Ok(load()?
             .into_iter()
             .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))
@@ -828,7 +833,8 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-net-bench.img"
         | "boot-net-bench-profile.img"
         | "boot-net-bench-pinned.img"
-        | "boot-net-bench-cpu0.img" => of(&[Group::Base, Group::Addon, Group::Fstack, Group::Net]),
+        | "boot-net-bench-cpu0.img"
+        | "boot-net-bench-trace.img" => of(&[Group::Base, Group::Addon, Group::Fstack, Group::Net]),
         // The shell's image with the probe of F-Stack runs no network
         // service.
         "boot-fstack-probe.img" => of(&[Group::Base, Group::Addon, Group::Fstack]),
@@ -1187,6 +1193,8 @@ files = [
             "boot-net-bench-fast.img",
             "boot-net-bench-switch.img",
             "boot-net-bench-switch-profile.img",
+            "boot-net-bench-trace-fast.img",
+            "boot-net-bench-trace-switch.img",
         ] {
             let held = of_image(image).unwrap();
             assert!(held.iter().any(|p| p.name == "nginx-fast"), "{image}");

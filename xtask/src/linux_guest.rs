@@ -67,6 +67,16 @@ pub const BENCH_SWITCH_PROFILE_IMAGE: &str = "boot-net-bench-switch-profile.img"
 pub const FAST_ADDRESS: &str = "192.168.64.250";
 /// The machine of both guests (the provisional ruling B2 of the owner).
 pub const CPUS: usize = 4;
+/// The CPUs of the guests of this run (`net-bench --cpus`): `CPUS` unless it says otherwise.
+static CPUS_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(CPUS);
+
+pub fn set_cpus(n: usize) {
+    CPUS_NOW.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cpus() -> usize {
+    CPUS_NOW.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub const MEMORY_MIB: u64 = 1024;
 
 /// The CPUs the shell of a variant of the image may use, which is what
@@ -212,6 +222,33 @@ pub fn build_switch_profile_image() -> Result<PathBuf, String> {
         bench_switch_profile_programs(),
         BOOT_PROFILE,
     )
+}
+
+/// The images of the measurement with the time stamps along the packet path (`cargo xtask
+/// net-trace`): `netd` built with the feature `trace`; the packages and libc.so are built with
+/// STAFETO_TRACE=1 in the environment (the glue of F-Stack and the layer carry the points).
+pub const TRACE_IMAGE: &str = "boot-net-bench-trace.img";
+pub const TRACE_FAST_IMAGE: &str = "boot-net-bench-trace-fast.img";
+pub const TRACE_SWITCH_IMAGE: &str = "boot-net-bench-trace-switch.img";
+
+/// Builds the image `name` of `base` with the time stamps in the network service.
+pub fn build_trace_image(
+    name: &'static str,
+    base: &'static [ImageProgram],
+) -> Result<PathBuf, String> {
+    if std::env::var_os("STAFETO_TRACE").is_none() {
+        return Err(
+            "the images with the time stamps need STAFETO_TRACE=1 in the environment".to_owned(),
+        );
+    }
+    let mut programs = base.to_vec();
+    for program in &mut programs {
+        if program.0 == "netd" {
+            program.3 = &["trace"];
+        }
+    }
+    crate::probe_ca::ensure(false)?;
+    build_boot_image(name, Box::leak(programs.into_boxed_slice()), BOOT_PROFILE)
 }
 
 // What both guests carry -------------------------------------------------------
@@ -863,7 +900,7 @@ pub(crate) fn machine(suffix: &vz::Suffix) -> vz::Machine {
 /// The same with `net` network devices (two for F1).
 pub(crate) fn machine_with(suffix: &vz::Suffix, net: usize) -> vz::Machine {
     vz::Machine {
-        cpus: Some(CPUS),
+        cpus: Some(cpus()),
         memory_mib: Some(MEMORY_MIB),
         net,
         mac_suffix: suffix.value,
