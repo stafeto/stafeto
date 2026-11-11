@@ -701,6 +701,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
+    if std::env::var_os("STAFETO_TRACE").is_some() {
+        return Err(
+            "STAFETO_TRACE is set in the environment: the images would be built with the time stamps of the packet path (`cargo xtask net-trace`) and ci would trace them silently; unset it and run ci again"
+                .to_owned(),
+        );
+    }
     if let Some(group) = &options.group
         && !known.contains(group)
     {
