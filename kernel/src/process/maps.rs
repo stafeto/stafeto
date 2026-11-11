@@ -25,14 +25,16 @@ use crate::memory;
 use abi::{Access, Call};
 use core::mem::{align_of, size_of};
 use kcore::maps::{Mapping, Maps};
+use kcore::must::Must;
 use kcore::slab::PageSource;
 
 /// The mapping table of a process: MAX_MAPPINGS entries in one paid page
 /// recorded in its page log. The page lives until the process shell is freed.
 pub type Table = Maps<NonNull<Memory>>;
 
-const _: () =
-    assert!(size_of::<Table>() <= PAGE_SIZE as usize && align_of::<Table>() <= PAGE_SIZE as usize);
+const _: () = ::core::assert!(
+    size_of::<Table>() <= PAGE_SIZE as usize && align_of::<Table>() <= PAGE_SIZE as usize
+);
 
 /// Pages a portion of mem_map, mem_unmap or mem_protect takes at most
 /// (spec 7.7).
@@ -109,7 +111,7 @@ pub(super) unsafe fn table<'a>(process: NonNull<Process>) -> Option<&'a mut Tabl
 /// As for `table`; the process lives, so the entry is there.
 unsafe fn entry(on: &Change) -> Mapping<NonNull<Memory>> {
     // SAFETY: the caller's promise.
-    let table = unsafe { table(on.target) }.expect("a table with a busy entry");
+    let table = unsafe { table(on.target) }.must("a table with a busy entry");
     *table.get(on.index as usize)
 }
 
@@ -209,7 +211,7 @@ pub fn reserve_mapping(
     crate::window::map_checked();
     make_table(target)?;
     // SAFETY: as above; the table was just made.
-    let table = unsafe { table(target) }.expect("the table was just made");
+    let table = unsafe { table(target) }.must("the table was just made");
     let index = table.insert_checked(mapping)?;
     table.set_busy(index, true);
     memory::retain_mapping(mapping.object);
@@ -441,7 +443,7 @@ pub fn exec_frames(on: &Change) -> Option<Frames> {
 pub unsafe fn finish_change(on: Change, cause: u8) {
     crate::obj::assert_held();
     // SAFETY: the caller's promise.
-    let table = unsafe { table(on.target) }.expect("a table with a busy entry");
+    let table = unsafe { table(on.target) }.must("a table with a busy entry");
     let index = on.index as usize;
     match on.op {
         Op::Map { prepaid, .. } => {
@@ -517,7 +519,7 @@ pub unsafe fn abandon_change(on: Change, cause: u8) {
     crate::obj::assert_held();
     if check_alive(on.target).is_ok() {
         // SAFETY: the process lives, and the entry is the call's.
-        let table = unsafe { table(on.target) }.expect("a table with a busy entry");
+        let table = unsafe { table(on.target) }.must("a table with a busy entry");
         let index = on.index as usize;
         let gone = match on.op {
             Op::Map { .. } => table.shrink_to(index, on.done),

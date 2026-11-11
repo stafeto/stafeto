@@ -8,6 +8,7 @@
 //! and a process in which no thread ever started lives until its
 //! references go.
 
+use crate::must::Must;
 use abi::{Error, ProcessState};
 
 pub struct Life {
@@ -40,7 +41,7 @@ impl Life {
         if !self.is_alive() {
             return Err(Error::BadState);
         }
-        self.live = self.live.checked_add(1).expect("started threads overflow");
+        self.live = self.live.checked_add(1).must("started threads overflow");
         Ok(())
     }
 
@@ -51,7 +52,7 @@ impl Life {
         if !self.is_alive() {
             return false;
         }
-        self.live = self.live.checked_sub(1).expect("an exit without a start");
+        self.live = self.live.checked_sub(1).must("an exit without a start");
         self.live == 0 && self.end(ProcessState::Exited { code: 0 })
     }
 

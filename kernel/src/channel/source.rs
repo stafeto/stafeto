@@ -137,7 +137,9 @@ impl Source {
     }
 
     fn own_slot(&self) -> &Slot<Owner> {
-        self.slot.as_ref().expect("an attached source")
+        self.slot
+            .as_ref()
+            .unwrap_or_else(|| kcore::fail_here!("an attached source"))
     }
 
     /// The priority of the source's slot.
@@ -161,7 +163,12 @@ impl Source {
         // and the slot stays in place with its object.
         unsafe {
             let c = (*this.as_ptr()).channel;
-            let slot = NonNull::from((*this.as_ptr()).slot.as_mut().expect("an attached source"));
+            let slot = NonNull::from(
+                (*this.as_ptr())
+                    .slot
+                    .as_mut()
+                    .unwrap_or_else(|| kcore::fail_here!("an attached source")),
+            );
             post(c, slot, bits, cause)
         }
     }

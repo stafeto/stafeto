@@ -25,6 +25,7 @@ use kcore::gic::{
     WAKER_PROCESSOR_SLEEP,
 };
 use kcore::layout::LINEAR_BASE;
+use kcore::must::Must;
 
 /// Whether `init` found a GICv3 in the device tree.
 static V3: AtomicBool = AtomicBool::new(false);
@@ -90,7 +91,7 @@ fn wait_clear(at: usize, bits: u32, what: &str) {
             return;
         }
     }
-    panic!("the GIC keeps {what} set");
+    ::core::panic!("the GIC keeps {what} set");
 }
 
 /// The base of this CPU's own registers: the CPU interface of a GICv2, the
@@ -121,14 +122,14 @@ fn block(intid: u32) -> usize {
 /// lines go to this CPU; the priority mask lets DEFAULT_PRIORITY through.
 /// Runs once, at boot.
 pub fn init(info: &BootInfo) {
-    let gic = info.gic.expect("no GIC in the device tree");
+    let gic = info.gic.must("no GIC in the device tree");
     let [dist, cpu] = gic.mapped();
     assert!(DIST.load(Ordering::Relaxed) == 0, "gic::init runs once");
     V3.store(gic.version == GicVersion::V3, Ordering::Relaxed);
     DIST.store(LINEAR_BASE + dist.base as usize, Ordering::Relaxed);
     match gic.version {
         GicVersion::V2 => init_v2(cpu),
-        GicVersion::V3 => init_v3(cpu),
+        GicVersion::V3 => init_v3(cpu, info),
     }
     enable_ipi();
 }
@@ -190,7 +191,7 @@ fn enable_cpu_interface_v2() {
 /// affinity in `redistributors`, the first REDISTRIBUTOR_WINDOW bytes of
 /// the first redistributor region, and woken; then the CPU interface
 /// through its system registers, which head.S opened at EL2.
-fn init_v3(redistributors: Region) {
+fn init_v3(redistributors: Region, info: &BootInfo) {
     let dist = base(&DIST);
     write(dist + GICD_CTLR, 0);
     wait_clear(dist + GICD_CTLR, GICD_CTLR_RWP, "GICD_CTLR.RWP");
@@ -215,14 +216,16 @@ fn init_v3(redistributors: Region) {
         Ordering::Relaxed,
     );
     WINDOW_SIZE.store(redistributors.size as usize, Ordering::Relaxed);
-    init_v3_cpu();
+    init_v3_cpu(Some(info));
 }
 
 /// This CPU's part of the GICv3: its redistributor, found by its
 /// affinity in the window over the redistributors, woken, its SGIs and
 /// PPIs reset; then the CPU interface through its system registers, which
-/// head.S opened at EL2.
-fn init_v3_cpu() {
+/// head.S opened at EL2. The boot CPU passes the device tree: it sets the
+/// ITS up (its::init) before its own LPIs and collection; every CPU then
+/// turns its LPIs on (its::init_cpu).
+fn init_v3_cpu(boot: Option<&BootInfo>) {
     let window = WINDOW.load(Ordering::Relaxed);
     let size = WINDOW_SIZE.load(Ordering::Relaxed) as u64;
     let mpidr = registers::mpidr_el1();
@@ -233,7 +236,7 @@ fn init_v3_cpu() {
     };
     let affinity = gic::redistributor_affinity(mpidr);
     let rd = gic::find_redistributor(typer, size, affinity)
-        .expect("no redistributor for this CPU in the window");
+        .must("no redistributor for this CPU in the window");
     let rd = window + rd as usize;
     cpu::this().gic.store(rd, Ordering::Relaxed);
     write(
@@ -248,6 +251,10 @@ fn init_v3_cpu() {
     write(rd + SGI_FRAME + GICD_IGROUPR, u32::MAX);
     reset_lines(rd + SGI_FRAME, 0..FIRST_SPI);
     wait_clear(rd + GICR_CTLR, GICR_CTLR_RWP, "GICR_CTLR.RWP");
+    if let Some(info) = boot {
+        super::its::init(info, rd);
+    }
+    super::its::init_cpu(rd);
     let sre = read_sysreg!("icc_sre_el1");
     write_icc!("icc_sre_el1", sre | ICC_SRE_SRE);
     assert!(
@@ -280,7 +287,7 @@ pub fn init_secondary() {
             own_interface();
             enable_cpu_interface_v2();
         }
-        GicVersion::V3 => init_v3_cpu(),
+        GicVersion::V3 => init_v3_cpu(None),
     }
     enable_ipi();
 }
@@ -371,6 +378,30 @@ pub fn mask(intid: u32) {
     }
 }
 
+/// Sends the shared line `intid` to CPU `cpu`, which is up (spec 9):
+/// its byte of GICD_ITARGETSR with the CPU's interface bit on a GICv2, its
+/// GICD_IROUTER with the CPU's affinity on a GICv3. The line is masked
+/// meanwhile.
+pub fn set_route(intid: u32, cpu: usize) {
+    let dist = base(&DIST);
+    let block = cpu::block(cpu);
+    match kind() {
+        GicVersion::V2 => {
+            let (offset, shift) = gic::byte(GICD_ITARGETSR, intid);
+            let bit = (block.gic.load(Ordering::Relaxed) as u32 & 0xFF) << shift;
+            write(
+                dist + offset,
+                (read(dist + offset) & !(0xFF << shift)) | bit,
+            );
+        }
+        GicVersion::V3 => {
+            let at = dist + GICD_IROUTER + 8 * intid as usize;
+            // SAFETY: GICD_IROUTER is a 64-bit register of the distributor.
+            unsafe { mmio::write64(at, gic::irouter(block.mpidr.load(Ordering::Relaxed))) };
+        }
+    }
+}
+
 /// Makes the line edge-triggered, or level-triggered, in GICD_ICFGR
 /// [G25]; the line is masked meanwhile (spec 9).
 pub fn set_trigger(intid: u32, edge: bool) {
@@ -404,8 +435,8 @@ fn acknowledge_v2() -> u32 {
 /// EOI.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
 pub fn acknowledge() -> Option<Ack> {
-    let iar = match kind() {
-        GicVersion::V2 => acknowledge_v2(),
+    match kind() {
+        GicVersion::V2 => Ack::from_iar(acknowledge_v2()),
         GicVersion::V3 => {
             let iar: u64;
             // SAFETY: reading ICC_IAR1_EL1 acknowledges the interrupt, as
@@ -414,10 +445,10 @@ pub fn acknowledge() -> Option<Ack> {
             unsafe {
                 asm!("mrs {}, icc_iar1_el1", "dsb sy", out(reg) iar, options(nostack, preserves_flags))
             };
-            iar as u32
+            // The INTID is 24 bits wide: an LPI is 8192 and up [G40].
+            Ack::from_iar_v3(iar as u32)
         }
-    };
-    Ack::from_iar(iar)
+    }
 }
 
 /// EOI: ends an acknowledged interrupt, its priority drop and its

@@ -686,6 +686,34 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::irq_bind_checks_the_callers_limits,
     ),
     (
+        "irq_bind_takes_the_cpu_of_a_line",
+        calls::irq_bind_takes_the_cpu_of_a_line,
+    ),
+    (
+        "lpi_goes_to_the_cpu_of_its_binding",
+        calls::lpi_goes_to_the_cpu_of_its_binding,
+    ),
+    (
+        "a_discarded_event_raises_nothing",
+        calls::a_discarded_event_raises_nothing,
+    ),
+    (
+        "msi_create_checks_in_order",
+        calls::msi_create_checks_in_order,
+    ),
+    (
+        "irq_bind_event_checks_and_reports",
+        calls::irq_bind_event_checks_and_reports,
+    ),
+    (
+        "lpi_is_delivered_and_a_late_one_is_ended",
+        calls::lpi_is_delivered_and_a_late_one_is_ended,
+    ),
+    (
+        "lpis_run_out_and_come_back",
+        calls::lpis_run_out_and_come_back,
+    ),
+    (
         "irq_bind_refuses_lines_past_the_distributor",
         calls::irq_bind_refuses_lines_past_the_distributor,
     ),

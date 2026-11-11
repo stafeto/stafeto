@@ -69,6 +69,22 @@ pub const PROGRAMS: [ImageProgram; 6] = [
     ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
 ];
 
+/// The probe's image on the machine with an ITS (qemu::VIRT_ITS): the
+/// service's record on MSI-X (init's feature `net-its`).
+pub const ITS_PROGRAMS: [ImageProgram; 6] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-net-probe", "net-its"],
+    ),
+    RAM,
+    RNG,
+    ENTROPY,
+    ("netd", "netd", NETD_STACK_SIZE, &["probe", "profile"]),
+    ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
+];
+
 /// The image of two network devices: the probe's image with init's table of
 /// two devices (`table-net-probe-two`).
 pub const TWO_PROGRAMS: [ImageProgram; 6] = [
@@ -216,6 +232,9 @@ fn measured_name(what: &str) -> &'static str {
 /// instance) and the MAC.
 pub const DEVICE_LINE: &str =
     "virtio-net: virtio-mmio at 0xa000e00, line 55, status 0x0, mac 52:54:00:12:34:56";
+/// The same on the machine with an ITS: the function and its two vectors.
+pub const DEVICE_LINE_MSI: &str =
+    "virtio-net: 1af4:1041 at 0x3f010000, msi-x 2 vectors, status 0x0, mac 52:54:00:12:34:56";
 const LEASE: &str = "net: lease 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3";
 const STATIC: &str = "net: static 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3";
 const CONFIG: &str =
@@ -610,8 +629,13 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
         Mode::Static => (STATIC, "net: lease"),
     };
     let sockets = roles.places.map(|n| format!("net-probe: sockets {n} ok"));
+    let device = if count(DEVICE_LINE_MSI) > 0 {
+        DEVICE_LINE_MSI
+    } else {
+        DEVICE_LINE
+    };
     let mut once = vec![
-        (DEVICE_LINE, 2),
+        (device, 2),
         (addressed, 2),
         (CONFIG, 1),
         (PINGS, 1),
@@ -933,7 +957,7 @@ fn run(
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    cmd.args(qemu::net(&[]));
+    cmd.args(qemu::net_on(machine, &[]));
     let forward = if two { Some(free_tcp_port()?) } else { None };
     if two {
         cmd.args(qemu::net_two(forward));
@@ -1753,6 +1777,17 @@ fn choice_features(receive: usize, groups: usize, send: usize) -> Vec<&'static s
 /// The steps run needs the emulation's own clock, so it runs on QEMU's
 /// TCG only.
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
+    // On the machine with an ITS the device is the function with MSI-X: the
+    // images of one device, with the lease and with the static address.
+    if machine.msi() {
+        for (name, mode) in [
+            ("boot-net-probe-its.img", Mode::Dhcp),
+            ("boot-net-probe-its-static.img", Mode::Static),
+        ] {
+            run(machine, name, &ITS_PROGRAMS, mode, Roles::LIMIT, false)?;
+        }
+        return Ok(());
+    }
     run(
         machine,
         "boot-net-probe.img",

@@ -526,6 +526,8 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     let kernel = build(Variant::Normal)?;
     let (name, programs) = if steps {
         (STEPS_IMAGE, steps_programs())
+    } else if machine.msi() {
+        (net::ITS_IMAGE, net::its_programs())
     } else {
         (net::IMAGE, net::programs())
     };
@@ -552,7 +554,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     ];
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    cmd.args(qemu::net(&forwards));
+    cmd.args(qemu::net_on(machine, &forwards));
     if steps {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }

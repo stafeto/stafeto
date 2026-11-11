@@ -20,6 +20,9 @@ impl Process {
         rights: Rights,
         kind: impl FnOnce(&Object) -> Option<U>,
     ) -> Result<U, Error> {
+        // The object a lookup gives holds no reference: it stays in place
+        // while the caller's section lasts (checked in test builds only).
+        crate::obj::assert_held();
         self.handles.get_as(h, rights, kind)
     }
 
