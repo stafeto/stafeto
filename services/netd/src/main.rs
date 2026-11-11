@@ -2042,10 +2042,17 @@ fn crash(r: &Request<'_>) -> Answer {
 fn trace_dump(kernel: &mut kdump::KernelDump) {
     kernel.freeze();
     let (mut buf, mut len, mut records) = ([0u8; 64], 0, 0u32);
+    // The kernel's part goes slower still: a record lost on the console breaks a chain of the
+    // analysis, and a part of 800 lines at this pace stays under the silence init allows.
+    let (per, lines) = if kernel.is_open() && NET_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+        (40, 800)
+    } else {
+        (60, 1_500)
+    };
     let mut write = |bytes: &[u8]| {
         let _ = rt::console::write(bytes);
         records += 1;
-        if records % 60 == 0 {
+        if records % per == 0 {
             let began = rt::time::now();
             while rt::time::now().wrapping_sub(began) < 52 * rt::time::frequency() / 1000 {
                 let _ = rt::sys::yield_now();
@@ -2062,11 +2069,11 @@ fn trace_dump(kernel: &mut kdump::KernelDump) {
         len += line.len() + 1;
     };
     if kernel.is_open() && NET_DONE.load(core::sync::atomic::Ordering::Relaxed) {
-        kernel.part(1_500, &mut emit);
+        kernel.part(lines, &mut emit);
         write(&buf[..len]);
         return;
     }
-    let done = trace::dump_part("n", 1_500, trace::RECORDS, &mut emit);
+    let done = trace::dump_part("n", lines, trace::RECORDS, &mut emit);
     write(&buf[..len]);
     if done {
         NET_DONE.store(true, core::sync::atomic::Ordering::Relaxed);

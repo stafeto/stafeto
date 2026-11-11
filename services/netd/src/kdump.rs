@@ -7,8 +7,10 @@
 //! CPUs as lines `tr k<cpu> <point> <ticks> <key>` (hexadecimal; the points of
 //! abi::STAMP_*), and the line `tr k done` ends them. The first part freezes
 //! the rings of the kernel, so that what the idle CPUs write during the long
-//! dump does not wear out what the load made. A kernel without the stamps
-//! refuses the call: the line `tr k none`.
+//! dump does not wear out what the load made. After the records of a CPU
+//! comes the line `tr k<cpu> 0 <records made> <records given>`, with which the
+//! reader counts what the console lost. A kernel without the stamps refuses
+//! the call: the line `tr k none`.
 
 use core::fmt::Write;
 use rt::Handle;
@@ -25,6 +27,8 @@ pub struct KernelDump {
     done: bool,
     cpu: u64,
     next: u64,
+    /// The records of this CPU's ring given so far.
+    given: u64,
 }
 
 struct Line {
@@ -52,6 +56,7 @@ impl KernelDump {
             done: false,
             cpu: 0,
             next: 0,
+            given: 0,
         }
     }
 
@@ -112,11 +117,21 @@ impl KernelDump {
                     emit(text);
                 }
                 lines += 1;
+                self.given += 1;
             }
             self.next = batch.next;
             if batch.count == 0 || batch.next >= batch.head {
+                let mut line = Line {
+                    bytes: [0; 64],
+                    len: 0,
+                };
+                let _ = write!(line, "tr k{} 0 {:x} {:x}", self.cpu, batch.head, self.given);
+                if let Ok(text) = core::str::from_utf8(&line.bytes[..line.len]) {
+                    emit(text);
+                }
                 self.cpu += 1;
                 self.next = 0;
+                self.given = 0;
             }
         }
         if self.cpu >= CPUS {
