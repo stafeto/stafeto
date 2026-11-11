@@ -11,7 +11,7 @@
 //!   know the method.
 //! * The copy of an immutable file of `FILE_MAX` (256 KiB) or less goes into the arena: up to
 //!   `PIECES_MAX` memory objects made as they are needed, outside the lock, with the process's own
-//!   quota (the first of 64 KiB, the others of 256 KiB: `PIECE_SIZES`), mapped as pieces of
+//!   quota (the first the size of its file, the second of 64 KiB, the others of 256 KiB: `PIECE_SIZES`), mapped as pieces of
 //!   the kind `posix_map::Kind::FileCache` (a forked child has none). A file takes a run of whole
 //!   pages of one piece; the pages are filled with READ_AT_FD_INTO in portions of `READ_PORTION`,
 //!   a step of the service each. Pieces are never given back.
@@ -186,11 +186,10 @@ fn active() -> bool {
 }
 
 /// Makes a piece of `pages` pages (a memory object of the process's own, mapped as a piece of
-/// the arena) outside the lock and offers it to the next holder. One thread makes it; the
+/// the arena) outside the lock and offers it to the next holder, which clears `making` when it takes the piece. One thread makes it; the
 /// others, and a call that finds a piece waiting, look again. The system's refusal is final.
 fn make_piece(pages: usize) {
-    if SHARED.spare_base.load(Ordering::Acquire) != 0 || SHARED.making.swap(true, Ordering::AcqRel)
-    {
+    if !SHARED.begin_make() {
         return;
     }
     let made = sys::mem_create((pages * PAGE) as u64)
@@ -205,9 +204,8 @@ fn make_piece(pages: usize) {
         });
     match made {
         Some((base, handle)) => SHARED.offer(base, handle, pages),
-        None => SHARED.refused.store(true, Ordering::Release),
+        None => SHARED.refuse(),
     }
-    SHARED.making.store(false, Ordering::Release);
 }
 
 /// A read of the description `target` of the service for the bytes of `out` at `offset`, from

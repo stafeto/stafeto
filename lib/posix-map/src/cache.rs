@@ -13,12 +13,13 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize
 pub const PIECE_PAGES: usize = 64;
 pub const PIECE_BYTES: usize = PIECE_PAGES * PAGE;
 pub const PIECES_MAX: usize = 8;
-/// The pages of the pieces in the order they are made: the first is small (a 1 KiB file costs
-/// 64 KiB, not 256 KiB), the others are `PIECE_PAGES`. Each piece takes a place of the table of
-/// mappings, so the pieces stay few. A file that needs more pages than the next size asks for a
-/// piece of its own size. The pieces hold 464 of the 512 pages of the default budget, so the arena
-/// holds at most 1.8 MiB until the budget is lowered.
-pub const PIECE_SIZES: [usize; PIECES_MAX] = [16, 64, 64, 64, 64, 64, 64, 64];
+/// The pages of the pieces in the order they are made: the first is the size of its file (a
+/// file that fits one page costs one page), the second has 16, the others are `PIECE_PAGES`. A
+/// process that reads one small file once pays for that file alone. Each piece takes a place of
+/// the table of mappings, so the pieces stay few. A file that needs more pages than the next
+/// size asks for a piece of its own size. The pieces hold 465 of the 512 pages of the default
+/// budget, so the arena holds at most 1.8 MiB until the budget is lowered.
+pub const PIECE_SIZES: [usize; PIECES_MAX] = [1, 16, 64, 64, 64, 64, 64, 64];
 /// The largest file the cache takes.
 pub const FILE_MAX: usize = PIECE_BYTES;
 /// The default budget in pages (2 MiB).
@@ -146,7 +147,20 @@ impl Shared {
         }
     }
 
-    /// A piece made outside the lock waits for the next holder.
+    /// A thread asks to make a piece: true for one thread at a time, and not while a made piece
+    /// waits. `making` stays set until `take_spare` has read the piece (or `refuse` is called),
+    /// so only one spare exists at a time and no maker overwrites it.
+    pub fn begin_make(&self) -> bool {
+        self.spare_base.load(Ordering::Acquire) == 0 && !self.making.swap(true, Ordering::AcqRel)
+    }
+
+    /// The system refused the piece: no more are asked for.
+    pub fn refuse(&self) {
+        self.refused.store(true, Ordering::Release);
+        self.making.store(false, Ordering::Release);
+    }
+
+    /// A piece made outside the lock waits for the next holder. The maker keeps `making` set.
     pub fn offer(&self, base: usize, handle: u64, pages: usize) {
         self.spare_handle.store(handle, Ordering::Relaxed);
         self.spare_pages.store(pages, Ordering::Relaxed);
@@ -156,11 +170,14 @@ impl Shared {
     fn take_spare(&self) -> Option<(usize, u64, usize)> {
         let base = self.spare_base.swap(0, Ordering::Acquire);
         (base != 0).then(|| {
-            (
+            let taken = (
                 base,
                 self.spare_handle.load(Ordering::Relaxed),
                 self.spare_pages.load(Ordering::Relaxed),
-            )
+            );
+            // The three words are read: the next piece may be made.
+            self.making.store(false, Ordering::Release);
+            taken
         })
     }
 
@@ -787,25 +804,57 @@ mod tests {
     }
 
     #[test]
+    fn a_second_maker_waits_until_the_spare_is_taken() {
+        let r = Shared::new();
+        let mut c = Cache::new();
+        immutable(&mut c, 3, 1, 1024);
+        // Thread A makes a piece of 16 pages and offers it.
+        assert!(r.begin_make());
+        r.offer(0x2000_0000, 7, 16);
+        // Thread B, which looked before the offer, must not make another piece while the spare
+        // waits (the old code cleared `making` at the offer, so B made one of 40 pages and the
+        // holder read B's handle and pages for A's base).
+        assert!(!r.begin_make());
+        assert!(!r.begin_make());
+        // The holder takes A's three words, and then the next maker may go.
+        assert_eq!(c.plan(3, 1, true, &r), Plan::Fill { entry: 0, piece: 0 });
+        assert_eq!(c.pieces[0].base, 0x2000_0000);
+        assert_eq!(c.pieces[0].handle, 7);
+        assert_eq!(c.pieces[0].pages, 16);
+        assert!(r.begin_make());
+        r.refuse();
+        assert!(r.refused.load(Ordering::Acquire));
+        assert!(!r.making.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn the_first_piece_is_small_and_the_next_ones_have_the_piece_size() {
         let r = Box::new(Shared::new());
         let mut c = Cache::new();
         immutable(&mut c, 3, 1, 1024);
-        // The first file asks for a piece of 16 pages, not of 64.
-        assert_eq!(c.plan(3, 1, true, &r), Plan::NeedPiece { pages: 16 });
-        r.offer(0x2000_0000, 7, 16);
+        // The first file asks for a piece of its own size, one page.
+        assert_eq!(c.plan(3, 1, true, &r), Plan::NeedPiece { pages: 1 });
+        r.offer(0x2000_0000, 7, 1);
         assert!(matches!(
             c.plan(3, 1, true, &r),
             Plan::Fill { piece: 0, .. }
         ));
-        assert_eq!(c.pieces[0].pages, 16);
-        // A file of 20 pages does not fit it: the second piece has 64.
+        assert_eq!(c.pieces[0].pages, 1);
+        // A file of 20 pages does not fit the next of 16: the piece has the size of the file.
         immutable(&mut c, 4, 2, 20 * PAGE as u32);
-        assert_eq!(c.plan(4, 1, true, &r), Plan::NeedPiece { pages: 64 });
-        r.offer(0x2100_0000, 8, 64);
+        assert_eq!(c.plan(4, 1, true, &r), Plan::NeedPiece { pages: 20 });
+        r.offer(0x2100_0000, 8, 20);
         assert!(matches!(
             c.plan(4, 1, true, &r),
             Plan::Fill { piece: 1, .. }
+        ));
+        // The third piece has 64.
+        immutable(&mut c, 6, 4, 30 * PAGE as u32);
+        assert_eq!(c.plan(6, 1, true, &r), Plan::NeedPiece { pages: 64 });
+        r.offer(0x2200_0000, 9, 64);
+        assert!(matches!(
+            c.plan(6, 1, true, &r),
+            Plan::Fill { piece: 2, .. }
         ));
         // A refused piece is not asked for again.
         immutable(&mut c, 5, 3, 60 * PAGE as u32);
