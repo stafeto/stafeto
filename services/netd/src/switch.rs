@@ -1586,7 +1586,7 @@ impl Switch {
                     }
                     let Some(t) = self.tables.as_mut() else {
                         trace::frame(P_N_TO_STACK, frame, true);
-                        passed += self.to_stack(n, len, sum, DEFAULT_INSTANCE);
+                        passed += self.pass_to_stack(n, len, sum, DEFAULT_INSTANCE);
                         continue;
                     };
                     match route::route(t, frame, Source::Wire) {
@@ -1611,7 +1611,7 @@ impl Switch {
                                 true,
                             );
                             if route::deliver(t, sums::mark(d, sum), frame) {
-                                passed += self.to_stack(n, len, sum, lane_of(d));
+                                passed += self.pass_to_stack(n, len, sum, lane_of(d));
                             } else {
                                 self.give(n);
                             }
@@ -1637,7 +1637,7 @@ impl Switch {
     /// device that merges segments it is copied into a buffer of the pool and the chain goes
     /// back to the device at once; a frame with no buffer of the pool to go in is dropped (TCP
     /// repeats it). The number of frames passed (0 or 1).
-    fn to_stack(&mut self, n: u16, len: usize, sum: bool, lane: usize) -> usize {
+    fn pass_to_stack(&mut self, n: u16, len: usize, sum: bool, lane: usize) -> usize {
         if !self.merged {
             offer_must(&mut self.passed, lane, pack_frame(n, len as u16, sum));
             return 1;
