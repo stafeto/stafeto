@@ -1875,6 +1875,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // device's address.
         "boot-net-bench-switch.img"
         | "boot-net-bench-switch-profile.img"
+        | "boot-net-bench-switch-pinned.img"
         | "boot-net-bench-trace-switch.img" => {
             let mut files = net_bench_files(name);
             for (path, label, bytes) in [
@@ -2761,6 +2762,9 @@ mod tests {
                 "boot-net-bench-trace-fast.img" => crate::linux_guest::bench_fast_programs(),
                 "boot-net-bench-switch-profile.img" => {
                     crate::linux_guest::bench_switch_profile_programs()
+                }
+                "boot-net-bench-switch-pinned.img" => {
+                    crate::linux_guest::bench_switch_pinned_programs()
                 }
                 "boot-fast-switch-vz.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchVz)

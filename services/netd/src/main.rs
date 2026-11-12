@@ -1074,6 +1074,18 @@ impl Driver<'_> {
     #[cfg(feature = "profile")]
     fn profile_snapshot(&self) {
         profile::store(Counter::Ran, self.ran());
+        // How the load is shared: the SYNs of each member of a group, the frames of each
+        // consumer of the switch.
+        for (at, n) in self.net.groups.served_by_position().iter().enumerate() {
+            profile::store_at(Counter::Member0, at, *n);
+        }
+        for (at, n) in switch::INNER.stats.rx_by.iter().enumerate() {
+            profile::store_at(
+                Counter::Cons0,
+                at,
+                u64::from(n.load(core::sync::atomic::Ordering::Relaxed)),
+            );
+        }
         let id = profile::next_id();
         profile::records(id, &profile::snapshot(), |record| rt::println!("{record}"));
         profile::take_maxima();

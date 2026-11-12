@@ -653,6 +653,7 @@ pub fn check() -> Result<(), String> {
         "boot-net-bench-fast.img",
         "boot-net-bench-switch.img",
         "boot-net-bench-switch-profile.img",
+        "boot-net-bench-switch-pinned.img",
         "boot-net-bench-trace.img",
         "boot-net-bench-trace-fast.img",
         "boot-net-bench-trace-switch.img",
@@ -790,6 +791,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-fast-switch-vz.img"
         | "boot-net-bench-switch.img"
         | "boot-net-bench-switch-profile.img"
+        | "boot-net-bench-switch-pinned.img"
         | "boot-net-bench-trace-fast.img"
         | "boot-net-bench-trace-switch.img"
         | "boot-net-bench-fast.img" => Ok(load()?
@@ -1194,6 +1196,7 @@ files = [
             "boot-net-bench-fast.img",
             "boot-net-bench-switch.img",
             "boot-net-bench-switch-profile.img",
+            "boot-net-bench-switch-pinned.img",
             "boot-net-bench-trace-fast.img",
             "boot-net-bench-trace-switch.img",
         ] {
