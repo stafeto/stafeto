@@ -146,7 +146,7 @@ impl Driver<'_> {
         if s.data.consumer.is_some() || self.side.blocks.in_use() >= usize::from(self.side.max) {
             return limit();
         }
-        let Some(lease) = self.stack.lease else {
+        let Some(lease) = self.inst.stack.lease else {
             return refuse(proto_net::NET_DOWN);
         };
         // An object of `mem_create` with every page its own.
@@ -159,19 +159,19 @@ impl Driver<'_> {
             return Answer::Status(Status::Kernel(Error::BadState));
         };
         let now = seconds();
-        let mut both = Both(&mut self.net.tcp_ports, &mut self.net.udp_ports);
+        let mut both = Both(&mut self.inst.net.tcp_ports, &mut self.inst.net.udp_ports);
         let busy = (0..MAX_CONSUMERS).fold(0u8, |m, c| {
             m | u8::from(self.side.entries[c].is_some()) << c
         });
         // The mappings of the ring are counted up front: a ring that does not fit the budget is
         // refused here, and a late `mem_map` never fails a consumer that was told OK.
         let chunks = Mappings::for_ring(size, PAGE as u64, MAP_CHUNK);
-        if !self.net.buffers.mappings().reserve(chunks) {
+        if !self.inst.net.buffers.mappings().reserve(chunks) {
             return limit();
         }
         let Some((c, generation, block)) = self.side.blocks.alloc_except(&mut both, now, busy)
         else {
-            self.net.buffers.mappings().release(chunks);
+            self.inst.net.buffers.mappings().release(chunks);
             return limit();
         };
 
@@ -191,7 +191,7 @@ impl Driver<'_> {
             Ok(copy) => copy,
             Err(error) => {
                 rt::println!("net: switch attach: labelling the gate: {error:?}");
-                self.net.buffers.mappings().release(chunks);
+                self.inst.net.buffers.mappings().release(chunks);
                 giveup(&mut self.side);
                 return Answer::Status(Status::Kernel(error));
             }
@@ -220,7 +220,7 @@ impl Driver<'_> {
             offload: switch::INNER.offload(),
         };
         if reply.write(r.reply()).is_err() {
-            self.net.buffers.mappings().release(chunks);
+            self.inst.net.buffers.mappings().release(chunks);
             giveup(&mut self.side);
             return Answer::Status(Status::BadSize);
         }
@@ -245,7 +245,7 @@ impl Driver<'_> {
     /// One chunk of the mapping of each ring that is not mapped yet; when a ring is whole the
     /// switch is given it. True when work is left.
     fn map_step(&mut self, step: &mut Chunks) -> bool {
-        let Some(process) = self.net.process.as_deref() else {
+        let Some(process) = self.inst.net.process.as_deref() else {
             return false;
         };
         let mut left = false;
@@ -309,7 +309,7 @@ impl Driver<'_> {
 
     /// One chunk of the unmapping of each ring the switch is done with. True when work is left.
     fn unmap_step(&mut self, step: &mut Chunks) -> bool {
-        let Some(process) = self.net.process.as_deref() else {
+        let Some(process) = self.inst.net.process.as_deref() else {
             return false;
         };
         let mut left = false;
@@ -342,7 +342,7 @@ impl Driver<'_> {
                 left = true;
             } else {
                 let chunks = e.chunks;
-                self.net.buffers.mappings().release(chunks);
+                self.inst.net.buffers.mappings().release(chunks);
                 self.side.entries[c] = None;
             }
         }
@@ -365,7 +365,7 @@ impl Driver<'_> {
             return refuse(proto_net::NOT_ALLOWED);
         };
         // Vouched for once, here: the user is not asked again (as `bind` of Linux).
-        let Some(uid) = self.net.vouch(identity) else {
+        let Some(uid) = self.inst.net.vouch(identity) else {
             return refuse(proto_net::NOT_ALLOWED);
         };
         if hold.first < 1024 && uid != 0 {
@@ -383,13 +383,14 @@ impl Driver<'_> {
         let shared = hold.flags & sw::REUSEPORT != 0;
         // The group of the same ports whose holder shares them with this user.
         let same = self
+            .inst
             .net
             .holds
             .same(hold.protocol as u8, first, count, shared, uid);
         if same.is_none() {
             // Ports inside the block of a consumer's temporary ports are not for a group:
             // the switch would refuse them and the group would stay in the books.
-            if !ports_free_of_blocks(self.net.ports(proto), first, count) {
+            if !ports_free_of_blocks(self.inst.net.ports(proto), first, count) {
                 return refuse(proto_net::IN_USE);
             }
             for port in hold_ports(first, count) {
@@ -402,20 +403,20 @@ impl Driver<'_> {
                     reuse: false,
                     share_uid: shared.then_some(uid),
                 };
-                if conflicts(&new, self.net.bindings(port, usize::MAX, true)) {
+                if conflicts(&new, self.inst.net.bindings(port, usize::MAX, true)) {
                     return refuse(proto_net::IN_USE);
                 }
             }
         }
         let group = match same {
             Some(g) => g,
-            None => match self.net.holds.free_slot() {
+            None => match self.inst.net.holds.free_slot() {
                 Some(g) => g,
                 None => return limit(),
             },
         } as u8
             + 1;
-        let Some(place) = self.net.hold_place(proto, group) else {
+        let Some(place) = self.inst.net.hold_place(proto, group) else {
             return refuse(proto_net::NO_BUFFERS);
         };
         let command = Command::Hold {
@@ -425,8 +426,8 @@ impl Driver<'_> {
             count,
         };
         if !switch::command(command) {
-            self.net.places.free(place);
-            self.net.socks[place] = crate::net::Sock::EMPTY;
+            self.inst.net.places.free(place);
+            self.inst.net.socks[place] = crate::net::Sock::EMPTY;
             return limit();
         }
         let book = Hold {
@@ -442,7 +443,7 @@ impl Driver<'_> {
             tcp_ports,
             udp_ports,
             ..
-        } = &mut *self.net;
+        } = &mut *self.inst.net;
         holds.add(
             group,
             book,
@@ -452,9 +453,9 @@ impl Driver<'_> {
                 udp_ports
             },
         );
-        self.net.places.hold(place);
+        self.inst.net.places.hold(place);
         s.data.held.add(place);
-        match sw::write_place_reply(self.net.places.name(place), r.reply()) {
+        match sw::write_place_reply(self.inst.net.places.name(place), r.reply()) {
             Ok(()) => Answer::Reply(Outgoing::new()),
             Err(status) => Answer::Status(status),
         }
@@ -477,16 +478,16 @@ impl Driver<'_> {
             return refuse(proto_net::INVALID);
         };
         let c = mine.number;
-        let Some(i) = self.net.find_any(&s.data.held, place) else {
+        let Some(i) = self.inst.net.find_any(&s.data.held, place) else {
             return refuse(proto_net::BAD_FD);
         };
-        let group = self.net.socks[i].hold;
+        let group = self.inst.net.socks[i].hold;
         if group == 0 {
             return refuse(proto_net::BAD_FD);
         }
         // A LEAVE this session owes for the group (it closed its last description a moment ago)
         // would undo the join that follows it.
-        self.net.holds.cancel_leave(group, mine);
+        self.inst.net.holds.cancel_leave(group, mine);
         if !switch::command(Command::Join { group, consumer: c }) {
             return refuse(proto_net::BUSY);
         }
@@ -541,7 +542,7 @@ impl Driver<'_> {
     /// did not fit before.
     pub(crate) fn back_step(&mut self) {
         rt::service::step_own();
-        switch::INNER.back_told.seen();
+        self.inst.lane.back_told.seen();
         for c in 0..MAX_CONSUMERS as u8 {
             if self.side.detach_due & (1 << c) != 0
                 && switch::command(Command::Detach { consumer: c })
@@ -567,7 +568,7 @@ impl Driver<'_> {
             self.tell(crate::BACK);
         }
         let now = seconds();
-        let mut both = Both(&mut self.net.tcp_ports, &mut self.net.udp_ports);
+        let mut both = Both(&mut self.inst.net.tcp_ports, &mut self.inst.net.udp_ports);
         self.side.blocks.expire(&mut both, now);
     }
 
@@ -601,13 +602,13 @@ impl Driver<'_> {
                 self.leave(consumer);
             }
             Back::Freed { group } => {
-                let net = &mut *self.net;
+                let net = &mut *self.inst.net;
                 net.holds
                     .freed(group, &mut net.tcp_ports, &mut net.udp_ports);
             }
             Back::Failed { group } => {
                 rt::println!("net: switch refused a command for group {group}");
-                let net = &mut *self.net;
+                let net = &mut *self.inst.net;
                 net.holds
                     .failed(group, &mut net.tcp_ports, &mut net.udp_ports);
             }
@@ -617,9 +618,9 @@ impl Driver<'_> {
     /// The descriptions of ports that closed: the switch is told, one holder each, and the
     /// consumers that closed their last description of a group leave it.
     pub(crate) fn drain_releases(&mut self) {
-        while let Some((group, mine)) = self.net.holds.next_leave() {
+        while let Some((group, mine)) = self.inst.net.holds.next_leave() {
             // A consumer that is gone (or whose number is another's now) has nothing to leave.
-            let wanted = self.side.owners.is_current(mine) && self.net.holds.switch_has(group);
+            let wanted = self.side.owners.is_current(mine) && self.inst.net.holds.switch_has(group);
             if wanted
                 && !switch::command(Command::Leave {
                     group,
@@ -629,14 +630,15 @@ impl Driver<'_> {
                 self.tell(crate::BACK);
                 return;
             }
-            self.net.holds.leave_told(group, mine);
+            self.inst.net.holds.leave_told(group, mine);
         }
-        while let Some(group) = self.net.holds.next_due() {
-            if self.net.holds.switch_has(group) && !switch::command(Command::Release { group }) {
+        while let Some(group) = self.inst.net.holds.next_due() {
+            if self.inst.net.holds.switch_has(group) && !switch::command(Command::Release { group })
+            {
                 self.tell(crate::BACK);
                 return;
             }
-            self.net.holds.told(group);
+            self.inst.net.holds.told(group);
         }
     }
 }

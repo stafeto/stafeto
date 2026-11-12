@@ -17,11 +17,11 @@
 //! stops the device (Status 0) before it lets the objects of an instance
 //! go.
 //!
-//! The service has two threads (`switch.rs`). The switch thread, one level
-//! above the stack on the CPU of the line, owns the device's transport,
-//! queues, doorbells and binding; the stack thread described below is its
-//! consumer, and they pass the numbers of the device's buffers in rings,
-//! with no copy. The text below tells the steps of the stack as they were
+//! The service has three threads (`switch.rs`, `instance.rs`). The first one builds the
+//! service and then waits. The switch thread, one level above the stack on the CPU of the
+//! line, owns the device's transport, queues, doorbells and binding; the thread of the stack
+//! instance, described below, is its internal consumer, and they pass the numbers of the
+//! device's buffers in rings, with no copy. The text below tells the steps of the stack as they were
 //! before the split, with the queue of the device replaced by those rings.
 //!
 //! The service never waits for the device. An interrupt (or the service's
@@ -54,6 +54,7 @@ mod device;
 mod dma;
 mod fast;
 mod files;
+mod instance;
 #[cfg(feature = "trace")]
 mod kdump;
 mod msix;
@@ -69,6 +70,7 @@ use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use device::{DEVICE, NetDevice, RxRing, TxRing};
+use instance::Instance;
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
 use netd::lines::Mac;
@@ -531,7 +533,8 @@ fn main(_: u64) -> u64 {
         second,
         second_storage,
     } = tables;
-    let mut device = NetDevice::new(RxRing::inner(), TxRing::inner(), mac);
+    let lane = &switch::INNER.lanes[netd::switchlogic::route::DEFAULT_INSTANCE];
+    let mut device = NetDevice::new(RxRing::inner(lane), TxRing::inner(lane), mac);
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
     // The switch's tables and the timer of their sweep, when the file asks for consumers.
     let (switch_tables, sweep_timer) = match make_switch_tables(
@@ -631,9 +634,7 @@ fn main(_: u64) -> u64 {
     let mut driver = Driver {
         #[cfg(feature = "trace")]
         kernel_stamps: kdump::KernelDump::new(kernel_stamps),
-        device,
-        stack,
-        net,
+        inst: Instance::new(lane, device, stack, net),
         notify,
         _switch: (switch_thread, wake_switch),
         timer,
@@ -673,7 +674,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "probe")]
         longest: [0; 2],
         #[cfg(any(feature = "probe", feature = "profile"))]
-        own: &s.thread,
+        own: None,
         maps: Maps {
             _dma: dma_object,
             _net: net_object,
@@ -682,11 +683,39 @@ fn main(_: u64) -> u64 {
             second: second_objects,
         },
     };
+    let mut launch = instance::Launch {
+        driver: &mut driver,
+        channel: &channel,
+        config: Some(Config {
+            issued: 0,
+            heartbeat: Some(Heartbeat {
+                to: &s.parent,
+                period_ns: args.map_or(0, |a| a.period_ns),
+                priority: level,
+            }),
+        }),
+        sessions,
+        entry: instance_entry,
+    };
+    // The loop of the instance runs in a thread of its own; this thread has nothing more to do.
+    if instance::start(&mut launch, &s.process, level).is_err() {
+        return NOT_STARTED;
+    }
+    instance::wait_forever(level)
+}
+
+/// The first steps of the instance and its loop, on its thread (`instance::start`).
+fn instance_entry(launch: &mut instance::Launch<'_, Driver<'_>>) -> u64 {
+    let driver = &mut *launch.driver;
+    #[cfg(any(feature = "probe", feature = "profile"))]
+    {
+        driver.own = sys::self_thread().ok();
+    }
     if driver.switch_address() {
         driver.tell(BACK);
     }
     // The static address names its servers at once; a lease does in its event.
-    if driver.stack.lease.is_some() {
+    if driver.inst.stack.lease.is_some() {
         driver.tell(RESOLV);
     }
     // The first step starts the DHCP client.
@@ -695,15 +724,8 @@ fn main(_: u64) -> u64 {
     driver.rx1_step(false);
     #[cfg(feature = "steps")]
     rt::service::report_steps(14);
-    let config = Config {
-        issued: 0,
-        heartbeat: Some(Heartbeat {
-            to: &s.parent,
-            period_ns: args.map_or(0, |a| a.period_ns),
-            priority: level,
-        }),
-    };
-    let _ = rt::service::run_in(&channel, &mut driver, config, sessions);
+    let config = launch.config.take().expect("the loop starts once");
+    let _ = rt::service::run_in(launch.channel, driver, config, &mut *launch.sessions);
     STOPPED
 }
 
@@ -787,6 +809,15 @@ fn make_switch_tables(
     let mut tables = Tables::new(own, ports, Flows::new(slots, &secret), switch::tag);
     // SAFETY: the park belongs to the tables from here.
     tables.set_park(unsafe { &mut *PARKED_SYNS.0.get() });
+    // The stack instances are consumers of the switch too, from its first step: they take the
+    // frames the tables name for them through their lanes (no block of ports yet: the
+    // instance sends from the whole ephemeral range, as the stack always did).
+    for k in 0..switch::INSTANCES {
+        assert!(
+            tables.attach_instance(k, 1, None),
+            "an instance has its place"
+        );
+    }
     Ok((Some(tables), (timer, view)))
 }
 
@@ -1038,9 +1069,9 @@ struct Driver<'a> {
     /// The address the switch was last told (a renewal of the lease that changes nothing is
     /// not told: consumers end their processes on a new address).
     switch_ip: netd::books::AddressSync,
-    device: NetDevice,
-    stack: Stack<'static>,
-    net: &'a mut Net,
+    /// The stack instance this loop runs: its device (a lane of the switch's rings), its
+    /// smoltcp interface and its tables of sockets.
+    inst: Instance<'a>,
     /// A copy of the service's channel with NOTIFY: the service tells
     /// itself a step is due, and the switch tells the stack of frames.
     notify: Handle<Channel>,
@@ -1105,7 +1136,7 @@ struct Driver<'a> {
     /// as in rt's count of steps. No handle of its own: the operations of
     /// role `w` take the service's handles up to its limit.
     #[cfg(any(feature = "probe", feature = "profile"))]
-    own: &'a Handle<rt::handle::Thread>,
+    own: Option<Handle<rt::handle::Thread>>,
     maps: Maps,
 }
 
@@ -1118,7 +1149,7 @@ impl Driver<'_> {
         profile::store(Counter::Ran, self.ran());
         // How the load is shared: the SYNs of each member of a group, the frames of each
         // consumer of the switch.
-        for (at, n) in self.net.groups.served_by_position().iter().enumerate() {
+        for (at, n) in self.inst.net.groups.served_by_position().iter().enumerate() {
             profile::store_at(Counter::Member0, at, *n);
         }
         for (at, n) in switch::INNER.stats.rx_by.iter().enumerate() {
@@ -1138,7 +1169,9 @@ impl Driver<'_> {
     /// `probe` or `profile`).
     #[cfg(any(feature = "probe", feature = "profile"))]
     fn ran(&self) -> u64 {
-        sys::thread_ran(self.own).unwrap_or(0)
+        self.own
+            .as_ref()
+            .map_or(0, |t| sys::thread_ran(t).unwrap_or(0))
     }
 
     /// A step of waking (`which` 0) or of departure (1) ran until now from
@@ -1177,13 +1210,13 @@ impl Driver<'_> {
     /// The requests made while a step or a departure was wanted: the loop
     /// is told, once.
     fn after_request(&mut self) {
-        if core::mem::take(&mut self.net.step_due) {
+        if core::mem::take(&mut self.inst.net.step_due) {
             self.want_step();
         }
-        if core::mem::take(&mut self.net.cleanup_wanted) {
+        if core::mem::take(&mut self.inst.net.cleanup_wanted) {
             self.cleanup();
         }
-        if core::mem::take(&mut self.net.wake_wanted) {
+        if core::mem::take(&mut self.inst.net.wake_wanted) {
             self.tell(WAKE);
         }
         if self.side.max > 0 {
@@ -1194,7 +1227,7 @@ impl Driver<'_> {
         }
         // An operation with a time limit was made: the timer may be set
         // earlier for it.
-        if core::mem::take(&mut self.net.deadline_new) {
+        if core::mem::take(&mut self.inst.net.deadline_new) {
             self.arm(now_ns());
         }
         self.bell_release();
@@ -1237,29 +1270,34 @@ impl Driver<'_> {
         profile::count(Counter::StepRx);
         // Seen before the ring is looked at: frames the switch passes after
         // this tell the stack again.
-        switch::INNER.stack_awake();
+        self.inst.lane.stack_awake();
         self.say_merged();
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_rx = true;
-            switch::INNER.kick(false);
+            self.inst.lane.kick(false);
             return;
         }
         let began = split::now();
         split::begin_step();
         let now = now_ns();
-        self.device.rx.begin_step(Budget::receiving());
-        self.device.tx.begin_step(Budget::receiving());
-        stack::ingress(&mut self.stack, &mut self.device, self.net, now);
+        self.inst.device.rx.begin_step(Budget::receiving());
+        self.inst.device.tx.begin_step(Budget::receiving());
+        stack::ingress(
+            &mut self.inst.stack,
+            &mut self.inst.device,
+            self.inst.net,
+            now,
+        );
         self.events(now);
         self.finish_step(now);
-        rt::service::step_detail(self.device.step_frames() as u64);
+        rt::service::step_detail(self.inst.device.step_frames() as u64);
         // Frames the share of the step left in the switch's ring or in the
         // loop: another step of receiving.
         let kernel = split::now();
-        let more = !switch::INNER.rx_ready.is_empty()
-            || self.device.looped.waiting() > 0
-            || self.device.has_deferred();
+        let more = !self.inst.lane.rx_ready.is_empty()
+            || self.inst.device.looped.waiting() > 0
+            || self.inst.device.has_deferred();
         let continued = more && self.tell(RX);
         let sending = self.next_steps(now, continued);
         self.kick_switch(continued || sending);
@@ -1278,20 +1316,20 @@ impl Driver<'_> {
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_tx = true;
-            switch::INNER.kick(false);
+            self.inst.lane.kick(false);
             return;
         }
         let began = split::now();
         split::begin_step();
         let now = now_ns();
-        self.device.rx.begin_step(Budget::sending());
-        self.device.tx.begin_step(Budget::sending());
-        self.stack.egress(
+        self.inst.device.rx.begin_step(Budget::sending());
+        self.inst.device.tx.begin_step(Budget::sending());
+        self.inst.stack.egress(
             now,
-            &mut self.device,
-            &mut self.net.due,
-            &mut self.net.touched,
-            &mut self.net.passed,
+            &mut self.inst.device,
+            &mut self.inst.net.due,
+            &mut self.inst.net.touched,
+            &mut self.inst.net.passed,
         );
         self.events(now);
         if now >= self.neighbours_at {
@@ -1301,16 +1339,16 @@ impl Driver<'_> {
             self.ask_at = None;
             self.ask_neighbours();
         }
-        if deadline && self.net.orphans_wait() {
+        if deadline && self.inst.net.orphans_wait() {
             self.tell(SWEEP);
         }
-        if deadline && self.net.rst_waiting() {
-            self.net.cleanup_wanted = true;
+        if deadline && self.inst.net.rst_waiting() {
+            self.inst.net.cleanup_wanted = true;
         }
         self.finish_step(now);
-        rt::service::step_detail(self.device.step_frames() as u64);
+        rt::service::step_detail(self.inst.device.step_frames() as u64);
         let kernel = split::now();
-        let continued = self.device.looped.waiting() > 0 && self.tell(RX);
+        let continued = self.inst.device.looped.waiting() > 0 && self.tell(RX);
         let sending = self.next_steps(now, continued);
         self.kick_switch(continued || sending);
         let end = split::now();
@@ -1322,8 +1360,8 @@ impl Driver<'_> {
     /// What every step ends with: the operations that wait are looked at by a
     /// step of their own.
     fn finish_step(&mut self, _now: u64) {
-        self.net.schedule_wake();
-        if self.net.wake_pending() {
+        self.inst.net.schedule_wake();
+        if self.inst.net.wake_pending() {
             self.tell(WAKE);
         }
     }
@@ -1335,7 +1373,7 @@ impl Driver<'_> {
         // The DHCP client's set has a message to send after a frame of the
         // server (a request after an offer) that only a pass of sending
         // makes; without this step it would wait for the client's retry.
-        let sending = (self.net.due.any() || self.stack.service_due) && self.tell(TX);
+        let sending = (self.inst.net.due.any() || self.inst.stack.service_due) && self.tell(TX);
         if !receiving && !sending {
             self.arm(now);
         }
@@ -1426,29 +1464,29 @@ impl Driver<'_> {
 
     /// What the DHCP client and the PING made of the step.
     fn events(&mut self, now: u64) {
-        let dhcp = if self.stack.take_service_ran() {
-            self.stack.dhcp_event()
+        let dhcp = if self.inst.stack.take_service_ran() {
+            self.inst.stack.dhcp_event()
         } else {
             None
         };
         match dhcp {
             Some(Event::Leased(lease)) => {
-                self.net.external = Some(lease.address);
+                self.inst.net.external = Some(lease.address);
                 self.addresses();
-                self.net.touch_all();
+                self.inst.net.touch_all();
                 self.tell(RESOLV);
                 rt::println!("net: lease {}", lease.summary())
             }
             Some(Event::Lost) => {
-                self.net.external = None;
+                self.inst.net.external = None;
                 self.addresses();
-                self.net.touch_all();
+                self.inst.net.touch_all();
                 rt::println!("net: lease lost")
             }
             None => {}
         }
         if self.ping.is_some()
-            && let Some(end) = self.stack.ping_end(now)
+            && let Some(end) = self.inst.stack.ping_end(now)
         {
             self.finish_ping(end);
         }
@@ -1456,13 +1494,13 @@ impl Driver<'_> {
 
     /// The frames to the addresses of the interface stay in the loop.
     fn addresses(&mut self) {
-        let (own, count) = self.stack.addresses();
-        self.device.set_addresses(&own[..count]);
-        self.device.seed_neighbours();
+        let (own, count) = self.inst.stack.addresses();
+        self.inst.device.set_addresses(&own[..count]);
+        self.inst.device.seed_neighbours();
         self.neighbours_at = now_ns() + NEIGHBOURS_NS;
         self.ask_due = true;
         self.asked = 0;
-        self.net.step_due = true;
+        self.inst.net.step_due = true;
         if self.switch_address() {
             self.tell(BACK);
         }
@@ -1476,6 +1514,7 @@ impl Driver<'_> {
             return false;
         }
         let (ip, prefix) = self
+            .inst
             .stack
             .lease
             .map_or(([0; 4], 0), |lease| (lease.address, lease.prefix.min(32)));
@@ -1497,13 +1536,14 @@ impl Driver<'_> {
     /// of a name followed at once by a connection to the gateway would wait
     /// for the second.
     fn ask_neighbours(&mut self) {
-        let Some(lease) = self.stack.lease else {
+        let Some(lease) = self.inst.stack.lease else {
             self.ask_due = false;
             return;
         };
         let (targets, count) =
             netd::resolv::neighbours(lease.address, lease.prefix, lease.gateway, &lease.servers);
         let sent = self
+            .inst
             .device
             .ask_neighbours(lease.address, &targets[self.asked.min(count)..count]);
         let (asked, round) = netd::resolv::round(self.asked.min(count), sent, count);
@@ -1526,7 +1566,7 @@ impl Driver<'_> {
     /// servers leaves the file as it is.
     fn resolv_step(&mut self) {
         rt::service::step_own();
-        let Some(lease) = self.stack.lease else {
+        let Some(lease) = self.inst.stack.lease else {
             return;
         };
         let text = Text::new(&lease.servers);
@@ -1572,7 +1612,7 @@ impl Driver<'_> {
     /// then.
     fn kick_switch(&mut self, more: bool) {
         let held = !more && self.bell_waits();
-        switch::INNER.kick(more || held);
+        self.inst.lane.kick(more || held);
     }
 
     /// Frames of the stack wait for the switch's doorbell and a call of a
@@ -1585,7 +1625,7 @@ impl Driver<'_> {
         let own = self.told & STEP_BITS != 0;
         let notify = &self.notify;
         let verdict = self.bell.decide(
-            switch::INNER.tx_sub.len(),
+            self.inst.lane.tx_sub.len(),
             own,
             || sys::channel_info(notify).is_ok_and(|info| info.queued > 0),
             now_ns(),
@@ -1613,19 +1653,20 @@ impl Driver<'_> {
     /// already (`bell_checked`).
     fn bell_release(&mut self) {
         if self.bell.on() && !self.bell_checked && !self.bell_waits() {
-            switch::INNER.kick(false);
+            self.inst.lane.kick(false);
         }
     }
 
     /// Sets the timer for the stack's next work (`next`), the PING's
     /// deadline or the sweep of the streams that close, never in the past.
     fn arm(&mut self, now: u64) {
-        let sweep = (self.net.orphans_wait() || self.net.rst_waiting()).then(|| now + SWEEP_NS);
+        let sweep =
+            (self.inst.net.orphans_wait() || self.inst.net.rst_waiting()).then(|| now + SWEEP_NS);
         let at = [
-            self.stack.next_deadline(),
-            self.stack.ping.as_ref().map(|p| p.deadline_ns),
+            self.inst.stack.next_deadline(),
+            self.inst.stack.ping.as_ref().map(|p| p.deadline_ns),
             sweep,
-            self.net.next_deadline(),
+            self.inst.net.next_deadline(),
             Some(self.neighbours_at),
             self.ask_at,
             self.second.as_deref().and_then(|s| s.next_at),
@@ -1664,7 +1705,7 @@ impl Driver<'_> {
         #[cfg(all(feature = "probe", feature = "profile"))]
         self.profile_snapshot();
         let (lease, mac) = if device == 0 {
-            (self.stack.lease, self.mac)
+            (self.inst.stack.lease, self.mac)
         } else {
             match self.second.as_deref() {
                 Some(second) if second.mode != second::Mode::Dead => {
@@ -1692,22 +1733,22 @@ impl Driver<'_> {
     /// The counters of the probe's line.
     #[cfg(feature = "probe")]
     fn report_frames(&self) {
-        let (rx, rx_dropped, rx_martian) = self.device.rx.counters();
-        let tx = self.device.tx.counters();
+        let (rx, rx_dropped, rx_martian) = self.inst.device.rx.counters();
+        let tx = self.inst.device.tx.counters();
         rt::println!(
             "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {} syn_dropped {} set_barred {} syn_stray {} orphan_reused {} bad_sum {} demux_probe {}",
             rx,
             tx.tx,
             tx.dhcp,
-            rx_dropped + tx.dropped + self.device.looped.dropped(),
+            rx_dropped + tx.dropped + self.inst.device.looped.dropped(),
             rx_martian + tx.martian,
-            self.net.counters.listen_short,
-            self.net.counters.syn_dropped,
-            self.net.counters.set_barred,
-            self.net.counters.syn_stray,
-            self.net.counters.orphan_reused,
-            self.device.bad_sum,
-            self.net.demux.probe_max
+            self.inst.net.counters.listen_short,
+            self.inst.net.counters.syn_dropped,
+            self.inst.net.counters.set_barred,
+            self.inst.net.counters.syn_stray,
+            self.inst.net.counters.orphan_reused,
+            self.inst.device.bad_sum,
+            self.inst.net.demux.probe_max
         );
         rt::println!(
             "net: bells tx {} frames {}",
@@ -1729,15 +1770,15 @@ impl Driver<'_> {
         if self.side.max > 0 {
             self.report_switch();
         }
-        let [first, all] = self.net.counters.buffers_used;
+        let [first, all] = self.inst.net.counters.buffers_used;
         if all != 0 {
             rt::println!("net: buffers 1 used {first} pages, 64 used {all} pages");
         }
-        if self.net.counters.largest_copy != 0 {
+        if self.inst.net.counters.largest_copy != 0 {
             rt::println!(
                 "net: buffer portion {} largest copy {}",
                 netd::ring::BUFFER_PORTION,
-                self.net.counters.largest_copy
+                self.inst.net.counters.largest_copy
             );
         }
         if let Some((refused, lost, broken)) =
@@ -1802,13 +1843,13 @@ impl Driver<'_> {
                 self.hold = false;
                 self.held_rx = false;
                 self.held_tx = false;
-                self.net.step_due = true;
+                self.inst.net.step_due = true;
                 self.tell(RX);
             }
-            proto_net::HOLD_DROP => self.device.tx.drop_loop = 1,
+            proto_net::HOLD_DROP => self.inst.device.tx.drop_loop = 1,
             _ => {
-                self.net.touch_all();
-                self.net.step_due = true;
+                self.inst.net.touch_all();
+                self.inst.net.step_due = true;
             }
         }
         Answer::Status(Status::Ok)
@@ -1831,13 +1872,13 @@ impl Driver<'_> {
         if self.ping.is_some() {
             return Answer::Status(proto_net::LIMIT);
         }
-        if self.stack.lease.is_none() {
+        if self.inst.stack.lease.is_none() {
             return Answer::Status(code(proto_net::NET_DOWN));
         }
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
-        if !self.stack.ping_start(target, now_ns(), length) {
+        if !self.inst.stack.ping_start(target, now_ns(), length) {
             let status = code(proto_net::NO_BUFFERS);
             let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
             return Answer::Deferred;
@@ -1900,7 +1941,7 @@ impl Service<0> for Driver<'_> {
         let began = profile::now();
         let method = r.method();
         trace::point(P_N_REQ_BEGIN, u32::from(method));
-        self.net.claim(s, r.label());
+        self.inst.net.claim(s, r.label());
         let answer = match Method::from_number(r.method()) {
             Some(Method::Config) => self.config(r),
             #[cfg(feature = "probe")]
@@ -1911,7 +1952,7 @@ impl Service<0> for Driver<'_> {
             Some(Method::Crash) => crash(r),
             #[cfg(feature = "probe")]
             Some(Method::Hold) => self.hold(r),
-            Some(Method::Buffer) => self.net.buffer(s, r),
+            Some(Method::Buffer) => self.inst.net.buffer(s, r),
             Some(Method::Claim) => self.claim(s, r),
             Some(Method::ClaimMore) => self.claim_more(s, r),
             Some(Method::Kick) => self.kick(s, r),
@@ -1919,7 +1960,7 @@ impl Service<0> for Driver<'_> {
             Some(Method::Attach) => self.attach(s, r),
             Some(Method::Join) => self.join(s, r),
             Some(method) => match sockets::Request::parse(method, r.body()) {
-                Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
+                Some(Ok(call)) => self.inst.net.call(&mut self.inst.stack, s, r, call),
                 Some(Err(status)) => Answer::Status(status),
                 None => Answer::Status(Status::UnknownMethod),
             },
@@ -1929,7 +1970,7 @@ impl Service<0> for Driver<'_> {
         trace::point(P_N_REQ_END, u32::from(method));
         profile::call(method, began);
         #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
-        if core::mem::take(&mut self.net.profile_due) {
+        if core::mem::take(&mut self.inst.net.profile_due) {
             #[cfg(feature = "probe")]
             self.report_frames();
             #[cfg(feature = "profile")]
@@ -1950,18 +1991,18 @@ impl Service<0> for Driver<'_> {
         let held = core::mem::take(&mut s.data.held);
         let long = core::mem::take(&mut s.data.long);
         // The shared buffer is unmapped by a step of departure.
-        if self.net.retire_buffer(s) {
+        if self.inst.net.retire_buffer(s) {
             self.cleanup();
         }
         // The interest sets of the session go with it, their records in steps.
-        if self.net.interest.sets_of(s.label()) != 0 {
-            self.net.interest.drop_sets_of(s.label());
+        if self.inst.net.interest.sets_of(s.label()) != 0 {
+            self.inst.net.interest.drop_sets_of(s.label());
             self.cleanup();
         }
-        if self.net.depart(&mut self.stack, held, long) {
+        if self.inst.net.depart(&mut self.inst.stack, held, long) {
             self.cleanup();
         }
-        self.net.step_due = true;
+        self.inst.net.step_due = true;
         self.after_request();
     }
 
@@ -1970,14 +2011,15 @@ impl Service<0> for Driver<'_> {
         rt::service::step_own();
         // The last copy of a pass: its reference of the place goes.
         if netd::passes::Passes::is_pass(label) {
-            self.net.pass_gone(&mut self.stack, label);
+            self.inst.net.pass_gone(&mut self.inst.stack, label);
             self.after_request();
             return;
         }
-        if let Some(held) = self.net.unborn(label)
+        if let Some(held) = self.inst.net.unborn(label)
             && self
+                .inst
                 .net
-                .depart(&mut self.stack, held, LongSession::default())
+                .depart(&mut self.inst.stack, held, LongSession::default())
         {
             self.cleanup();
         }
@@ -2036,7 +2078,7 @@ impl Service<0> for Driver<'_> {
                         profile::count(Counter::StepWake);
                         #[cfg(feature = "probe")]
                         let began = self.ran();
-                        let left = self.net.wake(&mut self.stack, now_ns());
+                        let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
                         if left {
@@ -2048,7 +2090,7 @@ impl Service<0> for Driver<'_> {
                         profile::count(Counter::StepCleanup);
                         #[cfg(feature = "probe")]
                         let began = self.ran();
-                        let more = self.net.depart_step(&mut self.stack);
+                        let more = self.inst.net.depart_step(&mut self.inst.stack);
                         #[cfg(feature = "probe")]
                         self.measured(1, began);
                         if more {
@@ -2062,7 +2104,7 @@ impl Service<0> for Driver<'_> {
                     _ => {
                         rt::service::step_own();
                         profile::count(Counter::StepSweep);
-                        if self.net.sweep(&mut self.stack, now_ns()) {
+                        if self.inst.net.sweep(&mut self.inst.stack, now_ns()) {
                             self.tell(SWEEP);
                         }
                     }
@@ -2081,7 +2123,7 @@ impl Service<0> for Driver<'_> {
                 self.armed = None;
                 self.bell.timer_gone();
                 let now = now_ns();
-                self.net.expire(now);
+                self.inst.net.expire(now);
                 if self
                     .second
                     .as_deref()
