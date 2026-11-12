@@ -13,7 +13,7 @@
 
 use abi::STAMPS_BATCH;
 use core::sync::atomic::{
-    AtomicPtr, AtomicU64,
+    AtomicPtr, AtomicU64, fence,
     Ordering::{Acquire, Relaxed, Release},
 };
 
@@ -71,9 +71,9 @@ impl Ring {
     pub unsafe fn install(&self, words: *mut u64, records: usize) {
         assert!(records.is_power_of_two() && records > 1, "a ring of stamps");
         self.head.store(0, Relaxed);
-        self.mask.store(records as u64 - 1, Relaxed);
-        self.write_mask.store(records as u64 - 1, Relaxed);
-        self.words.store(words.cast(), Release);
+        self.words.store(words.cast(), Relaxed);
+        self.mask.store(records as u64 - 1, Release);
+        self.write_mask.store(records as u64 - 1, Release);
     }
 
     /// Stops the ring taking records, for good: the records it holds stay,
@@ -115,7 +115,7 @@ impl Ring {
     /// changes nothing: the owner may write meanwhile, and the records it
     /// wrote over during the read are counted in `torn`.
     pub fn read(&self, first: u64, mut put: impl FnMut(usize, [u64; 2])) -> Batch {
-        let mask = self.mask.load(Relaxed);
+        let mask = self.mask.load(Acquire);
         if mask == 0 {
             return Batch::default();
         }
@@ -137,9 +137,16 @@ impl Ring {
             put(i as usize, [w0, w1]);
         }
         // The owner wrote over the records from `start` up to this number
-        // while they were read.
-        let now = self.head.load(Acquire);
-        let torn = now.saturating_sub(len).saturating_sub(start).min(count);
+        // while they were read. The fence orders the loads of the words above
+        // before the load of the head. When the head is `now`, the owner may
+        // be writing record `now`, which takes the place of record
+        // `now - len`: that record counts as torn too.
+        fence(Acquire);
+        let now = self.head.load(Relaxed);
+        let torn = (now + 1)
+            .saturating_sub(len)
+            .saturating_sub(start)
+            .min(count);
         let next = if cfg!(feature = "break-stamps-portion") {
             start + count + u64::from(count == STAMPS_BATCH as u64)
         } else {
@@ -217,7 +224,9 @@ mod tests {
         ring.freeze();
         fill(&ring, 20, 40);
         let (all, batches) = dump(&ring, 0);
-        assert_eq!(all, (4..20).map(rec).collect::<Vec<_>>());
+        // The oldest record of a full ring may be the one being written
+        // over, so a read leaves it out.
+        assert_eq!(all, (5..20).map(rec).collect::<Vec<_>>());
         assert_eq!(batches[0].head, 20);
     }
 
@@ -239,10 +248,12 @@ mod tests {
         let (ring, _) = ring(16);
         fill(&ring, 0, 40);
         let (all, batches) = dump(&ring, 0);
-        assert_eq!(all, (24..40).map(rec).collect::<Vec<_>>());
+        assert_eq!(all, (25..40).map(rec).collect::<Vec<_>>());
         assert_eq!(batches[0].head, 40);
         // The next record after the last is the head.
         assert_eq!(batches.iter().map(|b| b.count).sum::<u64>(), 16);
+        // One of them, the oldest, is torn.
+        assert_eq!(batches[0].torn, 1);
         // A cursor inside the ring goes on from there.
         let (tail, _) = dump(&ring, 30);
         assert_eq!(tail, (30..40).map(rec).collect::<Vec<_>>());
@@ -284,9 +295,25 @@ mod tests {
                 fill(&ring, 128, 138);
             }
         });
-        assert_eq!((b.count, b.torn, b.next), (60, 10, 60));
+        assert_eq!((b.count, b.torn, b.next), (60, 11, 60));
         // The records after the torn ones are the true ones.
-        assert_eq!(&got[10..], &(10..60).map(rec).collect::<Vec<_>>()[..]);
+        assert_eq!(&got[11..], &(11..60).map(rec).collect::<Vec<_>>()[..]);
+    }
+
+    #[test]
+    fn the_record_the_owner_is_writing_during_a_read_is_counted_torn() {
+        let (ring, words) = ring(16);
+        // Records 0..=16 are published: the head is 17, the ring holds 1..=16.
+        fill(&ring, 0, 17);
+        // The owner starts record 17, which takes the place of record 1: it
+        // has written the first word only.
+        words[2] = 1017;
+        let mut got = Vec::new();
+        let b = ring.read(0, |_, w| got.push(w));
+        assert_eq!((b.count, b.head), (16, 17));
+        // Record 1 came back with the new ticks and the old key.
+        assert_eq!(got[0], [1017, rec(1)[1]]);
+        assert_eq!(b.torn, 1);
     }
 
     #[test]

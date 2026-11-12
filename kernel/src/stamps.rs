@@ -53,6 +53,11 @@ impl Stamps {
 /// stamps on that CPU and says so.
 #[cfg(feature = "stamps")]
 pub fn init(index: usize) {
+    // A CPU that was refused leaves its block prepared, and the next CPU
+    // takes the same index: the memory stays.
+    if crate::arch::cpu::block(index).local.stamps.ring.is_installed() {
+        return;
+    }
     let mut quota = kcore::quota::Account::new((RECORDS * abi::STAMPS_RECORD) as u64);
     match crate::mm::phys::alloc_zeroed(ORDER, &mut quota) {
         Ok(frame) => {
