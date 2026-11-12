@@ -3400,6 +3400,25 @@ impl Results {
     fn num(&self, key: &str, field: &str) -> Option<f64> {
         self.recs.get(key)?.get(field)?.parse().ok()
     }
+
+    /// The number of a ceiling that counts: a round that stayed broken after its repeats
+    /// (`broken`, a worker misplaced or starved) is left out of the ratios and the medians and
+    /// listed apart.
+    fn counted_num(&self, key: &str, field: &str) -> Option<f64> {
+        if self.recs.get(key)?.contains_key("broken") {
+            return None;
+        }
+        self.num(key, field)
+    }
+
+    /// The ceilings of the rounds that stayed broken: key and reason.
+    fn broken_ceilings(&self) -> Vec<(String, String)> {
+        self.recs
+            .iter()
+            .filter(|(k, _)| k.starts_with("ceiling."))
+            .filter_map(|(k, r)| Some((k.clone(), r.get("broken")?.clone())))
+            .collect()
+    }
 }
 
 fn ms(ns: u64) -> String {
@@ -3773,8 +3792,10 @@ impl Results {
             let ceiling_idle: Vec<f64> = self
                 .recs
                 .iter()
-                .filter(|(k, _)| {
-                    k.starts_with("ceiling.r") && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                .filter(|(k, r)| {
+                    k.starts_with("ceiling.r")
+                        && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                        && !r.contains_key("broken")
                 })
                 .flat_map(|(_, r)| {
                     r.get("cpu_idle")
@@ -3788,8 +3809,10 @@ impl Results {
             let transfer: Vec<f64> = self
                 .recs
                 .iter()
-                .filter(|(k, _)| {
-                    k.starts_with("ceiling.r") && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                .filter(|(k, r)| {
+                    k.starts_with("ceiling.r")
+                        && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                        && !r.contains_key("broken")
                 })
                 .filter_map(|(_, r)| transfer_bytes(r.get("transfer")?))
                 .map(|b| b * 8.0 / 1e6)
@@ -3884,7 +3907,7 @@ impl Results {
             for wl in Workload::ALL {
                 for round in 1..=MAX_ROUNDS {
                     let rps = |sys: System| {
-                        self.num(
+                        self.counted_num(
                             &format!(
                                 "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
                                 sys.name(),
@@ -3977,7 +4000,10 @@ impl Results {
                 g("timeout"),
                 g("non2xx"),
                 g("cpu_idle"),
-                g("alert")
+                match r.get("broken") {
+                    Some(why) => format!("{} (BROKEN, left out of the medians: {why})", g("alert")),
+                    None => g("alert"),
+                }
             );
         }
         t
@@ -4002,7 +4028,7 @@ impl Results {
                     let mut ratios = Vec::new();
                     for round in 1..=MAX_ROUNDS {
                         let rps = |sys: System| {
-                            self.num(
+                            self.counted_num(
                                 &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
                                 "per_second",
                             )
@@ -4044,6 +4070,13 @@ impl Results {
                         verdict(median >= bound),
                     );
                 }
+            }
+        }
+        let broken = self.broken_ceilings();
+        if !broken.is_empty() {
+            t += "\nRounds left out of the ratios and the medians (a worker misplaced or starved after the repeats):\n\n";
+            for (key, why) in broken {
+                t += &format!("* `{key}`: {why}\n");
             }
         }
         t
@@ -5586,6 +5619,45 @@ mod tests {
             ),
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_round_that_stayed_broken_is_left_out_of_the_ratios_and_listed() {
+        let dir = std::env::temp_dir().join(format!("net-bench-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("results")).unwrap();
+        let put = |key: &str, rps: f64, broken: Option<&str>| {
+            let mut r = Rec::new();
+            r.insert("per_second".into(), format!("{rps}"));
+            if let Some(why) = broken {
+                r.insert("broken".into(), why.to_owned());
+            }
+            std::fs::write(dir.join("results").join(format!("{key}.rec")), rec_text(&r)).unwrap()
+        };
+        // S4 over S4o: 0.96, 0.50 (a starved worker, broken), 0.96.
+        for (round, s4, broken) in [
+            (1, 96.0, None),
+            (
+                2,
+                50.0,
+                Some("worker 2 took 0 jiffies against a mean of 316"),
+            ),
+            (3, 96.0, None),
+        ] {
+            put(&format!("ceiling.r{round}.S4o.w7.c64"), 100.0, None);
+            put(&format!("ceiling.r{round}.S4.w7.c64"), s4, broken);
+        }
+        let text = tables(&dir).unwrap();
+        assert!(
+            text.contains("| S4 over S4o | W7 | 64 | 0.960 / 0.960 | 0.960 | 0.95 | yes | yes |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`ceiling.r2.S4.w7.c64`: worker 2 took 0 jiffies"),
+            "{text}"
+        );
+        assert!(text.contains("BROKEN, left out of the medians"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
