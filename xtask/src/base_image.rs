@@ -43,7 +43,7 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
     programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
-    programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
+    programs.push(("netd", "netd", net::NETD_STACK_SIZE, &["instances-2"]));
     programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
     programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
     // The tool is started from its file `/bin/pkg`: stack 0 keeps it out of the image as a
