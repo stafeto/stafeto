@@ -46,3 +46,6 @@ pub mod tlb;
 pub mod token;
 pub mod upcall;
 pub mod window;
+
+#[cfg(feature = "builder")]
+extern crate alloc;
