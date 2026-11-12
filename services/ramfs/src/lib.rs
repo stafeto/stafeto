@@ -2272,6 +2272,28 @@ impl<'a> Ram<'a> {
         Ok(n)
     }
 
+    /// SNAPSHOT_FD: whether the file of the description `fd` can change through no description
+    /// (the files of the image table and of the layers, and the motd: the files `write_at`,
+    /// `pwrite` and the open for writing refuse), with its length and the key of its node. The
+    /// key is the place and generation of the node, so a place a layer takes again has another
+    /// key; it is zero for a file that can change.
+    pub fn snapshot(&self, fds: &Fds, fd: u32) -> Result<proto_fs::SnapshotReply, u32> {
+        let open = self.get(fds, fd)?;
+        if !matches!(open.file, File::ImageRegular(_) | File::Motd) {
+            return Ok(proto_fs::SnapshotReply {
+                flags: 0,
+                length: 0,
+                key: 0,
+            });
+        }
+        let token = self.token(open.file);
+        Ok(proto_fs::SnapshotReply {
+            flags: proto_fs::SNAPSHOT_IMMUTABLE,
+            length: self.length(open.file) as u64,
+            key: u64::from(token.slot) | token.generation << 32,
+        })
+    }
+
     pub fn write_at(
         &mut self,
         fds: &mut Fds,
@@ -3302,6 +3324,63 @@ mod tests {
         let b = ram.open(&mut fds, "/bin/sub/b", READ_ONLY).unwrap();
         assert_eq!(ram.read(&mut fds, b, &mut out), Ok(4));
         assert_eq!(&out[..4], b"beta");
+    }
+
+    /// SNAPSHOT_FD says immutable for the files of the table and of a layer and for nothing a
+    /// description can change: `/tmp`, the devices and a directory answer mutable with no key.
+    /// The check is the one that refuses writes (`File::ImageRegular` and `File::Motd`): a
+    /// check by `read_only_regular` lets `/dev/null` through, and one by any regular file
+    /// lets `/tmp` through.
+    #[test]
+    fn snapshot_fd_names_the_immutable_files_and_only_them() {
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/null", REGULAR | 0o666, 2),
+            entry("/dev/urandom", REGULAR | 0o666, 2),
+            entry("/bin", DIRECTORY | 0o755, 0),
+            entry("/bin/ash", REGULAR | 0o755, 1),
+            entry("/bin/ls", REGULAR | 0o755, 1),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
+        let mut fds = Fds::default();
+        let ash = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        let reply = ram.snapshot(&fds, ash).unwrap();
+        assert!(reply.immutable());
+        assert_eq!(reply.length, ram.information("/bin/ash").unwrap().size);
+        assert_ne!(reply.key, 0);
+        // Two names of one file and two descriptions of one name share the key.
+        let ls = ram.open(&mut fds, "/bin/ls", READ_ONLY).unwrap();
+        let again = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        assert_eq!(ram.snapshot(&fds, ls).unwrap(), reply);
+        assert_eq!(ram.snapshot(&fds, again).unwrap(), reply);
+        // The motd is fixed.
+        let motd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+        let reply = ram.snapshot(&fds, motd).unwrap();
+        assert!(reply.immutable());
+        assert_eq!(reply.length, MOTD.len() as u64);
+        // Everything a description can change, and what is no regular file, is mutable.
+        let mutable = proto_fs::SnapshotReply {
+            flags: 0,
+            length: 0,
+            key: 0,
+        };
+        let tmp = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(ram.snapshot(&fds, tmp), Ok(mutable));
+        for path in ["/dev/null", "/dev/urandom"] {
+            let fd = ram.open(&mut fds, path, READ_ONLY).unwrap();
+            assert_eq!(ram.snapshot(&fds, fd), Ok(mutable), "{path}");
+        }
+        let dir = ram.open(&mut fds, "/bin", READ_ONLY).unwrap();
+        assert_eq!(ram.snapshot(&fds, dir), Ok(mutable));
+        assert_eq!(ram.snapshot(&fds, 900), Err(BAD_FD));
+        // A write to the file of /tmp stays visible to the next read, which is why it never
+        // takes a copy.
+        assert_eq!(ram.write(&mut fds, tmp, b"abc"), Ok(3));
+        assert_eq!(ram.snapshot(&fds, tmp), Ok(mutable));
     }
 
     /// The null device takes any write whole and drops it, reads end at

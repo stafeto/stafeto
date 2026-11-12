@@ -705,6 +705,44 @@ fn a_place_taken_again_has_another_inode_and_the_token_of_the_old_file_is_refuse
     assert_eq!(read_all(&ram, new), b"second");
 }
 
+#[test]
+fn snapshot_fd_names_a_layer_file_immutable_and_a_place_taken_again_has_a_new_key() {
+    let mut ram = ram();
+    attach(
+        &mut ram,
+        1,
+        Spec::new().file("/one", 0o644, b"first").build(),
+    );
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    let old = path(&ram, "/one").unwrap();
+    let fd = ram
+        .open_token(&mut fds, old, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let first = ram.snapshot(&fds, fd).unwrap();
+    assert!(first.immutable());
+    assert_eq!(first.length, 5);
+    ram.close(&mut fds, fd).unwrap();
+    detach(&mut ram, 1);
+    settle(&mut ram);
+    attach(
+        &mut ram,
+        2,
+        Spec::new().file("/two", 0o644, b"second").build(),
+    );
+    let new = path(&ram, "/two").unwrap();
+    assert_eq!(new.slot, old.slot);
+    let fd = ram
+        .open_token(&mut fds, new, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let second = ram.snapshot(&fds, fd).unwrap();
+    assert!(second.immutable());
+    assert_eq!(second.length, 6);
+    assert_ne!(second.key, first.key);
+}
+
 /// The unlink and the rest of the changes to the names and the attributes of a layer.
 fn run_rename(ram: &mut Ram<'_>, from: &[u8], to: &[u8]) -> Result<NamespaceOutcome, u32> {
     run_ns(ram, NamespaceIntent::Rename, from, Some(to))

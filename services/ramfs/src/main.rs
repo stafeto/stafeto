@@ -456,6 +456,64 @@ fn main(_: u64) -> u64 {
     4
 }
 
+/// The calls the service answered (feature `profile`): every request, the reads among them
+/// (READ, READ_AT, READ_FD_INTO, READ_AT_FD_INTO) and SNAPSHOT_FD. A record goes to the console at
+/// most every 100 ms and only when a counter changed, so an idle service prints nothing.
+#[cfg(feature = "profile")]
+mod calls {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use proto_fs::Method;
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static SNAPS: AtomicU64 = AtomicU64::new(0);
+    static PRINTED: AtomicU64 = AtomicU64::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static ID: AtomicU64 = AtomicU64::new(0);
+
+    pub fn count(method: u16) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        match Method::from_number(method) {
+            Some(Method::Read | Method::ReadAt | Method::ReadFdInto | Method::ReadAtFdInto) => {
+                READS.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Method::SnapshotFd) => {
+                SNAPS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let now = rt::time::now();
+        if now >= NEXT.load(Ordering::Relaxed) {
+            report(now);
+        }
+    }
+
+    /// The record of the counters when they changed since the last one and 100 ms have passed
+    /// (the service's notifications, the heartbeat among them, call it, so an idle service shows
+    /// its last counters within a heartbeat).
+    pub fn flush() {
+        let now = rt::time::now();
+        if now >= NEXT.load(Ordering::Relaxed) {
+            report(now);
+        }
+    }
+
+    fn report(now: u64) {
+        let calls = CALLS.load(Ordering::Relaxed);
+        if calls == PRINTED.load(Ordering::Relaxed) {
+            return;
+        }
+        NEXT.store(now + rt::time::frequency() / 10, Ordering::Relaxed);
+        PRINTED.store(calls, Ordering::Relaxed);
+        let id = ID.fetch_add(1, Ordering::Relaxed) + 1;
+        rt::println!(
+            "ramfs: prof {id} calls {calls} reads {} snaps {}",
+            READS.load(Ordering::Relaxed),
+            SNAPS.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// What the mapping thread is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mapping {
@@ -2223,6 +2281,8 @@ impl Service<0> for Fs {
         sessions: &mut [Option<Session<Fds, 0>>],
         notice: rt::service::Notice,
     ) {
+        #[cfg(feature = "profile")]
+        calls::flush();
         if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
             self.wait_timer_armed = false;
             self.waits.poll();
@@ -2513,6 +2573,8 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        #[cfg(feature = "profile")]
+        calls::count(r.method());
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         let first = !s.data.claimed;
@@ -3163,6 +3225,23 @@ impl Service<0> for Fs {
                 }
             }
             Some(Method::ReadFdInto | Method::ReadAtFdInto) => self.read_portion(s, r),
+            Some(Method::SnapshotFd) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                match self.ram.snapshot(&s.data, fd) {
+                    Ok(reply) => {
+                        if reply.write(r.reply()).is_err() {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::Write) => {
                 if let Err(code) = self.authenticate(&mut s.data, r.label()) {
                     return status(code);

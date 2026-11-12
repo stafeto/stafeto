@@ -799,6 +799,40 @@ fn parse_profile(lines: &[String]) -> Option<(u64, Vec<(String, u64)>)> {
     Some((id, pairs))
 }
 
+/// The last record of the file service's counters, `ramfs: prof <id> calls <n> reads <n> snaps
+/// <n>` (an image with the feature `profile` of `ramfs`), as the pairs `fs_calls`, `fs_reads`
+/// and `fs_snaps`; None when the console holds none.
+fn parse_fs_profile(lines: &[String]) -> Option<Vec<(String, u64)>> {
+    let line = lines.iter().rfind(|l| l.contains("ramfs: prof "))?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let value = |name: &str| -> Option<u64> {
+        let at = words.iter().position(|w| *w == name)?;
+        words.get(at + 1)?.parse().ok()
+    };
+    Some(vec![
+        ("fs_calls".to_owned(), value("calls")?),
+        ("fs_reads".to_owned(), value("reads")?),
+        ("fs_snaps".to_owned(), value("snaps")?),
+    ])
+}
+
+/// The calls of the file service per answer in a profile change: `fs_calls_per_answer` and
+/// `fs_reads_per_answer` after the counters (nothing when the profile holds no record of the
+/// service or the run had no answers).
+fn fs_per_answer(profile: &mut Vec<(String, f64)>, answers: usize) {
+    if answers == 0 {
+        return;
+    }
+    let of = |name: &str, profile: &[(String, f64)]| {
+        profile.iter().find(|(n, _)| n == name).map(|(_, v)| *v)
+    };
+    let (calls, reads) = (of("fs_calls", profile), of("fs_reads", profile));
+    if let (Some(calls), Some(reads)) = (calls, reads) {
+        profile.push(("fs_calls_per_answer".to_owned(), calls / answers as f64));
+        profile.push(("fs_reads_per_answer".to_owned(), reads / answers as f64));
+    }
+}
+
 /// The profile of a run: the change of every counter between two snapshots
 /// and the values of the maxima (names ending in `_max`) of the second.
 fn profile_change(before: &[(String, u64)], after: &[(String, u64)]) -> Vec<(String, f64)> {
@@ -1506,17 +1540,37 @@ impl Guest {
     /// feature `profile`): `posix-net stat` makes the service print its
     /// records, which reach the console a moment later.
     fn profile(&mut self) -> Result<Vec<(String, u64)>, String> {
+        if self.sys == System::F1 {
+            return self.fs_profile();
+        }
         let last = parse_profile(&self.run.text()).map_or(0, |(id, _)| id);
         crate::net_tls::capture(&mut self.run, "posix-net stat", "profile", DIALOG_STEP)?;
         for _ in 0..20 {
-            if let Some((id, pairs)) = parse_profile(&self.run.text())
+            let text = self.run.text();
+            if let Some((id, mut pairs)) = parse_profile(&text)
                 && id > last
             {
+                // The file service's counters ride with the network service's.
+                pairs.extend(parse_fs_profile(&text).unwrap_or_default());
                 return Ok(pairs);
             }
             crate::net_tls::capture(&mut self.run, "sleep 1", "profwait", DIALOG_STEP)?;
         }
         Err("the network service printed no whole profile".to_owned())
+    }
+
+    /// The counters of the file service alone (the image of F1): the console is read for two
+    /// seconds, by a command that makes no call of the file service, so that the last record
+    /// of a service that has been quiet shows.
+    fn fs_profile(&mut self) -> Result<Vec<(String, u64)>, String> {
+        crate::net_tls::capture(&mut self.run, "sleep 2", "fsprof", DIALOG_STEP)?;
+        // A service that made no call has printed nothing: its counters are zero.
+        Ok(parse_fs_profile(&self.run.text()).unwrap_or_else(|| {
+            ["fs_calls", "fs_reads", "fs_snaps"]
+                .iter()
+                .map(|n| ((*n).to_owned(), 0))
+                .collect()
+        }))
     }
 
     /// The readings before a run, in the order that keeps the reads of the
@@ -1561,6 +1615,7 @@ impl Guest {
         used.placed = placed_text(&procs);
         if let (Some(a), Some(b)) = (&before.snapshot, &snapshot) {
             used.profile = profile_change(a, b);
+            fs_per_answer(&mut used.profile, answers);
         }
         Ok(used)
     }
@@ -2262,6 +2317,9 @@ impl Bench {
         match sys {
             System::S4 => self.opts.image != ImageKind::Plain,
             System::F1s => self.opts.image == ImageKind::Profile,
+            // The image of F1 has no network service profile; its file service's counters
+            // are read.
+            System::F1 => true,
             _ => false,
         }
     }
@@ -4606,6 +4664,40 @@ mod tests {
             "cpu1 1 0 2 3 0 6 7 0".to_owned(),
         ];
         assert_eq!(parse_irq(&stat), (10, 12));
+    }
+
+    #[test]
+    fn the_file_services_record_gives_the_calls_per_answer() {
+        let lines: Vec<String> = [
+            "ramfs: prof 1 calls 10 reads 4 snaps 1",
+            "net: something else",
+            "ramfs: prof 2 calls 30 reads 14 snaps 2",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let last = parse_fs_profile(&lines).unwrap();
+        assert_eq!(
+            last,
+            [
+                ("fs_calls".to_owned(), 30),
+                ("fs_reads".to_owned(), 14),
+                ("fs_snaps".to_owned(), 2)
+            ]
+        );
+        assert!(parse_fs_profile(&lines[1..2]).is_none());
+        let before = [("fs_calls".to_owned(), 10), ("fs_reads".to_owned(), 4)];
+        let after = [("fs_calls".to_owned(), 30), ("fs_reads".to_owned(), 14)];
+        let mut change = profile_change(&before, &after);
+        fs_per_answer(&mut change, 1000);
+        assert_eq!(
+            change.last(),
+            Some(&("fs_reads_per_answer".to_owned(), 0.01))
+        );
+        assert!(change.contains(&("fs_calls_per_answer".to_owned(), 0.02)));
+        let mut none = vec![("tx".to_owned(), 5.0)];
+        fs_per_answer(&mut none, 1000);
+        assert_eq!(none.len(), 1);
     }
 
     #[test]

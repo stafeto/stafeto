@@ -392,6 +392,25 @@ pub fn terminal_path(terminal: u32) -> Option<&'static str> {
     (terminal == proto_tty::CONSOLE).then_some("/dev/console")
 }
 
+/// What the layer above does when the last descriptor of a description of the file service goes
+/// (the copies of its files, `posix_abi::filecache`). Set once at start.
+static RAM_CLOSED: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Sets the function the release of a description of the file service calls first.
+pub fn set_ram_closed(hook: fn(RamTarget)) {
+    RAM_CLOSED.store(hook as *mut (), core::sync::atomic::Ordering::Release);
+}
+
+fn ram_closed(target: RamTarget) {
+    let hook = RAM_CLOSED.load(core::sync::atomic::Ordering::Acquire);
+    if !hook.is_null() {
+        // SAFETY: the pointer is null or a `fn(RamTarget)` that `set_ram_closed` stored.
+        let hook = unsafe { core::mem::transmute::<*mut (), fn(RamTarget)>(hook) };
+        hook(target);
+    }
+}
+
 /// One process's file state, mutated by one owner: the table of
 /// descriptors and the current directory. The requests to the services go
 /// through the `Transport`, which needs no owner: the owner snapshots a
@@ -604,7 +623,10 @@ impl Transport {
     /// requests before the heap run it on a small stack.
     pub fn release(&self, target: Option<Target>) -> Result<(), FsError> {
         match target {
-            Some(Target::Ram(fd) | Target::Random(fd)) => self.close_file(fd),
+            Some(Target::Ram(fd) | Target::Random(fd)) => {
+                ram_closed(fd);
+                self.close_file(fd)
+            }
             Some(Target::Pipe(end)) => self.close_pipe(end),
             Some(Target::Fifo(pair)) => {
                 match self.pipe_endpoint_call(proto_pipe::Method::Close, pair.endpoint(), None) {
@@ -780,6 +802,20 @@ impl Transport {
     /// pread of the service's description `fd`.
     pub fn read_at(&self, fd: u32, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
         self.files().read_at(fd, offset, out).map_err(FsError::from)
+    }
+
+    /// SNAPSHOT_FD of the service's description `fd`. None when the service does not know the
+    /// method or answers it in a way this layer does not read: the description is then read
+    /// as before. An answer about the file and an interruption are errors.
+    pub fn snapshot(&self, fd: u32) -> Result<Option<proto_fs::SnapshotReply>, FsError> {
+        match self.files().snapshot(fd) {
+            Ok(reply) => Ok(Some(reply)),
+            Err(Status::Kernel(rt::abi::Error::Interrupted)) => Err(FsError::Interrupted),
+            Err(
+                Status::Kernel(_) | Status::UnknownMethod | Status::BadVersion | Status::BadSize,
+            ) => Ok(None),
+            Err(status) => Err(FsError::from(status)),
+        }
     }
 
     /// READ_FD_INTO (READ_AT_FD_INTO with `offset`) of the service's description `fd`: up to

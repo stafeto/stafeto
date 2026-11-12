@@ -19,6 +19,7 @@ pub mod cpus;
 mod drain_driver;
 mod drain_hooks;
 mod filebuf;
+pub mod filecache;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;

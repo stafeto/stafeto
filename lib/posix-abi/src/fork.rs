@@ -980,6 +980,8 @@ fn child() -> Result<(), &'static str> {
         crate::net::after_fork(handle(raw(Slot::Net)));
         // The child asks for a buffer of the large reads of files of its own.
         crate::filebuf::after_fork();
+        // The child's copies of files are its own: none yet.
+        crate::filecache::after_fork();
         // The child's session with the package service is the clone the
         // parent made.
         crate::packages::after_fork(handle(raw(Slot::Packages)));

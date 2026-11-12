@@ -1287,6 +1287,21 @@ impl Files {
         Ok(n)
     }
 
+    /// SNAPSHOT_FD: whether the file of the description `fd` is immutable, with its length and
+    /// the key of its node (`proto_fs::SnapshotReply`).
+    pub fn snapshot(&self, fd: u32) -> Result<proto_fs::SnapshotReply, Status> {
+        let mut w = Writer::new();
+        Method::SnapshotFd.header().write(&mut w)?;
+        w.u32(fd)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        proto_fs::SnapshotReply::read(r)
+    }
+
     /// READ_FD_INTO, or READ_AT_FD_INTO with `offset`: up to `count` bytes (at most
     /// `READ_PORTION`) of the file of `fd` into `memory` from `place`, a whole page, through a
     /// copy of `memory` the service maps for the copy; the count read. The position of the

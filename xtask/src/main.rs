@@ -6059,9 +6059,9 @@ const RAM_STEP_KINDS: [(usize, &str); 26] = [
     (46, "ChangeStep"),
     (47, "ChangeQuery"),
     (48, "ChangeRelease"),
-    // The statistics count every method from 64 on in the kind 63 (IpcJobs, ReadFdInto and
-    // ReadAtFdInto): the detail of the longest step says which it was.
-    (63, "IpcJobs, ReadFdInto, ReadAtFdInto"),
+    // The statistics count every method from 64 on in the kind 63 (IpcJobs, ReadFdInto,
+    // ReadAtFdInto and SnapshotFd): the detail of the longest step says which it was.
+    (63, "IpcJobs, ReadFdInto, ReadAtFdInto, SnapshotFd"),
     (64, "notification"),
     (65, "maintenance"),
     (66, "session gone"),
