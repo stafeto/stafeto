@@ -92,6 +92,9 @@ pub(crate) struct State {
     /// lets go of them (`take_closed`).
     closed: [Closed; CLOSED_MAX],
     closed_len: usize,
+    /// A piece of the arena of the file cache is being mapped: a room that is full does not take
+    /// the arena's other pieces back for it.
+    making_cache: bool,
 }
 
 /// A shared mapping of a file that went: its pin (place and generation),
@@ -140,6 +143,7 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     grow_longest: 0,
     closed: [(0, 0, 0, false); CLOSED_MAX],
     closed_len: 0,
+    making_cache: false,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
 /// Set while a thread is inside the heap's section, for the probes.
@@ -670,7 +674,10 @@ impl State {
             existing: Some(handle),
             ..Source::anonymous()
         };
-        let (index, address) = self.make_own(None, pages, Access::ReadWrite, false, source, 0)?;
+        self.making_cache = kind == posix_map::Kind::FileCache;
+        let made = self.make_own(None, pages, Access::ReadWrite, false, source, 0);
+        self.making_cache = false;
+        let (index, address) = made?;
         self.map.object_mut(index).kind = kind;
         Ok(address)
     }
@@ -718,6 +725,22 @@ impl State {
         Ok(())
     }
 
+    /// The piece of the file cache's arena at `address` (`pages` pages) leaves the process
+    /// (`mem_unmap`) and its object closes. The arena's pieces are of a kind that `unmap` refuses
+    /// (the program cannot unmap them), so the cache takes them back through this.
+    pub(crate) fn unmap_cache_piece(&mut self, address: usize, pages: usize) -> Result<(), i32> {
+        if self.map.cache_piece(address) != Some(pages) {
+            return Err(EINVAL);
+        }
+        // SAFETY: the pages are the layer's own piece of the arena, which the caller (the cache,
+        // holding its lock, with no entry in the piece) gives up.
+        unsafe { sys::mem_unmap(&config().process, address, (pages * PAGE) as u64) }
+            .map_err(|e| self.refused(e))?;
+        self.map.unmap_cache_piece(address);
+        self.space.set(address, pages, Page::Unbacked);
+        Ok(())
+    }
+
     /// The pins of `closed`, moved to `out`: how many.
     pub(crate) fn take_closed(&mut self, out: &mut [Closed]) -> usize {
         let n = self.closed_len.min(out.len());
@@ -757,8 +780,15 @@ impl State {
         if let Some(at) = self.space.find(pages, Page::Unbacked, from_top) {
             return Some(at);
         }
-        self.extend_room().ok()?;
-        self.space.find(pages, Page::Unbacked, from_top)
+        if self.extend_room().is_ok() {
+            return self.space.find(pages, Page::Unbacked, from_top);
+        }
+        // The room is full: the copies of files the arena holds give way (they are copies; the
+        // service has the files).
+        if !self.making_cache && crate::filecache::release(self) {
+            return self.space.find(pages, Page::Unbacked, from_top);
+        }
+        None
     }
 
     /// The room grows from 32 MiB to 1 GiB for a process with a quota above

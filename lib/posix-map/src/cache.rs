@@ -525,6 +525,29 @@ impl Cache {
         }
     }
 
+    /// The last piece of the arena when no entry holds a page of it: its base and pages. The
+    /// heap asks for it when the room of the process is full (`pop_piece` follows once the piece
+    /// is unmapped).
+    pub fn empty_tail(&self) -> Option<(usize, usize)> {
+        let last = self.pieces_made.checked_sub(1)?;
+        let piece = &self.pieces[last];
+        (piece.taken == 0).then_some((piece.base, piece.pages))
+    }
+
+    /// The last piece leaves the arena; the next piece made is the size the list says for its
+    /// place.
+    pub fn pop_piece(&mut self) {
+        if let Some(last) = self.pieces_made.checked_sub(1) {
+            self.pieces[last] = Piece {
+                base: 0,
+                handle: 0,
+                taken: 0,
+                pages: 0,
+            };
+            self.pieces_made = last;
+        }
+    }
+
     /// The state of a forked child: nothing, the pieces being the parent's. In place, with no
     /// temporary of the size of the state (the child runs on a copy of the caller's stack, which
     /// may be a handler's alternate stack of a few KiB); the budget stays.
@@ -890,6 +913,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_room_gets_the_idle_pieces_back_from_the_end_of_the_arena() {
+        let r = shared();
+        let mut c = cache(2, 20);
+        immutable(&mut c, 3, 100, 10);
+        assert!(matches!(read(&mut c, &r, 3), Plan::Fill { .. }));
+        assert_eq!(c.pieces_made, 2);
+        // The entry holds pages of the first piece: the end of the arena is the second, which no
+        // entry holds.
+        assert_eq!(c.empty_tail(), Some((c.pieces[1].base, c.pieces[1].pages)));
+        c.pop_piece();
+        assert_eq!(c.pieces_made, 1);
+        // The first piece still has the entry's pages: it stays until the entry goes.
+        assert_eq!(c.empty_tail(), None);
+        assert!(c.evict_one(&r));
+        assert_eq!(c.empty_tail(), Some((c.pieces[0].base, c.pieces[0].pages)));
+        c.pop_piece();
+        assert_eq!((c.pieces_made, c.used_pages), (0, 0));
+        assert_eq!(c.empty_tail(), None);
+    }
+
+    #[test]
     fn the_reset_of_a_fork_and_the_clear_are_in_place_and_keep_the_budget() {
         let r = shared();
         let mut c = cache(1, 20);
@@ -904,6 +948,10 @@ mod tests {
         assert!(core::mem::size_of::<Cache>() > 4 * 1024);
         // The state is static in every process that links the layer and counts against its
         // memory quota (a process of the posix-procs workload has 5 pages of room): it stays small.
-        assert!(core::mem::size_of::<Cache>() <= 12 * 1024, "{}", core::mem::size_of::<Cache>());
+        assert!(
+            core::mem::size_of::<Cache>() <= 12 * 1024,
+            "{}",
+            core::mem::size_of::<Cache>()
+        );
     }
 }

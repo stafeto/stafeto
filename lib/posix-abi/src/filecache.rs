@@ -14,7 +14,7 @@
 //!   quota (the first the size of its file, the second of 64 KiB, the others of 256 KiB: `PIECE_SIZES`), mapped as pieces of
 //!   the kind `posix_map::Kind::FileCache` (a forked child has none). A file takes a run of whole
 //!   pages of one piece; the pages are filled with READ_AT_FD_INTO in portions of `READ_PORTION`,
-//!   a step of the service each. Pieces are never given back.
+//!   a step of the service each. The pieces stay until the process ends, but for one case: when a mapping or a stack of the process finds its room full (`release`, called by the allocator holding its lock), every copy no read holds goes and the empty pieces at the end of the arena are unmapped, which is a call of the system under the cache lock. Nothing else takes the heap's lock while holding the cache's, so the order is safe; a cache lock that is taken gives nothing back.
 //! * An entry (the copy) is named by the node key of the service, so the descriptions of one file
 //!   share it and a place a layer takes again gets a new copy. A description names its entry by
 //!   (slot, generation) of the description, never by the number: a number closed and opened
@@ -183,6 +183,31 @@ fn active() -> bool {
             }
         }
     }
+}
+
+/// The room of the process is full (`heap` is held by the caller): the arena gives back what no
+/// read holds. Every copy no read is copying from goes, then the pieces left empty at the end of
+/// the arena are unmapped. True when a piece went. A busy or an off cache gives nothing.
+pub(crate) fn release(state: &mut crate::allocation::State) -> bool {
+    if MODE.load(Ordering::Acquire) != 1 {
+        return false;
+    }
+    let Some(mut guard) = Guard::try_new() else {
+        return false;
+    };
+    if guard.pieces_made == 0 {
+        return false;
+    }
+    while guard.evict_one(&SHARED) {}
+    let mut freed = false;
+    while let Some((base, pages)) = guard.empty_tail() {
+        if state.unmap_cache_piece(base, pages).is_err() {
+            break;
+        }
+        guard.pop_piece();
+        freed = true;
+    }
+    freed
 }
 
 /// Makes a piece of `pages` pages (a memory object of the process's own, mapped as a piece of

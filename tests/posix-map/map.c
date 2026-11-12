@@ -426,6 +426,7 @@ static void table_full(void) {
  * the service, then the pieces of the arena and the pages taken. */
 void stafeto_probe_file_cache(unsigned long long *out);
 void stafeto_probe_file_cache_budget(unsigned long kib);
+extern uint64_t stafeto_probe_room_pages(void);
 
 struct fcache { unsigned long long hits, fills, snaps, service, pieces, pages; };
 
@@ -648,6 +649,53 @@ static void fc_deep(void) {
     close(fd);
 }
 
+/* A process whose room is full gets the arena back: stacks with guards of 2 MiB (a hole of the
+ * room that costs no memory) fill the 32 MiB room of a process with the quota of a command until
+ * one is refused; the call that found no room takes the idle copies and the pieces of the arena
+ * back, so the arena is gone afterwards, the stack that was refused is made, and a read of the
+ * file copies it in again. */
+static void *fc_park(void *arg) {
+    char byte;
+    return read(*(int *)arg, &byte, 1) == 1 ? NULL : arg;
+}
+
+static void fc_room(void) {
+    char want[512], got[512];
+    int n = fc_slurp("/etc/motd", want, sizeof want);
+    int fd = open("/etc/motd", O_RDONLY);
+    check("cache: room open", n > 0 && fd >= 0 && pread(fd, got, (size_t)n, 0) == n);
+    check("cache: room: the arena is there", fc_now().pieces >= 1);
+    check("cache: room: the room is the small one", stafeto_probe_room_pages() == 8192);
+    int fds[2];
+    check("cache: room: a pipe", pipe(fds) == 0);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setguardsize(&attr, 2UL << 20);
+    pthread_t threads[40];
+    int made = 0, refused = 0;
+    for (; made < 40; made++) {
+        if (pthread_create(&threads[made], &attr, fc_park, &fds[0]) != 0) { refused = 1; break; }
+        if (fc_now().pieces == 0) break;
+    }
+    check("cache: room: the room filled and gave the arena back", fc_now().pieces == 0 && made > 1);
+    if (!refused && made < 40) {
+        /* The arena went with the call that took the last stack: it succeeded. */
+        check("cache: room: the stack that found the room full was made", made < 40);
+    }
+    check("cache: room: a read after the arena went copies the file again",
+          pread(fd, got, (size_t)n, 0) == n && memcmp(got, want, (size_t)n) == 0);
+    char byte = 'x';
+    int total = made + (refused ? 0 : 1);
+    for (int i = 0; i < total && i < 40; i++)
+        if (write(fds[1], &byte, 1) != 1) break;
+    for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+    if (!refused && made < 40) pthread_join(threads[made], NULL);
+    pthread_attr_destroy(&attr);
+    close(fds[0]);
+    close(fds[1]);
+    close(fd);
+}
+
 static void file_cache(void) {
     fc_hundred();
     fc_mutable();
@@ -656,6 +704,7 @@ static void file_cache(void) {
     fc_deep();
     fc_mapping();
     fc_budget();
+    fc_room();
     if (!failures) printf("posix-map: file cache ok\n");
 }
 
