@@ -199,6 +199,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "firmware-tree"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+]
+
+[[package]]
 name = "gencat"
 version = "0.1.0"
 dependencies = [

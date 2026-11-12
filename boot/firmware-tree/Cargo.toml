@@ -1,0 +1,22 @@
+[package]
+name = "firmware-tree"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "ACPI tables and the EFI memory map into the device tree stafeto boots with, tested on the host"
+
+[lib]
+bench = false
+
+[dependencies]
+kcore = { path = "../../kcore", features = ["builder"] }
+
+[features]
+# Deliberate breaks, for the tests and the loader runs that must catch them
+# (the Ч2 note, section 7).
+break-merge = []
+break-spcr = []
+break-iort-count = []
+break-dtb-gib = []
