@@ -122,11 +122,11 @@ impl Stock {
     }
 
     /// The stock of a ring of `chains` buffers, fewer than `RX_LOW` buffers can carry: the
-    /// doorbell is due when the device is down to a quarter of them, and a batch is the whole
+    /// doorbell is due when the device is down to a sixteenth of them, and a batch is the whole
     /// ring (the device reads the ring of available buffers when a frame comes, VZ, so a doorbell
     /// for a batch has no use, and a doorbell is an exit from the guest).
     pub const fn for_chains(chains: u32) -> Stock {
-        Stock::with(chains / 4, chains)
+        Stock::with(chains / 16, chains)
     }
 
     const fn with(low: u32, batch: u32) -> Stock {
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ring_of_64_chains_rings_when_the_device_is_down_to_a_quarter() {
+    fn a_ring_of_64_chains_rings_when_the_device_is_down_to_a_sixteenth() {
         let fill = |stock: &mut Stock| {
             for _ in 0..TAILS {
                 stock.added();
@@ -543,12 +543,12 @@ mod tests {
         };
         let mut chains = Stock::for_chains(TAILS as u32);
         fill(&mut chains);
-        back(&mut chains, 40);
-        assert!(!chains.due(true), "24 are left and 40 went in: no bell yet");
-        back(&mut chains, 8);
+        back(&mut chains, 50);
+        assert!(!chains.due(true), "14 are left and 50 went in: no bell yet");
+        back(&mut chains, 10);
         assert!(
             chains.due(true),
-            "16 are left: the device is down to a quarter"
+            "4 are left: the device is down to a sixteenth"
         );
         // A ring of 256 buffers rings for a batch of `RX_LOW` that went in.
         let mut plain = Stock::new();
