@@ -15,7 +15,7 @@ kcore = { path = "../../kcore", features = ["builder"] }
 
 [features]
 # Deliberate breaks, for the tests and the loader runs that must catch them
-# (the Ч2 note, section 7).
+# (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 7).
 break-merge = []
 break-spcr = []
 break-iort-count = []

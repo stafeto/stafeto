@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The EFI memory map as the device tree's `memory` and `reserved-memory`
-//! (the Ч2 note, section 4). The rule is Linux arm64's
+//! (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 4). The rule is Linux arm64's
 //! (`drivers/firmware/efi/efi-init.c`, `reserve_regions`): memory is what
 //! carries the write-back attribute, and what the firmware keeps (runtime
 //! services, ACPI, reserved) is withheld from the kernel with `no-map`.
@@ -57,7 +57,7 @@ impl Desc {
     }
 }
 
-/// The numbers the loader reports (the Ч2 note, section 8).
+/// The numbers the loader reports (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stats {
     pub descriptors: usize,

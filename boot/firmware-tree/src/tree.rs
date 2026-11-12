@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The device tree for stafeto from a `Platform` and the classified memory
-//! map (the Ч2 note, section 3, "Дерево целиком"). It is written for the
+//! map (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 3). It is written for the
 //! kernel's `kcore::bootinfo::parse` and for nothing else: loading Linux with
 //! it is not a goal.
 

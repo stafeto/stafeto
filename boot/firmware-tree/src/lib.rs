@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The firmware's description of the machine, turned into the device tree
-//! the kernel boots with (the Ч2 note): ACPI tables and the EFI memory map
+//! the kernel boots with (stafeto-design tasks/2026-11-12-aws-efi-loader.md): ACPI tables and the EFI memory map
 //! in, a tree and a verdict of the kernel's own parser out. No hardware is
 //! touched here: the boot loader (`boot/efi-loader`) reads the memory, this
 //! crate works on slices, so every case runs on the host.

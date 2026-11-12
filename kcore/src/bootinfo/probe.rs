@@ -49,7 +49,7 @@ impl PciHosts {
 
 /// The properties of one node that `uart_16550` and `pci_hosts` read. A
 /// second small walk, so that `parse` and the kernel's code stay as they are:
-/// the kernel does not call these (the console of milestone Ч3 moves
+/// the kernel does not call these (the console of the console part moves
 /// `uart_16550` into `BootInfo`).
 #[derive(Clone, Copy)]
 struct Probe<'a> {

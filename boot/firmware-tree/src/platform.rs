@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! What the kernel needs from the static ACPI tables (the Ч2 note, section
+//! What the kernel needs from the static ACPI tables (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section
 //! 3): the CPUs and the interrupt controller from the MADT, the PSCI
 //! conduit from the FADT, the timer interrupts from the GTDT, the console
 //! from the SPCR, the PCI hosts from the MCFG, and the DeviceID map of the
