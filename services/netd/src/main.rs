@@ -127,7 +127,7 @@ use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::SomeTransport;
 use virtio_mmio::PAGE;
-use virtio_net::open::{MAC, MTU, OFFLOAD, STATUS};
+use virtio_net::open::{MAC, MTU, OFFLOAD, STATUS, TSO};
 use virtio_net::transport::{self, Function, OpenError};
 use virtio_net::{OpenFailure, Opened};
 use virtio_pci::qemu;
@@ -165,7 +165,8 @@ pub(crate) const TRANSMITQ: u16 = 1;
 /// The features the service asks for (`virtio_net::open`):
 /// `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
 /// `VIRTIO_NET_F_STATUS`. The checksum offload is added by `start_device` when
-/// the device takes it (`virtio_net::open_offload`); no segmentation offload, no
+/// the device takes it (`virtio_net::open_offload`), the segmentation offload
+/// when the service has the 64 KiB tails of the receiving chains it needs; no
 /// merged buffers, no control queue (Virtio 1.2, 5.1.3). Apple's device
 /// clears `FEATURES_OK` for any set without MTU.
 const WANTED: u64 = MTU | MAC | STATUS;
@@ -264,6 +265,10 @@ fn main(_: u64) -> u64 {
     else {
         return NO_START_DATA;
     };
+    // The tails of the chains of receiving (4 MiB), for a device that merges the segments it
+    // receives: the record of one device has them, the record of two has none (its start data
+    // is full) and keeps the pair of sums.
+    let tails_object = s.take::<Memory>("tails").ok();
     // The record of two devices gives the second device objects of its own
     // (init's table): the service drives it on `dma1` and the first
     // megabyte of `net1a`, and keeps the others.
@@ -271,7 +276,7 @@ fn main(_: u64) -> u64 {
     let objects = if second_objects.iter().all(Option::is_some) {
         2 + SECOND_OBJECTS.len()
     } else {
-        2
+        2 + usize::from(tails_object.is_some())
     };
     let args = ServiceArgs::read(s.args()).ok();
     // The own arguments: the physical addresses of the objects, which init
@@ -280,6 +285,11 @@ fn main(_: u64) -> u64 {
     let own = args.map_or(&[][..], |a| a.own);
     let (dma_pa, net_pa) = (word(own, 0), word(own, 8));
     let (dma1_pa, net1_pa) = (word(own, 16), word(own, 24));
+    let tails_pa = if tails_object.is_some() && objects == 3 {
+        word(own, 16)
+    } else {
+        0
+    };
     let second_pas: [u64; 5] = core::array::from_fn(|i| word(own, 16 + 8 * i));
     // The size of each object as the kernel has it: the owner maps what is
     // there, whatever init's table says.
@@ -450,16 +460,41 @@ fn main(_: u64) -> u64 {
         Ok(found) => found,
         Err(code) => return code,
     };
-    let opened = match start_device(&mut transport, "virtio-net", true) {
+    let opened = match start_device(
+        &mut transport,
+        "virtio-net",
+        true,
+        tails_pa != 0 && settings.tso(),
+    ) {
         Ok(opened) => opened,
         Err(code) => return code,
     };
     let (mac, link) = (opened.mac, opened.link);
     let offload = opened.features & OFFLOAD == OFFLOAD;
+    // The device that took the four bits of segmentation merges segments into frames of up to
+    // 64 KiB: its ring of receiving is chains of a head and a tail.
+    let tso = opened.features & TSO == TSO;
+    let tails_mapped = !tso
+        || tails_object.as_ref().is_some_and(|object| {
+            sys::mem_map(
+                &s.process,
+                object,
+                0,
+                netd::ring::TAIL_PAGES as u64 * page,
+                dma::TAILS_AT,
+                rw,
+            )
+            .is_ok()
+                && dma::attach_tails(DEVICE, dma_pa, net_pa, tails_pa)
+        });
+    if !tails_mapped {
+        return NOT_MAPPED;
+    }
     rt::println!(
-        "net-offload: features {:#x}, checksum offload {}",
+        "net-offload: features {:#x}, checksum offload {}, segmentation offload {}",
         opened.features,
-        if offload { "on" } else { "off" }
+        if offload { "on" } else { "off" },
+        if tso { "on" } else { "off" }
     );
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
     let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
@@ -526,7 +561,7 @@ fn main(_: u64) -> u64 {
         irq,
         switch_channel,
         link,
-        offload,
+        (offload, tso),
         (switch_tables, sweep_timer.0, sweep_timer.1),
     );
     if let Some(irq_tx) = irq_tx {
@@ -641,6 +676,7 @@ fn main(_: u64) -> u64 {
         maps: Maps {
             _dma: dma_object,
             _net: net_object,
+            _tails: tails_object,
             windows,
             second: second_objects,
         },
@@ -758,15 +794,17 @@ fn make_switch_tables(
 /// and gives the code the service ends with.
 ///
 /// With `offload` the checksum offload is asked for and kept when the device takes it
-/// (`virtio_net::open_offload`); the second device and its owner's frames keep their sums
-/// in software.
+/// (`virtio_net::open_offload`), with `tso` the segmentation offload too (the driver has the
+/// tails of the chains of receiving it needs); the second device and its owner's frames keep
+/// their sums in software.
 fn start_device(
     transport: &mut SomeTransport<'static>,
     tag: &str,
     offload: bool,
+    tso: bool,
 ) -> Result<Opened, u64> {
     let started = if offload {
-        virtio_net::open_offload(transport, WANTED)
+        virtio_net::open_offload(transport, WANTED, tso)
     } else {
         virtio_net::open(transport, WANTED)
     };
@@ -985,6 +1023,7 @@ impl Tables {
 struct Maps {
     _dma: Handle<Memory>,
     _net: Handle<Memory>,
+    _tails: Option<Handle<Memory>>,
     windows: [Option<Handle<Memory>>; 3],
     second: [Option<Handle<Memory>>; SECOND_OBJECTS.len()],
 }
@@ -1638,6 +1677,18 @@ impl Driver<'_> {
             switch::INNER.bells_tx(),
             tx.tx
         );
+        if switch::INNER.merged() {
+            let st = &switch::INNER.stats;
+            let get =
+                |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
+            rt::println!(
+                "net: merged {} cut {} merged_dropped {} merged_max {}",
+                get(&st.merged),
+                get(&st.cut),
+                get(&st.merged_dropped),
+                get(&st.merged_max)
+            );
+        }
         if self.side.max > 0 {
             self.report_switch();
         }

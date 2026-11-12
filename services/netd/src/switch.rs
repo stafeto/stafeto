@@ -63,10 +63,11 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
-    SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
-    SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TX_BUFFERS,
-    TX_SHARE, bell_due, drive,
+    CUT_RESERVE, CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY,
+    RX_BACK_LAZY_MERGED, RX_BUFFERS, RunClock, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS,
+    SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS,
+    SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due,
+    drive,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -80,7 +81,10 @@ use rt::{Handle, Stack, sys};
 use virtio_drivers::transport::SomeTransport;
 use virtio_mmio::Isr;
 use virtio_net::barrier::ring;
-use virtio_net::rings::Sent;
+use virtio_net::books::TAIL_LEN;
+use virtio_net::cut::{Frame2, Plan};
+use virtio_net::frames::{BUFFER_LEN, MAX_FRAME};
+use virtio_net::rings::{Sent, tail_at};
 
 const RECEIVEQ: u16 = 0;
 const TRANSMITQ: u16 = 1;
@@ -122,6 +126,12 @@ pub struct Inner {
     pub back_told: Told,
     /// The device completes the sums of TCP (set when the switch starts, before the stack runs).
     offload: AtomicBool,
+    /// The device merges the segments it receives (the ring of receiving is chains of 64: the
+    /// stack gives its buffers back sooner, `RX_BACK_LAZY_MERGED`).
+    merged: AtomicBool,
+    /// The switch holds a merged frame it cut part of and waits for the stack to take segments
+    /// (the end of a run of the stack wakes it).
+    cut_wait: AtomicBool,
     /// The start of the port table (the switch writes it, the stack reads single bytes), or 0
     /// without a switch table.
     ports_base: AtomicUsize,
@@ -170,6 +180,13 @@ pub struct Stats {
     pub sum_tx: AtomicU32,
     pub sum_rx: AtomicU32,
     pub sum_soft: AtomicU32,
+    /// Merged frames the device handed over, the segments they were cut into, and the merged
+    /// frames dropped whole (no plan, a sum the device did not check, a length past the chain).
+    pub merged: AtomicU32,
+    pub cut: AtomicU32,
+    pub merged_dropped: AtomicU32,
+    /// The longest merged frame seen, in bytes after the header.
+    pub merged_max: AtomicU32,
 }
 
 impl Stats {
@@ -199,6 +216,10 @@ impl Stats {
             sum_tx: AtomicU32::new(0),
             sum_rx: AtomicU32::new(0),
             sum_soft: AtomicU32::new(0),
+            merged: AtomicU32::new(0),
+            cut: AtomicU32::new(0),
+            merged_dropped: AtomicU32::new(0),
+            merged_max: AtomicU32::new(0),
         }
     }
 }
@@ -274,6 +295,8 @@ impl Inner {
             frames_tx: AtomicU32::new(0),
             back_told: Told::new(),
             offload: AtomicBool::new(false),
+            merged: AtomicBool::new(false),
+            cut_wait: AtomicBool::new(false),
             ports_base: AtomicUsize::new(0),
             stats: Stats::new(),
         }
@@ -306,6 +329,20 @@ impl Inner {
     /// Whether the device completes the sums of TCP.
     pub fn offload(&self) -> bool {
         self.offload.load(Ordering::Relaxed)
+    }
+
+    /// Whether the device merges the segments it receives.
+    pub fn merged(&self) -> bool {
+        self.merged.load(Ordering::Relaxed)
+    }
+
+    /// The buffers of receiving the stack gives back before it wakes the switch for them alone.
+    fn back_lazy(&self) -> usize {
+        if self.merged() {
+            RX_BACK_LAZY_MERGED
+        } else {
+            RX_BACK_LAZY
+        }
     }
 
     /// Frames the switch dropped (no frame) and the martian ones.
@@ -370,14 +407,17 @@ impl Inner {
         fence(Ordering::SeqCst);
         let starved = self.starved.load(Ordering::SeqCst);
         let due = if more {
-            self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= RX_BACK_LAZY || starved
+            self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= self.back_lazy() || starved
         } else {
             // One read-modify-write ends the run and reads what the switch
             // held, so that neither misses the other.
             let held = self.run.end();
             // Buffers of receiving given back wait for the switch's next step
             // (the queue has 256 of them), a frame to send does not.
-            held || !self.tx_sub.is_empty() || self.rx_back.len() >= RX_BACK_LAZY || starved
+            held || !self.tx_sub.is_empty()
+                || self.rx_back.len() >= self.back_lazy()
+                || starved
+                || self.cut_wait.load(Ordering::SeqCst)
         };
         if due && self.switch_told.tell() {
             profile::count(Counter::WakeSwitch);
@@ -406,6 +446,18 @@ impl Inner {
 }
 
 pub static INNER: Inner = Inner::new();
+
+/// A merged frame the switch is cutting into segments: the buffer it came in (its head, with the
+/// tail behind it), the bytes the device wrote, the plan, the next segment and where the
+/// segments go (decided by the first).
+#[derive(Clone, Copy)]
+struct Big {
+    n: u16,
+    used: usize,
+    plan: Plan,
+    next: usize,
+    to: Decision,
+}
 
 /// The owner of a buffer in the queue that is the stack's.
 const OWN_STACK: u8 = MAX_CONSUMERS as u8;
@@ -448,6 +500,11 @@ pub struct Switch {
     /// The device completes the sums of TCP and checks them on frames it receives
     /// (`CSUM` and `GUEST_CSUM` negotiated); without it the switch completes them.
     offload: bool,
+    /// The device merges the segments it receives (`GUEST_TSO4`): the ring of receiving is
+    /// chains, and a frame may come longer than a frame of the wire.
+    merged: bool,
+    /// The merged frame being cut.
+    big: Option<Big>,
     /// Whose each buffer of the queue of sending is, in the order they went in: the device
     /// returns them in order, so a count of reclaimed buffers pops the owners.
     fifo: [u8; TX_BUFFERS],
@@ -504,14 +561,19 @@ impl Switch {
         irq: Handle<Interrupt>,
         channel: Handle<Channel>,
         link: bool,
-        offload: bool,
+        (offload, merged): (bool, bool),
         (tables, timer, view): (Option<Tables<'static>>, Handle<Timer>, Handle<Channel>),
     ) -> Switch {
-        let mut rx = virtio_net::RxRing::new(rx_queue, net_at(DEVICE));
+        let mut rx = if merged {
+            virtio_net::RxRing::with_tails(rx_queue, net_at(DEVICE), crate::dma::TAILS_AT)
+        } else {
+            virtio_net::RxRing::new(rx_queue, net_at(DEVICE))
+        };
         if let Err(broken) = rx.fill(RX_BUFFERS) {
             fail(broken.text(false));
         }
         INNER.offload.store(offload, Ordering::Release);
+        INNER.merged.store(merged, Ordering::Release);
         use virtio_drivers::transport::Transport;
         transport.finish_init();
         ring(&mut transport, RECEIVEQ);
@@ -543,6 +605,8 @@ impl Switch {
             next_c: 0,
             scratch: [0; CELL],
             offload,
+            merged,
+            big: None,
             fifo: [0; TX_BUFFERS],
             fifo_head: 0,
             fifo_len: 0,
@@ -614,8 +678,14 @@ impl Switch {
     /// the stack was out of them and has some now.
     fn lend(&mut self) -> bool {
         let share = self.share();
+        // A device that merges segments has the segments of a merged frame read in buffers of
+        // sending (`cut_more`): the last `CUT_RESERVE` stay in the pool.
+        let keep = if self.merged { CUT_RESERVE } else { 0 };
         if share == TX_SHARE {
             while INNER.tx_supply.len() < share {
+                if self.tx.book.free() <= keep {
+                    break;
+                }
                 let Some(n) = self.tx.book.alloc() else {
                     break;
                 };
@@ -628,7 +698,7 @@ impl Switch {
                 let held = INNER.tx_supply.len()
                     + INNER.tx_sub.len()
                     + usize::from(self.inflight[usize::from(OWN_STACK)]);
-                if held >= share {
+                if held >= share || self.tx.book.free() <= keep {
                     break;
                 }
                 let Some(n) = self.tx.book.alloc() else {
@@ -824,7 +894,11 @@ impl Switch {
         // Frames left in the queue with room for them, or in the stack's
         // ring of frames to send: another step follows at once.
         let room_left = room.saturating_sub(passed);
-        let more_rx = room_left > 0 && self.rx.queue.can_pop();
+        // A merged frame with segments left goes on at once, unless it waits for the stack
+        // (`cut_wait`: the end of the stack's run wakes the switch).
+        let more_rx = room_left > 0
+            && (self.rx.queue.can_pop()
+                || self.big.is_some() && !INNER.cut_wait.load(Ordering::Relaxed));
         // While steps follow, the device is asked for no interrupt. The run
         // ends with the interrupts asked for again, a full barrier and one
         // more look at the queue, so that a frame that came between is not
@@ -1368,6 +1442,13 @@ impl Switch {
     fn receive(&mut self, mut budget: usize) -> usize {
         let mut passed = 0;
         let mut taken = 0;
+        // A merged frame cut in an earlier step goes on first: the frames behind it wait.
+        if self.big.is_some() {
+            passed += self.cut_more(&mut budget, &mut taken);
+            if self.big.is_some() {
+                return passed;
+            }
+        }
         while budget > 0 {
             if self.tables.is_some() && taken >= SWITCH_BASE && self.over_soft() {
                 break;
@@ -1382,6 +1463,19 @@ impl Switch {
             // SAFETY: the device returned the buffer (it is used), and the
             // switch holds no other reference to it.
             let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
+            // A frame longer than a frame of the wire: the device merged segments of one flow.
+            if self.merged && used > HDR_LEN + MAX_FRAME {
+                if self.begin_cut(n, used, slice) {
+                    passed += self.cut_more(&mut budget, &mut taken);
+                    if self.big.is_some() {
+                        break;
+                    }
+                } else {
+                    bump(&INNER.stats.merged_dropped);
+                    self.give(n);
+                }
+                continue;
+            }
             match frames::classify(slice, used) {
                 RxFrame::Frame(len) => {
                     profile::count(Counter::WireRx);
@@ -1466,6 +1560,160 @@ impl Switch {
         if let Err(broken) = self.rx.give(n) {
             fail(broken.text(false));
         }
+    }
+
+    /// The bytes of the merged frame in chain `n`, `used` bytes written by the device (the
+    /// header, then the frame): the part in the head and the part in the tail. None for a length
+    /// past the chain.
+    fn merged_frame(&self, n: u16, used: usize) -> Option<Frame2<'static>> {
+        let total = used.checked_sub(HDR_LEN)?;
+        if used > BUFFER_LEN + TAIL_LEN {
+            return None;
+        }
+        let first = total.min(BUFFER_LEN - HDR_LEN);
+        // SAFETY: the device returned the chain (it is used), and the switch holds no other
+        // reference to it.
+        let head = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
+        let tail: &[u8] = if total > first {
+            // SAFETY: the same chain's tail.
+            unsafe { tail_at(self.rx.tails(), n) }
+        } else {
+            &[]
+        };
+        Some(Frame2 {
+            head: &head[HDR_LEN..HDR_LEN + first],
+            tail: &tail[..total - first],
+        })
+    }
+
+    /// Starts the cut of the merged frame in chain `n` (`head` is its first buffer): false for
+    /// a frame whose data the device did not check (the sums of the segments are made over it
+    /// here, so a bad byte would pass for good) and for a frame that is no open flow of TCP in
+    /// IPv4 or whose length is no chain's; the caller drops it.
+    fn begin_cut(&mut self, n: u16, used: usize, head: &[u8]) -> bool {
+        bump(&INNER.stats.merged);
+        let longest = (used - HDR_LEN) as u32;
+        if longest > INNER.stats.merged_max.load(Ordering::Relaxed) {
+            INNER.stats.merged_max.store(longest, Ordering::Relaxed);
+        }
+        // The line says the cut works on a plain image: at each power of two.
+        let count = INNER.stats.merged.load(Ordering::Relaxed);
+        if count.is_power_of_two() {
+            rt::println!(
+                "net: merged {count} frames, the longest of {} bytes, cut into {} segments, {} dropped",
+                INNER.stats.merged_max.load(Ordering::Relaxed),
+                INNER.stats.cut.load(Ordering::Relaxed),
+                INNER.stats.merged_dropped.load(Ordering::Relaxed)
+            );
+        }
+        if !frames::sum_checked(head) {
+            return false;
+        }
+        let Some(plan) = self
+            .merged_frame(n, used)
+            .and_then(|frame| Plan::new(&frame))
+        else {
+            return false;
+        };
+        self.big = Some(Big {
+            n,
+            used,
+            plan,
+            next: 0,
+            to: Decision::Stack,
+        });
+        true
+    }
+
+    /// The merged frame ends: its buffer goes back to the device.
+    fn end_cut(&mut self) {
+        if let Some(big) = self.big.take() {
+            self.give(big.n);
+        }
+    }
+
+    /// Cuts the next segments of the merged frame and passes them on, as many as the step's
+    /// budget allows (`CUT_WEIGHT` frames each) and the stack takes: the frame stays (`self.big`)
+    /// while segments are left. The segments are frames of an MTU with whole sums (the device
+    /// checked the data), so they go with the sum good; the first names where they all go, as
+    /// the route of a flow does. The segments of the stack go in buffers of sending, read in
+    /// place and given back through `rx_back` as any frame of the switch's own turn; when the
+    /// stack's ring is full or no such buffer is free the cut waits (`cut_wait` has the end of
+    /// the stack's run wake the switch). The number of segments passed to the stack.
+    fn cut_more(&mut self, budget: &mut usize, taken: &mut usize) -> usize {
+        if INNER.cut_wait.load(Ordering::Relaxed) {
+            INNER.cut_wait.store(false, Ordering::SeqCst);
+        }
+        let mut passed = 0;
+        while let Some(mut big) = self.big {
+            if big.next >= big.plan.segments() {
+                self.end_cut();
+                break;
+            }
+            if *budget == 0 || (self.tables.is_some() && *taken >= SWITCH_BASE && self.over_soft())
+            {
+                break;
+            }
+            let Some(frame) = self.merged_frame(big.n, big.used) else {
+                bump(&INNER.stats.merged_dropped);
+                self.end_cut();
+                break;
+            };
+            let Some(len) = big.plan.build(&frame, big.next, &mut self.scratch) else {
+                bump(&INNER.stats.merged_dropped);
+                self.end_cut();
+                break;
+            };
+            let seg = &self.scratch[..len];
+            if big.next == 0 {
+                if frames::martian(seg) {
+                    INNER.martian.fetch_add(1, Ordering::Relaxed);
+                    self.end_cut();
+                    break;
+                }
+                big.to = match self.tables.as_mut() {
+                    Some(t) => route::route(t, seg, Source::Wire),
+                    None => Decision::Stack,
+                };
+                if let Decision::Drop(why) = big.to {
+                    INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
+                    self.end_cut();
+                    break;
+                }
+            }
+            match (big.to, self.tables.as_mut()) {
+                (Decision::Consumer { consumer, .. }, Some(t)) => {
+                    INNER.stats.rx_consumer.fetch_add(1, Ordering::Relaxed);
+                    INNER.stats.rx_by[usize::from(consumer) % 8].fetch_add(1, Ordering::Relaxed);
+                    route::deliver(t, sums::mark(big.to, true), seg);
+                }
+                _ => {
+                    let stack_full = INNER.rx_ready.len() >= RX_AHEAD;
+                    let Some(m) = (!stack_full).then(|| self.tx.book.alloc()).flatten() else {
+                        INNER.cut_wait.store(true, Ordering::SeqCst);
+                        self.big = Some(big);
+                        break;
+                    };
+                    // SAFETY: the buffer is free (just taken from the pool).
+                    let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), m) };
+                    slice[HDR_LEN..HDR_LEN + len].copy_from_slice(seg);
+                    if netd::books::offer(&INNER.rx_ready, pack_frame(m, len as u16, true)) {
+                        passed += 1;
+                    } else {
+                        self.tx.book.release(m);
+                        INNER.cut_wait.store(true, Ordering::SeqCst);
+                        self.big = Some(big);
+                        break;
+                    }
+                }
+            }
+            bump(&INNER.stats.cut);
+            big.next += 1;
+            self.big = Some(big);
+            *budget = budget.saturating_sub(CUT_WEIGHT);
+            *taken += CUT_WEIGHT;
+        }
+        passed
     }
 
     /// Rings the doorbell of each queue that got buffers, once for a run
