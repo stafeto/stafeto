@@ -190,7 +190,7 @@ fn with_tls(base: &str) -> String {
         let text = crate::nginx_probe::replaced(
             base,
             "worker_shutdown_timeout 5s;\n",
-            "worker_shutdown_timeout 5s;\nenv STAFETO_FAST_STATS;\n",
+            "worker_shutdown_timeout 5s;\nenv STAFETO_FAST_STATS;\nenv STAFETO_FAST_WAKES;\n",
         );
         crate::nginx_probe::replaced(
             &text,
@@ -988,6 +988,8 @@ fn scenario(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     booted(run)?;
+    run.send("export STAFETO_FAST_WAKES=1")?;
+    run.expect("# ", DIALOG_STEP)?;
     // 1.
     let up = started(run, CONF)?;
     let (master, workers) = master_and_workers(run, "start", true)?;
@@ -1037,7 +1039,9 @@ fn scenario(
         notes.push(format!(
             "4: the worker holds {rss} KiB and the master {master_rss} KiB after the load"
         ));
-        // 5.
+        // 5. The totals the worker says every second, one line before the
+        // pauses and one after.
+        let before = wakes_line(run)?;
         let (median, slow) = wake(address)?;
         notes.push(format!(
             "5: median answer after a pause of 60 ms {} us (at most {} us), {:.0} % over {} us (at most {:.0} %)",
@@ -1055,6 +1059,12 @@ fn scenario(
                 WAKE_SLOW.as_micros()
             ));
         }
+        let wakes = wakes_line(run)?.since(&before);
+        check_wakes(&wakes)?;
+        notes.push(format!(
+            "5: {} sleeps of the worker during the pauses, {} ended by a notification, {} by the deadline ({} of those with a frame already in the ring, at most 1 %), {} by another descriptor",
+            wakes.sleeps, wakes.bell, wakes.deadline, wakes.deadline_found, wakes.other
+        ));
         // 6.
         notes.push(format!("6: {}", reload(run, address)?));
         tls_streams(tls, "after the reload")?;
@@ -1258,6 +1268,89 @@ pub fn parse_stats(line: &str) -> Option<Stats> {
     })
 }
 
+/// The sleeps of the worker's loop by what woke them, from a line of the glue.
+#[derive(Debug, PartialEq)]
+pub struct Wakes {
+    pub sleeps: u64,
+    pub bell: u64,
+    pub deadline: u64,
+    pub other: u64,
+    pub deadline_found: u64,
+}
+
+impl Wakes {
+    /// What came between two lines (`self` the later one).
+    pub fn since(&self, before: &Wakes) -> Wakes {
+        Wakes {
+            sleeps: self.sleeps.saturating_sub(before.sleeps),
+            bell: self.bell.saturating_sub(before.bell),
+            deadline: self.deadline.saturating_sub(before.deadline),
+            other: self.other.saturating_sub(before.other),
+            deadline_found: self.deadline_found.saturating_sub(before.deadline_found),
+        }
+    }
+}
+
+/// `fast: wakes sleeps=N bell=N deadline=N other=N deadline_found=N`.
+pub fn parse_wakes(line: &str) -> Option<Wakes> {
+    let rest = line.split("fast: wakes ").nth(1)?;
+    let field = |name: &str| -> Option<u64> {
+        rest.split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    Some(Wakes {
+        sleeps: field("sleeps")?,
+        bell: field("bell")?,
+        deadline: field("deadline")?,
+        other: field("other")?,
+        deadline_found: field("deadline_found")?,
+    })
+}
+
+/// What the worker did during the paused requests (the change of the counters
+/// over step 5 alone). A sleep that ended by the deadline with a frame already
+/// in the ring may be a lost wake-up or a notification still on its way (the
+/// ring is looked at the instant the sleep ends), so the probe judges the
+/// share of the wakes that had a frame: `deadline_found` of `bell + deadline_found`
+/// stays at most a quarter (about 5 % on QEMU's TCG with the interrupt working,
+/// half with it switched off in every second sleep) and at least
+/// `WAKES_ALLOWED` of them pass whatever the count. The interrupt of the device
+/// wakes the idle loop and the deadline is only the backstop; the counters rule
+/// out a lost wake-up and say nothing of a slow one. The sleeps seen must reach
+/// `WAKES_MIN`.
+const WAKES_MIN: u64 = 30;
+const WAKES_ALLOWED: u64 = 2;
+pub fn check_wakes(w: &Wakes) -> Result<(), String> {
+    if w.sleeps < WAKES_MIN {
+        return Err(format!(
+            "the worker slept {} times, wanted {WAKES_MIN}",
+            w.sleeps
+        ));
+    }
+    let with_frames = w.bell + w.deadline_found;
+    if w.deadline_found > WAKES_ALLOWED && w.deadline_found * 4 > with_frames {
+        return Err(format!(
+            "{} of {with_frames} wakes with a frame in the ring ended by the deadline (at most a quarter): the interrupt did not wake the loop",
+            w.deadline_found
+        ));
+    }
+    Ok(())
+}
+
+/// The next line `fast: wakes` the worker says (every second).
+fn wakes_line(run: &mut qemu::Run) -> Result<Wakes, String> {
+    run.send("echo wakes-mark")?;
+    run.expect("wakes-mark", DIALOG_STEP)?;
+    let line = run.expect_line(
+        "the counters of the sleeps",
+        |l| l.contains("fast: wakes "),
+        Duration::from_secs(8),
+    )?;
+    parse_wakes(&line).ok_or_else(|| format!("no counters in {line:?}"))
+}
+
 /// `wrk -t2 -c200 -d<seconds>s URL` run on the Mac.
 fn wrk(url: &str, seconds: u64) -> Result<Wrk, String> {
     let output = std::process::Command::new("wrk")
@@ -1434,6 +1527,63 @@ pub fn vz_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wakes_bound_is_a_quarter_of_the_wakes_with_a_frame() {
+        let line = "fast: wakes sleeps=1000 bell=980 deadline=15 other=5 deadline_found=10";
+        let w = parse_wakes(line).unwrap();
+        assert_eq!(
+            w,
+            Wakes {
+                sleeps: 1000,
+                bell: 980,
+                deadline: 15,
+                other: 5,
+                deadline_found: 10
+            }
+        );
+        assert!(check_wakes(&w).is_ok());
+        // More than a quarter of the wakes that had a frame fails.
+        let slow = Wakes {
+            bell: 29,
+            deadline_found: 10,
+            ..w
+        };
+        assert!(check_wakes(&slow).is_err());
+        assert!(check_wakes(&Wakes { bell: 30, ..slow }).is_ok());
+        // A small number of sleeps tolerates the allowance and no more.
+        let few = |found| Wakes {
+            sleeps: 100,
+            bell: 4,
+            deadline: 0,
+            other: 0,
+            deadline_found: found,
+        };
+        assert!(check_wakes(&few(2)).is_ok());
+        assert!(check_wakes(&few(3)).is_err());
+        assert!(
+            check_wakes(&Wakes {
+                sleeps: 5,
+                ..few(0)
+            })
+            .is_err()
+        );
+        assert_eq!(parse_wakes("fast: stats ticks=1"), None);
+    }
+
+    #[test]
+    fn the_change_between_two_lines_is_what_the_bound_judges() {
+        let a = parse_wakes("fast: wakes sleeps=500 bell=480 deadline=15 other=5 deadline_found=9")
+            .unwrap();
+        let b = parse_wakes("fast: wakes sleeps=560 bell=538 deadline=17 other=5 deadline_found=9")
+            .unwrap();
+        let d = b.since(&a);
+        assert_eq!(
+            (d.sleeps, d.bell, d.deadline, d.deadline_found),
+            (60, 58, 2, 0)
+        );
+        assert!(check_wakes(&d).is_ok());
+    }
 
     #[test]
     fn the_images_have_the_table_and_the_program() {

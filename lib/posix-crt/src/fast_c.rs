@@ -108,6 +108,23 @@ pub unsafe extern "C" fn stafeto_fast_wait(timeout_ns: u64, bits: *mut u32) -> c
     }
 }
 
+/// The counters of the sleeps of the program's loop: `out[0]` sleeps, `out[1]`
+/// wakes by a notification of the service, `out[2]` wakes by the deadline,
+/// `out[3]` wakes by an event of another descriptor.
+///
+/// # Safety
+/// `out` is null or points to four writable `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_wake_counts(out: *mut u64) {
+    if out.is_null() {
+        return;
+    }
+    for (k, value) in posix_abi::epoll::wake_counts().into_iter().enumerate() {
+        // SAFETY: the caller's pointer holds four words.
+        unsafe { out.add(k).write(value) };
+    }
+}
+
 /// Tells the network service of frames in the bypass ring.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fast_kick(count: u32) -> c_int {

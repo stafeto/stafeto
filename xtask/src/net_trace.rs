@@ -38,6 +38,7 @@ const N_STK_BEGIN: u8 = 14;
 const N_STK_END: u8 = 15;
 const N_REQ_BEGIN: u8 = 16;
 const N_REQ_END: u8 = 17;
+const N_IRQ1: u8 = 18;
 const W_WAKE: u8 = 32;
 const W_RX: u8 = 33;
 const W_TX: u8 = 34;
@@ -473,6 +474,7 @@ fn point_name(id: u8) -> String {
         (N_STK_END, "stack step end"),
         (N_REQ_BEGIN, "request received"),
         (N_REQ_END, "request answered"),
+        (N_IRQ1, "interrupt of the second device"),
         (W_WAKE, "worker woke"),
         (W_RX, "worker took a frame"),
         (W_TX, "worker put a frame"),

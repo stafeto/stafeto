@@ -1888,10 +1888,12 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 // among them): the copy of the configuration passes the
                 // variable on to the worker.
                 run.send(&format!(
-                    "(echo 'env STAFETO_FAST_STATS;'; cat {conf}) > /tmp/fast-stats.conf"
+                    "(echo 'env STAFETO_FAST_STATS;'; echo 'env STAFETO_FAST_WAKES;'; cat {conf}) > /tmp/fast-stats.conf"
                 ))?;
                 run.expect("# ", DIALOG_STEP)?;
-                run.send("STAFETO_FAST_STATS=1 nginx-fast -c /tmp/fast-stats.conf & M=$!")?;
+                run.send(
+                    "STAFETO_FAST_STATS=1 STAFETO_FAST_WAKES=1 nginx-fast -c /tmp/fast-stats.conf & M=$!",
+                )?;
             } else {
                 run.send(&format!("nginx-fast -c {conf} & M=$!"))?;
             }
