@@ -16,6 +16,7 @@
 pub mod image_probe;
 pub mod images;
 pub mod loaders;
+pub mod placing;
 pub mod queue;
 pub mod queued;
 pub mod records;
