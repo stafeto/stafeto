@@ -1107,7 +1107,7 @@ impl Driver<'_> {
         profile::store(Counter::Ran, self.ran());
         // How the load is shared: the SYNs of each member of a group, the frames of each
         // consumer of the switch.
-        for (at, n) in self.net.groups.served_by_position().iter().enumerate() {
+        for (at, n) in self.inst.net.groups.served_by_position().iter().enumerate() {
             profile::store_at(Counter::Member0, at, *n);
         }
         for (at, n) in switch::INNER.stats.rx_by.iter().enumerate() {
