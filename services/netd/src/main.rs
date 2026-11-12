@@ -395,6 +395,7 @@ fn main(_: u64) -> u64 {
         cpus => cpus,
     };
     let instances = netd::home::count(cpus);
+    rt::println!("net: {instances} stack instances, CPUs {cpus:#b} of {allowed:#b}");
     let mut extra: [Option<Extra>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
     for slot in extra.iter_mut().take(instances).skip(1) {
         match Extra::new(level) {
@@ -2003,7 +2004,7 @@ impl Driver<'_> {
             Ok(session) => {
                 s.data.homed = true;
                 let there = netd::home::cpu_of(self.cpus, home).unwrap_or(0);
-                match r.reply().u32(there) {
+                match sockets::write_word(r.reply(), there) {
                     Ok(()) => Answer::Reply([session.erase()].into()),
                     Err(status) => Answer::Status(status),
                 }
@@ -2219,7 +2220,7 @@ impl Driver<'_> {
 /// The answer of HOME that leaves the session where it is, at the instance on CPU `here`.
 fn stays(s: &mut Session<Client, 0>, r: &mut Request<'_>, here: u32) -> Answer {
     s.data.homed = true;
-    match r.reply().u32(here) {
+    match sockets::write_word(r.reply(), here) {
         Ok(()) => Answer::Reply(Outgoing::new()),
         Err(status) => Answer::Status(status),
     }

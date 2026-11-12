@@ -2144,7 +2144,10 @@ impl Net {
                     self.births[birth] = Some((label, Held::EMPTY, root, s.label()));
                 }
                 self.counters.homed += 1;
-                Answer::Reply([session.erase()].into())
+                match sockets::write_cloned(r.reply(), 0) {
+                    Ok(()) => Answer::Reply([session.erase()].into()),
+                    Err(status) => Answer::Status(status),
+                }
             }
             Err(e) => {
                 self.clones.gone(label);

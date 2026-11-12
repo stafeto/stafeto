@@ -3285,7 +3285,7 @@ static void instances(void)
 		int status = 0;
 		REQUIRE(waitpid(pids[i], &status, 0) == pids[i]);
 		REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-		printf("posix-net: note: instances worker %d cpu %d home %d calls %u remote %u\n",
+		printf("posix-net: instances note: worker %d cpu %d home %d calls %u remote %u\n",
 		       i, rep.cpu, rep.home, rep.calls, rep.remote);
 		/* The worker stood on the CPU its mask names, its home is the instance of that CPU,
 		 * and no call it made crossed to another CPU. */
