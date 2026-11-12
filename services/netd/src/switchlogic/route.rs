@@ -95,10 +95,14 @@ pub enum Reason {
     Flows,
     /// An entry with `TX_SUM` on a device without the offload (ATTACH said so).
     Sum,
+    /// A frame of the segmentation offload the rules of `virtio_net::tso` refuse, one for the
+    /// shared address (it never reaches the device: the stack leaves such flows without the
+    /// offload), or an entry with `TX_TSO` on a device that does not cut.
+    Tso,
 }
 
 impl Reason {
-    pub const COUNT: usize = Reason::Sum as usize + 1;
+    pub const COUNT: usize = Reason::Tso as usize + 1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,6 +521,31 @@ pub fn check_tx(t: &mut Tables, c: u8, frame: &[u8]) -> Verdict {
         if let Some(x) = t.consumers[usize::from(c)].as_mut() {
             x.ring.refused = x.ring.refused.wrapping_add(1);
         }
+    }
+    v
+}
+
+/// `check_tx` for the headers of a frame of the segmentation offload: `head` is the copy of its
+/// first bytes with `headers` bytes of Ethernet, IPv4 and TCP headers (`virtio_net::tso::parse`
+/// checked them against the frame's length). The rules of section 4 hold for the headers as for a
+/// frame that has no data: MAC, addresses, the four-tuple in the table of flows. A frame for the
+/// shared address is refused (it would be a turn, which the device never sees).
+pub fn check_tso(t: &mut Tables, c: u8, head: &[u8], headers: usize) -> Verdict {
+    t.guard.check();
+    // The copy stands for a frame of the headers alone: its IP length says so.
+    let mut only = [0u8; virtio_net::cut::MAX_HEADERS];
+    let Some(only) = only.get_mut(..headers) else {
+        return Verdict::Refuse(Reason::Tso);
+    };
+    only.copy_from_slice(&head[..headers]);
+    only[ETHERNET_HEADER + 2..ETHERNET_HEADER + 4]
+        .copy_from_slice(&((headers - ETHERNET_HEADER) as u16).to_be_bytes());
+    let v = match verdict(t, c, only, false) {
+        Verdict::Hairpin => Verdict::Refuse(Reason::Tso),
+        v => v,
+    };
+    if let Verdict::Refuse(r) = v {
+        refuse_tx(t, c, r);
     }
     v
 }
@@ -2046,6 +2075,49 @@ mod tests {
             Verdict::Refuse(r) => r,
             v => panic!("{v:?}"),
         }
+    }
+
+    #[test]
+    fn the_headers_of_a_frame_of_the_offload_pass_the_rules_of_a_frame_of_the_consumer() {
+        with(|t, _| {
+            // The flow exists (its SYN went out as an ordinary frame); the frame of the offload
+            // is a segment of it.
+            assert_eq!(check_tx(t, 0, &out_tcp(BLOCK0, 80, SYN)), Verdict::Send);
+            let head = out_tcp(BLOCK0, 80, ACK_);
+            assert_eq!(head.len(), 54);
+            assert_eq!(check_tso(t, 0, &head, 54), Verdict::Send);
+            // The copy is longer than the headers (up to 128 bytes of the frame): the rest does
+            // not count, and the length field says nothing about it.
+            let mut long = head.clone();
+            long.extend_from_slice(&[0xAA; 70]);
+            assert_eq!(check_tso(t, 0, &long, 54), Verdict::Send);
+            let before = t.refused[Reason::Tso as usize];
+            // A flow the consumer does not have, a source port of another consumer's block.
+            for other in [out_tcp(BLOCK0, 81, ACK_), out_tcp(BLOCK2, 80, ACK_)] {
+                assert_eq!(check_tso(t, 0, &other, 54), Verdict::Refuse(Reason::Tcp));
+            }
+            // A frame for the shared address never reaches the device: refused as a turn.
+            assert_eq!(check_tx(t, 0, &hair_tcp(BLOCK0, 90, SYN)), Verdict::Hairpin);
+            let turn = hair_tcp(BLOCK0, 90, ACK_);
+            assert_eq!(check_tso(t, 0, &turn, 54), Verdict::Refuse(Reason::Tso));
+            assert_eq!(t.refused[Reason::Tso as usize], before + 1);
+            // Another source MAC, address or options are the frame's own faults.
+            let mut f = head.clone();
+            f[6] ^= 1;
+            assert_eq!(check_tso(t, 0, &f, 54), Verdict::Refuse(Reason::SrcMac));
+            let mut f = head.clone();
+            f[26] ^= 1;
+            assert_eq!(check_tso(t, 0, &f, 54), Verdict::Refuse(Reason::SrcAddr));
+            let opt = with_options(&head, 4);
+            assert_eq!(
+                check_tso(t, 0, &opt, opt.len()),
+                Verdict::Refuse(Reason::Ipv4)
+            );
+            // Headers longer than the copy.
+            assert_eq!(check_tso(t, 0, &head, 600), Verdict::Refuse(Reason::Tso));
+            // Every refusal is counted in the consumer's ring too.
+            assert!(t.consumers[0].as_ref().unwrap().ring.refused >= 6);
+        });
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! (`pop`, `reclaim`).
 
 use crate::barrier;
-use crate::books::{QUEUE_SIZE, RxBook, TAIL_LEN, TAILS, TxBook, offset};
+use crate::books::{CHAIN_MAX, QUEUE_SIZE, RxBook, TAIL_LEN, TAILS, TxBook, offset};
 use crate::frames::{BUFFER_LEN, Csum, HDR_LEN, tx_prepare_with};
 use virtio_drivers::Hal;
 use virtio_drivers::queue::VirtQueue;
@@ -406,6 +406,44 @@ impl<H: Hal> TxRing<H> {
         }
     }
 
+    /// Puts the frame of the segmentation offload in the queue as one chain: `buffers` hold the
+    /// header of virtio (`tso::header`, written by the caller in the first) and `total` bytes
+    /// in all, `BUFFER_LEN` to a buffer and the rest in the last. The buffers are the pool's and
+    /// the device does not hold them; a chain that does not fit the length, or a full queue,
+    /// puts them all back in the pool (`Dropped`).
+    pub fn submit_chain(&mut self, buffers: &[u16], total: usize) -> Result<Sent, Broken> {
+        let n = buffers.len();
+        let mut parts: [&[u8]; CHAIN_MAX] = [&[]; CHAIN_MAX];
+        let fits = n <= CHAIN_MAX && total > HDR_LEN && total.div_ceil(BUFFER_LEN) == n;
+        if fits {
+            for (i, &b) in buffers.iter().enumerate() {
+                // SAFETY: the buffer is the pool's and the device does not hold it.
+                let slice = unsafe { buffer_at(self.base, b) };
+                parts[i] = &slice[..(total - i * BUFFER_LEN).min(BUFFER_LEN)];
+            }
+        }
+        // SAFETY: the buffers are untouched until `reclaim` pops the chain.
+        let sent = if fits {
+            unsafe { self.queue.add(&parts[..n], &mut []) }.map_err(|_| ())
+        } else {
+            Err(())
+        };
+        match sent {
+            Ok(token) if self.book.sent_chain(token, buffers) => {
+                self.dirty = true;
+                self.pending += 1;
+                Ok(Sent::Queued)
+            }
+            Ok(_) => Err(Broken::Twice),
+            Err(()) => {
+                for &b in buffers {
+                    self.book.release(b);
+                }
+                Ok(Sent::Dropped)
+            }
+        }
+    }
+
     /// Takes back up to `limit` of the buffers the device sent; how many.
     /// The rest stay in the ring of used buffers for the next call: a device
     /// that sends a whole queue at once (QEMU's bottom half run late, VZ)
@@ -413,6 +451,9 @@ impl<H: Hal> TxRing<H> {
     /// of the service would make that step as long as the queue.
     #[inline]
     pub fn reclaim(&mut self, limit: usize) -> Result<usize, Broken> {
+        // The chain of a frame of the segmentation offload is one entry of the used ring and
+        // gives back all its buffers: the count is the buffers.
+        let mut buffers = 0;
         take_back(limit, || {
             if !self.queue.can_pop() {
                 return Ok(false);
@@ -421,15 +462,22 @@ impl<H: Hal> TxRing<H> {
             let Some(token) = self.queue.peek_used() else {
                 return Ok(false);
             };
+            let chain = self.book.chain_len(token);
             let n = self.book.reclaim(token).ok_or(Broken::Unknown)?;
             // SAFETY: the device returned the buffer; the book gave it back
             // to the pool just now and nothing uses it before this ends.
             let slice = unsafe { buffer_at(self.base, n) };
-            // SAFETY: the buffer `submit` added with this token; only the
-            // number of descriptors of the chain matters to the crate.
-            let popped = unsafe { self.queue.pop_used(token, &[&slice[..HDR_LEN]], &mut []) };
+            let head: &[u8] = &slice[..HDR_LEN];
+            // SAFETY: the buffers `submit` or `submit_chain` added with this token; only
+            // the number of descriptors of the chain matters to the crate.
+            let popped = unsafe {
+                self.queue
+                    .pop_used(token, &[head; CHAIN_MAX][..chain], &mut [])
+            };
+            buffers += chain;
             popped.map(|_| true).map_err(|_| Broken::NotTaken)
-        })
+        })?;
+        Ok(buffers)
     }
 }
 
@@ -727,5 +775,51 @@ mod tests {
         assert_eq!(ring.pop(), Ok(Some((0, 64_306))));
         assert_eq!(ring.pop(), Ok(None));
         ring.give(0).unwrap();
+    }
+
+    #[test]
+    fn a_frame_of_the_offload_goes_as_one_chain_and_comes_back_as_its_buffers() {
+        const NEXT: u16 = 1;
+        let (rig, rx) = rig();
+        let mut tx = TxRing::new(rx.queue, rig.heads);
+        let total = HDR_LEN + 10_300;
+        let take = |tx: &mut TxRing<crate::Host<0>>, n: usize| -> Vec<u16> {
+            (0..n).map(|_| tx.book.alloc().unwrap()).collect()
+        };
+        let buffers = take(&mut tx, total.div_ceil(BUFFER_LEN));
+        assert_eq!(buffers.len(), 6);
+        assert_eq!(tx.submit_chain(&buffers, total), Ok(Sent::Queued));
+        assert_eq!(tx.book.outstanding(), 6);
+        let mut at = 0;
+        let mut seen = 0;
+        loop {
+            let (addr, len, flags, next) = descriptor(&rig, at);
+            let want = (total - seen * BUFFER_LEN).min(BUFFER_LEN);
+            assert_eq!(
+                (addr, len),
+                (
+                    (rig.heads + usize::from(buffers[seen]) * BUFFER_LEN) as u64,
+                    want as u32
+                )
+            );
+            seen += 1;
+            if flags & NEXT == 0 {
+                break;
+            }
+            at = usize::from(next);
+        }
+        assert_eq!(seen, 6, "one descriptor for each buffer");
+        // The device returns the chain by its head; every buffer is back in the pool.
+        device_uses(&rig, 0, 0, 0);
+        assert_eq!(tx.reclaim(8), Ok(6));
+        assert_eq!(tx.book.free(), crate::books::TX_BUFFERS);
+        assert_eq!(tx.book.outstanding(), 0);
+        // A length that does not fit the buffers, and one buffer too many, are no chain.
+        let two = take(&mut tx, 2);
+        assert_eq!(tx.submit_chain(&two, HDR_LEN + 100), Ok(Sent::Dropped));
+        assert_eq!(tx.book.free(), crate::books::TX_BUFFERS, "back in the pool");
+        let ten = take(&mut tx, 10);
+        assert_eq!(tx.submit_chain(&ten, 10 * BUFFER_LEN), Ok(Sent::Dropped));
+        assert_eq!(tx.book.free(), crate::books::TX_BUFFERS);
     }
 }

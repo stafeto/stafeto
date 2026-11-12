@@ -15,11 +15,19 @@
 //! TX ring (8 bytes), `rx_slots` cells to receive into and `tx_slots` to
 //! send from, `CELL` bytes each (a cell of FILL is a cell number below `rx_slots`). Every index is a u32 that grows without
 //! wrapping to the size; the entry of index `i` is `i % slots`.
+//!
+//! A frame of up to `TSO_FRAME_MAX` bytes (the segmentation offload, `TX_SUM | TX_TSO`) takes
+//! `k = cells(len)` entries in a row, and so the `k` cells of those entries, which lie one after
+//! the other in the object: the first entry has the length of the whole frame and the MSS in its
+//! spare, the next `k - 1` are zero. A frame never runs over the end of the array of cells: the
+//! consumer first writes a `TX_PAD` entry that skips the rest of the array (its spare is the
+//! number of entries it skips, itself included). The switch takes the frame in pieces and frees
+//! the entries (`TX_TAIL` moves by `k`) after the last.
 
 use crate::{Config, Method};
 use proto_wire::{Reader, Status, Writer};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const PAGE: usize = 4096;
 pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
@@ -67,9 +75,42 @@ pub const TX_FLAGS: u16 = 0;
 /// without the offload) completes the sum over the segment. The flag stands alone: with
 /// `TX_LOOP` or on a frame that is no TCP the entry is refused.
 pub const TX_SUM: u16 = 1;
+/// A frame of TCP in IPv4 longer than one cell, which the device cuts into segments of the MSS in
+/// the entry's spare (the offload of the segmentation): `TX_SUM | TX_TSO`, the frame in
+/// `cells(len)` cells in a row. Allowed only when ATTACH said `tso`. Refused (and counted) for a
+/// frame the checks of the header refuse (`netd::switchlogic::tso`).
+pub const TX_TSO: u16 = 2;
+/// The entry that skips the cells to the end of the array of cells (the next frame of the
+/// segmentation offload starts at the first); its spare is the number of entries it skips.
+pub const TX_PAD: u16 = 8;
+/// The bytes of headers of a frame of the segmentation offload that the switch copies and
+/// checks (Ethernet, IPv4 and TCP with options), and the most of data after them.
+pub const TSO_HEAD_MAX: usize = 128;
+pub const TSO_BODY_MAX: usize = 16384;
+pub const TSO_FRAME_MAX: usize = TSO_BODY_MAX + TSO_HEAD_MAX;
+/// The least MSS of an entry of the segmentation offload (RFC 9293, 3.7.1: the default 536), and
+/// the most (1 500 less the shortest IPv4 and TCP headers, the largest MTU of the wire).
+pub const TSO_MSS_MIN: u16 = 536;
+pub const TSO_MSS_MAX: u32 = 1460;
+/// The shortest frame of the segmentation offload: Ethernet, IPv4 and TCP headers without options.
+pub const TSO_HEAD_MIN: usize = 54;
+/// The most cells a frame of the segmentation offload takes.
+pub const TSO_CELLS_MAX: u32 = TSO_FRAME_MAX.div_ceil(CELL) as u32;
+const _: () = assert!(TSO_CELLS_MAX == 9);
+
+/// The cells (and the entries of TX) a frame of `len` bytes takes.
+pub const fn cells(len: usize) -> u32 {
+    if len == 0 {
+        1
+    } else {
+        len.div_ceil(CELL) as u32
+    }
+}
+
 /// A packet of the loopback network of the consumer's stack for a port that is no port of
 /// that stack (both addresses in 127.0.0.0/8, else the ring breaks); the switch routes it by
-/// its port. `TX_FLAGS`, `TX_SUM` and `TX_LOOP` are the values the flags of a TX entry may have.
+/// its port. `TX_FLAGS`, `TX_SUM`, `TX_LOOP`, `TX_SUM | TX_TSO` and `TX_PAD` are the values the
+/// flags of a TX entry may have.
 pub const TX_LOOP: u16 = 4;
 
 /// The bits the switch notifies the consumer with.
@@ -141,6 +182,14 @@ impl Layout {
     }
     pub const fn total(&self) -> usize {
         self.tx_cells() + self.tx_slots as usize * CELL
+    }
+    /// Whether `k` entries from index `i` lie in a row in the array (no run over its end).
+    pub const fn tx_run_fits(&self, i: u32, k: u32) -> bool {
+        (i % self.tx_slots) as u64 + k as u64 <= self.tx_slots as u64
+    }
+    /// The entries from index `i` to the end of the array of cells.
+    pub const fn tx_to_end(&self, i: u32) -> u32 {
+        self.tx_slots - i % self.tx_slots
     }
 }
 
@@ -311,6 +360,9 @@ pub struct Attached {
     /// The device completes the sums of TCP: only then may an entry say `TX_SUM` (else it is
     /// refused). The consumer sums its own segments otherwise.
     pub offload: bool,
+    /// The device cuts frames of TCP into segments (`HOST_TSO4`): only then may an entry say
+    /// `TX_SUM | TX_TSO` (else it is refused). Implies `offload`.
+    pub tso: bool,
 }
 
 impl Attached {
@@ -321,7 +373,8 @@ impl Attached {
         self.config.write_fields(w)?;
         w.u32(self.block_first)?;
         w.u32(self.block_count)?;
-        w.u32(u32::from(self.offload))
+        w.u32(u32::from(self.offload))?;
+        w.u32(u32::from(self.tso))
     }
 
     /// A refusal is its status alone and comes back as the error.
@@ -339,6 +392,7 @@ impl Attached {
         let config = Config::read_fields(&mut r)?;
         let (block_first, block_count) = (r.u32()?, r.u32()?);
         let offload = r.u32()? != 0;
+        let tso = r.u32()? != 0;
         r.finish()?;
         Ok(Attached {
             consumer,
@@ -347,6 +401,7 @@ impl Attached {
             block_first,
             block_count,
             offload,
+            tso,
         })
     }
 }
@@ -515,6 +570,35 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_of_the_offload_takes_cells_and_runs_in_a_row_that_do_not_cross_the_end() {
+        assert_eq!(cells(0), 1);
+        assert_eq!(cells(1), 1);
+        assert_eq!(cells(CELL), 1);
+        assert_eq!(cells(CELL + 1), 2);
+        assert_eq!(cells(10_300), 6);
+        assert_eq!(cells(TSO_BODY_MAX + TSO_HEAD_MAX), 9);
+        assert_eq!(cells(TSO_FRAME_MAX), TSO_CELLS_MAX);
+        let l = Layout::new(256, 64).unwrap();
+        assert!(l.tx_run_fits(0, 9) && l.tx_run_fits(55, 9) && !l.tx_run_fits(56, 9));
+        assert!(l.tx_run_fits(63, 1) && !l.tx_run_fits(63, 2));
+        assert!(l.tx_run_fits(64 + 55, 9), "the index wraps with the array");
+        assert_eq!(l.tx_to_end(0), 64);
+        assert_eq!(l.tx_to_end(61), 3);
+        assert_eq!(l.tx_to_end(64), 64);
+        assert_eq!(
+            l.tx_to_end(u32::MAX),
+            1,
+            "indices wrap past u32 with the array"
+        );
+        // The cells of a run lie one after the other.
+        assert_eq!(l.tx_cell(9) + 3 * CELL, l.tx_cell(12));
+        // The flags of the offload and the pad are bits of their own.
+        assert_eq!(TX_SUM | TX_TSO | TX_LOOP | TX_PAD, 15);
+        assert_eq!(TX_TSO, 2);
+        assert_eq!(TX_PAD, 8);
+    }
+
+    #[test]
     fn attach_round_trips_and_refuses_bad_sizes() {
         let mut w = Writer::new();
         write_attach(Layout::DEFAULT, &mut w).unwrap();
@@ -542,6 +626,7 @@ mod tests {
             block_first: 49152,
             block_count: 512,
             offload: true,
+            tso: true,
         };
         let mut w = Writer::new();
         a.write(&mut w).unwrap();
@@ -549,6 +634,7 @@ mod tests {
         assert_eq!(Attached::read(w.as_bytes()), Ok(a));
         let off = Attached {
             offload: false,
+            tso: false,
             ..a
         };
         let mut w = Writer::new();

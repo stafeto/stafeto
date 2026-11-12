@@ -244,14 +244,14 @@ glue_stats(void)
     stats_said = ticks;
     ff_stafeto_device_stats(&st);
     fprintf(stderr,
-        "fast: stats ticks=%llu notifications=%llu kicks=%llu sleeps=%llu found_work=%llu passes=%llu rx=%llu tx=%llu bell_rx_passes=%llu bell_rx=%llu bell_tx=%llu sum_tx=%llu sum_rx=%llu\n",
+        "fast: stats ticks=%llu notifications=%llu kicks=%llu sleeps=%llu found_work=%llu passes=%llu rx=%llu tx=%llu bell_rx_passes=%llu bell_rx=%llu bell_tx=%llu sum_tx=%llu sum_rx=%llu tso_tx=%llu\n",
         (unsigned long long)ticks, (unsigned long long)st.notifications,
         (unsigned long long)st.kicks, (unsigned long long)st.sleeps,
         (unsigned long long)st.sleeps_found_work, (unsigned long long)passes,
         (unsigned long long)st.rx_frames, (unsigned long long)st.tx_frames,
         (unsigned long long)st.bell_rx_passes, (unsigned long long)st.bell_rx,
         (unsigned long long)st.bell_tx, (unsigned long long)st.tx_sum,
-        (unsigned long long)st.rx_sum_ok);
+        (unsigned long long)st.rx_sum_ok, (unsigned long long)st.tx_tso);
     glue_scale();
     fflush(stderr);
 }

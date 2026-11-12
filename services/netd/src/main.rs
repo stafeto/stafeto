@@ -671,6 +671,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "probe")]
         held_tx: false,
         merged_next: 1,
+        tso_next: 1,
         #[cfg(feature = "probe")]
         longest: [0; 2],
         #[cfg(any(feature = "probe", feature = "profile"))]
@@ -1125,6 +1126,8 @@ struct Driver<'a> {
     held_tx: bool,
     /// The count of merged frames at which the stack says the line of the cut next.
     merged_next: u32,
+    /// The count of frames of the segmentation offload at which the next line is said.
+    tso_next: u32,
     /// The longest step of waking and of departure so far (the probe's lines
     /// `net: step wake` and `net: step cleanup`, which the measurement of the
     /// interest sets reads: the own steps of the service are one kind).
@@ -1251,6 +1254,15 @@ impl Driver<'_> {
             return;
         }
         let st = &switch::INNER.stats;
+        let tso = st.tso.load(core::sync::atomic::Ordering::Relaxed);
+        if tso >= self.tso_next {
+            self.tso_next = (tso + 1).next_power_of_two();
+            rt::println!(
+                "net: tso {tso} frames in {} chunks, {} waited for buffers",
+                st.tso_chunks.load(core::sync::atomic::Ordering::Relaxed),
+                st.tso_waits.load(core::sync::atomic::Ordering::Relaxed)
+            );
+        }
         let count = st.merged.load(core::sync::atomic::Ordering::Relaxed);
         if count >= self.merged_next {
             self.merged_next = (count + 1).next_power_of_two();

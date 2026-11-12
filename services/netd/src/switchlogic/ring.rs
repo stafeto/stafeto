@@ -84,6 +84,13 @@ pub enum Tx {
     Sum(usize),
     /// A packet of the loopback network of this length (`TX_LOOP`).
     Loop(usize),
+    /// A frame of the segmentation offload (`TX_SUM | TX_TSO`): its first `TSO_HEAD_MAX` bytes
+    /// (or all of a shorter frame) are in the buffer, the rest stays in the cells (`tso_read`)
+    /// until `tso_done`. The entries stay in TX meanwhile.
+    Tso {
+        len: usize,
+        mss: u16,
+    },
     /// An entry with flags or a spare or a length the cell cannot hold: dropped.
     Refused,
 }
@@ -99,6 +106,8 @@ pub struct ConsumerRing {
     done_tail: u32,
     broken: Option<Violation>,
     told: bool,
+    /// The entries of the frame of the segmentation offload the switch holds (0: none).
+    held: u32,
     pub rx_full: u32,
     pub refused: u32,
 }
@@ -126,6 +135,7 @@ impl ConsumerRing {
             done_tail: 0,
             broken: None,
             told: false,
+            held: 0,
             rx_full: 0,
             refused: 0,
         })
@@ -220,33 +230,99 @@ impl ConsumerRing {
         true
     }
 
-    /// Takes the next frame of TX into `out`.
+    /// Takes the next frame of TX into `out`. A frame of the segmentation offload comes as
+    /// `Tso` with its headers in `out` and holds its entries until `tso_done`; nothing else is
+    /// taken meanwhile.
     pub fn take_tx(&mut self, out: &mut [u8; CELL]) -> Tx {
-        if self.is_broken() || self.tx_head == self.tx_tail {
+        while !self.is_broken() && self.held == 0 && self.tx_head != self.tx_tail {
+            // Two atomic reads, so that the length checked is the length used.
+            let at = self.layout.tx_entry(self.tx_tail);
+            let (word0, word1) = (self.mem.load(at), self.mem.load(at + 4));
+            let e = sw::TxEntry {
+                len: word0 as u16,
+                flags: (word0 >> 16) as u16,
+                spare: word1,
+            };
+            let queued = self.tx_head.wrapping_sub(self.tx_tail);
+            if e.flags == sw::TX_PAD {
+                // The cells to the end of the array, so that the next frame of the offload lies
+                // in a row. Anything else about it breaks the ring.
+                let rest = self.layout.tx_to_end(self.tx_tail);
+                if e.len != 0 || e.spare != rest || rest >= sw::TSO_CELLS_MAX || queued < rest {
+                    self.break_with(Violation::Tx);
+                    return Tx::Empty;
+                }
+                self.tx_tail = self.tx_tail.wrapping_add(rest);
+                continue;
+            }
+            if e.flags == sw::TX_SUM | sw::TX_TSO {
+                return self.take_tso(e, queued, out);
+            }
+            let cell = self.layout.tx_cell(self.tx_tail);
+            self.tx_tail = self.tx_tail.wrapping_add(1);
+            if !matches!(e.flags, sw::TX_FLAGS | sw::TX_SUM | sw::TX_LOOP)
+                || e.spare != 0
+                || usize::from(e.len) > CELL
+            {
+                return Tx::Refused;
+            }
+            self.mem.read(cell, &mut out[..usize::from(e.len)]);
+            return match e.flags {
+                sw::TX_LOOP => Tx::Loop(usize::from(e.len)),
+                sw::TX_SUM => Tx::Sum(usize::from(e.len)),
+                _ => Tx::Frame(usize::from(e.len)),
+            };
+        }
+        Tx::Empty
+    }
+
+    /// The entry of a frame of the segmentation offload at `tx_tail`, `queued` entries
+    /// published. The shape of the run breaks the ring (a length past `TSO_FRAME_MAX`, fewer
+    /// entries than the length needs, a run over the end of the array, a continuation that is
+    /// not zero); the MSS and the length of the headers refuse the frame, and its entries are
+    /// freed.
+    fn take_tso(&mut self, e: sw::TxEntry, queued: u32, out: &mut [u8; CELL]) -> Tx {
+        let len = usize::from(e.len);
+        let k = sw::cells(len);
+        let fits =
+            len <= sw::TSO_FRAME_MAX && queued >= k && self.layout.tx_run_fits(self.tx_tail, k);
+        let zero = fits
+            && (1..k).all(|i| {
+                let at = self.layout.tx_entry(self.tx_tail.wrapping_add(i));
+                self.mem.load(at) == 0 && self.mem.load(at + 4) == 0
+            });
+        if !zero {
+            self.break_with(Violation::Tx);
             return Tx::Empty;
         }
-        // Two atomic reads, so that the length checked is the length used.
-        let at = self.layout.tx_entry(self.tx_tail);
-        let (word0, word1) = (self.mem.load(at), self.mem.load(at + 4));
-        let e = sw::TxEntry {
-            len: word0 as u16,
-            flags: (word0 >> 16) as u16,
-            spare: word1,
-        };
-        let cell = self.layout.tx_cell(self.tx_tail);
-        self.tx_tail = self.tx_tail.wrapping_add(1);
-        if !matches!(e.flags, sw::TX_FLAGS | sw::TX_SUM | sw::TX_LOOP)
-            || e.spare != 0
-            || usize::from(e.len) > CELL
+        let mss = e.spare;
+        if !(u32::from(sw::TSO_MSS_MIN)..=sw::TSO_MSS_MAX).contains(&mss) || len < sw::TSO_HEAD_MIN
         {
+            self.tx_tail = self.tx_tail.wrapping_add(k);
             return Tx::Refused;
         }
-        self.mem.read(cell, &mut out[..usize::from(e.len)]);
-        match e.flags {
-            sw::TX_LOOP => Tx::Loop(usize::from(e.len)),
-            sw::TX_SUM => Tx::Sum(usize::from(e.len)),
-            _ => Tx::Frame(usize::from(e.len)),
+        let head = len.min(sw::TSO_HEAD_MAX);
+        self.mem
+            .read(self.layout.tx_cell(self.tx_tail), &mut out[..head]);
+        self.held = k;
+        Tx::Tso {
+            len,
+            mss: mss as u16,
         }
+    }
+
+    /// Frame bytes `from..from + out.len()` of the frame of the segmentation offload held now
+    /// (`Tx::Tso`), read from the consumer's cells. The consumer may change them meanwhile:
+    /// what is read is what goes out, and a change only damages its own stream.
+    pub fn tso_read(&self, from: usize, out: &mut [u8]) {
+        debug_assert!(self.held > 0 && from + out.len() <= self.held as usize * CELL);
+        self.mem.read(self.layout.tx_cell(self.tx_tail) + from, out);
+    }
+
+    /// The frame held is gone (sent, or refused after its headers): its entries are free.
+    pub fn tso_done(&mut self) {
+        self.tx_tail = self.tx_tail.wrapping_add(self.held);
+        self.held = 0;
     }
 
     /// The switch's indices and counters, for the consumer's eyes.
@@ -259,7 +335,7 @@ impl ConsumerRing {
 
     /// Whether the TX index of this step's poll is ahead of the switch's.
     pub fn tx_waiting(&self) -> bool {
-        !self.is_broken() && self.tx_head != self.tx_tail
+        !self.is_broken() && self.held == 0 && self.tx_head != self.tx_tail
     }
 
     /// Whether the consumer has put a frame in TX that the switch has not taken: a fresh read
@@ -488,7 +564,6 @@ pub(crate) mod tests {
             (2049, 1, 0, false),
             (100, 1, 7, false),
             (100, 2, 0, false),
-            (100, 8, 0, false),
             (100, 5, 0, false),
             (100, 3, 0, false),
             (100, 0x100, 0, false),
@@ -515,6 +590,297 @@ pub(crate) mod tests {
         }
         assert_eq!(ring.poll(), Poll::Live);
         assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+    }
+
+    /// A frame of the segmentation offload as the consumer writes it: the first entry with the
+    /// length and the MSS, then `cells(len) - 1` entries of zeros, one `tx_head` store.
+    fn tso_entries(rig: &Rig, len: u16, mss: u32) {
+        let m = rig.mem();
+        let head = m.load(sw::TX_HEAD);
+        let k = sw::cells(usize::from(len));
+        let first = TxEntry {
+            len,
+            flags: sw::TX_SUM | sw::TX_TSO,
+            spare: mss,
+        };
+        m.write(rig.layout.tx_entry(head), &first.to_bytes());
+        for i in 1..k {
+            m.write(rig.layout.tx_entry(head.wrapping_add(i)), &[0; 8]);
+        }
+        m.store(sw::TX_HEAD, head.wrapping_add(k));
+        // The cells hold a pattern the reads can be told by.
+        let room = rig.layout.total() - rig.layout.tx_cell(head);
+        for j in 0..usize::from(len).min(room) {
+            m.write(rig.layout.tx_cell(head) + j, &[(j % 251) as u8]);
+        }
+    }
+
+    #[test]
+    fn a_frame_of_the_offload_comes_with_its_headers_and_holds_its_entries_until_done() {
+        let l = Layout::new(256, 64).unwrap();
+        let rig = Rig::new(l);
+        let mut ring = rig.ring();
+        let mut out = [0; CELL];
+        tso_entries(&rig, 10_300, 1448);
+        rig.send(b"after", 0);
+        assert_eq!(ring.poll(), Poll::Live);
+        assert_eq!(
+            ring.take_tx(&mut out),
+            Tx::Tso {
+                len: 10_300,
+                mss: 1448
+            }
+        );
+        let want: Vec<u8> = (0..sw::TSO_HEAD_MAX).map(|j| (j % 251) as u8).collect();
+        assert_eq!(
+            &out[..sw::TSO_HEAD_MAX],
+            &want[..],
+            "the headers are copied"
+        );
+        // Nothing else is taken while it is held, and the room is not given back.
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+        assert!(!ring.tx_waiting());
+        ring.publish();
+        assert_eq!(rig.mem().load(sw::TX_TAIL), 0);
+        // The data is read from the cells, past the headers, at any offset.
+        let mut part = [0u8; 300];
+        ring.tso_read(4_000, &mut part);
+        let want: Vec<u8> = (4_000..4_300).map(|j| (j % 251) as u8).collect();
+        assert_eq!(&part[..], &want[..]);
+        ring.tso_done();
+        ring.publish();
+        assert_eq!(rig.mem().load(sw::TX_TAIL), 6);
+        assert_eq!(
+            ring.take_tx(&mut out),
+            Tx::Frame(5),
+            "the next entry follows the run"
+        );
+        assert_eq!(&out[..5], b"after");
+    }
+
+    #[test]
+    fn a_frame_of_the_offload_shorter_than_a_cell_takes_one_entry_and_a_short_one_is_whole() {
+        let rig = Rig::new(Layout::new(256, 64).unwrap());
+        let mut ring = rig.ring();
+        let mut out = [0; CELL];
+        tso_entries(&rig, 2_000, 1448);
+        tso_entries(&rig, 60, 1448);
+        ring.poll();
+        assert_eq!(
+            ring.take_tx(&mut out),
+            Tx::Tso {
+                len: 2_000,
+                mss: 1448
+            }
+        );
+        ring.tso_done();
+        // A frame under the headers' minimum is refused: its entry is free.
+        assert_eq!(ring.take_tx(&mut out), Tx::Tso { len: 60, mss: 1448 });
+        ring.tso_done();
+        let rig = Rig::new(Layout::new(256, 64).unwrap());
+        let mut ring = rig.ring();
+        tso_entries(&rig, 53, 1448);
+        ring.poll();
+        assert_eq!(ring.take_tx(&mut out), Tx::Refused);
+        assert_eq!(ring.poll(), Poll::Live, "a short frame breaks nothing");
+    }
+
+    #[test]
+    fn an_mss_out_of_range_refuses_the_frame_and_frees_its_entries() {
+        for mss in [0, 1, 535, 1461, 9_000, u32::MAX] {
+            let rig = Rig::new(Layout::new(256, 64).unwrap());
+            let mut ring = rig.ring();
+            let mut out = [0; CELL];
+            tso_entries(&rig, 5_000, mss);
+            rig.send(b"next", 0);
+            ring.poll();
+            assert_eq!(ring.take_tx(&mut out), Tx::Refused, "{mss}");
+            assert_eq!(
+                ring.take_tx(&mut out),
+                Tx::Frame(4),
+                "three entries freed: {mss}"
+            );
+        }
+        for mss in [536, 1460] {
+            let rig = Rig::new(Layout::new(256, 64).unwrap());
+            let mut ring = rig.ring();
+            let mut out = [0; CELL];
+            tso_entries(&rig, 5_000, mss);
+            ring.poll();
+            assert!(matches!(ring.take_tx(&mut out), Tx::Tso { .. }), "{mss}");
+        }
+    }
+
+    #[test]
+    fn the_shape_of_a_run_of_the_offload_breaks_the_ring() {
+        let l = Layout::new(256, 64).unwrap();
+        let mut out = [0; CELL];
+        // A length past the offload's bound.
+        for len in [sw::TSO_FRAME_MAX as u16 + 1, 20_000, u16::MAX] {
+            let rig = Rig::new(l);
+            let mut ring = rig.ring();
+            raw_tx(&rig, len, sw::TX_SUM | sw::TX_TSO, 1448);
+            ring.poll();
+            assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+            assert_eq!(ring.poll(), Poll::Broke(Violation::Tx), "{len}");
+        }
+        // Fewer entries published than the length takes (the rest of the run is not there).
+        let rig = Rig::new(l);
+        let mut ring = rig.ring();
+        raw_tx(&rig, 10_000, sw::TX_SUM | sw::TX_TSO, 1448);
+        ring.poll();
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+        assert_eq!(ring.poll(), Poll::Broke(Violation::Tx));
+        // A continuation that is not zero: any of its three fields.
+        for (len, flags, spare) in [(1u16, 0u16, 0u32), (0, 1, 0), (0, 0, 1), (0, sw::TX_PAD, 0)] {
+            let rig = Rig::new(l);
+            let mut ring = rig.ring();
+            tso_entries(&rig, 5_000, 1448);
+            let at = l.tx_entry(2);
+            rig.mem()
+                .write(at, &TxEntry { len, flags, spare }.to_bytes());
+            ring.poll();
+            assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+            assert_eq!(
+                ring.poll(),
+                Poll::Broke(Violation::Tx),
+                "{len} {flags} {spare}"
+            );
+        }
+        // A run over the end of the array without a pad in front.
+        let rig = Rig::new(l);
+        let mut ring = rig.ring();
+        for _ in 0..62 {
+            rig.send(b"x", 0);
+        }
+        ring.poll();
+        for _ in 0..62 {
+            assert_eq!(ring.take_tx(&mut out), Tx::Frame(1));
+        }
+        tso_entries(&rig, 5_000, 1448);
+        ring.poll();
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+        assert_eq!(ring.poll(), Poll::Broke(Violation::Tx));
+    }
+
+    #[test]
+    fn a_pad_skips_the_rest_of_the_array_and_the_frame_starts_at_its_first_cell() {
+        let l = Layout::new(256, 64).unwrap();
+        let rig = Rig::new(l);
+        let mut ring = rig.ring();
+        let mut out = [0; CELL];
+        for _ in 0..61 {
+            rig.send(b"x", 0);
+        }
+        ring.poll();
+        for _ in 0..61 {
+            assert_eq!(ring.take_tx(&mut out), Tx::Frame(1));
+        }
+        // Entries 61 to 63 are skipped by a pad at 61; the frame of three cells is at 64 (cell 0).
+        raw_tx(&rig, 0, sw::TX_PAD, 3);
+        let m = rig.mem();
+        m.store(sw::TX_HEAD, 64);
+        tso_entries(&rig, 5_000, 1448);
+        ring.poll();
+        assert_eq!(
+            ring.take_tx(&mut out),
+            Tx::Tso {
+                len: 5_000,
+                mss: 1448
+            }
+        );
+        assert_eq!(out[0], 0);
+        assert_eq!(ring.poll(), Poll::Live);
+        let mut part = [0u8; 4];
+        ring.tso_read(2_048, &mut part);
+        assert_eq!(
+            part,
+            [
+                (2048 % 251) as u8,
+                (2049 % 251) as u8,
+                (2050 % 251) as u8,
+                (2051 % 251) as u8
+            ]
+        );
+        ring.tso_done();
+        ring.publish();
+        assert_eq!(
+            rig.mem().load(sw::TX_TAIL),
+            67,
+            "the pad's 3 and the frame's 3 are free"
+        );
+    }
+
+    #[test]
+    fn a_pad_that_is_not_the_rest_of_the_array_breaks_the_ring() {
+        let l = Layout::new(256, 64).unwrap();
+        let mut out = [0; CELL];
+        // At index 56: the rest of the array is 8 entries.
+        for (len, spare, queued, broke) in [
+            (0u16, 8u32, 8u32, false),
+            (0, 7, 8, true),
+            (0, 9, 9, true),
+            (1, 8, 8, true),
+            (0, 8, 7, true),
+        ] {
+            let rig = Rig::new(l);
+            let mut ring = rig.ring();
+            for _ in 0..56 {
+                rig.send(b"x", 0);
+            }
+            ring.poll();
+            for _ in 0..56 {
+                ring.take_tx(&mut out);
+            }
+            let m = rig.mem();
+            m.write(
+                l.tx_entry(56),
+                &TxEntry {
+                    len,
+                    flags: sw::TX_PAD,
+                    spare,
+                }
+                .to_bytes(),
+            );
+            m.store(sw::TX_HEAD, 56 + queued);
+            ring.poll();
+            let first = ring.take_tx(&mut out);
+            if broke {
+                assert_eq!(first, Tx::Empty, "{len} {spare} {queued}");
+                assert_eq!(ring.poll(), Poll::Broke(Violation::Tx));
+            } else {
+                assert_eq!(first, Tx::Empty);
+                assert_eq!(
+                    ring.poll(),
+                    Poll::Live,
+                    "a pad of the rest, and no entry after it"
+                );
+            }
+        }
+        // A pad of nine or more cannot be: no frame is longer than nine cells.
+        let big = Layout::new(256, 64).unwrap();
+        let rig = Rig::new(big);
+        let mut ring = rig.ring();
+        for _ in 0..50 {
+            rig.send(b"x", 0);
+        }
+        ring.poll();
+        for _ in 0..50 {
+            ring.take_tx(&mut out);
+        }
+        rig.mem().write(
+            big.tx_entry(50),
+            &TxEntry {
+                len: 0,
+                flags: sw::TX_PAD,
+                spare: 14,
+            }
+            .to_bytes(),
+        );
+        rig.mem().store(sw::TX_HEAD, 64);
+        ring.poll();
+        assert_eq!(ring.take_tx(&mut out), Tx::Empty);
+        assert_eq!(ring.poll(), Poll::Broke(Violation::Tx));
     }
 
     #[test]

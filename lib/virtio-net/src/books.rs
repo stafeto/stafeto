@@ -101,7 +101,17 @@ pub struct TxBook {
     free_len: usize,
     buffer_of: [u16; QUEUE_SIZE],
     out: [bool; QUEUE_SIZE],
+    /// The buffers of the chain a token stands for (1 for a frame in one buffer), and the buffer
+    /// that follows each buffer of a chain (a frame of the segmentation offload, `tso`).
+    chain: [u8; QUEUE_SIZE],
+    next: [u16; TX_BUFFERS],
 }
+
+/// The most buffers a frame of the segmentation offload takes: its header and
+/// `TSO_FRAME_MAX` bytes in buffers of `BUFFER_LEN`.
+pub const CHAIN_MAX: usize =
+    (crate::frames::HDR_LEN + proto_net::switch::TSO_FRAME_MAX).div_ceil(BUFFER_LEN);
+const _: () = assert!(CHAIN_MAX == 9);
 
 impl TxBook {
     pub const fn new() -> TxBook {
@@ -117,6 +127,8 @@ impl TxBook {
             free_len: TX_BUFFERS,
             buffer_of: [0; QUEUE_SIZE],
             out: [false; QUEUE_SIZE],
+            chain: [1; QUEUE_SIZE],
+            next: [0; TX_BUFFERS],
         }
     }
 
@@ -153,24 +165,68 @@ impl TxBook {
         true
     }
 
-    /// The device returned `token`: its buffer goes back to the pool. The
-    /// buffer, None for a token the device does not hold.
+    /// The chain of `buffers` (2 to `CHAIN_MAX`, all of the pool's, none twice) is in the queue
+    /// under `token`: one frame of the segmentation offload. False, and nothing recorded, for a
+    /// token that is out, a chain of another length or a buffer that is no send buffer.
+    pub fn sent_chain(&mut self, token: u16, buffers: &[u16]) -> bool {
+        let t = usize::from(token);
+        let ok = (1..=CHAIN_MAX).contains(&buffers.len())
+            && buffers
+                .iter()
+                .all(|&b| (RX_BUFFERS..BUFFERS).contains(&usize::from(b)));
+        if !ok || t >= QUEUE_SIZE || self.out[t] {
+            return false;
+        }
+        self.buffer_of[t] = buffers[0];
+        self.chain[t] = buffers.len() as u8;
+        for pair in buffers.windows(2) {
+            self.next[usize::from(pair[0]) - RX_BUFFERS] = pair[1];
+        }
+        self.out[t] = true;
+        true
+    }
+
+    /// The buffers of the chain under `token` (1 for a frame in one buffer; 0 for a token the
+    /// device does not hold).
+    pub fn chain_len(&self, token: u16) -> usize {
+        let t = usize::from(token);
+        if t < QUEUE_SIZE && self.out[t] {
+            usize::from(self.chain[t])
+        } else {
+            0
+        }
+    }
+
+    /// The device returned `token`: its buffer, or every buffer of its chain, goes back to the
+    /// pool. The first buffer, None for a token the device does not hold.
     pub fn reclaim(&mut self, token: u16) -> Option<u16> {
         let t = usize::from(token);
         if t >= QUEUE_SIZE || !self.out[t] {
             return None;
         }
-        let buffer = self.buffer_of[t];
-        if !self.release(buffer) {
-            return None;
+        let first = self.buffer_of[t];
+        let mut buffer = first;
+        for k in 0..self.chain[t] {
+            // Read the link before the buffer is free to be sent again.
+            let after = self.next[usize::from(buffer).wrapping_sub(RX_BUFFERS) % TX_BUFFERS];
+            if !self.release(buffer) {
+                return None;
+            }
+            if k + 1 < self.chain[t] {
+                buffer = after;
+            }
         }
+        self.chain[t] = 1;
         self.out[t] = false;
-        Some(buffer)
+        Some(first)
     }
 
     /// How many buffers the device holds.
     pub fn outstanding(&self) -> usize {
-        self.out.iter().filter(|&&o| o).count()
+        (0..QUEUE_SIZE)
+            .filter(|&t| self.out[t])
+            .map(|t| usize::from(self.chain[t]))
+            .sum()
     }
 }
 
@@ -256,5 +312,42 @@ mod tests {
         // A buffer given back that is not the pool's.
         assert!(!pool.release(5));
         assert!(!pool.release(300), "the pool is full");
+    }
+
+    #[test]
+    fn a_chain_returns_every_buffer_by_its_token_and_only_once() {
+        let mut pool = TxBook::new();
+        let chain: Vec<u16> = (0..6).map(|_| pool.alloc().unwrap()).collect();
+        let single = pool.alloc().unwrap();
+        assert!(pool.sent_chain(9, &chain));
+        assert!(pool.sent(10, single));
+        assert_eq!(pool.chain_len(9), 6);
+        assert_eq!(pool.chain_len(10), 1);
+        assert_eq!(pool.chain_len(11), 0);
+        assert_eq!(pool.outstanding(), 7);
+        assert_eq!(pool.free(), TX_BUFFERS - 7);
+        assert!(!pool.sent_chain(9, &chain), "a token already out");
+        assert!(!pool.sent_chain(12, &[]), "no chain of no buffers");
+        assert!(
+            !pool.sent_chain(12, &[1, 2]),
+            "receive buffers are no chain"
+        );
+        assert!(
+            !pool.sent_chain(12, &[300; CHAIN_MAX + 1]),
+            "a chain too long"
+        );
+        assert_eq!(pool.reclaim(9), Some(chain[0]));
+        assert_eq!(pool.reclaim(9), None, "the device returned it twice");
+        assert_eq!(pool.free(), TX_BUFFERS - 1);
+        assert_eq!(pool.reclaim(10), Some(single));
+        assert_eq!(pool.free(), TX_BUFFERS);
+        // Every buffer of the chain can be allocated again, once.
+        let mut again = vec![];
+        while let Some(b) = pool.alloc() {
+            again.push(b);
+        }
+        again.sort_unstable();
+        again.dedup();
+        assert_eq!(again.len(), TX_BUFFERS);
     }
 }

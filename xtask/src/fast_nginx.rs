@@ -160,6 +160,19 @@ const RUN_WITHIN: Duration = Duration::from_secs(300);
 /// `/etc/netd.conf` of the images of the switch: eight consumers, 16 384 flows.
 pub const SWITCH_NETD_CONF: &[u8] = b"switch 8\nflows 16384\n";
 
+/// The same with the segmentation offload asked for (`tso 1`).
+pub const SWITCH_NETD_CONF_TSO: &[u8] = b"switch 8\nflows 16384\ntso 1\n";
+
+/// `netd.conf` of the images of the switch: with `STAFETO_SWITCH_TSO=1` in the environment of
+/// the build, the one with `tso 1` (the measurement of the offload on VZ builds both).
+pub fn switch_netd_conf() -> &'static [u8] {
+    if std::env::var_os("STAFETO_SWITCH_TSO").is_some_and(|v| v == "1") {
+        SWITCH_NETD_CONF_TSO
+    } else {
+        SWITCH_NETD_CONF
+    }
+}
+
 /// The package's settings with the worker under root: the images of the
 /// second device (CLAIM wants the superuser) run these until the second
 /// device goes (stage Sh4d).

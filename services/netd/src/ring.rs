@@ -269,7 +269,19 @@ const _: () = assert!(
     SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_800 + SUM_TICKS) <= SWITCH_BASE * 1_800
         && SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_500 + SUM_TICKS) <= SWITCH_BASE * 1_500
 );
+/// A chunk of a frame of the segmentation offload is a copy of `CHUNK` (4 096) bytes out of the
+/// consumer's cells into the device's buffers, about 2 460 ticks under -icount, and the
+/// bookkeeping of the chain: `TSO_TICKS`. It weighs the whole base share like a heavy frame
+/// (`SUM_WEIGHT`), so the frames a step always takes hold at most one chunk, and the worst step
+/// is the soft share, one chunk past it, the base frames of the wire and the tail: 17 600 ticks
+/// against the bound.
+pub const TSO_TICKS: usize = 3_100;
+pub const TSO_WEIGHT: usize = SWITCH_BASE;
 pub const SWITCH_SOFT: u64 = 7_000;
+const _: () = assert!(
+    SWITCH_BASE.div_ceil(TSO_WEIGHT) * TSO_TICKS <= SWITCH_BASE * 1_800
+        && SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000 <= 18_369
+);
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;

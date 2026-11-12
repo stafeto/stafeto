@@ -142,7 +142,7 @@ pub fn ipv4_ends(frame: &[u8]) -> Option<([u8; 4], [u8; 4])> {
 /// words are read big-endian, so the sum of 64-bit words is the sum of the
 /// 16-bit words of RFC 1071 (2^16 is 1 modulo 0xFFFF). A tail shorter than
 /// eight bytes is padded with zeros, which only the last piece may have.
-fn add(mut acc: u64, data: &[u8]) -> u64 {
+pub(crate) fn add(mut acc: u64, data: &[u8]) -> u64 {
     let (words, tail) = data.as_chunks::<8>();
     for chunk in words {
         let (sum, carry) = acc.overflowing_add(u64::from_be_bytes(*chunk));
@@ -158,7 +158,7 @@ fn add(mut acc: u64, data: &[u8]) -> u64 {
 }
 
 /// The sum folded to 16 bits.
-fn fold(acc: u64) -> u16 {
+pub(crate) fn fold(acc: u64) -> u16 {
     let mut sum = (acc & 0xFFFF_FFFF) + (acc >> 32);
     sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
     sum = (sum & 0xFFFF) + (sum >> 16);
@@ -172,7 +172,7 @@ pub fn checksum(data: &[u8]) -> u16 {
 }
 
 /// The offset of the sum in a TCP header.
-const TCP_SUM_AT: usize = 16;
+pub(crate) const TCP_SUM_AT: usize = 16;
 
 pub const IPV4_PROTO_ICMP: u8 = 1;
 pub const IPV4_PROTO_TCP: u8 = 6;
