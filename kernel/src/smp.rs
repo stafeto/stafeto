@@ -211,7 +211,7 @@ extern "C" fn secondary_main(block: &'static CpuBlock) -> ! {
     block.state.store(UP, Ordering::Release);
     #[cfg(feature = "cpu1-check-probe")]
     assert!(
-        cpu::this().index() != 1 || core::hint::black_box(false),
+        cpu::this().index() != 1 || (probe_wait_report() && core::hint::black_box(false)),
         "probe: a check fails on CPU 1"
     );
     // From here the CPU schedules the threads that are placed on it.
@@ -465,4 +465,25 @@ pub fn qsbr_probe() {
         "qsbr       {cpus} CPUs: a period ended after {} ticks",
         timer::now() - began
     );
+}
+
+/// Set when CPU 0 has printed the whole boot report: the probe of a failing
+/// check on CPU 1 waits for it, so that its panic report does not interleave
+/// with the report lines on the serial line.
+#[cfg(feature = "cpu1-check-probe")]
+static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// CPU 0 has printed the whole boot report.
+#[cfg(feature = "cpu1-check-probe")]
+pub fn boot_report_done() {
+    REPORTED.store(true, Ordering::Release);
+}
+
+/// The probe waits for the end of the boot report; true when it came.
+#[cfg(feature = "cpu1-check-probe")]
+fn probe_wait_report() -> bool {
+    while !REPORTED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    true
 }

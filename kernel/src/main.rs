@@ -189,4 +189,6 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
         mm::phys::free_frames()
     };
     kprintln!("frames     {} MiB free", (free * PAGE_SIZE) >> 20);
+    #[cfg(feature = "cpu1-check-probe")]
+    smp::boot_report_done();
 }
