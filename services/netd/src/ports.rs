@@ -11,7 +11,7 @@
 use core::hash::Hasher;
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
 use core::hash::SipHasher;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
 /// The protocols.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,46 +28,133 @@ pub enum Proto {
 /// another instance is refused or tries the next. The switch reads the same bytes to steer a
 /// frame to the instance that holds its port (`switchlogic::tables::Tables::port`), and an
 /// instance reads them to tell a frame for another instance from one for itself.
-pub struct Claims([AtomicU8; 2 * 65536]);
+pub struct Claims {
+    ports: [AtomicU8; 2 * 65536],
+    /// For each word of 64 ports of the ephemeral range, of each protocol: how many of its ports
+    /// have a claim of their own, and the owner (plus one) of a run that holds the whole word
+    /// (the blocks of the consumers, which take 8 words at a time instead of 512 claims, so
+    /// that the step of an ATTACH stays short).
+    counts: [AtomicU16; 2 * EPHEMERAL_WORDS],
+    runs: [AtomicU8; 2 * EPHEMERAL_WORDS],
+}
 
 impl Claims {
     pub const fn new() -> Claims {
-        Claims([const { AtomicU8::new(0) }; 2 * 65536])
+        Claims {
+            ports: [const { AtomicU8::new(0) }; 2 * 65536],
+            counts: [const { AtomicU16::new(0) }; 2 * EPHEMERAL_WORDS],
+            runs: [const { AtomicU8::new(0) }; 2 * EPHEMERAL_WORDS],
+        }
     }
 
     fn at(proto: Proto, port: u16) -> usize {
         usize::from(proto == Proto::Udp) * 65536 + usize::from(port)
     }
 
+    /// The word of the ephemeral range `port` is in (with the protocol's half), if it is in it.
+    fn word(proto: Proto, port: u16) -> Option<usize> {
+        (port >= EPHEMERAL_FIRST && u32::from(port - EPHEMERAL_FIRST) < EPHEMERAL_COUNT).then(
+            || {
+                usize::from(proto == Proto::Udp) * EPHEMERAL_WORDS
+                    + usize::from(port - EPHEMERAL_FIRST) / 64
+            },
+        )
+    }
+
     /// Takes `port` for instance `who`; true when it is the instance's already.
     pub fn claim(&self, proto: Proto, port: u16, who: u8) -> bool {
         let me = who + 1;
-        match self.0[Self::at(proto, port)].compare_exchange(
+        match self.ports[Self::at(proto, port)].compare_exchange(
             0,
             me,
-            Ordering::AcqRel,
-            Ordering::Acquire,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         ) {
-            Ok(_) => true,
+            Ok(_) => {
+                if let Some(w) = Self::word(proto, port) {
+                    self.counts[w].fetch_add(1, Ordering::SeqCst);
+                    let run = self.runs[w].load(Ordering::SeqCst);
+                    if run != 0 && run != me {
+                        // A run holds the word: the port is not free.
+                        self.counts[w].fetch_sub(1, Ordering::SeqCst);
+                        self.ports[Self::at(proto, port)].store(0, Ordering::SeqCst);
+                        return false;
+                    }
+                }
+                true
+            }
             Err(held) => held == me,
         }
     }
 
     /// Lets go of `port`, if it is `who`'s.
     pub fn release(&self, proto: Proto, port: u16, who: u8) {
-        let _ = self.0[Self::at(proto, port)].compare_exchange(
-            who + 1,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self.ports[Self::at(proto, port)]
+            .compare_exchange(who + 1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            && let Some(w) = Self::word(proto, port)
+        {
+            self.counts[w].fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// The instance that holds `port`.
     pub fn owner(&self, proto: Proto, port: u16) -> Option<u8> {
-        self.0[Self::at(proto, port)]
+        let own = self.ports[Self::at(proto, port)]
             .load(Ordering::Acquire)
-            .checked_sub(1)
+            .checked_sub(1);
+        own.or_else(|| {
+            Self::word(proto, port)
+                .and_then(|w| self.runs[w].load(Ordering::Acquire).checked_sub(1))
+        })
+    }
+
+    /// Whether no port of the run of words (`first` and `count` aligned on 64 in the ephemeral
+    /// range) has a claim, its own or a run's.
+    pub fn run_free(&self, proto: Proto, first: u16, count: u16) -> bool {
+        let Some(w) = Self::word(proto, first) else {
+            return false;
+        };
+        (w..w + usize::from(count) / 64).all(|w| {
+            self.runs[w].load(Ordering::Acquire) == 0 && self.counts[w].load(Ordering::Acquire) == 0
+        })
+    }
+
+    /// Takes the run of words for `who`; false, and nothing taken, when one has a claim.
+    pub fn claim_run(&self, proto: Proto, first: u16, count: u16, who: u8) -> bool {
+        let Some(from) = Self::word(proto, first) else {
+            return false;
+        };
+        let words = from..from + usize::from(count) / 64;
+        for w in words.clone() {
+            let taken = self.runs[w]
+                .compare_exchange(0, who + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            // A port claimed in the word before the run took it stands in the count.
+            if !taken || self.counts[w].load(Ordering::SeqCst) != 0 {
+                for u in from..=w {
+                    if u < w || taken {
+                        let _ = self.runs[u].compare_exchange(
+                            who + 1,
+                            0,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn release_run(&self, proto: Proto, first: u16, count: u16, who: u8) {
+        if let Some(from) = Self::word(proto, first) {
+            for w in from..from + usize::from(count) / 64 {
+                let _ =
+                    self.runs[w].compare_exchange(who + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -254,9 +341,9 @@ impl PortMap {
                 .iter()
                 .zip(&self.reserved[words])
                 .all(|(u, r)| *u | *r == 0)
-                && self.shared.is_none_or(|s| {
-                    (first..=first + (count - 1)).all(|p| s.claims.owner(s.proto, p).is_none())
-                });
+                && self
+                    .shared
+                    .is_none_or(|s| s.claims.run_free(s.proto, first, count));
         }
         (0..count).all(|i| !self.held(first + i))
     }
@@ -280,13 +367,10 @@ impl PortMap {
         }
         let last = first + (count - 1);
         if Self::aligned(first, count) {
-            if let Some(s) = self.shared {
-                for p in first..=last {
-                    if !s.claims.claim(s.proto, p, s.who) {
-                        (first..p).for_each(|q| s.claims.release(s.proto, q, s.who));
-                        return false;
-                    }
-                }
+            if let Some(s) = self.shared
+                && !s.claims.claim_run(s.proto, first, count, s.who)
+            {
+                return false;
             }
             let word = usize::from(first - EPHEMERAL_FIRST) / 64;
             self.reserved[word..word + usize::from(count) / 64].fill(!0);
@@ -311,7 +395,7 @@ impl PortMap {
             let word = usize::from(first - EPHEMERAL_FIRST) / 64;
             self.reserved[word..word + usize::from(count) / 64].fill(0);
             if let Some(s) = self.shared {
-                (first..=last).for_each(|p| s.claims.release(s.proto, p, s.who));
+                s.claims.release_run(s.proto, first, count, s.who);
             }
             return;
         }
@@ -353,9 +437,7 @@ impl PortMap {
         *n = n.saturating_sub(1);
         if *n == 0 {
             self.mark(port, false);
-            // The claim of a port inside a block of a consumer is the block's.
             if was > 0
-                && !self.is_reserved(port)
                 && let Some(s) = self.shared
             {
                 s.claims.release(s.proto, port, s.who);
