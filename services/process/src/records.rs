@@ -160,6 +160,9 @@ pub struct Record<P> {
     pub deferred_stop: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
+    /// Whether `Processes::place` put its main thread on `cpu` (a record the
+    /// service never placed, such as an adopted one, has no CPU of its own).
+    pub placed: bool,
     /// The CPUs its process runs on (kernel spec 8, process_create x8):
     /// the record of init's table for a process init knows, and the
     /// parent's for a child of fork or spawn; exec keeps it. Every process
@@ -419,6 +422,14 @@ impl<P> Records<P> {
         self.records.get(index)?.as_ref()
     }
 
+    /// The CPU the service put the main thread of the record `index` on, and
+    /// None for a record it never placed (an adopted one), whose `cpu` of 0
+    /// says nothing.
+    pub fn placed_cpu(&self, index: usize) -> Option<usize> {
+        let record = self.get(index)?;
+        record.placed.then_some(usize::from(record.cpu))
+    }
+
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Record<P>> {
         self.records.get_mut(index)?.as_mut()
     }
@@ -611,6 +622,7 @@ impl<P> Records<P> {
             nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
             carried_ticks: 0,
             cpu: 0,
+            placed: false,
             cpus: parent.map_or(0, |p| self.records[p].as_ref().unwrap().cpus),
             children_ticks: 0,
             carried_kernel: 0,
@@ -1258,6 +1270,27 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_placed_cpu_is_the_one_asked_for_and_none_before_a_placement() {
+        let mut t = Records::<u32>::new();
+        let make = |t: &mut Records<u32>| {
+            let label = t.next_label().unwrap();
+            t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession)
+        };
+        let (parent, child) = (make(&mut t), make(&mut t));
+        // Never placed (an adopted record): CPU 0 is no placement.
+        assert_eq!(t.placed_cpu(parent), None);
+        for (index, cpu) in [(parent, 1), (child, 3)] {
+            let record = t.get_mut(index).unwrap();
+            (record.cpu, record.placed) = (cpu, true);
+        }
+        // The two records differ, so asking for the child's CPU where the
+        // parent's is meant shows.
+        assert_eq!(t.placed_cpu(parent), Some(1));
+        assert_eq!(t.placed_cpu(child), Some(3));
+        assert_eq!(t.placed_cpu(99), None);
+    }
 
     #[test]
     fn renice_follows_the_effective_id_of_the_target() {
