@@ -28,6 +28,7 @@ use core::sync::atomic::Ordering;
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::images::{self, Images};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
+use posix_process_service::placing::{self, Crowd};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
@@ -184,7 +185,7 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 };
 /// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
 /// runs at most this many).
-const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = placing::MAX_CPUS;
 /// The window over which a placement judges whether a process keeps its CPU
 /// busy (`Processes::place`).
 const LOAD_WINDOW_NS: u64 = 10_000_000;
@@ -641,15 +642,6 @@ enum Taken {
 
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
-}
-/// The CPUs a process may use: the mask of its page (`Page::cpus`, 0 for
-/// all) within the mask of its record (`Record::cpus`, 0 where none is
-/// known), and the record's when the page names none of them.
-fn allowed_cpus(page: u64, record: u64) -> u64 {
-    match page & if record == 0 { u64::MAX } else { record } {
-        0 => record,
-        mask => mask,
-    }
 }
 
 /// The status of a failed call of groups and sessions.
@@ -3544,7 +3536,8 @@ impl Processes {
         }
     }
 
-    /// The CPU for the main thread of the image of the record `child`
+    /// The CPU for the main thread of the image of the record `child`, made
+    /// for the record `parent`
     /// (spawn, fork and exec): the least busy of the CPUs its page allows
     /// (`Page::cpus`, all when 0) among those of its record (`Record::cpus`,
     /// the CPUs the kernel lets its threads run on; when the page names
@@ -3556,7 +3549,7 @@ impl Processes {
     /// which one call per CPU reads at the close of a window), and each image
     /// put on it in this window and the one before counts as one more, since
     /// it may not have run enough to show in that time yet.
-    fn place(&mut self, child: usize) -> u8 {
+    fn place(&mut self, child: usize, parent: usize) -> u8 {
         let Ok(info) = sys::cpu_info(0) else {
             return 0;
         };
@@ -3573,23 +3566,26 @@ impl Processes {
             .records
             .get(child)
             .map_or(0, |record| u64::from(record.cpus));
-        let allowed = allowed_cpus(page, record);
+        let allowed = placing::allowed_cpus(page, record);
         let now = Self::timer_now();
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);
         }
-        let busy = |p: &Self, c: usize| {
-            u32::from(p.window_load[c] >= 250) + p.window_issued[0][c] + p.window_issued[1][c]
+        // The parent of the image made it and waits, so its own mark on its
+        // CPU does not count against its children.
+        let parent = self
+            .records
+            .get(parent)
+            .map(|parent| usize::from(parent.cpu));
+        let crowd = Crowd {
+            load: &self.window_load,
+            issued: [&self.window_issued[0], &self.window_issued[1]],
+            parent,
         };
         // Among the least busy, the first after the CPU of the last
         // placement: images made one after the other, before any of them
         // has run to show in the time, still go to different CPUs.
-        let last = usize::from(self.placed_last);
-        let cpu = (1..=cpus)
-            .map(|step| (last + step) % cpus)
-            .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
-            .min_by_key(|&c| busy(self, c))
-            .map_or(0, |c| c as u8);
+        let cpu = placing::choose(cpus, allowed, usize::from(self.placed_last), &crowd) as u8;
         self.placed_last = cpu;
         let issued = &mut self.window_issued[0][usize::from(cpu)];
         *issued = issued.saturating_add(1);
@@ -3631,7 +3627,7 @@ impl Processes {
         making: &Making,
     ) -> Result<Option<Work>, abi::Error> {
         let cpu = if matches!(making.work, Work::Thread) {
-            self.place(child)
+            self.place(child, parent)
         } else {
             0
         };
@@ -3765,7 +3761,7 @@ impl Processes {
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
                             cpu: u32::from(record.cpu),
-                            cpus: allowed_cpus(
+                            cpus: placing::allowed_cpus(
                                 self.pages.page(i).map_or(0, |page| {
                                     page.cpus.load(core::sync::atomic::Ordering::Acquire)
                                 }),
