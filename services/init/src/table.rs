@@ -2255,14 +2255,14 @@ mod tests {
     }
 
     /// The record of one network device has the tails of the chains of receiving of a device that
-    /// merges segments: 4 MiB, one contiguous object, after the two it always had; the record of two
-    /// devices has none, because its start data is full.
+    /// merges segments (`NETD_VZ_TSO`): 4 MiB, one contiguous object, after the two it always had; the
+    /// other records have none (that of two devices has no room, its start data is full).
     #[test]
     fn the_record_of_one_network_device_has_the_tails_of_its_chains() {
-        let names: Vec<_> = net::NETD_VZ.dma.iter().map(|d| d.name).collect();
+        let names: Vec<_> = net::NETD_VZ_TSO.dma.iter().map(|d| d.name).collect();
         assert_eq!(names, ["dma", "net", "tails"]);
-        assert_eq!(net::NETD_VZ.dma[..2], net::NETD.dma[..]);
-        let tails = net::NETD_VZ.dma[2];
+        assert_eq!(net::NETD_VZ_TSO.dma[..2], net::NETD.dma[..]);
+        let tails = net::NETD_VZ_TSO.dma[2];
         assert_eq!(
             (tails.size, tails.uncached, tails.duplicate),
             (4 * 1024 * 1024, false, false)
@@ -2270,7 +2270,7 @@ mod tests {
         assert_eq!(tails.size / PAGE, abi::MAX_CONTIGUOUS_PAGES);
         // QEMU's records keep the two objects (and the guest's memory); the record of two devices
         // has no room.
-        for record in [net::NETD, net::NETD_VZ2, net::NETD_TWO] {
+        for record in [net::NETD, net::NETD_VZ, net::NETD_VZ2, net::NETD_TWO] {
             assert!(!record.dma.iter().any(|d| d.name == "tails"));
         }
     }
@@ -2321,7 +2321,13 @@ mod tests {
         // through the second channel when one comes, the second line of a
         // record of two devices keeps its label, and no other service gets
         // the second channel.
-        for record in [net::NETD, net::NETD_VZ, net::NETD_VZ2, net::NETD_TWO] {
+        for record in [
+            net::NETD,
+            net::NETD_VZ,
+            net::NETD_VZ_TSO,
+            net::NETD_VZ2,
+            net::NETD_TWO,
+        ] {
             assert!(line_thread(&record), "{}", record.name);
             assert!(record.ceiling > record.priority);
             assert_eq!(binding_route(&record, 0, true), Through::Bound);

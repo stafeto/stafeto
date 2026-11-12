@@ -246,9 +246,18 @@ pub const SWITCH_BASE: usize = 3;
 /// frames into the base share (2 x 3 100 ticks against the 5 400 the asserts count).
 pub const SUM_TICKS: usize = 1_300;
 pub const SUM_WEIGHT: usize = SWITCH_BASE;
-/// A segment of a merged frame costs a copy of up to 1 514 bytes and the sums over them, about
-/// 900 and `SUM_TICKS` under -icount: two frames of the step.
-pub const CUT_WEIGHT: usize = 2;
+/// A segment of a merged frame costs a copy of up to 1 514 bytes into the scratch, the sum of the
+/// IPv4 header and a second copy into the buffer of the stack or the ring of a consumer, about
+/// 2 000 ticks under -icount (the sum of the TCP segment is not made: the segment goes with the
+/// sum good). It weighs the whole base share, like a frame with a sum made in software
+/// (`SUM_WEIGHT`), so the frames a step always takes hold at most one segment, and the step
+/// without tables, which has no time check, holds at most `SWITCH_RX` / `CUT_WEIGHT` segments.
+pub const CUT_TICKS: usize = 2_000;
+pub const CUT_WEIGHT: usize = SWITCH_BASE;
+const _: () = assert!(
+    SWITCH_BASE.div_ceil(CUT_WEIGHT) * CUT_TICKS <= SWITCH_BASE * 1_500
+        && SWITCH_RX.div_ceil(CUT_WEIGHT) * CUT_TICKS <= 6_000
+);
 /// The buffers of sending the switch does not lend the stack when the device merges segments:
 /// the segments of a merged frame for the stack are read in buffers of sending, as many as the
 /// stack's ring of frames holds (`RX_AHEAD`).

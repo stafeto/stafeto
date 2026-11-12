@@ -30,8 +30,8 @@
 //! * `tso 0` or `tso 1`: whether the service asks the device for the segmentation offload
 //!   (the device then merges the segments it receives into frames of up to 64 KiB, and the
 //!   receiving ring is 64 chains of a head and a 64 KiB tail instead of 256 buffers); 0 or no
-//!   line keeps the checksum offload alone. Only a record with the tails (VZ with one device)
-//!   can take it.
+//!   line keeps the checksum offload alone. Only the record with the tails (`NETD_VZ_TSO`, the
+//!   VZ image that asks for it) can take it; elsewhere the line changes nothing.
 //! * A key twice, an unknown key, a word more, a bad address: an error with
 //!   the line's number, counted from 1.
 //!

@@ -1418,11 +1418,14 @@ impl Switch {
         let sweeping = count > 0 || !t.flows.is_empty() || settling || t.parked() > 0;
         // A budget spent moves a timer armed for later (the sweep's) to the end of the period.
         let waits_for_period = self.blocked && self.budget_hit;
-        if (sweeping || self.blocked) && (!self.armed || waits_for_period) {
+        // A merged frame waiting for the stack's ring or a buffer of sending is looked at again
+        // by the same timer, so that it does not wait for the next event of another kind.
+        let cutting = self.big.is_some() && INNER.cut_wait.load(Ordering::Relaxed);
+        if (sweeping || self.blocked || cutting) && (!self.armed || waits_for_period) {
             let after = if self.blocked && self.budget_hit {
                 // The entries wait for the next period.
                 self.period.remaining(now_ns()).max(20_000)
-            } else if self.blocked {
+            } else if self.blocked || cutting {
                 1_000_000
             } else if settling {
                 2_000_000
@@ -1595,16 +1598,6 @@ impl Switch {
         let longest = (used - HDR_LEN) as u32;
         if longest > INNER.stats.merged_max.load(Ordering::Relaxed) {
             INNER.stats.merged_max.store(longest, Ordering::Relaxed);
-        }
-        // The line says the cut works on a plain image: at each power of two.
-        let count = INNER.stats.merged.load(Ordering::Relaxed);
-        if count.is_power_of_two() {
-            rt::println!(
-                "net: merged {count} frames, the longest of {} bytes, cut into {} segments, {} dropped",
-                INNER.stats.merged_max.load(Ordering::Relaxed),
-                INNER.stats.cut.load(Ordering::Relaxed),
-                INNER.stats.merged_dropped.load(Ordering::Relaxed)
-            );
         }
         if !frames::sum_checked(head) {
             return false;

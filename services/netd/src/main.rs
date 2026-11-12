@@ -266,8 +266,8 @@ fn main(_: u64) -> u64 {
         return NO_START_DATA;
     };
     // The tails of the chains of receiving (4 MiB), for a device that merges the segments it
-    // receives: the record of one device has them, the record of two has none (its start data
-    // is full) and keeps the pair of sums.
+    // receives: only the record `NETD_VZ_TSO` has them (the image that says `tso 1`); a service
+    // without them keeps the pair of sums whatever netd.conf says.
     let tails_object = s.take::<Memory>("tails").ok();
     // The record of two devices gives the second device objects of its own
     // (init's table): the service drives it on `dma1` and the first

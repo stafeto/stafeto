@@ -7,13 +7,14 @@
 //! Apple's device, `DATA_VALID` and `RSC_INFO` in `flags`. The stacks and the
 //! rings of the consumers take frames of an MTU, so the driver cuts a merged
 //! frame into segments of the MTU again (`Plan`), each with its own headers
-//! and whole sums, the way a device cuts a frame to send.
+//! and the sum of the IPv4 header (the segments go on with the sum of the TCP segment good, the
+//! device having checked the data), the way a device cuts a frame to send.
 //!
 //! A merged frame lies in two pieces: the first descriptor of its chain holds
 //! the header of virtio and the start of the frame, the second the rest
 //! (`Frame2`).
 
-use crate::frames::{ETHERNET_HEADER, ETHERTYPE_IPV4, IPV4_PROTO_TCP, MAX_FRAME, fill_sums};
+use crate::frames::{ETHERNET_HEADER, ETHERTYPE_IPV4, IPV4_PROTO_TCP, MAX_FRAME, checksum};
 
 /// The most the headers of one segment hold: Ethernet, IPv4 with 40 bytes of
 /// options, TCP with 40.
@@ -118,8 +119,8 @@ impl Plan {
 
     /// Writes segment `k` into `out`: the headers of the frame, the length,
     /// the identification and the sequence number of the segment, FIN and PSH
-    /// on the last one only and CWR on the first only, then its data and the
-    /// sums. The bytes of the frame `out` holds; None for a `k` past the last
+    /// on the last one only and CWR on the first only, then its data and
+    /// the sum of the IPv4 header. The bytes of the frame `out` holds; None for a `k` past the last
     /// or an `out` too short.
     pub fn build(&self, frame: &Frame2<'_>, k: usize, out: &mut [u8]) -> Option<usize> {
         if k >= self.segments() {
@@ -154,7 +155,13 @@ impl Plan {
         if k > 0 {
             out[tcp_at + 13] &= !TCP_CWR;
         }
-        fill_sums(out);
+        // The segment goes on with the sum good (the device checked the data): only the IPv4
+        // header gets its sum; the field of the TCP sum stays the merged frame's.
+        let ip_end = tcp_at;
+        out[ip_at + 10] = 0;
+        out[ip_at + 11] = 0;
+        let header = checksum(&out[ip_at..ip_end]);
+        out[ip_at + 10..ip_at + 12].copy_from_slice(&header.to_be_bytes());
         Some(len)
     }
 }
@@ -162,7 +169,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{MAX_FRAME, verify_sums};
+    use crate::frames::{MAX_FRAME, fill_sums, verify_header};
 
     /// A merged frame: Ethernet, IPv4 with `ip_options` bytes of options, TCP
     /// with `tcp_options` and `data` bytes, sums whole.
@@ -216,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn the_segments_hold_the_data_in_order_with_whole_sums() {
+    fn the_segments_hold_the_data_in_order_with_the_header_sums() {
         for (ip_options, tcp_options, size, at) in [
             (0, 12, 64_000, 2036),
             (0, 0, 64_240, 1500),
@@ -232,7 +239,10 @@ mod tests {
             let mut gathered = Vec::new();
             for (k, s) in segments.iter().enumerate() {
                 assert!(s.len() <= MAX_FRAME);
-                assert!(verify_sums(s), "segment {k} has whole sums");
+                assert!(
+                    verify_header(s),
+                    "segment {k} has the sum of its IPv4 header"
+                );
                 let t = ETHERNET_HEADER + 20 + ip_options;
                 let seq = u32::from_be_bytes(s[t + 4..t + 8].try_into().unwrap());
                 assert_eq!(seq, 1_000 + (k * plan.mss) as u32);
