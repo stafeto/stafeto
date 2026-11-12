@@ -32,7 +32,9 @@
 //! group (`member0` to `member7`, the groups summed), and the frames the
 //! switch passed to each consumer from the wire (`cons0` to `cons7`) say how
 //! the workers of a server share the load; both are set when a snapshot is
-//! taken.
+//! taken. The member counts cost one increment per SYN in every image; `cons` copies
+//! the switch's `rx_by` (32 bits, wraps after about 3 h at 190 000 requests a second, harmless
+//! for a round of 30 s).
 
 use core::fmt::{self, Write};
 
