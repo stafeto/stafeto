@@ -13,8 +13,9 @@
 
 use abi::STAMPS_BATCH;
 use core::sync::atomic::{
-    AtomicPtr, AtomicU64, fence,
+    AtomicPtr, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
+    fence,
 };
 
 /// What a read of the ring gave.
