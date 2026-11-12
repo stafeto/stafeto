@@ -68,8 +68,8 @@ unsafe fn buffer_at<'a, const D: usize>(n: u16) -> &'a mut [u8] {
 enum RxPort<const D: usize> {
     /// The device's queue, which this thread drives.
     Wire(virtio_net::RxRing<Host<D>>),
-    /// The switch thread's ring of received frames.
-    Inner,
+    /// The ring of received frames of an instance's lane in the switch.
+    Inner(&'static switch::Lane),
 }
 
 /// Where the frames of a ring of sending go.
@@ -77,9 +77,9 @@ enum RxPort<const D: usize> {
 enum TxPort<const D: usize> {
     /// The device's queue and the pool of its buffers.
     Wire(virtio_net::TxRing<Host<D>>),
-    /// The switch thread's rings: buffers come from its supply and the
+    /// The rings of an instance's lane in the switch: buffers come from its supply and the
     /// frames go to its ring of frames to send.
-    Inner,
+    Inner(&'static switch::Lane),
 }
 
 /// The ring of receiving (`virtio_net::RxRing`) with the share of the step
@@ -101,8 +101,8 @@ impl<const D: usize> RxRing<D> {
 
     /// The ring over the switch's (`switch.rs`): the frames come from its
     /// ring of received frames and the buffers go back through its ring.
-    pub fn inner() -> RxRing<D> {
-        RxRing::with(RxPort::Inner)
+    pub fn inner(lane: &'static switch::Lane) -> RxRing<D> {
+        RxRing::with(RxPort::Inner(lane))
     }
 
     fn with(port: RxPort<D>) -> RxRing<D> {
@@ -120,7 +120,7 @@ impl<const D: usize> RxRing<D> {
     pub fn wire(&mut self) -> &mut virtio_net::RxRing<Host<D>> {
         match &mut self.port {
             RxPort::Wire(ring) => ring,
-            RxPort::Inner => unreachable!("the switch owns the queue"),
+            RxPort::Inner(_) => unreachable!("the switch owns the queue"),
         }
     }
 
@@ -132,8 +132,8 @@ impl<const D: usize> RxRing<D> {
                     fail(broken.text(false));
                 }
             }
-            RxPort::Inner => {
-                switch::must(&switch::INNER.rx_back, u32::from(n));
+            RxPort::Inner(lane) => {
+                switch::must(&lane.rx_back, u32::from(n));
             }
         }
     }
@@ -163,7 +163,7 @@ impl<const D: usize> RxRing<D> {
     pub fn counters(&self) -> (u64, u64, u64) {
         match self.port {
             RxPort::Wire(_) => (self.frames, self.dropped, self.martian),
-            RxPort::Inner => {
+            RxPort::Inner(_) => {
                 let (dropped, martian) = switch::INNER.rx_counts();
                 (self.frames, self.dropped + dropped, self.martian + martian)
             }
@@ -190,8 +190,8 @@ impl<const D: usize> RxRing<D> {
                 // The switch took the frame off the queue and checked its
                 // header (`switch::Switch::receive`): the length is the
                 // frame's.
-                RxPort::Inner => {
-                    let word = switch::INNER.rx_ready.pop()?;
+                RxPort::Inner(lane) => {
+                    let word = lane.rx_ready.pop()?;
                     let (n, len, sum) = unpack_frame(word);
                     self.budget.take_rx();
                     self.frames += 1;
@@ -241,8 +241,8 @@ impl<const D: usize> TxRing<D> {
     }
 
     /// The ring over the switch's (`switch.rs`).
-    pub fn inner() -> TxRing<D> {
-        TxRing::with(TxPort::Inner)
+    pub fn inner(lane: &'static switch::Lane) -> TxRing<D> {
+        TxRing::with(TxPort::Inner(lane))
     }
 
     fn with(port: TxPort<D>) -> TxRing<D> {
@@ -259,7 +259,7 @@ impl<const D: usize> TxRing<D> {
     pub fn wire(&mut self) -> &mut virtio_net::TxRing<Host<D>> {
         match &mut self.port {
             TxPort::Wire(ring) => ring,
-            TxPort::Inner => unreachable!("the switch owns the queue"),
+            TxPort::Inner(_) => unreachable!("the switch owns the queue"),
         }
     }
 
@@ -272,7 +272,7 @@ impl<const D: usize> TxRing<D> {
     fn free(&self) -> usize {
         match &self.port {
             TxPort::Wire(ring) => ring.book.free(),
-            TxPort::Inner => switch::INNER.supply_len(),
+            TxPort::Inner(lane) => lane.supply_len(),
         }
     }
 
@@ -281,7 +281,7 @@ impl<const D: usize> TxRing<D> {
     fn alloc(&mut self) -> Option<u16> {
         match &mut self.port {
             TxPort::Wire(ring) => ring.book.alloc(),
-            TxPort::Inner => switch::INNER.take_supply(),
+            TxPort::Inner(lane) => lane.take_supply(),
         }
     }
 
@@ -291,8 +291,8 @@ impl<const D: usize> TxRing<D> {
             TxPort::Wire(ring) => {
                 ring.book.release(n);
             }
-            TxPort::Inner => {
-                switch::must(&switch::INNER.tx_back, u32::from(n));
+            TxPort::Inner(lane) => {
+                switch::must(&lane.tx_back, u32::from(n));
             }
         }
     }
@@ -311,7 +311,7 @@ impl<const D: usize> TxRing<D> {
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub fn counters(&self) -> Counters {
         let mut counters = self.counters;
-        if matches!(self.port, TxPort::Inner) {
+        if matches!(self.port, TxPort::Inner(_)) {
             counters.dropped += switch::INNER.tx_dropped();
         }
         counters
@@ -329,7 +329,7 @@ impl<const D: usize> TxRing<D> {
         // sums whole.
         // Without the offload the stack makes the sum whole here, as the second device does:
         // the switch's step would pay for it otherwise.
-        let partial = matches!(self.port, TxPort::Inner)
+        let partial = matches!(self.port, TxPort::Inner(_))
             && switch::INNER.offload()
             && frames::fill_partial(frame).is_some();
         if !partial {
@@ -351,8 +351,8 @@ impl<const D: usize> TxRing<D> {
             },
             // The ring holds as many words as there are buffers, and the
             // pool lent this one.
-            TxPort::Inner => {
-                switch::must(&switch::INNER.tx_sub, pack_frame(n, len as u16, partial));
+            TxPort::Inner(lane) => {
+                switch::must(&lane.tx_sub, pack_frame(n, len as u16, partial));
                 profile::count(Counter::FramesTx);
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);

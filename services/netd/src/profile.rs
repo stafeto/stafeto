@@ -26,7 +26,8 @@
 //! (`isr_*`) and around the reopening of the line (`reopen_*`). The time the
 //! service itself ran (`ran_ticks`, its thread's own time, which the kernel
 //! counts apart from the time of others), the ticks of the steps by kind
-//! (`step_rx_ticks`, `step_tx_ticks`, `step_other_ticks`) and of the
+//! (`step_rx_ticks`, `step_tx_ticks`, `step_other_ticks`), of the steps of the switch
+//! (`switch_ticks`) and of the
 //! checksums (`sum_ticks`) give the parts of the time of a request.
 
 use core::fmt::{self, Write};
@@ -70,6 +71,10 @@ counters! {
     StepRxTicks = "step_rx_ticks",
     StepTxTicks = "step_tx_ticks",
     StepOtherTicks = "step_other_ticks",
+    // The ticks of the switch's steps (the clock's, from the start of a step to its end): the part
+    // of the time of CPU 0 that the stack's counters above do not hold once the stack is a
+    // consumer of the switch.
+    SwitchTicks = "switch_ticks",
     Ran = "ran_ticks",
     CopyN = "copy_n",
     CopyBytes = "copy_bytes",

@@ -98,7 +98,7 @@ impl Driver<'_> {
         let Ok(identity) = r.handles.take::<Channel>(0) else {
             return refuse(proto_net::NOT_ALLOWED);
         };
-        if self.net.vouch(identity) != Some(0) {
+        if self.inst.net.vouch(identity) != Some(0) {
             return refuse(proto_net::NOT_ALLOWED);
         }
         if device != 1 || pages != RING_PAGES {
@@ -208,7 +208,7 @@ impl Driver<'_> {
             };
             let _ = handles.push(copy.erase());
         }
-        let Some(process) = self.net.process.as_deref() else {
+        let Some(process) = self.inst.net.process.as_deref() else {
             return Answer::Status(Status::Kernel(Error::BadState));
         };
         let Some(ring) = self.owner.as_mut().and_then(|o| o.ring.take()) else {
@@ -273,7 +273,7 @@ impl Driver<'_> {
             second.take_back();
         }
         if owner.more
-            && let Some(process) = self.net.process.as_deref()
+            && let Some(process) = self.inst.net.process.as_deref()
         {
             // SAFETY: the ring was the owner's memory; the service dropped
             // its view of it (`take_back`) and keeps nothing there.

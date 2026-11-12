@@ -3,7 +3,8 @@
 
 //! The tables of the switch (note Sh4, 3.5): a byte per port and protocol
 //! (0 the stack, 1..=32 a group, `BLOCK_MARK` + c the ephemeral block of
-//! consumer c), the groups, the consumers and the flows. Only the switch
+//! consumer c, the consumers of the service's own process (the stack instances) counted
+//! after those of the programs), the groups, the consumers and the flows. Only the switch
 //! thread writes them; the stack thread asks through the command ring
 //! (`commands.rs`), and a debug build checks the thread of every write.
 
@@ -16,6 +17,11 @@ use core::hash::Hasher;
 use core::hash::SipHasher;
 
 pub const MAX_CONSUMERS: usize = 8;
+/// The stack instances of the service itself (internal consumers, `Internal`): instance k has
+/// the number `INTERNAL_BASE + k` wherever a consumer's number is kept (flows, group members,
+/// the marks of the port table), above those of the processes.
+pub const MAX_INSTANCES: usize = 4;
+pub const INTERNAL_BASE: u8 = MAX_CONSUMERS as u8;
 pub const MAX_GROUPS: usize = 32;
 pub const MAX_MEMBERS: usize = 8;
 /// The port-table value of consumer c's block is `BLOCK_MARK + c`.
@@ -376,6 +382,7 @@ impl<'a> Flows<'a> {
 /// What the removal of a flow touches: the books of its owner and its group.
 pub struct Books<'b> {
     consumers: &'b mut [Option<Consumer>; MAX_CONSUMERS],
+    instances: &'b mut [Option<Internal>; MAX_INSTANCES],
     groups: &'b mut [Option<Group>; MAX_GROUPS],
     ports: &'b mut [u8],
     freed: &'b mut u32,
@@ -383,22 +390,31 @@ pub struct Books<'b> {
 
 impl Books<'_> {
     fn owner_live(&self, f: &Flow) -> bool {
-        self.consumers
-            .get(usize::from(f.consumer))
-            .and_then(Option::as_ref)
-            .is_some_and(|c| c.generation == f.generation)
+        match instance_of(f.consumer) {
+            Some(k) => self.instances[k]
+                .as_ref()
+                .is_some_and(|x| x.generation == f.generation),
+            None => self
+                .consumers
+                .get(usize::from(f.consumer))
+                .and_then(Option::as_ref)
+                .is_some_and(|c| c.generation == f.generation),
+        }
     }
 
     /// The flow is leaving the table: its owner and its group have one flow less, and a
     /// draining group that has none left is freed.
     fn gone(&mut self, f: &Flow) {
-        if let Some(c) = self
-            .consumers
-            .get_mut(usize::from(f.consumer))
-            .and_then(Option::as_mut)
-            .filter(|c| c.generation == f.generation)
-        {
-            c.flows = c.flows.saturating_sub(1);
+        if self.owner_live(f) {
+            let flows = match instance_of(f.consumer) {
+                Some(k) => self.instances[k].as_mut().map(|x| &mut x.flows),
+                None => self.consumers[usize::from(f.consumer)]
+                    .as_mut()
+                    .map(|c| &mut c.flows),
+            };
+            if let Some(n) = flows {
+                *n = n.saturating_sub(1);
+            }
         }
         if f.flags & GROUPED == 0 {
             return;
@@ -428,6 +444,7 @@ macro_rules! books {
     ($t:expr) => {
         Books {
             consumers: &mut $t.consumers,
+            instances: &mut $t.instances,
             groups: &mut $t.groups,
             ports: &mut *$t.ports,
             freed: &mut $t.freed,
@@ -465,6 +482,25 @@ impl Consumer {
     pub fn in_block(&self, port: u16) -> bool {
         port.wrapping_sub(self.block) < BLOCK_PORTS
     }
+}
+
+/// The place of the internal consumer a consumer number stands for (`INTERNAL_BASE` + k).
+pub fn instance_of(id: u8) -> Option<usize> {
+    let k = usize::from(id.checked_sub(INTERNAL_BASE)?);
+    (k < MAX_INSTANCES).then_some(k)
+}
+
+/// A stack instance of the service as a consumer of the switch: the thread that runs it takes
+/// its frames as numbers of buffers through its own set of rings (`switch::Lane`), so it has no
+/// ring of cells and no copy. It holds an ephemeral block, owns the flows of the connections
+/// its queues took, and is a member of the groups of the listening ports it waits on, as a
+/// process is.
+#[derive(Clone, Copy, Debug)]
+pub struct Internal {
+    pub generation: u32,
+    /// The first port of its block of outgoing ports, when it has one.
+    pub block: Option<u16>,
+    pub flows: u32,
 }
 
 /// A parked SYN: the flow key it names, when it came (ms) and its bytes.
@@ -544,6 +580,7 @@ pub struct Tables<'a> {
     pub left: u32,
     pub groups: [Option<Group>; MAX_GROUPS],
     pub consumers: [Option<Consumer>; MAX_CONSUMERS],
+    pub instances: [Option<Internal>; MAX_INSTANCES],
     pub flows: Flows<'a>,
     pub refused: [u32; Reason::COUNT],
     /// Groups freed that the stack has not been told of (bit n - 1 is group n); `commands::poll`
@@ -575,6 +612,7 @@ impl<'a> Tables<'a> {
             left: 0,
             groups: [None; MAX_GROUPS],
             consumers: [const { None }; MAX_CONSUMERS],
+            instances: [None; MAX_INSTANCES],
             flows,
             refused: [0; Reason::COUNT],
             freed: 0,
@@ -661,9 +699,12 @@ impl<'a> Tables<'a> {
             !g.draining
                 && g.members.iter().flatten().any(|m| {
                     self.live(m.0, m.1)
-                        && self.consumers[usize::from(m.0)].as_ref().is_some_and(|c| {
-                            c.ring.fill_avail() >= super::route::MIN_FILL && c.flows < limit
-                        })
+                        && match instance_of(m.0) {
+                            Some(k) => self.instances[k].is_some_and(|x| x.flows < limit),
+                            None => self.consumers[usize::from(m.0)].as_ref().is_some_and(|c| {
+                                c.ring.fill_avail() >= super::route::MIN_FILL && c.flows < limit
+                            }),
+                        }
                 })
         })
     }
@@ -728,10 +769,84 @@ impl<'a> Tables<'a> {
 
     /// Whether consumer `c` of generation `g` is there and its ring whole.
     pub fn live(&self, c: u8, g: u32) -> bool {
-        self.consumers
-            .get(usize::from(c))
-            .and_then(Option::as_ref)
-            .is_some_and(|x| x.generation == g && !x.ring.is_broken())
+        match instance_of(c) {
+            Some(k) => self.instances[k].is_some_and(|x| x.generation == g),
+            None => self
+                .consumers
+                .get(usize::from(c))
+                .and_then(Option::as_ref)
+                .is_some_and(|x| x.generation == g && !x.ring.is_broken()),
+        }
+    }
+
+    /// The generation of consumer `c`, a process or an instance.
+    fn generation_of(&self, c: u8) -> Option<u32> {
+        match instance_of(c) {
+            Some(k) => self.instances[k].map(|x| x.generation),
+            None => self
+                .consumers
+                .get(usize::from(c))
+                .and_then(Option::as_ref)
+                .map(|x| x.generation),
+        }
+    }
+
+    /// The count of flows of consumer `c`, a process or an instance.
+    pub fn owner_flows(&mut self, c: u8) -> Option<&mut u32> {
+        match instance_of(c) {
+            Some(k) => self.instances[k].as_mut().map(|x| &mut x.flows),
+            None => self
+                .consumers
+                .get_mut(usize::from(c))
+                .and_then(Option::as_mut)
+                .map(|x| &mut x.flows),
+        }
+    }
+
+    /// Instance `k` is a consumer of generation `generation` from now on, with a block of
+    /// outgoing ports of its own when `block` names one: the ports of the block go to it
+    /// (`BLOCK_MARK` + its number in the port table). False for a place that is taken or
+    /// absent, or a block that does not fit.
+    pub fn attach_instance(&mut self, k: usize, generation: u32, block: Option<u16>) -> bool {
+        self.guard.check();
+        if block.is_some_and(|b| u32::from(b) + u32::from(BLOCK_PORTS) > 65536) {
+            return false;
+        }
+        let Some(slot @ None) = self.instances.get_mut(k) else {
+            return false;
+        };
+        *slot = Some(Internal {
+            generation,
+            block,
+            flows: 0,
+        });
+        if let Some(b) = block {
+            for proto in [Proto::Tcp, Proto::Udp] {
+                self.mark(proto, b, BLOCK_PORTS, BLOCK_MARK + INTERNAL_BASE + k as u8);
+            }
+        }
+        true
+    }
+
+    /// Takes instance `k` out of its groups and its block, as `detach` does a process.
+    pub fn detach_instance(&mut self, k: usize) -> bool {
+        self.guard.check();
+        let Some(gone) = self.instances.get_mut(k).and_then(Option::take) else {
+            return false;
+        };
+        let id = INTERNAL_BASE + k as u8;
+        for g in self.groups.iter_mut().flatten() {
+            g.members
+                .iter_mut()
+                .filter(|m| m.is_some_and(|m| m.0 == id))
+                .for_each(|m| *m = None);
+        }
+        if let Some(b) = gone.block {
+            for proto in [Proto::Tcp, Proto::Udp] {
+                self.mark(proto, b, BLOCK_PORTS, 0);
+            }
+        }
+        true
     }
 
     pub fn attach(&mut self, c: u8, generation: u32, ring: ConsumerRing, block: u16) -> bool {
@@ -839,9 +954,8 @@ impl<'a> Tables<'a> {
 
     pub fn join(&mut self, number: u8, c: u8) -> bool {
         self.guard.check();
-        let generation = match self.consumers.get(usize::from(c)).and_then(Option::as_ref) {
-            Some(x) => x.generation,
-            None => return false,
+        let Some(generation) = self.generation_of(c) else {
+            return false;
         };
         let Some(Some(g)) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
             return false;
@@ -883,6 +997,16 @@ impl<'a> Tables<'a> {
                 x.generation = x.generation.checked_add(1).unwrap_or(1);
                 for g in self.groups.iter_mut().flatten() {
                     for m in g.members.iter_mut().flatten().filter(|m| m.0 == c as u8) {
+                        m.1 = x.generation;
+                    }
+                }
+            }
+            for (k, slot) in self.instances.iter_mut().enumerate() {
+                let Some(x) = slot else { continue };
+                x.generation = x.generation.checked_add(1).unwrap_or(1);
+                let id = INTERNAL_BASE + k as u8;
+                for g in self.groups.iter_mut().flatten() {
+                    for m in g.members.iter_mut().flatten().filter(|m| m.0 == id) {
                         m.1 = x.generation;
                     }
                 }
@@ -1268,8 +1392,10 @@ pub(crate) mod tests {
 
     fn sweep(f: &mut Flows, now: u32, cs: &mut [Option<Consumer>; MAX_CONSUMERS]) {
         let (mut groups, mut ports, mut freed) = ([None; MAX_GROUPS], vec![0u8; 131072], 0);
+        let mut instances = [None; MAX_INSTANCES];
         let mut books = Books {
             consumers: cs,
+            instances: &mut instances,
             groups: &mut groups,
             ports: &mut ports,
             freed: &mut freed,
@@ -1510,6 +1636,42 @@ pub(crate) mod tests {
                 assert!(t.hold(1, Proto::Tcp, 8080, 1));
             }
             assert_eq!(t.group(1).unwrap().holders, 70_001);
+        });
+    }
+
+    #[test]
+    fn an_instance_takes_a_free_place_and_a_block_that_fits_and_gives_both_back() {
+        with(|t, _| {
+            assert!(!t.attach_instance(MAX_INSTANCES, 1, None), "no such place");
+            assert!(
+                !t.attach_instance(0, 1, Some(65535)),
+                "the block runs off the ports"
+            );
+            assert!(t.attach_instance(0, 1, Some(51200)));
+            assert!(!t.attach_instance(0, 2, None), "the place is taken");
+            for proto in [Proto::Tcp, Proto::Udp] {
+                assert_eq!(t.port(proto, 51200), BLOCK_MARK + INTERNAL_BASE);
+                assert_eq!(
+                    t.port(proto, 51200 + BLOCK_PORTS - 1),
+                    BLOCK_MARK + INTERNAL_BASE
+                );
+                assert_eq!(t.port(proto, 51200 + BLOCK_PORTS), 0);
+            }
+            assert!(t.live(INTERNAL_BASE, 1) && !t.live(INTERNAL_BASE, 2));
+            assert!(!t.live(INTERNAL_BASE + 1, 1), "an empty place is not live");
+            assert!(t.hold(3, Proto::Tcp, 9000, 1) && t.join(3, INTERNAL_BASE));
+            assert!(!t.join(3, INTERNAL_BASE + 1), "an empty place cannot join");
+            assert!(t.detach_instance(0));
+            assert_eq!(t.port(Proto::Tcp, 51200), 0);
+            assert!(
+                !t.group(3)
+                    .unwrap()
+                    .members
+                    .iter()
+                    .flatten()
+                    .any(|m| m.0 == INTERNAL_BASE)
+            );
+            assert!(t.attach_instance(0, 2, None), "the place is free again");
         });
     }
 }
