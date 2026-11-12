@@ -26,7 +26,7 @@ use abi::{
     Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KERNEL_CALL_SLOTS,
     KernelStats, LOG_BATCH, LOG_RECORD, LogBatch, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo,
     Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
-    SOURCE_SHIFT, Source, TRIGGER_EDGE, ThreadInfo,
+    SOURCE_SHIFT, STAMPS_BATCH, STAMPS_RECORD, Source, TRIGGER_EDGE, ThreadInfo,
 };
 use core::arch::asm;
 
@@ -655,6 +655,60 @@ pub fn log_peek_other(
         msgbuf::read(i * LOG_RECORD, record);
     }
     Ok((batch, x[4]))
+}
+
+/// What object_info(STAMPS) gave (abi::INFO_STAMPS): the records now in
+/// the first `count` of the caller's `records`, the number of the next one,
+/// the number the ring has made and the leading records among `count` that
+/// the owner wrote over meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StampsBatch {
+    pub count: u64,
+    pub next: u64,
+    pub head: u64,
+    pub torn: u64,
+}
+
+/// object_info(STAMPS) through the system resource with KSTATS: up to
+/// abi::STAMPS_BATCH records of the ring of time stamps of `cpu` from number
+/// `first` on, as the words the kernel writes (the ticks, then the key in bits
+/// 0-31, the point in bits 32-39 and the CPU in bits 40-47); `freeze` stops
+/// every ring first. INVALID_ARGS from a kernel without the feature `stamps`.
+pub fn stamps_read(
+    resource: &Handle<Resource>,
+    cpu: u64,
+    first: u64,
+    freeze: bool,
+    records: &mut [[u64; 2]; STAMPS_BATCH],
+) -> Result<StampsBatch, Error> {
+    if cpu >= 1 << (64 - abi::STAMPS_CPU_SHIFT) || first >= abi::STAMPS_FREEZE {
+        return Err(Error::InvalidArgs);
+    }
+    let args = [
+        resource.raw().0,
+        abi::INFO_STAMPS,
+        cpu << abi::STAMPS_CPU_SHIFT | if freeze { abi::STAMPS_FREEZE } else { 0 } | first,
+    ];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    let batch = StampsBatch {
+        count: x[1],
+        next: x[2],
+        head: x[3],
+        torn: x[4],
+    };
+    for (i, record) in records
+        .iter_mut()
+        .enumerate()
+        .take((batch.count as usize).min(STAMPS_BATCH))
+    {
+        let mut bytes = [0u8; STAMPS_RECORD];
+        msgbuf::read(i * STAMPS_RECORD, &mut bytes);
+        *record = [
+            u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+            u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes")),
+        ];
+    }
+    Ok(batch)
 }
 
 /// Reads the log at `next` (sequence plus one) without advancing the

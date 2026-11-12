@@ -20,10 +20,12 @@ pub fn handle(ack: Ack) {
     if intid < 16 {
         // A software-generated interrupt: a command from another CPU, or the
         // probe's. `smp::handle` ends it.
+        crate::stamps::sgi_got(intid);
         return crate::smp::handle(ack);
     }
     #[cfg(feature = "trace")]
     crate::log::interrupt(intid);
+    crate::stamps::irq(intid);
     if intid == timer::INTID {
         // A level line may reach the GIC once more after the EOI that
         // followed a disarm: without the timer's condition the interrupt is

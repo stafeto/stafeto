@@ -243,8 +243,15 @@ pub fn build_trace_image(
     }
     let mut programs = base.to_vec();
     for program in &mut programs {
-        if program.0 == "netd" {
-            program.3 = &["trace"];
+        match program.0 {
+            "netd" => program.3 = &["trace"],
+            // The service dumps the rings of the kernel with a resource that the table gives it.
+            "init" => {
+                let mut features = program.3.to_vec();
+                features.push("bench-stamps");
+                program.3 = Box::leak(features.into_boxed_slice());
+            }
+            _ => {}
         }
     }
     crate::probe_ca::ensure(false)?;

@@ -1239,37 +1239,51 @@ fn attack(
     } else {
         write_targets(&targets, base, &wl.paths())?;
     }
-    let mut go =
-        |name: &str, seconds: u32, out: &Path| -> Result<(Option<String>, usize), String> {
-            let args = if wl.tls() {
-                h2load_args(&targets, rate, seconds, keep_alive, out)
-            } else {
-                vegeta_args(&targets, rate, seconds, keep_alive, out)
-            };
-            match guest.as_deref_mut() {
-                Some(run) => {
-                    let mut server = Server::Guest(run);
-                    let mark = server.mark()?;
-                    let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
-                    let log = server.log_since(mark)?;
-                    let mut found = alerts(&log);
-                    found.extend(seen);
-                    Ok((found.first().cloned(), malloc_failures(&log)))
-                }
-                None => {
-                    run_tool(raw, name, program, &args)?;
-                    Ok((None, 0))
-                }
-            }
+    let mut go = |name: &str,
+                  seconds: u32,
+                  out: &Path,
+                  last: bool|
+     -> Result<(Option<String>, usize), String> {
+        let args = if wl.tls() {
+            h2load_args(&targets, rate, seconds, keep_alive, out)
+        } else {
+            vegeta_args(&targets, rate, seconds, keep_alive, out)
         };
+        match guest.as_deref_mut() {
+            Some(run) => {
+                let mut server = Server::Guest(run);
+                let mark = server.mark()?;
+                let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
+                if last
+                    && FREEZE_AFTER_LOAD.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Server::Guest(run) = &mut server
+                {
+                    crate::net_tls::capture(
+                        run,
+                        "posix-net stat",
+                        "trace-f",
+                        Duration::from_secs(300),
+                    )?;
+                }
+                let log = server.log_since(mark)?;
+                let mut found = alerts(&log);
+                found.extend(seen);
+                Ok((found.first().cloned(), malloc_failures(&log)))
+            }
+            None => {
+                run_tool(raw, name, program, &args)?;
+                Ok((None, 0))
+            }
+        }
+    };
     if warm > 0 {
         let out = raw.join(format!("{tag}-warm.{extension}"));
-        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out)?;
+        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out, false)?;
         let _ = std::fs::remove_file(&out);
         stop_on(&format!("{key} (warm-up)"), &Vec::from_iter(alert))?;
     }
     let results = raw.join(format!("{tag}.{extension}"));
-    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results)?;
+    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results, true)?;
     let samples = if wl.tls() {
         parse_h2load_log(
             &std::fs::read_to_string(&results)
@@ -1293,6 +1307,12 @@ fn attack(
     let _ = Command::new("gzip").arg("-f").arg(&results).status();
     Ok(m)
 }
+
+/// Whether the guest of a step of the time stamps is told to stop its rings the moment the load
+/// ends (`posix-net stat`, whose first part freezes the rings of the service and of the kernel),
+/// so that the idle CPUs do not write over what the load made while the host is busy with the
+/// results. Set by `stage` for a stafeto guest of `--trace`.
+static FREEZE_AFTER_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Homebrew's nginx on the loopback with stafeto's settings and the files
 /// of both guests: the floor of the Mac.
@@ -1573,20 +1593,30 @@ impl Guest {
             ));
             Ok(())
         };
-        // The workers first: their rings keep filling with the records of the idle loop. They
+        // The first part of the service's dump stops the rings of the kernel, which the idle CPUs
+        // would wear out during the long dump that follows.
+        crate::net_tls::capture(&mut self.run, "posix-net stat", "trace-n", wait)?;
+        // The workers next: their rings keep filling with the records of the idle loop. They
         // write their lines as they exit (a QUIT to nginx).
         crate::net_tls::capture(&mut self.run, "kill -QUIT $M", "trace-q", wait)?;
         settle(&mut self.run, "the workers", "tr w")?;
         // Each `posix-net stat` gives the next part of the service's ring (it is killed if it is
-        // silent for long); the line `tr n done` ends it.
-        for _ in 0..80 {
+        // silent for long); the line `tr n done` ends it, and then the rings of the kernel follow
+        // in parts of their own, which the line `tr k done` (or `tr k none`, for a kernel that has
+        // no stamps) ends.
+        for _ in 0..160 {
             crate::net_tls::capture(&mut self.run, "posix-net stat", "trace-n", wait)?;
             crate::net_tls::capture(&mut self.run, "sleep 1", "pump", wait)?;
-            if self.run.text().iter().any(|l| l.trim() == "tr n done") {
+            let text = self.run.text();
+            if text
+                .iter()
+                .any(|l| matches!(l.trim(), "tr k done" | "tr k none"))
+            {
                 break;
             }
         }
         settle(&mut self.run, "the service", "tr n ")?;
+        settle(&mut self.run, "the kernel", "tr k")?;
         Ok(())
     }
 
@@ -2005,6 +2035,9 @@ struct Options {
     /// needs the variable STAFETO_TRACE=1): the guest dumps its rings after each ceiling, and
     /// each ceiling has its own guest.
     trace: bool,
+    /// The kernel with its time stamps (feature `stamps`) under the plain images (`--stamps`):
+    /// the cost of the stamps in the rows. `--trace` has the kernel's stamps as well.
+    stamps: bool,
     /// Only the 64 connections of the ceilings (`--c64`), and the rates of the phase `at`.
     c64: bool,
     rates: Vec<u32>,
@@ -2024,7 +2057,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace | --stamps] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -2050,6 +2083,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         switch_cpu0: false,
         cpus: linux_guest::CPUS,
         trace: false,
+        stamps: false,
         c64: false,
         rates: Vec::new(),
         pause_after: None,
@@ -2102,6 +2136,7 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--switch-cpu0" => o.switch_cpu0 = true,
             "--cpus" => o.cpus = number(value(arg)?, arg)? as usize,
             "--trace" => o.trace = true,
+            "--stamps" => o.stamps = true,
             "--c64" => o.c64 = true,
             "--rates" => {
                 o.rates = value(arg)?
@@ -2366,7 +2401,8 @@ impl Bench {
             } else {
                 None
             };
-            let mut m = attack(
+            FREEZE_AFTER_LOAD.store(trace && !sys.linux(), std::sync::atomic::Ordering::Relaxed);
+            let attacked = attack(
                 &raw,
                 Some(&mut g.run),
                 key,
@@ -2376,7 +2412,9 @@ impl Bench {
                 secs,
                 warm,
                 wl.keep_alive(),
-            )?;
+            );
+            FREEZE_AFTER_LOAD.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut m = attacked?;
             if let Some(before) = before {
                 m.cpu = Some(g.close_window(&before, m.ok)?);
             }
@@ -3855,7 +3893,14 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     if o.systems.iter().any(|s| !s.linux() && *s != System::S4o) {
         crate::busybox_build()?;
         crate::nano_build()?;
-        kernel = build(Variant::Normal)?.image;
+        // The kernel of the images of the time stamps has its own (feature `stamps`), and so
+        // has the kernel of the measure of what those stamps cost.
+        kernel = build(if o.trace || o.stamps {
+            Variant::Stamps
+        } else {
+            Variant::Normal
+        })?
+        .image;
         if o.systems.contains(&System::S4) {
             image = match o.image {
                 _ if o.trace => linux_guest::build_trace_image(

@@ -21,7 +21,7 @@
 
 use super::fstack::{FAST_NGINX_VZ_TABLE, FAST_SWITCH_VZ_TABLE};
 use super::net::{NET_LAUNCHER, NET_VZ_TABLE};
-use super::{BENCH_CPUS, BENCH_PINNED_CPUS, Record};
+use super::{BENCH_CPUS, BENCH_PINNED_CPUS, NET_SERVICE, Record};
 
 const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -66,6 +66,10 @@ const fn on_cpu_0(table: [Record; 10]) -> [Record; 10] {
 
 /// `table` with the record of the shell's launcher (found by its name) on
 /// the CPUs `cpus`; the launcher keeps the quota of the table it came from.
+/// With the feature `bench-stamps` (the images of the time stamps, `cargo
+/// xtask net-trace`) the network service gets a resource with KSTATS under
+/// the name `trace`, with which it dumps the rings of the kernel; no other
+/// image has it.
 const fn with_launcher<const N: usize>(table: &[Record], cpus: u8) -> [Record; N] {
     assert!(table.len() == N);
     let mut out = [table[0]; N];
@@ -75,6 +79,11 @@ const fn with_launcher<const N: usize>(table: &[Record], cpus: u8) -> [Record; N
         out[at] = if str_eq(table[at].name, NET_LAUNCHER.name) {
             launchers += 1;
             Record { cpus, ..table[at] }
+        } else if cfg!(feature = "bench-stamps") && str_eq(table[at].name, NET_SERVICE) {
+            Record {
+                trace: true,
+                ..table[at]
+            }
         } else {
             table[at]
         };

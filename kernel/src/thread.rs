@@ -1189,6 +1189,7 @@ pub fn run(next: NonNull<Thread>) -> ! {
     if prev != Some(next) {
         crate::log::switch(index(next));
     }
+    crate::stamps::run(next);
     // SAFETY: the running thread and `next` are alive, and so are their
     // processes; the kernel touches them one at a time.
     unsafe {

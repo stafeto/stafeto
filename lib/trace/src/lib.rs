@@ -153,7 +153,17 @@ mod on {
         }
     }
 
+    static FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Stops the ring taking records: a dump that takes long reads what the load made.
+    pub fn freeze() {
+        FROZEN.store(true, Relaxed);
+    }
+
     pub fn point(id: u8, key: u32) {
+        if FROZEN.load(Relaxed) {
+            return;
+        }
         let Some(ring) = ring() else { return };
         let at = (NEXT.fetch_add(1, Relaxed) & (RECORDS - 1)) * 2;
         let now = ticks();
@@ -253,6 +263,14 @@ pub fn ticks() -> u64 {
     return on::ticks();
     #[cfg(not(feature = "on"))]
     0
+}
+
+/// Stops the ring of this process taking records, for good: the dump of a ring that takes long
+/// (the network service's, about two minutes) reads what the load made, and the records of the
+/// idle loop that follow do not write over it.
+pub fn freeze() {
+    #[cfg(feature = "on")]
+    on::freeze();
 }
 
 /// A record of `id` with `key` now.

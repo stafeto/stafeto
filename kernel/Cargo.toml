@@ -94,4 +94,8 @@ atomic-locks = ["kcore/atomic-locks"]
 locked-decide = []
 baseline = ["ktest", "atomic-locks", "locked-decide"]
 trace = []
+# The time stamps of the kernel (kernel/src/stamps.rs): a ring of 8 192
+# records per CPU, dumped with object_info STAMPS. No normal or ci image has
+# them; `cargo xtask net-trace` builds them in.
+stamps = []
 trace-test = ["ktest", "trace"]
