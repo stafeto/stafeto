@@ -21,7 +21,7 @@ pub struct Crowd<'a> {
     /// two windows, so the bias to the parent's CPU is one mark at most. For
     /// an exec the parent is the process itself, so an image made by fork
     /// and then exec stays on the CPU the fork gave it when nothing else is
-    /// lighter.
+    /// lighter. `discounted_parent` says when it is set.
     pub parent: Option<usize>,
 }
 
@@ -46,6 +46,27 @@ pub fn choose(cpus: usize, allowed: u64, last: usize, crowd: &Crowd<'_>) -> usiz
         .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
         .min_by_key(|&c| crowd.busy(c))
         .unwrap_or(0)
+}
+
+/// The CPU whose mark of the parent's own placement is left out of the
+/// crowd: that of the record `parent` (None when the service never placed it),
+/// and only when the mask `allowed` of the image leaves CPU 0 out (0 for any
+/// CPU). CPU 0 is where the network service and its switch run, so a mask
+/// without it marks a set of CPUs the launcher keeps for its workers (the
+/// measurement images, `BENCH_PINNED_CPUS`), and there the children of one
+/// parent are to spread over the set, the parent's CPU included. Everywhere
+/// else the parent's mark counts like any other, which keeps its children
+/// off its CPU (and off CPU 0 below the switch) when others are lighter.
+pub fn discounted_parent<P>(
+    records: &crate::records::Records<P>,
+    allowed: u64,
+    parent: usize,
+) -> Option<usize> {
+    if allowed != 0 && allowed & 1 == 0 {
+        records.placed_cpu(parent)
+    } else {
+        None
+    }
 }
 
 /// The mask of the CPUs an image may stand on: the CPUs its page names
@@ -118,6 +139,31 @@ mod tests {
         };
         assert_eq!(crowd.busy(2), 0);
         assert_eq!(crowd.busy(1), 3);
+    }
+
+    #[test]
+    fn the_discount_is_for_a_mask_without_cpu_0_and_the_placed_parent() {
+        use crate::records::{Join, Records};
+        use proto_process::Credentials;
+        let mut t = Records::<u32>::new();
+        let mut make = |cpu: Option<u8>| {
+            let label = t.next_label().unwrap();
+            let index = t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession);
+            if let Some(cpu) = cpu {
+                let record = t.get_mut(index).unwrap();
+                (record.cpu, record.placed) = (cpu, true);
+            }
+            index
+        };
+        let (parent, child, adopted) = (make(Some(1)), make(Some(3)), make(None));
+        // The CPU of the parent, not that of the image placed.
+        assert_eq!(discounted_parent(&t, 0b1110, parent), Some(1));
+        assert_ne!(discounted_parent(&t, 0b1110, parent), t.placed_cpu(child));
+        // A parent the service never placed: none.
+        assert_eq!(discounted_parent(&t, 0b1110, adopted), None);
+        // Any CPU, or a mask with CPU 0: the parent's mark counts.
+        assert_eq!(discounted_parent(&t, 0, parent), None);
+        assert_eq!(discounted_parent(&t, 0b0011, parent), None);
     }
 
     #[test]

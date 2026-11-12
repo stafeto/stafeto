@@ -3571,9 +3571,9 @@ impl Processes {
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);
         }
-        // The mark of the parent's own placement does not count against the
-        // image made for it (none for a parent the service never placed).
-        let parent = self.records.placed_cpu(parent);
+        // In a mask without CPU 0 the mark of the parent's own placement does
+        // not count against the image made for it (placing::discounted_parent).
+        let parent = placing::discounted_parent(&self.records, allowed, parent);
         let crowd = Crowd {
             load: &self.window_load,
             issued: [&self.window_issued[0], &self.window_issued[1]],
