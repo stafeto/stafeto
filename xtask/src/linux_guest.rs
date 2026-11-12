@@ -62,6 +62,10 @@ pub const BENCH_SWITCH_IMAGE: &str = "boot-net-bench-switch.img";
 /// The image of F1s with the counters of the network service: a file of its own, so that a build
 /// of one never replaces the other.
 pub const BENCH_SWITCH_PROFILE_IMAGE: &str = "boot-net-bench-switch-profile.img";
+/// The image of F1s with the counters of the network service and the shell's processes on CPUs
+/// 1 to 3 (`init::table::bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE`): the workers of nginx-fast
+/// never stand on the CPU of the switch.
+pub const BENCH_SWITCH_PINNED_IMAGE: &str = "boot-net-bench-switch-pinned.img";
 /// The second device's address in the image of F1 (the static address of
 /// `netd.conf`: the NAT of VZ has no lease for a device that the stack owns).
 pub const FAST_ADDRESS: &str = "192.168.64.250";
@@ -225,6 +229,31 @@ pub fn build_switch_profile_image() -> Result<PathBuf, String> {
     build_boot_image(
         BENCH_SWITCH_PROFILE_IMAGE,
         bench_switch_profile_programs(),
+        BOOT_PROFILE,
+    )
+}
+
+/// The programs of the image of F1s with the counters of the network service and the shell's
+/// processes on CPUs 1 to 3 (`table-bench-fast-switch-pinned-vz`).
+pub fn bench_switch_pinned_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = bench_switch_profile_programs().to_vec();
+        for program in &mut programs {
+            if program.0 == "init" {
+                program.3 = &["table-bench-fast-switch-pinned-vz"];
+            }
+        }
+        programs
+    })
+}
+
+/// Builds the image of F1s with the profile and the shell's processes on CPUs 1 to 3.
+pub fn build_switch_pinned_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
+    build_boot_image(
+        BENCH_SWITCH_PINNED_IMAGE,
+        bench_switch_pinned_programs(),
         BOOT_PROFILE,
     )
 }
@@ -1573,6 +1602,24 @@ mod tests {
         assert_eq!(bench_programs()[0].3, &["table-bench-vz"]);
         assert_eq!(net::vz_programs(false)[0].3, &["table-net-vz"]);
         assert_eq!(bench_programs().len(), net::vz_programs(false).len());
+    }
+
+    #[test]
+    fn the_pinned_image_of_f1s_differs_from_that_with_the_profile_in_the_table_alone() {
+        let profile = bench_switch_profile_programs();
+        let pinned = bench_switch_pinned_programs();
+        assert_eq!(pinned.len(), profile.len());
+        for (one, base) in pinned.iter().zip(profile) {
+            if one.0 == "init" {
+                assert_eq!(one.3, &["table-bench-fast-switch-pinned-vz"]);
+            } else {
+                assert_eq!(one, base);
+            }
+        }
+        assert_eq!(
+            bench_switch_profile_programs()[0].3,
+            &["table-bench-fast-switch-vz"]
+        );
     }
 
     #[test]

@@ -17,7 +17,12 @@
 //!
 //! `boot-net-bench-fast.img` (the row F1) is the image of nginx on the
 //! stack on VZ (`fstack::FAST_NGINX_VZ_TABLE`, both network devices) with the
-//! same one change: the launcher of the shell on the four CPUs.
+//! same one change: the launcher of the shell on the four CPUs. The pinned
+//! variants (`BENCH_PINNED_VZ_TABLE`, `BENCH_FAST_SWITCH_PINNED_VZ_TABLE`)
+//! give the launcher CPUs 1 to 3: the process service places a worker of nginx
+//! on the least busy CPU of the launcher's mask (a later `sched_setaffinity`
+//! does not move it, `docs/smp.md`), so with that mask no worker stands on CPU 0
+//! next to the network service and the switch.
 
 use super::fstack::{FAST_NGINX_VZ_TABLE, FAST_SWITCH_VZ_TABLE};
 use super::net::{NET_LAUNCHER, NET_VZ_TABLE};
@@ -98,6 +103,7 @@ const PINNED: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_PINNED_CPUS);
 const CPU0: [Record; 10] = on_cpu_0(with_launcher(NET_VZ_TABLE, BENCH_CPUS));
 const FAST_TABLE: [Record; 10] = with_launcher(FAST_NGINX_VZ_TABLE, BENCH_CPUS);
 const FAST_SWITCH_TABLE: [Record; 10] = with_launcher(FAST_SWITCH_VZ_TABLE, BENCH_CPUS);
+const FAST_SWITCH_PINNED: [Record; 10] = with_launcher(FAST_SWITCH_VZ_TABLE, BENCH_PINNED_CPUS);
 
 /// The image of the shell with the network service on VZ, with the shell's
 /// processes on all four CPUs: the record of `NET_LAUNCHER` by name, so that
@@ -119,3 +125,7 @@ pub const BENCH_FAST_VZ_TABLE: &[Record] = &FAST_TABLE;
 
 /// The same on the switch: one device, the shell's processes on all four CPUs (the row F1s).
 pub const BENCH_FAST_SWITCH_VZ_TABLE: &[Record] = &FAST_SWITCH_TABLE;
+
+/// The same on the switch with the shell's processes on CPUs 1 to 3: the
+/// workers of nginx-fast never run on the CPU of the switch.
+pub const BENCH_FAST_SWITCH_PINNED_VZ_TABLE: &[Record] = &FAST_SWITCH_PINNED;

@@ -213,6 +213,22 @@ thread whose wake is on its way (`info_in_flight`).
   mask the kernel gave the process (EINVAL for a mask with none of those
   CPUs): the kernel moves no thread, so the mask works for the threads made
   later and for the next exec (`taskset -c N command`).
+  **A call does not move the running thread (#670).** `sched_setaffinity`
+  only records the mask in the page of the process (`lib/posix-abi/src/cpus.rs`);
+  the main thread of an image stands where the process service's `place` put it
+  when the process was made, and it stays there whatever the call says. A server
+  that pins itself after `fork` (nginx's `worker_cpu_affinity` calls it in the
+  worker) therefore keeps the CPU `place` chose: the pin holds only when `place`
+  happened to choose the same CPU, and which CPU that is depends on the load
+  window and on the last placement. The way to put workers on chosen CPUs is the
+  mask of the record that starts them: the workers of a shell started from a
+  launcher whose mask is CPUs 1 to 3 (the images of the measurement,
+  `BENCH_PINNED_CPUS`) are placed on the least busy of those, in turn when they
+  are made one after the other, and none stands on CPU 0 with the network
+  service and its switch. A worker on CPU 0 runs below those services and is
+  served in bursts (a starved worker of 11.11 used 20 jiffies where the others
+  used 500). A call that moves the calling thread is a decision for the kernel
+  notes, with no code yet.
 - **The CPU mask of a process (#419).** A process has a mask of the CPUs
   its threads run on, set by its creator (`process_create` x8: 0 is the
   creator's own, otherwise a subset of it, ACCESS_DENIED for more) and never

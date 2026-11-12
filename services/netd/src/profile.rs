@@ -27,7 +27,12 @@
 //! service itself ran (`ran_ticks`, its thread's own time, which the kernel
 //! counts apart from the time of others), the ticks of the steps by kind
 //! (`step_rx_ticks`, `step_tx_ticks`, `step_other_ticks`) and of the
-//! checksums (`sum_ticks`) give the parts of the time of a request.
+//! checksums (`sum_ticks`) give the parts of the time of a request. The
+//! connections each member of an SO_REUSEPORT group took, by position in the
+//! group (`member0` to `member7`, the groups summed), and the frames the
+//! switch passed to each consumer from the wire (`cons0` to `cons7`) say how
+//! the workers of a server share the load; both are set when a snapshot is
+//! taken.
 
 use core::fmt::{self, Write};
 
@@ -92,6 +97,24 @@ counters! {
     WireTx = "wire_tx",
     SumTx = "sum_tx",
     SumSoft = "sum_soft",
+    // The SYNs each member of a group took, by position (reuse.rs), and the frames of the wire
+    // the switch passed to each consumer (switch.rs), set at the snapshot.
+    Member0 = "member0",
+    Member1 = "member1",
+    Member2 = "member2",
+    Member3 = "member3",
+    Member4 = "member4",
+    Member5 = "member5",
+    Member6 = "member6",
+    Member7 = "member7",
+    Cons0 = "cons0",
+    Cons1 = "cons1",
+    Cons2 = "cons2",
+    Cons3 = "cons3",
+    Cons4 = "cons4",
+    Cons5 = "cons5",
+    Cons6 = "cons6",
+    Cons7 = "cons7",
     // The maxima: the counters from here on are not differences.
     RingMax = "ring_max",
     IsrMax = "isr_max",
@@ -251,6 +274,12 @@ mod on {
         COUNTS[counter as usize].store(value, Relaxed);
     }
 
+    /// Sets the counter `first` plus `at` (the counters of a run of positions
+    /// that follow each other) to a value read elsewhere.
+    pub fn store_at(first: Counter, at: usize, value: u64) {
+        COUNTS[first as usize + at].store(value, Relaxed);
+    }
+
     /// The number of the next snapshot.
     pub fn next_id() -> u64 {
         static ID: AtomicU64 = AtomicU64::new(0);
@@ -298,6 +327,8 @@ mod off {
     #[inline(always)]
     pub fn store(_: Counter, _: u64) {}
     #[inline(always)]
+    pub fn store_at(_: Counter, _: usize, _: u64) {}
+    #[inline(always)]
     pub fn next_id() -> u64 {
         0
     }
@@ -331,6 +362,30 @@ mod tests {
         assert_eq!(NAMES[Counter::CallMax as usize], "call_max");
         assert_eq!(COUNTERS, Counter::RunMax as usize + 1);
         assert_eq!(NAMES[Counter::RunMax as usize], "run_max");
+    }
+
+    #[test]
+    fn the_members_and_the_consumers_are_runs_of_eight_in_order() {
+        assert_eq!(Counter::Member7 as usize - Counter::Member0 as usize, 7);
+        assert_eq!(Counter::Cons7 as usize - Counter::Cons0 as usize, 7);
+        assert_eq!(Counter::Cons0 as usize, Counter::Member7 as usize + 1);
+        for i in 0..8 {
+            assert_eq!(NAMES[Counter::Member0 as usize + i], format!("member{i}"));
+            assert_eq!(NAMES[Counter::Cons0 as usize + i], format!("cons{i}"));
+        }
+        // Both runs are sums: the maxima come after them.
+        assert!((Counter::Cons7 as usize) < SUMS);
+        assert_eq!(crate::reuse::SERVED_POSITIONS, 8);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn a_run_of_positions_is_stored_one_counter_each() {
+        store_at(Counter::Member0, 2, 41);
+        store_at(Counter::Cons0, 7, 9);
+        let now = snapshot();
+        assert_eq!(now.counters[Counter::Member2 as usize], 41);
+        assert_eq!(now.counters[Counter::Cons7 as usize], 9);
     }
 
     #[test]

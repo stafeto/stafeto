@@ -15,6 +15,12 @@
 //!    and HTTP/2.
 //! 1. `nginx -c /etc/nginx/nginx.conf &`: the console shows `using the
 //!    "epoll" event method` and four `start worker process` lines.
+//!    The workers are placed by the process service (`place`, docs/smp.md) on
+//!    the least busy CPUs of the shell's mask. A pin made after `fork`, nginx's
+//!    `worker_cpu_affinity` (`sched_setaffinity` in the worker), only records
+//!    the mask and moves no running thread, so the probe asserts nothing of
+//!    the CPU a worker stands on; the measurement keeps its workers off CPU 0
+//!    with the mask of the shell's launcher (`--image pinned` of `net-bench`).
 //! 2. Five processes `nginx`; the four workers have the user ID 65534
 //!    (`nobody`) in `/proc/<pid>/status`, the master 0.
 //! 3. 200 requests HTTP/1.1 `GET /index.html` over 16 connections that stay

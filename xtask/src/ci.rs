@@ -513,6 +513,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         build_variant(BenchImage::Profile)?;
         build_variant(BenchImage::Pinned)?;
         build_variant(BenchImage::Cpu0)?;
+        super::linux_guest::build_switch_pinned_image()?;
         super::linux_guest::build_fast_image().map(|_| ())
     }));
 
