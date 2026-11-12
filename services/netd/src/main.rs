@@ -669,6 +669,7 @@ fn main(_: u64) -> u64 {
         held_rx: false,
         #[cfg(feature = "probe")]
         held_tx: false,
+        merged_next: 1,
         #[cfg(feature = "probe")]
         longest: [0; 2],
         #[cfg(any(feature = "probe", feature = "profile"))]
@@ -1091,6 +1092,8 @@ struct Driver<'a> {
     held_rx: bool,
     #[cfg(feature = "probe")]
     held_tx: bool,
+    /// The count of merged frames at which the stack says the line of the cut next.
+    merged_next: u32,
     /// The longest step of waking and of departure so far (the probe's lines
     /// `net: step wake` and `net: step cleanup`, which the measurement of the
     /// interest sets reads: the own steps of the service are one kind).
@@ -1196,12 +1199,34 @@ impl Driver<'_> {
     /// service's own. It takes up to STEP_RX frames the switch passed
     /// (loopback first), with the stack's answers to them, and asks for the
     /// steps that follow.
+    /// The line of the cut of merged frames at each power of two of their count, said here (the
+    /// stack's step) and never in a step of the switch.
+    fn say_merged(&mut self) {
+        if !switch::INNER.merged() {
+            return;
+        }
+        let st = &switch::INNER.stats;
+        let count = st.merged.load(core::sync::atomic::Ordering::Relaxed);
+        if count >= self.merged_next {
+            self.merged_next = (count + 1).next_power_of_two();
+            let get =
+                |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
+            rt::println!(
+                "net: merged {count} frames, the longest of {} bytes, cut into {} segments, {} dropped",
+                get(&st.merged_max),
+                get(&st.cut),
+                get(&st.merged_dropped)
+            );
+        }
+    }
+
     fn rx_step(&mut self) {
         rt::service::step_own();
         profile::count(Counter::StepRx);
         // Seen before the ring is looked at: frames the switch passes after
         // this tell the stack again.
         switch::INNER.stack_awake();
+        self.say_merged();
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_rx = true;
