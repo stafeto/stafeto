@@ -3571,12 +3571,9 @@ impl Processes {
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);
         }
-        // The parent of the image made it and waits, so its own mark on its
-        // CPU does not count against its children.
-        let parent = self
-            .records
-            .get(parent)
-            .map(|parent| usize::from(parent.cpu));
+        // The mark of the parent's own placement does not count against the
+        // image made for it (none for a parent the service never placed).
+        let parent = self.records.placed_cpu(parent);
         let crowd = Crowd {
             load: &self.window_load,
             issued: [&self.window_issued[0], &self.window_issued[1]],
@@ -3667,6 +3664,7 @@ impl Processes {
                 let started = sys::thread_start(&thread);
                 if let Some(record) = self.records.get_mut(child) {
                     record.cpu = cpu;
+                    record.placed = true;
                 }
                 let place = self.loaders.get_mut(slot).ok_or(abi::Error::BadState)?;
                 place.held.thread = Some(thread);

@@ -13,10 +13,15 @@ pub const MAX_CPUS: usize = 8;
 pub struct Crowd<'a> {
     pub load: &'a [u32; MAX_CPUS],
     pub issued: [&'a [u32; MAX_CPUS]; 2],
-    /// The CPU of the parent of the image placed. The parent made the image
-    /// and sleeps until it ends or asks for more, so the mark its own
-    /// placement left on that CPU does not count as a crowd for its children
-    /// (one mark at most: marks of other images there stay).
+    /// The CPU the service put the parent of the image placed on (None for a
+    /// parent it never placed). The mark of the parent's own placement does
+    /// not count against its children: the parent made the image and is
+    /// no crowd for it. The discount is one mark of that CPU for every
+    /// placement, taken whether or not the parent's own mark is still in the
+    /// two windows, so the bias to the parent's CPU is one mark at most. For
+    /// an exec the parent is the process itself, so an image made by fork
+    /// and then exec stays on the CPU the fork gave it when nothing else is
+    /// lighter.
     pub parent: Option<usize>,
 }
 

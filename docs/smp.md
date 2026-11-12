@@ -205,7 +205,7 @@ thread whose wake is on its way (`info_in_flight`).
   the last window of 10 ms (the time asleep from `object_info` CPU, read once
   per CPU when a window closes) and each image put on it in the last two
   windows counts as one more; among equals the CPU after the last choice wins,
-  so images made in a row go to different CPUs. The step reads no process
+  so images made in a row go to different CPUs. The mark of the parent's own placement does not count against its children (one mark of the parent's CPU, whether or not it is still in the windows; none for a parent the service never placed, such as an adopted record). The parent of an exec is the process itself, so an image made by fork and then exec stays on the CPU the fork gave it when no other CPU is lighter (#677). The step reads no process
   record, so it costs the same with a hundred processes (`process-steps`
   places on one CPU too, with 248 children live). A thread starts on the CPU of its creator or, when
   the mask does not allow that, on the lowest CPU it names.
