@@ -65,11 +65,10 @@ use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    CUT_RESERVE, CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY,
-    RX_BACK_LAZY_MERGED, RX_BUFFERS, RunClock, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS,
-    SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS,
-    SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due,
-    drive,
+    CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
+    STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
+    SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
+    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, drive,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -138,8 +137,8 @@ pub struct Inner {
     frames_tx: AtomicU32,
     /// The device completes the sums of TCP (set when the switch starts, before the stack runs).
     offload: AtomicBool,
-    /// The device merges the segments it receives (the ring of receiving is chains of 64: the
-    /// stack gives its buffers back sooner, `RX_BACK_LAZY_MERGED`).
+    /// The device merges the segments it receives (the ring of receiving is chains of 64, and the
+    /// stack reads its frames in the buffers of a pool, `netd::pool`).
     merged: AtomicBool,
     /// The switch holds a merged frame it cut part of and waits for the stack to take segments
     /// (the end of a run of the stack wakes it).
@@ -199,6 +198,8 @@ pub struct Stats {
     pub merged_dropped: AtomicU32,
     /// The longest merged frame seen, in bytes after the header.
     pub merged_max: AtomicU32,
+    /// Frames for the stack dropped because the pool of its buffers was empty.
+    pub pool_empty: AtomicU32,
 }
 
 impl Stats {
@@ -232,6 +233,7 @@ impl Stats {
             cut: AtomicU32::new(0),
             merged_dropped: AtomicU32::new(0),
             merged_max: AtomicU32::new(0),
+            pool_empty: AtomicU32::new(0),
         }
     }
 }
@@ -310,11 +312,7 @@ fn offer_must(passed: &mut u8, k: usize, word: u32) {
 
 /// The buffers of receiving the stack gives back before it wakes the switch for them alone.
 fn back_lazy() -> usize {
-    if INNER.merged() {
-        RX_BACK_LAZY_MERGED
-    } else {
-        RX_BACK_LAZY
-    }
+    RX_BACK_LAZY
 }
 
 impl Lane {
@@ -557,6 +555,8 @@ pub struct Switch {
     merged: bool,
     /// The merged frame being cut.
     big: Option<Big>,
+    /// The buffers the stack reads its frames in when the device merges segments (`netd::pool`).
+    pool: netd::pool::Pool,
     /// Whose each buffer of the queue of sending is, in the order they went in: the device
     /// returns them in order, so a count of reclaimed buffers pops the owners.
     fifo: [u8; TX_BUFFERS],
@@ -660,6 +660,11 @@ impl Switch {
             offload,
             merged,
             big: None,
+            pool: if merged {
+                netd::pool::Pool::filled(virtio_net::books::TAILS, RX_BUFFERS)
+            } else {
+                netd::pool::Pool::empty()
+            },
             fifo: [0; TX_BUFFERS],
             fifo_head: 0,
             fifo_len: 0,
@@ -732,13 +737,10 @@ impl Switch {
     /// (bit k for instance k) that were out of them and have some now.
     fn lend(&mut self) -> u8 {
         let share = self.share();
-        // A device that merges segments has the segments of a merged frame read in buffers of
-        // sending (`cut_more`): the last `CUT_RESERVE` stay in the pool.
-        let keep = if self.merged { CUT_RESERVE } else { 0 };
         let mut lent = 0;
         for (k, lane) in INNER.lanes[..INSTANCES].iter().enumerate() {
             if self.tables.is_none() {
-                while lane.tx_supply.len() < share && self.tx.book.free() > keep {
+                while lane.tx_supply.len() < share {
                     let Some(n) = self.tx.book.alloc() else {
                         break;
                     };
@@ -751,7 +753,7 @@ impl Switch {
                     let held = lane.tx_supply.len()
                         + lane.tx_sub.len()
                         + usize::from(self.inflight[usize::from(own_stack(k))]);
-                    if held >= share || self.tx.book.free() <= keep {
+                    if held >= share {
                         break;
                     }
                     let Some(n) = self.tx.book.alloc() else {
@@ -885,6 +887,14 @@ impl Switch {
                 // A frame the switch turned to the stack came in a buffer of sending.
                 if word as usize >= RX_BUFFERS {
                     self.tx.book.release(word as u16);
+                } else if self.merged {
+                    // A buffer of the pool: the chains of the ring never reach the stack. The
+                    // pool's `held` marks are shared by the lanes: with INSTANCES above 1 they
+                    // must be one pool for each lane (a number one lane returns could be
+                    // another's).
+                    if !self.pool.put(word as u16) {
+                        fail("the stack gave back a buffer of receiving it does not hold");
+                    }
                 } else if let Err(broken) = self.rx.give(word as u16) {
                     fail(broken.text(false));
                 }
@@ -1584,12 +1594,8 @@ impl Switch {
                     }
                     let Some(t) = self.tables.as_mut() else {
                         trace::frame(P_N_TO_STACK, frame, true);
-                        offer_must(
-                            &mut self.passed,
-                            DEFAULT_INSTANCE,
-                            pack_frame(n, len as u16, sum),
-                        );
-                        passed += 1;
+                        passed += self.pass_to_stack(n, len, sum, DEFAULT_INSTANCE);
+                        self.weigh_copy(&mut budget, &mut taken);
                         continue;
                     };
                     match route::route(t, frame, Source::Wire) {
@@ -1614,9 +1620,8 @@ impl Switch {
                                 true,
                             );
                             if route::deliver(t, sums::mark(d, sum), frame) {
-                                let word = pack_frame(n, len as u16, sum);
-                                offer_must(&mut self.passed, lane_of(d), word);
-                                passed += 1;
+                                passed += self.pass_to_stack(n, len, sum, lane_of(d));
+                                self.weigh_copy(&mut budget, &mut taken);
                             } else {
                                 self.give(n);
                             }
@@ -1636,6 +1641,43 @@ impl Switch {
             }
         }
         passed
+    }
+
+    /// The frame of `len` bytes in buffer `n` of the ring goes to the stack. With the chains of a
+    /// device that merges segments it is copied into a buffer of the pool and the chain goes
+    /// back to the device at once; a frame with no buffer of the pool to go in is dropped (TCP
+    /// repeats it). The number of frames passed (0 or 1).
+    fn pass_to_stack(&mut self, n: u16, len: usize, sum: bool, lane: usize) -> usize {
+        if !self.merged {
+            offer_must(&mut self.passed, lane, pack_frame(n, len as u16, sum));
+            return 1;
+        }
+        let Some(p) = self.pool.take() else {
+            bump(&INNER.stats.pool_empty);
+            self.give(n);
+            return 0;
+        };
+        // SAFETY: the chain is the switch's (the device returned it), and the buffer of the pool
+        // is free (just taken).
+        let (from, to) = unsafe {
+            (
+                virtio_net::rings::buffer_at(self.rx.base(), n),
+                virtio_net::rings::buffer_at(self.rx.base(), p),
+            )
+        };
+        to[HDR_LEN..HDR_LEN + len].copy_from_slice(&from[HDR_LEN..HDR_LEN + len]);
+        self.give(n);
+        offer_must(&mut self.passed, lane, pack_frame(p, len as u16, sum));
+        1
+    }
+
+    /// The copy of a frame for the stack into the pool counts `STACK_COPY_WEIGHT` frames of the
+    /// step (one is counted already).
+    fn weigh_copy(&self, budget: &mut usize, taken: &mut usize) {
+        if self.merged {
+            *budget = budget.saturating_sub(STACK_COPY_WEIGHT - 1);
+            *taken += STACK_COPY_WEIGHT - 1;
+        }
     }
 
     fn give(&mut self, n: u16) {
@@ -1706,11 +1748,11 @@ impl Switch {
 
     /// Cuts the next segments of the merged frame and passes them on, as many as the step's
     /// budget allows (`CUT_WEIGHT` frames each) and the stack takes: the frame stays (`self.big`)
-    /// while segments are left. The segments are frames of an MTU with whole sums (the device
-    /// checked the data), so they go with the sum good; the first names where they all go, as
-    /// the route of a flow does. The segments of the stack go in buffers of sending, read in
-    /// place and given back through `rx_back` as any frame of the switch's own turn; when the
-    /// stack's ring is full or no such buffer is free the cut waits (`cut_wait` has the end of
+    /// while segments are left. The segments are frames of an MTU (the device checked the data), so
+    /// they go with the sum good; the first names where they all go, as
+    /// the route of a flow does. The segments of the stack go in buffers of the pool, read in
+    /// place and given back through `rx_back`; when the stack's ring is full or the pool has
+    /// no buffer free the cut waits (`cut_wait` has the end of
     /// the stack's run wake the switch). The number of segments passed to the stack.
     fn cut_more(&mut self, budget: &mut usize, taken: &mut usize) -> usize {
         if INNER.cut_wait.load(Ordering::Relaxed) {
@@ -1762,18 +1804,18 @@ impl Switch {
                 _ => {
                     let lane = lane_of(big.to);
                     let stack_full = INNER.lanes[lane].rx_ready.len() >= RX_AHEAD;
-                    let Some(m) = (!stack_full).then(|| self.tx.book.alloc()).flatten() else {
+                    let Some(m) = (!stack_full).then(|| self.pool.take()).flatten() else {
                         INNER.cut_wait.store(true, Ordering::SeqCst);
                         self.big = Some(big);
                         break;
                     };
                     // SAFETY: the buffer is free (just taken from the pool).
-                    let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), m) };
+                    let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), m) };
                     slice[HDR_LEN..HDR_LEN + len].copy_from_slice(seg);
                     if offer(&mut self.passed, lane, pack_frame(m, len as u16, true)) {
                         passed += 1;
                     } else {
-                        self.tx.book.release(m);
+                        self.pool.put(m);
                         INNER.cut_wait.store(true, Ordering::SeqCst);
                         self.big = Some(big);
                         break;

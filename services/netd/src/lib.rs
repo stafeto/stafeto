@@ -27,6 +27,7 @@ pub mod owners;
 pub mod passes;
 pub mod pci;
 pub mod places;
+pub mod pool;
 pub mod ports;
 pub mod profile;
 pub mod resolv;

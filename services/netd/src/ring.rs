@@ -203,10 +203,6 @@ pub const SWITCH_BACK: usize = 32;
 /// The buffers of receiving the stack gives back before it wakes the switch
 /// for them alone (with a frame to send or a held doorbell it wakes it anyway).
 pub const RX_BACK_LAZY: usize = 64;
-/// The same once the ring of receiving is 64 chains (a device that merges segments): a quarter
-/// of them.
-pub const RX_BACK_LAZY_MERGED: usize = 16;
-const _: () = assert!(RX_BACK_LAZY_MERGED * 4 <= virtio_net::books::TAILS);
 /// The frames of the wire the switch leaves for the stack at most: more
 /// stay in the queue of the device until the stack gave buffers back.
 pub const RX_AHEAD: usize = 32;
@@ -254,14 +250,21 @@ pub const SUM_WEIGHT: usize = SWITCH_BASE;
 /// without tables, which has no time check, holds at most `SWITCH_RX` / `CUT_WEIGHT` segments.
 pub const CUT_TICKS: usize = 2_000;
 pub const CUT_WEIGHT: usize = SWITCH_BASE;
+/// A frame for the stack of a device that merges segments is copied out of its chain into a
+/// buffer of the pool (`pool`), about `COPY_TICKS` under -icount more than the 210 of a frame
+/// taken off the queue, and counts as `STACK_COPY_WEIGHT` frames of the step. Two of them in the
+/// base share cost what three frames of the table path do (1 800 each).
+pub const COPY_TICKS: usize = 900;
+pub const STACK_COPY_WEIGHT: usize = 2;
+const _: () = assert!(
+    SWITCH_STEP_REST + SWITCH_RX.div_ceil(STACK_COPY_WEIGHT) * (SWITCH_STEP_RX_FRAME + COPY_TICKS)
+        <= 18_369
+        && SWITCH_BASE.div_ceil(STACK_COPY_WEIGHT) * (1_800 + COPY_TICKS) <= SWITCH_BASE * 1_800
+);
 const _: () = assert!(
     SWITCH_BASE.div_ceil(CUT_WEIGHT) * CUT_TICKS <= SWITCH_BASE * 1_500
         && SWITCH_RX.div_ceil(CUT_WEIGHT) * CUT_TICKS <= 6_000
 );
-/// The buffers of sending the switch does not lend the stack when the device merges segments:
-/// the segments of a merged frame for the stack are read in buffers of sending, as many as the
-/// stack's ring of frames holds (`RX_AHEAD`).
-pub const CUT_RESERVE: usize = RX_AHEAD;
 const _: () = assert!(
     SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_800 + SUM_TICKS) <= SWITCH_BASE * 1_800
         && SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_500 + SUM_TICKS) <= SWITCH_BASE * 1_500
