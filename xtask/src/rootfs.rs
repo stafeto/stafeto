@@ -1230,6 +1230,9 @@ const NETD_CONF_STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10
 /// device: no address for the first, which keeps DHCP.
 const NETD_CONF_STATIC1: &[u8] = b"address1 192.168.64.250/24\n";
 
+/// `/etc/netd.conf` of the VZ images with one device: the segmentation offload on.
+const NETD_CONF_TSO: &[u8] = b"tso 1\n";
+
 /// The files of the shell images with the network service: the shell's, the
 /// page `httpd -h /www` serves, and the probes of the sockets and of the
 /// resolver. `/etc/resolv.conf` is the network service's to write.
@@ -1900,10 +1903,19 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
-        "boot-net-vz.img"
-        | "boot-net-vz2.img"
-        | "boot-net-vz-steps.img"
-        | "boot-net-vz2-steps.img" => net_files(name),
+        "boot-net-vz2.img" | "boot-net-vz2-steps.img" => net_files(name),
+        // One device on VZ with the segmentation offload asked for (`tso 1`): the device merges
+        // the segments it receives, and the switch cuts them again.
+        "boot-net-vz.img" | "boot-net-vz-steps.img" => {
+            let mut files = net_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", NETD_CONF_TSO),
+            ));
+            files
+        }
         "boot-net-vz2-static.img" => {
             let mut files = net_files(name);
             files.push(of(

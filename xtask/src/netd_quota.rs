@@ -25,7 +25,7 @@
 
 use crate::net::NETD_STACK_SIZE;
 use init::table::Record;
-use init::table::net::{NETD, NETD_TWO, NETD_VZ, NETD_VZ2};
+use init::table::net::{NETD, NETD_TWO, NETD_VZ, NETD_VZ_TSO, NETD_VZ2};
 use std::path::Path;
 use std::sync::PoisonError;
 
@@ -42,9 +42,10 @@ const PAGE: u64 = 4096;
 pub const OBJECTS_MARGIN: u64 = 64;
 
 /// Every record of the service: they share NETD's quota.
-const RECORDS: [(&str, &Record); 4] = [
+const RECORDS: [(&str, &Record); 5] = [
     ("NETD", &NETD),
     ("NETD_VZ", &NETD_VZ),
+    ("NETD_VZ_TSO", &NETD_VZ_TSO),
     ("NETD_VZ2", &NETD_VZ2),
     ("NETD_TWO", &NETD_TWO),
 ];

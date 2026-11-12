@@ -8,7 +8,7 @@
 //! (`virtio_net::books`), and this module names them for the service.
 
 pub use virtio_net::books::{
-    BUFFERS, NET_PAGES, QUEUE_SIZE, RX_BUFFERS, RxBook, TX_BUFFERS, TxBook, offset,
+    BUFFERS, NET_PAGES, QUEUE_SIZE, RX_BUFFERS, RxBook, TAIL_PAGES, TX_BUFFERS, TxBook, offset,
 };
 
 /// The frames a step of receiving takes and the frames a step of sending
@@ -203,6 +203,10 @@ pub const SWITCH_BACK: usize = 32;
 /// The buffers of receiving the stack gives back before it wakes the switch
 /// for them alone (with a frame to send or a held doorbell it wakes it anyway).
 pub const RX_BACK_LAZY: usize = 64;
+/// The same once the ring of receiving is 64 chains (a device that merges segments): a quarter
+/// of them.
+pub const RX_BACK_LAZY_MERGED: usize = 16;
+const _: () = assert!(RX_BACK_LAZY_MERGED * 4 <= virtio_net::books::TAILS);
 /// The frames of the wire the switch leaves for the stack at most: more
 /// stay in the queue of the device until the stack gave buffers back.
 pub const RX_AHEAD: usize = 32;
@@ -242,6 +246,22 @@ pub const SWITCH_BASE: usize = 3;
 /// frames into the base share (2 x 3 100 ticks against the 5 400 the asserts count).
 pub const SUM_TICKS: usize = 1_300;
 pub const SUM_WEIGHT: usize = SWITCH_BASE;
+/// A segment of a merged frame costs a copy of up to 1 514 bytes into the scratch, the sum of the
+/// IPv4 header and a second copy into the buffer of the stack or the ring of a consumer, about
+/// 2 000 ticks under -icount (the sum of the TCP segment is not made: the segment goes with the
+/// sum good). It weighs the whole base share, like a frame with a sum made in software
+/// (`SUM_WEIGHT`), so the frames a step always takes hold at most one segment, and the step
+/// without tables, which has no time check, holds at most `SWITCH_RX` / `CUT_WEIGHT` segments.
+pub const CUT_TICKS: usize = 2_000;
+pub const CUT_WEIGHT: usize = SWITCH_BASE;
+const _: () = assert!(
+    SWITCH_BASE.div_ceil(CUT_WEIGHT) * CUT_TICKS <= SWITCH_BASE * 1_500
+        && SWITCH_RX.div_ceil(CUT_WEIGHT) * CUT_TICKS <= 6_000
+);
+/// The buffers of sending the switch does not lend the stack when the device merges segments:
+/// the segments of a merged frame for the stack are read in buffers of sending, as many as the
+/// stack's ring of frames holds (`RX_AHEAD`).
+pub const CUT_RESERVE: usize = RX_AHEAD;
 const _: () = assert!(
     SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_800 + SUM_TICKS) <= SWITCH_BASE * 1_800
         && SWITCH_BASE.div_ceil(SUM_WEIGHT) * (1_500 + SUM_TICKS) <= SWITCH_BASE * 1_500

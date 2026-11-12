@@ -23,6 +23,18 @@ pub const BUFFERS: usize = RX_BUFFERS + TX_BUFFERS;
 pub const NET_PAGES: usize = BUFFERS * BUFFER_LEN / 4096;
 const _: () = assert!(NET_PAGES == 256);
 
+/// The chains of the ring of receiving once the device merges segments
+/// (`VIRTIO_NET_F_GUEST_TSO4`, Virtio 1.2, 5.1.6.3.1: buffers of at least 65 562
+/// bytes): the buffer `n` of 0 to `TAILS` - 1 is the head of a chain and
+/// its tail of `TAIL_LEN` bytes follows it in the object of tails. A chain holds
+/// the 12-byte header and a frame of up to 67 572 bytes.
+pub const TAILS: usize = 64;
+pub const TAIL_LEN: usize = 65536;
+/// The pages of the object of tails: the most a contiguous object may be.
+pub const TAIL_PAGES: usize = TAILS * TAIL_LEN / 4096;
+const _: () = assert!(TAIL_PAGES == 1024 && TAILS <= RX_BUFFERS);
+const _: () = assert!(BUFFER_LEN + TAIL_LEN >= 65562);
+
 /// The offset in the network object of buffer `n`.
 pub const fn offset(n: u16) -> usize {
     n as usize * BUFFER_LEN

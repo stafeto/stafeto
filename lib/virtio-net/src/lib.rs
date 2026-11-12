@@ -8,8 +8,8 @@
 //! (`host`), the transport of a device on virtio-mmio or Virtio PCI
 //! (`transport`, with the configuration space of a function from a copy,
 //! `Snapshot`), the start of a device (`open`), the accesses to its
-//! registers and the barriers of its rings (`mmio`, `barrier`), and the copy
-//! of a frame (`copy`).
+//! registers and the barriers of its rings (`mmio`, `barrier`), the copy
+//! of a frame (`copy`) and the cut of a merged frame (`cut`).
 //!
 //! It makes no call of the kernel and holds no stack: whoever maps the
 //! objects and the window, and owns the line, uses it. The network service
@@ -23,6 +23,7 @@
 pub mod barrier;
 pub mod books;
 pub mod copy;
+pub mod cut;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod frames;

@@ -16,7 +16,9 @@
 //!
 //! The service holds two DMA objects: `dma` (8 pages, uncached: the pages
 //! of the two queues) and `net` (a megabyte of cached memory: 512 buffers
-//! of 2 KiB for the frames). The device masters the bus with no SMMU (spec
+//! of 2 KiB for the frames); in `NETD_VZ_TSO`, the record of the VZ image that asks
+//! for the segmentation offload, a third, `tails` (4 MiB of cached memory: the
+//! tails of the 64 chains of receiving when the device merges segments). The device masters the bus with no SMMU (spec
 //! 9): the service is trusted, and init stops the device before the objects
 //! of an instance that ended go: Status 0, which reads 0 once the reset is
 //! done.
@@ -62,6 +64,23 @@ pub const DMA: &[Dma] = &[
     Dma {
         name: "net",
         size: 256 * PAGE,
+        uncached: false,
+        duplicate: false,
+    },
+];
+
+/// The objects of an instance on VZ with one device and the segmentation offload: those of `DMA` and the tails of the 64 chains
+/// of receiving of a device that merges segments (netd/src/dma.rs maps them when the device takes
+/// the segmentation offload): 4 MiB, the most a contiguous object may be. QEMU's device offers no
+/// segmentation offload on user networking, so its records keep two objects (and the memory of
+/// the guest); the record of two devices has no room for a third (`DMA_TWO`: its start data is
+/// full) and keeps the pair of sums.
+pub const DMA_TAILS: &[Dma] = &[
+    DMA[0],
+    DMA[1],
+    Dma {
+        name: "tails",
+        size: 1024 * PAGE,
         uncached: false,
         duplicate: false,
     },
@@ -279,6 +298,15 @@ pub const NETD_VZ: Record = Record {
     args: &VZ_ARGS,
     quiesce: &VZ_STOP,
     ..NETD
+};
+
+/// `NETD_VZ` with the tails of the chains of receiving: the image that asks the service for the
+/// segmentation offload (`tso 1` in its `netd.conf`) has this record. The other images of VZ do
+/// not carry the 4 MiB, and a service that finds no `tails` keeps the pair of sums whatever
+/// `netd.conf` says.
+pub const NETD_VZ_TSO: Record = Record {
+    dma: DMA_TAILS,
+    ..NETD_VZ
 };
 
 /// The service on VZ with both network devices: the windows hold the pages
@@ -659,7 +687,7 @@ pub const NET_VZ_TABLE: &[Record] = &[
     super::ramfs::TTY,
     super::entropy::RNG_VZ,
     super::entropy::ENTROPY,
-    NETD_VZ,
+    NETD_VZ_TSO,
 ];
 
 /// The image of the shell on VZ with both network devices.

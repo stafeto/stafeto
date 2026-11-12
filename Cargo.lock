@@ -1440,6 +1440,7 @@ dependencies = [
  "proto-net",
  "virtio-drivers",
  "virtio-mmio",
+ "zerocopy",
 ]
 
 [[package]]

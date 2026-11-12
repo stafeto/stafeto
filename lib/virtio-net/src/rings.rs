@@ -15,7 +15,7 @@
 //! (`pop`, `reclaim`).
 
 use crate::barrier;
-use crate::books::{QUEUE_SIZE, RxBook, TxBook, offset};
+use crate::books::{QUEUE_SIZE, RxBook, TAIL_LEN, TAILS, TxBook, offset};
 use crate::frames::{BUFFER_LEN, Csum, HDR_LEN, tx_prepare_with};
 use virtio_drivers::Hal;
 use virtio_drivers::queue::VirtQueue;
@@ -63,6 +63,20 @@ pub unsafe fn buffer_at<'a>(base: usize, n: u16) -> &'a mut [u8] {
     unsafe { core::slice::from_raw_parts_mut((base + offset(n)) as *mut u8, BUFFER_LEN) }
 }
 
+/// The tail of the chain of buffer `n`, in the object of tails mapped at `base`.
+///
+/// # Safety
+///
+/// As `buffer_at`, for the object of tails and a `n` below `TAILS`.
+#[inline]
+pub unsafe fn tail_at<'a>(base: usize, n: u16) -> &'a mut [u8] {
+    debug_assert!(usize::from(n) < TAILS);
+    // SAFETY: the caller's promise.
+    unsafe {
+        core::slice::from_raw_parts_mut((base + usize::from(n) * TAIL_LEN) as *mut u8, TAIL_LEN)
+    }
+}
+
 /// The buffers of the ring of receiving as far as its doorbell goes. A device
 /// reads the ring of available buffers when a frame comes (VZ), so the
 /// driver may leave the doorbell until the device has few of the buffers its
@@ -78,7 +92,7 @@ pub unsafe fn buffer_at<'a>(base: usize, n: u16) -> &'a mut [u8] {
 /// bound the time such a device waits: the doorbell rings when the device
 /// has used the flag once (`wanted` false was seen) and now asks for a
 /// notification, and in any case after `RX_LOW` buffers went back.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stock {
     /// In the queue: given, and neither used by the device nor taken back.
     queued: u32,
@@ -87,6 +101,16 @@ pub struct Stock {
     /// The device has asked for no notification at least once: it uses the
     /// flag, and the flag 0 is its call for a doorbell.
     flagged: bool,
+    /// The least buffers the device is left with when the doorbell rings.
+    low: u32,
+    /// The buffers added since the last doorbell that make it due.
+    batch: u32,
+}
+
+impl Default for Stock {
+    fn default() -> Stock {
+        Stock::new()
+    }
 }
 
 /// The least buffers the device is left with when the doorbell rings.
@@ -94,10 +118,24 @@ pub const RX_LOW: u32 = 64;
 
 impl Stock {
     pub const fn new() -> Stock {
+        Stock::with(RX_LOW, RX_LOW)
+    }
+
+    /// The stock of a ring of `chains` buffers, fewer than `RX_LOW` buffers can carry: the
+    /// doorbell is due when the device is down to a quarter of them, and a batch is the whole
+    /// ring (the device reads the ring of available buffers when a frame comes, VZ, so a doorbell
+    /// for a batch has no use, and a doorbell is an exit from the guest).
+    pub const fn for_chains(chains: u32) -> Stock {
+        Stock::with(chains / 4, chains)
+    }
+
+    const fn with(low: u32, batch: u32) -> Stock {
         Stock {
             queued: 0,
             pending: 0,
             flagged: false,
+            low,
+            batch,
         }
     }
 
@@ -139,7 +177,7 @@ impl Stock {
             self.flagged = true;
         }
         self.pending > 0
-            && (self.left() <= RX_LOW || self.pending >= RX_LOW || (self.flagged && wanted))
+            && (self.left() <= self.low || self.pending >= self.batch || (self.flagged && wanted))
     }
 }
 
@@ -168,6 +206,8 @@ pub struct RxRing<H: Hal> {
     pub queue: Queue<H>,
     book: RxBook,
     base: usize,
+    /// Where the object of tails is mapped, 0 for a ring of single buffers.
+    tails: usize,
     /// Buffers went back in since the last doorbell.
     pub dirty: bool,
     /// What the device was shown of the buffers (`Stock`).
@@ -181,9 +221,26 @@ impl<H: Hal> RxRing<H> {
             queue,
             book: RxBook::new(),
             base,
+            tails: 0,
             dirty: false,
             stock: Stock::new(),
         }
+    }
+
+    /// The ring over `queue` for a device that merges segments: each buffer
+    /// of 0 to `TAILS` - 1 goes in as a chain, with its tail of the object
+    /// mapped at `tails` behind it.
+    pub fn with_tails(queue: Queue<H>, base: usize, tails: usize) -> RxRing<H> {
+        RxRing {
+            tails,
+            stock: Stock::for_chains(TAILS as u32),
+            ..RxRing::new(queue, base)
+        }
+    }
+
+    /// Where the tails lie in the driver, 0 for none.
+    pub fn tails(&self) -> usize {
+        self.tails
     }
 
     /// Where its buffers lie in the driver.
@@ -203,8 +260,16 @@ impl<H: Hal> RxRing<H> {
         // is new or was popped), and nothing else refers to it until
         // `pop_used` returns it.
         let slice = unsafe { buffer_at(self.base, n) };
-        // SAFETY: the buffer stays untouched until `pop` takes it.
-        let token = unsafe { self.queue.add(&[], &mut [slice]) };
+        let token = if self.tails == 0 {
+            // SAFETY: the buffer stays untouched until `pop` takes it.
+            unsafe { self.queue.add(&[], &mut [slice]) }
+        } else if usize::from(n) < TAILS {
+            // SAFETY: as above, for the tail of the same buffer too.
+            let tail = unsafe { tail_at(self.tails, n) };
+            unsafe { self.queue.add(&[], &mut [slice, tail]) }
+        } else {
+            return Err(Broken::Refused);
+        };
         match token {
             Ok(token) if self.book.put(token, n) => {
                 self.dirty = true;
@@ -215,9 +280,11 @@ impl<H: Hal> RxRing<H> {
         }
     }
 
-    /// Fills the queue with the buffers 0 to `limit` - 1, at the start.
+    /// Fills the queue with the buffers 0 to `limit` - 1, at the start (the
+    /// chains of `TAILS` at most for a ring with tails).
     pub fn fill(&mut self, limit: usize) -> Result<(), Broken> {
-        for n in 0..limit.min(QUEUE_SIZE) as u16 {
+        let most = if self.tails == 0 { QUEUE_SIZE } else { TAILS };
+        for n in 0..limit.min(most) as u16 {
             self.give(n)?;
         }
         Ok(())
@@ -239,7 +306,13 @@ impl<H: Hal> RxRing<H> {
         // SAFETY: the device returned the buffer (it is used).
         let slice = unsafe { buffer_at(self.base, n) };
         // SAFETY: the same buffer `give` added with this token.
-        let popped = unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) };
+        let popped = if self.tails == 0 {
+            unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) }
+        } else {
+            // SAFETY: the same tail `give` added behind this buffer.
+            let tail = unsafe { tail_at(self.tails, n) };
+            unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice, tail]) }
+        };
         let used = popped.map_err(|_| Broken::NotTaken)?;
         self.stock.used();
         Ok(Some((n, used as usize)))
@@ -373,6 +446,8 @@ fn take_back(limit: usize, mut one: impl FnMut() -> Result<bool, Broken>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use virtio_drivers::transport::{DeviceStatus, DeviceType, InterruptStatus, Transport};
+    use zerocopy::{FromBytes, Immutable, IntoBytes};
 
     #[test]
     fn a_device_that_starved_and_waits_for_the_doorbell_gets_it() {
@@ -449,5 +524,208 @@ mod tests {
     #[should_panic(expected = "never given")]
     fn a_buffer_taken_back_that_was_never_given_is_a_count_error() {
         Stock::new().used();
+    }
+
+    #[test]
+    fn a_ring_of_64_chains_rings_when_the_device_is_down_to_a_quarter() {
+        let fill = |stock: &mut Stock| {
+            for _ in 0..TAILS {
+                stock.added();
+            }
+            assert!(stock.due(true));
+            stock.rung();
+        };
+        let back = |stock: &mut Stock, n: usize| {
+            for _ in 0..n {
+                stock.used();
+                stock.added();
+            }
+        };
+        let mut chains = Stock::for_chains(TAILS as u32);
+        fill(&mut chains);
+        back(&mut chains, 40);
+        assert!(!chains.due(true), "24 are left and 40 went in: no bell yet");
+        back(&mut chains, 8);
+        assert!(
+            chains.due(true),
+            "16 are left: the device is down to a quarter"
+        );
+        // A ring of 256 buffers rings for a batch of `RX_LOW` that went in.
+        let mut plain = Stock::new();
+        for _ in 0..QUEUE_SIZE {
+            plain.added();
+        }
+        plain.rung();
+        back(&mut plain, 40);
+        assert!(!plain.due(true), "216 of 256 are left, 40 went in");
+        back(&mut plain, 24);
+        assert!(plain.due(true), "a batch of 64 went in");
+    }
+
+    /// A transport that takes the queue and says nothing else.
+    struct Stub;
+
+    impl Transport for Stub {
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Network
+        }
+        fn read_device_features(&mut self) -> u64 {
+            0
+        }
+        fn write_driver_features(&mut self, _: u64) {}
+        fn max_queue_size(&mut self, _: u16) -> u32 {
+            QUEUE_SIZE as u32
+        }
+        fn notify(&mut self, _: u16) {}
+        fn get_status(&self) -> DeviceStatus {
+            DeviceStatus::empty()
+        }
+        fn set_status(&mut self, _: DeviceStatus) {}
+        fn set_guest_page_size(&mut self, _: u32) {}
+        fn requires_legacy_layout(&self) -> bool {
+            false
+        }
+        fn queue_set(&mut self, _: u16, _: u32, _: u64, _: u64, _: u64) {}
+        fn queue_unset(&mut self, _: u16) {}
+        fn queue_used(&mut self, _: u16) -> bool {
+            false
+        }
+        fn ack_interrupt(&mut self) -> InterruptStatus {
+            InterruptStatus::default()
+        }
+        fn read_config_generation(&self) -> u32 {
+            0
+        }
+        fn read_config_space<T: FromBytes + IntoBytes>(
+            &self,
+            _: usize,
+        ) -> virtio_drivers::Result<T> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+        fn write_config_space<T: IntoBytes + Immutable>(
+            &mut self,
+            _: usize,
+            _: T,
+        ) -> virtio_drivers::Result<()> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+    }
+
+    /// A device of the host's memory for a ring with tails: the queues, the
+    /// heads and the tails lie in vectors, the addresses of the device are the
+    /// driver's.
+    struct Rig {
+        /// The statics of device slot 0 are one, the tests take turns.
+        _slot: std::sync::MutexGuard<'static, ()>,
+        _queues: Vec<u8>,
+        _heads: Vec<u8>,
+        _tails: Vec<u8>,
+        queues: usize,
+        heads: usize,
+        tails: usize,
+    }
+
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn rig() -> (Rig, RxRing<crate::Host<0>>) {
+        let slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::host::{PAGE, Region, attach};
+        let aligned = |v: &Vec<u8>| (v.as_ptr() as usize).next_multiple_of(PAGE);
+        let queues = vec![0u8; 9 * PAGE];
+        let heads = vec![0u8; crate::books::BUFFERS * BUFFER_LEN + PAGE];
+        let tails = vec![0u8; TAILS * TAIL_LEN + PAGE];
+        let (q, h, t) = (aligned(&queues), aligned(&heads), aligned(&tails));
+        let region = |va: usize, len: usize| Region {
+            va,
+            pa: va as u64,
+            len,
+        };
+        assert!(attach(
+            0,
+            region(q, 8 * PAGE),
+            &[
+                region(h, crate::books::BUFFERS * BUFFER_LEN),
+                region(t, TAILS * TAIL_LEN)
+            ]
+        ));
+        let mut transport = Stub;
+        let queue = Queue::<crate::Host<0>>::new(&mut transport, 0, false, false).unwrap();
+        let ring = RxRing::with_tails(queue, h, t);
+        (
+            Rig {
+                _slot: slot,
+                _queues: queues,
+                _heads: heads,
+                _tails: tails,
+                queues: q,
+                heads: h,
+                tails: t,
+            },
+            ring,
+        )
+    }
+
+    /// The descriptor `i` of the first queue: address, length, flags, next.
+    fn descriptor(rig: &Rig, i: usize) -> (u64, u32, u16, u16) {
+        // SAFETY: the table lies at the start of the queues' object.
+        let d = unsafe { core::slice::from_raw_parts((rig.queues + 16 * i) as *const u8, 16) };
+        (
+            u64::from_le_bytes(d[..8].try_into().unwrap()),
+            u32::from_le_bytes(d[8..12].try_into().unwrap()),
+            u16::from_le_bytes(d[12..14].try_into().unwrap()),
+            u16::from_le_bytes(d[14..16].try_into().unwrap()),
+        )
+    }
+
+    /// The device returns the chain that starts at descriptor `head` having
+    /// written `len` bytes (the used ring is the third page of the queues).
+    fn device_uses(rig: &Rig, slot: u16, head: u32, len: u32) {
+        let used = rig.queues + 2 * crate::host::PAGE;
+        // SAFETY: the used ring lies in the queues' object.
+        unsafe {
+            let entry = (used + 4 + 8 * usize::from(slot)) as *mut u32;
+            entry.write_volatile(head);
+            entry.add(1).write_volatile(len);
+            ((used + 2) as *mut u16).write_volatile(slot + 1);
+        }
+    }
+
+    #[test]
+    fn a_ring_with_tails_gives_a_chain_of_the_head_and_the_tail() {
+        const WRITE: u16 = 2;
+        const NEXT: u16 = 1;
+        let (rig, mut ring) = rig();
+        ring.give(3).unwrap();
+        let (first, len, flags, next) = descriptor(&rig, 0);
+        assert_eq!(
+            (first, len),
+            ((rig.heads + 3 * BUFFER_LEN) as u64, BUFFER_LEN as u32)
+        );
+        assert_eq!(flags, NEXT | WRITE);
+        let (second, len, flags, _) = descriptor(&rig, usize::from(next));
+        assert_eq!(
+            (second, len),
+            ((rig.tails + 3 * TAIL_LEN) as u64, TAIL_LEN as u32)
+        );
+        assert_eq!(flags, WRITE);
+        assert!(BUFFER_LEN as u32 + len >= 65_562, "Virtio 1.2, 5.1.6.3.1");
+        // A buffer past the tails has none.
+        assert_eq!(ring.give(TAILS as u16), Err(Broken::Refused));
+    }
+
+    #[test]
+    fn a_chain_comes_back_with_the_length_the_device_wrote() {
+        let (rig, mut ring) = rig();
+        ring.fill(256).unwrap();
+        assert_eq!(
+            ring.stock.left() + ring.stock.pending(),
+            TAILS as u32,
+            "64 chains, no more"
+        );
+        assert_eq!(ring.pop(), Ok(None));
+        device_uses(&rig, 0, 0, 64_306);
+        assert_eq!(ring.pop(), Ok(Some((0, 64_306))));
+        assert_eq!(ring.pop(), Ok(None));
+        ring.give(0).unwrap();
     }
 }
