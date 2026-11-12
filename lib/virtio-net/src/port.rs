@@ -403,6 +403,12 @@ mod c {
         port().map_or(1, |p| c_int::from(p.sleep_begin()))
     }
 
+    /// 1 when DONE holds an entry now (a look, nothing taken).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_rx_pending() -> c_int {
+        port().map_or(0, |p| c_int::from(p.work()))
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn vnet_port_sleep_end() {
         if let Some(p) = port() {

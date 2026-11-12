@@ -55,6 +55,9 @@ pub const P_N_STK_END: u8 = 15;
 pub const P_N_REQ_BEGIN: u8 = 16;
 /// The request answered.
 pub const P_N_REQ_END: u8 = 17;
+/// An interrupt of the second device's own line reached the service (the step that
+/// reads its status; the first device's interrupts come to the switch thread, `P_N_WAKE`).
+pub const P_N_IRQ1: u8 = 18;
 /// The worker's loop woke from its wait (the key: the bits it got).
 pub const P_W_WAKE: u8 = 32;
 /// The worker took a frame off the ring or the device.
