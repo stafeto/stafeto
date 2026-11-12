@@ -49,8 +49,8 @@ const _: () = assert!(READ_PORTION.is_multiple_of(PAGE));
 
 /// The tries of a wait for the lock that has a way out: a lock held by a thread of a lower level
 /// that a higher one preempted is not waited for, the call goes by the service. Every section
-/// under the lock is bounded by the constants of the state (at most 1,040 visits of entries by
-/// the clock, 8 pieces of 64 pages for a run, 520 entries for a key) and makes no call of the
+/// under the lock is bounded by the constants of the state (at most 256 visits of entries by
+/// the clock, 8 pieces of 64 pages for a run, 128 entries for a key) and makes no call of the
 /// system.
 const TRIES: u32 = 64;
 

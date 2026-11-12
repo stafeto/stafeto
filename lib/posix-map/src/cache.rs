@@ -26,9 +26,11 @@ pub const FILE_MAX: usize = PIECE_BYTES;
 pub const BUDGET_PAGES: usize = PIECES_MAX * PIECE_PAGES;
 /// The descriptions the cache knows at once: a description goes to the place of its slot modulo
 /// this, and the one that was there goes out (it asks the service once more when read again).
-pub const DESCS: usize = 1024;
-/// More than the pages of the default budget, which is what bounds the entries with pages.
-pub const ENTRIES: usize = BUDGET_PAGES + 8;
+pub const DESCS: usize = 128;
+/// The files the cache holds at once. The state is static in every process that links the layer
+/// and counts against its memory quota, so the table is small (about 8 KiB with the descriptions):
+/// a read that finds no free entry evicts one, and when none can go the read goes by the service.
+pub const ENTRIES: usize = 128;
 pub const NONE: u16 = u16::MAX;
 
 const _: () = assert!(ENTRIES < NONE as usize);
@@ -897,8 +899,11 @@ mod tests {
         assert_eq!((c.used_pages, c.pieces_made, c.budget_pages), (0, 0, 20));
         assert!(c.find_key(100).is_none());
         assert_eq!(c.plan(3, 1, true, &r), Plan::Ask);
-        // The state of the cache is far above what a stack of a handler holds, so no operation
+        // The state of the cache is well above what a stack of a handler should hold, so no operation
         // may build it as a value.
-        assert!(core::mem::size_of::<Cache>() > 32 * 1024);
+        assert!(core::mem::size_of::<Cache>() > 4 * 1024);
+        // The state is static in every process that links the layer and counts against its
+        // memory quota (a process of the posix-procs workload has 5 pages of room): it stays small.
+        assert!(core::mem::size_of::<Cache>() <= 12 * 1024, "{}", core::mem::size_of::<Cache>());
     }
 }
