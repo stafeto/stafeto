@@ -143,6 +143,9 @@ bench-stamps = []
 # (table/bench.rs).
 table-bench-fast-vz = []
 table-bench-fast-switch-vz = []
+# The image of F1s with the shell's processes on CPUs 1 to 3, away from the
+# network service and the switch on CPU 0.
+table-bench-fast-switch-pinned-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.

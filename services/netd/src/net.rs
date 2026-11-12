@@ -23,7 +23,7 @@ use netd::owners::Owners;
 use netd::passes::Passes;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State, orphan_is_over};
 use netd::ports::{Binding, PortMap, Proto};
-use netd::reuse::{Groups, NO_GROUP};
+use netd::reuse::{Groups, Members, NO_GROUP};
 use netd::ring::{OrphanQueue, WakeBudget};
 use proto_net::sockets::{self, opt};
 use proto_net::{Address, INET};
@@ -340,6 +340,41 @@ pub struct Counters {
     /// feature `probe`): never more than the portion.
     #[cfg(feature = "probe")]
     pub largest_copy: u64,
+}
+
+/// The members of a group as the circle asks about them while it picks.
+struct GroupMembers<'a> {
+    socks: &'a mut [Sock; SOCKETS_MAX],
+    stack: &'a mut Stack<'static>,
+    now: u64,
+    /// Whether a queue was counted again for this SYN.
+    counted: bool,
+    /// The queue socket that takes the SYN, once a member is confirmed.
+    found: Option<usize>,
+}
+
+impl Members for GroupMembers<'_> {
+    fn usable(&mut self, place: usize) -> bool {
+        if !self.socks[place].listening {
+            return false;
+        }
+        if !self.counted {
+            self.counted = Net::refresh_room(self.socks, self.stack, place, self.now);
+        }
+        self.socks[place].room > 0
+    }
+
+    fn confirm(&mut self, place: usize) -> bool {
+        self.found = Net::listening_member(self.socks, self.stack, place);
+        if self.found.is_none() {
+            // The count was behind: none listens, and the member is out of
+            // the choice until its queue is counted again.
+            let s = &mut self.socks[place];
+            s.room = 0;
+            s.room_at = self.now;
+        }
+        self.found.is_some()
+    }
 }
 
 /// The sockets of the service.
@@ -1434,12 +1469,16 @@ impl Net {
 
     /// The first socket of the queue of listening place `listener` that
     /// still listens.
-    fn listening_member(&self, stack: &mut Stack<'static>, listener: usize) -> Option<usize> {
-        let sock = &self.socks[listener];
+    fn listening_member(
+        socks: &[Sock; SOCKETS_MAX],
+        stack: &mut Stack<'static>,
+        listener: usize,
+    ) -> Option<usize> {
+        let sock = &socks[listener];
         (0..usize::from(sock.member_count))
             .map(|k| usize::from(sock.members[k]))
             .find(|&m| {
-                self.socks[m]
+                socks[m]
                     .handle
                     .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
             })
@@ -1480,34 +1519,34 @@ impl Net {
     /// that queue: of the listening description `lead`, or of the member of
     /// its group the circle comes to that listens and has room. A queue
     /// without room costs no look at its sockets, and at most one queue is
-    /// counted again for a SYN.
+    /// counted again for a SYN. A member whose count was behind (none of its
+    /// sockets listens) is left out and the circle goes on to the next one.
     fn pick_member(&mut self, stack: &mut Stack<'static>, lead: usize) -> Option<(usize, usize)> {
         let now = now_ns();
         let group = self.socks[lead].group;
-        let listener = if group == NO_GROUP {
+        if group == NO_GROUP {
             Self::refresh_room(&mut self.socks, stack, lead, now);
-            (self.socks[lead].room > 0).then_some(lead)
-        } else {
-            let socks = &mut self.socks;
-            let mut counted = false;
-            self.groups.pick(usize::from(group), |m| {
-                if !socks[m].listening {
-                    return false;
-                }
-                if !counted {
-                    counted = Self::refresh_room(socks, stack, m, now);
-                }
-                socks[m].room > 0
-            })
-        }?;
-        let member = self.listening_member(stack, listener);
-        if member.is_none() {
-            // The count was behind: none listens.
-            let s = &mut self.socks[listener];
-            s.room = 0;
-            s.room_at = now;
+            if self.socks[lead].room == 0 {
+                return None;
+            }
+            let member = Self::listening_member(&self.socks, stack, lead);
+            if member.is_none() {
+                // The count was behind: none listens.
+                let s = &mut self.socks[lead];
+                s.room = 0;
+                s.room_at = now;
+            }
+            return member.map(|m| (m, lead));
         }
-        member.map(|m| (m, listener))
+        let mut members = GroupMembers {
+            socks: &mut self.socks,
+            stack,
+            now,
+            counted: false,
+            found: None,
+        };
+        let listener = self.groups.pick_member(usize::from(group), &mut members)?;
+        members.found.map(|m| (m, listener))
     }
 
     /// After the stack took a SYN for a listening description: the stack hands

@@ -1182,6 +1182,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-bench-cpu0-vz") as usize
     + cfg!(feature = "table-bench-fast-vz") as usize
     + cfg!(feature = "table-bench-fast-switch-vz") as usize
+    + cfg!(feature = "table-bench-fast-switch-pinned-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1263,6 +1264,7 @@ const _: () = assert!(
     feature = "table-bench-cpu0-vz",
     feature = "table-bench-fast-vz",
     feature = "table-bench-fast-switch-vz",
+    feature = "table-bench-fast-switch-pinned-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1380,6 +1382,8 @@ pub const TABLE: &[Record] = bench::BENCH_CPU0_VZ_TABLE;
 pub const TABLE: &[Record] = bench::BENCH_FAST_VZ_TABLE;
 #[cfg(feature = "table-bench-fast-switch-vz")]
 pub const TABLE: &[Record] = bench::BENCH_FAST_SWITCH_VZ_TABLE;
+#[cfg(feature = "table-bench-fast-switch-pinned-vz")]
+pub const TABLE: &[Record] = bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -2605,6 +2609,40 @@ mod tests {
                 assert_eq!(pinned, plain, "{}", pinned.name);
             }
         }
+    }
+
+    /// The pinned variant of the image of F1s differs from the image of F1s
+    /// in the launcher's mask alone, CPUs 1 to 3; the network service and the
+    /// switch stay on CPU 0.
+    #[test]
+    fn the_pinned_f1s_image_differs_from_the_f1s_image_in_the_launcher_mask_alone() {
+        assert_eq!(
+            order_of(bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE),
+            order_of(bench::BENCH_FAST_SWITCH_VZ_TABLE)
+        );
+        for (pinned, plain) in bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE
+            .iter()
+            .zip(bench::BENCH_FAST_SWITCH_VZ_TABLE)
+        {
+            if pinned.name == bench::BENCH_LAUNCHER.name {
+                assert_eq!(pinned.cpus, BENCH_PINNED_CPUS);
+                assert_eq!(pinned.cpus & 1, 0, "no CPU 0 for the workers");
+                assert_eq!(
+                    Record {
+                        cpus: plain.cpus,
+                        ..*pinned
+                    },
+                    *plain
+                );
+            } else {
+                assert_eq!(pinned, plain, "{}", pinned.name);
+            }
+        }
+        let netd = bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE
+            .iter()
+            .find(|r| r.name == NET_SERVICE)
+            .unwrap();
+        assert_eq!(netd.cpus, NETD_CPUS);
     }
 
     /// The table of the image with every program on CPU 0 differs from the

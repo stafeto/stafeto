@@ -337,6 +337,9 @@ struct CpuUse {
     /// Where the processes of one name were at the end: `name=cpu,cpu;...`
     /// (field `processor` of `/proc/<pid>/stat`).
     placed: String,
+    /// Each process at the end with the CPU it last ran on and the jiffies it used between the
+    /// readings (the judge of a round reads the workers from it).
+    served: Vec<Served>,
     /// The profile of the network service between the two snapshots:
     /// `name`, the change of a counter or the largest value of a maximum.
     profile: Vec<(String, f64)>,
@@ -680,11 +683,12 @@ fn parse_stat(lines: &[String]) -> Vec<(u64, u64)> {
     cpus.into_iter().map(|c| c.1).collect()
 }
 
-/// One process of `/proc/<pid>/stat`: its number, its name, its user and
+/// One process of `/proc/<pid>/stat`: its number, its parent's, its name, its user and
 /// system time together (jiffies) and the CPU it last ran on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Proc {
     pid: u64,
+    ppid: u64,
     name: String,
     jiffies: u64,
     cpu: u64,
@@ -710,6 +714,7 @@ fn parse_proc_times(lines: &[String]) -> Vec<Proc> {
         if let (Some(user), Some(system)) = (time(11), time(12)) {
             out.push(Proc {
                 pid,
+                ppid: time(1).unwrap_or(0),
                 name: line[open + 1..close].to_owned(),
                 jiffies: user + system,
                 cpu: time(36).unwrap_or(0),
@@ -763,6 +768,141 @@ fn placed_text(procs: &[Proc]) -> String {
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// One process of a round: its number, name, the CPU it last ran on and the jiffies it used
+/// between the two readings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Served {
+    pid: u64,
+    ppid: u64,
+    name: String,
+    cpu: u64,
+    ticks: u64,
+}
+
+/// The processes of `after` with the jiffies each used since `before` (one that began between
+/// the readings counts from zero).
+fn served_of(before: &[Proc], after: &[Proc]) -> Vec<Served> {
+    after
+        .iter()
+        .map(|p| Served {
+            pid: p.pid,
+            ppid: p.ppid,
+            name: p.name.clone(),
+            cpu: p.cpu,
+            ticks: p.jiffies.saturating_sub(
+                before
+                    .iter()
+                    .find(|b| b.pid == p.pid && b.name == p.name)
+                    .map_or(0, |b| b.jiffies),
+            ),
+        })
+        .collect()
+}
+
+/// `pid:cpu:ticks` of each process, joined by `;`.
+fn served_text(served: &[Served]) -> String {
+    served
+        .iter()
+        .map(|p| format!("{}={}:{}:{}", p.name, p.pid, p.cpu, p.ticks))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// How many times a broken round is taken again.
+const BROKEN_REPEATS: u32 = 3;
+
+/// The share of the mean below which a worker has served almost nothing.
+const WORKER_FLOOR_PERCENT: u64 = 50;
+
+/// The workers of the row: the processes named `name` but the master, which serves nothing and
+/// is the parent of the others; the numbers of the processes do not say (a slot that was freed
+/// comes back with a higher generation). Without a parent among them the lowest number is
+/// taken. In the order of their numbers.
+fn workers_of<'a>(served: &'a [Served], name: &str) -> Vec<&'a Served> {
+    let mut mine: Vec<&Served> = served.iter().filter(|p| p.name == name).collect();
+    mine.sort_by_key(|p| p.pid);
+    let master = mine
+        .iter()
+        .find(|m| mine.iter().any(|p| p.ppid == m.pid))
+        .or(mine.first())
+        .map(|m| m.pid);
+    mine.into_iter().filter(|p| Some(p.pid) != master).collect()
+}
+
+/// What a round of a row that runs several workers on CPUs 1 to 3 must show to count: the
+/// workers (`workers_of`) are as many as the row says, none stands on CPU 0 (next to the network
+/// service and its switch, below which it is served in bursts), and none served almost nothing,
+/// by the jiffies it used and by the counters of the network service (`member<i>`, the SYNs each
+/// member of the group took, for S4; `cons<i>`, the frames of the wire the switch passed to each
+/// consumer, for F1s). None when the round counts; else why it is broken.
+fn broken_round(
+    served: &[Served],
+    profile: &[(String, f64)],
+    name: &str,
+    workers: usize,
+    counter: &str,
+    cpus: usize,
+) -> Option<String> {
+    let mine = workers_of(served, name);
+    if mine.len() != workers {
+        return Some(format!(
+            "{} workers of {name}, wanted {workers}",
+            mine.len()
+        ));
+    }
+    if cpus > 1
+        && let Some(p) = mine.iter().find(|p| p.cpu == 0)
+    {
+        return Some(format!("worker {} stands on CPU 0", p.pid));
+    }
+    let starved = |values: &[u64], what: &str| -> Option<String> {
+        let total: u64 = values.iter().sum();
+        if total == 0 {
+            return Some(format!("no {what} at all"));
+        }
+        let mean = total / values.len() as u64;
+        let at = values
+            .iter()
+            .position(|v| v * 100 < mean * WORKER_FLOOR_PERCENT)?;
+        Some(format!(
+            "worker {at} took {} {what} against a mean of {mean}",
+            values[at]
+        ))
+    };
+    let ticks: Vec<u64> = mine.iter().map(|p| p.ticks).collect();
+    if let Some(why) = starved(&ticks, "jiffies") {
+        return Some(why);
+    }
+    let counted: Vec<u64> = (0..workers)
+        .filter_map(|i| {
+            profile
+                .iter()
+                .find(|(n, _)| *n == format!("{counter}{i}"))
+                .map(|(_, v)| *v as u64)
+        })
+        .collect();
+    // An image without the counters has none to read.
+    if counted.len() == workers {
+        return starved(&counted, counter);
+    }
+    None
+}
+
+/// Workers that share a CPU while another CPU after CPU 0 has none: the process service puts
+/// the master on the least busy CPU and weighs CPU 1, which the services of the image share,
+/// as busy, so three workers can stand on CPUs 2, 3 and 2. The round counts all the same (each
+/// worker is served); the record names it.
+fn stacked_workers(served: &[Served], name: &str, cpus: usize) -> Option<String> {
+    let mine = workers_of(served, name);
+    let mut on = vec![Vec::new(); cpus];
+    for p in &mine {
+        on.get_mut(p.cpu as usize)?.push(p.pid);
+    }
+    let empty = on.iter().skip(1).any(Vec::is_empty);
+    let stack = on.iter().skip(1).find(|w| w.len() > 1)?;
+    empty.then(|| format!("workers {stack:?} share a CPU while another has none"))
 }
 
 /// The snapshot of the network service's profile, the records `net: prof
@@ -1054,6 +1194,7 @@ impl Measured {
                 irq_us: f("cpu_irq_us").unwrap_or(0.0),
                 softirq_us: f("cpu_softirq_us").unwrap_or(0.0),
                 placed: g("cpu_placed").unwrap_or("").to_owned(),
+                served: Vec::new(),
                 profile: procs_of(g("cpu_profile").unwrap_or("")),
                 idle: g("cpu_idle")
                     .unwrap_or("")
@@ -1480,6 +1621,8 @@ struct Prepared {
     /// The image of F1.
     fast_image: PathBuf,
     switch_image: PathBuf,
+    /// The workers of nginx on S4 (4, the file's setting, unless `--s4-workers` says otherwise).
+    s4_workers: usize,
     /// The workers of nginx-fast on F1s (1 except in `kill-watch`).
     switch_workers: usize,
     /// The worker lines of `worker_cpu_affinity` for F1s, when its workers are pinned.
@@ -1613,6 +1756,7 @@ impl Guest {
         }
         used.procs = proc_use(&before.procs, &procs, answers);
         used.placed = placed_text(&procs);
+        used.served = served_of(&before.procs, &procs);
         if let (Some(a), Some(b)) = (&before.snapshot, &snapshot) {
             used.profile = profile_change(a, b);
             fs_per_answer(&mut used.profile, answers);
@@ -1966,7 +2110,7 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
                 &mut run,
                 &mut report,
                 false,
-                linux_guest::cpus(),
+                shell_cpus,
                 "nginx-fast",
                 &format!("nginx-fast -T -c {conf}"),
             )?;
@@ -2000,14 +2144,30 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
         } else {
             NGINX_CONF
         };
+        // `--s4-workers`: a copy of the settings with the workers it names, the one difference.
+        let few = !tls && prep.s4_workers != 4;
+        let conf = if few {
+            run.send(&format!(
+                "sed 's/^worker_processes 4;/worker_processes {};/' {conf} > /tmp/s4-n.conf",
+                prep.s4_workers
+            ))?;
+            run.expect("# ", DIALOG_STEP)?;
+            "/tmp/s4-n.conf"
+        } else {
+            conf
+        };
         run.send(&format!("nginx -c {conf} & M=$!"))?;
         run.expect_line(
             "the event method",
             |l| l.contains("using the \"epoll\" event method"),
             START_WITHIN,
         )?;
-        linux_guest::workers_up(&mut run, DIALOG_STEP, 4)?;
-        if tls {
+        linux_guest::workers_up(
+            &mut run,
+            DIALOG_STEP,
+            if tls || !few { 4 } else { prep.s4_workers },
+        )?;
+        if few || tls {
             linux_guest::read_fingerprints_of(
                 &mut run,
                 &mut report,
@@ -2019,7 +2179,14 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
         } else {
             linux_guest::read_fingerprints(&mut run, &mut report, false, shell_cpus)?;
         }
-        let wanted = if tls { &prep.config_tls } else { &prep.config };
+        let wanted = if few {
+            // The copy differs from the file by the number of workers.
+            &report.config_digest.clone()
+        } else if tls {
+            &prep.config_tls
+        } else {
+            &prep.config
+        };
         linux_guest::verify(&report, wanted, &prep.www)?;
         expect_fetch((lease.address, 80).into())?;
         if tls {
@@ -2078,6 +2245,9 @@ struct Options {
     /// the network service, or that one with the shell's processes on CPUs 1
     /// to 3.
     image: ImageKind,
+    /// The workers of nginx on S4 (`--s4-workers`; 4, the setting of the file, unless it says
+    /// otherwise).
+    s4_workers: usize,
     /// The workers of nginx-fast on F1s (F1 has the one device, so one worker).
     switch_workers: usize,
     /// The workers of F1s stand on CPUs 1 to 3 (`worker_cpu_affinity`), away from `netd`'s CPU 0.
@@ -2112,7 +2282,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace | --stamps] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1,f1s,s4o] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds,idle,latency,at] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--old DIR] [--switch-workers N] [--s4-workers N] [--switch-pin | --switch-cpu0] [--cpus N] [--trace | --stamps] [--c64] [--rates R,R] [--pause-after S] [--quick] [--resume DIR] | tables DIR | kill-watch [--workers N] [--kills K] [--bound MS]";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -2133,6 +2303,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         resume: None,
         old: None,
         image: ImageKind::Plain,
+        s4_workers: 4,
         switch_workers: 1,
         switch_pin: false,
         switch_cpu0: false,
@@ -2200,6 +2371,7 @@ fn options(args: &[String]) -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "--switch-workers" => o.switch_workers = number(value(arg)?, arg)? as usize,
+            "--s4-workers" => o.s4_workers = number(value(arg)?, arg)? as usize,
             "--pause-after" => o.pause_after = Some(u64::from(number(value(arg)?, arg)?)),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
             "--max-rounds" => o.max_rounds = number(value(arg)?, arg)?,
@@ -2251,6 +2423,9 @@ fn options(args: &[String]) -> Result<Options, String> {
             o.max_rounds, o.rounds
         ));
     }
+    if o.s4_workers == 0 || o.s4_workers > 4 {
+        return Err("--s4-workers 1 to 4 (the settings of the file have four)".to_owned());
+    }
     if o.switch_workers == 0 {
         return Err("--switch-workers 0".to_owned());
     }
@@ -2283,8 +2458,8 @@ fn options(args: &[String]) -> Result<Options, String> {
         );
     }
     linux_guest::set_cpus(o.cpus);
-    if matches!(o.image, ImageKind::Pinned | ImageKind::Cpu0) && o.systems.contains(&System::F1s) {
-        return Err("--image pinned and cpu0 have no variant of F1s".to_owned());
+    if o.image == ImageKind::Cpu0 && o.systems.contains(&System::F1s) {
+        return Err("--image cpu0 has no variant of F1s".to_owned());
     }
     if o.image != ImageKind::Plain && o.systems.contains(&System::F1) {
         return Err(
@@ -2316,7 +2491,7 @@ impl Bench {
     fn profiled(&self, sys: System) -> bool {
         match sys {
             System::S4 => self.opts.image != ImageKind::Plain,
-            System::F1s => self.opts.image == ImageKind::Profile,
+            System::F1s => matches!(self.opts.image, ImageKind::Profile | ImageKind::Pinned),
             // The image of F1 has no network service profile; its file service's counters
             // are read.
             System::F1 => true,
@@ -2634,7 +2809,24 @@ impl Bench {
         (rstar > 0).then(|| (rstar, rec.get("above").and_then(|a| unopt(a))))
     }
 
-    /// `wrk` against the set: the ceiling.
+    /// The rule a round of `sys` must meet, when the image keeps the workers off CPU 0 (`--image
+    /// pinned`): the name of the workers, how many, and the counter of the network service that
+    /// says how the load was shared (`broken_round`).
+    fn round_rule(&self, sys: System) -> Option<(&'static str, usize, &'static str)> {
+        if self.opts.image != ImageKind::Pinned {
+            return None;
+        }
+        match sys {
+            System::S4 => Some(("nginx", self.opts.s4_workers, "member")),
+            System::F1s => Some(("nginx-fast", self.opts.switch_workers, "cons")),
+            _ => None,
+        }
+    }
+
+    /// `wrk` against the set: the ceiling. A round that is broken (a worker misplaced, or one
+    /// that served almost nothing, `broken_round`) is kept apart under `broken.<key>.<n>` and
+    /// taken again on a fresh guest, up to `BROKEN_REPEATS` times; the last one stays under
+    /// the key with its `broken` field.
     fn ceiling(
         &mut self,
         key: &str,
@@ -2645,6 +2837,32 @@ impl Bench {
         if self.get(key).is_some() {
             return Ok(());
         }
+        for attempt in 0..=BROKEN_REPEATS {
+            let Some(why) = self.ceiling_once(key, sys, wl, connections)? else {
+                return Ok(());
+            };
+            if attempt == BROKEN_REPEATS {
+                say(format!("{key}: broken ({why}); no more repeats, kept"));
+                return Ok(());
+            }
+            say(format!("{key}: broken ({why}); taken again"));
+            if let Some(rec) = self.get(key) {
+                self.put(&format!("broken.{key}.{}", attempt + 1), &rec);
+                let _ = std::fs::remove_file(self.results.join(format!("{key}.rec")));
+            }
+            self.release();
+        }
+        Ok(())
+    }
+
+    /// One try of the ceiling; the reason when the round is broken.
+    fn ceiling_once(
+        &mut self,
+        key: &str,
+        sys: System,
+        wl: Workload,
+        connections: u32,
+    ) -> Result<Option<String>, String> {
         if self.opts.trace {
             self.phase = format!("ceiling {}", wl.name());
         }
@@ -2711,8 +2929,29 @@ impl Bench {
             Ok::<(Wrk, CpuUse, Option<String>), String>((wrk, cpu, found.first().cloned()))
         })();
         let mut rec = Rec::new();
+        let mut broken = None;
         match result {
             Ok((wrk, cpu, alert)) => {
+                broken = self.round_rule(sys).and_then(|(name, workers, counter)| {
+                    broken_round(
+                        &cpu.served,
+                        &cpu.profile,
+                        name,
+                        workers,
+                        counter,
+                        linux_guest::cpus(),
+                    )
+                });
+                if let Some(why) = &broken {
+                    rec.insert("broken".into(), why.clone());
+                }
+                if let Some((name, _, _)) = self.round_rule(sys)
+                    && let Some(note) = stacked_workers(&cpu.served, name, linux_guest::cpus())
+                {
+                    say(format!("{key}: {note}"));
+                    rec.insert("stacked".into(), note);
+                }
+                rec.insert("cpu_workers".into(), served_text(&cpu.served));
                 rec.insert("per_second".into(), format!("{:.0}", wrk.per_second));
                 rec.insert("transfer".into(), wrk.transfer.clone());
                 rec.insert("connect".into(), wrk.connect.to_string());
@@ -2754,7 +2993,7 @@ impl Bench {
         if trace {
             self.release();
         }
-        Ok(())
+        Ok(broken)
     }
 
     /// The limit of the NAT: `iperf3` between the Mac and L4 without nginx
@@ -3161,6 +3400,25 @@ impl Results {
     fn num(&self, key: &str, field: &str) -> Option<f64> {
         self.recs.get(key)?.get(field)?.parse().ok()
     }
+
+    /// The number of a ceiling that counts: a round that stayed broken after its repeats
+    /// (`broken`, a worker misplaced or starved) is left out of the ratios and the medians and
+    /// listed apart.
+    fn counted_num(&self, key: &str, field: &str) -> Option<f64> {
+        if self.recs.get(key)?.contains_key("broken") {
+            return None;
+        }
+        self.num(key, field)
+    }
+
+    /// The ceilings of the rounds that stayed broken: key and reason.
+    fn broken_ceilings(&self) -> Vec<(String, String)> {
+        self.recs
+            .iter()
+            .filter(|(k, _)| k.starts_with("ceiling."))
+            .filter_map(|(k, r)| Some((k.clone(), r.get("broken")?.clone())))
+            .collect()
+    }
 }
 
 fn ms(ns: u64) -> String {
@@ -3534,8 +3792,10 @@ impl Results {
             let ceiling_idle: Vec<f64> = self
                 .recs
                 .iter()
-                .filter(|(k, _)| {
-                    k.starts_with("ceiling.r") && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                .filter(|(k, r)| {
+                    k.starts_with("ceiling.r")
+                        && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                        && !r.contains_key("broken")
                 })
                 .flat_map(|(_, r)| {
                     r.get("cpu_idle")
@@ -3549,8 +3809,10 @@ impl Results {
             let transfer: Vec<f64> = self
                 .recs
                 .iter()
-                .filter(|(k, _)| {
-                    k.starts_with("ceiling.r") && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                .filter(|(k, r)| {
+                    k.starts_with("ceiling.r")
+                        && k.ends_with(&format!(".{name}.c{CONNECTIONS}"))
+                        && !r.contains_key("broken")
                 })
                 .filter_map(|(_, r)| transfer_bytes(r.get("transfer")?))
                 .map(|b| b * 8.0 / 1e6)
@@ -3645,7 +3907,7 @@ impl Results {
             for wl in Workload::ALL {
                 for round in 1..=MAX_ROUNDS {
                     let rps = |sys: System| {
-                        self.num(
+                        self.counted_num(
                             &format!(
                                 "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
                                 sys.name(),
@@ -3738,7 +4000,10 @@ impl Results {
                 g("timeout"),
                 g("non2xx"),
                 g("cpu_idle"),
-                g("alert")
+                match r.get("broken") {
+                    Some(why) => format!("{} (BROKEN, left out of the medians: {why})", g("alert")),
+                    None => g("alert"),
+                }
             );
         }
         t
@@ -3763,7 +4028,7 @@ impl Results {
                     let mut ratios = Vec::new();
                     for round in 1..=MAX_ROUNDS {
                         let rps = |sys: System| {
-                            self.num(
+                            self.counted_num(
                                 &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
                                 "per_second",
                             )
@@ -3805,6 +4070,13 @@ impl Results {
                         verdict(median >= bound),
                     );
                 }
+            }
+        }
+        let broken = self.broken_ceilings();
+        if !broken.is_empty() {
+            t += "\nRounds left out of the ratios and the medians (a worker misplaced or starved after the repeats):\n\n";
+            for (key, why) in broken {
+                t += &format!("* `{key}`: {why}\n");
             }
         }
         t
@@ -3987,6 +4259,8 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
                     linux_guest::TRACE_SWITCH_IMAGE,
                     linux_guest::bench_switch_programs(),
                 )?
+            } else if o.image == ImageKind::Pinned {
+                linux_guest::build_switch_pinned_image()?
             } else if o.image == ImageKind::Profile {
                 linux_guest::build_switch_profile_image()?
             } else {
@@ -4017,6 +4291,7 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         image,
         fast_image,
         switch_image,
+        s4_workers: o.s4_workers,
         switch_workers: o.switch_workers,
         switch_affinity: if o.switch_cpu0 {
             Some(vec!["0001"; o.switch_workers].join(" "))
@@ -4619,7 +4894,7 @@ mod tests {
         let lines: Vec<String> = [
             "12 (sh) S 1 12 12 0 0 0 0 0 0 0 300 20 0 0 20 0",
             "30 (nginx) S 1 30 30 0 0 0 0 0 0 0 100 10 0 0 20 0",
-            "31 (nginx) S 1 30 30 0 0 0 0 0 0 0 50 0 0 0 20 0",
+            "31 (nginx) S 30 30 30 0 0 0 0 0 0 0 50 0 0 0 20 0",
             "40 (a (b) c) S 1 40 40 0 0 0 0 0 0 0 7 1 0 0 20 0",
             "not a stat line",
         ]
@@ -4628,6 +4903,7 @@ mod tests {
         let before = parse_proc_times(&lines);
         assert_eq!(before.len(), 4);
         assert_eq!(before[0].jiffies, 320);
+        assert_eq!((before[1].ppid, before[2].ppid), (1, 30));
         assert_eq!((before[3].pid, before[3].name.as_str()), (40, "a (b) c"));
         assert_eq!(before[3].jiffies, 8);
         let mut after = before.clone();
@@ -4636,6 +4912,7 @@ mod tests {
         after[2].jiffies += 25;
         after.push(Proc {
             pid: 50,
+            ppid: 40,
             name: "nginx".into(),
             jiffies: 25,
             cpu: 3,
@@ -4728,6 +5005,182 @@ mod tests {
         assert!(parse_profile(&lines[2..]).is_none());
     }
 
+    fn proc(pid: u64, cpu: u64, ticks: u64) -> Served {
+        Served {
+            pid,
+            ppid: if pid == 258 { 257 } else { 258 },
+            name: "nginx".to_owned(),
+            cpu,
+            ticks,
+        }
+    }
+
+    /// The master (the lowest number) and three workers on CPUs 1 to 3.
+    fn good_round() -> Vec<Served> {
+        vec![
+            proc(258, 1, 3),
+            proc(259, 1, 950),
+            proc(260, 2, 1000),
+            proc(261, 3, 980),
+        ]
+    }
+
+    fn counts(name: &str, values: [f64; 3]) -> Vec<(String, f64)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("{name}{i}"), *v))
+            .collect()
+    }
+
+    #[test]
+    fn a_round_with_its_workers_placed_and_served_counts() {
+        let members = counts("member", [21.0, 21.0, 22.0]);
+        assert_eq!(
+            broken_round(&good_round(), &members, "nginx", 3, "member", 4),
+            None
+        );
+        // The master, on CPU 1 beside a worker, serves nothing and is not looked at.
+        let mut round = good_round();
+        round[0] = proc(258, 0, 0);
+        assert_eq!(
+            broken_round(&round, &members, "nginx", 3, "member", 4),
+            None
+        );
+        // An image without the counters has none to read.
+        assert_eq!(
+            broken_round(&good_round(), &[], "nginx", 3, "member", 4),
+            None
+        );
+    }
+
+    #[test]
+    fn the_master_is_the_parent_of_the_workers_whatever_its_number() {
+        // A slot that was freed comes back with a higher generation: the master of 11.11 was 514
+        // and its workers 259, 260 and 261.
+        let at = |pid, ppid, cpu, ticks| Served {
+            pid,
+            ppid,
+            name: "nginx".to_owned(),
+            cpu,
+            ticks,
+        };
+        let round = [
+            at(259, 514, 2, 466),
+            at(260, 514, 3, 490),
+            at(261, 514, 1, 465),
+            at(514, 257, 1, 0),
+        ];
+        assert_eq!(broken_round(&round, &[], "nginx", 3, "member", 4), None);
+        // The master's idle jiffies are not a worker's: with the lowest number taken for it the
+        // round would look starved.
+        let lowest = [
+            at(259, 514, 2, 466),
+            at(260, 514, 3, 490),
+            at(261, 514, 1, 465),
+        ];
+        let why = broken_round(&lowest, &[], "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("2 workers"), "{why}");
+    }
+
+    #[test]
+    fn a_worker_on_cpu_0_breaks_the_round() {
+        // The round of 11.11: the worker that stood beside the switch used 20 jiffies of 500.
+        let mut round = good_round();
+        round[3] = proc(261, 0, 980);
+        let why = broken_round(&round, &[], "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("261") && why.contains("CPU 0"), "{why}");
+        // With one CPU there is no other to stand on.
+        assert_eq!(broken_round(&round, &[], "nginx", 3, "member", 1), None);
+    }
+
+    #[test]
+    fn two_workers_on_one_cpu_count_but_are_named() {
+        let mut round = good_round();
+        round[3] = proc(261, 2, 980);
+        // CPU 3 has none while CPU 2 has two: the record says so, the round counts.
+        assert_eq!(broken_round(&round, &[], "nginx", 3, "member", 4), None);
+        let note = stacked_workers(&round, "nginx", 4).unwrap();
+        assert!(note.contains("260") && note.contains("261"), "{note}");
+        // One to a CPU: nothing to name.
+        assert_eq!(stacked_workers(&good_round(), "nginx", 4), None);
+        // Four workers on three CPUs share by necessity, and none stands empty.
+        let four = [
+            proc(258, 1, 1),
+            proc(259, 1, 9),
+            proc(260, 2, 9),
+            proc(261, 3, 9),
+            proc(262, 3, 9),
+        ];
+        assert_eq!(stacked_workers(&four, "nginx", 4), None);
+    }
+
+    #[test]
+    fn a_worker_that_used_almost_nothing_breaks_the_round() {
+        let mut round = good_round();
+        round[1] = proc(259, 1, 20);
+        let why = broken_round(&round, &[], "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("jiffies"), "{why}");
+        // Half of the mean is the line: 510 of a mean of 836 passes, 330 does not.
+        let mut round = vec![
+            proc(1, 1, 0),
+            proc(2, 1, 1000),
+            proc(3, 2, 1000),
+            proc(4, 3, 1000),
+        ];
+        round[1].ticks = 510;
+        let ok = broken_round(&round, &[], "nginx", 3, "member", 4);
+        assert_eq!(ok, None);
+        round[1].ticks = 330;
+        assert!(broken_round(&round, &[], "nginx", 3, "member", 4).is_some());
+    }
+
+    #[test]
+    fn a_member_that_took_almost_no_connection_breaks_the_round() {
+        let members = counts("member", [31.0, 31.0, 2.0]);
+        let why = broken_round(&good_round(), &members, "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("member"), "{why}");
+        let none = counts("cons", [0.0, 0.0, 0.0]);
+        let why = broken_round(&good_round(), &none, "nginx", 3, "cons", 4).unwrap();
+        assert!(why.contains("no cons"), "{why}");
+        // The counters of the other row do not count.
+        assert_eq!(
+            broken_round(
+                &good_round(),
+                &counts("member", [0.0; 3]),
+                "nginx",
+                3,
+                "cons",
+                4
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_round_with_the_wrong_number_of_workers_is_broken() {
+        let round = &good_round()[..3];
+        let why = broken_round(round, &[], "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("2 workers"), "{why}");
+        let why = broken_round(&[], &[], "nginx", 3, "member", 4).unwrap();
+        assert!(why.contains("0 workers"), "{why}");
+    }
+
+    #[test]
+    fn the_jiffies_of_a_process_are_those_since_the_first_reading() {
+        let p = |pid, jiffies| Proc {
+            pid,
+            ppid: 1,
+            name: "nginx".to_owned(),
+            jiffies,
+            cpu: 2,
+        };
+        let served = served_of(&[p(5, 100), p(6, 40)], &[p(5, 160), p(6, 40), p(7, 30)]);
+        let ticks: Vec<u64> = served.iter().map(|s| s.ticks).collect();
+        assert_eq!(ticks, [60, 0, 30]);
+        assert_eq!(served_text(&served[..1]), "nginx=5:2:60");
+    }
+
     #[test]
     fn the_image_option_is_read_and_refused() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -4759,6 +5212,7 @@ mod tests {
                 irq_us: 1.5,
                 softirq_us: 3.25,
                 placed: "nginx=0,1,2,3".into(),
+                served: Vec::new(),
                 profile: vec![("step_rx".into(), 120.0), ("ring_max".into(), 900.0)],
             }),
             counters: "ListenDrops 0 ListenOverflows 0".into(),
@@ -5169,6 +5623,45 @@ mod tests {
     }
 
     #[test]
+    fn a_round_that_stayed_broken_is_left_out_of_the_ratios_and_listed() {
+        let dir = std::env::temp_dir().join(format!("net-bench-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("results")).unwrap();
+        let put = |key: &str, rps: f64, broken: Option<&str>| {
+            let mut r = Rec::new();
+            r.insert("per_second".into(), format!("{rps}"));
+            if let Some(why) = broken {
+                r.insert("broken".into(), why.to_owned());
+            }
+            std::fs::write(dir.join("results").join(format!("{key}.rec")), rec_text(&r)).unwrap()
+        };
+        // S4 over S4o: 0.96, 0.50 (a starved worker, broken), 0.96.
+        for (round, s4, broken) in [
+            (1, 96.0, None),
+            (
+                2,
+                50.0,
+                Some("worker 2 took 0 jiffies against a mean of 316"),
+            ),
+            (3, 96.0, None),
+        ] {
+            put(&format!("ceiling.r{round}.S4o.w7.c64"), 100.0, None);
+            put(&format!("ceiling.r{round}.S4.w7.c64"), s4, broken);
+        }
+        let text = tables(&dir).unwrap();
+        assert!(
+            text.contains("| S4 over S4o | W7 | 64 | 0.960 / 0.960 | 0.960 | 0.95 | yes | yes |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`ceiling.r2.S4.w7.c64`: worker 2 took 0 jiffies"),
+            "{text}"
+        );
+        assert!(text.contains("BROKEN, left out of the medians"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_of_stafeto_rows_alone_skips_the_nat_phase_and_s4o_needs_its_build() {
         let o = options(&["--systems".into(), "f1s,f1,s4".into()]).unwrap();
         assert_eq!(o.phases, ["sweep", "rounds"]);
@@ -5229,8 +5722,16 @@ mod tests {
             (1, false, None)
         );
         assert!(options(&args(&["--switch-workers", "0"])).is_err());
-        assert!(options(&args(&["--systems", "f1s", "--image", "pinned"])).is_err());
+        assert!(options(&args(&["--systems", "f1s", "--image", "pinned"])).is_ok());
+        assert!(options(&args(&["--systems", "f1s", "--image", "cpu0"])).is_err());
         assert!(options(&args(&["--systems", "f1s", "--image", "profile"])).is_ok());
+        assert_eq!(
+            options(&args(&["--s4-workers", "3"])).unwrap().s4_workers,
+            3
+        );
+        assert_eq!(options(&[]).unwrap().s4_workers, 4);
+        assert!(options(&args(&["--s4-workers", "0"])).is_err());
+        assert!(options(&args(&["--s4-workers", "5"])).is_err());
     }
 
     #[test]

@@ -205,7 +205,7 @@ thread whose wake is on its way (`info_in_flight`).
   the last window of 10 ms (the time asleep from `object_info` CPU, read once
   per CPU when a window closes) and each image put on it in the last two
   windows counts as one more; among equals the CPU after the last choice wins,
-  so images made in a row go to different CPUs. The step reads no process
+  so images made in a row go to different CPUs. Where the mask of the image leaves CPU 0 out (the launcher of the measurement images keeps CPUs 1 to 3 for its workers) the mark of the parent's own placement does not count against its children, one mark of the parent's CPU whether or not it is still in the windows, and none for a parent the service never placed (an adopted record); everywhere else the parent's mark counts like any other. The parent of an exec is the process itself, so in such a mask an image made by fork and then exec stays on the CPU the fork gave it when no other CPU is lighter (#677). The step reads no process
   record, so it costs the same with a hundred processes (`process-steps`
   places on one CPU too, with 248 children live). A thread starts on the CPU of its creator or, when
   the mask does not allow that, on the lowest CPU it names.
@@ -213,6 +213,22 @@ thread whose wake is on its way (`info_in_flight`).
   mask the kernel gave the process (EINVAL for a mask with none of those
   CPUs): the kernel moves no thread, so the mask works for the threads made
   later and for the next exec (`taskset -c N command`).
+  **A call does not move the running thread (#670).** `sched_setaffinity`
+  only records the mask in the page of the process (`lib/posix-abi/src/cpus.rs`);
+  the main thread of an image stands where the process service's `place` put it
+  when the process was made, and it stays there whatever the call says. A server
+  that pins itself after `fork` (nginx's `worker_cpu_affinity` calls it in the
+  worker) therefore keeps the CPU `place` chose: the pin holds only when `place`
+  happened to choose the same CPU, and which CPU that is depends on the load
+  window and on the last placement. The way to put workers on chosen CPUs is the
+  mask of the record that starts them: the workers of a shell started from a
+  launcher whose mask is CPUs 1 to 3 (the images of the measurement,
+  `BENCH_PINNED_CPUS`) are placed on the least busy of those, in turn when they
+  are made one after the other, and none stands on CPU 0 with the network
+  service and its switch. A worker on CPU 0 runs below those services and is
+  served in bursts (a starved worker of 11.11 used 20 jiffies where the others
+  used 500). A call that moves the calling thread is a decision for the kernel
+  notes, with no code yet.
 - **The CPU mask of a process (#419).** A process has a mask of the CPUs
   its threads run on, set by its creator (`process_create` x8: 0 is the
   creator's own, otherwise a subset of it, ACCESS_DENIED for more) and never
