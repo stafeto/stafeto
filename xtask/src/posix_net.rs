@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 67] = [
+pub const CHECKS: [&str; 68] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -94,6 +94,7 @@ pub const CHECKS: [&str; 67] = [
     "epoll-rdhup-unix",
     "fast-claim-off",
     "wait-churn",
+    "home-fork",
 ];
 
 /// The check of the stack instances (`cargo xtask posix-net instances`): one worker on each CPU

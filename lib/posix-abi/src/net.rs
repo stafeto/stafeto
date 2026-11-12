@@ -30,8 +30,8 @@ use crate::sockets::{
     MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN,
     SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
     SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_STAFETO_CALLS,
-    SO_STAFETO_COUNT, SO_STAFETO_HOME, SO_STAFETO_REMOTE, SO_TYPE, SOCK_DGRAM, SOCK_NONBLOCK,
-    SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
+    SO_STAFETO_COUNT, SO_STAFETO_HOME, SO_STAFETO_HOMING, SO_STAFETO_REMOTE, SO_TYPE, SOCK_DGRAM,
+    SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -95,6 +95,12 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    // The image carries the flag and `HOME_CPU` of the thread that forked. A thread of the
+    // parent that stood in the middle of its ask (ASKING) has no counterpart in the child to
+    // finish it, so the child's first call that makes a socket would wait for ever: the child
+    // stays in the home its clone of the session stands in.
+    let _ = HOMING.compare_exchange(ASKING, ASKED, Ordering::AcqRel, Ordering::Acquire);
+    // TODO(#615 P3): a child that holds only listening sockets chooses a home of its own.
     // The clone has no shared buffer: the child asks for its own.
     netbuf::after_fork();
 }
@@ -959,6 +965,14 @@ fn value_of(number: u32, value: &[u8]) -> Result<u32, i32> {
 /// SO_LINGER, 16 for the timeouts).
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
     // The layer's own count of the calls from other CPUs (no request to the service).
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING {
+        return with_socket(fd, |_| {
+            let bytes = HOMING.load(Ordering::Acquire).to_ne_bytes();
+            let n = out.len().min(4);
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(4)
+        });
+    }
     if level == SOL_SOCKET && name == SO_STAFETO_REMOTE {
         return with_socket(fd, |_| {
             let bytes = REMOTE.load(Ordering::Relaxed).to_ne_bytes();
@@ -1007,6 +1021,18 @@ pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i3
         return with_socket(fd, |_| {
             REMOTE.store(0, Ordering::Relaxed);
             COUNTING.store(on, Ordering::Relaxed);
+            Ok(())
+        });
+    }
+    // A probe of the fork rule: 1 puts the flag of the home in the state of a thread that is
+    // in the middle of its ask, 0 puts it back to done.
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING {
+        if value.len() < 4 {
+            return Err(EINVAL);
+        }
+        let on = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) != 0;
+        return with_socket(fd, |_| {
+            HOMING.store(if on { ASKING } else { ASKED }, Ordering::Release);
             Ok(())
         });
     }

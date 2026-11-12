@@ -425,11 +425,6 @@ impl Driver<'_> {
             first,
             count,
         };
-        if !switch::command(command) {
-            self.inst.net.places.free(place);
-            self.inst.net.socks[place] = crate::net::Sock::EMPTY;
-            return limit();
-        }
         let book = Hold {
             proto: hold.protocol as u8,
             count,
@@ -444,15 +439,50 @@ impl Driver<'_> {
             udp_ports,
             ..
         } = &mut *self.inst.net;
-        holds.add(
-            group,
-            book,
-            if proto == Proto::Tcp {
-                tcp_ports
-            } else {
-                udp_ports
-            },
-        );
+        let map = if proto == Proto::Tcp {
+            tcp_ports
+        } else {
+            udp_ports
+        };
+        // A new group takes its ports before the switch hears of it: a port another instance
+        // holds refuses the group, and a refusal of the switch gives the ports back.
+        let new_group = same.is_none();
+        if new_group && !holds.add(group, book, map) {
+            self.inst.net.places.free(place);
+            self.inst.net.socks[place] = crate::net::Sock::EMPTY;
+            return refuse(proto_net::IN_USE);
+        }
+        if !switch::command(command) {
+            if new_group {
+                let Net {
+                    holds,
+                    tcp_ports,
+                    udp_ports,
+                    ..
+                } = &mut *self.inst.net;
+                holds.freed(group, tcp_ports, udp_ports);
+            }
+            self.inst.net.places.free(place);
+            self.inst.net.socks[place] = crate::net::Sock::EMPTY;
+            return limit();
+        }
+        if !new_group {
+            let Net {
+                holds,
+                tcp_ports,
+                udp_ports,
+                ..
+            } = &mut *self.inst.net;
+            let _ = holds.add(
+                group,
+                book,
+                if proto == Proto::Tcp {
+                    tcp_ports
+                } else {
+                    udp_ports
+                },
+            );
+        }
         self.inst.net.places.hold(place);
         s.data.held.add(place);
         match sw::write_place_reply(self.inst.net.places.name(place), r.reply()) {

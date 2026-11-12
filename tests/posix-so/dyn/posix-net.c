@@ -3297,6 +3297,39 @@ static void instances(void)
 	REQUIRE(calls_total > 0);
 }
 
+/* The home of a session and a fork: a thread of the parent that stands in the middle of its
+ * ask (HOMING 1, set by the probe) has no counterpart in the child, so the child must start
+ * with the ask done (2) and its first call that makes a socket must return. The alarm turns
+ * a child that waits for ever into a failure. */
+#define SO_STAFETO_HOMING 0x7357
+
+static void home_fork(void)
+{
+	int port, lis = listener(8, &port);
+	unsigned one = 1, zero = 0;
+
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &one, sizeof one) == 0);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		alarm(10);
+		unsigned state = 0;
+		socklen_t len = sizeof state;
+		if (getsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &state, &len) != 0 || state != 2)
+			_exit(2);
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0)
+			_exit(3);
+		close(s);
+		_exit(0);
+	}
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &zero, sizeof zero) == 0);
+	REQUIRE(close(lis) == 0);
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 /* `posix-net stat`: the two options of the shared buffers. */
 static int stat_buffers(void)
 {
@@ -3417,6 +3450,7 @@ static const struct {
 	{ "epoll-rdhup-unix", epoll_rdhup_unix },
 	{ "fast-claim-off", fast_claim_off },
 	{ "wait-churn", wait_churn },
+	{ "home-fork", home_fork },
 };
 
 /* Checks that run alone, in a process that has made no socket yet (named on the line). */

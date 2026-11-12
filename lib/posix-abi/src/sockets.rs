@@ -70,6 +70,9 @@ pub const SO_STAFETO_CALLS: i32 = 0x7354;
 pub const SO_STAFETO_REMOTE: i32 = 0x7355;
 /// Sets the count of the calls from other CPUs on (1) or off and clears it.
 pub const SO_STAFETO_COUNT: i32 = 0x7356;
+/// The state of the flag of the session's home (probe of the fork rule): reads 0 not asked,
+/// 1 asking, 2 done; a write of 1 sets asking, of 0 sets done.
+pub const SO_STAFETO_HOMING: i32 = 0x7357;
 pub const SO_REUSEPORT: i32 = 15;
 pub const SO_LINGER: i32 = 13;
 pub const SO_RCVTIMEO: i32 = 20;

@@ -160,9 +160,18 @@ pub fn ephemeral(offset: u32, counter: u32, map: &PortMap) -> Option<u16> {
             return Some(port);
         }
     }
-    let after = offset.wrapping_add(counter).wrapping_add(TRIES) % EPHEMERAL_COUNT;
-    map.first_free_from(after)
-        .map(|n| EPHEMERAL_FIRST + n as u16)
+    // The bitmap is this instance's: a port another instance holds (a block of a consumer
+    // included) is skipped here, one port at a time, for at most one round of the range.
+    let mut from = offset.wrapping_add(counter).wrapping_add(TRIES) % EPHEMERAL_COUNT;
+    for _ in 0..EPHEMERAL_COUNT {
+        let n = map.first_free_from(from)?;
+        let port = EPHEMERAL_FIRST + n as u16;
+        if !map.held_elsewhere(port) {
+            return Some(port);
+        }
+        from = n + 1;
+    }
+    None
 }
 
 /// How many sockets hold each port of one protocol. With a count, a socket
@@ -217,19 +226,10 @@ impl PortMap {
         self.held[usize::from(port)] > 0 || self.is_reserved(port) || self.held_elsewhere(port)
     }
 
-    /// `hold`, refused (false) when another instance holds `port`.
+    /// `hold`, refused (false) when another instance holds `port`. Kept for the callers that
+    /// name the refusal; `hold` itself refuses the same way.
     pub fn try_hold(&mut self, port: u16) -> bool {
-        if self.held_elsewhere(port) {
-            return false;
-        }
-        if self.held[usize::from(port)] == 0
-            && let Some(s) = self.shared
-            && !s.claims.claim(s.proto, port, s.who)
-        {
-            return false;
-        }
-        self.hold(port);
-        true
+        self.hold(port)
     }
 
     pub fn is_reserved(&self, port: u16) -> bool {
@@ -247,10 +247,16 @@ impl PortMap {
         if Self::aligned(first, count) {
             let word = usize::from(first - EPHEMERAL_FIRST) / 64;
             let words = word..word + usize::from(count) / 64;
+            // The claims are the one port space of all instances: a port another instance
+            // holds (or a block of a consumer that instance 0 made, which the claims carry)
+            // is not free, though this map's bitmap says so.
             return self.used[words.clone()]
                 .iter()
                 .zip(&self.reserved[words])
-                .all(|(u, r)| *u | *r == 0);
+                .all(|(u, r)| *u | *r == 0)
+                && self.shared.is_none_or(|s| {
+                    (first..=first + (count - 1)).all(|p| s.claims.owner(s.proto, p).is_none())
+                });
         }
         (0..count).all(|i| !self.held(first + i))
     }
@@ -263,21 +269,36 @@ impl PortMap {
             && count.is_multiple_of(64)
     }
 
-    /// `hold` for each of `count` ports from `first`. An aligned run of the ephemeral range
-    /// (the blocks of the switch hold 512 ports at once) is a few bits of `reserved`: the run
-    /// must have been free (`free_run`).
-    pub fn hold_run(&mut self, first: u16, count: u16) {
+    /// `hold` for each of `count` ports from `first`; false, and nothing held, when one of the
+    /// ports is held by another instance. An aligned run of the ephemeral range (the blocks of
+    /// the switch hold 512 ports at once) is a few bits of `reserved` and a claim for each
+    /// port, so that every instance sees the block as taken: the run must have been free
+    /// (`free_run`).
+    pub fn hold_run(&mut self, first: u16, count: u16) -> bool {
         if count == 0 {
-            return;
+            return true;
         }
+        let last = first + (count - 1);
         if Self::aligned(first, count) {
+            if let Some(s) = self.shared {
+                for p in first..=last {
+                    if !s.claims.claim(s.proto, p, s.who) {
+                        (first..p).for_each(|q| s.claims.release(s.proto, q, s.who));
+                        return false;
+                    }
+                }
+            }
             let word = usize::from(first - EPHEMERAL_FIRST) / 64;
             self.reserved[word..word + usize::from(count) / 64].fill(!0);
-            return;
+            return true;
         }
-        for p in first..=first + (count - 1) {
-            self.hold(p);
+        for p in first..=last {
+            if !self.hold(p) {
+                (first..p).for_each(|q| self.release(q));
+                return false;
+            }
         }
+        true
     }
 
     /// `release` for each of `count` ports from `first` (a run `hold_run` took).
@@ -285,12 +306,16 @@ impl PortMap {
         if count == 0 {
             return;
         }
+        let last = first + (count - 1);
         if Self::aligned(first, count) {
             let word = usize::from(first - EPHEMERAL_FIRST) / 64;
             self.reserved[word..word + usize::from(count) / 64].fill(0);
+            if let Some(s) = self.shared {
+                (first..=last).for_each(|p| s.claims.release(s.proto, p, s.who));
+            }
             return;
         }
-        for p in first..=first + (count - 1) {
+        for p in first..=last {
             self.release(p);
         }
     }
@@ -306,16 +331,20 @@ impl PortMap {
         }
     }
 
-    pub fn hold(&mut self, port: u16) {
-        let n = &mut self.held[usize::from(port)];
-        let first = *n == 0;
-        *n = n.saturating_add(1);
-        if first {
-            self.mark(port, true);
-            if let Some(s) = self.shared {
-                s.claims.claim(s.proto, port, s.who);
+    /// One more socket holds `port`. False, and nothing counted, when another instance holds
+    /// it: the claim is the instance's right to the port.
+    pub fn hold(&mut self, port: u16) -> bool {
+        let n = self.held[usize::from(port)];
+        if n == 0 {
+            if let Some(s) = self.shared
+                && !s.claims.claim(s.proto, port, s.who)
+            {
+                return false;
             }
+            self.mark(port, true);
         }
+        self.held[usize::from(port)] = n.saturating_add(1);
+        true
     }
 
     pub fn release(&mut self, port: u16) {
@@ -324,7 +353,9 @@ impl PortMap {
         *n = n.saturating_sub(1);
         if *n == 0 {
             self.mark(port, false);
+            // The claim of a port inside a block of a consumer is the block's.
             if was > 0
+                && !self.is_reserved(port)
                 && let Some(s) = self.shared
             {
                 s.claims.release(s.proto, port, s.who);
@@ -570,5 +601,89 @@ mod tests {
         let first = ephemeral(100, 0, &a).unwrap();
         assert!(a.try_hold(first));
         assert_eq!(ephemeral(100, 0, &b), Some(first + 1));
+    }
+
+    /// The 512-port block `n` of the ephemeral range.
+    fn block(n: u16) -> u16 {
+        EPHEMERAL_FIRST + n * 512
+    }
+
+    #[test]
+    fn a_consumer_block_is_taken_for_every_instance() {
+        let (mut a, mut b) = shared_maps();
+        assert!(a.free_run(block(3), 512) && b.free_run(block(3), 512));
+        assert!(a.hold_run(block(3), 512));
+        // Instance 1 sees every port of the block as held and cannot take one.
+        for port in [block(3), block(3) + 100, block(3) + 511] {
+            assert!(b.held(port) && b.held_elsewhere(port));
+            assert!(!b.try_hold(port) && !b.hold(port));
+        }
+        assert!(!b.free_run(block(3), 512));
+        assert!(
+            !b.free_run(block(3) - 64, 128),
+            "a run that half meets the block"
+        );
+        assert!(b.hold(block(3) + 512) && b.hold(block(3) - 1));
+        b.release(block(3) + 512);
+        b.release(block(3) - 1);
+        // The choice of an ephemeral port never lands in the block, from any start: with
+        // every other block held by instance 0 it is the one free block that is chosen.
+        for n in (0..32).filter(|n| *n != 3 && *n != 9) {
+            assert!(a.hold_run(block(n), 512));
+        }
+        assert!(a.free_run(block(9), 512) && !a.free_run(block(3), 512));
+        for offset in [0, 1, 700, 3 * 512, 9 * 512 - 1, 16383] {
+            for counter in [0, 5, 64, 1000] {
+                let port = ephemeral(offset, counter, &b).expect("a free block is left");
+                assert!(
+                    (block(9)..block(9) + 512).contains(&port),
+                    "port {port} is outside the free block"
+                );
+            }
+        }
+        // The block lets go: instance 1 may take its ports.
+        for n in (0..32).filter(|n| *n != 9) {
+            a.release_run(block(n), 512);
+        }
+        assert!(!b.held(block(3) + 7) && b.try_hold(block(3) + 7));
+        assert!(b.free_run(block(4), 512));
+    }
+
+    #[test]
+    fn a_block_is_not_made_over_the_ports_of_another_instance() {
+        let (mut a, mut b) = shared_maps();
+        // Instance 1 holds a port in block 5 only: instance 0's bitmap does not show it.
+        assert!(b.hold(block(5) + 300));
+        assert!(!a.is_reserved(block(5) + 300) && a.held[usize::from(block(5) + 300)] == 0);
+        assert!(!a.free_run(block(5), 512));
+        assert!(a.free_run(block(6), 512));
+        // A hold that races the check is refused whole and leaves nothing of the run.
+        assert!(!a.hold_run(block(5), 512));
+        assert!(!a.is_reserved(block(5)) && !a.is_reserved(block(5) + 511));
+        assert_eq!(b_owner(&b, block(5)), None);
+        assert_eq!(b_owner(&b, block(5) + 300), Some(1));
+        b.release(block(5) + 300);
+        assert!(a.free_run(block(5), 512) && a.hold_run(block(5), 512));
+    }
+
+    fn b_owner(map: &PortMap, port: u16) -> Option<u8> {
+        let s = map.shared.expect("a shared map");
+        s.claims.owner(s.proto, port)
+    }
+
+    #[test]
+    fn a_hold_of_a_port_another_instance_holds_counts_nothing() {
+        let (mut a, mut b) = shared_maps();
+        assert!(a.hold(8080));
+        assert!(!b.hold(8080));
+        assert!(b.held[8080] == 0 && b_owner(&b, 8080) == Some(0));
+        // The holder's own second hold counts.
+        assert!(a.hold(8080));
+        a.release(8080);
+        assert!(b_owner(&a, 8080) == Some(0));
+        // A run holds nothing when one of its ports is another's.
+        assert!(!b.hold_run(8079, 3));
+        assert!(b.held[8079] == 0 && b.held[8081] == 0);
+        assert!(a.hold(8079) && a.hold(8081));
     }
 }

@@ -261,6 +261,33 @@ const _: () = assert!(
         <= 18_369
         && SWITCH_BASE.div_ceil(STACK_COPY_WEIGHT) * (1_800 + COPY_TICKS) <= SWITCH_BASE * 1_800
 );
+/// Takes `weight` frames of the step's share for work a frame brings besides its own pass
+/// (`budget` is what the step may still take, `taken` what it has taken).
+pub fn charge(budget: &mut usize, taken: &mut usize, weight: usize) {
+    *budget = budget.saturating_sub(weight);
+    *taken += weight;
+}
+/// An ARP reply goes to every instance: the others get a copy of it in a buffer of sending,
+/// each of `STACK_COPY_WEIGHT` frames of the step (it is a copy of the frame and an offer to
+/// the lane, with no frame taken off the queue). A frame that is begun is copied to all the
+/// instances (a neighbour that misses a reply asks again, and the lanes must not differ), so a
+/// step that starts its last frame with a share left can go over by one frame's copies.
+/// `arp_copies_in_step(n)` is what a step of the tables path makes at most with `n` instances
+/// when every frame of the wire is an ARP reply: each frame costs its own pop and `n - 1`
+/// copies, and only the last one is cut short by the share.
+pub const fn arp_copies_in_step(instances: usize) -> usize {
+    let copies = instances.saturating_sub(1);
+    let per_frame = 1 + STACK_COPY_WEIGHT * copies;
+    SWITCH_ROUTED.div_ceil(per_frame) * copies
+}
+/// The most copies of ARP replies a step makes, whatever the number of instances.
+pub const ARP_COPIES_STEP: usize = arp_copies_in_step(crate::switchlogic::tables::MAX_INSTANCES);
+const _: () = assert!(
+    arp_copies_in_step(2) <= ARP_COPIES_STEP
+        && arp_copies_in_step(3) <= ARP_COPIES_STEP
+        && SWITCH_STEP_REST + SWITCH_ROUTED * SWITCH_STEP_RX_FRAME + ARP_COPIES_STEP * COPY_TICKS
+            <= 18_369
+);
 const _: () = assert!(
     SWITCH_BASE.div_ceil(CUT_WEIGHT) * CUT_TICKS <= SWITCH_BASE * 1_500
         && SWITCH_RX.div_ceil(CUT_WEIGHT) * CUT_TICKS <= 6_000
@@ -1002,6 +1029,34 @@ impl Default for Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step of the tables path in which every frame of the wire is an ARP reply: the copies
+    /// it makes with `instances` instances, charged as `switch::arp_copies` charges them.
+    fn arp_flood_copies(instances: usize, weight: usize) -> usize {
+        let (mut budget, mut taken, mut copies) = (SWITCH_ROUTED, 0, 0);
+        while budget > 0 {
+            taken += 1;
+            budget -= 1;
+            for _ in 1..instances {
+                copies += 1;
+                charge(&mut budget, &mut taken, weight);
+            }
+        }
+        copies
+    }
+
+    #[test]
+    fn a_stream_of_arp_replies_holds_the_copies_of_a_step_to_the_bound() {
+        for n in 2..=crate::switchlogic::tables::MAX_INSTANCES {
+            let copies = arp_flood_copies(n, STACK_COPY_WEIGHT);
+            assert_eq!(copies, arp_copies_in_step(n), "{n} instances");
+            assert!(copies <= ARP_COPIES_STEP);
+        }
+        // Without the charge the step makes a copy for every other instance of each frame.
+        let n = crate::switchlogic::tables::MAX_INSTANCES;
+        assert!(arp_flood_copies(n, 0) > ARP_COPIES_STEP);
+        assert_eq!(arp_flood_copies(n, 0), SWITCH_ROUTED * (n - 1));
+    }
 
     #[test]
     fn the_switch_collects_a_bigger_batch_than_the_stack() {

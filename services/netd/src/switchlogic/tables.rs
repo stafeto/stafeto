@@ -1151,15 +1151,23 @@ enum Number {
 /// the service keeps.
 pub trait Registry {
     fn held(&self, port: u16) -> bool;
-    fn hold(&mut self, port: u16);
+    /// False, and nothing held, when the port is held by another instance.
+    fn hold(&mut self, port: u16) -> bool;
     fn release(&mut self, port: u16);
     /// Whether none of the `count` ports from `first` is held. The maps answer a run of the
     /// ephemeral range a word of 64 ports at a time (a step of the service stays short).
     fn free_run(&self, first: u16, count: u16) -> bool {
         (0..count).all(|i| !self.held(first + i))
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
-        (0..count).for_each(|i| self.hold(first + i));
+    /// False, and nothing held, when one port of the run is held by another instance.
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
+        for i in 0..count {
+            if !self.hold(first + i) {
+                (0..i).for_each(|j| self.release(first + j));
+                return false;
+            }
+        }
+        true
     }
     fn release_run(&mut self, first: u16, count: u16) {
         (0..count).for_each(|i| self.release(first + i));
@@ -1170,7 +1178,7 @@ impl Registry for PortMap {
     fn free_run(&self, first: u16, count: u16) -> bool {
         PortMap::free_run(self, first, count)
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
         PortMap::hold_run(self, first, count)
     }
     fn release_run(&mut self, first: u16, count: u16) {
@@ -1179,7 +1187,7 @@ impl Registry for PortMap {
     fn held(&self, port: u16) -> bool {
         PortMap::held(self, port)
     }
-    fn hold(&mut self, port: u16) {
+    fn hold(&mut self, port: u16) -> bool {
         PortMap::hold(self, port)
     }
     fn release(&mut self, port: u16) {
@@ -1194,9 +1202,15 @@ impl Registry for Both<'_> {
     fn free_run(&self, first: u16, count: u16) -> bool {
         self.0.free_run(first, count) && self.1.free_run(first, count)
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
-        self.0.hold_run(first, count);
-        self.1.hold_run(first, count);
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
+        if !self.0.hold_run(first, count) {
+            return false;
+        }
+        if !self.1.hold_run(first, count) {
+            self.0.release_run(first, count);
+            return false;
+        }
+        true
     }
     fn release_run(&mut self, first: u16, count: u16) {
         self.0.release_run(first, count);
@@ -1205,9 +1219,15 @@ impl Registry for Both<'_> {
     fn held(&self, port: u16) -> bool {
         self.0.held(port) || self.1.held(port)
     }
-    fn hold(&mut self, port: u16) {
-        self.0.hold(port);
-        self.1.hold(port);
+    fn hold(&mut self, port: u16) -> bool {
+        if !self.0.hold(port) {
+            return false;
+        }
+        if !self.1.hold(port) {
+            self.0.release(port);
+            return false;
+        }
+        true
     }
     fn release(&mut self, port: u16) {
         self.0.release(port);
@@ -1288,10 +1308,12 @@ impl Blocks {
     ) -> Option<(u8, u32, u16)> {
         self.expire(map, now);
         let c = (0..MAX_CONSUMERS).find(|&c| busy & (1 << c) == 0 && self.usable(c))?;
-        let b = (0..BLOCKS)
-            .rev()
-            .find(|&b| self.state[b] == Block::Free && map.free_run(Self::first(b), BLOCK_PORTS))?;
-        map.hold_run(Self::first(b), BLOCK_PORTS);
+        // A block another instance takes between the check and the hold is skipped.
+        let b = (0..BLOCKS).rev().find(|&b| {
+            self.state[b] == Block::Free
+                && map.free_run(Self::first(b), BLOCK_PORTS)
+                && map.hold_run(Self::first(b), BLOCK_PORTS)
+        })?;
         self.state[b] = Block::Held;
         self.owner[c] = Some(b);
         self.number[c] = Number::Free;
@@ -1602,6 +1624,53 @@ pub(crate) mod tests {
         let (mut b, mut map) = (Blocks::new(), PortMap::new());
         map.hold(65535);
         assert_eq!(b.alloc(&mut map, 0).unwrap().2, 64512);
+    }
+
+    /// The TCP and UDP maps of instances 0 and 1 over one set of claims (boxed: a map is
+    /// large).
+    fn instance_maps() -> [Box<PortMap>; 4] {
+        let claims: &'static crate::ports::Claims =
+            Box::leak(Box::new(crate::ports::Claims::new()));
+        [
+            (0, Proto::Tcp),
+            (0, Proto::Udp),
+            (1, Proto::Tcp),
+            (1, Proto::Udp),
+        ]
+        .map(|(who, proto)| {
+            let mut map = Box::new(PortMap::new());
+            map.share(claims, who, proto);
+            map
+        })
+    }
+
+    #[test]
+    fn a_consumer_block_is_out_of_reach_of_the_ports_of_the_other_instances() {
+        let [mut t0, mut u0, mut t1, u1] = instance_maps();
+        let mut b = Blocks::new();
+        let (_, _, first) = b.alloc(&mut Both(&mut t0, &mut u0), 0).unwrap();
+        for port in [first, first + 200, first + 511] {
+            assert!(t1.held(port) && u1.held(port));
+            assert!(!t1.hold(port));
+        }
+        // Instance 1's choice of a port keeps out of the block.
+        for offset in [0, 1, u32::from(first - EPHEMERAL_FIRST), 12345] {
+            let port = crate::ports::ephemeral(offset, 0, &t1).unwrap();
+            assert!(port < first || port - first >= BLOCK_PORTS);
+        }
+    }
+
+    #[test]
+    fn a_block_is_not_given_over_the_ports_of_another_instance() {
+        let [mut t0, mut u0, mut t1, _] = instance_maps();
+        let mut b = Blocks::new();
+        // Instance 1 holds a port in every block but the second one from the start.
+        for n in (0..BLOCKS as u16).filter(|n| *n != 1) {
+            assert!(t1.hold(EPHEMERAL_FIRST + n * BLOCK_PORTS + 17));
+        }
+        let (_, _, first) = b.alloc(&mut Both(&mut t0, &mut u0), 0).unwrap();
+        assert_eq!(first, EPHEMERAL_FIRST + BLOCK_PORTS);
+        assert!(b.alloc(&mut Both(&mut t0, &mut u0), 0).is_none());
     }
 
     #[test]

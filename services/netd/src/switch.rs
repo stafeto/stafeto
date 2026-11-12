@@ -69,7 +69,7 @@ use netd::ring::{
     CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
     STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
     SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, drive,
+    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, charge, drive,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -1666,7 +1666,7 @@ impl Switch {
                                 self.pass_to_stack(n, len, sum, k, room);
                                 self.weigh_copy(&mut budget, &mut taken);
                                 if matches!(d, Decision::ArpAll) {
-                                    self.arp_copies(frame, sum, room);
+                                    self.arp_copies(frame, sum, room, &mut budget, &mut taken);
                                 }
                             } else {
                                 self.give(n);
@@ -1689,8 +1689,19 @@ impl Switch {
     }
 
     /// The instances after the default one get a copy of an ARP reply, each in a buffer of
-    /// sending that comes back through `rx_back` as the turned frames' do.
-    fn arp_copies(&mut self, frame: &[u8], sum: bool, room: &mut [usize; MAX_INSTANCES]) {
+    /// sending that comes back through `rx_back` as the turned frames' do. Each copy is a copy
+    /// of a frame into a buffer and counts `STACK_COPY_WEIGHT` frames of the step, so a stream of
+    /// ARP replies holds a step to `ARP_COPIES_STEP` copies whatever the number of instances
+    /// (`ring::ARP_COPIES_STEP`): without the charge each reply of the stream would cost the
+    /// step a copy for every other instance.
+    fn arp_copies(
+        &mut self,
+        frame: &[u8],
+        sum: bool,
+        room: &mut [usize; MAX_INSTANCES],
+        budget: &mut usize,
+        taken: &mut usize,
+    ) {
         for k in (DEFAULT_INSTANCE + 1)..self.instances {
             if !lane_rules::take_room(room, k) {
                 bump(&INNER.stats.lane_full);
@@ -1703,6 +1714,7 @@ impl Switch {
             let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
             slice[HDR_LEN..HDR_LEN + frame.len()].copy_from_slice(frame);
             offer_must(&mut self.passed, k, pack_frame(n, frame.len() as u16, sum));
+            charge(budget, taken, STACK_COPY_WEIGHT);
         }
     }
 
@@ -1750,8 +1762,7 @@ impl Switch {
     /// step (one is counted already).
     fn weigh_copy(&self, budget: &mut usize, taken: &mut usize) {
         if self.merged {
-            *budget = budget.saturating_sub(STACK_COPY_WEIGHT - 1);
-            *taken += STACK_COPY_WEIGHT - 1;
+            charge(budget, taken, STACK_COPY_WEIGHT - 1);
         }
     }
 

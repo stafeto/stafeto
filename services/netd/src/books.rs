@@ -332,21 +332,29 @@ impl Holds {
     }
 
     /// A description joined group `group` (1-based): one more holder, or a new group whose
-    /// ports the registry takes.
-    pub fn add(&mut self, group: u8, h: Hold, ports: &mut PortMap) {
+    /// ports the registry takes. False, and no group, when another instance holds one of the
+    /// ports.
+    #[must_use]
+    pub fn add(&mut self, group: u8, h: Hold, ports: &mut PortMap) -> bool {
         let book = &mut self.list[usize::from(group) - 1];
         if book.used {
             book.holders += 1;
-        } else {
-            *book = Hold {
-                used: true,
-                holders: 1,
-                ..h
-            };
-            for port in hold_ports(h.first, h.count) {
-                ports.hold(port);
+            return true;
+        }
+        for port in hold_ports(h.first, h.count) {
+            if !ports.hold(port) {
+                for taken in h.first..port {
+                    ports.release(taken);
+                }
+                return false;
             }
         }
+        *book = Hold {
+            used: true,
+            holders: 1,
+            ..h
+        };
+        true
     }
 
     /// The group is gone from the switch's tables: the slot and the ports go.
@@ -652,7 +660,7 @@ mod tests {
             first: 65535,
             ..Hold::default()
         };
-        holds.add(1, h, &mut tcp);
+        assert!(holds.add(1, h, &mut tcp));
         assert!(tcp.held(65535) && !tcp.held(0));
         holds.freed(1, &mut tcp, &mut udp);
         assert!(!tcp.held(65535) && !tcp.held(0));
@@ -703,6 +711,32 @@ mod tests {
     }
 
     #[test]
+    fn a_group_over_a_port_of_another_instance_is_refused_whole() {
+        let claims: &'static crate::ports::Claims =
+            Box::leak(Box::new(crate::ports::Claims::new()));
+        let (mut mine, mut other) = (Box::new(PortMap::new()), Box::new(PortMap::new()));
+        mine.share(claims, 0, crate::ports::Proto::Tcp);
+        other.share(claims, 1, crate::ports::Proto::Tcp);
+        assert!(other.hold(8002));
+        let mut holds = Holds::new();
+        let h = Hold {
+            proto: 6,
+            count: 4,
+            first: 8000,
+            ..Hold::default()
+        };
+        assert!(!holds.add(1, h, &mut mine));
+        // Nothing of the group is held, the slot is free, and the other's port stays its own.
+        assert!(holds.free_slot() == Some(0) && !holds.list[0].used);
+        assert!(!mine.held(8000) && !mine.held(8001) && !mine.held(8003));
+        assert_eq!(claims.owner(crate::ports::Proto::Tcp, 8002), Some(1));
+        assert_eq!(claims.owner(crate::ports::Proto::Tcp, 8000), None);
+        other.release(8002);
+        assert!(holds.add(1, h, &mut mine));
+        assert!(!other.hold(8001) && claims.owner(crate::ports::Proto::Tcp, 8001) == Some(0));
+    }
+
+    #[test]
     fn a_failed_hold_gives_back_its_group_every_time() {
         let mut holds = Holds::new();
         let (mut tcp, mut udp) = (PortMap::new(), PortMap::new());
@@ -716,7 +750,7 @@ mod tests {
                 first: 8000,
                 ..Hold::default()
             };
-            holds.add(slot as u8 + 1, h, &mut tcp);
+            assert!(holds.add(slot as u8 + 1, h, &mut tcp));
             assert!(tcp.held(8000));
             holds.failed(slot as u8 + 1, &mut tcp, &mut udp);
             assert!(!tcp.held(8000) && !tcp.held(8001));
@@ -740,9 +774,9 @@ mod tests {
             first: 80,
             ..Hold::default()
         };
-        holds.add(1, h, &mut tcp);
+        assert!(holds.add(1, h, &mut tcp));
         for _ in 1..300 {
-            holds.add(1, h, &mut tcp);
+            assert!(holds.add(1, h, &mut tcp));
         }
         for _ in 0..300 {
             holds.closed(1);
