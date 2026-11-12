@@ -11,7 +11,9 @@
 //! LISTEN of the set of places of the socket named; the sets keep the queue
 //! sockets of different members apart (`owners`), so that socket is the
 //! chosen member's own and the choice is exact. A member that is full is
-//! skipped.
+//! skipped, and so is one the service believed to listen that turns out not
+//! to (the next member after it is tried). Each group counts the SYNs each
+//! member took (`served`), which the profile exports by position.
 
 /// The members of a group at most.
 pub const REUSE_MAX: usize = 16;
@@ -19,6 +21,19 @@ pub const REUSE_MAX: usize = 16;
 pub const GROUPS_MAX: usize = 32;
 /// The group a place is in, or none.
 pub const NO_GROUP: u8 = u8::MAX;
+/// The positions the profile counts apart: a member at a later position is
+/// counted with the last.
+pub const SERVED_POSITIONS: usize = 8;
+
+/// What a group asks of the sockets while it picks a member.
+pub trait Members {
+    /// Whether the member `place` listens and has room in its queue.
+    fn usable(&mut self, place: usize) -> bool;
+    /// Whether the member `place`, found usable, can take the SYN. A member
+    /// that cannot is left out of the choice by the implementation (it is no
+    /// longer usable), and the next one is tried.
+    fn confirm(&mut self, place: usize) -> bool;
+}
 
 /// Why a place cannot join a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +54,8 @@ struct Group {
     /// Where the circle goes on: the position of the member to look at first.
     next: u8,
     members: [u16; REUSE_MAX],
+    /// The SYNs each member took, by position.
+    served: [u64; REUSE_MAX],
 }
 
 const EMPTY: Group = Group {
@@ -49,6 +66,7 @@ const EMPTY: Group = Group {
     len: 0,
     next: 0,
     members: [0; REUSE_MAX],
+    served: [0; REUSE_MAX],
 };
 
 /// The groups.
@@ -113,6 +131,7 @@ impl Groups {
             return Err(Refused::Full);
         }
         g.members[usize::from(g.len)] = place as u16;
+        g.served[usize::from(g.len)] = 0;
         g.len += 1;
         Ok(k)
     }
@@ -127,6 +146,7 @@ impl Groups {
         {
             // The order of the members is kept: the circle goes by position.
             g.members.copy_within(at + 1..len, at);
+            g.served.copy_within(at + 1..len, at);
             g.len -= 1;
             // A member before the pointer left: the pointer moves back with
             // the rest, so the circle does not jump over the next member.
@@ -165,6 +185,40 @@ impl Groups {
             }
         }
         None
+    }
+}
+
+impl Groups {
+    /// The member that takes the next SYN: the circle's choice among the
+    /// usable members whose `confirm` holds, at most `REUSE_MAX` tries. The
+    /// SYN is counted for the member. None when no member takes it.
+    pub fn pick_member(&mut self, k: usize, members: &mut impl Members) -> Option<usize> {
+        for _ in 0..REUSE_MAX {
+            let m = self.pick(k, |m| members.usable(m))?;
+            if members.confirm(m) {
+                let g = &mut self.groups[k];
+                if let Some(at) = g.members[..usize::from(g.len)]
+                    .iter()
+                    .position(|&p| usize::from(p) == m)
+                {
+                    g.served[at] += 1;
+                }
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// The SYNs the members took, summed over the groups by position (a
+    /// position beyond `SERVED_POSITIONS` is counted in the last).
+    pub fn served_by_position(&self) -> [u64; SERVED_POSITIONS] {
+        let mut out = [0; SERVED_POSITIONS];
+        for g in self.groups.iter().filter(|g| g.used) {
+            for (at, n) in g.served[..usize::from(g.len)].iter().enumerate() {
+                out[at.min(SERVED_POSITIONS - 1)] += n;
+            }
+        }
+        out
     }
 }
 
@@ -271,5 +325,98 @@ mod tests {
         g.join([0; 4], 80, 1, 99).unwrap();
         let seen: Vec<_> = (0..5).map(|_| g.pick(k, |_| true).unwrap()).collect();
         assert!(seen.contains(&99), "{seen:?}");
+    }
+
+    /// Members for a test: the places in `dead` look usable and cannot take
+    /// the SYN (a count behind), and are usable no more once found out.
+    struct Fake {
+        dead: Vec<usize>,
+        found_out: Vec<usize>,
+        confirms: u32,
+    }
+
+    impl Members for Fake {
+        fn usable(&mut self, place: usize) -> bool {
+            !self.found_out.contains(&place)
+        }
+        fn confirm(&mut self, place: usize) -> bool {
+            self.confirms += 1;
+            if self.dead.contains(&place) {
+                self.found_out.push(place);
+                return false;
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn a_member_that_cannot_take_the_syn_leaves_the_choice_to_the_next_one() {
+        let (mut g, k) = four();
+        // The circle is at 10, which is dead: the SYN goes to 11, not away.
+        let mut f = Fake {
+            dead: vec![10],
+            found_out: Vec::new(),
+            confirms: 0,
+        };
+        assert_eq!(g.pick_member(k, &mut f), Some(11));
+        assert_eq!(f.confirms, 2);
+        // The ones after it come in turn; the dead one is not tried again.
+        assert_eq!(g.pick_member(k, &mut f), Some(12));
+        assert_eq!(g.pick_member(k, &mut f), Some(13));
+        assert_eq!(g.pick_member(k, &mut f), Some(11));
+        assert_eq!(f.confirms, 5);
+        // Every member dead: none, after at most REUSE_MAX tries.
+        let mut all = Fake {
+            dead: vec![10, 11, 12, 13],
+            found_out: Vec::new(),
+            confirms: 0,
+        };
+        assert_eq!(g.pick_member(k, &mut all), None);
+        assert_eq!(all.confirms, 4);
+    }
+
+    #[test]
+    fn each_member_counts_the_syns_it_took_by_position() {
+        let (mut g, k) = four();
+        let mut f = Fake {
+            dead: vec![11],
+            found_out: Vec::new(),
+            confirms: 0,
+        };
+        for _ in 0..9 {
+            g.pick_member(k, &mut f).unwrap();
+        }
+        // 11 is dead: nine SYNs go to 10, 12 and 13 in turn, three each.
+        assert_eq!(g.served_by_position(), [3, 0, 3, 3, 0, 0, 0, 0]);
+        // A second group adds at its own positions; a leaving member takes
+        // its count along and the positions close up.
+        let k2 = g.join([0; 4], 81, 1, 30).unwrap();
+        let mut all = Fake {
+            dead: Vec::new(),
+            found_out: Vec::new(),
+            confirms: 0,
+        };
+        g.pick_member(k2, &mut all).unwrap();
+        assert_eq!(g.served_by_position(), [4, 0, 3, 3, 0, 0, 0, 0]);
+        g.leave(k, 10);
+        assert_eq!(g.served_by_position(), [1, 3, 3, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_member_beyond_the_counted_positions_is_counted_in_the_last() {
+        let mut g = Groups::new();
+        let k = g.join([0; 4], 80, 1, 0).unwrap();
+        for place in 1..12 {
+            g.join([0; 4], 80, 1, place).unwrap();
+        }
+        let mut all = Fake {
+            dead: Vec::new(),
+            found_out: Vec::new(),
+            confirms: 0,
+        };
+        for _ in 0..12 {
+            g.pick_member(k, &mut all).unwrap();
+        }
+        assert_eq!(g.served_by_position(), [1, 1, 1, 1, 1, 1, 1, 5]);
     }
 }
