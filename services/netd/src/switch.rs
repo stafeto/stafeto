@@ -66,9 +66,9 @@ use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
     CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
-    STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL,
-    SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper,
-    TX_BUFFERS, TX_SHARE, bell_due, drive,
+    STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
+    SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
+    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, drive,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -198,6 +198,8 @@ pub struct Stats {
     pub merged_dropped: AtomicU32,
     /// The longest merged frame seen, in bytes after the header.
     pub merged_max: AtomicU32,
+    /// Frames for the stack dropped because the pool of its buffers was empty.
+    pub pool_empty: AtomicU32,
 }
 
 impl Stats {
@@ -231,6 +233,7 @@ impl Stats {
             cut: AtomicU32::new(0),
             merged_dropped: AtomicU32::new(0),
             merged_max: AtomicU32::new(0),
+            pool_empty: AtomicU32::new(0),
         }
     }
 }
@@ -885,8 +888,13 @@ impl Switch {
                 if word as usize >= RX_BUFFERS {
                     self.tx.book.release(word as u16);
                 } else if self.merged {
-                    // A buffer of the pool: the chains of the ring never reach the stack.
-                    self.pool.put(word as u16);
+                    // A buffer of the pool: the chains of the ring never reach the stack. The
+                    // pool's `held` marks are shared by the lanes: with INSTANCES above 1 they
+                    // must be one pool for each lane (a number one lane returns could be
+                    // another's).
+                    if !self.pool.put(word as u16) {
+                        fail("the stack gave back a buffer of receiving it does not hold");
+                    }
                 } else if let Err(broken) = self.rx.give(word as u16) {
                     fail(broken.text(false));
                 }
@@ -1587,6 +1595,7 @@ impl Switch {
                     let Some(t) = self.tables.as_mut() else {
                         trace::frame(P_N_TO_STACK, frame, true);
                         passed += self.pass_to_stack(n, len, sum, DEFAULT_INSTANCE);
+                        self.weigh_copy(&mut budget, &mut taken);
                         continue;
                     };
                     match route::route(t, frame, Source::Wire) {
@@ -1612,6 +1621,7 @@ impl Switch {
                             );
                             if route::deliver(t, sums::mark(d, sum), frame) {
                                 passed += self.pass_to_stack(n, len, sum, lane_of(d));
+                                self.weigh_copy(&mut budget, &mut taken);
                             } else {
                                 self.give(n);
                             }
@@ -1643,7 +1653,7 @@ impl Switch {
             return 1;
         }
         let Some(p) = self.pool.take() else {
-            INNER.dropped.fetch_add(1, Ordering::Relaxed);
+            bump(&INNER.stats.pool_empty);
             self.give(n);
             return 0;
         };
@@ -1659,6 +1669,15 @@ impl Switch {
         self.give(n);
         offer_must(&mut self.passed, lane, pack_frame(p, len as u16, sum));
         1
+    }
+
+    /// The copy of a frame for the stack into the pool counts `STACK_COPY_WEIGHT` frames of the
+    /// step (one is counted already).
+    fn weigh_copy(&self, budget: &mut usize, taken: &mut usize) {
+        if self.merged {
+            *budget = budget.saturating_sub(STACK_COPY_WEIGHT - 1);
+            *taken += STACK_COPY_WEIGHT - 1;
+        }
     }
 
     fn give(&mut self, n: u16) {

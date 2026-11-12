@@ -1257,10 +1257,11 @@ impl Driver<'_> {
             let get =
                 |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
             rt::println!(
-                "net: merged {count} frames, the longest of {} bytes, cut into {} segments, {} dropped",
+                "net: merged {count} frames, the longest of {} bytes, cut into {} segments, {} dropped, pool empty {}",
                 get(&st.merged_max),
                 get(&st.cut),
-                get(&st.merged_dropped)
+                get(&st.merged_dropped),
+                get(&st.pool_empty)
             );
         }
     }
@@ -1760,11 +1761,12 @@ impl Driver<'_> {
             let get =
                 |c: &core::sync::atomic::AtomicU32| c.load(core::sync::atomic::Ordering::Relaxed);
             rt::println!(
-                "net: merged {} cut {} merged_dropped {} merged_max {}",
+                "net: merged {} cut {} merged_dropped {} merged_max {} pool_empty {}",
                 get(&st.merged),
                 get(&st.cut),
                 get(&st.merged_dropped),
-                get(&st.merged_max)
+                get(&st.merged_max),
+                get(&st.pool_empty)
             );
         }
         if self.side.max > 0 {
