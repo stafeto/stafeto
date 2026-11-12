@@ -118,6 +118,7 @@ pub fn window(wanted: u64) -> u64 {
 /// another CPU (cmd::flush, cleanup, qsbr::kick).
 pub fn ring(to: usize) {
     if !on() {
+        crate::stamps::sgi_sent(to, true);
         return gic::send_sgi(to, SGI_CMD);
     }
     // Release: the queue (its tail was stored with Release) and the flags of
@@ -137,6 +138,7 @@ pub fn ring(to: usize) {
         old
     };
     let sgi = old & POLLING == 0;
+    crate::stamps::sgi_sent(to, sgi);
     #[cfg(feature = "smp-measure")]
     crate::smpm::rang(sgi);
     if sgi {

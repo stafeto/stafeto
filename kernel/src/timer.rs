@@ -280,10 +280,12 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
             }
         }
     }
+    crate::stamps::origin(abi::WAKE_TIMER);
     // SAFETY: the caller's handle holds the timer, which is attached; the
     // slot lives as long as the timer. The channel is open: a closed one
     // would only drop the post.
     let _ = unsafe { Source::post(source(t), TIMER_BITS, cause) };
+    crate::stamps::origin(0);
     Ok(())
 }
 
@@ -472,7 +474,9 @@ fn post_fired(batch: &[Option<NonNull<Timer>>; FIRE_PORTION], level: u8) {
             if (*t.as_ptr()).dying {
                 continue;
             }
+            crate::stamps::origin(abi::WAKE_TIMER);
             let _ = Source::post(source(*t), TIMER_BITS, level);
+            crate::stamps::origin(0);
         }
     }
 }

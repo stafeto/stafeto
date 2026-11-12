@@ -116,6 +116,11 @@ pub fn prepare(index: usize) -> &'static CpuBlock {
     b.index.store(index as u32, Ordering::Relaxed);
     b.stack_top.store(stack_top_of(index), Ordering::Relaxed);
     crate::local::init(&b.local);
+    // CPU 0 takes the memory of its ring once the allocator is up.
+    #[cfg(feature = "stamps")]
+    if index != 0 {
+        crate::stamps::init(index);
+    }
     b
 }
 

@@ -57,6 +57,10 @@ pub struct Local {
     /// timers, level 1 first (timer). Zeros until `init`: an `Item` is not
     /// all zeros, and a `Local` of zeros lives in .bss, outside the image file.
     pub firings: [UnsafeCell<MaybeUninit<Item>>; LEVELS],
+    /// The ring of time stamps (stamps.rs); the last field, so that a kernel
+    /// without the feature has the layout it had.
+    #[cfg(feature = "stamps")]
+    pub stamps: crate::stamps::Stamps,
 }
 
 // SAFETY: a CPU reaches only its own `Local` (`local`), with interrupts
@@ -78,6 +82,8 @@ impl Local {
             entry: UnsafeCell::new((0, 0)),
             time: CpuTime::new(),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],
+            #[cfg(feature = "stamps")]
+            stamps: crate::stamps::Stamps::new(),
         }
     }
 }

@@ -50,6 +50,75 @@ const C_RET: u8 = 49;
 const C_EPOLL: u8 = 50;
 const C_EPOLL_RET: u8 = 51;
 
+// The points of the kernel's time stamps (abi::STAMP_*), the causes of a thread made ready (abi::WAKE_*)
+// and the line of the virtual timer, whose interrupts are not those of a device.
+const K_IRQ: u8 = abi::STAMP_IRQ;
+const K_READY: u8 = abi::STAMP_READY;
+const K_RUN: u8 = abi::STAMP_RUN;
+const K_SGI_SENT: u8 = abi::STAMP_SGI_SENT;
+const K_SGI_GOT: u8 = abi::STAMP_SGI_GOT;
+const K_WFI: u8 = abi::STAMP_WFI;
+const WAKE_COMMAND: u8 = abi::WAKE_COMMAND;
+const TIMER_LINE: u32 = kcore::gic::VIRTUAL_TIMER_INTID;
+/// The records of a ring of the kernel (kernel/src/stamps.rs `RECORDS`): a CPU that gave this many
+/// has written over its older ones.
+const KERNEL_RING: usize = 8192;
+/// How far before the first record of a frame the interrupt that brought it may lie.
+const IRQ_LOOK_BACK_US: f64 = 5000.0;
+
+/// A record of the ring of a CPU of the kernel (the lines `tr k<cpu> <point> <ticks> <key>`):
+/// the key of a thread made ready holds its number below, the cause in bits 16-23 and its CPU in
+/// bits 24-31; that of an SGI sent the target CPU and, in bit 8, whether the SGI was sent (a
+/// polling CPU takes the bell alone); that of a thread that got the CPU its number; that of
+/// `wfi` 0 for the entry and 1 for the exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Kev {
+    t: u64,
+    cpu: u8,
+    point: u8,
+    key: u32,
+}
+
+/// The number of the CPU in the label `k<cpu>` of a ring of the kernel.
+fn kernel_cpu(label: &str) -> Option<u8> {
+    label.strip_prefix('k')?.parse().ok()
+}
+
+/// What the dump says of each ring of the kernel: its CPU, the records it made and the records it
+/// gave (the line `tr k<cpu> 0 <made> <given>` after them).
+fn kernel_given(text: &str) -> Vec<(u8, u64, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut w = line.split_whitespace();
+            (w.next()? == "tr").then_some(())?;
+            let cpu = kernel_cpu(w.next()?)?;
+            (u8::from_str_radix(w.next()?, 16).ok()? == 0).then_some(())?;
+            let made = u64::from_str_radix(w.next()?, 16).ok()?;
+            let given = u64::from_str_radix(w.next()?, 16).ok()?;
+            Some((cpu, made, given))
+        })
+        .collect()
+}
+
+/// The records of the rings of the kernel in a console log, in time order.
+fn parse_kernel(text: &str) -> Vec<Kev> {
+    let mut out: Vec<Kev> = text
+        .lines()
+        .filter_map(|line| {
+            let mut w = line.split_whitespace();
+            (w.next()? == "tr").then_some(())?;
+            let cpu = kernel_cpu(w.next()?)?;
+            let point = u8::from_str_radix(w.next()?, 16).ok()?;
+            let t = u64::from_str_radix(w.next()?, 16).ok()?;
+            let key = u32::from_str_radix(w.next()?, 16).ok()?;
+            // The line that ends the records of a CPU (`kernel_given`), no record.
+            (point != 0).then_some(Kev { t, cpu, point, key })
+        })
+        .collect();
+    out.sort_by_key(|k| k.t);
+    out
+}
+
 #[derive(Clone, Debug)]
 struct Ev {
     t: u64,
@@ -68,6 +137,9 @@ fn parse(text: &str) -> (Vec<Ev>, f64) {
             let mut w = line.split_whitespace();
             (w.next()? == "tr").then_some(())?;
             let label = w.next()?.to_owned();
+            if kernel_cpu(&label).is_some() {
+                return None;
+            }
             let id = u8::from_str_radix(w.next()?, 16).ok()?;
             let t = u64::from_str_radix(w.next()?, 16).ok()?;
             let key = u32::from_str_radix(w.next()?, 16).ok()?;
@@ -548,8 +620,20 @@ fn duration_rows(events: &[Ev], tpu: f64, out: &mut String) {
 }
 
 /// The report of one console log: the paths that its records make.
+#[cfg(test)]
 fn report(name: &str, text: &str, worst: usize, window: Option<(f64, f64)>) -> String {
+    report_pooled(name, text, worst, window).0
+}
+
+/// `report`, and the splits of the windows of its requests for `show` to pool over logs.
+fn report_pooled(
+    name: &str,
+    text: &str,
+    worst: usize,
+    window: Option<(f64, f64)>,
+) -> (String, Vec<(&'static str, Vec<Split>)>) {
     let (mut events, tpu) = parse(text);
+    let kernel = parse_kernel(text);
     if let Some((from, to)) = window
         && let Some(t0) = events.first().map(|e| e.t)
     {
@@ -560,7 +644,7 @@ fn report(name: &str, text: &str, worst: usize, window: Option<(f64, f64)>) -> S
     }
     let mut out = format!("## {name}: {} records\n", events.len());
     if events.is_empty() {
-        return out;
+        return (out, Vec::new());
     }
     let has = |id: u8| events.iter().any(|e| e.id == id);
     let mut requests = 0;
@@ -591,7 +675,385 @@ fn report(name: &str, text: &str, worst: usize, window: Option<(f64, f64)>) -> S
     sleeps_and_repeats(&events, tpu, &mut out);
     silences(&events, tpu, &mut out);
     duration_rows(&events, tpu, &mut out);
+    let pooled = kernel_report(&events, &kernel, &kernel_given(text), tpu, worst, &mut out);
+    (out, pooled)
+}
+
+/// A record of a ring of a program or of the kernel.
+#[derive(Clone, Copy, Debug)]
+enum Item<'a> {
+    User(&'a Ev),
+    Kernel(&'a Kev),
+}
+
+impl Item<'_> {
+    fn time(&self) -> u64 {
+        match self {
+            Item::User(e) => e.t,
+            Item::Kernel(k) => k.t,
+        }
+    }
+}
+
+/// The records of the programs and of the kernel between `from` and `to` ticks, in the order of
+/// their time (the counter is one for every CPU and for the kernel and the programs alike).
+fn merge<'a>(user: &'a [Ev], kernel: &'a [Kev], from: u64, to: u64) -> Vec<Item<'a>> {
+    let mut out: Vec<Item<'a>> = user
+        .iter()
+        .filter(|e| e.t >= from && e.t <= to)
+        .map(Item::User)
+        .chain(
+            kernel
+                .iter()
+                .filter(|k| k.t >= from && k.t <= to)
+                .map(Item::Kernel),
+        )
+        .collect();
+    if !cfg!(feature = "break-stamps-merge") {
+        out.sort_by_key(Item::time);
+    }
     out
+}
+
+/// What the kernel did between two points of a request, in ticks: the threads made ready on
+/// another CPU (the time from the wake-up to the SGI sent, in flight until the CPU came out of
+/// `wfi`, from that to the handler of the SGI) and the wait of every thread made ready for the CPU
+/// (to the moment it got it); `work` is what is left of the window, the time of the programs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Split {
+    window: u64,
+    post: u64,
+    flight: u64,
+    wfi: u64,
+    queue: u64,
+    work: u64,
+    /// The threads made ready in the window, and the SGIs among them.
+    hops: usize,
+    sgis: usize,
+}
+
+/// The `Split` of the window `from` to `to` of the sorted records of the kernel, along the chain of
+/// wake-ups that starts on CPU `start` at `from`: the next thread that CPU made ready, how long it
+/// took to get the CPU it was made ready on, and from there the next thread that CPU made ready, and
+/// so on to the end of the window. Wake-ups of other threads that happen meanwhile are not on the
+/// chain and count nowhere.
+fn split(kernel: &[Kev], from: u64, to: u64, start: u8) -> Split {
+    let win: Vec<&Kev> = kernel.iter().filter(|k| k.t >= from && k.t <= to).collect();
+    let mut s = Split {
+        window: to.saturating_sub(from),
+        ..Split::default()
+    };
+    let (mut cpu, mut at) = (start, from);
+    while let Some(r) = win.iter().find(|k| {
+        k.point == K_READY && k.cpu == cpu && k.t >= at && (k.key >> 16) as u8 != WAKE_COMMAND
+    }) {
+        let (thread, target) = (r.key & 0xffff, (r.key >> 24) as u8);
+        let run_after = |t: u64| {
+            win.iter()
+                .find(|k| k.point == K_RUN && k.cpu == target && k.key == thread && k.t >= t)
+                .map(|k| k.t)
+        };
+        let sent = win.iter().find(|k| {
+            k.point == K_SGI_SENT
+                && k.cpu == r.cpu
+                && k.key & 0xff == u32::from(target)
+                && k.key & 0x100 != 0
+                && k.t >= r.t
+        });
+        let got = sent.and_then(|s| {
+            win.iter()
+                .find(|k| k.point == K_SGI_GOT && k.cpu == target && k.t >= s.t)
+        });
+        let arrived = match (target == r.cpu, sent, got) {
+            (false, Some(sent), Some(got)) => {
+                let out = win.iter().rev().find(|k| {
+                    k.point == K_WFI
+                        && k.key == 1
+                        && k.cpu == target
+                        && k.t >= sent.t
+                        && k.t <= got.t
+                });
+                run_after(got.t).inspect(|&run| {
+                    s.post += sent.t - r.t;
+                    match out.filter(|_| !cfg!(feature = "break-stamps-split")) {
+                        Some(out) => {
+                            s.flight += out.t - sent.t;
+                            s.wfi += got.t - out.t;
+                        }
+                        None => s.flight += got.t - sent.t,
+                    }
+                    s.queue += run - got.t;
+                    s.sgis += 1;
+                })
+            }
+            // On the CPU of its own, or on a polling CPU that took the bell alone.
+            _ => run_after(r.t).inspect(|&run| {
+                s.queue += run - r.t;
+            }),
+        };
+        let Some(run) = arrived else { break };
+        s.hops += 1;
+        (cpu, at) = (target, run + 1);
+    }
+    s.work = s.window.saturating_sub(s.post + s.flight + s.wfi + s.queue);
+    s
+}
+
+/// One row of the table of splits: the medians of each part over `windows`, in microseconds.
+fn split_row(name: &str, splits: &[Split], tpu: f64, out: &mut String) {
+    if splits.is_empty() {
+        return;
+    }
+    let median = |f: fn(&Split) -> u64| {
+        let mut v: Vec<f64> = splits.iter().map(|s| f(s) as f64 / tpu).collect();
+        stats(&mut v).1
+    };
+    let hops: usize = splits.iter().map(|s| s.hops).sum();
+    let sgis: usize = splits.iter().map(|s| s.sgis).sum();
+    out.push_str(&format!(
+        "| {name} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} / {:.2} |\n",
+        splits.len(),
+        median(|s| s.window),
+        median(|s| s.post),
+        median(|s| s.flight),
+        median(|s| s.wfi),
+        median(|s| s.queue),
+        median(|s| s.work),
+        hops as f64 / splits.len() as f64,
+        sgis as f64 / splits.len() as f64
+    ));
+}
+
+/// The table of splits of a set of windows: all of them, and the slowest 1 % (at least one).
+fn split_table(
+    title: &str,
+    windows: &[(u64, u64, u8)],
+    kernel: &[Kev],
+    tpu: f64,
+    out: &mut String,
+) -> Vec<Split> {
+    let splits: Vec<Split> = windows
+        .iter()
+        .map(|&(a, b, cpu)| split(kernel, a, b, cpu))
+        .collect();
+    splits_table(title, &splits, tpu, out);
+    splits
+}
+
+/// The table of `splits`: all of them, and the slowest 1 % (at least one).
+fn splits_table(title: &str, splits: &[Split], tpu: f64, out: &mut String) {
+    if splits.is_empty() {
+        return;
+    }
+    let mut splits = splits.to_vec();
+    out.push_str(&format!(
+        "\n### Kernel: {title}\n\n| set | samples | window median us | wake to SGI sent | SGI in flight | out of wfi to the handler | wait in the run queue | work of the programs | threads made ready / SGIs per request |\n|---|---|---|---|---|---|---|---|---|\n"
+    ));
+    split_row("all", &splits, tpu, out);
+    splits.sort_by_key(|s| std::cmp::Reverse(s.window));
+    split_row(
+        "the slowest 1 %",
+        &splits[..splits.len().div_ceil(100)],
+        tpu,
+        out,
+    );
+}
+
+/// The time that every ring of the kernel covers: from the oldest record of the latest ring that
+/// wrote over its older ones (a busy CPU's covers less time than an idle one's) to the last record
+/// of any ring. A window of a request outside it has no complete kernel records.
+fn kernel_cover(kernel: &[Kev], given: &[(u8, u64, u64)]) -> Option<(u64, u64)> {
+    let last = kernel.last()?.t;
+    let mut from = kernel.first()?.t;
+    let mut cpus: Vec<u8> = kernel.iter().map(|k| k.cpu).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    for cpu in cpus {
+        let mine: Vec<&Kev> = kernel.iter().filter(|k| k.cpu == cpu).collect();
+        let made = given.iter().find(|g| g.0 == cpu).map_or(0, |g| g.1);
+        // The console loses a few records of a dump: a ring with nine tenths of its records, or one
+        // that says it made more than it holds, has written over its older ones.
+        if mine.len() * 10 >= KERNEL_RING * 9 || made > KERNEL_RING as u64 {
+            from = from.max(mine[0].t);
+        }
+    }
+    Some((from, last))
+}
+
+/// What each CPU's ring of the kernel holds: the records by point, and the interrupts of devices
+/// apart from those of the timer.
+fn kernel_counts(kernel: &[Kev], tpu: f64, out: &mut String) {
+    let (Some(first), Some(last)) = (kernel.first(), kernel.last()) else {
+        return;
+    };
+    out.push_str(&format!(
+        "\n### Kernel rings: {} records over {:.1} ms\n\n| CPU | records | interrupts of devices | timer | threads made ready | run | SGI sent (bell alone) | SGI got | wfi entered |\n|---|---|---|---|---|---|---|---|---|\n",
+        kernel.len(),
+        (last.t - first.t) as f64 / tpu / 1000.0
+    ));
+    let mut cpus: Vec<u8> = kernel.iter().map(|k| k.cpu).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    for cpu in cpus {
+        let mine = || kernel.iter().filter(move |k| k.cpu == cpu);
+        let n = |f: &dyn Fn(&Kev) -> bool| mine().filter(|k| f(k)).count();
+        out.push_str(&format!(
+            "| {cpu} | {} | {} | {} | {} | {} | {} ({}) | {} | {} |\n",
+            mine().count(),
+            n(&|k| k.point == K_IRQ && k.key != TIMER_LINE),
+            n(&|k| k.point == K_IRQ && k.key == TIMER_LINE),
+            n(&|k| k.point == K_READY),
+            n(&|k| k.point == K_RUN),
+            n(&|k| k.point == K_SGI_SENT),
+            n(&|k| k.point == K_SGI_SENT && k.key & 0x100 == 0),
+            n(&|k| k.point == K_SGI_GOT),
+            n(&|k| k.point == K_WFI && k.key == 0),
+        ));
+    }
+}
+
+/// The name of a kernel record, for the lists of the slowest requests.
+fn kernel_name(k: &Kev) -> String {
+    let cause = |c: u8| match c {
+        abi::WAKE_NOTIFY => "notification",
+        abi::WAKE_REPLY => "reply",
+        abi::WAKE_REQUEST => "request",
+        abi::WAKE_COMMAND => "command",
+        abi::WAKE_TIMER => "timer",
+        abi::WAKE_IRQ => "interrupt",
+        _ => "other",
+    };
+    match k.point {
+        K_IRQ => format!("cpu{} line {}", k.cpu, k.key),
+        K_READY => format!(
+            "cpu{} thread {} ready ({}) on cpu{}",
+            k.cpu,
+            k.key & 0xffff,
+            cause((k.key >> 16) as u8),
+            k.key >> 24
+        ),
+        K_RUN => format!("cpu{} thread {} runs", k.cpu, k.key),
+        K_SGI_SENT => format!(
+            "cpu{} SGI to cpu{}{}",
+            k.cpu,
+            k.key & 0xff,
+            if k.key & 0x100 == 0 {
+                " (bell alone)"
+            } else {
+                ""
+            }
+        ),
+        K_SGI_GOT => format!("cpu{} SGI got", k.cpu),
+        K_WFI => format!("cpu{} wfi {}", k.cpu, if k.key == 1 { "out" } else { "in" }),
+        other => format!("cpu{} point {other}", k.cpu),
+    }
+}
+
+/// The windows of the requests of S4 (from the step of the stack that took the frame to the frame
+/// that the stack passed to the switch) and of F1 (from the last interrupt of a device before the
+/// worker took the frame to the worker's frame sent), with the kernel's rings in them.
+fn kernel_report(
+    events: &[Ev],
+    kernel: &[Kev],
+    given: &[(u8, u64, u64)],
+    tpu: f64,
+    worst: usize,
+    out: &mut String,
+) -> Vec<(&'static str, Vec<Split>)> {
+    let mut pooled = Vec::new();
+    if kernel.is_empty() {
+        return pooled;
+    }
+    kernel_counts(kernel, tpu, out);
+    for &(cpu, made, given) in given {
+        let seen = kernel
+            .iter()
+            .filter(|k| usize::from(k.cpu) == usize::from(cpu))
+            .count() as u64;
+        out.push_str(&format!(
+            "\nCPU {cpu}: {made} records made, {given} given by the kernel, {seen} read from the console (lost on the console: {}).\n",
+            given.saturating_sub(seen)
+        ));
+    }
+    let (cover_from, cover_to) = kernel_cover(kernel, given).unwrap_or((0, 0));
+    out.push_str(&format!(
+        "\nEvery ring of the kernel covers {:.1} ms; the windows of requests below lie inside it.\n",
+        (cover_to - cover_from) as f64 / tpu / 1000.0
+    ));
+    let inside = |&(a, b, _): &(u64, u64, u8)| a >= cover_from && b <= cover_to;
+    let has = |id: u8| events.iter().any(|e| e.id == id);
+    let at = |c: &[(&str, u64)], name: &str| c.iter().find(|p| p.0 == name).map(|p| p.1);
+    if has(N_TO_STACK) {
+        // The service stands on CPU 0 (NETD_CPUS of init's table).
+        let windows: Vec<(u64, u64, u8)> = chains(events, STACK_PATH, tpu)
+            .iter()
+            .filter_map(|c| Some((at(c, "step")?, at(c, "stk_tx")?, 0)))
+            .filter(|(a, b, _)| a < b)
+            .filter(inside)
+            .collect();
+        let title = "S4, from the step of the stack to the frame it passed to the switch";
+        pooled.push((title, split_table(title, &windows, kernel, tpu, out)));
+        slowest_with_kernel(events, kernel, &windows, worst, tpu, out);
+    }
+    if !has(N_RX) && has(W_RX) {
+        let irqs: Vec<(u64, u8)> = kernel
+            .iter()
+            .filter(|k| k.point == K_IRQ && k.key != TIMER_LINE)
+            .map(|k| (k.t, k.cpu))
+            .collect();
+        let back = (IRQ_LOOK_BACK_US * tpu) as u64;
+        let windows: Vec<(u64, u64, u8)> = chains(events, OWN_PATH, tpu)
+            .iter()
+            .filter_map(|c| {
+                let (rx, tx) = (at(c, "wrx")?, at(c, "wtx")?);
+                let i = irqs.partition_point(|t| t.0 <= rx).checked_sub(1)?;
+                let (irq, cpu) = irqs[i];
+                (rx - irq <= back && irq < tx).then_some((irq, tx, cpu))
+            })
+            .filter(inside)
+            .collect();
+        let title = "F1, from the last interrupt of a device before the worker took the frame to the frame it sent";
+        pooled.push((title, split_table(title, &windows, kernel, tpu, out)));
+        slowest_with_kernel(events, kernel, &windows, worst, tpu, out);
+    }
+    pooled
+}
+
+/// The `worst` slowest windows with the records of the programs and of the kernel in them, in the
+/// order of their time.
+fn slowest_with_kernel(
+    events: &[Ev],
+    kernel: &[Kev],
+    windows: &[(u64, u64, u8)],
+    worst: usize,
+    tpu: f64,
+    out: &mut String,
+) {
+    if worst == 0 || windows.is_empty() {
+        return;
+    }
+    let mut order: Vec<&(u64, u64, u8)> = windows.iter().collect();
+    order.sort_by_key(|w| std::cmp::Reverse(w.1 - w.0));
+    out.push_str(&format!(
+        "\nThe {worst} slowest windows, records of the programs and of the kernel in them (us from the start):\n\n"
+    ));
+    for &&(from, to, _) in order.iter().take(worst) {
+        let items: Vec<String> = merge(events, kernel, from, to)
+            .iter()
+            .map(|i| {
+                let name = match i {
+                    Item::User(e) => format!("{} point {}", e.label, e.id),
+                    Item::Kernel(k) => kernel_name(k),
+                };
+                format!("{name} {:.1}", (i.time() - from) as f64 / tpu)
+            })
+            .collect();
+        out.push_str(&format!(
+            "* {:.1} us: {}\n",
+            (to - from) as f64 / tpu,
+            items.join(", ")
+        ));
+    }
 }
 
 fn logs_of(arg: &Path) -> Vec<PathBuf> {
@@ -638,14 +1100,31 @@ fn show(args: &[String]) -> Result<String, String> {
         return Err(USAGE.to_owned());
     }
     let mut out = String::new();
+    let mut pooled: Vec<(&str, Vec<Split>, usize)> = Vec::new();
     for f in files {
         let text = std::fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
         if text.lines().any(|l| l.starts_with("tr ")) {
             let name = f
                 .file_name()
                 .map_or(String::new(), |n| n.to_string_lossy().into_owned());
-            out.push_str(&report(&name, &text, worst, window));
+            let (text, splits) = report_pooled(&name, &text, worst, window);
+            out.push_str(&text);
+            for (title, list) in splits {
+                match pooled.iter_mut().find(|p| p.0 == title) {
+                    Some(p) => {
+                        p.1.extend(list);
+                        p.2 += 1;
+                    }
+                    None => pooled.push((title, list, 1)),
+                }
+            }
         }
+    }
+    // The windows of all the logs of one kind together, when there are several: the rings cover
+    // seconds of a run, and the slowest 1 % of one guest is a handful of requests.
+    for (title, splits, logs) in pooled.iter().filter(|p| p.2 > 1) {
+        let title = format!("{title}; the windows of {logs} logs together");
+        splits_table(&title, splits, DEFAULT_TICKS_PER_US, &mut out);
     }
     Ok(out)
 }
@@ -811,6 +1290,163 @@ mod tests {
         assert_eq!(tpu, 50.0);
         let (_, tpu) = parse("tr n 0 1000 10\n");
         assert_eq!(tpu, 24.0);
+    }
+
+    /// A record of a ring of the kernel: CPU, point, ticks and key, as the line is.
+    fn kline(cpu: u8, point: u8, t: u64, key: u32) -> String {
+        format!("tr k{cpu} {point:x} {t:x} {key:x}")
+    }
+
+    /// The key of a thread made ready: the number, the cause and the CPU it is made ready on.
+    fn ready(thread: u32, cause: u8, cpu: u32) -> u32 {
+        thread | u32::from(cause) << 16 | cpu << 24
+    }
+
+    /// One request of S4 (24 ticks to the microsecond are not wanted here: the counter of the
+    /// log says 1 000 000 Hz, one tick a microsecond). The step of the stack on CPU 0 ends at 1000
+    /// and wakes the worker (thread 5) on CPU 2, asleep in `wfi`; the worker runs, calls the stack
+    /// (thread 3, CPU 0, asleep too), and the stack passes the frame at 2000.
+    fn s4_log() -> String {
+        [
+            "tr n 0 0 1 f4240".to_owned(),
+            line("n", N_RX, 900, 0xa),
+            line("n", N_TO_STACK, 905, 0xa),
+            line("n", N_WAKE_STACK, 910, 0),
+            line("n", N_STK_BEGIN, 1000, 1),
+            line("n", N_STK_TX, 2000, 0xa),
+            line("n", N_TX_SUBMIT, 2010, 0xa),
+            line("n", N_BELL, 2020, 0),
+            // The rings of the kernel cover the window of the request.
+            kline(0, K_WFI, 990, 0),
+            kline(0, K_WFI, 2010, 0),
+            // The stack wakes the worker on CPU 2: the SGI goes at 1010, CPU 2 comes out of
+            // `wfi` at 1400, takes the SGI at 1420 and runs the worker at 1500.
+            kline(0, K_READY, 1005, ready(5, abi::WAKE_NOTIFY, 2)),
+            kline(0, K_SGI_SENT, 1010, 2 | 0x100),
+            kline(2, K_WFI, 1400, 1),
+            kline(2, K_SGI_GOT, 1420, 15),
+            kline(2, K_READY, 1425, ready(5, WAKE_COMMAND, 2)),
+            kline(2, K_RUN, 1500, 5),
+            // The worker answers at 1700 through the stack on CPU 0, which was asleep: the SGI
+            // at 1705, `wfi` out at 1760, the SGI taken at 1770, the stack runs at 1800.
+            kline(2, K_READY, 1700, ready(3, abi::WAKE_REQUEST, 0)),
+            kline(2, K_SGI_SENT, 1705, 1 << 8),
+            kline(0, K_WFI, 1760, 1),
+            kline(0, K_SGI_GOT, 1770, 15),
+            kline(0, K_RUN, 1800, 3),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn the_rings_of_the_kernel_are_not_the_records_of_the_programs() {
+        let (events, tpu) = parse(&s4_log());
+        assert_eq!(tpu, 1.0);
+        assert!(
+            events.iter().all(|e| !e.label.starts_with('k')),
+            "{events:?}"
+        );
+        let kernel = parse_kernel(&s4_log());
+        assert_eq!(kernel.len(), 13);
+        assert!(kernel.windows(2).all(|w| w[0].t <= w[1].t));
+        assert_eq!(
+            kernel[1],
+            Kev {
+                t: 1005,
+                cpu: 0,
+                point: K_READY,
+                key: ready(5, abi::WAKE_NOTIFY, 2)
+            }
+        );
+    }
+
+    #[test]
+    fn the_rings_of_the_kernel_and_of_the_programs_meet_in_time_order() {
+        // The program's record at 1450 lies between kernel records of CPU 2 and of CPU 0.
+        let log = [
+            line("w1", W_RX, 1450, 0xa),
+            kline(2, K_WFI, 1400, 1),
+            kline(0, K_SGI_GOT, 1500, 15),
+            kline(1, K_RUN, 1300, 7),
+            line("w1", W_TX, 1600, 0xa),
+        ]
+        .join("\n");
+        let (events, _) = parse(&log);
+        let kernel = parse_kernel(&log);
+        let merged = merge(&events, &kernel, 1300, 1500);
+        let times: Vec<u64> = merged.iter().map(Item::time).collect();
+        assert_eq!(times, [1300, 1400, 1450, 1500], "{merged:?}");
+        assert!(matches!(merged[2], Item::User(e) if e.id == W_RX));
+    }
+
+    #[test]
+    fn a_wake_on_another_cpu_is_split_into_its_parts() {
+        let kernel = parse_kernel(&s4_log());
+        let s = split(&kernel, 1000, 2000, 0);
+        // Wake to SGI sent: 5 + 5. In flight until `wfi` out: 390 + 55. Out of `wfi` to the handler:
+        // 20 + 10. The run queue: 80 + 30. Work: the rest of 1000.
+        assert_eq!(
+            (s.post, s.flight, s.wfi, s.queue),
+            (10, 445, 30, 110),
+            "{s:?}"
+        );
+        assert_eq!((s.hops, s.sgis, s.work), (2, 2, 405), "{s:?}");
+    }
+
+    #[test]
+    fn wakes_of_other_threads_on_other_cpus_are_not_on_the_chain() {
+        // CPU 3 wakes a thread of its own on CPU 1 in the middle of the request: not a wake of the
+        // chain that CPU 0 starts, so the split is the same.
+        let log = format!(
+            "{}\n{}\n{}\n{}\n",
+            s4_log(),
+            kline(3, K_READY, 1100, ready(9, abi::WAKE_NOTIFY, 1)),
+            kline(3, K_SGI_SENT, 1105, 1 | 0x100),
+            kline(1, K_RUN, 1300, 9)
+        );
+        let kernel = parse_kernel(&log);
+        let s = split(&kernel, 1000, 2000, 0);
+        assert_eq!(
+            (s.post, s.flight, s.wfi, s.queue, s.hops),
+            (10, 445, 30, 110, 2),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn the_report_of_a_request_gives_the_split_of_the_window_and_of_its_tail() {
+        let text = report("t", &s4_log(), 1, None);
+        assert!(
+            text.contains(
+                "| all | 1 | 1000.0 | 10.0 | 445.0 | 30.0 | 110.0 | 405.0 | 2.00 / 2.00 |"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "| the slowest 1 % | 1 | 1000.0 | 10.0 | 445.0 | 30.0 | 110.0 | 405.0 | 2.00 / 2.00 |"
+            ),
+            "{text}"
+        );
+        // The list of the slowest: the kernel's records between the program's.
+        assert!(
+            text.contains("cpu2 wfi out 400.0, cpu2 SGI got 420.0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_line_after_the_records_of_a_cpu_counts_what_the_console_lost() {
+        // CPU 0 has 7 records in the log, and the kernel says it gave 8: one was lost.
+        let log = format!("{}\n{}\n", s4_log(), "tr k0 0 2000 8");
+        let text = report("t", &log, 0, None);
+        assert!(
+            text.contains("CPU 0: 8192 records made, 8 given by the kernel, 7 read from the console (lost on the console: 1)"),
+            "{text}"
+        );
+        assert_eq!(kernel_given(&log), [(0, 0x2000, 8)]);
+        // The line is no record.
+        assert_eq!(parse_kernel(&log).len(), parse_kernel(&s4_log()).len());
     }
 
     #[test]

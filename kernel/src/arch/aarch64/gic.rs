@@ -466,9 +466,11 @@ pub fn end(ack: Ack) {
 /// same. None when the wake-up brought nothing to acknowledge.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
 pub fn wait() -> Option<Ack> {
+    crate::stamps::wfi(false);
     // SAFETY: waiting for an interrupt has no side effects; the DSB lets
     // earlier stores (to the GIC and the timer) complete first.
     unsafe { asm!("dsb sy", "wfi", options(nostack, preserves_flags)) };
+    crate::stamps::wfi(true);
     acknowledge()
 }
 

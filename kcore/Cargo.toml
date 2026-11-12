@@ -28,3 +28,8 @@ ready-gap-all = ["ready-gap"]
 break-reserved = []
 break-flush = []
 break-aside = []
+# Deliberate breaks of the ring of time stamps, for the host tests that must
+# catch them: a read that does not skip the records a wrapped ring wrote
+# over, and a portion whose cursor jumps a record.
+break-stamps-wrap = []
+break-stamps-portion = []

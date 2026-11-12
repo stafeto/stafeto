@@ -244,7 +244,7 @@ pub unsafe fn post(
             if lends(c) {
                 sched::boost_in_place(k, t, priority, ceiling(t));
             }
-            sched::wake(k, t);
+            sched::wake(k, t, abi::WAKE_NOTIFY);
         }
         true
     });

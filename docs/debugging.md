@@ -240,3 +240,27 @@ While the MMU is off, code executes at physical addresses (the image is
 placed at `0x40200000`), while symbols in the ELF are recorded at virtual
 addresses (starting at `0xffffffffc0000000`). Set a breakpoint before the
 MMU is enabled at the physical address: `breakpoint set -a 0x40200000`.
+
+## Time stamps of the kernel
+
+The kernel feature `stamps` is a debug build: no normal or ci image has it, and
+the `.text` of the normal kernel is the same with or without the code. Each CPU
+keeps a ring of 8 192 records of 16 bytes (counter, point, CPU, key) in 128 KiB
+of frames taken at boot, written with interrupts masked and no lock. The six
+points are an interrupt coming in, a thread made ready (with its cause), a
+thread getting the CPU, an SGI sent and received, and the entry to and exit
+from `wfi`. `object_info` with the kind `STAMPS` and a resource with `KSTATS`
+reads a ring in portions of 60 records, and can freeze all rings so that a
+long dump reads what the load made.
+
+`STAFETO_TRACE=1 cargo xtask net-trace run --systems s4 --workloads w1
+--phases at --rates 300` builds the kernel with the feature and the images with
+the stamps of the network path. Right after the load the guest freezes its rings
+and the network service dumps them to the console after its own, as lines
+`tr k<cpu> <point> <ticks> <key>`. `cargo xtask net-trace show DIR` merges them
+with the rings of the programs by the counter and splits the window of each
+request into the wake-up to the SGI, the SGI in flight, the exit from `wfi`, the
+wait in the run queue and the work of the programs, for all requests and for the
+slowest 1 %; `--worst N` lists the records of the kernel and of the programs
+inside the N slowest windows. `cargo xtask net-bench run --stamps` runs the plain
+images on the kernel with the stamps, to measure what the stamps cost.

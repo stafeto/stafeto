@@ -136,6 +136,9 @@ table-bench-pinned-vz = []
 # The same image with every program on CPU 0, where the network service runs
 # (the measurement of the cost of a call on another CPU).
 table-bench-cpu0-vz = []
+# The network service of a bench table gets a resource with KSTATS, `trace`:
+# the images of the time stamps dump the rings of the kernel with it.
+bench-stamps = []
 # The same for the row F1: nginx on the stack on VZ, both network devices
 # (table/bench.rs).
 table-bench-fast-vz = []

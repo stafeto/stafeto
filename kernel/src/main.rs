@@ -46,6 +46,7 @@ mod session;
 mod smp;
 #[cfg(feature = "smp-measure")]
 mod smpm;
+mod stamps;
 mod syscall;
 mod testpoint;
 mod thread;
@@ -86,6 +87,8 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     sched::init(clock);
     idle::init();
     smp::start(boot);
+    #[cfg(feature = "stamps")]
+    stamps::init(0);
     report(boot, clock, &init);
     smp::sgi_probe();
     smp::lock_probe();
@@ -186,4 +189,6 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
         mm::phys::free_frames()
     };
     kprintln!("frames     {} MiB free", (free * PAGE_SIZE) >> 20);
+    #[cfg(feature = "cpu1-check-probe")]
+    smp::boot_report_done();
 }

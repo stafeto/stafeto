@@ -547,7 +547,7 @@ unsafe fn wake_clients(process: NonNull<Process>) -> (bool, usize) {
                 };
                 (*t.as_ptr()).waits = None;
                 syscall::set_result(t, Err(Error::PeerClosed));
-                sched::wake(k, t);
+                sched::wake(k, t, abi::WAKE_OTHER);
                 heads += 1;
             }
             Some((heads, !accepted(process, k.s).is_empty()))

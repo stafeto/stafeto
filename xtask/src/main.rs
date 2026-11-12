@@ -1389,6 +1389,14 @@ enum Variant {
     BaselineEl0,
     TraceEl0,
     TestIcountEl0,
+    /// The build with the time stamps of the kernel (feature `stamps`):
+    /// `cargo xtask net-trace` and the measures with it use it; no other
+    /// run and no ci image does.
+    Stamps,
+    /// The kernel tests of the icount build with the time stamps in, and
+    /// the second image of them (`kernel-test 512M icount-stamps`).
+    TestIcountStamps,
+    TestIcountStampsEl0,
     FaultProbe,
     OverflowProbe,
     /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
@@ -1449,13 +1457,16 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 32] = [
+    const ALL: [Variant; 35] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
         Variant::TestEl0,
         Variant::TestIcount,
         Variant::TestIcountEl0,
+        Variant::Stamps,
+        Variant::TestIcountStamps,
+        Variant::TestIcountStampsEl0,
         Variant::FaultProbe,
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
@@ -1496,6 +1507,9 @@ impl Variant {
             Variant::BaselineEl0 => Some("baseline,el0-half"),
             Variant::TraceEl0 => Some("trace-test,el0-half"),
             Variant::TestIcountEl0 => Some("icount,el0-half"),
+            Variant::Stamps => Some("stamps"),
+            Variant::TestIcountStamps => Some("icount,stamps"),
+            Variant::TestIcountStampsEl0 => Some("icount,stamps,el0-half"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
@@ -1530,6 +1544,7 @@ impl Variant {
         match self {
             Variant::Normal
             | Variant::TraceNormal
+            | Variant::Stamps
             | Variant::FaultProbe
             | Variant::OverflowProbe
             | Variant::CpuOnRefused
@@ -1561,6 +1576,8 @@ impl Variant {
             | Variant::BaselineEl0
             | Variant::TraceEl0
             | Variant::TestIcountEl0
+            | Variant::TestIcountStamps
+            | Variant::TestIcountStampsEl0
             | Variant::SmpMeasure
             | Variant::SmpMeasureNoPoll
             | Variant::SmpChecks => (TEST_KERNEL_LIMIT, "test builds"),
@@ -1575,6 +1592,7 @@ impl Variant {
             Variant::Baseline => Some(Variant::BaselineEl0),
             Variant::Trace => Some(Variant::TraceEl0),
             Variant::TestIcount => Some(Variant::TestIcountEl0),
+            Variant::TestIcountStamps => Some(Variant::TestIcountStampsEl0),
             _ => None,
         }
     }
@@ -1591,6 +1609,9 @@ impl Variant {
             Variant::BaselineEl0 => "stafeto-baseline-el0",
             Variant::TraceEl0 => "stafeto-trace-el0",
             Variant::TestIcountEl0 => "stafeto-ktest-icount-el0",
+            Variant::Stamps => "stafeto-stamps",
+            Variant::TestIcountStamps => "stafeto-ktest-icount-stamps",
+            Variant::TestIcountStampsEl0 => "stafeto-ktest-icount-stamps-el0",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
@@ -1632,7 +1653,7 @@ commands:
   test [--jobs N] host tests, then boot checks, the console dialog, init
             tests and kernel tests in QEMU; N boots at a time (half the
             cores by default; 1 runs them one after the other)
-  kernel-test [machine [icount]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`
+  kernel-test [machine [icount|icount-stamps]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`, with the time stamps of the kernel in as well with `icount-stamps`
   init-test [machine] run only the EL0 init test image in QEMU (512M by default)
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci [--jobs N] formatting, clippy, then everything `test` does
@@ -1971,6 +1992,8 @@ fn main() {
         Some("kernel-test") => {
             let variant = if args.get(2).is_some_and(|a| a == "icount") {
                 Variant::TestIcount
+            } else if args.get(2).is_some_and(|a| a == "icount-stamps") {
+                Variant::TestIcountStamps
             } else {
                 Variant::Test
             };
@@ -10575,7 +10598,7 @@ fn stack_overflow_report() -> Result<(), String> {
 /// of tests that passed. The boot report names `m`'s PSCI conduit, as
 /// the kernel took it from the device tree (on VIRT_EL2 SMC).
 fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
-    let icount = variant == Variant::TestIcount;
+    let icount = matches!(variant, Variant::TestIcount | Variant::TestIcountStamps);
     // The tests of a kind of build run in two images: the first holds the
     // tests of the calls, the second the EL0 tests (Variant::el0_half).
     // Each is judged by its own count; the lines and the passes join.
@@ -10678,6 +10701,8 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         Variant::Baseline => measure::record_as(m, &lines, "baseline "),
         Variant::Trace => measure::record_as(m, &lines, "trace "),
         Variant::TestIcount => measure::record_as(m, &lines, measure::ICOUNT),
+        // The numbers of a debug build stay out of the files of measures.
+        Variant::TestIcountStamps => {}
         _ => measure::record(m, &lines),
     }
     Ok(passed.len())
@@ -13321,6 +13346,7 @@ mod tests {
             (Variant::Baseline, Variant::BaselineEl0),
             (Variant::Trace, Variant::TraceEl0),
             (Variant::TestIcount, Variant::TestIcountEl0),
+            (Variant::TestIcountStamps, Variant::TestIcountStampsEl0),
         ] {
             assert_eq!(whole.el0_half(), Some(half));
             assert_eq!(

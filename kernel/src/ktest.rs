@@ -274,6 +274,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_cpu_reads_the_time_of_a_cpu,
     ),
     (
+        "object_info_stamps_exists_only_in_the_stamps_build",
+        calls::object_info_stamps_exists_only_in_the_stamps_build,
+    ),
+    (
         "closing_a_handle_releases_its_object",
         calls::closing_a_handle_releases_its_object,
     ),
