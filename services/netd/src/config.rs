@@ -29,6 +29,11 @@
 //!   as many places); 16384 without the line.
 //! * `instances N`: the most stack instances the service runs, 1 to 4; it runs one for each
 //!   CPU of its mask up to that number (`netd::home`).
+//! * `tso 0` or `tso 1`: whether the service asks the device for the segmentation offload
+//!   (the device then merges the segments it receives into frames of up to 64 KiB, and the
+//!   receiving ring is 64 chains of a head and a 64 KiB tail instead of 256 buffers); 0 or no
+//!   line keeps the checksum offload alone. Only the record with the tails (`NETD_VZ_TSO`, the
+//!   VZ image that asks for it) can take it; elsewhere the line changes nothing.
 //! * A key twice, an unknown key, a word more, a bad address: an error with
 //!   the line's number, counted from 1.
 //!
@@ -69,6 +74,7 @@ pub struct Settings {
     pub switch: Option<u8>,
     pub flows_line: Option<u32>,
     pub instances_line: Option<u8>,
+    pub tso_line: Option<bool>,
 }
 
 impl Settings {
@@ -85,6 +91,11 @@ impl Settings {
     /// The most stack instances: the line's, or `INSTANCES_MAX`.
     pub fn instances(&self) -> usize {
         usize::from(self.instances_line.unwrap_or(INSTANCES_MAX))
+    }
+
+    /// Whether the service asks for the segmentation offload (`tso 1`).
+    pub fn tso(&self) -> bool {
+        self.tso_line.unwrap_or(false)
     }
 
     /// The flows the table of the switch holds.
@@ -106,6 +117,7 @@ pub enum Reason {
     BadAddress,
     BadPrefix,
     BadHandover,
+    BadTso,
     BadBuffers,
     BadSwitch,
     BadFlows,
@@ -130,6 +142,7 @@ impl Reason {
             Reason::BadAddress => "bad address",
             Reason::BadPrefix => "bad prefix length",
             Reason::BadHandover => "handover is 0 or 1",
+            Reason::BadTso => "tso is 0 or 1",
             Reason::BadBuffers => "buffers is a number from 0 to 64",
             Reason::BadSwitch => "switch is a number from 0 to 8",
             Reason::BadFlows => "flows is a number from 256 to 131072",
@@ -259,6 +272,7 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
             | b"switch"
             | b"flows"
             | b"instances"
+            | b"tso"
     );
     if !known {
         return Err(Reason::UnknownKey);
@@ -304,6 +318,11 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
             }
             set(&mut settings.instances_line, n as u8)
         }
+        b"tso" => match value {
+            b"0" => set(&mut settings.tso_line, false),
+            b"1" => set(&mut settings.tso_line, true),
+            _ => Err(Reason::BadTso),
+        },
         b"flows" => {
             let n = number(value, FLOWS_RANGE.1).ok_or(Reason::BadFlows)?;
             if n < FLOWS_RANGE.0 {
@@ -498,6 +517,20 @@ mod tests {
         assert_eq!(fault(b"flows 131073"), (1, Reason::BadFlows));
         assert_eq!(fault(b"flows 1x"), (1, Reason::BadFlows));
         assert_eq!(fault(b"switch 1\nswitch 2"), (2, Reason::KeyTwice));
+    }
+
+    #[test]
+    fn tso_is_zero_or_one_and_off_without_the_line() {
+        assert!(!parse(b"").unwrap().tso());
+        assert!(!parse(b"switch 2\n").unwrap().tso());
+        assert!(parse(b"tso 1").unwrap().tso());
+        assert!(!parse(b"tso 0").unwrap().tso());
+        assert_eq!(parse(b"tso 0").unwrap().tso_line, Some(false));
+        assert_eq!(fault(b"tso 2"), (1, Reason::BadTso));
+        assert_eq!(fault(b"tso on"), (1, Reason::BadTso));
+        assert_eq!(fault(b"tso"), (1, Reason::NoValue));
+        assert_eq!(fault(b"tso 1\ntso 1"), (2, Reason::KeyTwice));
+        assert_eq!(fault(b"tso 1 1"), (1, Reason::ExtraWord));
     }
 
     #[test]

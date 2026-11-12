@@ -9,7 +9,7 @@
 //! its own slot of the library's statics (`Host<D>`).
 
 use netd::pci;
-use netd::ring::NET_PAGES;
+use netd::ring::{NET_PAGES, TAIL_PAGES};
 use virtio_mmio::PAGE;
 pub use virtio_net::Host;
 use virtio_net::Region;
@@ -26,6 +26,9 @@ pub const fn dma_at(d: usize) -> usize {
 pub const fn net_at(d: usize) -> usize {
     0x10_0400_0000 + d * 0x0100_0000
 }
+
+/// Where the service maps the object of tails of the chains of receiving (device 0 only).
+pub const TAILS_AT: usize = 0x10_0800_0000;
 
 pub const fn mmio_at(d: usize) -> usize {
     0x10_1000_0000 + d * 0x1_0000
@@ -104,6 +107,27 @@ pub fn attach(d: usize, dma_pa: u64, net_pa: u64) -> bool {
         len: NET_PAGES * PAGE,
     };
     virtio_net::host::attach(d, queues, &[buffers])
+}
+
+/// `attach` for a device that merges segments: the object of tails
+/// (`TAIL_PAGES` pages at `TAILS_AT`) is the second of the buffers' regions.
+pub fn attach_tails(d: usize, dma_pa: u64, net_pa: u64, tails_pa: u64) -> bool {
+    let queues = Region {
+        va: dma_at(d),
+        pa: dma_pa,
+        len: DMA_PAGES * PAGE,
+    };
+    let buffers = Region {
+        va: net_at(d),
+        pa: net_pa,
+        len: NET_PAGES * PAGE,
+    };
+    let tails = Region {
+        va: TAILS_AT,
+        pa: tails_pa,
+        len: TAIL_PAGES * PAGE,
+    };
+    tails_pa != 0 && virtio_net::host::attach(d, queues, &[buffers, tails])
 }
 
 /// BAR 4 of the network function of QEMU's machine with an ITS, where the

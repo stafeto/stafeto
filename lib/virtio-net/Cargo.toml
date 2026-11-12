@@ -24,3 +24,7 @@ proto-net = { path = "../../proto/net" }
 # a panic that calls the C library's `abort`.
 [features]
 ffi = []
+
+[dev-dependencies]
+# The traits the crate's `Transport` is bounded by, for the stub transport of the tests of the rings.
+zerocopy = { version = "0.8", default-features = false }

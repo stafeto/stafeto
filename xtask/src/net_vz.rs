@@ -52,6 +52,108 @@ use crate::{
     busybox_build, nano_build, net, net_probe, qemu, relibc, rootfs, vz,
 };
 
+/// The bytes the Mac sends the guest and reads back (`upload_round_trip`).
+const UPLOAD_BYTES: usize = 1 << 20;
+
+/// The bytes of the upload: 1 MiB, or `NET_VZ_UPLOAD_MIB` MiB (a longer one makes the device merge
+/// longer runs).
+fn upload_bytes() -> usize {
+    std::env::var("NET_VZ_UPLOAD_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&m| (1..=64).contains(&m))
+        .map_or(UPLOAD_BYTES, |m| m << 20)
+}
+
+/// The pattern of the upload: no two blocks alike, so a lost, doubled or moved segment shows.
+fn upload_pattern(bytes: usize) -> Vec<u8> {
+    (0..bytes)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 ^ (i >> 16) as u8)
+        .collect()
+}
+
+/// 1 MiB from the Mac to the guest and back: `nc -l -p 9000 < /dev/null > /tmp/up` takes it (a
+/// background job that reads the terminal is stopped), then `nc -l -p 9001 < /tmp/up` gives it,
+/// and the Mac compares what it reads with what it sent. The device that merges the segments it
+/// receives hands the guest the upload in frames of up to 64 KiB, which the switch cuts again
+/// (`cut`); with `merged` the guest's line says so (`net: merged`). Whether the device merges
+/// depends on the pacing of the Mac, so the round trip is repeated (up to three times) until the
+/// line shows; the check fails when it never does.
+fn upload_round_trip(run: &mut qemu::Run, guest: Ipv4Addr, merged: bool) -> Result<(), String> {
+    let bytes = upload_bytes();
+    let pattern = upload_pattern(bytes);
+    for attempt in 1..=3 {
+        let up_ms = one_round_trip(run, guest, &pattern)?;
+        println!(
+            "net-vz: {} MiB up in {up_ms} ms and back whole",
+            bytes >> 20
+        );
+        if !merged {
+            return Ok(());
+        }
+        let line = run
+            .lines()
+            .iter()
+            .rfind(|l| l.contains("net: merged"))
+            .cloned();
+        if let Some(line) = line {
+            println!("net-vz: {line}");
+            return Ok(());
+        }
+        println!("net-vz: the device merged no segment in attempt {attempt}");
+    }
+    Err("the device merged no segments of the upload (no `net: merged` line)".into())
+}
+
+/// One round trip of `pattern` through the guest; the milliseconds the upload took.
+fn one_round_trip(run: &mut qemu::Run, guest: Ipv4Addr, pattern: &[u8]) -> Result<u128, String> {
+    use std::io::{Read, Write};
+    let bytes = pattern.len();
+    let connect = |port: u16| -> Result<TcpStream, String> {
+        let mut last = String::new();
+        for _ in 0..10 {
+            match TcpStream::connect_timeout(&(guest, port).into(), Duration::from_secs(3)) {
+                Ok(c) => {
+                    let _ = c.set_read_timeout(Some(Duration::from_secs(20)));
+                    let _ = c.set_write_timeout(Some(Duration::from_secs(20)));
+                    return Ok(c);
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+        Err(format!("connect to {guest}:{port}: {last}"))
+    };
+    run.send("nc -l -p 9000 < /dev/null > /tmp/up &")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let began = Instant::now();
+    let mut up = connect(9000)?;
+    up.write_all(pattern)
+        .map_err(|e| format!("upload of {bytes} bytes: {e}"))?;
+    drop(up);
+    let up_ms = began.elapsed().as_millis();
+    run.send("wc -c < /tmp/up")?;
+    run.expect(&format!("{bytes}"), Duration::from_secs(30))
+        .map_err(|e| format!("the guest did not receive {bytes} bytes: {e}"))?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("nc -l -p 9001 < /tmp/up &")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let mut down = connect(9001)?;
+    let mut back = Vec::with_capacity(bytes);
+    down.read_to_end(&mut back)
+        .map_err(|e| format!("reading the upload back: {e} after {} bytes", back.len()))?;
+    if back != pattern {
+        let at = back.iter().zip(pattern).position(|(a, b)| a != b);
+        return Err(format!(
+            "the upload came back different: {} bytes of {bytes}, first difference at {at:?}",
+            back.len()
+        ));
+    }
+    Ok(up_ms)
+}
+
 /// The lease within this long after the services started.
 const LEASE_WITHIN: Duration = Duration::from_secs(20);
 /// The second device's lease within this long.
@@ -482,6 +584,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
             run.expect("# ", DIALOG_STEP)?;
             Some(net_curl::requests(http(guest), Instant::now())?)
         };
+        if !options.nginx {
+            upload_round_trip(&mut run, guest, options.devices == 1)?;
+        }
         // The guest has talked to the Mac: its address must be ours by the
         // ARP cache and by the DHCP service's file.
         arp_is(guest, &macs[0])?;
