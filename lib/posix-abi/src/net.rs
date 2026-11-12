@@ -29,11 +29,12 @@ use crate::sockets::{
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, KEPT_FLAGS, MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL,
     MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN,
     SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
-    SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_TYPE, SOCK_DGRAM,
-    SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
+    SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_STAFETO_CALLS,
+    SO_STAFETO_COUNT, SO_STAFETO_HOME, SO_STAFETO_REMOTE, SO_TYPE, SOCK_DGRAM, SOCK_NONBLOCK,
+    SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
 };
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_fs::{NetTarget, Target};
 use proto_net::sockets::{self as wire, CLONE_MAX, List, Request, opt};
 use proto_net::{Address, DATA_MAX};
@@ -63,6 +64,18 @@ const EINPROGRESS: i32 = 115;
 /// The session with the network service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
 
+/// Where the process stands with the home of its session (HOME): not asked, asking, done.
+static HOMING: AtomicU32 = AtomicU32::new(0);
+const NOT_ASKED: u32 = 0;
+const ASKING: u32 = 1;
+const ASKED: u32 = 2;
+/// The CPU the instance of the service that holds the session runs on (`u32::MAX` before the
+/// reply of HOME), and whether the calls from other CPUs are counted (a test of the
+/// placement sets it with `SO_STAFETO_COUNT`) and how many were.
+static HOME_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static REMOTE: AtomicU32 = AtomicU32::new(0);
+
 /// The process's session with the network service, which the start gives
 /// (init's CONNECT, or the loader's slot Net), and the hook that closes the
 /// descriptions the layer's descriptors held.
@@ -89,9 +102,80 @@ pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
 /// The session with the network service, for the requests and for the
 /// clones a child gets.
 pub fn session() -> Option<rt::abi::Handle> {
+    if COUNTING.load(Ordering::Relaxed) {
+        note_cpu();
+    }
     match SESSION.load(Ordering::Acquire) {
         0 => None,
         raw => Some(rt::abi::Handle(raw)),
+    }
+}
+
+/// Counts a call that does not come from the CPU of the instance that holds the session.
+#[cold]
+fn note_cpu() {
+    let home = HOME_CPU.load(Ordering::Relaxed);
+    if home != u32::MAX && rt::sys::cpu_info(0).is_ok_and(|info| info.current != u64::from(home)) {
+        REMOTE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The session's place with the service, once, before the first call that makes or touches a
+/// socket: the service gives the session a home instance, the one that runs on the CPU of this
+/// thread (HOME), and when that is not the instance that holds the session now, the reply brings
+/// the session on the home's channel, which takes the place of the old one. The session has no
+/// sockets yet, so nothing moves with it. A forked child keeps what its parent had (the flag is
+/// copied with the image, and the clone of the session stands where the parent's does); an
+/// exec'd image asks again and hears that the session is homed. An error leaves the session as
+/// it is.
+pub(crate) fn ensure_home() {
+    loop {
+        match HOMING.compare_exchange(NOT_ASKED, ASKING, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                home_session();
+                HOMING.store(ASKED, Ordering::Release);
+                return;
+            }
+            Err(ASKED) => return,
+            // Another thread asks: its reply is what this one waits for.
+            Err(_) => {
+                let _ = rt::sys::yield_now();
+            }
+        }
+    }
+}
+
+fn home_session() {
+    let raw = SESSION.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let service = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+    let Ok(info) = rt::sys::cpu_info(0) else {
+        return;
+    };
+    let mut w = Writer::new();
+    if proto_net::write_home(info.current as u32, info.allowed as u32, &mut w).is_err() {
+        return;
+    }
+    let mut reply = loop {
+        match rt::sys::send(&service, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            Err(_) => return,
+            Ok(reply) => break reply,
+        }
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut r = Reader::new(reply.bytes(&mut buffer));
+    if r.u32().map(Status::from_code) != Ok(Status::Ok) {
+        return;
+    }
+    let Ok(cpu) = r.u32() else { return };
+    HOME_CPU.store(cpu, Ordering::Release);
+    if let Ok(home) = reply.handles.take::<Channel>(0) {
+        // The home's session takes the place of the old one, which closes.
+        let old = SESSION.swap(home.into_raw().0, Ordering::AcqRel);
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(old)));
     }
 }
 
@@ -318,6 +402,8 @@ pub(crate) fn epoll_set(
     list: wire::EpollList,
     statuses: &mut [u32; wire::EPOLL_BATCH],
 ) -> Result<u32, i32> {
+    // A set lives in the home with the sockets it holds.
+    ensure_home();
     let service = channel()?;
     let mut w = Writer::new();
     Request::EpollSet { set, list }
@@ -606,6 +692,7 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
     if domain != AF_INET {
         return Err(EAFNOSUPPORT);
     }
+    ensure_home();
     if kind & !(0xf | SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
@@ -799,6 +886,8 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
         SO_DOMAIN => (opt::DOMAIN, false),
         SO_STAFETO_BUFFERS => (opt::BUFFERS, false),
         SO_STAFETO_BUFFERED => (opt::BUFFERED, false),
+        SO_STAFETO_HOME => (opt::HOME, false),
+        SO_STAFETO_CALLS => (opt::CALLS, false),
         _ => return Err(ENOPROTOOPT),
     })
 }
@@ -869,6 +958,15 @@ fn value_of(number: u32, value: &[u8]) -> Result<u32, i32> {
 /// getsockopt: the int of the option into `out`; its true length, 4 (8 for
 /// SO_LINGER, 16 for the timeouts).
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
+    // The layer's own count of the calls from other CPUs (no request to the service).
+    if level == SOL_SOCKET && name == SO_STAFETO_REMOTE {
+        return with_socket(fd, |_| {
+            let bytes = REMOTE.load(Ordering::Relaxed).to_ne_bytes();
+            let n = out.len().min(4);
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(4)
+        });
+    }
     if let Some(number) = structured(level, name) {
         return with_socket(fd, |description| {
             let value = word(&Request::GetOpt {
@@ -901,6 +999,17 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usiz
 }
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
+    if level == SOL_SOCKET && name == SO_STAFETO_COUNT {
+        if value.len() < 4 {
+            return Err(EINVAL);
+        }
+        let on = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) != 0;
+        return with_socket(fd, |_| {
+            REMOTE.store(0, Ordering::Relaxed);
+            COUNTING.store(on, Ordering::Relaxed);
+            Ok(())
+        });
+    }
     if let Some(number) = structured(level, name) {
         let word = value_of(number, value)?;
         return with_socket(fd, |description| {

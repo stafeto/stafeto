@@ -63,6 +63,7 @@ use core::sync::atomic::{
 };
 use netd::frames::{self, HDR_LEN, RxFrame};
 use netd::gates::{Run, Told};
+use netd::lanes as lane_rules;
 use netd::profile::{self, Counter};
 use netd::ring::{
     PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock, STACK_SHARE,
@@ -182,6 +183,8 @@ pub struct Stats {
     pub sum_tx: AtomicU32,
     pub sum_rx: AtomicU32,
     pub sum_soft: AtomicU32,
+    /// Frames of the wire dropped because the lane of the instance they were for had no room.
+    pub lane_full: AtomicU32,
 }
 
 impl Stats {
@@ -211,6 +214,7 @@ impl Stats {
             sum_tx: AtomicU32::new(0),
             sum_rx: AtomicU32::new(0),
             sum_soft: AtomicU32::new(0),
+            lane_full: AtomicU32::new(0),
         }
     }
 }
@@ -227,11 +231,12 @@ pub fn command(cmd: commands::Command) -> bool {
     true
 }
 
-/// Whether a frame the stack built for its own address is for a port a group or a consumer
-/// holds: it then goes to the switch, which turns it back in (R-2a). One byte of the port
-/// table is read without a lock; a stale byte makes the switch hand the frame back to the
-/// stack, which answers with a RST as for a SYN that came before `bind`.
-pub fn turn_wanted(frame: &[u8]) -> bool {
+/// Whether a frame instance `me` built for its own address is for a port a group or a consumer
+/// holds, or another instance does: it then goes to the switch, which turns it back in (R-2a).
+/// One byte of the port table is read without a lock, and the claims of the instances are
+/// read the same way; a stale byte makes the switch hand the frame back to the instance, which
+/// answers with a RST as for a SYN that came before `bind`.
+pub fn turn_wanted(frame: &[u8], me: usize) -> bool {
     let base = INNER.ports_base.load(Ordering::Acquire);
     if base == 0 {
         return false;
@@ -252,7 +257,17 @@ pub fn turn_wanted(frame: &[u8]) -> bool {
     // SAFETY: `base` is the start of the port table of 2 x 65 536 bytes, which lives for the
     // service's life; a byte is read atomically, and the switch thread writes bytes.
     let byte = unsafe { AtomicU8::from_ptr((base + proto * 65536 + port) as *mut u8) };
-    byte.load(Ordering::Relaxed) != 0
+    if byte.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let proto = if proto == 0 {
+        netd::ports::Proto::Tcp
+    } else {
+        netd::ports::Proto::Udp
+    };
+    netd::ports::CLAIMS
+        .owner(proto, port as u16)
+        .is_some_and(|owner| usize::from(owner) != me)
 }
 
 /// Puts `word` in `ring`. Each ring holds as many words as there are
@@ -303,6 +318,12 @@ impl Lane {
         }
     }
 
+    /// The number of this lane: the place it has in `INNER.lanes`, which is its instance's.
+    pub fn number(&self) -> usize {
+        (core::ptr::from_ref(self) as usize - INNER.lanes.as_ptr() as usize)
+            / core::mem::size_of::<Lane>()
+    }
+
     /// The switch tells the stack thread (`BACK`) that answers wait in `COMMANDS.to_stack`.
     fn tell_back(&self) {
         if self.back_told.tell() {
@@ -338,6 +359,15 @@ impl Lane {
     /// The stack's own channel is the one the switch wakes.
     pub fn set_stack_channel(&self, raw: u64) {
         self.stack_channel.store(raw, Ordering::Release);
+    }
+
+    /// Tells the instance a step of `bits` is due (the first instance, of a new address): no
+    /// run of the instance begins, since the switch holds no bell for it.
+    pub fn poke(&self, bits: u64) {
+        let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
+            self.stack_channel.load(Ordering::Acquire),
+        ));
+        let _ = sys::notify(&channel, bits);
     }
 
     /// The start of a step of the stack that the notification of the switch
@@ -454,10 +484,6 @@ const fn own_stack(k: usize) -> u8 {
     MAX_CONSUMERS as u8 + k as u8
 }
 
-/// The stack instances the service runs (P1: one; the rings, the books of the buffers and the
-/// routing take any number up to `MAX_INSTANCES`).
-pub const INSTANCES: usize = 1;
-const _: () = assert!(INSTANCES >= 1 && INSTANCES <= MAX_INSTANCES);
 const _: () = assert!(Why::Parked as usize == 6);
 
 /// The switch: the device's transport and queues, the binding of its
@@ -495,6 +521,14 @@ pub struct Switch {
     /// The instances (bit k for instance k) the step put a frame in the ring of, to be woken
     /// at its end.
     passed: u8,
+    /// How many stack instances there are (the lanes in use), and the lane whose rings come
+    /// first in the next step: the step's budgets are shared by all lanes, and the first one
+    /// turns, so that no lane waits behind the others for ever.
+    instances: usize,
+    turn: lane_rules::Turn,
+    /// The lanes whose frames are in the queue of sending, rung for by no bell yet: only
+    /// these hold the bell for the end of their run.
+    submitted: u8,
     /// The frame of a consumer, copied out of its ring and checked here.
     scratch: [u8; CELL],
     /// The device completes the sums of TCP and checks them on frames it receives
@@ -558,7 +592,9 @@ impl Switch {
         link: bool,
         offload: bool,
         (tables, timer, view): (Option<Tables<'static>>, Handle<Timer>, Handle<Channel>),
+        instances: usize,
     ) -> Switch {
+        assert!((1..=MAX_INSTANCES).contains(&instances));
         let mut rx = virtio_net::RxRing::new(rx_queue, net_at(DEVICE));
         if let Err(broken) = rx.fill(RX_BUFFERS) {
             fail(broken.text(false));
@@ -594,6 +630,9 @@ impl Switch {
             consumers_before: 0,
             next_c: 0,
             passed: 0,
+            instances,
+            turn: lane_rules::Turn::new(),
+            submitted: 0,
             scratch: [0; CELL],
             offload,
             fifo: [0; TX_BUFFERS],
@@ -656,7 +695,7 @@ impl Switch {
         } else {
             TX_SHARE
         };
-        all / INSTANCES
+        all / self.instances
     }
 
     /// The buffers of the queue of sending one consumer may have at a time.
@@ -669,7 +708,7 @@ impl Switch {
     fn lend(&mut self) -> u8 {
         let share = self.share();
         let mut lent = 0;
-        for (k, lane) in INNER.lanes[..INSTANCES].iter().enumerate() {
+        for (k, lane) in INNER.lanes[..self.instances].iter().enumerate() {
             if self.tables.is_none() {
                 while lane.tx_supply.len() < share {
                     let Some(n) = self.tx.book.alloc() else {
@@ -809,12 +848,18 @@ impl Switch {
         // it did not use, then its frames to send.
         // At most `SWITCH_BACK` of each a step (the step is bound, and the
         // rest makes the step follow at once).
-        let lanes = &INNER.lanes[..INSTANCES];
-        for lane in lanes {
-            for _ in 0..SWITCH_BACK {
+        let lanes = &INNER.lanes[..self.instances];
+        // One budget for all lanes, whatever their number, and the first lane turns: the
+        // longest step does not grow with the instances.
+        let first = self.turn.first(self.instances);
+        let (mut rx_budget, mut tx_back_budget) = (SWITCH_BACK, SWITCH_BACK);
+        for k in lane_rules::order(first, self.instances) {
+            let lane = &lanes[k];
+            while rx_budget > 0 {
                 let Some(word) = lane.rx_back.pop() else {
                     break;
                 };
+                rx_budget -= 1;
                 // A frame the switch turned to the stack came in a buffer of sending.
                 if word as usize >= RX_BUFFERS {
                     self.tx.book.release(word as u16);
@@ -822,28 +867,30 @@ impl Switch {
                     fail(broken.text(false));
                 }
             }
-            for _ in 0..SWITCH_BACK {
+            while tx_back_budget > 0 {
                 let Some(word) = lane.tx_back.pop() else {
                     break;
                 };
+                tx_back_budget -= 1;
                 self.tx.book.release(word as u16);
             }
         }
-        let mut passed = 0;
         let mut taken = 0;
-        for (k, lane) in lanes.iter().enumerate() {
-            for _ in 0..SWITCH_TX {
+        let mut sub_budget = SWITCH_TX;
+        for k in lane_rules::order(first, self.instances) {
+            let lane = &lanes[k];
+            while sub_budget > 0 {
                 let Some(word) = lane.tx_sub.pop() else {
                     break;
                 };
+                sub_budget -= 1;
                 let (n, len, partial) = unpack_frame(word);
-                let (to_stack, turned) = self.stack_frame(k, n, usize::from(len), partial);
-                passed += to_stack;
+                let turned = self.stack_frame(k, n, usize::from(len), partial);
                 // A frame turned into the tables costs a copy and a route as a frame of a
                 // consumer does: past the first few the step goes on only while it is short.
                 taken += usize::from(turned);
                 if turned && !netd::books::may_take(taken, SWITCH_BASE, self.over_soft()) {
-                    break;
+                    sub_budget = 0;
                 }
             }
         }
@@ -860,17 +907,19 @@ impl Switch {
         #[cfg(feature = "steps")]
         self.part(1, self.ran().saturating_sub(before_consumers));
         // The frames of the wire.
-        let room = lanes
-            .iter()
-            .map(|lane| RX_AHEAD.saturating_sub(lane.rx_ready.len()))
-            .min()
-            .unwrap_or(0);
+        // Each lane has its own room: a lane that does not take its frames (its instance is
+        // stopped or slow) costs its own frames, which are dropped when it has no room, and
+        // never holds the frames of the others in the queue.
+        let mut room = [0; MAX_INSTANCES];
+        for (r, lane) in room.iter_mut().zip(lanes) {
+            *r = RX_AHEAD.saturating_sub(lane.rx_ready.len());
+        }
         let budget = if self.tables.is_some() {
             SWITCH_ROUTED
         } else {
             SWITCH_RX
         };
-        passed += self.receive(room.min(budget));
+        self.receive(lane_rules::widest(&room).min(budget), &mut room);
         #[cfg(feature = "steps")]
         let before_sweep = self.ran();
         if let Some(t) = self.tables.as_mut()
@@ -896,7 +945,7 @@ impl Switch {
         self.passed = 0;
         // Frames left in the queue with room for them, or in the stack's
         // ring of frames to send: another step follows at once.
-        let room_left = room.saturating_sub(passed);
+        let room_left = lane_rules::widest(&room);
         let more_rx = room_left > 0 && self.rx.queue.can_pop();
         // While steps follow, the device is asked for no interrupt. The run
         // ends with the interrupts asked for again, a full barrier and one
@@ -1018,10 +1067,9 @@ impl Switch {
     }
 
     /// A frame of the stack: a turn to the shared address goes through the tables, any other
-    /// into the queue. The number of frames passed to the stack, and whether the frame was
-    /// turned into the tables.
+    /// into the queue. Whether the frame was turned into the tables.
     /// `partial`: the stack left the sum of a segment of TCP partial (`TxRing::submit`).
-    fn stack_frame(&mut self, from: usize, n: u16, len: usize, partial: bool) -> (usize, bool) {
+    fn stack_frame(&mut self, from: usize, n: u16, len: usize, partial: bool) -> bool {
         // SAFETY: the stack gave the buffer up (it is in `tx_sub`), and the device does not
         // hold it.
         let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
@@ -1036,7 +1084,7 @@ impl Switch {
                 INNER.stats.hairpin.fetch_add(1, Ordering::Relaxed);
                 route::route(t, frame, Source::Stack)
             };
-            let passed = match decision {
+            match decision {
                 // A stale byte of the stack's: the frame goes back, and the stack answers it.
                 // An instance a table names gets it as it is, the number of the buffer of
                 // sending that carries it. A full ring of frames for the stack drops it (TCP
@@ -1047,17 +1095,13 @@ impl Switch {
                     } else {
                         lane_of(decision)
                     };
-                    if offer(&mut self.passed, to, pack_frame(n, len as u16, partial)) {
-                        1
-                    } else {
+                    if !offer(&mut self.passed, to, pack_frame(n, len as u16, partial)) {
                         self.tx.book.release(n);
-                        0
                     }
                 }
                 Decision::Drop(why) => {
                     INNER.stats.drops[why as usize].fetch_add(1, Ordering::Relaxed);
                     self.tx.book.release(n);
-                    0
                 }
                 d => {
                     if let Decision::Consumer { consumer, .. } = d {
@@ -1068,10 +1112,9 @@ impl Switch {
                     // The frame never reaches the device: a partial sum is good as it is.
                     route::deliver(t, sums::mark(d, partial), frame);
                     self.tx.book.release(n);
-                    0
                 }
-            };
-            return (passed, true);
+            }
+            return true;
         }
         #[cfg(feature = "probe")]
         if let Some(t) = self.tables.as_ref()
@@ -1094,13 +1137,14 @@ impl Switch {
                 trace::frame(P_N_TX_SUBMIT, frame, false);
                 INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
                 self.queued(own_stack(from));
+                self.submitted |= 1 << from;
             }
             Ok(Sent::Dropped) => {
                 INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(broken) => fail(broken.text(true)),
         }
-        (0, false)
+        false
     }
 
     /// Takes frames of the consumers' TX rings in turn, one from each in a round, up to
@@ -1440,10 +1484,10 @@ impl Switch {
     /// to the stack (its number and the length of its frame), to a consumer
     /// (copied into its ring, the buffer back in the queue), or back to the
     /// queue when it holds no frame or one the tables drop. Every buffer
-    /// taken costs one unit of the share. The number of frames passed to the
-    /// stack.
-    fn receive(&mut self, mut budget: usize) -> usize {
-        let mut passed = 0;
+    /// taken costs one unit of the share. `room` is what each lane can still take
+    /// (`RX_AHEAD` less its frames): a frame for a lane with no room is dropped and counted,
+    /// and an ARP reply goes to every instance (the others get a copy in a buffer of sending).
+    fn receive(&mut self, mut budget: usize, room: &mut [usize; MAX_INSTANCES]) {
         let mut taken = 0;
         while budget > 0 {
             if self.tables.is_some() && taken >= SWITCH_BASE && self.over_soft() {
@@ -1490,12 +1534,16 @@ impl Switch {
                     }
                     let Some(t) = self.tables.as_mut() else {
                         trace::frame(P_N_TO_STACK, frame, true);
-                        offer_must(
-                            &mut self.passed,
-                            DEFAULT_INSTANCE,
-                            pack_frame(n, len as u16, sum),
-                        );
-                        passed += 1;
+                        if lane_rules::take_room(room, DEFAULT_INSTANCE) {
+                            offer_must(
+                                &mut self.passed,
+                                DEFAULT_INSTANCE,
+                                pack_frame(n, len as u16, sum),
+                            );
+                        } else {
+                            bump(&INNER.stats.lane_full);
+                            self.give(n);
+                        }
                         continue;
                     };
                     match route::route(t, frame, Source::Wire) {
@@ -1521,8 +1569,16 @@ impl Switch {
                             );
                             if route::deliver(t, sums::mark(d, sum), frame) {
                                 let word = pack_frame(n, len as u16, sum);
-                                offer_must(&mut self.passed, lane_of(d), word);
-                                passed += 1;
+                                let k = lane_of(d);
+                                if lane_rules::take_room(room, k) {
+                                    offer_must(&mut self.passed, k, word);
+                                } else {
+                                    bump(&INNER.stats.lane_full);
+                                    self.give(n);
+                                }
+                                if matches!(d, Decision::ArpAll) {
+                                    self.arp_copies(frame, sum, room);
+                                }
                             } else {
                                 self.give(n);
                             }
@@ -1541,7 +1597,24 @@ impl Switch {
                 }
             }
         }
-        passed
+    }
+
+    /// The instances after the default one get a copy of an ARP reply, each in a buffer of
+    /// sending that comes back through `rx_back` as the turned frames' do.
+    fn arp_copies(&mut self, frame: &[u8], sum: bool, room: &mut [usize; MAX_INSTANCES]) {
+        for k in (DEFAULT_INSTANCE + 1)..self.instances {
+            if !lane_rules::take_room(room, k) {
+                bump(&INNER.stats.lane_full);
+                continue;
+            }
+            let Some(n) = self.tx.book.alloc() else {
+                return;
+            };
+            // SAFETY: the buffer is free (just taken from the pool).
+            let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
+            slice[HDR_LEN..HDR_LEN + frame.len()].copy_from_slice(frame);
+            offer_must(&mut self.passed, k, pack_frame(n, frame.len() as u16, sum));
+        }
     }
 
     fn give(&mut self, n: u16) {
@@ -1573,18 +1646,28 @@ impl Switch {
         if tx.pending > 0 {
             tx.waited += 1;
         }
-        let lanes = &INNER.lanes[..INSTANCES];
-        let more = more || lanes.iter().any(|lane| lane.run.busy());
+        // Only the lanes whose frames wait for the bell count: a run of an instance that put
+        // nothing in the queue neither delays the bell nor holds it.
+        let lanes = &INNER.lanes[..self.instances];
+        let submitted = self.submitted;
+        let waiting = |k: usize| lane_rules::waiting(submitted, k);
+        let more = more
+            || lanes
+                .iter()
+                .enumerate()
+                .any(|(k, lane)| waiting(k) && lane.run.busy());
         let due = bell_due(SWITCH_BELL, tx.pending, tx.waited, more);
         // Held for the end of the stack's run, which tells the switch; when
-        // the run is over meanwhile, it rings now. Every instance in a run holds it.
+        // the run is over meanwhile, it rings now. Every instance that has frames waiting and
+        // is in a run holds it.
         let ring_now = due
             || (tx.pending > 0
                 && !continued
-                && !lanes
-                    .iter()
-                    .fold(false, |held, lane| lane.run.hold() | held));
+                && !lanes.iter().enumerate().fold(false, |held, (k, lane)| {
+                    (waiting(k) && lane.run.hold()) | held
+                }));
         if ring_now {
+            self.submitted = 0;
             lanes.iter().for_each(|lane| lane.run.unhold());
             INNER.bells_tx.fetch_add(1, Ordering::Relaxed);
             tx.rung();
@@ -1659,21 +1742,20 @@ pub struct NotStarted;
 
 /// Starts the switch thread at `priority` (above the stack's) over
 /// `switch`, which waits on its channel `channel` for the interrupts of the
-/// line and the stack's notifications. `stack` is the stack's channel
-/// copy with NOTIFY and `wake` the switch's, both for the life of the
-/// service.
+/// line and the stack's notifications. `wake` is the switch's channel copy
+/// with NOTIFY, which the instances wake it with, for the life of the
+/// service (the lanes know the channels of the instances, `Lane::set_stack_channel`).
 pub fn start(
     mut switch: Switch,
     process: &Handle<Process>,
     priority: u8,
-    (stack, wake): (&Handle<Channel>, &Handle<Channel>),
+    wake: &Handle<Channel>,
 ) -> Result<Handle<Thread>, NotStarted> {
     // The channel and timer of the pauses: a wait channel, so that the pause lends no priority.
     let pause = sys::channel_create_wait(priority)
         .and_then(|channel| sys::timer_create(&channel, priority).map(|timer| (channel, timer)))
         .map_err(|_| NotStarted)?;
     switch.pause = Some(pause);
-    INNER.lanes[DEFAULT_INSTANCE].set_stack_channel(stack.raw().0);
     INNER.switch_channel.store(wake.raw().0, Ordering::Release);
     // SAFETY: the slot is empty and the thread that reads it does not exist
     // yet.

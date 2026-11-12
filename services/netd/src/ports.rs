@@ -11,6 +11,7 @@
 use core::hash::Hasher;
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
 use core::hash::SipHasher;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// The protocols.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,66 @@ pub enum Proto {
     Tcp = 6,
     Udp = 17,
 }
+
+/// The ports the stack instances of the service hold, for all of them: one byte for each port
+/// of each protocol, 0 for a port no instance holds and the instance's number plus one for the
+/// instance that does. An instance takes a port here the first time one of its sockets holds
+/// it and lets it go with the last (`PortMap`), so that the instances share one port space
+/// without a lock: a bind or a choice of an ephemeral port that finds the port taken by
+/// another instance is refused or tries the next. The switch reads the same bytes to steer a
+/// frame to the instance that holds its port (`switchlogic::tables::Tables::port`), and an
+/// instance reads them to tell a frame for another instance from one for itself.
+pub struct Claims([AtomicU8; 2 * 65536]);
+
+impl Claims {
+    pub const fn new() -> Claims {
+        Claims([const { AtomicU8::new(0) }; 2 * 65536])
+    }
+
+    fn at(proto: Proto, port: u16) -> usize {
+        usize::from(proto == Proto::Udp) * 65536 + usize::from(port)
+    }
+
+    /// Takes `port` for instance `who`; true when it is the instance's already.
+    pub fn claim(&self, proto: Proto, port: u16, who: u8) -> bool {
+        let me = who + 1;
+        match self.0[Self::at(proto, port)].compare_exchange(
+            0,
+            me,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(held) => held == me,
+        }
+    }
+
+    /// Lets go of `port`, if it is `who`'s.
+    pub fn release(&self, proto: Proto, port: u16, who: u8) {
+        let _ = self.0[Self::at(proto, port)].compare_exchange(
+            who + 1,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// The instance that holds `port`.
+    pub fn owner(&self, proto: Proto, port: u16) -> Option<u8> {
+        self.0[Self::at(proto, port)]
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+    }
+}
+
+impl Default for Claims {
+    fn default() -> Claims {
+        Claims::new()
+    }
+}
+
+/// The claims of all the instances: the one port space of the service.
+pub static CLAIMS: Claims = Claims::new();
 
 /// What a socket holds of a port: where the registry looks for a conflict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +171,9 @@ pub fn ephemeral(offset: u32, counter: u32, map: &PortMap) -> Option<u16> {
 /// of the ephemeral range are also a bit each, set while the count is not
 /// zero, for the search of a free one.
 pub struct PortMap {
+    /// The claims of all instances and this map's instance with the protocol it counts; none
+    /// for a map that has the ports to itself.
+    shared: Option<Shared>,
     held: [u16; 65536],
     used: [u64; EPHEMERAL_WORDS],
     /// Blocks of the ephemeral range that consumers of the switch hold (a run aligned on
@@ -118,19 +182,54 @@ pub struct PortMap {
     reserved: [u64; EPHEMERAL_WORDS],
 }
 
+#[derive(Clone, Copy)]
+struct Shared {
+    claims: &'static Claims,
+    who: u8,
+    proto: Proto,
+}
+
 const EPHEMERAL_WORDS: usize = EPHEMERAL_COUNT as usize / 64;
 
 impl PortMap {
     pub const fn new() -> PortMap {
         PortMap {
+            shared: None,
             held: [0; 65536],
             used: [0; EPHEMERAL_WORDS],
             reserved: [0; EPHEMERAL_WORDS],
         }
     }
 
+    /// The map counts the ports of `proto` for instance `who`, and takes them from `claims`
+    /// (and gives them back) as the instance's first socket holds a port and its last lets go.
+    pub fn share(&mut self, claims: &'static Claims, who: u8, proto: Proto) {
+        self.shared = Some(Shared { claims, who, proto });
+    }
+
+    /// Whether another instance holds `port`.
+    pub fn held_elsewhere(&self, port: u16) -> bool {
+        self.shared
+            .is_some_and(|s| s.claims.owner(s.proto, port).is_some_and(|o| o != s.who))
+    }
+
     pub fn held(&self, port: u16) -> bool {
-        self.held[usize::from(port)] > 0 || self.is_reserved(port)
+        self.held[usize::from(port)] > 0 || self.is_reserved(port) || self.held_elsewhere(port)
+    }
+
+    /// `hold`, refused (false) when another instance holds `port`.
+    pub fn try_hold(&mut self, port: u16) -> bool {
+        if self.held_elsewhere(port) {
+            return false;
+        }
+        if self.held[usize::from(port)] == 0
+            && let Some(s) = self.shared
+            && !s.claims.claim(s.proto, port, s.who)
+        {
+            return false;
+        }
+        self.hold(port);
+        true
     }
 
     pub fn is_reserved(&self, port: u16) -> bool {
@@ -213,14 +312,23 @@ impl PortMap {
         *n = n.saturating_add(1);
         if first {
             self.mark(port, true);
+            if let Some(s) = self.shared {
+                s.claims.claim(s.proto, port, s.who);
+            }
         }
     }
 
     pub fn release(&mut self, port: u16) {
         let n = &mut self.held[usize::from(port)];
+        let was = *n;
         *n = n.saturating_sub(1);
         if *n == 0 {
             self.mark(port, false);
+            if was > 0
+                && let Some(s) = self.shared
+            {
+                s.claims.release(s.proto, port, s.who);
+            }
         }
     }
 
@@ -420,5 +528,47 @@ mod tests {
         assert!(!map.held(80));
         map.release(80);
         assert!(!map.held(80), "a count does not go below zero");
+    }
+
+    fn shared_maps() -> (PortMap, PortMap) {
+        let claims: &'static Claims = Box::leak(Box::new(Claims::new()));
+        let (mut a, mut b) = (PortMap::new(), PortMap::new());
+        a.share(claims, 0, Proto::Tcp);
+        b.share(claims, 1, Proto::Tcp);
+        (a, b)
+    }
+
+    #[test]
+    fn a_port_one_instance_holds_is_refused_to_another_until_the_last_socket_lets_go() {
+        let (mut a, mut b) = shared_maps();
+        assert!(a.try_hold(80));
+        assert!(a.try_hold(80), "the holder takes it again");
+        assert!(!b.try_hold(80));
+        assert!(b.held(80) && b.held_elsewhere(80) && !a.held_elsewhere(80));
+        a.release(80);
+        assert!(!b.try_hold(80), "one holder is left");
+        a.release(80);
+        assert!(b.try_hold(80), "the last let go");
+        assert!(a.held_elsewhere(80));
+    }
+
+    #[test]
+    fn the_ports_of_another_protocol_are_another_space() {
+        let claims: &'static Claims = Box::leak(Box::new(Claims::new()));
+        let (mut tcp, mut udp) = (PortMap::new(), PortMap::new());
+        tcp.share(claims, 0, Proto::Tcp);
+        udp.share(claims, 1, Proto::Udp);
+        assert!(tcp.try_hold(53));
+        assert!(udp.try_hold(53));
+        assert_eq!(claims.owner(Proto::Tcp, 53), Some(0));
+        assert_eq!(claims.owner(Proto::Udp, 53), Some(1));
+    }
+
+    #[test]
+    fn an_ephemeral_choice_skips_the_ports_of_another_instance() {
+        let (mut a, b) = shared_maps();
+        let first = ephemeral(100, 0, &a).unwrap();
+        assert!(a.try_hold(first));
+        assert_eq!(ephemeral(100, 0, &b), Some(first + 1));
     }
 }

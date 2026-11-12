@@ -45,6 +45,9 @@ pub struct Buffers {
     /// The mappings of the service: a buffer takes one while its entry is taken, and the rings of
     /// consumers draw on the same budget (`books::NETD_MAPPINGS`).
     maps: Mappings,
+    /// The number of the first address this table's entries are mapped at: the instances of the
+    /// service take turns in the 64 (`Buffers::of_instance`).
+    base: usize,
 }
 
 impl Default for Buffers {
@@ -63,12 +66,29 @@ impl Buffers {
             used: 0,
             retired: 0,
             maps: Mappings::new(),
+            base: 0,
             limit: if limit as usize > BUFFER_SESSIONS {
                 BUFFER_SESSIONS as u16
             } else {
                 limit
             },
         }
+    }
+
+    /// The table of instance `k` of `instances`: each has an equal part of the entries' places
+    /// (so that no two map at one address), within the limit of `netd.conf`, and all draw on
+    /// the one budget of mappings of the service.
+    pub fn of_instance(limit: u16, k: usize, instances: usize) -> Buffers {
+        let part = BUFFER_SESSIONS / instances.max(1);
+        let mut table = Buffers::new(limit.min(part as u16));
+        table.base = k * part;
+        table.maps = Mappings::shared();
+        table
+    }
+
+    /// The number of the address entry `i` is mapped at (`dma::buffer_at`).
+    pub fn address_of(&self, i: usize) -> usize {
+        self.base + i
     }
 
     /// The budget of mappings, for the rings of consumers to draw on.
@@ -286,5 +306,38 @@ mod tests {
         );
         // A window that offers more than it is asked for is held to the rest.
         assert_eq!(copy_portion(1000, 512, |_, _| 4096), 512);
+    }
+
+    #[test]
+    fn the_instances_map_their_buffers_at_places_of_their_own_and_share_one_budget() {
+        // Three instances of 64 places: 21 each (the part is the integer share).
+        let mut tables: Vec<Buffers> = (0..3).map(|k| Buffers::of_instance(64, k, 3)).collect();
+        assert!(tables.iter().all(|t| t.limit() == 21));
+        let mut places = std::collections::BTreeSet::new();
+        for t in tables.iter_mut() {
+            for n in 0..21 {
+                let i = t.give(n).unwrap();
+                assert!(places.insert(t.address_of(i)), "an address given twice");
+            }
+            assert_eq!(t.give(99), Err(Refusal::Full));
+        }
+        assert_eq!(places.len(), 63);
+        assert!(places.iter().all(|&p| p < BUFFER_SESSIONS));
+        // The budget of mappings is the service's: 63 taken, 45 are left for the others.
+        let mut rest = Mappings::shared();
+        assert!(rest.reserve(crate::books::NETD_MAPPINGS - 63));
+        assert!(!rest.reserve(1), "the budget is spent for every instance");
+        rest.release(crate::books::NETD_MAPPINGS - 63);
+        for t in tables.iter_mut() {
+            for i in 0..21 {
+                t.free(i);
+            }
+        }
+        let mut all = Mappings::shared();
+        assert!(
+            all.reserve(crate::books::NETD_MAPPINGS),
+            "every entry gave its mapping back"
+        );
+        all.release(crate::books::NETD_MAPPINGS);
     }
 }

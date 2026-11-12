@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -3158,6 +3159,144 @@ static void epoll_rdhup_unix(void)
 	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
 }
 
+
+/* ---------------------------------------------------------------- stack instances:
+ * the service runs an instance of its stack on each CPU of its mask, and a process's
+ * session gets its home at its first call that makes a socket, the instance on the CPU of
+ * the calling thread. One worker on each CPU of the process (three on CPUs 1 to 3 in the
+ * pinned image) makes a listener, connects to the next worker's and accepts the
+ * previous one's, so every connection but a single CPU's own is a loopback connection
+ * between two instances, and sends a byte round the ring and back. Each worker then reads
+ * its home (the number of the instance that holds its session) and the count of its calls
+ * that were made from another CPU than the home's: both are compared. The check runs
+ * in a process of its own (`posix-net ADDRESS instances`): a process that has made sockets
+ * is homed already, and so are the children it forks. */
+
+#define SO_STAFETO_HOME 0x7353
+#define SO_STAFETO_CALLS 0x7354
+#define SO_STAFETO_REMOTE 0x7355
+#define SO_STAFETO_COUNT 0x7356
+#define WORKERS 4
+
+struct worker_report {
+	int cpu, home;
+	unsigned calls, remote, round;
+};
+
+static unsigned stafeto_opt(int fd, int name)
+{
+	unsigned v = 0;
+	socklen_t len = sizeof v;
+	REQUIRE(getsockopt(fd, SOL_SOCKET, name, &v, &len) == 0);
+	return v;
+}
+
+/* The CPUs the process may run on, in order. */
+static int process_cpus(int *list)
+{
+	cpu_set_t set;
+	int n = 0;
+
+	CPU_ZERO(&set);
+	REQUIRE(sched_getaffinity(0, sizeof set, &set) == 0);
+	for (int c = 0; c < 8 && n < WORKERS; c++)
+		if (CPU_ISSET(c, &set))
+			list[n++] = c;
+	return n;
+}
+
+static void worker_run(int rank, int count, int cpu, int up, int down)
+{
+	struct worker_report rep;
+	int ports[WORKERS], port;
+
+	memset(&rep, 0, sizeof rep);
+	/* The first call that makes a socket homes the session by this thread's CPU. */
+	rep.cpu = sched_getcpu();
+	int lis = listener(8, &port);
+	int one = 1;
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_COUNT, &one, sizeof one) == 0);
+	REQUIRE(write(up, &port, sizeof port) == (ssize_t)sizeof port);
+	REQUIRE(read(down, ports, sizeof ports) == (ssize_t)sizeof ports);
+	int next = (rank + 1) % count, prev = (rank + count - 1) % count;
+	int c = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c >= 0);
+	struct sockaddr_in a = at(LOOPBACK, ports[next]);
+	REQUIRE(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+	int s = accept(lis, NULL, NULL);
+	REQUIRE(s >= 0);
+	/* A byte round the ring and the answer back. */
+	char out = (char)('a' + rank), in = 0;
+	REQUIRE(write(c, &out, 1) == 1);
+	REQUIRE(read(s, &in, 1) == 1 && in == (char)('a' + prev));
+	out = (char)('A' + rank);
+	REQUIRE(write(s, &out, 1) == 1);
+	REQUIRE(read(c, &in, 1) == 1 && in == (char)('A' + next));
+	/* And a round of the worker's own, between sockets of its instance. */
+	int own_c, own_s;
+	pair(lis, port, &own_c, &own_s);
+	exchange(own_c, own_s, 'o');
+	rep.home = (int)stafeto_opt(lis, SO_STAFETO_HOME);
+	rep.calls = stafeto_opt(lis, SO_STAFETO_CALLS);
+	rep.remote = stafeto_opt(lis, SO_STAFETO_REMOTE);
+	rep.round = (unsigned)count;
+	(void)cpu;
+	REQUIRE(write(up, &rep, sizeof rep) == (ssize_t)sizeof rep);
+	REQUIRE(close(own_c) == 0 && close(own_s) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+	_exit(0);
+}
+
+static void instances(void)
+{
+	int cpus[WORKERS], n = process_cpus(cpus);
+	cpu_set_t all;
+	int up[WORKERS][2], down[WORKERS][2];
+	pid_t pids[WORKERS];
+
+	REQUIRE(n >= 1);
+	CPU_ZERO(&all);
+	REQUIRE(sched_getaffinity(0, sizeof all, &all) == 0);
+	for (int i = 0; i < n; i++) {
+		REQUIRE(pipe(up[i]) == 0 && pipe(down[i]) == 0);
+		/* The child takes the mask of one CPU and is placed on it. */
+		cpu_set_t one;
+		CPU_ZERO(&one);
+		CPU_SET(cpus[i], &one);
+		REQUIRE(sched_setaffinity(0, sizeof one, &one) == 0);
+		pids[i] = fork();
+		REQUIRE(pids[i] >= 0);
+		if (pids[i] == 0)
+			worker_run(i, n, cpus[i], up[i][1], down[i][0]);
+	}
+	REQUIRE(sched_setaffinity(0, sizeof all, &all) == 0);
+	int ports[WORKERS];
+	for (int i = 0; i < n; i++)
+		REQUIRE(read(up[i][0], &ports[i], sizeof ports[i]) == (ssize_t)sizeof ports[i]);
+	int full[WORKERS] = { 0 };
+	for (int i = 0; i < n; i++)
+		full[i] = ports[i];
+	for (int i = 0; i < n; i++)
+		REQUIRE(write(down[i][1], full, sizeof full) == (ssize_t)sizeof full);
+	unsigned calls_total = 0;
+	for (int i = 0; i < n; i++) {
+		struct worker_report rep;
+		REQUIRE(read(up[i][0], &rep, sizeof rep) == (ssize_t)sizeof rep);
+		int status = 0;
+		REQUIRE(waitpid(pids[i], &status, 0) == pids[i]);
+		REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		printf("posix-net: note: instances worker %d cpu %d home %d calls %u remote %u\n",
+		       i, rep.cpu, rep.home, rep.calls, rep.remote);
+		/* The worker stood on the CPU its mask names, its home is the instance of that CPU,
+		 * and no call it made crossed to another CPU. */
+		REQUIRE(rep.cpu == cpus[i]);
+		REQUIRE(rep.home == cpus[i]);
+		REQUIRE(rep.remote == 0);
+		calls_total += rep.calls;
+	}
+	REQUIRE(calls_total > 0);
+}
+
 /* `posix-net stat`: the two options of the shared buffers. */
 static int stat_buffers(void)
 {
@@ -3280,6 +3419,14 @@ static const struct {
 	{ "wait-churn", wait_churn },
 };
 
+/* Checks that run alone, in a process that has made no socket yet (named on the line). */
+static const struct {
+	const char *name;
+	void (*run)(void);
+} SOLO[] = {
+	{ "instances", instances },
+};
+
 int main(int argc, char **argv)
 {
 	if (argc >= 2 && strcmp(argv[1], "exec-child") == 0)
@@ -3297,6 +3444,18 @@ int main(int argc, char **argv)
 	if (argc != 2 && argc != 3) {
 		printf("posix-net: usage: posix-net ADDRESS [NAME]\n");
 		return 2;
+	}
+	if (argc == 3) {
+		for (unsigned i = 0; i < sizeof SOLO / sizeof SOLO[0]; i++) {
+			if (strcmp(argv[2], SOLO[i].name) != 0)
+				continue;
+			check = SOLO[i].name;
+			SOLO[i].run();
+			printf("posix-net: %s ok\n", SOLO[i].name);
+			printf("posix-net: 1 checks ok\n");
+			fflush(stdout);
+			return 0;
+		}
 	}
 	int count = (int)(sizeof CHECKS / sizeof CHECKS[0]);
 	int ran = 0;

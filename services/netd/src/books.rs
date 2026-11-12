@@ -109,14 +109,31 @@ impl Chunks {
 pub const NETD_MAPPINGS: u32 = 108;
 const _: () = assert!(NETD_MAPPINGS + 20 <= abi::MAX_MAPPINGS);
 
+/// What every instance's `Mappings::shared` draws on: the service has one process and one
+/// budget, whatever the number of its instances.
+static SHARED_USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// The mappings reserved from the budget: one for each buffer, one for each chunk of a ring.
 pub struct Mappings {
     used: u32,
+    /// The budget is the service's (`SHARED_USED`), and `used` counts what this table took.
+    shared: bool,
 }
 
 impl Mappings {
     pub const fn new() -> Mappings {
-        Mappings { used: 0 }
+        Mappings {
+            used: 0,
+            shared: false,
+        }
+    }
+
+    /// A table that draws on the budget of the whole service.
+    pub const fn shared() -> Mappings {
+        Mappings {
+            used: 0,
+            shared: true,
+        }
     }
 
     /// The mappings a ring of `bytes` bytes takes when it is mapped `chunk_pages` pages at a time.
@@ -126,6 +143,17 @@ impl Mappings {
 
     /// Takes `n` mappings, or none when the budget lacks them.
     pub fn reserve(&mut self, n: u32) -> bool {
+        use core::sync::atomic::Ordering;
+        if self.shared {
+            let taken = SHARED_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&sum| sum <= NETD_MAPPINGS)
+            });
+            if taken.is_err() {
+                return false;
+            }
+            self.used += n;
+            return true;
+        }
         match self.used.checked_add(n) {
             Some(sum) if sum <= NETD_MAPPINGS => {
                 self.used = sum;
@@ -136,7 +164,12 @@ impl Mappings {
     }
 
     pub fn release(&mut self, n: u32) {
-        self.used = self.used.saturating_sub(n);
+        use core::sync::atomic::Ordering;
+        let n = n.min(self.used);
+        if self.shared {
+            SHARED_USED.fetch_sub(n, Ordering::AcqRel);
+        }
+        self.used -= n;
     }
 
     pub fn used(&self) -> u32 {

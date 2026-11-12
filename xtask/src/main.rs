@@ -1952,6 +1952,7 @@ commands:
             stafeto's image of the measurement (four CPUs, 1 GiB each) and
             compares the versions of nginx and OpenSSL, the fingerprint of
             `nginx -T` and the SHA-256 of /www, and fetches every file
+  posix-net instances  run one worker on each CPU of two, homed on the instance of its CPU
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
@@ -9338,6 +9339,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-net", || posix_net::probe(&qemu::VIRT, false)),
         // Many waits with late answers on two CPUs: none fails with EAGAIN.
         job("posix-net wait-churn smp 2", posix_net::wait_churn_smp),
+        job("posix-net instances smp 2", posix_net::instances_smp),
         // The TCP/IP stack of FreeBSD 15 (F-Stack) in a process, on its own
         // loopback: 16 MiB, 1 000 connections, its clock. Also in the group
         // `net`.

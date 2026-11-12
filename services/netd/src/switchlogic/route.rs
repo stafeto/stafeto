@@ -12,8 +12,8 @@
 //! send check and B's flow at steering: the keys differ in the ports.
 
 use super::tables::{
-    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, PARK_FRAME, RST, RST_PEER, Tables,
-    UNCONFIRMED, instance_of,
+    BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, INTERNAL_BASE, MAX_GROUPS, OWN_MARK, PARK_FRAME, RST,
+    RST_PEER, Tables, UNCONFIRMED, instance_of,
 };
 use crate::ports::Proto;
 use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, DONE_LOOP, FRAME_MAX};
@@ -266,6 +266,12 @@ fn to(consumer: u8, flags: u16) -> Decision {
 
 /// The owner of the ephemeral block a port-table value marks, when it is there.
 fn block_owner(t: &Tables, mark: u8) -> Option<u8> {
+    // A port an instance holds (`OWN_MARK` + k) is the instance's whole, as a block is.
+    if mark >= OWN_MARK {
+        let k = usize::from(mark - OWN_MARK);
+        t.instances.get(k)?.as_ref()?;
+        return Some(INTERNAL_BASE + k as u8);
+    }
     let c = mark.checked_sub(BLOCK_MARK)?;
     match instance_of(c) {
         Some(k) => t.instances[k].as_ref()?,
@@ -2344,7 +2350,7 @@ mod tests {
     #[test]
     fn a_frame_for_a_port_of_an_instances_block_goes_to_that_instance() {
         with(|t, _| {
-            assert!(t.attach_instance(2, 1, Some(INSTANCE_BLOCK)));
+            assert!(t.attach_instance(2, Some(INSTANCE_BLOCK)).is_some());
             let tcp = wire_tcp(443, INSTANCE_BLOCK + 7, ACK_);
             assert_eq!(route(t, &tcp, Source::Wire), Decision::Instance(2));
             let udp = wire_udp(53, INSTANCE_BLOCK + 511);
@@ -2365,9 +2371,57 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_for_a_port_an_instance_holds_goes_to_it_whatever_the_flow_table_says() {
+        let claims: &'static crate::ports::Claims =
+            Box::leak(Box::new(crate::ports::Claims::new()));
+        with(|t, _| {
+            t.set_claims(claims);
+            assert!(t.attach_instance(1, None).is_some());
+            assert!(claims.claim(Proto::Tcp, 8085, 1));
+            assert!(claims.claim(Proto::Udp, 5400, 1));
+            // A SYN, the segments after it and a datagram: all to instance 1, with no flow made.
+            for flags in [SYN, ACK_, 0x18] {
+                assert_eq!(
+                    route(t, &wire_tcp(4000, 8085, flags), Source::Wire),
+                    Decision::Instance(1)
+                );
+            }
+            assert_eq!(
+                route(t, &wire_udp(53, 5400), Source::Wire),
+                Decision::Instance(1)
+            );
+            assert_eq!(t.flows.len(), 0);
+            // A port nobody holds stays the default instance's.
+            assert_eq!(
+                route(t, &wire_tcp(4000, 8086, SYN), Source::Wire),
+                Decision::Stack
+            );
+            // The loopback network is steered the same way.
+            let looped = ip_frame(
+                THEM,
+                ([2, 0, 0, 0, 0, 1], [127, 0, 0, 1]),
+                6,
+                &tcp_part(4000, 8085, SYN),
+            );
+            let looped = {
+                let mut f = looped;
+                f[26..30].copy_from_slice(&[127, 0, 0, 1]);
+                f
+            };
+            assert_eq!(route_loop(t, &looped), Decision::Instance(1));
+            // The instance gives the port up: the frames fall back to the default instance.
+            claims.release(Proto::Tcp, 8085, 1);
+            assert_eq!(
+                route(t, &wire_tcp(4000, 8085, SYN), Source::Wire),
+                Decision::Stack
+            );
+        });
+    }
+
+    #[test]
     fn a_syn_for_the_queue_of_an_instance_makes_the_flow_for_that_instance() {
         with(|t, _| {
-            assert!(t.attach_instance(1, 7, None));
+            assert!(t.attach_instance(1, None).is_some());
             assert!(t.hold(3, Proto::Tcp, 9090, 1));
             assert!(t.join(3, instance(1)));
             let syn = route(t, &wire_tcp(4000, 9090, SYN), Source::Wire);
@@ -2394,7 +2448,7 @@ mod tests {
     #[test]
     fn instances_and_processes_share_a_group_by_hash() {
         with(|t, _| {
-            assert!(t.attach_instance(0, 1, None));
+            assert!(t.attach_instance(0, None).is_some());
             assert!(t.hold(4, Proto::Tcp, 9191, 1));
             assert!(t.join(4, 0) && t.join(4, instance(0)));
             let mut seen = [0u32; 2];
@@ -2414,7 +2468,7 @@ mod tests {
     #[test]
     fn a_new_address_ends_the_flows_of_an_instance_and_its_membership_follows() {
         with(|t, _| {
-            assert!(t.attach_instance(3, 1, None));
+            assert!(t.attach_instance(3, None).is_some());
             assert!(t.hold(5, Proto::Tcp, 9292, 1) && t.join(5, instance(3)));
             assert_eq!(
                 route(t, &wire_tcp(5000, 9292, SYN), Source::Wire),

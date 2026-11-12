@@ -255,6 +255,14 @@ impl<const D: usize> TxRing<D> {
         }
     }
 
+    /// The number of the instance this ring belongs to (the first for the device's own).
+    pub fn instance(&self) -> usize {
+        match &self.port {
+            TxPort::Inner(lane) => lane.number(),
+            TxPort::Wire(_) => 0,
+        }
+    }
+
     /// The device's ring (the second device's).
     pub fn wire(&mut self) -> &mut virtio_net::TxRing<Host<D>> {
         match &mut self.port {
@@ -757,7 +765,7 @@ impl<const D: usize> TxToken<'_, D> {
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
             // A frame for a port a consumer or a group of the switch holds goes to the switch,
             // which turns it into their tables (R-2a); its sums are filled as for the wire.
-            if D == DEVICE && ring.drop_loop == 0 && switch::turn_wanted(frame) {
+            if D == DEVICE && ring.drop_loop == 0 && switch::turn_wanted(frame, ring.instance()) {
                 ring.submit(n, len);
                 return (result, true);
             }

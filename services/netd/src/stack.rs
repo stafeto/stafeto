@@ -123,6 +123,17 @@ impl Lease {
     }
 }
 
+/// The lease as the instances share it (`netd::published`).
+pub fn record_of(lease: Option<Lease>) -> Option<netd::published::Record> {
+    let lease = lease?;
+    Some(netd::published::Record {
+        address: lease.address,
+        prefix: lease.prefix,
+        gateway: lease.gateway,
+        servers: lease.servers,
+    })
+}
+
 /// What came of the DHCP client in a step.
 pub enum Event {
     Leased(Lease),
@@ -260,6 +271,21 @@ impl<'a> Stack<'a> {
             servers: [dns, None, None],
         };
         self.apply(&lease);
+    }
+
+    /// Takes the address the first instance published (the record, or none): this interface
+    /// has the address and the route the first one has.
+    pub fn follow(&mut self, record: Option<&netd::published::Record>) {
+        match record {
+            Some(r) => self.apply(&Lease {
+                address: r.address,
+                prefix: r.prefix,
+                gateway: r.gateway,
+                dns: r.servers[0],
+                servers: r.servers,
+            }),
+            None => self.remove(),
+        }
     }
 
     fn apply(&mut self, lease: &Lease) {

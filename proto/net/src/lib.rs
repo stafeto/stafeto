@@ -47,6 +47,8 @@
 //! | CONFIG (21) | the header alone (device 0), or a device (u32, 0 or 1) | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
 //! | CLAIM (26), CLAIM_MORE (36), KICK (37) | `fast` | `fast` |
 //! | PORT_HOLD (38), ATTACH (39), JOIN (40) | `switch` | `switch` |
+//! | HOME (41) | the CPU of the calling thread (u32) and the CPUs of its process (u32, a mask) | status; a handle too when the home is not the instance the session is at: the process's session on the home's channel, which takes the place of the old one |
+//! | HOME_MAKE (42) | the root (u64): only an instance of the service sends it to another | status and one handle: a new session of the root, empty |
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
 //! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address), 3 drops the next frame the stack sends to itself (a test of the timers); only a service built with the feature `probe` has it | status |
 //! | PING_WIRE (31) | as PING; the echo request carries 1 472 bytes, a frame of 1 514; only a service built with the feature `probe` has it | as PING |
@@ -112,12 +114,14 @@ pub enum Method {
     PortHold = 38,
     Attach = 39,
     Join = 40,
+    Home = 41,
+    HomeMake = 42,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 42] = [
+    pub const ALL: [Method; 44] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -158,6 +162,8 @@ impl Method {
         Method::PortHold,
         Method::Attach,
         Method::Join,
+        Method::Home,
+        Method::HomeMake,
         Method::Ping,
         Method::Crash,
     ];
@@ -319,6 +325,38 @@ pub fn read_hold(mut body: Reader<'_>) -> Result<u32, Status> {
         HOLD_OFF | HOLD_ON | HOLD_ADDRESS | HOLD_DROP => Ok(value),
         _ => Err(Status::BadSize),
     }
+}
+
+/// The request HOME: the CPU of the calling thread and the CPUs of its process (a mask). The
+/// service gives the session a home instance (the one that runs on that CPU), once; the reply
+/// carries the session on the home's channel when the home is another instance than the one
+/// that holds the session now (`netd::home`).
+pub fn write_home(cpu: u32, allowed: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Home.header().write(w)?;
+    w.u32(cpu)?;
+    w.u32(allowed)
+}
+
+/// The CPU and the mask of HOME from `body`: BAD_SIZE unless two u32.
+pub fn read_home(mut body: Reader<'_>) -> Result<(u32, u32), Status> {
+    let cpu = body.u32()?;
+    let allowed = body.u32()?;
+    body.finish()?;
+    Ok((cpu, allowed))
+}
+
+/// The request HOME_MAKE: the instance that holds a process's session asks the home for a
+/// session of the same root (the label of init's client).
+pub fn write_home_make(root: u64, w: &mut Writer) -> Result<(), Status> {
+    Method::HomeMake.header().write(w)?;
+    w.u64(root)
+}
+
+/// The root of HOME_MAKE from `body`: BAD_SIZE unless one u64.
+pub fn read_home_make(mut body: Reader<'_>) -> Result<u64, Status> {
+    let root = body.u64()?;
+    body.finish()?;
+    Ok(root)
 }
 
 /// The family of an IPv4 address on the wire.
@@ -547,14 +585,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=40).collect();
+        let mut expected: Vec<u16> = (1..=42).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(41), None);
+        assert_eq!(Method::from_number(43), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
@@ -715,6 +753,23 @@ mod tests {
             Err(Status::BadSize)
         );
         assert_eq!(read_hold(Reader::new(&[1, 0])), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn home_and_home_make_round_trip_and_refuse_other_shapes() {
+        let mut w = Writer::new();
+        write_home(3, 0b1110, &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        assert_eq!(Header::read(&mut r).unwrap(), Method::Home.header());
+        assert_eq!(read_home(r), Ok((3, 0b1110)));
+        assert_eq!(read_home(Reader::new(&[0; 4])), Err(Status::BadSize));
+        assert_eq!(read_home(Reader::new(&[0; 12])), Err(Status::BadSize));
+        let mut w = Writer::new();
+        write_home_make(0x1234_5678_9abc, &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        assert_eq!(Header::read(&mut r).unwrap(), Method::HomeMake.header());
+        assert_eq!(read_home_make(r), Ok(0x1234_5678_9abc));
+        assert_eq!(read_home_make(Reader::new(&[0; 4])), Err(Status::BadSize));
     }
 
     #[test]

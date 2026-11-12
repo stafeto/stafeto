@@ -11,13 +11,15 @@
 //!
 //! The thread of the instance runs `rt::service::run_in` on a channel of its own (`launch`),
 //! above every process, and a thread of the process that has nothing else to do waits
-//! (`wait_forever`). Several instances, each in a thread on its own CPU, are the next stages;
-//! what they share (the port registry, the neighbours, the address) is theirs to settle.
+//! (`wait_forever`). The service runs one instance for each CPU of its mask, each in a thread
+//! on its own CPU (`start`); what they share is one address (`netd::published`), one port
+//! space (`netd::ports::CLAIMS`) and the rings of the switch, one lane for each.
 
 use crate::device::NetDevice;
 use crate::net::{Client, Net};
 use crate::stack::Stack;
 use crate::switch::Lane;
+use netd::switchlogic::tables::MAX_INSTANCES;
 use rt::handle::{Channel, Process};
 use rt::service::{Config, Session};
 use rt::{Handle, Stack as ThreadStack, sys};
@@ -61,35 +63,44 @@ pub struct Launch<'a, D> {
 }
 
 const STACK_BYTES: usize = 64 * 1024;
-static STACK: ThreadStack<STACK_BYTES> = ThreadStack::new();
-/// The message buffer of the thread: the page after the switch's, which follows the first
-/// thread's.
-const BUFFER: usize = abi::INIT_MSGBUF as usize + 2 * 4096;
+static STACKS: [ThreadStack<STACK_BYTES>; MAX_INSTANCES] =
+    [const { ThreadStack::new() }; MAX_INSTANCES];
+/// The message buffer of instance `k`'s thread: the pages after the switch's, which follows
+/// the first thread's.
+const fn buffer(k: usize) -> usize {
+    abi::INIT_MSGBUF as usize + (2 + k) * 4096
+}
 
 /// Why the thread did not start.
 #[derive(Debug)]
 pub struct NotStarted;
 
-/// Starts the instance's thread at `priority` over `launch`, which stays where it is until the
-/// service ends. The thread runs `launch.entry` and ends the program with its code.
+/// Starts the thread of instance `k` on CPU `cpu` (the kernel's choice when none) at
+/// `priority` over `launch`, which stays where it is until the service ends. The thread runs
+/// `launch.entry` and ends the program with its code.
 pub fn start<D>(
     launch: &mut Launch<'_, D>,
     process: &Handle<Process>,
     priority: u8,
+    k: usize,
+    cpu: Option<u32>,
 ) -> Result<(), NotStarted> {
     let arg = core::ptr::from_mut(launch) as u64;
-    // SAFETY: STACK is the thread's alone, and the page after the switch thread's message
-    // buffer is free; `arg` points to a launch that outlives the thread (the first thread
-    // waits for ever after this).
+    // SAFETY: the stack of `k` is the thread's alone, and the page of its message buffer is
+    // free; `arg` points to a launch that outlives the thread (the first thread waits for
+    // ever after this).
     let thread = unsafe {
-        sys::thread_create(
+        sys::thread_create_on(
             process,
             thread_main::<D>,
-            STACK.top(),
+            STACKS[k].top(),
             arg,
             priority,
             abi::Policy::Fifo,
-            BUFFER,
+            buffer(k),
+            None,
+            // The CPU plus one; 0 is the CPU of the caller.
+            cpu.map_or(0, |c| c as u8 + 1),
         )
     }
     .map_err(|_| NotStarted)?;

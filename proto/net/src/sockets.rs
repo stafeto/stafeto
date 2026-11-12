@@ -68,6 +68,12 @@ pub mod opt {
     /// GETOPT on any description of the session: the KiB that went through
     /// the shared buffers since the service started (wrapping).
     pub const BUFFERED: u32 = 40;
+    /// GETOPT on any description of the session: the number of the stack instance that holds
+    /// the session (its home).
+    pub const HOME: u32 = 41;
+    /// GETOPT on any description of the session: the requests the instance has answered since
+    /// the service started (wrapping).
+    pub const CALLS: u32 = 42;
     /// The bit of the value of LINGER that says it is on.
     pub const LINGER_ON: u32 = 0x8000_0000;
 }
@@ -1294,6 +1300,7 @@ mod tests {
         assert_eq!(read_received_count(w.as_bytes(), 99), Err(Status::BadSize));
         // The options of the buffers are new numbers.
         assert_eq!((opt::BUFFERS, opt::BUFFERED), (39, 40));
+        assert_eq!((opt::HOME, opt::CALLS), (41, 42));
     }
 
     #[test]
