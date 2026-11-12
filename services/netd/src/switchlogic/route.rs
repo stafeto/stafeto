@@ -13,7 +13,7 @@
 
 use super::tables::{
     BLOCK_MARK, FIN_IN, FIN_OUT, FlowKey, MAX_GROUPS, PARK_FRAME, RST, RST_PEER, Tables,
-    UNCONFIRMED,
+    UNCONFIRMED, instance_of,
 };
 use crate::ports::Proto;
 use proto_net::switch::{DONE_ARP_COPY, DONE_ICMP_ERROR, DONE_LOOP, FRAME_MAX};
@@ -35,6 +35,10 @@ pub enum Source {
     Stack,
     Consumer(u8),
 }
+
+/// The stack instance a frame goes to when no table names one: instance 0, the one that holds
+/// DHCP, the neighbours and the echo of ICMP.
+pub const DEFAULT_INSTANCE: usize = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
@@ -58,7 +62,11 @@ pub enum Why {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
+    /// The default instance: nothing in the tables claims the frame.
     Stack,
+    /// Internal consumer `k` (`Tables::attach_instance`) owns the block, the flow or the
+    /// queue the frame is for: it takes the frame as a number of a buffer, no copy.
+    Instance(u8),
     Consumer {
         consumer: u8,
         flags: u16,
@@ -205,7 +213,9 @@ pub fn unpark(t: &mut Tables, budget: usize) -> usize {
             deliver(t, d, frame);
             given += 1;
         } else {
-            // The group went, or its member filled up between the choice and the routing.
+            // The group went, or its member filled up between the choice and the routing, or
+            // the member that joined is an instance, which has no cell to copy the parked SYN
+            // into: the peer repeats the SYN and it goes to the instance as a frame of the wire.
             t.park_dropped += 1;
         }
     }
@@ -245,17 +255,28 @@ pub fn route(t: &mut Tables, frame: &[u8], from: Source) -> Decision {
     }
 }
 
+/// The decision for owner `consumer`: a process (its ring takes the frame with `flags`) or a
+/// stack instance of the service (`flags` are the ring's and mean nothing to it).
 fn to(consumer: u8, flags: u16) -> Decision {
-    Decision::Consumer { consumer, flags }
+    match instance_of(consumer) {
+        Some(k) => Decision::Instance(k as u8),
+        None => Decision::Consumer { consumer, flags },
+    }
 }
 
 /// The owner of the ephemeral block a port-table value marks, when it is there.
 fn block_owner(t: &Tables, mark: u8) -> Option<u8> {
     let c = mark.checked_sub(BLOCK_MARK)?;
-    t.consumers
-        .get(usize::from(c))
-        .and_then(Option::as_ref)
-        .filter(|x| !x.ring.is_broken())?;
+    match instance_of(c) {
+        Some(k) => t.instances[k].as_ref()?,
+        None => {
+            t.consumers
+                .get(usize::from(c))
+                .and_then(Option::as_ref)
+                .filter(|x| !x.ring.is_broken())?;
+            return Some(c);
+        }
+    };
     Some(c)
 }
 
@@ -274,6 +295,11 @@ fn pick(t: &Tables, number: u8, hash: u64, min_fill: u32, flows: bool) -> Pick {
     let limit = (t.flows.capacity() / 2) as u32;
     let live = |m: &&(u8, u32)| t.live(m.0, m.1);
     let fits = |m: &&(u8, u32)| {
+        // An instance takes frames as numbers of buffers: no cells to run short of.
+        if let Some(k) = instance_of(m.0) {
+            let x = t.instances[k].as_ref().expect("live");
+            return !(flows && x.flows >= limit);
+        }
         let c = t.consumers[usize::from(m.0)].as_ref().expect("live");
         c.ring.fill_avail() >= min_fill && !(flows && c.flows >= limit)
     };
@@ -342,6 +368,11 @@ fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8], parkable: bool) -> Decision {
             return to(f.consumer, 0);
         }
     }
+    // An instance is trusted to send from its block only: its connections have no flow made at
+    // sending (its frames go straight to the device), and the port tells whose a segment is.
+    if let Some(c) = block_owner(t, mark).filter(|&c| instance_of(c).is_some()) {
+        return to(c, 0);
+    }
     if !group || !syn {
         return Decision::Stack;
     }
@@ -367,8 +398,8 @@ fn tcp(t: &mut Tables, ip: &Ip, frame: &[u8], parkable: bool) -> Decision {
         }
         None => {}
     }
-    if let Some(x) = t.consumers[usize::from(c)].as_mut() {
-        x.flows += 1;
+    if let Some(n) = t.owner_flows(c) {
+        *n += 1;
     }
     to(c, 0)
 }
@@ -467,7 +498,8 @@ pub fn deliver(t: &mut Tables, d: Decision, frame: &[u8]) -> bool {
             }
             true
         }
-        Decision::Stack => true,
+        // The caller hands the buffer to the lane of the instance (`switch::Switch`).
+        Decision::Stack | Decision::Instance(_) => true,
         Decision::Drop(_) => false,
     }
 }
@@ -716,6 +748,7 @@ fn udp_tx(t: &mut Tables, c: u8, ip: &Ip) -> Result<(), Reason> {
 mod tests {
     use super::*;
     use crate::switchlogic::ring::tests::Rig;
+    use crate::switchlogic::tables::INTERNAL_BASE;
     use crate::switchlogic::tables::tests::{OWN, Rng, with, with_flows};
     use crate::switchlogic::tables::{PARK_MS, PARK_PER_GROUP, PARK_SCAN_MS, PARK_SLOTS, ParkSlot};
     use proto_net::switch as sw;
@@ -2297,6 +2330,109 @@ mod tests {
             assert!(faces_own(t, &f));
             f[23] = 1;
             assert!(!faces_own(t, &f), "ICMP is the stack's own");
+        });
+    }
+
+    // ----- internal consumers: the stack instances of the service (P1 of the shared stack) -----
+
+    const INSTANCE_BLOCK: u16 = 50688;
+
+    fn instance(id: usize) -> u8 {
+        INTERNAL_BASE + id as u8
+    }
+
+    #[test]
+    fn a_frame_for_a_port_of_an_instances_block_goes_to_that_instance() {
+        with(|t, _| {
+            assert!(t.attach_instance(2, 1, Some(INSTANCE_BLOCK)));
+            let tcp = wire_tcp(443, INSTANCE_BLOCK + 7, ACK_);
+            assert_eq!(route(t, &tcp, Source::Wire), Decision::Instance(2));
+            let udp = wire_udp(53, INSTANCE_BLOCK + 511);
+            assert_eq!(route(t, &udp, Source::Wire), Decision::Instance(2));
+            // The ports around the block are not its (the one before lies in the block of a
+            // process, whose segments need a flow).
+            let before = wire_tcp(443, INSTANCE_BLOCK - 1, ACK_);
+            assert_eq!(route(t, &before, Source::Wire), Decision::Stack);
+            let after = wire_tcp(443, INSTANCE_BLOCK + 512, ACK_);
+            assert_eq!(route(t, &after, Source::Wire), Decision::Stack);
+            // An instance's frame goes to the lane of the instance, which takes no copy.
+            assert!(deliver(t, Decision::Instance(2), &tcp));
+            // It leaves: the block is the stack's again.
+            assert!(t.detach_instance(2));
+            assert_eq!(route(t, &tcp, Source::Wire), Decision::Stack);
+            assert!(!t.detach_instance(2), "a place left twice");
+        });
+    }
+
+    #[test]
+    fn a_syn_for_the_queue_of_an_instance_makes_the_flow_for_that_instance() {
+        with(|t, _| {
+            assert!(t.attach_instance(1, 7, None));
+            assert!(t.hold(3, Proto::Tcp, 9090, 1));
+            assert!(t.join(3, instance(1)));
+            let syn = route(t, &wire_tcp(4000, 9090, SYN), Source::Wire);
+            assert_eq!(syn, Decision::Instance(1));
+            assert_eq!(t.flows.len(), 1, "the SYN made a flow");
+            assert_eq!(t.instances[1].unwrap().flows, 1);
+            // The segments that follow find the flow, whatever the port table says.
+            for flags in [ACK_, 0x18, 0x11] {
+                let d = route(t, &wire_tcp(4000, 9090, flags), Source::Wire);
+                assert_eq!(d, Decision::Instance(1));
+            }
+            // An ICMP error that quotes the connection goes to the instance too.
+            let err = icmp_error(3, 6, OWN_IP, PEER, 9090, 4000);
+            assert!(matches!(
+                route(t, &err, Source::Wire),
+                Decision::Instance(1)
+            ));
+            // A segment of another connection with no SYN goes to the stack.
+            let stray = route(t, &wire_tcp(4001, 9090, ACK_), Source::Wire);
+            assert_eq!(stray, Decision::Stack);
+        });
+    }
+
+    #[test]
+    fn instances_and_processes_share_a_group_by_hash() {
+        with(|t, _| {
+            assert!(t.attach_instance(0, 1, None));
+            assert!(t.hold(4, Proto::Tcp, 9191, 1));
+            assert!(t.join(4, 0) && t.join(4, instance(0)));
+            let mut seen = [0u32; 2];
+            for sport in 2000..2100 {
+                match route(t, &wire_tcp(sport, 9191, SYN), Source::Wire) {
+                    Decision::Consumer { consumer: 0, .. } => seen[0] += 1,
+                    Decision::Instance(0) => seen[1] += 1,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(seen[0] > 20 && seen[1] > 20, "{seen:?}");
+            let owned = t.consumers[0].as_ref().unwrap().flows + t.instances[0].unwrap().flows;
+            assert_eq!(owned, 100);
+        });
+    }
+
+    #[test]
+    fn a_new_address_ends_the_flows_of_an_instance_and_its_membership_follows() {
+        with(|t, _| {
+            assert!(t.attach_instance(3, 1, None));
+            assert!(t.hold(5, Proto::Tcp, 9292, 1) && t.join(5, instance(3)));
+            assert_eq!(
+                route(t, &wire_tcp(5000, 9292, SYN), Source::Wire),
+                Decision::Instance(3)
+            );
+            let old = t.instances[3].unwrap().generation;
+            t.set_address([10, 0, 3, 7], 24);
+            assert_eq!(t.instances[3].unwrap().generation, old + 1);
+            assert!(!t.live(instance(3), old), "the old generation is dead");
+            assert!(t.live(instance(3), old + 1));
+            // The group's member followed the generation: a new SYN still finds it.
+            let syn = ip_frame(
+                THEM,
+                ([2, 0, 0, 0, 0, 1], [10, 0, 3, 7]),
+                6,
+                &tcp_part(5001, 9292, SYN),
+            );
+            assert_eq!(route(t, &syn, Source::Wire), Decision::Instance(3));
         });
     }
 }
