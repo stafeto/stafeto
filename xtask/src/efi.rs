@@ -325,10 +325,7 @@ pub fn vz() -> Result<(), String> {
     if o.lines.iter().any(|l| l.contains("KERNEL PANIC")) {
         return Err("VZ through the loader: the kernel panicked".into());
     }
-    println!(
-        "efi on VZ: ok; the shell connected {:.1} s after the start",
-        took.as_secs_f64()
-    );
+    println!("efi on VZ: ok; the shell connected through VZEFIBootLoader and the loader");
     Ok(())
 }
 
