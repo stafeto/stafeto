@@ -505,8 +505,10 @@ pub static INNER: Inner = Inner::new();
 
 /// What a step of a frame of the offload did.
 enum TsoStep {
-    /// A chunk was copied (the last one queued the chain).
+    /// A chunk of data was copied (`TSO_WEIGHT`).
     Copied,
+    /// The chain was taken, or queued: a light item (the weight of a frame).
+    Small,
     /// No chain of buffers for it yet.
     Waits,
     /// Its consumer is gone or its ring broke: the frame is dropped.
@@ -586,6 +588,9 @@ pub struct Switch {
     /// it was taken from.
     tso: [Option<TsoSend>; MAX_CONSUMERS],
     tso_gen: [u32; MAX_CONSUMERS],
+    /// The device is asked for an interrupt when it returns buffers of sending: a frame of the
+    /// offload waits for a chain, and the switch sleeps until the device frees buffers.
+    tx_irq: bool,
     /// The buffers the stack reads its frames in when the device merges segments (`netd::pool`).
     pool: netd::pool::Pool,
     /// Whose each buffer of the queue of sending is, in the order they went in: the device
@@ -693,6 +698,7 @@ impl Switch {
             big: None,
             tso: [const { None }; MAX_CONSUMERS],
             tso_gen: [0; MAX_CONSUMERS],
+            tx_irq: false,
             pool: if merged {
                 netd::pool::Pool::filled(virtio_net::books::TAILS, RX_BUFFERS)
             } else {
@@ -967,6 +973,10 @@ impl Switch {
         if self.tables.is_some() {
             more_c = self.consumer_frames();
         }
+        if self.tx_irq && !self.tso.iter().flatten().any(|s| s.nbuf == 0) {
+            self.tx.queue.set_dev_notify(false);
+            self.tx_irq = false;
+        }
         #[cfg(feature = "steps")]
         self.part(1, self.ran().saturating_sub(before_consumers));
         // The frames of the wire.
@@ -1107,9 +1117,13 @@ impl Switch {
             t.consumers.iter().enumerate().filter_map(|(c, x)| {
                 x.as_ref().map(|x| {
                     // A frame of the offload with its chain taken is copied whatever the
-                    // share of the queue.
-                    if self.tso[c].as_ref().is_some_and(|s| s.nbuf > 0) {
-                        (self.period.left(), 0)
+                    // share of the queue; one that waits for its chain is work only when the
+                    // chain can be taken (else the switch would spin on it).
+                    if let Some(s) = self.tso[c].as_ref() {
+                        let can = s.nbuf > 0
+                            || s.may_take(self.tx.book.free(), usize::from(self.inflight[c]), cap)
+                            || self.tx.queue.can_pop();
+                        (can && self.period.left(), 0)
                     } else {
                         (
                             x.ring.tx_pending() && self.period.left(),
@@ -1261,6 +1275,11 @@ impl Switch {
                             budget = budget.saturating_sub(TSO_WEIGHT);
                             taken += TSO_WEIGHT;
                         }
+                        TsoStep::Small => {
+                            progressed = true;
+                            budget = budget.saturating_sub(1);
+                            taken += 1;
+                        }
                         TsoStep::Waits => blocked = true,
                         TsoStep::Gone => {}
                     }
@@ -1389,9 +1408,11 @@ impl Switch {
         }
     }
 
-    /// One step of the frame of consumer `c` the switch holds: its chain of buffers is taken
-    /// when it has none (they all or none), then a chunk is copied; after the last the chain goes
-    /// into the queue and the entries are free.
+    /// One item of the frame of consumer `c` the switch holds, one of three in turn: its chain of
+    /// buffers is taken (all or none) with the headers put in the first (`TsoStep::Small`), a
+    /// chunk of the data is copied (`TsoStep::Copied`, the heavy item), and, once every byte is
+    /// in, the chain goes into the queue and the entries are free (`Small`). The items are apart
+    /// so that each stays within the weight the step rule charges for it.
     fn tso_step(&mut self, c: usize) -> TsoStep {
         let gone = self.tables.as_ref().is_none_or(|t| {
             t.consumers[c]
@@ -1410,11 +1431,16 @@ impl Switch {
             return TsoStep::Gone;
         }
         if s.nbuf == 0 {
-            // A consumer with nothing in the queue may always send one frame; the rest keeps
-            // to its share (`consumer_cap`).
             let (k, held) = (s.buffers(), usize::from(self.inflight[c]));
-            if self.tx.book.free() < k || held > 0 && held + k > cap {
-                bump(&INNER.stats.tso_waits);
+            if !s.may_take(self.tx.book.free(), held, cap) {
+                if !core::mem::replace(&mut s.waited, true) {
+                    bump(&INNER.stats.tso_waits);
+                }
+                // The device tells when it returns buffers (`go_idle` looks once more after
+                // this, for buffers it returned already).
+                if !core::mem::replace(&mut self.tx_irq, true) {
+                    self.tx.queue.set_dev_notify(true);
+                }
                 return TsoStep::Waits;
             }
             for slot in &mut s.bufs[..k] {
@@ -1423,16 +1449,17 @@ impl Switch {
             s.nbuf = k;
             // SAFETY: the buffers are free (just taken from the pool).
             s.begin(unsafe { virtio_net::rings::buffer_at(self.tx.base(), s.bufs[0]) });
+            return TsoStep::Small;
         }
-        let base = self.tx.base();
-        let t = self.tables.as_ref().expect("checked above");
-        let ring = &t.consumers[c].as_ref().expect("checked above").ring;
-        // SAFETY: the buffers of the chain are the switch's until it is queued.
-        let whole = s.chunk(ring, &mut |n| unsafe {
-            virtio_net::rings::buffer_at(base, n)
-        });
-        bump(&INNER.stats.tso_chunks);
-        if !whole {
+        if !s.done() {
+            let base = self.tx.base();
+            let t = self.tables.as_ref().expect("checked above");
+            let ring = &t.consumers[c].as_ref().expect("checked above").ring;
+            // SAFETY: the buffers of the chain are the switch's until it is queued.
+            s.chunk(ring, &mut |n| unsafe {
+                virtio_net::rings::buffer_at(base, n)
+            });
+            bump(&INNER.stats.tso_chunks);
             return TsoStep::Copied;
         }
         let (bufs, n, total) = (s.bufs, s.nbuf, s.total());
@@ -1457,7 +1484,7 @@ impl Switch {
         if let Some(x) = self.tables.as_mut().and_then(|t| t.consumers[c].as_mut()) {
             x.ring.tso_done();
         }
-        TsoStep::Copied
+        TsoStep::Small
     }
 
     /// The copy in `scratch` is checked and goes out, or turns back into the tables. `sum`: the

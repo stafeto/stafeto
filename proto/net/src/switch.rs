@@ -88,9 +88,11 @@ pub const TX_PAD: u16 = 8;
 pub const TSO_HEAD_MAX: usize = 128;
 pub const TSO_BODY_MAX: usize = 16384;
 pub const TSO_FRAME_MAX: usize = TSO_BODY_MAX + TSO_HEAD_MAX;
-/// The least MSS of an entry of the segmentation offload (RFC 9293, 3.7.1: the default 536), and
-/// the most (1 500 less the shortest IPv4 and TCP headers, the largest MTU of the wire).
-pub const TSO_MSS_MIN: u16 = 536;
+/// The least MSS of an entry of the segmentation offload, and the most (1 500 less the shortest
+/// IPv4 and TCP headers, the largest MTU of the wire). The least is FreeBSD's `tcp_minmss` (216):
+/// the stack sends `t_maxseg` less the options, so a peer with an MSS of 536 and timestamps gets
+/// segments of 524 (virtio has no floor of its own).
+pub const TSO_MSS_MIN: u16 = 216;
 pub const TSO_MSS_MAX: u32 = 1460;
 /// The shortest frame of the segmentation offload: Ethernet, IPv4 and TCP headers without options.
 pub const TSO_HEAD_MIN: usize = 54;

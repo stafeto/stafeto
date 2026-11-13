@@ -34,6 +34,8 @@ pub struct Send {
     /// The device buffers of the chain, taken; `nbuf` of them.
     pub bufs: [u16; CHAIN_MAX],
     pub nbuf: usize,
+    /// The frame waited for its buffers (said once, so the counter counts frames).
+    pub waited: bool,
 }
 
 impl Send {
@@ -52,6 +54,7 @@ impl Send {
             copied: h.headers,
             bufs: [0; CHAIN_MAX],
             nbuf: 0,
+            waited: false,
         }
     }
 
@@ -71,6 +74,14 @@ impl Send {
         first[..HDR_LEN].copy_from_slice(&tso::header(&self.head, self.mss));
         first[HDR_LEN..HDR_LEN + self.head.headers]
             .copy_from_slice(&self.bytes[..self.head.headers]);
+    }
+
+    /// Whether the chain can be taken now: `free` buffers are in the pool and the consumer has
+    /// `held` of its share of `cap` in the queue. A consumer with nothing in the queue may always
+    /// send one frame; the rest keeps to its share.
+    pub fn may_take(&self, free: usize, held: usize, cap: usize) -> bool {
+        let k = self.buffers();
+        free >= k && (held == 0 || held + k <= cap)
     }
 
     /// Whether every byte is copied.
@@ -288,5 +299,26 @@ mod tests {
             6,
             "six cells for a frame of 10 294 bytes"
         );
+    }
+
+    #[test]
+    fn a_frame_waits_for_all_its_buffers_and_a_consumer_with_none_in_the_queue_may_always_send() {
+        let f = frame(16_384);
+        let (_bufs, shape) = through(&f, 1448);
+        assert_eq!(shape.nbuf, 9);
+        let h = tso::parse(&f[..128], f.len(), 1448).unwrap();
+        let s = Send::new(&f[..128], f.len(), 1448, h);
+        assert_eq!(s.buffers(), 9);
+        // Free buffers: eight are not enough (the switch would spin on a frame it cannot take).
+        for free in 0..9 {
+            assert!(!s.may_take(free, 0, 64), "{free} free");
+        }
+        assert!(s.may_take(9, 0, 64));
+        // A share of 21 (three workers) holds one frame of nine and not a second.
+        assert!(s.may_take(200, 12, 21));
+        assert!(!s.may_take(200, 13, 21));
+        // A consumer with nothing in the queue takes a frame even when its share is smaller.
+        assert!(s.may_take(200, 0, 8));
+        assert!(!s.may_take(200, 1, 8));
     }
 }

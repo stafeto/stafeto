@@ -540,8 +540,10 @@ pub fn check_tso(t: &mut Tables, c: u8, head: &[u8], headers: usize) -> Verdict 
     only.copy_from_slice(&head[..headers]);
     only[ETHERNET_HEADER + 2..ETHERNET_HEADER + 4]
         .copy_from_slice(&((headers - ETHERNET_HEADER) as u16).to_be_bytes());
+    // `verdict` answers `Loop` and `Broke` for a frame flagged as loopback only: none here, but a
+    // frame that would get one is refused and counted like a turn.
     let v = match verdict(t, c, only, false) {
-        Verdict::Hairpin => Verdict::Refuse(Reason::Tso),
+        Verdict::Hairpin | Verdict::Loop | Verdict::Broke => Verdict::Refuse(Reason::Tso),
         v => v,
     };
     if let Verdict::Refuse(r) = v {

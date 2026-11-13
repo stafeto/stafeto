@@ -23,7 +23,7 @@ pub const GSO_TCPV4: u8 = 1;
 /// the length of the segment, the way FreeBSD and the drivers of DPDK write it for a frame of
 /// TSO, so the device adds the length of each segment it cuts. `true` puts the length of the whole
 /// frame's TCP part in it, as a single frame has it.
-pub const PSEUDO_WITH_LENGTH: bool = false;
+pub const PSEUDO_WITH_LENGTH: bool = true;
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -53,7 +53,7 @@ pub enum Refusal {
     Protocol,
     /// The data is no more than one segment (nothing to cut), or more than the offload takes.
     Data,
-    /// The size of a segment is outside 536 to what the MTU of 1 500 leaves after the headers.
+    /// The size of a segment is outside 216 (`TSO_MSS_MIN`) to what the MTU of 1 500 leaves after the headers.
     Mss,
     /// SYN, RST or CWR: a device without `HOST_ECN` does not cut a frame with CWR, and a SYN or
     /// an RST has no data to cut.
@@ -285,9 +285,11 @@ pub(crate) mod tests {
         assert_eq!(ok(&many, many.len(), 1448), Err(Refusal::Data));
         let most = frame(0, 0, 16_384, 0x10);
         assert!(ok(&most, most.len(), 1448).is_ok());
-        // The size of a segment: below 536, above what 1 500 leaves.
-        assert_eq!(ok(&good, n, 535), Err(Refusal::Mss));
-        assert!(ok(&good, n, 536).is_ok());
+        // The size of a segment: below 216, above what 1 500 leaves.
+        assert_eq!(ok(&good, n, 215), Err(Refusal::Mss));
+        assert!(ok(&good, n, 216).is_ok());
+        // A peer with an MSS of 536 and timestamps: FreeBSD cuts at 524 (the old floor refused it).
+        assert!(ok(&good, n, 524).is_ok());
         assert!(ok(&good, n, 1460).is_ok());
         assert_eq!(ok(&good, n, 1461), Err(Refusal::Mss));
         assert_eq!(ok(&big, big.len(), 1421), Err(Refusal::Mss));
@@ -323,6 +325,7 @@ pub(crate) mod tests {
             (12, 10_240, 1448, 0x18),
             (12, 16_384, 1448, 0x19),
             (0, 1449, 536, 0x10),
+            (12, 1449, 524, 0x10),
             (40, 9_999, 1460 - 40, 0x10),
         ] {
             let mut f = frame(0, tcp_options, data, flags);

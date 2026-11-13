@@ -687,7 +687,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_mss_out_of_range_refuses_the_frame_and_frees_its_entries() {
-        for mss in [0, 1, 535, 1461, 9_000, u32::MAX] {
+        for mss in [0, 1, 215, 1461, 9_000, u32::MAX] {
             let rig = Rig::new(Layout::new(256, 64).unwrap());
             let mut ring = rig.ring();
             let mut out = [0; CELL];
@@ -701,7 +701,7 @@ pub(crate) mod tests {
                 "three entries freed: {mss}"
             );
         }
-        for mss in [536, 1460] {
+        for mss in [216, 524, 1460] {
             let rig = Rig::new(Layout::new(256, 64).unwrap());
             let mut ring = rig.ring();
             let mut out = [0; CELL];
