@@ -1,0 +1,1 @@
+virt,gic-version=3,its=on,acpi=on,highmem-ecam=off -cpu cortex-a72 -m 512M -smp 2

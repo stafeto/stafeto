@@ -212,18 +212,29 @@ impl Iterator for Reservations<'_> {
     }
 }
 
-/// Writes blobs for tests: the tokens of a structure block in the order
+#[cfg(all(feature = "builder", not(test)))]
+use alloc::vec::Vec;
+
+/// Writes blobs, for tests and for the boot loader (feature `builder`, which the
+/// kernel leaves off): the tokens of a structure block in the order
 /// given, whether they nest or not, after a header of version 17 and an
 /// empty memory reservation block.
-#[cfg(test)]
-pub(crate) struct Builder {
+#[cfg(any(test, feature = "builder"))]
+pub struct Builder {
     structure: Vec<u8>,
     strings: Vec<u8>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "builder"))]
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "builder"))]
 impl Builder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             structure: Vec::new(),
             strings: Vec::new(),
@@ -239,7 +250,7 @@ impl Builder {
         self.structure.resize(align4(self.structure.len()), 0);
     }
 
-    pub(crate) fn begin(mut self, name: &str) -> Self {
+    pub fn begin(mut self, name: &str) -> Self {
         self = self.token(TOKEN_BEGIN_NODE);
         self.structure.extend(name.as_bytes());
         self.structure.push(0);
@@ -247,7 +258,7 @@ impl Builder {
         self
     }
 
-    pub(crate) fn prop(mut self, name: &str, value: &[u8]) -> Self {
+    pub fn prop(mut self, name: &str, value: &[u8]) -> Self {
         let nameoff = self.strings.len() as u32;
         self.strings.extend(name.as_bytes());
         self.strings.push(0);
@@ -260,17 +271,17 @@ impl Builder {
     }
 
     /// A property of big-endian 32-bit cells.
-    pub(crate) fn cells(self, name: &str, cells: &[u32]) -> Self {
+    pub fn cells(self, name: &str, cells: &[u32]) -> Self {
         let value: Vec<u8> = cells.iter().flat_map(|c| c.to_be_bytes()).collect();
         self.prop(name, &value)
     }
 
-    pub(crate) fn end(self) -> Self {
+    pub fn end(self) -> Self {
         self.token(TOKEN_END_NODE)
     }
 
     /// The blob, with the END token after the tokens given.
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         let Builder { structure, strings } = self.token(TOKEN_END);
         let rsvmap = HEADER_SIZE;
         let off_struct = rsvmap + 16;

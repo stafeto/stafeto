@@ -371,7 +371,7 @@ static METADATA: Guarded<Region> = Guarded::new(Region { base: 0, size: 0 });
 
 /// Starts the allocator with the usable RAM that is mapped now; returns the
 /// rest, which becomes reachable with the kernel page tables.
-pub fn init(boot: &Boot) -> RegionList<32> {
+pub fn init(boot: &Boot) -> RegionList<{ kcore::bootinfo::USABLE_REGIONS }> {
     let memory = boot.info.memory.as_slice();
     let span_base = memory.iter().map(|r| r.base).min().must("no memory") / PAGE_SIZE * PAGE_SIZE;
     let span_end = memory.iter().map(|r| r.end()).max().must("no memory");
