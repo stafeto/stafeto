@@ -1046,7 +1046,12 @@ impl Switch {
         self.receive(lane_rules::widest(&room).min(budget), &mut room);
         #[cfg(feature = "steps")]
         let before_sweep = self.ran();
-        if let Some(t) = self.tables.as_mut()
+        // The sweep (128 places, up to 7 000 ticks under -icount) goes only into a step that is
+        // inside its soft share, so that it never comes on top of a step full of frames; a step
+        // that is over it leaves the sweep to the next one (`last_sweep` stays).
+        let sweep_now = !self.over_soft();
+        if sweep_now
+            && let Some(t) = self.tables.as_mut()
             && now.wrapping_sub(self.last_sweep) >= SWEEP_EVERY_NS
         {
             self.last_sweep = now;

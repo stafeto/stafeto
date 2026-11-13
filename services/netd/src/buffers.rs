@@ -7,7 +7,10 @@
 //! (`dma::buffer_at` in the program); a session names the entry by its
 //! index. An entry whose session went is retired: it stays taken until the
 //! step that unmaps it lets it go, one unmap a step, and its generation
-//! grows then.
+//! grows then. The map of 64 pages is the longest call the service makes (about 11 000 ticks
+//! under -icount), so BUFFER takes the entry and the object in its own step and a step of
+//! its own does the map and the reply: an entry is waiting from the one to the other, and is
+//! no buffer of its session yet (`owned_by`).
 //!
 //! The service reads nothing that steers it from the buffer: the offset and
 //! the length of a cell come in the request (`proto_net::cell_fits`), and
@@ -40,6 +43,8 @@ pub struct Buffers {
     used: u64,
     /// The entries whose session went and that wait to be unmapped.
     retired: u64,
+    /// The entries taken by a BUFFER whose map has not been made yet.
+    waiting: u64,
     /// The limit of `netd.conf` (`buffers N`).
     limit: u16,
     /// The mappings of the service: a buffer takes one while its entry is taken, and the rings of
@@ -65,6 +70,7 @@ impl Buffers {
             }; BUFFER_SESSIONS],
             used: 0,
             retired: 0,
+            waiting: 0,
             maps: Mappings::new(),
             base: 0,
             limit: if limit as usize > BUFFER_SESSIONS {
@@ -128,6 +134,7 @@ impl Buffers {
         }
         self.used &= !(1 << i);
         self.retired &= !(1 << i);
+        self.waiting &= !(1 << i);
         self.maps.release(1);
         let e = &mut self.entries[i];
         e.label = 0;
@@ -141,6 +148,36 @@ impl Buffers {
         }
     }
 
+    /// The entry `i`, just given, waits for its map.
+    pub fn wait(&mut self, i: usize) {
+        if i < BUFFER_SESSIONS && self.used & (1 << i) != 0 {
+            self.waiting |= 1 << i;
+        }
+    }
+
+    /// The map of the entry `i` is made: it is its session's buffer now.
+    pub fn mapped(&mut self, i: usize) {
+        if i < BUFFER_SESSIONS {
+            self.waiting &= !(1 << i);
+        }
+    }
+
+    /// Whether the entry `i` waits for its map.
+    pub fn is_waiting(&self, i: usize) -> bool {
+        i < BUFFER_SESSIONS && self.waiting & (1 << i) != 0
+    }
+
+    /// The first entry that waits for its map, which a step maps.
+    pub fn next_waiting(&self) -> Option<usize> {
+        (self.waiting != 0).then(|| self.waiting.trailing_zeros() as usize)
+    }
+
+    /// Whether the entry `i` is taken by the session `label`, in any state (waiting, mapped or
+    /// retired): a session that kept the number of an entry that was given back finds it so.
+    pub fn held_by(&self, i: usize, label: u64) -> bool {
+        i < BUFFER_SESSIONS && self.used & (1 << i) != 0 && self.entries[i].label == label
+    }
+
     /// The first retired entry, which a step unmaps and frees.
     pub fn next_retired(&self) -> Option<usize> {
         (self.retired != 0).then(|| self.retired.trailing_zeros() as usize)
@@ -151,6 +188,7 @@ impl Buffers {
         i < BUFFER_SESSIONS
             && self.used & (1 << i) != 0
             && self.retired & (1 << i) == 0
+            && self.waiting & (1 << i) == 0
             && self.entries[i].label == label
     }
 
@@ -250,6 +288,31 @@ mod tests {
         assert_eq!(b.give(999), Ok(5));
         assert!(b.owned_by(5, 999));
         assert!(!b.owned_by(5, 105));
+    }
+
+    #[test]
+    fn an_entry_that_waits_for_its_map_is_no_buffer_yet() {
+        let mut b = Buffers::new(64);
+        let i = b.give(7).unwrap();
+        b.wait(i);
+        assert!(b.is_waiting(i) && b.held_by(i, 7) && !b.owned_by(i, 7));
+        assert_eq!(b.next_waiting(), Some(i));
+        b.mapped(i);
+        assert!(!b.is_waiting(i) && b.owned_by(i, 7));
+        assert_eq!(b.next_waiting(), None);
+        // Freed while waiting (the session went, or the map failed): nothing waits any longer,
+        // and a session that kept the number does not hold the entry the next one gets.
+        let j = b.give(8).unwrap();
+        b.wait(j);
+        b.free(j);
+        assert_eq!(b.next_waiting(), None);
+        assert!(!b.is_waiting(j) && !b.held_by(j, 8));
+        assert_eq!(b.give(9), Ok(j));
+        assert!(!b.held_by(j, 8) && b.held_by(j, 9));
+        // An entry that is not taken waits for nothing.
+        b.free(j);
+        b.wait(j);
+        assert_eq!(b.next_waiting(), None);
     }
 
     #[test]

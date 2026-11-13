@@ -190,6 +190,12 @@ impl Hold {
     }
 }
 
+/// The longest step the service aims at, in ticks under -icount: 10 percent under the bound of
+/// 0.9 of term B (18 369). The probes warn above it (`xtask`, `net_probe::STEP_MARGIN`), and the
+/// worst-case sums of the step rule of the switch are held to it, so that a small change or the
+/// noise of a boot does not take a step past the bound.
+pub const STEP_MARGIN: usize = 16_500;
+
 /// The frames the switch thread takes off the queue of receiving in one
 /// step, and the frames of sending it puts in the queue (the bound of a
 /// step, as `STEP_RX` and `STEP_TX` are for the stack): a frame costs the
@@ -197,6 +203,13 @@ impl Hold {
 /// -icount, and the step is bound by 0.9 of term B (18 369).
 pub const SWITCH_RX: usize = 8;
 pub const SWITCH_TX: usize = 16;
+/// The time in ticks a step of receiving may have used when it takes another frame of the wire:
+/// a frame of the wire costs up to 7 200 ticks under -icount (the answer to it, a copy and the
+/// sum, included) and the rest of the step 3 000, so two of them past the soft share would go
+/// over the margin. Past it the frame waits for the next step, which the stack tells itself.
+/// On a real clock a step is far under it and takes its `STEP_RX` frames whatever they are.
+pub const RX_SOFT: u64 = 6_000;
+const _: () = assert!(RX_SOFT as usize + 7_200 + 3_000 <= STEP_MARGIN);
 /// The buffers the stack gave back (of receiving, of sending) the switch
 /// takes in a step, each.
 pub const SWITCH_BACK: usize = 32;
@@ -323,21 +336,26 @@ const _: () = assert!(
 /// owners, about 1 300) are items of their own, `TSO_SMALL_TICKS` at most, and weigh one frame
 /// each (the base share counts 1 800 for a frame of a consumer). A chunk weighs the whole base share like a heavy frame
 /// (`SUM_WEIGHT`), so the frames a step always takes hold at most one chunk, and the worst step
-/// is the soft share, one chunk past it, the base frames of the wire and the tail: 17 600 ticks
-/// against the bound.
+/// is the soft share, one chunk past it, the base frames of the wire and the tail: 16 200 ticks
+/// against the margin (`STEP_MARGIN`).
 pub const TSO_TICKS: usize = 3_100;
 pub const TSO_SMALL_TICKS: usize = 1_300;
 pub const TSO_WEIGHT: usize = SWITCH_BASE;
-pub const SWITCH_SOFT: u64 = 7_000;
+pub const SWITCH_SOFT: u64 = 5_600;
 const _: () = assert!(
     TSO_SMALL_TICKS <= 1_800
         && SWITCH_BASE.div_ceil(TSO_WEIGHT) * TSO_TICKS <= SWITCH_BASE * 1_800
-        && SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000 <= 18_369
+        && SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000 <= STEP_MARGIN
 );
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
+/// A step of the sweep of the flow table (128 places, up to 32 removals) costs up to 7 200 ticks
+/// under -icount. The switch makes it only in a step that is inside its soft share, so the
+/// worst step with a sweep is the soft share, the sweep and the tail of 1 500 ticks.
+pub const SWEEP_TICKS: usize = 7_200;
+const _: () = assert!(SWITCH_SOFT as usize + SWEEP_TICKS + 1_500 <= STEP_MARGIN);
 /// The CPU the switch thread leaves to the levels below it, two parts.
 ///
 /// The budget (`Period`): the thread spends at most `CONSUMER_BUDGET_NS` of each
@@ -549,7 +567,7 @@ const _: () = assert!(SWITCH_STEP_REST + SWITCH_RX * SWITCH_STEP_RX_FRAME <= 12_
 /// 3 300. The worst case is the soft share, one more frame, the base frames of the second
 /// kind and the tail.
 const _: () = assert!(
-    SWITCH_SOFT as usize + 1_800 + SWITCH_BASE * 1_500 + 3_000 <= 18_369
+    SWITCH_SOFT as usize + 1_800 + SWITCH_BASE * 1_500 + 3_000 <= STEP_MARGIN
         && 3_300 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
 );
 
@@ -1101,6 +1119,29 @@ impl Default for Budget {
 
 #[cfg(test)]
 mod tests {
+    /// The constants of the step rule that hold the longest step of the switch and of the stack
+    /// under `STEP_MARGIN` (10 percent under 0.9 of term B): a change to one of them is a change
+    /// to the margin, and is made with the measurement of `net-probe steps` and
+    /// `fast-probe switch steps` beside it.
+    #[test]
+    fn the_step_rule_constants_hold_the_margin() {
+        assert_eq!(STEP_MARGIN, 16_500);
+        assert_eq!(SWITCH_BASE, 3);
+        assert_eq!(SWITCH_SOFT, 5_600);
+        assert_eq!(RX_SOFT, 6_000);
+        assert_eq!(SWEEP_TICKS, 7_200);
+        // The sums that hold them to the margin are asserts at the constants (they fail the
+        // build); the sums are pinned here too, so that a change of one number shows as a change
+        // of the rule.
+        let worst = [
+            SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000,
+            SWITCH_SOFT as usize + SWEEP_TICKS + 1_500,
+            RX_SOFT as usize + 7_200 + 3_000,
+        ];
+        assert_eq!(worst, [16_200, 14_300, 16_200]);
+        assert!(worst.iter().all(|&w| w <= STEP_MARGIN));
+    }
+
     use super::*;
 
     /// An instance fed items of 100 us one after another: it pauses once its run has lasted

@@ -376,6 +376,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
             "fast-switch steps: every kind: {rows:?} (bound {})",
             net_probe::STEP_MAX
         );
+        net_probe::say_margin("fast-probe switch steps", &rows);
     }
     println!(
         "fast-switch {scenario:?} passed in {:.0} s",

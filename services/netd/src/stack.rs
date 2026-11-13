@@ -599,10 +599,20 @@ impl<'a> Stack<'a> {
 pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net, now_ns: u64) {
     let now = instant(now_ns);
     let mut first = true;
+    let entered = rt::time::now();
     loop {
         let began = split::now();
         let sent = split::get(&split::TX);
         let Some(dest) = device.stage() else { break };
+        // A frame of the wire that comes after the soft share of the step (`RX_SOFT`) waits for
+        // the next step, as one the stack answers does: two full frames never make one step.
+        if !first
+            && device.held_is_wire()
+            && rt::time::now().saturating_sub(entered) > netd::ring::RX_SOFT
+        {
+            device.defer_held();
+            break;
+        }
         let place = net.route(stack, dest);
         if core::mem::take(&mut net.drop_frame) {
             // A SYN to a queue with no room: no RST, the peer sends it again.
