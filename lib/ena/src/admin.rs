@@ -262,3 +262,48 @@ pub const HOST_INFO_NUM_CPUS: usize = 188;
 /// `ENA_COMMON_SPEC_VERSION_MAJOR` and `_MINOR` of ena_common_defs.h.
 pub const SPEC_VERSION_MAJOR: u16 = 2;
 pub const SPEC_VERSION_MINOR: u16 = 0;
+
+/// `ena_admin_aq_create_cq_cmd`, after the common descriptor: `cq_caps_1` at 4
+/// (interrupt mode in bit 5), `cq_caps_2` at 5 (the entry size in 32-bit words,
+/// bits 4:0), `cq_depth` (16 bits) at 6, `msix_vector` at 8, `cq_ba` at 12.
+pub const CQ_CAPS_1: usize = 4;
+pub const CQ_CAPS_2: usize = 5;
+pub const CQ_DEPTH: usize = 6;
+pub const CQ_MSIX_VECTOR: usize = 8;
+pub const CQ_BA: usize = 12;
+pub const CQ_INTERRUPT_MODE: u8 = 1 << 5;
+
+/// `ena_admin_aq_create_sq_cmd`: `sq_identity` at 4 (the direction in bits
+/// 7:5), `sq_caps_2` at 6 (placement policy in 3:0, completion policy in 6:4),
+/// `sq_caps_3` at 7 (bit 0: physically contiguous), `cq_idx` (16 bits) at 8,
+/// `sq_depth` (16 bits) at 10, `sq_ba` at 12, `sq_head_writeback` at 20.
+pub const SQ_IDENTITY: usize = 4;
+pub const SQ_CAPS_2: usize = 6;
+pub const SQ_CAPS_3: usize = 7;
+pub const SQ_CQ_IDX: usize = 8;
+pub const SQ_DEPTH: usize = 10;
+pub const SQ_BA: usize = 12;
+pub const SQ_DIRECTION_SHIFT: u8 = 5;
+/// enum ena_admin_sq_direction.
+pub const SQ_DIRECTION_TX: u8 = 1;
+pub const SQ_DIRECTION_RX: u8 = 2;
+/// enum ena_admin_placement_policy_type, and enum
+/// ena_admin_completion_policy_type with the shift of its field.
+pub const PLACEMENT_HOST: u8 = 1;
+pub const COMPLETION_POLICY_DESC: u8 = 0;
+pub const COMPLETION_POLICY_SHIFT: u8 = 4;
+pub const SQ_PHYSICALLY_CONTIGUOUS: u8 = 1;
+
+/// `ena_admin_acq_create_cq_resp_desc`, from `ACQ_DATA`: `cq_idx` (16 bits) 0,
+/// `cq_actual_depth` (16 bits) 2, `numa_node_register_offset` 4,
+/// `cq_head_db_register_offset` 8, `cq_interrupt_unmask_register_offset` 12.
+pub const CQ_RESP_IDX: usize = 0;
+pub const CQ_RESP_HEAD_DB: usize = 8;
+pub const CQ_RESP_UNMASK: usize = 12;
+/// `ena_admin_acq_create_sq_resp_desc`, from `ACQ_DATA`: `sq_idx` (16 bits) 0,
+/// `sq_doorbell_offset` 4.
+pub const SQ_RESP_IDX: usize = 0;
+pub const SQ_RESP_DB: usize = 4;
+
+/// An entry of an MSI-X table is 16 bytes (PCI Local Bus 3.0, 6.8.2).
+pub const MSIX_ENTRY: usize = 16;

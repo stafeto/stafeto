@@ -42,13 +42,15 @@ const USAGE: &str = "usage: xtask aws check
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
+       xtask aws pair --ami AMI [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
        xtask aws clean --session S
        xtask aws sweep [--remove]";
 
 // ---- the CLI -------------------------------------------------------------------
 
 /// Hides the identifiers the reports must not carry: account numbers (twelve
-/// digits), and the ids of instances, images, volumes, snapshots and groups.
+/// digits), the ids of instances, images, volumes, snapshots and groups, and IPv4
+/// addresses.
 pub fn redact(text: &str) -> String {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -76,6 +78,13 @@ pub fn redact(text: &str) -> String {
                     continue 'outer;
                 }
             }
+            if (i == 0 || b[i - 1] != b'.')
+                && let Some(n) = ipv4_len(&text[i..])
+            {
+                out.push_str("<ip>");
+                i += n;
+                continue;
+            }
             if b.len() >= i + 12
                 && b[i..i + 12].iter().all(u8::is_ascii_digit)
                 && (b.len() == i + 12 || !b[i + 12].is_ascii_alphanumeric())
@@ -90,6 +99,35 @@ pub fn redact(text: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// The length of the dotted quad (four decimal numbers of at most three digits, 0 to 255)
+/// that starts `text`, if one does and no digit or dot continues it.
+fn ipv4_len(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut at = 0;
+    for part in 0..4 {
+        let digits = b[at..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > 3 || text[at..at + digits].parse::<u16>().ok()? > 255 {
+            return None;
+        }
+        at += digits;
+        if part < 3 {
+            if b.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+    }
+    match b.get(at) {
+        Some(c)
+            if c.is_ascii_digit()
+                || *c == b'.' && b.get(at + 1).is_some_and(u8::is_ascii_digit) =>
+        {
+            None
+        }
+        _ => Some(at),
+    }
 }
 
 /// The program that runs the calls: `aws`, or a fake of the host tests.
@@ -350,6 +388,21 @@ fn delete(s: &Session, kind: Kind, id: &str) -> Result<(), String> {
             aws(&["ec2", "deregister-image", "--image-id", id])?;
         }
         Kind::Group => {
+            // A group of the pair names itself in its rules: they go first (a closed
+            // group has none of this kind, and the calls then say so, which is no matter).
+            for what in [
+                "revoke-security-group-ingress",
+                "revoke-security-group-egress",
+            ] {
+                let _ = aws(&[
+                    "ec2",
+                    what,
+                    "--group-id",
+                    id,
+                    "--ip-permissions",
+                    &self_rule(id),
+                ]);
+            }
             aws(&["ec2", "delete-security-group", "--group-id", id])?;
         }
     }
@@ -534,14 +587,24 @@ fn default_subnet() -> Result<(String, String), String> {
         "describe-subnets",
         "--filters",
         "Name=default-for-az,Values=true",
-        "Name=availability-zone,Values=eu-central-1a",
+        &format!("Name=availability-zone,Values={}", zone()),
         "--query",
         "Subnets[0].[SubnetId,VpcId]",
     ])?;
     let f: Vec<&str> = r.split_whitespace().collect();
     match f[..] {
         [s, v] => Ok((s.to_string(), v.to_string())),
-        _ => Err("no default subnet in eu-central-1a".into()),
+        _ => Err(format!("no default subnet in {}", zone())),
+    }
+}
+
+/// The zone the instances start in: `eu-central-1a`, or the letter `a`, `b` or `c` in
+/// `STAFETO_AWS_ZONE` (a zone that has no capacity for the type answers
+/// InsufficientInstanceCapacity; the next launch may name another).
+fn zone() -> String {
+    match std::env::var("STAFETO_AWS_ZONE").as_deref() {
+        Ok(z @ ("a" | "b" | "c")) => format!("{REGION}{z}"),
+        _ => format!("{REGION}a"),
     }
 }
 
@@ -620,6 +683,13 @@ struct Launch<'a> {
     ty: &'a str,
     user_data: Option<&'a Path>,
     extra_snapshot: Option<&'a str>,
+    /// A group of the caller (the pair's, whose rules it has checked); the closed group of
+    /// the session when none.
+    group: Option<&'a str>,
+    /// The interface gets a public address (the one session that reaches the internet).
+    public_ip: bool,
+    /// The address in the subnet the interface takes, when the caller fixes it.
+    private_ip: Option<&'a str>,
 }
 
 /// Starts one instance with every guard; the journal has it and its volumes.
@@ -636,11 +706,16 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
             "{live} instances of the project are alive: the limit is {MAX_LIVE}"
         ));
     }
-    let group = closed_group(s)?;
-    assert_closed(&group)?;
+    let group = match l.group {
+        Some(g) => g.to_string(),
+        None => {
+            let g = closed_group(s)?;
+            assert_closed(&g)?;
+            g
+        }
+    };
     let (subnet, _) = default_subnet()?;
-    let nic =
-        format!("DeviceIndex=0,SubnetId={subnet},AssociatePublicIpAddress=false,Groups={group}");
+    let nic = nic_spec(&subnet, &group, l.public_ip, l.private_ip);
     let mut args: Vec<String> = [
         "ec2",
         "run-instances",
@@ -738,6 +813,17 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
     }
     println!("started a {} ({})", l.ty, redact(&id));
     Ok((id, started))
+}
+
+/// The `--network-interfaces` value of an instance.
+fn nic_spec(subnet: &str, group: &str, public_ip: bool, private_ip: Option<&str>) -> String {
+    let mut nic = format!(
+        "DeviceIndex=0,SubnetId={subnet},AssociatePublicIpAddress={public_ip},Groups={group}"
+    );
+    if let Some(ip) = private_ip {
+        nic.push_str(&format!(",PrivateIpAddress={ip}"));
+    }
+    nic
 }
 
 /// A token for one call of `run-instances`: the session and the clock.
@@ -1123,6 +1209,9 @@ fn boot(args: &[String]) -> Result<(), String> {
             ty: &ty,
             user_data: None,
             extra_snapshot: None,
+            group: None,
+            public_ip: false,
+            private_ip: None,
         },
     )?;
     let result = (|| {
@@ -1208,6 +1297,27 @@ fn last_octets(mac: &str) -> String {
 /// key made for the session; the text goes to `serial.log`. The host key is
 /// taken on first use into the session's own known_hosts.
 fn serial(s: &Session, id: &str, seconds: u64) -> Result<String, String> {
+    // What is typed, and when (seconds after the connection): a line end to
+    // wake the prompt, the command, a line end again.
+    let script = [
+        (seconds.saturating_sub(40), "\r".to_string()),
+        (
+            seconds.saturating_sub(30),
+            "echo stafeto-ok; uname -a\r".to_string(),
+        ),
+        (seconds.saturating_sub(15), "\r".to_string()),
+    ];
+    serial_typing(s, id, seconds, &script)
+}
+
+/// The serial console of `id` for `seconds`, typing each `(second, text)` of `script` at its
+/// second after the connection; what came is the text returned.
+fn serial_typing(
+    s: &Session,
+    id: &str,
+    seconds: u64,
+    script: &[(u64, String)],
+) -> Result<String, String> {
     let key = s.dir.join("serial");
     if !key.exists() {
         let st = Command::new("ssh-keygen")
@@ -1259,13 +1369,6 @@ fn serial(s: &Session, id: &str, seconds: u64) -> Result<String, String> {
         .stderr(errf)
         .spawn()
         .map_err(|e| e.to_string())?;
-    // What is typed, and when (seconds after the connection): a line end to
-    // wake the prompt, the command, a line end again.
-    let script: [(u64, &str); 3] = [
-        (seconds.saturating_sub(40), "\r"),
-        (seconds.saturating_sub(30), "echo stafeto-ok; uname -a\r"),
-        (seconds.saturating_sub(15), "\r"),
-    ];
     let mut stdin = ssh.stdin.take();
     let mut next = 0;
     let start = Instant::now();
@@ -1424,6 +1527,9 @@ fn neighbour(args: &[String]) -> Result<(), String> {
             ty: "t4g.small",
             user_data: Some(&script),
             extra_snapshot: snapshot.as_deref(),
+            group: None,
+            public_ip: false,
+            private_ip: None,
         },
     )?;
     let result = (|| {
@@ -1513,6 +1619,9 @@ fn dump_run(s: &Session) -> Result<(), String> {
             ty: "t4g.small",
             user_data: None,
             extra_snapshot: None,
+            group: None,
+            public_ip: false,
+            private_ip: None,
         },
     )?;
     let snap = (|| {
@@ -1565,8 +1674,356 @@ fn dump_run(s: &Session) -> Result<(), String> {
     std::fs::write(s.dir.join("dump-snapshot.txt"), snap).map_err(|e| e.to_string())
 }
 
+// ---- the pair: stafeto and a Linux neighbour in one group ---------------------------------------
+
+/// What the one session that reaches the internet opens on the way out, besides the
+/// group itself: the ports of `wget` and of the name server (the answer to a request is
+/// return traffic of the group's state, nothing comes in from outside).
+const INTERNET_EGRESS: [(&str, u16); 3] = [("tcp", 80), ("tcp", 443), ("udp", 53)];
+
+/// The rule of the group for itself, all protocols: the pair talks to each other.
+fn self_rule(group: &str) -> String {
+    format!("IpProtocol=-1,UserIdGroupPairs=[{{GroupId={group}}}]")
+}
+
+/// The rule of the internet session for one of `INTERNET_EGRESS`.
+fn internet_rule((protocol, port): (&str, u16)) -> String {
+    format!("IpProtocol={protocol},FromPort={port},ToPort={port},IpRanges=[{{CidrIp=0.0.0.0/0}}]")
+}
+
+/// The session's group of the pair: inbound and outbound only to its own members. With
+/// `internet` the way out also lets TCP 80 and 443 and UDP 53 go to any address; nothing
+/// comes in from outside in either form.
+fn pair_group(s: &Session, internet: bool) -> Result<String, String> {
+    if let Some((_, g)) = s.live().into_iter().find(|(k, _)| *k == Kind::Group) {
+        return Ok(g);
+    }
+    let (_, vpc) = default_subnet()?;
+    s.note("intent", Kind::Group, "stafeto-pair")?;
+    let mut args: Vec<String> = ["ec2", "create-security-group", "--group-name"]
+        .map(String::from)
+        .to_vec();
+    args.push(format!("stafeto-pair-{}", s.id));
+    args.extend(
+        [
+            "--description",
+            "stafeto: the pair talks to each other",
+            "--vpc-id",
+            &vpc,
+        ]
+        .map(String::from),
+    );
+    args.extend(s.tag_spec(&["security-group"]));
+    args.extend(["--query", "GroupId"].map(String::from));
+    let g = aws_s(&args)?;
+    s.note("created", Kind::Group, &g)?;
+    aws(&[
+        "ec2",
+        "revoke-security-group-egress",
+        "--group-id",
+        &g,
+        "--ip-permissions",
+        "IpProtocol=-1,IpRanges=[{CidrIp=0.0.0.0/0}]",
+    ])?;
+    aws(&[
+        "ec2",
+        "authorize-security-group-ingress",
+        "--group-id",
+        &g,
+        "--ip-permissions",
+        &self_rule(&g),
+    ])?;
+    aws(&[
+        "ec2",
+        "authorize-security-group-egress",
+        "--group-id",
+        &g,
+        "--ip-permissions",
+        &self_rule(&g),
+    ])?;
+    if internet {
+        for rule in INTERNET_EGRESS {
+            aws(&[
+                "ec2",
+                "authorize-security-group-egress",
+                "--group-id",
+                &g,
+                "--ip-permissions",
+                &internet_rule(rule),
+            ])?;
+        }
+    }
+    Ok(g)
+}
+
+/// The guard of the pair's group: every rule in names the group itself (no address range),
+/// and every rule out names the group or, in the internet session, one of
+/// `INTERNET_EGRESS` for all addresses.
+fn assert_pair(group: &str, internet: bool) -> Result<(), String> {
+    let inbound = aws(&[
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group,
+        "--query",
+        "SecurityGroups[0].IpPermissions[].[length(IpRanges),length(Ipv6Ranges),length(PrefixListIds),length(UserIdGroupPairs)]",
+    ])?;
+    let nums: Vec<&str> = inbound.split_whitespace().collect();
+    if nums.chunks(4).any(|c| c[..3].iter().any(|n| *n != "0")) || nums.len() != 4 {
+        return Err(format!(
+            "group {} lets something in other than its own members: no instance starts in it",
+            redact(group)
+        ));
+    }
+    let wide = aws(&[
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group,
+        "--query",
+        "SecurityGroups[0].IpPermissionsEgress[?length(IpRanges) > `0` || length(Ipv6Ranges) > `0`].[IpProtocol,FromPort,ToPort]",
+    ])?;
+    let found: Vec<&str> = wide.split_whitespace().collect();
+    let allowed: Vec<String> = if internet {
+        INTERNET_EGRESS
+            .iter()
+            .flat_map(|(p, n)| [p.to_string(), n.to_string(), n.to_string()])
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut triples: Vec<&[&str]> = found.chunks(3).collect();
+    triples.sort();
+    let mut want: Vec<Vec<&str>> = allowed
+        .chunks(3)
+        .map(|c| c.iter().map(String::as_str).collect())
+        .collect();
+    want.sort();
+    if !found.len().is_multiple_of(3)
+        || triples.len() != want.len()
+        || triples.iter().zip(&want).any(|(a, b)| *a != b.as_slice())
+    {
+        return Err(format!(
+            "group {} lets more out than the pair needs: no instance starts in it",
+            redact(group)
+        ));
+    }
+    Ok(())
+}
+
+/// The neighbour's address in the subnet: the host 200 of the network the CIDR block names
+/// (the subnet is at least a /24: the default ones are a /20), so that stafeto can be told
+/// where it is before the neighbour exists.
+fn neighbour_address(cidr: &str) -> Result<String, String> {
+    let (net, bits) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("{cidr:?} is no block"))?;
+    let bits: u8 = bits.parse().map_err(|_| format!("{cidr:?} is no block"))?;
+    let o: Vec<&str> = net.split('.').collect();
+    if o.len() != 4 || bits > 24 || o.iter().any(|x| x.parse::<u8>().is_err()) {
+        return Err(format!("{cidr:?} is no block of at least 254 hosts"));
+    }
+    Ok(format!("{}.{}.{}.200", o[0], o[1], o[2]))
+}
+
+/// What the neighbour does as its user data: serves a page on port 8080 for stafeto's `wget`,
+/// pings stafeto and fetches its page with `curl`, every 15 s, and says what it got on its
+/// console in lines that begin with `NEIGHBOUR-`.
+fn pair_neighbour_script(stafeto: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+exec 2>/dev/null
+O=/dev/console
+STAF={stafeto}
+mkdir -p /srv/n
+echo stafeto-neighbour-page > /srv/n/index.html
+(cd /srv/n && python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 &)
+echo "NEIGHBOUR-START" > $O
+sleep 45
+for i in $(seq 1 60); do
+  p=$(ping -c 3 -W 2 $STAF | grep -E 'transmitted|rtt' | tr '\n' ' ')
+  echo "NEIGHBOUR-PING $i $p" > $O
+  c=$(curl -m 5 -s -o /tmp/page -w '%{{http_code}}' http://$STAF/)
+  echo "NEIGHBOUR-CURL $i $c $(head -c 80 /tmp/page | tr -d '\r\n')" > $O
+  sleep 15
+done
+echo "NEIGHBOUR-DONE" > $O
+"#
+    )
+}
+
+/// The lines stafeto is typed, each at its second after the serial connection: the page it
+/// serves, a fetch from the neighbour's page and, in the internet session, from the internet.
+/// `@NEIGHBOUR@` is the neighbour's address.
+fn pair_commands(internet: bool) -> Vec<String> {
+    let mut c = vec![
+        "echo stafeto-pair-start".to_string(),
+        "echo stafeto-httpd-ok > /tmp/index.html; httpd -p 80 -h /tmp &".to_string(),
+        "wget -T 10 -O - http://@NEIGHBOUR@:8080/".to_string(),
+    ];
+    if internet {
+        c.push("wget -T 20 -O - http://example.com/".to_string());
+    }
+    c.push("echo stafeto-pair-done".to_string());
+    c
+}
+
+/// The typed lines at their seconds: the first after `delay`, then one every `gap`, each
+/// with the neighbour's address put in and a line end after it.
+fn typed(commands: &[String], neighbour: &str, delay: u64, gap: u64) -> Vec<(u64, String)> {
+    let mut out = vec![(delay.saturating_sub(10), "\r".to_string())];
+    for (i, c) in commands.iter().enumerate() {
+        out.push((
+            delay + gap * i as u64,
+            format!("{}\r", c.replace("@NEIGHBOUR@", neighbour)),
+        ));
+    }
+    out
+}
+
+fn instance_ip(id: &str) -> Result<String, String> {
+    aws(&[
+        "ec2",
+        "describe-instances",
+        "--instance-ids",
+        id,
+        "--query",
+        "Reservations[0].Instances[0].PrivateIpAddress",
+    ])
+}
+
+fn subnet_cidr() -> Result<String, String> {
+    let (subnet, _) = default_subnet()?;
+    aws(&[
+        "ec2",
+        "describe-subnets",
+        "--subnet-ids",
+        &subnet,
+        "--query",
+        "Subnets[0].CidrBlock",
+    ])
+}
+
+/// `aws pair`: stafeto and an Amazon Linux neighbour in the pair's group. The neighbour serves
+/// a page and pings and fetches stafeto's; stafeto, typed through the serial console, serves a
+/// page, fetches the neighbour's and, with `--internet`, example.com. The consoles of both are
+/// printed (identifiers and addresses hidden), both instances end, and the group goes.
+fn pair(args: &[String]) -> Result<(), String> {
+    let ami = flag(args, "--ami").ok_or("pair needs --ami")?;
+    let internet = args.iter().any(|a| a == "--internet");
+    let seconds: u64 = flag(args, "--serial")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(330);
+    let delay: u64 = flag(args, "--delay")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(90);
+    let gap: u64 = flag(args, "--gap")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(25);
+    let s = Session::open(flag(args, "--session"))?;
+    let group = pair_group(&s, internet)?;
+    assert_pair(&group, internet)?;
+    let (sid, started) = launch(
+        &s,
+        &Launch {
+            ami: &ami,
+            ty: "t4g.small",
+            user_data: None,
+            extra_snapshot: None,
+            group: Some(&group),
+            public_ip: internet,
+            private_ip: None,
+        },
+    )?;
+    let mut neighbour: Option<(String, Instant)> = None;
+    let result = (|| {
+        match eni_mac(&sid) {
+            Ok(mac) => println!("interface mac ..:..:..:{}", last_octets(&mac)),
+            Err(e) => println!("interface mac: {e}"),
+        }
+        let stafeto = instance_ip(&sid)?;
+        let nip = neighbour_address(&subnet_cidr()?)?;
+        let script = s.dir.join("pair-neighbour.sh");
+        std::fs::write(&script, pair_neighbour_script(&stafeto)).map_err(|e| e.to_string())?;
+        let nami = neighbour_ami()?;
+        neighbour = Some(launch(
+            &s,
+            &Launch {
+                ami: &nami,
+                ty: "t4g.small",
+                user_data: Some(&script),
+                extra_snapshot: None,
+                group: Some(&group),
+                public_ip: false,
+                private_ip: Some(&nip),
+            },
+        )?);
+        let nid = neighbour
+            .as_ref()
+            .map(|(i, _)| i.clone())
+            .unwrap_or_default();
+        for _ in 0..40 {
+            if state(&sid)? == "running" {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let commands = pair_commands(internet);
+        let typing = typed(&commands, &nip, delay, gap);
+        let text = serial_typing(&s, &sid, seconds, &typing)?;
+        println!("--- stafeto, serial console, {seconds} s ---");
+        for l in text.lines() {
+            println!("{}", redact(l));
+        }
+        println!("--- end of serial console ---");
+        // The neighbour's side: its console, until it has said a page of stafeto's or 150 s
+        // have passed.
+        let begun = Instant::now();
+        let mut ntext = String::new();
+        loop {
+            if let Ok(t) = console(&nid)
+                && !t.is_empty()
+            {
+                ntext = t;
+            }
+            let got = ntext
+                .lines()
+                .any(|l| l.contains("NEIGHBOUR-CURL") && l.contains(" 200 "));
+            if got || begun.elapsed() > Duration::from_secs(150) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(10));
+        }
+        println!("--- neighbour, console lines ---");
+        for l in ntext.lines().filter(|l| l.contains("NEIGHBOUR-")) {
+            println!("{}", redact(l));
+        }
+        println!("--- end of neighbour ---");
+        let slog = s.dir.join("console.log");
+        let sconsole = console(&sid).unwrap_or_default();
+        let _ = std::fs::write(&slog, &sconsole);
+        print_console(&sconsole);
+        Ok(())
+    })();
+    let mut result = result;
+    if let Some((nid, nstart)) = neighbour {
+        result = release(&s, Kind::Instance, &nid, result);
+        println!(
+            "estimated cost of the neighbour: {:.3} USD",
+            cost(nstart.elapsed(), PRICE_SMALL)
+        );
+    }
+    result = release(&s, Kind::Instance, &sid, result);
+    println!(
+        "estimated cost of stafeto: {:.3} USD",
+        cost(started.elapsed(), PRICE_SMALL)
+    );
+    result
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
+        Some("pair") => pair(&args[1..]),
         Some("check") => check(),
         Some("image") => image(&args[1..]),
         Some("boot") => boot(&args[1..]),
@@ -1598,6 +2055,88 @@ mod tests {
         assert_eq!(redact(t), "i-... ami-... snap-... <account> x");
         assert_eq!(redact("1234567890123"), "1234567890123");
         assert_eq!(redact("vol-0123456789abcdef0z"), "vol-0123456789abcdef0z");
+    }
+
+    #[test]
+    fn addresses_are_hidden_and_other_numbers_are_not() {
+        assert_eq!(
+            redact("lease 10.1.2.3/20 gw 172.31.0.1."),
+            "lease <ip>/20 gw <ip>."
+        );
+        assert_eq!(
+            redact("version 0.10 and 1.2.3 and 300.1.1.1"),
+            "version 0.10 and 1.2.3 and 300.1.1.1"
+        );
+        assert_eq!(redact("1.2.3.4.5"), "1.2.3.4.5");
+        assert_eq!(
+            redact("ena: caps 0x3028 dma_width 48"),
+            "ena: caps 0x3028 dma_width 48"
+        );
+    }
+
+    #[test]
+    fn the_pair_rules_name_the_group_itself_and_the_internet_ones_three_ports() {
+        assert_eq!(
+            self_rule("sg-1"),
+            "IpProtocol=-1,UserIdGroupPairs=[{GroupId=sg-1}]"
+        );
+        let rules: Vec<String> = INTERNET_EGRESS.iter().map(|r| internet_rule(*r)).collect();
+        assert_eq!(rules.len(), 3);
+        assert!(rules[2].starts_with("IpProtocol=udp,FromPort=53,ToPort=53,"));
+        // No rule for the way in has an address range: the one rule is the group's own.
+        assert!(!self_rule("sg-1").contains("CidrIp"));
+    }
+
+    #[test]
+    fn the_neighbours_address_is_the_200th_host_of_the_subnets_network() {
+        assert_eq!(neighbour_address("172.31.0.0/20").unwrap(), "172.31.0.200");
+        assert_eq!(neighbour_address("10.0.5.0/24").unwrap(), "10.0.5.200");
+        assert!(neighbour_address("10.0.5.0/28").is_err());
+        assert!(neighbour_address("nonsense").is_err());
+    }
+
+    #[test]
+    fn the_neighbour_script_carries_the_address_it_is_given_and_says_its_lines_on_the_console() {
+        let t = pair_neighbour_script("172.31.9.9");
+        assert!(t.contains("STAF=172.31.9.9"));
+        assert!(t.starts_with("#!/bin/bash"));
+        for word in [
+            "NEIGHBOUR-PING",
+            "NEIGHBOUR-CURL",
+            "http.server 8080",
+            "NEIGHBOUR-DONE",
+        ] {
+            assert!(t.contains(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn the_typed_lines_follow_each_other_by_the_gap_and_name_the_neighbour() {
+        let c = pair_commands(true);
+        assert!(c.iter().any(|l| l.contains("example.com")));
+        assert!(
+            !pair_commands(false)
+                .iter()
+                .any(|l| l.contains("example.com"))
+        );
+        let t = typed(&c, "172.31.0.200", 90, 25);
+        assert_eq!(t[0], (80, "\r".to_string()));
+        assert_eq!(t[1].0, 90);
+        assert_eq!(t[2].0, 115);
+        assert!(t[3].1.contains("http://172.31.0.200:8080/"));
+        assert!(t.iter().all(|(_, l)| l.ends_with('\r')));
+    }
+
+    #[test]
+    fn the_nic_of_an_instance_names_the_group_the_public_address_and_the_fixed_one() {
+        assert_eq!(
+            nic_spec("subnet-1", "sg-1", false, None),
+            "DeviceIndex=0,SubnetId=subnet-1,AssociatePublicIpAddress=false,Groups=sg-1"
+        );
+        assert!(
+            nic_spec("subnet-1", "sg-1", true, Some("10.0.0.200"))
+                .ends_with("AssociatePublicIpAddress=true,Groups=sg-1,PrivateIpAddress=10.0.0.200")
+        );
     }
 
     #[test]
@@ -1723,6 +2262,9 @@ exit 0
                 ty: "t4g.small",
                 user_data: None,
                 extra_snapshot: None,
+                group: None,
+                public_ip: false,
+                private_ip: None,
             },
         )
     }

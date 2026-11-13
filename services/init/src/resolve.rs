@@ -246,6 +246,22 @@ fn enable(config: &mut impl Config, at: pci::Address) {
     }
 }
 
+/// The functions `place` turned on for a record, so that a record left out (whatever step
+/// of it failed after the first window) leaves none of them able to master the bus.
+struct Enabled {
+    at: [Option<pci::Address>; MAX_WINDOWS],
+    count: usize,
+}
+
+impl Enabled {
+    fn note(&mut self, at: pci::Address) {
+        if self.at.iter().flatten().all(|a| *a != at) && self.count < MAX_WINDOWS {
+            self.at[self.count] = Some(at);
+            self.count += 1;
+        }
+    }
+}
+
 // The buffers and their fill counts are the caller's; a struct for them would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn place(
@@ -257,6 +273,43 @@ fn place(
     bindings: &mut [Binding; MAX_BINDINGS],
     b_at: &mut usize,
     measured: &mut Measured,
+) -> Result<(), Refusal> {
+    let mut enabled = Enabled {
+        at: [None; MAX_WINDOWS],
+        count: 0,
+    };
+    let placed = place_in(
+        r,
+        platform,
+        config,
+        windows,
+        w_at,
+        bindings,
+        b_at,
+        measured,
+        &mut enabled,
+    );
+    // An error after the first enable (a short BAR, a binding without its function, any
+    // later step): the record is left out and its devices stop mastering the bus.
+    if placed.is_err() && !cfg!(feature = "break-master-left") {
+        for at in enabled.at.iter().flatten() {
+            pci::disable_master(config, *at);
+        }
+    }
+    placed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_in(
+    r: &Record,
+    platform: &Platform,
+    config: &mut impl Config,
+    windows: &mut [Window; MAX_WINDOWS],
+    w_at: &mut usize,
+    bindings: &mut [Binding; MAX_BINDINGS],
+    b_at: &mut usize,
+    measured: &mut Measured,
+    enabled: &mut Enabled,
 ) -> Result<(), Refusal> {
     let refuse = |window, cause| Refusal {
         record: r.name,
@@ -270,6 +323,7 @@ fn place(
                 let f = locate(config, platform, id, index)
                     .ok_or(refuse(w.name, Cause::NoFunction { id, index }))?;
                 enable(config, f.at);
+                enabled.note(f.at);
                 Window {
                     base: platform.ecam.address(f.at).unwrap_or(0),
                     len: PAGE,
@@ -294,13 +348,8 @@ fn place(
                     }
                 };
                 enable(config, f.at);
+                enabled.note(f.at);
                 if size < w.base + w.len && !cfg!(feature = "break-bar-size") {
-                    // The function was enabled above (and perhaps by an earlier
-                    // window of the record): a record that is left out leaves
-                    // its device unable to master the bus.
-                    if !cfg!(feature = "break-master-left") {
-                        pci::disable_master(config, f.at);
-                    }
                     return Err(refuse(
                         w.name,
                         Cause::Short {
@@ -600,6 +649,35 @@ mod tests {
             .unwrap();
         assert!(matches!(e.cause, Cause::Short { .. }));
         assert_eq!(config.words[&(ENA, pci::COMMAND)] & pci::BUS_MASTER, 0);
+    }
+
+    /// Fails under `break-master-left`.
+    #[test]
+    fn a_record_whose_binding_fails_after_the_windows_leaves_bus_mastering_off() {
+        let mut config = t4g();
+        config.words.insert((ENA, pci::COMMAND), 0);
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x1000,
+            At::Bar {
+                id: 0x1d0f_ec20,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        // The vector belongs to a function the instance does not have.
+        let b: &'static [Binding] =
+            Box::leak(Box::new([Binding::msi_of("irq0", 0x1d0f_ffff, 0, 0)]));
+        let e = resolve_one(&[record("net", w, b)], &mut config)
+            .err()
+            .unwrap();
+        assert!(matches!(e.cause, Cause::NoFunction { .. }));
+        assert_eq!(
+            config.words[&(ENA, pci::COMMAND)] & pci::BUS_MASTER,
+            0,
+            "the window turned the function on and the binding failed after it"
+        );
     }
 
     #[test]
