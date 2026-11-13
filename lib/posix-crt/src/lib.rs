@@ -450,10 +450,16 @@ fn loaded_main() -> u64 {
                     .map_err(|_| "clock session failed")
             })
             .and_then(|()| {
-                let uart = one(Slot::Driver).map(Handle::from_raw);
+                let secure = area.flags & SECURE != 0;
+                // A set-ID program takes no console input session from its
+                // caller, who could put a channel of its own there and feed
+                // the program what it reads (the loader has no root of the
+                // driver to verify it with): the handle closes, and a read of
+                // the console gives EBADF. The program reads its terminal
+                // through the Terminal session, which the loader verifies.
+                let uart = one(Slot::Driver).map(Handle::from_raw).filter(|_| !secure);
                 let inherited = inherited(&area);
                 let count = area.descriptor_count as usize;
-                let secure = area.flags & SECURE != 0;
                 if let Some(identity) = one(Slot::PosixId) {
                     posix_abi::process::set_identity(Handle::from_raw(identity));
                 }
