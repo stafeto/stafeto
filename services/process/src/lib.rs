@@ -20,6 +20,7 @@ pub mod placing;
 pub mod queue;
 pub mod queued;
 pub mod records;
+pub mod roots;
 pub mod shares;
 pub mod signals;
 pub mod terminals;

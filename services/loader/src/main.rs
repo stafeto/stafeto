@@ -302,6 +302,10 @@ struct Loaded {
     /// libc.so and the vector of a dynamic program.
     dynamic: Option<Dynamic>,
     given: [Option<Handle<Channel>>; SLOTS],
+    /// The root of the channel service, if the start gave a Pipes session
+    /// and the service registered it: `finish` verifies the session with it
+    /// when the program is set-ID.
+    pipes_root: Option<Handle<Channel>>,
 }
 
 /// What a dynamic program adds to a loaded one: the image session of
@@ -462,6 +466,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut completed = false;
     let mut terminal_actions: Option<TerminalLoads> = None;
     let mut trusted_terminal = None;
+    let mut pipes_root = None;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
         if ready && (!completed || (0..SLOTS).any(|i| needed[i] && given[i].is_none())) {
@@ -475,6 +480,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 maps,
                 dynamic,
                 given,
+                pipes_root: pipes_root.take(),
             }));
         }
         if ready && copied {
@@ -627,13 +633,14 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     },
                     Some(Method::Go) if !copied && fork.is_some() => {
                         if trusted_terminal.is_none() {
-                            trusted_terminal = match loader_terminal(session) {
-                                Ok(terminal) => terminal,
-                                Err(code) => {
-                                    reply(token, code);
-                                    return None;
-                                }
-                            };
+                            trusted_terminal =
+                                match loader_root(session, proto_process::ROOT_TERMINAL) {
+                                    Ok(terminal) => terminal,
+                                    Err(code) => {
+                                        reply(token, code);
+                                        return None;
+                                    }
+                                };
                         }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
@@ -658,13 +665,14 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     }
                     Some(Method::Go) if block_len.is_some() && loaded.is_none() => {
                         if trusted_terminal.is_none() {
-                            trusted_terminal = match loader_terminal(session) {
-                                Ok(terminal) => terminal,
-                                Err(code) => {
-                                    reply(token, code);
-                                    return None;
-                                }
-                            };
+                            trusted_terminal =
+                                match loader_root(session, proto_process::ROOT_TERMINAL) {
+                                    Ok(terminal) => terminal,
+                                    Err(code) => {
+                                        reply(token, code);
+                                        return None;
+                                    }
+                                };
                         }
                         if let Some(terminals) = terminal_actions.as_mut()
                             && let Err(code) = terminals.finish()
@@ -695,6 +703,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                         match load(own, &block, exec_source.take()).and_then(|done| {
                             if completed {
+                                pipes_root_before_ready(session, &given, &mut pipes_root)?;
                                 tell_ready(session, image_pages(&done.2))?;
                             }
                             Ok(done)
@@ -769,6 +778,13 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 reply(token, Status::BadSize.code());
                                 return None;
                             }
+                            if loaded.is_some()
+                                && let Err(code) =
+                                    pipes_root_before_ready(session, &given, &mut pipes_root)
+                            {
+                                reply(token, code);
+                                return None;
+                            }
                             if (loaded.is_some() || copied)
                                 && let Err(code) = tell_ready(
                                     session,
@@ -816,7 +832,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                     && let Some(offered) = given[Slot::Terminal as usize].take()
                                 {
                                     if trusted_terminal.is_none() {
-                                        trusted_terminal = match loader_terminal(session) {
+                                        trusted_terminal = match loader_root(
+                                            session,
+                                            proto_process::ROOT_TERMINAL,
+                                        ) {
                                             Ok(terminal) => terminal,
                                             Err(code) => {
                                                 reply(token, code);
@@ -1037,15 +1056,58 @@ fn verify_session(
     Ok(session)
 }
 
-fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {
-    let request = proto_process::Method::LoaderTerminal.header().bytes();
-    let mut reply = sys::send(session, &request).map_err(code)?;
+/// The root of the service of a slot the process service keeps (`root` is
+/// `proto_process::ROOT_TERMINAL` and the others): none when its service
+/// registered none.
+fn loader_root(session: &Handle<Channel>, root: u32) -> Result<Option<Handle<Channel>>, u32> {
+    let mut request = Writer::new();
+    proto_process::Method::LoaderRoot
+        .header()
+        .write(&mut request)
+        .and_then(|()| proto_process::LoaderRoot { root }.write(&mut request))
+        .map_err(|_| pl::IO)?;
+    let mut reply = sys::send(session, request.as_bytes()).map_err(code)?;
     let mut buffer = [0; MESSAGE_MAX];
     match Reader::new(reply.bytes(&mut buffer)).u32() {
         Ok(0) => reply.handles.take::<Channel>(0).map(Some).map_err(code),
         Ok(proto_process::UNREGISTERED) => Ok(None),
         _ => Err(pl::IO),
     }
+}
+
+/// Before Ready, when the process service still answers a loader's request
+/// for a root: the root of the Pipes session of a start that gives one,
+/// which `finish` needs if the start turns out to be a set-ID program (the
+/// credentials come after Ready).
+fn pipes_root_before_ready(
+    session: &Handle<Channel>,
+    given: &[Option<Handle<Channel>>; SLOTS],
+    root: &mut Option<Handle<Channel>>,
+) -> Result<(), u32> {
+    if given[Slot::Pipes as usize].is_some() && root.is_none() {
+        *root = loader_root(session, proto_process::ROOT_PIPES)?;
+    }
+    Ok(())
+}
+
+/// A set-ID program takes its Pipes session only from the channel service:
+/// the offered one goes to the service's root, which returns it when it is a
+/// live session of the service and a new clone otherwise, so a forged
+/// channel never receives a request. A start the root cannot verify is
+/// refused (the code of an unreachable or unregistered service).
+fn verify_pipes(
+    pipes: Option<&Handle<Channel>>,
+    offered: Handle<Channel>,
+) -> Result<Handle<Channel>, u32> {
+    let pipes = pipes.ok_or(pl::IO)?;
+    let request = proto_pipe::Method::VerifySession.header().bytes();
+    let mut reply = sys::send_handles(pipes, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
 }
 
 /// Verify before a parent can commit SetId. True tty descriptions and
@@ -2114,6 +2176,7 @@ fn finish(
         mut maps,
         dynamic,
         mut given,
+        pipes_root,
     } = loaded;
     let Ok(block) = Block::read(staged(block_len)) else {
         return GAVE_UP;
@@ -2121,6 +2184,15 @@ fn finish(
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
     let secure = c.uid != c.euid || c.gid != c.egid;
+    // A set-ID program takes its Pipes session from the channel service
+    // alone: a forged one is replaced, and a start the service cannot
+    // verify is refused. Any other program keeps what its parent gave.
+    if secure && let Some(offered) = given[Slot::Pipes as usize].take() {
+        match verify_pipes(pipes_root.as_ref(), offered) {
+            Ok(session) => given[Slot::Pipes as usize] = Some(session),
+            Err(_) => return GAVE_UP,
+        }
+    }
     let flags =
         if secure { pl::SECURE } else { 0 } | if dynamic.is_some() { pl::DYNAMIC } else { 0 };
     let process = own.process.raw().0;
@@ -2192,6 +2264,7 @@ fn finish(
         own.identity,
         start,
         session,
+        pipes_root,
     ));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {

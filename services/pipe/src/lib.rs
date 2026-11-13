@@ -19,6 +19,7 @@ pub mod carry;
 pub mod ipc;
 pub mod named;
 pub mod sockets;
+pub mod verify;
 pub mod watches;
 pub use named::NamedInode;
 use proto_pipe::sock::{SOCK_END, SOCKETS};

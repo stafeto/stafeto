@@ -81,7 +81,10 @@ pub use named::WatchSet;
 /// semaphores answer EPERM to a caller that holds no right to the object
 /// (`ipc::op::ADDR_WAIT`, `ADDR_WAKE`, `NSEM_WAIT`, `NSEM_POST`); the layout
 /// of the words is as it was.
-pub const VERSION: u16 = 2;
+///
+/// Version 3: VerifySession, which the loader sends to the service's root
+/// (`ROOT`) for the Pipes session of a set-ID program.
+pub const VERSION: u16 = 3;
 
 /// The pipes of the service.
 pub const PIPES: usize = 64;
@@ -127,6 +130,11 @@ pub const INVALID: u32 = 706;
 /// The labels the service gives itself: bit 63, which no label of init
 /// has.
 pub const OWN: u64 = 1 << 63;
+
+/// The label of the service's root session, which it registers with the
+/// process service (Register with the PIPE mark) and the loaders send
+/// VerifySession: no other request goes through it.
+pub const ROOT: u64 = OWN | 1 << 60;
 
 /// The pipe of an end and whether it is the write end.
 pub const fn end_of(description: u32) -> (usize, bool) {
@@ -179,10 +187,19 @@ pub enum Method {
     SockConnectWait = 43,
     SockConnectTake = 44,
     BrokerJobs = 45,
+    /// VerifySession, through the root session (`ROOT`): no body, one
+    /// channel with SEND and TRANSFER. The reply: status 0 and the channel
+    /// itself when it is a live session of the service (a copy of its
+    /// channel with the label of a session, an init client's or a clone's),
+    /// a new clone with no descriptions otherwise, and no request goes
+    /// through a channel that is not the service's. BAD_SIZE for a body, no
+    /// channel or too many, or a channel without the two rights;
+    /// ACCESS_DENIED from any session but the root.
+    VerifySession = 46,
 }
 
 impl Method {
-    pub const ALL: [Method; 44] = [
+    pub const ALL: [Method; 45] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -227,6 +244,7 @@ impl Method {
         Method::SockConnectWait,
         Method::SockConnectTake,
         Method::BrokerJobs,
+        Method::VerifySession,
     ];
 
     pub const fn number(self) -> u16 {
@@ -244,7 +262,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
 ];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
