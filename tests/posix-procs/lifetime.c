@@ -342,6 +342,41 @@ static void core_lock_query(int fd, off_t start, off_t length, short kind,
         expect("core canonical blocker length", query.l_len == blocker_length, 1);
     }
 }
+/* The longest scans of the service: 64 descriptions hold one record each in one inode, so
+ * every record has an owner of its own, and a request that conflicts with the last record
+ * reads the whole list before it ends. */
+static void core_lock_owners(void) {
+    const char *path = "/tmp/full-inode-lock-owners";
+    int fds[64];
+    for (int i = 0; i < 64; i++) fds[i] = -1;
+    for (int i = 0; i < 64; i++) {
+        fds[i] = lifecycle_open(path);
+        if (fds[i] < 0) goto done;
+    }
+    for (int i = 0; i < 64; i++) {
+        struct flock lock = {0};
+        lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+        lock.l_start = 4 * i; lock.l_len = 3;
+        expect("owners: one record for each description", fcntl(fds[i], 37, &lock), 0);
+    }
+    struct flock clash = {0};
+    clash.l_type = F_WRLCK; clash.l_whence = SEEK_SET;
+    clash.l_start = 252; clash.l_len = 3;
+    errno = 0;
+    expect("owners: a clash with the last record", fcntl(fds[0], 37, &clash), -1);
+    expect("owners: the clash is refused", errno == EAGAIN || errno == EACCES, 1);
+    struct flock gap = {0};
+    gap.l_type = F_UNLCK; gap.l_whence = SEEK_SET;
+    gap.l_start = 0; gap.l_len = 3;
+    expect("owners: one description frees its record", fcntl(fds[0], 37, &gap), 0);
+    struct flock again = {0};
+    again.l_type = F_WRLCK; again.l_whence = SEEK_SET;
+    again.l_start = 0; again.l_len = 3;
+    expect("owners: the freed place is taken again", fcntl(fds[0], 37, &again), 0);
+done:
+    for (int i = 0; i < 64; i++) if (fds[i] >= 0) close(fds[i]);
+    expect("owners: unlink fixture", unlink(path), 0);
+}
 static void public_lock_core(void) {
     const char *path = "/tmp/full-inode-lock-core";
     int fd = lifecycle_open(path);
@@ -400,6 +435,7 @@ static void public_lock_core(void) {
     core_lock_query(fd, 255, 1, F_UNLCK, 0, 0);
     expect("core final descriptor close", close(fd), 0);
     expect("core unlink fixture", unlink(path), 0);
+    core_lock_owners();
     if (!failures) puts("posix-procs: full inode lock core ok");
 }
 
