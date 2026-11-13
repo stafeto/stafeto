@@ -165,6 +165,8 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
         boot.kernel_image.end()
     );
     kprintln!("dtb        PA {:#x}", boot.dtb.base);
+    // The length of the boot seed the tree holds (spec 13.3); init gets it.
+    kprintln!("seed       {} bytes", info.seed.map_or(0, |r| r.size));
     if let Some(r) = info.uart_pl011 {
         kprintln!("pl011      {:#x}", r.base);
     }

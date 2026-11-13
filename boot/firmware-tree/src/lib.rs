@@ -17,6 +17,7 @@ pub mod console;
 pub mod efimap;
 pub mod error;
 pub mod platform;
+pub mod seed;
 pub mod tree;
 
 pub use error::Error;

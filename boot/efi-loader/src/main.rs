@@ -19,6 +19,7 @@ extern crate alloc;
 mod arena;
 mod cpu;
 mod port;
+mod rng;
 
 use alloc::format;
 use alloc::string::String;
@@ -412,6 +413,7 @@ fn make_tree(
     map: &[Desc],
     loaded: &Loaded,
     boot_mpidr: u64,
+    seed: &[u8],
 ) -> (Vec<u8>, Classified, check::Summary) {
     let protect = [
         Region {
@@ -427,6 +429,7 @@ fn make_tree(
         memory: &classified,
         initrd: loaded.image,
         boot_mpidr,
+        seed,
     })
     .unwrap_or_else(|e| refuse(&e));
     let at = Placement {
@@ -622,9 +625,29 @@ fn main() -> Status {
         loaded.image.size
     ));
 
+    // The sources of random bytes, while the boot services are alive: the
+    // seed goes to `/chosen/rng-seed` and the kernel clears it there. The
+    // line names the sources and no byte.
+    let mut found = rng::collect(CONDUIT.load(core::sync::atomic::Ordering::Relaxed));
+    match &found.seed {
+        Some(seed) => say(&format!(
+            "efi-loader: boot seed {} bytes ({})\n",
+            seed.len(),
+            found.sources.join(", ")
+        )),
+        None => say(
+            "efi-loader: no source of random bytes (efi-rng, smccc-trng, rndr): the kernel gets no boot seed\n",
+        ),
+    }
+    let mut seed: Vec<u8> = found.seed.map_or_else(Vec::new, |s| s.to_vec());
+    if let Some(bytes) = found.seed.as_mut() {
+        posix_random::erase(bytes);
+    }
+
     // The trial tree from the map as it is now, with the boot services alive.
     let trial = snapshot(buf);
-    let (blob, classified, summary) = make_tree(&platform, &trial.descs, &loaded, boot_mpidr);
+    let (blob, classified, summary) =
+        make_tree(&platform, &trial.descs, &loaded, boot_mpidr, &seed);
     report(&platform, &classified, &summary, blob.len());
     write_tree(&blob, loaded.tree);
 
@@ -638,8 +661,9 @@ fn main() -> Status {
     say(&format!(
         "efi-loader: boot services left after {tries} attempt(s)\n"
     ));
-    let (blob, _, _) = make_tree(&platform, &final_map, &loaded, boot_mpidr);
+    let (blob, _, _) = make_tree(&platform, &final_map, &loaded, boot_mpidr, &seed);
     write_tree(&blob, loaded.tree);
+    posix_random::erase(&mut seed);
     // The part of the kernel's own check that the tree's size decides was
     // done with this blob: the tree region is now the final one.
 

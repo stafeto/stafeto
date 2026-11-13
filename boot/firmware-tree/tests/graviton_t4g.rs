@@ -84,6 +84,7 @@ fn blob() -> Vec<u8> {
         memory: &memory,
         initrd: IMAGE,
         boot_mpidr: 0,
+        seed: &[],
     })
     .unwrap()
 }

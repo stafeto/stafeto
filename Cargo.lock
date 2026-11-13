@@ -147,6 +147,7 @@ version = "0.1.0"
 dependencies = [
  "firmware-tree",
  "kcore",
+ "posix-random",
  "uefi",
  "uefi-raw",
 ]
@@ -234,6 +235,7 @@ name = "firmware-tree"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "posix-random",
 ]
 
 [[package]]

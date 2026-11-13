@@ -273,6 +273,7 @@ fn tree_of(p: &Platform, memory: &Classified) -> Result<Vec<u8>, Error> {
         memory,
         initrd: IMAGE,
         boot_mpidr: 0,
+        seed: &[],
     })
 }
 
@@ -350,6 +351,7 @@ fn the_boot_cpu_goes_first_and_an_unknown_one_is_refused() {
         memory: &memory(),
         initrd: IMAGE,
         boot_mpidr: 1,
+        seed: &[],
     })
     .unwrap();
     assert_eq!(
@@ -361,6 +363,7 @@ fn the_boot_cpu_goes_first_and_an_unknown_one_is_refused() {
         memory: &memory(),
         initrd: IMAGE,
         boot_mpidr: 7,
+        seed: &[],
     });
     assert!(matches!(refused, Err(Error::Unsupported(_))));
 }
@@ -649,4 +652,29 @@ fn a_16550_with_contradictory_access_fields_is_refused_when_the_tables_are_read(
     assert!(matches!(m.platform(), Err(Error::Unsupported(w)) if w.contains("disagree")));
     m.spcr = (0, 0x7000_0000, 8, 2);
     assert!(matches!(m.platform(), Err(Error::Unsupported(w)) if w.contains("access size")));
+}
+
+/// The seed of the loader goes to `/chosen/rng-seed` whole, and the kernel's
+/// own parser finds it where the kernel will clear it; with no seed the
+/// tree has none.
+#[test]
+fn the_seed_goes_into_the_trees_chosen_node_and_the_kernel_finds_it() {
+    let p = Machine::qemu().platform().unwrap();
+    let seed: Vec<u8> = (1..=64).collect();
+    let blob = build(&Input {
+        platform: &p,
+        memory: &memory(),
+        initrd: IMAGE,
+        boot_mpidr: 0,
+        seed: &seed,
+    })
+    .unwrap();
+    let (_, info) = check(&blob, &placement()).unwrap();
+    let found = info.seed.expect("the kernel finds no rng-seed in the tree");
+    assert_eq!(found.size, 64);
+    let at = found.base as usize;
+    assert_eq!(&blob[at..at + 64], &seed[..]);
+    // No seed, no property.
+    let (_, info) = run(&Machine::qemu()).unwrap();
+    assert_eq!(info.seed, None);
 }

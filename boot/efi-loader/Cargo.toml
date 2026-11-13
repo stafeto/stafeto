@@ -16,6 +16,7 @@ bench = false
 [dependencies]
 firmware-tree = { path = "../firmware-tree" }
 kcore = { path = "../../kcore" }
+posix-random = { path = "../../lib/posix-random" }
 uefi-raw = "0.17.0"
 uefi = { version = "0.41.0", default-features = false, features = ["alloc"] }
 
@@ -36,3 +37,4 @@ break-merge = ["firmware-tree/break-merge"]
 break-spcr = ["firmware-tree/break-spcr"]
 break-iort-count = ["firmware-tree/break-iort-count"]
 break-dtb-gib = ["firmware-tree/break-dtb-gib"]
+break-no-seed = ["firmware-tree/break-no-seed"]
