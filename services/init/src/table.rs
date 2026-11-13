@@ -1108,6 +1108,7 @@ fn order(table: &[Record]) -> Order {
     order
 }
 
+pub mod aws;
 pub mod base;
 pub mod bench;
 pub mod ceiling;
@@ -1281,7 +1282,8 @@ const _: () = assert!(
     feature = "table-fast-switch-vz",
     feature = "table-fast-switch-scale",
     feature = "table-fast-switch-scale-vz",
-    feature = "table-posix-map-big"
+    feature = "table-posix-map-big",
+    feature = "table-aws"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1336,6 +1338,8 @@ pub const TABLE: &[Record] = vz::TABLE;
 pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
 #[cfg(feature = "table-busybox-dialog-vz")]
 pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
+#[cfg(feature = "table-aws")]
+pub const TABLE: &[Record] = aws::TABLE;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
 #[cfg(feature = "table-rtbench-posix")]

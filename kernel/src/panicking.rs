@@ -14,7 +14,7 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 /// off once the port's transmitter is idle (`stop`).
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    stay_up_with_a_letter(info);
+    mark_the_panic(info);
     if PANICKING.swap(true, Ordering::Relaxed) {
         // The handler itself failed, e.g. its stop call faulted. Anything more
         // than a line on the console could fail again and recurse.
@@ -35,16 +35,15 @@ fn panic(info: &PanicInfo<'_>) -> ! {
 }
 
 /// The first boot on EC2 cannot show the report (feature `early-marks`): a
-/// letter says that the kernel panicked, and the machine stays up for the
-/// console to be read.
+/// line says that the kernel panicked, before the report that the console
+/// of the kernel may not be able to show.
 #[cfg(feature = "early-marks")]
-fn stay_up_with_a_letter(info: &PanicInfo<'_>) {
+fn mark_the_panic(info: &PanicInfo<'_>) {
     crate::arch::marks::panic_line(info);
-    park()
 }
 
 #[cfg(not(feature = "early-marks"))]
-fn stay_up_with_a_letter(_: &PanicInfo<'_>) {}
+fn mark_the_panic(_: &PanicInfo<'_>) {}
 
 /// The start of every report that ends in a panic (spec 16.1): the
 /// console's port comes back to the kernel, whoever has it, and the

@@ -220,6 +220,9 @@ pub struct BootInfo {
     pub no_map: RegionList<8>,
     pub initrd: Option<Region>,
     pub uart_pl011: Option<Region>,
+    /// The first 16550 node, the console of a machine without a PL011
+    /// (the loader writes it from the SPCR).
+    pub uart_16550: Option<Uart16550>,
     /// The first enabled node of an interrupt controller the kernel knows.
     pub gic: Option<Gic>,
     pub psci: PsciConduit,
@@ -510,6 +513,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
         no_map: RegionList::new(),
         initrd: None,
         uart_pl011: None,
+        uart_16550: None,
         gic: None,
         psci: PsciConduit::None,
         cpus: CpuList::new(),
@@ -574,6 +578,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
     if info.memory.as_slice().is_empty() {
         return Err(BootInfoError::NoMemory);
     }
+    info.uart_16550 = probe::uart_16550(fdt)?;
     Ok(info)
 }
 
@@ -588,9 +593,7 @@ pub const BOOT_TAKEN: usize = 24;
 /// at most once per taken range (`memmap::usable`, `Boot::usable`).
 pub const USABLE_REGIONS: usize = 32;
 
-#[cfg(any(test, feature = "builder"))]
 mod probe;
-#[cfg(any(test, feature = "builder"))]
 pub use probe::{PCI_HOSTS, PciHost, PciHosts, Uart16550, pci_hosts, uart_16550};
 
 #[cfg(test)]

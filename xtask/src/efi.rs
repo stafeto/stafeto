@@ -246,6 +246,9 @@ fn wait_for_quiet_mac() -> Result<(), String> {
 /// `-kernel`, then the boot through the loader and edk2 from the disk, and
 /// the comparison of the boot reports.
 pub fn run(names: &[String]) -> Result<(), String> {
+    let its = names.iter().any(|n| n == "its-64k");
+    let names: Vec<String> = names.iter().filter(|n| *n != "its-64k").cloned().collect();
+    let names = &names[..];
     let fw = firmware()?;
     let machines: Vec<&Machine> = if names.is_empty() {
         MACHINES.to_vec()
@@ -260,7 +263,11 @@ pub fn run(names: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?
     };
-    let a = build(Variant::Normal)?;
+    let a = build(if its {
+        Variant::ItsProbe
+    } else {
+        Variant::Normal
+    })?;
     let loader = build_loader(&[])?;
     for m in machines {
         let disk = crate::target_dir().join(format!("efi-disk-{}.raw", m.name));

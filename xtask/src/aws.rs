@@ -871,6 +871,10 @@ fn register(s: &Session, snap: &str, name: &str) -> Result<String, String> {
 /// image of `variant`.
 fn make_disk(features: &[&str], variant: Variant, out: &Path) -> Result<Artifacts, String> {
     let a = build(variant)?;
+    let a = Artifacts {
+        boot_image: crate::aws_boot_image()?,
+        ..a
+    };
     let loader = efi::build_loader(features)?;
     efi::make_disk(&loader, &a, out)?;
     Ok(a)

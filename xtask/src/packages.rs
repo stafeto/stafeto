@@ -806,6 +806,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         "boot-full.img" => load(),
         other if without_name(other).is_some() => without(load()?, without_name(other).unwrap()),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
+        "boot-aws.img" => of(&[Group::Base]),
         "boot-net.img"
         | "boot-net-its.img"
         | "boot-net-curl-steps.img"

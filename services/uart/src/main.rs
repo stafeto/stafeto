@@ -19,7 +19,7 @@
 
 use abi::time::next_release;
 use abi::{Access, Error, LOG_BATCH, LOG_RECORD, LogBatch, Source};
-use core::cell::UnsafeCell;
+use core::cell::{Cell as FlagCell, UnsafeCell};
 use core::fmt::{self, Write};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +37,8 @@ use uart::input::{self, Input, RX_RING};
 use uart::irq::{self, Irq, RX_PASS};
 use uart::output::Output;
 use uart::regs::{
-    ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
-    LCR_H_FEN, LCR_H_WLEN_8, MIS,
+    ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
+    LCR_H_FEN, LCR_H_WLEN_8, MIS, RT, RX, TX,
 };
 use uart::writes::{self, Armed, Rooms, Writes};
 
@@ -49,6 +49,10 @@ const REGS_AT: usize = 0x10_0000_0000;
 const PAGE: u64 = 4096;
 /// The period of the reads of the kernel log.
 const LOG_PERIOD_NS: u64 = 50_000_000;
+/// The period of the poll of a 16550.
+const POLL_NS: u64 = 10_000_000;
+/// The kind byte of the arguments for a 16550.
+const KIND_16550: u8 = 1;
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// A separate one-shot timer resumes paced transmit portions.
@@ -129,20 +133,118 @@ fn state() -> Option<&'static mut State> {
     }))
 }
 
-/// The registers of the PL011 through the window mapped at its base.
-struct Regs(usize);
+/// The registers of the console through the window mapped at its base: a
+/// PL011 as it is, or a 16550 shown to the driver as a PL011 (the flags, the
+/// data register, the masked interrupts, which a poll of LSR makes up), so
+/// that the logic of input, output and the log is one for both. The 16550 is
+/// byte-wide with its registers one apart, as the SPCR of EC2 says, and the
+/// driver polls it: its FIFOs are the firmware's, and no interrupt is bound.
+struct Regs {
+    base: usize,
+    ns16550: bool,
+    /// Bytes written since LSR last showed room: the 16-byte FIFO takes
+    /// that many, though THRE says only that it is empty.
+    sent: FlagCell<u8>,
+    /// The copy of the interrupt mask the driver writes.
+    imsc: FlagCell<u32>,
+}
+
+/// LSR of the 16550 at register 5: data ready, transmitter room, both empty.
+const LSR: usize = 5;
+const LSR_DR: u32 = 1;
+const LSR_THRE: u32 = 1 << 5;
+const LSR_TEMT: u32 = 1 << 6;
+/// The depth of the FIFO of a 16550A.
+const FIFO16550: u8 = 16;
 
 impl Regs {
+    fn new(base: usize, ns16550: bool) -> Regs {
+        Regs {
+            base,
+            ns16550,
+            sent: FlagCell::new(0),
+            imsc: FlagCell::new(0),
+        }
+    }
+
+    fn byte(&self, reg: usize) -> u32 {
+        // SAFETY: the window maps the 16550's page at self.base, as device
+        // memory; `reg` is a byte register of it.
+        u32::from(unsafe { mmio::read8(self.base + reg) })
+    }
+
+    fn put(&self, reg: usize, value: u32) {
+        // SAFETY: as for `byte`.
+        unsafe { mmio::write8(self.base + reg, value as u8) }
+    }
+
     fn read(&self, reg: usize) -> u32 {
-        // SAFETY: the window maps the PL011's page at self.0, readable and
-        // writable, as device memory; `reg` is the offset of a 32-bit
-        // register of uart::regs.
-        unsafe { mmio::read32(self.0 + reg) }
+        if !self.ns16550 {
+            // SAFETY: the window maps the PL011's page at self.base, readable
+            // and writable, as device memory; `reg` is the offset of a 32-bit
+            // register of uart::regs.
+            return unsafe { mmio::read32(self.base + reg) };
+        }
+        let lsr = self.byte(LSR);
+        match reg {
+            FR => {
+                if lsr & LSR_THRE != 0 {
+                    self.sent.set(0);
+                }
+                let mut flags = 0;
+                if lsr & LSR_DR == 0 {
+                    flags |= FR_RXFE;
+                }
+                if lsr & LSR_THRE == 0 || self.sent.get() >= FIFO16550 {
+                    flags |= FR_TXFF;
+                }
+                flags |= if lsr & LSR_TEMT != 0 {
+                    FR_TXFE
+                } else {
+                    FR_BUSY
+                };
+                flags
+            }
+            DR => self.byte(0),
+            MIS => {
+                let mut raw = 0;
+                if lsr & LSR_DR != 0 {
+                    raw |= RX | RT;
+                }
+                if lsr & LSR_THRE != 0 {
+                    raw |= TX;
+                }
+                raw & self.imsc.get()
+            }
+            IMSC => self.imsc.get(),
+            _ => 0,
+        }
     }
 
     fn write(&self, reg: usize, value: u32) {
-        // SAFETY: as for `read`.
-        unsafe { mmio::write32(self.0 + reg, value) }
+        if !self.ns16550 {
+            // SAFETY: as for `read`.
+            unsafe { mmio::write32(self.base + reg, value) };
+            return;
+        }
+        match reg {
+            DR => {
+                self.sent.set(self.sent.get().saturating_add(1));
+                self.put(0, value);
+            }
+            IMSC => self.imsc.set(value),
+            // The line control of the PL011 is the one place the 16550 is set
+            // up: no interrupts, FIFOs on and cleared (trigger 8), 8N1 with the
+            // divisor latch closed, DTR, RTS and OUT2. The divisor stays the
+            // firmware's.
+            LCR_H => {
+                self.put(1, 0);
+                self.put(2, 0x87);
+                self.put(3, 0x03);
+                self.put(4, 0x0B);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -167,9 +269,18 @@ fn main(_: u64) -> u64 {
     let Ok(mut got) = rt::service::register(&s.parent, &channel) else {
         return NOT_REGISTERED;
     };
-    let (Ok(window), Ok(irq)) = (got.take::<Memory>("regs"), got.take::<Interrupt>("irq")) else {
+    // The kind of the console is the ninth byte of the arguments: 1 is a
+    // 16550 polled every POLL_NS, with no interrupt bound.
+    let poll = args
+        .and_then(|a| a.own.get(8))
+        .is_some_and(|k| *k == KIND_16550);
+    let Ok(window) = got.take::<Memory>("regs") else {
         return NOT_REGISTERED;
     };
+    let irq = got.take::<Interrupt>("irq").ok();
+    if irq.is_none() && !poll {
+        return NOT_REGISTERED;
+    }
     if sys::mem_map(&s.process, &window, 0, PAGE, REGS_AT, Access::ReadWrite).is_err() {
         return NOT_MAPPED;
     }
@@ -191,7 +302,8 @@ fn main(_: u64) -> u64 {
         level,
         // SAFETY: only the main thread reaches CLONE_TABLE, here once.
         clones: unsafe { &mut *CLONE_TABLE.0.get() },
-        regs: Regs(REGS_AT),
+        regs: Regs::new(REGS_AT, poll),
+        poll,
         irq,
         log,
         timer,
@@ -211,8 +323,16 @@ fn main(_: u64) -> u64 {
         .and_then(|a| a.own.get(..8))
         .and_then(|b| b.try_into().ok())
         .map_or(0, u64::from_le_bytes);
-    let line = sys::irq_info(&uart.irq).map_or(0, |info| info.line);
-    uart.say(format_args!("uart: pl011 at {base:#x}, line {line}\n"));
+    if poll {
+        uart.say(format_args!("uart: 16550 at {base:#x}, polling\n"));
+    } else {
+        let line = uart
+            .irq
+            .as_ref()
+            .and_then(|i| sys::irq_info(i).ok())
+            .map_or(0, |info| info.line);
+        uart.say(format_args!("uart: pl011 at {base:#x}, line {line}\n"));
+    }
     let heartbeat = Heartbeat {
         to: &s.parent,
         period_ns: args.map_or(0, |a| a.period_ns),
@@ -236,7 +356,9 @@ struct Uart {
     /// The sessions CLONE gave that live, bounded for each client.
     clones: &'static mut Clones<CLONES>,
     regs: Regs,
-    irq: Handle<Interrupt>,
+    irq: Option<Handle<Interrupt>>,
+    /// A 16550 with no interrupt: the timer of 10 ms does the work of one.
+    poll: bool,
     log: Handle<Resource>,
     timer: Handle<Timer>,
     /// The copy of the channel with RECEIVE the timer posts through, with
@@ -282,8 +404,15 @@ impl Uart {
         regs.write(CR, CR_ON);
         regs.read(IMSC);
         // The binding lives as long as the driver.
-        let _ = sys::irq_ack(&self.irq);
+        self.ack();
         self.defer_output(false);
+    }
+
+    /// Opens the line again; a polled console has none.
+    fn ack(&self) {
+        if let Some(irq) = &self.irq {
+            let _ = sys::irq_ack(irq);
+        }
     }
 
     /// Formats a line of the driver into its output, the way the clients'
@@ -401,7 +530,7 @@ impl Uart {
         self.regs.write(IMSC, end.imsc);
         self.regs.read(IMSC);
         // The binding lives as long as the driver.
-        let _ = sys::irq_ack(&self.irq);
+        self.ack();
         self.defer_output(false);
     }
 
@@ -460,7 +589,8 @@ impl Uart {
     /// now (spec 10): those that passed are not made up.
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
-        self.deadline = next_release(self.t0, LOG_PERIOD_NS, now);
+        let period = if self.poll { POLL_NS } else { LOG_PERIOD_NS };
+        self.deadline = next_release(self.t0, period, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
@@ -864,6 +994,9 @@ impl Service<HELD> for Uart {
                 self.kick();
             }
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
+                if self.poll {
+                    self.interrupt();
+                }
                 self.take_log();
                 self.arm();
             }

@@ -23,9 +23,9 @@
 
 use crate::arch::{mmio, timer};
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 use kcore::bootinfo::{BootInfo, Region};
-use kcore::console::{FR_TXFF, covers};
+use kcore::console::{self as rules, FR_TXFF, covers};
 use kcore::layout::LINEAR_BASE;
 
 /// Registers of the PL011 by their offsets [R12, G36].
@@ -40,6 +40,16 @@ const CR_ENABLE: u32 = 0x301;
 /// as before `set_port`.
 static PORT_BASE: AtomicU64 = AtomicU64::new(0);
 static PORT_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The kind of the port: PL011, or a 16550 with the register shift and
+/// access width of its node (byte or 32 bits).
+static KIND: AtomicU8 = AtomicU8::new(0);
+const PL011: u8 = 0;
+const NS16550: u8 = 1;
+static SHIFT: AtomicU8 = AtomicU8::new(0);
+static WIDTH: AtomicU8 = AtomicU8::new(1);
+/// The transmitter of a 16550 gave no room within 1 ms: bytes go to the log
+/// only, until the port is set up again.
+static STUCK: AtomicBool = AtomicBool::new(false);
 /// The device windows alive now that cover a page of the port.
 static WINDOWS: AtomicU32 = AtomicU32::new(0);
 /// The last such window went: the next write sets the port up again.
@@ -64,22 +74,43 @@ fn port() -> Region {
 /// there is a port.
 fn reg(offset: usize) -> Option<usize> {
     let p = port();
+    let offset = if KIND.load(Relaxed) == NS16550 {
+        offset << SHIFT.load(Relaxed)
+    } else {
+        offset
+    };
     (p.size > 0).then(|| LINEAR_BASE + p.base as usize + offset)
+}
+
+fn is_16550() -> bool {
+    KIND.load(Relaxed) == NS16550
 }
 
 /// Writes `value` to register `offset` of the port, if there is one.
 fn write_reg(offset: usize, value: u32) {
     if let Some(addr) = reg(offset) {
-        // SAFETY: the port is the PL011 of the device tree, device memory
-        // in the linear map, which mm::kmap maps before `set_port`.
-        unsafe { mmio::write32(addr, value) }
+        // SAFETY: the port is the PL011 or 16550 of the device tree, device
+        // memory in the linear map, which mm::kmap maps before `set_port`.
+        unsafe {
+            if is_16550() && WIDTH.load(Relaxed) == 1 {
+                mmio::write8(addr, value as u8)
+            } else {
+                mmio::write32(addr, value)
+            }
+        }
     }
 }
 
 /// Reads register `offset` of the port; 0 without one.
 fn read_reg(offset: usize) -> u32 {
     // SAFETY: as in `write_reg`.
-    reg(offset).map_or(0, |addr| unsafe { mmio::read32(addr) })
+    reg(offset).map_or(0, |addr| unsafe {
+        if is_16550() && WIDTH.load(Relaxed) == 1 {
+            u32::from(mmio::read8(addr))
+        } else {
+            mmio::read32(addr)
+        }
+    })
 }
 
 /// The port from now on is the PL011 of the device tree `info` describes,
@@ -87,11 +118,20 @@ fn read_reg(offset: usize) -> u32 {
 /// before goes out on it first, in its order (log::show_early). Called
 /// once, when the kernel tables, which map that PL011, are live.
 pub fn set_port(info: &BootInfo) {
-    let p = info.uart_pl011.unwrap_or(Region { base: 0, size: 0 });
+    let (p, kind) = match (info.uart_pl011, info.uart_16550) {
+        (Some(p), _) => (p, PL011),
+        (None, Some(u)) => {
+            SHIFT.store(u.reg_shift, Relaxed);
+            WIDTH.store(u.io_width, Relaxed);
+            (u.regs, NS16550)
+        }
+        _ => (Region { base: 0, size: 0 }, PL011),
+    };
+    KIND.store(kind, Relaxed);
     PORT_BASE.store(p.base, Relaxed);
     PORT_SIZE.store(p.size, Relaxed);
     if p.size > 0 {
-        write_reg(CR, CR_ENABLE);
+        set_up();
         crate::log::show_early();
     }
 }
@@ -125,8 +165,17 @@ pub fn window_gone(base: u64, pages: u64) {
 /// the receiver on, as a driver that died may have left them off, and its
 /// interrupts masked, as it may have left them open.
 fn set_up() {
-    write_reg(CR, CR_ENABLE);
-    write_reg(IMSC, 0);
+    if is_16550() {
+        // No interrupts, 8N1 with the divisor latch closed: a driver that
+        // died may have left the port in the divisor mode. The divisor and
+        // the FIFOs are the firmware's.
+        write_reg(rules::REG_IER, 0);
+        write_reg(rules::REG_LCR, rules::LCR_8N1);
+        STUCK.store(false, Relaxed);
+    } else {
+        write_reg(CR, CR_ENABLE);
+        write_reg(IMSC, 0);
+    }
 }
 
 /// A report that ends in a panic takes the port, whoever has it (spec
@@ -138,6 +187,20 @@ pub fn take_back() {
 }
 
 fn putc(byte: u8) {
+    if is_16550() {
+        if STUCK.load(Relaxed) {
+            return;
+        }
+        // At most 1 ms for room, then the byte is lost and the port is
+        // marked stuck until the next set-up (spec 3.2).
+        let deadline = timer::now().saturating_add(timer::frequency() / 1000);
+        if !rules::wait_room(|| read_reg(rules::REG_LSR), || timer::now() >= deadline) {
+            STUCK.store(true, Relaxed);
+            return;
+        }
+        write_reg(rules::REG_THR, u32::from(byte));
+        return;
+    }
     let Some(dr) = reg(DR) else { return };
     while read_reg(FR) & FR_TXFF != 0 {}
     // SAFETY: as in `write_reg`.
@@ -165,6 +228,12 @@ pub fn write_bytes(bytes: &[u8]) {
 /// off. QEMU never shows the transmitter busy.
 pub fn drain() {
     let deadline = timer::now().saturating_add(timer::frequency() / 100);
+    if is_16550() {
+        if !STUCK.load(Relaxed) {
+            rules::drain_16550(|| read_reg(rules::REG_LSR), || timer::now() >= deadline);
+        }
+        return;
+    }
     kcore::console::drain(|| read_reg(FR), || timer::now() >= deadline);
 }
 

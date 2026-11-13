@@ -980,6 +980,27 @@ fn shell_program_list() -> Vec<ImageProgram> {
     programs
 }
 
+/// The programs of the shell on EC2 (init's table `table-aws`): the shell
+/// image's services and BusyBox, with init's table for the 16550 of the
+/// SPCR and no entropy service.
+fn aws_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let packages =
+            packages::of_image("boot-aws.img").unwrap_or_else(|e| panic!("the image of EC2: {e}"));
+        let mut programs = SHELL_SERVICES.to_vec();
+        programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
+        programs.extend(package_programs(&packages));
+        programs.extend(SHELL_SERVICES_LAST.iter().take(2));
+        programs
+    })
+}
+
+/// The boot image of the shell on EC2.
+pub(crate) fn aws_boot_image() -> Result<PathBuf, String> {
+    build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)
+}
+
 /// The builds of the programs that `packages` name (PACKAGE_PROGRAMS).
 fn package_programs(packages: &[packages::Package]) -> Vec<ImageProgram> {
     packages
@@ -1460,10 +1481,14 @@ enum Variant {
     /// The stage marks of the first boot on EC2 (kernel feature `early-marks`,
     /// `xtask aws`).
     EarlyMarks,
+    /// The ITS with the ladder of page sizes from 64 KiB and the tables
+    /// treated as non-shareable (kernel features `its-page-64k`,
+    /// `its-nonshare`; `cargo xtask efi EFI its-64k`).
+    ItsProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 36] = [
+    const ALL: [Variant; 37] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1500,6 +1525,7 @@ impl Variant {
         Variant::IdleNoDrain,
         Variant::IdleNoIrq,
         Variant::EarlyMarks,
+        Variant::ItsProbe,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1544,6 +1570,7 @@ impl Variant {
             Variant::IdleNoDrain => Some("break-idle-drain"),
             Variant::IdleNoIrq => Some("break-idle-irq"),
             Variant::EarlyMarks => Some("early-marks"),
+            Variant::ItsProbe => Some("its-page-64k,its-nonshare"),
         }
     }
 
@@ -1576,6 +1603,7 @@ impl Variant {
             | Variant::IdleNoDrain
             | Variant::IdleNoIrq
             | Variant::EarlyMarks
+            | Variant::ItsProbe
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1648,6 +1676,7 @@ impl Variant {
             Variant::IdleNoDrain => "stafeto-idle-no-drain",
             Variant::IdleNoIrq => "stafeto-idle-no-irq",
             Variant::EarlyMarks => "stafeto-early-marks",
+            Variant::ItsProbe => "stafeto-its-probe",
         }
     }
 }
