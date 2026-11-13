@@ -22,6 +22,8 @@ bench = false
 # boot image of subproject 1 with it.
 [features]
 crash = []
+# A deliberate break: a 16550 console is not polled (xtask uart-breaks).
+break-uart-poll = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

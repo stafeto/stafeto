@@ -140,6 +140,16 @@ static LPIS: [AtomicPtr<Irq>; MAX_LPIS] =
 /// binding left LPIS has passed (`reclaim`). Under `OBJ`.
 static LPI_MAP: Guarded<LpiMap> = Guarded::new(LpiMap::new());
 
+/// The LPIs the distributor gives (`its::lpi_limit`): `bind_event` refuses
+/// with LIMIT_REACHED past them. Set once at boot, before any binding.
+static LPI_LIMIT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(MAX_LPIS as u32);
+
+/// Restricts the LPIs handed out to the first `limit` (at boot).
+pub fn set_lpi_limit(limit: u32) {
+    LPI_LIMIT.store(limit, Ordering::Relaxed);
+}
+
 /// Bindings whose places have not gone back.
 static LIVE: Live = Live::new();
 
@@ -214,7 +224,10 @@ pub fn bind_event(
     cpu: u32,
 ) -> Result<(NonNull<Irq>, Job), Error> {
     channel::reserve_source(c)?;
-    let Some(lpi) = LPI_MAP.lock().take() else {
+    let Some(lpi) = LPI_MAP
+        .lock()
+        .take_within(LPI_LIMIT.load(Ordering::Relaxed))
+    else {
         channel::remove_source(c);
         return Err(Error::LimitReached);
     };

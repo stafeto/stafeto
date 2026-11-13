@@ -43,6 +43,9 @@ unsafe extern "C" {
 /// start.
 fn launch_ash() -> c_int {
     const EINTR: c_int = 4;
+    // The console of a machine like EC2 shows complete lines only, and the
+    // prompt has none: this line says that the shell is on its way.
+    rt::println!("ash-launch: ash on tty");
     let argv = [GETTY.as_ptr(), core::ptr::null()];
     let mut pid: c_int = 0;
     // SAFETY: the path and the arguments are NUL-terminated and live on;

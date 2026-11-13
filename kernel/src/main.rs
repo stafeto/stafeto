@@ -64,29 +64,45 @@ use kcore::time::Clock;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'D');
     arch::cpu::init_boot();
     arch::exceptions::init();
     qsbr::init();
     mm::aspace::begin();
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'E');
     psci::set_conduit(boot.info.psci);
     // Until the kernel's own tables are built, the allocator sees only the
     // RAM in the GiBs the boot page tables map; the kernel tables are built
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
     mm::kmap::switch_to_kernel_tables(boot);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'F');
     console::set_port(&boot.info);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'G');
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
     mm::aspace::init(boot);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'H');
     arch::gic::init(&boot.info);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'I');
     memory::forbid(&boot.info);
     let clock = arch::timer::init();
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'J');
     sched::init(clock);
     idle::init();
     smp::start(boot);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'K');
     #[cfg(feature = "stamps")]
     stamps::init(0);
     report(boot, clock, &init);

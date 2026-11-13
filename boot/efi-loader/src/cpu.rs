@@ -86,7 +86,8 @@ pub unsafe fn clean_range(base: u64, len: u64) {
 // masks the interrupts, stops both timers (the firmware may have left its
 // tick on, G28), clears SCTLR.M and SCTLR.C at the current level and keeps
 // SCTLR.I, invalidates the instruction cache, and jumps with x0 = the tree
-// and x1 = x2 = x3 = 0 (Linux booting.rst, G1, G3).
+// and x1 = x2 = x3 = 0 (Linux booting.rst, G1, G3); x1 is the address of the
+// port of the stage marks when the loader is built with `early-marks`.
 global_asm!(
     r#"
     .section .text.stafeto_enter, "ax"
@@ -95,6 +96,7 @@ global_asm!(
 stafeto_enter:
     mov     x16, x0
     mov     x17, x1
+    mov     x15, x2
     msr     daifset, #0xf
     msr     cntv_ctl_el0, xzr
     msr     cntp_ctl_el0, xzr
@@ -116,7 +118,7 @@ stafeto_enter:
     dsb     nsh
     isb
     mov     x0, x17
-    mov     x1, xzr
+    mov     x1, x15
     mov     x2, xzr
     mov     x3, xzr
     br      x16
@@ -126,7 +128,7 @@ stafeto_enter_end:
 );
 
 unsafe extern "C" {
-    fn stafeto_enter(entry: u64, dtb: u64) -> !;
+    fn stafeto_enter(entry: u64, dtb: u64, mark_port: u64) -> !;
     static stafeto_enter_end: u8;
 }
 
@@ -141,7 +143,7 @@ pub fn trampoline() -> (u64, u64) {
 ///
 /// # Safety
 /// Boot services are gone, the kernel and the tree are in place and clean.
-pub unsafe fn enter_kernel(entry: u64, dtb: u64) -> ! {
+pub unsafe fn enter_kernel(entry: u64, dtb: u64, mark_port: u64) -> ! {
     // SAFETY: the caller's.
-    unsafe { stafeto_enter(entry, dtb) }
+    unsafe { stafeto_enter(entry, dtb, mark_port) }
 }
