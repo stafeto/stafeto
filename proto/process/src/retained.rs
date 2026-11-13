@@ -122,6 +122,7 @@ mod tests {
         WhoReply {
             pid: 300,
             index: 44,
+            ceiling: 31,
             image: 2,
             loader: Some(LoaderOf {
                 image: 2,

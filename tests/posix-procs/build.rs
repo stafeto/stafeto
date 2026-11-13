@@ -30,6 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed=lock-sweep-share.c");
     println!("cargo:rerun-if-changed=lock-fifo-full.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=pshared-key.c");
     println!("cargo:rerun-if-changed=stepfifo.inc");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");

@@ -280,6 +280,34 @@ fn vouch(notary: &Handle<Channel>, identity: &Handle<Channel>) -> Option<proto_p
     proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
 }
 
+/// ShareHeld through the notary session: what right the record `index`
+/// (in the generation its Vouch gave) has to the shared object (`kind`,
+/// `key`). None for any answer but a right: STALE, a refusal, no reply.
+fn share_held(
+    notary: &Handle<Channel>,
+    index: u32,
+    generation: u64,
+    kind: u32,
+    key: u64,
+) -> Option<proto_process::Held> {
+    let mut w = proto_wire::Writer::new();
+    proto_process::Method::ShareHeld
+        .header()
+        .write(&mut w)
+        .ok()?;
+    proto_process::ShareHeld {
+        index,
+        generation,
+        kind,
+        key,
+    }
+    .write(&mut w)
+    .ok()?;
+    let reply = sys::send(notary, w.as_bytes()).ok()?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    proto_process::Held::read(reply.bytes(&mut buffer)).ok()
+}
+
 /// EACCES as the code of a refusal of the IPC calls.
 const NOT_ALLOWED: u32 = proto_pipe::ipc::ERRNO + 13;
 
@@ -365,7 +393,32 @@ impl PipeService {
             uid: credentials.euid,
             gid: credentials.egid,
             pid: s.data.known.pid().unwrap_or(0),
+            ceiling: s.data.known.ceiling().unwrap_or(0),
+            hold: false,
         })
+    }
+
+    /// Whether the client of `s` holds, for writing, the shared object the
+    /// words of an address call name (kind, key): the process service
+    /// vouches, once for each object while the generation of the client's
+    /// record stands (`Known::held`), with no call in between.
+    fn holds_for_write(&mut self, s: &mut Session<Client, 0>, call: &Call<'_>) -> bool {
+        let w = call.words();
+        let (Some(&kind), Some(&key)) = (w.first(), w.get(1)) else {
+            return false;
+        };
+        let Ok(kind) = u32::try_from(kind) else {
+            return false;
+        };
+        let Some(notary) = self.notary.as_ref() else {
+            return false;
+        };
+        s.data
+            .known
+            .held(generation, kind, key, |index, generation| {
+                share_held(notary, index, generation, kind, key)
+            })
+            == proto_process::Held::Write
     }
 
     /// Tells each operation `wakes` names that its end changed.
@@ -901,7 +954,7 @@ impl PipeService {
         if !self.take_ok(s, call.key, endpoint) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
-        let who = match self.who(s, offered) {
+        let mut who = match self.who(s, offered) {
             Ok(who) => who,
             Err(code) => {
                 if long {
@@ -910,6 +963,12 @@ impl PipeService {
                 return status(code);
             }
         };
+        // A wait or wake by address is the right of a process that holds the
+        // object of the key (the process service vouches), never of whoever
+        // names a key.
+        if matches!(call.op, ipc_op::ADDR_WAIT | ipc_op::ADDR_WAKE) {
+            who.hold = self.holds_for_write(s, &call);
+        }
         if call.op == ipc_op::MQ_OPEN
             && s.data.held.count() + self.named.reservations(s.label()) + 1 > HELD_MAX
         {

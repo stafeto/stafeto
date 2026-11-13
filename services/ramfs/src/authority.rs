@@ -485,6 +485,7 @@ mod retained_source_tests {
     #[test]
     fn public_infinity_binds_and_refreshes_without_unbounding_paid_memory() {
         let mut who = WhoReply {
+            ceiling: 31,
             pid: 1,
             credentials: proto_process::Credentials::ROOT,
             generation: 1,

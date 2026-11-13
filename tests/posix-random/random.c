@@ -41,6 +41,9 @@
 
 extern char **environ;
 extern uint64_t random_probe_calls(void);
+extern int stafeto_probe_loader_start(unsigned mode);
+extern unsigned stafeto_probe_loader_stop(void);
+extern unsigned stafeto_probe_loader_listen(void);
 
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -389,6 +392,67 @@ static int nested(void) {
     return urandom_threads();
 }
 
+/* The count of requests a forged entropy service got (the listener's return). */
+static void *forged_listener(void *unused) {
+    (void)unused;
+    return (void *)(unsigned long)stafeto_probe_loader_listen();
+}
+
+/* Starts `path` in the role `role` with a channel of the probe's own in the Entropy place (a
+ * caller that bypasses the layer), which the probe serves as a forged entropy service. Its exit
+ * status goes to `*status`, the requests the forged service got to `*requests`. */
+static int forged_run(const char *path, const char *role, int *status, unsigned *requests) {
+    pthread_t listener;
+    void *count = NULL;
+    char *argv[] = {"posix-random", (char *)role, NULL};
+    pid_t pid = 0;
+    CHECK(stafeto_probe_loader_start(5) == 0);
+    CHECK(pthread_create(&listener, NULL, forged_listener, NULL) == 0);
+    CHECK(posix_spawn(&pid, path, NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, status, 0) == pid);
+    CHECK(stafeto_probe_loader_stop() == 0);
+    CHECK(pthread_join(listener, &count) == 0);
+    *requests = (unsigned)(unsigned long)count;
+    return 0;
+}
+
+/* A set-ID program takes no entropy session from its caller. The control: a program that is not
+ * set-ID takes the same forged channel and asks it for a key, so the forgery reaches the place. */
+static int forged(void) {
+    int status = 0;
+    unsigned requests = 0;
+    CHECK(forged_run("/bin/posix-random", "forged", &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests != 0);
+    CHECK(forged_run("/bin/posix-random-suid", "setid", &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests == 0);
+    printf("posix-random: a set-ID program takes no entropy session from its caller, and gives ENOSYS\n");
+    return 0;
+}
+
+/* The role `forged`: asks the entropy session for bytes; a forged service answers none. */
+static int forged_role(void) {
+    unsigned char bytes[16];
+    (void)getentropy(bytes, sizeof bytes);
+    return 0;
+}
+
+/* The role `setid`: the program has no entropy session, so every source gives ENOSYS. */
+static int setid_role(void) {
+    unsigned char bytes[16];
+    errno = 0;
+    CHECK(getentropy(bytes, sizeof bytes) == -1);
+    CHECK(errno == ENOSYS);
+    errno = 0;
+    CHECK(getrandom(bytes, sizeof bytes, 0) == -1);
+    CHECK(errno == ENOSYS);
+    errno = 0;
+    CHECK(getrandom(bytes, sizeof bytes, GRND_NONBLOCK) == -1);
+    CHECK(errno == ENOSYS);
+    return 0;
+}
+
 static int first(void) {
     static unsigned char a[256], b[256], big[4096];
     unsigned char c[257], d[64];
@@ -425,6 +489,7 @@ static int first(void) {
     CHECK(arc4() == 0);
     CHECK(temporary() == 0);
     CHECK(descriptor() == 0);
+    CHECK(forged() == 0);
     return 0;
 }
 
@@ -511,6 +576,8 @@ static int fd_closed(const char *number) {
 
 int main(int argc, char **argv) {
     int status;
+    if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
+    if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forked() : first();

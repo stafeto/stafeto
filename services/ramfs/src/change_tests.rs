@@ -80,6 +80,7 @@ fn session() -> Fds {
 }
 fn credentials(uid: u32, euid: u32, gid: u32, egid: u32) -> Fds {
     let who = WhoReply {
+        ceiling: 31,
         pid: 300,
         credentials: Credentials {
             uid,

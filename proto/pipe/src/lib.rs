@@ -77,7 +77,11 @@ pub use named::{
 
 pub use named::WatchSet;
 
-pub const VERSION: u16 = 1;
+/// Version 2: the waits and wakes by address and the waits and posts of named
+/// semaphores answer EPERM to a caller that holds no right to the object
+/// (`ipc::op::ADDR_WAIT`, `ADDR_WAKE`, `NSEM_WAIT`, `NSEM_POST`); the layout
+/// of the words is as it was.
+pub const VERSION: u16 = 2;
 
 /// The pipes of the service.
 pub const PIPES: usize = 64;
