@@ -11,6 +11,17 @@ use crate::arch::{gic, timer};
 use crate::{irq, sched};
 use kcore::gic::{Ack, has_mask};
 
+/// Takes the interrupt that is pending at this CPU, if one is, with the
+/// CPU's interrupts masked: the boot's probes wait this way.
+#[inline(never)]
+pub fn poll() {
+    if crate::arch::irq_pending()
+        && let Some(ack) = gic::acknowledge()
+    {
+        handle(ack);
+    }
+}
+
 /// Handles an interrupt acknowledged at the GIC and ends it: the kernel's
 /// timer; a line bound to a channel, which is masked and posts to it
 /// (irq::deliver); any other line is masked and ended, since nothing
@@ -43,8 +54,7 @@ pub fn handle(ack: Ack) {
         // An LPI has no line to mask and no active state: the EOI below
         // ends it, delivered or not (spec 9).
         crate::obj::serving(crate::obj::ENTRY_INTERRUPT);
-        #[cfg(feature = "its-int")]
-        gic_its_seen(intid);
+        crate::arch::its::seen(intid);
         let _ = irq::deliver_lpi(intid);
     } else {
         // `deliver` looks the line up without a lock and enters the section
@@ -58,9 +68,4 @@ pub fn handle(ack: Ack) {
         }
     }
     gic::end(ack);
-}
-
-#[cfg(feature = "its-int")]
-fn gic_its_seen(intid: u32) {
-    crate::arch::its::int_probe::seen(intid);
 }

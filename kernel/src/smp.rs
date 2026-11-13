@@ -245,7 +245,8 @@ impl Matrix {
 /// the senders wrote name the pairs; each is read with acquire, after the
 /// SGI, so that the sender's barrier shows. On a GICv2 the source of the SGI
 /// must be the CPU interface of the sender whose flag is read. Ends the
-/// interrupt.
+/// interrupt. Out of line: `wcet bound` names it.
+#[inline(never)]
 pub fn handle(ack: Ack) {
     let me = cpu::this().index();
     let cpus = cpus();
@@ -303,11 +304,7 @@ pub fn sgi_probe() {
     ping_all(0, cpus);
     let limit = timer::now() + WAIT_SECONDS * timer::frequency();
     loop {
-        if crate::arch::irq_pending()
-            && let Some(ack) = gic::acknowledge()
-        {
-            handle(ack);
-        }
+        crate::interrupt::poll();
         let missing = (0..cpus)
             .flat_map(|to| (0..cpus).map(move |from| (to, from)))
             .find(|&(to, from)| to != from && GOT_PONG.at(to, from).load(Ordering::Relaxed) == 0);
