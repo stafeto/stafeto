@@ -247,7 +247,7 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", RAMFS_PROBE_STACK_SIZE, &[]),
 ];
-const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
+const POSIX_FILES_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -263,8 +263,10 @@ const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
         POSIX_STACK_SIZE,
         &["files", "names-loss"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
+const LOADER_ABORT_PROGRAMS: [ImageProgram; 8] = [
     (
         "init",
         "init",
@@ -286,8 +288,10 @@ const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
         &["loader-abort"],
     ),
     ("loader", "loader", 0, &["auth-probe"]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const IMAGE_GATES_PROGRAMS: [ImageProgram; 6] = [
+const IMAGE_GATES_PROGRAMS: [ImageProgram; 8] = [
     (
         "init",
         "init",
@@ -309,8 +313,10 @@ const IMAGE_GATES_PROGRAMS: [ImageProgram; 6] = [
         &["image-gates"],
     ),
     ("loader", "loader", 0, &["image-gates"]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const RAMFS_GC_PROGRAMS: [ImageProgram; 5] = [
+const RAMFS_GC_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe", "steps"]),
     (
@@ -321,8 +327,10 @@ const RAMFS_GC_PROGRAMS: [ImageProgram; 5] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-files", "ramfs-gc", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
+const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 9] = [
     (
         "init",
         "init",
@@ -345,8 +353,10 @@ const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("ramfs-holder", "ramfs-holder", CHILD_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_ABI_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -359,10 +369,12 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The POSIX ABI image whose process service ends before it registers:
 /// each POSIX process fails its load (`posix_orphans`).
-const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -375,8 +387,10 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_THREAD_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -394,8 +408,10 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -412,6 +428,8 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The image of console-restart-vz: init watches the old DMA object of
 /// the driver that ended (`dma-watch`).
@@ -446,7 +464,7 @@ const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
 ];
 /// The POSIX images of Apple VZ: those of QEMU with init's VZ tables and
 /// the Virtio console's driver in place of the PL011's.
-const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -463,8 +481,10 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_SHARED_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -482,9 +502,11 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
-const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_INPUT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", SVC_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -501,8 +523,10 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["input-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -519,11 +543,13 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["input-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the pipes, the
 /// process and clock services, the loader (the probe forks) and the probe.
-const POSIX_TTY_PROGRAMS: [ImageProgram; 10] = [
+const POSIX_TTY_PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-tty"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
@@ -539,15 +565,17 @@ const POSIX_TTY_PROGRAMS: [ImageProgram; 10] = [
     ("loader", "loader", 0, &[]),
     ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
     ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 10] = {
+const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_PROGRAMS;
     programs[2].3 = &["trust-probe", "steps"];
     programs[5].3 = &["tty-probe", "steps"];
     programs
 };
 /// Full terminal control steps with sixteen live POSIX clients over a PTY.
-const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 10] = {
+const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_STEPS_PROGRAMS;
     programs[2].3 = &["quiet-steps"];
     programs[5].3 = &[];
@@ -557,7 +585,7 @@ const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 10] = {
 };
 /// The same over the Virtio console's driver on Apple VZ (xtask
 /// posix-tty-vz).
-const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 10] = [
+const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-tty-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
@@ -573,8 +601,10 @@ const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 10] = [
     ("loader", "loader", 0, &[]),
     ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
     ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -591,8 +621,10 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -609,8 +641,10 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
         POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
+const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -629,9 +663,11 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The first C program on relibc (5a′) and the services it needs.
-const RELIBC_PROGRAMS: [ImageProgram; 5] = [
+const RELIBC_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -642,6 +678,8 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The probe of POSIX processes (5b) and the services it needs, the loader
 /// and BusyBox with its applets, which the table of files names (5c): the
@@ -869,7 +907,7 @@ const POSIX_STEPS_GRID_PROGRAMS: [ImageProgram; 9] = {
     programs
 };
 /// The threads of relibc (5a′) and the services they need.
-const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
+const RELIBC_THREADS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -880,8 +918,10 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-threads", "relibc-threads", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
+const BUSYBOX_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -892,8 +932,10 @@ const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("busybox-probe", "busybox-probe", POSIX_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-const ASH_PROGRAMS: [ImageProgram; 5] = [
+const ASH_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -909,6 +951,8 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
         POSIX_STACK_SIZE,
         &["ash-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The programs of the shell image besides those of its packages: the
 /// services that start before the packages' programs.
@@ -1081,7 +1125,7 @@ const TTY_VZ_PROGRAMS: [ImageProgram; 4] = [
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
 ];
-const LS_PROGRAMS: [ImageProgram; 5] = [
+const LS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -1097,6 +1141,8 @@ const LS_PROGRAMS: [ImageProgram; 5] = [
         POSIX_STACK_SIZE,
         &["ls-probe"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
@@ -3129,6 +3175,48 @@ fn build_boot_image(
     })
 }
 
+/// The packages of the tests and apps that link relibc's `libc.a` (their
+/// build script names relibc). Their start takes the stack canary from
+/// AT_RANDOM, or from a blocking `getrandom`, and ends the program with abort
+/// when it has neither.
+fn relibc_packages(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for group in ["tests", "apps"] {
+        let Ok(entries) = std::fs::read_dir(root.join(group)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let build = std::fs::read_to_string(entry.path().join("build.rs")).unwrap_or_default();
+            let manifest =
+                std::fs::read_to_string(entry.path().join("Cargo.toml")).unwrap_or_default();
+            if !build.contains("relibc") {
+                continue;
+            }
+            let name = manifest
+                .lines()
+                .find_map(|l| l.strip_prefix("name = \""))
+                .and_then(|l| l.strip_suffix('"'));
+            if let Some(name) = name {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The first program of `programs` on relibc when the image has no entropy
+/// service: that program would end in its start ("posix means entropy").
+fn without_entropy(root: &Path, programs: &[ImageProgram]) -> Option<&'static str> {
+    if programs.iter().any(|p| p.0 == "entropy") {
+        return None;
+    }
+    let relibc = relibc_packages(root);
+    programs
+        .iter()
+        .find(|p| relibc.iter().any(|name| name == p.1))
+        .map(|p| p.1)
+}
+
 /// The copy of the ELF file of `package` that the boot image `image` was
 /// built from, under the directory `target`.
 fn image_elf(target: &Path, image: &str, package: &str) -> PathBuf {
@@ -3164,6 +3252,11 @@ fn write_boot_image_files(
     env: &[(&str, &str)],
     extra: Vec<rootfs::RootFile>,
 ) -> Result<PathBuf, String> {
+    if let Some(program) = without_entropy(&root(), programs) {
+        return Err(format!(
+            "the image {name} starts {program}, a program on relibc, and has no entropy service"
+        ));
+    }
     let mut cmd = cargo();
     cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
@@ -4837,7 +4930,7 @@ fn relibc_hello_probe() -> Result<(), String> {
             qemu::cpus()
         ),
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 28 options claimed, timers 202405",
-        "relibc-hello: getentropy without the service: ENOSYS",
+        "relibc-hello: getentropy gives bytes from the service",
         "relibc-hello: ok",
         "RELIBC PANIC: ",
     ] {
@@ -5362,13 +5455,13 @@ fn ramfs_gc_probe() -> Result<(), String> {
 fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    const MEASURED: [ImageProgram; 6] = {
+    const MEASURED: [ImageProgram; 8] = {
         let mut programs = IMAGE_GATES_PROGRAMS;
         programs[1].3 = &["image-gates", "steps"];
         programs[2].3 = &["image-probe", "steps"];
         programs
     };
-    const NORMAL: [ImageProgram; 6] = {
+    const NORMAL: [ImageProgram; 8] = {
         let mut programs = MEASURED;
         programs[1].3 = &["auth-probe", "steps"];
         programs[2].3 = &["steps"];
@@ -5428,7 +5521,7 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
 fn loader_info_probe() -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    const PROGRAMS: [ImageProgram; 6] = {
+    const PROGRAMS: [ImageProgram; 8] = {
         let mut programs = LOADER_ABORT_PROGRAMS;
         programs[0].3 = &["table-posix-files", "loader-info"];
         programs[1].3 = &["image-info-probe", "steps"];
@@ -5461,7 +5554,7 @@ fn loader_info_probe() -> Result<(), String> {
 fn loader_abort_probe(measured: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    const MEASURED: [ImageProgram; 6] = {
+    const MEASURED: [ImageProgram; 8] = {
         let mut programs = LOADER_ABORT_PROGRAMS;
         programs[1].3 = &["auth-probe", "steps"];
         programs
@@ -5547,12 +5640,12 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
 fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    const MEASURED: [ImageProgram; 5] = {
+    const MEASURED: [ImageProgram; 7] = {
         let mut programs = POSIX_FILES_PROGRAMS;
         programs[1].3 = &["steps"];
         programs
     };
-    const DATA: [ImageProgram; 5] = {
+    const DATA: [ImageProgram; 7] = {
         let mut programs = POSIX_FILES_PROGRAMS;
         programs[0].3 = &["table-posix-files", "data-carrier-probe"];
         programs[1].3 = &["steps", "auth-probe"];
@@ -15269,5 +15362,185 @@ mod workspace_root_tests {
         std::fs::write(partial.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(partial.join("xtask/Cargo.toml"), "[package]\n").unwrap();
         assert!(workspace_root_from(&partial).is_err());
+    }
+}
+
+#[cfg(test)]
+mod entropy_in_images_tests {
+    use super::*;
+
+    /// "Posix means entropy": an image that starts a program on relibc has the
+    /// entropy service, since the start of such a program takes its stack
+    /// canary from it and ends without one.
+    #[test]
+    fn an_image_with_a_program_on_relibc_has_the_entropy_service() {
+        let tables: &[(&str, &[ImageProgram])] = &[
+            ("blk_probe::PROGRAMS", &crate::blk_probe::PROGRAMS),
+            ("display_probe::PROGRAMS", &crate::display_probe::PROGRAMS),
+            ("entropy::PROGRAMS", &crate::entropy::PROGRAMS),
+            ("entropy::SEED_PROGRAMS", &crate::entropy::SEED_PROGRAMS),
+            (
+                "entropy::SEED_BREAK_PROGRAMS",
+                &crate::entropy::SEED_BREAK_PROGRAMS,
+            ),
+            ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
+            ("gpu_probe::PROGRAMS", &crate::gpu_probe::PROGRAMS),
+            (
+                "gpu_probe::STEPS_PROGRAMS",
+                &crate::gpu_probe::STEPS_PROGRAMS,
+            ),
+            ("input_probe::PROGRAMS", &crate::input_probe::PROGRAMS),
+            (
+                "input_probe::STEPS_PROGRAMS",
+                &crate::input_probe::STEPS_PROGRAMS,
+            ),
+            ("main::BOOT_PROGRAMS", &BOOT_PROGRAMS),
+            ("main::VZ_PROGRAMS", &VZ_PROGRAMS),
+            ("main::RTBENCH_PROGRAMS", &RTBENCH_PROGRAMS),
+            ("main::RTBENCH_POSIX_PROGRAMS", &RTBENCH_POSIX_PROGRAMS),
+            (
+                "main::RTBENCH_POSIX_VZ_PROGRAMS",
+                &RTBENCH_POSIX_VZ_PROGRAMS,
+            ),
+            ("main::EXT4RO_PROGRAMS", &EXT4RO_PROGRAMS),
+            ("main::RAMFS_PROGRAMS", &RAMFS_PROGRAMS),
+            ("main::POSIX_FILES_PROGRAMS", &POSIX_FILES_PROGRAMS),
+            ("main::LOADER_ABORT_PROGRAMS", &LOADER_ABORT_PROGRAMS),
+            ("main::IMAGE_GATES_PROGRAMS", &IMAGE_GATES_PROGRAMS),
+            ("main::RAMFS_GC_PROGRAMS", &RAMFS_GC_PROGRAMS),
+            ("main::RAMFS_CLEANUP_PROGRAMS", &RAMFS_CLEANUP_PROGRAMS),
+            ("main::POSIX_ABI_PROGRAMS", &POSIX_ABI_PROGRAMS),
+            ("main::POSIX_ORPHAN_PROGRAMS", &POSIX_ORPHAN_PROGRAMS),
+            ("main::POSIX_THREAD_PROGRAMS", &POSIX_THREAD_PROGRAMS),
+            (
+                "main::POSIX_CANCEL_INPUT_PROGRAMS",
+                &POSIX_CANCEL_INPUT_PROGRAMS,
+            ),
+            ("main::VZ_WATCH_PROGRAMS", &VZ_WATCH_PROGRAMS),
+            ("main::VZ_EARLY_PROGRAMS", &VZ_EARLY_PROGRAMS),
+            ("main::RTBENCH_VZ_PROGRAMS", &RTBENCH_VZ_PROGRAMS),
+            (
+                "main::POSIX_VZ_CANCEL_INPUT_PROGRAMS",
+                &POSIX_VZ_CANCEL_INPUT_PROGRAMS,
+            ),
+            ("main::POSIX_SHARED_PROGRAMS", &POSIX_SHARED_PROGRAMS),
+            ("main::POSIX_TLS_PROGRAMS", &POSIX_TLS_PROGRAMS),
+            ("main::POSIX_INPUT_PROGRAMS", &POSIX_INPUT_PROGRAMS),
+            ("main::POSIX_VZ_INPUT_PROGRAMS", &POSIX_VZ_INPUT_PROGRAMS),
+            ("main::POSIX_TTY_PROGRAMS", &POSIX_TTY_PROGRAMS),
+            ("main::POSIX_TTY_STEPS_PROGRAMS", &POSIX_TTY_STEPS_PROGRAMS),
+            (
+                "main::POSIX_TTY_CONTROL_PROGRAMS",
+                &POSIX_TTY_CONTROL_PROGRAMS,
+            ),
+            ("main::POSIX_TTY_VZ_PROGRAMS", &POSIX_TTY_VZ_PROGRAMS),
+            ("main::POSIX_INTERRUPT_PROGRAMS", &POSIX_INTERRUPT_PROGRAMS),
+            (
+                "main::POSIX_VZ_INTERRUPT_PROGRAMS",
+                &POSIX_VZ_INTERRUPT_PROGRAMS,
+            ),
+            ("main::POSIX_VZ_THREAD_PROGRAMS", &POSIX_VZ_THREAD_PROGRAMS),
+            ("main::RELIBC_PROGRAMS", &RELIBC_PROGRAMS),
+            ("main::POSIX_PROCS_PROGRAMS", &POSIX_PROCS_PROGRAMS),
+            ("main::POSIX_LIFETIMES_PROGRAMS", &POSIX_LIFETIMES_PROGRAMS),
+            (
+                "main::POSIX_LOCK_LIFECYCLE_PROGRAMS",
+                &POSIX_LOCK_LIFECYCLE_PROGRAMS,
+            ),
+            ("main::POSIX_LOCK_CORE_PROGRAMS", &POSIX_LOCK_CORE_PROGRAMS),
+            ("main::POSIX_LOCK_PAGE_PROGRAMS", &POSIX_LOCK_PAGE_PROGRAMS),
+            ("main::POSIX_LOCK_FIFO_PROGRAMS", &POSIX_LOCK_FIFO_PROGRAMS),
+            ("main::POSIX_LOCK_RING_PROGRAMS", &POSIX_LOCK_RING_PROGRAMS),
+            ("main::POSIX_SHARES_PROGRAMS", &POSIX_SHARES_PROGRAMS),
+            (
+                "main::POSIX_SPAWN_CHURN_PROGRAMS",
+                &POSIX_SPAWN_CHURN_PROGRAMS,
+            ),
+            ("main::POSIX_MATH_PROGRAMS", &POSIX_MATH_PROGRAMS),
+            ("main::POSIX_PARK_PROGRAMS", &POSIX_PARK_PROGRAMS),
+            ("main::POSIX_FIFO_PROGRAMS", &POSIX_FIFO_PROGRAMS),
+            (
+                "main::POSIX_FIFO_STEPS_PROGRAMS",
+                &POSIX_FIFO_STEPS_PROGRAMS,
+            ),
+            ("main::POSIX_SYNC_PROGRAMS", &POSIX_SYNC_PROGRAMS),
+            ("main::POSIX_RESOURCES_PROGRAMS", &POSIX_RESOURCES_PROGRAMS),
+            ("main::POSIX_MAP_PROGRAMS", &POSIX_MAP_PROGRAMS),
+            ("main::POSIX_MAP_BIG_PROGRAMS", &POSIX_MAP_BIG_PROGRAMS),
+            ("main::POSIX_SO_PROGRAMS", &POSIX_SO_PROGRAMS),
+            ("main::POSIX_SO_STEPS_PROGRAMS", &POSIX_SO_STEPS_PROGRAMS),
+            ("main::POSIX_NAMES_PROGRAMS", &POSIX_NAMES_PROGRAMS),
+            (
+                "main::POSIX_NATIVE_SCOPE_PROGRAMS",
+                &POSIX_NATIVE_SCOPE_PROGRAMS,
+            ),
+            (
+                "main::POSIX_VZ_NATIVE_SCOPE_PROGRAMS",
+                &POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
+            ),
+            ("main::POSIX_STEPS_PROGRAMS", &POSIX_STEPS_PROGRAMS),
+            (
+                "main::POSIX_STEPS_GRID_PROGRAMS",
+                &POSIX_STEPS_GRID_PROGRAMS,
+            ),
+            ("main::RELIBC_THREADS_PROGRAMS", &RELIBC_THREADS_PROGRAMS),
+            ("main::BUSYBOX_PROGRAMS", &BUSYBOX_PROGRAMS),
+            ("main::ASH_PROGRAMS", &ASH_PROGRAMS),
+            ("main::SHELL_SERVICES", &SHELL_SERVICES),
+            ("main::SHELL_SERVICES_LAST", &SHELL_SERVICES_LAST),
+            ("main::TTY_PROGRAMS", &TTY_PROGRAMS),
+            ("main::TTY_STEPS_PROGRAMS", &TTY_STEPS_PROGRAMS),
+            ("main::TTY_VZ_PROGRAMS", &TTY_VZ_PROGRAMS),
+            ("main::LS_PROGRAMS", &LS_PROGRAMS),
+            ("main::TEST_PROGRAMS", &TEST_PROGRAMS),
+            ("main::SVC_PROGRAMS", &SVC_PROGRAMS),
+            ("main::CYCLE_PROGRAMS", &CYCLE_PROGRAMS),
+            ("main::CEILING_PROGRAMS", &CEILING_PROGRAMS),
+            ("main::SOCK_PROGRAMS", &SOCK_PROGRAMS),
+            ("main::SOCK_PROGRAMS_STEPS", &SOCK_PROGRAMS_STEPS),
+            ("main::IPC_PROGRAMS", &IPC_PROGRAMS),
+            ("main::IPC_PROGRAMS_STEPS", &IPC_PROGRAMS_STEPS),
+            ("net_probe::PROGRAMS", &crate::net_probe::PROGRAMS),
+            ("net_probe::ITS_PROGRAMS", &crate::net_probe::ITS_PROGRAMS),
+            ("net_probe::TWO_PROGRAMS", &crate::net_probe::TWO_PROGRAMS),
+            (
+                "net_probe::TWO_STEPS_PROGRAMS",
+                &crate::net_probe::TWO_STEPS_PROGRAMS,
+            ),
+            (
+                "net_probe::STEPS_PROGRAMS",
+                &crate::net_probe::STEPS_PROGRAMS,
+            ),
+            ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
+            ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
+            ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
+        ];
+        let root = root();
+        assert!(
+            relibc_packages(&root).len() > 10,
+            "the packages on relibc were not found"
+        );
+        let lacking: Vec<String> = tables
+            .iter()
+            .filter_map(|(name, programs)| {
+                without_entropy(&root, programs).map(|p| format!("{name}: {p}"))
+            })
+            .collect();
+        assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
+    }
+
+    #[test]
+    fn an_image_without_the_entropy_service_is_refused() {
+        let root = root();
+        let with = [
+            ("init", "init", 0, &[][..]),
+            ("hello", "relibc-hello", 0, &[][..]),
+            ("entropy", "entropy", 0, &[][..]),
+        ];
+        assert_eq!(without_entropy(&root, &with), None);
+        let without = &with[..2];
+        assert_eq!(without_entropy(&root, without), Some("relibc-hello"));
+        // A program of Rust alone needs none.
+        assert_eq!(without_entropy(&root, &with[..1]), None);
     }
 }

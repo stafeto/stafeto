@@ -142,11 +142,13 @@ pub const LAYER_PROBE_TABLE: &[Record] = &[
         name: "layer-user",
         program: "layer-user",
         args: b"layer-user\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "clock", "posix", "entropy"],
         quota: 1024 * PAGE,
         root: true,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// A POSIX process: main at the probe's level, the ceiling one above it,
@@ -176,12 +178,14 @@ pub const BUSYBOX_TABLE: &[Record] = &[
     Record {
         name: "busybox-probe",
         program: "busybox-probe",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "clock", "posix", "entropy"],
         quota: 512 * PAGE,
         // The first POSIX process: root, so ash prompts with `#`.
         root: true,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The dialog: the console's driver, the RAM files, the process and clock
@@ -281,12 +285,14 @@ pub const POSIX_TTY_TABLE: &[Record] = &[
         name: "posix-tty",
         program: "posix-tty",
         args: b"posix-tty\0",
-        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         quota: DIALOG_QUOTA,
         root: true,
         ..POSIX
     },
     TTY,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probes of console input and interruption (posix-threads with
@@ -301,12 +307,14 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     Record {
         name: "posix-probe",
         program: "posix-probe",
-        connects: &["ramfs", "uart", "clock", "posix"],
+        connects: &["ramfs", "uart", "clock", "posix", "entropy"],
         quota: 512 * PAGE,
         // Diagnostic writers exercise the fixed root-owned /tmp/probe node.
         root: true,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 #[cfg(not(feature = "data-carrier-probe"))]
@@ -329,11 +337,13 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "posix-files",
         program: "posix-files",
         args: b"posix-files\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "clock", "posix", "entropy"],
         quota: 2048 * PAGE,
         root: true,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// Genuine uncommitted exec attempts with one pending image at a time.
@@ -359,11 +369,13 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "posix-files",
         program: "posix-files",
         args: b"posix-files\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "clock", "posix", "entropy"],
         quota: 2048 * PAGE,
         root: true,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// Owner and retained foreign session holder for the unfinished-binding fixture.
@@ -384,7 +396,7 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "posix-files",
         program: "posix-files",
         args: b"posix-files\0",
-        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        connects: &["ramfs", "clock", "posix", "entropy", "ramfs-holder"],
         priority: 30,
         ceiling: 31,
         quota: 2048 * PAGE,
@@ -403,7 +415,7 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "ramfs-owner-0",
         args: b"posix-files\00\0",
         program: "posix-files",
-        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        connects: &["ramfs", "clock", "posix", "entropy", "ramfs-holder"],
         priority: 30,
         ceiling: 31,
         quota: 2048 * PAGE,
@@ -414,7 +426,7 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "ramfs-owner-1",
         args: b"posix-files\01\0",
         program: "posix-files",
-        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        connects: &["ramfs", "clock", "posix", "entropy", "ramfs-holder"],
         priority: 30,
         ceiling: 31,
         quota: 2048 * PAGE,
@@ -425,13 +437,15 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         name: "ramfs-owner-2",
         args: b"posix-files\02\0",
         program: "posix-files",
-        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        connects: &["ramfs", "clock", "posix", "entropy", "ramfs-holder"],
         priority: 30,
         ceiling: 31,
         quota: 2048 * PAGE,
         root: false,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 pub const POSIX_ABI_TABLE: &[Record] = &[
@@ -476,7 +490,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix-abi-probe",
         program: "posix-abi-probe",
         args: b"posix-abi-probe\0argument\0",
-        connects: &["ramfs", "clock", "clock-peer", "posix", "long"],
+        connects: &["ramfs", "clock", "clock-peer", "posix", "long", "entropy"],
         quota: 2048 * PAGE,
         // Each pthread holds five handles: its thread, its own copy with
         // MANAGE, its channel, its timer (posix-sync) and its exit channel;
@@ -508,6 +522,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         handle_limit: 16,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The first C program on relibc (5a′): the RAM files, the process and
@@ -521,7 +537,7 @@ pub const RELIBC_TABLE: &[Record] = &[
         program: "relibc-hello",
         root: true,
         args: b"relibc-hello\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "clock", "posix", "entropy"],
         quota: 512 * PAGE,
         ..POSIX
     },
@@ -542,6 +558,8 @@ pub const RELIBC_TABLE: &[Record] = &[
         args: b"relibc-hello\0panic\0",
         ..RELIBC_HELLO
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The pipe service (5e), beside the RAM file service at its level: its
@@ -810,7 +828,7 @@ const RELIBC_HELLO: Record = Record {
     name: "relibc-hello",
     program: "relibc-hello",
     args: b"relibc-hello\0",
-    connects: &["ramfs", "clock", "posix"],
+    connects: &["ramfs", "clock", "posix", "entropy"],
     quota: 512 * PAGE,
     ..POSIX
 };
@@ -831,6 +849,8 @@ pub const RELIBC_THREADS_TABLE: &[Record] = &[
         root: true,
         ..RELIBC_TABLE[3]
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The service of long operations of rtbench 2 (tests/svc, role `l`)
@@ -1017,11 +1037,13 @@ pub const POSIX_DISPLAY_TABLE: &[Record] = &[
         name: "posix-display",
         program: "posix-display",
         args: b"posix-display\0",
-        connects: &["ramfs", "pipe", "clock", "posix", "gpu"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
         root: true,
         quota: PROCS_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the screen and the keys on libc.so (tests/display-run and
@@ -1045,7 +1067,7 @@ pub const DISPLAY_TABLE: &[Record] = &[
         name: "display-run",
         program: "display-run",
         args: b"display-run\0run\0",
-        connects: &["ramfs", "pipe", "clock", "posix", "gpu"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
         root: true,
         quota: PROCS_QUOTA,
         ..POSIX
@@ -1054,11 +1076,13 @@ pub const DISPLAY_TABLE: &[Record] = &[
         name: "display-run-b",
         program: "display-run",
         args: b"display-run\0nogpu\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: false,
         quota: PROCS_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// Functional loader channel probe with the process probe's ordinary image.

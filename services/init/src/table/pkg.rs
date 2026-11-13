@@ -262,7 +262,7 @@ pub const PKG_SLOT: Record = Record {
     name: "pkg-slot",
     program: "pkg-slot",
     args: b"pkg-slot\0",
-    connects: &["ramfs", "pipe", "clock", "posix", "pkgd"],
+    connects: &["ramfs", "pipe", "clock", "posix", "pkgd", "entropy"],
     quota: super::ramfs::PROCS_QUOTA,
     // The disk of the probe is empty: the service formats it before it answers, and the
     // probe starts when it said READY.
@@ -283,6 +283,8 @@ pub const PKG_SLOT_TABLE: &[Record] = &[
     BLK,
     PKGD,
     PKG_SLOT,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The client of the wait probe (xtask init-wait): the program of the store probe, whose

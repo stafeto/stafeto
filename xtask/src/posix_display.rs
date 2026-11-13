@@ -16,7 +16,7 @@ use crate::{
 
 /// The probe's image: the services of the POSIX probes, the display
 /// service and the probe, which starts its own file once.
-pub const PROGRAMS: [ImageProgram; 8] = [
+pub const PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-display"]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     (
@@ -38,6 +38,18 @@ pub const PROGRAMS: [ImageProgram; 8] = [
         "posix-display",
         "posix-display-probe",
         crate::POSIX_STACK_SIZE,
+        &[],
+    ),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
         &[],
     ),
 ];

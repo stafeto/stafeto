@@ -855,16 +855,16 @@ int main(int argc, char **argv) {
     if (status) return status;
     status = constants();
     if (status) return status;
-    /* No entropy service in this image: getentropy has no source. */
+    /* The image has the entropy service (a program on relibc needs it for its stack canary). */
     unsigned char random_bytes[16];
+    unsigned char zero[16] = {0};
     errno = 0;
     int got_entropy = getentropy(random_bytes, sizeof random_bytes);
-    if (got_entropy != -1 || errno != ENOSYS) {
-        printf("relibc-hello: getentropy without the service gave %d, errno %d\n", got_entropy,
-               errno);
+    if (got_entropy != 0 || memcmp(random_bytes, zero, sizeof zero) == 0) {
+        printf("relibc-hello: getentropy gave %d, errno %d\n", got_entropy, errno);
         return 9;
     }
-    printf("relibc-hello: getentropy without the service: ENOSYS\n");
+    printf("relibc-hello: getentropy gives bytes from the service\n");
     printf("relibc-hello: ok\n");
     return 0;
 }

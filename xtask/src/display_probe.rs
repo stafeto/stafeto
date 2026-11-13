@@ -34,7 +34,7 @@ use crate::{
 
 /// The probe's image: the services of the POSIX probes, the input and the
 /// display service (with the method that ends it), and the launcher.
-pub const PROGRAMS: [ImageProgram; 9] = [
+pub const PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-display"]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     (
@@ -59,6 +59,18 @@ pub const PROGRAMS: [ImageProgram; 9] = [
         &["crash"],
     ),
     ("display-run", "display-run", POSIX_STACK_SIZE, &[]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
 ];
 
 const PATTERN: &str = "display-probe: pattern crc ";
