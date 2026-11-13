@@ -143,7 +143,18 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
     // /timer
     if let Some(t) = &p.timer {
         let mut cells = Vec::new();
+        // A timer the GTDT leaves out (GSIV 0: Apple's firmware has no
+        // secure timer) takes the architectural PPI of the slot (G27).
+        const ARCHITECTURAL: [u32; 4] = [29, 30, 27, 26];
         for (i, irq) in t.irqs.iter().enumerate() {
+            let irq = if irq.gsiv == 0 {
+                crate::platform::TimerIrq {
+                    gsiv: ARCHITECTURAL[i],
+                    flags: 0,
+                }
+            } else {
+                *irq
+            };
             if !(16..32).contains(&irq.gsiv) {
                 return Err(Error::Unsupported("GTDT timer interrupt is not a PPI"));
             }

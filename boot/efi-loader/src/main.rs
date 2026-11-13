@@ -366,6 +366,10 @@ fn dump(root: &mut Directory, tables: &[([u8; 4], &[u8])], map: &[Desc]) -> ! {
     let mut write = |name: &str, bytes: &[u8]| {
         let mut buf16 = [0u16; 32];
         let name16 = CStr16::from_str_with_buf(name, &mut buf16).expect("name");
+        // A file of an earlier dump goes first: a write does not shorten it.
+        if let Ok(old) = dir.open(name16, FileMode::ReadWrite, A::empty()) {
+            let _ = old.delete();
+        }
         let handle = dir
             .open(name16, FileMode::CreateReadWrite, A::empty())
             .unwrap_or_else(|e| refuse(&format!("cannot create {name}: {e}")));

@@ -298,6 +298,95 @@ pub fn run(names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the samples of the host test of the translation live.
+pub const FIXTURES: &str = "boot/firmware-tree/tests/fixtures";
+
+/// `cargo xtask efi-fixtures [NAME]`: the loader with `dump` on `EFI` writes
+/// the firmware's ACPI tables, its memory map and the GUIDs of its
+/// configuration tables to the ESP and stops; the files and QEMU's own
+/// tree of the same machine (`dumpdtb`) go to `FIXTURES/qemu-efi/`.
+pub fn fixtures(args: &[String]) -> Result<(), String> {
+    // `efi-fixtures vz DISK`: the dump a run of vz-run --efi-writable left on DISK.
+    if let [kind, disk] = args {
+        if kind == "vz-disk" {
+            // A fresh disk with the dump loader, for `vz-run --efi-writable`.
+            let a = build(Variant::Normal)?;
+            return make_disk(&build_loader(&["dump"])?, &a, Path::new(disk));
+        }
+        if kind != "vz" {
+            return Err("usage: efi-fixtures [vz DISK]".into());
+        }
+        let out = crate::root().join(FIXTURES).join("vz-efi");
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        for (name, bytes) in efi_disk::read_dir(Path::new(disk), "stafeto/dump")? {
+            std::fs::write(out.join(&name), bytes).map_err(|e| format!("{name}: {e}"))?;
+            println!("fixture vz-efi/{name}");
+        }
+        return Ok(());
+    }
+    let fw = firmware()?;
+    let a = build(Variant::Normal)?;
+    let loader = build_loader(&["dump"])?;
+    let disk = crate::target_dir().join("efi-disk-dump.raw");
+    make_disk(&loader, &a, &disk)?;
+    wait_for_quiet_mac()?;
+    let cmd = command(&EFI, &fw, &disk, false, "dump")?;
+    let o = qemu::run_until(
+        cmd,
+        Duration::from_secs(120),
+        Some("efi-loader: dump written"),
+    )?;
+    if !o.stopped_on_marker {
+        return Err(format!(
+            "the loader wrote no dump; last lines: {:?}",
+            &o.lines[o.lines.len().saturating_sub(6)..]
+        ));
+    }
+    let out = crate::root().join(FIXTURES).join("qemu-efi");
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    for (name, bytes) in efi_disk::read_dir(&disk, "stafeto/dump")? {
+        std::fs::write(out.join(&name), bytes).map_err(|e| format!("{name}: {e}"))?;
+        println!("fixture {name}");
+    }
+    // QEMU's tree of the same machine: the arguments of the run, and the
+    // machine told to write it out and exit.
+    let dtb = out.join("virt.dtb");
+    wait_for_quiet_mac()?;
+    let status = Command::new("qemu-system-aarch64")
+        .args([
+            "-machine",
+            &format!("{},dumpdtb={}", EFI.machine, dtb.display()),
+        ])
+        .args([
+            "-cpu", EFI.cpu, "-m", EFI.memory, "-smp", "2", "-display", "none",
+        ])
+        .args(qemu::ENTROPY)
+        .args(qemu::NO_NIC)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("dumpdtb: {status}"));
+    }
+    // QEMU writes its whole 1 MiB buffer and says so in the header: the
+    // blob ends where its strings do, and the header says that.
+    let mut blob = std::fs::read(&dtb).map_err(|e| e.to_string())?;
+    let be = |at: usize| u32::from_be_bytes(blob[at..at + 4].try_into().unwrap()) as usize;
+    let end = (be(8) + be(36)).max(be(12) + be(32));
+    blob.truncate(end);
+    blob[4..8].copy_from_slice(&(end as u32).to_be_bytes());
+    std::fs::write(&dtb, blob).map_err(|e| e.to_string())?;
+    std::fs::write(
+        out.join("machine.txt"),
+        format!(
+            "{} -cpu {} -m {} -smp 2\n",
+            EFI.machine, EFI.cpu, EFI.memory
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    println!("fixture virt.dtb");
+    Ok(())
+}
+
 /// What a deliberate break must do (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 7), the host tests
 /// of `firmware-tree` and the run of the loader under QEMU.
 struct Break {

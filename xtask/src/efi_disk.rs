@@ -204,6 +204,35 @@ pub fn build(path: &Path, files: &[EspFile<'_>]) -> Result<(), String> {
     Ok(())
 }
 
+/// The files of directory `dir` (names with `/` between) of the ESP of the
+/// disk at `path`, as (name, bytes): what the loader's `dump` wrote.
+pub fn read_dir(path: &Path, dir: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let err = |what: &str, e: &dyn std::fmt::Display| format!("{}: {what}: {e}", path.display());
+    let mut file = std::fs::File::open(path).map_err(|e| err("open", &e))?;
+    let parts = read_partitions(&mut file)?;
+    let (first, last) = (parts[0].1, parts[0].2);
+    let slice = StreamSlice::new(file, first * SECTOR, (last + 1) * SECTOR)
+        .map_err(|e| err("partition", &e))?;
+    let fs =
+        FileSystem::new(BufStream::new(slice), FsOptions::new()).map_err(|e| err("mount", &e))?;
+    let folder = fs.root_dir().open_dir(dir).map_err(|e| err(dir, &e))?;
+    let mut out = Vec::new();
+    for entry in folder.iter() {
+        let entry = entry.map_err(|e| err(dir, &e))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry
+            .to_file()
+            .read_to_end(&mut bytes)
+            .map_err(|e| err(&entry.file_name(), &e))?;
+        out.push((entry.file_name(), bytes));
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// What a reader found: the partitions of the GPT, as (type GUID bytes, first
 /// LBA, last LBA), after the checks of both headers.
 pub fn read_partitions<R: Read + Seek>(disk: &mut R) -> Result<Vec<([u8; 16], u64, u64)>, String> {
