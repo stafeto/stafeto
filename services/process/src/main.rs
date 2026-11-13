@@ -1195,6 +1195,9 @@ impl Processes {
         if method == Method::RetainedLoader as u16 {
             return self.retained_loader(r);
         }
+        if method == Method::ShareHeld as u16 {
+            return self.share_held(r);
+        }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -1356,6 +1359,39 @@ impl Processes {
             .and_then(|()| who.write(r.reply()))
             .is_err()
         {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
+    }
+
+    /// ShareHeld through a notary session: what right the record `index`
+    /// has to the shared object of `key`, as the generation of its Vouch
+    /// says. STALE when the record is another one by now (its process
+    /// ended, or it lost a right and the generation moved), so that the
+    /// asker vouches again. The table is searched through, O(SHARES).
+    fn share_held(&mut self, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let ask = match proto_process::ShareHeld::read(r.body()) {
+            Ok(ask) => ask,
+            Err(status) => return Answer::Status(status),
+        };
+        let index = ask.index as usize;
+        if self.records.get(index).is_none() || self.generations.get(index) != ask.generation {
+            return refuse(proto_process::STALE);
+        }
+        let kind = if ask.kind == proto_process::HELD_KIND_ANON {
+            shares::Kind::Anon
+        } else {
+            shares::Kind::File
+        };
+        let held = match self.shares.held(index, kind, ask.key) {
+            shares::Held::None => proto_process::HELD_NONE,
+            shares::Held::Read => proto_process::HELD_READ,
+            shares::Held::Write => proto_process::HELD_WRITE,
+        };
+        if r.reply().u32(0).is_err() || r.reply().u32(held).is_err() {
             return Answer::Status(Status::BadSize);
         }
         Answer::Reply(Outgoing::new())
@@ -1731,8 +1767,23 @@ impl Processes {
                 self.wake_sharers();
                 Answer::Status(Status::Ok)
             }
+            // An anonymous object: the service makes its key and enters the
+            // caller as the writer. No place: FULL, and the object has no key.
+            proto_process::SHARE_ANON if r.handles.is_empty() && key == 0 && pages == 0 => {
+                let Some(key) = self.shares.anon(index) else {
+                    return refuse(proto_process::FULL);
+                };
+                if r.reply().u32(0).is_err() || r.reply().u64(key).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
             proto_process::SHARE_DETACH if r.handles.is_empty() => {
-                self.shares.detach(key, index);
+                // A right that is lost moves the generation of the record, so
+                // that the services that remember a Vouch ask again.
+                if self.shares.detach(key, index) {
+                    self.generations.raise(index);
+                }
                 self.wake_sharers();
                 Answer::Status(Status::Ok)
             }
@@ -4421,6 +4472,12 @@ impl Processes {
         // The services that remember credentials see the new ones before
         // the child runs a request.
         self.generations.raise(child);
+        // A child of fork maps what its parent maps: it is a user of the
+        // anonymous shared objects its parent is one of. The service does it
+        // here; what the child says of itself would count for nothing.
+        if fork {
+            self.shares.fork_anon(index, child);
+        }
         let slot = self.loaders.of(child).expect("a committed place");
         let place = self.loaders.get_mut(slot).expect("a place");
         self.routers[child] = place.held.thread.take();
