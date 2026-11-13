@@ -488,8 +488,18 @@ fn loaded_main() -> u64 {
         rt::println!("POSIX startup: {}", why);
         return 125;
     }
-    // SAFETY: still single-threaded.
-    unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
+    // A set-ID program takes no entropy session from its caller, who could
+    // put a service of its own there and so know the program's keys: the
+    // handle closes, and getentropy, getrandom and arc4random give ENOSYS
+    // (a loaded program has no name lookup to reach the service by, and
+    // nothing falls back to a weaker source). SAFETY: still single-threaded.
+    unsafe {
+        posix_abi::random::init(
+            one(Slot::Entropy)
+                .map(Handle::from_raw)
+                .filter(|_| area.flags & SECURE == 0),
+        )
+    };
     // A set-ID program takes no display session from its caller, who could
     // put a channel of its own there: the handle closes and the screen
     // calls give ENODEV. SAFETY: as above.

@@ -2133,6 +2133,19 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-random", 0o755, ROOT, "posix-random"),
+                // Owned by another user: a spawn of it runs with a real ID that
+                // differs from the effective one (AT_SECURE).
+                of(
+                    "/bin/posix-random-suid",
+                    0o4755,
+                    (1000, 100),
+                    Source::Variant {
+                        program: "posix-random",
+                        tag: "setid",
+                        // A file of its own: equal bytes would be one file.
+                        extra: 4096,
+                    },
+                ),
                 dir("/dev"),
             ];
             files.extend(devices());
