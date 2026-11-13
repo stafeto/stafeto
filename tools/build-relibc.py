@@ -162,7 +162,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # tagged pin-60b70ca6.
 # getspnam and getspnam_r match the whole name
 # (stafeto-design#634); tagged pin-bbcd2dcc.
-COMMIT = "bbcd2dcc3465ca73b765c7ad0b724487652b2ed7"
+# The stack canary from AT_RANDOM (a blocking getrandom without it, abort
+# without both), mkstemp and its kin, tmpnam, tempnam, the DNS transaction
+# number and shmget fail with ENOSYS without entropy and draw nothing from
+# the clock; tagged pin-d17e0a97.
+COMMIT = "d17e0a9776a58728290559f22a2f9a8393035223"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

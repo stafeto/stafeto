@@ -806,6 +806,7 @@ version = "0.1.0"
 name = "posix-random-probe"
 version = "0.1.0"
 dependencies = [
+ "posix-abi",
  "posix-crt",
  "rt",
 ]

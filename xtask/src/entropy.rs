@@ -433,13 +433,13 @@ static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"], &[
 static RANDOM_BREAK_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &["break-at-random"]);
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 23] = [
-    "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
-    "posix-random: getentropy waited for the first seed with another inside a handler",
+const RANDOM_LINES: [&str; 26] = [
+    "posix-random: the start waited for the first seed, so getrandom with GRND_NONBLOCK gave every byte in main",
+    "posix-random: getentropy with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
-    "posix-random: arc4random went on after a handler without SA_RESTART",
-    "posix-random: getentropy is no point of cancellation: it returned, the next point cancelled",
-    "posix-random: cancellation left the first seed wait bounded",
+    "posix-random: arc4random gave its word in a thread that got a signal",
+    "posix-random: getentropy gave its bytes in a thread that was asked to cancel",
+    "posix-random: cancellation left the calls of getentropy bounded",
     "posix-random: two threads read 4096 bytes of /dev/urandom at once, all different",
     "posix-random: getentropy gave 256 bytes twice, they differ",
     "posix-random: getentropy of 257 bytes gave EINVAL",
@@ -453,6 +453,9 @@ const RANDOM_LINES: [&str; 23] = [
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
     "posix-random: AT_RANDOM gave 16 bytes to each of two programs, they differ and are not zero",
+    "posix-random: the stack canary differs in each of three programs, is not zero and has a zero low byte",
+    "posix-random: without entropy mkstemp, mkostemp, mkdtemp, mktemp, tmpnam, tempnam and shmget of a new segment failed with ENOSYS and left no name",
+    "posix-random: a lookup without entropy failed with EAI_SYSTEM and ENOSYS",
     "posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request",
     "posix-random: a set-ID program has AT_RANDOM from its verified session",
     "posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request",

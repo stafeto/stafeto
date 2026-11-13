@@ -38,7 +38,10 @@
 #include <sys/auxv.h>
 #include <sys/random.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -51,6 +54,7 @@
 
 extern char **environ;
 extern uint64_t random_probe_calls(void);
+extern void random_probe_drop_session(void);
 extern int stafeto_probe_loader_start(unsigned mode);
 extern unsigned stafeto_probe_loader_stop(void);
 extern unsigned stafeto_probe_loader_listen(void);
@@ -254,6 +258,101 @@ static int at_random(void) {
     return 0;
 }
 
+/* The canary of the stack protector is a value of the process: not zero, the low byte zero (a
+ * string copy stops at it), and different in every process. */
+static int canary_ok(uintptr_t guard) {
+    return guard != 0 && (guard & 0xff) == 0;
+}
+
+/* The role `canary`: the canary goes to the descriptor `number` (a pipe). */
+static int canary_role(const char *number) {
+    uintptr_t guard = __stack_chk_guard;
+    CHECK(canary_ok(guard));
+    CHECK(write(atoi(number), &guard, sizeof guard) == (ssize_t)sizeof guard);
+    return 0;
+}
+
+/* Two programs started one after the other (each with AT_RANDOM from the loader) and this
+ * program (which init started, so its start took the canary from getrandom) have three canaries
+ * that differ; none is the constant the library once had. */
+static int canary(void) {
+    int ends[2];
+    uintptr_t a = 0, b = 0, mine = __stack_chk_guard;
+    CHECK(pipe(ends) == 0);
+    CHECK(spawn_role("canary", ends[1]) == 0);
+    CHECK(spawn_role("canary", ends[1]) == 0);
+    CHECK(read_all(ends[0], (unsigned char *)&a, sizeof a) == (ssize_t)sizeof a);
+    CHECK(read_all(ends[0], (unsigned char *)&b, sizeof b) == (ssize_t)sizeof b);
+    CHECK(close(ends[0]) == 0 && close(ends[1]) == 0);
+    CHECK(canary_ok(a) && canary_ok(b) && canary_ok(mine));
+    CHECK(a != b && a != mine && b != mine);
+    CHECK(mine != (uintptr_t)0xd048c37519fcadfeULL && a != (uintptr_t)0xd048c37519fcadfeULL);
+    printf("posix-random: the stack canary differs in each of three programs, is not zero and has a "
+           "zero low byte (%016llx, %016llx, %016llx)\n",
+           (unsigned long long)a, (unsigned long long)b, (unsigned long long)mine);
+    return 0;
+}
+
+/* The role `noentropy`: the session with the entropy service is gone before the process asked
+ * the generator for a byte (the program started with AT_RANDOM, so its start took none). Every
+ * call that needs a random name fails with ENOSYS and no name made of the clock comes: the
+ * template stays as it was, mktemp gives an empty string, tmpnam and tempnam give NULL, a
+ * lookup of a name fails with EAI_SYSTEM, and shmget of a new segment fails; a lookup of a
+ * segment by its key asks for no number and reaches the service (ENOENT). */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static int no_entropy_role(void) {
+    unsigned char bytes[8];
+    random_probe_drop_session();
+    errno = 0;
+    CHECK(getrandom(bytes, sizeof bytes, 0) == -1 && errno == ENOSYS);
+
+    char fd_name[] = "/tmp/probeXXXXXX", ex_name[] = "/tmp/probeXXXXXX";
+    char dir_name[] = "/tmp/dirXXXXXX", tmp_name[] = "/tmp/tmpXXXXXX";
+    errno = 0;
+    CHECK(mkstemp(fd_name) == -1 && errno == ENOSYS);
+    CHECK(strcmp(fd_name, "/tmp/probeXXXXXX") == 0);
+    errno = 0;
+    CHECK(mkostemp(ex_name, O_CLOEXEC) == -1 && errno == ENOSYS);
+    CHECK(strcmp(ex_name, "/tmp/probeXXXXXX") == 0);
+    errno = 0;
+    CHECK(mkdtemp(dir_name) == NULL && errno == ENOSYS);
+    CHECK(strcmp(dir_name, "/tmp/dirXXXXXX") == 0);
+    CHECK(mktemp(tmp_name) == tmp_name && tmp_name[0] == 0);
+    errno = 0;
+    CHECK(tmpnam(NULL) == NULL && errno == ENOSYS);
+    errno = 0;
+    CHECK(tempnam("/tmp", "pfx") == NULL && errno == ENOSYS);
+
+    /* A resolver file with one server, so that the lookup reaches the transaction number. */
+    int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        static const char conf[] = "nameserver 10.0.0.1\n";
+        CHECK(write(fd, conf, sizeof conf - 1) == (ssize_t)sizeof conf - 1);
+        CHECK(close(fd) == 0);
+        struct addrinfo hints, *found = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        errno = 0;
+        CHECK(getaddrinfo("no-such-name.example", "80", &hints, &found) == EAI_SYSTEM);
+        CHECK(errno == ENOSYS);
+        printf("posix-random: a lookup without entropy failed with EAI_SYSTEM and ENOSYS\n");
+    } else {
+        printf("posix-random: no /etc/resolv.conf to write (errno %d), the lookup is not probed\n",
+               errno);
+    }
+
+    errno = 0;
+    CHECK(shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600) == -1 && errno == ENOSYS);
+    errno = 0;
+    CHECK(shmget((key_t)0x5a17, 4096, 0600) == -1 && errno == ENOENT);
+    printf("posix-random: without entropy mkstemp, mkostemp, mkdtemp, mktemp, tmpnam, tempnam and "
+           "shmget of a new segment failed with ENOSYS and left no name\n");
+    return 0;
+}
+#pragma clang diagnostic pop
+
 /* A descriptor of a device crosses posix_spawn (without FD_CLOEXEC). */
 static int descriptor(void) {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -298,7 +397,7 @@ static void pause_ms(long ms) {
 }
 
 /*
- * Beside the main thread's wait before the first seed: a thread in
+ * Beside the main thread's getentropy: a thread in
  * arc4random gets SIGUSR2, whose handler has no SA_RESTART, and goes on
  * (arc4random has no way to fail); a thread in getentropy gets a request
  * of cancellation, and getentropy, no point of cancellation, returns its
@@ -381,11 +480,14 @@ static int nested(void) {
     unsigned char outer[32];
     void *poked = NULL;
     pthread_t t;
-    /* The service's first fill waits 500 ms (slow-start). */
+    /* The service's first fill waits 500 ms (slow-start). The start of the program, which has no
+     * AT_RANDOM before the seed, waited for it to take its stack canary, so the seed is there
+     * when main runs: no wait is left to see from here (the wait itself is the probe
+     * tests/entropy's). */
     errno = 0;
-    CHECK(getrandom(outer, sizeof outer, GRND_NONBLOCK) == -1);
-    CHECK(errno == EAGAIN);
-    printf("posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN\n");
+    CHECK(getrandom(outer, sizeof outer, GRND_NONBLOCK) == (ssize_t)sizeof outer);
+    CHECK(!all_zero(outer, sizeof outer));
+    printf("posix-random: the start waited for the first seed, so getrandom with GRND_NONBLOCK gave every byte in main\n");
     struct sigaction quiet;
     memset(&quiet, 0, sizeof quiet);
     quiet.sa_handler = on_usr2;
@@ -399,24 +501,27 @@ static int nested(void) {
     CHECK(pthread_join(t, &poked) == 0 && poked == NULL);
     CHECK(nested_done == 1);
     CHECK(!all_zero(outer, sizeof outer));
-    printf("posix-random: getentropy waited for the first seed with another inside a handler\n");
+    printf("posix-random: getentropy with another inside a handler\n");
     void *ended = NULL;
     CHECK(pthread_join(arc4_thread, &ended) == 0 && ended == NULL);
-    CHECK(usr2_ran == 1 && arc4_done == 1);
-    printf("posix-random: arc4random went on after a handler without SA_RESTART (%08x)\n",
+    /* The seed is there before main, so arc4random does not wait and SIGUSR2 may find the thread
+     * gone: the handler need not have run. */
+    CHECK(arc4_done == 1);
+    printf("posix-random: arc4random gave its word in a thread that got a signal (%08x)\n",
            (unsigned)arc4_value);
     CHECK(pthread_join(cancel_thread, &ended) == 0);
-    CHECK(ended == PTHREAD_CANCELED && cancel_returned == 1);
-    printf("posix-random: getentropy is no point of cancellation: it returned, the next point "
-           "cancelled\n");
+    /* The thread has its bytes before the request of cancellation comes; the request finds it at
+     * its next point of cancellation or gone. */
+    CHECK((ended == PTHREAD_CANCELED || ended == NULL) && cancel_returned == 1);
+    printf("posix-random: getentropy gave its bytes in a thread that was asked to cancel\n");
     /* The counter includes the other three threads, the signal handlers
      * and their joins while this thread waits for the first key. A finite
      * set of requests fits well below this allowance. Retrying SEED on
      * every cancellation EINTR turns the wait into thousands of calls. */
-    printf("posix-random: first seed wait used %llu kernel calls\n",
+    printf("posix-random: getentropy used %llu kernel calls\n",
            (unsigned long long)cancel_wait_calls);
     CHECK(cancel_wait_calls <= 1024);
-    printf("posix-random: cancellation left the first seed wait bounded\n");
+    printf("posix-random: cancellation left the calls of getentropy bounded\n");
     CHECK(pipe(outer_pipe) == 0 && pipe(inner_pipe) == 0);
     nested_mode = 1;
     nested_done = 0;
@@ -459,8 +564,8 @@ static int forged_run(const char *path, const char *role, unsigned mode, int *st
 }
 
 /* A set-ID program takes its entropy session only from the entropy service. The control: a
- * program that is not set-ID takes the forged channel and asks it for a key, so the forgery
- * reaches the place. The set-ID program gets a session of the service in its place: the bytes
+ * program that is not set-ID takes the forged channel and asks it for a key (for its canary), so
+ * the forgery reaches the place and the program ends in its start. The set-ID program gets a session of the service in its place: the bytes
  * come from the genuine service, its descendants get them too, and the forged service gets no
  * request. A set-ID program started with the genuine session of its parent works the same (the
  * last run). */
@@ -468,7 +573,10 @@ static int forged(void) {
     int status = 0;
     unsigned requests = 0;
     CHECK(forged_run("/bin/posix-random", "forged", 5, &status, &requests) == 0);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* The forged service answers no byte, so the program has neither AT_RANDOM nor a getrandom
+     * for its stack canary, and its start ends it with abort before main. */
+    CHECK((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+          (WIFEXITED(status) && WEXITSTATUS(status) == 134));
     CHECK(requests != 0);
     CHECK(forged_run("/bin/posix-random-suid", "setid", 5, &status, &requests) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -738,6 +846,8 @@ static int first(void) {
     CHECK(temporary() == 0);
     CHECK(descriptor() == 0);
     CHECK(at_random() == 0);
+    CHECK(canary() == 0);
+    CHECK(spawn_role("noentropy", -1) == 0);
     CHECK(forged() == 0);
     CHECK(forged_pipes() == 0);
     return 0;
@@ -846,6 +956,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "forgedpipe") == 0) return forged_pipe_role();
     if (argc > 1 && strcmp(argv[1], "setidpipe") == 0) return setid_pipe_role();
     if (argc > 2 && strcmp(argv[1], "auxrandom") == 0) return auxrandom_role(argv[2]);
+    if (argc > 2 && strcmp(argv[1], "canary") == 0) return canary_role(argv[2]);
+    if (argc > 1 && strcmp(argv[1], "noentropy") == 0) return no_entropy_role();
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forked() : first();
