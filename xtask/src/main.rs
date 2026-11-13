@@ -1972,6 +1972,7 @@ commands:
             `httpd -f -p 80 -h /www &` fetches the page of the image
   efi [EFI|EFI_EL2] boot the system through the EFI loader under edk2 from a GPT disk with an ESP and compare
             the kernel's boot report with the same machine started with -kernel
+  efi-vz    boot the disk of the EFI loader on Apple VZ (VZEFIBootLoader) to the shell
   efi-fixtures take the firmware's tables and memory map and QEMU's own tree as the samples of the host test of firmware-tree
   efi-breaks the deliberate breaks of the loader: each fails its host test and, where it can, its run under edk2
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
@@ -1995,6 +1996,7 @@ fn main() {
         Some("build") => build(Variant::Normal).map(|_| ()),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
+        Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("test") => jobs::parse_jobs("test", &args[1..]).and_then(test),

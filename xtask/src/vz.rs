@@ -199,7 +199,7 @@ pub fn command_cpus(kernel: &Path, boot: &Path, cpus: usize) -> Result<Command, 
 
 /// The kernel image and the boot image of VZ, and a line of the report
 /// with the kernel's size: the build that ships (spec 3.4).
-fn images() -> Result<(crate::Artifacts, std::path::PathBuf), String> {
+pub(crate) fn images() -> Result<(crate::Artifacts, std::path::PathBuf), String> {
     let kernel = build(Variant::Normal)?;
     let boot = build_boot_image("boot-vz.img", &VZ_PROGRAMS, BOOT_PROFILE)?;
     let bytes = std::fs::metadata(&kernel.image)

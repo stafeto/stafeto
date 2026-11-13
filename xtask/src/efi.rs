@@ -298,6 +298,40 @@ pub fn run(names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask efi-vz`: the disk of the loader with the kernel and the boot
+/// image of VZ on Apple Virtualization.framework (`vz-run --efi`): the
+/// system comes up to the shell through VZEFIBootLoader and the loader.
+pub fn vz() -> Result<(), String> {
+    let (kernel, boot) = crate::vz::images()?;
+    let a = Artifacts {
+        boot_image: boot,
+        ..kernel
+    };
+    let loader = build_loader(&[])?;
+    let disk = crate::target_dir().join("efi-disk-vz.raw");
+    make_disk(&loader, &a, &disk)?;
+    let runner = crate::vz::runner()?;
+    wait_for_quiet_mac()?;
+    let mut cmd = Command::new(runner);
+    cmd.args(["--efi"]).arg(&disk).args(["--cpus", "2"]);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let found = run.expect_line(
+        crate::SHELL_CONNECTED,
+        |l| l == crate::SHELL_CONNECTED,
+        Duration::from_secs(120),
+    );
+    let o = run.stop();
+    found.map_err(|e| format!("VZ through the loader: {e}"))?;
+    if o.lines.iter().any(|l| l.contains("KERNEL PANIC")) {
+        return Err("VZ through the loader: the kernel panicked".into());
+    }
+    println!(
+        "efi on VZ: ok; the shell connected {:.1} s after the start",
+        took.as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Where the samples of the host test of the translation live.
 pub const FIXTURES: &str = "boot/firmware-tree/tests/fixtures";
 
