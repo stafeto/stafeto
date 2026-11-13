@@ -401,6 +401,137 @@ pub const fn pending(creadr: usize, cwriter: usize) -> usize {
     (cwriter + QUEUE_BYTES - creadr) % QUEUE_BYTES / COMMAND_BYTES
 }
 
+/// The slots of the queue a sender that holds `OBJ` may fill and no other
+/// sender may: a section reserves its commands (`room`) before it changes
+/// anything, and the commands go in later, so what a sender outside `OBJ`
+/// takes in between must leave them (spec 8.1).
+pub const QUEUE_KEEP: usize = MAX_BATCH;
+
+/// The byte offset the writer is at after `sent` commands in all: the
+/// queue starts empty at offset 0, so the count of commands sent and the
+/// offset are one number (spec 8.1).
+pub const fn write_offset(sent: u64) -> usize {
+    (sent % QUEUE_SLOTS as u64) as usize * COMMAND_BYTES
+}
+
+/// The commands the ITS has run of the `sent` ones in all, when it has
+/// read up to `creadr`: sent less those it still has to read. `sent` is
+/// 64 bits wide and never wraps in the life of the machine, so a target
+/// taken from it compares with the answer at any distance, which a
+/// position on the ring cannot do once other CPUs have sent a lap's worth
+/// of commands meanwhile.
+pub fn done(sent: u64, creadr: usize) -> u64 {
+    #[cfg(feature = "break-its-counter-32")]
+    let sent = sent & 0xFFFF_FFFF;
+    sent - pending(creadr, write_offset(sent)) as u64
+}
+
+/// True once the ITS has run the first `target` commands.
+pub fn reached(sent: u64, creadr: usize, target: u64) -> bool {
+    if cfg!(feature = "break-its-ring-position") {
+        return pending(creadr, write_offset(target)) == 0;
+    }
+    done(sent, creadr) >= target
+}
+
+/// Whether `need` commands go into the queue now and leave `keep` slots
+/// free, when `sent` commands went in and the ITS is known to have run
+/// `done` of them (a count that only lags the truth, so the answer only
+/// under-counts the room): a section asks with `keep` 0, a sender outside
+/// `OBJ` with QUEUE_KEEP.
+pub fn room(sent: u64, done: u64, need: usize, keep: usize) -> bool {
+    #[cfg(feature = "break-its-keep")]
+    let keep = {
+        let _ = keep;
+        0
+    };
+    let outstanding = sent.saturating_sub(done) as usize;
+    (QUEUE_SLOTS - 1).saturating_sub(outstanding) >= need + keep
+}
+
+/// Whether the ITS has stopped (spec 8.1): commands are outstanding and
+/// `done` has not moved, and nothing has been sent, for `limit` ticks. The
+/// clock is the machine's: the last time `done` advanced (`last_advance`)
+/// and the last time commands went in (`last_send`), whichever is later.
+/// The time a portion of cleanup has waited for its turn is no evidence of
+/// a stop, since the ITS runs on its own.
+pub fn stalled(now: u64, last_advance: u64, last_send: u64, limit: u64) -> bool {
+    #[cfg(feature = "break-its-stall-clock")]
+    let last_advance = {
+        let _ = last_advance;
+        0
+    };
+    now.saturating_sub(last_advance.max(last_send)) > limit
+}
+
+/// What a portion of cleanup waits for before its section: the commands
+/// of its object's teardown, which it sent in one portion and finds run in
+/// a later one (spec 7.7, 8.1). The object keeps it. `target` is the count
+/// of commands sent when its commands went in; 0 before they did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Wait {
+    target: u64,
+}
+
+/// What one step of a `Wait` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The commands ran: the portion goes on to its section.
+    Done,
+    /// They did not, or the queue had no room for them, or no consistent
+    /// look at the queue was had: the portion queues its object again and
+    /// returns.
+    Again,
+    /// The ITS has not moved for the limit with commands outstanding.
+    Stalled,
+}
+
+impl Wait {
+    pub const fn new() -> Wait {
+        Wait { target: 0 }
+    }
+
+    /// One step. `send` puts the commands in and gives the count of commands
+    /// sent after them, or None when the queue has no room; it is called
+    /// until it gives one and not again. `done` gives the commands the ITS
+    /// has run so far, read once, or None when no consistent look was had
+    /// (another CPU was adding commands), which is "not yet". `stalled` is
+    /// asked only when the commands have not run.
+    pub fn step(
+        &mut self,
+        send: impl FnOnce() -> Option<u64>,
+        done: impl FnOnce() -> Option<u64>,
+        stalled: impl FnOnce() -> bool,
+    ) -> Step {
+        let mut sent_now = false;
+        if self.target == 0 || cfg!(feature = "break-its-step-resend") {
+            match send() {
+                Some(target) => {
+                    self.target = target;
+                    sent_now = true;
+                }
+                None => return Self::late(stalled),
+            }
+        }
+        if cfg!(feature = "break-its-step-early") && sent_now {
+            return Step::Done;
+        }
+        if done().is_some_and(|d| d >= self.target) {
+            Step::Done
+        } else {
+            Self::late(stalled)
+        }
+    }
+
+    fn late(stalled: impl FnOnce() -> bool) -> Step {
+        if stalled() {
+            Step::Stalled
+        } else {
+            Step::Again
+        }
+    }
+}
+
 /// GITS_CREADR and CWRITER hold the byte offset in bits [19:5] [G44].
 pub const OFFSET_MASK: u64 = 0xF_FFE0;
 
@@ -656,6 +787,195 @@ mod tests {
         assert_eq!(pending(126 * 32, 2 * 32), 4);
         assert_eq!(free_slots(10 * 32, 9 * 32), 0);
         assert_eq!(free_slots(10 * 32, 10 * 32), 127);
+    }
+
+    /// A fake ITS: `sent` commands, `run` of them executed.
+    fn creadr_of(run: u64) -> usize {
+        write_offset(run)
+    }
+
+    #[test]
+    fn the_counter_gives_the_commands_run() {
+        assert_eq!(write_offset(0), 0);
+        assert_eq!(write_offset(128), 0);
+        assert_eq!(write_offset(130), 2 * 32);
+        for (sent, run) in [(0, 0), (5, 0), (5, 5), (127, 3), (128, 1), (300, 200)] {
+            assert_eq!(done(sent, creadr_of(run)), run, "sent {sent} run {run}");
+        }
+    }
+
+    #[test]
+    fn a_target_is_reached_at_any_distance() {
+        // The commands of a call went in at count 10; 96 and then more of
+        // other CPUs followed, and the ITS ran them all: the ring position
+        // of the target is far behind the reader, and it must read done.
+        let target = 10;
+        assert!(!reached(10, creadr_of(5), target));
+        assert!(reached(10, creadr_of(10), target));
+        assert!(reached(106, creadr_of(106), target));
+        assert!(reached(106, creadr_of(106 - 1), target));
+        assert!(reached(10 + 5 * 128 + 3, creadr_of(10 + 5 * 128), target));
+        // Past 2^32 commands the counter still compares.
+        let big = (1u64 << 32) + 7;
+        assert!(!reached(big + 4, creadr_of(big - 1), big));
+        assert!(reached(big + 4, creadr_of(big), big));
+        assert!(reached(big + 4, creadr_of(big + 4), big + 4));
+        assert_eq!(done(big + 4, creadr_of(big)), big);
+    }
+
+    #[test]
+    fn a_ring_wide_gap_between_the_target_and_the_reader_is_still_ahead() {
+        // The reader looks at a target that is 100 commands behind the ITS.
+        let sent = 1000;
+        assert!(reached(sent, creadr_of(sent - 3), sent - 100));
+        assert!(!reached(sent, creadr_of(sent - 3), sent - 2));
+    }
+
+    #[test]
+    fn room_keeps_the_slots_of_a_section() {
+        // Empty queue: 127 slots.
+        assert!(room(0, 0, 127, 0));
+        assert!(!room(0, 0, 128, 0));
+        // A sender outside OBJ leaves QUEUE_KEEP of them.
+        assert!(room(0, 0, 127 - QUEUE_KEEP, QUEUE_KEEP));
+        assert!(!room(0, 0, 127 - QUEUE_KEEP + 1, QUEUE_KEEP));
+        // 120 commands outstanding: a section's 4 fit, another sender's 4 do not.
+        assert!(room(120, 0, 4, 0));
+        assert!(!room(120, 0, 4, QUEUE_KEEP));
+        assert!(room(120, 0, 3, 0));
+        // A lap later: the same.
+        assert!(room(120 + 128, 128, 4, 0));
+        assert!(!room(120 + 128, 128, 4, QUEUE_KEEP));
+        // A count that lags the truth only takes room away.
+        assert!(!room(120, 0, 8, 0));
+        assert!(room(120, 100, 8, 0));
+    }
+
+    /// A fake ITS the test drives: it counts the commands sent and run, has
+    /// room for `space` more, and says what the stall clock says.
+    struct Fake {
+        sent: u64,
+        run: u64,
+        space: usize,
+        sends: usize,
+        look: bool,
+        stalled: bool,
+    }
+
+    impl Fake {
+        fn new(sent: u64, run: u64, space: usize) -> Fake {
+            Fake {
+                sent,
+                run,
+                space,
+                sends: 0,
+                look: true,
+                stalled: false,
+            }
+        }
+
+        fn step(&mut self, w: &mut Wait) -> Step {
+            let (sent, run, space, look, stalled) = (
+                &mut self.sent,
+                self.run,
+                self.space,
+                self.look,
+                self.stalled,
+            );
+            let sends = &mut self.sends;
+            w.step(
+                || {
+                    *sends += 1;
+                    (space >= 3).then(|| {
+                        *sent += 3;
+                        *sent
+                    })
+                },
+                || look.then_some(run),
+                || stalled,
+            )
+        }
+    }
+
+    #[test]
+    fn a_wait_sends_once_and_finishes_when_the_commands_ran() {
+        let mut q = Fake::new(100, 100, 10);
+        let mut w = Wait::new();
+        // Sent, not run: again, twice; the commands went in once.
+        assert_eq!(q.step(&mut w), Step::Again);
+        assert_eq!(q.step(&mut w), Step::Again);
+        assert_eq!(q.sends, 1);
+        assert_eq!(q.sent, 103);
+        q.run = 102;
+        assert_eq!(q.step(&mut w), Step::Again);
+        q.run = 103;
+        assert_eq!(q.step(&mut w), Step::Done);
+        assert_eq!(q.sends, 1);
+    }
+
+    #[test]
+    fn a_wait_with_no_room_asks_again_and_sends_nothing() {
+        let mut q = Fake::new(0, 0, 2);
+        let mut w = Wait::new();
+        assert_eq!(q.step(&mut w), Step::Again);
+        assert_eq!(q.step(&mut w), Step::Again);
+        assert_eq!(q.sent, 0);
+        assert_eq!(q.sends, 2);
+        q.space = 3;
+        assert_eq!(q.step(&mut w), Step::Again);
+        assert_eq!(q.sent, 3);
+        q.run = 3;
+        assert_eq!(q.step(&mut w), Step::Done);
+    }
+
+    #[test]
+    fn a_wait_without_a_consistent_look_is_not_yet_and_never_a_stop() {
+        // Another CPU adds commands at each look: no look is had; the
+        // portion waited a long time for its turn, and the ITS is fine.
+        let mut q = Fake::new(10, 10, 10);
+        let mut w = Wait::new();
+        assert_eq!(q.step(&mut w), Step::Again);
+        q.look = false;
+        for _ in 0..5 {
+            assert_eq!(q.step(&mut w), Step::Again);
+        }
+        q.look = true;
+        q.run = q.sent;
+        assert_eq!(q.step(&mut w), Step::Done);
+    }
+
+    #[test]
+    fn a_wait_stops_only_when_the_clock_says_the_its_did() {
+        let mut q = Fake::new(0, 0, 10);
+        let mut w = Wait::new();
+        assert_eq!(q.step(&mut w), Step::Again);
+        q.stalled = true;
+        assert_eq!(q.step(&mut w), Step::Stalled);
+        // Commands that ran are done, whatever the clock says.
+        q.run = q.sent;
+        assert_eq!(q.step(&mut w), Step::Done);
+        // A queue with no room for long is a stop too.
+        let mut q = Fake::new(0, 0, 0);
+        q.stalled = true;
+        assert_eq!(
+            Wait::new().step(|| None, || Some(0), || q.stalled),
+            Step::Stalled
+        );
+    }
+
+    #[test]
+    fn the_stall_clock_counts_the_its_not_the_portion() {
+        let limit = 1000;
+        // The ITS advanced at 4990 and commands went in at 4995; a portion
+        // that comes at 5000 after waiting for its turn finds no stop.
+        assert!(!stalled(5000, 4990, 4995, limit));
+        // Advanced long ago, but commands went in just now.
+        assert!(!stalled(5000, 10, 4990, limit));
+        // Sent long ago, advanced just now.
+        assert!(!stalled(5000, 4990, 10, limit));
+        // Neither for more than the limit: stopped.
+        assert!(stalled(5000, 3000, 3999, limit));
+        assert!(!stalled(5000, 3000, 4000, limit));
     }
 
     #[test]

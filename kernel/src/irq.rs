@@ -24,10 +24,11 @@
 //! gives the channel's slot and reference back and lets the payer's shell
 //! go.
 
+use crate::arch::its::Position;
 use crate::arch::{gic, its};
 use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item};
-use crate::msi::{self, Job, Msi};
+use crate::msi::{self, Msi};
 use crate::obj::Guarded;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
@@ -36,7 +37,7 @@ use abi::{Error, IrqInfo};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use kcore::gic::{FIRST_LPI, FIRST_SPI, FIRST_SPURIOUS};
-use kcore::its::{Command, LpiMap, MAX_LPIS};
+use kcore::its::{Command, LpiMap, MAX_LPIS, Step, Wait};
 
 /// The bits of an interrupt (spec 6.5): bit 0 at each delivery.
 const IRQ_BITS: u64 = 1;
@@ -80,6 +81,12 @@ pub struct Irq {
     /// The level the cleanup that retired the binding ran at, for the
     /// release of its payer's shell once the memory goes (`reclaim`).
     level: u8,
+    /// The wait of its portion for the DISCARD of its event to run.
+    wait: Wait,
+    /// The count of commands its mapping is at in the ITS queue: the
+    /// mapping is in force once the ITS has run that many (`ack`); 0 for a
+    /// binding of a line.
+    mapped_at: u64,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
     /// The binding waits in the list of retired objects for the end of a
@@ -110,6 +117,8 @@ impl Irq {
             masked: false,
             payer,
             level: 0,
+            wait: Wait::new(),
+            mapped_at: 0,
             cleanup: Item::new(),
             deferred: Deferred::new(),
         }
@@ -207,13 +216,15 @@ pub fn bind(
 /// open channel, as irq_bind checked them (spec 9): its slot has
 /// `priority` and `label`, and its interrupts go to CPU `cpu`. It takes one
 /// of the channel's slots, then a free LPI (LIMIT_REACHED when all
-/// MAX_LPIS are taken), then a place in the pool of bindings of `payer`
-/// (NO_MEMORY when the quota falls short); nothing changes on either. The
+/// MAX_LPIS are taken, or the ITS queue has no room for the commands), then
+/// a place in the pool of bindings of `payer` (NO_MEMORY when the quota
+/// falls short); nothing changes on either. The
 /// binding goes into LPIS and holds the device and the payer's shell. The
 /// LPI is edge-triggered and the kernel masks nothing (spec 9): the
-/// caller runs the returned job, the property byte and the ITS commands,
-/// once its section ended. The caller gets the first reference, which
-/// counts as a handle.
+/// property byte is set and the commands of the ITS are put in the queue
+/// here, in the section, and the caller tells the ITS about them, and waits
+/// at most a segment, once its section ended. The caller gets the first
+/// reference, which counts as a handle, and the count the commands are at.
 pub fn bind_event(
     payer: NonNull<Process>,
     c: NonNull<Channel>,
@@ -222,7 +233,10 @@ pub fn bind_event(
     event: u32,
     priority: u8,
     cpu: u32,
-) -> Result<(NonNull<Irq>, Job), Error> {
+) -> Result<(NonNull<Irq>, Position), Error> {
+    if !its::room(MAP_COMMANDS) {
+        return Err(Error::LimitReached);
+    }
     channel::reserve_source(c)?;
     let Some(lpi) = LPI_MAP
         .lock()
@@ -247,14 +261,20 @@ pub fn bind_event(
     msi::take(device, event);
     LIVE.made();
     LPIS[(lpi - FIRST_LPI) as usize].store(b.as_ptr(), Ordering::Release);
-    let job = Job::MapEvent {
-        device_id: msi::device_id(device),
-        event,
-        lpi,
-        cpu,
-    };
-    Ok((b, job))
+    its::set_property(lpi, Some(kcore::gic::DEFAULT_PRIORITY));
+    let device_id = msi::device_id(device);
+    let pos = its::enqueue(&[
+        Command::mapti(device_id, event, lpi, cpu as u16),
+        Command::inv(device_id, event),
+        Command::sync(its::rdbase(cpu as usize)),
+    ]);
+    // SAFETY: the binding was just made, and nothing else refers to it.
+    unsafe { (*b.as_ptr()).mapped_at = pos.count() };
+    Ok((b, pos))
 }
+
+/// The commands irq_bind of an event puts in the queue: MAPTI, INV, SYNC.
+const MAP_COMMANDS: usize = 3;
 
 /// The count of references to `b`, through the raw pointer.
 ///
@@ -347,16 +367,23 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
 }
 
 /// irq_ack (spec 9) of `b`, which the caller's handle holds: PEER_CLOSED
-/// once the channel closed, and the line stays masked for good; otherwise
+/// once the channel closed, and the line stays masked for good; for an event
+/// the count its mapping is at goes to `mapping`; otherwise
 /// a line an interrupt masked opens again, and a line that is open stays
 /// so. O(1).
-pub fn ack(b: NonNull<Irq>) -> Result<(), Error> {
+pub fn ack(b: NonNull<Irq>, mapping: &mut Option<u64>) -> Result<(), Error> {
     let p = b.as_ptr();
     // SAFETY: the caller's handle holds the binding, which holds its
     // channel; only the fields are touched.
     unsafe {
         if channel::is_closed((*p).source.channel()) {
             return Err(Error::PeerClosed);
+        }
+        // An event: the count its mapping is at, which the caller compares
+        // with the commands run once its section ended, since that reads a
+        // register of the ITS.
+        if (*p).event.is_some() {
+            *mapping = Some((*p).mapped_at);
         }
         if (*p).masked {
             (*p).masked = false;
@@ -465,27 +492,41 @@ pub fn deliver_lpi(lpi: u32) -> bool {
 /// The ITS side of the portion of a binding nothing refers to
 /// (cleanup::portion), outside `OBJ` (spec 8.1): for an event of an MSI
 /// device, INV of its disabled property byte, DISCARD of its mapping and
-/// SYNC, which the portion waits for before its own section. Nothing for a
-/// binding of a line.
+/// SYNC, which the portion looks at once before its section. `Done` when
+/// the ITS ran them, and always for a binding of a line; otherwise the
+/// portion queues the binding again, and a later one looks again.
 ///
 /// # Safety
 /// Nothing refers to the binding, and it is in no queue.
 #[inline(never)]
-pub unsafe fn unmap(b: NonNull<Irq>) {
-    // SAFETY: the caller's promise; only the fields are read, and the device
-    // lives while the binding holds its reference.
+pub unsafe fn unmap(b: NonNull<Irq>) -> Step {
+    // SAFETY: the caller's promise; only the fields are read, and the
+    // device lives while the binding holds its reference.
     let Some(event) = (unsafe { (*b.as_ptr()).event }) else {
-        return;
+        return Step::Done;
     };
     let device_id = msi::device_id(event.device);
-    // SAFETY: as above.
-    let cpu = unsafe { (*b.as_ptr()).cpu };
-    let pos = its::send(&[
-        Command::inv(device_id, event.id),
-        Command::discard(device_id, event.id),
-        Command::sync(its::rdbase(cpu as usize)),
-    ]);
-    its::wait(pos, "DISCARD");
+    // SAFETY: as above; the wait is the portion's alone.
+    let (cpu, wait) = unsafe { ((*b.as_ptr()).cpu, &mut (*b.as_ptr()).wait) };
+    its::step(
+        wait,
+        &[
+            Command::inv(device_id, event.id),
+            Command::discard(device_id, event.id),
+            Command::sync(its::rdbase(cpu as usize)),
+        ],
+        "DISCARD",
+    )
+}
+
+/// The place of the binding in the cleanup queue, for the portion that
+/// queues it again after `unmap`.
+///
+/// # Safety
+/// `b` is alive, and the caller is its portion.
+pub unsafe fn cleanup_item(b: NonNull<Irq>) -> NonNull<Item> {
+    // SAFETY: the caller's promise; the address of a field.
+    unsafe { NonNull::new_unchecked(&raw mut (*b.as_ptr()).cleanup) }
 }
 
 /// The portion of a binding nothing refers to (cleanup::portion), at
