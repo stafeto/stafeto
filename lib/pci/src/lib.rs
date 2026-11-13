@@ -176,7 +176,11 @@ pub fn scan(
                 continue;
             };
             let multi = config.read(zero, HEADER) & (1 << 23) != 0;
-            let count = if multi { 8 } else { 1 };
+            let count = if multi || cfg!(feature = "break-multifunction") {
+                8
+            } else {
+                1
+            };
             for f in 0..count {
                 let at = Address::new(bus, device, f);
                 let found = if f == 0 {
@@ -307,7 +311,7 @@ pub const CLASS_COMMUNICATION: u32 = 0x07;
 /// size is checked against the base: a base the size does not divide is the
 /// firmware's own mistake.
 pub fn measure(config: &mut impl Config, function: &Function, bar: &Bar) -> Result<u64, Refused> {
-    if function.class >> 16 == CLASS_COMMUNICATION {
+    if function.class >> 16 == CLASS_COMMUNICATION && !cfg!(feature = "break-measure-console") {
         return Err(Refused::Console);
     }
     let at = function.at;
@@ -329,8 +333,10 @@ pub fn measure(config: &mut impl Config, function: &Function, bar: &Bar) -> Resu
             mask_size(u64::from(high) << 32 | u64::from(low & !0xF), u64::MAX)
         }
     };
-    config.write(at, COMMAND, command);
-    if size != 0 && (!size.is_power_of_two() || bar.base % size != 0) {
+    if !cfg!(feature = "break-restore-command") {
+        config.write(at, COMMAND, command);
+    }
+    if size != 0 && (!size.is_power_of_two() || !bar.base.is_multiple_of(size)) {
         return Err(Refused::Misaligned);
     }
     Ok(size)
@@ -356,7 +362,7 @@ pub fn capability(
     if at < FIRST_CAPABILITY {
         return None;
     }
-    for _ in 0..MOST_CAPABILITIES {
+    for _ in 0..MOST_CAPABILITIES + usize::from(cfg!(feature = "break-cap-limit")) {
         let head = read(at);
         if wanted(head) {
             return Some(at);
@@ -435,5 +441,7 @@ pub fn msix(mut read: impl FnMut(usize) -> u32) -> Option<Msix> {
     })
 }
 
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 #[cfg(test)]
 mod tests;

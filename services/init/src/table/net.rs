@@ -121,11 +121,13 @@ pub const NETD: Record = Record {
         base: TRANSPORT & !(PAGE - 1),
         len: PAGE,
         duplicate: false,
+        at: crate::table::At::Fixed,
     }],
     bindings: &[Binding {
         name: "irq",
         line: LINE,
         edge: false,
+        of: None,
     }],
     connects: &["entropy", "ramfs"],
     args: &TRANSPORT.to_le_bytes(),
@@ -282,18 +284,21 @@ pub const NETD_VZ: Record = Record {
             base: VZ_ECAM + (VZ_DEVICE[0] << 15),
             len: super::PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         Window {
             name: "bar",
             base: VZ_BAR,
             len: VZ_BAR_LEN,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[Binding {
         name: "irq",
         line: 64 + VZ_DEVICE[0] as u32,
         edge: false,
+        of: None,
     }],
     args: &VZ_ARGS,
     quiesce: &VZ_STOP,
@@ -320,6 +325,7 @@ pub const NETD_VZ2: Record = Record {
             base: VZ_ECAM + (VZ_DEVICE[0] << 15),
             len: vz_function(1) + super::PAGE - vz_function(0),
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         // The program that claims the second device gets copies of the
         // window (spec 6, 3.9); the service keeps its own.
@@ -328,6 +334,7 @@ pub const NETD_VZ2: Record = Record {
             base: VZ_BAR,
             len: 2 * VZ_BAR_LEN,
             duplicate: true,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[
@@ -335,11 +342,13 @@ pub const NETD_VZ2: Record = Record {
             name: "irq",
             line: 64 + VZ_DEVICE[0] as u32,
             edge: false,
+            of: None,
         },
         Binding {
             name: "irq1",
             line: 64 + VZ_DEVICE[1] as u32,
             edge: false,
+            of: None,
         },
     ],
     args: &VZ2_ARGS,
@@ -364,12 +373,14 @@ pub const NETD_ITS: Record = Record {
             base: qemu::NET_FUNCTION,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         Window {
             name: "bar",
             base: qemu::NET.bar,
             len: qemu::NET.len + qemu::NET_MSIX_LEN,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[
@@ -420,6 +431,7 @@ pub const NETD_TWO: Record = Record {
             base: TRANSPORT & !(PAGE - 1),
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         // The program that claims the second device gets copies of the
         // window (spec 6, 3.9); the service keeps its own.
@@ -428,6 +440,7 @@ pub const NETD_TWO: Record = Record {
             base: TRANSPORT1 & !(PAGE - 1),
             len: PAGE,
             duplicate: true,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[
@@ -435,11 +448,13 @@ pub const NETD_TWO: Record = Record {
             name: "irq",
             line: LINE,
             edge: false,
+            of: None,
         },
         Binding {
             name: "irq1",
             line: LINE1,
             edge: false,
+            of: None,
         },
     ],
     args: &MMIO2_ARGS,

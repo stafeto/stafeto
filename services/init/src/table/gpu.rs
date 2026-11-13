@@ -77,11 +77,13 @@ pub const GPU: Record = Record {
         base: TRANSPORT & !(PAGE - 1),
         len: PAGE,
         duplicate: false,
+        at: crate::table::At::Fixed,
     }],
     bindings: &[Binding {
         name: "irq",
         line: LINE,
         edge: false,
+        of: None,
     }],
     connects: &[],
     args: &TRANSPORT.to_le_bytes(),

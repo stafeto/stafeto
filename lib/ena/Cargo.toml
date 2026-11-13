@@ -1,0 +1,22 @@
+[package]
+name = "ena"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later WITH GCC-exception-3.1"
+description = "A driver of the Amazon ENA network device as a library: registers, the admin queue by polling, asynchronous events, the watchdog and the reset in place"
+
+# No call of the kernel and no stack: tested on the host against a model of the device.
+[lib]
+bench = false
+
+[features]
+# The deliberate breaks of the host tests (`cargo xtask ena-breaks`): each
+# makes the driver do one wrong thing a test of the model catches.
+break-acq-phase = []
+break-aenq-head = []
+break-reset-wait = []
+break-dma-width = []
+# The model of the device for the tests of a service (`ena::model`).
+model = []

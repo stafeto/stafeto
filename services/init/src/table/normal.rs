@@ -38,11 +38,13 @@ pub const TABLE: &[Record] = &[
             base: PL011,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         }],
         bindings: &[Binding {
             name: "irq",
             line: PL011_LINE,
             edge: false,
+            of: None,
         }],
         connects: &[],
         args: &PL011.to_le_bytes(),

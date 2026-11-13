@@ -32,6 +32,7 @@ pub const PCI_WALK_QEMU: Record = Record {
         base: virtio_pci::qemu::ECAM,
         len: 0x10_0000,
         duplicate: false,
+        at: crate::table::At::Fixed,
     }],
     ..super::vz::PCI_WALK
 };
@@ -91,18 +92,21 @@ pub const BLK: Record = Record {
             base: qemu::DISK_FUNCTION,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         Window {
             name: "bar",
             base: qemu::DISK.bar,
             len: qemu::DISK.len,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[Binding {
         name: "irq",
         line: qemu::DISK_LINE,
         edge: false,
+        of: None,
     }],
     connects: &[],
     args: &BLK_ARGS,

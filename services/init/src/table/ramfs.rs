@@ -219,6 +219,7 @@ const RTC: Window = Window {
     base: 0x0901_0000,
     len: PAGE,
     duplicate: false,
+    at: crate::table::At::Fixed,
 };
 
 /// The clock service with the window over the PL031, for the machines that

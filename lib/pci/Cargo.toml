@@ -9,3 +9,12 @@ description = "PCI configuration space access through ECAM: enumeration, BARs as
 
 [lib]
 bench = false
+
+[features]
+# The in-memory set of functions of the tests (`pci::fake`).
+fake = []
+# Deliberate breaks the host tests catch (`cargo xtask ena-breaks`).
+break-measure-console = []
+break-restore-command = []
+break-multifunction = []
+break-cap-limit = []

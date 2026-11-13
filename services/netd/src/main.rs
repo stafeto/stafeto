@@ -52,6 +52,7 @@ mod cells;
 mod consumers;
 mod device;
 mod dma;
+mod ena_service;
 mod fast;
 mod files;
 mod instance;
@@ -264,6 +265,11 @@ fn main(_: u64) -> u64 {
     };
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
+    }
+    // A record with an ENA device holds the object `ena` and runs the driver
+    // of the second kind of device (ena_service.rs).
+    if let Ok(object) = s.take::<Memory>("ena") {
+        return ena_service::run(s, object);
     }
     #[cfg(feature = "trace")]
     let kernel_stamps = s.take::<Resource>("trace").ok();

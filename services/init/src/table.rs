@@ -160,6 +160,47 @@ pub struct Window {
     pub base: u64,
     pub len: u64,
     pub duplicate: bool,
+    /// Where `base` counts from.
+    pub at: At,
+}
+
+/// How a window finds its place. `Fixed` windows lie where `base` says. The
+/// other forms name a PCI function, which init finds when it starts
+/// (`resolve`): the `index`-th function in the order of the walk of the buses
+/// whose vendor and device are `id` (`vendor << 16 | device`), and the
+/// window takes the place the firmware gave it, so that no table holds an
+/// address the firmware chose. For them `len` is the bytes the record
+/// wants (the BAR measured at start must hold them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    Fixed,
+    /// `base` is the offset in BAR `bar` of the function; the window is
+    /// `base` bytes past the BAR as the firmware set it, plus the platform's
+    /// shift for the kind of the BAR.
+    Bar {
+        id: u32,
+        index: u8,
+        bar: u8,
+    },
+    /// The page of the function's configuration in ECAM; `base` is 0 and
+    /// `len` one page.
+    Config {
+        id: u32,
+        index: u8,
+    },
+}
+
+impl Window {
+    /// A window at `base`.
+    pub const fn fixed(name: &'static str, base: u64, len: u64, duplicate: bool) -> Window {
+        Window {
+            name,
+            base,
+            len,
+            duplicate,
+            at: At::Fixed,
+        }
+    }
 }
 
 /// An interrupt binding init makes for a service through its registered
@@ -174,6 +215,9 @@ pub struct Binding {
     pub line: u32,
     /// Edge-triggered; level-triggered otherwise.
     pub edge: bool,
+    /// The function whose RID an MSI binding takes (`Binding::msi_of`): the
+    /// `index`-th function with PCI id `id`, which init finds when it starts.
+    pub of: Option<(u32, u8)>,
 }
 
 /// The mark of a `line` that names an MSI event: the RID of the function
@@ -188,6 +232,17 @@ impl Binding {
             name,
             line: MSI_EVENT | rid << 8 | event,
             edge: false,
+            of: None,
+        }
+    }
+
+    /// The binding `name` of event `event` of the function the table names
+    /// by its PCI id and index (`At::Bar`): init puts its RID in when it
+    /// starts, from the walk of the buses.
+    pub const fn msi_of(name: &'static str, id: u32, index: u8, event: u32) -> Binding {
+        Binding {
+            of: Some((id, index)),
+            ..Binding::msi(name, 0, event)
         }
     }
 
@@ -411,6 +466,32 @@ pub fn first_cpu(log: bool, mask: u8) -> u8 {
 }
 
 impl Record {
+    /// A record of nothing: the filler of the buffers of a resolved table.
+    pub const EMPTY: Record = Record {
+        name: "",
+        program: "",
+        kind: Kind::Client,
+        priority: 1,
+        ceiling: 1,
+        quota: MIN_QUOTA,
+        handle_limit: 1,
+        restart: Restart::Never,
+        console: false,
+        log: false,
+        trace: false,
+        windows: &[],
+        bindings: &[],
+        connects: &[],
+        args: &[],
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
+        root: false,
+        shares: Shares::CREATOR,
+        cpus: 1,
+        waits: &[],
+    };
+
     /// The watchdog of a service; None for a client.
     pub const fn watch(&self) -> Option<Watch> {
         match self.kind {
@@ -1341,6 +1422,12 @@ pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-aws")]
 pub const TABLE: &[Record] = aws::TABLE;
+pub use crate::resolve::table;
+/// The platform a table with places by function (`At`) resolves them on.
+#[cfg(feature = "table-aws")]
+pub const PLATFORM: Option<crate::resolve::Platform> = Some(aws::PLATFORM);
+#[cfg(not(feature = "table-aws"))]
+pub const PLATFORM: Option<crate::resolve::Platform> = None;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
 #[cfg(feature = "table-rtbench-posix")]
@@ -1495,11 +1582,13 @@ mod tests {
         base: 0x0901_0000,
         len: PAGE,
         duplicate: false,
+        at: crate::table::At::Fixed,
     };
     const RTC_IRQ: Binding = Binding {
         name: "rtc-irq",
         line: 34,
         edge: false,
+        of: None,
     };
 
     /// The layer session goes to one named client that connects to the RAM service.
@@ -1875,17 +1964,20 @@ mod tests {
             base: 0x0902_0000,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         };
         const W3: Window = Window {
             name: "rtc3",
             base: 0x0903_0000,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         };
         const B2: Binding = Binding {
             name: "irq2",
             line: 1019,
             edge: true,
+            of: None,
         };
         let with = |windows: &'static [Window], bindings: &'static [Binding]| {
             [Record {
@@ -1949,6 +2041,7 @@ mod tests {
                 base,
                 len,
                 duplicate: false,
+                at: crate::table::At::Fixed,
             }];
             check_one(Record {
                 windows: Box::leak(Box::new(w)),

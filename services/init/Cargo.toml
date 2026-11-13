@@ -26,6 +26,9 @@ steps = ["rt/step-stats"]
 # (rt feature beat-grid): the worst phase of their wait for init, which
 # xtask process-steps grid measures apart from the other steps.
 steps-grid = ["steps", "rt/beat-grid"]
+# Deliberate breaks the host tests catch (`cargo xtask ena-breaks`).
+break-bar-size = []
+break-bar-offset = []
 table-test = []
 table-cycle = []
 table-ceiling = []
@@ -194,6 +197,7 @@ proto-pipe = { path = "../../proto/pipe" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 virtio-pci = { path = "../../lib/virtio-pci" }
+pci = { path = "../../lib/pci" }
 # The text of a batch of the kernel log (uart::log), which the worker
 # shows once the console's driver ended for good.
 uart = { path = "../uart" }
@@ -207,3 +211,4 @@ rt = { path = "../../lib/rt" }
 # (netd::pci).
 [dev-dependencies]
 netd = { path = "../netd" }
+pci = { path = "../../lib/pci", features = ["fake"] }

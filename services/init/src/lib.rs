@@ -13,6 +13,7 @@
 
 pub mod labels;
 pub mod quota;
+pub mod resolve;
 pub mod restart;
 pub mod table;
 pub mod waits;

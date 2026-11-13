@@ -992,6 +992,16 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
         programs.extend(package_programs(&packages));
         programs.extend(SHELL_SERVICES_LAST.iter().take(2));
+        // The network service with the ENA of the instance (init's record `net`).
+        // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
+        // queue on purpose (`aws image --ena-break-aenq`).
+        let break_aenq: &'static [&'static str] = if std::env::var_os("STAFETO_ENA_BREAK").is_some()
+        {
+            &["ena-break-aenq"]
+        } else {
+            &[]
+        };
+        programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
         programs
     })
 }
@@ -2022,6 +2032,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
   help      this text";
@@ -2037,6 +2048,7 @@ fn main() {
         Some("aws") => aws::run(&args[1..]),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
+        Some("ena-breaks") => ena_breaks(),
         Some("uart-breaks") => uart_breaks(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
@@ -2492,6 +2504,43 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// The kernel image of `variant` and the boot image of the normal build,
 /// each built once in a run of xtask, whatever number of checks takes
 /// them.
+/// The deliberate breaks of the PCI library, the ENA driver and the places of
+/// init's table (`cargo xtask ena-breaks`): each is a feature of its crate that
+/// does one wrong thing, and the host tests of the crate pass without it and
+/// fail with it.
+const ENA_BREAKS: [(&str, &str); 10] = [
+    ("pci", "break-measure-console"),
+    ("pci", "break-restore-command"),
+    ("pci", "break-multifunction"),
+    ("pci", "break-cap-limit"),
+    ("init", "break-bar-size"),
+    ("init", "break-bar-offset"),
+    ("ena", "break-acq-phase"),
+    ("ena", "break-aenq-head"),
+    ("ena", "break-reset-wait"),
+    ("ena", "break-dma-width"),
+];
+
+fn ena_breaks() -> Result<(), String> {
+    for package in ["pci", "ena", "init"] {
+        let mut ok = cargo();
+        ok.args(["test", "--package", package, "--lib"]);
+        run_cmd(&mut ok)?;
+    }
+    for (package, feature) in ENA_BREAKS {
+        let mut broken = cargo();
+        broken.args(["test", "--package", package, "--lib", "--features", feature]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => {
+                println!("ena-breaks: {feature} is caught by the host tests of {package}");
+            }
+            Ok(_) => return Err(format!("{feature} passed the host tests of {package}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// `cargo xtask uart-breaks`: the host tests of the driver pass, and fail
 /// under the feature `break-uart-poll`, which leaves a 16550 console with
 /// no poll.
@@ -9617,6 +9666,10 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "virtio-pci",
         "--package",
+        "pci",
+        "--package",
+        "ena",
+        "--package",
         "proto-entropy",
         "--package",
         "virtio-rng",
@@ -12382,6 +12435,10 @@ fn ci_lints() -> Result<(), String> {
         "proto-tty",
         "--package",
         "virtio-pci",
+        "--package",
+        "pci",
+        "--package",
+        "ena",
         "--package",
         "proto-entropy",
         "--package",

@@ -4,16 +4,105 @@
 //! The table of the shell on EC2 (t4g.small): the dialog of
 //! `ramfs::BUSYBOX_DIALOG_TABLE` with the 16550 the SPCR names for the
 //! console, polled, and nothing that needs Virtio, NVMe or the network
-//! device: no entropy service, no `net`, no windows over PCI.
+//! device besides the ENA's service `net` (polled, optional): no entropy
+//! service, no Virtio window.
 
-use super::{GENERAL_CPUS, Kind, Record, Restart, Shares, Window};
+use super::{At, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write};
 use crate::PAGE;
+use crate::resolve::Platform;
 use crate::watch::Watch;
+use pci::Ecam;
 
 const MS: u64 = 1_000_000;
 /// The console port of the SPCR of a t4g.small: a 16550 with byte
 /// registers one apart (`boot/firmware-tree/tests/fixtures/graviton-t4g`).
 pub const SPCR_PORT: u64 = 0x090a_0000;
+/// The ECAM of a t4g.small as its MCFG names it: segment 0, buses 0 to 255
+/// from 0x20000000 (`fixtures/graviton-t4g/04-MCFG.bin`).
+pub const ECAM: Ecam = Ecam {
+    base: 0x2000_0000,
+    first_bus: 0,
+    last_bus: 255,
+};
+/// The platform the places of this table are found on. The walk covers bus 0
+/// alone: every function of the instance is there (`pci.txt` of the fixtures)
+/// and the host bridge at 00:00.0 is class 0x0600, so no bridge leads to
+/// another bus; a test keeps this true of the fixture. There is no I/O
+/// window (`iomem.txt`), so the shift of an I/O BAR is 0.
+pub const PLATFORM: Platform = Platform {
+    ecam: ECAM,
+    scan_last_bus: 0,
+    io_shift: 0,
+    optional: &[super::NET_SERVICE],
+};
+/// The ENA function: Amazon's vendor id and device 0xec20 (`pci.txt` of the
+/// fixtures), the first and only one.
+pub const ENA_ID: u32 = 0x1d0f_ec20;
+/// The bytes of BAR 0 of the ENA the service maps: the registers and the
+/// doorbells lie in the first 16 KiB (`iomem.txt` of the fixtures).
+const ENA_BAR_LEN: u64 = 4 * PAGE;
+/// The command word of a function.
+const COMMAND: u64 = 4;
+/// The stop of the ENA: bus mastering and memory decoding off (the command
+/// word 0 of function 0, through the page of its configuration in ECAM), so
+/// that the device writes no frame the allocator gives back. That the device
+/// stops DMA at once on it is the question the next step settles by killing
+/// the service in the middle of the receiving of frames (the note
+/// `2026-11-13-aws-ena.md`, section 2).
+static ENA_STOP: [Write; 1] = [Write {
+    window: "ecam",
+    offset: COMMAND,
+    bits: 32,
+    value: 0,
+    settled: 0xFFFF,
+    only_if: None,
+}];
+/// The memory of the admin structures: one uncached object of 128 KiB (order
+/// 5), where the queue pairs of the next step go too.
+const ENA_DMA: &[Dma] = &[Dma {
+    name: "ena",
+    size: 32 * PAGE,
+    uncached: true,
+    duplicate: false,
+}];
+
+/// The network service with the ENA of the instance: the windows are found
+/// by the walk of the function (`At`), no interrupt is bound (the device is
+/// polled), and the record is optional.
+pub const NET: Record = Record {
+    windows: &[
+        Window {
+            name: "bar",
+            base: 0,
+            len: ENA_BAR_LEN,
+            duplicate: false,
+            at: At::Bar {
+                id: ENA_ID,
+                index: 0,
+                bar: 0,
+            },
+        },
+        Window {
+            name: "ecam",
+            base: 0,
+            len: PAGE,
+            duplicate: false,
+            at: At::Config {
+                id: ENA_ID,
+                index: 0,
+            },
+        },
+    ],
+    bindings: &[],
+    connects: &[],
+    args: &[],
+    dma: ENA_DMA,
+    quiesce: &ENA_STOP,
+    restart: Restart::Never,
+    waits: &[],
+    ..super::net::NETD
+};
+
 /// The kind byte of `uart`'s arguments: a 16550 that is polled.
 const KIND_16550: u8 = 1;
 
@@ -51,6 +140,7 @@ pub const CONSOLE: Record = Record {
         base: SPCR_PORT,
         len: PAGE,
         duplicate: false,
+        at: crate::table::At::Fixed,
     }],
     bindings: &[],
     connects: &[],
@@ -108,6 +198,7 @@ pub const TABLE: &[Record] = &[
         ..named(DIALOG, "busybox-probe")
     },
     named(DIALOG, "tty"),
+    NET,
 ];
 
 #[cfg(test)]
@@ -142,7 +233,8 @@ mod tests {
                 "clock",
                 "pipe",
                 "busybox-probe",
-                "tty"
+                "tty",
+                "net"
             ]
         );
         // The posix record is the shell dialog's, with its larger quota; the
@@ -156,12 +248,95 @@ mod tests {
     }
 
     #[test]
-    fn no_record_connects_to_net_or_entropy_or_a_pci_window() {
+    fn no_record_connects_to_net_or_entropy_and_only_net_has_pci_windows() {
         for r in TABLE {
             assert!(!r.connects.contains(&"net") && !r.connects.contains(&"entropy"));
-            assert!(r.windows.iter().all(|w| w.base == SPCR_PORT));
-            assert!(r.bindings.is_empty());
+            if r.name == "net" {
+                assert!(r.windows.iter().all(|w| w.at != At::Fixed));
+            } else {
+                assert!(r.windows.iter().all(|w| w.base == SPCR_PORT));
+                assert!(r.bindings.is_empty());
+            }
         }
+    }
+
+    #[test]
+    fn the_platform_is_the_mcfg_of_a_t4g_and_its_walk_reaches_every_function() {
+        let mcfg = include_bytes!(
+            "../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/04-MCFG.bin"
+        );
+        // The allocation structure follows the 36-byte header and 8 reserved
+        // bytes: base (8), segment (2), first bus, last bus.
+        let base = u64::from_le_bytes(mcfg[44..52].try_into().unwrap());
+        assert_eq!(base, ECAM.base);
+        assert_eq!((mcfg[54], mcfg[55]), (ECAM.first_bus, ECAM.last_bus));
+        assert_eq!(
+            PLATFORM.scan_last_bus, 0,
+            "the walk covers bus 0, which the MCFG range holds"
+        );
+        // Every function of the fixture is on bus 0, and none is a bridge to
+        // another bus (class 0x0604): the walk of bus 0 is the walk of all.
+        let pci =
+            include_str!("../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/pci.txt");
+        let mut functions = 0;
+        for line in pci.lines().filter(|l| l.starts_with("0000:")) {
+            assert!(line.starts_with("0000:00:"), "{line}");
+            assert!(!line.contains("class=0x0604"), "{line}");
+            functions += 1;
+        }
+        assert_eq!(functions, 5);
+        // The ENA's id is the one of the fixture.
+        assert!(pci.contains("vendor=0x1d0f device=0xec20"));
+        assert_eq!(ENA_ID, 0x1d0f_ec20);
+    }
+
+    #[test]
+    fn the_net_record_gets_the_bar_of_the_fixtures_iomem_and_its_page_of_ecam() {
+        let mut config = pci::fake::t4g();
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
+        let net = found.table.iter().find(|r| r.name == "net").unwrap();
+        // `iomem.txt`: 80004000-80007fff : 0000:00:05.0.
+        let iomem =
+            include_str!("../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/iomem.txt");
+        assert!(iomem.contains("80004000-80007fff : 0000:00:05.0"));
+        let bar = net.windows.iter().find(|w| w.name == "bar").unwrap();
+        assert_eq!((bar.base, bar.len), (0x8000_4000, 0x4000));
+        let ecam = net.windows.iter().find(|w| w.name == "ecam").unwrap();
+        assert_eq!((ecam.base, ecam.len), (0x2000_0000 + (5 << 15), PAGE));
+        assert!(net.windows.iter().all(|w| w.at == At::Fixed));
+        // The resolved table is a good table, and the other records are untouched.
+        assert!(crate::table::check(found.table).is_ok());
+        assert_eq!(found.table.len(), TABLE.len());
+        assert!(found.skipped.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn without_the_ena_the_net_record_is_left_out_with_its_cause_and_the_table_stays_whole() {
+        let mut config = pci::fake::Fake::default();
+        config.function(pci::Address::new(0, 1, 0), 0x1d0f, 0x8250, 0x070003, false);
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
+        assert!(found.table.iter().all(|r| r.name != "net"));
+        assert_eq!(found.table.len(), TABLE.len() - 1);
+        let left = found.skipped[0].unwrap();
+        assert_eq!(left.record, "net");
+        assert!(matches!(
+            left.cause,
+            crate::resolve::Cause::NoFunction {
+                id: ENA_ID,
+                index: 0
+            }
+        ));
+        assert!(crate::table::check(found.table).is_ok());
+    }
+
+    #[test]
+    fn the_net_record_stops_the_function_by_its_command_word() {
+        let q = NET.quiesce[0];
+        assert_eq!((q.window, q.offset, q.bits, q.value), ("ecam", 4, 32, 0));
     }
 
     #[test]

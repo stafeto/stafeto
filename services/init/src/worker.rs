@@ -28,8 +28,8 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use init::table::{
-    BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE, RAM_SERVICE,
-    Record, TABLE,
+    self, BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE, RAM_SERVICE,
+    Record,
 };
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
@@ -295,7 +295,7 @@ extern "C" fn work(_: u64) -> ! {
                 label,
                 program,
                 quota,
-            } => Some(load(&TABLE[place], label, &program, quota)),
+            } => Some(load(&table::table()[place], label, &program, quota)),
             Order::Teardown { place } => {
                 // The handles close here, the cleanup at the worker's level,
                 // once the device stopped.
@@ -496,7 +496,7 @@ pub fn take_stuck(place: usize) -> bool {
 /// to the allocator while the device may still write them, and the record
 /// is marked broken (`take_stuck`).
 fn stop(place: usize, mut gone: Instance) {
-    let record = &TABLE[place];
+    let record = &table::table()[place];
     if quiesce(record) {
         #[cfg(feature = "dma-watch")]
         watch(record, &gone);
