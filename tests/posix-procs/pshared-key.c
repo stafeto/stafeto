@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* A wait or wake by address on a shared word is the right of a process that
  * holds the object (#525).
  *
