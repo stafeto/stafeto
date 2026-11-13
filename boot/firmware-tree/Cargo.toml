@@ -24,5 +24,5 @@ break-smmu-ignore = []
 break-dtb-gib = []
 # The tree leaves out `rng-seed`, whatever the loader found.
 break-no-seed = []
-# The tree is built with the seed itself, not a placeholder (the test of the heap).
+# The tree is built with the seed itself, which leaves copies in the heap (the test of the heap fails).
 break-seed-in-heap = []

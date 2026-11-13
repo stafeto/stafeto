@@ -668,17 +668,20 @@ fn main() -> Status {
     write_tree(&blob, loaded.tree);
     posix_random::erase(&mut blob);
     if let Some(bytes) = seed.as_mut() {
-        let Some(at) = at else {
-            refuse(&"the tree has no rng-seed to patch")
-        };
-        // SAFETY: the tree's room, allocated for it and ours.
-        let room = unsafe {
-            core::slice::from_raw_parts_mut(loaded.tree.base as *mut u8, efimap::TREE_ROOM as usize)
-        };
-        ensure!(
-            firmware_tree::seed::patch(room, at.base as usize, bytes),
-            "the seed does not fit the tree"
-        );
+        // No property to patch only under `break-no-seed`, which leaves it out.
+        if let Some(at) = at {
+            // SAFETY: the tree's room, allocated for it and ours.
+            let room = unsafe {
+                core::slice::from_raw_parts_mut(
+                    loaded.tree.base as *mut u8,
+                    efimap::TREE_ROOM as usize,
+                )
+            };
+            ensure!(
+                firmware_tree::seed::patch(room, at.base as usize, bytes),
+                "the seed does not fit the tree"
+            );
+        }
         posix_random::erase(bytes);
     }
     // The part of the kernel's own check that the tree's size decides was
