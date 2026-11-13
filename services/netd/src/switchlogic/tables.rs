@@ -349,8 +349,13 @@ impl<'a> Flows<'a> {
     /// (at the half fill of the table about a dozen places, 24 at the most before a
     /// lookup gives up), so the work of a call is bounded, and the walk goes on in the next.
     pub fn sweep(&mut self, now: u32, books: &mut Books) {
+        self.sweep_places(now, books, SWEEP_STEP);
+    }
+
+    /// `sweep` over `places` places: a piece of it, which always fits a step.
+    pub fn sweep_places(&mut self, now: u32, books: &mut Books, places: usize) {
         let mut removed = 0;
-        for _ in 0..SWEEP_STEP {
+        for _ in 0..places {
             let f = self.slots[self.cursor];
             if !f.is_empty() {
                 let age = now.wrapping_sub(f.seen);
@@ -1122,6 +1127,13 @@ impl<'a> Tables<'a> {
         self.flows.sweep(self.now, &mut books);
     }
 
+    /// A piece of `sweep`: `places` places from where the last call stopped.
+    pub fn sweep_piece(&mut self, places: usize) {
+        self.guard.check();
+        let mut books = books!(self);
+        self.flows.sweep_places(self.now, &mut books, places);
+    }
+
     /// `sweep` at time `now`, for the idle timer.
     pub fn sweep_at(&mut self, now: u32) {
         self.now = now;
@@ -1714,6 +1726,24 @@ pub(crate) mod tests {
             }
             assert!(most > 0 && most <= SWEEP_REMOVALS, "{most} at most");
             assert_eq!(t.flows.len(), 0);
+        });
+    }
+
+    #[test]
+    fn pieces_of_the_sweep_cover_the_table_and_remove_what_expired() {
+        with_flows(512, |t, _| {
+            t.now = 0;
+            for n in 0..128 {
+                t.insert_embryo(&key(n), 0, 1, 1);
+            }
+            assert!(!t.flows.is_empty());
+            t.now = 100;
+            // 512 places in pieces of the overdue sweep: 512 / 32 pieces, however many steps
+            // came between (each removes at most the cap).
+            for _ in 0..(512 / crate::ring::SWEEP_PIECE + 4) {
+                t.sweep_piece(crate::ring::SWEEP_PIECE);
+            }
+            assert_eq!(t.flows.len(), 0, "the pieces left expired flows");
         });
     }
 

@@ -502,6 +502,10 @@ pub struct Net {
     /// them since the start.
     pub buffers: Buffers,
     pub buffered: u64,
+    /// The BUFFERs that wait for the step of their map, by entry (`cells::Waiting`), and whether
+    /// one was taken since the loop was told.
+    pub waiting: [Option<crate::cells::Waiting>; netd::buffers::BUFFER_SESSIONS],
+    pub buffer_wanted: bool,
     notary: Option<Handle<Channel>>,
     /// A step of the stack is due (a request changed a socket): the loop
     /// tells itself.
@@ -577,6 +581,7 @@ impl Net {
             addr_of_mut!((*at).level).write(level);
             addr_of_mut!((*at).process).write(Some(Handle::borrowed(process.raw())));
             addr_of_mut!((*at).buffers).write(buffers);
+            rt::bss::fill_none(addr_of_mut!((*at).waiting));
             // The ports are the service's, for all its instances (`ports::CLAIMS`).
             (*at).tcp_ports.share(claims, who, Proto::Tcp);
             (*at).udp_ports.share(claims, who, Proto::Udp);
