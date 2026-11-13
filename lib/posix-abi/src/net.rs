@@ -124,8 +124,10 @@ pub fn session() -> Option<rt::abi::Handle> {
     // call without a socket: CONFIG, the resolver) would still hold, and a handle number that
     // is made again would send its call to another service. After the first call this is one
     // load.
-    if HOMING.load(Ordering::Acquire) != ASKED {
-        ensure_home();
+    // It only waits for an ask in progress: a reader never starts the ask (a fork that clones
+    // the session would otherwise home the parent from the wrong CPU before its children ran).
+    while HOMING.load(Ordering::Acquire) == ASKING {
+        let _ = rt::sys::yield_now();
     }
     if COUNTING.load(Ordering::Relaxed) {
         note_cpu();
