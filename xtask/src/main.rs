@@ -5614,12 +5614,24 @@ fn check_lock_steps(
             ));
         }
     }
-    if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
-        return Err(format!(
-            "{name}: dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
-        ));
+    // Every step of the service stays under 0.9 of term B (the bound of the netd probes); the
+    // three longest kinds and a warning for each kind above the margin go to the console.
+    net_probe::say_margin(name, steps);
+    ram_step_verdict(name, steps)
+}
+
+/// Fails when a step of the RAM file service passes 0.9 of term B.
+fn ram_step_verdict(name: &str, steps: &[(usize, u64, u64)]) -> Result<(), String> {
+    match steps
+        .iter()
+        .find(|(_, ticks, _)| *ticks > net_probe::STEP_MAX)
+    {
+        Some((kind, ticks, detail)) => Err(format!(
+            "{name}: the RAM step of kind {kind} takes {ticks} ticks (detail {detail}), past 0.9 of term B ({}): {steps:?}",
+            net_probe::STEP_MAX
+        )),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
@@ -13241,6 +13253,28 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_ram_step_past_the_bound_fails_and_one_past_the_margin_only_warns() {
+        let bound = super::net_probe::STEP_MAX;
+        let margin = super::net_probe::STEP_MARGIN;
+        assert_eq!((margin, bound), (16_500, 18_369));
+        let at_bound = [(65, bound, 3), (50, 9_000, 0)];
+        assert!(super::ram_step_verdict("pages", &at_bound).is_ok());
+        let past = [(65, bound + 1, 3), (50, 9_000, 0)];
+        let error = super::ram_step_verdict("pages", &past).unwrap_err();
+        assert!(
+            error.contains("kind 65") && error.contains("18369"),
+            "{error}"
+        );
+        let warned =
+            super::net_probe::margin_lines("pages", &[(65, margin + 1, 3), (50, margin, 0)]);
+        assert_eq!(
+            warned.iter().filter(|l| l.starts_with("warning:")).count(),
+            1
+        );
+        assert!(warned[1].contains("kind 65"));
+    }
+
     #[test]
     fn lock_budget_requires_actual_measurements() {
         let measured = [(50, 18_336, 0), (65, 15_419, 0)];
