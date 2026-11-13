@@ -130,11 +130,14 @@ pub mod op {
     /// sem_close: w0 id.
     pub const NSEM_CLOSE: u32 = 34;
     /// sem_wait (long): w0 id, w1 nowait, cred, w3 the level of the waiting
-    /// thread (the layer adds it; 0 when it is not there). The service keeps
+    /// thread (the layer adds it; 0 when it is not there; the service cuts it
+    /// to the ceiling of the caller's process). EPERM for a session that
+    /// has not opened the semaphore. The service keeps
     /// the waiters in the order of their levels, the greater first, the
     /// older first among equals, and a post wakes one.
     pub const NSEM_WAIT: u32 = 35;
-    /// sem_post: w0 id.
+    /// sem_post: w0 id. EPERM for a session that has not opened the
+    /// semaphore.
     pub const NSEM_POST: u32 = 36;
     /// sem_getvalue: w0 id. => the value.
     pub const NSEM_VALUE: u32 = 37;
@@ -145,12 +148,16 @@ pub mod op {
     /// thread. The start puts the waiter in the table of waiting operations
     /// and answers at once (WAIT); the layer then reads the word, and either
     /// takes (the answer is ready when a wake came since the start, else it
-    /// comes with the wake) or cancels (the word changed).
+    /// comes with the wake) or cancels (the word changed). The service takes
+    /// the waiter only from a process the process service vouches holds the
+    /// object of the key for writing (EPERM otherwise), and cuts the level
+    /// to the ceiling of that process.
     pub const ADDR_WAIT: u32 = 38;
     /// A wake by address: w0 kind, w1 key, w2 offset, w3 how many to wake at
     /// most. The waiters of the word wake in the order of their levels, the
     /// older first among equals. => w0 how many were woken (at most
-    /// `ADDR_WAKE_MAX`).
+    /// `ADDR_WAKE_MAX`). EPERM for a caller that holds no right to write the
+    /// object, as for the wait.
     pub const ADDR_WAKE: u32 = 39;
     /// The most waiters one `ADDR_WAKE` wakes: a notification for each, and a
     /// step of the service stays under term B. The caller asks again when
@@ -181,6 +188,13 @@ pub struct Who {
     pub uid: u32,
     pub gid: u32,
     pub pid: u32,
+    /// The ceiling of the caller's process, from the same vouching: the
+    /// highest level a waiter of it may have.
+    pub ceiling: u8,
+    /// Whether the process service vouched that the caller holds, for
+    /// writing, the shared object a call by address names (`ADDR_WAIT`,
+    /// `ADDR_WAKE`); the service asks for those two operations only.
+    pub hold: bool,
 }
 
 /// The caller as an operation sees it: who, and the time the layer read.

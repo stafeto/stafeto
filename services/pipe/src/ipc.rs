@@ -71,9 +71,6 @@ pub const IPC_TAG: u32 = 1 << 29;
 pub const BLOCKED_MAX: usize = 128;
 /// The wakes of departed waiters by address that wait for a step.
 const ORPHANS_MAX: usize = 32;
-/// The highest level a waiter by address may have: the ceiling of the
-/// processes of POSIX; the service does not know the level of a client.
-const ADDR_LEVEL_MAX: u8 = 36;
 
 // Linux's numbers, relibc's.
 const EPERM: u32 = 1;
@@ -1376,7 +1373,16 @@ impl Ipc {
 
     /// `ADDR_WAIT`: the start puts the waiter in the table; its take returns
     /// at once once a wake has come.
-    fn addr_wait(&mut self, label: u64, key: Option<u64>, w: &[u64]) -> Flow {
+    /// A start needs the right the process service vouched for (`who.hold`);
+    /// the level is cut to the ceiling of the caller's process. The take of
+    /// a waiter that stands needs nothing new.
+    fn addr_wait(
+        &mut self,
+        label: u64,
+        key: Option<u64>,
+        w: &[u64],
+        who: Who,
+    ) -> Result<Flow, u32> {
         let word = Word {
             kind: w[0],
             key: w[1],
@@ -1395,14 +1401,17 @@ impl Ipc {
                     self.addr_pending -= 1;
                 }
                 b.state = Wait::Taken;
-                return Flow::Done;
+                return Ok(Flow::Done);
             }
         }
-        self.start_word = word;
-        Flow::Wait {
-            queue: Self::set_number(0),
-            block: Block::Addr(w[3].min(u64::from(ADDR_LEVEL_MAX)) as u8),
+        if !who.hold {
+            return Err(fail(EPERM));
         }
+        self.start_word = word;
+        Ok(Flow::Wait {
+            queue: Self::set_number(0),
+            block: Block::Addr(w[3].min(u64::from(who.ceiling)) as u8),
+        })
     }
 
     /// Wakes the list of a queue or set when the object is gone or changed.
@@ -2317,11 +2326,13 @@ impl Ipc {
         w: &[u64],
         c: &Cred,
         retry: bool,
+        ceiling: u8,
     ) -> Result<Flow, u32> {
         let s = self.sem_set(w[0], retry)?;
         if !self.sems[s].named {
             return Err(fail(EINVAL));
         }
+        self.nsem_held(label, s)?;
         if let Some(at) = key.and_then(Self::blocked_place) {
             let b = &mut self.blocked[at];
             if b.used
@@ -2346,19 +2357,33 @@ impl Ipc {
         }
         // The level of the waiter follows the credentials, when the layer
         // sent one (a request without it waits at the level 0).
-        let level = w.get(2 + Cred::WORDS).copied().unwrap_or(0).min(255) as u8;
+        let level = w
+            .get(2 + Cred::WORDS)
+            .copied()
+            .unwrap_or(0)
+            .min(u64::from(ceiling)) as u8;
         Ok(Flow::Wait {
             queue: Self::set_number(s),
             block: Block::Named(level),
         })
     }
 
-    fn nsem_post(&mut self, w: &[u64], c: &Cred, wakes: &mut Wakes) -> Result<(), u32> {
+    /// The session `label` has opened the named semaphore in `s` (and not
+    /// closed it): a wait or a post of anyone else is EPERM.
+    fn nsem_held(&mut self, label: u64, s: usize) -> Result<(), u32> {
+        let era = self.sems[s].era;
+        self.hold_find(label, true, s, era)
+            .map(|_| ())
+            .ok_or(fail(EPERM))
+    }
+
+    fn nsem_post(&mut self, label: u64, w: &[u64], c: &Cred, wakes: &mut Wakes) -> Result<(), u32> {
         let s = self.sem_set(w[0], false)?;
-        let set = &mut self.sems[s];
-        if !set.named {
+        if !self.sems[s].named {
             return Err(fail(EINVAL));
         }
+        self.nsem_held(label, s)?;
+        let set = &mut self.sems[s];
         if u32::from(set.vals[0]) >= SEM_VALUE_MAX {
             return Err(fail(EOVERFLOW));
         }
@@ -2640,20 +2665,26 @@ impl Pipes {
             op::NSEM_WAIT => {
                 need(2 + Cred::WORDS)?;
                 let c = cred(2)?;
-                self.ipc.nsem_wait(label, call.key, w, &c, retry)
+                self.ipc
+                    .nsem_wait(label, call.key, w, &c, retry, who.ceiling)
             }
             op::NSEM_POST => {
                 need(1 + Cred::WORDS)?;
                 let c = cred(1)?;
-                self.ipc.nsem_post(w, &c, wakes)?;
+                self.ipc.nsem_post(label, w, &c, wakes)?;
                 Ok(Flow::Done)
             }
             op::ADDR_WAIT => {
                 need(4)?;
-                Ok(self.ipc.addr_wait(label, call.key, w))
+                self.ipc.addr_wait(label, call.key, w, who)
             }
             op::ADDR_WAKE => {
                 need(4)?;
+                // The wake of a word is the right of a process that holds
+                // its object for writing.
+                if !who.hold {
+                    return Err(fail(EPERM));
+                }
                 let word = Word {
                     kind: w[0],
                     key: w[1],
@@ -2924,6 +2955,8 @@ mod tests {
         uid: 1000,
         gid: 100,
         pid: 7,
+        ceiling: 36,
+        hold: true,
     };
     const NOW: u64 = 50;
 
@@ -3122,6 +3155,8 @@ mod tests {
             uid: 2000,
             gid: 200,
             pid: 8,
+            ceiling: 36,
+            hold: true,
         };
         assert_eq!(r.err(&mut p, op::MQ_OPEN, &other, b"/q"), 13);
         // Nor may it take the name away.
@@ -3334,6 +3369,8 @@ mod tests {
             uid: 2000,
             gid: 200,
             pid: 9,
+            ceiling: 36,
+            hold: true,
         };
         assert_eq!(r.err(&mut p, op::MSG_CTL, &other, b""), 1);
         r.who.uid = 0;
@@ -3771,6 +3808,13 @@ mod tests {
         p.ipc_note_wait(label, n, queue, block);
     }
 
+    /// The session `label` opens the named semaphore `name` that exists.
+    fn nsem_join(r: &mut Run, p: &mut Pipes, label: u64, name: &[u8]) -> u64 {
+        let (flow, out) = r.call(p, label, op::NSEM_OPEN, &with_cred(&[0, 0, 0]), name, None);
+        assert_eq!(flow, Ok(Flow::Done));
+        out.words[0]
+    }
+
     /// The take of the operation `n` that was given the unit: whether it got
     /// the semaphore.
     fn nsem_take(r: &mut Run, p: &mut Pipes, label: u64, n: u64, id: u64) -> bool {
@@ -3897,6 +3941,91 @@ mod tests {
         assert_eq!(addr_wake_all(&mut r, &mut p, 77, 64, 5), 0);
         // The two other words still wait.
         assert_eq!(p.ipc.counted, 2);
+    }
+
+    /// A caller the process service does not vouch for as a holder of the
+    /// object, for writing, stands in no table and wakes nobody; its call
+    /// is EPERM (the layer falls back to polling its own word).
+    #[test]
+    fn a_wait_or_wake_by_address_needs_the_right_to_the_object() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        addr_wait_at(&mut r, &mut p, 1, 1, 77, 64, 10);
+        let used = |p: &Pipes| p.ipc.blocked.iter().filter(|b| b.used).count();
+        assert_eq!(used(&p), 1);
+        // A stranger's wait, at the highest level: refused, nothing stands.
+        r.who.hold = false;
+        let (flow, _) = r.call(&mut p, 2, op::ADDR_WAIT, &[1, 77, 64, 255], b"", None);
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + EPERM));
+        assert_eq!(used(&p), 1, "no waiter was put in the table");
+        assert_eq!(p.ipc.counted, 1);
+        // Its wake finds nobody to give to the legitimate waiter.
+        let (flow, _) = r.call(&mut p, 2, op::ADDR_WAKE, &[1, 77, 64, 4], b"", None);
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + EPERM));
+        assert_eq!(r.wakes.iter().count(), 0, "nobody was woken");
+        // The holder's wake reaches its waiter, which no one took the place of.
+        r.who.hold = true;
+        assert_eq!(addr_wake_all(&mut r, &mut p, 77, 64, 1), 1);
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 1)]);
+        // A waiter that stands takes its wake though the right is not asked
+        // again at the take: the table is the check.
+        r.who.hold = false;
+        assert!(addr_take(&mut r, &mut p, 1, 1, 77, 64));
+        assert_eq!(p.ipc.counted, 0);
+    }
+
+    /// The level of a waiter is its claim cut to the ceiling of its process.
+    #[test]
+    fn the_level_of_a_waiter_is_cut_to_the_ceiling_of_its_process() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        r.who.ceiling = 30;
+        let (flow, _) = r.call(&mut p, 1, op::ADDR_WAIT, &[1, 5, 0, 255], b"", None);
+        let Ok(Flow::Wait { block, .. }) = flow else {
+            panic!("{flow:?}")
+        };
+        assert_eq!(block, Block::Addr(30));
+        let (flow, _) = r.call(&mut p, 1, op::ADDR_WAIT, &[1, 5, 4, 12], b"", None);
+        let Ok(Flow::Wait { block, .. }) = flow else {
+            panic!("{flow:?}")
+        };
+        assert_eq!(block, Block::Addr(12), "a lower claim stands");
+        let w = with_cred(&[O_CREAT, 0o600, 0]);
+        let id = r.ok(&mut p, op::NSEM_OPEN, &w, b"/lv").words[0];
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &[id, 0, NOW, 255], b"", None);
+        let Ok(Flow::Wait { block, .. }) = flow else {
+            panic!("{flow:?}")
+        };
+        assert_eq!(block, Block::Named(30));
+    }
+
+    /// A named semaphore is waited on and posted by the sessions that opened
+    /// it; a session that knows its number has nothing of it.
+    #[test]
+    fn a_named_semaphore_is_waited_on_and_posted_by_its_openers() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let w = with_cred(&[O_CREAT, 0o600, 1]);
+        let id = r.ok(&mut p, op::NSEM_OPEN, &w, b"/own").words[0];
+        // Session 2 has not opened it: no wait, no try-wait, no post.
+        for words in [[id, 0, NOW, 255], [id, 1, NOW, 0]] {
+            let (flow, _) = r.call(&mut p, 2, op::NSEM_WAIT, &words, b"", None);
+            assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + EPERM));
+        }
+        let (flow, _) = r.call(&mut p, 2, op::NSEM_POST, &with_cred(&[id]), b"", None);
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + EPERM));
+        assert_eq!(
+            r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0],
+            1,
+            "untouched"
+        );
+        assert_eq!(p.ipc.counted, 0);
+        // The opener may, and a session that opened it after may too.
+        nsem_join(&mut r, &mut p, 2, b"/own");
+        let (flow, _) = r.call(&mut p, 2, op::NSEM_WAIT, &[id, 1, NOW, 0], b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        // Closing takes the right with it.
+        let (flow, _) = r.call(&mut p, 2, op::NSEM_CLOSE, &[id], b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        let (flow, _) = r.call(&mut p, 2, op::NSEM_POST, &with_cred(&[id]), b"", None);
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + EPERM));
     }
 
     #[test]
@@ -4038,6 +4167,8 @@ mod tests {
         r.ok(&mut p, op::NSEM_WAIT, &with_cred(&[id, 0]), b"");
         // A session that goes with a granted waiter owes its unit to the
         // others, handed on by a step.
+        nsem_join(&mut r, &mut p, 7, b"/p");
+        nsem_join(&mut r, &mut p, 8, b"/p");
         nsem_wait_at(&mut r, &mut p, 7, 5, id, 9);
         nsem_wait_at(&mut r, &mut p, 8, 6, id, 3);
         r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
@@ -4062,6 +4193,7 @@ mod tests {
         for n in 1..=24u64 {
             nsem_wait_at(&mut r, &mut p, 1, n, id, 4);
         }
+        nsem_join(&mut r, &mut p, 2, b"/m");
         for n in 25..=54u64 {
             nsem_wait_at(&mut r, &mut p, 2, n, id, 3);
         }
@@ -4108,6 +4240,7 @@ mod tests {
             )
             .words[0];
         assert_eq!((next - 1) & 31, (id - 1) & 31);
+        nsem_join(&mut r, &mut p, 2, b"/y");
         nsem_wait_at(&mut r, &mut p, 2, 40, next, 4);
         r.ok(&mut p, op::NSEM_POST, &with_cred(&[next]), b"");
         assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(2, 40)]);
