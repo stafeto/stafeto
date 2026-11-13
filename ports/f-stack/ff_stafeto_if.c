@@ -110,6 +110,12 @@ extern void stafeto_trace_frame(unsigned id, const void *frame, unsigned len, in
 #define PORT_WAKE_GONE 8u
 /* The longest frame of the wire the interface takes: header and MTU. */
 #define FF_STAFETO_FRAME_MAX 1514
+/* The longest frame of the segmentation offload (the headers and 16 KiB of data) and the
+ * bits of the offload word of the claim (snapshot[6]): the device completes the sums of
+ * TCP, and it cuts frames of TCP (entry flags TX_SUM | TX_TSO). */
+#define FF_STAFETO_TSO_FRAME_MAX 16512
+#define VNET_PORT_OFFLOAD_SUM 1
+#define VNET_PORT_OFFLOAD_TSO 2
 #define FF_STAFETO_FRAME_MIN 60
 #define BYPASS_KICK_MAX 16
 /* How long a frame waits for room in the full queue of sending. */
@@ -157,6 +163,8 @@ static uint32_t notified;
 static int service_gone;
 static int tx_batch;
 static int tx_stalled;
+/* The device cuts frames of TCP (the claim says so, and the interface offers TSO). */
+static int tso_on;
 static int bypass_batch;
 static struct ff_stafeto_device_stats stats;
 
@@ -363,6 +371,7 @@ ff_dpdk_init(int argc, char **argv)
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
         stats.ticks_per_second = frequency;
         stats.free_low = vnet_port_fill_free();
+        tso_on = (dev_claim.snapshot[6] & VNET_PORT_OFFLOAD_TSO) != 0;
     } else if (dev_on) {
         int opened = vnet_open(&dev_claim);
 
@@ -425,7 +434,10 @@ ff_dpdk_if_up(void)
             cfg.hw_features.rx_csum = 1;
             /* Only a device that completes the sums (snapshot[6]) takes
              * segments without them; else the stack sums its own. */
-            cfg.hw_features.tx_csum_l4 = dev_claim.snapshot[6] != 0;
+            cfg.hw_features.tx_csum_l4 = (dev_claim.snapshot[6] & VNET_PORT_OFFLOAD_SUM) != 0;
+            /* A device that cuts frames of TCP gets the stack's segments whole, up to
+             * 16 KiB (stafeto.patch sets the limits of the interface). */
+            cfg.hw_features.tx_tso = tso_on;
         }
         dev_ctx = ff_veth_attach(&cfg);
         if (dev_ctx == NULL) {
@@ -559,6 +571,7 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     uint8_t *to;
     void *cur;
     int off = 0, sent;
+    uint16_t tso_mss = 0;
     struct ff_tx_offload offload;
 
     memset(&offload, 0, sizeof(offload));
@@ -569,7 +582,13 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
         return dev_on ? ff_ENETDOWN : 0;
     }
     began = counter();
-    if (total <= 0 || total > FF_STAFETO_FRAME_MAX) {
+    if (tso_on) {
+        /* The segment size of a frame the stack hands over whole for the device to cut. */
+        ff_mbuf_tx_offload(m, &offload);
+        if (total > FF_STAFETO_FRAME_MAX && offload.tso_seg_size != 0 && offload.tcp_csum)
+            tso_mss = offload.tso_seg_size;
+    }
+    if (total <= 0 || total > (tso_mss != 0 ? FF_STAFETO_TSO_FRAME_MAX : FF_STAFETO_FRAME_MAX)) {
         stats.tx_long++;
         ff_mbuf_free(m);
         return ff_EMSGSIZE;
@@ -577,13 +596,15 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     if (port_on) {
         uint64_t until;
 
-        to = vnet_port_tx_cell();
+        /* A frame of the offload takes the cells it needs in a row. */
+        to = tso_mss != 0 ? vnet_port_tx_span((uint32_t)total) : vnet_port_tx_cell();
         if (to == NULL && !tx_stalled) {
             /* TX is full: publish what waits and give the switch up to
              * FF_STAFETO_TX_WAIT_US to take entries. */
             until = counter() + stats.ticks_per_second * FF_STAFETO_TX_WAIT_US / 1000000;
             tx_flush();
-            while ((to = vnet_port_tx_cell()) == NULL) {
+            while ((to = tso_mss != 0 ? vnet_port_tx_span((uint32_t)total) :
+                        vnet_port_tx_cell()) == NULL) {
                 if (counter() >= until) {
                     tx_stalled = 1;
                     break;
@@ -608,8 +629,21 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
             vnet_copy(to + off, data, len);
             off += (int)len;
         }
-        ff_mbuf_tx_offload(m, &offload);
+        if (!tso_on)
+            ff_mbuf_tx_offload(m, &offload);
         ff_mbuf_free(m);
+        if (tso_mss != 0) {
+            /* The switch writes the sum of the pseudo-header and has the device cut the
+             * frame into segments of the stack's size. */
+            TRACE_FRAME(TP_TX, to, FF_STAFETO_FRAME_MAX, 0);
+            vnet_port_tx_submit_tso((uint32_t)off, tso_mss);
+            stats.tx_tso++;
+            stats.tx_frames++;
+            if (++tx_batch >= FF_STAFETO_TX_BATCH)
+                tx_flush();
+            stats.tx_send_ticks += counter() - began;
+            return 0;
+        }
         if (off < FF_STAFETO_FRAME_MIN) {
             memset(to + off, 0, FF_STAFETO_FRAME_MIN - off);
             off = FF_STAFETO_FRAME_MIN;

@@ -69,7 +69,8 @@ use netd::ring::{
     CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
     STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
     SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
+    SWITCH_TX, Stepper, TSO_WEIGHT, TX_BUFFERS, TX_SHARE, bell_due, charge, drive,
+    for_each_arp_copy,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -77,7 +78,8 @@ use netd::switchlogic::ring::Tx;
 use netd::switchlogic::route::{self, DEFAULT_INSTANCE, Decision, Reason, Source, Verdict, Why};
 use netd::switchlogic::sums;
 use netd::switchlogic::tables::{MAX_CONSUMERS, MAX_INSTANCES, Tables};
-use proto_net::switch::{CELL, WAKE_RING};
+use netd::switchlogic::tso::Send as TsoSend;
+use proto_net::switch::{CELL, TSO_HEAD_MAX, WAKE_RING};
 use rt::handle::{Channel, Interrupt, Process, Thread, Timer};
 use rt::{Handle, Stack, sys};
 use virtio_drivers::transport::SomeTransport;
@@ -87,6 +89,7 @@ use virtio_net::books::TAIL_LEN;
 use virtio_net::cut::{Frame2, Plan};
 use virtio_net::frames::{BUFFER_LEN, MAX_FRAME};
 use virtio_net::rings::{Sent, tail_at};
+use virtio_net::tso;
 
 const RECEIVEQ: u16 = 0;
 const TRANSMITQ: u16 = 1;
@@ -203,6 +206,11 @@ pub struct Stats {
     pub merged_max: AtomicU32,
     /// Frames for the stack dropped because the pool of its buffers was empty.
     pub pool_empty: AtomicU32,
+    /// Frames of the segmentation offload given to the device, the chunks they were copied in,
+    /// and the entries that waited for buffers of sending (counted once each).
+    pub tso: AtomicU32,
+    pub tso_chunks: AtomicU32,
+    pub tso_waits: AtomicU32,
 }
 
 impl Stats {
@@ -238,6 +246,9 @@ impl Stats {
             merged_dropped: AtomicU32::new(0),
             merged_max: AtomicU32::new(0),
             pool_empty: AtomicU32::new(0),
+            tso: AtomicU32::new(0),
+            tso_chunks: AtomicU32::new(0),
+            tso_waits: AtomicU32::new(0),
         }
     }
 }
@@ -492,6 +503,12 @@ impl Inner {
         self.offload.load(Ordering::Relaxed)
     }
 
+    /// Whether the device cuts the frames of TCP it is given whole (`HOST_TSO4`): the device
+    /// that merges received segments takes all six features of the offload or none, so it does.
+    pub fn tso(&self) -> bool {
+        self.merged() && self.offload()
+    }
+
     /// Frames the switch dropped (no frame) and the martian ones.
     pub fn rx_counts(&self) -> (u64, u64) {
         (
@@ -516,6 +533,18 @@ impl Inner {
 }
 
 pub static INNER: Inner = Inner::new();
+
+/// What a step of a frame of the offload did.
+enum TsoStep {
+    /// A chunk of data was copied (`TSO_WEIGHT`).
+    Copied,
+    /// The chain was taken, or queued: a light item (the weight of a frame).
+    Small,
+    /// No chain of buffers for it yet.
+    Waits,
+    /// Its consumer is gone or its ring broke: the frame is dropped.
+    Gone,
+}
 
 /// A merged frame the switch is cutting into segments: the buffer it came in (its head, with the
 /// tail behind it), the bytes the device wrote, the plan, the next segment and where the
@@ -589,6 +618,14 @@ pub struct Switch {
     merged: bool,
     /// The merged frame being cut.
     big: Option<Big>,
+    /// The frame of the segmentation offload of each consumer the switch holds (copied in
+    /// chunks over several steps, then queued as one chain), and the generation of the consumer
+    /// it was taken from.
+    tso: [Option<TsoSend>; MAX_CONSUMERS],
+    tso_gen: [u32; MAX_CONSUMERS],
+    /// The device is asked for an interrupt when it returns buffers of sending: a frame of the
+    /// offload waits for a chain, and the switch sleeps until the device frees buffers.
+    tx_irq: bool,
     /// The buffers the stack reads its frames in when the device merges segments (`netd::pool`).
     pool: netd::pool::Pool,
     /// Whose each buffer of the queue of sending is, in the order they went in: the device
@@ -699,6 +736,9 @@ impl Switch {
             offload,
             merged,
             big: None,
+            tso: [const { None }; MAX_CONSUMERS],
+            tso_gen: [0; MAX_CONSUMERS],
+            tx_irq: false,
             pool: if merged {
                 netd::pool::Pool::filled(virtio_net::books::TAILS, RX_BUFFERS)
             } else {
@@ -775,6 +815,11 @@ impl Switch {
     /// Lends each instance free buffers of sending up to its share. The set of the instances
     /// (bit k for instance k) that were out of them and have some now.
     fn lend(&mut self) -> u8 {
+        // The buffers the device returns gather for a frame of the offload that waits for its
+        // chain; the stack gets them after.
+        if self.tso.iter().flatten().any(|s| s.nbuf == 0) {
+            return 0;
+        }
         let share = self.share();
         let mut lent = 0;
         for (k, lane) in INNER.lanes[..self.instances].iter().enumerate() {
@@ -979,6 +1024,10 @@ impl Switch {
         if self.tables.is_some() {
             more_c = self.consumer_frames();
         }
+        if self.tx_irq && !self.tso.iter().flatten().any(|s| s.nbuf == 0) {
+            self.tx.queue.set_dev_notify(false);
+            self.tx_irq = false;
+        }
         #[cfg(feature = "steps")]
         self.part(1, self.ran().saturating_sub(before_consumers));
         // The frames of the wire.
@@ -1117,19 +1166,31 @@ impl Switch {
         // (the 1 ms timer and the returned buffers look at it again); counting it would
         // make the switch run again at once, above the stack, and spin.
         let (cap, free) = (self.consumer_cap(), self.tx.book.free());
-        let work = netd::books::has_work(
-            t.consumers.iter().enumerate().filter_map(|(c, x)| {
-                x.as_ref().map(|x| {
-                    (
-                        x.ring.tx_pending() && self.period.left(),
-                        usize::from(self.inflight[c]),
-                    )
-                })
-            }),
-            cap,
-            free,
-            !COMMANDS.to_switch.is_empty(),
-        );
+        // A frame of the offload the switch holds is work by its own rule (`tso_work`): a chunk
+        // to copy, a chain that can be taken, or used buffers posted that the next step gives
+        // back; the entries of such a consumer wait behind it.
+        let tso_work = self.tso.iter().flatten().any(|s| {
+            netd::books::tso_work(
+                s.nbuf > 0,
+                s.may_take(free, usize::from(self.inflight[s.consumer]), cap),
+                self.tx.queue.can_pop(),
+                self.period.left(),
+            )
+        });
+        let work = tso_work
+            || netd::books::has_work(
+                t.consumers.iter().enumerate().filter_map(|(c, x)| {
+                    x.as_ref().filter(|_| self.tso[c].is_none()).map(|x| {
+                        (
+                            x.ring.tx_pending() && self.period.left(),
+                            usize::from(self.inflight[c]),
+                        )
+                    })
+                }),
+                cap,
+                free,
+                !COMMANDS.to_switch.is_empty(),
+            );
         if work {
             self.clear_idle();
         }
@@ -1249,6 +1310,40 @@ impl Switch {
                     break;
                 }
                 let c = (usize::from(self.next_c) + k) % MAX_CONSUMERS;
+                // A frame of the segmentation offload the switch holds goes on a chunk at a
+                // time, in the share of its consumer's turn.
+                // While a frame of the offload waits for its chain the entries of the other
+                // consumers wait too, so the buffers the device returns gather (`may_send_small`).
+                if self.tso[c].is_none()
+                    && !netd::books::may_send_small(self.tso.iter().flatten().any(|s| s.nbuf == 0))
+                {
+                    blocked = true;
+                    continue;
+                }
+                if self.tso[c].is_some() {
+                    if !self.period.left() {
+                        blocked = true;
+                        spent = true;
+                        continue;
+                    }
+                    let began = now_ns();
+                    match self.tso_step(c) {
+                        TsoStep::Copied => {
+                            progressed = true;
+                            budget = budget.saturating_sub(TSO_WEIGHT);
+                            taken += TSO_WEIGHT;
+                        }
+                        TsoStep::Small => {
+                            progressed = true;
+                            budget = budget.saturating_sub(1);
+                            taken += 1;
+                        }
+                        TsoStep::Waits => blocked = true,
+                        TsoStep::Gone => {}
+                    }
+                    self.period.spend(now_ns().wrapping_sub(began));
+                    continue;
+                }
                 // A frame waits in its ring while this consumer holds its share of the
                 // queue, or no buffer is free.
                 if netd::books::blocked(usize::from(self.inflight[c]), cap, self.tx.book.free()) {
@@ -1298,6 +1393,12 @@ impl Switch {
                         taken += 1;
                         self.consumer_loop(c as u8, len);
                     }
+                    Tx::Tso { len, mss } => {
+                        progressed = true;
+                        budget -= 1;
+                        taken += 1;
+                        self.consumer_tso(c as u8, len, mss);
+                    }
                 }
                 self.period.spend(now_ns().wrapping_sub(began));
             }
@@ -1311,18 +1412,139 @@ impl Switch {
         // again at once (it would spin above the stack): the timer looks again in a
         // millisecond, and the steps that return buffers go on as before.
         self.blocked = blocked
-            && self
-                .tables
-                .as_ref()
-                .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting()));
-        // More follows at once only for entries that may still be taken.
+            && (self.tso.iter().flatten().any(|s| s.nbuf == 0)
+                || self
+                    .tables
+                    .as_ref()
+                    .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting())));
+        // More follows at once only for entries that may still be taken, and for a frame of
+        // the offload that has chunks left to copy.
         budget == 0
-            && self.tables.as_ref().is_some_and(|t| {
-                t.consumers
-                    .iter()
-                    .flatten()
-                    .any(|x| x.ring.tx_waiting() && self.period.left())
-            })
+            && self.period.left()
+            && (self.tso.iter().flatten().any(|s| s.nbuf > 0)
+                || self
+                    .tables
+                    .as_ref()
+                    .is_some_and(|t| t.consumers.iter().flatten().any(|x| x.ring.tx_waiting())))
+    }
+
+    /// The frame of consumer `c` for the device to cut (`TX_SUM | TX_TSO`), its headers in
+    /// `scratch`: the rules of the headers, then the entries are held and the frame is copied
+    /// in chunks (`tso_step`). A refusal frees the entries and is counted.
+    fn consumer_tso(&mut self, c: u8, len: usize, mss: u16) {
+        let Some(t) = self.tables.as_mut() else {
+            return;
+        };
+        let head = &self.scratch[..len.min(TSO_HEAD_MAX)];
+        // The consumer was told at ATTACH whether the device cuts: an entry on a device that
+        // does not is refused with the others that break a rule of the headers.
+        let parsed = if INNER.tso() {
+            tso::parse(head, len, mss).ok()
+        } else {
+            None
+        };
+        let Some(h) = parsed else {
+            route::refuse_tx(t, c, Reason::Tso);
+            Self::tso_free(t, c);
+            return;
+        };
+        // `check_tso` counts its own refusals.
+        if route::check_tso(t, c, head, h.headers) != Verdict::Send {
+            Self::tso_free(t, c);
+            return;
+        }
+        if let Some(x) = t.consumers[usize::from(c)].as_ref() {
+            self.tso_gen[usize::from(c)] = x.generation;
+            let mut held = TsoSend::new(&self.scratch, len, mss, h);
+            held.consumer = usize::from(c);
+            self.tso[usize::from(c)] = Some(held);
+        }
+    }
+
+    /// The entries of the frame held from consumer `c` are free.
+    fn tso_free(t: &mut Tables<'static>, c: u8) {
+        if let Some(x) = t.consumers[usize::from(c)].as_mut() {
+            x.ring.tso_done();
+        }
+    }
+
+    /// One item of the frame of consumer `c` the switch holds, one of three in turn: its chain of
+    /// buffers is taken (all or none) with the headers put in the first (`TsoStep::Small`), a
+    /// chunk of the data is copied (`TsoStep::Copied`, the heavy item), and, once every byte is
+    /// in, the chain goes into the queue and the entries are free (`Small`). The items are apart
+    /// so that each stays within the weight the step rule charges for it.
+    fn tso_step(&mut self, c: usize) -> TsoStep {
+        let gone = self.tables.as_ref().is_none_or(|t| {
+            t.consumers[c]
+                .as_ref()
+                .is_none_or(|x| x.generation != self.tso_gen[c] || x.ring.is_broken())
+        });
+        let cap = self.consumer_cap();
+        let Some(s) = self.tso[c].as_mut() else {
+            return TsoStep::Gone;
+        };
+        if gone {
+            for &b in &s.bufs[..s.nbuf] {
+                self.tx.book.release(b);
+            }
+            self.tso[c] = None;
+            return TsoStep::Gone;
+        }
+        if s.nbuf == 0 {
+            let (k, held) = (s.buffers(), usize::from(self.inflight[c]));
+            if !s.may_take(self.tx.book.free(), held, cap) {
+                if !core::mem::replace(&mut s.waited, true) {
+                    bump(&INNER.stats.tso_waits);
+                }
+                // The device tells when it returns buffers (`go_idle` looks once more after
+                // this, for buffers it returned already).
+                if !core::mem::replace(&mut self.tx_irq, true) {
+                    self.tx.queue.set_dev_notify(true);
+                }
+                return TsoStep::Waits;
+            }
+            for slot in &mut s.bufs[..k] {
+                *slot = self.tx.book.alloc().expect("counted above");
+            }
+            s.nbuf = k;
+            // SAFETY: the buffers are free (just taken from the pool).
+            s.begin(unsafe { virtio_net::rings::buffer_at(self.tx.base(), s.bufs[0]) });
+            return TsoStep::Small;
+        }
+        if !s.done() {
+            let base = self.tx.base();
+            let t = self.tables.as_ref().expect("checked above");
+            let ring = &t.consumers[c].as_ref().expect("checked above").ring;
+            // SAFETY: the buffers of the chain are the switch's until it is queued.
+            s.chunk(ring, &mut |n| unsafe {
+                virtio_net::rings::buffer_at(base, n)
+            });
+            bump(&INNER.stats.tso_chunks);
+            return TsoStep::Copied;
+        }
+        let (bufs, n, total) = (s.bufs, s.nbuf, s.total());
+        match self.tx.submit_chain(&bufs[..n], total) {
+            Ok(Sent::Queued) => {
+                bump(&INNER.stats.tso);
+                bump(&INNER.stats.sum_tx);
+                profile::count(Counter::SumTx);
+                profile::count(Counter::WireTx);
+                INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
+                INNER.stats.tx_consumer.fetch_add(1, Ordering::Relaxed);
+                for _ in 0..n {
+                    self.queued(c as u8);
+                }
+            }
+            Ok(Sent::Dropped) => {
+                INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(broken) => fail(broken.text(true)),
+        }
+        self.tso[c] = None;
+        if let Some(x) = self.tables.as_mut().and_then(|t| t.consumers[c].as_mut()) {
+            x.ring.tso_done();
+        }
+        TsoStep::Small
     }
 
     /// The copy in `scratch` is checked and goes out, or turns back into the tables. `sum`: the
@@ -1547,11 +1769,16 @@ impl Switch {
         // A merged frame waiting for the stack's ring or a buffer of sending is looked at again
         // by the same timer, so that it does not wait for the next event of another kind.
         let cutting = self.big.is_some() && INNER.cut_wait.load(Ordering::Relaxed);
-        if (sweeping || self.blocked || cutting) && (!self.armed || waits_for_period) {
+        // A frame of the offload waiting for its chain moves a timer armed for later (the
+        // sweep's) to 1 ms: used buffers may be posted without a new interrupt.
+        let tso_waits = self.tso.iter().flatten().any(|s| s.nbuf == 0);
+        if (sweeping || self.blocked || cutting || tso_waits)
+            && (!self.armed || waits_for_period || tso_waits)
+        {
             let after = if self.blocked && self.budget_hit {
                 // The entries wait for the next period.
                 self.period.remaining(now_ns()).max(20_000)
-            } else if self.blocked || cutting {
+            } else if self.blocked || cutting || tso_waits {
                 1_000_000
             } else if settling {
                 2_000_000

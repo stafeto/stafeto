@@ -128,6 +128,16 @@ int vnet_port_tx_flush(void);
  * their software sums). */
 void vnet_port_tx_submit_sum(uint32_t len);
 
+/* A frame of TCP in IPv4 for the device to cut into segments (the segmentation offload;
+ * only when ATTACH said so, bit 1 of the offload word). vnet_port_tx_span(len) gives the
+ * first of the cells in a row that a frame of len bytes (at most 16512) takes, 2048 bytes
+ * each, or NULL when TX has no room; when the run would cross the end of the array it
+ * writes the entry that skips the rest first. vnet_port_tx_submit_tso makes the entries of
+ * the frame (flags 3, the MSS in the spare of the first, zero entries after it). The sum
+ * field of the TCP header is the switch's to write. */
+uint8_t *vnet_port_tx_span(uint32_t len);
+void vnet_port_tx_submit_tso(uint32_t len, uint32_t mss);
+
 /* The entry for the packet in the cell is a packet of the loopback network (flag 4): both its
  * addresses are in 127.0.0.0/8 and its port is no port of this stack's; the switch routes it. */
 void vnet_port_tx_submit_loop(uint32_t len);

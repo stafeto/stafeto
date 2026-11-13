@@ -1426,7 +1426,7 @@ fn switch_files(image: &str) -> Vec<RootFile> {
         (
             "/etc/netd.conf",
             "netd-switch.conf",
-            crate::fast_nginx::SWITCH_NETD_CONF,
+            crate::fast_nginx::switch_netd_conf(),
         ),
     ] {
         let file = files
@@ -1892,7 +1892,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 (
                     "/etc/netd.conf",
                     "netd-switch.conf",
-                    crate::fast_nginx::SWITCH_NETD_CONF,
+                    crate::fast_nginx::switch_netd_conf(),
                 ),
             ] {
                 match files.iter_mut().find(|f| f.path == path) {

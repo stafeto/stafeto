@@ -478,7 +478,8 @@ pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
         layout.tx_slots,
         attached.block_first,
         attached.block_count,
-        u32::from(attached.offload),
+        // Bit 0: the device completes the sums of TCP; bit 1: it cuts frames of TCP (`TX_TSO`).
+        u32::from(attached.offload) | u32::from(attached.tso) << 1,
     ]);
     crate::allocation::heap(|state| -> Result<(), i32> {
         out.window = state.map_fast(ring, pages, 0)? as u64;
