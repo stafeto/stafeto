@@ -131,10 +131,11 @@ const SEED_WINDOW: usize = 0x64_0000_0000;
 /// all the same; the kernel kept no other copy.
 fn wipe_seed(process: &Handle<Process>, seed: Handle<Memory>) {
     if sys::mem_map(process, &seed, 0, 4096, SEED_WINDOW, Access::ReadWrite).is_ok() {
-        for i in 0..4096 {
-            // SAFETY: the page is mapped read and write at SEED_WINDOW, 4096 bytes.
-            unsafe { ((SEED_WINDOW + i) as *mut u8).write_volatile(0) };
-        }
+        // SAFETY: the page is mapped read and write at SEED_WINDOW, 4096 bytes.
+        unsafe { core::ptr::write_bytes(SEED_WINDOW as *mut u8, 0, 4096) };
+        // The fence and the unmap call that follows keep the stores: the call
+        // is an `asm!` that may read memory, so the zeros reach the page first.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: the window is init's own and nothing else uses it.
         let _ = unsafe { sys::mem_unmap(process, SEED_WINDOW, 4096) };
     }
