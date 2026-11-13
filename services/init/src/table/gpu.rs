@@ -96,6 +96,7 @@ pub const GPU: Record = Record {
         value: 0,
         settled: 0xFFFF_FFFF,
         only_if: None,
+        confirm: None,
     }],
     trusted: true,
     root: false,

@@ -130,10 +130,36 @@ pub fn needs(table: &[Record]) -> bool {
     })
 }
 
-/// A resolved table, and the records the platform left out with their cause.
+/// The BARs measured at the start, each once: (function, BAR, bytes). Only the
+/// BARs a window of the table names are measured: the boot disk and the console
+/// are never written to.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Measured {
+    pub list: [Option<(pci::Address, u8, u64)>; 8],
+}
+
+impl Measured {
+    pub fn get(&self, at: pci::Address, bar: u8) -> Option<u64> {
+        self.list
+            .iter()
+            .flatten()
+            .find(|(a, b, _)| *a == at && *b == bar)
+            .map(|(_, _, size)| *size)
+    }
+
+    fn put(&mut self, at: pci::Address, bar: u8, size: u64) {
+        if let Some(slot) = self.list.iter_mut().find(|s| s.is_none()) {
+            *slot = Some((at, bar, size));
+        }
+    }
+}
+
+/// A resolved table, the records the platform left out with their cause, and
+/// the BARs measured on the way.
 pub struct Resolved {
     pub table: &'static [Record],
     pub skipped: [Option<Refusal>; MAX_SKIPPED],
+    pub measured: Measured,
 }
 
 /// `table` with each place found, built in `store`, which lives on.
@@ -154,9 +180,19 @@ pub fn resolve(
     let mut ranges = [(0, 0, 0, 0); MAX_RECORDS];
     let mut skipped = [None; MAX_SKIPPED];
     let mut left_out = 0;
+    let mut measured = Measured::default();
     for r in table {
         let (w_from, b_from) = (w_at, b_at);
-        match place(r, platform, config, windows, &mut w_at, bindings, &mut b_at) {
+        match place(
+            r,
+            platform,
+            config,
+            windows,
+            &mut w_at,
+            bindings,
+            &mut b_at,
+            &mut measured,
+        ) {
             Ok(()) => {
                 records[r_at] = *r;
                 ranges[r_at] = (w_from, w_at, b_from, b_at);
@@ -181,6 +217,7 @@ pub fn resolve(
     Ok(Resolved {
         table: &records[..r_at],
         skipped,
+        measured,
     })
 }
 
@@ -200,6 +237,17 @@ fn locate(
     )
 }
 
+/// Turns memory decoding, bus mastering on and INTx off in the function the table
+/// gives a window over: the firmware leaves them off. The inverse write is the
+/// stop of the record (`Write` on the command word).
+fn enable(config: &mut impl Config, at: pci::Address) {
+    if !cfg!(feature = "break-no-enable") {
+        pci::enable(config, at);
+    }
+}
+
+// The buffers and their fill counts are the caller's; a struct for them would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn place(
     r: &Record,
     platform: &Platform,
@@ -208,6 +256,7 @@ fn place(
     w_at: &mut usize,
     bindings: &mut [Binding; MAX_BINDINGS],
     b_at: &mut usize,
+    measured: &mut Measured,
 ) -> Result<(), Refusal> {
     let refuse = |window, cause| Refusal {
         record: r.name,
@@ -220,6 +269,7 @@ fn place(
             At::Config { id, index } => {
                 let f = locate(config, platform, id, index)
                     .ok_or(refuse(w.name, Cause::NoFunction { id, index }))?;
+                enable(config, f.at);
                 Window {
                     base: platform.ecam.address(f.at).unwrap_or(0),
                     len: PAGE,
@@ -233,8 +283,17 @@ fn place(
                 let b = pci::bar(config, f.at, bar as usize)
                     .filter(|b| b.base != 0)
                     .ok_or(refuse(w.name, Cause::NoBar { id, bar }))?;
-                let size = pci::measure(config, &f, &b)
-                    .map_err(|why| refuse(w.name, Cause::Measure { bar, why }))?;
+                // Each BAR is measured once.
+                let size = match measured.get(f.at, bar) {
+                    Some(size) if !cfg!(feature = "break-measure-twice") => size,
+                    _ => {
+                        let size = pci::measure(config, &f, &b)
+                            .map_err(|why| refuse(w.name, Cause::Measure { bar, why }))?;
+                        measured.put(f.at, bar, size);
+                        size
+                    }
+                };
+                enable(config, f.at);
                 if size < w.base + w.len && !cfg!(feature = "break-bar-size") {
                     return Err(refuse(
                         w.name,
@@ -351,9 +410,16 @@ use pci::Function;
 
 /// Walks the buses of `platform` once and gives `show` a `Line` for each
 /// function: the lines init prints at its start, so that the console shows
-/// every function of the instance with its BARs. Each BAR is measured
-/// here, before any driver runs, except on a serial function.
-pub fn list(config: &mut impl Config, platform: &Platform, mut show: impl FnMut(&Line)) {
+/// every function of the instance with its BARs. Nothing is written: the size of a
+/// BAR is shown when `measured` has it (the BARs the table's windows name, measured
+/// once by `resolve`), and `+?` otherwise, so the boot disk and the console are
+/// left alone.
+pub fn list(
+    config: &mut impl Config,
+    platform: &Platform,
+    measured: &Measured,
+    mut show: impl FnMut(&Line),
+) {
     let mut found = [None; 32 * 8];
     let mut count = 0;
     pci::scan(
@@ -378,7 +444,7 @@ pub fn list(config: &mut impl Config, platform: &Platform, mut show: impl FnMut(
             let registers = bar.registers();
             let empty = bar.base == 0;
             if !empty {
-                bars[n] = Some((bar, pci::measure(config, function, &bar).ok()));
+                bars[n] = Some((bar, measured.get(function.at, n as u8)));
             }
             n += registers;
         }
@@ -645,19 +711,87 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_lists_every_function_with_its_bars_and_measures_all_but_the_console() {
+    fn the_walk_writes_nothing_and_shows_sizes_only_of_the_bars_the_table_measured() {
         let mut config = t4g();
+        // The table names the ENA's BAR 0 alone.
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x4000,
+            At::Bar {
+                id: 0x1d0f_ec20,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        let found = resolve_one(&[record("net", w, &[])], &mut config).unwrap();
+        config.log.clear();
         let mut lines = Vec::new();
-        list(&mut config, &PLATFORM, |l| lines.push(l.to_string()));
+        list(&mut config, &PLATFORM, &found.measured, |l| {
+            lines.push(l.to_string())
+        });
+        assert!(config.log.is_empty(), "the list writes nothing");
         assert_eq!(
             lines,
             [
                 "pci 00:00.0 1d0f:0200 rev 05 class 060000",
                 "pci 00:01.0 1d0f:8250 rev 05 class 070003 bar0 0x8000c000+?",
-                "pci 00:04.0 1d0f:8061 rev 05 class 010802 bar0 0x80008000+0x4000",
+                "pci 00:04.0 1d0f:8061 rev 05 class 010802 bar0 0x80008000+?",
                 "pci 00:05.0 1d0f:ec20 rev 05 class 020000 bar0 0x80004000+0x4000",
-                "pci 00:1f.0 1d0f:8061 rev 05 class 010802 bar0 0x80000000+0x4000",
+                "pci 00:1f.0 1d0f:8061 rev 05 class 010802 bar0 0x80000000+?",
             ]
+        );
+    }
+
+    /// Fails under `break-measure-twice`.
+    #[test]
+    fn a_bar_is_measured_once_however_many_windows_name_it_and_no_other_is_touched() {
+        let mut config = t4g();
+        let at = At::Bar {
+            id: 0x1d0f_ec20,
+            index: 0,
+            bar: 0,
+        };
+        let w: &'static [Window] = Box::leak(Box::new([
+            window("a", 0, 0x1000, at),
+            window("b", 0x1000, 0x1000, at),
+        ]));
+        config.log.clear();
+        resolve_one(&[record("net", w, &[])], &mut config).unwrap();
+        let ones = config
+            .log
+            .iter()
+            .filter(|(_, off, v)| *off == pci::BAR0 && *v == 0xFFFF_FFFF)
+            .count();
+        assert_eq!(ones, 1);
+        // Only the ENA's function was written to: not the disks, not the console.
+        assert!(config.log.iter().all(|(at, _, _)| *at == ENA));
+    }
+
+    /// Fails under `break-no-enable`.
+    #[test]
+    fn the_function_a_window_names_gets_memory_decoding_and_bus_mastering() {
+        let mut config = t4g();
+        config.words.insert((ENA, pci::COMMAND), 0);
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x1000,
+            At::Bar {
+                id: 0x1d0f_ec20,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        resolve_one(&[record("net", w, &[])], &mut config).unwrap();
+        assert_eq!(
+            config.words[&(ENA, pci::COMMAND)],
+            pci::MEMORY | pci::BUS_MASTER | pci::INTX_DISABLE
+        );
+        // The other functions are as the firmware left them.
+        assert_eq!(
+            config.words[&(pci::Address::new(0, 4, 0), pci::COMMAND)],
+            0x0006
         );
     }
 
@@ -670,7 +804,9 @@ mod tests {
         config.words.insert((ENA, 0x54), 0x4);
         config.words.insert((ENA, 0x58), 0x1004);
         let mut lines = Vec::new();
-        list(&mut config, &PLATFORM, |l| lines.push(l.to_string()));
+        list(&mut config, &PLATFORM, &Measured::default(), |l| {
+            lines.push(l.to_string())
+        });
         assert!(
             lines[3].ends_with("msix 9 bir 4 table 0x0 pba 0x1000"),
             "{}",

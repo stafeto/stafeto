@@ -134,17 +134,23 @@ struct Walk {
 
 impl pci::Config for Walk {
     fn read(&mut self, at: pci::Address, offset: usize) -> u32 {
-        let page = self.ecam.offset(at).unwrap_or(0) as usize;
+        // A bus outside the range reads as an empty function.
+        let Some(page) = self.ecam.offset(at) else {
+            return 0xFFFF_FFFF;
+        };
         // SAFETY: `resolved` maps the bus range of the platform read and write
-        // at ECAM_WINDOW as device memory; `at` lies in it (the walk is bounded
-        // by that range) and `offset` is a word within the function's page.
-        unsafe { mmio::read32(ECAM_WINDOW + page + offset) }
+        // at ECAM_WINDOW as device memory; `at` lies in it (checked above) and
+        // `offset` is a word within the function's page.
+        unsafe { mmio::read32(ECAM_WINDOW + page as usize + offset) }
     }
 
     fn write(&mut self, at: pci::Address, offset: usize, value: u32) {
-        let page = self.ecam.offset(at).unwrap_or(0) as usize;
+        // A write to a bus outside the range goes nowhere (and not to 00:00.0).
+        let Some(page) = self.ecam.offset(at) else {
+            return;
+        };
         // SAFETY: as for `read`.
-        unsafe { mmio::write32(ECAM_WINDOW + page + offset, value) }
+        unsafe { mmio::write32(ECAM_WINDOW + page as usize + offset, value) }
     }
 }
 
@@ -181,12 +187,18 @@ fn resolved(init: &rt::InitHandles) -> bool {
     };
     // SAFETY: the room is used here only, once, before init has a second thread.
     let room = unsafe { &mut *ROOM.0.get() };
-    resolve::list(&mut walk, &platform, |line| println!("{line}"));
+    // The places first (they measure the BARs the table names, once), then the
+    // list, which writes nothing.
     let outcome = if resolve::needs(TABLE) {
         resolve::resolve(TABLE, &platform, &mut walk, room).map(Some)
     } else {
         Ok(None)
     };
+    let measured = match &outcome {
+        Ok(Some(found)) => found.measured,
+        _ => resolve::Measured::default(),
+    };
+    resolve::list(&mut walk, &platform, &measured, |line| println!("{line}"));
     // SAFETY: the window is init's own, mapped above, and nothing reads it now.
     let _ = unsafe { sys::mem_unmap(&init.process, ECAM_WINDOW, len) };
     match outcome {

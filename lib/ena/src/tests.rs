@@ -36,7 +36,9 @@ fn run(model: &Model, ena: &mut Ena<Model>, ns: u64) -> Vec<Event> {
                 e => events.push(e),
             }
         }
-        model.advance(100 * MS);
+        // Fast steps while the device comes up (each read through memory takes
+        // a step), slow ones once it runs.
+        model.advance(if ena.is_up() { 100 * MS } else { MS });
     }
     events
 }
@@ -47,11 +49,26 @@ fn has_line(model: &Model, text: &str) -> bool {
 
 #[test]
 fn the_reset_word_puts_the_reason_in_the_top_bits() {
-    assert_eq!(regs::reset_word(regs::RESET_NORMAL), 1);
-    assert_eq!(regs::reset_word(regs::RESET_KEEP_ALIVE_TO), 0x1000_0001);
-    assert_eq!(regs::reset_word(regs::RESET_MISS_TX_CMPL), 0x3000_0001);
+    assert_eq!(regs::reset_word(regs::RESET_NORMAL, false), 1);
+    assert_eq!(
+        regs::reset_word(regs::RESET_KEEP_ALIVE_TO, false),
+        0x1000_0001
+    );
+    assert_eq!(
+        regs::reset_word(regs::RESET_MISS_TX_CMPL, false),
+        0x3000_0001
+    );
     // Above 15 the next four bits carry the high part.
-    assert_eq!(regs::reset_word(regs::RESET_DEVICE_REQUEST), 0x3100_0001);
+    assert_eq!(
+        regs::reset_word(regs::RESET_DEVICE_REQUEST, true),
+        0x3100_0001
+    );
+    // A device without extended reasons gets the generic one in its place.
+    assert_eq!(
+        regs::reset_word(regs::RESET_DEVICE_REQUEST, false),
+        0xd000_0001
+    );
+    assert_eq!(regs::reset_word(regs::RESET_GENERIC, false), 0xd000_0001);
 }
 
 #[test]
@@ -109,7 +126,8 @@ fn a_device_comes_up_on_polling_in_direct_mode() {
     // The order of the commands: the attributes and the features, the two
     // sets, then the statistics.
     use adm::{GET_FEATURE as G, GET_STATS, SET_FEATURE as S_};
-    assert_eq!(model.commands()[..8], [G, G, G, G, G, S_, S_, GET_STATS]);
+    assert_eq!(model.commands()[..9], [S_, G, G, G, G, G, G, S_, S_]);
+    assert_eq!(model.commands()[9], GET_STATS);
     for line in [
         "ena: Direct read",
         "ena: reset ok",
@@ -449,13 +467,40 @@ fn three_resets_in_a_minute_end_the_recovery() {
 fn a_poll_that_has_nothing_to_do_does_no_register_read() {
     let (model, mut ena) = rig(1);
     run(&model, &mut ena, 3 * S);
-    // Within one 100 ms step nothing is read: the watchdog's read of the
-    // status is once a second.
-    let before = model.0.borrow().read_requests;
+    // Let what is due finish: the watchdog's read of the status, once a second.
+    for _ in 0..5 {
+        ena.poll();
+    }
+    let before = model.0.borrow().reg_reads;
     for _ in 0..50 {
         assert_eq!(ena.poll(), Event::Idle);
     }
-    assert_eq!(model.0.borrow().read_requests, before);
+    assert_eq!(model.0.borrow().reg_reads, before);
+}
+
+/// A step makes at most one access to a register, in either mode: no step
+/// reads a second register or waits for an answer.
+#[test]
+fn a_step_makes_at_most_one_register_read_in_either_mode() {
+    for rev in [1u8, 0] {
+        let (model, mut ena) = rig(rev);
+        let mut worst = 0;
+        for _ in 0..20_000 {
+            let before = {
+                let m = model.0.borrow();
+                m.reg_reads + m.read_requests
+            };
+            ena.poll();
+            let after = {
+                let m = model.0.borrow();
+                m.reg_reads + m.read_requests
+            };
+            worst = worst.max(after - before);
+            model.advance(MS);
+        }
+        assert!(ena.is_up(), "rev {rev}");
+        assert_eq!(worst, 1, "rev {rev}");
+    }
 }
 
 /// Fails under `break-resp-rewrite`: the reset clears the address of the
@@ -495,4 +540,152 @@ fn the_event_doorbell_is_written_after_the_groups_are_set() {
         model.log_lines()
     );
     assert_eq!(model.0.borrow().aenq_head_db_for_test(), 16);
+}
+
+/// Fails under `break-zero-early`: the driver zeroes the rings before it asserts
+/// the reset, and a completion the old device still posts lands in them afterwards
+/// and is taken for the answer to the first command of the new bring-up.
+#[test]
+fn a_completion_posted_while_the_reset_runs_is_not_taken_as_fresh() {
+    let s = Scenario {
+        stale_at_reset: true,
+        reset_ns: 100 * MS,
+        // The real answers take 20 ms, so that the stale one is there first.
+        answer_delay_ns: 20 * MS,
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(1, s, 0x4_3000_0000);
+    run(&model, &mut ena, 3 * S);
+    ena.request_reset(regs::RESET_OS_TRIGGER);
+    run(&model, &mut ena, 3 * S);
+    assert!(ena.is_up(), "{:#?}", model.log_lines());
+    assert_eq!(ena.info().mac, [0x06, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f]);
+    assert_eq!(model.violations(), Vec::<String>::new());
+}
+
+/// A bring-up that fails counts as an attempt and starts again; the third inside
+/// a minute ends the recovery.
+#[test]
+fn a_failed_bring_up_is_tried_again_and_the_third_failure_in_a_minute_is_final() {
+    let s = Scenario {
+        error_status: Some((adm::GET_FEATURE, adm::UNSUPPORTED_OPCODE)),
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(1, s, 0x4_3000_0000);
+    let events = run(&model, &mut ena, 3 * S);
+    let tries = events
+        .iter()
+        .filter(|e| matches!(e, Event::Resetting(regs::RESET_INIT_ERR)))
+        .count();
+    assert_eq!(tries, 2, "{events:?}");
+    assert!(events.contains(&Event::Failed(Failure::Admin {
+        opcode: adm::GET_FEATURE,
+        status: adm::UNSUPPORTED_OPCODE
+    })));
+    assert_eq!(ena.resets().by_reason[regs::RESET_INIT_ERR as usize], 3);
+    // A failure the device gets over (the answers are late until the next reset)
+    // is survived.
+    let (model, mut ena) = rig(1);
+    let mut events = Vec::new();
+    while !has_line(&model, "ena: reset ok") {
+        events.push(ena.poll());
+        model.advance(MS);
+    }
+    model.set(|s| {
+        s.answer_delay_ns = 2 * S;
+        s.delay_ends_at_reset = true;
+    });
+    events.extend(run(&model, &mut ena, 6 * S));
+    assert!(
+        events.contains(&Event::Resetting(regs::RESET_INIT_ERR)),
+        "{events:?}"
+    );
+    assert!(ena.is_up(), "{:#?}", model.log_lines());
+}
+
+/// Fails under `break-reset-reason`: a reason above 15 goes out as it is.
+#[test]
+fn a_reset_reason_above_15_goes_as_generic_to_a_device_without_extended_reasons() {
+    let (model, mut ena) = rig(1);
+    run(&model, &mut ena, 3 * S);
+    ena.request_reset(regs::RESET_DEVICE_REQUEST);
+    run(&model, &mut ena, 3 * S);
+    assert_eq!(model.resets().last(), Some(&regs::RESET_GENERIC));
+}
+
+/// Fails under `break-read-retry`: one timeout switches the read mode.
+#[test]
+fn a_read_that_gets_no_answer_is_tried_again_in_the_same_mode() {
+    let s = Scenario {
+        readless_drop: 2,
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(0, s, 0x4_3000_0000);
+    run(&model, &mut ena, 3 * S);
+    assert!(ena.is_up());
+    assert_eq!(ena.mode(), ReadMode::Readless);
+    assert!(!has_line(&model, "trying"));
+}
+
+/// Fails under `break-read-hint`: the timeout of a read through memory is the
+/// device's hint when it gives one.
+#[test]
+fn the_read_timeout_is_the_devices_hint() {
+    let s = Scenario {
+        hint_mmio_ms: 500,
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(0, s, 0x4_3000_0000);
+    run(&model, &mut ena, 3 * S);
+    assert!(ena.is_up());
+    assert_eq!(ena.info().hint_mmio_ms, 500);
+    model.set(|s| s.readless_dead = true);
+    let began = model.now();
+    let mut ended = None;
+    while model.now() < began + 20 * S {
+        let events = run(&model, &mut ena, 10 * MS);
+        if events.iter().any(|e| matches!(e, Event::Resetting(_))) {
+            ended = Some(model.now());
+            break;
+        }
+    }
+    // Three reads, 500 ms each, after the status is due (at most a second).
+    assert!(ended.unwrap() - began >= 1_500 * MS, "{:?}", ended);
+}
+
+/// Fails under `break-ask-lost`: a reset asked for during the bring-up is dropped.
+#[test]
+fn a_reset_asked_for_during_the_bring_up_is_kept_until_the_device_is_up() {
+    let (model, mut ena) = rig(1);
+    ena.request_reset(regs::RESET_OS_TRIGGER);
+    run(&model, &mut ena, 6 * S);
+    assert_eq!(ena.resets().by_reason[regs::RESET_OS_TRIGGER as usize], 1);
+    assert!(ena.is_up());
+}
+
+/// Fails under `break-eni-gate`: the ENI statistics are asked of a device that
+/// does not advertise them.
+#[test]
+fn the_eni_statistics_are_asked_only_of_a_device_that_advertises_them() {
+    let s = Scenario {
+        eni_stats: false,
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(1, s, 0x4_3000_0000);
+    run(&model, &mut ena, 70 * S);
+    assert!(ena.is_up());
+    assert!(!model.commands().contains(&adm::GET_STATS));
+    assert!(ena.eni_stats().is_none());
+}
+
+#[test]
+fn the_host_info_and_the_link_speed_are_given_and_read_before_the_device_is_up() {
+    let (model, mut ena) = rig(1);
+    ena.set_host(0x28, 2);
+    run(&model, &mut ena, 3 * S);
+    assert_eq!(model.commands()[0], adm::SET_FEATURE);
+    let page = model.host_info().unwrap();
+    assert_eq!(page[0], 4);
+    assert_eq!(&page[4..11], b"stafeto");
+    assert_eq!(ena.info().speed_mbps, 25_000);
 }

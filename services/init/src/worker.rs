@@ -28,8 +28,8 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use init::table::{
-    self, BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE, RAM_SERVICE,
-    Record,
+    self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE,
+    RAM_SERVICE, Record,
 };
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
@@ -544,7 +544,7 @@ fn quiesce(record: &Record) -> bool {
                 (0..SETTLE_READS).any(|_| u32::from(mmio::read8(at)) & q.settled == q.value)
             } else {
                 mmio::write32(at, q.value);
-                (0..SETTLE_READS).any(|_| mmio::read32(at) & q.settled == q.value)
+                q.settled == 0 || (0..SETTLE_READS).any(|_| mmio::read32(at) & q.settled == q.value)
             }
         };
         // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
@@ -552,8 +552,38 @@ fn quiesce(record: &Record) -> bool {
         if !settled {
             return false;
         }
+        if let Some(c) = q.confirm
+            && !confirmed(record, c)
+        {
+            return false;
+        }
     }
     true
+}
+
+/// Whether the register of `c` shows its state (Write::confirm), read through a
+/// window of init's own at QUIESCE_WINDOW at most SETTLE_READS times; false when it
+/// does not or the window does not come.
+fn confirmed(record: &Record, c: Confirm) -> bool {
+    let Some(w) = record.windows.iter().find(|w| w.name == c.window) else {
+        return false;
+    };
+    let page = c.offset & !(PAGE - 1);
+    let resource = view::<Resource>(RESOURCE);
+    let own = view::<Process>(OWN);
+    let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+        return false;
+    };
+    if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
+        return false;
+    }
+    let at = QUIESCE_WINDOW + (c.offset - page) as usize;
+    // SAFETY: the window maps the register's page at QUIESCE_WINDOW as device
+    // memory, read; the register is a word within it (the checks of the table).
+    let shown = (0..SETTLE_READS).any(|_| unsafe { mmio::read32(at) } & c.mask == c.value);
+    // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+    let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+    shown
 }
 
 /// Whether the register of `g` shows one of its bits (Write::only_if),

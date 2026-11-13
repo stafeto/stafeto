@@ -300,8 +300,24 @@ pub struct Write {
     pub offset: u64,
     pub bits: u8,
     pub value: u32,
+    /// The bits of the register that must read back as `value` (0: no read-back,
+    /// for a register that does not hold what is written).
     pub settled: u32,
     pub only_if: Option<Gate>,
+    /// A register that must show a state before the next write goes: the device's
+    /// own acknowledgement of this one.
+    pub confirm: Option<Confirm>,
+}
+
+/// A 32-bit register read through the record's window `window` at word `offset`
+/// until its bits `mask` show `value`, at most worker::SETTLE_READS times; the
+/// stop failed otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Confirm {
+    pub window: &'static str,
+    pub offset: u64,
+    pub mask: u32,
+    pub value: u32,
 }
 
 /// A 32-bit register a Write depends on: at word `offset` of the record's
@@ -1084,8 +1100,14 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
                 .iter()
                 .any(|w| w.name == g.window && g.offset.is_multiple_of(4) && g.offset + 4 <= w.len)
         });
+        let confirm = q.confirm.is_none_or(|c| {
+            r.windows
+                .iter()
+                .any(|w| w.name == c.window && c.offset.is_multiple_of(4) && c.offset + 4 <= w.len)
+        });
         let within = width
             && gate
+            && confirm
             && window.is_some_and(|w| q.offset.is_multiple_of(bytes) && q.offset + bytes <= w.len);
         if !within {
             return Err(TableError::Quiesce {
@@ -2158,6 +2180,7 @@ mod tests {
             value: 0,
             settled: u32::MAX,
             only_if: None,
+            confirm: None,
         };
         let driver = |dma: &'static [Dma], trusted| Record {
             windows: &[RTC],
@@ -3638,5 +3661,29 @@ mod tests {
         assert_eq!(on_cpus(GENERAL_CPUS, 0b0001), (0b0001, true));
         // None of its CPUs is up: all that are, and the line says so.
         assert_eq!(on_cpus(RT_CPUS, 0b0011), (0b0011, false));
+    }
+
+    /// A confirmation names a word of a window of the record.
+    #[test]
+    fn a_confirmation_outside_the_windows_of_the_record_is_refused() {
+        let good = aws::NET;
+        assert!(check_record(&good).is_ok());
+        static BAD: [Write; 1] = [Write {
+            confirm: Some(Confirm {
+                window: "bar",
+                offset: 0x4000,
+                mask: 8,
+                value: 8,
+            }),
+            ..aws::NET.quiesce[0]
+        }];
+        let bad = Record {
+            quiesce: &BAD,
+            ..aws::NET
+        };
+        assert!(matches!(
+            check_record(&bad),
+            Err(TableError::Quiesce { window: "bar", .. })
+        ));
     }
 }

@@ -29,6 +29,8 @@ steps-grid = ["steps", "rt/beat-grid"]
 # Deliberate breaks the host tests catch (`cargo xtask ena-breaks`).
 break-bar-size = []
 break-bar-offset = []
+break-measure-twice = []
+break-no-enable = []
 table-test = []
 table-cycle = []
 table-ceiling = []

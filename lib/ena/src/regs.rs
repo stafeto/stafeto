@@ -79,8 +79,8 @@ pub const MMIO_REG_READ_REQ_ID_MASK: u32 = 0xffff;
 pub const MMIO_REG_READ_REG_OFF_SHIFT: u32 = 16;
 pub const MMIO_REG_READ_REG_OFF_MASK: u32 = 0xffff_0000;
 
-// `ENA_REGS_ADMIN_INTR_MASK` of ena_com.c (a plain `#define` outside the enums): the value that masks the admin interrupt in INTR_MASK, which a
-// poller writes so that the device never raises it.
+// The value this driver writes to INTR_MASK so that the admin interrupt stays
+// masked while it polls (its own choice, not a number of the headers).
 pub const ADMIN_INTR_MASK: u32 = 1;
 
 // enum ena_regs_reset_reason_types.
@@ -105,10 +105,16 @@ pub const RESET_TX_DESCRIPTOR_MALFORMED: u32 = 17;
 pub const RESET_MISSING_ADMIN_INTERRUPT: u32 = 18;
 pub const RESET_DEVICE_REQUEST: u32 = 19;
 
-/// The `DEV_CTL` word that resets the device for `reason`: the reset bit,
-/// the low four bits of the reason in bits 31:28, and the next four in bits
-/// 27:24, where reasons above 15 go.
-pub const fn reset_word(reason: u32) -> u32 {
+/// The `DEV_CTL` word that resets the device for `reason`: the reset bit, the
+/// low four bits of the reason in bits 31:28, and, when the device advertises
+/// extended reset reasons (`extended`), the next four in bits 27:24. A reason above
+/// 15 that the device cannot take goes as `RESET_GENERIC`.
+pub const fn reset_word(reason: u32, extended: bool) -> u32 {
+    let reason = if reason > 15 && !extended && !cfg!(feature = "break-reset-reason") {
+        RESET_GENERIC
+    } else {
+        reason
+    };
     DEV_CTL_DEV_RESET_MASK
         | (reason << DEV_CTL_RESET_REASON_SHIFT) & DEV_CTL_RESET_REASON_MASK
         | ((reason >> 4) << DEV_CTL_RESET_REASON_EXT_SHIFT) & DEV_CTL_RESET_REASON_EXT_MASK

@@ -50,8 +50,18 @@ pub struct Scenario {
     pub fatal_event_at_ns: Option<u64>,
     /// How long a reset takes.
     pub reset_ns: u64,
+    /// The device's `mmio_read_timeout` hint in ms, 0 for none.
+    pub hint_mmio_ms: u16,
     /// The admin completion carries another command's id.
     pub wrong_command_id: bool,
+    /// An old device posts a completion into slot 1 of the old completion queue
+    /// 10 ms into the reset (id 1, success, the first phase, an empty body).
+    pub stale_at_reset: bool,
+    /// The device advertises the ENI statistics.
+    pub eni_stats: bool,
+    /// The next requests for a read through memory that go unanswered.
+    pub readless_drop: u32,
+    /// The device lacks extended reset reasons (always, in this model).
     /// The next reset ends the delay of the answers.
     pub delay_ends_at_reset: bool,
     /// The device posts a link-change event (up) once the groups are set.
@@ -72,8 +82,12 @@ impl Default for Scenario {
             fatal_at_ns: None,
             fatal_event_at_ns: None,
             reset_ns: 5 * MS,
+            hint_mmio_ms: 0,
             wrong_command_id: false,
             delay_ends_at_reset: false,
+            stale_at_reset: false,
+            eni_stats: true,
+            readless_drop: 0,
             link_event: true,
             llq: false,
         }
@@ -122,9 +136,13 @@ pub struct Inner {
     pub commands: Vec<u8>,
     pub resets: Vec<u32>,
     pub read_requests: u32,
+    /// Plain reads of a register.
+    pub reg_reads: u32,
     pub reset_sequence: Vec<&'static str>,
     revision: u8,
     link_pending: bool,
+    stale_due: Option<u64>,
+    host_info: Option<[u8; 16]>,
 }
 
 /// The model, shared by the test and the platform the driver holds.
@@ -166,9 +184,12 @@ impl Model {
             commands: Vec::new(),
             resets: Vec::new(),
             read_requests: 0,
+            reg_reads: 0,
             reset_sequence: Vec::new(),
             revision,
             link_pending: false,
+            stale_due: None,
+            host_info: None,
         })))
     }
 
@@ -224,6 +245,10 @@ impl Model {
         self.0.borrow().intr_mask
     }
 
+    pub fn host_info(&self) -> Option<[u8; 16]> {
+        self.0.borrow().host_info
+    }
+
     pub fn mtu(&self) -> u32 {
         self.0.borrow().mtu
     }
@@ -233,6 +258,7 @@ impl Platform for Model {
     fn read32(&self, offset: u32) -> u32 {
         let mut m = self.0.borrow_mut();
         m.tick();
+        m.reg_reads += 1;
         m.read_reg(offset)
     }
 
@@ -385,13 +411,23 @@ impl Inner {
         self.aenq_head_db
     }
 
+    /// The device starts its reset. What it still has in flight (answers) stays
+    /// pending and lands in the old rings while the reset runs, as a device that
+    /// has not noticed the reset yet would post it; the queues are forgotten when
+    /// the reset ends (`finish_reset`).
     fn start_reset(&mut self) {
         if self.scenario.delay_ends_at_reset {
             self.scenario.answer_delay_ns = 0;
         }
         self.reset_until = Some(self.now + self.scenario.reset_ns);
+        self.stale_due = self.scenario.stale_at_reset.then_some(self.now + 10 * MS);
         self.resp_lo = 0;
         self.resp_hi = 0;
+        self.link_pending = false;
+    }
+
+    fn finish_reset(&mut self) {
+        self.reset_until = None;
         self.aq_base = 0;
         self.acq_base = 0;
         self.aenq_base = 0;
@@ -404,12 +440,15 @@ impl Inner {
         self.aenq_head_db = 0;
         self.enabled_groups = 0;
         self.answers.clear();
-        self.link_pending = false;
     }
 
     fn readless(&mut self, value: u32) {
         self.read_requests += 1;
         if self.scenario.readless_dead {
+            return;
+        }
+        if self.scenario.readless_drop > 0 {
+            self.scenario.readless_drop -= 1;
             return;
         }
         let offset =
@@ -521,7 +560,12 @@ impl Inner {
                 put32(body, adm::ATTR_IMPL_ID, 3);
                 put32(body, adm::ATTR_VERSION, 0x0001_0000);
                 put32(body, adm::ATTR_SUPPORTED, features);
-                put32(body, adm::ATTR_CAPABILITIES, 1 << adm::CAP_ENI_STATS);
+                let caps = if self.scenario.eni_stats {
+                    1 << adm::CAP_ENI_STATS
+                } else {
+                    0
+                };
+                put32(body, adm::ATTR_CAPABILITIES, caps);
                 put32(body, adm::ATTR_PHYS_WIDTH, self.scenario.dma_width);
                 body[adm::ATTR_MAC..adm::ATTR_MAC + 6]
                     .copy_from_slice(&[0x06, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f]);
@@ -556,10 +600,13 @@ impl Inner {
                 put32(body, adm::OFFLOAD_RX_SUPPORTED, 0x7);
             }
             adm::HW_HINTS => {
+                body[adm::HINT_MMIO_READ..][..2]
+                    .copy_from_slice(&self.scenario.hint_mmio_ms.to_le_bytes());
                 body[adm::HINT_WATCHDOG..][..2].copy_from_slice(&6_000u16.to_le_bytes());
                 body[adm::HINT_MISSING_TX..][..2].copy_from_slice(&5_000u16.to_le_bytes());
             }
             adm::LLQ => put32(body, adm::LLQ_MAX_NUM, 4),
+            adm::LINK_CONFIG => put32(body, adm::LINK_SPEED, 25_000),
             _ => return adm::UNSUPPORTED_OPCODE,
         }
         adm::SUCCESS
@@ -577,6 +624,19 @@ impl Inner {
                 self.next_keep_ns = self.now + 1_000 * MS;
             }
             adm::MTU => self.mtu = word(adm::FEAT_DATA + adm::MTU_VALUE),
+            adm::HOST_ATTR_CONFIG => {
+                // As the device: OS type 0 is refused.
+                let pa = u64::from(word(adm::FEAT_DATA + adm::HOST_OS_INFO_BA))
+                    | u64::from(u16::from_le_bytes([
+                        cmd[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 4],
+                        cmd[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 5],
+                    ])) << 32;
+                let page = self.mem_get(self.va(pa), 16);
+                if page[..4] == [0; 4] {
+                    return adm::ILLEGAL_PARAMETER;
+                }
+                self.host_info = Some(page.try_into().unwrap());
+            }
             _ => return adm::UNSUPPORTED_OPCODE,
         }
         adm::SUCCESS
@@ -629,9 +689,19 @@ impl Inner {
             && self.now >= until
             && !self.scenario.reset_never_ends
         {
-            self.reset_until = None;
+            self.finish_reset();
         }
         if self.in_reset() {
+            // Answers still in flight land in the old rings.
+            self.deliver();
+            if self.stale_due.is_some_and(|t| self.now >= t) && self.acq_base != 0 {
+                self.stale_due = None;
+                let mut entry = [0u8; adm::ENTRY];
+                entry[adm::ACQ_FLAGS] = 1;
+                entry[adm::ACQ_COMMAND] = 1;
+                let va = self.va(self.acq_base) + adm::ENTRY;
+                self.mem_put(va, &entry);
+            }
             return;
         }
         self.deliver();

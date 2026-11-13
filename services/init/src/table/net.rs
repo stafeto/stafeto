@@ -140,6 +140,7 @@ pub const NETD: Record = Record {
         value: 0,
         settled: 0xFFFF_FFFF,
         only_if: None,
+        confirm: None,
     }],
     trusted: true,
     root: false,
@@ -214,6 +215,7 @@ const fn pci_stop(bar: u64, ecam: u64) -> [Write; 2] {
                 offset: ecam + COMMAND,
                 bits: MEMORY,
             }),
+            confirm: None,
         },
         Write {
             window: "ecam",
@@ -222,6 +224,7 @@ const fn pci_stop(bar: u64, ecam: u64) -> [Write; 2] {
             value: 0,
             settled: 0xFFFF,
             only_if: None,
+            confirm: None,
         },
     ]
 }
@@ -466,6 +469,7 @@ pub const NETD_TWO: Record = Record {
             value: 0,
             settled: 0xFFFF_FFFF,
             only_if: None,
+            confirm: None,
         },
         Write {
             window: "mmio1",
@@ -474,6 +478,7 @@ pub const NETD_TWO: Record = Record {
             value: 0,
             settled: 0xFFFF_FFFF,
             only_if: None,
+            confirm: None,
         },
     ],
     dma: DMA_TWO,

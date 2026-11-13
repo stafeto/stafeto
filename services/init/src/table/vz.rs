@@ -101,6 +101,7 @@ pub const CONSOLE: Record = Record {
                 offset: COMMAND,
                 bits: MEMORY,
             }),
+            confirm: None,
         },
         // The command word; its status half reads back what it holds. VZ
         // stops the machine at a byte write to the configuration space.
@@ -111,6 +112,7 @@ pub const CONSOLE: Record = Record {
             value: 0,
             settled: 0xFFFF,
             only_if: None,
+            confirm: None,
         },
     ],
     trusted: true,

@@ -1,18 +1,33 @@
 The numeric definitions in src/regs.rs and src/admin.rs (register offsets,
 masks, shifts, command and feature codes, the layout of the admin, event and
-statistics structures) are taken from the header files of the ENA device
-definitions, which are distributed under the BSD 3-Clause license:
+statistics structures) are taken from these header files of the ENA device
+definitions, distributed under the BSD 3-Clause license, at the revisions
+named (the latest commit of each file when they were read, 2026-11-13):
 
   FreeBSD sys/contrib/ena-com/ena_defs/ena_regs_defs.h
+    commit f5f8d7c9cdf0341f7c5fdb3a7c3358ec0ed67a0c (2024-10-15)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
   FreeBSD sys/contrib/ena-com/ena_defs/ena_admin_defs.h
+    commit 0f6f75189f5e55a5846e3b20eec18db93cfafa89 (2026-10-29)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
   FreeBSD sys/contrib/ena-com/ena_defs/ena_common_defs.h
+    commit adfed2d835a7f9382941896d15a487dac6fe659c (2023-12-28)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
   DPDK drivers/net/ena/base/ena_defs/ena_regs_defs.h
+    commit 95eaa71c66eadb6a6924cc5241e02d3dcc58217c (2024-07-08)
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) Amazon.com, Inc. or its affiliates. All rights reserved.
   DPDK drivers/net/ena/base/ena_defs/ena_admin_defs.h
+    commit 5bf30b41705a95578d515c50b04bafce75437b1d (2025-10-21)
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) Amazon.com, Inc. or its affiliates. All rights reserved.
 
 Only numbers were carried over: no function body and no comment of those
-trees is part of this library.
+trees is part of this library. The depths, timeouts and the INTR_MASK value
+in the driver are its own choices.
 
-Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
+The license text of the FreeBSD headers:
+
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

@@ -98,6 +98,7 @@ pub const RNG: Record = Record {
         value: 0,
         settled: 0xFFFF_FFFF,
         only_if: None,
+        confirm: None,
     }],
     trusted: true,
     root: false,
@@ -145,6 +146,7 @@ pub const RNG_VZ: Record = Record {
                 offset: COMMAND,
                 bits: MEMORY,
             }),
+            confirm: None,
         },
         Write {
             window: "ecam",
@@ -153,6 +155,7 @@ pub const RNG_VZ: Record = Record {
             value: 0,
             settled: 0xFFFF,
             only_if: None,
+            confirm: None,
         },
     ],
     ..RNG

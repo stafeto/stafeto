@@ -46,6 +46,7 @@ pub const STATELESS_OFFLOAD_CONFIG: u8 = 11;
 pub const MTU: u8 = 14;
 pub const AENQ_CONFIG: u8 = 26;
 pub const LINK_CONFIG: u8 = 27;
+pub const HOST_ATTR_CONFIG: u8 = 28;
 
 // enum ena_admin_aq_caps_id: the bits of `capabilities` of the device
 // attributes.
@@ -149,8 +150,8 @@ pub const QUEUE_CQ_DEPTH: usize = 12;
 /// 0 (ms), `driver_watchdog_timeout` 2 (ms), `missing_tx_completion_timeout`
 /// 4 (ms), `missed_tx_completion_count_threshold_to_reset` 6,
 /// `admin_completion_tx_timeout` 8 (ms), `netdev_wd_timeout` 10 (ms),
-/// `max_tx_sgl_size` 12, `max_rx_sgl_size` 14. `HINT_NO_TIMEOUT`
-/// (`ENA_HW_HINTS_NO_TIMEOUT` of ena_com.h) says the device wants no timeout.
+/// `max_tx_sgl_size` 12, `max_rx_sgl_size` 14. A hint of `HINT_NO_TIMEOUT`
+/// (all ones) is taken to mean that the device wants no timeout.
 pub const HINT_MMIO_READ: usize = 0;
 pub const HINT_WATCHDOG: usize = 2;
 pub const HINT_MISSING_TX: usize = 4;
@@ -227,15 +228,37 @@ pub const READLESS_REG_OFF: usize = 2;
 pub const READLESS_REG_VAL: usize = 4;
 pub const READLESS_LEN: usize = 8;
 
-/// Depth of the admin queue and of its completion queue
-/// (`ENA_ADMIN_QUEUE_DEPTH` of ena_com.c), and of the event queue
-/// (`ENA_ASYNC_QUEUE_DEPTH`).
+/// The choices of this driver, not numbers of the device's headers: the depth of
+/// the admin queue and of its completion queue, the depth of the event queue,
+/// the widest DMA address the driver will hand a device (48 bits, the width
+/// the device's `CAPS` also reports), the admin command timeout used when the
+/// device gives none (3 s), and the keep-alive timeout used when the device
+/// gives no hint (6 s).
 pub const ADMIN_DEPTH: u16 = 32;
 pub const EVENT_DEPTH: u16 = 16;
-/// `ENA_MAX_PHYS_ADDR_SIZE_BITS` of ena_com.h.
 pub const MAX_PHYS_ADDR_BITS: u32 = 48;
-/// `ADMIN_CMD_TIMEOUT_US` of ena_com.c: the admin command timeout a device
-/// that gives none (`CAPS.ADMIN_CMD_TO` 0) gets, in microseconds.
 pub const ADMIN_CMD_TIMEOUT_US: u64 = 3_000_000;
-/// `ENA_DEFAULT_KEEP_ALIVE_TO` of the FreeBSD driver's ena.h: 6 seconds.
 pub const KEEP_ALIVE_TIMEOUT_MS: u64 = 6_000;
+
+/// `ena_admin_set_feature_host_attr_desc`, from `FEAT_DATA`: `os_info_ba` (an
+/// `ena_common_mem_addr`: the low 32 bits, then the high 16 and 16 reserved)
+/// at 0, `debug_ba` at 8, `debug_area_size` at 16.
+pub const HOST_OS_INFO_BA: usize = 0;
+
+/// `ena_admin_host_info`, 4 KiB of physically contiguous memory in the host's:
+/// `os_type` (32 bits) at 0, `os_dist_str` (128 bytes) at 4, `os_dist` at 132,
+/// `kernel_ver_str` (32 bytes) at 136, `kernel_ver` at 168, `driver_version` at
+/// 172 (major in 7:0, minor 15:8, sub-minor 23:16), `supported_network_features`
+/// (two words) at 176, `ena_spec_version` (16 bits, major in the high byte) at
+/// 184, `bdf` (16 bits: function 2:0, device 7:3, bus 15:8) at 186, `num_cpus`
+/// (16 bits) at 188, `driver_supported_features` at 192.
+pub const HOST_INFO_OS_TYPE: usize = 0;
+pub const HOST_INFO_OS_DIST_STR: usize = 4;
+pub const HOST_INFO_KERNEL_VER_STR: usize = 136;
+pub const HOST_INFO_DRIVER_VERSION: usize = 172;
+pub const HOST_INFO_SPEC_VERSION: usize = 184;
+pub const HOST_INFO_BDF: usize = 186;
+pub const HOST_INFO_NUM_CPUS: usize = 188;
+/// `ENA_COMMON_SPEC_VERSION_MAJOR` and `_MINOR` of ena_common_defs.h.
+pub const SPEC_VERSION_MAJOR: u16 = 2;
+pub const SPEC_VERSION_MINOR: u16 = 0;

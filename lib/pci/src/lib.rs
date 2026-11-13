@@ -113,6 +113,8 @@ pub const CAPABILITIES: usize = 0x34;
 pub const IO: u32 = 1 << 0;
 pub const MEMORY: u32 = 1 << 1;
 pub const BUS_MASTER: u32 = 1 << 2;
+/// INTx Disable: with it set the function raises no INTx.
+pub const INTX_DISABLE: u32 = 1 << 10;
 /// The first byte past the header, where capabilities begin.
 pub const FIRST_CAPABILITY: usize = 0x40;
 /// The capabilities a list may hold: 48 fit in the 192 bytes past the
@@ -347,6 +349,13 @@ pub fn measure(config: &mut impl Config, function: &Function, bar: &Bar) -> Resu
 /// BAR are not part of the size.
 const fn mask_size(mask: u64, all: u64) -> u64 {
     if mask == 0 { 0 } else { (!mask & all) + 1 }
+}
+
+/// Turns memory decoding and bus mastering on and INTx off in the function: the
+/// command word is written whole, with the status half 0, which clears nothing.
+pub fn enable(config: &mut impl Config, at: Address) {
+    let command = config.read(at, COMMAND) & 0xFFFF;
+    config.write(at, COMMAND, command | MEMORY | BUS_MASTER | INTX_DISABLE);
 }
 
 /// The offset of the first capability of the function's list whose first

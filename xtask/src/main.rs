@@ -1008,7 +1008,36 @@ fn aws_programs() -> &'static [ImageProgram] {
 
 /// The boot image of the shell on EC2.
 pub(crate) fn aws_boot_image() -> Result<PathBuf, String> {
-    build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)
+    let path = build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)?;
+    image_has_ena_notice(&path)?;
+    Ok(path)
+}
+
+/// Fails unless the boot image at `path` carries the notice of the ENA driver
+/// as a file and in its table of files under `rootfs::ENA_NOTICE`.
+fn image_has_ena_notice(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let notice = include_bytes!("../../lib/ena/NOTICE");
+    let table = image
+        .files()
+        .find(|f| f.name == "rootfs")
+        .ok_or_else(|| format!("{}: no table of files", path.display()))?;
+    let table = bootimg::rootfs::Rootfs::parse(table.data, image.count())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let held = table
+        .find(rootfs::ENA_NOTICE)
+        .and_then(|n| image.file_at(table.entry(n as u32).file))
+        .is_some_and(|f| f.data == notice.as_slice());
+    if !held {
+        return Err(format!(
+            "{} carries no {} with the text of lib/ena/NOTICE",
+            path.display(),
+            rootfs::ENA_NOTICE
+        ));
+    }
+    Ok(())
 }
 
 /// The builds of the programs that `packages` name (PACKAGE_PROGRAMS).
@@ -2508,7 +2537,7 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// init's table (`cargo xtask ena-breaks`): each is a feature of its crate that
 /// does one wrong thing, and the host tests of the crate pass without it and
 /// fail with it.
-const ENA_BREAKS: [(&str, &str); 11] = [
+const ENA_BREAKS: [(&str, &str); 19] = [
     ("pci", "break-measure-console"),
     ("pci", "break-restore-command"),
     ("pci", "break-multifunction"),
@@ -2520,6 +2549,14 @@ const ENA_BREAKS: [(&str, &str); 11] = [
     ("ena", "break-reset-wait"),
     ("ena", "break-dma-width"),
     ("ena", "break-resp-rewrite"),
+    ("ena", "break-zero-early"),
+    ("ena", "break-reset-reason"),
+    ("ena", "break-read-hint"),
+    ("ena", "break-read-retry"),
+    ("ena", "break-ask-lost"),
+    ("ena", "break-eni-gate"),
+    ("init", "break-measure-twice"),
+    ("init", "break-no-enable"),
 ];
 
 fn ena_breaks() -> Result<(), String> {
@@ -3048,6 +3085,18 @@ fn write_elf_image(
         }
     }
     listed.extend(extra);
+    // An image with `netd` carries the ENA driver, whose numbers come from
+    // BSD-3-Clause headers: the notice goes in under the licences of the system.
+    if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "netd"))
+    {
+        for f in rootfs::ena_notice() {
+            if !listed.iter().any(|g| g.path == f.path) {
+                listed.push(f);
+            }
+        }
+    }
     // A program that asks for the dynamic linker needs the library the loader
     // opens for it (spec 2, 3.12.4).
     if dynamic && !listed.iter().any(|f| f.path == rootfs::LIBRARY) {

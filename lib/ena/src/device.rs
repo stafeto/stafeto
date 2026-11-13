@@ -50,19 +50,25 @@ pub const AQ_AT: usize = 0;
 pub const ACQ_AT: usize = 0x800;
 pub const AENQ_AT: usize = 0x1000;
 pub const READLESS_AT: usize = 0x1400;
-/// The bytes the admin structures take.
-pub const ADMIN_BYTES: usize = 0x1408;
+/// The page of the host info (`ena_admin_host_info`, 4 KiB).
+pub const HOST_AT: usize = 0x2000;
+/// The bytes the admin structures and the host info take.
+pub const ADMIN_BYTES: usize = 0x3000;
+/// The OS type the host info carries: the device refuses 0 (status 5) and takes 4.
+const HOST_OS_TYPE: u32 = 4;
 
 const NS_PER_MS: u64 = 1_000_000;
 /// How long a read through memory waits for its answer, and the most
 /// reads it makes while it does (a device that answers needs a few).
 const READLESS_NS: u64 = 20 * NS_PER_MS;
-const READLESS_SPINS: u32 = 100_000;
+/// Consecutive reads without an answer in one mode before the other is tried.
+const READ_RETRIES: u8 = 3;
 /// The step of the watchdog, and of the read of `DEV_STS` inside it.
 const WATCH_NS: u64 = 100 * NS_PER_MS;
 const STATUS_NS: u64 = 1_000 * NS_PER_MS;
-/// The event entries one step reads.
-const EVENTS_PER_STEP: u32 = 4;
+/// The event entries one step reads, and the register accesses it makes at most.
+pub const EVENTS_PER_STEP: u32 = 4;
+pub const REG_ACCESSES_PER_STEP: u32 = 1;
 /// How often the statistics of the device are read, and the keep-alive
 /// lines that follow the first three.
 const STATS_NS: u64 = 60_000 * NS_PER_MS;
@@ -145,6 +151,7 @@ pub struct Info {
     pub offload_tx: u32,
     pub offload_rx: u32,
     pub hint_watchdog_ms: u32,
+    pub hint_mmio_ms: u32,
     pub hint_missing_tx_ms: u32,
     pub aenq_supported: u32,
     pub aenq_enabled: u32,
@@ -179,11 +186,28 @@ pub struct Resets {
     pub by_reason: [u32; 20],
 }
 
+/// What a read of a register gave.
+enum Reg {
+    Value(u32),
+    Wait,
+    Failed,
+}
+
+/// A read through memory in flight.
+#[derive(Clone, Copy, Debug)]
+struct Rd {
+    offset: u32,
+    id: u16,
+    deadline: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     /// Mode, answer address, the first read; `reason` is the cause of a
     /// reset, 0 for the first start.
     Begin,
+    /// The status and capabilities before the reset, read one a step.
+    Probe,
     /// Waiting for `DEV_STS.READY`.
     Ready {
         since: u64,
@@ -196,7 +220,10 @@ enum Stage {
     Released {
         since: u64,
     },
+    /// The version and capability registers, read one a step.
     Identify,
+    /// The host info: given to the device before the features.
+    Host,
     /// The feature `FEATURES[at]`, asked or being answered.
     Features {
         at: usize,
@@ -213,13 +240,14 @@ enum Stage {
 /// The features read at bring-up, in order: the id and the bit of
 /// `supported_features` that must be set for the device to know it (0 for
 /// the attributes themselves).
-const FEATURES: [(u8, bool); 6] = [
+const FEATURES: [(u8, bool); 7] = [
     (adm::DEVICE_ATTRIBUTES, true),
     (adm::MAX_QUEUES_EXT, false),
     (adm::AENQ_CONFIG, true),
     (adm::STATELESS_OFFLOAD_CONFIG, false),
     (adm::HW_HINTS, false),
     (adm::LLQ, false),
+    (adm::LINK_CONFIG, false),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +255,7 @@ enum Pending {
     Feature { id: u8 },
     Set { id: u8 },
     Stats,
+    Host,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -244,8 +273,18 @@ pub struct Ena<P: Platform> {
     stage: Stage,
     reason: u32,
     mode: ReadMode,
-    /// The other mode was tried once after a read timed out.
+    /// The other mode was tried once after reads timed out.
     tried_other: bool,
+    /// A read through memory in flight, reads without an answer in a row, and
+    /// the registers of a gather read so far.
+    rd: Option<Rd>,
+    rd_fail: u8,
+    gather: [u32; 3],
+    gathered: u8,
+    /// The reads of the status register in the watchdog that got no answer in a row.
+    status_fail: u8,
+    /// The watchdog wants the status register read (one access, in a later step).
+    status_due: bool,
     req_id: u16,
     // The queues.
     aq_tail: u16,
@@ -278,6 +317,9 @@ pub struct Ena<P: Platform> {
     asked: Option<u32>,
     /// The head of the event queue is not written back (a deliberate break).
     hold_head: bool,
+    /// The function's bus, device and function in 16 bits, and the CPUs: the host info.
+    bdf: u16,
+    cpus: u16,
 }
 
 impl<P: Platform> Ena<P> {
@@ -285,8 +327,8 @@ impl<P: Platform> Ena<P> {
     /// `region` (`ADMIN_BYTES` at least, a page-aligned physical address,
     /// zeroed memory that nothing else uses), on a function of PCI revision
     /// `revision`: bit 0 of it set means the device answers a plain read of
-    /// its registers, clear means a read through memory (`ENA_MMIO_DISABLE_REG_READ`
-    /// of FreeBSD's ena.h).
+    /// its registers, clear means a read through memory (the rule is checked on
+    /// the device: a t4g.small has revision 0 and answers reads through memory).
     ///
     /// # Safety
     ///
@@ -312,6 +354,12 @@ impl<P: Platform> Ena<P> {
                 ReadMode::Readless
             },
             tried_other: false,
+            rd: None,
+            rd_fail: 0,
+            gather: [0; 3],
+            gathered: 0,
+            status_fail: 0,
+            status_due: false,
             req_id: 0,
             aq_tail: 0,
             aq_phase: 1,
@@ -340,6 +388,8 @@ impl<P: Platform> Ena<P> {
             up_once: false,
             asked: None,
             hold_head: cfg!(feature = "break-aenq-head"),
+            bdf: 0,
+            cpus: 1,
         })
     }
 
@@ -380,6 +430,13 @@ impl<P: Platform> Ena<P> {
     /// device (`ena-break-aenq`).
     pub fn hold_event_head(&mut self, hold: bool) {
         self.hold_head = hold;
+    }
+
+    /// What the host info says of the function and the host: `bdf` is
+    /// `Address::rid` of the function, `cpus` the CPUs the service runs on.
+    pub fn set_host(&mut self, bdf: u16, cpus: u16) {
+        self.bdf = bdf;
+        self.cpus = cpus;
     }
 
     /// Asks for a reset with `reason`: the next step starts it.
@@ -425,36 +482,80 @@ impl<P: Platform> Ena<P> {
 
     // The registers.
 
-    /// A register, read in the current mode; None when a read through
-    /// memory got no answer.
-    fn read_reg(&mut self, offset: u32) -> Option<u32> {
+    /// The timeout of a read through memory: the device's own hint (`mmio_read_timeout`,
+    /// in ms) when it gave one, else 20 ms.
+    fn readless_ns(&self) -> u64 {
+        match self.info.hint_mmio_ms {
+            _ if cfg!(feature = "break-read-hint") => READLESS_NS,
+            0 => READLESS_NS,
+            ms => u64::from(ms) * NS_PER_MS,
+        }
+    }
+
+    /// One register, at most one device access a call and no wait: a plain
+    /// read answers at once; a read through memory writes its request on the
+    /// first call and looks for the answer on the next ones, `Wait` until it
+    /// comes or the timeout passes (`Failed`).
+    fn reg(&mut self, offset: u32) -> Reg {
         match self.mode {
-            ReadMode::Direct => Some(self.p.read32(offset)),
+            ReadMode::Direct => Reg::Value(self.p.read32(offset)),
             ReadMode::Readless => {
-                self.req_id = self.req_id.wrapping_add(1);
-                let id = self.req_id;
-                // An answer that is not this request's: the id is 0 and
-                // the value is the timeout marker.
-                self.zero(READLESS_AT, adm::READLESS_LEN);
-                self.p.wmb();
-                let word = (offset << regs::MMIO_REG_READ_REG_OFF_SHIFT
-                    & regs::MMIO_REG_READ_REG_OFF_MASK)
-                    | u32::from(id) & regs::MMIO_REG_READ_REQ_ID_MASK;
-                self.p.write32(regs::MMIO_REG_READ, word);
-                let deadline = self.p.now_ns() + READLESS_NS;
-                for _ in 0..READLESS_SPINS {
-                    self.p.rmb();
-                    if self.read_u16(READLESS_AT + adm::READLESS_REQ_ID) == id
-                        && u32::from(self.read_u16(READLESS_AT + adm::READLESS_REG_OFF)) == offset
-                    {
-                        return Some(self.read_u32(READLESS_AT + adm::READLESS_REG_VAL));
+                let now = self.p.now_ns();
+                match self.rd {
+                    Some(rd) if rd.offset == offset => {
+                        self.p.rmb();
+                        if self.read_u16(READLESS_AT + adm::READLESS_REQ_ID) == rd.id
+                            && u32::from(self.read_u16(READLESS_AT + adm::READLESS_REG_OFF))
+                                == offset
+                        {
+                            self.rd = None;
+                            return Reg::Value(self.read_u32(READLESS_AT + adm::READLESS_REG_VAL));
+                        }
+                        if now > rd.deadline {
+                            self.rd = None;
+                            return Reg::Failed;
+                        }
+                        Reg::Wait
                     }
-                    if self.p.now_ns() > deadline {
-                        break;
+                    _ => {
+                        self.req_id = self.req_id.wrapping_add(1);
+                        let id = self.req_id;
+                        // An answer that is not this request's: id 0, no value.
+                        self.zero(READLESS_AT, adm::READLESS_LEN);
+                        self.p.wmb();
+                        let word = (offset << regs::MMIO_REG_READ_REG_OFF_SHIFT
+                            & regs::MMIO_REG_READ_REG_OFF_MASK)
+                            | u32::from(id) & regs::MMIO_REG_READ_REQ_ID_MASK;
+                        self.p.write32(regs::MMIO_REG_READ, word);
+                        self.rd = Some(Rd {
+                            offset,
+                            id,
+                            deadline: now + self.readless_ns(),
+                        });
+                        Reg::Wait
                     }
                 }
-                None
             }
+        }
+    }
+
+    /// Reads `offsets` in order, one a call, into `self.gather`: Some(values) once all are in.
+    /// A call that reads nothing new (`Wait`) or fails gives `Err` with the event to return.
+    fn gather<const N: usize>(&mut self, offsets: [u32; N]) -> Result<[u32; N], Event> {
+        let at = usize::from(self.gathered);
+        match self.reg(offsets[at]) {
+            Reg::Value(v) => {
+                self.rd_fail = 0;
+                self.gather[at] = v;
+                self.gathered += 1;
+                if usize::from(self.gathered) == N {
+                    self.gathered = 0;
+                    return Ok(core::array::from_fn(|i| self.gather[i]));
+                }
+                Err(Event::Progress)
+            }
+            Reg::Wait => Err(Event::Idle),
+            Reg::Failed => Err(self.read_failed()),
         }
     }
 
@@ -469,21 +570,31 @@ impl<P: Platform> Ena<P> {
 
     // The steps.
 
-    /// One step. The caller calls it when it has time: on a timer, and again
-    /// at once after `Progress`.
+    /// One step: at most one register access, `EVENTS_PER_STEP` event entries
+    /// and a few admin entries, never a wait. The caller calls it when it has
+    /// time (on a timer) and again at once after `Progress`.
     pub fn poll(&mut self) -> Event {
         let now = self.p.now_ns();
-        if let Some(reason) = self.asked.take()
-            && matches!(self.stage, Stage::Running)
+        // A reset asked for while the device comes up waits for it to be up.
+        if cfg!(feature = "break-ask-lost") {
+            if let Some(reason) = self.asked.take()
+                && matches!(self.stage, Stage::Running)
+            {
+                return self.start_reset(reason, now);
+            }
+        } else if matches!(self.stage, Stage::Running)
+            && let Some(reason) = self.asked.take()
         {
             return self.start_reset(reason, now);
         }
         match self.stage {
             Stage::Begin => self.begin(now),
+            Stage::Probe => self.probe(now),
             Stage::Ready { since } => self.ready(now, since),
             Stage::Asserted { since } => self.asserted(now, since),
             Stage::Released { since } => self.released(now, since),
             Stage::Identify => self.identify(now),
+            Stage::Host => self.host(now),
             Stage::Features { at } => self.features(now, at),
             Stage::Configure { at } => self.configure(now, at),
             Stage::Running => self.running(now),
@@ -497,19 +608,29 @@ impl<P: Platform> Ena<P> {
         Event::Failed(failure)
     }
 
+    /// A failure of the bring-up the device may get over: counts as an attempt of
+    /// the three a minute and starts the reset again, until the third ends the
+    /// recovery (`Failed`, and the owner of the driver restarts its service).
+    fn recover(&mut self, failure: Failure, now: u64) -> Event {
+        self.p.log(format_args!("ena: bring-up failed {failure:?}"));
+        match self.start_reset(regs::RESET_INIT_ERR, now) {
+            Event::Failed(_) => self.fail(failure),
+            e => e,
+        }
+    }
+
     /// The device asked to go down: counts it, and gives up after the
     /// third inside a minute.
     fn start_reset(&mut self, reason: u32, now: u64) -> Event {
         self.p.log(format_args!(
             "ena: reset reason {reason} after {} s",
-            (now - self.up_ns) / (1000 * NS_PER_MS)
+            now.saturating_sub(self.up_ns) / (1000 * NS_PER_MS)
         ));
         if reason == regs::RESET_KEEP_ALIVE_TO {
-            // What the device posted: its tail and the first entry.
-            let tail = self.read_reg(regs::AENQ_TAIL);
+            // The first entry of the event queue: all zero when the device posted nothing.
             let words = [0, 4, 8, 12].map(|i| self.read_u32(AENQ_AT + i));
             self.p.log(format_args!(
-                "ena: no keep-alive; aenq tail {tail:?} head {} entry0 {:#x} {:#x} {:#x} {:#x}",
+                "ena: no keep-alive; head {} entry0 {:#x} {:#x} {:#x} {:#x}",
                 self.aenq_head, words[0], words[1], words[2], words[3]
             ));
         }
@@ -527,13 +648,15 @@ impl<P: Platform> Ena<P> {
         self.reset_began_ns = now;
         self.stage = Stage::Begin;
         self.command = None;
+        self.rd = None;
+        self.gathered = 0;
         Event::Resetting(reason)
     }
 
     fn begin(&mut self, now: u64) -> Event {
         self.began_ns = now;
-        // Fresh queues on the same memory.
-        self.zero(0, ADMIN_BYTES);
+        // Fresh books for the queues. The memory is zeroed once the reset is
+        // over (`released`): an old device may still post into it until then.
         self.aq_tail = 0;
         self.aq_phase = 1;
         self.acq_head = 0;
@@ -544,6 +667,11 @@ impl<P: Platform> Ena<P> {
         self.keep_watch = false;
         self.keep_run = 0;
         self.link = None;
+        self.rd = None;
+        self.gathered = 0;
+        if cfg!(feature = "break-zero-early") {
+            self.zero(0, READLESS_AT);
+        }
         if self.mode == ReadMode::Readless {
             self.write_pair(
                 regs::MMIO_RESP_LO,
@@ -551,10 +679,15 @@ impl<P: Platform> Ena<P> {
                 self.region.pa + READLESS_AT as u64,
             );
         }
-        let sts = self.read_reg(regs::DEV_STS);
-        let caps = self.read_reg(regs::CAPS);
-        let (Some(sts), Some(caps)) = (sts, caps) else {
-            return self.read_failed();
+        self.stage = Stage::Probe;
+        Event::Progress
+    }
+
+    /// The status and capability registers before the reset: the reset timeout.
+    fn probe(&mut self, now: u64) -> Event {
+        let [sts, caps] = match self.gather([regs::DEV_STS, regs::CAPS]) {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         self.p.log(format_args!(
             "ena: {:?} read; dev_sts {sts:#x} caps {caps:#x}",
@@ -573,10 +706,17 @@ impl<P: Platform> Ena<P> {
         Event::Progress
     }
 
-    /// A register read got no answer: tries the other mode once, then gives up.
+    /// A register read got no answer: tries again in the same mode, and after
+    /// `READ_RETRIES` in a row the other mode once, then gives up (a recovery).
     fn read_failed(&mut self) -> Event {
+        self.rd_fail += 1;
+        if self.rd_fail < READ_RETRIES && !cfg!(feature = "break-read-retry") {
+            return Event::Idle;
+        }
+        self.rd_fail = 0;
+        let now = self.p.now_ns();
         if self.tried_other {
-            return self.fail(Failure::ReadTimeout);
+            return self.recover(Failure::ReadTimeout, now);
         }
         self.tried_other = true;
         self.mode = match self.mode {
@@ -591,18 +731,32 @@ impl<P: Platform> Ena<P> {
         Event::Progress
     }
 
+    /// The status register, one read a step: its value, or the event to return.
+    fn status(&mut self) -> Result<u32, Event> {
+        match self.reg(regs::DEV_STS) {
+            Reg::Value(v) => {
+                self.rd_fail = 0;
+                Ok(v)
+            }
+            Reg::Wait => Err(Event::Idle),
+            Reg::Failed => Err(self.read_failed()),
+        }
+    }
+
     fn ready(&mut self, now: u64, since: u64) -> Event {
-        let Some(sts) = self.read_reg(regs::DEV_STS) else {
-            return self.read_failed();
+        let sts = match self.status() {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         if sts & regs::DEV_STS_READY_MASK == 0 {
             if now - since > self.reset_ns_limit {
                 self.p.log(format_args!("ena: reset failed sts {sts:#x}"));
-                return self.fail(Failure::NotReady);
+                return self.recover(Failure::NotReady, now);
             }
             return Event::Idle;
         }
-        self.write_reg(regs::DEV_CTL, regs::reset_word(self.reason));
+        let extended = self.info.capabilities & (1 << adm::CAP_EXTENDED_RESET_REASONS) != 0;
+        self.write_reg(regs::DEV_CTL, regs::reset_word(self.reason, extended));
         // The reset clears the address of the answers of a read through memory:
         // the polls that follow need it again.
         if self.mode == ReadMode::Readless && !cfg!(feature = "break-resp-rewrite") {
@@ -612,13 +766,15 @@ impl<P: Platform> Ena<P> {
                 self.region.pa + READLESS_AT as u64,
             );
         }
+        self.rd = None;
         self.stage = Stage::Asserted { since: now };
         Event::Progress
     }
 
     fn asserted(&mut self, now: u64, since: u64) -> Event {
-        let Some(sts) = self.read_reg(regs::DEV_STS) else {
-            return self.read_failed();
+        let sts = match self.status() {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         if sts & regs::DEV_STS_RESET_IN_PROGRESS_MASK != 0 {
             self.write_reg(regs::DEV_CTL, 0);
@@ -627,7 +783,7 @@ impl<P: Platform> Ena<P> {
         }
         if now - since > self.reset_ns_limit {
             self.p.log(format_args!("ena: reset failed sts {sts:#x}"));
-            return self.fail(Failure::ResetTimeout);
+            return self.recover(Failure::ResetTimeout, now);
         }
         Event::Idle
     }
@@ -635,11 +791,17 @@ impl<P: Platform> Ena<P> {
     fn released(&mut self, now: u64, since: u64) -> Event {
         // The wait for the device to finish; `break-reset-wait` goes on at once,
         // while it still resets.
-        let Some(sts) = self.read_reg(regs::DEV_STS) else {
-            return self.read_failed();
+        let sts = match self.status() {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         let finished = sts & regs::DEV_STS_RESET_IN_PROGRESS_MASK == 0;
         if finished || cfg!(feature = "break-reset-wait") {
+            // The old device is silent now: whatever it posted into the rings
+            // while it still ran goes, and the rings are fresh.
+            if !cfg!(feature = "break-zero-early") {
+                self.zero(0, READLESS_AT);
+            }
             let ms = (now - self.began_ns) / NS_PER_MS;
             self.p.log(format_args!("ena: reset ok {ms} ms"));
             self.stage = Stage::Identify;
@@ -647,19 +809,17 @@ impl<P: Platform> Ena<P> {
         }
         if now - since > self.reset_ns_limit {
             self.p.log(format_args!("ena: reset failed sts {sts:#x}"));
-            return self.fail(Failure::ResetTimeout);
+            return self.recover(Failure::ResetTimeout, now);
         }
         Event::Idle
     }
 
     fn identify(&mut self, now: u64) -> Event {
-        let (Some(version), Some(controller), Some(caps)) = (
-            self.read_reg(regs::VERSION),
-            self.read_reg(regs::CONTROLLER_VERSION),
-            self.read_reg(regs::CAPS),
-        ) else {
-            return self.read_failed();
-        };
+        let [version, controller, caps] =
+            match self.gather([regs::VERSION, regs::CONTROLLER_VERSION, regs::CAPS]) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
         let width = (caps & regs::CAPS_DMA_ADDR_WIDTH_MASK) >> regs::CAPS_DMA_ADDR_WIDTH_SHIFT;
         let admin =
             u64::from((caps & regs::CAPS_ADMIN_CMD_TO_MASK) >> regs::CAPS_ADMIN_CMD_TO_SHIFT) * 100;
@@ -710,13 +870,13 @@ impl<P: Platform> Ena<P> {
         self.write_reg(regs::AENQ_CAPS, u32::from(adm::EVENT_DEPTH) | size);
         // The event queue's head starts at its depth: the device owns all
         // entries. The doorbell that tells it so is written last, in `up`: the
-        // device sends no event before it (the FreeBSD driver writes it once
-        // everything else is set, in `ena_com_admin_aenq_enable`). The admin
+        // device sends no event before it (seen on the device: written earlier,
+        // no event came in three launches). The admin
         // interrupt stays masked, the driver polls.
         self.aenq_head = adm::EVENT_DEPTH;
         self.aenq_phase = 1;
         self.write_reg(regs::INTR_MASK, regs::ADMIN_INTR_MASK);
-        self.stage = Stage::Features { at: 0 };
+        self.stage = Stage::Host;
         let _ = now;
         Event::Progress
     }
@@ -787,6 +947,58 @@ impl<P: Platform> Ena<P> {
         }
     }
 
+    /// The host info: written into its page, then given to the device with
+    /// SET_FEATURE `HOST_ATTR_CONFIG`, before the features. A refusal is logged and
+    /// the bring-up goes on (the device took it with OS type 4 and refused 0 with
+    /// status 5 on a t4g.small).
+    fn host(&mut self, now: u64) -> Event {
+        let Some(command) = self.command else {
+            let at = HOST_AT;
+            self.zero(at, 4096);
+            let put = |s: &Self, off: usize, bytes: &[u8]| {
+                for (i, b) in bytes.iter().enumerate() {
+                    s.write_u8(at + off + i, *b);
+                }
+            };
+            put(self, adm::HOST_INFO_OS_TYPE, &HOST_OS_TYPE.to_le_bytes());
+            put(self, adm::HOST_INFO_OS_DIST_STR, b"stafeto");
+            put(self, adm::HOST_INFO_KERNEL_VER_STR, b"0.2.0");
+            put(self, adm::HOST_INFO_DRIVER_VERSION, &1u32.to_le_bytes());
+            let spec = adm::SPEC_VERSION_MAJOR << 8 | adm::SPEC_VERSION_MINOR;
+            put(self, adm::HOST_INFO_SPEC_VERSION, &spec.to_le_bytes());
+            put(self, adm::HOST_INFO_BDF, &self.bdf.to_le_bytes());
+            put(self, adm::HOST_INFO_NUM_CPUS, &self.cpus.to_le_bytes());
+            let pa = self.region.pa + HOST_AT as u64;
+            self.p.wmb();
+            self.submit(adm::SET_FEATURE, Pending::Host, now, |e| {
+                e[adm::FEAT_ID] = adm::HOST_ATTR_CONFIG;
+                e[adm::FEAT_DATA + adm::HOST_OS_INFO_BA..][..4]
+                    .copy_from_slice(&(pa as u32).to_le_bytes());
+                e[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 4..][..2]
+                    .copy_from_slice(&((pa >> 32) as u16).to_le_bytes());
+            });
+            return Event::Progress;
+        };
+        let Some((_, status, _)) = self.complete() else {
+            if now - command.sent_ns > self.admin_limit_ns() {
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::SET_FEATURE,
+                        status: 0xFF,
+                    },
+                    now,
+                );
+            }
+            return Event::Idle;
+        };
+        if status != adm::SUCCESS {
+            self.p
+                .log(format_args!("ena: host info refused, status {status}"));
+        }
+        self.stage = Stage::Features { at: 0 };
+        Event::Progress
+    }
+
     // The features.
 
     fn features(&mut self, now: u64, at: usize) -> Event {
@@ -795,26 +1007,35 @@ impl<P: Platform> Ena<P> {
         };
         let Some((_, status, body)) = self.complete() else {
             if now - command.sent_ns > self.admin_limit_ns() {
-                return self.fail(Failure::Admin {
-                    opcode: adm::GET_FEATURE,
-                    status: 0xFF,
-                });
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::GET_FEATURE,
+                        status: 0xFF,
+                    },
+                    now,
+                );
             }
             return Event::Idle;
         };
         let Pending::Feature { id } = command.pending else {
-            return self.fail(Failure::Admin {
-                opcode: adm::GET_FEATURE,
-                status,
-            });
+            return self.recover(
+                Failure::Admin {
+                    opcode: adm::GET_FEATURE,
+                    status,
+                },
+                now,
+            );
         };
         if status != adm::SUCCESS {
             // The attributes and the event groups are needed; the rest is advice.
             if FEATURES[at].1 {
-                return self.fail(Failure::Admin {
-                    opcode: adm::GET_FEATURE,
-                    status,
-                });
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::GET_FEATURE,
+                        status,
+                    },
+                    now,
+                );
             }
             self.p
                 .log(format_args!("ena: feature {id} refused, status {status}"));
@@ -855,9 +1076,9 @@ impl<P: Platform> Ena<P> {
 
     fn submit_get(&mut self, id: u8, now: u64) {
         self.submit(adm::GET_FEATURE, Pending::Feature { id }, now, |e| {
-            // `FEAT_FLAGS` stays 0 as in the driver of FreeBSD, whose
-            // commands the device is known to take; the version is the newest the
-            // driver reads of the two features that have a second one.
+            // `FEAT_FLAGS` stays 0, which the device takes (seen on the device);
+            // the version is the newest the driver reads of the two features that
+            // have a second one.
             e[adm::FEAT_ID] = id;
             e[adm::FEAT_VERSION] = match id {
                 adm::MAX_QUEUES_EXT | adm::LLQ => 1,
@@ -908,10 +1129,14 @@ impl<P: Platform> Ena<P> {
                     ms => u32::from(ms),
                 };
                 self.info.hint_watchdog_ms = hint(self, adm::HINT_WATCHDOG);
+                self.info.hint_mmio_ms = hint(self, adm::HINT_MMIO_READ);
                 self.info.hint_missing_tx_ms = hint(self, adm::HINT_MISSING_TX);
             }
             adm::LLQ => {
                 self.info.llq = u32_at(self, adm::LLQ_MAX_NUM) != 0;
+            }
+            adm::LINK_CONFIG => {
+                self.info.speed_mbps = u32_at(self, adm::LINK_SPEED);
             }
             _ => {}
         }
@@ -920,11 +1145,11 @@ impl<P: Platform> Ena<P> {
     fn report_attributes(&mut self) {
         let i = self.info;
         self.p.log(format_args!(
-            "ena: aq ok; mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu {} features {:#x} queues sq {}/{} cq {}/{} depth {}/{} llq {}; offload tx {:#x} rx {:#x}; hints watchdog {} missing_tx {}",
+            "ena: aq ok; mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu {} features {:#x} queues sq {}/{} cq {}/{} depth {}/{} llq {}; offload tx {:#x} rx {:#x}; hints watchdog {} missing_tx {} mmio {}; link {} Mb/s",
             i.mac[0], i.mac[1], i.mac[2], i.mac[3], i.mac[4], i.mac[5],
             i.max_mtu, i.supported, i.tx_sq, i.rx_sq, i.tx_cq, i.rx_cq, i.tx_depth, i.rx_depth,
             if i.llq { "yes" } else { "no" },
-            i.offload_tx, i.offload_rx, i.hint_watchdog_ms, i.hint_missing_tx_ms,
+            i.offload_tx, i.offload_rx, i.hint_watchdog_ms, i.hint_missing_tx_ms, i.hint_mmio_ms, i.speed_mbps,
         ));
     }
 
@@ -962,19 +1187,25 @@ impl<P: Platform> Ena<P> {
         };
         let Some((_, status, _)) = self.complete() else {
             if now - command.sent_ns > self.admin_limit_ns() {
-                return self.fail(Failure::Admin {
-                    opcode: adm::SET_FEATURE,
-                    status: 0xFF,
-                });
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::SET_FEATURE,
+                        status: 0xFF,
+                    },
+                    now,
+                );
             }
             return Event::Idle;
         };
         if status != adm::SUCCESS {
             if at == 0 {
-                return self.fail(Failure::Admin {
-                    opcode: adm::SET_FEATURE,
-                    status,
-                });
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::SET_FEATURE,
+                        status,
+                    },
+                    now,
+                );
             }
             self.p
                 .log(format_args!("ena: mtu {MTU} refused, status {status}"));
@@ -1030,8 +1261,30 @@ impl<P: Platform> Ena<P> {
                 return self.start_reset(reason, now);
             }
         }
-        if self.command.is_none() && now - self.stats_ns >= STATS_NS
-            || self.eni_reads == 0 && self.command.is_none()
+        if self.status_due {
+            match self.reg(regs::DEV_STS) {
+                Reg::Value(sts) => {
+                    self.status_due = false;
+                    self.status_fail = 0;
+                    if sts & regs::DEV_STS_FATAL_ERROR_MASK != 0 {
+                        return self.start_reset(regs::RESET_GENERIC, now);
+                    }
+                }
+                Reg::Wait => return Event::Idle,
+                Reg::Failed => {
+                    self.status_fail += 1;
+                    if self.status_fail >= READ_RETRIES {
+                        self.status_fail = 0;
+                        self.status_due = false;
+                        return self.start_reset(regs::RESET_DRIVER_INVALID_STATE, now);
+                    }
+                }
+            }
+            return Event::Progress;
+        }
+        let eni = self.info.capabilities & (1 << adm::CAP_ENI_STATS) != 0
+            || cfg!(feature = "break-eni-gate");
+        if eni && self.command.is_none() && (now - self.stats_ns >= STATS_NS || self.eni_reads == 0)
         {
             self.stats_ns = now;
             self.submit(adm::GET_STATS, Pending::Stats, now, |e| {
@@ -1148,13 +1401,7 @@ impl<P: Platform> Ena<P> {
         }
         if now - self.status_ns >= STATUS_NS {
             self.status_ns = now;
-            match self.read_reg(regs::DEV_STS) {
-                Some(sts) if sts & regs::DEV_STS_FATAL_ERROR_MASK != 0 => {
-                    return Some(regs::RESET_GENERIC);
-                }
-                Some(_) => {}
-                None => return Some(regs::RESET_DRIVER_INVALID_STATE),
-            }
+            self.status_due = true;
         }
         None
     }

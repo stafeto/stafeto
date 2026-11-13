@@ -132,6 +132,7 @@ pub const BLK: Record = Record {
                 offset: COMMAND,
                 bits: MEMORY,
             }),
+            confirm: None,
         },
         Write {
             window: "ecam",
@@ -140,6 +141,7 @@ pub const BLK: Record = Record {
             value: 0,
             settled: 0xFFFF,
             only_if: None,
+            confirm: None,
         },
     ],
     trusted: true,

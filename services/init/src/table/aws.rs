@@ -7,7 +7,7 @@
 //! device besides the ENA's service `net` (polled, optional): no entropy
 //! service, no Virtio window.
 
-use super::{At, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write};
+use super::{At, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write};
 use crate::PAGE;
 use crate::resolve::Platform;
 use crate::watch::Watch;
@@ -43,20 +43,60 @@ pub const ENA_ID: u32 = 0x1d0f_ec20;
 const ENA_BAR_LEN: u64 = 4 * PAGE;
 /// The command word of a function.
 const COMMAND: u64 = 4;
-/// The stop of the ENA: bus mastering and memory decoding off (the command
-/// word 0 of function 0, through the page of its configuration in ECAM), so
-/// that the device writes no frame the allocator gives back. That the device
-/// stops DMA at once on it is the question the next step settles by killing
-/// the service in the middle of the receiving of frames (the note
-/// `2026-11-13-aws-ena.md`, section 2).
-static ENA_STOP: [Write; 1] = [Write {
-    window: "ecam",
-    offset: COMMAND,
-    bits: 32,
-    value: 0,
-    settled: 0xFFFF,
-    only_if: None,
-}];
+/// The registers of BAR 0 the stop writes: `DEV_CTL` and `DEV_STS`, and the
+/// words of them (`lib/ena/src/regs.rs`).
+const DEV_CTL: u64 = 0x54;
+const DEV_STS: u64 = 0x58;
+/// `DEV_CTL`: the reset bit with the reason SHUTDOWN (11) in bits 31:28.
+const RESET_SHUTDOWN: u32 = 1 | 11 << 28;
+/// `DEV_STS.RESET_IN_PROGRESS`.
+const IN_PROGRESS: u32 = 0x8;
+/// The stop of the ENA, in its order: the device is reset through BAR 0 (the reset
+/// bit, then the device's own acknowledgement in `DEV_STS`, then the bit
+/// cleared and the end of the reset in `DEV_STS`), and only then the command word of
+/// function 0 goes to 0 (bus mastering and memory decoding off, through the page of its
+/// configuration in ECAM), so that the device writes no frame once init lets the DMA
+/// object go: init keeps the object when a step does not confirm. `DEV_CTL` is not
+/// read back (`settled` 0): the device may not hold what is written to it.
+static ENA_STOP: [Write; 3] = [
+    Write {
+        window: "bar",
+        offset: DEV_CTL,
+        bits: 32,
+        value: RESET_SHUTDOWN,
+        settled: 0,
+        only_if: None,
+        confirm: Some(Confirm {
+            window: "bar",
+            offset: DEV_STS,
+            mask: IN_PROGRESS,
+            value: IN_PROGRESS,
+        }),
+    },
+    Write {
+        window: "bar",
+        offset: DEV_CTL,
+        bits: 32,
+        value: 0,
+        settled: 0,
+        only_if: None,
+        confirm: Some(Confirm {
+            window: "bar",
+            offset: DEV_STS,
+            mask: IN_PROGRESS,
+            value: 0,
+        }),
+    },
+    Write {
+        window: "ecam",
+        offset: COMMAND,
+        bits: 32,
+        value: 0,
+        settled: 0xFFFF,
+        only_if: None,
+        confirm: None,
+    },
+];
 /// The memory of the admin structures: one uncached object of 128 KiB (order
 /// 5), where the queue pairs of the next step go too.
 const ENA_DMA: &[Dma] = &[Dma {
@@ -98,7 +138,9 @@ pub const NET: Record = Record {
     args: &[],
     dma: ENA_DMA,
     quiesce: &ENA_STOP,
-    restart: Restart::Never,
+    // Init starts the service again after a failure (`FAILED`, 8) it cannot get over;
+    // the driver tries three resets a minute before it gives up.
+    restart: Restart::Always,
     waits: &[],
     ..super::net::NETD
 };
@@ -334,9 +376,29 @@ mod tests {
     }
 
     #[test]
-    fn the_net_record_stops_the_function_by_its_command_word() {
-        let q = NET.quiesce[0];
-        assert_eq!((q.window, q.offset, q.bits, q.value), ("ecam", 4, 32, 0));
+    fn the_net_record_resets_the_device_through_bar_0_before_it_clears_the_command_word() {
+        let q = NET.quiesce;
+        // The reset with its reason, confirmed by DEV_STS; then released, confirmed;
+        // then the command word.
+        assert_eq!(
+            (q[0].window, q[0].offset, q[0].value),
+            ("bar", 0x54, 0xB000_0001)
+        );
+        assert_eq!(
+            q[0].confirm.map(|c| (c.offset, c.mask, c.value)),
+            Some((0x58, 8, 8))
+        );
+        assert_eq!((q[1].offset, q[1].value), (0x54, 0));
+        assert_eq!(
+            q[1].confirm.map(|c| (c.offset, c.mask, c.value)),
+            Some((0x58, 8, 0))
+        );
+        assert_eq!(
+            (q[2].window, q[2].offset, q[2].bits, q[2].value),
+            ("ecam", 4, 32, 0)
+        );
+        // The record is restarted by init after a failure.
+        assert_eq!(NET.restart, Restart::Always);
     }
 
     #[test]
