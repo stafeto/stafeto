@@ -2744,6 +2744,7 @@ fn its_breaks() -> Result<(), String> {
         "break-its-align-4k",
         "break-its-readback-mask",
         "break-its-print-pa",
+        "break-its-rwp-ignore",
     ] {
         let mut broken = cargo();
         broken.args([
@@ -2800,6 +2801,7 @@ fn its_int() -> Result<(), String> {
         let result = its_int_lines(&o.lines, SMP_CPUS);
         if !broken {
             its_boot_lines(&o.lines, SMP_CPUS)?;
+            its_cpu_lines(&o.lines, SMP_CPUS)?;
         }
         match (broken, result) {
             (false, Ok(())) => {
@@ -2851,13 +2853,23 @@ fn its_boot_lines(lines: &[String], cpus: usize) -> Result<(), String> {
         }
     }
     for cpu in 0..cpus {
+        let p = format!("its self-test: LPI {} reached CPU {cpu} after ", 8192 + cpu);
+        if find(&p).is_none() {
+            return Err(format!("no line `{p}`"));
+        }
+    }
+    Ok(())
+}
+
+/// The lines of the per-CPU record, which only a kernel with the feature
+/// `its-int` keeps: the registers at entry and after the setup of each CPU.
+fn its_cpu_lines(lines: &[String], cpus: usize) -> Result<(), String> {
+    for cpu in 0..cpus {
         for p in [
             format!("gicr cpu {cpu} entry ctlr "),
             format!("gicr cpu {cpu} set propbaser "),
-            format!("its mapc cpu {cpu} target "),
-            format!("its self-test: LPI {} reached CPU {cpu} after ", 8192 + cpu),
         ] {
-            if find(&p).is_none() {
+            if !lines.iter().any(|l| l.starts_with(&p)) {
                 return Err(format!("no line `{p}`"));
             }
         }
@@ -2929,11 +2941,11 @@ fn its_lpis() -> Result<(), String> {
             .lines
             .iter()
             .filter(|l| {
-                l.starts_with("gicr cpu ") && l.contains(" set ") && l.ends_with(" cleared 0x1")
+                l.starts_with("gicr cpu ") && l.contains(" set ") && l.contains(" cleared 0x1 ")
             })
             .count();
         let verdict = if cleared == SMP_CPUS {
-            its_boot_lines(&o.lines, SMP_CPUS)
+            its_boot_lines(&o.lines, SMP_CPUS).and_then(|()| its_cpu_lines(&o.lines, SMP_CPUS))
         } else {
             Err(format!(
                 "EnableLPIs was cleared on {cleared} of {SMP_CPUS} CPUs"

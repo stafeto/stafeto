@@ -67,20 +67,26 @@ static PROP_PA: AtomicU64 = AtomicU64::new(0);
 static PEND_PA: [AtomicU64; cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; cpu::MAX_CPUS];
 /// RD_base registers the boot reads and writes for each CPU, kept for the
 /// lines `report_cpus` prints once every CPU is up (a CPU in bring-up prints
-/// nothing).
+/// nothing); only the kernel feature `its-int` keeps them.
+#[cfg(feature = "its-int")]
 const E_CTLR: usize = 0;
+#[cfg(feature = "its-int")]
 const E_TYPER: usize = 1;
+#[cfg(feature = "its-int")]
 const E_PROP: usize = 2;
+#[cfg(feature = "its-int")]
 const E_PEND: usize = 3;
 const S_PROP_WROTE: usize = 4;
 const S_PROP_READ: usize = 5;
 const S_PEND_WROTE: usize = 6;
 const S_PEND_READ: usize = 7;
 const S_CTLR: usize = 8;
+#[cfg(feature = "its-int")]
 const CLEARED: usize = 9;
 const TARGET: usize = 10;
 const SET_DONE: usize = 11;
 /// Sixteen words a CPU, so that the index is a shift (erratum 835769).
+#[cfg(feature = "its-int")]
 static CPU_LOG: [[AtomicU64; 16]; cpu::MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 16] }; cpu::MAX_CPUS];
 /// Why a CPU turned the ITS off in `init_cpu`: the kind (OFF_* or 0), the CPU
@@ -92,9 +98,10 @@ static OFF_READ: AtomicU64 = AtomicU64::new(0);
 const OFF_LPIS: u32 = 1;
 const OFF_PROP: u32 = 2;
 const OFF_PEND: u32 = 3;
-/// Polls of Register Write Pending after EnableLPIs is cleared: at most
-/// 1 000 000 reads of GICR_CTLR on each CPU at boot, outside `OBJ`.
-const RWP_POLLS: u32 = 1_000_000;
+/// The wait for Register Write Pending after EnableLPIs is cleared: a tenth
+/// of a second of the counter (100 ms) on each CPU at boot, outside `OBJ`,
+/// however long a trapped read of GICR_CTLR takes.
+const RWP_DIV: u64 = 10;
 /// The wait of the boot self-test for one LPI: 10 ms of the counter.
 const SELFTEST_HZ_DIV: u64 = 100;
 /// The longest segment of a wait, in counter ticks (`its command ticks`).
@@ -285,6 +292,7 @@ pub fn init(info: &BootInfo, redistributor: usize) {
     assert!(TREE.set(*info).is_ok(), "its::init runs once");
     #[cfg(feature = "its-lpis-preset")]
     preset_lpis(redistributor);
+    #[cfg(feature = "its-int")]
     record_entry(cpu::this().index(), redistributor);
     if let Err(why) = setup(info, node.regs.base, max_device, redistributor) {
         // Nothing has enabled the ITS yet: it stays off and the machine runs
@@ -295,6 +303,7 @@ pub fn init(info: &BootInfo, redistributor: usize) {
 }
 
 /// What a CPU's redistributor holds when the kernel gets it.
+#[cfg(feature = "its-int")]
 fn record_entry(cpu: usize, rd: usize) {
     let log = &CPU_LOG[cpu];
     // SAFETY: GICR_CTLR, GICR_TYPER, GICR_PROPBASER and GICR_PENDBASER are
@@ -304,9 +313,9 @@ fn record_entry(cpu: usize, rd: usize) {
             u64::from(mmio::read32(rd + kcore::gic::GICR_CTLR)),
             Ordering::Relaxed,
         );
-        log[E_TYPER].store(mmio::read64(rd + kcore::gic::GICR_TYPER), Ordering::Relaxed);
-        log[E_PROP].store(mmio::read64(rd + its::GICR_PROPBASER), Ordering::Relaxed);
-        log[E_PEND].store(mmio::read64(rd + its::GICR_PENDBASER), Ordering::Relaxed);
+        note(cpu, E_TYPER, mmio::read64(rd + kcore::gic::GICR_TYPER));
+        note(cpu, E_PROP, mmio::read64(rd + its::GICR_PROPBASER));
+        note(cpu, E_PEND, mmio::read64(rd + its::GICR_PENDBASER));
     }
 }
 
@@ -344,7 +353,7 @@ fn preset_lpis(first: usize) {
 
 /// Clears EnableLPIs of the redistributor at `rd` as Linux does (write 0,
 /// wait for Register Write Pending, read again): Err(GICR_CTLR) when the
-/// bit stays. The wait is POLLS reads of GICR_CTLR at most. The break
+/// bit stays or RWP does not clear in 100 ms. The break
 /// `break-its-keep-firmware-lpis` leaves the bit as it is.
 fn clear_lpis(rd: usize) -> Result<(), u32> {
     if cfg!(feature = "break-its-keep-firmware-lpis") {
@@ -357,10 +366,15 @@ fn clear_lpis(rd: usize) -> Result<(), u32> {
         // SAFETY: as above.
         |v| unsafe { mmio::write32(ctlr, v) },
         || {
-            for _ in 0..RWP_POLLS {
+            let limit = timer::frequency() / RWP_DIV;
+            let began = timer::now();
+            loop {
                 // SAFETY: as above.
                 if unsafe { mmio::read32(ctlr) } & kcore::gic::GICR_CTLR_RWP == 0 {
-                    break;
+                    return true;
+                }
+                if timer::now() - began > limit {
+                    return false;
                 }
             }
         },
@@ -576,6 +590,7 @@ fn setup(info: &BootInfo, regs: u64, max_device: u32, redistributor: usize) -> R
             return off("a table of over 256 pages");
         }
         let pa = table_block(table.bytes);
+        assert!(pa.is_multiple_of(page), "an ITS table is not on its page");
         if its::baser_type(old) == its::BASER_TYPE_DEVICE {
             dt_pa = pa;
         } else {
@@ -617,6 +632,15 @@ fn setup(info: &BootInfo, regs: u64, max_device: u32, redistributor: usize) -> R
     Ok(())
 }
 
+/// Keeps a register value of this CPU for `report_cpus` (feature `its-int`).
+#[cfg(feature = "its-int")]
+fn note(cpu: usize, at: usize, value: u64) {
+    CPU_LOG[cpu][at].store(value, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "its-int"))]
+fn note(_cpu: usize, _at: usize, _value: u64) {}
+
 /// This CPU's part of the LPIs, called by `gic::init_v3_cpu` once the
 /// redistributor at `rd` is awake: the tables, EnableLPIs, and the CPU's
 /// collection (ICID = the CPU's number) mapped to it (spec 9).
@@ -626,10 +650,10 @@ pub fn init_cpu(rd: usize) {
         return;
     }
     let cpu = cpu::this().index();
+    #[cfg(feature = "its-int")]
     if cpu != 0 {
         record_entry(cpu, rd);
     }
-    let log = &CPU_LOG[cpu];
     // EnableLPIs set by firmware: clear it, as Linux does, or leave the ITS
     // off (the tables of the firmware stay in use otherwise).
     let ctlr_at = rd + kcore::gic::GICR_CTLR;
@@ -637,10 +661,14 @@ pub fn init_cpu(rd: usize) {
         off_cpu(OFF_LPIS, cpu, 0, u64::from(ctlr));
         return;
     }
-    // SAFETY: as above.
-    let now = unsafe { mmio::read32(ctlr_at) } & its::GICR_CTLR_ENABLE_LPIS;
-    let was = log[E_CTLR].load(Ordering::Relaxed) & u64::from(its::GICR_CTLR_ENABLE_LPIS);
-    log[CLEARED].store(u64::from(was != 0 && now == 0), Ordering::Relaxed);
+    #[cfg(feature = "its-int")]
+    {
+        // SAFETY: GICR_CTLR of this CPU's RD_base frame.
+        let now = unsafe { mmio::read32(ctlr_at) } & its::GICR_CTLR_ENABLE_LPIS;
+        let was =
+            CPU_LOG[cpu][E_CTLR].load(Ordering::Relaxed) & u64::from(its::GICR_CTLR_ENABLE_LPIS);
+        note(cpu, CLEARED, u64::from(was != 0 && now == 0));
+    }
     let (share, cache) = attributes();
     let prop = its::propbaser(PROP_PA.load(Ordering::Relaxed), its::ID_BITS, share, cache);
     let pend = its::pendbaser(PEND_PA[cpu].load(Ordering::Relaxed), share, cache);
@@ -654,11 +682,11 @@ pub fn init_cpu(rd: usize) {
             mmio::read64(rd + its::GICR_PENDBASER),
         )
     };
-    log[S_PROP_WROTE].store(prop, Ordering::Relaxed);
-    log[S_PROP_READ].store(prop_read, Ordering::Relaxed);
-    log[S_PEND_WROTE].store(pend, Ordering::Relaxed);
-    log[S_PEND_READ].store(pend_read, Ordering::Relaxed);
-    log[SET_DONE].store(1, Ordering::Relaxed);
+    note(cpu, S_PROP_WROTE, prop);
+    note(cpu, S_PROP_READ, prop_read);
+    note(cpu, S_PEND_WROTE, pend);
+    note(cpu, S_PEND_READ, pend_read);
+    note(cpu, SET_DONE, 1);
     if its::verify("GICR_PROPBASER", prop, prop_read, its::PROPBASER_CHECK).is_err() {
         off_cpu(OFF_PROP, cpu, prop, prop_read);
         return;
@@ -673,7 +701,7 @@ pub fn init_cpu(rd: usize) {
         mmio::write32(ctlr_at, ctlr | its::GICR_CTLR_ENABLE_LPIS);
         mmio::read32(ctlr_at)
     };
-    log[S_CTLR].store(u64::from(ctlr), Ordering::Relaxed);
+    note(cpu, S_CTLR, u64::from(ctlr));
     let typer = read64(its::GITS_TYPER);
     let target = if its::typer_pta(typer) {
         (rd - LINEAR_BASE) as u64
@@ -682,7 +710,7 @@ pub fn init_cpu(rd: usize) {
         its::processor_number(unsafe { mmio::read64(rd + kcore::gic::GICR_TYPER) }) << 16
     };
     RDBASE[cpu].store(target, Ordering::Relaxed);
-    log[TARGET].store(target, Ordering::Relaxed);
+    note(cpu, TARGET, target);
     let pos = send(&[
         Command::mapc(cpu as u16, target, true),
         Command::sync(target),
@@ -690,10 +718,12 @@ pub fn init_cpu(rd: usize) {
     wait(pos, "MAPC");
 }
 
-/// Up to six named words of a console line: ` name 0xvalue` each, those
+#[cfg(feature = "its-int")]
+/// Up to seven named words of a console line: ` name 0xvalue` each, those
 /// after the last name left out.
-struct Words([(&'static str, u64); 6]);
+struct Words([(&'static str, u64); 7]);
 
+#[cfg(feature = "its-int")]
 impl core::fmt::Display for Words {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for (name, value) in self.0.iter().filter(|w| !w.0.is_empty()) {
@@ -706,11 +736,12 @@ impl core::fmt::Display for Words {
 /// The lines about the redistributors and the ITS of every CPU, from the
 /// values `record_entry` and `init_cpu` kept: the console of a CPU in
 /// bring-up is not used. Then the reason a CPU turned the ITS off.
+#[cfg(feature = "its-int")]
 fn report_cpus() {
     for (cpu, log) in CPU_LOG.iter().enumerate().take(crate::smp::cpus()) {
         let get = |i: usize| log[i].load(Ordering::Relaxed);
         let words = |at: usize, names: &[&'static str]| {
-            let mut w = Words([("", 0); 6]);
+            let mut w = Words([("", 0); 7]);
             for (n, name) in names.iter().enumerate() {
                 w.0[n] = (*name, get(at + n));
             }
@@ -725,12 +756,23 @@ fn report_cpus() {
                 "gicr cpu {cpu} set{}",
                 words(
                     S_PROP_WROTE,
-                    &["propbaser", "read", "pendbaser", "read", "ctlr", "cleared"]
+                    &[
+                        "propbaser",
+                        "read",
+                        "pendbaser",
+                        "read",
+                        "ctlr",
+                        "cleared",
+                        "mapc target"
+                    ]
                 )
             );
-            kprintln!("its mapc cpu {cpu}{}", words(TARGET, &["target"]));
         }
     }
+}
+
+/// The line that says why a CPU turned the ITS off, in every kernel.
+fn report_off() {
     let wrote = OFF_WROTE.load(Ordering::Relaxed);
     let read = OFF_READ.load(Ordering::Relaxed);
     let cpu = OFF_CPU.load(Ordering::Relaxed);
@@ -1215,7 +1257,9 @@ fn step_of(what: Step, device: u32, itt_pa: u64, cpus: usize, e: usize) -> bool 
 /// must fail; `break-its-selftest-ignore` leaves the ITS on after a failure.
 #[inline(never)]
 pub fn selftest() {
+    #[cfg(feature = "its-int")]
     report_cpus();
+    report_off();
     if !present() {
         return;
     }
@@ -1225,10 +1269,7 @@ pub fn selftest() {
     publish(itt_va, its::ITT_MAX_BYTES);
     #[cfg(feature = "its-int")]
     {
-        kprintln!(
-            "its-int: device {device:#x}, {cpus} events, ITT {itt_pa:#x}, non-shareable {}",
-            NON_SHAREABLE.load(Ordering::Relaxed)
-        );
+        kprintln!("its-int: device {device:#x} ITT {itt_pa:#x}");
     }
     WATCH.store(true, Ordering::Relaxed);
     let go = |what, e| step_of(what, device, itt_pa, cpus, e);
@@ -1244,9 +1285,9 @@ pub fn selftest() {
         for s in &SEEN {
             s.store(0, Ordering::Release);
         }
-        let since = timer::now();
+        // The 10 ms start when the INT command has run.
         if go(Step::Raise, e) {
-            *slot = wait_for(e, lpi, since, limit);
+            *slot = wait_for(e, lpi, timer::now(), limit);
         }
         match slot {
             Some(ticks) => {
@@ -1286,8 +1327,7 @@ pub fn selftest() {
 pub mod int_probe {
     use super::*;
 
-    /// What tells a delivery that failed apart from another: the LPI each of
-    /// the first two CPUs took last, the target CPU's GICR_CTLR (bit 0 is
+    /// What tells a delivery that failed apart from another: the LPI CPU 0 took last, the target CPU's GICR_CTLR (bit 0 is
     /// EnableLPIs), the property byte (bit 0 enables) and the pending bit of
     /// the LPI, read after the cache dropped the line of the pending table.
     pub fn diagnose(cpu: usize, lpi: u32) {
@@ -1308,10 +1348,9 @@ pub mod int_probe {
             )
         };
         kprintln!(
-            "its-int: CPU {cpu}: ctlr {ctlr:#x} prop {prop:#x} pend {} last LPI {} {}",
+            "its-int: CPU {cpu}: ctlr {ctlr:#x} prop {prop:#x} pend {} seen {}",
             (pend >> (lpi % 8)) & 1,
-            SEEN[0].load(Ordering::Acquire),
-            SEEN[1].load(Ordering::Acquire)
+            SEEN[0].load(Ordering::Acquire)
         );
     }
 }

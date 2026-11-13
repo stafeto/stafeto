@@ -55,3 +55,5 @@ break-its-stall-clock = []
 break-its-align-4k = []
 break-its-readback-mask = []
 break-its-print-pa = []
+# A wait for Register Write Pending that timed out is taken as done.
+break-its-rwp-ignore = []

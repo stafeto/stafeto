@@ -731,21 +731,24 @@ pub fn verdict(arrived: &[Option<u64>]) -> Result<(), NotDelivered> {
 
 /// Clears EnableLPIs at entry, as Linux does for a kernel that finds it set:
 /// write the register without the bit, wait for Register Write Pending
-/// (`settle`, bounded by its caller), read again. Err(ctlr) when the bit is
-/// still set, which leaves the tables of the firmware in use.
+/// (`settle`, bounded by its caller, false when the bound ran out), read
+/// again. Err(ctlr) when the bit is still set, which leaves the tables of the
+/// firmware in use, or when RWP did not clear in time: the registers of the
+/// tables may not be written while a write is pending. The break
+/// `break-its-rwp-ignore` takes no notice of a wait that timed out.
 pub fn clear_enable_lpis(
     mut read: impl FnMut() -> u32,
     mut write: impl FnMut(u32),
-    mut settle: impl FnMut(),
+    mut settle: impl FnMut() -> bool,
 ) -> Result<(), u32> {
     let ctlr = read();
     if ctlr & GICR_CTLR_ENABLE_LPIS == 0 {
         return Ok(());
     }
     write(ctlr & !GICR_CTLR_ENABLE_LPIS);
-    settle();
+    let settled = settle() || cfg!(feature = "break-its-rwp-ignore");
     let after = read();
-    if after & GICR_CTLR_ENABLE_LPIS == 0 {
+    if settled && after & GICR_CTLR_ENABLE_LPIS == 0 {
         Ok(())
     } else {
         Err(after)
@@ -1272,7 +1275,14 @@ mod tests {
         // A redistributor that takes the write.
         let reg = Cell::new(GICR_CTLR_ENABLE_LPIS | 0x10);
         let waits = Cell::new(0);
-        let r = clear_enable_lpis(|| reg.get(), |v| reg.set(v), || waits.set(waits.get() + 1));
+        let r = clear_enable_lpis(
+            || reg.get(),
+            |v| reg.set(v),
+            || {
+                waits.set(waits.get() + 1);
+                true
+            },
+        );
         assert_eq!(r, Ok(()));
         assert_eq!(reg.get(), 0x10, "the other bits stay");
         assert_eq!(waits.get(), 1);
@@ -1281,7 +1291,20 @@ mod tests {
         assert_eq!(r, Ok(()));
         // A redistributor that keeps the bit.
         let stuck = Cell::new(GICR_CTLR_ENABLE_LPIS);
-        let r = clear_enable_lpis(|| stuck.get(), |_| {}, || {});
+        let r = clear_enable_lpis(|| stuck.get(), |_| {}, || true);
         assert_eq!(r, Err(GICR_CTLR_ENABLE_LPIS));
+    }
+
+    #[test]
+    fn a_register_write_still_pending_leaves_the_its_off() {
+        use core::cell::Cell;
+        // The bit clears at once, but RWP never does.
+        let reg = Cell::new(GICR_CTLR_ENABLE_LPIS);
+        let r = clear_enable_lpis(|| reg.get(), |v| reg.set(v), || false);
+        assert!(r.is_err(), "the tables would be written with RWP set");
+        // The same register with RWP clearing in time is fine.
+        reg.set(GICR_CTLR_ENABLE_LPIS);
+        let r = clear_enable_lpis(|| reg.get(), |v| reg.set(v), || true);
+        assert_eq!(r, Ok(()));
     }
 }

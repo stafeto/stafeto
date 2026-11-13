@@ -50,7 +50,7 @@ break-its-selftest-ignore = ["its-int-drop"]
 # firmware that used LPIs would leave it: the kernel clears the bit and sets
 # its own tables (xtask its-lpis); `break-its-keep-firmware-lpis` does not
 # clear it, and the LPI cannot arrive.
-its-lpis-preset = []
+its-lpis-preset = ["its-int"]
 break-its-keep-firmware-lpis = ["its-lpis-preset"]
 # The command queue and the property table on the 4 KiB and 8 KiB blocks of
 # before the fix (the diagnostic kernel of the session on EC2).
