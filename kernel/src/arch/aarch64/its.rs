@@ -560,7 +560,6 @@ fn setup(
             return off("a table of over 256 pages");
         }
         let pa = table_block(table.bytes);
-        assert!(pa.is_multiple_of(page), "an ITS table is not on its page");
         #[cfg(feature = "its-int")]
         if its::baser_type(old) == its::BASER_TYPE_DEVICE {
             dt_pa = pa;

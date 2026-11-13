@@ -245,7 +245,8 @@ impl Matrix {
 /// the senders wrote name the pairs; each is read with acquire, after the
 /// SGI, so that the sender's barrier shows. On a GICv2 the source of the SGI
 /// must be the CPU interface of the sender whose flag is read. Ends the
-/// interrupt.
+/// interrupt. Out of line: `wcet bound` names it.
+#[inline(never)]
 pub fn handle(ack: Ack) {
     let me = cpu::this().index();
     let cpus = cpus();
