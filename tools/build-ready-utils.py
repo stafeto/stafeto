@@ -243,7 +243,7 @@ class Build:
         self.build = work / "build"
         self.clang, self.lld, self.ar, self.objcopy = clang, lld, ar, objcopy
         self.base = ["--target=aarch64-linux-gnu", "-nostdinc", f"-isystem{include}",
-                     f"-idirafter{COMPAT}", f"-idirafter{BUSYBOX_COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
+                     f"-idirafter{COMPAT}", f"-idirafter{BUSYBOX_COMPAT}", "-mno-outline-atomics", "-fstack-protector-strong",
                      "-ffunction-sections", "-fdata-sections", "-Os", "-w", *flags]
         self.log = work / "build" / "build.log"
         # The text of the notices in the files of the sources built here

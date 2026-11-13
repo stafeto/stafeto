@@ -137,7 +137,7 @@ def main() -> None:
     stubs(log, clang, nm, libc, stub)
     cc = " ".join((str(clang), "--target=aarch64-linux-gnu", "-nostdinc",
                    f"-isystem {RELIBC / 'include'}", "-mno-outline-atomics",
-                   "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
+                   "-fstack-protector-strong", "-ffunction-sections", "-fdata-sections",
                    A53_ERRATA, "-fPIC", *UNWIND_CFLAGS))
     env = dict(os.environ, **CACHE, CC=cc, CFLAGS="-Os -w",
                LDFLAGS=f"-static -nostdlib --ld-path={lld} -L{RELIBC / 'lib'} {stub}",

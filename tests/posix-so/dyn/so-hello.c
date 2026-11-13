@@ -119,6 +119,20 @@ static int dl(void) {
     return bits;
 }
 
+/* The canary of the stack protector is libc.so's __stack_chk_guard, which the program reaches
+ * through its GOT (no copy relocation), so the value the start set is the one the program's
+ * prologues and epilogues use: not zero, with a zero low byte. */
+extern uintptr_t __stack_chk_guard;
+
+/* A protected function (a local array gives it a canary) that writes past its buffer with a
+ * length known only at run time; the return finds the canary changed and calls
+ * __stack_chk_fail, which ends the program by SIGABRT. Without the protector it returns. */
+__attribute__((noinline)) static void overflow(size_t length) {
+    char buffer[16];
+    memset(buffer, 'A', length);
+    __asm__ volatile("" : : "r"(buffer) : "memory");
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "hello";
     if (strcmp(mode, "wait") == 0) {
@@ -128,6 +142,13 @@ int main(int argc, char **argv) {
         return read(0, &byte, 1) == 1 ? 0 : 1;
     }
     if (strcmp(mode, "dl") == 0) return dl();
+    if (strcmp(mode, "guard") == 0)
+        return __stack_chk_guard != 0 && (__stack_chk_guard & 0xff) == 0 ? 0 : 1;
+    if (strcmp(mode, "smash") == 0) {
+        volatile size_t length = 64;
+        overflow(length);
+        return 0;
+    }
     if (strcmp(mode, "secure") == 0) {
         /* AT_SECURE as the program sees it, with the environment untouched:
          * the loader never reads LD_PRELOAD, whatever the mode. The exit

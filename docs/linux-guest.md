@@ -110,7 +110,7 @@ built into the two nginx differs, and the report of a measurement names it:
 
 | What | Linux (Alpine) | stafeto | Effect on HTTP |
 |---|---|---|---|
-| compiler and flags | gcc 15, the flags of `abuild.conf` of the branch (stack protector, PIE) | clang, `-Os -fno-stack-protector -fPIC -mno-outline-atomics -mfix-cortex-a53-835769` | CPU time per request |
+| compiler and flags | gcc 15, the flags of `abuild.conf` of the branch (stack protector, PIE) | clang, `-Os -fstack-protector-strong -fPIC -mno-outline-atomics -mfix-cortex-a53-835769` | CPU time per request |
 | modules built in | `gzip`, `gunzip`, `gzip_static`, `sub`, `addition`, `realip`, `dav`, `flv`, `mp4`, `slice`, `secure_link`, `auth_request`, `stub_status`, `v3`, dynamic modules | `--without-http_gzip_module`, `ssl` and `v2` only | slight: the filters of `gzip`, `sub`, `addition` and `gunzip` sit in the chain and test their flag on every answer; one setting cannot level it |
 | `--with-threads`, `--with-file-aio` | yes | no | none while `aio` is off |
 | PCRE2 | the library of Alpine, with JIT | 10.49 built here, no JIT | none: no regular expression in the settings, `pcre_jit` is off |

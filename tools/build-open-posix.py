@@ -55,7 +55,7 @@ SECTIONS = ("conformance/interfaces", "conformance/definitions", "conformance/be
 # include/mk/config.mk.in, with relibc's headers and the C ABI they describe.
 FLAGS = ("--target=aarch64-linux-gnu", "-nostdinc", "-isystem", str(INCLUDE),
          "-mno-outline-atomics", "-mllvm", "-enable-machine-outliner=never",
-         "-mfix-cortex-a53-835769", "-fno-stack-protector", "-fno-pic",
+         "-mfix-cortex-a53-835769", "-fstack-protector-strong", "-fno-pic",
          "-g0", "-O2", "-w", f"-fmacro-prefix-map={SOURCE}/=", "-std=c99", "-D_POSIX_C_SOURCE=200809L", "-D_XOPEN_SOURCE=700")
 
 

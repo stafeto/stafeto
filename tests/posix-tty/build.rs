@@ -48,7 +48,7 @@ fn main() {
             // Cortex-A53 erratum 835769 (the PinePhone's A64).
             "-mfix-cortex-a53-835769",
             "-nostdinc",
-            "-fno-stack-protector",
+            "-fstack-protector-strong",
             "-fno-pic",
             "-std=c11",
             "-O2",

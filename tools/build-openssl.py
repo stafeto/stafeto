@@ -124,7 +124,7 @@ def configure_line() -> str:
 def compiler(clang: Path) -> str:
     """The wrapper script that Configure and make run as CC."""
     flags = ("--target=aarch64-linux-gnu", "-nostdinc", "-isystem", str(RELIBC / "include"),
-             "-idirafter", str(COMPAT), "-mno-outline-atomics", "-fno-stack-protector",
+             "-idirafter", str(COMPAT), "-mno-outline-atomics", "-fstack-protector-strong",
              "-ffunction-sections", "-fdata-sections", A53_ERRATA, *UNWIND_CFLAGS)
     return "#!/bin/sh\nexec " + " ".join((str(clang), *flags)) + ' "$@"\n'
 

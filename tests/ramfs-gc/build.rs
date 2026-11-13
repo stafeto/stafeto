@@ -23,7 +23,7 @@ fn main() {
             "--target=aarch64-linux-gnu",
             "-mfix-cortex-a53-835769",
             "-nostdinc",
-            "-fno-stack-protector",
+            "-fstack-protector-strong",
             "-fno-pic",
             "-std=c11",
             "-O2",

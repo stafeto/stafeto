@@ -111,7 +111,7 @@ def main() -> None:
     objcopy = tool("llvm-objcopy", "llvm")
     cc = (str(clang), "--target=aarch64-linux-gnu", "-nostdinc",
           "-isystem", str(RELIBC / "include"), "-mno-outline-atomics",
-          "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
+          "-fstack-protector-strong", "-ffunction-sections", "-fdata-sections",
           A53_ERRATA, "-fPIC", "-O2", *UNWIND_CFLAGS, *ENGINE_CFLAGS,
           f"-I{source}", f"-I{PORT_DIR}")
     objects = []

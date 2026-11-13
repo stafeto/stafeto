@@ -205,7 +205,7 @@ def build(log: Path, jobs: int) -> None:
     # programs of the system. The FreeBSD half adds -nostdinc and its own
     # headers (lib/Makefile); the host half adds relibc's.
     cc = " ".join((str(clang), "--target=aarch64-linux-gnu", "-mno-outline-atomics",
-                   "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
+                   "-fstack-protector-strong", "-ffunction-sections", "-fdata-sections",
                    A53_ERRATA, "-fPIC", "-MD"))
     # The host half also reads the claim of the second device
     # (<stafeto/fast.h>) and the library of its driver (vnet.h).
@@ -262,7 +262,7 @@ def probe(log: Path) -> None:
         out = WORK / f"fstack-probe-{source.stem}.o"
         run(log, clang, "--target=aarch64-linux-gnu", "-nostdinc", "-isystem", RELIBC / "include",
             "-isystem", FAST_INCLUDE, "-isystem", VNET_INCLUDE,
-            "-I", INCLUDE, "-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
+            "-I", INCLUDE, "-mno-outline-atomics", "-fstack-protector-strong", "-ffunction-sections",
             "-fdata-sections", A53_ERRATA, "-fPIC", "-fno-builtin", "-O2", "-Wall", "-Werror",
             "-c", source, "-o", out)
         objects.append(out)
@@ -280,7 +280,7 @@ def glue(log: Path) -> None:
     for source, out in ((GLUE_SOURCE, GLUE), (LAYER_SOURCE, LAYER)):
         run(log, clang, "--target=aarch64-linux-gnu", "-nostdinc", "-isystem", RELIBC / "include",
             "-isystem", FAST_INCLUDE, "-isystem", VNET_INCLUDE,
-            "-I", INCLUDE, "-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
+            "-I", INCLUDE, "-mno-outline-atomics", "-fstack-protector-strong", "-ffunction-sections",
             "-fdata-sections", A53_ERRATA, "-fPIC", "-fno-builtin", "-O2", "-Wall", "-Werror",
             "-c", source, "-o", out)
 

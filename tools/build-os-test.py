@@ -54,7 +54,7 @@ INCLUDE = Path(os.environ.get("STAFETO_RELIBC_SYSROOT", ROOT / "target" / "relib
 # os-test's compile.sh, with the C ABI relibc's headers describe.
 FLAGS = ("--target=aarch64-linux-gnu", "-nostdinc", "-isystem", str(INCLUDE),
          "-mno-outline-atomics", "-mllvm", "-enable-machine-outliner=never",
-         "-mfix-cortex-a53-835769", "-fno-stack-protector",
+         "-mfix-cortex-a53-835769", "-fstack-protector-strong",
          "-O2", "-Wall", "-Wextra", "-Werror=implicit-function-declaration",
          "-D_GNU_SOURCE", "-D_BSD_SOURCE", "-D_ALL_SOURCE", "-D_DEFAULT_SOURCE")
 
