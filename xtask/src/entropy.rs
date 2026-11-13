@@ -296,31 +296,37 @@ pub fn probe_vz() -> Result<(), String> {
 /// The C probe of the layer's generator (tests/posix-random): the POSIX
 /// services, the loader, the entropy device's driver and service, and the
 /// probe, which starts its own file once.
-pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-posix-random"]),
-    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
-    (
-        "posix-process-service",
-        "posix-process-service",
-        64 * 1024,
-        &[],
-    ),
-    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
-    ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
-    // The first fill waits 500 ms: the probe meets the wait for it.
-    ("entropy", "entropy", ENTROPY_STACK_SIZE, &["slow-start"]),
-    (
-        "posix-random",
-        "posix-random-probe",
-        crate::POSIX_STACK_SIZE,
-        &[],
-    ),
-];
+pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9] {
+    [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-random"]),
+        ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            &[],
+        ),
+        ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+        ("pipe", "pipe", crate::PIPE_STACK_SIZE, pipe),
+        ("loader", "loader", 0, &[]),
+        ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
+        // The first fill waits 500 ms: the probe meets the wait for it.
+        ("entropy", "entropy", ENTROPY_STACK_SIZE, &["slow-start"]),
+        (
+            "posix-random",
+            "posix-random-probe",
+            crate::POSIX_STACK_SIZE,
+            &[],
+        ),
+    ]
+}
+
+/// The probe's image with the steps of the pipe service counted.
+static RANDOM_PROGRAMS: [ImageProgram; 9] = random_programs(&[]);
+static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"]);
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 20] = [
+const RANDOM_LINES: [&str; 21] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
@@ -340,17 +346,53 @@ const RANDOM_LINES: [&str; 20] = [
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
     "posix-random: a set-ID program takes no entropy session from its caller, and gives ENOSYS",
+    "posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request",
     "posix-random: ok",
 ];
 
 /// `cargo xtask posix-random` and its boot in `test`: getentropy and
 /// getrandom from C on relibc, and a forked child's bytes, on `machine`.
 pub fn random_probe(machine: &qemu::Machine) -> Result<(), String> {
+    random_run(machine, false).map(drop)
+}
+
+/// `cargo xtask posix-random-steps`: the same probe under -icount with the
+/// pipe service's steps counted; VerifySession (kind 46, which the set-ID
+/// starts of the probe send it) stays under 0.9 of term B.
+pub fn random_steps() -> Result<(), String> {
+    let lines = random_run(&qemu::VIRT, true)?;
+    let rows = longest_steps(&lines, "4");
+    let Some(row) = rows.iter().find(|r| r.0 == 46) else {
+        return Err(format!(
+            "the pipe service ran no VerifySession step: {rows:?}"
+        ));
+    };
+    println!(
+        "pipe service VerifySession: {} ticks, detail {}, B {}",
+        row.1,
+        row.2,
+        crate::TERM_B
+    );
+    if row.1 > crate::TERM_B * 9 / 10 {
+        return Err(format!("VerifySession: a step past 0.9 of B: {row:?}"));
+    }
+    Ok(())
+}
+
+fn random_run(machine: &qemu::Machine, steps: bool) -> Result<Vec<String>, String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-posix-random.img", &RANDOM_PROGRAMS, BOOT_PROFILE)?;
+    let programs: &[ImageProgram] = if steps {
+        &RANDOM_PROGRAMS_STEPS
+    } else {
+        &RANDOM_PROGRAMS
+    };
+    let image = build_boot_image("boot-posix-random.img", programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    if steps {
+        cmd.args(qemu::ICOUNT);
+    }
     const ENDS: &str = "init: posix-random ended: ";
     let output = run_until(cmd, crate::BOOT_TIMEOUT, Some(ENDS), &kernel.elf)?;
     for line in RANDOM_LINES {
@@ -364,7 +406,7 @@ pub fn random_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-random on {}: getentropy, getrandom and fork: ok",
         machine.name
     );
-    Ok(())
+    Ok(output.lines)
 }
 
 #[cfg(test)]

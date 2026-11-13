@@ -1416,15 +1416,7 @@ impl Init {
                 duplicate: false,
             }
         } else if notary {
-            let set_id = table::SET_ID_VOUCHERS.contains(&client.name);
-            let terminal = client.name == table::TERMINAL_SERVICE;
-            let mut mark = proto_process::NOTARY;
-            if set_id {
-                mark |= proto_process::SET_ID;
-            }
-            if terminal {
-                mark |= proto_process::TERMINAL;
-            }
+            let mark = table::notary_mark(client.name);
             Grant {
                 mark,
                 duplicate: false,

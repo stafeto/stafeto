@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -398,15 +399,17 @@ static void *forged_listener(void *unused) {
     return (void *)(unsigned long)stafeto_probe_loader_listen();
 }
 
-/* Starts `path` in the role `role` with a channel of the probe's own in the Entropy place (a
- * caller that bypasses the layer), which the probe serves as a forged entropy service. Its exit
- * status goes to `*status`, the requests the forged service got to `*requests`. */
-static int forged_run(const char *path, const char *role, int *status, unsigned *requests) {
+/* Starts `path` in the role `role` with a channel of the probe's own in the Entropy place (mode
+ * 5) or the Pipes place (mode 6), a caller that bypasses the layer, which the probe serves as a
+ * forged service. Its exit status goes to `*status`, the requests the forged service got to
+ * `*requests`. */
+static int forged_run(const char *path, const char *role, unsigned mode, int *status,
+                      unsigned *requests) {
     pthread_t listener;
     void *count = NULL;
     char *argv[] = {"posix-random", (char *)role, NULL};
     pid_t pid = 0;
-    CHECK(stafeto_probe_loader_start(5) == 0);
+    CHECK(stafeto_probe_loader_start(mode) == 0);
     CHECK(pthread_create(&listener, NULL, forged_listener, NULL) == 0);
     CHECK(posix_spawn(&pid, path, NULL, NULL, argv, environ) == 0);
     CHECK(waitpid(pid, status, 0) == pid);
@@ -421,13 +424,63 @@ static int forged_run(const char *path, const char *role, int *status, unsigned 
 static int forged(void) {
     int status = 0;
     unsigned requests = 0;
-    CHECK(forged_run("/bin/posix-random", "forged", &status, &requests) == 0);
+    CHECK(forged_run("/bin/posix-random", "forged", 5, &status, &requests) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(requests != 0);
-    CHECK(forged_run("/bin/posix-random-suid", "setid", &status, &requests) == 0);
+    CHECK(forged_run("/bin/posix-random-suid", "setid", 5, &status, &requests) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(requests == 0);
     printf("posix-random: a set-ID program takes no entropy session from its caller, and gives ENOSYS\n");
+    return 0;
+}
+
+/* A set-ID program takes its Pipes session only from the channel service. The control: a program
+ * that is not set-ID takes the forged channel and its pipe() reaches it, so the forgery gets to
+ * the place. The set-ID program gets a session of the service in its place: pipe() and a
+ * socketpair work, and the forged service gets no request. A set-ID program started with the
+ * genuine session of its parent works the same (the last run). */
+static int forged_pipes(void) {
+    int status = 0;
+    unsigned requests = 0;
+    CHECK(forged_run("/bin/posix-random", "forgedpipe", 6, &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests != 0);
+    CHECK(forged_run("/bin/posix-random-suid", "setidpipe", 6, &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests == 0);
+    pid_t pid = 0;
+    char *argv[] = {"posix-random", "setidpipe", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random-suid", NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request\n");
+    return 0;
+}
+
+/* The role `forgedpipe`: makes a pipe through the session it was given; a forged service
+ * answers none, so the call fails. */
+static int forged_pipe_role(void) {
+    int ends[2];
+    (void)pipe(ends);
+    return 0;
+}
+
+/* The role `setidpipe`: the pipe session is the service's, so a pipe carries a byte and a
+ * socketpair of AF_UNIX does too. */
+static int setid_pipe_role(void) {
+    int ends[2], pair[2];
+    char out = 'p', in = 0;
+    CHECK(pipe(ends) == 0);
+    CHECK(write(ends[1], &out, 1) == 1);
+    CHECK(read(ends[0], &in, 1) == 1);
+    CHECK(in == 'p');
+    CHECK(close(ends[0]) == 0 && close(ends[1]) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    out = 's';
+    CHECK(write(pair[0], &out, 1) == 1);
+    CHECK(read(pair[1], &in, 1) == 1);
+    CHECK(in == 's');
+    CHECK(close(pair[0]) == 0 && close(pair[1]) == 0);
     return 0;
 }
 
@@ -490,6 +543,7 @@ static int first(void) {
     CHECK(temporary() == 0);
     CHECK(descriptor() == 0);
     CHECK(forged() == 0);
+    CHECK(forged_pipes() == 0);
     return 0;
 }
 
@@ -578,6 +632,8 @@ int main(int argc, char **argv) {
     int status;
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
+    if (argc > 1 && strcmp(argv[1], "forgedpipe") == 0) return forged_pipe_role();
+    if (argc > 1 && strcmp(argv[1], "setidpipe") == 0) return setid_pipe_role();
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forked() : first();

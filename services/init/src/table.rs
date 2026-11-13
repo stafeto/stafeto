@@ -122,6 +122,29 @@ pub const PACKAGE_SERVICE: &str = "pkgd";
 /// The name of the terminal service (5f): its notary session may send
 /// TtySignal, SetCtty and DropCtty (proto_process::TERMINAL).
 pub const TERMINAL_SERVICE: &str = "tty";
+/// The services that send their root to the process service with Register
+/// (proto_process::ROOT_MARKS), each with the mark init gives its notary
+/// session and no other entry: the terminal, channel and network services.
+/// The entropy service takes its place here with its own part.
+pub const ROOT_SERVICES: &[(&str, u64)] = &[
+    (TERMINAL_SERVICE, proto_process::TERMINAL),
+    (PIPE_SERVICE, proto_process::PIPE),
+    (NET_SERVICE, proto_process::NET),
+];
+
+/// The label mark of the notary session of the voucher `name`: NOTARY, with
+/// SET_ID for the file services and the mark of its root for the services
+/// of ROOT_SERVICES. Nothing but this function grants a mark.
+pub fn notary_mark(name: &str) -> u64 {
+    let mut mark = proto_process::NOTARY;
+    if SET_ID_VOUCHERS.contains(&name) {
+        mark |= proto_process::SET_ID;
+    }
+    if let Some((_, root)) = ROOT_SERVICES.iter().find(|(service, _)| *service == name) {
+        mark |= root;
+    }
+    mark
+}
 /// The name of the identity session of a POSIX process in its start data
 /// (spec 2, 3.1): the process gives copies of it to the services it asks
 /// something of, which ask the process service who it is.
@@ -3697,5 +3720,45 @@ mod tests {
             check_record(&bad),
             Err(TableError::Quiesce { window: "bar", .. })
         ));
+    }
+
+    /// Only the services of ROOT_SERVICES get the mark of a root, each its
+    /// own, and every other voucher gets a notary session with no mark of
+    /// a root: a service without the mark cannot register a root.
+    #[test]
+    fn only_the_named_services_get_a_root_mark() {
+        use proto_process::{NOTARY, ROOT_MARKS, SET_ID, root_of};
+        for &(name, mark) in ROOT_SERVICES {
+            assert!(VOUCHERS.contains(&name), "{name} asks for a notary session");
+            assert!(ROOT_MARKS.contains(&mark), "{name}");
+            assert_eq!(notary_mark(name), NOTARY | mark);
+            assert!(root_of(notary_mark(name) | 5).is_some());
+        }
+        for &name in VOUCHERS {
+            let named = ROOT_SERVICES.iter().any(|&(service, _)| service == name);
+            let marks = notary_mark(name) & ROOT_MARKS.iter().fold(0, |all, m| all | m);
+            assert_eq!(marks != 0, named, "{name}");
+            assert_eq!(root_of(notary_mark(name)).is_some(), named, "{name}");
+        }
+        assert_eq!(notary_mark(RAM_SERVICE), NOTARY | SET_ID);
+        assert_eq!(notary_mark("anything-else"), NOTARY);
+        // The marks of the services differ.
+        for (i, &(_, a)) in ROOT_SERVICES.iter().enumerate() {
+            for &(_, b) in &ROOT_SERVICES[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// No table has two records with the name of a service that holds a
+    /// root mark, so each mark has at most one holder.
+    #[test]
+    fn each_root_mark_has_one_holder_in_a_table() {
+        for table in all_tables() {
+            for &(service, _) in ROOT_SERVICES {
+                let holders = table.iter().filter(|r| r.name == service).count();
+                assert!(holders <= 1, "{service}: {holders} records");
+            }
+        }
     }
 }
