@@ -155,7 +155,9 @@ const RX1: u64 = 64;
 const RETURN: u64 = 128;
 /// The switch thread has answers for the stack (`switch::COMMANDS`).
 pub(crate) const BACK: u64 = 256;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK;
+/// The map of a shared buffer a BUFFER waits for (`Net::map_waiting`).
+const MAP: u64 = 512;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The label of the sweep's timer on the switch thread's channel.
@@ -1303,6 +1305,11 @@ struct Driver<'a> {
     bell_checked: bool,
     /// A step of departure is due that no notification told.
     cleanup_due: bool,
+    /// CONFIG asked for the probe's report of counters: it is said after the step, outside it
+    /// (a line costs the console path of the kernel, about 70 ticks a character, and the report
+    /// is no work of the service).
+    #[cfg(feature = "probe")]
+    report_due: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
     /// The step that ran last among those asked for together.
@@ -1396,6 +1403,8 @@ impl<'a> Driver<'a> {
             bell: netd::ring::Hold::new(),
             bell_checked: false,
             cleanup_due: false,
+            #[cfg(feature = "probe")]
+            report_due: false,
             armed: None,
             last_step: 0,
             neighbours_at: 0,
@@ -1564,6 +1573,9 @@ impl Driver<'_> {
         }
         if core::mem::take(&mut self.inst.net.wake_wanted) {
             self.tell(WAKE);
+        }
+        if core::mem::take(&mut self.inst.net.buffer_wanted) {
+            self.tell(MAP);
         }
         if self.side.max > 0 {
             self.drain_releases();
@@ -2147,11 +2159,9 @@ impl Driver<'_> {
             return Answer::Status(Status::BadSize);
         }
         #[cfg(feature = "probe")]
-        self.report_frames();
-        // The probe image with the profile prints the totals here, so that
-        // a boot of it checks that the records come whole.
-        #[cfg(all(feature = "probe", feature = "profile"))]
-        self.profile_snapshot();
+        {
+            self.report_due = true;
+        }
         let (lease, mac) = if device == 0 {
             (self.inst.stack.lease, self.mac)
         } else {
@@ -2455,15 +2465,6 @@ impl Driver<'_> {
         self.after_request();
         trace::point(P_N_REQ_END, u32::from(method));
         profile::call(method, began);
-        #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
-        if core::mem::take(&mut self.inst.net.profile_due) {
-            #[cfg(feature = "probe")]
-            self.report_frames();
-            #[cfg(feature = "profile")]
-            self.profile_snapshot();
-            #[cfg(feature = "trace")]
-            trace_dump(&mut self.kernel_stamps);
-        }
         answer
     }
 
@@ -2483,7 +2484,7 @@ impl Driver<'_> {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK];
+                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -2503,6 +2504,12 @@ impl Driver<'_> {
                     }
                     RETURN => self.return_step(),
                     BACK => self.back_step(),
+                    MAP => {
+                        rt::service::step_own();
+                        if self.inst.net.map_waiting() {
+                            self.tell(MAP);
+                        }
+                    }
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
@@ -2637,6 +2644,26 @@ impl Service<0> for Driver<'_> {
     fn between_requests(&mut self) {
         self.bell_release();
         self.bell_checked = false;
+        // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
+        // answer went, so that the lines of the console do not count in the step.
+        #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
+        if core::mem::take(&mut self.inst.net.profile_due) {
+            #[cfg(feature = "probe")]
+            self.report_frames();
+            #[cfg(feature = "profile")]
+            self.profile_snapshot();
+            #[cfg(feature = "trace")]
+            trace_dump(&mut self.kernel_stamps);
+        }
+        // The report CONFIG asked for, likewise.
+        #[cfg(feature = "probe")]
+        if core::mem::take(&mut self.report_due) {
+            self.report_frames();
+            // The probe image with the profile prints the totals here, so that
+            // a boot of it checks that the records come whole.
+            #[cfg(feature = "profile")]
+            self.profile_snapshot();
+        }
     }
 
     fn notification(&mut self, n: Notice) {

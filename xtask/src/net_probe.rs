@@ -279,6 +279,9 @@ const NET_TAG: &str = "14";
 const STEP_KINDS: [(usize, &str); 3] = [(21, "Config"), (62, "Ping"), (65, "the own steps")];
 /// The most one step of the service may take (spec 6): 0.9 of term B.
 pub const STEP_MAX: u64 = TERM_B * 9 / 10;
+/// The longest step the service aims at: 10 percent under `STEP_MAX` (`netd::ring::STEP_MARGIN`).
+/// A probe that sees a step above it says so, long before the bound fails a run.
+pub const STEP_MARGIN: u64 = netd::ring::STEP_MARGIN as u64;
 /// The most the step of a CLONE of 64 descriptions may take: a portion, 0.8 of
 /// term B.
 pub const PORTION_MAX: u64 = TERM_B * 8 / 10;
@@ -1081,6 +1084,43 @@ fn steps_run(
     )?))
 }
 
+/// The three longest kinds of `rows`, longest first: `(kind, ticks)`.
+pub fn three_longest(rows: &[(usize, u64, u64)]) -> Vec<(usize, u64)> {
+    let mut all: Vec<(usize, u64)> = rows.iter().map(|&(kind, ticks, _)| (kind, ticks)).collect();
+    all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    all.truncate(3);
+    all
+}
+
+/// The line of the three longest kinds, and a warning line for each kind above `STEP_MARGIN`.
+pub fn margin_lines(what: &str, rows: &[(usize, u64, u64)]) -> Vec<String> {
+    let top = three_longest(rows);
+    let text: Vec<_> = top
+        .iter()
+        .map(|(kind, ticks)| format!("kind {kind} {ticks}"))
+        .collect();
+    let mut lines = vec![format!(
+        "the three longest steps, {what}: {} (margin {STEP_MARGIN}, bound {STEP_MAX})",
+        text.join(", ")
+    )];
+    for &(kind, ticks, _) in rows {
+        if ticks > STEP_MARGIN {
+            lines.push(format!(
+                "warning: the step of kind {kind} takes {ticks} ticks in {what}, above the margin {STEP_MARGIN} ({} ticks of the bound {STEP_MAX} left)",
+                STEP_MAX.saturating_sub(ticks)
+            ));
+        }
+    }
+    lines
+}
+
+/// Says `margin_lines` on the console.
+pub fn say_margin(what: &str, rows: &[(usize, u64, u64)]) {
+    for line in margin_lines(what, rows) {
+        println!("{line}");
+    }
+}
+
 fn print_rows(machine: &qemu::Machine, what: &str, rows: &[(usize, u64, u64)]) {
     let text: Vec<_> = rows
         .iter()
@@ -1091,6 +1131,7 @@ fn print_rows(machine: &qemu::Machine, what: &str, rows: &[(usize, u64, u64)]) {
         machine.name,
         text.join(", ")
     );
+    say_margin(what, rows);
 }
 
 /// The check of `steps_verdict` over rows already read.
@@ -1969,6 +2010,30 @@ fn rates(machine: &qemu::Machine) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_margin_is_ten_percent_under_the_bound_and_names_the_kinds_above_it() {
+        assert_eq!(STEP_MAX, 18_369);
+        assert_eq!(STEP_MARGIN, 16_500);
+        let rows = [
+            (65, 14_440, 0),
+            (21, 16_501, 0),
+            (25, 9_000, 0),
+            (67, 15_096, 0),
+        ];
+        assert_eq!(
+            three_longest(&rows),
+            [(21, 16_501), (67, 15_096), (65, 14_440)]
+        );
+        let lines = margin_lines("run B", &rows);
+        assert!(lines[0].contains("kind 21 16501, kind 67 15096, kind 65 14440"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("warning:") && lines[1].contains("kind 21"));
+        // At the margin and under it: no warning.
+        let calm = [(21, 16_500, 0), (65, 100, 0)];
+        assert_eq!(margin_lines("run B", &calm).len(), 1);
+        assert!(three_longest(&[]).is_empty());
+    }
+
     use super::*;
 
     const COUNTERS: &str = "martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 orphan_reused 0 bad_sum 0 demux_probe 2";

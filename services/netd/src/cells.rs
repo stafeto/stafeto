@@ -15,23 +15,34 @@
 use crate::dma;
 use crate::net::{Client, Net};
 use abi::{Access, Error, Rights};
-use netd::buffers::{Refusal, copy_portion};
+use netd::buffers::{Part, Refusal, copy_portion};
 use netd::ring::BUFFER_PORTION;
 use proto_net::{BUFFER_SIZE, code};
 use proto_wire::Status;
-use rt::handle::Memory;
-use rt::service::{Answer, Request, Session};
+use rt::handle::{Memory, Outgoing};
+use rt::service::{Answer, Pending, Request, Session};
 use rt::sys;
 use smoltcp::socket::tcp;
 
 type Sess = Session<Client, 0>;
+
+/// A BUFFER that waits for its map: the client's object and the reply it is owed.
+pub struct Waiting {
+    object: rt::handle::Handle<Memory>,
+    pending: Pending,
+    /// The status of the map once it was made: the answer waits for a step of its own.
+    status: Option<Status>,
+}
 
 /// The rights the object of BUFFER must carry.
 const NEEDED: Rights = Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0);
 
 impl Net {
     /// BUFFER: the object the request carries becomes the session's shared
-    /// buffer, mapped for the session's life.
+    /// buffer, mapped for the session's life. The request checks the object and takes an
+    /// entry; the map of its 64 pages (the longest call of the service, about 11 000 ticks
+    /// under -icount) and the reply are a step of their own (`map_waiting`), so that neither
+    /// step comes near the bound.
     pub fn buffer(&mut self, s: &mut Sess, r: &mut Request<'_>) -> Answer {
         let size = match proto_net::read_buffer(r.body()) {
             Ok(size) => size,
@@ -56,53 +67,122 @@ impl Net {
                     && info.pages * virtio_mmio::PAGE as u64 >= BUFFER_SIZE as u64 => {}
             _ => return Answer::Status(code(proto_net::INVALID)),
         }
-        if s.data.buffer.is_some() {
+        // A number whose entry was given back (a map that failed) is no buffer.
+        if s.data
+            .buffer
+            .is_some_and(|i| self.buffers.held_by(usize::from(i), s.label()))
+        {
             return Answer::Status(code(proto_net::EXISTS));
         }
-        let Some(process) = self.process.as_deref() else {
+        if self.process.is_none() {
             return Answer::Status(Status::Kernel(Error::BadState));
-        };
+        }
         let i = match self.buffers.give(s.label()) {
             Ok(i) => i,
             Err(Refusal::Full) => return Answer::Status(Status::Kernel(Error::LimitReached)),
         };
-        let at = dma::buffer_at(self.buffers.address_of(i));
-        match sys::mem_map(
-            process,
-            &object,
-            0,
-            BUFFER_SIZE as u64,
-            at,
-            Access::ReadWrite,
-        ) {
-            Ok(()) => {
-                s.data.buffer = Some(i as u8);
-                // The quota the mappings cost, for the probe's role `B`
-                // (CONFIG prints it).
-                #[cfg(feature = "probe")]
-                match self.buffers.count() {
-                    1 => self.counters.buffers_used[0] = quota_used(process),
-                    64 => self.counters.buffers_used[1] = quota_used(process),
-                    _ => {}
+        let Some(pending) = r.defer() else {
+            self.buffers.free(i);
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        self.buffers.wait(i);
+        s.data.buffer = Some(i as u8);
+        self.waiting[i] = Some(Waiting {
+            object,
+            pending,
+            status: None,
+        });
+        self.buffer_wanted = true;
+        Answer::Deferred
+    }
+
+    /// The step of a BUFFER that waits, one part a step: the map of the first entry whose
+    /// object is not mapped, after the answer of the first whose map was made (the answers go first: with many BUFFERs at once each is answered two steps after its map) (the close of the
+    /// handle and the reply are calls of the kernel of their own, and the map needs the step to
+    /// itself). True when more is to do.
+    pub fn map_waiting(&mut self) -> bool {
+        let part = netd::buffers::next_part(self.waiting_answer(), self.waiting_map());
+        if let Some(Part::Map(i)) = part {
+            let at = dma::buffer_at(self.buffers.address_of(i));
+            let status = match (self.process.as_deref(), self.waiting[i].as_ref()) {
+                (Some(process), Some(w)) => {
+                    match sys::mem_map(
+                        process,
+                        &w.object,
+                        0,
+                        BUFFER_SIZE as u64,
+                        at,
+                        Access::ReadWrite,
+                    ) {
+                        Ok(()) => {
+                            // The quota the mappings cost, for the probe's role `B`
+                            // (CONFIG prints it).
+                            #[cfg(feature = "probe")]
+                            match self.buffers.count() {
+                                1 => self.counters.buffers_used[0] = quota_used(process),
+                                64 => self.counters.buffers_used[1] = quota_used(process),
+                                _ => {}
+                            }
+                            Status::Ok
+                        }
+                        Err(Error::NoMemory | Error::LimitReached) => {
+                            Status::Kernel(Error::LimitReached)
+                        }
+                        Err(other) => Status::Kernel(other),
+                    }
                 }
-                // The mapping keeps the object; the handle goes.
-                drop(object);
-                Answer::Status(Status::Ok)
+                _ => Status::Kernel(Error::BadState),
+            };
+            if let Some(w) = self.waiting[i].as_mut() {
+                w.status = Some(status);
             }
-            Err(error) => {
-                self.buffers.free(i);
-                let error = match error {
-                    Error::NoMemory | Error::LimitReached => Error::LimitReached,
-                    other => other,
-                };
-                Answer::Status(Status::Kernel(error))
-            }
+            return true;
         }
+        let Some(Part::Answer(i)) = part else {
+            return false;
+        };
+        if let Some(Waiting {
+            object,
+            pending,
+            status: Some(status),
+        }) = self.waiting[i].take()
+        {
+            // The mapping keeps the object; the handle goes.
+            drop(object);
+            if status == Status::Ok {
+                self.buffers.mapped(i);
+            } else {
+                self.buffers.free(i);
+            }
+            let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
+        }
+        self.waiting_answer().is_some() || self.waiting_map().is_some()
+    }
+
+    /// The first entry that waits for its map.
+    fn waiting_map(&self) -> Option<usize> {
+        (0..self.waiting.len())
+            .find(|&i| self.waiting[i].as_ref().is_some_and(|w| w.status.is_none()))
+    }
+
+    /// The first entry whose map was made (or refused) and whose BUFFER is not answered.
+    fn waiting_answer(&self) -> Option<usize> {
+        (0..self.waiting.len())
+            .find(|&i| self.waiting[i].as_ref().is_some_and(|w| w.status.is_some()))
     }
 
     /// The buffer of entry `i` is unmapped and its entry freed: one call of
-    /// the kernel. A failure leaves the mapping and frees nothing.
+    /// the kernel (none for an entry whose BUFFER waits for its map: its object goes and its
+    /// BUFFER unanswered). A failure leaves the mapping and frees nothing.
     pub fn unmap_buffer(&mut self, i: usize) -> bool {
+        let made = self.waiting[i]
+            .as_ref()
+            .is_some_and(|w| w.status == Some(Status::Ok));
+        if self.buffers.is_waiting(i) && !made {
+            self.waiting[i] = None;
+            self.buffers.free(i);
+            return true;
+        }
         let Some(process) = self.process.as_deref() else {
             return false;
         };
@@ -116,6 +196,7 @@ impl Net {
             )
         };
         if gone.is_ok() {
+            self.waiting[i] = None;
             self.buffers.free(i);
         }
         gone.is_ok()
@@ -126,6 +207,9 @@ impl Net {
     pub fn drop_buffer(&mut self, s: &mut Sess) {
         if let Some(i) = s.data.buffer.take() {
             let i = usize::from(i);
+            if !self.buffers.held_by(i, s.label()) {
+                return;
+            }
             if !self.unmap_buffer(i) {
                 // A step of departure tries again.
                 self.buffers.retire(i);
@@ -134,15 +218,29 @@ impl Net {
         }
     }
 
-    /// The session went: its buffer waits for a step of departure.
+    /// The session went: its buffer waits for a step of departure (one that waits for its map
+    /// goes at once).
     pub fn retire_buffer(&mut self, s: &mut Sess) -> bool {
-        match s.data.buffer.take() {
-            Some(i) => {
-                self.buffers.retire(usize::from(i));
-                true
-            }
-            None => false,
+        let Some(i) = s.data.buffer.take() else {
+            return false;
+        };
+        let i = usize::from(i);
+        if !self.buffers.held_by(i, s.label()) {
+            return false;
         }
+        if self.unmap_if_waiting(i) {
+            return false;
+        }
+        self.buffers.retire(i);
+        true
+    }
+
+    /// An entry whose BUFFER waits for its map is given back without a call of the kernel.
+    fn unmap_if_waiting(&mut self, i: usize) -> bool {
+        let made = self.waiting[i]
+            .as_ref()
+            .is_some_and(|w| w.status == Some(Status::Ok));
+        self.buffers.is_waiting(i) && !made && self.unmap_buffer(i)
     }
 
     /// One retired buffer is unmapped (a step of departure); true when more wait.
