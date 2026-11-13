@@ -162,31 +162,47 @@ fn local(port: u16) -> SocketAddr {
 /// while the connections it opens stay open together.
 pub(crate) const FORWARD_CONNECT_GAP: Duration = Duration::from_millis(4);
 
-/// `TcpStream::connect_timeout` to a forwarded port, started at least
-/// `FORWARD_CONNECT_GAP` after the previous connect of any thread of this
-/// process ended. The connects of the process take turns (a connect to the
-/// host's own end of a forward ends within a millisecond).
+/// Waits until `FORWARD_CONNECT_GAP` has passed since the last connect to
+/// `address` started (by any thread of the process; each address of a
+/// forward has its own clock, so that boots running side by side in one
+/// process do not delay each other). The wait is the only time a lock is
+/// held: the connect that follows takes none.
+pub(crate) fn pace_forward(address: &SocketAddr) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    type Clock = Arc<Mutex<Option<Instant>>>;
+    static CLOCKS: Mutex<Option<HashMap<SocketAddr, Clock>>> = Mutex::new(None);
+    let clock = CLOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry(*address)
+        .or_default()
+        .clone();
+    let mut last_start = clock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wait) =
+        last_start.and_then(|t| (t + FORWARD_CONNECT_GAP).checked_duration_since(Instant::now()))
+    {
+        std::thread::sleep(wait);
+    }
+    *last_start = Some(Instant::now());
+}
+
+/// `TcpStream::connect_timeout` to a forwarded port after `pace_forward`.
 pub(crate) fn connect_forwarded(
     address: &SocketAddr,
     within: Duration,
 ) -> std::io::Result<TcpStream> {
-    use std::sync::Mutex;
-    static LAST_END: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut last_end = LAST_END.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(wait) =
-        last_end.and_then(|t| (t + FORWARD_CONNECT_GAP).checked_duration_since(Instant::now()))
-    {
-        std::thread::sleep(wait);
-    }
-    let stream = TcpStream::connect_timeout(address, within);
-    *last_end = Some(Instant::now());
-    stream
+    pace_forward(address);
+    TcpStream::connect_timeout(address, within)
 }
 
 /// `get`, giving up after `within` on each step.
 pub fn get_within(address: SocketAddr, within: Duration) -> Result<(Vec<u8>, Duration), String> {
+    pace_forward(&address);
     let started = Instant::now();
-    let mut stream = connect_forwarded(&address, within).map_err(|e| format!("connect: {e}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(within))
         .and_then(|()| stream.set_write_timeout(Some(within)))
@@ -767,6 +783,21 @@ mod tests {
             "{} of {BURST} failed: {failed:?}",
             failed.len()
         );
+    }
+
+    /// Connects to two forwards do not delay each other, and those to one
+    /// forward keep the gap whichever thread makes them.
+    #[test]
+    fn the_gap_is_kept_for_each_address_apart() {
+        let a: SocketAddr = ([127, 0, 0, 1], 40001).into();
+        let b: SocketAddr = ([127, 0, 0, 1], 40002).into();
+        pace_forward(&a);
+        let started = Instant::now();
+        pace_forward(&b);
+        assert!(started.elapsed() < FORWARD_CONNECT_GAP, "b waited for a");
+        let started = Instant::now();
+        pace_forward(&a);
+        assert!(started.elapsed() >= FORWARD_CONNECT_GAP - Duration::from_millis(1));
     }
 
     /// The checks xtask expects are those the program runs, in its order.

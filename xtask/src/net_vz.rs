@@ -277,17 +277,29 @@ fn arp_table(root: bool) -> Option<String> {
 /// the table that `arp` prints to a user leaves out the entries of the
 /// bridge of the virtual network (`arp -n ADDRESS` says "no entry" for them
 /// too) while the kernel holds them: `sudo -n arp -an` lists them. Where
-/// that is not allowed either the step says so and is skipped (the DHCP
+/// that is refused the step says so and is skipped, but a table of root
+/// without the address fails it (the DHCP
 /// service's file, which `lease_is_ours` reads, still binds the address to
 /// the device).
 fn arp_is(address: Ipv4Addr, mac: &str) -> Result<(), String> {
-    let line = [false, true]
-        .into_iter()
-        .filter_map(arp_table)
-        .find_map(|table| arp_line(&table, address));
+    let mut read_any = false;
+    let mut line = None;
+    for root in [false, true] {
+        if let Some(table) = arp_table(root) {
+            // A user's table without the address may be the table the user
+            // is shown; only a table of root settles that it is missing.
+            read_any |= root;
+            line = line.or_else(|| arp_line(&table, address));
+        }
+    }
     let Some(line) = line else {
+        if read_any {
+            return Err(format!(
+                "arp has no entry for {address} in the table of `sudo -n arp -an`"
+            ));
+        }
         println!(
-            "net-vz: arp: no entry for {address} in the table of this user or of `sudo -n arp -an`; skipped"
+            "net-vz: arp: the table of this user does not list {address} and `sudo -n arp -an` is refused; check skipped"
         );
         return Ok(());
     };
