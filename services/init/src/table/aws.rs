@@ -270,18 +270,26 @@ const fn named(table: &[Record], name: &str) -> Record {
 
 const DIALOG: &[Record] = super::ramfs::BUSYBOX_DIALOG_TABLE;
 
+/// The launcher of the shell with a session with the network service: the shell and its
+/// commands get the same (the launcher's connections are the shell's), and the quota of a
+/// command that links OpenSSL. No entropy service on EC2: the launcher does not name it.
+const LAUNCHER: Record = Record {
+    connects: &["ramfs", "tty", "pipe", "clock", "posix", super::NET_SERVICE],
+    quota: super::net::NET_COMMAND_QUOTA,
+    ..named(DIALOG, "busybox-probe")
+};
+
 pub const TABLE: &[Record] = &[
     CONSOLE,
     named(DIALOG, "ramfs"),
-    named(DIALOG, "posix"),
+    // The process service with the pool of the shell's image with the network: `httpd` forks
+    // a child for each connection.
+    super::net::NET_PROCESS_SERVICE,
     // No PL031 on EC2: the clock starts at the time the image was built.
     named(super::ramfs::POSIX_ABI_TABLE, "clock"),
     named(DIALOG, "pipe"),
     // The image of this table has no entropy service.
-    Record {
-        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
-        ..named(DIALOG, "busybox-probe")
-    },
+    LAUNCHER,
     named(DIALOG, "tty"),
     NET,
 ];
@@ -333,9 +341,15 @@ mod tests {
     }
 
     #[test]
-    fn no_record_connects_to_net_or_entropy_and_only_net_has_pci_windows() {
+    fn only_the_launcher_connects_to_net_none_to_entropy_and_only_net_has_pci_windows() {
         for r in TABLE {
-            assert!(!r.connects.contains(&"net") && !r.connects.contains(&"entropy"));
+            assert!(!r.connects.contains(&"entropy"));
+            assert_eq!(
+                r.connects.contains(&"net"),
+                r.name == "busybox-probe",
+                "{}",
+                r.name
+            );
             if r.name == "net" {
                 assert!(r.windows.iter().all(|w| w.at != At::Fixed));
             } else {

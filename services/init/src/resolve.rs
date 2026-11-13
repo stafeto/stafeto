@@ -22,6 +22,9 @@ pub const MAX_WINDOWS: usize = 24;
 pub const MAX_BINDINGS: usize = 24;
 /// The records an optional rule may leave out of a table at most.
 pub const MAX_SKIPPED: usize = 4;
+/// The names of services the records that remain keep in their lists of
+/// connections after the records that were left out are taken off them.
+pub const MAX_NAMES: usize = 64;
 
 /// What the platform gives the walk: the ECAM of the MCFG, the last bus
 /// init walks (the buses of the firmware's numbering that hold functions;
@@ -113,6 +116,7 @@ pub struct Store {
     pub records: [Record; MAX_RECORDS],
     pub windows: [Window; MAX_WINDOWS],
     pub bindings: [Binding; MAX_BINDINGS],
+    pub names: [&'static str; MAX_NAMES],
 }
 
 impl Store {
@@ -120,6 +124,7 @@ impl Store {
         records: [Record::EMPTY; MAX_RECORDS],
         windows: [Window::fixed("", 0, 0, false); MAX_WINDOWS],
         bindings: [Binding::msi("", 0, 0); MAX_BINDINGS],
+        names: [""; MAX_NAMES],
     };
 }
 
@@ -175,6 +180,7 @@ pub fn resolve(
         records,
         windows,
         bindings,
+        names,
     } = store;
     let (mut r_at, mut w_at, mut b_at) = (0, 0, 0);
     let mut ranges = [(0, 0, 0, 0); MAX_RECORDS];
@@ -206,12 +212,37 @@ pub fn resolve(
             Err(refusal) => return Err(refusal),
         }
     }
+    // A record that connects to a service that was left out would make the table whole
+    // no more: its list of connections goes on without that name.
+    let mut name_ranges: [Option<(usize, usize)>; MAX_RECORDS] = [None; MAX_RECORDS];
+    if left_out > 0 {
+        let gone = |name: &str| skipped.iter().flatten().any(|s| s.record == name);
+        let mut at = 0;
+        for (record, range) in records.iter().zip(name_ranges.iter_mut()).take(r_at) {
+            if record.connects.iter().any(|c| gone(c)) {
+                let from = at;
+                for c in record.connects.iter().filter(|c| !gone(c)) {
+                    if let Some(slot) = names.get_mut(at) {
+                        *slot = c;
+                        at += 1;
+                    }
+                }
+                *range = Some((from, at));
+            }
+        }
+    }
     // The buffers are done with: from here they are shared and live on.
+    let names: &'static [&'static str] = names;
     let windows: &'static [Window] = windows;
     let bindings: &'static [Binding] = bindings;
-    for (record, (w_from, w_to, b_from, b_to)) in records.iter_mut().zip(ranges) {
+    for (record, ((w_from, w_to, b_from, b_to), n_range)) in
+        records.iter_mut().zip(ranges.into_iter().zip(name_ranges))
+    {
         record.windows = &windows[w_from..w_to];
         record.bindings = &bindings[b_from..b_to];
+        if let Some((from, to)) = n_range {
+            record.connects = &names[from..to];
+        }
     }
     let records: &'static [Record] = records;
     Ok(Resolved {
@@ -721,6 +752,45 @@ mod tests {
             }
         );
         assert!(config.log.is_empty());
+    }
+
+    #[test]
+    fn a_record_that_connects_to_a_service_left_out_goes_on_without_that_name() {
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x1000,
+            At::Bar {
+                id: 0x1d0f_ffff,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        let t = [
+            record("optional", w, &[]),
+            Record {
+                connects: &["a", "optional", "b"],
+                ..record("one", &[], &[])
+            },
+            Record {
+                connects: &["optional"],
+                ..record("only", &[], &[])
+            },
+            Record {
+                connects: &["a"],
+                ..record("clean", &[], &[])
+            },
+        ];
+        let found = resolve_one(&t, &mut t4g()).unwrap();
+        let connects: Vec<_> = found.table.iter().map(|r| (r.name, r.connects)).collect();
+        assert_eq!(
+            connects,
+            [
+                ("one", &["a", "b"][..]),
+                ("only", &[][..]),
+                ("clean", &["a"][..])
+            ]
+        );
     }
 
     #[test]

@@ -195,7 +195,12 @@ impl EnaSwitch {
         if again {
             return true;
         }
-        self.arm(SAFETY_NS);
+        let after = if svc::POLL_FALLBACK.load(Ordering::Relaxed) {
+            POLL_NS
+        } else {
+            SAFETY_NS
+        };
+        self.arm(after);
         false
     }
 

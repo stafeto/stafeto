@@ -76,8 +76,13 @@ const _: () = assert!(
         <= (netd::choose::BOUND / 4) as u32
 );
 const _: () = assert!(ena::io::IO_STORES / 4 <= ena::device::RESET_ZERO_STORES);
+/// How long the mapping of an event may take before the table is programmed anyway.
+const MAPPED_LIMIT_NS: u64 = 2_000_000_000;
 /// The longest the bring-up may take before the service gives up.
 const BRINGUP_LIMIT_NS: u64 = 20_000_000_000;
+/// The keep-alives (one a second) after which a device with vectors and no interrupt is
+/// rebuilt.
+const SILENCE_KEEPALIVES: u64 = 6;
 /// The code the service ends with when the device cannot be recovered (three failed resets
 /// in a minute); init stops the device and starts the service again.
 const FAILED: u64 = 8;
@@ -94,6 +99,9 @@ const ADMIN_BIT: u64 = 1;
 pub static IO_EPOCH: AtomicU32 = AtomicU32::new(1);
 static INFO: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
 static RESET_ASK: AtomicBool = AtomicBool::new(false);
+/// No interrupt came although the device has vectors, even after a rebuild: the switch thread
+/// looks at the queue every 500 us where it looked every 100 ms (the data path works, by polling).
+pub static POLL_FALLBACK: AtomicBool = AtomicBool::new(false);
 pub static SWITCH_RAW: AtomicU64 = AtomicU64::new(0);
 static ADMIN_RAW: AtomicU64 = AtomicU64::new(0);
 
@@ -280,6 +288,68 @@ fn msi_plan(irq: &[Option<Handle<Interrupt>>; 2]) -> ([Option<(u64, u32)>; 2], O
     (messages, Some(msix.at))
 }
 
+/// Waits (at most `MAPPED_LIMIT_NS`, with a heartbeat on the way) until the ITS has run the
+/// commands of each binding's event: `irq_ack` says `WOULD_BLOCK` until it has. A message the
+/// device writes before that is lost, so the table is programmed after it, not before.
+fn wait_mapped(
+    irq: &[Option<Handle<Interrupt>>; 2],
+    parent: &Handle<Channel>,
+    channel: &Handle<Channel>,
+    timer: &Handle<Timer>,
+) {
+    let began = time::ticks_to_ns(time::now());
+    for (v, binding) in irq.iter().enumerate() {
+        let Some(binding) = binding else {
+            continue;
+        };
+        let mut waits = 0u32;
+        while let Err(abi::Error::WouldBlock) = sys::irq_ack(binding) {
+            let now = time::ticks_to_ns(time::now());
+            if now - began > MAPPED_LIMIT_NS {
+                rt::println!("ena: the mapping of vector {v} is not done after 2 s");
+                return;
+            }
+            waits += 1;
+            heartbeat(parent);
+            let _ = sys::timer_set(timer, now + BRINGUP_TICK_NS);
+            let _ = sys::receive(channel);
+        }
+        if waits > 0 {
+            rt::println!("ena: vector {v} mapped after {waits} waits");
+        }
+    }
+}
+
+/// What the function and the bindings say of the vectors once the device is up, for the
+/// console: the capability's first word, the table entries and the bindings' LPIs.
+fn say_msix(hw: &Hw, irq: &[Option<Handle<Interrupt>>; 2]) {
+    let Some(at) = hw.msix_at else {
+        return;
+    };
+    // SAFETY: the page of the function is mapped at ECAM_AT as device memory (`run`); `at` is
+    // the MSI-X capability the walk found.
+    let head = unsafe { rt::mmio::read32(ECAM_AT + at) };
+    let command = unsafe { rt::mmio::read32(ECAM_AT + 4) };
+    rt::println!("ena: msix cap {head:#x} command {command:#x}");
+    for v in 0..2u32 {
+        let base = MSIX_TABLE_OFFSET + 16 * v;
+        let words = [0, 4, 8, 12].map(|o| hw.bar.read32(base + o));
+        let lpi = irq[v as usize]
+            .as_ref()
+            .and_then(|b| sys::irq_info(b).ok())
+            .map_or((0, 0), |i| (i.lpi_number, i.cpu));
+        rt::println!(
+            "ena: msix vector {v} {:#x} {:#x} {:#x} {:#x}; lpi {} cpu {}",
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            lpi.0,
+            lpi.1
+        );
+    }
+}
+
 /// Runs the admin side until the device is up; false when it failed or took too long.
 fn bring_up(
     ena: &mut Ena<Hw>,
@@ -318,6 +388,9 @@ struct Admin {
     deadline: u64,
     stats_at: u64,
     stats_count: u32,
+    /// The device has vectors, and a rebuild for silence was tried (once).
+    msi: bool,
+    silent_tried: bool,
     /// The probe's deliberate break: after the first start the head of the event queue is
     /// not written back, until the reset it causes.
     #[cfg(feature = "ena-break-aenq")]
@@ -377,7 +450,36 @@ impl Admin {
                 sys::process_exit(FAILED);
             }
         }
+        self.check_silence();
         self.say_stats();
+    }
+
+    /// The device has vectors, has said keep-alives for a while and no interrupt came: the
+    /// table is written again by a rebuild, once (the messages the device wrote before the ITS
+    /// had mapped the events were lost; a later pair works).
+    fn check_silence(&mut self) {
+        if !self.msi || !self.ena.is_up() {
+            return;
+        }
+        let heard = STATS.irq[0].load(Ordering::Relaxed) + STATS.irq[1].load(Ordering::Relaxed);
+        if self.silent_tried {
+            // Still silent after the rebuild: poll quickly from now on.
+            if heard == 0
+                && self.ena.keep_alive().count >= 2 * SILENCE_KEEPALIVES
+                && !POLL_FALLBACK.swap(true, Ordering::AcqRel)
+            {
+                rt::println!("ena: still no interrupt: the queue is polled every 500 us");
+            }
+            return;
+        }
+        if heard == 0 && self.ena.keep_alive().count >= SILENCE_KEEPALIVES {
+            self.silent_tried = true;
+            rt::println!(
+                "ena: no interrupt after {} keep-alives: the device is rebuilt once",
+                SILENCE_KEEPALIVES
+            );
+            self.ena.request_reset(ena::regs::RESET_NORMAL);
+        }
     }
 
     /// The counters of the data path, every 10 s for three minutes and then every minute.
@@ -524,6 +626,10 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // it started this instance.
     let revision = unsafe { rt::mmio::read32(ECAM_AT + 8) } as u8;
     let (messages, msix_at) = msi_plan(&irq);
+    let msi = msix_at.is_some();
+    if msix_at.is_some() {
+        wait_mapped(&irq, &s.parent, &admin_channel, &admin_timer);
+    }
     let hw = Hw {
         bar: {
             // SAFETY: BAR 0 is mapped at BAR_AT for 4 pages (the window of init's table).
@@ -571,6 +677,9 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         rt::println!("ena: break: the event head is held");
     }
     let mac = ena.info().mac;
+    if msix_at.is_some() {
+        say_msix(&hw, &irq);
+    }
     rt::println!(
         "net: ena mac {}, link {}",
         netd::lines::Mac(mac),
@@ -644,7 +753,6 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // The switch thread: the wire over the pair, whose first epoch is odd (down) until the
     // admin side's `Up` of this bring-up has been seen (it was: the epoch is even already).
     let wire = Wire::new(hw, region, bufs);
-    let msi = msix_at.is_some();
     let Some(switch) = EnaSwitch::new(wire, switch_channel, irq, msi, level + 1) else {
         return NOT_STARTED;
     };
@@ -691,6 +799,8 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // The first thread is the admin thread from here on.
     let admin = Admin {
         ena,
+        msi,
+        silent_tried: false,
         channel: admin_channel,
         timer: admin_timer,
         deadline: 0,
