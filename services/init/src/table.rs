@@ -1330,6 +1330,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-random-net") as usize
+    + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
@@ -1413,6 +1414,7 @@ const _: () = assert!(
     feature = "table-input",
     feature = "table-posix-random",
     feature = "table-posix-random-net",
+    feature = "table-posix-random-net2",
     feature = "table-posix-display",
     feature = "table-display",
     feature = "table-fstack-probe",
@@ -1559,6 +1561,8 @@ pub const TABLE: &[Record] = input::TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 #[cfg(feature = "table-posix-random-net")]
 pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
+#[cfg(feature = "table-posix-random-net2")]
+pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 #[cfg(feature = "table-display")]
@@ -3048,6 +3052,7 @@ mod tests {
             ramfs::TTY_STEPS_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             net::POSIX_RANDOM_NET_TABLE,
+            net::POSIX_RANDOM_NET2_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
             ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,

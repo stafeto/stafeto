@@ -204,7 +204,9 @@ fn main(_: u64) -> u64 {
     };
     match registrar {
         Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
-        _ => rt::println!("entropy: no thread to register the root; set-ID starts will wait"),
+        _ => rt::println!(
+            "entropy: no thread to register the root; set-ID starts are refused until it is registered"
+        ),
     }
     let mut service = Entropy {
         source: Source::new(),

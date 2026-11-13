@@ -703,6 +703,22 @@ pub const POSIX_RANDOM_NET_TABLE: &[Record] = &[
     NETD_QEMU,
 ];
 
+/// The same for the role `net2` (`cargo xtask posix-random-net-two`): the service runs two stack
+/// instances on two CPUs, and the probe's process is homed on the second.
+pub const POSIX_RANDOM_NET2_TABLE: &[Record] = &[
+    POSIX_RANDOM_NET_TABLE[0],
+    POSIX_RANDOM_NET_TABLE[1],
+    POSIX_RANDOM_NET_TABLE[2],
+    POSIX_RANDOM_NET_TABLE[3],
+    POSIX_RANDOM_NET_TABLE[4],
+    POSIX_RANDOM_NET_TABLE[5],
+    Record {
+        args: b"posix-random\0net2\0",
+        ..POSIX_RANDOM_NET_TABLE[6]
+    },
+    POSIX_RANDOM_NET_TABLE[7],
+];
+
 /// The image of the shell with both network devices on QEMU (`cargo xtask
 /// fast-probe`): a program of the shell claims the second (spec 6, 3.9).
 pub const NET_TWO_TABLE: &[Record] = &[

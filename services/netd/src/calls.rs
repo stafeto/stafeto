@@ -2131,14 +2131,21 @@ impl Net {
         answer
     }
 
-    /// VERIFY_SESSION through the root session: the offered channel comes back
-    /// when it is a live session of a client of the service, with the
-    /// descriptions it holds; any other gets a new session with none, and the
-    /// offered channel is let go of with no request sent through it. Every step
-    /// is O(1): the label check, and the same work as HOME_MAKE for the new
-    /// session.
-    pub fn verify_session(&mut self, s: &mut Sess, r: &mut Request<'_>) -> Answer {
-        if s.label() != proto_net::ROOT {
+    /// VERIFY_SESSION through the root session (or, from the first instance to
+    /// the home of a session, `HOME_LABEL`): the offered channel comes back when
+    /// it is a live session of a client of this instance, with the descriptions
+    /// it holds. Any other goes to `elsewhere`, which may know it for a session
+    /// of another instance and answers for it (the first instance forwards it
+    /// there); when it does not, the offered channel is let go of with no
+    /// request sent through it and a new session with no descriptions takes its
+    /// place. Every step is O(1).
+    pub fn verify_session(
+        &mut self,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        elsewhere: impl FnOnce(Handle<Channel>, &mut Request<'_>) -> Result<Answer, Handle<Channel>>,
+    ) -> Answer {
+        if s.label() != proto_net::ROOT && s.label() != HOME_LABEL {
             return refuse(proto_net::NOT_ALLOWED);
         }
         if r.body().finish().is_err() || r.handles.len() != 1 {
@@ -2158,8 +2165,13 @@ impl Net {
                 Err(status) => Answer::Status(status),
             };
         }
-        drop(offered);
-        self.empty_session(s, r, proto_net::ROOT, false)
+        match elsewhere(offered, r) {
+            Ok(answer) => answer,
+            Err(offered) => {
+                drop(offered);
+                self.empty_session(s, r, proto_net::ROOT, false)
+            }
+        }
     }
 
     /// A new session of `root` with no descriptions, counted with the root's

@@ -190,6 +190,8 @@ table-input = []
 table-posix-random = []
 # The same with the network service (xtask posix-random-net).
 table-posix-random-net = []
+# The same with two stack instances of the network service (xtask posix-random-net-two).
+table-posix-random-net2 = []
 # The C probe of the display service's place in a process (xtask posix-display).
 table-posix-display = []
 # The C probe of the screen and the keys on libc.so (xtask display-probe).

@@ -27,7 +27,6 @@ use proto_pipe::sock::{
     Addr, PASS, PASSES_MAX, PASSES_PER_MESSAGE, Received, Recv, SEND_MAX, Send,
 };
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
-use proto_process::retry::{Attempt, Retry};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long, watch};
 use rt::abi::{Error, ObjectKind, Rights, Source};
@@ -208,14 +207,34 @@ fn main(_: u64) -> u64 {
         step_told: false,
         step_due: false,
         files_notify: None,
-        root: Retry::new(),
     };
-    // The root of the service goes to the process service with the PIPE
-    // mark of the notary session, for the loaders to verify the Pipes
-    // session of a set-ID program with: at every start, so that an instance
-    // after a restart replaces the root of the one that went. A registration
-    // that fails is tried again from the loop (`keep_root`).
-    service.keep_root();
+    // The root of the service goes to the process service with the PIPE mark of the notary
+    // session, for the loaders to verify the Pipes session of a set-ID program with: at every
+    // start, so that an instance after a restart replaces the root of the one that went. A
+    // thread of its own makes it and tries again until it succeeds (`rt::roots::keep`), so a
+    // process service that is late or refuses never holds a request of this loop.
+    PARENT.store(start.parent.raw().0, Ordering::Release);
+    CHANNEL.store(channel.raw().0, Ordering::Release);
+    LEVEL.store(u64::from(level), Ordering::Release);
+    // SAFETY: REGISTRAR is the registrar's alone, and the page after the main thread's message
+    // buffer is free.
+    let registrar = unsafe {
+        sys::thread_create(
+            &start.process,
+            register_root,
+            REGISTRAR.top(),
+            0,
+            level,
+            rt::abi::Policy::Fifo,
+            REGISTRAR_BUFFER,
+        )
+    };
+    match registrar {
+        Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
+        _ => rt::println!(
+            "pipe: no thread to register the root; set-ID starts are refused until it is registered"
+        ),
+    }
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(4);
@@ -265,55 +284,22 @@ struct PipeService {
     /// A copy of the file service's channel with NOTIFY alone, which its
     /// first BROKER_JOBS brought: told of a job nobody asked it for.
     files_notify: Option<Handle<Channel>>,
-    /// Whether the root is registered with the process service, and when a
-    /// registration that failed is tried again.
-    root: Retry,
 }
 
-impl PipeService {
-    /// Registers the root with the process service (Register with the PIPE
-    /// mark through the notary session) when it is not registered and the
-    /// pause after the last failure has passed: at the start, and after that
-    /// at the loop's notifications (the heartbeat's too), so that a service
-    /// whose start-time registration failed does not stay without a root.
-    /// The failures are told at the first and then at every second one.
-    fn keep_root(&mut self) {
-        if self.root.is_done() {
-            return;
-        }
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        if !self.root.due(now) {
-            return;
-        }
-        if self.notary.is_none() {
-            match rt::roots::notary(&self.parent) {
-                rt::roots::Notary::Session(notary) => self.notary = Some(notary),
-                // No process service in the image: nothing to register with.
-                rt::roots::Notary::Absent => {
-                    self.root.stop();
-                    return;
-                }
-                rt::roots::Notary::Failed => {}
-            }
-        }
-        let registered = self.notary.as_ref().is_some_and(|notary| {
-            rt::roots::register(notary, &self.channel, proto_pipe::ROOT, self.level).is_ok()
-        });
-        match self.root.record(now, registered) {
-            Attempt::Registered { failures } if failures > 0 => {
-                rt::println!("pipe: root registered after {failures} failed attempts");
-            }
-            Attempt::Failed {
-                count,
-                wait_ns,
-                report: true,
-            } => rt::println!(
-                "pipe: registering the root failed ({count} so far), trying again in {} s",
-                wait_ns / 1_000_000_000
-            ),
-            _ => {}
-        }
-    }
+/// The registrar thread: the connection to init, the loop's channel and its level, which the
+/// root is made from, and the thread's stack and message buffer (the page after the main
+/// thread's).
+static PARENT: AtomicU64 = AtomicU64::new(0);
+static CHANNEL: AtomicU64 = AtomicU64::new(0);
+static LEVEL: AtomicU64 = AtomicU64::new(1);
+static REGISTRAR: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+const REGISTRAR_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+
+extern "C" fn register_root(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)));
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(CHANNEL.load(Ordering::Acquire)));
+    let level = LEVEL.load(Ordering::Acquire) as u8;
+    rt::roots::keep(&parent, &channel, proto_pipe::ROOT, level, "pipe")
 }
 
 /// Where the service maps the process service's page of the credentials
@@ -1959,10 +1945,6 @@ impl Service<0> for PipeService {
         {
             self.kick();
         }
-    }
-
-    fn maintenance(&mut self, _: &mut [Option<Session<Client, 0>>], _: Notice) {
-        self.keep_root();
     }
 
     /// The step of the descriptions that sessions which went let go of

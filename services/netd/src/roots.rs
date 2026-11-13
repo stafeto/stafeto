@@ -55,7 +55,9 @@ pub fn start(
     };
     match thread {
         Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
-        _ => rt::println!("net: no thread to register the root; set-ID starts will wait"),
+        _ => rt::println!(
+            "net: no thread to register the root; set-ID starts are refused until it is registered"
+        ),
     }
 }
 

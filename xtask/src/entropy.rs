@@ -380,10 +380,13 @@ pub fn random_steps() -> Result<(), String> {
 }
 
 /// The probe's image with the network service, and with its steps counted.
-const fn random_net_programs(netd: &'static [&'static str]) -> [ImageProgram; 10] {
+const fn random_net_programs(
+    table: &'static [&'static str],
+    netd: &'static [&'static str],
+) -> [ImageProgram; 10] {
     let base = random_programs(&[]);
     [
-        ("init", "init", INIT_STACK_SIZE, &["table-posix-random-net"]),
+        ("init", "init", INIT_STACK_SIZE, table),
         base[1],
         base[2],
         base[3],
@@ -395,14 +398,28 @@ const fn random_net_programs(netd: &'static [&'static str]) -> [ImageProgram; 10
         ("netd", "netd", crate::net_probe::NETD_STACK_SIZE, netd),
     ]
 }
-static RANDOM_NET_PROGRAMS: [ImageProgram; 10] = random_net_programs(&[]);
-static RANDOM_NET_PROGRAMS_STEPS: [ImageProgram; 10] = random_net_programs(&["steps"]);
+static RANDOM_NET_PROGRAMS: [ImageProgram; 10] =
+    random_net_programs(&["table-posix-random-net"], &[]);
+static RANDOM_NET_PROGRAMS_STEPS: [ImageProgram; 10] =
+    random_net_programs(&["table-posix-random-net"], &["steps"]);
+/// With two stack instances of the service (the image runs on two CPUs).
+static RANDOM_NET2_PROGRAMS: [ImageProgram; 10] =
+    random_net_programs(&["table-posix-random-net2"], &["instances-2"]);
+static RANDOM_NET2_PROGRAMS_STEPS: [ImageProgram; 10] =
+    random_net_programs(&["table-posix-random-net2"], &["instances-2", "steps"]);
 
 /// The lines of the C probe's role `net`, each a check that passed.
 const RANDOM_NET_LINES: [&str; 3] = [
     "posix-random: a set-ID program takes its net session from the service, and a forged one gets no request",
     "posix-random: a set-ID program keeps the socket it inherited with its net session",
     "posix-random: net ok",
+];
+
+/// The lines of the role `net2`.
+const RANDOM_NET2_LINES: [&str; 3] = [
+    "posix-random: the net session is homed on the second instance (CPU 1)",
+    "posix-random: a set-ID program keeps a socket of a session homed on the second instance",
+    "posix-random: net2 ok",
 ];
 
 /// The tag of the network service's lines of steps, and the kind of VerifySession.
@@ -415,24 +432,51 @@ const NETD_VERIFY_KIND: usize = 43;
 /// its steps: VerifySession (kind 43) and every other kind stay under the bound
 /// (`net_probe::STEP_MAX`), and the kinds above the margin are named.
 pub fn random_net(steps: bool) -> Result<(), String> {
+    random_net_run(steps, false)
+}
+
+/// `cargo xtask posix-random-net-two`: the same with two stack instances of the network
+/// service on two CPUs (role `net2`): the probe's process is homed on the second instance, and
+/// the set-ID program it starts keeps the socket it inherits, which the first instance's check
+/// forwards to the instance that holds it. With `steps` under -icount, naming the VerifySession
+/// steps of both instances.
+pub fn random_net_two(steps: bool) -> Result<(), String> {
+    qemu::on_cpus(2, || random_net_run(steps, true))
+}
+
+fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let programs: &[ImageProgram] = if steps {
-        &RANDOM_NET_PROGRAMS_STEPS
-    } else {
-        &RANDOM_NET_PROGRAMS
+    let programs: &[ImageProgram] = match (two, steps) {
+        (false, false) => &RANDOM_NET_PROGRAMS,
+        (false, true) => &RANDOM_NET_PROGRAMS_STEPS,
+        (true, false) => &RANDOM_NET2_PROGRAMS,
+        (true, true) => &RANDOM_NET2_PROGRAMS_STEPS,
     };
-    let image = build_boot_image("boot-posix-random-net.img", programs, BOOT_PROFILE)?;
+    let name = if two {
+        "boot-posix-random-net2.img"
+    } else {
+        "boot-posix-random-net.img"
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
-    if steps {
+    // Under -icount the counter holds the instructions of all the CPUs, so a step of one
+    // instance of two comes out in millions: the steps of two instances are read on the
+    // generic timer (the host's noise is in them).
+    if steps && !two {
         cmd.args(qemu::ICOUNT);
     }
     const ENDS: &str = "init: posix-random ended: ";
     let timeout = crate::BOOT_TIMEOUT * if steps { 20 } else { 2 };
     let output = run_until(cmd, timeout, Some(ENDS), &kernel.elf)?;
-    for line in RANDOM_NET_LINES {
+    let lines: &[&str] = if two {
+        &RANDOM_NET2_LINES
+    } else {
+        &RANDOM_NET_LINES
+    };
+    for line in lines {
         qemu::expect_marker(&output, line)?;
     }
     qemu::expect_stopped_on(
@@ -460,17 +504,32 @@ pub fn random_net(steps: bool) -> Result<(), String> {
             crate::net_probe::STEP_MARGIN,
             crate::net_probe::STEP_MAX
         );
-        if let Some(row) = rows.iter().find(|r| r.1 > crate::net_probe::STEP_MAX) {
+        if two {
+            let all: Vec<_> = output
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("service step: 14 kind 43 "))
+                .map(|l| l.split_whitespace().nth(5).unwrap_or("?"))
+                .collect();
+            println!(
+                "net service VerifySession steps of both instances, in order of the new longest: {all:?}"
+            );
+        }
+        // The timer's ticks of the two-CPU run are no instruction counts: no bound applies.
+        if two {
+            println!("posix-random-net-two: step ticks are the generic timer's, no bound applies");
+        } else if let Some(row) = rows.iter().find(|r| r.1 > crate::net_probe::STEP_MAX) {
             return Err(format!(
                 "the network service: a step past the bound: {row:?}"
             ));
         }
-        if verify.1 > crate::net_probe::STEP_MARGIN {
+        if !two && verify.1 > crate::net_probe::STEP_MARGIN {
             return Err(format!("VerifySession: a step past the margin: {verify:?}"));
         }
     }
     println!(
-        "posix-random-net: a set-ID program takes its net session from the service, keeps an inherited socket: ok"
+        "posix-random-net{}: a set-ID program takes its net session from the service, keeps an inherited socket: ok",
+        if two { "-two" } else { "" }
     );
     Ok(())
 }

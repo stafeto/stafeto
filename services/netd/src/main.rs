@@ -777,6 +777,7 @@ fn main(_: u64) -> u64 {
         } else {
             held_channels[k].as_ref().expect("made")
         };
+        INSTANCE_CHANNELS[k].store(channel_k.raw().0, core::sync::atomic::Ordering::Release);
         *launch = Some(instance::Launch {
             driver,
             channel: channel_k,
@@ -2445,7 +2446,17 @@ impl Driver<'_> {
         let method = r.method();
         // VERIFY_SESSION goes through the root alone, and the root has no
         // other request.
-        if (r.label() == proto_net::ROOT) != (method == Method::VerifySession.number()) {
+        // The first instance sends it to the home of a session (`HOME_LABEL`), as it sends
+        // HOME_MAKE.
+        let verify = method == Method::VerifySession.number();
+        let allowed = if r.label() == proto_net::ROOT {
+            verify
+        } else if verify {
+            r.label() == calls::HOME_LABEL
+        } else {
+            true
+        };
+        if !allowed {
             return Answer::Status(code(proto_net::NOT_ALLOWED));
         }
         trace::point(P_N_REQ_BEGIN, u32::from(method));
@@ -2454,7 +2465,12 @@ impl Driver<'_> {
         let answer = match Method::from_number(r.method()) {
             Some(Method::Home) => self.home(s, r),
             Some(Method::HomeMake) => self.inst.net.home_make(s, r),
-            Some(Method::VerifySession) => self.inst.net.verify_session(s, r),
+            Some(Method::VerifySession) => {
+                let (homes, instances) = (&self.homes, self.instances);
+                self.inst.net.verify_session(s, r, |offered, r| {
+                    forward_verify(homes, instances, offered, r)
+                })
+            }
             Some(Method::Config) => self.config(r),
             #[cfg(feature = "probe")]
             Some(Method::Ping) => self.ping(r, stack::ECHO_DATA),
@@ -2687,6 +2703,50 @@ impl Service<0> for Driver<'_> {
         self.handle_notification(n);
         self.end_item();
     }
+}
+
+/// The channels of the instances, by number, for the first instance to tell whose session a
+/// channel is (`copy_label` needs the channel itself); they live as long as the service.
+static INSTANCE_CHANNELS: [core::sync::atomic::AtomicU64; MAX_INSTANCES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_INSTANCES];
+
+/// VERIFY_SESSION of a channel that is no session of the first instance: when it is a copy of
+/// the channel of another instance (a process homed there), the first instance sends it on to
+/// that instance through the handle it asks that instance for sessions with (HOME_MAKE's
+/// direction: the instance after the first never calls the first), which checks it against its
+/// own clones and answers; the reply is passed on. Any other channel comes back, for the caller
+/// to replace.
+fn forward_verify(
+    homes: &[Option<Handle<Channel>>; MAX_INSTANCES],
+    instances: usize,
+    offered: Handle<Channel>,
+    r: &mut Request<'_>,
+) -> Result<Answer, Handle<Channel>> {
+    for k in 1..instances.min(MAX_INSTANCES) {
+        let Some(home) = homes[k].as_ref() else {
+            continue;
+        };
+        let channel = Handle::<Channel>::borrowed(abi::Handle(
+            INSTANCE_CHANNELS[k].load(core::sync::atomic::Ordering::Acquire),
+        ));
+        if sys::copy_label(&channel, &offered).is_err() {
+            continue;
+        }
+        let request = Method::VerifySession.header().bytes();
+        let mut reply = match sys::send_handles(home, &request, [offered.erase()]) {
+            Ok(reply) => reply,
+            Err(refused) => return Ok(Answer::Status(Status::Kernel(refused.error))),
+        };
+        let mut buffer = [0; abi::MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return Ok(Answer::Status(Status::Kernel(abi::Error::BadState)));
+        }
+        return match (reply.handles.take::<Channel>(0), r.reply().u32(0)) {
+            (Ok(session), Ok(())) => Ok(Answer::Reply([session.erase()].into())),
+            _ => Ok(Answer::Status(Status::BadSize)),
+        };
+    }
+    Err(offered)
 }
 
 /// CRASH: a load from page 0 ends the service with a fault while the

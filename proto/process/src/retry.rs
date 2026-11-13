@@ -66,12 +66,6 @@ impl Retry {
         self.failures
     }
 
-    /// There is nothing to register with (the image has no process service):
-    /// no attempt is due any more.
-    pub fn stop(&mut self) {
-        self.done = true;
-    }
-
     /// Whether an attempt is due at `now_ns`: the root is not registered and
     /// the pause after the last failure has passed.
     pub const fn due(&self, now_ns: u64) -> bool {
@@ -145,16 +139,6 @@ mod tests {
         // The first try succeeding is no failure.
         let mut first = Retry::new();
         assert_eq!(first.record(0, true), Attempt::Registered { failures: 0 });
-    }
-
-    #[test]
-    fn a_registration_with_nothing_to_register_with_stops() {
-        let mut retry = Retry::new();
-        retry.record(0, false);
-        assert!(retry.due(u64::MAX));
-        retry.stop();
-        assert!(retry.is_done());
-        assert!(!retry.due(u64::MAX));
     }
 
     #[test]

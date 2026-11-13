@@ -23,10 +23,12 @@
  * own: the child forgot the parent's key and buffer.
  */
 
+#define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -573,21 +575,10 @@ static int net_inherit_role(const char *number) {
     return loopback_exchange();
 }
 
-/* A set-ID program takes its Net session only from the network service. The control: a program
- * that is not set-ID takes the forged channel, and its socket() reaches it. The set-ID program
- * gets a session of the service in its place: a stream over the loopback works, and the forged
- * service gets no request. A set-ID program that inherits a socket of its parent keeps it: the
- * genuine session of the parent passes the check with the descriptions it holds. */
-static int net_run(void) {
+/* The parent opens a stream over the loopback, and a set-ID program it starts keeps the accepted
+ * end it inherits: it sends a byte through it, and the parent receives that byte. */
+static int inherit_check(void) {
     int status = 0;
-    unsigned requests = 0;
-    CHECK(forged_run("/bin/posix-random", "forgednet", 7, &status, &requests) == 0);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    CHECK(requests != 0);
-    CHECK(forged_run("/bin/posix-random-suid", "setidnet", 7, &status, &requests) == 0);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    CHECK(requests == 0);
-    printf("posix-random: a set-ID program takes its net session from the service, and a forged one gets no request\n");
     struct sockaddr_in a;
     socklen_t n = sizeof a;
     memset(&a, 0, sizeof a);
@@ -612,7 +603,59 @@ static int net_run(void) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(recv(c, &in, 1, 0) == 1 && in == 'i');
     CHECK(close(s) == 0 && close(c) == 0 && close(l) == 0);
+    return 0;
+}
+
+/* A set-ID program takes its Net session only from the network service. The control: a program
+ * that is not set-ID takes the forged channel, and its socket() reaches it. The set-ID program
+ * gets a session of the service in its place: a stream over the loopback works, and the forged
+ * service gets no request. A set-ID program that inherits a socket of its parent keeps it: the
+ * genuine session of the parent passes the check with the descriptions it holds. */
+static int net_run(void) {
+    int status = 0;
+    unsigned requests = 0;
+    CHECK(forged_run("/bin/posix-random", "forgednet", 7, &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests != 0);
+    CHECK(forged_run("/bin/posix-random-suid", "setidnet", 7, &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests == 0);
+    printf("posix-random: a set-ID program takes its net session from the service, and a forged one gets no request\n");
+    CHECK(inherit_check() == 0);
     printf("posix-random: a set-ID program keeps the socket it inherited with its net session\n");
+    return 0;
+}
+
+/* The Net session of a process pinned to CPU 1 is homed on the second stack instance of the
+ * service (HOME). The set-ID program it starts inherits a socket of that session, which the
+ * loader's check, made by the first instance, forwards to the instance that holds it: the
+ * socket survives. */
+static int net_home_child(void) {
+    int probe = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(probe >= 0);
+    unsigned home = 99;
+    socklen_t len = sizeof home;
+    CHECK(getsockopt(probe, SOL_SOCKET, 0x7353, &home, &len) == 0);
+    CHECK(home == 1);
+    CHECK(close(probe) == 0);
+    printf("posix-random: the net session is homed on the second instance (CPU %u)\n", home);
+    CHECK(inherit_check() == 0);
+    printf("posix-random: a set-ID program keeps a socket of a session homed on the second instance\n");
+    return 0;
+}
+
+static int net_home_run(void) {
+    cpu_set_t one;
+    int status = 0;
+    CPU_ZERO(&one);
+    CPU_SET(1, &one);
+    /* A child spawned under the mask of CPU 1 starts there (the role `net2child`). */
+    CHECK(sched_setaffinity(0, sizeof one, &one) == 0);
+    pid_t pid = 0;
+    char *argv[] = {"posix-random", "net2child", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return 0;
 }
 
@@ -746,6 +789,12 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "forgednet") == 0) return forged_net_role();
     if (argc > 1 && strcmp(argv[1], "setidnet") == 0) return setid_net_role();
     if (argc > 2 && strcmp(argv[1], "netinherit") == 0) return net_inherit_role(argv[2]);
+    if (argc > 1 && strcmp(argv[1], "net2child") == 0) return net_home_child();
+    if (argc > 1 && strcmp(argv[1], "net2") == 0) {
+        status = net_home_run();
+        if (status == 0) printf("posix-random: net2 ok\n");
+        return status;
+    }
     if (argc > 1 && strcmp(argv[1], "net") == 0) {
         status = net_run();
         if (status == 0) printf("posix-random: net ok\n");
