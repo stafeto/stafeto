@@ -257,14 +257,53 @@ pub fn lease_is_ours(who: &str, mac: &str, lease: Ipv4Addr) -> Result<(), String
     }
 }
 
-/// The ARP cache of the Mac must show `mac` for `address`.
+/// The table of `arp -an`, run by the user or (`root`) through `sudo -n`.
+fn arp_table(root: bool) -> Option<String> {
+    let mut command = if root {
+        let mut c = Command::new("sudo");
+        c.args(["-n", "/usr/sbin/arp"]);
+        c
+    } else {
+        Command::new("/usr/sbin/arp")
+    };
+    let output = command.arg("-an").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The ARP cache of the Mac must show `mac` for `address`. From macOS 27
+/// the table that `arp` prints to a user leaves out the entries of the
+/// bridge of the virtual network (`arp -n ADDRESS` says "no entry" for them
+/// too) while the kernel holds them: `sudo -n arp -an` lists them. Where
+/// that is refused the step says so and is skipped, but a table of root
+/// without the address fails it (the DHCP
+/// service's file, which `lease_is_ours` reads, still binds the address to
+/// the device).
 fn arp_is(address: Ipv4Addr, mac: &str) -> Result<(), String> {
-    let arp = Command::new("/usr/sbin/arp")
-        .args(["-n", &address.to_string()])
-        .output()
-        .map_err(|e| format!("arp: {e}"))?;
-    let text = String::from_utf8_lossy(&arp.stdout).into_owned();
-    let got = arp_mac(&text).ok_or_else(|| format!("arp has no entry for {address}: {text}"))?;
+    let mut read_any = false;
+    let mut line = None;
+    for root in [false, true] {
+        if let Some(table) = arp_table(root) {
+            // A user's table without the address may be the table the user
+            // is shown; only a table of root settles that it is missing.
+            read_any |= root;
+            line = line.or_else(|| arp_line(&table, address));
+        }
+    }
+    let Some(line) = line else {
+        if read_any {
+            return Err(format!(
+                "arp has no entry for {address} in the table of `sudo -n arp -an`"
+            ));
+        }
+        println!(
+            "net-vz: arp: the table of this user does not list {address} and `sudo -n arp -an` is refused; check skipped"
+        );
+        return Ok(());
+    };
+    let got = arp_mac(&line).ok_or_else(|| format!("arp: no address in {line:?}"))?;
     if got != mac {
         return Err(format!("arp gives {got} for {address}, wanted {mac}"));
     }
@@ -341,6 +380,15 @@ pub fn parse_ping(output: &str) -> Option<PingResult> {
             .find(|l| l.contains("round-trip"))
             .map(|l| l.trim().to_owned()),
     })
+}
+
+/// The line of the output of `arp -an` for `address`.
+pub fn arp_line(table: &str, address: Ipv4Addr) -> Option<String> {
+    let key = format!("({address}) ");
+    table
+        .lines()
+        .find(|l| l.contains(&key))
+        .map(|l| l.to_owned())
 }
 
 /// The MAC address in the output of `arp -n ADDRESS`, as two digits per
@@ -1037,6 +1085,15 @@ mod tests {
         let line = "? (192.168.64.4) at 2:73:74:66:0:2 on bridge100 ifscope [ethernet]\n";
         assert_eq!(arp_mac(line).as_deref(), Some("02:73:74:66:00:02"));
         assert_eq!(arp_mac("? (192.168.64.9) -- no entry"), None);
+    }
+
+    #[test]
+    fn the_line_of_an_address_is_found_in_the_table() {
+        let table = "? (192.168.64.14) at 2:73:74:66:0:9 on bridge100 ifscope [ethernet]\n\
+                     ? (192.168.64.4) at 2:73:74:66:0:2 on bridge100 ifscope [ethernet]\n";
+        let line = arp_line(table, "192.168.64.4".parse().unwrap()).unwrap();
+        assert_eq!(arp_mac(&line).as_deref(), Some("02:73:74:66:00:02"));
+        assert_eq!(arp_line(table, "192.168.64.1".parse().unwrap()), None);
     }
 
     #[test]

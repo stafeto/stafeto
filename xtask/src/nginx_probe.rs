@@ -43,7 +43,8 @@
 //!      loopback, its certificate given as the anchor: the page whole.
 //!    - 4e: `h2load -n 1000 -c 10 -m 10` from the host: 1000 answers 2xx over
 //!      TLS 1.3 and h2, none failed. A check: its rate is no measurement
-//!      (that runs with `--rate`). Where the host has no h2load the step
+//!      (that runs with `--rate`); the connections open ten milliseconds apart
+//!      (`-r 1 --rate-period=10ms`). Where the host has no h2load the step
 //!      says so and is skipped, on the runner of ci (GITHUB_ACTIONS) it
 //!      fails: the runner installs it (nghttp2-client in
 //!      .github/actions/setup).
@@ -106,6 +107,11 @@ const H2_STREAMS: usize = 10;
 const H2LOAD_REQUESTS: usize = 1000;
 const H2LOAD_CONNECTIONS: usize = 10;
 const H2LOAD_STREAMS: usize = 10;
+/// One connection every this long (`-r 1 --rate-period`), so that the
+/// one-connection queue of the host's end of the forward never overflows
+/// (see `net_curl::FORWARD_CONNECT_GAP`; h2load opens all ten in the same
+/// instant otherwise, and macOS resets those that find the queue full).
+const H2LOAD_CONNECTION_PERIOD: &str = "10ms";
 /// How long a run of the host's curl or h2load may take.
 const CLIENT_WITHIN: Duration = Duration::from_secs(120);
 /// `/etc/netd.conf` of the probe: DHCP, and eight sessions with a shared
@@ -421,8 +427,8 @@ pub(crate) struct Connection {
 
 impl Connection {
     pub(crate) fn open(address: SocketAddr, within: Duration) -> Result<Connection, String> {
-        let stream =
-            TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
+        let stream = crate::net_curl::connect_forwarded(&address, within)
+            .map_err(|e| format!("connect: {e}"))?;
         stream
             .set_read_timeout(Some(within))
             .and_then(|()| stream.set_write_timeout(Some(within)))
@@ -1237,6 +1243,8 @@ fn h2load(port: u16) -> Result<(), String> {
         .args(["-n", &H2LOAD_REQUESTS.to_string()])
         .args(["-c", &H2LOAD_CONNECTIONS.to_string()])
         .args(["-m", &H2LOAD_STREAMS.to_string()])
+        .args(["-r", "1"])
+        .arg(format!("--rate-period={H2LOAD_CONNECTION_PERIOD}"))
         .args(["-T", &CLIENT_WITHIN.as_secs().to_string()])
         .arg(format!("https://127.0.0.1:{port}/index.html"))
         .output();
