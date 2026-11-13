@@ -39,8 +39,8 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) a
 **Next**
 
 - AWS EC2 Graviton: EFI boot, ENA networking and MSI-X. The groundwork (an EFI loader, ACPI converted into a device tree, a GPT disk, MSI interrupts) is in release 0.3.0.
-- Reliability.
-- Scheduler time budgets.
+- Reliability: every service step held to its bound and checked in CI, the defects that reviews find fixed before new parts.
+- Scheduler time budgets: a thread runs within a budget per period, so an overrun stays inside its own process.
 - Shared libraries: `libc.so` and a dynamic loader are in; next come `dlopen` of new libraries and more sharing of data pages between processes.
 - The nine POSIX utilities that need services of their own: `at`, `batch`, `lp`, `mailx`, `locale`, `localedef`, `gettext`, `ngettext` and `msgfmt`.
 - System integrity: every program carries an Ed25519 signature from the release key or from an approved developer. A program with a broken or foreign signature does not start, and a manual scan checks the whole system against a signed manifest, in the spirit of `sfc /scannow`.
