@@ -151,11 +151,42 @@ fn local(port: u16) -> SocketAddr {
     ([127, 0, 0, 1], port).into()
 }
 
+/// The least time between two connects of this process to a forwarded port
+/// of QEMU's user network. The host's end of a forward listens with a queue
+/// of one connection; a connection that finds the queue full is dropped
+/// silently by a Linux host (the client sends its SYN again a second later)
+/// and reset by macOS (the client sees "Connection reset by peer" on its
+/// first read or write, and `setsockopt` on it fails with EINVAL). The user
+/// network takes a connection off the queue within a millisecond or two, so
+/// a gap of this size keeps the queue from ever filling, on both hosts,
+/// while the connections it opens stay open together.
+pub(crate) const FORWARD_CONNECT_GAP: Duration = Duration::from_millis(4);
+
+/// `TcpStream::connect_timeout` to a forwarded port, started at least
+/// `FORWARD_CONNECT_GAP` after the previous connect of any thread of this
+/// process ended. The connects of the process take turns (a connect to the
+/// host's own end of a forward ends within a millisecond).
+pub(crate) fn connect_forwarded(
+    address: &SocketAddr,
+    within: Duration,
+) -> std::io::Result<TcpStream> {
+    use std::sync::Mutex;
+    static LAST_END: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last_end = LAST_END.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wait) =
+        last_end.and_then(|t| (t + FORWARD_CONNECT_GAP).checked_duration_since(Instant::now()))
+    {
+        std::thread::sleep(wait);
+    }
+    let stream = TcpStream::connect_timeout(address, within);
+    *last_end = Some(Instant::now());
+    stream
+}
+
 /// `get`, giving up after `within` on each step.
 pub fn get_within(address: SocketAddr, within: Duration) -> Result<(Vec<u8>, Duration), String> {
     let started = Instant::now();
-    let mut stream =
-        TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
+    let mut stream = connect_forwarded(&address, within).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(within))
         .and_then(|()| stream.set_write_timeout(Some(within)))
@@ -670,6 +701,73 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" {
+        fn listen(fd: i32, backlog: i32) -> i32;
+    }
+
+    /// A burst of connects to a listener with a queue of one connection
+    /// (the host's end of a forward of QEMU's user network) that takes a
+    /// connection off the queue every 2 ms, as the user network does: with
+    /// the gap between connects every one is answered; without it macOS
+    /// resets those that find the queue full (and a Linux host drops their
+    /// SYN, which the client sends again a second later).
+    #[test]
+    fn a_burst_of_connects_to_a_forward_is_answered_whole() {
+        use std::os::fd::AsRawFd;
+        const BURST: usize = 24;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // SAFETY: `listen` on the descriptor of a listening socket only
+        // changes the length of its queue.
+        assert_eq!(unsafe { listen(listener.as_raw_fd(), 1) }, 0);
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let acceptor = std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                std::thread::sleep(Duration::from_millis(2));
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 1];
+                    stream.set_nonblocking(false).unwrap();
+                    if stream.read_exact(&mut request).is_ok() {
+                        let _ = stream.write_all(b"x");
+                    }
+                });
+            }
+        });
+        let clients: Vec<_> = (0..BURST)
+            .map(|_| {
+                std::thread::spawn(move || -> Result<(), String> {
+                    let mut stream = connect_forwarded(&address, Duration::from_millis(500))
+                        .map_err(|e| format!("connect: {e}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(|e| format!("socket options: {e}"))?;
+                    stream.write_all(b"?").map_err(|e| format!("write: {e}"))?;
+                    let mut answer = [0u8; 1];
+                    stream
+                        .read_exact(&mut answer)
+                        .map_err(|e| format!("read: {e}"))
+                })
+            })
+            .collect();
+        let failed: Vec<String> = clients
+            .into_iter()
+            .filter_map(|c| c.join().unwrap().err())
+            .collect();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        acceptor.join().unwrap();
+        assert!(
+            failed.is_empty(),
+            "{} of {BURST} failed: {failed:?}",
+            failed.len()
+        );
+    }
 
     /// The checks xtask expects are those the program runs, in its order.
     #[test]
