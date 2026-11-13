@@ -3112,6 +3112,31 @@ mod tests {
         assert_eq!(seed_only, 2, "EC2's image and the probe of the seed");
     }
 
+    /// A program on relibc takes its stack canary from AT_RANDOM, or, where
+    /// the loader gave none, from a blocking `getrandom`, and ends if it has
+    /// neither: every image that starts a program on relibc has the entropy
+    /// service, and the program connects to it.
+    #[test]
+    fn a_posix_process_connects_to_the_entropy_service() {
+        let mut lacking = Vec::new();
+        let tables = all_tables().into_iter().chain([
+            aws::TABLE,
+            pkg::PKG_SLOT_TABLE,
+            pkg::STORE_PROBE_TABLE,
+            pkg::INIT_WAIT_TABLE,
+        ]);
+        for (index, table) in tables.enumerate() {
+            for r in table.iter().filter(|r| r.connects.contains(&"posix")) {
+                // These two do not depend on posix-crt, which starts relibc and takes the canary.
+                const RUST_ONLY: [&str; 2] = ["posix-clock-peer", "svc"];
+                if !r.connects.contains(&ENTROPY_SERVICE) && !RUST_ONLY.contains(&r.program) {
+                    lacking.push(format!("table {index}: {} ({})", r.name, r.program));
+                }
+            }
+        }
+        assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
+    }
+
     #[test]
     fn the_network_service_is_given_the_boot_profile_and_the_probe_is_not() {
         assert!(BOOT_PROFILE_CLIENTS.contains(&net::NETD.name));
@@ -3320,6 +3345,8 @@ mod tests {
                 "ramfs",
                 "posix",
                 "clock-peer",
+                "rng",
+                "entropy",
                 "posix-abi-probe",
                 "posix-sender"
             ]
@@ -3334,6 +3361,8 @@ mod tests {
                     "pipe",
                     "ramfs",
                     "posix",
+                    "rng",
+                    "entropy",
                     "posix-tty"
                 ]
             );
@@ -3350,6 +3379,8 @@ mod tests {
                 "pipe",
                 "ramfs",
                 "posix",
+                "rng",
+                "entropy",
                 "busybox-probe"
             ]
         );
@@ -3388,6 +3419,8 @@ mod tests {
                 "clock",
                 "ramfs",
                 "posix",
+                "rng",
+                "entropy",
                 "relibc-hello",
                 "relibc-abort",
                 "relibc-assert",
@@ -3396,7 +3429,14 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::RELIBC_THREADS_TABLE),
-            ["clock", "ramfs", "posix", "relibc-threads"]
+            [
+                "clock",
+                "ramfs",
+                "posix",
+                "rng",
+                "entropy",
+                "relibc-threads"
+            ]
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),

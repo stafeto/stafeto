@@ -14,7 +14,7 @@ use crate::{
 
 /// The probe's image: the services of the store probe (the disk and package services too), and the
 /// probe, which starts its own file once.
-pub const PROGRAMS: [ImageProgram; 10] = [
+pub const PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", INIT_STACK_SIZE, &["table-pkg-slot"]),
     ("uart", "uart", crate::UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
@@ -35,6 +35,18 @@ pub const PROGRAMS: [ImageProgram; 10] = [
     ("pkgd", "pkgd", crate::store_probe::PKGD_STACK_SIZE, &[]),
     ("pkg-slot", "pkg-slot-probe", crate::POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
 ];
 
 /// The lines of the C probe, each a check that passed.

@@ -352,11 +352,17 @@ static volatile int jumped, handled;
 static void jump_out(int signal) { (void)signal; siglongjmp(back, 1); }
 static void count_handler(int signal) { (void)signal; handled++; }
 static pthread_t main_thread;
-/* Sends SIGUSR2 to the main thread `arg` times, one each time it sleeps. */
+/* Sends SIGUSR2 to the main thread `arg` times, one each time it sleeps. A signal of this kind
+ * does not queue: one sent while another is pending is lost, which a main thread that a busy
+ * host holds off the CPU for a few milliseconds makes happen. So when there are several, the
+ * sender waits until the handler of the one before has run. */
 static void *sends(void *arg) {
     for (long i = 0; i < (long)arg; i++) {
         sleep_ms(2);
+        int before = handled;
         CHECK(pthread_kill(main_thread, SIGUSR2) == 0);
+        if ((long)arg > 1)
+            while (handled == before) sleep_ms(1);
     }
     return NULL;
 }

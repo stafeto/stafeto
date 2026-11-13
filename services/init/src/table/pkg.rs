@@ -234,7 +234,7 @@ pub const STORE_PROBE: Record = Record {
     name: "store-probe",
     program: "store-probe",
     args: b"store-probe\0",
-    connects: &["ramfs", "clock", "posix", "pkgd"],
+    connects: &["ramfs", "clock", "posix", "pkgd", "entropy"],
     root: true,
     quota: super::ramfs::PROCS_QUOTA,
     ..super::ramfs::POSIX
@@ -254,6 +254,8 @@ pub const STORE_PROBE_TABLE: &[Record] = &[
     BLK,
     PKGD,
     STORE_PROBE,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the place `Packages` (tests/pkg-slot): the first POSIX process, root, with a
@@ -262,7 +264,7 @@ pub const PKG_SLOT: Record = Record {
     name: "pkg-slot",
     program: "pkg-slot",
     args: b"pkg-slot\0",
-    connects: &["ramfs", "pipe", "clock", "posix", "pkgd"],
+    connects: &["ramfs", "pipe", "clock", "posix", "pkgd", "entropy"],
     quota: super::ramfs::PROCS_QUOTA,
     // The disk of the probe is empty: the service formats it before it answers, and the
     // probe starts when it said READY.
@@ -283,6 +285,8 @@ pub const PKG_SLOT_TABLE: &[Record] = &[
     BLK,
     PKGD,
     PKG_SLOT,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The client of the wait probe (xtask init-wait): the program of the store probe, whose
@@ -307,6 +311,8 @@ pub const INIT_WAIT_TABLE: &[Record] = &[
     BLK,
     PKGD,
     INIT_WAIT_CLIENT,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 #[cfg(test)]

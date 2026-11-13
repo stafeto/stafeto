@@ -170,11 +170,21 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::POSIX_ABI_TABLE[3],
     Record {
-        connects: &["ramfs", "clock", "clock-peer", "posix", "long", "uart"],
+        connects: &[
+            "ramfs",
+            "clock",
+            "clock-peer",
+            "posix",
+            "long",
+            "uart",
+            "entropy",
+        ],
         ..super::ramfs::POSIX_ABI_TABLE[4]
     },
     super::ramfs::POSIX_ABI_TABLE[5],
     super::ramfs::POSIX_ABI_TABLE[6],
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
 ];
 
 /// The paid process pool and native loader fixture on VZ's PCI devices.
@@ -199,12 +209,11 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     // wrote into the boot image.
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
-    // The image of this table has no entropy service.
-    Record {
-        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
-        ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
-    },
+    // The launcher takes its stack canary from the entropy service.
+    super::ramfs::BUSYBOX_DIALOG_TABLE[5],
     super::ramfs::TTY,
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the terminal in C over the Virtio console's driver, as
@@ -217,6 +226,8 @@ pub const POSIX_TTY_TABLE: &[Record] = &[
     super::ramfs::POSIX_TTY_TABLE[4],
     super::ramfs::POSIX_TTY_TABLE[5],
     super::ramfs::TTY,
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
 ];
 
 /// The probes of console input and interruption, as
@@ -227,6 +238,8 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[1],
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::POSIX_DIALOG_TABLE[4],
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
 ];
 
 /// rtbench as a client beside the driver, which shows its lines: its main

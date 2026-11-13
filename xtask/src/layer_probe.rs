@@ -21,7 +21,7 @@ const STEP_MAX: u64 = TERM_B * 9 / 10;
 /// The largest step of the layer step method at 0.8 B.
 const PORTION_MAX: u64 = TERM_B * 8 / 10;
 
-const PROGRAMS: [ImageProgram; 7] = [
+const PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-layer-probe"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["layer-probe"]),
     (
@@ -34,8 +34,20 @@ const PROGRAMS: [ImageProgram; 7] = [
     ("layer-probe", "layer-probe", POSIX_STACK_SIZE, &[]),
     ("layer-user", "layer-user", POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &["small-pieces"]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
 ];
-const PROGRAMS_STEPS: [ImageProgram; 7] = {
+const PROGRAMS_STEPS: [ImageProgram; 9] = {
     let mut programs = PROGRAMS;
     programs[1].3 = &["layer-probe", "steps"];
     programs
