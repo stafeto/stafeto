@@ -233,7 +233,9 @@ The release key `stafeto-release-<year>` has a certificate for 396 days with
 the purpose `packages`. The private file lives only in the secret
 `RELEASE_SIGNING_KEY` of the environment `packages`; there is no other copy,
 and a lost secret is cured with a new key and a new certificate. The tree has
-`keys/stafeto-release-<year>.pub`, `.cert`, and `keys/revoked`, `revoked.sig`.
+`keys/stafeto-release-<year>.cert` (it carries the public key), and
+`keys/revoked`, `revoked.sig`. Every `.pub` in `keys/` is a root, which a test
+of `xtask` holds against `OFFICIAL_ROOTS`.
 The workflows read the name of the key from the newest certificate in `keys/`.
 Each year make a new key with the next year in its name; the old one lives
 until its certificate ends, and the packages signed in time stay valid.
@@ -252,7 +254,7 @@ network on again, put the key into the environment and remove the file:
     gh secret set RELEASE_SIGNING_KEY --repo stafeto/stafeto --env packages < ~/.stafeto-release/stafeto-release-2026.key
     rm -r ~/.stafeto-release
 
-and send the public files (`.pub`, `.cert`, `revoked`, `revoked.sig`) in a
+and send the public files (`.cert`, `revoked`, `revoked.sig`) in a
 request to `keys/`.
 
 **A leaked release key.** Make a new key and certificate offline. Run
