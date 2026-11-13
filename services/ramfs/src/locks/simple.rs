@@ -74,8 +74,15 @@ struct Entry {
     id: u32,
     next: u32,
 }
-// Unchanged records remain references into the old dispatch snapshot. A patch
-// index selects a replacement body; payer identifies its exact original root.
+// The place of an old record and its link; a request reads the body once while it walks.
+#[derive(Clone, Copy)]
+struct Old {
+    id: u32,
+    next: u32,
+}
+const OWNER_BITS: u64 = (1 << 40) - 1;
+// Unchanged records stay as they are in the pages. A patch index selects a replacement body;
+// payer identifies its exact original root.
 #[derive(Clone, Copy)]
 struct Work {
     id: u32,
@@ -85,15 +92,11 @@ struct Work {
 }
 impl Work {
     #[inline(always)]
-    fn lock<'a>(&self, old: &'a [Entry], patches: &'a [Lock]) -> &'a Lock {
-        if self.patch == u8::MAX {
-            &old[self.original as usize].lock
-        } else {
-            &patches[self.patch as usize]
-        }
+    fn lock<'a>(&self, patches: &'a [Lock]) -> &'a Lock {
+        &patches[self.patch as usize]
     }
     #[inline(always)]
-    fn root(&self, table: &SimpleLocks, old: &[Entry], root: Root) -> Root {
+    fn root(&self, table: &SimpleLocks, old: &[Old], root: Root) -> Root {
         if self.payer == u8::MAX {
             root
         } else {
@@ -514,9 +517,13 @@ impl SimpleLocks {
         let Command::Set(kind) = request.command else {
             return Err(Error::Invalid);
         };
-        let mut old = Buffer::new();
-        self.entries(storage, request.inode, &mut old)?;
-        let count = old.len();
+        storage.node(request.inode).map_err(|_| Error::Invalid)?;
+        let head = self.heads[request.inode.slot as usize];
+        if head.count != 0 && head.generation != request.inode.generation {
+            return Err(Error::Invalid);
+        }
+        let count = head.count as usize;
+        let mut old: Buffer<Old, PER_INODE> = Buffer::new();
         let mut work: Buffer<Work, { PER_INODE + 2 }> = Buffer::new();
         let mut patches: Buffer<Lock, { PER_INODE + 2 }> = Buffer::new();
         // Work references never move after append. Only these entries can need
@@ -531,75 +538,112 @@ impl SimpleLocks {
             kind,
             range: request.range,
         });
-        for (index, entry) in old[..count].iter().enumerate() {
+        let (from, to) = (request.range.first(), request.range.last());
+        // The owner of the record seen last: equal neighbours cost one decode and one
+        // liveness question. No stored key equals the first value.
+        let mut key = (u64::MAX, u64::MAX);
+        let (mut alive, mut own) = (false, false);
+        // The leading work entries that are the old records at their old places.
+        let mut intact = 0usize;
+        let mut id = head.first;
+        for index in 0..count {
+            let words = self.words(storage, id);
+            let entry_id = id;
+            id = words[4] as u32;
+            old.push(Old {
+                id: entry_id,
+                next: id,
+            });
+            if (words[2], words[3] & OWNER_BITS) != key {
+                key = (words[2], words[3] & OWNER_BITS);
+                let owner = Self::owner_of(&words);
+                alive = live(owner);
+                own = owner == request.owner;
+            }
             let original = index as u8;
-            if !live(entry.lock.owner) {
+            if !alive {
                 if dead.len < SWEEP_PIECE {
-                    dead.push(entry.lock.owner);
+                    dead.push(Self::owner_of(&words));
                 } else {
                     // The rest of the dead records are left to the sweep: a request frees
                     // at most `SWEEP_PIECE` of them, so that its step stays bounded. They
                     // block nobody and stay in place.
                     work.push(Work {
-                        id: entry.id,
+                        id: entry_id,
                         original,
                         payer: original,
                         patch: u8::MAX,
                     });
                     retained |= 1u64 << original;
+                    intact += usize::from(intact == len && original as usize == len);
                     len += 1;
                 }
                 continue;
             }
-            if let Some(kind) = kind
-                && entry.lock.owner != request.owner
-            {
-                let wanted = Lock {
-                    owner: request.owner,
-                    kind,
-                    range: request.range,
-                };
-                if entry.lock.conflicts(wanted) {
-                    return Err(Error::Conflict(entry.lock));
-                }
-            }
-            // A region already covered by this owner's identical kind is a
-            // semantic no-op, irrespective of its position in the inode list.
-            if kind == Some(entry.lock.kind)
-                && entry.lock.owner == request.owner
-                && entry.lock.range.first() <= request.range.first()
-                && entry.lock.range.last() >= request.range.last()
-            {
-                return Ok(());
-            }
-            if entry.lock.owner != request.owner || !entry.lock.range.overlaps(request.range) {
-                if let Some(lock) = added.as_mut()
-                    && entry.lock.owner == lock.owner
-                    && entry.lock.kind == lock.kind
-                    && let Some(range) = lock.range.merge(entry.lock.range)
+            let (first, last) = (words[0], words[1]);
+            let kind_of = if (words[3] >> 40) & 255 != 0 {
+                Kind::Write
+            } else {
+                Kind::Read
+            };
+            let overlaps = first <= to && from <= last;
+            if !own {
+                if overlaps
+                    && let Some(kind) = kind
+                    && (kind_of == Kind::Write || kind == Kind::Write)
                 {
-                    lock.range = range;
-                    continue;
+                    return Err(Error::Conflict(Lock {
+                        owner: Self::owner_of(&words),
+                        kind: kind_of,
+                        range: Range { first, last },
+                    }));
                 }
                 work.push(Work {
-                    id: entry.id,
+                    id: entry_id,
                     original,
                     payer: original,
                     patch: u8::MAX,
                 });
                 retained |= 1u64 << original;
+                intact += usize::from(intact == len && original as usize == len);
+                len += 1;
+                continue;
+            }
+            // A region already covered by this owner's identical kind is a
+            // semantic no-op, irrespective of its position in the inode list.
+            if kind == Some(kind_of) && first <= from && last >= to {
+                return Ok(());
+            }
+            if !overlaps {
+                if let Some(lock) = added.as_mut()
+                    && kind_of == lock.kind
+                    && let Some(range) = lock.range.merge(Range { first, last })
+                {
+                    lock.range = range;
+                    continue;
+                }
+                work.push(Work {
+                    id: entry_id,
+                    original,
+                    payer: original,
+                    patch: u8::MAX,
+                });
+                retained |= 1u64 << original;
+                intact += usize::from(intact == len && original as usize == len);
                 len += 1;
                 continue;
             }
             // Fully replaced regions have no fragments. Only the two interval
             // boundaries can need remainder bodies, regardless of list size.
-            if request.range.first() <= entry.lock.range.first()
-                && request.range.last() >= entry.lock.range.last()
-            {
+            if from <= first && to >= last {
                 continue;
             }
-            for (edge, lock) in entry
-                .lock
+            let entry_lock = Lock {
+                owner: request.owner,
+                kind: kind_of,
+                range: Range { first, last },
+            };
+            for (edge, lock) in entry_lock
                 .remainder(request.owner, request.range)
                 .into_iter()
                 .flatten()
@@ -620,7 +664,7 @@ impl SimpleLocks {
                     retained |= 1u64 << original;
                 }
                 work.push(Work {
-                    id: if edge == 0 { entry.id } else { NONE },
+                    id: if edge == 0 { entry_id } else { NONE },
                     original: if edge == 0 { original } else { u8::MAX },
                     payer: original,
                     patch,
@@ -628,6 +672,7 @@ impl SimpleLocks {
                 len += 1;
             }
         }
+        assert_eq!(id, NONE);
         // Each owner's intervals are disjoint and same-kind touching regions
         // already coalesced. Removing the requested interval leaves at most one
         // touching boundary on each side; merging it cannot expose a previously
@@ -713,7 +758,8 @@ impl SimpleLocks {
                 }
             }
         }
-        for i in 0..len {
+        // Only the link of the last intact record can change before the first edit.
+        for i in intact.saturating_sub(1)..len {
             let next = work
                 .get(i + 1)
                 .filter(|_| i + 1 < len)
@@ -721,7 +767,7 @@ impl SimpleLocks {
             let entry = work[i];
             let unchanged = entry.patch == u8::MAX;
             if !unchanged {
-                self.write(storage, entry.id, *entry.lock(&old, &patches), next);
+                self.write(storage, entry.id, *entry.lock(&patches), next);
                 changed = true;
             } else if old[entry.original as usize].next != next {
                 self.write_next(storage, entry.id, next);
@@ -975,6 +1021,7 @@ impl SimpleLocks {
         }
         total
     }
+    #[inline(always)]
     fn page(&self, id: u32) -> &LockPage {
         self.pages[id as usize / SLOTS]
             .paid
@@ -1057,19 +1104,26 @@ impl SimpleLocks {
         }
     }
     #[inline(always)]
-    fn read(&self, storage: &Storage<'_>, id: u32) -> (Lock, u32) {
-        let words = storage.lock_page_words(self.page(id), id as usize % SLOTS * BYTES);
-        let owner = match (words[3] >> 32) & 255 {
+    fn words(&self, storage: &Storage<'_>, id: u32) -> [u64; 5] {
+        storage.lock_page_words(self.page(id), id as usize % SLOTS * BYTES)
+    }
+    #[inline(always)]
+    fn owner_of(words: &[u64; 5]) -> Owner {
+        match (words[3] >> 32) & 255 {
             1 => Owner::Process(words[3] as u32),
             2 => Owner::Description {
                 slot: words[3] as u16,
                 generation: words[2],
             },
             _ => panic!("invalid stored lock owner"),
-        };
+        }
+    }
+    #[inline(always)]
+    fn read(&self, storage: &Storage<'_>, id: u32) -> (Lock, u32) {
+        let words = self.words(storage, id);
         (
             Lock {
-                owner,
+                owner: Self::owner_of(&words),
                 kind: if (words[3] >> 40) & 255 == 0 {
                     Kind::Read
                 } else {
@@ -1153,6 +1207,300 @@ mod tests {
     }
     fn payer(id: u64) -> Root {
         Root { id, generation: 7 }
+    }
+
+    fn list_of(table: &SimpleLocks, ram: &crate::Ram<'_>, file: Token) -> Vec<(Lock, u32)> {
+        let mut out = Buffer::new();
+        table.entries(&ram.storage, file, &mut out).unwrap();
+        out.iter().map(|entry| (entry.lock, entry.id)).collect()
+    }
+    fn owner_of(n: u32) -> Owner {
+        if n.is_multiple_of(2) {
+            Owner::Process(256 + n)
+        } else {
+            Owner::Description {
+                slot: n as u16,
+                generation: 9,
+            }
+        }
+    }
+    // The model keeps the intervals of each owner and kind as plain pairs.
+    #[derive(Clone, Default)]
+    struct Model(Vec<(Owner, bool, u64, u64)>);
+    impl Model {
+        fn set(
+            &mut self,
+            live: &dyn Fn(Owner) -> bool,
+            owner: Owner,
+            first: u64,
+            last: u64,
+            kind: Option<bool>,
+        ) -> Result<(), ()> {
+            if let Some(write) = kind {
+                for &(o, w, f, l) in &self.0 {
+                    if o != owner && live(o) && f <= last && first <= l && (w || write) {
+                        return Err(());
+                    }
+                }
+            }
+            let mut next = Vec::new();
+            for &(o, w, f, l) in &self.0 {
+                if o == owner && f <= last && first <= l {
+                    if f < first {
+                        next.push((o, w, f, first - 1));
+                    }
+                    if last < l {
+                        next.push((o, w, last + 1, l));
+                    }
+                } else {
+                    next.push((o, w, f, l));
+                }
+            }
+            if let Some(write) = kind {
+                next.push((owner, write, first, last));
+            }
+            let mut merged: Vec<(Owner, bool, u64, u64)> = Vec::new();
+            for kind in [false, true] {
+                let mut mine: Vec<_> = next
+                    .iter()
+                    .filter(|record| record.1 == kind && live(record.0))
+                    .copied()
+                    .collect();
+                mine.sort_by_key(|record| (format!("{:?}", record.0), record.2));
+                for record in mine {
+                    match merged.last_mut() {
+                        Some(top)
+                            if top.0 == record.0 && top.1 == kind && record.2 <= top.3 + 1 =>
+                        {
+                            top.3 = top.3.max(record.3)
+                        }
+                        _ => merged.push(record),
+                    }
+                }
+            }
+            self.0 = merged;
+            Ok(())
+        }
+        fn shape(&self) -> Vec<(String, bool, u64, u64)> {
+            let mut shape: Vec<_> = self
+                .0
+                .iter()
+                .map(|r| (format!("{:?}", r.0), r.1, r.2, r.3))
+                .collect();
+            shape.sort();
+            shape
+        }
+    }
+    fn shape_of(
+        table: &SimpleLocks,
+        ram: &crate::Ram<'_>,
+        file: Token,
+        live: &dyn Fn(Owner) -> bool,
+    ) -> Vec<(String, bool, u64, u64)> {
+        let mut shape: Vec<_> = list_of(table, ram, file)
+            .iter()
+            .filter(|(lock, _)| live(lock.owner))
+            .map(|(lock, _)| {
+                (
+                    format!("{:?}", lock.owner),
+                    lock.kind == Kind::Write,
+                    lock.range.first(),
+                    lock.range.last(),
+                )
+            })
+            .collect();
+        shape.sort();
+        shape
+    }
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+    // Returns how many requests were applied, refused by a conflict and refused for room.
+    fn against_the_model(
+        seed: u64,
+        owners: u32,
+        span: u64,
+        longest: u64,
+        dead_from: Option<u32>,
+    ) -> [usize; 3] {
+        let mut tally = [0; 3];
+        let mut ram = crate::Ram::default();
+        let file = inode(&mut ram, b"model");
+        let mut table = fresh();
+        let mut model = Model::default();
+        let mut state = seed;
+        let live = move |owner: Owner| {
+            dead_from.is_none_or(|from| (0..owners).all(|n| owner_of(n) != owner || n < from))
+        };
+        for step in 0..4000 {
+            let owner = owner_of((lcg(&mut state) % u64::from(owners)) as u32);
+            let first = lcg(&mut state) % span;
+            let last = first + lcg(&mut state) % longest;
+            let kind = match lcg(&mut state) % 5 {
+                0 => None,
+                1 | 2 => Some(Kind::Read),
+                _ => Some(Kind::Write),
+            };
+            if !live(owner) {
+                continue;
+            }
+            let before = list_of(&table, &ram, file);
+            let mut next = model.clone();
+            let expected = next.set(&live, owner, first, last, kind.map(|k| k == Kind::Write));
+            let request = Request {
+                inode: file,
+                owner,
+                root: 0,
+                range: Range::relative(0, first as i64, (last - first + 1) as i64).unwrap(),
+                command: Command::Set(kind),
+            };
+            let result = table.set(&mut ram.storage, payer(1), request, live);
+            match (expected, &result) {
+                (Ok(()), Ok(())) => {
+                    if shape_of(&table, &ram, file, &live) != next.shape() {
+                        panic!(
+                            "step {step}: the lists differ after {kind:?} {first}..={last} of {owner:?}"
+                        );
+                    }
+                    model = next;
+                    tally[0] += 1;
+                }
+                (Ok(()), Err(Error::NoLocks)) => {
+                    assert!(next.0.len() > PER_INODE, "step {step}: spurious NoLocks");
+                    tally[2] += 1;
+                    assert_eq!(list_of(&table, &ram, file), before, "step {step}");
+                }
+                (Err(()), Err(Error::Conflict(_))) => {
+                    tally[1] += 1;
+                    assert_eq!(list_of(&table, &ram, file), before, "step {step}");
+                }
+                other => panic!("step {step}: {other:?}"),
+            }
+            assert_eq!(table.count(file), list_of(&table, &ram, file).len());
+        }
+        tally
+    }
+
+    #[test]
+    fn a_long_run_of_requests_matches_a_model_of_the_records() {
+        for [applied, refused, full] in [
+            against_the_model(1, 4, 48, 10, None),
+            against_the_model(2, 2, 40, 6, None),
+        ] {
+            assert!(applied > 500 && refused > 100, "{applied} {refused} {full}");
+        }
+    }
+
+    #[test]
+    fn a_crowded_inode_matches_the_model_to_its_limit() {
+        // Short regions spread wide fill the inode to its 64 records and past them.
+        let [applied, _, full] = against_the_model(3, 8, 400, 2, None);
+        assert!(applied > 200 && full > 20, "{applied} {full}");
+    }
+
+    #[test]
+    fn records_of_dead_owners_block_nobody_and_never_show() {
+        let [applied, refused, _] = against_the_model(4, 6, 60, 8, Some(4));
+        assert!(applied > 300 && refused > 50, "{applied} {refused}");
+    }
+
+    #[test]
+    fn an_edit_at_the_first_middle_and_last_place_of_a_full_list_keeps_the_others_in_place() {
+        let owner = Owner::Process(256);
+        let other = Owner::Description {
+            slot: 3,
+            generation: 1,
+        };
+        let always = |_: Owner| true;
+        for place in [0i64, 1, 31, 62, 63] {
+            let mut ram = crate::Ram::default();
+            let file = inode(&mut ram, b"places");
+            let mut table = fresh();
+            for i in 0..63i64 {
+                let kind = Some(Kind::Write);
+                table
+                    .set(
+                        &mut ram.storage,
+                        payer(1),
+                        request(file, owner, 4 * i, 3, kind),
+                        always,
+                    )
+                    .unwrap();
+            }
+            let before = list_of(&table, &ram, file);
+            // One more record of the owner, after the last and next to nothing.
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(file, owner, 4 * 63, 3, Some(Kind::Write)),
+                    always,
+                )
+                .unwrap();
+            let after = list_of(&table, &ram, file);
+            assert_eq!(after.len(), 64);
+            assert_eq!(&after[..63], &before[..]);
+            // Another owner asks for the region at `place`: refused, nothing moves.
+            let clash = Request {
+                owner: other,
+                ..request(file, other, 4 * place, 3, Some(Kind::Read))
+            };
+            assert_eq!(
+                table.set(&mut ram.storage, payer(2), clash, always),
+                Err(Error::Conflict(after[place as usize].0))
+            );
+            assert_eq!(list_of(&table, &ram, file), after);
+            // The owner cuts the middle of the record at `place`: it splits and the
+            // records around it stay in their places (one needs room, so free one first).
+            let free = request(file, owner, 4 * ((place + 1) % 64), 3, None);
+            table.set(&mut ram.storage, payer(1), free, always).unwrap();
+            let cut = request(file, owner, 4 * place + 1, 1, None);
+            table.set(&mut ram.storage, payer(1), cut, always).unwrap();
+            let split = list_of(&table, &ram, file);
+            assert_eq!(split.len(), 64);
+            let kept = |list: &[(Lock, u32)]| {
+                let mut ids: Vec<u32> = list.iter().map(|(_, id)| *id).collect();
+                ids.sort();
+                ids
+            };
+            let around = kept(&after);
+            assert!(kept(&split).iter().filter(|id| around.contains(id)).count() >= 62);
+        }
+    }
+
+    #[test]
+    fn a_run_of_one_owner_costs_one_liveness_question_and_alternating_owners_one_each() {
+        let mut ram = crate::Ram::default();
+        let run = inode(&mut ram, b"run");
+        let alternate = inode(&mut ram, b"alternate");
+        let mut table = fresh();
+        let (a, b) = (Owner::Process(256), Owner::Process(257));
+        for i in 0..32i64 {
+            for (file, owner) in [(run, a), (alternate, if i % 2 == 0 { a } else { b })] {
+                table
+                    .set(
+                        &mut ram.storage,
+                        payer(1),
+                        request(file, owner, 4 * i, 3, Some(Kind::Write)),
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+        }
+        for (file, owner, questions) in [(run, a, 1), (alternate, a, 32)] {
+            let mut asked = 0;
+            let next = request(file, owner, 4 * 32, 3, Some(Kind::Write));
+            table
+                .set(&mut ram.storage, payer(1), next, |_| {
+                    asked += 1;
+                    true
+                })
+                .unwrap();
+            assert_eq!(asked, questions);
+        }
     }
 
     #[test]
