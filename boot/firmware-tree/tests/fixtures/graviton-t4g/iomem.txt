@@ -1,0 +1,45 @@
+09020000-09020017 : QEMU0002:00
+09030000-09030fff : ARMH0061:00
+  09030000-09030fff : ARMH0061:00 ARMH0061:00
+090b0000-090b0fff : AMZNC10C:00
+10000000-1000ffff : GICD
+10200000-1ffeffff : GICR
+20000000-200fffff : PCI ECAM
+40000000-7862ffff : System RAM
+  40000000-419fffff : Kernel code
+  41a00000-41fcffff : reserved
+  41fd0000-433fffff : Kernel data
+  72870000-7686ffff : reserved
+  76870000-76870fff : reserved
+  76a70000-76a8ffff : reserved
+  76a96000-778c7fff : reserved
+  784ce000-784cefff : reserved
+78630000-7863ffff : reserved
+78640000-786effff : System RAM
+  78640000-786effff : reserved
+786f0000-7872ffff : reserved
+78730000-7bbfffff : System RAM
+  7a189000-7a189fff : reserved
+7bc00000-7bfdffff : reserved
+7bfe0000-7fffffff : System RAM
+  7c000000-7fffffff : reserved
+80000000-ffffffff : PCI Bus 0000:00
+  80000000-80003fff : 0000:00:1f.0
+    80000000-80003fff : nvme
+  80004000-80007fff : 0000:00:05.0
+    80004000-80007fff : ena
+  80008000-8000bfff : 0000:00:04.0
+    80008000-8000bfff : nvme
+  8000c000-8000cfff : 0000:00:01.0
+    8000c000-8000c007 : serial
+400000000-43cbfffff : System RAM
+  4001bd000-4001bdfff : reserved
+  400200000-40020ffff : reserved
+  400210000-40021ffff : reserved
+  400220000-40022ffff : reserved
+  43a3fc000-43c7fffff : reserved
+  43c808000-43c808fff : reserved
+  43c80b000-43c80bfff : reserved
+  43c80c000-43c80efff : reserved
+  43c80f000-43cbfffff : reserved
+400000000000-407fffffffff : PCI Bus 0000:00

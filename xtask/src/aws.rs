@@ -212,9 +212,10 @@ impl Session {
     }
 
     fn tag_spec(&self, resources: &[&str]) -> Vec<String> {
-        resources
-            .iter()
-            .flat_map(|r| ["--tag-specifications".to_string(), self.tags(r)])
+        // One option with several values: a repeated option keeps its last
+        // value only, and the earlier resources would go untagged.
+        std::iter::once("--tag-specifications".to_string())
+            .chain(resources.iter().map(|r| self.tags(r)))
             .collect()
     }
 }
@@ -1441,6 +1442,18 @@ mod tests {
         let r = records(&text);
         assert_eq!(r.get("a").map(Vec::as_slice), Some(&b"hi\n"[..]));
         assert!(!r.contains_key("b"));
+    }
+
+    #[test]
+    fn one_tag_option_covers_every_resource() {
+        let s = Session {
+            id: "7".into(),
+            dir: PathBuf::new(),
+        };
+        let t = s.tag_spec(&["instance", "volume"]);
+        assert_eq!(t.iter().filter(|a| *a == "--tag-specifications").count(), 1);
+        assert_eq!(t.len(), 3);
+        assert!(t[1].contains("project") && t[2].starts_with("ResourceType=volume"));
     }
 
     #[test]
