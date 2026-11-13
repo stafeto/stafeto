@@ -227,8 +227,8 @@ fn setup(
     TRANSLATER.store(regs + its::GITS_TRANSLATER, Ordering::Relaxed);
     let typer = read64(its::GITS_TYPER);
     let gicd = info.gic.as_ref().map(|g| g.mapped()[0].base).unwrap_or(0);
-    // SAFETY: GICD_TYPER is a 32-bit register of the distributor, mapped.
     let gicd_typer = if gicd != 0 {
+        // SAFETY: GICD_TYPER is a 32-bit register of the distributor, mapped.
         unsafe { mmio::read32(LINEAR_BASE + gicd as usize + 0x4) }
     } else {
         0

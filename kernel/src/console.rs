@@ -74,11 +74,6 @@ fn port() -> Region {
 /// there is a port.
 fn reg(offset: usize) -> Option<usize> {
     let p = port();
-    let offset = if KIND.load(Relaxed) == NS16550 {
-        offset << SHIFT.load(Relaxed)
-    } else {
-        offset
-    };
     (p.size > 0).then(|| LINEAR_BASE + p.base as usize + offset)
 }
 
@@ -89,28 +84,47 @@ fn is_16550() -> bool {
 /// Writes `value` to register `offset` of the port, if there is one.
 fn write_reg(offset: usize, value: u32) {
     if let Some(addr) = reg(offset) {
-        // SAFETY: the port is the PL011 or 16550 of the device tree, device
-        // memory in the linear map, which mm::kmap maps before `set_port`.
-        unsafe {
-            if is_16550() && WIDTH.load(Relaxed) == 1 {
-                mmio::write8(addr, value as u8)
-            } else {
-                mmio::write32(addr, value)
-            }
-        }
+        // SAFETY: the port is the PL011 of the device tree, device memory
+        // in the linear map, which mm::kmap maps before `set_port`.
+        unsafe { mmio::write32(addr, value) }
     }
 }
 
 /// Reads register `offset` of the port; 0 without one.
 fn read_reg(offset: usize) -> u32 {
     // SAFETY: as in `write_reg`.
-    reg(offset).map_or(0, |addr| unsafe {
-        if is_16550() && WIDTH.load(Relaxed) == 1 {
+    reg(offset).map_or(0, |addr| unsafe { mmio::read32(addr) })
+}
+
+/// Register `n` of a 16550 port: `n` shifted by the node's `reg-shift`.
+fn ns_reg(n: usize) -> usize {
+    LINEAR_BASE + PORT_BASE.load(Relaxed) as usize + (n << SHIFT.load(Relaxed))
+}
+
+fn ns_write(n: usize, value: u32) {
+    let addr = ns_reg(n);
+    // SAFETY: the port is the 16550 of the device tree, device memory in the
+    // linear map, which mm::kmap maps before `set_port`; byte or 32-bit
+    // access as the node says.
+    unsafe {
+        if WIDTH.load(Relaxed) == 1 {
+            mmio::write8(addr, value as u8)
+        } else {
+            mmio::write32(addr, value)
+        }
+    }
+}
+
+fn ns_read(n: usize) -> u32 {
+    let addr = ns_reg(n);
+    // SAFETY: as in `ns_write`.
+    unsafe {
+        if WIDTH.load(Relaxed) == 1 {
             u32::from(mmio::read8(addr))
         } else {
             mmio::read32(addr)
         }
-    })
+    }
 }
 
 /// The port from now on is the PL011 of the device tree `info` describes,
@@ -169,8 +183,8 @@ fn set_up() {
         // No interrupts, 8N1 with the divisor latch closed: a driver that
         // died may have left the port in the divisor mode. The divisor and
         // the FIFOs are the firmware's.
-        write_reg(rules::REG_IER, 0);
-        write_reg(rules::REG_LCR, rules::LCR_8N1);
+        ns_write(rules::REG_IER, 0);
+        ns_write(rules::REG_LCR, rules::LCR_8N1);
         STUCK.store(false, Relaxed);
     } else {
         write_reg(CR, CR_ENABLE);
@@ -187,24 +201,24 @@ pub fn take_back() {
 }
 
 fn putc(byte: u8) {
-    if is_16550() {
-        if STUCK.load(Relaxed) {
-            return;
-        }
-        // At most 1 ms for room, then the byte is lost and the port is
-        // marked stuck until the next set-up (spec 3.2).
-        let deadline = timer::now().saturating_add(timer::frequency() / 1000);
-        if !rules::wait_room(|| read_reg(rules::REG_LSR), || timer::now() >= deadline) {
-            STUCK.store(true, Relaxed);
-            return;
-        }
-        write_reg(rules::REG_THR, u32::from(byte));
-        return;
-    }
     let Some(dr) = reg(DR) else { return };
     while read_reg(FR) & FR_TXFF != 0 {}
     // SAFETY: as in `write_reg`.
     unsafe { mmio::write32(dr, u32::from(byte)) };
+}
+
+/// One byte to a 16550: at most 1 ms for room, then the byte is lost and
+/// the port is marked stuck until the next set-up (spec 3.2).
+fn putc_16550(byte: u8) {
+    if STUCK.load(Relaxed) {
+        return;
+    }
+    let deadline = timer::now().saturating_add(timer::frequency() / 1000);
+    if !rules::wait_room(|| ns_read(rules::REG_LSR), || timer::now() >= deadline) {
+        STUCK.store(true, Relaxed);
+        return;
+    }
+    ns_write(rules::REG_THR, u32::from(byte));
 }
 
 /// Writes `bytes` to the port as they are, but for a CR before each LF,
@@ -214,6 +228,15 @@ fn putc(byte: u8) {
 pub fn write_bytes(bytes: &[u8]) {
     if RETURNED.swap(false, Relaxed) {
         set_up();
+    }
+    if is_16550() {
+        for &b in bytes {
+            if b == b'\n' {
+                putc_16550(b'\r');
+            }
+            putc_16550(b);
+        }
+        return;
     }
     for &b in bytes {
         if b == b'\n' {
@@ -230,7 +253,7 @@ pub fn drain() {
     let deadline = timer::now().saturating_add(timer::frequency() / 100);
     if is_16550() {
         if !STUCK.load(Relaxed) {
-            rules::drain_16550(|| read_reg(rules::REG_LSR), || timer::now() >= deadline);
+            rules::drain_16550(|| ns_read(rules::REG_LSR), || timer::now() >= deadline);
         }
         return;
     }
