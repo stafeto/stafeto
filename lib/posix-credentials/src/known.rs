@@ -99,11 +99,12 @@ impl Known {
     /// What right the client has to the shared object (`kind`, `key`). A
     /// remembered right stands while the page's word of the record is the
     /// generation of the answer, with no call. Otherwise `ask` (one
-    /// ShareHeld, given the record's index and that generation) says; a
-    /// right is remembered, and the oldest of the remembered goes out when
-    /// all `HELD_KEYS` places are taken. No right is remembered: a process
-    /// gains one without moving the generation, so a refusal is asked for
-    /// again. With no answer, or once the generation moved on since it, the
+    /// ShareHeld, given the record's index and that generation) says; the
+    /// right to write is remembered, and the oldest of the remembered goes
+    /// out when all `HELD_KEYS` places are taken. Nothing else is remembered
+    /// (the services treat a read right as a refusal): a process gains
+    /// the right to write without moving the generation, so a refusal and a
+    /// read right are asked for again. With no answer, or once the generation moved on since it, the
     /// result is `Held::None`: the next `credentials` asks Vouch again.
     pub fn held(
         &mut self,
@@ -127,7 +128,7 @@ impl Known {
             return rights.held;
         }
         let held = ask(known.index, known.generation).unwrap_or(Held::None);
-        if held != Held::None {
+        if held == Held::Write {
             self.held[self.next] = Some(Rights { kind, key, held });
             self.next = (self.next + 1) % HELD_KEYS;
         }
@@ -264,18 +265,43 @@ mod tests {
         assert_eq!(calls.get(), 5, "asked again after the move");
         // Four fit, the fifth pushes out the oldest (key 7).
         for key in 10..13 {
-            assert_eq!(ask(&mut known, key, Held::Read), Held::Read);
+            assert_eq!(ask(&mut known, key, Held::Write), Held::Write);
         }
         assert_eq!(calls.get(), 8);
         for key in [7, 10, 11, 12] {
-            ask(&mut known, key, Held::Read);
+            ask(&mut known, key, Held::Write);
         }
         assert_eq!(calls.get(), 8, "four are held");
         assert_eq!(ask(&mut known, 13, Held::Write), Held::Write);
         assert_eq!(calls.get(), 9);
         assert_eq!(ask(&mut known, 7, Held::Write), Held::Write);
         assert_eq!(calls.get(), 10, "the oldest went out");
-        assert_eq!(ask(&mut known, 12, Held::Read), Held::Read);
+        assert_eq!(ask(&mut known, 12, Held::Write), Held::Write);
         assert_eq!(calls.get(), 10, "the others stay");
+    }
+
+    /// A reader that later attaches as a writer is not held to its old
+    /// answer: the read right is asked for again while the generation stands.
+    #[test]
+    fn a_read_right_is_asked_for_again() {
+        let page = Cell::new(5u64);
+        let mut known = Known::new();
+        let generation = |_: usize| page.get();
+        known.credentials(generation, || Some(answer(0, 5)));
+        let rights = Cell::new(Held::Read);
+        let calls = Cell::new(0);
+        let mut ask = |known: &mut Known| {
+            known.held(generation, 0, 9, |_, _| {
+                calls.set(calls.get() + 1);
+                Some(rights.get())
+            })
+        };
+        assert_eq!(ask(&mut known), Held::Read);
+        assert_eq!(ask(&mut known), Held::Read);
+        assert_eq!(calls.get(), 2, "a read right is no hit");
+        rights.set(Held::Write);
+        assert_eq!(ask(&mut known), Held::Write, "the writer is heard at once");
+        assert_eq!(ask(&mut known), Held::Write);
+        assert_eq!(calls.get(), 3);
     }
 }
