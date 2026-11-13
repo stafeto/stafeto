@@ -38,6 +38,7 @@ abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 dynlink = { path = "../../lib/dynlink" }
 proto-fs = { path = "../../proto/fs" }
+proto-pipe = { path = "../../proto/pipe" }
 proto-loader = { path = "../../proto/loader" }
 proto-process = { path = "../../proto/process" }
 proto-tty = { path = "../../proto/tty" }

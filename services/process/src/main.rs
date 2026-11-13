@@ -32,6 +32,7 @@ use posix_process_service::placing::{self, Crowd};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
+use posix_process_service::roots::{Registration, Roots, registration};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::terminals::Terminals;
@@ -40,9 +41,10 @@ use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
-    SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId,
-    SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    LoaderRoot, Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL,
+    SI_QUEUE, SI_TIMER, SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS,
+    Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult,
+    WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -363,7 +365,10 @@ struct Processes {
     #[cfg(feature = "tty-probe")]
     tty_probe: Option<(usize, u32)>,
     terminal_notice: Option<Handle<Channel>>,
-    loader_terminal: Option<Handle<Channel>>,
+    /// The roots the services of the slots a loader verifies sent with
+    /// Register, by root (`proto_process::ROOT_TERMINAL` and the others): a
+    /// service that restarts registers again and its root replaces the old.
+    loader_roots: Roots<Handle<Channel>>,
     /// The controlling terminals of the sessions (5f).
     terminals: Terminals,
     /// The place of the service's channel that tells it of the next step
@@ -1213,13 +1218,15 @@ impl Processes {
             }
             return Answer::Reply([copy.erase()].into());
         }
-        if method == Method::Register as u16
-            && (r.handles.is_empty()
-                || proto_process::is_terminal(r.label()) && r.handles.len() == 2)
-        {
-            if !r.handles.is_empty() {
-                let notice = matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::NOTIFY));
-                let loader = matches!(r.handles.info(1), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::DUPLICATE));
+        // A service whose label has the mark of a root registers it: the
+        // terminal service with its notice, the others with the root alone.
+        let registration = registration(r.label(), r.handles.len());
+        if method == Method::Register as u16 && registration != Registration::Refused {
+            if let Registration::Root { root: _, at } = registration {
+                // The terminal service sends its notice first, then the root.
+                let notice = at == 0
+                    || matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::NOTIFY));
+                let loader = matches!(r.handles.info(at), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::DUPLICATE));
                 if !notice || !loader {
                     return Answer::Status(Status::BadSize);
                 }
@@ -1230,9 +1237,13 @@ impl Processes {
             if r.reply().u32(0).is_err() {
                 return Answer::Status(Status::BadSize);
             }
-            if proto_process::is_terminal(r.label()) && r.handles.len() == 2 {
-                self.terminal_notice = r.handles.take::<Channel>(0).ok();
-                self.loader_terminal = r.handles.take::<Channel>(1).ok();
+            if let Registration::Root { root, at } = registration {
+                if at == 1 {
+                    self.terminal_notice = r.handles.take::<Channel>(0).ok();
+                }
+                if let Ok(kept) = r.handles.take::<Channel>(at) {
+                    self.loader_roots.register(root, kept);
+                }
             }
             return Answer::Reply([copy.erase()].into());
         }
@@ -4197,6 +4208,22 @@ impl Processes {
         }
     }
 
+    /// The reply of a loader's request for a root: a copy of `root` that
+    /// sends and transfers, UNREGISTERED when its service sent none.
+    fn loader_root_reply(&self, root: Option<&Handle<Channel>>, r: &mut Request<'_>) -> Answer {
+        let Some(root) = root else {
+            return refuse(proto_process::UNREGISTERED);
+        };
+        let copy = match sys::handle_duplicate(root, Rights::SEND | Rights::TRANSFER) {
+            Ok(copy) => copy,
+            Err(e) => return kernel(e),
+        };
+        if r.reply().u32(0).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply([copy.erase()].into())
+    }
+
     /// A request through the session of the loader of the record in
     /// `child`: startup, readiness, final transfer and the trusted loader roots.
     fn loader_request(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
@@ -4209,32 +4236,28 @@ impl Processes {
         if r.method() == Method::Ready as u16 {
             return self.ready(child, r);
         }
+        if r.method() == Method::LoaderRoot as u16 {
+            let Ok(LoaderRoot { root }) = LoaderRoot::read(r.body()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading)
+                || !r.handles.is_empty()
+            {
+                return refuse(proto_process::PERMISSION);
+            }
+            return self.loader_root_reply(self.loader_roots.get(root), r);
+        }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
         match r.method() {
-            m if m == Method::LoaderTerminal as u16 || m == Method::LoaderClock as u16 => {
+            m if m == Method::LoaderClock as u16 => {
                 if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading)
                     || !r.handles.is_empty()
                 {
                     return refuse(proto_process::PERMISSION);
                 }
-                let root = if m == Method::LoaderClock as u16 {
-                    self.clock.as_ref()
-                } else {
-                    self.loader_terminal.as_ref()
-                };
-                let Some(terminal) = root else {
-                    return refuse(proto_process::UNREGISTERED);
-                };
-                let copy = match sys::handle_duplicate(terminal, Rights::SEND | Rights::TRANSFER) {
-                    Ok(copy) => copy,
-                    Err(e) => return kernel(e),
-                };
-                if r.reply().u32(0).is_err() {
-                    return Answer::Status(Status::BadSize);
-                }
-                Answer::Reply([copy.erase()].into())
+                self.loader_root_reply(self.clock.as_ref(), r)
             }
             m if m == Method::Boot as u16 => self.boot(child, slot, r),
             m if m == Method::Take as u16 => self.take(child, slot, r),
@@ -4657,7 +4680,7 @@ impl Service<0> for Processes {
             Method::Ready,
             Method::Take,
             Method::SetId,
-            Method::LoaderTerminal,
+            Method::LoaderRoot,
             Method::LoaderClock,
         ];
         if loaders_own.map(|m| m as u16).contains(&method) {

@@ -29,7 +29,7 @@ use proto_pipe::sock::{
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long, watch};
-use rt::abi::{Error, Rights, Source};
+use rt::abi::{Error, ObjectKind, Rights, Source};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{
     Answer, Config, Heartbeat, LongOps, LongSession, Notice, Request, Service, Session,
@@ -167,6 +167,15 @@ fn main(_: u64) -> u64 {
     let Ok(step) = sys::handle_label(&channel, Rights::NOTIFY, STEP, level) else {
         return 5;
     };
+    // The root of the service goes to the process service with the PIPE
+    // mark of the notary session, for the loaders to verify the Pipes
+    // session of a set-ID program with: at every start, so that an instance
+    // after a restart replaces the root of the one that went. A startup that
+    // waits for the process service to register, as the terminal service's.
+    let notary = rt::service::connect(&start.parent, "posix").ok();
+    if let Some(notary) = notary.as_ref() {
+        let _ = register_root(notary, &channel, level);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -198,7 +207,7 @@ fn main(_: u64) -> u64 {
         step,
         process: Handle::borrowed(start.process.raw()),
         parent: Handle::borrowed(start.parent.raw()),
-        notary: None,
+        notary,
         generations: None,
         step_told: false,
         step_due: false,
@@ -211,6 +220,30 @@ fn main(_: u64) -> u64 {
     rt::service::quiet_steps();
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
     4
+}
+
+/// Register with the root of the service (label `proto_pipe::ROOT`, SEND,
+/// DUPLICATE and TRANSFER) through the notary session: the process service
+/// keeps it for its loaders, and a later Register replaces it.
+fn register_root(
+    notary: &Handle<Channel>,
+    channel: &Handle<Channel>,
+    level: u8,
+) -> Result<(), Error> {
+    let root = sys::handle_label(
+        channel,
+        Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+        proto_pipe::ROOT,
+        level,
+    )?;
+    let request = proto_process::Method::Register.header().bytes();
+    let reply =
+        sys::send_handles(notary, &request, [root.erase()]).map_err(|refused| refused.error)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
+        Ok(0) => Ok(()),
+        _ => Err(Error::BadState),
+    }
 }
 
 struct PipeService {
@@ -1599,12 +1632,24 @@ impl PipeService {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
+        self.new_clone(held, root, &list[..count], r)
+    }
+
+    /// A new session of the service's own label that holds the descriptions
+    /// of `held` that `list` names, in the chain of `root`.
+    fn new_clone(
+        &mut self,
+        held: &Held,
+        root: u64,
+        list: &[Endpoint],
+        r: &mut Request<'_>,
+    ) -> Answer {
         if self.clones.room_within(root, ROOT_CLONES).is_err()
             || !self.pipes.ipc_inherit_room(r.label())
         {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        let mut child = match self.pipes.clone_endpoints(held, &list[..count]) {
+        let mut child = match self.pipes.clone_endpoints(held, list) {
             Ok(child) => child,
             Err(code) => return status(code),
         };
@@ -1645,6 +1690,34 @@ impl PipeService {
     }
 }
 
+impl PipeService {
+    /// VerifySession through the root: the offered channel comes back when
+    /// it is a live session of a client of the service; any other gets a new
+    /// clone with no descriptions, and the offered channel is let go of with
+    /// no request sent through it. Every step is O(1).
+    fn verify_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if !matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::TRANSFER))
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(offered) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let label = sys::copy_label(&self.channel, &offered).ok();
+        if pipe::verify::genuine(&*self.clones, label) {
+            if r.reply().u32(0).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply([offered.erase()].into());
+        }
+        drop(offered);
+        self.new_clone(&Held::default(), proto_pipe::ROOT, &[], r)
+    }
+}
+
 /// The value of a reply: status 0 and `words`.
 fn words(r: &mut Request<'_>, words: &[u32]) -> Answer {
     let w = r.reply();
@@ -1675,7 +1748,7 @@ impl Service<0> for PipeService {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45,
+                45, 46,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -1687,6 +1760,11 @@ impl Service<0> for PipeService {
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
+        // VerifySession goes through the root alone, and the root has no
+        // other request.
+        if (r.label() == proto_pipe::ROOT) != (r.method() == Method::VerifySession as u16) {
+            return Answer::Status(Status::Kernel(Error::AccessDenied));
+        }
         #[cfg(feature = "steps")]
         if r.method() == 17 {
             return rt::service::step_snapshot(r);
@@ -1804,6 +1882,7 @@ impl Service<0> for PipeService {
                 Answer::Status(Status::Ok)
             }
             Some(Method::BrokerJobs) => self.broker_jobs(r),
+            Some(Method::VerifySession) => self.verify_session(r),
             Some(
                 method @ (Method::PayerWitness
                 | Method::BrokerPrepare

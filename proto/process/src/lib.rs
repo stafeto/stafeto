@@ -166,6 +166,15 @@
 //! loader's identity, of the image its place loads, answers with the
 //! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
+//! Register of a root, through a notary session whose label has the mark of
+//! a root (TERMINAL with its notice, PIPE, NET or ENTROPY; init gives each
+//! to the one entry of its table that is that service): one handle, a
+//! channel of the service with SEND and DUPLICATE (TERMINAL: the notice and
+//! that channel). The service keeps it, a later Register of the same mark
+//! replacing it (a restarted service registers again), and hands a copy to
+//! a loader that asks LoaderRoot with the root's number; the loader sends
+//! the root VerifySession. PERMISSION for a session with no such mark.
+//!
 //! TtySignal, SetCtty and DropCtty, through a notary session whose label
 //! has TERMINAL (init gives it to the terminal service of its table; 5f):
 //! the service keeps which session each terminal is the controlling
@@ -206,7 +215,11 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 
-pub const VERSION: u16 = 12;
+/// Version 13: LoaderRoot (number 43, which LoaderTerminal had) names the
+/// slot whose root it asks for in a body, and the notary marks PIPE, NET and
+/// ENTROPY join TERMINAL as the marks of a service that sends its root
+/// with Register.
+pub const VERSION: u16 = 13;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -482,7 +495,10 @@ pub enum Method {
     DropCtty = 39,
     TtyEvents = 40,
     AckCtty = 41,
-    LoaderTerminal = 43,
+    /// Empty handles, through an active loader session before Ready; the
+    /// body is `LoaderRoot`. Reply: status and the registered root of the
+    /// slot with SEND|TRANSFER (UNREGISTERED when its service sent none).
+    LoaderRoot = 43,
     /// Empty body and no handles, through an active loader session before Ready.
     /// Reply: status and the trusted Clock endpoint with SEND|TRANSFER.
     LoaderClock = 45,
@@ -738,6 +754,70 @@ pub const TERMINAL: u64 = 1 << 60;
 /// Whether `label` is that of the terminal service's notary session.
 pub const fn is_terminal(label: u64) -> bool {
     is_notary(label) && label & TERMINAL != 0
+}
+
+/// The marks of the notary sessions of the services that send their root
+/// to the process service with Register, which init gives only to the
+/// entry of its table that is such a service: the channel service (PIPE),
+/// the network service (NET) and the entropy service (ENTROPY). Bits 59 to
+/// 57, with NOTARY; TERMINAL is the fourth.
+pub const PIPE: u64 = 1 << 59;
+pub const NET: u64 = 1 << 58;
+pub const ENTROPY: u64 = 1 << 57;
+
+/// The roots the process service keeps for the loaders, by the slot they
+/// are the root of: a loader asks for one with LoaderRoot and sends it
+/// VerifySession.
+pub const ROOT_TERMINAL: u32 = 0;
+pub const ROOT_PIPES: u32 = 1;
+pub const ROOT_NET: u32 = 2;
+pub const ROOT_ENTROPY: u32 = 3;
+pub const ROOTS: usize = 4;
+
+/// The marks of the roots, in the order of the roots.
+pub const ROOT_MARKS: [u64; ROOTS] = [TERMINAL, PIPE, NET, ENTROPY];
+
+/// The root a notary label may register: the one whose mark it has, and
+/// none for a label with no mark or with two (init gives one at most).
+pub const fn root_of(label: u64) -> Option<u32> {
+    if !is_notary(label) {
+        return None;
+    }
+    let mut found = None;
+    let mut i = 0;
+    while i < ROOTS {
+        if label & ROOT_MARKS[i] != 0 {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i as u32);
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The body of LoaderRoot: the root asked for (`ROOT_TERMINAL` and the
+/// others).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoaderRoot {
+    pub root: u32,
+}
+
+impl LoaderRoot {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.root)
+    }
+
+    /// BAD_SIZE out of the layout or for a root the service has no place for.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let root = r.u32()?;
+        r.finish()?;
+        if root as usize >= ROOTS {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { root })
+    }
 }
 
 /// The terminals of the terminal service: the console and 8
@@ -1913,7 +1993,7 @@ mod tests {
             Method::DropCtty,
             Method::TtyEvents,
             Method::AckCtty,
-            Method::LoaderTerminal,
+            Method::LoaderRoot,
             Method::LoaderClock,
             Method::Image,
             Method::SetGroups,
@@ -2142,6 +2222,46 @@ mod tests {
     }
 
     #[test]
+    fn a_root_is_registered_by_its_own_mark_alone() {
+        // The marks are distinct bits below SET_ID and above init's counter.
+        let mut all = 0;
+        for mark in ROOT_MARKS {
+            assert_eq!(mark.count_ones(), 1);
+            assert_eq!(all & mark, 0);
+            assert!(mark < SET_ID && mark > 1 << 40);
+            all |= mark;
+        }
+        for (i, mark) in ROOT_MARKS.into_iter().enumerate() {
+            assert_eq!(root_of(NOTARY | mark | 7), Some(i as u32));
+            // A session of a service with no mark, or with the mark of no
+            // notary session, has no root to register.
+            assert_eq!(root_of(mark | 7), None);
+            assert_eq!(root_of(1 << 63 | NOTARY | mark), None);
+        }
+        assert_eq!(root_of(NOTARY | 7), None);
+        assert_eq!(root_of(NOTARY | SET_ID | 7), None);
+        assert_eq!(root_of(NOTARY | PIPE | NET), None);
+    }
+
+    #[test]
+    fn loader_root_has_one_layout() {
+        let mut w = Writer::new();
+        LoaderRoot { root: ROOT_PIPES }.write(&mut w).unwrap();
+        assert_eq!(
+            LoaderRoot::read(Reader::new(w.as_bytes())),
+            Ok(LoaderRoot { root: ROOT_PIPES })
+        );
+        let mut w = Writer::new();
+        LoaderRoot { root: ROOTS as u32 }.write(&mut w).unwrap();
+        assert_eq!(
+            LoaderRoot::read(Reader::new(w.as_bytes())),
+            Err(Status::BadSize)
+        );
+        assert_eq!(LoaderRoot::read(Reader::new(&[])), Err(Status::BadSize));
+        assert_eq!(Method::LoaderRoot as u16, 43);
+    }
+
+    #[test]
     fn share_held_has_one_layout() {
         let ask = ShareHeld {
             index: 12,
@@ -2202,7 +2322,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 12);
+        assert_eq!(VERSION, 13);
     }
 
     #[test]
