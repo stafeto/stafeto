@@ -366,6 +366,28 @@ static int crypt_salts(void) {
     return 0;
 }
 
+/* The role `arc4fork`: the first arc4random output of a program starts from the spare bytes of
+ * AT_RANDOM, and a forked child must not repeat the parent's. Neither calls arc4random before
+ * the fork. */
+static int arc4_fork_role(void) {
+    int ends[2];
+    CHECK(pipe(ends) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    unsigned char mine[8];
+    arc4random_buf(mine, sizeof mine);
+    if (pid == 0) {
+        _exit(write(ends[1], mine, sizeof mine) == (ssize_t)sizeof mine ? 0 : 1);
+    }
+    unsigned char theirs[8];
+    CHECK(read(ends[0], theirs, sizeof theirs) == (ssize_t)sizeof theirs);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(memcmp(mine, theirs, sizeof mine) != 0);
+    printf("posix-random: the first arc4random words of a parent and its forked child differ\n");
+    return 0;
+}
+
 /* The role `noentropy`: the session with the entropy service is gone before the process asked
  * the generator for a byte (the program started with AT_RANDOM, so its start took none). Every
  * call that needs a random name fails with ENOSYS and no name made of the clock comes: the
@@ -926,6 +948,7 @@ static int first(void) {
     CHECK(at_random() == 0);
     CHECK(canary() == 0);
     CHECK(smash() == 0);
+    CHECK(spawn_role("arc4fork", -1) == 0);
     CHECK(spawn_role("noentropy", -1) == 0);
     CHECK(forged() == 0);
     CHECK(forged_pipes() == 0);
@@ -1037,6 +1060,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "auxrandom") == 0) return auxrandom_role(argv[2]);
     if (argc > 2 && strcmp(argv[1], "canary") == 0) return canary_role(argv[2]);
     if (argc > 1 && strcmp(argv[1], "smash") == 0) return smash_role();
+    if (argc > 1 && strcmp(argv[1], "arc4fork") == 0) return arc4_fork_role();
     if (argc > 1 && strcmp(argv[1], "noentropy") == 0) return no_entropy_role();
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);

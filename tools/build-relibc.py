@@ -169,8 +169,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Salts of crypt from getrandom (ENOSYS without entropy), whole reads of
 # getrandom, the spare bytes of AT_RANDOM in the first arc4random, a line on
 # a long wait for the first seed, before the abort of a start without entropy
-# and before the abort of __stack_chk_fail; tagged pin-1b20cd22.
-COMMIT = "1b20cd22ed9a4f14c1b114cc805e780f9be06b8e"
+# and before the abort of __stack_chk_fail; tagged pin-1b20cd22; then the fork child clears the spare AT_RANDOM word, tagged pin-2ae5cdf6.
+COMMIT = "2ae5cdf6e4271dc149b1e5af4f20acd716c8ab18"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

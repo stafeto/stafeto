@@ -2193,6 +2193,13 @@ impl Fs {
                     self.ram.release(&mut child);
                     return Answer::Status(Status::BadSize);
                 }
+                // A slot of births that is taken belongs to a departure that has not ended.
+                if self.births[Self::birth_index(label)].is_some() {
+                    self.drop_identity(&mut child);
+                    self.ram.release(&mut child);
+                    self.places.release(label);
+                    return status(proto_fs::TOO_MANY_OPEN_FILES);
+                }
                 self.births[Self::birth_index(label)] = Some((label, child));
                 let adopted = self.clones.adopt(label, r.label());
                 debug_assert!(adopted.is_ok(), "the place of a new label is free");
@@ -2279,8 +2286,15 @@ impl Service<0> for Fs {
         self.waits.poll();
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
-        if !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label()) {
-            self.departures.admit(self.places.place(s.label()));
+        // A label with no place has no departure of its own (its index would be the
+        // departure of birth 0).
+        let place = self.places.place(s.label());
+        if place < ramfs::places::COUNT
+            && !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label())
+            && !self.departures.contains(place)
+        {
+            self.places.hold(s.label());
+            self.departures.admit(place);
         }
     }
 
@@ -2308,7 +2322,10 @@ impl Service<0> for Fs {
             self.lock_sweep.restart();
             self.lock_sweep_pending = self.locks.has_locks();
             if !Self::lock_custody_empty(self.wait_jobs, self.places, fds, label) {
-                self.departures.admit(SESSIONS + i);
+                if !self.departures.contains(SESSIONS + i) {
+                    self.places.hold(label);
+                    self.departures.admit(SESSIONS + i);
+                }
                 return;
             }
             self.births[i] = None;
@@ -3994,7 +4011,8 @@ impl Fs {
                     self.births[i - SESSIONS] = None;
                 }
                 self.departures.release(i);
-                self.places.release(label);
+                // The place of the label goes back after its last departure.
+                self.places.finish(label);
                 self.clones.gone(label);
                 work = true;
             }

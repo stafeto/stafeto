@@ -3180,7 +3180,7 @@ fn build_boot_image(
 /// dependencies, for every target), and those whose build script names relibc.
 /// Their start takes the stack canary from AT_RANDOM, or from a blocking
 /// `getrandom`, and ends the program with abort when it has neither.
-fn relibc_packages(root: &Path) -> Vec<String> {
+fn relibc_packages(root: &Path) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let tree = std::process::Command::new(cargo)
@@ -3188,8 +3188,15 @@ fn relibc_packages(root: &Path) -> Vec<String> {
         .args(["--edges", "normal", "--target", "all", "--offline"])
         .args(["--prefix", "depth"])
         .current_dir(root)
-        .output();
-    if let Some(tree) = tree.ok().filter(|t| t.status.success()) {
+        .output()
+        .map_err(|e| format!("cargo tree: {e}"))?;
+    if !tree.status.success() {
+        return Err(format!(
+            "cargo tree failed, the packages on relibc are unknown: {}",
+            String::from_utf8_lossy(&tree.stderr)
+        ));
+    }
+    {
         // "<depth><name> v<version> (<path>)": the workspace's own packages
         // carry a path, and the root of the tree (depth 0) is posix-crt.
         for line in String::from_utf8_lossy(&tree.stdout).lines() {
@@ -3225,20 +3232,20 @@ fn relibc_packages(root: &Path) -> Vec<String> {
     }
     names.sort();
     names.dedup();
-    names
+    Ok(names)
 }
 
 /// The first program of `programs` on relibc when the image has no entropy
 /// service: that program would end in its start ("posix means entropy").
-fn without_entropy(root: &Path, programs: &[ImageProgram]) -> Option<&'static str> {
+fn without_entropy(root: &Path, programs: &[ImageProgram]) -> Result<Option<&'static str>, String> {
     if programs.iter().any(|p| p.0 == "entropy") {
-        return None;
+        return Ok(None);
     }
-    let relibc = relibc_packages(root);
-    programs
+    let relibc = relibc_packages(root)?;
+    Ok(programs
         .iter()
         .find(|p| relibc.iter().any(|name| name == p.1))
-        .map(|p| p.1)
+        .map(|p| p.1))
 }
 
 /// The copy of the ELF file of `package` that the boot image `image` was
@@ -3276,7 +3283,7 @@ fn write_boot_image_files(
     env: &[(&str, &str)],
     extra: Vec<rootfs::RootFile>,
 ) -> Result<PathBuf, String> {
-    if let Some(program) = without_entropy(&root(), programs) {
+    if let Some(program) = without_entropy(&root(), programs)? {
         return Err(format!(
             "the image {name} starts {program}, a program on relibc, and has no entropy service"
         ));
@@ -15549,13 +15556,15 @@ mod entropy_in_images_tests {
         let tables = image_program_tables();
         let root = root();
         assert!(
-            relibc_packages(&root).len() > 10,
+            relibc_packages(&root).unwrap().len() > 10,
             "the packages on relibc were not found"
         );
         let lacking: Vec<String> = tables
             .iter()
             .filter_map(|(name, programs)| {
-                without_entropy(&root, programs).map(|p| format!("{name}: {p}"))
+                without_entropy(&root, programs)
+                    .unwrap()
+                    .map(|p| format!("{name}: {p}"))
             })
             .collect();
         assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
@@ -15571,7 +15580,7 @@ mod entropy_in_images_tests {
     fn a_posix_process_connects_to_the_entropy_service() {
         use init::table::{ALL_TABLES, aws, pkg};
         let root = root();
-        let relibc = relibc_packages(&root);
+        let relibc = relibc_packages(&root).unwrap();
         assert!(relibc.len() > 10, "the packages on relibc were not found");
         let images = image_program_tables();
         let package_of = |program: &str| {
@@ -15601,6 +15610,14 @@ mod entropy_in_images_tests {
         assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
     }
 
+    /// A failing `cargo tree` is an error, not an empty list of packages.
+    #[test]
+    fn the_packages_on_relibc_fail_loudly_when_cargo_tree_does() {
+        assert!(relibc_packages(Path::new("/nonexistent-workspace")).is_err());
+        let dir = std::env::temp_dir();
+        assert!(without_entropy(&dir, &[("hello", "relibc-hello", 0, &[][..])]).is_err());
+    }
+
     #[test]
     fn an_image_without_the_entropy_service_is_refused() {
         let root = root();
@@ -15609,10 +15626,10 @@ mod entropy_in_images_tests {
             ("hello", "relibc-hello", 0, &[][..]),
             ("entropy", "entropy", 0, &[][..]),
         ];
-        assert_eq!(without_entropy(&root, &with), None);
+        assert_eq!(without_entropy(&root, &with), Ok(None));
         let without = &with[..2];
-        assert_eq!(without_entropy(&root, without), Some("relibc-hello"));
+        assert_eq!(without_entropy(&root, without), Ok(Some("relibc-hello")));
         // A program of Rust alone needs none.
-        assert_eq!(without_entropy(&root, &with[..1]), None);
+        assert_eq!(without_entropy(&root, &with[..1]), Ok(None));
     }
 }
