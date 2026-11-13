@@ -2154,7 +2154,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-posix-random.img" | "boot-posix-random-net.img" | "boot-posix-random-net2.img" => {
+        "boot-posix-random.img"
+        | "boot-posix-random-break.img"
+        | "boot-posix-random-net.img"
+        | "boot-posix-random-net2.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-random", 0o755, ROOT, "posix-random"),

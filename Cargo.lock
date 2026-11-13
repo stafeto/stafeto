@@ -377,6 +377,7 @@ dependencies = [
  "abi",
  "bootimg",
  "dynlink",
+ "posix-random",
  "proto-clock",
  "proto-entropy",
  "proto-fs",

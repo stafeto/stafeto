@@ -2152,6 +2152,7 @@ commands:
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
+  random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
   seed-breaks run the kernel tests with the boot seed left in the device tree: the test of the wipe must fail, and only it
   its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
@@ -2180,6 +2181,7 @@ fn main() {
         Some("its-lpis") => its_lpis(),
         Some("its-breaks") => its_breaks(),
         Some("seed-breaks") => seed_breaks(),
+        Some("random-breaks") => entropy::random_breaks(),
         Some("entropy-seed") => entropy::seed_probe(),
         Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
@@ -9814,6 +9816,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("its lpis", its_lpis),
         job("its breaks", its_breaks),
         job("seed breaks", seed_breaks),
+        job("random breaks", entropy::random_breaks),
         job("entropy seed", entropy::seed_probe),
         job("its slow", its_slow),
         job("smp 4 window", smp_window),

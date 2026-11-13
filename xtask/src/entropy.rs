@@ -398,7 +398,10 @@ pub fn probe_vz() -> Result<(), String> {
 /// The C probe of the layer's generator (tests/posix-random): the POSIX
 /// services, the loader, the entropy device's driver and service, and the
 /// probe, which starts its own file once.
-pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9] {
+pub const fn random_programs(
+    pipe: &'static [&'static str],
+    loader: &'static [&'static str],
+) -> [ImageProgram; 9] {
     [
         ("init", "init", INIT_STACK_SIZE, &["table-posix-random"]),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
@@ -410,7 +413,7 @@ pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9]
         ),
         ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
         ("pipe", "pipe", crate::PIPE_STACK_SIZE, pipe),
-        ("loader", "loader", 0, &[]),
+        ("loader", "loader", 0, loader),
         ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
         // The first fill waits 500 ms: the probe meets the wait for it.
         ("entropy", "entropy", ENTROPY_STACK_SIZE, &["slow-start"]),
@@ -424,11 +427,13 @@ pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9]
 }
 
 /// The probe's image with the steps of the pipe service counted.
-static RANDOM_PROGRAMS: [ImageProgram; 9] = random_programs(&[]);
-static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"]);
+static RANDOM_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &[]);
+static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"], &[]);
+/// The same with a loader that gives AT_RANDOM as zeros (feature `break-at-random`).
+static RANDOM_BREAK_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &["break-at-random"]);
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 21] = [
+const RANDOM_LINES: [&str; 23] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
@@ -447,7 +452,9 @@ const RANDOM_LINES: [&str; 21] = [
     "posix-random: mkstemp gave",
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
+    "posix-random: AT_RANDOM gave 16 bytes to each of two programs, they differ and are not zero",
     "posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request",
+    "posix-random: a set-ID program has AT_RANDOM from its verified session",
     "posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request",
     "posix-random: ok",
 ];
@@ -486,7 +493,7 @@ const fn random_net_programs(
     table: &'static [&'static str],
     netd: &'static [&'static str],
 ) -> [ImageProgram; 10] {
-    let base = random_programs(&[]);
+    let base = random_programs(&[], &[]);
     [
         ("init", "init", INIT_STACK_SIZE, table),
         base[1],
@@ -633,6 +640,34 @@ fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
         "posix-random-net{}: a set-ID program takes its net session from the service, keeps an inherited socket: ok",
         if two { "-two" } else { "" }
     );
+    Ok(())
+}
+
+/// `cargo xtask random-breaks`: the probe of AT_RANDOM with a loader that
+/// gives zeros fails (the probe's check of the bytes; its exit code 20), and
+/// no line `posix-random: ok` comes.
+pub fn random_breaks() -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-random-break.img",
+        &RANDOM_BREAK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(
+        cmd,
+        crate::BOOT_TIMEOUT,
+        Some("init: posix-random ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "init: posix-random ended: exit code 20")?;
+    if output.lines.iter().any(|l| l == "posix-random: ok") {
+        return Err("the loader that gives zeros passed the probe".into());
+    }
+    qemu::expect_marker(&output, "check failed at line")?;
+    println!("random-breaks: a loader that gives AT_RANDOM as zeros is caught");
     Ok(())
 }
 

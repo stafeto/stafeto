@@ -19,6 +19,8 @@ bench = false
 
 [features]
 auth-probe = []
+# Deliberate breakage (cargo xtask random-breaks): AT_RANDOM is 16 bytes of zeros.
+break-at-random = []
 image-gates = ["auth-probe"]
 image-info-probe = ["image-gates"]
 # The probes of the copy of a fork (posix-procs): pieces of 64 KiB, so
@@ -37,6 +39,7 @@ proto-clock = { path = "../../proto/clock" }
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 dynlink = { path = "../../lib/dynlink" }
+posix-random = { path = "../../lib/posix-random" }
 proto-entropy = { path = "../../proto/entropy" }
 proto-fs = { path = "../../proto/fs" }
 proto-net = { path = "../../proto/net" }

@@ -94,13 +94,16 @@ mod auxv {
     pub const AT_PHNUM: usize = 5;
     pub const AT_PAGESZ: usize = 6;
     pub const AT_SECURE: usize = 23;
+    pub const AT_RANDOM: usize = 25;
 }
 
 /// The auxiliary vector into `out`, pairs of words: the program headers
 /// (relibc builds the static TLS from `PT_TLS`), the page size and, for
-/// a set-ID program, AT_SECURE; then AT_NULL. Six pairs.
+/// a set-ID program, AT_SECURE, and, with `random`, AT_RANDOM (the address
+/// of the 16 bytes in the start area, `proto_loader::RANDOM_AT`); then
+/// AT_NULL. Six pairs, seven with `random`.
 #[cfg(not(feature = "shared"))]
-fn auxiliary(out: &mut [usize], secure: bool) {
+fn auxiliary(out: &mut [usize], secure: bool, random: bool) {
     use auxv::*;
     let header = ptr::addr_of!(__ehdr_start).cast::<u8>();
     // SAFETY: the ELF header is 64 readable bytes.
@@ -117,6 +120,11 @@ fn auxiliary(out: &mut [usize], secure: bool) {
         (AT_PHNUM, phnum),
         (AT_PAGESZ, 4096),
         (AT_SECURE, usize::from(secure)),
+        if random {
+            (AT_RANDOM, proto_loader::RANDOM_AT as usize)
+        } else {
+            (AT_NULL, 0)
+        },
         (AT_NULL, 0),
     ];
     for (index, (key, value)) in pairs.into_iter().enumerate() {
@@ -138,7 +146,7 @@ fn start_relibc(arguments: &[*mut c_char]) -> ! {
     }
     // argv's NULL and the empty environment's NULL follow the arguments.
     let auxv = 1 + arguments.len() + 2;
-    auxiliary(&mut stack[auxv..], false);
+    auxiliary(&mut stack[auxv..], false, false);
     // SAFETY: the stack follows the Linux start contract, and it lives on:
     // relibc's start does not return.
     unsafe { enter_relibc(stack.as_ptr(), main) }
@@ -563,7 +571,11 @@ fn loaded_main() -> u64 {
         let auxv = unsafe {
             core::slice::from_raw_parts_mut(area.auxv as *mut usize, 2 * proto_loader::AUXV_PAIRS)
         };
-        auxiliary(auxv, area.flags & SECURE != 0);
+        auxiliary(
+            auxv,
+            area.flags & SECURE != 0,
+            area.flags & proto_loader::RANDOM != 0,
+        );
     }
     // SAFETY: the area holds the initial stack and lives for good.
     unsafe { enter_relibc(area.stack as *const usize, main) }

@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/random.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -43,6 +44,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef AT_RANDOM
+#define AT_RANDOM 25
+#endif
 
 extern char **environ;
 extern uint64_t random_probe_calls(void);
@@ -217,6 +222,36 @@ static int spawn_role(const char *role, int fd) {
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status));
     return WEXITSTATUS(status);
+}
+
+/* The role `auxrandom`: the 16 bytes AT_RANDOM points to, which the loader took from the
+ * entropy service, go to the descriptor `number` (a pipe); none, or all zero, is a failure. */
+static int auxrandom_role(const char *number) {
+    int fd = atoi(number);
+    const unsigned char *at = (const unsigned char *)getauxval(AT_RANDOM);
+    CHECK(at != NULL);
+    unsigned char bytes[16];
+    for (int i = 0; i < 16; i++) bytes[i] = at[i];
+    CHECK(!all_zero(bytes, sizeof bytes));
+    CHECK(write(fd, bytes, sizeof bytes) == (ssize_t)sizeof bytes);
+    return 0;
+}
+
+/* Two programs started one after the other each have AT_RANDOM, and their 16 bytes differ. */
+static int at_random(void) {
+    int ends[2];
+    unsigned char a[16], b[16];
+    CHECK(pipe(ends) == 0);
+    CHECK(spawn_role("auxrandom", ends[1]) == 0);
+    CHECK(spawn_role("auxrandom", ends[1]) == 0);
+    CHECK(read_all(ends[0], a, sizeof a) == (ssize_t)sizeof a);
+    CHECK(read_all(ends[0], b, sizeof b) == (ssize_t)sizeof b);
+    CHECK(!all_zero(a, sizeof a) && !all_zero(b, sizeof b));
+    CHECK(memcmp(a, b, sizeof a) != 0);
+    CHECK(close(ends[0]) == 0 && close(ends[1]) == 0);
+    printf("posix-random: AT_RANDOM gave 16 bytes to each of two programs, they differ and are "
+           "not zero (%016llx, %016llx)\n", head(a), head(b));
+    return 0;
 }
 
 /* A descriptor of a device crosses posix_spawn (without FD_CLOEXEC). */
@@ -444,6 +479,7 @@ static int forged(void) {
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     printf("posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request\n");
+    printf("posix-random: a set-ID program has AT_RANDOM from its verified session\n");
     return 0;
 }
 
@@ -513,6 +549,12 @@ static int setid_role(void) {
     CHECK(getrandom(again, sizeof again, 0) == (ssize_t)sizeof again);
     CHECK(memcmp(bytes, again, sizeof bytes) != 0);
     CHECK(getrandom(again, sizeof again, GRND_NONBLOCK) == (ssize_t)sizeof again);
+    /* The loader took AT_RANDOM from the same verified session. */
+    const unsigned char *at = (const unsigned char *)getauxval(AT_RANDOM);
+    CHECK(at != NULL);
+    unsigned char aux[16];
+    for (int i = 0; i < 16; i++) aux[i] = at[i];
+    CHECK(!all_zero(aux, sizeof aux));
     pid_t pid = 0;
     int status = 0;
     char *argv[] = {"posix-random", "descendant", NULL};
@@ -695,6 +737,7 @@ static int first(void) {
     CHECK(arc4() == 0);
     CHECK(temporary() == 0);
     CHECK(descriptor() == 0);
+    CHECK(at_random() == 0);
     CHECK(forged() == 0);
     CHECK(forged_pipes() == 0);
     return 0;
@@ -802,6 +845,7 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && strcmp(argv[1], "forgedpipe") == 0) return forged_pipe_role();
     if (argc > 1 && strcmp(argv[1], "setidpipe") == 0) return setid_pipe_role();
+    if (argc > 2 && strcmp(argv[1], "auxrandom") == 0) return auxrandom_role(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forked() : first();
