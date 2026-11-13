@@ -43,12 +43,6 @@ pub const CAPABILITIES: usize = 0x34;
 /// `cfg_type` of the common configuration (Virtio 1.2, 4.1.4).
 const VENDOR_CAPABILITY: u32 = 0x09;
 const COMMON_CONFIG: u32 = 1;
-/// The first byte past the header of the configuration space, where
-/// capabilities begin.
-const FIRST_CAPABILITY: usize = 0x40;
-/// The capabilities a list may hold: 48 fit in the 192 bytes past the
-/// header, so a longer walk is a loop in the list.
-const MOST_CAPABILITIES: usize = 48;
 /// The 64-bit BAR 0 and 1, and BAR 2.
 pub const BAR0: usize = 0x10;
 pub const BAR1: usize = 0x14;
@@ -194,29 +188,6 @@ pub fn bus_master(command: u32) -> u32 {
     (command & 0xFFFF & !INTX_DISABLE) | MEMORY | BUS_MASTER
 }
 
-/// The offset of the first capability of the function's list, from
-/// `read`, the 32-bit registers of the configuration space, whose first
-/// word `wanted` takes. None when the list holds none or does not end: a
-/// next pointer below 0x40 or off a word ends the list, as `virtio-drivers`
-/// reads it.
-fn capability(read: &mut impl FnMut(usize) -> u32, wanted: impl Fn(u32) -> bool) -> Option<usize> {
-    let mut at = (read(CAPABILITIES) & 0xFC) as usize;
-    if at < FIRST_CAPABILITY {
-        return None;
-    }
-    for _ in 0..MOST_CAPABILITIES {
-        let head = read(at);
-        if wanted(head) {
-            return Some(at);
-        }
-        at = ((head >> 8) & 0xFF) as usize;
-        if at < FIRST_CAPABILITY || at & 3 != 0 {
-            return None;
-        }
-    }
-    None
-}
-
 /// Where the function's capability list puts the Virtio common
 /// configuration, as (BAR, offset), from `read`, the 32-bit registers of
 /// the configuration space: the first vendor capability of `cfg_type` 1
@@ -229,77 +200,21 @@ fn capability(read: &mut impl FnMut(usize) -> u32, wanted: impl Fn(u32) -> bool)
 /// BAR 0.
 pub fn common_config(mut read: impl FnMut(usize) -> u32) -> Option<(u8, u32)> {
     // cap_vndr, cap_next, cap_len, cfg_type; then bar; then offset.
-    let at = capability(&mut read, |head| {
+    let at = pci::capability(&mut read, |head| {
         head & 0xFF == VENDOR_CAPABILITY && (head >> 16) & 0xFF >= 16 && head >> 24 == COMMON_CONFIG
     })?;
     Some((read(at + 4) as u8, read(at + 8)))
 }
 
-/// The MSI-X capability (PCI Local Bus 3.0, 6.8.2): its ID, and the bits of
-/// its first word, whose upper half is Message Control: MSI-X Enable (15),
-/// Function Mask (14) and the table's size less one (10:0).
-pub const MSIX_CAPABILITY: u32 = 0x11;
-pub const MSIX_ENABLE: u32 = 1 << 31;
-pub const MSIX_FUNCTION_MASK: u32 = 1 << 30;
-/// An entry of the table: 16 bytes, the address (low, high), the data and
-/// Vector Control, whose bit 0 masks the vector.
-pub const MSIX_ENTRY: usize = 16;
-pub const MSIX_MASKED: u32 = 1;
+pub use pci::{
+    MSIX_CAPABILITY, MSIX_ENABLE, MSIX_ENTRY, MSIX_FUNCTION_MASK, MSIX_MASKED, Msix, NO_VECTOR,
+    msix,
+};
 /// The fields of the Virtio common configuration that tie a queue to an
-/// MSI-X vector (Virtio 1.2, 4.1.4.3), 16 bits each, and the value of no
-/// vector.
+/// MSI-X vector (Virtio 1.2, 4.1.4.3), 16 bits each.
 pub const MSIX_CONFIG: usize = 0x10;
 pub const QUEUE_SELECT: usize = 0x16;
 pub const QUEUE_MSIX_VECTOR: usize = 0x1A;
-pub const NO_VECTOR: u16 = 0xFFFF;
-
-/// The function's MSI-X capability: where it lies in the configuration
-/// space, the vectors of its table, and the table's BAR and offset there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Msix {
-    pub at: usize,
-    pub vectors: u16,
-    pub bar: u8,
-    pub offset: u32,
-}
-
-impl Msix {
-    /// The first word of the capability with MSI-X on and no function
-    /// mask, from the word `head` read there; the ID and next pointer are
-    /// read-only, and the table size too.
-    pub const fn enabled(head: u32) -> u32 {
-        (head | MSIX_ENABLE) & !MSIX_FUNCTION_MASK
-    }
-
-    /// The four words of the table entry of a vector that writes `data` to
-    /// `address`, unmasked.
-    pub const fn entry(address: u64, data: u32) -> [u32; 4] {
-        [address as u32, (address >> 32) as u32, data, 0]
-    }
-
-    /// The vector of queue `queue`: queue i takes vector i while the table
-    /// has one, and none past it (a driver then polls that queue).
-    pub const fn queue_vector(&self, queue: u16) -> u16 {
-        if queue < self.vectors {
-            queue
-        } else {
-            NO_VECTOR
-        }
-    }
-}
-
-/// The function's MSI-X capability, from `read` as `common_config` takes
-/// it; None without one.
-pub fn msix(mut read: impl FnMut(usize) -> u32) -> Option<Msix> {
-    let at = capability(&mut read, |head| head & 0xFF == MSIX_CAPABILITY)?;
-    let table = read(at + 4);
-    Some(Msix {
-        at,
-        vectors: ((read(at) >> 16) & 0x7FF) as u16 + 1,
-        bar: (table & 0b111) as u8,
-        offset: table & !0b111,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -496,7 +411,9 @@ mod tests {
                 at: 0x98,
                 vectors: 3,
                 bar: 1,
-                offset: 0
+                offset: 0,
+                pba_bar: 0,
+                pba_offset: 0
             }
         );
         // The common configuration behind it is still found.

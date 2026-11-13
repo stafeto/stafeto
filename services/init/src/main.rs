@@ -21,12 +21,14 @@ mod worker;
 
 use abi::{Access, Rights};
 use bootimg::{BootImage, Program};
+use core::cell::UnsafeCell;
 use init::labels::Labels;
-use init::table::{self, MAX_RECORDS, Record, TABLE};
+use init::resolve::{self, Store};
+use init::table::{self, At, MAX_RECORDS, Record, TABLE};
 use proto_init::{OWN_ARGS_MAX, SERVICE_ARGS_FIXED};
 use rt::handle::{Memory, Process};
 use rt::service::Config;
-use rt::{Handle, println, sys};
+use rt::{Handle, mmio, println, sys};
 
 rt::entry!(main);
 
@@ -57,10 +59,18 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = sys::handle_duplicate(&init.resource, Rights::DEBUG) {
         rt::console::set(console);
     }
-    let order = match table::check(TABLE) {
+    if let Err(e) = table::check(TABLE) {
+        println!("init: table refused: {e}");
+        return REFUSED;
+    }
+    if (table::PLATFORM.is_some() || resolve::needs(TABLE)) && !resolved(&init) {
+        return REFUSED;
+    }
+    let table = table::table();
+    let order = match table::check(table) {
         Ok(order) => order,
         Err(e) => {
-            println!("init: table refused: {e}");
+            println!("init: table refused after the places were found: {e}");
             return REFUSED;
         }
     };
@@ -104,6 +114,128 @@ fn main(_: u64) -> u64 {
     panic!("init stopped serving its channel: {error:?}")
 }
 
+/// Where init maps the ECAM it walks to find the functions the table names
+/// (`resolve`), until the walk is done.
+const ECAM_WINDOW: usize = 0x63_0000_0000;
+
+/// The room of the resolved table, which lives as long as init.
+struct Room(UnsafeCell<Store>);
+
+// SAFETY: `resolved` hands it out once, on init's main thread, before any
+// other thread of init exists.
+unsafe impl Sync for Room {}
+
+static ROOM: Room = Room(UnsafeCell::new(Store::EMPTY));
+
+/// The words of the functions through the window over ECAM at `ECAM_WINDOW`.
+struct Walk {
+    ecam: pci::Ecam,
+}
+
+impl pci::Config for Walk {
+    fn read(&mut self, at: pci::Address, offset: usize) -> u32 {
+        // A bus outside the range reads as an empty function.
+        let Some(page) = self.ecam.offset(at) else {
+            return 0xFFFF_FFFF;
+        };
+        // SAFETY: `resolved` maps the bus range of the platform read and write
+        // at ECAM_WINDOW as device memory; `at` lies in it (checked above) and
+        // `offset` is a word within the function's page.
+        unsafe { mmio::read32(ECAM_WINDOW + page as usize + offset) }
+    }
+
+    fn write(&mut self, at: pci::Address, offset: usize, value: u32) {
+        // A write to a bus outside the range goes nowhere (and not to 00:00.0).
+        let Some(page) = self.ecam.offset(at) else {
+            return;
+        };
+        // SAFETY: as for `read`.
+        unsafe { mmio::write32(ECAM_WINDOW + page as usize + offset, value) }
+    }
+}
+
+/// Walks the buses of the platform once: prints a line for each function
+/// with its BARs (init::resolve::list), then finds the places the table
+/// names by function (init::resolve) and installs the resolved table; false,
+/// with the line of the cause, when a record that is not optional has no
+/// place.
+fn resolved(init: &rt::InitHandles) -> bool {
+    let Some(platform) = table::PLATFORM else {
+        println!("init: table refused: the table names functions and the platform has no ECAM");
+        return false;
+    };
+    let len = platform.window_len();
+    let Ok(window) = sys::device_window_create(&init.resource, platform.ecam.base, len) else {
+        println!("init: table refused: no window over the ECAM");
+        return false;
+    };
+    if sys::mem_map(
+        &init.process,
+        &window,
+        0,
+        len,
+        ECAM_WINDOW,
+        Access::ReadWrite,
+    )
+    .is_err()
+    {
+        println!("init: table refused: the ECAM does not map");
+        return false;
+    }
+    let mut walk = Walk {
+        ecam: platform.ecam,
+    };
+    // SAFETY: the room is used here only, once, before init has a second thread.
+    let room = unsafe { &mut *ROOM.0.get() };
+    // The places first (they measure the BARs the table names, once), then the
+    // list, which writes nothing.
+    let outcome = if resolve::needs(TABLE) {
+        resolve::resolve(TABLE, &platform, &mut walk, room).map(Some)
+    } else {
+        Ok(None)
+    };
+    let measured = match &outcome {
+        Ok(Some(found)) => found.measured,
+        _ => resolve::Measured::default(),
+    };
+    resolve::list(&mut walk, &platform, &measured, |line| println!("{line}"));
+    // SAFETY: the window is init's own, mapped above, and nothing reads it now.
+    let _ = unsafe { sys::mem_unmap(&init.process, ECAM_WINDOW, len) };
+    match outcome {
+        Ok(None) => true,
+        Ok(Some(found)) => {
+            for left_out in found.skipped.iter().flatten() {
+                println!("init: left out: {left_out}");
+            }
+            print_places(TABLE, found.table);
+            resolve::install(found.table);
+            true
+        }
+        Err(refusal) => {
+            println!("init: table refused: {refusal}");
+            false
+        }
+    }
+}
+
+/// One line for each window the walk placed: the record, the window and
+/// the physical range the firmware's BAR gave it.
+fn print_places(named: &[Record], found: &[Record]) {
+    for r in named {
+        let Some(placed) = found.iter().find(|f| f.name == r.name) else {
+            continue;
+        };
+        for (was, now) in r.windows.iter().zip(placed.windows) {
+            if was.at != At::Fixed {
+                println!(
+                    "init: {} {} at {:#x} len {:#x}",
+                    r.name, now.name, now.base, now.len
+                );
+            }
+        }
+    }
+}
+
 /// The program of each record of the table, by its place, from the boot
 /// image `image`, which init maps at IMAGE through its process `own`; the
 /// first record whose program is not in the image.
@@ -122,7 +254,7 @@ fn programs(
     };
     let boot = BootImage::parse(bytes).ok();
     let mut programs = [None; MAX_RECORDS];
-    for (place, r) in TABLE.iter().enumerate() {
+    for (place, r) in table::table().iter().enumerate() {
         let file = boot.and_then(|b| b.files().find(|f| f.name == r.program));
         let program = file.and_then(|f| Program::parse(f.data).ok());
         programs[place] = Some(program.ok_or(r)?);
