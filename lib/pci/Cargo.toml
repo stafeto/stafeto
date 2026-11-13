@@ -1,0 +1,11 @@
+[package]
+name = "pci"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "PCI configuration space access through ECAM: enumeration, BARs as the firmware set them, BAR sizes, the capability list and MSI-X"
+
+[lib]
+bench = false

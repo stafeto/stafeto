@@ -445,6 +445,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pci"
+version = "0.1.0"
+
+[[package]]
 name = "pci-walk"
 version = "0.1.0"
 dependencies = [
@@ -1561,6 +1565,9 @@ dependencies = [
 [[package]]
 name = "virtio-pci"
 version = "0.1.0"
+dependencies = [
+ "pci",
+]
 
 [[package]]
 name = "virtio-rng"

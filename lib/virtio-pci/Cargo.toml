@@ -9,3 +9,6 @@ description = "The PCI configuration a Virtio PCI driver of stafeto writes on Ap
 
 [lib]
 bench = false
+
+[dependencies]
+pci = { path = "../pci" }
