@@ -490,9 +490,11 @@ fn loaded_main() -> u64 {
     }
     // A set-ID program takes no entropy session from its caller, who could
     // put a service of its own there and so know the program's keys: the
-    // handle closes, and getentropy, getrandom and arc4random give ENOSYS
-    // (a loaded program has no name lookup to reach the service by, and
-    // nothing falls back to a weaker source). SAFETY: still single-threaded.
+    // handle closes, getentropy and getrandom give ENOSYS and arc4random
+    // aborts (a loaded program has no name lookup to reach the service by).
+    // The libc still falls back to the clock for the names of mkstemp and
+    // its kin and for the DNS transaction ID, and the shmget nonce becomes
+    // 0: those are tracked as their own issues. SAFETY: still single-threaded.
     unsafe {
         posix_abi::random::init(
             one(Slot::Entropy)
