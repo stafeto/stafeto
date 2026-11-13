@@ -158,7 +158,9 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
         core::mem::size_of::<Fds>()
     );
     assert_eq!(core::mem::size_of::<Shared>(), 72);
-    assert_eq!(core::mem::size_of::<Fds>(), 2240);
+    // The ceiling of the vouched record (`WhoReply::ceiling`, #525) is 8 bytes
+    // of the binding with its padding.
+    assert_eq!(core::mem::size_of::<Fds>(), 2248);
     // The tables of numbers and receipts are not part of it: they are a pool.
     assert_eq!(core::mem::size_of::<Wide>(), 4864);
     assert_eq!(

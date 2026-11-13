@@ -3331,6 +3331,8 @@ static int proc_descriptions(void) {
 }
 #endif
 
+#include "pshared-key.c"
+
 static int role(const char *name) {
 #if PROCFS
     if (strcmp(name, "proc-fd") == 0) return proc_fd_role();
@@ -3344,6 +3346,8 @@ static int role(const char *name) {
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
     if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
 #endif
+    if (strcmp(name, "pshkey") == 0) return pk_owner_role();
+    if (strcmp(name, "pshthief") == 0) return pk_thief_role();
     if (strcmp(name, "shares") == 0) return shares_role();
     if (strcmp(name, "shares-main") == 0) return shares_main();
     if (strcmp(name, "faults") == 0) return faults_role();
@@ -5664,6 +5668,8 @@ int main(int argc, char **argv) {
     pipes();
     printf("posix-procs: stage shell signals\n");
     shell_signals();
+    printf("posix-procs: stage pshared keys\n");
+    run_role("/bin/procs-child", "pshkey", NULL);
     printf("posix-procs: stage null device\n");
     null_device();
     printf("posix-procs: stage wave\n");
