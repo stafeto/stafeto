@@ -15610,7 +15610,7 @@ mod entropy_in_images_tests {
         assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
     }
 
-    /// A failing `cargo tree` is an error, not an empty list of packages.
+    /// A failing `cargo tree` gives an error.
     #[test]
     fn the_packages_on_relibc_fail_loudly_when_cargo_tree_does() {
         assert!(relibc_packages(Path::new("/nonexistent-workspace")).is_err());
