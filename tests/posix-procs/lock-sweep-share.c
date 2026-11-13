@@ -22,9 +22,10 @@ static long long ss_now(void) {
 static void ss_path(char *path, size_t size, unsigned child, unsigned file) {
     snprintf(path, size, "/tmp/sweep-%u-%u", child, file);
 }
-/* The longest of SS_SLEEPS sleeps of one millisecond, in nanoseconds; spread
- * over about 300 ms of the machine's time so that one full period of the
- * service's timer is covered. */
+/* The longest lateness of SS_SLEEPS sleeps of one millisecond and of the
+ * pauses of 12 ms between them, in nanoseconds; spread over about 300 ms of
+ * the machine's time so that one full period of the service's timer is
+ * covered. */
 static long long ss_worst_sleep(void) {
     long long worst = 0;
     for (unsigned i = 0; i < SS_SLEEPS; i++) {
@@ -34,8 +35,16 @@ static long long ss_worst_sleep(void) {
         long long end = ss_now();
         if (end < 0) return -1;
         if (end - start > worst) worst = end - start;
+        /* The pause between the sleeps is a sleep as well: a stall that
+         * lands in it shows as lateness there, whatever the phase of the
+         * service's timer. Counted as the time past 11 ms, so that a pause
+         * on time weighs about as much as a sleep of 1 ms. */
         const struct timespec gap = {0, 12000000};
-        nanosleep(&gap, NULL);
+        long long pause_start = ss_now();
+        if (pause_start < 0 || nanosleep(&gap, NULL)) return -1;
+        long long pause_end = ss_now();
+        if (pause_end < 0) return -1;
+        if (pause_end - pause_start - 11000000LL > worst) worst = pause_end - pause_start - 11000000LL;
     }
     return worst;
 }
@@ -98,7 +107,7 @@ static int public_lock_sweep_share(void) {
     }
     if (!failed) {
         long long busy = ss_worst_sleep();
-        printf("posix-procs: lock sweep share: %u inodes locked by %u children, worst 1 ms sleep %lld us\n",
+        printf("posix-procs: lock sweep share: %u inodes locked by %u children, worst sleep or pause %lld us\n",
                locked, started, busy < 0 ? -1 : busy / 1000);
         if (busy < 0 || busy > SS_LIMIT_NS) SS_FAIL();
     }

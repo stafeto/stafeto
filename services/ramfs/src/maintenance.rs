@@ -35,6 +35,7 @@ pub struct Share {
     budget: u64,
     end: u64,
     spent: u64,
+    last: u64,
 }
 impl Share {
     pub const fn new(window: u64, budget: u64) -> Self {
@@ -43,6 +44,7 @@ impl Share {
             budget,
             end: 0,
             spent: 0,
+            last: 0,
         }
     }
     /// The work cost `cost` nanoseconds and ended at `now`. The result is the
@@ -54,6 +56,29 @@ impl Share {
         }
         self.spent = self.spent.saturating_add(cost);
         (self.spent >= self.budget).then_some(self.end)
+    }
+    /// A turn of the work ran from `began` to `ended`; `busy` is the time
+    /// the service spent on other work since the previous turn ended. The
+    /// time since the previous turn ended counts when it is at most `gap`
+    /// (round trips, empty turns). A longer gap may hold idle time, so it
+    /// counts only as far as the busy time shows: work of the service in a
+    /// long gap is charged, its idle time is not. A spent budget forgets
+    /// the run: the next turn starts a new one.
+    pub fn turn(&mut self, began: u64, ended: u64, gap: u64, busy: u64) -> Option<u64> {
+        let since = if self.last == 0 {
+            0
+        } else {
+            began.saturating_sub(self.last)
+        };
+        let between = if self.last != 0 && since <= gap {
+            since
+        } else {
+            busy.min(since)
+        };
+        let cost = ended.saturating_sub(began).saturating_add(between);
+        let paused = self.charge(ended, cost);
+        self.last = if paused.is_some() { 0 } else { ended };
+        paused
     }
 }
 
@@ -157,6 +182,77 @@ mod tests {
         // After the end a new window opens with a fresh budget.
         assert_eq!(share.charge(11_000, 200), None);
         assert_eq!(share.charge(11_300, 2_400), Some(21_000));
+    }
+
+    #[test]
+    fn turns_charge_the_wall_time_since_the_previous_turn_ended() {
+        const GAP: u64 = 1_000;
+        let mut share = Share::new(10_000, 2_500);
+        // Turns of 100 with empty turns and round trips of 400 between them:
+        // each turn after the first costs 500. Charging only the bodies would
+        // reach 2500 after 25 turns and the run would last 12 000.
+        let mut now = 1_000u64;
+        let mut tripped = None;
+        assert_eq!(share.turn(now, now + 100, GAP, 0), None);
+        now += 100;
+        let start = 1_000;
+        for _ in 0..20 {
+            let began = now + 400;
+            now = began + 100;
+            if let Some(until) = share.turn(began, now, GAP, 0) {
+                tripped = Some((now, until));
+                break;
+            }
+        }
+        let (at, until) = tripped.expect("the budget trips");
+        assert!(at - start <= 2_500 + 500, "ran {} of wall time", at - start);
+        assert_eq!(until, 11_100);
+    }
+
+    #[test]
+    fn an_idle_gap_longer_than_the_limit_charges_only_the_turn() {
+        let mut share = Share::new(10_000, 2_500);
+        assert_eq!(share.turn(1_000, 1_100, 1_000, 0), None);
+        // Idle for 5000 (no busy time): the turn costs 100 alone.
+        assert_eq!(share.turn(6_100, 6_200, 1_000, 0), None);
+        assert_eq!(share.turn(6_900, 7_000, 1_000, 0), None);
+        // The first turn charged 100, the second 100, the third 800.
+        assert_eq!(share.charge(7_000, 1_500), Some(11_100));
+    }
+
+    #[test]
+    fn a_gap_of_exactly_the_limit_is_charged() {
+        let mut share = Share::new(10_000, 2_500);
+        assert_eq!(share.turn(1_000, 1_100, 1_000, 0), None);
+        // Gap 1000 = the limit: charged in full, 1000 + 400 = 1400 so far
+        // plus 100 for the first turn.
+        assert_eq!(share.turn(2_100, 2_500, 1_000, 0), None);
+        assert_eq!(share.spent, 100 + 1_000 + 400);
+    }
+
+    #[test]
+    fn busy_work_in_a_gap_over_the_limit_is_charged() {
+        let mut share = Share::new(10_000, 2_500);
+        assert_eq!(share.turn(1_000, 1_100, 1_000, 0), None);
+        // A gap of 1500 filled with 1500 of busy work (a long legacy step,
+        // queued requests) counts in full.
+        assert_eq!(share.turn(2_600, 2_700, 1_000, 1_500), None);
+        assert_eq!(share.spent, 100 + 1_500 + 100);
+        // Busy time never counts past the gap itself.
+        assert_eq!(share.turn(3_200, 3_300, 1_000, 9_000), None);
+        assert_eq!(share.spent, 1_700 + 500 + 100);
+    }
+
+    #[test]
+    fn a_tripped_budget_forgets_the_run() {
+        let mut share = Share::new(2_000, 500);
+        assert_eq!(share.turn(100, 200, 2_000, 0), None);
+        assert_eq!(share.turn(200, 900, 2_000, 0), Some(2_200));
+        // The service paused to the end of the window. With the run
+        // forgotten the next turn costs its own 100; the 1300 since the
+        // trip would trip the new window at once.
+        assert_eq!(share.turn(2_200, 2_300, 2_000, 0), None);
+        assert_eq!(share.spent, 100);
     }
 
     #[test]

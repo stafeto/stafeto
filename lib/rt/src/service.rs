@@ -112,6 +112,9 @@ pub trait Service<const K: usize> {
         let _ = notice;
     }
 
+    /// Before every request the loop took, once the receive has returned.
+    fn before_request(&mut self) {}
+
     /// After every request the loop took, one the library refused for its
     /// header or its session as well.
     fn between_requests(&mut self) {}
@@ -451,6 +454,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     msgbuf::read(0, bytes);
                 }
                 let kind = steps::kind_of(bytes);
+                service.before_request();
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 #[cfg(feature = "step-stats")]
