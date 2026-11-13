@@ -38,7 +38,7 @@ const BLOCK: usize = 512 * 1024;
 const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--its-int] [--ena-break-aenq] [--session S]
+       xtask aws image [--dump] [--marks] [--its-int] [--ena-break-aenq] [--ena-break-exit] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
@@ -983,10 +983,11 @@ fn image(args: &[String]) -> Result<(), String> {
     let dump = args.iter().any(|a| a == "--dump");
     let marks = args.iter().any(|a| a == "--marks");
     let broken = args.iter().any(|a| a == "--ena-break-aenq");
-    if broken {
+    let exits = args.iter().any(|a| a == "--ena-break-exit");
+    if broken || exits {
         // Read once, where the program list of the image is made.
         // SAFETY: xtask is single-threaded here, before the image is built.
-        unsafe { std::env::set_var("STAFETO_ENA_BREAK", "1") };
+        unsafe { std::env::set_var("STAFETO_ENA_BREAK", if exits { "exit" } else { "1" }) };
     }
     let its_int = args.iter().any(|a| a == "--its-int");
     let s = Session::open(flag(args, "--session"))?;
@@ -1013,6 +1014,8 @@ fn image(args: &[String]) -> Result<(), String> {
         "dump"
     } else if marks {
         "marks"
+    } else if exits {
+        "ena-exit"
     } else if broken {
         "ena-break"
     } else if its_int {

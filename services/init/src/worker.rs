@@ -352,6 +352,9 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
     if !init::device::start(record, &mut Hw) {
         return Err(Error::BadState);
     }
+    if !record.start.is_empty() {
+        rt::println!("init: {} device command word written", record.name);
+    }
     let channel = view::<Channel>(CHANNEL);
     let cpus = cpus_of(record);
     let params = SpawnParams {
@@ -501,7 +504,16 @@ pub fn take_stuck(place: usize) -> bool {
 /// is marked broken (`take_stuck`).
 fn stop(place: usize, mut gone: Instance) {
     let record = &table::table()[place];
-    if init::device::stop(record, &mut Hw) {
+    let stopped = init::device::stop(record, &mut Hw);
+    if !record.release.is_empty() {
+        let what = if stopped {
+            "stopped and confirmed"
+        } else {
+            "did not stop, its DMA memory stays kept"
+        };
+        rt::println!("init: {} device {what}", record.name);
+    }
+    if stopped {
         #[cfg(feature = "dma-watch")]
         watch(record, &gone);
     } else {

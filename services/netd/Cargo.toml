@@ -26,6 +26,8 @@ bench = false
 [features]
 # The ENA kind of device breaks its keep-alives on purpose after the first start (the probe of the reset in place on EC2, `cargo xtask aws boot --ena-break-aenq`).
 ena-break-aenq = []
+# The ENA service exits once, 40 s into the uptime, so that init stops the device and starts it again (`cargo xtask aws image --ena-break-exit`).
+ena-break-exit = []
 probe = []
 batch-16 = []
 batch-8 = []

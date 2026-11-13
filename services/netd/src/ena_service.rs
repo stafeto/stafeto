@@ -99,7 +99,17 @@ struct EnaService {
     /// event queue is not written back, until the reset it causes.
     #[cfg(feature = "ena-break-aenq")]
     broken: bool,
+    /// The probe of a restart (`ena-break-exit`): the uptime at which this instance
+    /// began.
+    #[cfg(feature = "ena-break-exit")]
+    born_ns: u64,
 }
+
+/// The probe of a restart (`ena-break-exit`): the instance that began before this uptime
+/// exits with FAILED once the device is up and the uptime reaches it, so init stops
+/// the device and starts the service again; the next instance begins after it and runs on.
+#[cfg(feature = "ena-break-exit")]
+const BREAK_EXIT_NS: u64 = 40_000_000_000;
 
 impl EnaService {
     fn arm(&mut self) {
@@ -127,6 +137,17 @@ impl EnaService {
                 #[cfg(feature = "ena-break-aenq")]
                 Event::Resetting(_) => self.ena.hold_event_head(false),
                 _ => {}
+            }
+        }
+        #[cfg(feature = "ena-break-exit")]
+        {
+            let now = time::ticks_to_ns(time::now());
+            if self.ena.is_up() && self.born_ns < BREAK_EXIT_NS && now >= BREAK_EXIT_NS {
+                rt::println!(
+                    "ena: break: the service exits, uptime {} s",
+                    now / 1_000_000_000
+                );
+                sys::process_exit(FAILED);
             }
         }
     }
@@ -222,7 +243,14 @@ pub fn run(s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         deadline: 0,
         #[cfg(feature = "ena-break-aenq")]
         broken: false,
+        #[cfg(feature = "ena-break-exit")]
+        born_ns: time::ticks_to_ns(time::now()),
     };
+    #[cfg(feature = "ena-break-exit")]
+    rt::println!(
+        "ena: break armed, uptime {} s",
+        service.born_ns / 1_000_000_000
+    );
     service.arm();
     let heartbeat = Heartbeat {
         to: &s.parent,

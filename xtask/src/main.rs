@@ -995,12 +995,12 @@ fn aws_programs() -> &'static [ImageProgram] {
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
-        let break_aenq: &'static [&'static str] = if std::env::var_os("STAFETO_ENA_BREAK").is_some()
-        {
-            &["ena-break-aenq"]
-        } else {
-            &[]
-        };
+        let break_aenq: &'static [&'static str] =
+            match std::env::var("STAFETO_ENA_BREAK").as_deref() {
+                Ok("exit") => &["ena-break-exit"],
+                Ok(_) => &["ena-break-aenq"],
+                Err(_) => &[],
+            };
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
         programs
     })
