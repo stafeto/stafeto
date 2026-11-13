@@ -109,6 +109,8 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     smp::sgi_probe();
     smp::lock_probe();
     smp::qsbr_probe();
+    #[cfg(feature = "its-int")]
+    arch::its::int_probe::run_probe();
     #[cfg(feature = "fault-probe")]
     {
         // A window over the console's page leaves a record nobody showed:

@@ -5,8 +5,9 @@
 //! irq_bind and irq_ack.
 
 use super::{Args, Values, caller, caller_ceiling, cause, lookup};
+use crate::arch::its::{self, Position};
 use crate::memory;
-use crate::msi::{self, Job};
+use crate::msi;
 use crate::object::Object;
 use crate::process;
 use crate::thread::Thread;
@@ -71,18 +72,28 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     // line, whose checks give its errors.
     // The lookup is inside the section: the pointer it gives holds no
     // reference, and another CPU may close the device meanwhile.
-    let mut job = Job::None;
+    let mut commands = None;
     let result = super::objects(|| {
         let device = lookup(thread, a[0], Rights::MANAGE, Object::msi);
         if !matches!(device, Err(Error::WrongType | Error::BadHandle)) {
-            irq_bind_event(thread, a, cpu, device, &mut job)
+            irq_bind_event(thread, a, cpu, device, &mut commands)
         } else {
             irq_bind_line(thread, a, cpu)
         }
     });
-    // The ITS commands of an event go outside the section, and the call
-    // returns when they ran (spec 8.1).
-    job.run();
+    // The commands of an event are in the queue (spec 8.1): the ITS is told
+    // outside the section, and the call waits one segment for it, no more.
+    // The mapping is in force once the ITS ran the commands, which the
+    // driver sees as a notification after it unmasks its vector and looks
+    // at its queues once (spec 9).
+    if let Some(pos) = commands {
+        its::ring();
+        let mapped = its::wait_once(pos);
+        return result.map(|mut values| {
+            values.push(u64::from(mapped));
+            values
+        });
+    }
     result
 }
 
@@ -120,15 +131,18 @@ fn irq_bind_line(thread: NonNull<Thread>, a: &Args, cpu: u32) -> Result<Values, 
 /// caller's ceiling (ACCESS_DENIED); an event with a binding (BAD_STATE), a
 /// closed channel (PEER_CLOSED); then the resources: room in the caller's
 /// table (LIMIT_REACHED), a slot of the channel and a free LPI
+/// (LIMIT_REACHED), the room for its commands in the ITS queue
 /// (LIMIT_REACHED), a page of the caller's pool of bindings and a block of
 /// its table (NO_MEMORY). Returns x1 the binding, x2 the MSI address, x3
-/// the MSI data, and the job of the ITS.
+/// the MSI data, x4 (added by `irq_bind`) 1 when the ITS ran the commands
+/// of the mapping and 0 when it did not yet, and in `commands` the count the commands of the ITS are
+/// at in the queue.
 fn irq_bind_event(
     thread: NonNull<Thread>,
     a: &Args,
     cpu: u32,
     device: Result<NonNull<msi::Msi>, Error>,
-    job: &mut Job,
+    commands: &mut Option<Position>,
 ) -> Result<Values, Error> {
     let priority = priority_arg(a[3])?;
     event_flags_arg(a[4])?;
@@ -141,8 +155,8 @@ fn irq_bind_event(
         return Err(Error::PeerClosed);
     }
     process::handle_room(caller(thread))?;
-    let (b, work) = irq::bind_event(caller(thread), c, label, device, event, priority, cpu)?;
-    *job = work;
+    let (b, pos) = irq::bind_event(caller(thread), c, label, device, event, priority, cpu)?;
+    *commands = Some(pos);
     let info = irq::info(b);
     let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
     // SAFETY: the reference `bind_event` handed out goes; the handle, if it
@@ -182,33 +196,46 @@ fn check_cpu(cpu: u32) -> Result<(), Error> {
 /// DEVICE); a DeviceID that has a device (BAD_STATE); then the resources:
 /// room in the caller's table, a place in DEVICES (LIMIT_REACHED), a place
 /// in the pool of devices of the caller, which grows by a page the quota
-/// pays for (NO_MEMORY). The ITS maps the device after the section
-/// (MAPD, SYNC), and the call returns once they ran (spec 8.1).
+/// pays for (NO_MEMORY), and the room for the MAPD in the ITS queue
+/// (LIMIT_REACHED). The MAPD goes into the queue in the section and the ITS
+/// is told after it; the call does not wait for the ITS (spec 8.1, 9).
 #[inline(never)]
 pub(super) fn msi_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let device_id = msi::check(a[1], a[2])?;
-    let mut job = Job::None;
+    let mut commands = None;
     let result = super::objects(|| {
         lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
         process::handle_room(caller(thread))?;
-        let (m, work) = msi::create(caller(thread), device_id, a[2] as u32)?;
-        job = work;
+        let (m, pos) = msi::create(caller(thread), device_id, a[2] as u32)?;
+        commands = Some(pos);
         let h = process::insert_handle(caller(thread), Object::Msi(m), OWNER_RIGHTS);
         // SAFETY: the reference `create` handed out goes; the handle, if it
         // went in, holds the device, and without it the device goes.
         unsafe { msi::release(m, cause(thread)) };
         Ok(Values::new(&[h?.0]))
     });
-    job.run();
+    if commands.is_some() {
+        its::ring();
+    }
     result
 }
 
 /// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens
 /// again (spec 9); an open line stays open, 0 all the same. PEER_CLOSED once
-/// the binding's channel closed, and the line stays masked.
+/// the binding's channel closed, and the line stays masked. For an event of
+/// an MSI device WOULD_BLOCK while the ITS has not run the commands of its
+/// mapping (irq_bind returned x4 = 0): the driver asks again before it
+/// unmasks its vector (spec 9). The check reads a register of the ITS and
+/// goes after the section.
 #[inline(never)]
 pub(super) fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
-    irq::ack(b)?;
+    let mut mapping = None;
+    super::objects(|| {
+        let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
+        irq::ack(b, &mut mapping)
+    })?;
+    if mapping.is_some_and(|at| !its::mapped(at)) {
+        return Err(Error::WouldBlock);
+    }
     Ok(Values::none())
 }

@@ -38,7 +38,7 @@ const BLOCK: usize = 512 * 1024;
 const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--ena-break-aenq] [--session S]
+       xtask aws image [--dump] [--marks] [--its-int] [--ena-break-aenq] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
@@ -988,6 +988,7 @@ fn image(args: &[String]) -> Result<(), String> {
         // SAFETY: xtask is single-threaded here, before the image is built.
         unsafe { std::env::set_var("STAFETO_ENA_BREAK", "1") };
     }
+    let its_int = args.iter().any(|a| a == "--its-int");
     let s = Session::open(flag(args, "--session"))?;
     let mut features = Vec::new();
     if dump {
@@ -996,6 +997,10 @@ fn image(args: &[String]) -> Result<(), String> {
     let variant = if marks {
         features.push("early-marks");
         Variant::EarlyMarks
+    } else if its_int {
+        // The kernel runs the self-test of the ITS before init starts and
+        // prints one line for each CPU's LPI (`its-int:` in the console).
+        Variant::ItsInt
     } else {
         Variant::Normal
     };
@@ -1010,6 +1015,8 @@ fn image(args: &[String]) -> Result<(), String> {
         "marks"
     } else if broken {
         "ena-break"
+    } else if its_int {
+        "its-int"
     } else {
         "plain"
     };

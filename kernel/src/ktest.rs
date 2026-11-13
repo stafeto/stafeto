@@ -718,6 +718,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::lpis_run_out_and_come_back,
     ),
     (
+        "a_full_its_queue_fails_the_calls_that_need_it",
+        calls::a_full_its_queue_fails_the_calls_that_need_it,
+    ),
+    (
+        "waits_for_the_its_are_one_segment_and_portions_do_not_wait",
+        calls::waits_for_the_its_are_one_segment_and_portions_do_not_wait,
+    ),
+    (
         "irq_bind_refuses_lines_past_the_distributor",
         calls::irq_bind_refuses_lines_past_the_distributor,
     ),
