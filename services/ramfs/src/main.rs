@@ -142,6 +142,28 @@ const AUDIT_TIMER_LABEL: u64 = 0x4155_4454;
 /// The label of the notification the pipe service sends when a job for the
 /// file of a segment is there that nobody asked it for.
 const IPC_JOBS_LABEL: u64 = 0x4950_434a;
+/// The detail the step statistics print for the longest own step (kind 65): the branch of the
+/// maintenance dispatch that ran.
+mod own_step {
+    pub const PIPE: u64 = 1;
+    pub const LAYER: u64 = 2;
+    /// The sweep of locks: the code in bits 48 and up, then the locks removed (bits 36 to 47),
+    /// the inodes passed (24 to 35) and the locks examined (0 to 23) in the turn.
+    pub const LOCK_SWEEP: u64 = 3;
+    pub const LOCK_WAITS: u64 = 4;
+    pub const ORPHAN: u64 = 5;
+    pub const RECLAIM: u64 = 6;
+    pub const DEPARTURE: u64 = 7;
+    pub const AUDIT: u64 = 8;
+
+    pub fn sweep(turn: &ramfs::locks::simple::Sweep) -> u64 {
+        LOCK_SWEEP << 48
+            | ((turn.removed as u64) & 0xfff) << 36
+            | ((turn.visited as u64) & 0xfff) << 24
+            | (turn.locks as u64) & 0xff_ffff
+    }
+}
+
 /// The time between two steps of the audit. The audit runs on a timer
 /// between them, so that the clients below the service keep their time while
 /// it goes round: a turn after turn of the whole round held them back for as
@@ -3854,6 +3876,7 @@ impl Fs {
         if self.pipe_broker.is_some()
             && (self.ipc_jobs_pending || (!self.ipc_armed && self.ipc_arm_tries < 3))
         {
+            rt::service::step_detail(own_step::PIPE);
             self.ipc_arm_tries = self.ipc_arm_tries.saturating_add(1);
             self.ipc_jobs_pending = self.ipc_jobs_round().unwrap_or(false);
             self.legacy_pending = true;
@@ -3873,6 +3896,7 @@ impl Fs {
         // an empty sweep or of waits that wait for nothing.
         self.layer_pump();
         if self.ram.storage.layer_work() {
+            rt::service::step_detail(own_step::LAYER);
             let now = self.time_source.now();
             self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
             self.layer_pump();
@@ -3897,6 +3921,7 @@ impl Fs {
                 let slot = self.orphan_cursor as usize;
                 self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
                 if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
+                    rt::service::step_detail(own_step::ORPHAN);
                     let (id, owner) = (job.id, job.owner);
                     let before = (self.orphan_count, self.ram.storage.available().pages);
                     self.cancel_job(id, owner, None);
@@ -3909,6 +3934,7 @@ impl Fs {
                 #[cfg(not(feature = "steps"))]
                 let retained = false;
                 if !retained {
+                    rt::service::step_detail(own_step::RECLAIM);
                     work = self.ram.storage.reclaim_step();
                 }
             }
@@ -3930,6 +3956,7 @@ impl Fs {
         if self.departure_turn
             && let Some(i) = self.departures.next_place()
         {
+            rt::service::step_detail(own_step::DEPARTURE);
             let (label, complete) = if i < SESSIONS {
                 let s = sessions[i].as_mut().expect("retained departed session");
                 let label = s.label();
@@ -3994,6 +4021,7 @@ impl Fs {
                 Self::slot_empty(departures, births, sessions, i)
             });
         self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
+        rt::service::step_detail(own_step::AUDIT);
         let mut client_work = false;
         let i = self.maintenance.position;
         if self.departures.contains(i) {
@@ -4031,23 +4059,27 @@ impl Fs {
         let page = self.lifetimes.as_ref();
         let (storage, descriptions) = self.ram.lock_parts();
         if self.lock_maintenance_work == 0 && self.lock_sweep_pending {
-            self.locks.sweep_run(
-                storage,
-                &mut self.lock_sweep,
-                SWEEP_EMPTY_RUN,
-                |owner| match owner {
-                    Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-                    Owner::Description { slot, generation } => {
-                        descriptions.live(Token { slot, generation })
-                    }
-                },
-            );
+            let turn =
+                self.locks
+                    .sweep_run(
+                        storage,
+                        &mut self.lock_sweep,
+                        SWEEP_EMPTY_RUN,
+                        |owner| match owner {
+                            Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
+                            Owner::Description { slot, generation } => {
+                                descriptions.live(Token { slot, generation })
+                            }
+                        },
+                    );
+            rt::service::step_detail(own_step::sweep(&turn));
             self.lock_sweep_pending = self.locks.has_locks() && self.lock_sweep.pending();
             if !self.locks.has_locks() {
                 self.lock_sweep.stop();
             }
         }
         if self.lock_maintenance_work == 1 {
+            rt::service::step_detail(own_step::LOCK_WAITS);
             let births = &*self.births;
             let places = self.places;
             self.waits.maintenance(

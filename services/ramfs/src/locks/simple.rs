@@ -156,6 +156,11 @@ impl Conflicts {
 pub struct SweepCursor {
     pub inode: usize,
     remaining: usize,
+    /// The locks of the inode under the cursor already examined (they are kept) and the
+    /// revision the list had then: a list changed by anyone else is examined again from its
+    /// first lock.
+    examined: usize,
+    revision: u64,
 }
 impl SweepCursor {
     /// A new death owes a complete circle from the current physical position.
@@ -183,11 +188,15 @@ pub struct QueryDetails {
 pub struct Sweep {
     pub visited: usize,
     pub removed: usize,
+    /// The locks of the inodes the turn examined (an inode with none costs a few instructions).
+    pub locks: usize,
     pub wrapped: bool,
 }
 
 /// Distinct owners that hold at least one lock record at the same time.
 const OWNERS: usize = 2048;
+/// The locks of one inode that a turn of the sweep examines.
+pub const SWEEP_PIECE: usize = 16;
 
 #[derive(Clone, Copy)]
 struct Holder {
@@ -741,6 +750,17 @@ impl SimpleLocks {
         &mut self,
         storage: &mut Storage<'_>,
         inode: Token,
+        remove: impl FnMut(Lock) -> bool,
+    ) -> Result<bool, Error> {
+        self.remove_window(storage, inode, 0..PER_INODE, remove)
+    }
+    /// Removes the locks of the inode that `remove` selects among those at the places of
+    /// `window` in the list; the others stay without being asked about.
+    fn remove_window(
+        &mut self,
+        storage: &mut Storage<'_>,
+        inode: Token,
+        window: core::ops::Range<usize>,
         mut remove: impl FnMut(Lock) -> bool,
     ) -> Result<bool, Error> {
         let mut old = Buffer::new();
@@ -748,8 +768,8 @@ impl SimpleLocks {
         let count = old.len();
         let mut kept: Buffer<Entry, PER_INODE> = Buffer::new();
         let mut len = 0;
-        for entry in &old[..count] {
-            if remove(entry.lock) {
+        for (place, entry) in old[..count].iter().enumerate() {
+            if window.contains(&place) && remove(entry.lock) {
                 self.holders.sub(entry.lock.owner, 1);
                 self.free(storage, entry.id);
             } else {
@@ -789,12 +809,14 @@ impl SimpleLocks {
         let mut result = Sweep {
             visited: 0,
             removed: 0,
+            locks: 0,
             wrapped: false,
         };
         for _ in 0..max_inodes.min(cursor.remaining) {
             let slot = cursor.inode;
             let head = self.heads[slot];
             if head.count != 0 {
+                result.locks += head.count as usize;
                 let token = Token {
                     slot: slot as u16,
                     generation: head.generation,
@@ -813,6 +835,56 @@ impl SimpleLocks {
         }
         result
     }
+    /// Examines the inode under the cursor, at most `limit` locks of it, and moves the cursor
+    /// on only when the whole list has been examined: a list of 64 locks takes several turns,
+    /// so that no turn costs more than `limit` locks and the removals among them.
+    fn sweep_piece(
+        &mut self,
+        storage: &mut Storage<'_>,
+        cursor: &mut SweepCursor,
+        limit: usize,
+        mut live: impl FnMut(Owner) -> bool,
+    ) -> Sweep {
+        let slot = cursor.inode;
+        let head = self.heads[slot];
+        if head.count as usize <= limit {
+            cursor.examined = 0;
+            return self.sweep(storage, cursor, 1, live);
+        }
+        if cursor.examined >= head.count as usize || cursor.revision != head.revision {
+            cursor.examined = 0;
+        }
+        let from = cursor.examined;
+        let to = (from + limit).min(head.count as usize);
+        let token = Token {
+            slot: slot as u16,
+            generation: head.generation,
+        };
+        self.remove_window(storage, token, from..to, |lock| !live(lock.owner))
+            .expect("pinned sweep inode");
+        let after = self.heads[slot];
+        let removed = head.count as usize - after.count as usize;
+        let mut result = Sweep {
+            visited: 0,
+            removed,
+            locks: to - from,
+            wrapped: false,
+        };
+        if to >= head.count as usize {
+            cursor.examined = 0;
+            result.visited = 1;
+            cursor.remaining -= 1;
+            cursor.inode += 1;
+            if cursor.inode == storage::NODES {
+                cursor.inode = 0;
+                result.wrapped = true;
+            }
+        } else {
+            cursor.examined = to - removed;
+            cursor.revision = after.revision;
+        }
+        result
+    }
     /// One maintenance turn of the circle: it passes up to `max_empty`
     /// inodes without locks, which cost a few instructions each, and ends
     /// after the first inode that holds locks. A turn per inode would spend
@@ -828,6 +900,7 @@ impl SimpleLocks {
         let mut total = Sweep {
             visited: 0,
             removed: 0,
+            locks: 0,
             wrapped: false,
         };
         // A place with no node holds no lock and is passed by a few instructions, without a
@@ -852,9 +925,10 @@ impl SimpleLocks {
                 }
                 continue;
             }
-            let step = self.sweep(storage, cursor, 1, &mut live);
+            let step = self.sweep_piece(storage, cursor, SWEEP_PIECE, &mut live);
             total.visited += step.visited;
             total.removed += step.removed;
+            total.locks += step.locks;
             total.wrapped |= step.wrapped;
             spent += 1;
             if held || spent >= max_empty {
@@ -1142,6 +1216,94 @@ mod tests {
         // Two held inodes and the empty ones in runs of at most 64.
         assert!(turns <= 2 + storage::NODES / 64 + 2, "{turns}");
         assert_eq!(table.count(a) + table.count(b), 0);
+    }
+
+    fn fill(ram: &mut crate::Ram<'_>, table: &mut SimpleLocks, file: Token) {
+        for i in 0..PER_INODE as u32 {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(
+                        file,
+                        Owner::Process(256 + i),
+                        i64::from(i) * 3,
+                        1,
+                        Some(Kind::Read),
+                    ),
+                    |_| true,
+                )
+                .unwrap();
+        }
+        assert_eq!(table.count(file), PER_INODE);
+    }
+
+    #[test]
+    fn a_full_inode_is_swept_in_pieces_and_every_dead_lock_goes() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let file = inode(&mut ram, b"pieces");
+        let mut table = fresh();
+        fill(&mut ram, &mut table, file);
+        let mut cursor = SweepCursor::default();
+        cursor.restart();
+        let (mut turns_on_file, mut removed) = (0, 0);
+        let mut turns = 0;
+        while cursor.pending() {
+            let on_file = cursor.inode == usize::from(file.slot);
+            let result = table.sweep_run(
+                &mut ram.storage,
+                &mut cursor,
+                64,
+                |owner| matches!(owner, Owner::Process(pid) if pid % 2 == 0),
+            );
+            assert!(result.locks <= SWEEP_PIECE, "{}", result.locks);
+            if on_file && result.locks != 0 {
+                turns_on_file += 1;
+            }
+            removed += result.removed;
+            turns += 1;
+            assert!(turns < 4 * storage::NODES);
+        }
+        // The removed locks shorten the list, so the four pieces of 64 may take only three.
+        assert!((3..=PER_INODE / SWEEP_PIECE).contains(&turns_on_file));
+        assert_eq!(removed, PER_INODE / 2);
+        assert_eq!(table.count(file), PER_INODE / 2);
+    }
+
+    #[test]
+    fn a_list_changed_between_pieces_is_examined_again_from_its_first_lock() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let file = inode(&mut ram, b"changed");
+        let mut table = fresh();
+        fill(&mut ram, &mut table, file);
+        let mut cursor = SweepCursor::default();
+        cursor.restart();
+        while cursor.inode != usize::from(file.slot) {
+            table.sweep_run(&mut ram.storage, &mut cursor, 64, |_| true);
+        }
+        // One piece finds everybody alive; then another request takes the first lock away.
+        let first = table.sweep_run(&mut ram.storage, &mut cursor, 64, |_| true);
+        assert_eq!((first.locks, first.removed), (SWEEP_PIECE, 0));
+        table
+            .close(&mut ram.storage, file, Owner::Process(256))
+            .unwrap();
+        // Now all are dead: no lock may stay behind a piece that was skipped.
+        let mut turns = 0;
+        while table.count(file) != 0 {
+            table.sweep_run(&mut ram.storage, &mut cursor, 64, |_| false);
+            turns += 1;
+            assert!(turns <= PER_INODE, "{} locks left", table.count(file));
+        }
+    }
+
+    #[test]
+    fn the_piece_of_the_sweep_is_a_part_of_an_inode() {
+        const {
+            assert!(
+                SWEEP_PIECE > 0 && SWEEP_PIECE < PER_INODE && PER_INODE.is_multiple_of(SWEEP_PIECE)
+            )
+        };
+        assert_eq!(SWEEP_PIECE, 16);
     }
 
     #[test]
