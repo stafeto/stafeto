@@ -303,11 +303,7 @@ pub fn sgi_probe() {
     ping_all(0, cpus);
     let limit = timer::now() + WAIT_SECONDS * timer::frequency();
     loop {
-        if crate::arch::irq_pending()
-            && let Some(ack) = gic::acknowledge()
-        {
-            handle(ack);
-        }
+        crate::interrupt::poll();
         let missing = (0..cpus)
             .flat_map(|to| (0..cpus).map(move |from| (to, from)))
             .find(|&(to, from)| to != from && GOT_PONG.at(to, from).load(Ordering::Relaxed) == 0);

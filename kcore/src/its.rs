@@ -715,18 +715,17 @@ impl core::fmt::Display for NotDelivered {
     }
 }
 
-/// The verdict of the self-test: `arrived[c]` is the ticks the LPI of CPU
-/// `c` (FIRST_LPI + c) took, None when it did not arrive in time.
-pub fn verdict(arrived: &[Option<u64>]) -> Result<(), NotDelivered> {
-    for (cpu, ticks) in arrived.iter().enumerate() {
-        if ticks.is_none() {
-            return Err(NotDelivered {
-                cpu,
-                lpi: FIRST_LPI + cpu as u32,
-            });
-        }
+/// The verdict of the self-test: bit `c` of `arrived` is set when the LPI of
+/// CPU `c` (FIRST_LPI + c) arrived in time; the first of `cpus` CPUs with the
+/// bit clear is the one named.
+pub fn verdict(arrived: u64, cpus: usize) -> Result<(), NotDelivered> {
+    match (0..cpus).find(|c| arrived >> c & 1 == 0) {
+        None => Ok(()),
+        Some(cpu) => Err(NotDelivered {
+            cpu,
+            lpi: FIRST_LPI + cpu as u32,
+        }),
     }
-    Ok(())
 }
 
 /// Clears EnableLPIs at entry, as Linux does for a kernel that finds it set:
@@ -1258,13 +1257,13 @@ mod tests {
 
     #[test]
     fn a_self_test_that_lost_an_lpi_names_the_cpu() {
-        assert_eq!(verdict(&[Some(10), Some(20)]), Ok(()));
-        assert_eq!(verdict(&[]), Ok(()));
-        let err = verdict(&[Some(10), None]).unwrap_err();
+        assert_eq!(verdict(0b11, 2), Ok(()));
+        assert_eq!(verdict(0, 0), Ok(()));
+        let err = verdict(0b01, 2).unwrap_err();
         assert_eq!(err, NotDelivered { cpu: 1, lpi: 8193 });
         assert_eq!(format!("{err}"), "LPI 8193 did not reach CPU 1");
         assert_eq!(
-            format!("{}", verdict(&[None, None]).unwrap_err()),
+            format!("{}", verdict(0, 2).unwrap_err()),
             "LPI 8192 did not reach CPU 0"
         );
     }
