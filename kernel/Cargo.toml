@@ -124,6 +124,8 @@ idle-probe = ["idle-poll"]
 # The probe kernel with one deliberate break each: the sender reads POLLING
 # and writes BELL in two steps with a wait between them, the bell ends the poll
 # with no drain of the queues, and the poll does not read ISR_EL1.
+# Deliberate breakage: the kernel leaves the boot seed in the device tree.
+break-seed-wipe = []
 break-idle-bell = ["idle-probe", "window-probe"]
 break-idle-drain = ["idle-probe", "window-probe"]
 break-idle-irq = ["idle-probe", "window-probe"]

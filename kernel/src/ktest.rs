@@ -81,6 +81,10 @@ const TESTS: &[(&str, TestFn)] = &[
         "device_tree_matches_qemu_virt",
         device_tree_matches_qemu_virt,
     ),
+    (
+        "boot_seed_is_taken_and_cleared_in_the_tree",
+        boot_seed_is_taken_and_cleared_in_the_tree,
+    ),
     ("gic_matches_the_device_tree", gic_matches_the_device_tree),
     ("every_line_is_group_1", every_line_is_group_1),
     (
@@ -1018,6 +1022,38 @@ fn qemu_psci_conduit(pfr0: u64) -> PsciConduit {
 /// (ICC_SRE_EL1.SRE), Group 1 is on at the CPU interface
 /// (ICC_IGRPEN1_EL1) and at the distributor, with affinity routing
 /// (GICD_CTLR).
+/// QEMU writes 32 random bytes to `/chosen/rng-seed`. `boot::take_seed`
+/// moves them to the page of init's seed (abi::INIT_SEED), with their
+/// length first, and leaves zeros in the tree (spec 13.3): nothing in the
+/// tree gives them to a reader of it afterwards. The kernel keeps no
+/// copy, so the page is the only place they are in.
+fn boot_seed_is_taken_and_cleared_in_the_tree(boot: &Boot) -> Result<(), &'static str> {
+    let seed = boot.info.seed.ok_or("the tree has no rng-seed")?;
+    if seed.size != 32 {
+        return Err("rng-seed is not 32 bytes");
+    }
+    let tree = (LINEAR_BASE + (boot.dtb.base + seed.base) as usize) as *const u8;
+    // SAFETY: `parse` took the range from the blob, which the linear map
+    // reaches.
+    let before: [u8; 32] = core::array::from_fn(|i| unsafe { tree.add(i).read_volatile() });
+    if before.iter().all(|&b| b == 0) {
+        return Err("rng-seed is zero before it is taken");
+    }
+    let mut page = [0u32; 1 + abi::INIT_SEED_MAX / 4];
+    // SAFETY: the page is aligned to 4 bytes and has room for the length
+    // and SEED_MAX bytes; nothing else uses it.
+    unsafe { crate::boot::take_seed(boot, page.as_mut_ptr().cast()) };
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(page.as_ptr().cast(), 4 + 32) };
+    if bytes[..4] != 32u32.to_le_bytes() || bytes[4..] != before {
+        return Err("the page does not hold the length and the seed");
+    }
+    // SAFETY: as for `before`.
+    if (0..32).any(|i| unsafe { tree.add(i).read_volatile() } != 0) {
+        return Err("rng-seed is still in the tree");
+    }
+    Ok(())
+}
+
 fn gic_matches_the_device_tree(boot: &Boot) -> Result<(), &'static str> {
     let gic = boot.info.gic.ok_or("no GIC in the device tree")?;
     check(

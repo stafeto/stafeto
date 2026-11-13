@@ -1378,7 +1378,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 270;
+const INIT_TESTS: u32 = 271;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1554,10 +1554,14 @@ enum Variant {
     /// The self-test image of EC2 with the queue and the property table back on
     /// 4 KiB and 8 KiB blocks (`cargo xtask aws image --its-align-4k`).
     ItsIntAlign4k,
+    /// The kernel tests of the first image with the boot seed left in the
+    /// device tree (kernel feature `break-seed-wipe`, `cargo xtask
+    /// seed-breaks`): the test of the wipe must fail, and only it.
+    SeedNoWipe,
 }
 
 impl Variant {
-    const ALL: [Variant; 48] = [
+    const ALL: [Variant; 49] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1606,6 +1610,7 @@ impl Variant {
         Variant::ItsPreset,
         Variant::ItsPresetBreak,
         Variant::ItsIntAlign4k,
+        Variant::SeedNoWipe,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1662,6 +1667,7 @@ impl Variant {
             Variant::ItsPreset => Some("its-lpis-preset"),
             Variant::ItsPresetBreak => Some("break-its-keep-firmware-lpis"),
             Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
+            Variant::SeedNoWipe => Some("ktest,break-seed-wipe"),
         }
     }
 
@@ -1719,6 +1725,7 @@ impl Variant {
             | Variant::TestIcountStampsEl0
             | Variant::SmpMeasure
             | Variant::SmpMeasureNoPoll
+            | Variant::SeedNoWipe
             | Variant::SmpChecks => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
@@ -1792,6 +1799,7 @@ impl Variant {
             Variant::ItsPreset => "stafeto-its-preset",
             Variant::ItsPresetBreak => "stafeto-its-preset-break",
             Variant::ItsIntAlign4k => "stafeto-its-int-align4k",
+            Variant::SeedNoWipe => "stafeto-ktest-seed-no-wipe",
         }
     }
 }
@@ -2143,6 +2151,7 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
+  seed-breaks run the kernel tests with the boot seed left in the device tree: the test of the wipe must fail, and only it
   its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
   its-int   boot the self-test of the ITS in QEMU on four CPUs: an event mapped to each CPU's collection, raised by INT, received there; with the break (every event on CPU 0) the run must report the failure
@@ -2169,6 +2178,7 @@ fn main() {
         Some("its-drop") => its_drop(),
         Some("its-lpis") => its_lpis(),
         Some("its-breaks") => its_breaks(),
+        Some("seed-breaks") => seed_breaks(),
         Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
@@ -2735,6 +2745,29 @@ fn its_slow() -> Result<(), String> {
             Ok(())
         }
         Ok(_) => Err("the teardown that waits in one portion passed the kernel tests".into()),
+    }
+}
+
+/// The kernel test of the boot seed (spec 13.3).
+const SEED_TEST: &str = "boot_seed_is_taken_and_cleared_in_the_tree";
+
+/// `cargo xtask seed-breaks`: the kernel tests of the first image with the
+/// boot seed left in the device tree (`break-seed-wipe`) fail the test of
+/// the wipe and no other; the same test passes in every other run of the
+/// kernel tests.
+fn seed_breaks() -> Result<(), String> {
+    let a = build(Variant::SeedNoWipe)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
+    let r = qemu::parse_report(&o.lines);
+    match r.failed.as_slice() {
+        [(name, why)] if name == SEED_TEST => {
+            println!("seed-breaks: the seed left in the tree is caught ({why})");
+            Ok(())
+        }
+        [] => Err("the break (no wipe) passed the kernel tests".into()),
+        other => Err(format!("the break failed other tests: {other:?}")),
     }
 }
 
@@ -9757,6 +9790,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("its drop", its_drop),
         job("its lpis", its_lpis),
         job("its breaks", its_breaks),
+        job("seed breaks", seed_breaks),
         job("its slow", its_slow),
         job("smp 4 window", smp_window),
         job("smp 4 asid", || smp_asid(None)),

@@ -7,7 +7,7 @@
 
 use crate::arch::symbols;
 use bootimg::{BootImage, Program};
-use kcore::bootinfo::{self, BootInfo, Region, RegionList};
+use kcore::bootinfo::{self, BootInfo, Region, RegionList, SEED_MAX};
 use kcore::fdt::{self, Fdt};
 use kcore::layout::{LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
 use kcore::memmap;
@@ -89,6 +89,35 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
     };
     BOOT.set(boot)
         .unwrap_or_else(|_| panic!("boot::collect runs once"))
+}
+
+/// Moves the boot seed, the value of `/chosen/rng-seed`, to `page`, a
+/// page of memory: its u32 length in little endian (0 when the tree has no
+/// seed), then up to `SEED_MAX` bytes of it; and clears the property in the
+/// device tree, all of its bytes. The tree is in RAM, so only the kernel
+/// can clear it after the one read (spec 13.3). O(length of the property):
+/// the property lies in the tree, whose size the header bounds, and this
+/// runs once, before init.
+///
+/// # Safety
+///
+/// `page` is aligned to 4 bytes, writable for `4 + SEED_MAX` bytes, and
+/// nothing else uses it.
+pub unsafe fn take_seed(boot: &Boot, page: *mut u8) {
+    let Some(seed) = boot.info.seed else {
+        return;
+    };
+    let at = (LINEAR_BASE + (boot.dtb.base + seed.base) as usize) as *mut u8;
+    let n = (seed.size as usize).min(SEED_MAX);
+    // SAFETY: `parse` took the range from the blob, which lies in the mapped
+    // GiB, and it is RAM, so the linear map writes it; `page` is the
+    // caller's.
+    unsafe {
+        page.cast::<u32>().write((n as u32).to_le());
+        core::ptr::copy_nonoverlapping(at, page.add(4), n);
+        #[cfg(not(feature = "break-seed-wipe"))]
+        core::ptr::write_bytes(at, 0, seed.size as usize);
+    }
 }
 
 /// Init from the boot image (spec 3.3, 13.1), checked in full: where the

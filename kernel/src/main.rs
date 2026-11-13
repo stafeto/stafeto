@@ -129,7 +129,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
 fn finish(boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
     let image = boot.info.initrd.must("init came from the boot image");
-    init::start(program, image)
+    init::start(program, image, boot)
 }
 
 #[cfg(feature = "ktest")]

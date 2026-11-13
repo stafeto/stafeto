@@ -58,6 +58,9 @@ pub struct InitHandles {
     pub thread: Handle<Thread>,
     /// The boot image, a memory object with abi::INIT_BOOT_IMAGE_RIGHTS.
     pub boot_image: Handle<Memory>,
+    /// The page of the boot seed, a memory object with
+    /// abi::INIT_SEED_RIGHTS (layout at abi::INIT_SEED).
+    pub seed: Handle<Memory>,
 }
 
 /// x0 of the program's first thread, which `_start` keeps (spec 13.3): 0
@@ -88,6 +91,7 @@ pub fn init_handles() -> Option<InitHandles> {
         process: Handle::from_raw(abi::INIT_PROCESS),
         thread: Handle::from_raw(abi::INIT_THREAD),
         boot_image: Handle::from_raw(abi::INIT_BOOT_IMAGE),
+        seed: Handle::from_raw(abi::INIT_SEED),
     })
 }
 

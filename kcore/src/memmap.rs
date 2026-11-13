@@ -105,7 +105,15 @@ pub fn usable<const N: usize>(
         pieces = next;
         len = n;
     }
-    pieces[..len].sort_unstable_by_key(|p| p.base);
+    // An insertion sort: at most N pieces, once at boot, and the library's
+    // sort is two functions of over a kilobyte each in the kernel image.
+    for i in 1..len {
+        let mut j = i;
+        while j > 0 && pieces[j - 1].base > pieces[j].base {
+            pieces.swap(j - 1, j);
+            j -= 1;
+        }
+    }
     let mut out = RegionList::new();
     for p in &pieces[..len] {
         out.push(*p).map_err(|_| MemMapError::TooManyRegions)?;
@@ -230,6 +238,21 @@ mod tests {
     fn output_is_sorted_by_address() {
         let u = usable::<4>(&[r(0x8000_0000, MIB), r(0x4000_0000, MIB)], &[]).unwrap();
         assert_eq!(u.as_slice(), [r(0x4000_0000, MIB), r(0x8000_0000, MIB)]);
+    }
+
+    #[test]
+    fn many_regions_in_reverse_come_out_sorted() {
+        let memory = [
+            r(0xc000_0000, MIB),
+            r(0xa000_0000, MIB),
+            r(0x8000_0000, MIB),
+            r(0x6000_0000, MIB),
+            r(0x4000_0000, MIB),
+        ];
+        let u = usable::<8>(&memory, &[]).unwrap();
+        let mut want = memory;
+        want.reverse();
+        assert_eq!(u.as_slice(), want);
     }
 
     #[test]
