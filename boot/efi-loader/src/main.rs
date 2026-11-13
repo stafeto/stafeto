@@ -284,6 +284,10 @@ fn read_acpi() -> Acpi {
     let xsdt = at(xsdt_at, xsdt_len).unwrap_or_else(|| refuse(&"no XSDT"));
     let tables = Tables::read(xsdt, at).unwrap_or_else(|e| refuse(&e));
     let platform = Platform::from_tables(&tables).unwrap_or_else(|e| refuse(&e));
+    ensure!(
+        !platform.dma_translated,
+        "an SMMU stands in front of the root complex: the devices of this system address physical memory"
+    );
     let kept = tables
         .tables
         .iter()
