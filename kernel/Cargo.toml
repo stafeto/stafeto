@@ -27,6 +27,19 @@ el0-half = ["ktest"]
 # wait for its commands reads GITS_CREADR SLOW_READS more times before it
 # believes it (arch/aarch64/its.rs), so that a wait spans several segments.
 its-slow = []
+# The portion of a binding or a device that waits for the ITS to run its
+# teardown commands waits in one portion, in a loop, as the first version did:
+# with `its-slow` the bound of B_4 must fail (xtask kernel-test its-loop).
+break-its-loop = ["its-slow"]
+# The first look of the self-test of the ITS (xtask its-int): the kernel maps
+# one event of a device of its own to the collection of each CPU, has the ITS
+# raise it by INT, and prints the LPI each CPU received. Never in a shipped
+# kernel; the image of the first run on EC2 that wants MSI carries it.
+its-int = []
+# The self-test with one deliberate break: every event is mapped to the
+# collection of CPU 0, so that the LPI of another CPU's event must not arrive
+# there (xtask its-int).
+break-its-int-collection = ["its-int"]
 fault-probe = []
 # CPU 1 fails a check right after it is up: the report of the panic must carry
 # a backtrace of CPU 1's own stack (xtask smp-cpu-check).

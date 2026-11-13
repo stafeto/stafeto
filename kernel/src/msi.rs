@@ -9,22 +9,27 @@
 //! KiB at most, which the creator's quota pays for with the object's place
 //! in its pool (spec 7.5). The device is the right to bind its events
 //! (irq_bind, `MANAGE`): the binding is an LPI (irq.rs). The ITS commands
-//! that map and unmap the device run outside `OBJ` (its.rs, spec 8.1): the
-//! call that makes the device sends them after its section, and the
-//! portion that takes it apart sends them before its own. One device a
-//! DeviceID: DEVICES names them, 64 at most.
+//! that map and unmap the device: the call that makes the device puts its
+//! MAPD in the queue inside its section, so that the queue holds the
+//! commands in the order of the sections (its.rs, spec 8.1), tells the ITS
+//! after the section and does not wait; the portion that takes it apart
+//! sends its MAPD with V = 0 before its own section and goes on to the
+//! section once the ITS ran it, a later portion if it did not. One device
+//! a DeviceID: DEVICES names them, 64 at most.
 //!
 //! A device lives while references to it are left: its handles and the
 //! binding of each of its events.
 
-use crate::arch::its;
+use crate::arch::its::{self, Position};
 use crate::cleanup::{self, Item};
 use crate::obj::Guarded;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{Error, MsiInfo};
 use core::ptr::NonNull;
-use kcore::its::{Command, ITT_ALIGN, ITT_MAX_BYTES, MAX_MSI_EVENTS, event_bits, itt_bytes};
+use kcore::its::{
+    Command, ITT_ALIGN, ITT_MAX_BYTES, MAX_MSI_EVENTS, Step, Wait, event_bits, itt_bytes,
+};
 use kcore::layout::LINEAR_BASE;
 
 /// The devices at most, one for each DeviceID (spec 7.8).
@@ -46,6 +51,8 @@ pub struct Msi {
     payer: NonNull<Process>,
     /// The level the cleanup that retired the device ran at.
     level: u8,
+    /// The wait of its portion for the MAPD with V = 0 to run.
+    wait: Wait,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
 }
@@ -66,69 +73,6 @@ static DEVICES: Guarded<Devices> = Guarded::new(Devices([(0, 0); MAX_DEVICES]));
 /// Devices whose places have not gone back.
 static LIVE: Live = Live::new();
 
-/// The ITS work a call does after its section (spec 8.1), copied out of
-/// the objects so that no object is read outside the section.
-#[derive(Debug, Clone, Copy)]
-pub enum Job {
-    None,
-    /// MAPD of a new device and the SYNC after it.
-    MapDevice {
-        device_id: u32,
-        itt: u64,
-        bits: u32,
-    },
-    /// The property byte, MAPTI, INV and SYNC of a new binding.
-    MapEvent {
-        device_id: u32,
-        event: u32,
-        lpi: u32,
-        cpu: u32,
-    },
-}
-
-impl Job {
-    /// Does the work, outside `OBJ`: the commands go into the queue under
-    /// ITS_LOCK and the wait for them follows without any lock.
-    #[inline(never)]
-    pub fn run(self) {
-        let (commands, count, what) = match self {
-            Job::None => return,
-            Job::MapDevice {
-                device_id,
-                itt,
-                bits,
-            } => (
-                [
-                    Command::mapd(device_id, itt, bits, true),
-                    Command::sync(its::rdbase(0)),
-                    Command::sync(0),
-                ],
-                2,
-                "MAPD",
-            ),
-            Job::MapEvent {
-                device_id,
-                event,
-                lpi,
-                cpu,
-            } => {
-                its::set_property(lpi, Some(kcore::gic::DEFAULT_PRIORITY));
-                (
-                    [
-                        Command::mapti(device_id, event, lpi, cpu as u16),
-                        Command::inv(device_id, event),
-                        Command::sync(its::rdbase(cpu as usize)),
-                    ],
-                    3,
-                    "MAPTI",
-                )
-            }
-        };
-        let pos = its::send(&commands[..count]);
-        its::wait(pos, what);
-    }
-}
-
 /// The checks of msi_create that read the tree and the ITS, in the order of
 /// spec 11: INVALID_ARGS for events outside 1..=MAX_MSI_EVENTS, no ITS, a
 /// requester ID the `msi-map` does not name, a DeviceID past the device
@@ -148,14 +92,15 @@ pub fn check(rid: u64, events: u64) -> Result<u32, Error> {
 /// them (spec 9), in the pool of `payer`, the process of the thread that
 /// makes it, whose quota pays for a page when the pool grows (spec 7.8):
 /// BAD_STATE when the DeviceID has a device, LIMIT_REACHED when DEVICES is
-/// full, NO_MEMORY when the quota falls short; nothing changes then. The
-/// device holds the payer's shell; the caller gets the first reference and
-/// runs the returned job once its section ended.
+/// full or the ITS queue has no room for the MAPD, NO_MEMORY when the
+/// quota falls short; nothing changes then. The device holds the payer's
+/// shell; the caller gets the first reference, and the count the MAPD is
+/// at in the queue, which it tells the ITS about once its section ended.
 pub fn create(
     payer: NonNull<Process>,
     device_id: u32,
     events: u32,
-) -> Result<(NonNull<Msi>, Job), Error> {
+) -> Result<(NonNull<Msi>, Position), Error> {
     let mut devices = DEVICES.lock();
     if devices.0.iter().any(|&(id, at)| at != 0 && id == device_id) {
         return Err(Error::BadState);
@@ -165,6 +110,9 @@ pub fn create(
         .iter()
         .position(|&(_, at)| at == 0)
         .ok_or(Error::LimitReached)?;
+    if !its::room(MAP_COMMANDS) {
+        return Err(Error::LimitReached);
+    }
     let msi = Msi {
         itt: [0; ITT_MAX_BYTES],
         refs: Refs::one(),
@@ -173,6 +121,7 @@ pub fn create(
         bound: 0,
         payer,
         level: 0,
+        wait: Wait::new(),
         cleanup: Item::new(),
     };
     let m = process::paid_alloc(payer, msi)?;
@@ -181,14 +130,21 @@ pub fn create(
     devices.0[free] = (device_id, m.as_ptr() as usize);
     // SAFETY: the device was just made, and nothing else refers to it.
     let itt = unsafe { (*m.as_ptr()).itt.as_ptr() } as usize;
-    let job = Job::MapDevice {
-        device_id,
-        itt: (itt - LINEAR_BASE) as u64,
-        bits: event_bits(u64::from(events)),
-    };
     its::publish_itt(itt, ITT_MAX_BYTES);
-    Ok((m, job))
+    let pos = its::enqueue(&[
+        Command::mapd(
+            device_id,
+            (itt - LINEAR_BASE) as u64,
+            event_bits(u64::from(events)),
+            true,
+        ),
+        Command::sync(its::rdbase(0)),
+    ]);
+    Ok((m, pos))
 }
+
+/// The commands msi_create puts in the queue: MAPD and SYNC.
+const MAP_COMMANDS: usize = 2;
 
 /// The count of references to `m`, through the raw pointer.
 ///
@@ -274,20 +230,41 @@ pub fn info(m: NonNull<Msi>) -> MsiInfo {
 
 /// The ITS side of the portion of a device nothing refers to
 /// (cleanup::portion), outside `OBJ`: MAPD with V = 0 and the SYNC, which
-/// the portion waits for before it frees the ITT (spec 7.7, 8.1).
+/// the portion looks at once before its section (spec 7.7, 8.1). `Done`
+/// when the ITS ran them, before the ITT goes back; otherwise the portion
+/// queues the device again and a later one looks again.
 ///
 /// # Safety
 /// Nothing refers to the device, and it is in no queue.
 #[inline(never)]
-pub unsafe fn unmap(m: NonNull<Msi>) {
-    // SAFETY: the caller's promise; only the fields are read.
-    let (device_id, itt) =
-        unsafe { ((*m.as_ptr()).device_id, (*m.as_ptr()).itt.as_ptr() as usize) };
-    let pos = its::send(&[
-        Command::mapd(device_id, (itt - LINEAR_BASE) as u64, 1, false),
-        Command::sync(its::rdbase(0)),
-    ]);
-    its::wait(pos, "MAPD");
+pub unsafe fn unmap(m: NonNull<Msi>) -> Step {
+    // SAFETY: the caller's promise; only the fields are read and the wait
+    // is the portion's alone.
+    let (device_id, itt, wait) = unsafe {
+        (
+            (*m.as_ptr()).device_id,
+            (*m.as_ptr()).itt.as_ptr() as usize,
+            &mut (*m.as_ptr()).wait,
+        )
+    };
+    its::step(
+        wait,
+        &[
+            Command::mapd(device_id, (itt - LINEAR_BASE) as u64, 1, false),
+            Command::sync(its::rdbase(0)),
+        ],
+        "MAPD",
+    )
+}
+
+/// The place of the device in the cleanup queue, for the portion that
+/// queues it again after `unmap`.
+///
+/// # Safety
+/// `m` is alive, and the caller is its portion.
+pub unsafe fn cleanup_item(m: NonNull<Msi>) -> NonNull<Item> {
+    // SAFETY: the caller's promise; the address of a field.
+    unsafe { NonNull::new_unchecked(&raw mut (*m.as_ptr()).cleanup) }
 }
 
 /// The portion of a device nothing refers to, after `unmap`, in a section:
@@ -295,7 +272,7 @@ pub unsafe fn unmap(m: NonNull<Msi>) {
 /// reference to the payer's shell goes last.
 ///
 /// # Safety
-/// Nothing refers to the device, it is in no queue, and `unmap` ran.
+/// Nothing refers to the device, it is in no queue, and `unmap` said `Done`.
 #[inline(never)]
 pub unsafe fn clean(m: NonNull<Msi>, level: u8) {
     let mut devices = DEVICES.lock();

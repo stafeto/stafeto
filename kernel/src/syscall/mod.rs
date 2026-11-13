@@ -167,6 +167,13 @@ impl Values {
         Values { x, len }
     }
 
+    /// One more value after those it holds.
+    pub fn push(&mut self, value: u64) {
+        assert!(self.len < abi::RESULT_VALUES);
+        self.x[self.len].write(value);
+        self.len += 1;
+    }
+
     /// At most abi::RESULT_VALUES values, for x1 and up. Every call site
     /// passes an array of known length, so a longer slice is a bug there;
     /// it stops the kernel and never drops values silently while `len` still claims the full count.
@@ -268,7 +275,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::DeviceWindowCreate) => objects(|| device_window_create(thread, &args)),
         Some(Call::IrqBind) => irq_bind(thread, &args),
         Some(Call::MsiCreate) => msi_create(thread, &args),
-        Some(Call::IrqAck) => objects(|| irq_ack(thread, &args)),
+        Some(Call::IrqAck) => irq_ack(thread, &args),
         Some(Call::ClockNow) => clock_now(),
         Some(Call::TimerCreate) => {
             // The probe holds the thread here, with no section, until its

@@ -25,6 +25,7 @@ use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
+use kcore::its::Step;
 use kcore::must::Must;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::time::stretch;
@@ -422,22 +423,29 @@ pub fn portion() {
                 crate::memory::clean(m, level)
             }
             Work::Object(Object::Irq(b)) => {
-                // The ITS commands of an event go before the section, and
-                // the wait for them too (spec 8.1).
-                crate::irq::unmap(b);
-                crate::obj::serving(crate::obj::CLEAN_IRQ);
-                #[cfg(all(feature = "ktest", obj_checks))]
-                crate::obj::cleanup_seen(crate::obj::CLEAN_IRQ);
-                let _section = crate::obj::lock();
-                crate::irq::clean(b, level)
+                // The ITS commands of an event go before the section; the
+                // portion goes on once they ran, and otherwise queues the
+                // binding again at the tail of its level (spec 8.1).
+                if crate::irq::unmap(b) == Step::Done {
+                    crate::obj::serving(crate::obj::CLEAN_IRQ);
+                    #[cfg(all(feature = "ktest", obj_checks))]
+                    crate::obj::cleanup_seen(crate::obj::CLEAN_IRQ);
+                    let _section = crate::obj::lock();
+                    crate::irq::clean(b, level)
+                } else {
+                    enqueue(crate::irq::cleanup_item(b), Object::Irq(b), level)
+                }
             }
             Work::Object(Object::Msi(m)) => {
-                crate::msi::unmap(m);
-                crate::obj::serving(crate::obj::CLEAN_MSI);
-                #[cfg(all(feature = "ktest", obj_checks))]
-                crate::obj::cleanup_seen(crate::obj::CLEAN_MSI);
-                let _section = crate::obj::lock();
-                crate::msi::clean(m, level)
+                if crate::msi::unmap(m) == Step::Done {
+                    crate::obj::serving(crate::obj::CLEAN_MSI);
+                    #[cfg(all(feature = "ktest", obj_checks))]
+                    crate::obj::cleanup_seen(crate::obj::CLEAN_MSI);
+                    let _section = crate::obj::lock();
+                    crate::msi::clean(m, level)
+                } else {
+                    enqueue(crate::msi::cleanup_item(m), Object::Msi(m), level)
+                }
             }
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")
