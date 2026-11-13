@@ -577,6 +577,22 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
     Ok(info)
 }
 
+/// The room `kernel::boot::collect` keeps for what the boot itself holds:
+/// the kernel image, the device tree, the boot image, then every reserved
+/// region (3 + `BootInfo::reserved`). The kernel and the boot loader take the
+/// number from here, so a loader that checks its own tree against the
+/// kernel's limits cannot drift from them.
+pub const BOOT_TAKEN: usize = 24;
+
+/// The room for usable RAM regions: `memory` minus `taken` splits a region
+/// at most once per taken range (`memmap::usable`, `Boot::usable`).
+pub const USABLE_REGIONS: usize = 32;
+
+#[cfg(any(test, feature = "builder"))]
+mod probe;
+#[cfg(any(test, feature = "builder"))]
+pub use probe::{PCI_HOSTS, PciHost, PciHosts, Uart16550, pci_hosts, uart_16550};
+
 #[cfg(test)]
 mod tests {
     use super::*;

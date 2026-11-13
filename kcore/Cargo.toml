@@ -14,6 +14,9 @@ bench = false
 abi = { path = "../lib/abi" }
 
 [features]
+# The writer of device trees (fdt::Builder), for the boot loader, which needs
+# `alloc`; the kernel leaves it off.
+builder = []
 atomic-locks = []
 # ASIDs 4 bits wide, for the probe build of the kernel (feature asid-probe).
 narrow-asid = []

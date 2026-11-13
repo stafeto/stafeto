@@ -1,0 +1,35 @@
+[package]
+name = "efi-loader"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The UEFI application that boots stafeto: reads the kernel and the boot image from the ESP, builds the device tree from ACPI, enters the kernel"
+
+[[bin]]
+name = "efi-loader"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+firmware-tree = { path = "../firmware-tree" }
+kcore = { path = "../../kcore" }
+uefi-raw = "0.17.0"
+uefi = { version = "0.41.0", default-features = false, features = ["alloc"] }
+
+[features]
+# Writes the firmware's tables and memory map to \stafeto\dump on the ESP and
+# stops: the samples of the host tests (cargo xtask efi-fixtures).
+dump = []
+# Allocates a page between the memory map and ExitBootServices, so that the
+# first attempt meets a stale key.
+stale-key = []
+# Deliberate breaks (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 7).
+break-ebs-retry = []
+break-clean = []
+break-merge = ["firmware-tree/break-merge"]
+break-spcr = ["firmware-tree/break-spcr"]
+break-iort-count = ["firmware-tree/break-iort-count"]
+break-dtb-gib = ["firmware-tree/break-dtb-gib"]
