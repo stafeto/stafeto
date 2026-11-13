@@ -472,6 +472,12 @@ impl Net {
                 if name == opt::NREAD {
                     return self.readable(stack, r, place);
                 }
+                if name == opt::HOME {
+                    return word(r, u32::from(self.instance));
+                }
+                if name == opt::CALLS {
+                    return word(r, self.counters.calls as u32);
+                }
                 if name == opt::BUFFERS || name == opt::BUFFERED {
                     #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
                     if name == opt::BUFFERED {
@@ -850,10 +856,14 @@ impl Net {
             if ports::conflicts(&new, self.bindings(port, place, !sock.reuse)) {
                 return refuse(proto_net::IN_USE);
             }
-            if sharing && !self.join_group(place, ip, port, uid.unwrap_or(0)) {
+            // Another instance that holds the port refuses the bind (the one port space).
+            if !self.ports(sock.proto).try_hold(port) {
                 return refuse(proto_net::IN_USE);
             }
-            self.ports(sock.proto).hold(port);
+            if sharing && !self.join_group(place, ip, port, uid.unwrap_or(0)) {
+                self.ports(sock.proto).release(port);
+                return refuse(proto_net::IN_USE);
+            }
             port
         };
         if let (Proto::Udp, Some(handle)) = (sock.proto, sock.handle)
@@ -2103,6 +2113,49 @@ impl Net {
         }
     }
 
+    /// HOME_MAKE: a new session of `root` with no descriptions, for a process whose home this
+    /// instance is. Only an instance of the service sends it (the label of the handle it uses,
+    /// `HOME_LABEL`, is the service's own); the session is counted with the root's clones.
+    pub fn home_make(&mut self, s: &mut Sess, r: &mut Request<'_>) -> Answer {
+        if s.label() != HOME_LABEL {
+            return refuse(proto_net::NOT_ALLOWED);
+        }
+        let root = match proto_net::read_home_make(r.body()) {
+            Ok(root) if r.handles.is_empty() => root,
+            _ => return Answer::Status(Status::BadSize),
+        };
+        if self.clones.room_within(root, ROOT_CLONES).is_err() {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        };
+        let session = sys::handle_label(
+            &self.channel,
+            Rights::SEND | Rights::TRANSFER,
+            label,
+            self.level,
+        );
+        match session {
+            Ok(session) => {
+                // The session takes the root's name at its first request (`claim`), with
+                // nothing in hand.
+                if let Some(birth) = self.clones.place_of(label) {
+                    self.births[birth] = Some((label, Held::EMPTY, root, s.label()));
+                }
+                self.counters.homed += 1;
+                match sockets::write_cloned(r.reply(), 0) {
+                    Ok(()) => Answer::Reply([session.erase()].into()),
+                    Err(status) => Answer::Status(status),
+                }
+            }
+            Err(e) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(e))
+            }
+        }
+    }
+
     /// CLONE_MORE: more descriptions for the birth `word` (CLONE's reply)
     /// that the calling session made and that sent nothing yet. All the
     /// descriptions are checked before the birth changes, and one the birth
@@ -2142,3 +2195,6 @@ fn is_loopback_or_own(net: &Net, ip: [u8; 4]) -> bool {
 }
 
 const _: () = assert!(SESSIONS >= ROOT_CLONES);
+
+/// The label of the handle with which an instance of the service sends HOME_MAKE to another.
+pub const HOME_LABEL: u64 = 0x484F_4D45_0000_0001;

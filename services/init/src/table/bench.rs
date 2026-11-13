@@ -6,9 +6,10 @@
 //! the network service on Apple VZ (`net::NET_VZ_TABLE`) with one change,
 //! the CPUs of the shell and of the processes it starts, nginx among them:
 //! all four (`BENCH_CPUS`), as the Linux guest it is measured against has
-//! them. The network service stays on the boot CPU (`NETD_CPUS`), where
-//! every shared interrupt line is delivered, and the other services keep
-//! the CPUs of the services (`GENERAL_CPUS`).
+//! them. The network service has all four too, a stack instance on each (the
+//! thread of the line's interrupts stays on the boot CPU, where every shared
+//! interrupt line is delivered), and the other services keep the CPUs of the
+//! services (`GENERAL_CPUS`).
 //!
 //! The image has no tasks of realtime, so the SMP decision of 2026-10-17
 //! (ordinary processes on CPUs 0 and 1, CPUs 2 and 3 for realtime) does not
@@ -84,9 +85,13 @@ const fn with_launcher<const N: usize>(table: &[Record], cpus: u8) -> [Record; N
         out[at] = if str_eq(table[at].name, NET_LAUNCHER.name) {
             launchers += 1;
             Record { cpus, ..table[at] }
-        } else if cfg!(feature = "bench-stamps") && str_eq(table[at].name, NET_SERVICE) {
+        } else if str_eq(table[at].name, NET_SERVICE) {
+            // One stack instance on each of the four CPUs; the thread of the line's
+            // interrupts stays on the boot CPU. The stamps' resource is for the images of
+            // `cargo xtask net-trace` alone.
             Record {
-                trace: true,
+                cpus: BENCH_CPUS,
+                trace: cfg!(feature = "bench-stamps"),
                 ..table[at]
             }
         } else {

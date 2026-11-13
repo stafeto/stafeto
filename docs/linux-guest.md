@@ -50,8 +50,9 @@ The RAM service serves the files of an image straight from the image, so their b
 
 Stafeto's side is `boot-net-bench.img` (about 48 MB with the two sets): the network image of VZ with its own
 table of `init` (`services/init/src/table/bench.rs`). Its shell, and so nginx,
-runs on all four CPUs (`BENCH_CPUS = 0b1111`); the network service stays on the
-boot CPU and the other services on the CPUs of the services. No other image
+runs on all four CPUs (`BENCH_CPUS = 0b1111`); the network service has all four
+too (one stack instance on each, its thread of the line's interrupts on the boot
+CPU) and the other services stay on the CPUs of the services. No other image
 names `BENCH_CPUS` (a test of `init` scans the tables). Provisional owner ruling
 B2: four CPUs and 1 GiB for both guests (`vz-run --cpus 4 --memory 1024`).
 

@@ -551,6 +551,70 @@ pub fn run_in<S: Service<K>, const K: usize>(
 mod steps {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+    /// The loops of a process that count their steps at once (a service with an instance in each
+    /// of several threads): each has a place of its own for what a step in progress holds.
+    const LOOPS: usize = 8;
+
+    /// What a step in progress holds, for one loop (the thread that runs it is told by the
+    /// address of its message buffer, `msgbuf::address`, which is the thread's alone).
+    struct Slot {
+        /// The message buffer of the thread that leads the step in progress (0 for a free
+        /// place): only its sends count as the step's waits. The other threads of a service
+        /// (the adoption thread of the process service, the supply thread of the entropy
+        /// service, the loops of the other instances) send from their own loops, and their
+        /// waits are the preemption of the step, which stays in its own part.
+        leader: AtomicUsize,
+        /// Whether the step in progress counts as `OWN`.
+        owned: AtomicBool,
+        /// Whether the step in progress is the departure of a session.
+        departed: AtomicBool,
+        /// The ticks the step in progress has waited in `sys::send`.
+        waited: AtomicU64,
+        /// The ticks the step in progress has waited, after the answer of init to its
+        /// HEARTBEAT came, for the levels above the service to let it run.
+        preempted: AtomicU64,
+        /// The handle of the loop's own thread (made at the first step) and the CPU ticks it
+        /// had run when the step in progress began.
+        own: AtomicU64,
+        ran_begin: AtomicU64,
+        /// A number the handler of the step gives (`super::step_detail`), for the line a new
+        /// longest prints.
+        detail: AtomicU64,
+    }
+
+    static SLOTS: [Slot; LOOPS] = [const {
+        Slot {
+            leader: AtomicUsize::new(0),
+            owned: AtomicBool::new(false),
+            departed: AtomicBool::new(false),
+            waited: AtomicU64::new(0),
+            preempted: AtomicU64::new(0),
+            own: AtomicU64::new(0),
+            ran_begin: AtomicU64::new(0),
+            detail: AtomicU64::new(0),
+        }
+    }; LOOPS];
+
+    /// The place of the loop this thread runs, if it has one.
+    fn mine() -> Option<&'static Slot> {
+        let me = crate::msgbuf::address();
+        SLOTS
+            .iter()
+            .find(|s| s.leader.load(Ordering::Relaxed) == me)
+    }
+
+    /// The place of this thread's loop, taking a free one at its first step.
+    fn claim() -> Option<&'static Slot> {
+        mine().or_else(|| {
+            let me = crate::msgbuf::address();
+            SLOTS.iter().find(|s| {
+                s.leader
+                    .compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            })
+        })
+    }
+
     /// The kinds: methods below this number, and the notifications.
     pub const NOTICE: usize = 64;
     /// The notifications a service counts apart (`super::step_own`).
@@ -558,28 +622,8 @@ mod steps {
     /// The notifications of a departed session (CLIENT_GONE).
     pub const GONE: usize = OWN + 1;
     const KINDS: usize = GONE + 1;
-    /// Whether the step in progress counts as `OWN`.
-    static OWNED: AtomicBool = AtomicBool::new(false);
-    /// Whether the step in progress is the departure of a session.
-    static DEPARTED: AtomicBool = AtomicBool::new(false);
-    /// The ticks the step in progress has waited in `sys::send`.
-    static WAITED: AtomicU64 = AtomicU64::new(0);
-    /// The ticks the step in progress has waited, after the answer of init to
-    /// its HEARTBEAT came, for the levels above the service to let it run.
-    static PREEMPTED: AtomicU64 = AtomicU64::new(0);
     static BEATS: AtomicU64 = AtomicU64::new(0);
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    /// The message buffer of the thread that leads the step in progress
-    /// (`msgbuf::address`, one per thread): only its sends count as the
-    /// step's waits. The other threads of a service (the adoption thread of
-    /// the process service, the supply thread of the entropy service) send
-    /// from their own loops, and their waits are the preemption of the step,
-    /// which stays in its own part.
-    static LEADER: AtomicUsize = AtomicUsize::new(0);
-    /// The handle of the loop's own thread (made at the first step) and the
-    /// CPU ticks it had run when the step in progress began.
-    static SELF: AtomicU64 = AtomicU64::new(0);
-    static RAN_BEGIN: AtomicU64 = AtomicU64::new(0);
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The widest gap, over a run, between the clock and the CPU time of a
@@ -591,9 +635,6 @@ mod steps {
     static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
-    /// A number the handler of the step gives (`super::step_detail`), for
-    /// the line a new longest prints.
-    static DETAIL: AtomicU64 = AtomicU64::new(0);
     /// The tag a new longest prints with: the service that asked (0: none).
     static REPORT: AtomicU8 = AtomicU8::new(0);
 
@@ -605,13 +646,13 @@ mod steps {
     /// x5): the time of its own stints, which a thread of a higher level
     /// that runs in the middle of a step does not lengthen, as the clock
     /// does. 0 when the thread has no handle to itself.
-    fn own_ran() -> u64 {
-        let mut handle = SELF.load(Ordering::Relaxed);
+    fn own_ran(slot: &Slot) -> u64 {
+        let mut handle = slot.own.load(Ordering::Relaxed);
         if handle == 0 {
             match crate::sys::self_thread() {
                 Ok(own) => {
                     handle = own.into_raw().0;
-                    SELF.store(handle, Ordering::Relaxed);
+                    slot.own.store(handle, Ordering::Relaxed);
                 }
                 Err(_) => return 0,
             }
@@ -638,7 +679,9 @@ mod steps {
     }
 
     pub fn detail(value: u64) {
-        DETAIL.store(value, Ordering::Relaxed);
+        if let Some(slot) = mine() {
+            slot.detail.store(value, Ordering::Relaxed);
+        }
     }
 
     /// The kind of a request: its method, or the last place for a request
@@ -651,26 +694,30 @@ mod steps {
     }
 
     pub fn own() {
-        OWNED.store(true, Ordering::Relaxed);
+        if let Some(slot) = mine() {
+            slot.owned.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Starts the count of a step: what an earlier send of the loop
     /// (between steps) waited does not belong to it.
     pub fn restart() {
-        RAN_BEGIN.store(own_ran(), Ordering::Relaxed);
-        WAITED.store(0, Ordering::Relaxed);
-        PREEMPTED.store(0, Ordering::Relaxed);
-        LEADER.store(crate::msgbuf::address(), Ordering::Relaxed);
-        DEPARTED.store(false, Ordering::Relaxed);
+        let Some(slot) = claim() else { return };
+        slot.ran_begin.store(own_ran(slot), Ordering::Relaxed);
+        slot.waited.store(0, Ordering::Relaxed);
+        slot.preempted.store(0, Ordering::Relaxed);
+        slot.departed.store(false, Ordering::Relaxed);
     }
 
     pub fn gone() {
-        DEPARTED.store(true, Ordering::Relaxed);
+        if let Some(slot) = mine() {
+            slot.departed.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn waited(ticks: u64) {
-        if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
-            WAITED.fetch_add(ticks, Ordering::Relaxed);
+        if let Some(slot) = mine() {
+            slot.waited.fetch_add(ticks, Ordering::Relaxed);
         }
     }
 
@@ -686,29 +733,33 @@ mod steps {
     }
 
     pub fn preempted(ticks: u64) {
-        if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
-            PREEMPTED.fetch_add(ticks, Ordering::Relaxed);
+        if let Some(slot) = mine() {
+            slot.preempted.fetch_add(ticks, Ordering::Relaxed);
         }
     }
 
     pub fn end(began: u64, kind: usize) -> super::StepSample {
         let whole = super::time::now().saturating_sub(began);
-        let counted = WAITED.swap(0, Ordering::Relaxed);
-        let preempted = PREEMPTED.swap(0, Ordering::Relaxed);
+        let Some(slot) = mine() else {
+            // A loop that never restarted (no place was free): no accounting for it.
+            return super::StepSample::measured(kind, 0, whole, 0).cpu(0);
+        };
+        let counted = slot.waited.swap(0, Ordering::Relaxed);
+        let preempted = slot.preempted.swap(0, Ordering::Relaxed);
 
-        let kind = if OWNED.swap(false, Ordering::Relaxed) {
+        let kind = if slot.owned.swap(false, Ordering::Relaxed) {
             OWN
-        } else if DEPARTED.swap(false, Ordering::Relaxed) {
+        } else if slot.departed.swap(false, Ordering::Relaxed) {
             GONE
         } else {
             kind
         };
-        let detail = DETAIL.swap(0, Ordering::Relaxed);
+        let detail = slot.detail.swap(0, Ordering::Relaxed);
         // The step's own part is the CPU time of the loop's thread: neither
         // the wait for another service nor a thread of a higher level that
         // ran in the middle belongs to it (spec 2, 2: the levels of the
         // services are above those of the processes they serve).
-        let ran = own_ran().saturating_sub(RAN_BEGIN.load(Ordering::Relaxed));
+        let ran = own_ran(slot).saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
         let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
         if detail == 32 {

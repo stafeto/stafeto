@@ -27,6 +27,8 @@
 //!   the path off (ATTACH is refused and no table is made).
 //! * `flows N`: how many flows the switch's table holds, 256 to 131072 (the table has twice
 //!   as many places); 16384 without the line.
+//! * `instances N`: the most stack instances the service runs, 1 to 4; it runs one for each
+//!   CPU of its mask up to that number (`netd::home`).
 //! * `tso 0` or `tso 1`: whether the service asks the device for the segmentation offload
 //!   (the device then merges the segments it receives into frames of up to 64 KiB, and the
 //!   receiving ring is 64 chains of a head and a 64 KiB tail instead of 256 buffers); 0 or no
@@ -46,6 +48,8 @@ pub const BUFFERS_MAX: u16 = 64;
 /// The consumers of the switch at most, and the flows without a `flows` line.
 pub const SWITCH_MAX: u8 = 8;
 pub const FLOWS_DEFAULT: u32 = 16384;
+/// The stack instances at most (`switchlogic::tables::MAX_INSTANCES`).
+pub const INSTANCES_MAX: u8 = 4;
 pub const FLOWS_RANGE: (u32, u32) = (256, 131_072);
 
 /// An IPv4 address with the length of its network prefix.
@@ -69,6 +73,7 @@ pub struct Settings {
     pub buffers_line: Option<u16>,
     pub switch: Option<u8>,
     pub flows_line: Option<u32>,
+    pub instances_line: Option<u8>,
     pub tso_line: Option<bool>,
 }
 
@@ -81,6 +86,11 @@ impl Settings {
     /// The consumers of the switch; 0 is no switch.
     pub fn consumers(&self) -> u8 {
         self.switch.unwrap_or(0)
+    }
+
+    /// The most stack instances: the line's, or `INSTANCES_MAX`.
+    pub fn instances(&self) -> usize {
+        usize::from(self.instances_line.unwrap_or(INSTANCES_MAX))
     }
 
     /// Whether the service asks for the segmentation offload (`tso 1`).
@@ -111,6 +121,7 @@ pub enum Reason {
     BadBuffers,
     BadSwitch,
     BadFlows,
+    BadInstances,
     NeedsAddress,
     GatewayOutside,
     NotUnicast,
@@ -135,6 +146,7 @@ impl Reason {
             Reason::BadBuffers => "buffers is a number from 0 to 64",
             Reason::BadSwitch => "switch is a number from 0 to 8",
             Reason::BadFlows => "flows is a number from 256 to 131072",
+            Reason::BadInstances => "instances is a number from 1 to 4",
             Reason::NeedsAddress => "gateway and dns need an address line",
             Reason::GatewayOutside => "the gateway is outside the network of the address",
             Reason::NotUnicast => "not a unicast address (0.x.x.x, multicast or broadcast)",
@@ -259,6 +271,7 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
             | b"buffers"
             | b"switch"
             | b"flows"
+            | b"instances"
             | b"tso"
     );
     if !known {
@@ -297,6 +310,13 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
         b"switch" => {
             let n = number(value, u32::from(SWITCH_MAX)).ok_or(Reason::BadSwitch)?;
             set(&mut settings.switch, n as u8)
+        }
+        b"instances" => {
+            let n = number(value, u32::from(INSTANCES_MAX)).ok_or(Reason::BadInstances)?;
+            if n == 0 {
+                return Err(Reason::BadInstances);
+            }
+            set(&mut settings.instances_line, n as u8)
         }
         b"tso" => match value {
             b"0" => set(&mut settings.tso_line, false),
@@ -471,6 +491,16 @@ mod tests {
         let s = parse(b"address\t10.1.2.3/8   \r\n\tgateway  10.0.0.1").unwrap();
         assert_eq!(s.address.map(|a| a.prefix), Some(8));
         assert_eq!(s.gateway, Some([10, 0, 0, 1]));
+    }
+
+    #[test]
+    fn instances_is_a_number_from_one_to_four() {
+        assert_eq!(parse(b"instances 2").unwrap().instances(), 2);
+        assert_eq!(Settings::default().instances(), 4);
+        for bad in ["instances 0", "instances 5", "instances x", "instances -1"] {
+            assert_eq!(fault(bad.as_bytes()), (1, Reason::BadInstances), "{bad}");
+        }
+        assert_eq!(fault(b"instances 1\ninstances 2"), (2, Reason::KeyTwice));
     }
 
     #[test]

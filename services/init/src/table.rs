@@ -300,10 +300,11 @@ pub const SYSTEM_TIMERS: u32 = abi::MAX_SYSTEM_TIMERS;
 /// (SMP decision): the first two. The hard tasks of realtime get CPUs of
 /// their own (`RT_CPUS`, kernel spec 8), where no ordinary process runs.
 pub const GENERAL_CPUS: u8 = 0b0011;
-/// The CPU of the network service: the boot CPU, where every shared
-/// interrupt line is delivered, so that the line of its device and the
-/// service meet on one CPU.
-pub const NETD_CPUS: u8 = 0b0001;
+/// The CPUs of the network service: those of the services (`GENERAL_CPUS`), CPUs 0 and 1. It
+/// runs one stack instance on each CPU of its mask; the thread of the line's interrupts and
+/// the first instance stand on the boot CPU, where every shared interrupt line is delivered, and
+/// CPUs 2 and 3 stay for the tasks of realtime with no thread of the service on them.
+pub const NETD_CPUS: u8 = GENERAL_CPUS;
 /// The CPUs of the tasks of realtime, away from the ordinary processes.
 pub const RT_CPUS: u8 = 0b1100;
 /// The CPUs of the shell and its processes in the image of the measurement
@@ -2537,7 +2538,7 @@ mod tests {
     fn the_first_cpu_of_the_log_driver_is_in_its_mask() {
         assert_eq!(first_cpu(true, GENERAL_CPUS), 2);
         assert_eq!(first_cpu(true, BENCH_CPUS), 2);
-        assert_eq!(first_cpu(true, NETD_CPUS), 0);
+        assert_eq!(first_cpu(false, NETD_CPUS), 0);
         assert_eq!(first_cpu(true, RT_CPUS), 0);
         assert_eq!(first_cpu(false, GENERAL_CPUS), 0);
         for r in bench::BENCH_CPU0_VZ_TABLE {
@@ -2564,10 +2565,21 @@ mod tests {
                 .iter()
                 .filter(|r| r.cpus == BENCH_CPUS)
                 .count(),
-            1
+            2,
+            "the launcher and the network service"
         );
         for (bench, net) in bench::BENCH_VZ_TABLE.iter().zip(net::NET_VZ_TABLE) {
             if bench.name == bench::BENCH_LAUNCHER.name {
+                assert_eq!(bench.cpus, BENCH_CPUS);
+                assert_eq!(
+                    Record {
+                        cpus: net.cpus,
+                        ..*bench
+                    },
+                    *net
+                );
+            } else if bench.name == NET_SERVICE {
+                // A stack instance on each CPU.
                 assert_eq!(bench.cpus, BENCH_CPUS);
                 assert_eq!(
                     Record {
@@ -2584,7 +2596,7 @@ mod tests {
             .iter()
             .find(|r| r.name == NET_SERVICE)
             .unwrap();
-        assert_eq!(netd.cpus, NETD_CPUS);
+        assert_eq!(netd.cpus, BENCH_CPUS);
     }
 
     /// The pinned variant of the image of the measurement differs from it in
@@ -2646,7 +2658,10 @@ mod tests {
             .iter()
             .find(|r| r.name == NET_SERVICE)
             .unwrap();
-        assert_eq!(netd.cpus, NETD_CPUS);
+        assert_eq!(
+            netd.cpus, BENCH_CPUS,
+            "an instance on every CPU of the image"
+        );
     }
 
     /// The table of the image with every program on CPU 0 differs from the
@@ -2728,13 +2743,15 @@ mod tests {
                 .iter()
                 .filter(|r| r.cpus == BENCH_CPUS)
                 .count(),
-            1
+            2,
+            "the launcher and the network service"
         );
         for (bench, fast) in bench::BENCH_FAST_VZ_TABLE
             .iter()
             .zip(fstack::FAST_NGINX_VZ_TABLE)
         {
-            if bench.name == net::NET_LAUNCHER.name {
+            // The launcher and the network service (an instance on each CPU) have the four.
+            if bench.name == net::NET_LAUNCHER.name || bench.name == NET_SERVICE {
                 assert_eq!(bench.cpus, BENCH_CPUS);
                 assert_eq!(
                     Record {
@@ -2751,7 +2768,37 @@ mod tests {
             .iter()
             .find(|r| r.name == NET_SERVICE)
             .unwrap();
-        assert_eq!(netd.cpus, NETD_CPUS);
+        assert_eq!(netd.cpus, BENCH_CPUS);
+    }
+
+    /// The network service runs a stack instance on each CPU of its mask: CPUs 0 and 1 in every
+    /// image but the bench ones, so that no thread of it stands on CPUs 2 and 3, which stay for
+    /// the tasks of realtime; the bench images (and only they) give it all four.
+    #[test]
+    fn the_network_service_has_no_thread_on_the_cpus_of_realtime_outside_the_bench_images() {
+        assert_eq!(NETD_CPUS, 0b0011);
+        assert_eq!(NETD_CPUS & RT_CPUS, 0);
+        for table in all_tables() {
+            for r in table.iter().filter(|r| r.name == NET_SERVICE) {
+                assert_eq!(r.cpus & RT_CPUS, 0, "{}", r.name);
+            }
+        }
+        for table in [
+            bench::BENCH_VZ_TABLE,
+            bench::BENCH_PINNED_VZ_TABLE,
+            bench::BENCH_FAST_VZ_TABLE,
+            bench::BENCH_FAST_SWITCH_VZ_TABLE,
+            bench::BENCH_FAST_SWITCH_PINNED_VZ_TABLE,
+        ] {
+            let netd = table.iter().find(|r| r.name == NET_SERVICE).unwrap();
+            assert_eq!(netd.cpus, BENCH_CPUS);
+        }
+        // The image with every program on CPU 0 keeps its one instance.
+        let netd = bench::BENCH_CPU0_VZ_TABLE
+            .iter()
+            .find(|r| r.name == NET_SERVICE)
+            .unwrap();
+        assert_eq!(netd.cpus, 0b0001);
     }
 
     /// No other table names `BENCH_CPUS`: not by the constant (a scan of the

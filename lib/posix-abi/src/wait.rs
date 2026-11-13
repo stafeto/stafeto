@@ -1103,7 +1103,7 @@ fn large_in(
     let mut records = [EpollRecord::default(); wire::EPOLL_BATCH];
     let mut count = 0;
     let mut invalid = false;
-    let session = crate::net::session();
+    let session = crate::net::session_passive();
     // The records of a batch go in one EPOLL_SET; the first makes the set.
     let send = |records: &[EpollRecord], net: &mut NetWait| -> Result<(), i32> {
         if records.is_empty() {

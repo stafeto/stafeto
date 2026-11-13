@@ -132,12 +132,16 @@ impl Driver<'_> {
             _ => return refuse(proto_net::INVALID),
         }
         let pci = self.claimable.pci;
-        let window = if pci {
-            self.maps.windows[1].as_ref()
-        } else {
-            self.maps.windows[2].as_ref()
+        // Only the first instance has the device's objects (`Driver::maps`).
+        let Some(maps) = self.maps.as_ref() else {
+            return refuse(proto_net::INVALID);
         };
-        let [dma1, net1a, net1b, ..] = &self.maps.second;
+        let window = if pci {
+            maps.windows[1].as_ref()
+        } else {
+            maps.windows[2].as_ref()
+        };
+        let [dma1, net1a, net1b, ..] = &maps.second;
         let copies = [window, dma1.as_ref(), net1a.as_ref(), net1b.as_ref()];
         let mut handles = Outgoing::new();
         for h in copies {
@@ -200,7 +204,10 @@ impl Driver<'_> {
         if !self.owns(s) || self.owner.as_ref().is_some_and(|o| o.more) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
-        let [_, _, _, net1c, net1d] = &self.maps.second;
+        let Some(maps) = self.maps.as_ref() else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        let [_, _, _, net1c, net1d] = &maps.second;
         let mut handles = Outgoing::new();
         for h in [net1c.as_ref(), net1d.as_ref()] {
             let Some(copy) = h.and_then(|h| sys::handle_duplicate(h, GIVEN).ok()) else {
