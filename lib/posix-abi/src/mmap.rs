@@ -266,9 +266,14 @@ fn mmap0(
         },
         None => Source {
             // An anonymous shared object is named for waits by address
-            // between the processes that show it: the PID of its maker and
-            // a count of that process's (PIDs are not used again).
-            wait_key: if shared { next_wait_key() } else { 0 },
+            // between the processes that show it by a key of the process
+            // service's making, which enters this process as its writer
+            // (and a forked child with it); 0 for no key.
+            wait_key: if shared {
+                crate::shares::anon().unwrap_or(0)
+            } else {
+                0
+            },
             ..Source::anonymous()
         },
     };
@@ -277,12 +282,13 @@ fn mmap0(
     // Pages of code have an object of their own, so that they do not cut the
     // heap into pieces of writable and executable pages.
     let code = access == Access::ReadExec;
+    let wait_key = source.wait_key;
     let first = if source.existing.is_some() {
         access
     } else {
         Access::ReadWrite
     };
-    heap(|state| {
+    let made = heap(|state| {
         state.within_data(pages)?;
         let result = if fixed {
             let end = addr.checked_add(pages * PAGE).ok_or(ENOMEM)?;
@@ -318,7 +324,13 @@ fn mmap0(
             return Err(error);
         }
         Ok(result)
-    })
+    });
+    // An object that was not made leaves its entry with the process
+    // service, which this process uses no more.
+    if made.is_err() && wait_key != 0 {
+        crate::shares::detach(wait_key);
+    }
+    made
 }
 
 /// The key, the pages, a copy of the object and the pin (place and
@@ -577,17 +589,12 @@ pub(crate) fn is_unmapped(address: usize) -> bool {
     })
 }
 
-/// The key of the next anonymous shared object of this process.
-fn next_wait_key() -> u64 {
-    static COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let count = COUNT.fetch_add(1, Ordering::Relaxed);
-    (u64::from(crate::process::getpid() as u32) << 32) | u64::from(count)
-}
-
 /// The word of shared memory at `address` as the service names it for waits
 /// by address: the kind of the key (0 a file, 1 anonymous memory), the key
 /// and the offset of the word in the object. None for an address in no
-/// shared mapping, and for an object without a key.
+/// shared mapping, for an object without a key, and for an object the
+/// process may not write (the process service gives the right to wait and
+/// wake on a word to a holder of the object for writing alone).
 pub(crate) fn wait_word(address: usize) -> Option<(u64, u64, u64)> {
     heap(|state| {
         let index = state.map.find(address)?;
@@ -598,7 +605,11 @@ pub(crate) fn wait_word(address: usize) -> Option<(u64, u64, u64)> {
         }
         let in_object = (piece.offset() * PAGE + (address - piece.address)) as u64;
         match object.back {
-            Some(back) => Some((0, back.key, back.offset() + in_object)),
+            Some(back) => (back.registered && object.may_write).then_some((
+                0,
+                back.key,
+                back.offset() + in_object,
+            )),
             None => (object.wait_key != 0).then_some((1, object.wait_key, in_object)),
         }
     })

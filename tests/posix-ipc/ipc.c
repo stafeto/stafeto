@@ -1760,6 +1760,38 @@ static int shared_ends(int named) {
     return 0;
 }
 
+extern unsigned stafeto_shared_polls(void);
+
+/* A wait on a word of a shared page goes through the pipe service, which
+ * holds it for a process the process service vouches holds the page for
+ * writing (an anonymous page carries a key of the process service's, a file
+ * the grant of the file service): the wait does not fall back to the poll
+ * every millisecond. */
+static int shared_keyed(int named) {
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    CHECK(sem_init(&s->sem, 1, 0) == 0);
+    unsigned polls_before = stafeto_shared_polls();
+    struct timespec until = after_ms(200);
+    CHECK(sem_timedwait(&s->sem, &until) == -1 && errno == ETIMEDOUT);
+    unsigned polls = stafeto_shared_polls() - polls_before;
+    printf("posix-ipc: shared_keyed: %u polls in a wait of 200 ms\n", polls);
+    CHECK(polls == 0);
+    /* The same through a post from a forked child, which holds the page too. */
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        pause_ms(100);
+        _exit(sem_post(&s->sem) == 0 ? 0 : 1);
+    }
+    until = after_ms(2000);
+    CHECK(sem_timedwait(&s->sem, &until) == 0);
+    CHECK(wait_ok(pid));
+    CHECK(stafeto_shared_polls() - polls_before == 0);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
 /* A waiter on a word nobody changes uses next to no CPU while it waits. */
 static int shared_idle(int named) {
     struct shared *s = shared_page(named);
@@ -1784,7 +1816,6 @@ static int shared_idle(int named) {
     return 0;
 }
 
-extern unsigned stafeto_shared_polls(void);
 
 static struct shared *many_page;
 
@@ -1977,6 +2008,8 @@ static int shared_named_mutex_cond(void) { return shared_mutex_cond(1); }
 static int shared_anonymous_ends(void) { return shared_ends(0); }
 static int shared_named_ends(void) { return shared_ends(1); }
 static int shared_anonymous_idle(void) { return shared_idle(0); }
+static int shared_anonymous_keyed(void) { return shared_keyed(0); }
+static int shared_named_keyed(void) { return shared_keyed(1); }
 static int shared_named_idle(void) { return shared_idle(1); }
 
 int main(int argc, char **argv) {
@@ -2023,10 +2056,12 @@ int main(int argc, char **argv) {
     RUN(shared_anonymous_ends);
     RUN(shared_named_ends);
     RUN(shared_anonymous_idle);
+    RUN(shared_anonymous_keyed);
     RUN(shared_anonymous_owner);
     RUN(shared_named_owner);
     RUN(shared_many);
     RUN(shared_named_idle);
+    RUN(shared_named_keyed);
     RUN(limits);
     RUN(longest_steps);
     printf("posix-ipc: ok\n");
