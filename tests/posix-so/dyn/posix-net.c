@@ -3331,6 +3331,25 @@ static void home_fork(void)
 	struct timespec nap = { 0, 200 * 1000 * 1000 };
 	nanosleep(&nap, NULL);
 	REQUIRE(config_done == 0);
+	/* A spawn does not wait for the ask (nor does an exec, whose other threads are stopped and
+	 * never end it): the child comes and goes while the flag stands at 1. */
+	{
+		int p[2];
+		char number[16], *args[] = { NULL, (char *)"spawn-child", number, NULL };
+		pid_t kid;
+
+		REQUIRE(pipe(p) == 0);
+		snprintf(number, sizeof number, "%d", p[1]);
+		args[0] = (char *)self;
+		alarm(30);
+		REQUIRE(posix_spawn(&kid, self, NULL, NULL, args, environ) == 0);
+		REQUIRE(wait_exit(kid) == 0);
+		char b = 0;
+		REQUIRE(read(p[0], &b, 1) == 1 && b == 'x');
+		alarm(0);
+		close(p[0]);
+		close(p[1]);
+	}
 	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &zero, sizeof zero) == 0);
 	REQUIRE(pthread_join(reader, NULL) == 0 && config_done == 1);
 	unsetenv("STAFETO_NET_PROBE");

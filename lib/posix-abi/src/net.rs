@@ -64,6 +64,12 @@ const EINPROGRESS: i32 = 115;
 /// The session with the network service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
 
+/// The session handle that the home replaced, kept open for the life of the process (homing
+/// happens once): a reader that took the old handle before the swap (the clone of a spawn, a
+/// thread in a socketless call) still holds a handle to the right service, and a number that
+/// was closed cannot be made again for something else under it. `abandon` closes it.
+static PARKED: AtomicU64 = AtomicU64::new(0);
+
 /// Where the process stands with the home of its session (HOME): not asked, asking, done.
 static HOMING: AtomicU32 = AtomicU32::new(0);
 const NOT_ASKED: u32 = 0;
@@ -95,6 +101,8 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    // The parked handle is the parent's: the child has none.
+    PARKED.store(0, Ordering::Release);
     // The image carries the flag and `HOME_CPU` of the thread that forked. A thread of the
     // parent that stood in the middle of its ask (ASKING) has no counterpart in the child to
     // finish it, so the child's first call that makes a socket would wait for ever: the child
@@ -116,8 +124,10 @@ fn probe_on() -> bool {
     !unsafe { getenv(c"STAFETO_NET_PROBE".as_ptr()) }.is_null()
 }
 
-/// The session with the network service, for the requests and for the
-/// clones a child gets.
+/// The session with the network service, for the requests. The first call settles the home of
+/// the session (the rule: the home is the CPU of the first network call), and a call that finds
+/// an ask in progress waits for it. The handle the home replaces is parked, not closed, so the
+/// settling is not what keeps a reader's handle alive.
 pub fn session() -> Option<rt::abi::Handle> {
     // Every reader of `SESSION` waits for the home of the session to be settled: the reply of
     // HOME replaces the handle and closes the old one, which a thread that read it before (a
@@ -136,16 +146,12 @@ pub fn session() -> Option<rt::abi::Handle> {
     }
 }
 
-/// The session for a reader that may not use it (the clone a child gets in fork and spawn, the
-/// look of `poll` for network descriptors among others): it neither starts the ask for the home
-/// nor settles it before the read beyond waiting for one in progress, because it runs in the
-/// parent on the parent's CPU and must not home the parent there (the child homes itself on its
-/// own CPU at its first call). The clone is made at once, so the window a replacement could
-/// close the handle in is the one `fork` already has with the rest of the parent's state.
+/// The session for a reader that must not start or wait for the ask of the home (the clone a
+/// child gets in fork and spawn, the exec's slot table and `abandon`, the look of `poll`): it
+/// runs on the CPU of the parent or of the old image and must not home the process there, and
+/// in an exec the thread that was asking is stopped and never ends the ask. The handle it reads
+/// is live whatever a homing thread does meanwhile: the replaced one is parked, not closed.
 pub fn session_passive() -> Option<rt::abi::Handle> {
-    while HOMING.load(Ordering::Acquire) == ASKING {
-        let _ = rt::sys::yield_now();
-    }
     match SESSION.load(Ordering::Acquire) {
         0 => None,
         raw => Some(rt::abi::Handle(raw)),
@@ -214,9 +220,9 @@ fn home_session() {
     let Ok(cpu) = r.u32() else { return };
     HOME_CPU.store(cpu, Ordering::Release);
     if let Ok(home) = reply.handles.take::<Channel>(0) {
-        // The home's session takes the place of the old one, which closes.
+        // The home's session takes the place of the old one, which is parked, not closed.
         let old = SESSION.swap(home.into_raw().0, Ordering::AcqRel);
-        drop(Handle::<Channel>::from_raw(rt::abi::Handle(old)));
+        PARKED.store(old, Ordering::Release);
     }
 }
 
@@ -514,7 +520,16 @@ fn close_description(description: u32) {
 /// in each answer and says how many are left; the ask goes on until none is.
 pub(crate) fn abandon() {
     // An exec must not home the old image on the CPU it happens to run on: the new image asks
-    // for its own home at its first call.
+    // for its own home at its first call. The other threads are stopped, so the parked handle
+    // of an earlier home (no reader holds it any more) closes here.
+    abandon_on_session();
+    let parked = PARKED.swap(0, Ordering::AcqRel);
+    if parked != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(parked)));
+    }
+}
+
+fn abandon_on_session() {
     let Some(raw) = session_passive() else { return };
     let service = ManuallyDrop::new(Handle::<Channel>::borrowed(raw));
     let request = proto_net::Method::Abandon.header().bytes();
