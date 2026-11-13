@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "pkg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc-ffi",
  "pkgd",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "pkgd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "posix-platform"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dynlink",
  "posix-abi",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "abi",
  "bootimg",

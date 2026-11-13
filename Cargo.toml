@@ -5,7 +5,7 @@ default-members = ["kcore", "boot/firmware-tree", "lib/abi", "lib/entries", "lib
 [workspace.package]
 # The one place of the system's version: `uname`, the kernel crate and the release
 # archives of `cargo xtask dist` take it from here.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Sergey Subbotin <ssubbotin@gmail.com>"]
 repository = "https://github.com/stafeto/stafeto"

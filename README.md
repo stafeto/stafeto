@@ -8,7 +8,7 @@ Every path inside the kernel is bounded in time, and every driver and service ru
 
 ## Try it
 
-Download `stafeto-<version>-aarch64-virt.tar.xz` from the [latest release](https://github.com/stafeto/stafeto/releases), unpack it and run:
+Download `stafeto-<version>-aarch64-virt-base.tar.xz` (or `-full.tar.xz`, with every package, which needs 1024M of memory) from the [latest release](https://github.com/stafeto/stafeto/releases), unpack it and run:
 
 ```sh
 ./run.sh              # QEMU with emulation, any host
@@ -32,7 +32,7 @@ The details of each part and the known limits are in [docs/status.md](docs/statu
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) is done; subproject 2 (POSIX and services) ends with release 0.2.0.
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done (release 0.2.0); release 0.3.0 brings the network.
 
 **Next**
 
@@ -44,7 +44,7 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) i
 **Later subprojects**
 
 - Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way).
-- Network: virtio-net, a TCP/IP stack and IPv4 sockets (under way). BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
+- Network: virtio-net, a TCP/IP stack, IPv4 sockets, `epoll`, DHCP, `curl`, nginx and nginx on F-Stack are in release 0.3.0. BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
 - Packages and apps: a package format, signed packages, an app sandbox.
 
 ## Build from source
