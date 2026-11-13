@@ -380,6 +380,8 @@ impl Inner {
             self.scenario.answer_delay_ns = 0;
         }
         self.reset_until = Some(self.now + self.scenario.reset_ns);
+        self.resp_lo = 0;
+        self.resp_hi = 0;
         self.aq_base = 0;
         self.acq_base = 0;
         self.aenq_base = 0;
@@ -463,7 +465,12 @@ impl Inner {
             status = st;
         } else {
             match opcode {
-                adm::GET_FEATURE => status = self.get_feature(cmd[adm::FEAT_ID], &mut out),
+                adm::GET_FEATURE => {
+                    if cmd[adm::FEAT_ID] == adm::MAX_QUEUES_EXT && cmd[adm::FEAT_VERSION] != 1 {
+                        self.violations_push("the extended queue limits asked in version 0");
+                    }
+                    status = self.get_feature(cmd[adm::FEAT_ID], &mut out)
+                }
                 adm::SET_FEATURE => status = self.set_feature(cmd),
                 adm::GET_STATS => {
                     if cmd[adm::STATS_TYPE] == adm::STATS_TYPE_ENI {

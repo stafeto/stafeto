@@ -590,6 +590,15 @@ impl<P: Platform> Ena<P> {
             return Event::Idle;
         }
         self.write_reg(regs::DEV_CTL, regs::reset_word(self.reason));
+        // The reset clears the address of the answers of a read through memory:
+        // the polls that follow need it again.
+        if self.mode == ReadMode::Readless && !cfg!(feature = "break-resp-rewrite") {
+            self.write_pair(
+                regs::MMIO_RESP_LO,
+                regs::MMIO_RESP_HI,
+                self.region.pa + READLESS_AT as u64,
+            );
+        }
         self.stage = Stage::Asserted { since: now };
         Event::Progress
     }
@@ -832,8 +841,14 @@ impl<P: Platform> Ena<P> {
 
     fn submit_get(&mut self, id: u8, now: u64) {
         self.submit(adm::GET_FEATURE, Pending::Feature { id }, now, |e| {
-            e[adm::FEAT_FLAGS] = adm::FEAT_SELECT_CURRENT;
+            // `FEAT_FLAGS` stays 0 as in the driver of FreeBSD, whose
+            // commands the device is known to take; the version is the newest the
+            // driver reads of the two features that have a second one.
             e[adm::FEAT_ID] = id;
+            e[adm::FEAT_VERSION] = match id {
+                adm::MAX_QUEUES_EXT | adm::LLQ => 1,
+                _ => 0,
+            };
         });
     }
 

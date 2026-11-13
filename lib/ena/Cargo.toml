@@ -18,5 +18,6 @@ break-acq-phase = []
 break-aenq-head = []
 break-reset-wait = []
 break-dma-width = []
+break-resp-rewrite = []
 # The model of the device for the tests of a service (`ena::model`).
 model = []

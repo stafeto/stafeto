@@ -87,6 +87,7 @@ pub const FEAT_FLAGS: usize = 16;
 pub const FEAT_ID: usize = 17;
 pub const FEAT_VERSION: usize = 18;
 pub const FEAT_DATA: usize = 20;
+/// `select` of `flags`: 0x1 asks for the current value (the commands here leave 0).
 pub const FEAT_SELECT_CURRENT: u8 = 1;
 
 /// `ena_admin_aq_get_stats_cmd`: `type` at 16, `scope` at 17, `queue_idx` at

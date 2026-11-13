@@ -457,3 +457,16 @@ fn a_poll_that_has_nothing_to_do_does_no_register_read() {
     }
     assert_eq!(model.0.borrow().read_requests, before);
 }
+
+/// Fails under `break-resp-rewrite`: the reset clears the address of the
+/// answers of a read through memory and the driver does not write it again.
+#[test]
+fn a_reset_in_place_works_when_registers_are_read_through_memory() {
+    let (model, mut ena) = rig(0);
+    run(&model, &mut ena, 3 * S);
+    ena.request_reset(regs::RESET_OS_TRIGGER);
+    run(&model, &mut ena, 3 * S);
+    assert!(ena.is_up(), "{:#?}", model.log_lines());
+    assert_eq!(ena.mode(), ReadMode::Readless);
+    assert_eq!(model.violations(), Vec::<String>::new());
+}
