@@ -578,7 +578,13 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
     if info.memory.as_slice().is_empty() {
         return Err(BootInfoError::NoMemory);
     }
-    info.uart_16550 = probe::uart_16550(fdt)?;
+    // A 16550 node that cannot be read does not stop a machine that has a
+    // PL011 for its console.
+    info.uart_16550 = match probe::uart_16550(fdt) {
+        Ok(u) => u,
+        Err(_) if info.uart_pl011.is_some() => None,
+        Err(e) => return Err(e),
+    };
     Ok(info)
 }
 

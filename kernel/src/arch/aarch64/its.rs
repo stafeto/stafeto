@@ -252,6 +252,7 @@ fn setup(
     {
         return off("EnableLPIs was set before the kernel");
     }
+    crate::irq::set_lpi_limit(its::lpi_limit(gicd_typer));
     ITT_ENTRY.store(its::typer_itt_entry_size(typer) as usize, Ordering::Relaxed);
     PTA.store(its::typer_pta(typer), Ordering::Relaxed);
     let cpus = info.cpus.as_slice().len().max(1);

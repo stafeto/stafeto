@@ -201,8 +201,24 @@ pub const fn gicd_id_bits(typer: u32) -> u32 {
 /// the field is not 0, else None (the range IDbits give).
 pub const fn gicd_num_lpis(typer: u32) -> Option<u32> {
     let n = (typer >> 11) & 0x1F;
-    if n == 0 { None } else { Some(1 << (n + 1)) }
+    if n == 0 {
+        None
+    } else if n >= 31 {
+        Some(u32::MAX)
+    } else {
+        Some(1 << (n + 1))
+    }
 }
+/// The LPIs the kernel hands out on a distributor with `typer` in
+/// GICD_TYPER: MAX_LPIS, or fewer when the distributor restricts the range
+/// (`num_LPIs`, 128 on a t4g) [G50].
+pub const fn lpi_limit(typer: u32) -> u32 {
+    match gicd_num_lpis(typer) {
+        Some(n) if n < MAX_LPIS as u32 => n,
+        _ => MAX_LPIS as u32,
+    }
+}
+
 /// Whether the registers hold the shareability and cacheability written:
 /// Shareability [11:10] not 0 and Inner Cache [9:7] not 0 or 1 [G51].
 pub const fn holds_shareability(read: u64) -> bool {
@@ -404,11 +420,22 @@ impl LpiMap {
 
     /// The lowest free LPI, taken; None when all MAX_LPIS are in use.
     pub fn take(&mut self) -> Option<u32> {
+        self.take_within(MAX_LPIS as u32)
+    }
+
+    /// The lowest free LPI below `limit` LPIs from INTID 8192, taken; None
+    /// when they are all in use. The limit is what the distributor gives
+    /// (`lpi_limit`).
+    pub fn take_within(&mut self, limit: u32) -> Option<u32> {
         for (i, word) in self.taken.iter_mut().enumerate() {
             if *word != u64::MAX {
                 let bit = (!*word).trailing_zeros();
+                let n = (i as u32) * 64 + bit;
+                if n >= limit {
+                    return None;
+                }
                 *word |= 1 << bit;
-                return Some(FIRST_LPI + (i as u32) * 64 + bit);
+                return Some(FIRST_LPI + n);
             }
         }
         None

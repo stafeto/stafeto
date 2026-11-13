@@ -19,7 +19,7 @@
 
 use abi::time::next_release;
 use abi::{Access, Error, LOG_BATCH, LOG_RECORD, LogBatch, Source};
-use core::cell::{Cell as FlagCell, UnsafeCell};
+use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -37,9 +37,10 @@ use uart::input::{self, Input, RX_RING};
 use uart::irq::{self, Irq, RX_PASS};
 use uart::output::Output;
 use uart::regs::{
-    ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
-    LCR_H_FEN, LCR_H_WLEN_8, MIS, RT, RX, TX,
+    ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
+    LCR_H_FEN, LCR_H_WLEN_8, MIS,
 };
+use uart::view16550::{Bus, POLL_NS, View, layout, polls};
 use uart::writes::{self, Armed, Rooms, Writes};
 
 rt::entry!(main);
@@ -49,10 +50,7 @@ const REGS_AT: usize = 0x10_0000_0000;
 const PAGE: u64 = 4096;
 /// The period of the reads of the kernel log.
 const LOG_PERIOD_NS: u64 = 50_000_000;
-/// The period of the poll of a 16550.
-const POLL_NS: u64 = 10_000_000;
-/// The kind byte of the arguments for a 16550.
-const KIND_16550: u8 = 1;
+
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// A separate one-shot timer resumes paced transmit portions.
@@ -134,116 +132,70 @@ fn state() -> Option<&'static mut State> {
 }
 
 /// The registers of the console through the window mapped at its base: a
-/// PL011 as it is, or a 16550 shown to the driver as a PL011 (the flags, the
-/// data register, the masked interrupts, which a poll of LSR makes up), so
-/// that the logic of input, output and the log is one for both. The 16550 is
-/// byte-wide with its registers one apart, as the SPCR of EC2 says, and the
-/// driver polls it: its FIFOs are the firmware's, and no interrupt is bound.
+/// PL011 as it is, or a 16550 shown as a PL011 (uart::view16550).
 struct Regs {
     base: usize,
-    ns16550: bool,
-    /// Bytes written since LSR last showed room: the 16-byte FIFO takes
-    /// that many, though THRE says only that it is empty.
-    sent: FlagCell<u8>,
-    /// The copy of the interrupt mask the driver writes.
-    imsc: FlagCell<u32>,
+    view: Option<View<Mmio16550>>,
 }
 
-/// LSR of the 16550 at register 5: data ready, transmitter room, both empty.
-const LSR: usize = 5;
-const LSR_DR: u32 = 1;
-const LSR_THRE: u32 = 1 << 5;
-const LSR_TEMT: u32 = 1 << 6;
-/// The depth of the FIFO of a 16550A.
-const FIFO16550: u8 = 16;
+/// The access of the 16550's registers through the window: `reg` shifted by
+/// the node's `reg-shift`, a byte or a word by its `reg-io-width`.
+struct Mmio16550 {
+    base: usize,
+    shift: u8,
+    width: u8,
+}
 
-impl Regs {
-    fn new(base: usize, ns16550: bool) -> Regs {
-        Regs {
-            base,
-            ns16550,
-            sent: FlagCell::new(0),
-            imsc: FlagCell::new(0),
-        }
-    }
-
-    fn byte(&self, reg: usize) -> u32 {
-        // SAFETY: the window maps the 16550's page at self.base, as device
-        // memory; `reg` is a byte register of it.
-        u32::from(unsafe { mmio::read8(self.base + reg) })
-    }
-
-    fn put(&self, reg: usize, value: u32) {
-        // SAFETY: as for `byte`.
-        unsafe { mmio::write8(self.base + reg, value as u8) }
-    }
-
+impl Bus for Mmio16550 {
     fn read(&self, reg: usize) -> u32 {
-        if !self.ns16550 {
-            // SAFETY: the window maps the PL011's page at self.base, readable
-            // and writable, as device memory; `reg` is the offset of a 32-bit
-            // register of uart::regs.
-            return unsafe { mmio::read32(self.base + reg) };
-        }
-        let lsr = self.byte(LSR);
-        match reg {
-            FR => {
-                if lsr & LSR_THRE != 0 {
-                    self.sent.set(0);
-                }
-                let mut flags = 0;
-                if lsr & LSR_DR == 0 {
-                    flags |= FR_RXFE;
-                }
-                if lsr & LSR_THRE == 0 || self.sent.get() >= FIFO16550 {
-                    flags |= FR_TXFF;
-                }
-                flags |= if lsr & LSR_TEMT != 0 {
-                    FR_TXFE
-                } else {
-                    FR_BUSY
-                };
-                flags
+        let at = self.base + (reg << self.shift);
+        // SAFETY: the window maps the 16550's page at self.base, as device
+        // memory; `at` is a register of it, aligned to its width.
+        unsafe {
+            if self.width == 4 {
+                mmio::read32(at)
+            } else {
+                u32::from(mmio::read8(at))
             }
-            DR => self.byte(0),
-            MIS => {
-                let mut raw = 0;
-                if lsr & LSR_DR != 0 {
-                    raw |= RX | RT;
-                }
-                if lsr & LSR_THRE != 0 {
-                    raw |= TX;
-                }
-                raw & self.imsc.get()
-            }
-            IMSC => self.imsc.get(),
-            _ => 0,
         }
     }
 
     fn write(&self, reg: usize, value: u32) {
-        if !self.ns16550 {
-            // SAFETY: as for `read`.
-            unsafe { mmio::write32(self.base + reg, value) };
-            return;
+        let at = self.base + (reg << self.shift);
+        // SAFETY: as for `read`.
+        unsafe {
+            if self.width == 4 {
+                mmio::write32(at, value)
+            } else {
+                mmio::write8(at, value as u8)
+            }
         }
-        match reg {
-            DR => {
-                self.sent.set(self.sent.get().saturating_add(1));
-                self.put(0, value);
-            }
-            IMSC => self.imsc.set(value),
-            // The line control of the PL011 is the one place the 16550 is set
-            // up: no interrupts, FIFOs on and cleared (trigger 8), 8N1 with the
-            // divisor latch closed, DTR, RTS and OUT2. The divisor stays the
-            // firmware's.
-            LCR_H => {
-                self.put(1, 0);
-                self.put(2, 0x87);
-                self.put(3, 0x03);
-                self.put(4, 0x0B);
-            }
-            _ => {}
+    }
+}
+
+impl Regs {
+    fn new(base: usize, layout: Option<(u8, u8)>) -> Regs {
+        Regs {
+            base,
+            view: layout.map(|(shift, width)| View::new(Mmio16550 { base, shift, width })),
+        }
+    }
+
+    fn read(&self, reg: usize) -> u32 {
+        match &self.view {
+            Some(view) => view.read(reg),
+            // SAFETY: the window maps the PL011's page at self.base, readable
+            // and writable, as device memory; `reg` is the offset of a 32-bit
+            // register of uart::regs.
+            None => unsafe { mmio::read32(self.base + reg) },
+        }
+    }
+
+    fn write(&self, reg: usize, value: u32) {
+        match &self.view {
+            Some(view) => view.write(reg, value),
+            // SAFETY: as for `read`.
+            None => unsafe { mmio::write32(self.base + reg, value) },
         }
     }
 }
@@ -270,10 +222,12 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     // The kind of the console is the ninth byte of the arguments: 1 is a
-    // 16550 polled every POLL_NS, with no interrupt bound.
-    let poll = args
-        .and_then(|a| a.own.get(8))
-        .is_some_and(|k| *k == KIND_16550);
+    // 16550 polled every POLL_NS, with no interrupt bound; the shift and the
+    // width of its registers follow (uart::view16550::layout).
+    let own = args.map_or(&[][..], |a| a.own);
+    let kind = own.get(8).copied().unwrap_or(0);
+    let layout = layout(own).filter(|_| polls(kind));
+    let poll = layout.is_some();
     let Ok(window) = got.take::<Memory>("regs") else {
         return NOT_REGISTERED;
     };
@@ -302,7 +256,7 @@ fn main(_: u64) -> u64 {
         level,
         // SAFETY: only the main thread reaches CLONE_TABLE, here once.
         clones: unsafe { &mut *CLONE_TABLE.0.get() },
-        regs: Regs::new(REGS_AT, poll),
+        regs: Regs::new(REGS_AT, layout),
         poll,
         irq,
         log,

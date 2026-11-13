@@ -92,8 +92,20 @@ pub fn redact(text: &str) -> String {
     out
 }
 
+/// The program that runs the calls: `aws`, or a fake of the host tests.
+#[cfg(test)]
+static CLI: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn cli() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = CLI.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return p;
+    }
+    PathBuf::from("aws")
+}
+
 fn aws_cmd(args: &[&str]) -> Command {
-    let mut c = Command::new("aws");
+    let mut c = Command::new(cli());
     c.args(["--profile", PROFILE, "--region", REGION, "--output", "text"])
         .args(args)
         .env("AWS_PAGER", "");
@@ -283,7 +295,23 @@ fn guard(kind: Kind, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn exists(kind: Kind, id: &str) -> bool {
+/// Whether an error of a `describe-*` call says that the resource is gone:
+/// the codes of EC2 end in `.NotFound`. Every other error (expired
+/// credentials, throttling, a denied call) says nothing about the resource.
+fn is_not_found(error: &str) -> bool {
+    error.contains(".NotFound")
+}
+
+/// What a `describe-*` answer says of a resource: it lives, or it is gone.
+fn lives(answer: Result<String, String>) -> Result<bool, String> {
+    match answer {
+        Ok(s) => Ok(s != "terminated" && s != "deleted"),
+        Err(e) if is_not_found(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn exists(kind: Kind, id: &str) -> Result<bool, String> {
     let (cmd, ids, q) = match kind {
         Kind::Instance => (
             "describe-instances",
@@ -299,14 +327,11 @@ fn exists(kind: Kind, id: &str) -> bool {
             "SecurityGroups[0].GroupId",
         ),
     };
-    match aws(&["ec2", cmd, ids, id, "--query", q]) {
-        Ok(s) => s != "terminated" && s != "deleted",
-        Err(_) => false,
-    }
+    lives(aws(&["ec2", cmd, ids, id, "--query", q]))
 }
 
 fn delete(s: &Session, kind: Kind, id: &str) -> Result<(), String> {
-    if !exists(kind, id) {
+    if !exists(kind, id)? {
         return s.note("deleted", kind, id);
     }
     guard(kind, id)?;
@@ -330,6 +355,34 @@ fn delete(s: &Session, kind: Kind, id: &str) -> Result<(), String> {
     }
     println!("deleted {} {}", kind.name(), redact(id));
     s.note("deleted", kind, id)
+}
+
+/// Deletes `id` and merges a failed delete into `result`, loudly: an
+/// instance that stays alive costs money and must not pass unnoticed.
+fn release<T>(s: &Session, kind: Kind, id: &str, result: Result<T, String>) -> Result<T, String> {
+    match delete(s, kind, id) {
+        Ok(()) => result,
+        Err(e) => {
+            eprintln!(
+                "NOT REMOVED: {} {} is still there ({e}); run `xtask aws clean --session {}`",
+                kind.name(),
+                redact(id),
+                s.id
+            );
+            match result {
+                Ok(_) => Err(format!(
+                    "{} {} was not removed: {e}",
+                    kind.name(),
+                    redact(id)
+                )),
+                Err(r) => Err(format!(
+                    "{r}; and {} {} was not removed: {e}",
+                    kind.name(),
+                    redact(id)
+                )),
+            }
+        }
+    }
 }
 
 /// The journal of `s` in reverse order, instances first: a group cannot go
@@ -628,25 +681,71 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
     if let Some(u) = l.user_data {
         args.extend(["--user-data".to_string(), format!("file://{}", u.display())]);
     }
+    // The token makes a repeated call the same call, and lets a call that
+    // failed after AWS made the instance find it again.
+    let token = client_token(s);
+    args.extend(["--client-token".to_string(), token.clone()]);
     args.extend(["--query", "Instances[0].InstanceId"].map(String::from));
     s.note("intent", Kind::Instance, l.ty)?;
-    let id = aws_s(&args)?;
+    let id = match aws_s(&args) {
+        Ok(id) => id,
+        Err(e) => {
+            // The call may have made the instance before it failed: look it up
+            // by its token, journal it and remove it.
+            let found = aws(&[
+                "ec2",
+                "describe-instances",
+                "--filters",
+                &format!("Name=client-token,Values={token}"),
+                "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down",
+                "--query",
+                "Reservations[].Instances[].InstanceId",
+            ]);
+            return match found {
+                Ok(ids) => {
+                    let mut result = Err(e);
+                    for id in ids.split_whitespace() {
+                        s.note("created", Kind::Instance, id)?;
+                        result = release(s, Kind::Instance, id, result);
+                    }
+                    result
+                }
+                Err(look) => Err(format!(
+                    "{e}; and the lookup of an instance it may have made failed: {look}; \
+                     look for client token {token} (session {})",
+                    s.id
+                )),
+            };
+        }
+    };
     let started = Instant::now();
     s.note("created", Kind::Instance, &id)?;
-    for v in aws(&[
+    let volumes = aws(&[
         "ec2",
         "describe-instances",
         "--instance-ids",
         &id,
         "--query",
         "Reservations[0].Instances[0].BlockDeviceMappings[].Ebs.VolumeId",
-    ])?
-    .split_whitespace()
-    {
-        s.note("created", Kind::Volume, v)?;
+    ]);
+    let noted = volumes.and_then(|vs| {
+        vs.split_whitespace()
+            .try_for_each(|v| s.note("created", Kind::Volume, v))
+    });
+    if let Err(e) = noted {
+        // Nothing after the creation may leave the instance running.
+        return release(s, Kind::Instance, &id, Err(e));
     }
     println!("started a {} ({})", l.ty, redact(&id));
     Ok((id, started))
+}
+
+/// A token for one call of `run-instances`: the session and the clock.
+fn client_token(s: &Session) -> String {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("stafeto-{}-{ns}", s.id)
 }
 
 fn state(id: &str) -> Result<String, String> {
@@ -1044,9 +1143,11 @@ fn boot(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })();
-    if !stop || result.is_err() {
-        let _ = delete(&s, Kind::Instance, &id);
-    }
+    let result = if !stop || result.is_err() {
+        release(&s, Kind::Instance, &id, result)
+    } else {
+        result
+    };
     println!(
         "estimated cost of this instance: {:.3} USD",
         cost(started.elapsed(), PRICE_SMALL)
@@ -1305,7 +1406,7 @@ fn neighbour(args: &[String]) -> Result<(), String> {
         );
         Ok(())
     })();
-    let _ = delete(&s, Kind::Instance, &id);
+    let result = release(&s, Kind::Instance, &id, result);
     println!(
         "estimated cost of the neighbour: {:.3} USD",
         cost(started.elapsed(), PRICE_SMALL)
@@ -1408,7 +1509,7 @@ fn dump_run(s: &Session) -> Result<(), String> {
         aws(&["ec2", "wait", "snapshot-completed", "--snapshot-ids", &snap])?;
         Ok(snap)
     })();
-    let _ = delete(s, Kind::Instance, &id);
+    let snap = release(s, Kind::Instance, &id, snap);
     println!(
         "estimated cost of the dump instance: {:.3} USD",
         cost(started.elapsed(), PRICE_SMALL)
@@ -1500,6 +1601,162 @@ mod tests {
         assert_eq!(t.iter().filter(|a| *a == "--tag-specifications").count(), 1);
         assert_eq!(t.len(), 3);
         assert!(t[1].contains("project") && t[2].starts_with("ResourceType=volume"));
+    }
+
+    // ---- a fake CLI ----------------------------------------------------
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const FAKE: &str = r#"#!/bin/sh
+d="$(dirname "$0")"
+echo "$*" >> "$d/calls"
+case "$*" in
+ *run-instances*)
+   touch "$d/created"
+   if [ -f "$d/run_fails" ]; then echo "An error occurred (RequestLimitExceeded) when calling the RunInstances operation" >&2; exit 254; fi
+   echo i-0123456789abcdef0 ;;
+ *client-token*) if [ -f "$d/created" ]; then echo i-0123456789abcdef0; fi ;;
+ *terminate-instances*)
+   if [ -f "$d/terminate_fails" ]; then echo "An error occurred (Throttling) when calling the TerminateInstances operation" >&2; exit 254; fi
+   touch "$d/terminated" ;;
+ *BlockDeviceMappings*)
+   if [ -f "$d/volume_fails" ]; then echo "An error occurred (Throttling) when calling the DescribeInstances operation" >&2; exit 254; fi
+   echo vol-0123456789abcdef0 ;;
+ *State.Name*)
+   if [ -f "$d/describe_fails" ]; then echo "An error occurred (ExpiredToken) when calling the DescribeInstances operation" >&2; exit 254; fi
+   if [ -f "$d/gone" ]; then echo "An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation" >&2; exit 254; fi
+   if [ -f "$d/terminated" ]; then echo terminated; else echo running; fi ;;
+ *describe-tags*) echo stafeto ;;
+ *describe-subnets*) echo "subnet-1 vpc-1" ;;
+ *create-security-group*) echo sg-0123456789abcdef0 ;;
+ *length*) echo 0 ;;
+esac
+exit 0
+"#;
+
+    /// A session of its own under the journals, and a fake `aws` that
+    /// behaves as the files in its directory say; `f` runs with the lock.
+    fn with_fake(flags: &[&str], f: impl FnOnce(&Session, &Path)) {
+        let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("stafeto-fake-aws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("aws");
+        std::fs::write(&script, FAKE).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for flag in flags {
+            std::fs::write(dir.join(flag), "").unwrap();
+        }
+        *CLI.lock().unwrap() = Some(script);
+        let s = Session::open(Some(format!("9999-{}", std::process::id()))).unwrap();
+        let _ = std::fs::remove_file(s.ledger());
+        f(&s, &dir);
+        *CLI.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&s.dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn calls(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    fn launch_small(s: &Session) -> Result<(String, Instant), String> {
+        launch(
+            s,
+            &Launch {
+                ami: "ami-0123456789abcdef0",
+                ty: "t4g.small",
+                user_data: None,
+                extra_snapshot: None,
+            },
+        )
+    }
+
+    #[test]
+    fn only_a_not_found_error_says_a_resource_is_gone() {
+        assert_eq!(lives(Ok("running".into())), Ok(true));
+        assert_eq!(lives(Ok("terminated".into())), Ok(false));
+        assert_eq!(
+            lives(Err(
+                "aws ec2 describe-volumes: An error occurred (InvalidVolume.NotFound)".into()
+            )),
+            Ok(false)
+        );
+        for other in [
+            "ExpiredToken",
+            "Throttling",
+            "UnauthorizedOperation",
+            "a network error",
+        ] {
+            assert!(lives(Err(format!("aws ec2: {other}"))).is_err(), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_failed_describe_keeps_the_resource_in_the_journal() {
+        with_fake(&["describe_fails"], |s, _| {
+            s.note("created", Kind::Instance, "i-0123456789abcdef0")
+                .unwrap();
+            let e = delete(s, Kind::Instance, "i-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("ExpiredToken"), "{e}");
+            assert_eq!(s.live().len(), 1, "still journaled");
+        });
+        with_fake(&["gone"], |s, _| {
+            s.note("created", Kind::Instance, "i-0123456789abcdef0")
+                .unwrap();
+            delete(s, Kind::Instance, "i-0123456789abcdef0").unwrap();
+            assert!(s.live().is_empty(), "a NotFound journals the delete");
+        });
+    }
+
+    #[test]
+    fn a_run_instances_that_fails_after_the_instance_exists_removes_it() {
+        with_fake(&["run_fails"], |s, dir| {
+            let e = launch_small(s).unwrap_err();
+            assert!(e.contains("RequestLimitExceeded"), "{e}");
+            let c = calls(dir);
+            assert!(c.contains("--client-token stafeto-9999-"), "{c}");
+            assert!(
+                c.contains("Name=client-token,Values=stafeto-9999-"),
+                "looked up by token"
+            );
+            assert!(c.contains("terminate-instances"), "terminated");
+            assert!(s.live().iter().all(|(k, _)| *k != Kind::Instance));
+        });
+    }
+
+    #[test]
+    fn a_failed_volume_query_removes_the_instance() {
+        with_fake(&["volume_fails"], |s, dir| {
+            let e = launch_small(s).unwrap_err();
+            assert!(e.contains("Throttling"), "{e}");
+            assert!(calls(dir).contains("terminate-instances"));
+            assert!(s.live().iter().all(|(k, _)| *k != Kind::Instance));
+        });
+    }
+
+    #[test]
+    fn a_failed_terminate_is_reported_and_the_instance_stays_in_the_journal() {
+        with_fake(&["volume_fails", "terminate_fails"], |s, _| {
+            let e = launch_small(s).unwrap_err();
+            assert!(e.contains("was not removed"), "{e}");
+            assert!(
+                s.live().iter().any(|(k, _)| *k == Kind::Instance),
+                "clean can still find it"
+            );
+        });
+    }
+
+    #[test]
+    fn a_launch_that_works_journals_the_instance_and_its_volume() {
+        with_fake(&[], |s, _| {
+            let (id, _) = launch_small(s).unwrap();
+            assert_eq!(id, "i-0123456789abcdef0");
+            let live = s.live();
+            assert!(live.iter().any(|(k, _)| *k == Kind::Instance));
+            assert!(live.iter().any(|(k, _)| *k == Kind::Volume));
+        });
     }
 
     #[test]

@@ -17,10 +17,16 @@ pub const SPCR_PORT: u64 = 0x090a_0000;
 /// The kind byte of `uart`'s arguments: a 16550 that is polled.
 const KIND_16550: u8 = 1;
 
-const ARGS: [u8; 9] = {
+/// The register shift and access width of the console, from the same
+/// SPCR: byte registers one apart.
+const SHIFT: u8 = 0;
+const WIDTH: u8 = 1;
+
+const ARGS: [u8; 11] = {
     let base = SPCR_PORT.to_le_bytes();
     [
-        base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7], KIND_16550,
+        base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7], KIND_16550, SHIFT,
+        WIDTH,
     ]
 };
 
@@ -58,19 +64,50 @@ pub const CONSOLE: Record = Record {
     waits: &[],
 };
 
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The record of `table` named `name`: the records of the shell's table are
+/// chosen by name, so that a change of their order elsewhere cannot change this
+/// image.
+const fn named(table: &[Record], name: &str) -> Record {
+    let mut i = 0;
+    while i < table.len() {
+        if same(table[i].name, name) {
+            return table[i];
+        }
+        i += 1;
+    }
+    panic!("the table has no record of that name")
+}
+
+const DIALOG: &[Record] = super::ramfs::BUSYBOX_DIALOG_TABLE;
+
 pub const TABLE: &[Record] = &[
     CONSOLE,
-    super::ramfs::RAM_FIFO_CLOCKED,
-    super::ramfs::BUSYBOX_DIALOG_TABLE[2],
+    named(DIALOG, "ramfs"),
+    named(DIALOG, "posix"),
     // No PL031 on EC2: the clock starts at the time the image was built.
-    super::ramfs::POSIX_ABI_TABLE[2],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[4],
+    named(super::ramfs::POSIX_ABI_TABLE, "clock"),
+    named(DIALOG, "pipe"),
     // The image of this table has no entropy service.
     Record {
         connects: &["ramfs", "tty", "pipe", "clock", "posix"],
-        ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
+        ..named(DIALOG, "busybox-probe")
     },
-    super::ramfs::TTY,
+    named(DIALOG, "tty"),
 ];
 
 #[cfg(test)]
@@ -87,7 +124,35 @@ mod tests {
         assert_eq!(CONSOLE.windows[0].base, base);
         assert_eq!(&CONSOLE.args[..8], &base.to_le_bytes());
         assert_eq!(CONSOLE.args[8], KIND_16550);
+        // The access size of the SPCR is one byte, the registers one apart.
+        assert_eq!((CONSOLE.args[9], CONSOLE.args[10]), (0, 1));
+        assert_eq!(spcr[43], 1, "GAS access size: byte");
         assert!(CONSOLE.bindings.is_empty());
+    }
+
+    #[test]
+    fn the_records_are_the_ones_the_names_say() {
+        let names: Vec<&str> = TABLE.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "uart",
+                "ramfs",
+                "posix",
+                "clock",
+                "pipe",
+                "busybox-probe",
+                "tty"
+            ]
+        );
+        // The posix record is the shell dialog's, with its larger quota; the
+        // clock is the plain one, without the PL031's window.
+        let posix = TABLE.iter().find(|r| r.name == "posix").unwrap();
+        assert!(posix.quota > super::super::ramfs::POSIX_ABI_TABLE[1].quota);
+        let clock = TABLE.iter().find(|r| r.name == "clock").unwrap();
+        assert!(clock.windows.is_empty());
+        let launcher = TABLE.iter().find(|r| r.name == "busybox-probe").unwrap();
+        assert_eq!(launcher.program, "ash-launcher");
     }
 
     #[test]

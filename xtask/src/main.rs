@@ -2022,6 +2022,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
   help      this text";
 
@@ -2036,6 +2037,7 @@ fn main() {
         Some("aws") => aws::run(&args[1..]),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
+        Some("uart-breaks") => uart_breaks(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
@@ -2490,7 +2492,41 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// The kernel image of `variant` and the boot image of the normal build,
 /// each built once in a run of xtask, whatever number of checks takes
 /// them.
+/// `cargo xtask uart-breaks`: the host tests of the driver pass, and fail
+/// under the feature `break-uart-poll`, which leaves a 16550 console with
+/// no poll.
+fn uart_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "uart", "--lib"]);
+    run_cmd(&mut ok)?;
+    let mut broken = cargo();
+    broken.args([
+        "test",
+        "--package",
+        "uart",
+        "--lib",
+        "--features",
+        "break-uart-poll",
+    ]);
+    match broken.output() {
+        Ok(o) if !o.status.success() => {
+            println!("uart-breaks: break-uart-poll is caught by the host tests");
+            Ok(())
+        }
+        Ok(_) => Err("break-uart-poll passed the host tests".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn build(variant: Variant) -> Result<Artifacts, String> {
+    // STAFETO_ITS_PROBE=1 runs the probes of the ITS (`net-probe ITS`,
+    // `net-curl ITS`) on the kernel with the 64 KiB ladder and the tables
+    // treated as non-shareable (Variant::ItsProbe).
+    let variant = if variant == Variant::Normal && std::env::var_os("STAFETO_ITS_PROBE").is_some() {
+        Variant::ItsProbe
+    } else {
+        variant
+    };
     once(&BUILDS, variant, || build_kernel(variant))
 }
 
