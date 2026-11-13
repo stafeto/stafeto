@@ -36,5 +36,6 @@ pub mod published;
 pub mod resolv;
 pub mod reuse;
 pub mod ring;
+pub mod slots;
 pub mod spsc;
 pub mod switchlogic;

@@ -43,8 +43,6 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
     programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
-    // One instance: the image must keep 16 384 free pages after the services start, and each
-    // instance takes about 19 MiB of .bss (instances-2 left 12 221).
     programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
     programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
     programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));

@@ -9,15 +9,6 @@
 //! is local to its instance, and a call from a thread on another CPU of the same process is
 //! the one that crosses (`Counters::calls_remote`).
 
-/// How many instances the build has room for (the features `instances-2` and `instances-4`).
-pub const BUILT: usize = if cfg!(feature = "instances-4") {
-    4
-} else if cfg!(feature = "instances-2") {
-    2
-} else {
-    1
-};
-
 /// The CPUs the instances stand on: the `limit` lowest CPUs of `mask`, as a mask.
 pub fn instance_cpus(mask: u32, limit: usize) -> u32 {
     let mut left = mask;

@@ -960,6 +960,7 @@ impl Net {
         }
         if let Some(handle) = sock.handle {
             stack.drop_socket(handle);
+            self.free_slot(place);
         }
         let sock = &mut self.socks[place];
         sock.handle = None;

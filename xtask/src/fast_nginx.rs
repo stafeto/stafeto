@@ -1661,7 +1661,7 @@ mod tests {
         let netd = |kind| programs(kind).iter().find(|p| p.0 == "netd").unwrap().3;
         assert_eq!(netd(Kind::Crash), &["probe"]);
         assert_eq!(netd(Kind::Steps), &["steps"]);
-        assert_eq!(netd(Kind::Plain), &["instances-2"]);
+        assert!(netd(Kind::Plain).is_empty());
     }
 
     #[test]

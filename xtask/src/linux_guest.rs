@@ -123,7 +123,7 @@ fn variant_programs(table: &'static [&'static str]) -> Vec<ImageProgram> {
     for program in &mut programs {
         match program.0 {
             "init" => program.3 = table,
-            "netd" => program.3 = &["profile", "instances-4"],
+            "netd" => program.3 = &["profile"],
             "ramfs" => program.3 = &["profile"],
             _ => {}
         }
@@ -216,7 +216,7 @@ pub fn bench_switch_profile_programs() -> &'static [ImageProgram] {
         let mut programs = bench_switch_programs().to_vec();
         for program in &mut programs {
             if program.0 == "netd" {
-                program.3 = &["profile", "instances-4"];
+                program.3 = &["profile"];
             } else if program.0 == "ramfs" {
                 program.3 = &["profile"];
             }
@@ -280,7 +280,7 @@ pub fn build_trace_image(
     let mut programs = base.to_vec();
     for program in &mut programs {
         match program.0 {
-            "netd" => program.3 = &["trace", "instances-4"],
+            "netd" => program.3 = &["trace"],
             // The service dumps the rings of the kernel with a resource that the table gives it.
             "init" => {
                 let mut features = program.3.to_vec();
@@ -1636,7 +1636,7 @@ mod tests {
             for (variant, base) in programs.iter().zip(plain) {
                 match variant.0 {
                     "init" => assert_eq!(variant.3, &[table]),
-                    "netd" => assert_eq!(variant.3, &["profile", "instances-4"]),
+                    "netd" => assert_eq!(variant.3, &["profile"]),
                     "ramfs" => assert_eq!(variant.3, &["profile"]),
                     _ => assert_eq!(variant, base),
                 }

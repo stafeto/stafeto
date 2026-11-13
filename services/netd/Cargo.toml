@@ -52,11 +52,6 @@ limit-1280 = []
 # once a second, for the measurement of where the time of a request goes.
 profile = ["split"]
 steps = ["rt/step-stats"]
-# `instances-2` and `instances-4`: how many stack instances the service has room for in its
-# `.bss` (each takes about 19 MiB); without either, one. The images of the shell and of the
-# network on QEMU take two, the images of VZ four.
-instances-2 = []
-instances-4 = []
 # `trace`: the ring of time stamps along the packet path (lib/trace), dumped to
 # the console with the profile's totals, for the measurement of where the time of a
 # request goes. Off in every normal and ci image.

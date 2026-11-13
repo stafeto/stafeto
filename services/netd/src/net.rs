@@ -65,9 +65,34 @@ pub const FULL_PLACES: usize = 256;
 const SMALL_PLACES: usize = SOCKETS_MAX - FULL_PLACES;
 const PACKETS: usize = 16;
 
-/// The bytes of a direction of the buffers of place `i`.
-pub const fn buffer_of(i: usize) -> usize {
-    if i < FULL_PLACES {
+/// The memory of the buffers of every socket of every instance: the slots (`netd::slots`) the
+/// instances take in chunks of 64. A full slot is a pair of `BUFFER` bytes, a small one a pair
+/// of `SMALL_BUFFER`, and each slot has the packet records of a datagram socket. In `.bss`, so
+/// no page of it is touched before a socket uses it.
+struct PoolMemory {
+    full: [[u8; 2 * BUFFER]; FULL_PLACES],
+    small: [[u8; 2 * SMALL_BUFFER]; SMALL_PLACES],
+    meta: [[MaybeUninit<udp::PacketMetadata>; 2 * PACKETS]; SOCKETS_MAX],
+}
+struct Pool(core::cell::UnsafeCell<MaybeUninit<PoolMemory>>);
+// SAFETY: a slot is held by one place of one instance at a time (the chunk's owner in
+// `FULL_OWNERS` or `SMALL_OWNERS`), and only that instance reaches its memory.
+unsafe impl Sync for Pool {}
+static POOL: Pool = Pool(core::cell::UnsafeCell::new(MaybeUninit::zeroed()));
+static FULL_OWNERS: netd::slots::Owners<{ FULL_PLACES / netd::slots::CHUNK }> =
+    netd::slots::Owners::new();
+static SMALL_OWNERS: netd::slots::Owners<{ SMALL_PLACES / netd::slots::CHUNK }> =
+    netd::slots::Owners::new();
+const _: () = assert!(
+    FULL_PLACES.is_multiple_of(netd::slots::CHUNK)
+        && SMALL_PLACES.is_multiple_of(netd::slots::CHUNK)
+);
+/// The place has no slot (a place of a group of ports, or one that is free).
+const NO_SLOT: u16 = u16::MAX;
+
+/// The bytes of a direction of the buffers of the slot `slot` (full slots come first).
+const fn buffer_of_slot(slot: u16) -> usize {
+    if (slot as usize) < FULL_PLACES {
         BUFFER
     } else {
         SMALL_BUFFER
@@ -391,14 +416,11 @@ impl Members for GroupMembers<'_> {
 pub struct Net {
     pub places: Places<SOCKETS_MAX>,
     pub socks: [Sock; SOCKETS_MAX],
-    /// The buffers: place i below `FULL_PLACES` uses `pool_full[i]`, the others
-    /// `pool_small[i - FULL_PLACES]`; the first half for receiving and the
-    /// second for sending.
-    pool_full: [[u8; 2 * BUFFER]; FULL_PLACES],
-    pool_small: [[u8; 2 * SMALL_BUFFER]; SMALL_PLACES],
-    /// The packet records of a datagram socket: place i, then the two
-    /// directions.
-    udp_meta: [[MaybeUninit<udp::PacketMetadata>; 2 * PACKETS]; SOCKETS_MAX],
+    /// The slot of each place's buffers (`NO_SLOT` for none) and what this instance holds of
+    /// the store: the first half of a slot is for receiving and the second for sending.
+    slot_of: [u16; SOCKETS_MAX],
+    full_slots: netd::slots::Local<{ FULL_PLACES / netd::slots::CHUNK }>,
+    small_slots: netd::slots::Local<{ SMALL_PLACES / netd::slots::CHUNK }>,
     /// The bound places, in a chain for each port.
     pub chains: PortChains<SOCKETS_MAX>,
     /// The bound places that are connected and do not listen: a bind that
@@ -555,6 +577,7 @@ impl Net {
         unsafe {
             addr_of_mut!((*at).places).write(Places::new());
             rt::bss::fill(addr_of_mut!((*at).socks), Sock::EMPTY);
+            rt::bss::fill(addr_of_mut!((*at).slot_of), NO_SLOT);
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
             addr_of_mut!((*at).groups).write(Groups::new());
             addr_of_mut!((*at).owners).write(Owners::new());
@@ -591,32 +614,45 @@ impl Net {
 
     // ----- the places -----
 
-    /// The smoltcp socket for place `i`.
-    fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> Sh {
-        let size = buffer_of(i);
-        let base = if i < FULL_PLACES {
-            self.pool_full[i].as_mut_ptr()
-        } else {
-            self.pool_small[i - FULL_PLACES].as_mut_ptr()
+    /// The smoltcp socket for place `i`, with a slot of the store for its buffers: a full one
+    /// when this instance can get one, else a small one; None when the store has neither.
+    fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> Option<Sh> {
+        let who = self.instance;
+        let slot = match self.full_slots.take(&FULL_OWNERS, who) {
+            Some(s) => s,
+            None => FULL_PLACES + self.small_slots.take(&SMALL_OWNERS, who)?,
         };
-        // SAFETY: the pool's chunk of place `i` belongs to the socket of place
-        // `i` alone, which is removed before the place is free; the pool lives
-        // as long as the service.
+        let slot16 = slot as u16;
+        self.slot_of[i] = slot16;
+        let size = buffer_of_slot(slot16);
+        let memory = POOL.0.get().cast::<PoolMemory>();
+        // SAFETY: `slot` is this instance's (taken from its chunks), so the pair of buffers
+        // and the records belong to the socket of place `i` alone, which is removed (and the
+        // slot given back, `free_slot`) before the slot is used again; the pool lives as long
+        // as the service.
         let (rx, tx) = unsafe {
+            let base = if slot < FULL_PLACES {
+                core::ptr::addr_of_mut!((*memory).full[slot]).cast::<u8>()
+            } else {
+                core::ptr::addr_of_mut!((*memory).small[slot - FULL_PLACES]).cast::<u8>()
+            };
             (
                 core::slice::from_raw_parts_mut(base, size),
                 core::slice::from_raw_parts_mut(base.add(size), size),
             )
         };
-        match proto {
+        Some(match proto {
             Proto::Tcp => stack.tcp_add(i, rx, tx),
             Proto::Udp => {
-                let meta = self.udp_meta[i].as_mut_ptr().cast::<udp::PacketMetadata>();
+                // SAFETY: the records of `slot` are in bounds and are the socket's.
+                let meta = unsafe {
+                    core::ptr::addr_of_mut!((*memory).meta[slot]).cast::<udp::PacketMetadata>()
+                };
                 for k in 0..2 * PACKETS {
-                    // SAFETY: the record `k` of place `i` is in bounds.
+                    // SAFETY: the record `k` of the slot is in bounds.
                     unsafe { meta.add(k).write(udp::PacketMetadata::EMPTY) };
                 }
-                // SAFETY: as above, the records belong to place `i`.
+                // SAFETY: as above, the records belong to the slot.
                 let (rx_meta, tx_meta) = unsafe {
                     (
                         core::slice::from_raw_parts_mut(meta, PACKETS),
@@ -629,6 +665,29 @@ impl Net {
                     udp::PacketBuffer::new(tx_meta, tx),
                 )
             }
+        })
+    }
+
+    /// The slot of place `i` goes back to the store: its smoltcp socket is gone.
+    pub fn free_slot(&mut self, i: usize) {
+        let slot = core::mem::replace(&mut self.slot_of[i], NO_SLOT);
+        if slot == NO_SLOT {
+            return;
+        }
+        let slot = usize::from(slot);
+        if slot < FULL_PLACES {
+            self.full_slots.give(&FULL_OWNERS, self.instance, slot);
+        } else {
+            self.small_slots
+                .give(&SMALL_OWNERS, self.instance, slot - FULL_PLACES);
+        }
+    }
+
+    /// The bytes of a direction of place `i`'s buffers (the smaller size for a place with none).
+    fn buffer_len(&self, i: usize) -> usize {
+        match self.slot_of[i] {
+            NO_SLOT => SMALL_BUFFER,
+            slot => buffer_of_slot(slot),
         }
     }
 
@@ -679,7 +738,10 @@ impl Net {
                 i?
             }
         };
-        let handle = self.make_socket(stack, i, proto);
+        let Some(handle) = self.make_socket(stack, i, proto) else {
+            self.places.free(i);
+            return None;
+        };
         self.socks[i] = Sock {
             proto,
             handle: Some(handle),
@@ -762,6 +824,7 @@ impl Net {
             }
             stack.drop_socket(handle);
         }
+        self.free_slot(i);
         self.chains.unlink(i);
         self.connected.unlink(i);
         self.leave_queue(i);
@@ -1934,7 +1997,7 @@ impl Net {
                 Proto::Udp => sockets::DGRAM,
             },
             opt::ERROR => core::mem::take(&mut s.error),
-            opt::RCVBUF | opt::SNDBUF => buffer_of(i) as u32,
+            opt::RCVBUF | opt::SNDBUF => self.buffer_len(i) as u32,
             opt::ACCEPTCONN => u32::from(s.listening),
             opt::DOMAIN => INET,
             opt::KEEPALIVE => u32::from(s.keepalive),

@@ -73,7 +73,6 @@ use device::{DEVICE, NetDevice, RxRing, TxRing};
 use instance::Instance;
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
-use netd::home::BUILT;
 use netd::lines::Mac;
 use netd::profile::{self, Counter};
 use netd::published;
@@ -200,10 +199,10 @@ const CONFIG_ELSEWHERE: u64 = 10;
 /// the start (`Net::initialize_at`); nothing in them is touched before a
 /// socket needs it.
 struct Tables {
-    /// The tables of each stack instance the build has room for (`netd::home::BUILT`).
-    nets: [Net; BUILT],
-    storages: [Storage<'static>; BUILT],
-    sessions: [[Option<Session<Client, 0>>; SESSIONS]; BUILT],
+    /// The tables of each stack instance the build has room for (`MAX_INSTANCES`).
+    nets: [Net; MAX_INSTANCES],
+    storages: [Storage<'static>; MAX_INSTANCES],
+    sessions: [[Option<Session<Client, 0>>; SESSIONS]; MAX_INSTANCES],
     /// The second device, once `Second::start_at` built it, and its one
     /// socket's storage.
     second: core::mem::MaybeUninit<Second>,
@@ -390,7 +389,7 @@ fn main(_: u64) -> u64 {
     // instance k runs on the k-th CPU (`netd::home`). The instances after the first have a
     // channel and a timer of their own; sessions reach them through HOME.
     let allowed = sys::cpu_info(0).map_or(1, |info| info.allowed as u32);
-    let cpus = match netd::home::instance_cpus(allowed, settings.instances().min(BUILT)) {
+    let cpus = match netd::home::instance_cpus(allowed, settings.instances().min(MAX_INSTANCES)) {
         0 => 1,
         cpus => cpus,
     };
