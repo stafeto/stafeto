@@ -1644,7 +1644,7 @@ impl Processes {
 
     /// Share: the rendezvous of shared memory (`Method::Share`). Put and
     /// Attach take the object, Get answers with a copy of it; the table
-    /// is searched through, 16 entries.
+    /// is searched through, 48 entries.
     fn share(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let (Ok(operation), Ok(key), Ok(pages), Ok(())) =
