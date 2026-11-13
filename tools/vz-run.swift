@@ -6,6 +6,7 @@ import Virtualization
 
 let usage =
     "usage: vz-run [--window-reports] [--cpus N] [--memory MIB] [--net N] [--mac-suffix S] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n"
+    + "       vz-run --efi DISK [--efi-writable] [--cpus N] [--memory MIB]   (the disk of `cargo xtask efi`, booted through the EFI loader)\n"
 func fail() -> Never {
     fputs(usage, stderr)
     exit(2)
@@ -44,7 +45,24 @@ let macSuffix = number("--mac-suffix", 0, atMost: 255)
 // --time SECONDS: the time the guest's clock starts at, in seconds since
 // the epoch (the host's time by default).
 let startTime = number("--time", UInt64(Date().timeIntervalSince1970))
-guard arguments.count == 3 else { fail() }
+// --efi DISK: boots the disk of `cargo xtask efi` (a GPT with an ESP that
+// holds \EFI\BOOT\BOOTAA64.EFI, the kernel and the boot image) through
+// VZEFIBootLoader, as a second rehearsal of the loader without QEMU (the
+// note of the loader part, section 7). The disk is attached read-only; the console is
+// the Virtio console of the other mode, where the firmware's and the loader's
+// text appears if VZ's firmware uses it.
+var efiDisk: String? = nil
+// --efi-writable: the disk is attached for writing, as the loader's `dump` needs.
+let efiWritable = arguments.contains("--efi-writable")
+arguments = arguments.filter { $0 != "--efi-writable" }
+if let at = arguments.firstIndex(of: "--efi") {
+    guard at + 1 < arguments.count else { fail() }
+    efiDisk = arguments[at + 1]
+    arguments.removeSubrange(at...(at + 1))
+    guard arguments.count == 1 else { fail() }
+} else {
+    guard arguments.count == 3 else { fail() }
+}
 
 // VZ has no PL031, so the guest's clock service starts at the time the
 // boot image carries in its file `boot-time` (lib/rtc): 16 bytes, the
@@ -95,10 +113,28 @@ func stamped(_ path: String, _ seconds: UInt64) -> String {
 let configuration = VZVirtualMachineConfiguration()
 configuration.cpuCount = cpuCount
 configuration.memorySize = memoryMiB * 1024 * 1024
-let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
-boot.initialRamdiskURL = URL(fileURLWithPath: stamped(arguments[2], startTime))
-boot.commandLine = "console=hvc0"
-configuration.bootLoader = boot
+if let disk = efiDisk {
+    let boot = VZEFIBootLoader()
+    let store = NSTemporaryDirectory() + "vz-run-efi-\(getpid()).nvram"
+    do {
+        boot.variableStore = try VZEFIVariableStore(
+            creatingVariableStoreAt: URL(fileURLWithPath: store), options: [.allowOverwrite])
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: disk), readOnly: !efiWritable)
+        configuration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
+    } catch {
+        fputs("EFI configuration: \(error)\n", stderr)
+        exit(1)
+    }
+    atexit { unlink(NSTemporaryDirectory() + "vz-run-efi-\(getpid()).nvram") }
+    configuration.bootLoader = boot
+    configuration.platform = VZGenericPlatformConfiguration()
+} else {
+    let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
+    boot.initialRamdiskURL = URL(fileURLWithPath: stamped(arguments[2], startTime))
+    boot.commandLine = "console=hvc0"
+    configuration.bootLoader = boot
+}
 // The guest reads a pipe of the runner's, which the runner fills from its
 // stdin and never closes: the end of stdin (a closed pipe, Ctrl-D) reaches
 // VZ as nothing, since VZ gives the guest an empty receive at the end of

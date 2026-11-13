@@ -52,6 +52,8 @@ mod cyrillic;
 mod disasm;
 mod display_probe;
 mod doom;
+mod efi;
+mod efi_disk;
 mod entropy;
 mod fast_layer;
 mod fast_nginx;
@@ -1969,6 +1971,11 @@ commands:
             devices on the NAT and the Mac reaches the guest at its lease;
             `curl -s http://127.0.0.1:8080/index.html | shasum` after
             `httpd -f -p 80 -h /www &` fetches the page of the image
+  efi [EFI|EFI_EL2] boot the system through the EFI loader under edk2 from a GPT disk with an ESP and compare
+            the kernel's boot report with the same machine started with -kernel
+  efi-vz    boot the disk of the EFI loader on Apple VZ (VZEFIBootLoader) to the shell
+  efi-fixtures take the firmware's tables and memory map and QEMU's own tree as the samples of the host test of firmware-tree
+  efi-breaks the deliberate breaks of the loader: each fails its host test and, where it can, its run under edk2
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
@@ -1988,6 +1995,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
+        Some("efi") => efi::run(&args[1..]),
+        Some("efi-breaks") => efi::breaks(),
+        Some("efi-vz") => efi::vz(),
+        Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("test") => jobs::parse_jobs("test", &args[1..]).and_then(test),
         Some("kernel-test") => {
@@ -9154,6 +9165,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE).map(drop)
         }),
         job("boot 2G", two_gib_boot),
+        job("efi EFI", || efi::run(&["EFI".to_string()])),
+        job("efi EFI_EL2", || efi::run(&["EFI_EL2".to_string()])),
+        job("efi breaks", efi::breaks),
         job("smp 4 GICv2", || smp_boot(&qemu::VIRT, GIC_V2_LINE)),
         job("smp 4 GICv3", || smp_boot(&qemu::VIRT_V3, GIC_V3_LINE)),
         job("smp 4 EL2 GICv2", || smp_boot(&qemu::VIRT_EL2, GIC_V2_LINE)),
@@ -12272,6 +12286,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "kcore",
         "--package",
+        "firmware-tree",
+        "--package",
         "proto-init",
         "--package",
         "proto-fs",
@@ -12375,6 +12391,20 @@ fn ci_lints() -> Result<(), String> {
         "bootimg",
         "--target",
         KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]));
+    // The EFI loader and the translation it runs, for the target of UEFI
+    // applications.
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "efi-loader",
+        "--package",
+        "firmware-tree",
+        "--target",
+        "aarch64-unknown-uefi",
         "--",
         "-D",
         "warnings",

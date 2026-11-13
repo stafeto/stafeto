@@ -19,6 +19,11 @@ abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 # The records of the network service, whose quota `netd-quota` checks.
 init = { path = "../services/init" }
+# The ESP of the disk of the EFI loader (efi_disk.rs): FAT32 without the clock of
+# the host, so that the disk is the same file every time.
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+fscommon = "0.1.1"
+firmware-tree = { path = "../boot/firmware-tree" }
 kcore = { path = "../kcore" }
 netd = { path = "../services/netd" }
 pkgd = { path = "../services/pkgd", features = ["host"] }

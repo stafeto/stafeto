@@ -88,11 +88,12 @@ pub fn text(ram: &[u8]) -> String {
     String::from_utf8_lossy(&texts(ram).concat()).into_owned()
 }
 
-/// Saves SAVED bytes of RAM from KERNEL_PA through the monitor on `port`
+/// Saves SAVED bytes of RAM from `base` (KERNEL_PA for `-kernel`, where the
+/// EFI loader put the kernel otherwise) through the monitor on `port`
 /// into `to`, a file in QEMU's working directory, and gives them. The
 /// name stays short: the monitor echoes each byte of a command with the
 /// escapes of its line editor.
-pub fn save(port: u16, to: &Path) -> Result<Vec<u8>, String> {
+pub fn save_at(base: u64, port: u16, to: &Path) -> Result<Vec<u8>, String> {
     let name = to
         .file_name()
         .and_then(|n| n.to_str())
@@ -103,7 +104,7 @@ pub fn save(port: u16, to: &Path) -> Result<Vec<u8>, String> {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(to);
-    let command = format!("pmemsave {KERNEL_PA:#x} {SAVED:#x} {name}\n");
+    let command = format!("pmemsave {base:#x} {SAVED:#x} {name}\n");
     monitor
         .write_all(command.as_bytes())
         .map_err(|e| format!("monitor: {e}"))?;
@@ -127,6 +128,18 @@ pub fn save(port: u16, to: &Path) -> Result<Vec<u8>, String> {
 /// 200 ms until its text holds `marker` or `timeout` passes; QEMU is
 /// killed then. Gives the text.
 pub fn wait_for(
+    cmd: Command,
+    port: u16,
+    dump: &Path,
+    marker: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    wait_for_at(KERNEL_PA, cmd, port, dump, marker, timeout)
+}
+
+/// `wait_for` with the kernel at `base`.
+pub fn wait_for_at(
+    base: u64,
     mut cmd: Command,
     port: u16,
     dump: &Path,
@@ -153,7 +166,7 @@ pub fn wait_for(
     let mut text = String::new();
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        if let Ok(ram) = save(port, dump) {
+        if let Ok(ram) = save_at(base, port, dump) {
             text = self::text(&ram);
             if text.contains(marker) {
                 break;

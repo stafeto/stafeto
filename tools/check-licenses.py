@@ -84,6 +84,11 @@ OPENLIBM = ("openlibm/LICENSE.md",
 # COPYRIGHT), for core and alloc, which carry no licence file of their own.
 RUST_COPYRIGHT = ("COPYRIGHT", "Copyright (c) The Rust Project Contributors")
 
+# Weak copyleft a GPL-3.0-or-later program may link (MPL-2.0 section 3.3 lets
+# the combination go under the GPL): `ucs2`, which the `uefi` crate needs,
+# for the EFI loader alone. GPL-2.0-only programs and the layer do not take it.
+WEAK_COPYLEFT = {"MPL-2.0"}
+
 # Licences a GPL-3.0-or-later program may link from crates.io (drivers).
 PERMISSIVE = {"MIT", "0BSD", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT",
               "Zlib OR Apache-2.0 OR MIT", "BSD-2-Clause OR Apache-2.0 OR MIT"}
@@ -238,6 +243,7 @@ def workspace() -> None:
           " GPL-2.0-only compatible and exception crates alone")
     drivers(data, packages, named)
     crypto(data, packages, named)
+    efi_loader(data, packages, named)
 
 
 def drivers(data: dict, packages: dict, named: dict) -> None:
@@ -292,6 +298,30 @@ def crypto(data: dict, packages: dict, named: dict) -> None:
     if "ed25519-compact" not in outside:
         fail("pkgfmt no longer links ed25519-compact")
     print("pkgfmt links " + ", ".join(sorted(outside)) + " under permissive licences")
+
+
+def efi_loader(data: dict, packages: dict, named: dict) -> None:
+    """The EFI loader (boot/efi-loader, GPL-3.0-or-later) is a PE program for
+    aarch64-unknown-uefi that links the `uefi` crates and its own workspace
+    crates; the disk builder in xtask (a host tool, not shipped) takes
+    `fatfs` and `fscommon`. All of them are under permissive licences the GPL
+    takes, `ucs2` (MPL-2.0) apart, which the GPL takes through the MPL's section 3.3; the notices list the loader's crates as those of every binary that
+    `shipped()` finds."""
+    for name in ("efi-loader", "xtask"):
+        outside = []
+        for package_id in closure(data, [named[name]["id"]]):
+            package = packages[package_id]
+            if package["source"] is None:
+                continue
+            if not (allowed(package["license"] or "") or package["license"] in PERMISSIVE
+                    or (name == "efi-loader" and package["license"] in WEAK_COPYLEFT)):
+                fail(f"{name} links {package['name']} under {package['license']}")
+            outside.append(package["name"])
+        if name == "efi-loader" and "uefi" not in outside:
+            fail("efi-loader no longer links uefi")
+        if name == "xtask" and not {"fatfs", "fscommon"} <= set(outside):
+            fail("xtask no longer builds the ESP with fatfs and fscommon")
+        print(f"{name} links " + ", ".join(sorted(outside)) + " under licences the GPL takes")
 
 
 def licence_files(directory: Path) -> list[Path]:
@@ -357,7 +387,8 @@ def shipped_notices() -> list:
     notices = []
     for title, package in shipped():
         license_name = package["license"] or ""
-        if not (allowed(license_name) or license_name in PERMISSIVE):
+        if not (allowed(license_name) or license_name in PERMISSIVE
+                or license_name in WEAK_COPYLEFT):
             fail(f"a shipped binary links {package['name']} under {license_name!r}")
         files = licence_files(Path(package["manifest_path"]).parent)
         if not files:
