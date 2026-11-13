@@ -1754,7 +1754,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        "boot-ash-dialog.img" | "boot-aws.img" | "boot-doom.img" | "boot-doom-steps.img" => {
+            dialog(name)
+        }
         // The base image has no package that makes /usr and /usr/share,
         // which the time zones stand in.
         // The probe of the package tool (crate::pkg_probe) is the base image with the probe CA

@@ -1010,7 +1010,12 @@ fn boot(args: &[String]) -> Result<(), String> {
     )?;
     let result = (|| {
         if let Some(n) = flag(args, "--serial").and_then(|n| n.parse().ok()) {
-            aws(&["ec2", "wait", "instance-running", "--instance-ids", &id])?;
+            for _ in 0..40 {
+                if state(&id)? == "running" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
             match serial(&s, &id, n) {
                 Ok(t) => {
                     println!("--- serial console, first {n} s ---");
@@ -1077,13 +1082,19 @@ fn serial(s: &Session, id: &str, seconds: u64) -> Result<String, String> {
         &format!("file://{}.pub", key.display()),
     ])?;
     let log = s.dir.join("serial.log");
+    let err = s.dir.join("serial.err");
     let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let errf = std::fs::File::create(&err).map_err(|e| e.to_string())?;
     let mut ssh = Command::new("ssh")
-        .args(["-tt", "-i"])
+        .args(["-tt", "-v", "-i"])
         .arg(&key)
         .args([
             "-o",
             "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=30",
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
@@ -1095,21 +1106,52 @@ fn serial(s: &Session, id: &str, seconds: u64) -> Result<String, String> {
         .arg(format!(
             "{id}.port0@serial-console.ec2-instance-connect.{REGION}.aws"
         ))
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(out)
-        .stderr(Stdio::null())
+        .stderr(errf)
         .spawn()
         .map_err(|e| e.to_string())?;
+    // What is typed, and when (seconds after the connection): a line end to
+    // wake the prompt, the command, a line end again.
+    let script: [(u64, &str); 3] = [
+        (seconds.saturating_sub(40), "\r"),
+        (seconds.saturating_sub(30), "echo stafeto-ok; uname -a\r"),
+        (seconds.saturating_sub(15), "\r"),
+    ];
+    let mut stdin = ssh.stdin.take();
+    let mut next = 0;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(seconds) {
         if ssh.try_wait().map_err(|e| e.to_string())?.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        if next < script.len()
+            && start.elapsed() >= Duration::from_secs(script[next].0)
+            && let Some(w) = stdin.as_mut()
+        {
+            let _ = w.write_all(script[next].1.as_bytes());
+            let _ = w.flush();
+            next += 1;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
+    drop(stdin);
     let _ = ssh.kill();
     let _ = ssh.wait();
-    Ok(std::fs::read_to_string(&log).unwrap_or_default())
+    let mut text = std::fs::read_to_string(&log).unwrap_or_default();
+    let e = std::fs::read_to_string(&err).unwrap_or_default();
+    // The stages of the connection, to tell where a failure stands.
+    for l in e.lines().filter(|l| {
+        l.contains("Authenticated")
+            || l.contains("Connection established")
+            || l.contains("denied")
+            || l.contains("Permission")
+            || l.contains("closed")
+            || l.contains("Host key")
+    }) {
+        let _ = writeln!(text, "[ssh] {}", redact(l));
+    }
+    Ok(text)
 }
 
 // ---- the neighbour and the dump ---------------------------------------------------------------
