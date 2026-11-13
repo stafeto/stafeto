@@ -285,6 +285,40 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_16550_node_stops_parse_only_without_a_pl011() {
+        let tree = |pl011: bool| {
+            let mut b = Builder::new()
+                .begin("")
+                .cells("#address-cells", &[2])
+                .cells("#size-cells", &[2])
+                .begin("memory@40000000")
+                .prop("device_type", b"memory\0")
+                .cells("reg", &[0, 0x4000_0000, 0, 0x100_0000])
+                .end();
+            if pl011 {
+                b = b
+                    .begin("pl011@9000000")
+                    .prop("compatible", b"arm,pl011\0")
+                    .cells("reg", &[0, 0x0900_0000, 0, 0x1000])
+                    .end();
+            }
+            let blob = b
+                .begin("serial@1000")
+                .prop("compatible", b"ns16550a\0")
+                .cells("reg", &[0, 0x1000, 0, 0x100])
+                .cells("reg-io-width", &[2])
+                .end()
+                .end()
+                .finish();
+            info(&blob)
+        };
+        let ok = tree(true).unwrap();
+        assert_eq!(ok.uart_pl011, Some(region(0x0900_0000, 0x1000)));
+        assert_eq!(ok.uart_16550, None);
+        assert_eq!(tree(false), Err(BootInfoError::BadReg));
+    }
+
+    #[test]
     fn trees_without_a_16550_give_none_and_pl011_is_not_one() {
         for blob in [VIRT, VIRT_ITS, APPLE_VZ, A64] {
             assert_eq!(uart_16550(&Fdt::new(blob).unwrap()), Ok(None));

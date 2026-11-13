@@ -40,6 +40,7 @@ use uart::regs::{
     ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
     LCR_H_FEN, LCR_H_WLEN_8, MIS,
 };
+use uart::view16550::{Bus, POLL_NS, View, layout, polls};
 use uart::writes::{self, Armed, Rooms, Writes};
 
 rt::entry!(main);
@@ -49,6 +50,7 @@ const REGS_AT: usize = 0x10_0000_0000;
 const PAGE: u64 = 4096;
 /// The period of the reads of the kernel log.
 const LOG_PERIOD_NS: u64 = 50_000_000;
+
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// A separate one-shot timer resumes paced transmit portions.
@@ -129,20 +131,72 @@ fn state() -> Option<&'static mut State> {
     }))
 }
 
-/// The registers of the PL011 through the window mapped at its base.
-struct Regs(usize);
+/// The registers of the console through the window mapped at its base: a
+/// PL011 as it is, or a 16550 shown as a PL011 (uart::view16550).
+struct Regs {
+    base: usize,
+    view: Option<View<Mmio16550>>,
+}
 
-impl Regs {
+/// The access of the 16550's registers through the window: `reg` shifted by
+/// the node's `reg-shift`, a byte or a word by its `reg-io-width`.
+struct Mmio16550 {
+    base: usize,
+    shift: u8,
+    width: u8,
+}
+
+impl Bus for Mmio16550 {
     fn read(&self, reg: usize) -> u32 {
-        // SAFETY: the window maps the PL011's page at self.0, readable and
-        // writable, as device memory; `reg` is the offset of a 32-bit
-        // register of uart::regs.
-        unsafe { mmio::read32(self.0 + reg) }
+        let at = self.base + (reg << self.shift);
+        // SAFETY: the window maps the 16550's page at self.base, as device
+        // memory; `at` is a register of it, aligned to its width.
+        unsafe {
+            if self.width == 4 {
+                mmio::read32(at)
+            } else {
+                u32::from(mmio::read8(at))
+            }
+        }
     }
 
     fn write(&self, reg: usize, value: u32) {
+        let at = self.base + (reg << self.shift);
         // SAFETY: as for `read`.
-        unsafe { mmio::write32(self.0 + reg, value) }
+        unsafe {
+            if self.width == 4 {
+                mmio::write32(at, value)
+            } else {
+                mmio::write8(at, value as u8)
+            }
+        }
+    }
+}
+
+impl Regs {
+    fn new(base: usize, layout: Option<(u8, u8)>) -> Regs {
+        Regs {
+            base,
+            view: layout.map(|(shift, width)| View::new(Mmio16550 { base, shift, width })),
+        }
+    }
+
+    fn read(&self, reg: usize) -> u32 {
+        match &self.view {
+            Some(view) => view.read(reg),
+            // SAFETY: the window maps the PL011's page at self.base, readable
+            // and writable, as device memory; `reg` is the offset of a 32-bit
+            // register of uart::regs.
+            None => unsafe { mmio::read32(self.base + reg) },
+        }
+    }
+
+    fn write(&self, reg: usize, value: u32) {
+        match &self.view {
+            Some(view) => view.write(reg, value),
+            // SAFETY: as for `read`.
+            None => unsafe { mmio::write32(self.base + reg, value) },
+        }
     }
 }
 
@@ -167,9 +221,20 @@ fn main(_: u64) -> u64 {
     let Ok(mut got) = rt::service::register(&s.parent, &channel) else {
         return NOT_REGISTERED;
     };
-    let (Ok(window), Ok(irq)) = (got.take::<Memory>("regs"), got.take::<Interrupt>("irq")) else {
+    // The kind of the console is the ninth byte of the arguments: 1 is a
+    // 16550 polled every POLL_NS, with no interrupt bound; the shift and the
+    // width of its registers follow (uart::view16550::layout).
+    let own = args.map_or(&[][..], |a| a.own);
+    let kind = own.get(8).copied().unwrap_or(0);
+    let layout = layout(own).filter(|_| polls(kind));
+    let poll = layout.is_some();
+    let Ok(window) = got.take::<Memory>("regs") else {
         return NOT_REGISTERED;
     };
+    let irq = got.take::<Interrupt>("irq").ok();
+    if irq.is_none() && !poll {
+        return NOT_REGISTERED;
+    }
     if sys::mem_map(&s.process, &window, 0, PAGE, REGS_AT, Access::ReadWrite).is_err() {
         return NOT_MAPPED;
     }
@@ -191,7 +256,8 @@ fn main(_: u64) -> u64 {
         level,
         // SAFETY: only the main thread reaches CLONE_TABLE, here once.
         clones: unsafe { &mut *CLONE_TABLE.0.get() },
-        regs: Regs(REGS_AT),
+        regs: Regs::new(REGS_AT, layout),
+        poll,
         irq,
         log,
         timer,
@@ -211,8 +277,16 @@ fn main(_: u64) -> u64 {
         .and_then(|a| a.own.get(..8))
         .and_then(|b| b.try_into().ok())
         .map_or(0, u64::from_le_bytes);
-    let line = sys::irq_info(&uart.irq).map_or(0, |info| info.line);
-    uart.say(format_args!("uart: pl011 at {base:#x}, line {line}\n"));
+    if poll {
+        uart.say(format_args!("uart: 16550 at {base:#x}, polling\n"));
+    } else {
+        let line = uart
+            .irq
+            .as_ref()
+            .and_then(|i| sys::irq_info(i).ok())
+            .map_or(0, |info| info.line);
+        uart.say(format_args!("uart: pl011 at {base:#x}, line {line}\n"));
+    }
     let heartbeat = Heartbeat {
         to: &s.parent,
         period_ns: args.map_or(0, |a| a.period_ns),
@@ -236,7 +310,9 @@ struct Uart {
     /// The sessions CLONE gave that live, bounded for each client.
     clones: &'static mut Clones<CLONES>,
     regs: Regs,
-    irq: Handle<Interrupt>,
+    irq: Option<Handle<Interrupt>>,
+    /// A 16550 with no interrupt: the timer of 10 ms does the work of one.
+    poll: bool,
     log: Handle<Resource>,
     timer: Handle<Timer>,
     /// The copy of the channel with RECEIVE the timer posts through, with
@@ -282,8 +358,15 @@ impl Uart {
         regs.write(CR, CR_ON);
         regs.read(IMSC);
         // The binding lives as long as the driver.
-        let _ = sys::irq_ack(&self.irq);
+        self.ack();
         self.defer_output(false);
+    }
+
+    /// Opens the line again; a polled console has none.
+    fn ack(&self) {
+        if let Some(irq) = &self.irq {
+            let _ = sys::irq_ack(irq);
+        }
     }
 
     /// Formats a line of the driver into its output, the way the clients'
@@ -401,7 +484,7 @@ impl Uart {
         self.regs.write(IMSC, end.imsc);
         self.regs.read(IMSC);
         // The binding lives as long as the driver.
-        let _ = sys::irq_ack(&self.irq);
+        self.ack();
         self.defer_output(false);
     }
 
@@ -460,7 +543,8 @@ impl Uart {
     /// now (spec 10): those that passed are not made up.
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
-        self.deadline = next_release(self.t0, LOG_PERIOD_NS, now);
+        let period = if self.poll { POLL_NS } else { LOG_PERIOD_NS };
+        self.deadline = next_release(self.t0, period, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
@@ -864,6 +948,9 @@ impl Service<HELD> for Uart {
                 self.kick();
             }
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
+                if self.poll {
+                    self.interrupt();
+                }
                 self.take_log();
                 self.arm();
             }

@@ -16,11 +16,9 @@ use super::{cache, timer};
 use crate::mm::phys;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use kcore::PAGE_SIZE;
 use kcore::bootinfo::BootInfo;
 use kcore::its::{self, Command};
 use kcore::layout::LINEAR_BASE;
-use kcore::must::Must;
 use kcore::quota::Account;
 use kcore::sync::{SetOnce, Ticket};
 
@@ -184,94 +182,221 @@ pub fn init(info: &BootInfo, redistributor: usize) {
         return;
     };
     assert!(TREE.set(*info).is_ok(), "its::init runs once");
-    BASE.store(LINEAR_BASE + node.regs.base as usize, Ordering::Relaxed);
-    TRANSLATER.store(node.regs.base + its::GITS_TRANSLATER, Ordering::Relaxed);
+    if let Err(why) = setup(info, node.regs.base, max_device, redistributor) {
+        // Nothing has enabled the ITS yet: it stays off and the machine runs
+        // without MSI (spec 9). `BASE` stays 0, so `present` says no.
+        write32_at(node.regs.base, its::GITS_CTLR, 0);
+        kprintln!("its off: {why}");
+    }
+}
+
+/// `GITS_CTLR` written before `BASE` is set.
+fn write32_at(base: u64, at: usize, value: u32) {
+    // SAFETY: a register of the ITS control frame, which the kernel tables map.
+    unsafe { mmio::write32(LINEAR_BASE + base as usize + at, value) }
+}
+
+/// The page sizes ladder starts at: 4 KiB, or 64 KiB in the probe image.
+const FIRST_PAGE: u64 = if cfg!(feature = "its-page-64k") {
+    0x1_0000
+} else {
+    0x1000
+};
+
+/// A block of the allocator for a table of `bytes`, zeroed and cleaned to
+/// the point of coherency: the ITS may not snoop the caches.
+fn table_block(bytes: usize) -> u64 {
+    let (va, pa) = boot_block(its::block_order(bytes));
+    cache::clean_to_memory(va, bytes);
+    pa
+}
+
+/// Everything up to `GITS_CTLR.Enabled`; an Err is the reason the ITS stays
+/// off, said in one line (decision 2026-11-13, 1.5).
+fn setup(
+    info: &BootInfo,
+    regs: u64,
+    max_device: u32,
+    redistributor: usize,
+) -> Result<(), &'static str> {
+    BASE.store(LINEAR_BASE + regs as usize, Ordering::Relaxed);
+    let off = |why: &'static str| -> Result<(), &'static str> {
+        BASE.store(0, Ordering::Relaxed);
+        Err(why)
+    };
+    TRANSLATER.store(regs + its::GITS_TRANSLATER, Ordering::Relaxed);
     let typer = read64(its::GITS_TYPER);
-    assert!(typer & 1 != 0, "the ITS has no physical LPIs");
+    let gicd = info.gic.as_ref().map(|g| g.mapped()[0].base).unwrap_or(0);
+    let gicd_typer = if gicd != 0 {
+        // SAFETY: GICD_TYPER is a 32-bit register of the distributor, mapped.
+        unsafe { mmio::read32(LINEAR_BASE + gicd as usize + 0x4) }
+    } else {
+        0
+    };
+    let iidr = read32(0x4);
+    kprintln!("its typer {typer:#x} gicd_typer {gicd_typer:#x} iidr {iidr:#x}");
+    if typer & 1 == 0 {
+        return off("no physical LPIs");
+    }
+    if gicd != 0 && (!its::gicd_lpis(gicd_typer) || its::gicd_id_bits(gicd_typer) < its::ID_BITS) {
+        return off("the distributor takes no 14-bit LPIs");
+    }
+    // SAFETY: GICR_TYPER of the first RD_base frame, mapped.
+    if unsafe { mmio::read64(redistributor + kcore::gic::GICR_TYPER) } & its::GICR_TYPER_PLPIS == 0
+    {
+        return off("the redistributor takes no physical LPIs");
+    }
+    // SAFETY: GICR_CTLR of the same frame.
+    if unsafe { mmio::read32(redistributor + kcore::gic::GICR_CTLR) } & its::GICR_CTLR_ENABLE_LPIS
+        != 0
+    {
+        return off("EnableLPIs was set before the kernel");
+    }
+    crate::irq::set_lpi_limit(its::lpi_limit(gicd_typer));
     ITT_ENTRY.store(its::typer_itt_entry_size(typer) as usize, Ordering::Relaxed);
     PTA.store(its::typer_pta(typer), Ordering::Relaxed);
     let cpus = info.cpus.as_slice().len().max(1);
-    // Shareability: writing inner shareable and reading zero back means the
-    // GIC does not snoop; the tables are then non-cacheable and cleaned.
+
+    // The ITS is off while its tables change.
+    write32(its::GITS_CTLR, 0);
+    let mut quiet = false;
+    for _ in 0..1_000_000 {
+        if read32(its::GITS_CTLR) & its::CTLR_QUIESCENT != 0 {
+            quiet = true;
+            break;
+        }
+    }
+    if !quiet {
+        return off("not quiescent");
+    }
+
+    // Shareability: every register written inner shareable write-back is read
+    // back; one that holds neither puts the whole ITS in the mode without
+    // shareability (tables non-cacheable, cleaned by hand) [G51].
+    let mut holds = !cfg!(feature = "its-nonshare");
     // SAFETY: GICR_PROPBASER is a 64-bit register of the first RD_base
     // frame, which `init_v3` found and the tables map; LPIs are still off.
-    let probe = unsafe {
+    unsafe {
         let at = redistributor + its::GICR_PROPBASER;
-        mmio::write64(at, its::propbaser(0, its::ID_BITS, its::SHARE_INNER, 0));
-        let read = mmio::read64(at);
+        mmio::write64(
+            at,
+            its::propbaser(0, its::ID_BITS, its::SHARE_INNER, its::CACHE_RAWAWB),
+        );
+        holds &= its::holds_shareability(mmio::read64(at));
         mmio::write64(at, 0);
-        read
-    };
-    NON_SHAREABLE.store((probe >> 10) & 3 == 0, Ordering::Relaxed);
-    let (share, cache) = attributes();
+    }
+    let (queue_va, queue_pa) = boot_block(0);
+    cache::clean_to_memory(queue_va, its::QUEUE_BYTES);
+    // SAFETY: only this CPU runs and the queue is not in use yet.
+    unsafe { (*QUEUE.0.get()).va = queue_va };
+    write64(
+        its::GITS_CBASER,
+        its::cbaser(queue_pa, 1, its::SHARE_INNER, its::CACHE_RAWAWB),
+    );
+    holds &= its::holds_shareability(read64(its::GITS_CBASER));
+    let mut pages = [0u64; its::BASER_COUNT];
+    for (n, page) in pages.iter_mut().enumerate() {
+        let at = its::GITS_BASER + 8 * n;
+        let old = read64(at);
+        if !matches!(
+            its::baser_type(old),
+            its::BASER_TYPE_DEVICE | its::BASER_TYPE_COLLECTION
+        ) {
+            continue;
+        }
+        let Some(size) = its::pick_page(old, FIRST_PAGE, |probe| {
+            write64(at, probe);
+            read64(at)
+        }) else {
+            return off("no page size");
+        };
+        *page = size;
+    }
+    NON_SHAREABLE.store(!holds, Ordering::Relaxed);
+    let (share, cache_attr) = attributes();
+    write64(
+        its::GITS_CBASER,
+        its::cbaser(queue_pa, 1, share, cache_attr),
+    );
+    write64(its::GITS_CWRITER, 0);
 
     let (prop_va, prop_pa) = boot_block(1);
     // Every LPI starts disabled; priority and Group 1 are set at the bind.
     // SAFETY: the block is ours and PROP_TABLE_BYTES long.
     unsafe {
         core::ptr::write_bytes(
-            (prop_va) as *mut u8,
+            prop_va as *mut u8,
             its::prop_byte(0xA0) & !1,
             its::PROP_TABLE_BYTES,
         )
     };
-    publish(prop_va, its::PROP_TABLE_BYTES);
+    cache::clean_to_memory(prop_va, its::PROP_TABLE_BYTES);
     PROP_VA.store(prop_va, Ordering::Relaxed);
     PROP_PA.store(prop_pa, Ordering::Relaxed);
-
     for table in PEND_PA.iter().take(cpus) {
         // The pending table needs 64 KiB alignment, which only a block of
         // 16 frames has; the allocator takes blocks back whole, so the rest
         // of the block stays with the table (spec 7.8).
-        let (_, pa) = boot_block(4);
+        let (va, pa) = boot_block(4);
+        cache::clean_to_memory(va, its::PEND_TABLE_BYTES);
         table.store(pa, Ordering::Relaxed);
     }
 
-    // The ITS is off while its tables change.
-    write32(its::GITS_CTLR, 0);
-    for _ in 0..1_000_000 {
-        if read32(its::GITS_CTLR) & its::CTLR_QUIESCENT != 0 {
-            break;
-        }
-    }
-    let (queue_va, queue_pa) = boot_block(0);
-    // SAFETY: only this CPU runs and the queue is not in use yet.
-    unsafe { (*QUEUE.0.get()).va = queue_va };
-    write64(its::GITS_CBASER, its::cbaser(queue_pa, 1, share, cache));
-    write64(its::GITS_CWRITER, 0);
-    for n in 0..its::BASER_COUNT {
+    for (n, page) in pages.into_iter().enumerate() {
         let at = its::GITS_BASER + 8 * n;
         let old = read64(at);
-        let pages = match its::baser_type(old) {
+        if page == 0 {
+            // A table the firmware left in its own memory is not the ITS's
+            // any more once the boot services are gone [N11].
+            write64(at, 0);
+            continue;
+        }
+        let entry = its::baser_entry_size(old);
+        let table = match its::baser_type(old) {
             its::BASER_TYPE_DEVICE => {
-                // A flat table of at most 16 pages: DeviceIDs past it are
-                // refused at msi_create (decision, section 4).
-                let entry = its::baser_entry_size(old);
-                let top = (16 * PAGE_SIZE / entry - 1) as u32;
-                let max_device = max_device.min(top);
-                MAX_DEVICE_ID.store(max_device, Ordering::Relaxed);
-                its::device_table_pages(max_device, entry, 16).must("a table of 16 pages")
+                let t = its::device_table(max_device, entry, its::typer_device_bits(typer), page);
+                MAX_DEVICE_ID.store(t.entries - 1, Ordering::Relaxed);
+                t
             }
-            its::BASER_TYPE_COLLECTION => {
+            _ => {
                 if its::typer_hcc(typer) >= cpus as u64 {
+                    write64(at, 0);
                     continue;
                 }
-                its::collection_table_pages(cpus, its::baser_entry_size(old))
+                its::collection_table(cpus, entry, page)
             }
-            _ => continue,
         };
-        let order = pages.next_power_of_two().trailing_zeros() as u8;
-        let (_, pa) = boot_block(order);
-        // Pages of 4 KiB; a table that reads another page size back is
-        // sized in its pages.
-        write64(at, its::baser(old, pa, 1 << order, share, cache));
-        let new = read64(at);
-        assert!(
-            its::baser_page_size(new) == PAGE_SIZE,
-            "the ITS takes no 4 KiB table pages"
+        if table.pages > 256 {
+            return off("a table of over 256 pages");
+        }
+        let pa = table_block(table.bytes);
+        write64(
+            at,
+            its::baser(old, pa, table.pages, page, share, cache_attr),
         );
+        let new = read64(at);
+        let want = its::baser(old, pa, table.pages, page, share, cache_attr);
+        kprintln!(
+            "its baser{n} type {:#x} esz {entry} page {page:#x} pages {} ids {:#x} share {} cache {} was {old:#x}",
+            its::baser_type(old),
+            table.pages,
+            table.entries - 1,
+            (new >> 10) & 3,
+            (new >> 59) & 7
+        );
+        // Page size, Size and Valid must read as written; the shareability
+        // fields may differ (they are the ITS's to refuse).
+        let mask = (3 << 8) | 0xFF | (1 << 63);
+        if (new ^ want) & mask != 0 {
+            return off("a table register reads back other than written");
+        }
     }
     write32(its::GITS_CTLR, its::CTLR_ENABLED);
+    kprintln!(
+        "its on, non-shareable {}",
+        NON_SHAREABLE.load(Ordering::Relaxed)
+    );
+    Ok(())
 }
 
 /// This CPU's part of the LPIs, called by `gic::init_v3_cpu` once the

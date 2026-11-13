@@ -32,6 +32,8 @@ table-ceiling = []
 vz = []
 table-posix-abi-vz = []
 table-busybox-dialog-vz = []
+# The shell on EC2 (t4g.small): the console is the 16550 of the SPCR.
+table-aws = []
 table-rtbench-vz = []
 table-rtbench-posix = []
 table-rtbench-posix-vz = []

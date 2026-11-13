@@ -162,7 +162,14 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
         let info = &boot.info;
         let gic = info.gic.as_ref().map(Gic::mapped).into_iter().flatten();
         let its = info.its.map(|its| its.regs);
-        for dev in info.uart_pl011.into_iter().chain(gic).chain(its) {
+        let uart16550 = info.uart_16550.map(|u| u.regs);
+        for dev in info
+            .uart_pl011
+            .into_iter()
+            .chain(uart16550)
+            .chain(gic)
+            .chain(its)
+        {
             let (base, size) = pages(dev);
             map(
                 &mut pt,
@@ -172,6 +179,19 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 size,
                 Attrs::DEVICE,
                 "device",
+            );
+        }
+        #[cfg(feature = "early-marks")]
+        if let (Some(pa), None) = (crate::arch::marks::port(), info.uart_16550) {
+            let page = pa & !(PAGE_SIZE - 1);
+            map(
+                &mut pt,
+                &mut mem,
+                LINEAR_BASE + page as usize,
+                page,
+                PAGE_SIZE,
+                Attrs::DEVICE,
+                "early mark port",
             );
         }
         pt.root()

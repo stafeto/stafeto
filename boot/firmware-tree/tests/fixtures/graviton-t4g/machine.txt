@@ -1,0 +1,1 @@
+EC2 t4g.small, eu-central-1, 2 vCPU, 2 GiB; ACPI tables and memory map as the loader's dump mode wrote them (cargo xtask aws dump); DSDT, iomem.txt and pci.txt from Amazon Linux 2023 on the same type
