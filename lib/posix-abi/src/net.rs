@@ -124,13 +124,27 @@ pub fn session() -> Option<rt::abi::Handle> {
     // call without a socket: CONFIG, the resolver) would still hold, and a handle number that
     // is made again would send its call to another service. After the first call this is one
     // load.
-    // It only waits for an ask in progress: a reader never starts the ask (a fork that clones
-    // the session would otherwise home the parent from the wrong CPU before its children ran).
-    while HOMING.load(Ordering::Acquire) == ASKING {
-        let _ = rt::sys::yield_now();
+    if HOMING.load(Ordering::Acquire) != ASKED {
+        ensure_home();
     }
     if COUNTING.load(Ordering::Relaxed) {
         note_cpu();
+    }
+    match SESSION.load(Ordering::Acquire) {
+        0 => None,
+        raw => Some(rt::abi::Handle(raw)),
+    }
+}
+
+/// The session for a reader that may not use it (the clone a child gets in fork and spawn, the
+/// look of `poll` for network descriptors among others): it neither starts the ask for the home
+/// nor settles it before the read beyond waiting for one in progress, because it runs in the
+/// parent on the parent's CPU and must not home the parent there (the child homes itself on its
+/// own CPU at its first call). The clone is made at once, so the window a replacement could
+/// close the handle in is the one `fork` already has with the rest of the parent's state.
+pub fn session_passive() -> Option<rt::abi::Handle> {
+    while HOMING.load(Ordering::Acquire) == ASKING {
+        let _ = rt::sys::yield_now();
     }
     match SESSION.load(Ordering::Acquire) {
         0 => None,
@@ -499,7 +513,10 @@ fn close_description(description: u32) {
 /// threads never end their waits. The service lets go of a few operations
 /// in each answer and says how many are left; the ask goes on until none is.
 pub(crate) fn abandon() {
-    let Ok(service) = channel() else { return };
+    // An exec must not home the old image on the CPU it happens to run on: the new image asks
+    // for its own home at its first call.
+    let Some(raw) = session_passive() else { return };
+    let service = ManuallyDrop::new(Handle::<Channel>::borrowed(raw));
     let request = proto_net::Method::Abandon.header().bytes();
     loop {
         let reply = match rt::sys::send(&service, &request) {
@@ -529,7 +546,8 @@ pub(crate) fn abandon() {
 pub(crate) fn clone_kept(
     mut portion: impl FnMut(&mut [u32; CLONE_MAX]) -> Result<(usize, bool), i32>,
 ) -> Result<Option<Handle<Channel>>, i32> {
-    let Some(raw) = session() else {
+    // The parent's CPU is not the child's: the clone must not home the parent.
+    let Some(raw) = session_passive() else {
         return Ok(None);
     };
     let service = Handle::<Channel>::borrowed(raw);
