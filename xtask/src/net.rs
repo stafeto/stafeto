@@ -20,8 +20,9 @@ pub const ITS_IMAGE: &str = "boot-net-its.img";
 /// file `netd.conf`): about 62 KiB in the release build at 256 places, more at
 /// 320 groups of sockets (1 280 places); the image of two devices ran out of
 /// 128 KiB inside the second device's queue. 192 KiB leaves the calls under it
-/// their room.
-pub const NETD_STACK_SIZE: u32 = 192 * 1024;
+/// their room. 224 KiB since the run guard of the instances (192 KiB left the frame of `main`
+/// and `Switch::new` with nothing under them in the one-instance image).
+pub const NETD_STACK_SIZE: u32 = 224 * 1024;
 
 /// The ports of the host forwarded to the guest: HTTP and SSH.
 pub const FORWARDS: [qemu::Forward; 2] = [

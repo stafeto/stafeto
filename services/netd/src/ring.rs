@@ -267,6 +267,26 @@ pub fn charge(budget: &mut usize, taken: &mut usize, weight: usize) {
     *budget = budget.saturating_sub(weight);
     *taken += weight;
 }
+/// The copies of an ARP reply for the instances `first` to `instances - 1`: `copy(k)` makes the
+/// copy for instance `k` (Some(true) made, Some(false) none for that one, None no buffer left:
+/// the rest get none), and each copy made is charged to the step (`STACK_COPY_WEIGHT` frames).
+/// The loop of `switch::arp_copies`, kept here so that a test sees the charge.
+pub fn for_each_arp_copy(
+    first: usize,
+    instances: usize,
+    budget: &mut usize,
+    taken: &mut usize,
+    mut copy: impl FnMut(usize) -> Option<bool>,
+) {
+    for k in first..instances {
+        match copy(k) {
+            Some(true) => charge(budget, taken, STACK_COPY_WEIGHT),
+            Some(false) => {}
+            None => return,
+        }
+    }
+}
+
 /// An ARP reply goes to every instance: the others get a copy of it in a buffer of sending,
 /// each of `STACK_COPY_WEIGHT` frames of the step (it is a copy of the frame and an offer to
 /// the lane, with no frame taken off the queue). A frame that is begun is copied to all the
@@ -411,6 +431,42 @@ impl RunClock {
     /// The pause ended at `now`: a new run begins.
     pub fn rested(&mut self, now: u64) {
         self.since = Some(now);
+    }
+}
+
+/// The run of an instance's thread, which has no loop of its own (the service loop calls it for
+/// each item): `begin` says at the start of an item whether the run has lasted its time
+/// (`SWITCH_RUN_NS` without a rest of `SWITCH_REST_NS`, the constants of the switch's backstop)
+/// and the thread pauses first; `end` records when the item ended, so that the wait before the
+/// next item is known.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunGuard {
+    clock: RunClock,
+    left_at: u64,
+}
+
+impl RunGuard {
+    pub const fn new() -> RunGuard {
+        RunGuard {
+            clock: RunClock::new(),
+            left_at: 0,
+        }
+    }
+
+    /// An item begins at `now`; true when the thread pauses before it.
+    pub fn begin(&mut self, now: u64) -> bool {
+        self.clock.woke(now, now.wrapping_sub(self.left_at));
+        self.clock.pause_due(now)
+    }
+
+    /// The pause ended at `now`.
+    pub fn paused(&mut self, now: u64) {
+        self.clock.rested(now);
+    }
+
+    /// The item ended at `now`.
+    pub fn end(&mut self, now: u64) {
+        self.left_at = now;
     }
 }
 
@@ -1030,17 +1086,49 @@ impl Default for Budget {
 mod tests {
     use super::*;
 
+    /// An instance fed items of 100 us one after another: it pauses once its run has lasted
+    /// `SWITCH_RUN_NS`, and a gap of `SWITCH_REST_NS` starts a new run.
+    #[test]
+    fn an_instance_that_never_rests_pauses_after_its_run_and_a_rest_ends_the_run() {
+        let mut g = RunGuard::new();
+        let (mut now, mut pauses, mut first) = (1_000_000u64, 0, 0);
+        for i in 0..100 {
+            if g.begin(now) {
+                pauses += 1;
+                first = if first == 0 { i } else { first };
+                now += SWITCH_PAUSE_NS;
+                g.paused(now);
+            }
+            now += 100_000;
+            g.end(now);
+        }
+        assert!(pauses >= 4, "{pauses} pauses in 100 items of 100 us");
+        assert!(
+            first * 100_000 <= SWITCH_RUN_NS + 100_000,
+            "the first pause at item {first}"
+        );
+        // With a rest between the items the run never lasts: no pause.
+        let mut g = RunGuard::new();
+        let mut now = 1_000_000u64;
+        for _ in 0..100 {
+            assert!(!g.begin(now));
+            now += 100_000;
+            g.end(now);
+            now += SWITCH_REST_NS;
+        }
+    }
+
     /// A step of the tables path in which every frame of the wire is an ARP reply: the copies
-    /// it makes with `instances` instances, charged as `switch::arp_copies` charges them.
-    fn arp_flood_copies(instances: usize, weight: usize) -> usize {
+    /// it makes with `instances` instances, through the loop `switch::arp_copies` runs.
+    fn arp_flood_copies(instances: usize) -> usize {
         let (mut budget, mut taken, mut copies) = (SWITCH_ROUTED, 0, 0);
         while budget > 0 {
             taken += 1;
             budget -= 1;
-            for _ in 1..instances {
+            for_each_arp_copy(1, instances, &mut budget, &mut taken, |_| {
                 copies += 1;
-                charge(&mut budget, &mut taken, weight);
-            }
+                Some(true)
+            });
         }
         copies
     }
@@ -1048,14 +1136,10 @@ mod tests {
     #[test]
     fn a_stream_of_arp_replies_holds_the_copies_of_a_step_to_the_bound() {
         for n in 2..=crate::switchlogic::tables::MAX_INSTANCES {
-            let copies = arp_flood_copies(n, STACK_COPY_WEIGHT);
+            let copies = arp_flood_copies(n);
             assert_eq!(copies, arp_copies_in_step(n), "{n} instances");
             assert!(copies <= ARP_COPIES_STEP);
         }
-        // Without the charge the step makes a copy for every other instance of each frame.
-        let n = crate::switchlogic::tables::MAX_INSTANCES;
-        assert!(arp_flood_copies(n, 0) > ARP_COPIES_STEP);
-        assert_eq!(arp_flood_copies(n, 0), SWITCH_ROUTED * (n - 1));
     }
 
     #[test]

@@ -3297,37 +3297,55 @@ static void instances(void)
 	REQUIRE(calls_total > 0);
 }
 
-/* The home of a session and a fork: a thread of the parent that stands in the middle of its
- * ask (HOMING 1, set by the probe) has no counterpart in the child, so the child must start
- * with the ask done (2) and its first call that makes a socket must return. The alarm turns
- * a child that waits for ever into a failure. */
+/* The home of a session: a call that reads the session (the second device's config, which makes
+ * no socket) waits while another thread is in the middle of the ask of the home (HOMING 1, set
+ * by the probe), because the reply replaces the session and closes the old handle. A fork waits
+ * the same way, so a child never starts with an ask that no thread of its own will finish. */
 #define SO_STAFETO_HOMING 0x7357
+
+static volatile int config_done;
+
+static void *config_thread(void *arg)
+{
+	struct stafeto_fast_config c;
+
+	(void)arg;
+	(void)stafeto_fast_config(&c);
+	config_done = 1;
+	return NULL;
+}
 
 static void home_fork(void)
 {
 	int port, lis = listener(8, &port);
 	unsigned one = 1, zero = 0;
 
+	/* The hook is open only where the environment names it. */
+	unsigned state = 0;
+	socklen_t slen = sizeof state;
+	REQUIRE(getsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &state, &slen) != 0);
+	REQUIRE(setenv("STAFETO_NET_PROBE", "1", 1) == 0);
 	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &one, sizeof one) == 0);
+	pthread_t reader;
+	REQUIRE(pthread_create(&reader, NULL, config_thread, NULL) == 0);
+	struct timespec nap = { 0, 200 * 1000 * 1000 };
+	nanosleep(&nap, NULL);
+	REQUIRE(config_done == 0);
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &zero, sizeof zero) == 0);
+	REQUIRE(pthread_join(reader, NULL) == 0 && config_done == 1);
+	unsetenv("STAFETO_NET_PROBE");
+	/* With the ask done a fork child makes its socket at once. */
 	pid_t child = fork();
 	REQUIRE(child >= 0);
 	if (child == 0) {
 		alarm(10);
-		unsigned state = 0;
-		socklen_t len = sizeof state;
-		if (getsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &state, &len) != 0 || state != 2)
-			_exit(2);
 		int s = socket(AF_INET, SOCK_STREAM, 0);
-		if (s < 0)
-			_exit(3);
-		close(s);
-		_exit(0);
+		_exit(s < 0 ? 3 : 0);
 	}
 	int status = 0;
 	REQUIRE(waitpid(child, &status, 0) == child);
-	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_STAFETO_HOMING, &zero, sizeof zero) == 0);
-	REQUIRE(close(lis) == 0);
 	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	REQUIRE(close(lis) == 0);
 }
 
 /* `posix-net stat`: the two options of the shared buffers. */

@@ -109,6 +109,11 @@ impl Claims {
         })
     }
 
+    /// The owner of the run that holds the word of `port`.
+    pub fn run_owner(&self, proto: Proto, port: u16) -> Option<u8> {
+        Self::word(proto, port).and_then(|w| self.runs[w].load(Ordering::Acquire).checked_sub(1))
+    }
+
     /// Whether no port of the run of words (`first` and `count` aligned on 64 in the ephemeral
     /// range) has a claim, its own or a run's.
     pub fn run_free(&self, proto: Proto, first: u16, count: u16) -> bool {
@@ -241,24 +246,39 @@ pub fn offset(
 /// last candidate, found a word of the bitmap at a time (at most 256 words,
 /// whatever the number of sockets). None only when the whole range is held.
 pub fn ephemeral(offset: u32, counter: u32, map: &PortMap) -> Option<u16> {
+    ephemeral_steps(offset, counter, map).0
+}
+
+/// `ephemeral`, and how many ports it looked at.
+fn ephemeral_steps(offset: u32, counter: u32, map: &PortMap) -> (Option<u16>, u32) {
+    let mut steps = 0;
     for i in 0..TRIES {
         let port = candidate(offset, counter, i);
+        steps += 1;
         if !map.held(port) {
-            return Some(port);
+            return (Some(port), steps);
         }
     }
-    // The bitmap is this instance's: a port another instance holds (a block of a consumer
-    // included) is skipped here, one port at a time, for at most one round of the range.
+    // The bitmap is this instance's: a port another instance holds is skipped here, a port at
+    // a time, and the words that a run holds (a block of a consumer) whole, for at most one
+    // round of the range.
     let mut from = offset.wrapping_add(counter).wrapping_add(TRIES) % EPHEMERAL_COUNT;
     for _ in 0..EPHEMERAL_COUNT {
-        let n = map.first_free_from(from)?;
+        let Some(n) = map.first_free_from(from) else {
+            return (None, steps);
+        };
+        steps += 1;
         let port = EPHEMERAL_FIRST + n as u16;
         if !map.held_elsewhere(port) {
-            return Some(port);
+            return (Some(port), steps);
         }
-        from = n + 1;
+        from = if map.in_foreign_run(port) {
+            (n / 64 + 1) * 64
+        } else {
+            n + 1
+        };
     }
-    None
+    (None, steps)
 }
 
 /// How many sockets hold each port of one protocol. With a count, a socket
@@ -311,6 +331,15 @@ impl PortMap {
 
     pub fn held(&self, port: u16) -> bool {
         self.held[usize::from(port)] > 0 || self.is_reserved(port) || self.held_elsewhere(port)
+    }
+
+    /// Whether a run of another instance (a block of a consumer) holds the word of `port`.
+    pub fn in_foreign_run(&self, port: u16) -> bool {
+        self.shared.is_some_and(|s| {
+            s.claims
+                .run_owner(s.proto, port)
+                .is_some_and(|o| o != s.who)
+        })
     }
 
     /// `hold`, refused (false) when another instance holds `port`. Kept for the callers that
@@ -767,5 +796,19 @@ mod tests {
         assert!(!b.hold_run(8079, 3));
         assert!(b.held[8079] == 0 && b.held[8081] == 0);
         assert!(a.hold(8079) && a.hold(8081));
+    }
+
+    #[test]
+    fn the_search_passes_the_blocks_of_a_consumer_a_word_at_a_time() {
+        let (mut a, b) = shared_maps();
+        // Every block but the last is a consumer's (instance 0's): 31 blocks of 512 ports.
+        for n in 0..31 {
+            assert!(a.hold_run(block(n), 512));
+        }
+        let (port, steps) = ephemeral_steps(0, 0, &b);
+        assert_eq!(port.map(|p| p >= block(31)), Some(true));
+        // A port at a time it would be 15 872 looks; a word at a time under 400 (the 64 candidates
+        // that are tried first, then one look at each of 248 words).
+        assert!(steps < 400, "{steps} ports looked at");
     }
 }

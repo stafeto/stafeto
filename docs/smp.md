@@ -247,6 +247,17 @@ thread whose wake is on its way (`info_in_flight`).
   the child the service's own, every CPU). The test images that need the
   four CPUs for their load give their POSIX records `ALL_CPUS`. On four
   CPUs `nproc` in the shell says 2, and `taskset -c 3` is refused.
+- **Stack instances of the network service (#615).** `netd` runs one instance of its stack for
+  each CPU of its mask, at most four, as a thread above every POSIX process (level 35, the switch
+  36). In the normal images the mask is `GENERAL_CPUS`, so the instances stand on CPUs 0 and 1;
+  the images of the measurement give `netd` all four. A process that stands on CPU 1 shares it
+  with the instance of CPU 1 when its session is homed there, and the instance runs above it,
+  so it keeps the same backstop as the switch: after `SWITCH_RUN_NS` (2 ms) without a rest of
+  `SWITCH_REST_NS` it pauses `SWITCH_PAUSE_NS` (100 us), which bounds the time a flood of SYNs or
+  datagrams for its ports can take from the processes below it. Where the service has the
+  switch or a second device, one instance starts and every session stays on it (the methods of
+  both are the first instance's alone); forwarding them to the first instance, so that the
+  others serve sockets in such images, is left for later.
 - **The shares of thread numbers and timers (#354).** The 1,024 thread
   numbers of the system and its 8,192 timers are shared out like the memory
   quota (kernel spec 7.5): a process created with `x6` and `x7` has counts of

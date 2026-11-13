@@ -69,7 +69,7 @@ use netd::ring::{
     CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
     STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
     SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, charge, drive,
+    SWITCH_TX, Stepper, TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -1702,20 +1702,19 @@ impl Switch {
         budget: &mut usize,
         taken: &mut usize,
     ) {
-        for k in (DEFAULT_INSTANCE + 1)..self.instances {
+        let instances = self.instances;
+        for_each_arp_copy(DEFAULT_INSTANCE + 1, instances, budget, taken, |k| {
             if !lane_rules::take_room(room, k) {
                 bump(&INNER.stats.lane_full);
-                continue;
+                return Some(false);
             }
-            let Some(n) = self.tx.book.alloc() else {
-                return;
-            };
+            let n = self.tx.book.alloc()?;
             // SAFETY: the buffer is free (just taken from the pool).
             let slice = unsafe { virtio_net::rings::buffer_at(self.tx.base(), n) };
             slice[HDR_LEN..HDR_LEN + frame.len()].copy_from_slice(frame);
             offer_must(&mut self.passed, k, pack_frame(n, frame.len() as u16, sum));
-            charge(budget, taken, STACK_COPY_WEIGHT);
-        }
+            Some(true)
+        });
     }
 
     /// The frame of `len` bytes in buffer `n` of the ring goes to the stack. With the chains of a

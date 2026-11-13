@@ -105,9 +105,28 @@ pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     netbuf::after_fork();
 }
 
+unsafe extern "C" {
+    fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
+}
+
+/// Whether the probe hook of the home flag (`SO_STAFETO_HOMING`) is open: only in a process
+/// whose environment names it (`STAFETO_NET_PROBE`), as `STAFETO_FILE_CACHE` does for the cache.
+fn probe_on() -> bool {
+    // SAFETY: a NUL-terminated name; the answer is a C string or null.
+    !unsafe { getenv(c"STAFETO_NET_PROBE".as_ptr()) }.is_null()
+}
+
 /// The session with the network service, for the requests and for the
 /// clones a child gets.
 pub fn session() -> Option<rt::abi::Handle> {
+    // Every reader of `SESSION` waits for the home of the session to be settled: the reply of
+    // HOME replaces the handle and closes the old one, which a thread that read it before (a
+    // call without a socket: CONFIG, the resolver) would still hold, and a handle number that
+    // is made again would send its call to another service. After the first call this is one
+    // load.
+    if HOMING.load(Ordering::Acquire) != ASKED {
+        ensure_home();
+    }
     if COUNTING.load(Ordering::Relaxed) {
         note_cpu();
     }
@@ -965,7 +984,7 @@ fn value_of(number: u32, value: &[u8]) -> Result<u32, i32> {
 /// SO_LINGER, 16 for the timeouts).
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
     // The layer's own count of the calls from other CPUs (no request to the service).
-    if level == SOL_SOCKET && name == SO_STAFETO_HOMING {
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING && probe_on() {
         return with_socket(fd, |_| {
             let bytes = HOMING.load(Ordering::Acquire).to_ne_bytes();
             let n = out.len().min(4);
@@ -1026,7 +1045,7 @@ pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i3
     }
     // A probe of the fork rule: 1 puts the flag of the home in the state of a thread that is
     // in the middle of its ask, 0 puts it back to done.
-    if level == SOL_SOCKET && name == SO_STAFETO_HOMING {
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING && probe_on() {
         if value.len() < 4 {
             return Err(EINVAL);
         }

@@ -386,24 +386,6 @@ fn main(_: u64) -> u64 {
         }
     };
 
-    // One stack instance for each CPU of the service's mask, up to the file's limit: the
-    // instance k runs on the k-th CPU (`netd::home`). The instances after the first have a
-    // channel and a timer of their own; sessions reach them through HOME.
-    let allowed = sys::cpu_info(0).map_or(1, |info| info.allowed as u32);
-    let cpus = match netd::home::instance_cpus(allowed, settings.instances().min(BUILT)) {
-        0 => 1,
-        cpus => cpus,
-    };
-    let instances = netd::home::count(cpus);
-    rt::println!("net: {instances} stack instances, CPUs {cpus:#b} of {allowed:#b}");
-    let mut extra: [Option<Extra>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
-    for slot in extra.iter_mut().take(instances).skip(1) {
-        match Extra::new(level) {
-            Ok(made) => *slot = Some(made),
-            Err(code) => return code,
-        }
-    }
-
     let Ok(mut got) = rt::service::register_with(&s.parent, &channel, Some(&switch_channel)) else {
         return NOT_REGISTERED;
     };
@@ -418,6 +400,19 @@ fn main(_: u64) -> u64 {
     let irq_tx = got.take::<Interrupt>("irqtx").ok();
     let msi = irq_tx.is_some();
     let devices = 1 + usize::from(irq1.is_some());
+
+    // One stack instance for each CPU of the service's mask, up to the file's limit: the
+    // instance k runs on the k-th CPU (`netd::home`). The instances after the first have a
+    // channel and a timer of their own; sessions reach them through HOME.
+    // Where the service has the switch or a second device, every session stays on the first
+    // instance (the methods of both are its alone, `home`), so one instance starts. A stopgap:
+    // the forwarding of ATTACH, CLAIM, PORT_HOLD and JOIN to the first instance, which lets the
+    // others serve sockets in such images, belongs to P3 (deferred to the ENA work).
+    let (cpus, instances, mut extra) = match plan_instances(&settings, devices > 1, level) {
+        Ok(plan) => plan,
+        Err(code) => return code,
+    };
+
     let rw = Access::ReadWrite;
     let page = PAGE as u64;
     // QEMU's transports, or VZ's functions and their Virtio structures.
@@ -686,6 +681,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "trace")]
         kdump::KernelDump::new(kernel_stamps),
     );
+    driver0.pause = make_pause(level);
     driver0.cpus = cpus;
     driver0.instances = instances;
     driver0.routed = settings.consumers() > 0 || instances > 1;
@@ -743,6 +739,7 @@ fn main(_: u64) -> u64 {
             #[cfg(feature = "trace")]
             kdump::KernelDump::new(None),
         );
+        driver.pause = make_pause(level);
         driver.cpus = cpus;
         driver.instances = instances;
         driver.routed = true;
@@ -1198,6 +1195,42 @@ struct Maps {
 /// copy of it with NOTIFY (the loop tells itself steps, and the switch tells it frames), the
 /// timer of its deadlines, and the handle with which the first instance asks it for the sessions
 /// of the processes whose home it is (HOME).
+/// The CPUs of the instances, how many there are, and the channels and timers of those after
+/// the first (apart from `main`, whose frame is on the thread's small stack).
+#[inline(never)]
+fn plan_instances(
+    settings: &netd::config::Settings,
+    second_device: bool,
+    level: u8,
+) -> Result<(u32, usize, [Option<Extra>; MAX_INSTANCES]), u64> {
+    let limit = if settings.consumers() > 0 || second_device {
+        1
+    } else {
+        settings.instances().min(BUILT)
+    };
+    let allowed = sys::cpu_info(0).map_or(1, |info| info.allowed as u32);
+    let cpus = match netd::home::instance_cpus(allowed, limit) {
+        0 => 1,
+        cpus => cpus,
+    };
+    let instances = netd::home::count(cpus);
+    rt::println!("net: {instances} stack instances, CPUs {cpus:#b} of {allowed:#b}");
+    let mut extra: [Option<Extra>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
+    for slot in extra.iter_mut().take(instances).skip(1) {
+        *slot = Some(Extra::new(level)?);
+    }
+    Ok((cpus, instances, extra))
+}
+
+/// The channel and timer of an instance's pauses: a wait channel, so that the pause lends no
+/// priority.
+#[inline(never)]
+fn make_pause(level: u8) -> Option<(Handle<Channel>, Handle<Timer>)> {
+    sys::channel_create_wait(level)
+        .and_then(|channel| sys::timer_create(&channel, level).map(|timer| (channel, timer)))
+        .ok()
+}
+
 struct Extra {
     channel: Handle<Channel>,
     notify: Handle<Channel>,
@@ -1276,6 +1309,10 @@ struct Driver<'a> {
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
     neighbours_at: u64,
+    /// The run of the thread and the channel and timer of its pauses.
+    guard: netd::ring::RunGuard,
+    pause: Option<(Handle<Channel>, Handle<Timer>)>,
+    counters_pause_failed: u32,
     /// When the instance next leaves its counters for the profile record.
     #[cfg(feature = "profile")]
     snapshot_at: u64,
@@ -1360,6 +1397,9 @@ impl<'a> Driver<'a> {
             armed: None,
             last_step: 0,
             neighbours_at: 0,
+            guard: netd::ring::RunGuard::new(),
+            pause: None,
+            counters_pause_failed: 0,
             #[cfg(feature = "profile")]
             snapshot_at: 0,
             ask_due: false,
@@ -2047,7 +2087,8 @@ impl Driver<'_> {
         let here = u32::from(self.inst.net.cpu);
         // The methods of the switch (ATTACH, PORT_HOLD, JOIN) and of the second device (CLAIM)
         // are the first instance's alone: where the service has either, no session moves away
-        // from it, so that a program that attaches or claims later finds them.
+        // from it, so that a program that attaches or claims later finds them. A stopgap: the
+        // forwarding of those methods to the first instance belongs to P3.
         let owner_methods = self.side.max > 0 || self.second.is_some();
         if self.index != 0 || s.data.homed || s.data.held.count() > 0 || owner_methods {
             return stays(s, r, here);
@@ -2337,12 +2378,37 @@ const METHODS: &[u16] = &[
     27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
 ];
 
-impl Service<0> for Driver<'_> {
-    const VERSION: u16 = VERSION;
-    const METHODS: &'static [u16] = METHODS;
-    type Data = Client;
+impl Driver<'_> {
+    /// An item of work (a request or a notification) begins: the run of the thread goes on
+    /// through items that follow one another, and once it has lasted `SWITCH_RUN_NS` the thread
+    /// pauses `SWITCH_PAUSE_NS` on a wait channel, as the switch does, so that a flood of SYNs
+    /// or datagrams for this instance cannot hold its CPU from the processes below its level
+    /// (the worker that stands on the same CPU).
+    fn begin_item(&mut self) {
+        if self.guard.begin(now_ns()) {
+            self.pause();
+            self.guard.paused(now_ns());
+        }
+    }
 
-    fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+    fn end_item(&mut self) {
+        self.guard.end(now_ns());
+    }
+
+    fn pause(&mut self) {
+        let waited = match &self.pause {
+            Some((channel, timer)) => {
+                sys::timer_set(timer, now_ns() + netd::ring::SWITCH_PAUSE_NS).is_ok()
+                    && sys::receive(channel).is_ok()
+            }
+            None => false,
+        };
+        if !waited {
+            self.counters_pause_failed += 1;
+        }
+    }
+
+    fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
         trace::point(P_N_REQ_BEGIN, u32::from(method));
@@ -2389,62 +2455,7 @@ impl Service<0> for Driver<'_> {
         answer
     }
 
-    /// The client of `s` went: its operations go, and its descriptions are
-    /// let go of in steps.
-    fn gone(&mut self, s: &mut Session<Client, 0>) {
-        rt::service::step_own();
-        // The owner of the second device went: the device comes back.
-        self.owner_gone(s);
-        self.consumer_gone(s);
-        let held = core::mem::take(&mut s.data.held);
-        let long = core::mem::take(&mut s.data.long);
-        // The shared buffer is unmapped by a step of departure.
-        if self.inst.net.retire_buffer(s) {
-            self.cleanup();
-        }
-        // The interest sets of the session go with it, their records in steps.
-        if self.inst.net.interest.sets_of(s.label()) != 0 {
-            self.inst.net.interest.drop_sets_of(s.label());
-            self.cleanup();
-        }
-        if self.inst.net.depart(&mut self.inst.stack, held, long) {
-            self.cleanup();
-        }
-        self.inst.net.step_due = true;
-        self.after_request();
-    }
-
-    /// The last copy of a session Clone made went before it sent anything.
-    fn closed(&mut self, label: u64) {
-        rt::service::step_own();
-        // The last copy of a pass: its reference of the place goes.
-        if netd::passes::Passes::is_pass(label) {
-            self.inst.net.pass_gone(&mut self.inst.stack, label);
-            self.after_request();
-            return;
-        }
-        if let Some(held) = self.inst.net.unborn(label)
-            && self
-                .inst
-                .net
-                .depart(&mut self.inst.stack, held, LongSession::default())
-        {
-            self.cleanup();
-        }
-        self.after_request();
-    }
-
-    fn between_notifications(&mut self, _: Notice) {
-        self.bell_release();
-        self.bell_checked = false;
-    }
-
-    fn between_requests(&mut self) {
-        self.bell_release();
-        self.bell_checked = false;
-    }
-
-    fn notification(&mut self, n: Notice) {
+    fn handle_notification(&mut self, n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
             // (`proto_init::binding_label`): the line says whose interrupt it
@@ -2546,6 +2557,80 @@ impl Service<0> for Driver<'_> {
             }
             _ => {}
         }
+    }
+}
+
+impl Service<0> for Driver<'_> {
+    const VERSION: u16 = VERSION;
+    const METHODS: &'static [u16] = METHODS;
+    type Data = Client;
+
+    fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        self.begin_item();
+        let answer = self.handle_request(s, r);
+        self.end_item();
+        answer
+    }
+
+    /// The client of `s` went: its operations go, and its descriptions are
+    /// let go of in steps.
+    fn gone(&mut self, s: &mut Session<Client, 0>) {
+        rt::service::step_own();
+        // The owner of the second device went: the device comes back.
+        self.owner_gone(s);
+        self.consumer_gone(s);
+        let held = core::mem::take(&mut s.data.held);
+        let long = core::mem::take(&mut s.data.long);
+        // The shared buffer is unmapped by a step of departure.
+        if self.inst.net.retire_buffer(s) {
+            self.cleanup();
+        }
+        // The interest sets of the session go with it, their records in steps.
+        if self.inst.net.interest.sets_of(s.label()) != 0 {
+            self.inst.net.interest.drop_sets_of(s.label());
+            self.cleanup();
+        }
+        if self.inst.net.depart(&mut self.inst.stack, held, long) {
+            self.cleanup();
+        }
+        self.inst.net.step_due = true;
+        self.after_request();
+    }
+
+    /// The last copy of a session Clone made went before it sent anything.
+    fn closed(&mut self, label: u64) {
+        rt::service::step_own();
+        // The last copy of a pass: its reference of the place goes.
+        if netd::passes::Passes::is_pass(label) {
+            self.inst.net.pass_gone(&mut self.inst.stack, label);
+            self.after_request();
+            return;
+        }
+        if let Some(held) = self.inst.net.unborn(label)
+            && self
+                .inst
+                .net
+                .depart(&mut self.inst.stack, held, LongSession::default())
+        {
+            self.cleanup();
+        }
+        self.after_request();
+    }
+
+    fn between_notifications(&mut self, _: Notice) {
+        self.bell_release();
+        self.bell_checked = false;
+    }
+
+    fn between_requests(&mut self) {
+        self.bell_release();
+        self.bell_checked = false;
+    }
+
+    fn notification(&mut self, n: Notice) {
+        self.begin_item();
+        self.handle_notification(n);
+        self.end_item();
     }
 }
 
