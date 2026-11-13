@@ -998,7 +998,10 @@ fn aws_programs() -> &'static [ImageProgram] {
         let break_aenq: &'static [&'static str] =
             match std::env::var("STAFETO_ENA_BREAK").as_deref() {
                 Ok("exit") => &["ena-break-exit"],
-                Ok(_) => &["ena-break-aenq"],
+                Ok("1") => &["ena-break-aenq"],
+                Ok(other) => panic!(
+                    "STAFETO_ENA_BREAK={other:?}: the values are \"1\" (the event head is held) and \"exit\" (the service exits once)"
+                ),
                 Err(_) => &[],
             };
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
@@ -2589,7 +2592,7 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// init's table (`cargo xtask ena-breaks`): each is a feature of its crate that
 /// does one wrong thing, and the host tests of the crate pass without it and
 /// fail with it.
-const ENA_BREAKS: [(&str, &str); 24] = [
+const ENA_BREAKS: [(&str, &str); 35] = [
     ("pci", "break-measure-console"),
     ("pci", "break-restore-command"),
     ("pci", "break-multifunction"),
@@ -2614,10 +2617,21 @@ const ENA_BREAKS: [(&str, &str); 24] = [
     ("init", "break-no-start"),
     ("init", "break-keep-master"),
     ("init", "break-master-left"),
+    ("ena", "break-rx-phase"),
+    ("ena", "break-tx-phase"),
+    ("ena", "break-cq-phase"),
+    ("ena", "break-cq-head"),
+    ("ena", "break-no-unmask"),
+    ("ena", "break-msix-data"),
+    ("ena", "break-head-zero"),
+    ("ena", "break-msix-order"),
+    ("netd", "break-would-block"),
+    ("netd", "break-msix-offset"),
+    ("firmware-tree", "break-smmu-ignore"),
 ];
 
 fn ena_breaks() -> Result<(), String> {
-    for package in ["pci", "ena", "init"] {
+    for package in ["pci", "ena", "init", "netd", "firmware-tree"] {
         let mut ok = cargo();
         ok.args(["test", "--package", package, "--lib"]);
         run_cmd(&mut ok)?;

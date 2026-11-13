@@ -28,6 +28,10 @@ bench = false
 ena-break-aenq = []
 # The ENA service exits once, 40 s into the uptime, so that init stops the device and starts it again (`cargo xtask aws image --ena-break-exit`).
 ena-break-exit = []
+# Deliberate break of the host tests (`cargo xtask ena-breaks`): an acknowledgement that
+# said WOULD_BLOCK counts as done.
+break-would-block = []
+break-msix-offset = []
 probe = []
 batch-16 = []
 batch-8 = []
@@ -78,10 +82,12 @@ virtio-net = { path = "../../lib/virtio-net" }
 virtio-pci = { path = "../../lib/virtio-pci" }
 # The driver of the ENA device (ena_service.rs).
 ena = { path = "../../lib/ena" }
+pci = { path = "../../lib/pci" }
 trace = { path = "../../lib/trace", optional = true }
 
 # The numbers of the neighbours on VZ's bus that the BARs of `pci` go past.
 [dev-dependencies]
+ena = { path = "../../lib/ena", features = ["model"] }
 virtio-console = { path = "../virtio-console" }
 virtio-rng = { path = "../virtio-rng" }
 

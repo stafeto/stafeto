@@ -18,6 +18,7 @@ pub mod choose;
 pub mod config;
 pub mod copy;
 pub mod demux;
+pub mod enawire;
 pub mod frames;
 pub mod gates;
 pub mod groups;

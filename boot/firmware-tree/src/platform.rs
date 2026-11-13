@@ -137,6 +137,11 @@ pub struct Platform {
     pub msi: Vec<MsiRange>,
     /// What was accepted with a caveat, for the loader's summary.
     pub warnings: Vec<&'static str>,
+    /// An SMMU stands between a root complex and the interrupt controller (the IORT chains
+    /// the root complex through an SMMU node): the addresses a device uses may be
+    /// translated, and no driver of this system programs an SMMU. The ENA's queues and
+    /// buffers hold physical addresses, so the loader refuses to go on with such a machine.
+    pub dma_translated: bool,
     /// The GICR base of every enabled GICC, until the version is known.
     gicc_gicr: Vec<u64>,
 }
@@ -433,6 +438,7 @@ impl Platform {
                     // SMMU's own mappings; the kernel drives no SMMU, so the
                     // chain folds into one RID to DeviceID range.
                     3 | 4 => {
+                        self.dma_translated |= !cfg!(feature = "break-smmu-ignore");
                         self.warnings
                             .push("IORT: root complex behind an SMMU (folded, no SMMU driver)");
                         for [s_in, s_ids, s_out, s_target, s_flags] in mappings(node(target)?)? {

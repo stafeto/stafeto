@@ -16,6 +16,7 @@
 
 pub mod admin;
 pub mod device;
+pub mod io;
 pub mod mmio;
 pub mod regs;
 
@@ -26,3 +27,4 @@ pub mod model;
 mod tests;
 
 pub use device::{Ena, Event, Failure, Info, KeepAlive, Platform, ReadMode, Region};
+pub use io::{Buffers, Io, Rx};

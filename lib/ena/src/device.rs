@@ -15,6 +15,7 @@
 //! same memory, from `Stage::Begin` with the cause the watchdog found.
 
 use crate::admin::{self as adm};
+use crate::io::{self, Buffers};
 use crate::regs;
 use core::fmt;
 
@@ -32,6 +33,18 @@ pub trait Platform {
     /// register read that gave the phase.
     fn rmb(&self) {}
     fn log(&self, line: fmt::Arguments<'_>);
+    /// The address and data of MSI-X vector `vector` (the owner bound the vectors
+    /// to events of the function's MSI device), or None for a vector that has
+    /// none: the device then runs on polling.
+    fn msi(&self, _vector: u16) -> Option<(u64, u32)> {
+        None
+    }
+    /// Sets the Enable and Function Mask bits of the function's MSI-X capability.
+    fn msix_control(&self, _enable: bool, _function_mask: bool) {}
+    /// The data path's state: `Some` once the queues are made (the owner of the
+    /// pair may use them), `None` the moment the driver starts a reset or fails
+    /// (before it touches the rings). Called from the admin side's thread.
+    fn io_state(&self, _up: Option<&io::Info>) {}
 }
 
 /// A piece of memory the device reads and writes: `len` bytes at `va` in
@@ -245,6 +258,20 @@ enum Stage {
     Configure {
         at: usize,
     },
+    /// The memory of the queue pair zeroed, 4 KiB a step.
+    ZeroIo {
+        at: usize,
+    },
+    /// The completion queue of sending, of receiving, then the submission
+    /// queue of sending and of receiving.
+    Queues {
+        at: usize,
+    },
+    /// The MSI-X table, 4 words a vector one a step, then the capability and
+    /// the admin vector.
+    Msix {
+        at: usize,
+    },
     /// Up; waiting for the first link event for a while.
     Running,
     Failed(Failure),
@@ -267,6 +294,8 @@ const FEATURES: [(u8, bool); 7] = [
 enum Pending {
     Feature { id: u8 },
     Set { id: u8 },
+    CreateCq { rx: bool },
+    CreateSq { rx: bool },
     Stats,
     Host,
 }
@@ -333,6 +362,18 @@ pub struct Ena<P: Platform> {
     /// The function's bus, device and function in 16 bits, and the CPUs: the host info.
     bdf: u16,
     cpus: u16,
+    /// The buffers of the pair, when the data path is wanted, and the offset
+    /// in BAR 0 of the MSI-X table.
+    bufs: Option<Buffers>,
+    msix_table: Option<u32>,
+    /// What the creation of the queues told, and the indices of the
+    /// completion queues for the submission queues.
+    io_info: io::Info,
+    cq_tx: u16,
+    cq_rx: u16,
+    /// A toggle of the MSI-X table was asked for, and is running.
+    toggle_asked: bool,
+    toggling: bool,
 }
 
 impl<P: Platform> Ena<P> {
@@ -403,6 +444,13 @@ impl<P: Platform> Ena<P> {
             hold_head: cfg!(feature = "break-aenq-head"),
             bdf: 0,
             cpus: 1,
+            bufs: None,
+            msix_table: None,
+            io_info: io::Info::default(),
+            cq_tx: 0,
+            cq_rx: 0,
+            toggle_asked: false,
+            toggling: false,
         })
     }
 
@@ -450,6 +498,31 @@ impl<P: Platform> Ena<P> {
     pub fn set_host(&mut self, bdf: u16, cpus: u16) {
         self.bdf = bdf;
         self.cpus = cpus;
+    }
+
+    /// Asks for the data path: after the features the driver makes one queue
+    /// pair over the buffers `bufs` (the memory of the region from `io::IO_AT`
+    /// holds its queues) and, when the owner has MSI-X vectors (`Platform::msi`),
+    /// fills the table at `msix_table` in BAR 0. Before the first `poll`.
+    pub fn set_data_path(&mut self, bufs: Buffers, msix_table: Option<u32>) -> Result<(), Failure> {
+        if self.region.len < io::IO_END || !bufs.va.is_multiple_of(8) || !bufs.pa.is_multiple_of(8)
+        {
+            return Err(Failure::Region);
+        }
+        self.bufs = Some(bufs);
+        self.msix_table = msix_table;
+        Ok(())
+    }
+
+    /// Writes the MSI-X table again once, with the sequence of the first fill (everything
+    /// masked, rewritten, unmasked): the next step of a running device starts it.
+    pub fn request_msix_toggle(&mut self) {
+        self.toggle_asked = true;
+    }
+
+    /// The doorbells and registers of the pair, once it is made.
+    pub fn io_info(&self) -> Option<io::Info> {
+        (self.stage == Stage::Running && self.bufs.is_some()).then_some(self.io_info)
     }
 
     /// Whether the driver has already tried the other read mode since it was last up.
@@ -623,12 +696,16 @@ impl<P: Platform> Ena<P> {
             Stage::Host => self.host(now),
             Stage::Features { at } => self.features(now, at),
             Stage::Configure { at } => self.configure(now, at),
+            Stage::ZeroIo { at } => self.zero_io(at),
+            Stage::Queues { at } => self.queues(now, at),
+            Stage::Msix { at } => self.msix(at),
             Stage::Running => self.running(now),
             Stage::Failed(f) => Event::Failed(f),
         }
     }
 
     fn fail(&mut self, failure: Failure) -> Event {
+        self.p.io_state(None);
         self.p.log(format_args!("ena: failed {failure:?}"));
         self.stage = Stage::Failed(failure);
         Event::Failed(failure)
@@ -648,6 +725,8 @@ impl<P: Platform> Ena<P> {
     /// The device asked to go down: counts it, and gives up after the
     /// third inside a minute.
     fn start_reset(&mut self, reason: u32, now: u64) -> Event {
+        // The owner of the pair stops using the rings before anything here touches them.
+        self.p.io_state(None);
         self.p.log(format_args!(
             "ena: reset reason {reason} after {} s",
             now.saturating_sub(self.up_ns) / (1000 * NS_PER_MS)
@@ -686,6 +765,8 @@ impl<P: Platform> Ena<P> {
 
     fn begin(&mut self, now: u64) -> Event {
         self.began_ns = now;
+        self.toggling = false;
+        self.toggle_asked = false;
         // Fresh books for the queues. The memory is zeroed once the reset is
         // over (`released`): an old device may still post into it until then.
         self.aq_tail = 0;
@@ -873,7 +954,8 @@ impl<P: Platform> Ena<P> {
             (controller & regs::CONTROLLER_VERSION_IMPL_ID_MASK) >> regs::CONTROLLER_VERSION_IMPL_ID_SHIFT,
         ));
         // Every address the device is given must fit its width.
-        let top = self.region.pa + self.region.len as u64 - 1;
+        let top =
+            (self.region.pa + self.region.len as u64).max(self.bufs.map_or(0, |b| b.top())) - 1;
         let fits = width == 0 || width >= 64 || top >> width == 0;
         if !fits && !cfg!(feature = "break-dma-width") {
             return self.fail(Failure::DmaWidth { width });
@@ -1250,6 +1332,219 @@ impl<P: Platform> Ena<P> {
             self.stage = Stage::Configure { at: 1 };
             return Event::Progress;
         }
+        self.stage = if self.bufs.is_some() {
+            Stage::ZeroIo { at: 0 }
+        } else {
+            return self.up(now);
+        };
+        Event::Progress
+    }
+
+    /// The queues' memory, 512 64-bit stores a step.
+    fn zero_io(&mut self, at: usize) -> Event {
+        self.zero(io::IO_AT + at * 4096, 4096);
+        self.stage = if (at + 1) * 4096 < io::IO_BYTES {
+            Stage::ZeroIo { at: at + 1 }
+        } else {
+            Stage::Queues { at: 0 }
+        };
+        Event::Progress
+    }
+
+    /// The four queues, one command each.
+    fn queues(&mut self, now: u64, at: usize) -> Event {
+        let bufs = self.bufs.expect("the data path was asked for");
+        let Some(command) = self.command else {
+            let pa = |off: usize| self.region.pa + off as u64;
+            let msi = self.p.msi(1).is_some();
+            match at {
+                0 | 1 => {
+                    let rx = at == 1;
+                    let (words, base) = if rx {
+                        (io::RX_CDESC_WORDS, io::RX_CQ_AT)
+                    } else {
+                        (io::TX_CDESC_WORDS, io::TX_CQ_AT)
+                    };
+                    // The receiving queue is the one that interrupts; completions of
+                    // sending are taken in the switch's own step.
+                    let interrupt = rx && msi;
+                    let base = pa(base);
+                    self.submit(adm::CREATE_CQ, Pending::CreateCq { rx }, now, |e| {
+                        e[adm::CQ_CAPS_1] = if interrupt { adm::CQ_INTERRUPT_MODE } else { 0 };
+                        e[adm::CQ_CAPS_2] = words;
+                        e[adm::CQ_DEPTH..][..2].copy_from_slice(&io::DEPTH.to_le_bytes());
+                        let vector: u32 = if interrupt { 1 } else { 0 };
+                        e[adm::CQ_MSIX_VECTOR..][..4].copy_from_slice(&vector.to_le_bytes());
+                        put_addr(e, adm::CQ_BA, base);
+                    });
+                }
+                _ => {
+                    let rx = at == 3;
+                    let (cq, base) = if rx {
+                        (self.cq_rx, io::RX_SQ_AT)
+                    } else {
+                        (self.cq_tx, io::TX_SQ_AT)
+                    };
+                    let direction = if rx {
+                        adm::SQ_DIRECTION_RX
+                    } else {
+                        adm::SQ_DIRECTION_TX
+                    };
+                    let base = pa(base);
+                    self.submit(adm::CREATE_SQ, Pending::CreateSq { rx }, now, |e| {
+                        e[adm::SQ_IDENTITY] = direction << adm::SQ_DIRECTION_SHIFT;
+                        e[adm::SQ_CAPS_2] = adm::PLACEMENT_HOST
+                            | adm::COMPLETION_POLICY_DESC << adm::COMPLETION_POLICY_SHIFT;
+                        e[adm::SQ_CAPS_3] = adm::SQ_PHYSICALLY_CONTIGUOUS;
+                        e[adm::SQ_CQ_IDX..][..2].copy_from_slice(&cq.to_le_bytes());
+                        e[adm::SQ_DEPTH..][..2].copy_from_slice(&io::DEPTH.to_le_bytes());
+                        put_addr(e, adm::SQ_BA, base);
+                    });
+                }
+            }
+            let _ = bufs;
+            return Event::Progress;
+        };
+        let Some((_, status, body)) = self.complete() else {
+            if now - command.sent_ns > self.admin_limit_ns() {
+                return self.recover(
+                    Failure::Admin {
+                        opcode: adm::CREATE_CQ,
+                        status: 0xFF,
+                    },
+                    now,
+                );
+            }
+            return Event::Idle;
+        };
+        if status != adm::SUCCESS {
+            let opcode = if at < 2 {
+                adm::CREATE_CQ
+            } else {
+                adm::CREATE_SQ
+            };
+            return self.recover(Failure::Admin { opcode, status }, now);
+        }
+        match command.pending {
+            Pending::CreateCq { rx } => {
+                let idx = self.read_u16(body + adm::CQ_RESP_IDX);
+                let head = self.read_u32(body + adm::CQ_RESP_HEAD_DB);
+                let unmask = self.read_u32(body + adm::CQ_RESP_UNMASK);
+                if rx {
+                    self.cq_rx = idx;
+                    self.io_info.rx_cq_head_db = head;
+                    self.io_info.rx_unmask = unmask;
+                } else {
+                    self.cq_tx = idx;
+                    self.io_info.tx_cq_head_db = head;
+                }
+            }
+            Pending::CreateSq { rx } => {
+                let db = self.read_u32(body + adm::SQ_RESP_DB);
+                if rx {
+                    self.io_info.rx_db = db;
+                } else {
+                    self.io_info.tx_db = db;
+                }
+            }
+            _ => {}
+        }
+        self.stage = if at + 1 < 4 {
+            Stage::Queues { at: at + 1 }
+        } else {
+            self.p.log(format_args!(
+                "ena: io tx db {:#x} rx db {:#x} rx unmask {:#x} cq heads {:#x} {:#x}",
+                self.io_info.tx_db,
+                self.io_info.rx_db,
+                self.io_info.rx_unmask,
+                self.io_info.tx_cq_head_db,
+                self.io_info.rx_cq_head_db
+            ));
+            if self.msix_table.is_some() && self.p.msi(0).is_some() {
+                Stage::Msix { at: 0 }
+            } else {
+                return self.up(now);
+            }
+        };
+        Event::Progress
+    }
+
+    /// The MSI-X table with the sequence of a driver that leaves nothing to the device's
+    /// guess, one register access a step: Enable together with Function Mask; for each
+    /// vector its entry masked (control word 1), the address (low, high) and the data written,
+    /// the data read back; then each entry unmasked (control word 0), Function Mask cleared
+    /// and the admin vector unmasked. An entry is never rewritten while it is unmasked and
+    /// the function is enabled without the function mask (a toggle runs the same steps).
+    fn msix(&mut self, at: usize) -> Event {
+        let table = self.msix_table.expect("asked for");
+        const VECTORS: usize = 2;
+        const PER: usize = 5;
+        let entry = |v: usize, word: usize| table + (v * adm::MSIX_ENTRY + 4 * word) as u32;
+        let unmask_from = 1 + PER * VECTORS;
+        let clear_at = unmask_from + VECTORS;
+        if at == 0 {
+            // `break-msix-order`: enabled with no function mask and no masked entry.
+            self.p
+                .msix_control(true, !cfg!(feature = "break-msix-order"));
+            self.stage = Stage::Msix { at: 1 };
+            return Event::Progress;
+        }
+        if at < unmask_from {
+            let (v, k) = ((at - 1) / PER, (at - 1) % PER);
+            let Some((addr, data)) = self.p.msi(v as u16) else {
+                // A vector without an event: the pair runs on polling.
+                self.stage = Stage::Msix {
+                    at: 1 + PER * (v + 1),
+                };
+                return Event::Progress;
+            };
+            let data = if cfg!(feature = "break-msix-data") {
+                data ^ 1
+            } else {
+                data
+            };
+            match k {
+                0 if !cfg!(feature = "break-msix-order") => {
+                    self.p.write32(entry(v, 3), adm::MSIX_MASKED)
+                }
+                0 => {}
+                1 => self.p.write32(entry(v, 0), addr as u32),
+                2 => self.p.write32(entry(v, 1), (addr >> 32) as u32),
+                3 => self.p.write32(entry(v, 2), data),
+                _ => {
+                    let back = self.p.read32(entry(v, 2));
+                    if back != data {
+                        self.p.log(format_args!(
+                            "ena: msix vector {v} data reads back {back:#x}, wrote {data:#x}"
+                        ));
+                    }
+                }
+            }
+            self.stage = Stage::Msix { at: at + 1 };
+            return Event::Progress;
+        }
+        if at < clear_at {
+            let v = at - unmask_from;
+            if self.p.msi(v as u16).is_some() {
+                self.p.write32(entry(v, 3), 0);
+            }
+            self.stage = Stage::Msix { at: at + 1 };
+            return Event::Progress;
+        }
+        if at == clear_at {
+            self.p.msix_control(true, false);
+            self.stage = Stage::Msix { at: at + 1 };
+            return Event::Progress;
+        }
+        // The admin vector: the device raises it for the events and the answers.
+        self.p.write32(regs::INTR_MASK, 0);
+        if self.toggling {
+            self.toggling = false;
+            self.p.log(format_args!("ena: msix toggle done"));
+            self.stage = Stage::Running;
+            return Event::Progress;
+        }
+        let now = self.p.now_ns();
         self.up(now)
     }
 
@@ -1262,6 +1557,9 @@ impl<P: Platform> Ena<P> {
             self.tried_other = false;
         }
         self.stage = Stage::Running;
+        if self.bufs.is_some() {
+            self.p.io_state(Some(&self.io_info));
+        }
         self.up_ns = now;
         self.keep_ns = now;
         self.watch_ns = now;
@@ -1278,6 +1576,13 @@ impl<P: Platform> Ena<P> {
     // Running.
 
     fn running(&mut self, now: u64) -> Event {
+        if self.toggle_asked && self.msix_table.is_some() && self.p.msi(0).is_some() {
+            self.toggle_asked = false;
+            self.toggling = true;
+            self.p.log(format_args!("ena: msix toggle"));
+            self.stage = Stage::Msix { at: 0 };
+            return Event::Progress;
+        }
         if let Some(command) = self.command {
             if let Some((c, status, body)) = self.complete() {
                 self.stats_done(c, status, body);
@@ -1440,4 +1745,11 @@ impl<P: Platform> Ena<P> {
         }
         None
     }
+}
+
+/// A 48-bit address in an `ena_common_mem_addr` of the entry at `at`: the low
+/// 32 bits, then the high 16 bits (and 16 reserved).
+fn put_addr(e: &mut [u8; adm::ENTRY], at: usize, pa: u64) {
+    e[at..at + 4].copy_from_slice(&(pa as u32).to_le_bytes());
+    e[at + 4..at + 6].copy_from_slice(&((pa >> 32) as u16).to_le_bytes());
 }
