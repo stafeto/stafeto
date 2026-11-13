@@ -11,7 +11,7 @@
 use super::ring::{ConsumerRing, Poll, Violation};
 use super::route::Reason;
 use crate::demux::PROBE_LIMIT;
-use crate::ports::{EPHEMERAL_FIRST, PortMap, Proto};
+use crate::ports::{Claims, EPHEMERAL_FIRST, PortMap, Proto};
 use core::hash::Hasher;
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
 use core::hash::SipHasher;
@@ -26,6 +26,9 @@ pub const MAX_GROUPS: usize = 32;
 pub const MAX_MEMBERS: usize = 8;
 /// The port-table value of consumer c's block is `BLOCK_MARK + c`.
 pub const BLOCK_MARK: u8 = 64;
+/// The value `port` answers for a port the stack instance k holds in the claims
+/// (`ports::Claims`) and the table itself leaves at 0: `OWN_MARK + k`.
+pub const OWN_MARK: u8 = 128;
 pub const BLOCK_PORTS: u16 = 512;
 const BLOCKS: usize = 32;
 /// Seconds a block rests after its consumer left (TIME-WAIT outlives the process).
@@ -582,6 +585,12 @@ pub struct Tables<'a> {
     pub consumers: [Option<Consumer>; MAX_CONSUMERS],
     pub instances: [Option<Internal>; MAX_INSTANCES],
     pub flows: Flows<'a>,
+    /// The ports the instances hold (`ports::CLAIMS`): what the table has no byte for steers
+    /// to the instance that holds the port. None without instances to claim.
+    claims: Option<&'static Claims>,
+    /// The generation the next attached instance gets (a place that is attached again never
+    /// shares a generation with its earlier life, so its old flows are not its own).
+    next_generation: u32,
     pub refused: [u32; Reason::COUNT],
     /// Groups freed that the stack has not been told of (bit n - 1 is group n); `commands::poll`
     /// sends `Back::Freed` and clears the bit.
@@ -614,6 +623,8 @@ impl<'a> Tables<'a> {
             consumers: [const { None }; MAX_CONSUMERS],
             instances: [None; MAX_INSTANCES],
             flows,
+            claims: None,
+            next_generation: 1,
             refused: [0; Reason::COUNT],
             freed: 0,
             swept_told: 0,
@@ -753,8 +764,30 @@ impl<'a> Tables<'a> {
         self.ports.as_ptr()
     }
 
+    /// The mark of `port`: the table's byte, or `OWN_MARK` + k for a port with no byte that
+    /// attached instance k holds.
     pub fn port(&self, proto: Proto, port: u16) -> u8 {
-        self.ports[Self::at(proto, port)]
+        let mark = self.ports[Self::at(proto, port)];
+        if mark != 0 {
+            return mark;
+        }
+        let held = self.claims.and_then(|c| c.owner(proto, port));
+        match held {
+            Some(k)
+                if self
+                    .instances
+                    .get(usize::from(k))
+                    .is_some_and(Option::is_some) =>
+            {
+                OWN_MARK + k
+            }
+            _ => 0,
+        }
+    }
+
+    /// The instances' ports are read from `claims` from now on.
+    pub fn set_claims(&mut self, claims: &'static Claims) {
+        self.claims = Some(claims);
     }
 
     fn mark(&mut self, proto: Proto, first: u16, count: u16, v: u8) {
@@ -803,18 +836,33 @@ impl<'a> Tables<'a> {
         }
     }
 
-    /// Instance `k` is a consumer of generation `generation` from now on, with a block of
-    /// outgoing ports of its own when `block` names one: the ports of the block go to it
-    /// (`BLOCK_MARK` + its number in the port table). False for a place that is taken or
-    /// absent, or a block that does not fit.
-    pub fn attach_instance(&mut self, k: usize, generation: u32, block: Option<u16>) -> bool {
+    /// Instance `k` is a consumer from now on, with a block of outgoing ports of its own when
+    /// `block` names one: the ports of the block go to it (`BLOCK_MARK` + its number in the
+    /// port table). It gets a generation no earlier life of any place had; None for a place
+    /// that is taken or absent, or a block that does not fit or meets a port another owner
+    /// has marked.
+    pub fn attach_instance(&mut self, k: usize, block: Option<u16>) -> Option<u32> {
         self.guard.check();
         if block.is_some_and(|b| u32::from(b) + u32::from(BLOCK_PORTS) > 65536) {
-            return false;
+            return None;
         }
+        if let Some(b) = block {
+            let free = [Proto::Tcp, Proto::Udp].into_iter().all(|proto| {
+                let at = Self::at(proto, b);
+                self.ports[at..at + usize::from(BLOCK_PORTS)]
+                    .iter()
+                    .all(|&m| m == 0)
+            });
+            if !free {
+                return None;
+            }
+        }
+        let generation = self.next_generation;
         let Some(slot @ None) = self.instances.get_mut(k) else {
-            return false;
+            return None;
         };
+        // Zero is no generation (a flow of the empty place would match it).
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
         *slot = Some(Internal {
             generation,
             block,
@@ -825,7 +873,7 @@ impl<'a> Tables<'a> {
                 self.mark(proto, b, BLOCK_PORTS, BLOCK_MARK + INTERNAL_BASE + k as u8);
             }
         }
-        true
+        Some(generation)
     }
 
     /// Takes instance `k` out of its groups and its block, as `detach` does a process.
@@ -894,6 +942,10 @@ impl<'a> Tables<'a> {
         if first == 0 || u32::from(first) + u32::from(count) > 65536 || count == 0 {
             return false;
         }
+        // A port an instance holds cannot be a group's.
+        let claimed = self.claims.is_some_and(|c| {
+            (first..first + u16::from(count)).any(|p| c.owner(proto, p).is_some())
+        });
         let Some(slot) = self.groups.get_mut(usize::from(number).wrapping_sub(1)) else {
             return false;
         };
@@ -912,6 +964,9 @@ impl<'a> Tables<'a> {
                     .iter()
                     .any(|&b| b != 0)
                 {
+                    return false;
+                }
+                if claimed {
                     return false;
                 }
                 *slot = Some(Group {
@@ -1096,15 +1151,23 @@ enum Number {
 /// the service keeps.
 pub trait Registry {
     fn held(&self, port: u16) -> bool;
-    fn hold(&mut self, port: u16);
+    /// False, and nothing held, when the port is held by another instance.
+    fn hold(&mut self, port: u16) -> bool;
     fn release(&mut self, port: u16);
     /// Whether none of the `count` ports from `first` is held. The maps answer a run of the
     /// ephemeral range a word of 64 ports at a time (a step of the service stays short).
     fn free_run(&self, first: u16, count: u16) -> bool {
         (0..count).all(|i| !self.held(first + i))
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
-        (0..count).for_each(|i| self.hold(first + i));
+    /// False, and nothing held, when one port of the run is held by another instance.
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
+        for i in 0..count {
+            if !self.hold(first + i) {
+                (0..i).for_each(|j| self.release(first + j));
+                return false;
+            }
+        }
+        true
     }
     fn release_run(&mut self, first: u16, count: u16) {
         (0..count).for_each(|i| self.release(first + i));
@@ -1115,7 +1178,7 @@ impl Registry for PortMap {
     fn free_run(&self, first: u16, count: u16) -> bool {
         PortMap::free_run(self, first, count)
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
         PortMap::hold_run(self, first, count)
     }
     fn release_run(&mut self, first: u16, count: u16) {
@@ -1124,7 +1187,7 @@ impl Registry for PortMap {
     fn held(&self, port: u16) -> bool {
         PortMap::held(self, port)
     }
-    fn hold(&mut self, port: u16) {
+    fn hold(&mut self, port: u16) -> bool {
         PortMap::hold(self, port)
     }
     fn release(&mut self, port: u16) {
@@ -1139,9 +1202,15 @@ impl Registry for Both<'_> {
     fn free_run(&self, first: u16, count: u16) -> bool {
         self.0.free_run(first, count) && self.1.free_run(first, count)
     }
-    fn hold_run(&mut self, first: u16, count: u16) {
-        self.0.hold_run(first, count);
-        self.1.hold_run(first, count);
+    fn hold_run(&mut self, first: u16, count: u16) -> bool {
+        if !self.0.hold_run(first, count) {
+            return false;
+        }
+        if !self.1.hold_run(first, count) {
+            self.0.release_run(first, count);
+            return false;
+        }
+        true
     }
     fn release_run(&mut self, first: u16, count: u16) {
         self.0.release_run(first, count);
@@ -1150,9 +1219,15 @@ impl Registry for Both<'_> {
     fn held(&self, port: u16) -> bool {
         self.0.held(port) || self.1.held(port)
     }
-    fn hold(&mut self, port: u16) {
-        self.0.hold(port);
-        self.1.hold(port);
+    fn hold(&mut self, port: u16) -> bool {
+        if !self.0.hold(port) {
+            return false;
+        }
+        if !self.1.hold(port) {
+            self.0.release(port);
+            return false;
+        }
+        true
     }
     fn release(&mut self, port: u16) {
         self.0.release(port);
@@ -1233,10 +1308,12 @@ impl Blocks {
     ) -> Option<(u8, u32, u16)> {
         self.expire(map, now);
         let c = (0..MAX_CONSUMERS).find(|&c| busy & (1 << c) == 0 && self.usable(c))?;
-        let b = (0..BLOCKS)
-            .rev()
-            .find(|&b| self.state[b] == Block::Free && map.free_run(Self::first(b), BLOCK_PORTS))?;
-        map.hold_run(Self::first(b), BLOCK_PORTS);
+        // A block another instance takes between the check and the hold is skipped.
+        let b = (0..BLOCKS).rev().find(|&b| {
+            self.state[b] == Block::Free
+                && map.free_run(Self::first(b), BLOCK_PORTS)
+                && map.hold_run(Self::first(b), BLOCK_PORTS)
+        })?;
         self.state[b] = Block::Held;
         self.owner[c] = Some(b);
         self.number[c] = Number::Free;
@@ -1549,6 +1626,53 @@ pub(crate) mod tests {
         assert_eq!(b.alloc(&mut map, 0).unwrap().2, 64512);
     }
 
+    /// The TCP and UDP maps of instances 0 and 1 over one set of claims (boxed: a map is
+    /// large).
+    fn instance_maps() -> [Box<PortMap>; 4] {
+        let claims: &'static crate::ports::Claims =
+            Box::leak(Box::new(crate::ports::Claims::new()));
+        [
+            (0, Proto::Tcp),
+            (0, Proto::Udp),
+            (1, Proto::Tcp),
+            (1, Proto::Udp),
+        ]
+        .map(|(who, proto)| {
+            let mut map = Box::new(PortMap::new());
+            map.share(claims, who, proto);
+            map
+        })
+    }
+
+    #[test]
+    fn a_consumer_block_is_out_of_reach_of_the_ports_of_the_other_instances() {
+        let [mut t0, mut u0, mut t1, u1] = instance_maps();
+        let mut b = Blocks::new();
+        let (_, _, first) = b.alloc(&mut Both(&mut t0, &mut u0), 0).unwrap();
+        for port in [first, first + 200, first + 511] {
+            assert!(t1.held(port) && u1.held(port));
+            assert!(!t1.hold(port));
+        }
+        // Instance 1's choice of a port keeps out of the block.
+        for offset in [0, 1, u32::from(first - EPHEMERAL_FIRST), 12345] {
+            let port = crate::ports::ephemeral(offset, 0, &t1).unwrap();
+            assert!(port < first || port - first >= BLOCK_PORTS);
+        }
+    }
+
+    #[test]
+    fn a_block_is_not_given_over_the_ports_of_another_instance() {
+        let [mut t0, mut u0, mut t1, _] = instance_maps();
+        let mut b = Blocks::new();
+        // Instance 1 holds a port in every block but the second one from the start.
+        for n in (0..BLOCKS as u16).filter(|n| *n != 1) {
+            assert!(t1.hold(EPHEMERAL_FIRST + n * BLOCK_PORTS + 17));
+        }
+        let (_, _, first) = b.alloc(&mut Both(&mut t0, &mut u0), 0).unwrap();
+        assert_eq!(first, EPHEMERAL_FIRST + BLOCK_PORTS);
+        assert!(b.alloc(&mut Both(&mut t0, &mut u0), 0).is_none());
+    }
+
     #[test]
     fn the_stack_thread_cannot_write_a_table_outside_the_ring() {
         let (mut ports, mut mem) = (vec![0u8; 131072], vec![Flow::EMPTY; 64]);
@@ -1642,13 +1766,18 @@ pub(crate) mod tests {
     #[test]
     fn an_instance_takes_a_free_place_and_a_block_that_fits_and_gives_both_back() {
         with(|t, _| {
-            assert!(!t.attach_instance(MAX_INSTANCES, 1, None), "no such place");
-            assert!(
-                !t.attach_instance(0, 1, Some(65535)),
+            assert_eq!(
+                t.attach_instance(MAX_INSTANCES, None),
+                None,
+                "no such place"
+            );
+            assert_eq!(
+                t.attach_instance(0, Some(65535)),
+                None,
                 "the block runs off the ports"
             );
-            assert!(t.attach_instance(0, 1, Some(51200)));
-            assert!(!t.attach_instance(0, 2, None), "the place is taken");
+            assert_eq!(t.attach_instance(0, Some(51200)), Some(1));
+            assert_eq!(t.attach_instance(0, None), None, "the place is taken");
             for proto in [Proto::Tcp, Proto::Udp] {
                 assert_eq!(t.port(proto, 51200), BLOCK_MARK + INTERNAL_BASE);
                 assert_eq!(
@@ -1671,7 +1800,53 @@ pub(crate) mod tests {
                     .flatten()
                     .any(|m| m.0 == INTERNAL_BASE)
             );
-            assert!(t.attach_instance(0, 2, None), "the place is free again");
+            // The place is free again, with a generation of its own: nothing of the
+            // first life (its flows, its group memberships) is the new one's.
+            let again = t.attach_instance(0, None).expect("the place is free again");
+            assert_ne!(again, 1);
+            assert!(!t.live(INTERNAL_BASE, 1) && t.live(INTERNAL_BASE, again));
+        });
+    }
+
+    #[test]
+    fn a_block_that_meets_ports_another_owner_marked_is_refused() {
+        with(|t, _| {
+            // Instance 0 holds the block; instance 1 asks for one that overlaps its end.
+            assert!(t.attach_instance(0, Some(51200)).is_some());
+            assert_eq!(
+                t.attach_instance(1, Some(51200 + BLOCK_PORTS - 1)),
+                None,
+                "one port of the first block"
+            );
+            assert!(t.instances[1].is_none(), "nothing was taken");
+            assert!(t.attach_instance(1, Some(51200 + BLOCK_PORTS)).is_some());
+            // A group's port inside the block asked for is no free block either.
+            assert!(t.hold(7, Proto::Udp, 40000, 1));
+            assert_eq!(t.attach_instance(2, Some(40000 - 7)), None);
+        });
+    }
+
+    #[test]
+    fn the_ports_the_instances_hold_steer_to_them_and_leave_with_them() {
+        let claims: &'static Claims = Box::leak(Box::new(Claims::new()));
+        with(|t, _| {
+            t.set_claims(claims);
+            assert!(claims.claim(Proto::Tcp, 8085, 1));
+            assert_eq!(
+                t.port(Proto::Tcp, 8085),
+                0,
+                "instance 1 is not attached yet"
+            );
+            assert!(t.attach_instance(1, None).is_some());
+            assert_eq!(t.port(Proto::Tcp, 8085), OWN_MARK + 1);
+            assert_eq!(t.port(Proto::Udp, 8085), 0, "the other protocol");
+            // A group cannot hold ports the table has no byte for but an instance has.
+            assert!(t.detach_instance(1));
+            assert_eq!(
+                t.port(Proto::Tcp, 8085),
+                0,
+                "an instance that left steers nothing"
+            );
         });
     }
 }

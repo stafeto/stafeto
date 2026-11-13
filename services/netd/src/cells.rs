@@ -66,7 +66,7 @@ impl Net {
             Ok(i) => i,
             Err(Refusal::Full) => return Answer::Status(Status::Kernel(Error::LimitReached)),
         };
-        let at = dma::buffer_at(i);
+        let at = dma::buffer_at(self.buffers.address_of(i));
         match sys::mem_map(
             process,
             &object,
@@ -108,7 +108,13 @@ impl Net {
         };
         // SAFETY: nothing of the service's own lies in the buffer's range;
         // the bytes there are the client's.
-        let gone = unsafe { sys::mem_unmap(process, dma::buffer_at(i), BUFFER_SIZE as u64) };
+        let gone = unsafe {
+            sys::mem_unmap(
+                process,
+                dma::buffer_at(self.buffers.address_of(i)),
+                BUFFER_SIZE as u64,
+            )
+        };
         if gone.is_ok() {
             self.buffers.free(i);
         }
@@ -157,7 +163,7 @@ impl Net {
         if !self.buffers.owned_by(i, s.label()) || !proto_net::cell_fits(offset, len) {
             return Err(proto_net::INVALID);
         }
-        Ok(dma::buffer_at(i) + offset as usize)
+        Ok(dma::buffer_at(self.buffers.address_of(i)) + offset as usize)
     }
 
     /// GETOPT BUFFERS and BUFFERED.

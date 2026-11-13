@@ -29,11 +29,12 @@ use crate::sockets::{
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, KEPT_FLAGS, MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL,
     MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN,
     SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
-    SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_TYPE, SOCK_DGRAM,
+    SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_STAFETO_CALLS,
+    SO_STAFETO_COUNT, SO_STAFETO_HOME, SO_STAFETO_HOMING, SO_STAFETO_REMOTE, SO_TYPE, SOCK_DGRAM,
     SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
 };
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_fs::{NetTarget, Target};
 use proto_net::sockets::{self as wire, CLONE_MAX, List, Request, opt};
 use proto_net::{Address, DATA_MAX};
@@ -63,6 +64,24 @@ const EINPROGRESS: i32 = 115;
 /// The session with the network service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
 
+/// The session handle that the home replaced, kept open for the life of the process (homing
+/// happens once): a reader that took the old handle before the swap (the clone of a spawn, a
+/// thread in a socketless call) still holds a handle to the right service, and a number that
+/// was closed cannot be made again for something else under it. `abandon` closes it.
+static PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Where the process stands with the home of its session (HOME): not asked, asking, done.
+static HOMING: AtomicU32 = AtomicU32::new(0);
+const NOT_ASKED: u32 = 0;
+const ASKING: u32 = 1;
+const ASKED: u32 = 2;
+/// The CPU the instance of the service that holds the session runs on (`u32::MAX` before the
+/// reply of HOME), and whether the calls from other CPUs are counted (a test of the
+/// placement sets it with `SO_STAFETO_COUNT`) and how many were.
+static HOME_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static REMOTE: AtomicU32 = AtomicU32::new(0);
+
 /// The process's session with the network service, which the start gives
 /// (init's CONNECT, or the loader's slot Net), and the hook that closes the
 /// descriptions the layer's descriptors held.
@@ -82,16 +101,128 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    // The parked handle is the parent's: the child has none.
+    PARKED.store(0, Ordering::Release);
+    // The image carries the flag and `HOME_CPU` of the thread that forked. A thread of the
+    // parent that stood in the middle of its ask (ASKING) has no counterpart in the child to
+    // finish it, so the child's first call that makes a socket would wait for ever: the child
+    // stays in the home its clone of the session stands in.
+    let _ = HOMING.compare_exchange(ASKING, ASKED, Ordering::AcqRel, Ordering::Acquire);
+    // TODO(#615 P3): a child that holds only listening sockets chooses a home of its own.
     // The clone has no shared buffer: the child asks for its own.
     netbuf::after_fork();
 }
 
-/// The session with the network service, for the requests and for the
-/// clones a child gets.
+unsafe extern "C" {
+    fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
+}
+
+/// Whether the probe hook of the home flag (`SO_STAFETO_HOMING`) is open: only in a process
+/// whose environment names it (`STAFETO_NET_PROBE`), as `STAFETO_FILE_CACHE` does for the cache.
+fn probe_on() -> bool {
+    // SAFETY: a NUL-terminated name; the answer is a C string or null.
+    !unsafe { getenv(c"STAFETO_NET_PROBE".as_ptr()) }.is_null()
+}
+
+/// The session with the network service, for the requests. The first call settles the home of
+/// the session (the rule: the home is the CPU of the first network call), and a call that finds
+/// an ask in progress waits for it. The handle the home replaces is parked, not closed, so the
+/// settling is not what keeps a reader's handle alive.
 pub fn session() -> Option<rt::abi::Handle> {
+    // Every reader of `SESSION` waits for the home of the session to be settled: the reply of
+    // HOME replaces the handle and closes the old one, which a thread that read it before (a
+    // call without a socket: CONFIG, the resolver) would still hold, and a handle number that
+    // is made again would send its call to another service. After the first call this is one
+    // load.
+    if HOMING.load(Ordering::Acquire) != ASKED {
+        ensure_home();
+    }
+    if COUNTING.load(Ordering::Relaxed) {
+        note_cpu();
+    }
     match SESSION.load(Ordering::Acquire) {
         0 => None,
         raw => Some(rt::abi::Handle(raw)),
+    }
+}
+
+/// The session for a reader that must not start or wait for the ask of the home (the clone a
+/// child gets in fork and spawn, the exec's slot table and `abandon`, the look of `poll`): it
+/// runs on the CPU of the parent or of the old image and must not home the process there, and
+/// in an exec the thread that was asking is stopped and never ends the ask. The handle it reads
+/// is live whatever a homing thread does meanwhile: the replaced one is parked, not closed.
+pub fn session_passive() -> Option<rt::abi::Handle> {
+    match SESSION.load(Ordering::Acquire) {
+        0 => None,
+        raw => Some(rt::abi::Handle(raw)),
+    }
+}
+
+/// Counts a call that does not come from the CPU of the instance that holds the session.
+#[cold]
+fn note_cpu() {
+    let home = HOME_CPU.load(Ordering::Relaxed);
+    if home != u32::MAX && rt::sys::cpu_info(0).is_ok_and(|info| info.current != u64::from(home)) {
+        REMOTE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The session's place with the service, once, before the first call that makes or touches a
+/// socket: the service gives the session a home instance, the one that runs on the CPU of this
+/// thread (HOME), and when that is not the instance that holds the session now, the reply brings
+/// the session on the home's channel, which takes the place of the old one. The session has no
+/// sockets yet, so nothing moves with it. A forked child keeps what its parent had (the flag is
+/// copied with the image, and the clone of the session stands where the parent's does); an
+/// exec'd image asks again and hears that the session is homed. An error leaves the session as
+/// it is.
+pub(crate) fn ensure_home() {
+    loop {
+        match HOMING.compare_exchange(NOT_ASKED, ASKING, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                home_session();
+                HOMING.store(ASKED, Ordering::Release);
+                return;
+            }
+            Err(ASKED) => return,
+            // Another thread asks: its reply is what this one waits for.
+            Err(_) => {
+                let _ = rt::sys::yield_now();
+            }
+        }
+    }
+}
+
+fn home_session() {
+    let raw = SESSION.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let service = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+    let Ok(info) = rt::sys::cpu_info(0) else {
+        return;
+    };
+    let mut w = Writer::new();
+    if proto_net::write_home(info.current as u32, info.allowed as u32, &mut w).is_err() {
+        return;
+    }
+    let mut reply = loop {
+        match rt::sys::send(&service, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            Err(_) => return,
+            Ok(reply) => break reply,
+        }
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut r = Reader::new(reply.bytes(&mut buffer));
+    if r.u32().map(Status::from_code) != Ok(Status::Ok) {
+        return;
+    }
+    let Ok(cpu) = r.u32() else { return };
+    HOME_CPU.store(cpu, Ordering::Release);
+    if let Ok(home) = reply.handles.take::<Channel>(0) {
+        // The home's session takes the place of the old one, which is parked, not closed.
+        let old = SESSION.swap(home.into_raw().0, Ordering::AcqRel);
+        PARKED.store(old, Ordering::Release);
     }
 }
 
@@ -318,6 +449,8 @@ pub(crate) fn epoll_set(
     list: wire::EpollList,
     statuses: &mut [u32; wire::EPOLL_BATCH],
 ) -> Result<u32, i32> {
+    // A set lives in the home with the sockets it holds.
+    ensure_home();
     let service = channel()?;
     let mut w = Writer::new();
     Request::EpollSet { set, list }
@@ -386,7 +519,19 @@ fn close_description(description: u32) {
 /// threads never end their waits. The service lets go of a few operations
 /// in each answer and says how many are left; the ask goes on until none is.
 pub(crate) fn abandon() {
-    let Ok(service) = channel() else { return };
+    // An exec must not home the old image on the CPU it happens to run on: the new image asks
+    // for its own home at its first call. The other threads are stopped, so the parked handle
+    // of an earlier home (no reader holds it any more) closes here.
+    abandon_on_session();
+    let parked = PARKED.swap(0, Ordering::AcqRel);
+    if parked != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(parked)));
+    }
+}
+
+fn abandon_on_session() {
+    let Some(raw) = session_passive() else { return };
+    let service = ManuallyDrop::new(Handle::<Channel>::borrowed(raw));
     let request = proto_net::Method::Abandon.header().bytes();
     loop {
         let reply = match rt::sys::send(&service, &request) {
@@ -416,7 +561,8 @@ pub(crate) fn abandon() {
 pub(crate) fn clone_kept(
     mut portion: impl FnMut(&mut [u32; CLONE_MAX]) -> Result<(usize, bool), i32>,
 ) -> Result<Option<Handle<Channel>>, i32> {
-    let Some(raw) = session() else {
+    // The parent's CPU is not the child's: the clone must not home the parent.
+    let Some(raw) = session_passive() else {
         return Ok(None);
     };
     let service = Handle::<Channel>::borrowed(raw);
@@ -606,6 +752,7 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
     if domain != AF_INET {
         return Err(EAFNOSUPPORT);
     }
+    ensure_home();
     if kind & !(0xf | SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
@@ -799,6 +946,8 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
         SO_DOMAIN => (opt::DOMAIN, false),
         SO_STAFETO_BUFFERS => (opt::BUFFERS, false),
         SO_STAFETO_BUFFERED => (opt::BUFFERED, false),
+        SO_STAFETO_HOME => (opt::HOME, false),
+        SO_STAFETO_CALLS => (opt::CALLS, false),
         _ => return Err(ENOPROTOOPT),
     })
 }
@@ -869,6 +1018,23 @@ fn value_of(number: u32, value: &[u8]) -> Result<u32, i32> {
 /// getsockopt: the int of the option into `out`; its true length, 4 (8 for
 /// SO_LINGER, 16 for the timeouts).
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
+    // The layer's own count of the calls from other CPUs (no request to the service).
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING && probe_on() {
+        return with_socket(fd, |_| {
+            let bytes = HOMING.load(Ordering::Acquire).to_ne_bytes();
+            let n = out.len().min(4);
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(4)
+        });
+    }
+    if level == SOL_SOCKET && name == SO_STAFETO_REMOTE {
+        return with_socket(fd, |_| {
+            let bytes = REMOTE.load(Ordering::Relaxed).to_ne_bytes();
+            let n = out.len().min(4);
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(4)
+        });
+    }
     if let Some(number) = structured(level, name) {
         return with_socket(fd, |description| {
             let value = word(&Request::GetOpt {
@@ -901,6 +1067,29 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usiz
 }
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
+    if level == SOL_SOCKET && name == SO_STAFETO_COUNT {
+        if value.len() < 4 {
+            return Err(EINVAL);
+        }
+        let on = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) != 0;
+        return with_socket(fd, |_| {
+            REMOTE.store(0, Ordering::Relaxed);
+            COUNTING.store(on, Ordering::Relaxed);
+            Ok(())
+        });
+    }
+    // A probe of the fork rule: 1 puts the flag of the home in the state of a thread that is
+    // in the middle of its ask, 0 puts it back to done.
+    if level == SOL_SOCKET && name == SO_STAFETO_HOMING && probe_on() {
+        if value.len() < 4 {
+            return Err(EINVAL);
+        }
+        let on = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) != 0;
+        return with_socket(fd, |_| {
+            HOMING.store(if on { ASKING } else { ASKED }, Ordering::Release);
+            Ok(())
+        });
+    }
     if let Some(number) = structured(level, name) {
         let word = value_of(number, value)?;
         return with_socket(fd, |description| {

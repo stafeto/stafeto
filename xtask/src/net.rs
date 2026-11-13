@@ -20,8 +20,9 @@ pub const ITS_IMAGE: &str = "boot-net-its.img";
 /// file `netd.conf`): about 62 KiB in the release build at 256 places, more at
 /// 320 groups of sockets (1 280 places); the image of two devices ran out of
 /// 128 KiB inside the second device's queue. 192 KiB leaves the calls under it
-/// their room.
-pub const NETD_STACK_SIZE: u32 = 192 * 1024;
+/// their room. 224 KiB since the run guard of the instances (192 KiB left the frame of `main`
+/// and `Switch::new` with nothing under them in the one-instance image).
+pub const NETD_STACK_SIZE: u32 = 224 * 1024;
 
 /// The ports of the host forwarded to the guest: HTTP and SSH.
 pub const FORWARDS: [qemu::Forward; 2] = [
@@ -45,7 +46,7 @@ pub fn programs() -> &'static [ImageProgram] {
     LIST.get_or_init(|| {
         let mut programs = shell_programs().to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-net"]);
-        programs.push(("netd", "netd", NETD_STACK_SIZE, &[]));
+        programs.push(("netd", "netd", NETD_STACK_SIZE, &["instances-2"]));
         let net: Vec<packages::Package> = packages::of_image(IMAGE)
             .unwrap_or_else(|e| panic!("{IMAGE}: {e}"))
             .into_iter()
@@ -88,6 +89,8 @@ pub fn vz_programs(two: bool) -> &'static [ImageProgram] {
                 "uart" => {
                     *program = ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]);
                 }
+                // The images of VZ have four CPUs: room for an instance on each.
+                "netd" => program.3 = &["instances-4"],
                 _ => {}
             }
         }
