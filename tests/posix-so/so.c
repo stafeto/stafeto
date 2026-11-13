@@ -375,6 +375,23 @@ static void dl(void) {
     if (bits & 4096) printf("posix-so: so-hello dl said: %s", buf);
 }
 
+/* 14: the stack protector in a dynamic program. The canary the program sees is libc.so's and is
+ * set; an overflow in a protected function ends the program by SIGABRT, which the parent sees. */
+static void stack_protector(void) {
+    char buf[512];
+    int status = -1;
+    char *guard_argv[] = {(char *)"/bin/so-hello", (char *)"guard", NULL};
+    int error = run(guard_argv, buf, sizeof buf, &status);
+    check(8192, "so-hello sees a canary that is set, with a zero low byte",
+          error == 0 && exited_with(status, 0));
+    char *smash_argv[] = {(char *)"/bin/so-hello", (char *)"smash", NULL};
+    error = run(smash_argv, buf, sizeof buf, &status);
+    check(8192, "an overflow in a protected function of so-hello ends it by SIGABRT",
+          error == 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    if (!(bits & 8192))
+        printf("posix-so: a stack overflow in a protected function of a dynamic program ended it by SIGABRT\n");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "quick") == 0) {
         uint64_t at = ticks();
@@ -400,6 +417,7 @@ int main(int argc, char **argv) {
     no_exec();
     secure();
     dl();
+    stack_protector();
     rewrite();
     spawn_times();
     if (bits) {

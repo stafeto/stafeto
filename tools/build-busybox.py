@@ -382,7 +382,7 @@ def build(utilities: bool) -> None:
     run("make", "-j4", *[d + "/" for d in DIRECTORIES], f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
-            f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
+            f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fstack-protector-strong",
             "-ffunction-sections", "-fdata-sections", "-Dmain=applets_main", PIC,
             A53_ERRATA, *UNWIND_CFLAGS,
             # clang reads a global that is const only once, before BusyBox sets

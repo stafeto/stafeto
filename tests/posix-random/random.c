@@ -293,6 +293,35 @@ static int canary(void) {
     return 0;
 }
 
+/* A protected function (a local array, so -fstack-protector-strong gives it a canary) that
+ * writes past its buffer with a length known only at run time. The canary sits above the buffer,
+ * so the return finds it changed and calls __stack_chk_fail. Without the protector the function
+ * returns and the program goes on. */
+__attribute__((noinline)) static void overflow(size_t length) {
+    char buffer[16];
+    memset(buffer, 'A', length);
+    __asm__ volatile("" : : "r"(buffer) : "memory");
+}
+
+/* The role `smash`: overflows a buffer and, if the function returns, ends with 0. */
+static int smash_role(void) {
+    volatile size_t length = 64;
+    overflow(length);
+    return 0;
+}
+
+/* The program that smashed its stack ends by SIGABRT and its parent sees the signal. */
+static int smash(void) {
+    char *argv[] = {"posix-random", (char *)"smash", NULL};
+    pid_t pid = 0;
+    CHECK(posix_spawn(&pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    printf("posix-random: a stack overflow in a protected function ended the program by SIGABRT\n");
+    return 0;
+}
+
 /* The role `noentropy`: the session with the entropy service is gone before the process asked
  * the generator for a byte (the program started with AT_RANDOM, so its start took none). Every
  * call that needs a random name fails with ENOSYS and no name made of the clock comes: the
@@ -847,6 +876,7 @@ static int first(void) {
     CHECK(descriptor() == 0);
     CHECK(at_random() == 0);
     CHECK(canary() == 0);
+    CHECK(smash() == 0);
     CHECK(spawn_role("noentropy", -1) == 0);
     CHECK(forged() == 0);
     CHECK(forged_pipes() == 0);
@@ -957,6 +987,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "setidpipe") == 0) return setid_pipe_role();
     if (argc > 2 && strcmp(argv[1], "auxrandom") == 0) return auxrandom_role(argv[2]);
     if (argc > 2 && strcmp(argv[1], "canary") == 0) return canary_role(argv[2]);
+    if (argc > 1 && strcmp(argv[1], "smash") == 0) return smash_role();
     if (argc > 1 && strcmp(argv[1], "noentropy") == 0) return no_entropy_role();
     if (argc > 2 && strcmp(argv[1], "fdread") == 0) return fd_read(argv[2]);
     if (argc > 2 && strcmp(argv[1], "fdclosed") == 0) return fd_closed(argv[2]);

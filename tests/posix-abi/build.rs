@@ -50,7 +50,7 @@ fn main() {
             // The probe checks the library: the compiler must not answer
             // for malloc, calloc or the string functions.
             "-fno-builtin",
-            "-fno-stack-protector",
+            "-fstack-protector-strong",
             "-fno-pic",
             "-std=c11",
             "-O2",

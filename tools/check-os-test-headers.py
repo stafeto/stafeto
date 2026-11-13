@@ -53,7 +53,8 @@ def cross_env():
 def target_flags(sysroot):
     return ["--target=aarch64-linux-gnu", "-nostdinc", "-isystem",
             str(sysroot / "include"), "-std=c17", "-mno-outline-atomics",
-            "-mfix-cortex-a53-835769", "-fno-stack-protector", "-Wall", "-Wextra",
+            "-mfix-cortex-a53-835769", "-fno-stack-protector",  # compile-only header check, nothing runs
+            "-Wall", "-Wextra",
             "-Werror", "-Wno-error=deprecated", "-Wno-error=deprecated-declarations"]
 
 

@@ -409,6 +409,8 @@ pub fn probe_table(source: &Path, includes: &[PathBuf], work: &Path) -> Result<V
     cc.args([
         "--target=aarch64-linux-gnu",
         "-nostdinc",
+        // The object is only read for its section and never runs, so a canary
+        // would add symbols and no protection.
         "-fno-stack-protector",
         "-fno-builtin",
         "-std=c11",

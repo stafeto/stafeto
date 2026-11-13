@@ -339,7 +339,7 @@ def build(env: dict) -> None:
     # The host is Darwin; the target uses the Linux AArch64 binary128 ABI.
     run("make", "-j4", "libopenlibm.a", "OS=Linux", "ARCH=aarch64", "USECLANG=1",
         "USEGCC=0", f"CC={llvm('clang')}", f"AR={llvm('llvm-ar')}",
-        f"CFLAGS={cflags} -ffp-model=strict -ffunction-sections -fdata-sections -fno-stack-protector"
+        f"CFLAGS={cflags} -ffp-model=strict -ffunction-sections -fdata-sections -fstack-protector-strong"
         f" -I{SYSROOT / 'include'}", cwd=math, env=env)
     destination = SYSROOT / "lib"
     destination.mkdir(parents=True, exist_ok=True)

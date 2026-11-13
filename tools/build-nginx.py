@@ -247,7 +247,7 @@ def main() -> None:
     ncurses_module().stubs(log, clang, nm, libc, stub)
     cc = WORK / "cc"
     compiler(cc, clang, lld, stub)
-    flags = " ".join(("-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
+    flags = " ".join(("-mno-outline-atomics", "-fstack-protector-strong", "-ffunction-sections",
                       "-fdata-sections", A53_ERRATA, "-fPIC", *UNWIND_CFLAGS, "-Os"))
     UNKNOWN.write_text("")
     ANSWERS.write_text("")

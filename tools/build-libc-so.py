@@ -90,7 +90,7 @@ HELPER = re.compile(r"^(__aarch64_\w+|__[a-z]+(tf|ti)[0-9]|__(fix|float|extend|t
 # list names them (HELPER). Filled from relibc's archive by `build`.
 HELPER_KEEP: dict = {}
 CLANG_FLAGS = ["--target=aarch64-linux-gnu", "-mfix-cortex-a53-835769", "-nostdinc",
-               "-fno-stack-protector", "-fno-builtin", "-std=c11", "-O2", "-Wall", "-Wextra",
+               "-fstack-protector-strong", "-fno-builtin", "-std=c11", "-O2", "-Wall", "-Wextra",
                "-Werror"]
 PROGRAM_LD = ["-z", "now", "-z", "norelro", "-z", "separate-loadable-segments",
               "-z", "max-page-size=4096", "--hash-style=gnu", "--fix-cortex-a53-843419"]
