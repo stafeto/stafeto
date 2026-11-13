@@ -471,46 +471,28 @@ fn a_reset_in_place_works_when_registers_are_read_through_memory() {
     assert_eq!(model.violations(), Vec::<String>::new());
 }
 
+/// The device posts no event before the head doorbell is written, and the
+/// driver writes it once the groups are set.
 #[test]
-fn a_device_that_wants_the_host_info_sends_events_only_after_it() {
-    let s = Scenario {
-        needs_host_info: true,
-        ..Scenario::default()
-    };
-    // The plain bring-up gets no keep-alive: the watchdog resets the device.
-    let (model, mut ena) = rig_at(1, s.clone(), 0x4_3000_0000);
-    let events = run(&model, &mut ena, 12 * S);
-    assert!(events.contains(&Event::Resetting(regs::RESET_KEEP_ALIVE_TO)));
-    assert!(model.host_info().is_none());
-    assert!(has_line(&model, "ena: no keep-alive; variant 0 aenq tail"));
-    // With the host info (variant 1) the events come and the page holds what the host said.
-    let (model, mut ena) = rig_at(1, s, 0x4_3000_0000);
-    ena.set_variant(1);
-    ena.set_host(crate::device::HostInfo {
-        os_type: 0,
-        bdf: 0x28,
-        cpus: 2,
-    });
-    run(&model, &mut ena, 12 * S);
-    assert_eq!(ena.resets().count, 0);
-    assert!(ena.keep_alive().count >= 8);
-    assert!(has_line(&model, "ena: host info set"));
-    let page = model.host_info().unwrap();
-    assert_eq!(&page[4..11], b"stafeto");
-}
-
-#[test]
-fn the_admin_interrupt_stays_masked_unless_the_variant_unmasks_it() {
+fn the_event_doorbell_is_written_after_the_groups_are_set() {
     let (model, mut ena) = rig(1);
-    run(&model, &mut ena, 3 * S);
-    assert_eq!(model.intr_mask(), regs::ADMIN_INTR_MASK);
-    let s = Scenario {
-        needs_unmasked: true,
-        ..Scenario::default()
-    };
-    let (model, mut ena) = rig_at(1, s, 0x4_3000_0000);
-    ena.set_variant(2);
-    run(&model, &mut ena, 10 * S);
-    assert_eq!(model.intr_mask(), 0);
-    assert!(ena.keep_alive().count >= 6);
+    // Step until the groups are set, then check the doorbell was not yet rung.
+    let mut seen_groups = false;
+    for _ in 0..4000 {
+        ena.poll();
+        if has_line(&model, "ena: aenq groups") && !seen_groups {
+            seen_groups = true;
+            assert_eq!(model.0.borrow().aenq_head_db_for_test(), 0);
+        }
+        model.advance(MS);
+        if ena.is_up() {
+            break;
+        }
+    }
+    assert!(
+        seen_groups && ena.is_up(),
+        "{seen_groups} {:#?}",
+        model.log_lines()
+    );
+    assert_eq!(model.0.borrow().aenq_head_db_for_test(), 16);
 }

@@ -12,7 +12,6 @@
 
 use abi::{Access, Source};
 use core::fmt;
-use ena::device::HostInfo;
 use ena::mmio::Bar;
 use ena::{Ena, Event, Platform, Region};
 use proto_init::ServiceArgs;
@@ -76,14 +75,8 @@ impl Platform for Hw {
     }
 }
 
-/// The trials of the bring-up, one per reset until the device sends its
-/// keep-alives (`Ena::set_variant`): bit 0 sends the host info, bit 1 leaves
-/// the admin interrupt unmasked, bit 2 gives the host info another OS type.
-const TRIALS: [u32; 6] = [0, 1, 2, 3, 5, 7];
-
 struct EnaService {
     ena: Ena<Hw>,
-    trial: usize,
     timer: Handle<Timer>,
     deadline: u64,
     /// The probe's deliberate break: after the first start the head of the
@@ -99,37 +92,19 @@ impl EnaService {
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
 
-    fn set_trial(&mut self) {
-        let variant = TRIALS[self.trial % TRIALS.len()];
-        let os_type = if variant & 4 != 0 { 4 } else { 0 };
-        self.ena.set_host(HostInfo {
-            os_type,
-            bdf: 0,
-            cpus: 2,
-        });
-        self.ena.set_variant(variant);
-        rt::println!("ena: trial variant {variant}");
-        #[cfg(feature = "ena-break-aenq")]
-        self.ena.hold_event_head(false);
-    }
-
     fn step(&mut self) {
         for _ in 0..STEPS {
             match self.ena.poll() {
                 Event::Idle => break,
                 Event::Failed(_) => sys::process_exit(FAILED),
-                Event::Resetting(_) => {
-                    // A reset because no keep-alive came: the next trial.
-                    self.trial += 1;
-                    self.ena.forgive_resets();
-                    self.set_trial();
-                }
                 #[cfg(feature = "ena-break-aenq")]
                 Event::Up if !self.broken => {
                     self.broken = true;
                     self.ena.hold_event_head(true);
                     rt::println!("ena: break: the event head is held");
                 }
+                #[cfg(feature = "ena-break-aenq")]
+                Event::Resetting(_) => self.ena.hold_event_head(false),
                 _ => {}
             }
         }
@@ -226,13 +201,11 @@ pub fn run(s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     };
     let mut service = EnaService {
         ena,
-        trial: 0,
         timer,
         deadline: 0,
         #[cfg(feature = "ena-break-aenq")]
         broken: false,
     };
-    service.set_trial();
     service.arm();
     let heartbeat = Heartbeat {
         to: &s.parent,

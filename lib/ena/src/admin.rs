@@ -46,7 +46,6 @@ pub const STATELESS_OFFLOAD_CONFIG: u8 = 11;
 pub const MTU: u8 = 14;
 pub const AENQ_CONFIG: u8 = 26;
 pub const LINK_CONFIG: u8 = 27;
-pub const HOST_ATTR_CONFIG: u8 = 28;
 
 // enum ena_admin_aq_caps_id: the bits of `capabilities` of the device
 // attributes.
@@ -240,28 +239,3 @@ pub const MAX_PHYS_ADDR_BITS: u32 = 48;
 pub const ADMIN_CMD_TIMEOUT_US: u64 = 3_000_000;
 /// `ENA_DEFAULT_KEEP_ALIVE_TO` of the FreeBSD driver's ena.h: 6 seconds.
 pub const KEEP_ALIVE_TIMEOUT_MS: u64 = 6_000;
-
-/// `ena_admin_set_feature_host_attr_desc`, from `FEAT_DATA`: `os_info_ba` (an
-/// `ena_common_mem_addr`: the low 32 bits, then the high 16 and 16 reserved)
-/// at 0, `debug_ba` at 8, `debug_area_size` at 16.
-pub const HOST_OS_INFO_BA: usize = 0;
-pub const HOST_DEBUG_BA: usize = 8;
-pub const HOST_DEBUG_SIZE: usize = 16;
-
-/// `ena_admin_host_info`, 4 KiB of physically contiguous memory in the host's:
-/// `os_type` (32 bits) at 0, `os_dist_str` (128 bytes) at 4, `os_dist` at 132,
-/// `kernel_ver_str` (32 bytes) at 136, `kernel_ver` at 168, `driver_version` at
-/// 172 (major in 7:0, minor 15:8, sub-minor 23:16), `supported_network_features`
-/// (two words) at 176, `ena_spec_version` (16 bits, major in the high byte) at
-/// 184, `bdf` (16 bits: function 2:0, device 7:3, bus 15:8) at 186, `num_cpus`
-/// (16 bits) at 188, `driver_supported_features` at 192.
-pub const HOST_INFO_OS_TYPE: usize = 0;
-pub const HOST_INFO_OS_DIST_STR: usize = 4;
-pub const HOST_INFO_KERNEL_VER_STR: usize = 136;
-pub const HOST_INFO_DRIVER_VERSION: usize = 172;
-pub const HOST_INFO_SPEC_VERSION: usize = 184;
-pub const HOST_INFO_BDF: usize = 186;
-pub const HOST_INFO_NUM_CPUS: usize = 188;
-/// `ENA_COMMON_SPEC_VERSION_MAJOR` and `_MINOR` of ena_common_defs.h.
-pub const SPEC_VERSION_MAJOR: u16 = 2;
-pub const SPEC_VERSION_MINOR: u16 = 0;
