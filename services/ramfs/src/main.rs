@@ -155,6 +155,12 @@ mod own_step {
     pub const RECLAIM: u64 = 6;
     pub const DEPARTURE: u64 = 7;
     pub const AUDIT: u64 = 8;
+    /// A lock request that sets: the locks of its inode before (bits 8 to 15) and after.
+    #[cfg(feature = "steps")]
+    pub const SET: u64 = 9;
+    /// A close event: the records held in the table before (bits 16 to 31) and after.
+    #[cfg(feature = "steps")]
+    pub const CLOSE: u64 = 10;
 
     pub fn sweep(turn: &ramfs::locks::simple::Sweep) -> u64 {
         LOCK_SWEEP << 48
@@ -3196,7 +3202,15 @@ impl Service<0> for Fs {
                     Ok(event) => event,
                     Err(error) => return Answer::Status(error),
                 };
-                match self.ram.close_event(&mut s.data, self.locks, event) {
+                #[cfg(feature = "steps")]
+                let before = self.locks.total();
+                let closed = self.ram.close_event(&mut s.data, self.locks, event);
+                // The detail of the longest step: the records of the table before and after.
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(
+                    own_step::CLOSE << 48 | (before as u64) << 16 | self.locks.total() as u64,
+                );
+                match closed {
                     Ok(inode) => {
                         if let Some(inode) = inode {
                             self.waits.changed(inode);
@@ -5276,10 +5290,22 @@ impl Fs {
                     .locks
                     .query(storage, captured.request, live)
                     .map(Response::Blocker),
-                Command::Set(_) => self
-                    .locks
-                    .set(storage, captured.root, captured.request, live)
-                    .map(|()| Response::Changed),
+                Command::Set(_) => {
+                    // The detail of the longest step: the locks of the inode before and after.
+                    #[cfg(feature = "steps")]
+                    let before = self.locks.count(captured.request.inode);
+                    let set = self
+                        .locks
+                        .set(storage, captured.root, captured.request, live)
+                        .map(|()| Response::Changed);
+                    #[cfg(feature = "steps")]
+                    rt::service::step_detail(
+                        own_step::SET << 48
+                            | (before as u64) << 8
+                            | self.locks.count(captured.request.inode) as u64,
+                    );
+                    set
+                }
             }
         };
         if result == Ok(Response::Changed)
