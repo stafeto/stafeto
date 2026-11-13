@@ -744,7 +744,7 @@ mod tests {
         assert!(p[0].starts_with("proto-fs "));
         // A change of one version changes the digest.
         let mut q = p.clone();
-        q[1] = "proto-net 2".into();
+        q[1] = "proto-net 99".into();
         assert_ne!(digest(&p), digest(&q));
     }
 

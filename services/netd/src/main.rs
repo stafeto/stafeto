@@ -62,6 +62,7 @@ mod kdump;
 mod msix;
 mod net;
 mod owner;
+mod roots;
 mod second;
 mod seed;
 mod split;
@@ -800,6 +801,8 @@ fn main(_: u64) -> u64 {
             return NOT_STARTED;
         }
     }
+    // The root for the loaders goes to the process service from a thread of its own.
+    roots::start(&s.process, &s.parent, &channel, level);
     instance::wait_forever(level)
 }
 
@@ -2399,12 +2402,12 @@ const SWEEP_NS: u64 = 1_000_000_000;
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 62, 63,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
 ];
 
 impl Driver<'_> {
@@ -2440,12 +2443,18 @@ impl Driver<'_> {
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        // VERIFY_SESSION goes through the root alone, and the root has no
+        // other request.
+        if (r.label() == proto_net::ROOT) != (method == Method::VerifySession.number()) {
+            return Answer::Status(code(proto_net::NOT_ALLOWED));
+        }
         trace::point(P_N_REQ_BEGIN, u32::from(method));
         self.inst.net.claim(s, r.label());
         self.inst.net.counters.calls += 1;
         let answer = match Method::from_number(r.method()) {
             Some(Method::Home) => self.home(s, r),
             Some(Method::HomeMake) => self.inst.net.home_make(s, r),
+            Some(Method::VerifySession) => self.inst.net.verify_session(s, r),
             Some(Method::Config) => self.config(r),
             #[cfg(feature = "probe")]
             Some(Method::Ping) => self.ping(r, stack::ECHO_DATA),

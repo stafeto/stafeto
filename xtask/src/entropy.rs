@@ -345,7 +345,7 @@ const RANDOM_LINES: [&str; 21] = [
     "posix-random: mkstemp gave",
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
-    "posix-random: a set-ID program takes no entropy session from its caller, and gives ENOSYS",
+    "posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request",
     "posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request",
     "posix-random: ok",
 ];
@@ -376,6 +376,102 @@ pub fn random_steps() -> Result<(), String> {
     if row.1 > crate::TERM_B * 9 / 10 {
         return Err(format!("VerifySession: a step past 0.9 of B: {row:?}"));
     }
+    Ok(())
+}
+
+/// The probe's image with the network service, and with its steps counted.
+const fn random_net_programs(netd: &'static [&'static str]) -> [ImageProgram; 10] {
+    let base = random_programs(&[]);
+    [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-random-net"]),
+        base[1],
+        base[2],
+        base[3],
+        base[4],
+        base[5],
+        base[6],
+        base[7],
+        base[8],
+        ("netd", "netd", crate::net_probe::NETD_STACK_SIZE, netd),
+    ]
+}
+static RANDOM_NET_PROGRAMS: [ImageProgram; 10] = random_net_programs(&[]);
+static RANDOM_NET_PROGRAMS_STEPS: [ImageProgram; 10] = random_net_programs(&["steps"]);
+
+/// The lines of the C probe's role `net`, each a check that passed.
+const RANDOM_NET_LINES: [&str; 3] = [
+    "posix-random: a set-ID program takes its net session from the service, and a forged one gets no request",
+    "posix-random: a set-ID program keeps the socket it inherited with its net session",
+    "posix-random: net ok",
+];
+
+/// The tag of the network service's lines of steps, and the kind of VerifySession.
+const NETD_TAG: &str = "14";
+const NETD_VERIFY_KIND: usize = 43;
+
+/// `cargo xtask posix-random-net`: the sessions of a set-ID program with the network service
+/// (tests/posix-random, role `net`): the image of the probe of getentropy with the network
+/// service on QEMU's user network. With `steps` the same under -icount with the service counting
+/// its steps: VerifySession (kind 43) and every other kind stay under the bound
+/// (`net_probe::STEP_MAX`), and the kinds above the margin are named.
+pub fn random_net(steps: bool) -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let programs: &[ImageProgram] = if steps {
+        &RANDOM_NET_PROGRAMS_STEPS
+    } else {
+        &RANDOM_NET_PROGRAMS
+    };
+    let image = build_boot_image("boot-posix-random-net.img", programs, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::net(&[]));
+    if steps {
+        cmd.args(qemu::ICOUNT);
+    }
+    const ENDS: &str = "init: posix-random ended: ";
+    let timeout = crate::BOOT_TIMEOUT * if steps { 20 } else { 2 };
+    let output = run_until(cmd, timeout, Some(ENDS), &kernel.elf)?;
+    for line in RANDOM_NET_LINES {
+        qemu::expect_marker(&output, line)?;
+    }
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-random ended: exit code 0, not restarted",
+    )?;
+    if steps {
+        let mut rows = longest_steps(&output.lines, NETD_TAG);
+        let Some(verify) = rows.iter().find(|r| r.0 == NETD_VERIFY_KIND).copied() else {
+            return Err(format!(
+                "the network service ran no VerifySession step: {rows:?}"
+            ));
+        };
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let table: Vec<_> = rows
+            .iter()
+            .take(4)
+            .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
+            .collect();
+        println!(
+            "net service VerifySession: {} ticks, detail {}; the longest steps: {} (margin {}, bound {})",
+            verify.1,
+            verify.2,
+            table.join(", "),
+            crate::net_probe::STEP_MARGIN,
+            crate::net_probe::STEP_MAX
+        );
+        if let Some(row) = rows.iter().find(|r| r.1 > crate::net_probe::STEP_MAX) {
+            return Err(format!(
+                "the network service: a step past the bound: {row:?}"
+            ));
+        }
+        if verify.1 > crate::net_probe::STEP_MARGIN {
+            return Err(format!("VerifySession: a step past the margin: {verify:?}"));
+        }
+    }
+    println!(
+        "posix-random-net: a set-ID program takes its net session from the service, keeps an inherited socket: ok"
+    );
     Ok(())
 }
 

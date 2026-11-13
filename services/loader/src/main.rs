@@ -302,10 +302,10 @@ struct Loaded {
     /// libc.so and the vector of a dynamic program.
     dynamic: Option<Dynamic>,
     given: [Option<Handle<Channel>>; SLOTS],
-    /// The root of the channel service, if the start gave a Pipes session
-    /// and the service registered it: `finish` verifies the session with it
-    /// when the program is set-ID.
-    pipes_root: Option<Handle<Channel>>,
+    /// The roots of the services of `VERIFIED`, for the slots the start
+    /// gave and whose service registered a root: `finish` verifies the
+    /// sessions with them when the program is set-ID.
+    roots: Roots,
 }
 
 /// What a dynamic program adds to a loaded one: the image session of
@@ -466,7 +466,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut completed = false;
     let mut terminal_actions: Option<TerminalLoads> = None;
     let mut trusted_terminal = None;
-    let mut pipes_root = None;
+    let mut roots: Roots = [const { None }; VERIFIED.len()];
     let mut buffer = [0; MESSAGE_MAX];
     loop {
         if ready && (!completed || (0..SLOTS).any(|i| needed[i] && given[i].is_none())) {
@@ -480,7 +480,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 maps,
                 dynamic,
                 given,
-                pipes_root: pipes_root.take(),
+                roots: core::mem::take(&mut roots),
             }));
         }
         if ready && copied {
@@ -703,7 +703,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                         match load(own, &block, exec_source.take()).and_then(|done| {
                             if completed {
-                                pipes_root_before_ready(session, &given, &mut pipes_root)?;
+                                roots_before_ready(session, &given, &mut roots)?;
                                 tell_ready(session, image_pages(&done.2))?;
                             }
                             Ok(done)
@@ -779,8 +779,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 return None;
                             }
                             if loaded.is_some()
-                                && let Err(code) =
-                                    pipes_root_before_ready(session, &given, &mut pipes_root)
+                                && let Err(code) = roots_before_ready(session, &given, &mut roots)
                             {
                                 reply(token, code);
                                 return None;
@@ -1075,33 +1074,56 @@ fn loader_root(session: &Handle<Channel>, root: u32) -> Result<Option<Handle<Cha
     }
 }
 
+/// The slots whose sessions a set-ID program takes only from their service,
+/// each with the root the process service keeps for it.
+const VERIFIED: [(Slot, u32); 3] = [
+    (Slot::Pipes, proto_process::ROOT_PIPES),
+    (Slot::Net, proto_process::ROOT_NET),
+    (Slot::Entropy, proto_process::ROOT_ENTROPY),
+];
+
+/// The roots of `VERIFIED`, in its order.
+type Roots = [Option<Handle<Channel>>; VERIFIED.len()];
+
 /// Before Ready, when the process service still answers a loader's request
-/// for a root: the root of the Pipes session of a start that gives one,
-/// which `finish` needs if the start turns out to be a set-ID program (the
+/// for a root: the roots of the sessions of a start that gives them, which
+/// `finish` needs if the start turns out to be a set-ID program (the
 /// credentials come after Ready).
-fn pipes_root_before_ready(
+fn roots_before_ready(
     session: &Handle<Channel>,
     given: &[Option<Handle<Channel>>; SLOTS],
-    root: &mut Option<Handle<Channel>>,
+    roots: &mut Roots,
 ) -> Result<(), u32> {
-    if given[Slot::Pipes as usize].is_some() && root.is_none() {
-        *root = loader_root(session, proto_process::ROOT_PIPES)?;
+    for (root, &(slot, which)) in roots.iter_mut().zip(&VERIFIED) {
+        if given[slot as usize].is_some() && root.is_none() {
+            *root = loader_root(session, which)?;
+        }
     }
     Ok(())
 }
 
-/// A set-ID program takes its Pipes session only from the channel service:
-/// the offered one goes to the service's root, which returns it when it is a
-/// live session of the service and a new clone otherwise, so a forged
+/// The header of VerifySession of the service of `slot`.
+fn verify_header(slot: Slot) -> [u8; 8] {
+    match slot {
+        Slot::Net => proto_net::Method::VerifySession.header().bytes(),
+        Slot::Entropy => proto_entropy::Method::VerifySession.header().bytes(),
+        _ => proto_pipe::Method::VerifySession.header().bytes(),
+    }
+}
+
+/// A set-ID program takes its session of a slot of `VERIFIED` only from the
+/// service: the offered one goes to the service's root, which returns it when
+/// it is a live session of the service and a new clone otherwise, so a forged
 /// channel never receives a request. A start the root cannot verify is
 /// refused (the code of an unreachable or unregistered service).
-fn verify_pipes(
-    pipes: Option<&Handle<Channel>>,
+fn verify_slot(
+    slot: Slot,
+    root: Option<&Handle<Channel>>,
     offered: Handle<Channel>,
 ) -> Result<Handle<Channel>, u32> {
-    let pipes = pipes.ok_or(pl::IO)?;
-    let request = proto_pipe::Method::VerifySession.header().bytes();
-    let mut reply = sys::send_handles(pipes, &request, [offered.erase()])
+    let root = root.ok_or(pl::IO)?;
+    let request = verify_header(slot);
+    let mut reply = sys::send_handles(root, &request, [offered.erase()])
         .map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
@@ -2176,7 +2198,7 @@ fn finish(
         mut maps,
         dynamic,
         mut given,
-        pipes_root,
+        roots,
     } = loaded;
     let Ok(block) = Block::read(staged(block_len)) else {
         return GAVE_UP;
@@ -2184,13 +2206,17 @@ fn finish(
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
     let secure = c.uid != c.euid || c.gid != c.egid;
-    // A set-ID program takes its Pipes session from the channel service
-    // alone: a forged one is replaced, and a start the service cannot
+    // A set-ID program takes its Pipes, Net and Entropy sessions from their
+    // services alone: a forged one is replaced, and a start a service cannot
     // verify is refused. Any other program keeps what its parent gave.
-    if secure && let Some(offered) = given[Slot::Pipes as usize].take() {
-        match verify_pipes(pipes_root.as_ref(), offered) {
-            Ok(session) => given[Slot::Pipes as usize] = Some(session),
-            Err(_) => return GAVE_UP,
+    if secure {
+        for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
+            if let Some(offered) = given[slot as usize].take() {
+                match verify_slot(slot, root.as_ref(), offered) {
+                    Ok(session) => given[slot as usize] = Some(session),
+                    Err(_) => return GAVE_UP,
+                }
+            }
         }
     }
     let flags =
@@ -2264,7 +2290,7 @@ fn finish(
         own.identity,
         start,
         session,
-        pipes_root,
+        roots,
     ));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {

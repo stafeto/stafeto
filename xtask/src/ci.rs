@@ -276,6 +276,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("input-probe", 10),
     ("posix-random", 19),
     ("posix-random-steps", 19),
+    ("posix-random-net", 20),
+    ("posix-random-net-steps", 25),
     ("posix-display", 20),
     ("display-probe", 25),
 ];

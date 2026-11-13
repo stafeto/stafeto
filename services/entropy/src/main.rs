@@ -21,6 +21,14 @@
 //! first bytes hear of them TELLS a step. CLONE gives a child of a client
 //! a session of the service's own label.
 //!
+//! The service's root (proto_entropy::ROOT) goes to the process service with
+//! Register, for a loader to send VERIFY_SESSION for the Entropy session of a
+//! set-ID program: the session comes back when it is a live session of the
+//! service, and a new clone replaces any other. A thread of its own makes the
+//! registration (rt::roots::keep): the connection to the process service
+//! waits in init until the process service has started, which the loop (and
+//! its heartbeat) must not do, and the thread tries again until it succeeds.
+//!
 //! Every copy of a key or of the device's bytes the service makes is
 //! erased with volatile stores once it went (posix_random::erase): the
 //! generator's, FEED, the feeder's buffers and its message buffer. A reply
@@ -30,10 +38,11 @@
 #![no_std]
 #![no_main]
 
-use abi::{Error, MESSAGE_MAX, Rights, Source as From};
+use abi::{Error, MESSAGE_MAX, ObjectKind, Rights, Source as From};
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use entropy::verify;
 use entropy::{FIRST_BYTES, RESEED_NS, Source, Start};
 use proto_entropy::{Fill, Key, Method, NOT_READY, Seed, VERSION};
 use proto_init::ServiceArgs;
@@ -110,6 +119,15 @@ static LEVEL: AtomicU64 = AtomicU64::new(1);
 
 const FEEDER_STACK: usize = 8 * 1024;
 static STACK: Stack<FEEDER_STACK> = Stack::new();
+/// The registrar's stack and message buffer (the page after the feeder's),
+/// and the loop's channel it takes the root from.
+const REGISTRAR_STACK: usize = 16 * 1024;
+static REGISTRAR: Stack<REGISTRAR_STACK> = Stack::new();
+const REGISTRAR_BUFFER: usize = abi::INIT_MSGBUF as usize + 2 * 4096;
+static CHANNEL: AtomicU64 = AtomicU64::new(0);
+/// The clones the root's VERIFY_SESSION gives at most, for all the programs
+/// that start with a session that is not the service's.
+const ROOT_CLONES: usize = 255;
 /// The feeder's message buffer, the page after the main thread's.
 const FEEDER_BUFFER: usize = abi::INIT_MSGBUF as usize + 4096;
 
@@ -149,6 +167,7 @@ fn main(_: u64) -> u64 {
         return NO_FEEDER;
     };
     PARENT.store(s.parent.raw().0, Ordering::Release);
+    CHANNEL.store(channel.raw().0, Ordering::Release);
     NOTIFY.store(notify.into_raw().0, Ordering::Release);
     LEVEL.store(u64::from(level), Ordering::Release);
     // SAFETY: STACK is the feeder's alone, and the page after the main
@@ -169,6 +188,23 @@ fn main(_: u64) -> u64 {
     };
     if sys::thread_start(&feeder).is_err() {
         return NO_FEEDER;
+    }
+    // SAFETY: REGISTRAR is the registrar's alone, and the page after the
+    // feeder's message buffer is free.
+    let registrar = unsafe {
+        sys::thread_create(
+            &s.process,
+            register_root,
+            REGISTRAR.top(),
+            0,
+            level,
+            abi::Policy::Fifo,
+            REGISTRAR_BUFFER,
+        )
+    };
+    match registrar {
+        Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
+        _ => rt::println!("entropy: no thread to register the root; set-ID starts will wait"),
     }
     let mut service = Entropy {
         source: Source::new(),
@@ -287,7 +323,47 @@ impl Entropy {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        let Ok(label) = self.clones.give(OWN, r.label()) else {
+        let given = self.clones.give(OWN, r.label());
+        self.new_session(r, given)
+    }
+
+    /// VERIFY_SESSION through the root: the offered channel comes back when
+    /// it is a live session of a client of the service; any other gets a new
+    /// clone, and the offered channel is let go of with no request sent
+    /// through it. Every step is O(1).
+    fn verify_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if !matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::TRANSFER))
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(offered) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let label = sys::copy_label(&self.channel, &offered).ok();
+        if verify::genuine(&*self.clones, label) {
+            if r.reply().u32(Status::Ok.code()).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply([offered.erase()].into());
+        }
+        drop(offered);
+        let given = self
+            .clones
+            .give_within(OWN, proto_entropy::ROOT, ROOT_CLONES);
+        self.new_session(r, given)
+    }
+
+    /// The session for the clone `given` (a label, or Full): a copy of the
+    /// service's channel with that label.
+    fn new_session(
+        &mut self,
+        r: &mut Request<'_>,
+        given: Result<u64, proto_wire::clones::Full>,
+    ) -> Answer {
+        let Ok(label) = given else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
         let rights = Rights::SEND | Rights::TRANSFER;
@@ -359,6 +435,7 @@ const METHODS: &[u16] = &[
     Method::SeedTake.number(),
     Method::SeedCancel.number(),
     Method::Clone.number(),
+    Method::VerifySession.number(),
 ];
 
 impl Service<1> for Entropy {
@@ -367,11 +444,17 @@ impl Service<1> for Entropy {
     type Data = LongSession;
 
     fn request(&mut self, s: &mut Session<LongSession, 1>, r: &mut Request<'_>) -> Answer {
+        // VERIFY_SESSION goes through the root alone, and the root has no
+        // other request.
+        if (r.label() == proto_entropy::ROOT) != (r.method() == Method::VerifySession.number()) {
+            return Answer::Status(Status::Kernel(Error::AccessDenied));
+        }
         match Method::from_number(r.method()) {
             Some(Method::Seed) => self.seed(s, r),
             Some(Method::SeedTake) => self.take(s, r, false),
             Some(Method::SeedCancel) => self.take(s, r, true),
             Some(Method::Clone) => self.clone_session(r),
+            Some(Method::VerifySession) => self.verify_session(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -401,6 +484,15 @@ fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
         Ok(()) => Answer::Reply(Outgoing::new()),
         Err(status) => Answer::Status(status),
     }
+}
+
+/// The registrar thread: the root goes to the process service, tried until it
+/// is there (rt::roots::keep), and the thread ends.
+extern "C" fn register_root(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::Handle(PARENT.load(Ordering::Acquire)));
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Ordering::Acquire)));
+    let level = LEVEL.load(Ordering::Acquire) as u8;
+    rt::roots::keep(&parent, &channel, proto_entropy::ROOT, level, "entropy")
 }
 
 /// The feeder thread: connects to the driver, takes the device's bytes,

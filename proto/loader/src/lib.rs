@@ -445,6 +445,11 @@ pub enum Slot {
     Clock = 5,
     Driver = 6,
     Console = 7,
+    /// The sessions of the Pipes, Net and Entropy slots of a set-ID program go
+    /// to the root of their service, which returns a live session of the
+    /// service as it is and a new clone for any other channel, so the program
+    /// never takes a session a caller forged (the loader asks the process
+    /// service for the roots with LoaderRoot).
     Pipes = 8,
     Terminal = 9,
     Entropy = 10,
@@ -454,7 +459,8 @@ pub enum Slot {
     Display = 11,
     /// The process's session with the network service, a `Net` session
     /// (`proto_net`): fork and spawn give the child a CLONE of it, exec moves
-    /// it. Empty in an image without the network service.
+    /// it; a set-ID program keeps a genuine one with the descriptions it holds.
+    /// Empty in an image without the network service.
     Net = 12,
     /// The process's session with the package service, a `Pkg` session
     /// (`proto_pkg`): fork and spawn give the child a CLONE of it, exec moves

@@ -2130,6 +2130,8 @@ commands:
   efi-breaks the deliberate breaks of the loader: each fails its host test and, where it can, its run under edk2
   posix-random run the C probe of getentropy, getrandom, fork and the set-ID sessions in QEMU
   posix-random-steps the same probe under -icount with the pipe service's steps counted: VerifySession against term B
+  posix-random-net run the set-ID probe of the network session (forged channel replaced, inherited socket kept) in QEMU
+  posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
@@ -2461,6 +2463,8 @@ fn main() {
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("posix-random-steps") => entropy::random_steps(),
+        Some("posix-random-net") => entropy::random_net(false),
+        Some("posix-random-net-steps") => entropy::random_net(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
@@ -9881,6 +9885,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("pkg-slot", || pkg_slot::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-random-steps", entropy::random_steps),
+        job("posix-random-net", || entropy::random_net(false)),
+        job("posix-random-net-steps", || entropy::random_net(true)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.

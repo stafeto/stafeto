@@ -188,6 +188,8 @@ net-buffers = []
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).
 table-posix-random = []
+# The same with the network service (xtask posix-random-net).
+table-posix-random-net = []
 # The C probe of the display service's place in a process (xtask posix-display).
 table-posix-display = []
 # The C probe of the screen and the keys on libc.so (xtask display-probe).

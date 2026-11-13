@@ -494,20 +494,11 @@ fn loaded_main() -> u64 {
         rt::println!("POSIX startup: {}", why);
         return 125;
     }
-    // A set-ID program takes no entropy session from its caller, who could
-    // put a service of its own there and so know the program's keys: the
-    // handle closes, getentropy and getrandom give ENOSYS and arc4random
-    // aborts (a loaded program has no name lookup to reach the service by).
-    // The libc still falls back to the clock for the names of mkstemp and
-    // its kin and for the DNS transaction ID, and the shmget nonce becomes
-    // 0: those are tracked as their own issues. SAFETY: still single-threaded.
-    unsafe {
-        posix_abi::random::init(
-            one(Slot::Entropy)
-                .map(Handle::from_raw)
-                .filter(|_| area.flags & SECURE == 0),
-        )
-    };
+    // The entropy session of a set-ID program is the service's: the loader
+    // verified it with the service's root (a forged one is replaced), so
+    // getentropy, getrandom and arc4random work in it and in its descendants.
+    // SAFETY: still single-threaded.
+    unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
     // A set-ID program takes no display session from its caller, who could
     // put a channel of its own there: the handle closes and the screen
     // calls give ENODEV. SAFETY: as above.
@@ -518,8 +509,10 @@ fn loaded_main() -> u64 {
                 .filter(|_| area.flags & SECURE == 0),
         )
     };
-    // The network session passes as it comes, set-ID or not: a program that
-    // inherits sockets (inetd style) keeps serving them; the service
+    // The network session of a set-ID program is the service's, as the loader
+    // verified it with the service's root (the genuine one of the parent
+    // passes as it is, so a program that inherits sockets, inetd style, keeps
+    // serving them; a forged one is replaced by a new session); the service
     // checks the identity only through the process service. SAFETY: as above.
     unsafe { posix_abi::net::init(one(Slot::Net).map(Handle::from_raw)) };
     // A set-ID program takes no package session from its caller, who could

@@ -684,6 +684,25 @@ pub const NET_TABLE: &[Record] = &[
     NETD_QEMU,
 ];
 
+/// The probe of the sessions of a set-ID program with the network service
+/// (tests/posix-random, role `net`, `cargo xtask posix-random-net`): the table
+/// of the probe of getentropy with the network service on QEMU's user
+/// network, and the probe's record has a session with it.
+pub const POSIX_RANDOM_NET_TABLE: &[Record] = &[
+    super::ramfs::POSIX_RANDOM_TABLE[0],
+    super::ramfs::POSIX_RANDOM_TABLE[1],
+    super::ramfs::POSIX_RANDOM_TABLE[2],
+    super::ramfs::POSIX_RANDOM_TABLE[3],
+    super::ramfs::POSIX_RANDOM_TABLE[4],
+    super::ramfs::POSIX_RANDOM_TABLE[5],
+    Record {
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy", NET_SERVICE],
+        args: b"posix-random\0net\0",
+        ..super::ramfs::POSIX_RANDOM_TABLE[6]
+    },
+    NETD_QEMU,
+];
+
 /// The image of the shell with both network devices on QEMU (`cargo xtask
 /// fast-probe`): a program of the shell claims the second (spec 6, 3.9).
 pub const NET_TWO_TABLE: &[Record] = &[
