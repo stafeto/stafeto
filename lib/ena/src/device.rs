@@ -69,6 +69,19 @@ const STATUS_NS: u64 = 1_000 * NS_PER_MS;
 /// The event entries one step reads, and the register accesses it makes at most.
 pub const EVENTS_PER_STEP: u32 = 4;
 pub const REG_ACCESSES_PER_STEP: u32 = 1;
+/// The 64-bit stores of the step that zeroes the admin structures once the
+/// reset is over (`released`): the queues and the answer of a read, `READLESS_AT`
+/// bytes.
+pub const RESET_ZERO_STORES: u32 = (READLESS_AT / 8) as u32;
+/// The stores of the step that gives the host info (`host`): its page zeroed by
+/// 64-bit stores, then the bytes of its fields (4 of the OS type, 7 of the
+/// distribution name, 5 of the kernel version, 4 of the driver version, 2 of the
+/// spec version, 2 of the function, 2 of the CPU count).
+pub const HOST_STORES: u32 = 4096 / 8 + 4 + 7 + 5 + 4 + 2 + 2 + 2;
+/// The most memory stores any one step makes; no step makes a register access
+/// and more than a few of these besides.
+pub const MEM_STORES_PER_STEP: u32 = RESET_ZERO_STORES;
+const _: () = assert!(HOST_STORES <= MEM_STORES_PER_STEP);
 /// How often the statistics of the device are read, and the keep-alive
 /// lines that follow the first three.
 const STATS_NS: u64 = 60_000 * NS_PER_MS;
@@ -439,6 +452,12 @@ impl<P: Platform> Ena<P> {
         self.cpus = cpus;
     }
 
+    /// Whether the driver has already tried the other read mode since it was last up.
+    #[cfg(test)]
+    pub(crate) fn tried_other(&self) -> bool {
+        self.tried_other
+    }
+
     /// Asks for a reset with `reason`: the next step starts it.
     pub fn request_reset(&mut self, reason: u32) {
         self.asked = Some(reason);
@@ -474,9 +493,16 @@ impl<P: Platform> Ena<P> {
         unsafe { core::ptr::write_volatile(self.mem(at), value) }
     }
 
+    /// Zeroes `len` bytes at `at` with 64-bit stores, `len / 8` of them: the
+    /// region starts on a word (`open` checks) and the callers' offsets and
+    /// lengths are multiples of 8.
     fn zero(&self, at: usize, len: usize) {
-        for i in 0..len {
-            self.write_u8(at + i, 0);
+        assert!(at.is_multiple_of(8) && len.is_multiple_of(8));
+        for i in (0..len).step_by(8) {
+            // SAFETY: `at + i` is a word within the region (the callers' offsets are
+            // below `ADMIN_BYTES`, which `open` checked, and the region is word
+            // aligned); the device reads and writes it, so the store is volatile.
+            unsafe { core::ptr::write_volatile(self.mem(at + i).cast::<u64>(), 0) }
         }
     }
 
@@ -643,6 +669,11 @@ impl<P: Platform> Ena<P> {
         self.failures[FAILURES - 1] = now;
         if self.failures[0] != 0 && now - self.failures[0] < FAILURE_WINDOW_NS {
             return self.fail(Failure::TooManyResets);
+        }
+        // A request for a reset waits for the device to be up (`poll`); a reset that
+        // starts on its own answers it, so one fault takes one attempt of the three.
+        if !cfg!(feature = "break-ask-kept") {
+            self.asked = None;
         }
         self.reason = reason;
         self.reset_began_ns = now;
@@ -1226,6 +1257,10 @@ impl<P: Platform> Ena<P> {
         // All entries of the event queue are the device's: it may post.
         self.p.wmb();
         self.write_reg(regs::AENQ_HEAD_DB, u32::from(self.aenq_head));
+        // Once up, the next trouble with the reads starts with the first mode again.
+        if !cfg!(feature = "break-tried-kept") {
+            self.tried_other = false;
+        }
         self.stage = Stage::Running;
         self.up_ns = now;
         self.keep_ns = now;

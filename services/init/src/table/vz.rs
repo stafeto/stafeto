@@ -115,6 +115,8 @@ pub const CONSOLE: Record = Record {
             confirm: None,
         },
     ],
+    start: &[],
+    release: &[],
     trusted: true,
     root: false,
     shares: Shares::CREATOR,
@@ -143,6 +145,8 @@ pub const PCI_WALK: Record = Record {
     args: &[],
     dma: &[],
     quiesce: &[],
+    start: &[],
+    release: &[],
     ..super::entropy::RNG_VZ
 };
 

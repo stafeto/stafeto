@@ -42,6 +42,8 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         args,
         dma: &[],
         quiesce: &[],
+        start: &[],
+        release: &[],
         trusted: false,
         root: false,
         shares: Shares::CREATOR,

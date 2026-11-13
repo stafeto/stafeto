@@ -80,7 +80,7 @@ pub const MMIO_REG_READ_REG_OFF_SHIFT: u32 = 16;
 pub const MMIO_REG_READ_REG_OFF_MASK: u32 = 0xffff_0000;
 
 // The value this driver writes to INTR_MASK so that the admin interrupt stays
-// masked while it polls (its own choice, not a number of the headers).
+// masked while it polls (the driver's own choice; the headers give no number for it).
 pub const ADMIN_INTR_MASK: u32 = 1;
 
 // enum ena_regs_reset_reason_types.

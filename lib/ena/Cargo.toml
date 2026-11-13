@@ -25,5 +25,7 @@ break-read-hint = []
 break-read-retry = []
 break-ask-lost = []
 break-eni-gate = []
+break-ask-kept = []
+break-tried-kept = []
 # The model of the device for the tests of a service (`ena::model`).
 model = []

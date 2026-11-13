@@ -358,6 +358,13 @@ pub fn enable(config: &mut impl Config, at: Address) {
     config.write(at, COMMAND, command | MEMORY | BUS_MASTER | INTX_DISABLE);
 }
 
+/// Turns bus mastering off in the function, for a record that failed after
+/// `enable`: the command word is written whole, with the status half 0.
+pub fn disable_master(config: &mut impl Config, at: Address) {
+    let command = config.read(at, COMMAND) & 0xFFFF;
+    config.write(at, COMMAND, command & !BUS_MASTER);
+}
+
 /// The offset of the first capability of the function's list whose first
 /// word `wanted` takes, from `read`, the 32-bit registers of the
 /// configuration space. None when the list holds none or does not end: a

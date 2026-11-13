@@ -228,7 +228,7 @@ pub const READLESS_REG_OFF: usize = 2;
 pub const READLESS_REG_VAL: usize = 4;
 pub const READLESS_LEN: usize = 8;
 
-/// The choices of this driver, not numbers of the device's headers: the depth of
+/// The choices of this driver (they come from no number of the device's headers): the depth of
 /// the admin queue and of its completion queue, the depth of the event queue,
 /// the widest DMA address the driver will hand a device (48 bits, the width
 /// the device's `CAPS` also reports), the admin command timeout used when the

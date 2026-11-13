@@ -53,12 +53,10 @@ const RESET_SHUTDOWN: u32 = 1 | 11 << 28;
 const IN_PROGRESS: u32 = 0x8;
 /// The stop of the ENA, in its order: the device is reset through BAR 0 (the reset
 /// bit, then the device's own acknowledgement in `DEV_STS`, then the bit
-/// cleared and the end of the reset in `DEV_STS`), and only then the command word of
-/// function 0 goes to 0 (bus mastering and memory decoding off, through the page of its
-/// configuration in ECAM), so that the device writes no frame once init lets the DMA
-/// object go: init keeps the object when a step does not confirm. `DEV_CTL` is not
-/// read back (`settled` 0): the device may not hold what is written to it.
-static ENA_STOP: [Write; 3] = [
+/// cleared and the end of the reset in `DEV_STS`). `DEV_CTL` is not read back
+/// (`settled` 0): the device may not hold what is written to it. When a
+/// confirmation fails, init keeps the DMA object and marks the record broken.
+static ENA_STOP: [Write; 2] = [
     Write {
         window: "bar",
         offset: DEV_CTL,
@@ -87,16 +85,35 @@ static ENA_STOP: [Write; 3] = [
             value: 0,
         }),
     },
-    Write {
-        window: "ecam",
-        offset: COMMAND,
-        bits: 32,
-        value: 0,
-        settled: 0xFFFF,
-        only_if: None,
-        confirm: None,
-    },
 ];
+/// The command word of function 0 goes to 0 (bus mastering and memory decoding
+/// off, through the page of its configuration in ECAM) after the reset, and also
+/// when a step of the reset did not confirm: the device writes no frame once init
+/// lets the DMA object go, and a device that did not stop is kept from mastering
+/// the bus.
+static ENA_RELEASE: [Write; 1] = [Write {
+    window: "ecam",
+    offset: COMMAND,
+    bits: 32,
+    value: 0,
+    settled: 0xFFFF,
+    only_if: None,
+    confirm: None,
+}];
+/// The command word the start writes: memory decoding, bus mastering and INTx
+/// off, as `pci::enable` sets them. The stop clears them, and init applies this
+/// before each load of the service, so that the next instance reads BAR 0
+/// and the device masters the bus.
+const ENA_COMMAND: u32 = pci::MEMORY | pci::BUS_MASTER | pci::INTX_DISABLE;
+static ENA_START: [Write; 1] = [Write {
+    window: "ecam",
+    offset: COMMAND,
+    bits: 32,
+    value: ENA_COMMAND,
+    settled: ENA_COMMAND,
+    only_if: None,
+    confirm: None,
+}];
 /// The memory of the admin structures: one uncached object of 128 KiB (order
 /// 5), where the queue pairs of the next step go too.
 const ENA_DMA: &[Dma] = &[Dma {
@@ -138,6 +155,8 @@ pub const NET: Record = Record {
     args: &[],
     dma: ENA_DMA,
     quiesce: &ENA_STOP,
+    start: &ENA_START,
+    release: &ENA_RELEASE,
     // Init starts the service again after a failure (`FAILED`, 8) it cannot get over;
     // the driver tries three resets a minute before it gives up.
     restart: Restart::Always,
@@ -189,6 +208,8 @@ pub const CONSOLE: Record = Record {
     args: &ARGS,
     dma: &[],
     quiesce: &[],
+    start: &[],
+    release: &[],
     trusted: false,
     root: false,
     shares: Shares::CREATOR,
@@ -376,10 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn the_net_record_resets_the_device_through_bar_0_before_it_clears_the_command_word() {
+    fn the_net_record_resets_the_device_through_bar_0_and_clears_the_command_word_after() {
         let q = NET.quiesce;
-        // The reset with its reason, confirmed by DEV_STS; then released, confirmed;
-        // then the command word.
+        // The reset with its reason, confirmed by DEV_STS; then released, confirmed.
+        assert_eq!(q.len(), 2);
         assert_eq!(
             (q[0].window, q[0].offset, q[0].value),
             ("bar", 0x54, 0xB000_0001)
@@ -393,12 +414,106 @@ mod tests {
             q[1].confirm.map(|c| (c.offset, c.mask, c.value)),
             Some((0x58, 8, 0))
         );
+        // The command word goes to 0 after, whatever the confirmations showed.
+        let r = NET.release;
+        assert_eq!(r.len(), 1);
         assert_eq!(
-            (q[2].window, q[2].offset, q[2].bits, q[2].value),
+            (r[0].window, r[0].offset, r[0].bits, r[0].value),
             ("ecam", 4, 32, 0)
+        );
+        // The start writes it back: memory, bus master, INTx disable.
+        let s = NET.start;
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            (s[0].window, s[0].offset, s[0].bits, s[0].value),
+            ("ecam", 4, 32, 0x0406)
         );
         // The record is restarted by init after a failure.
         assert_eq!(NET.restart, Restart::Always);
+    }
+
+    /// A model of the ENA's command word and registers behind the windows of the
+    /// record: BAR 0 reads all ones while memory decoding is off, as the device
+    /// does, and the reset is acknowledged when `acknowledges`.
+    struct Model {
+        command: u32,
+        reset: bool,
+        acknowledges: bool,
+        /// The order the accesses came in.
+        log: Vec<String>,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Model {
+                command: ENA_COMMAND,
+                reset: false,
+                acknowledges: true,
+                log: Vec::new(),
+            }
+        }
+
+        /// What a service reads of DEV_STS: all ones with decoding off.
+        fn dev_sts(&self) -> u32 {
+            if self.command & pci::MEMORY == 0 {
+                0xFFFF_FFFF
+            } else {
+                u32::from(self.reset) * IN_PROGRESS
+            }
+        }
+    }
+
+    impl crate::device::Regs for Model {
+        fn write(&mut self, _: &Record, q: &Write) -> bool {
+            self.log
+                .push(format!("{}@{:#x}={:#x}", q.window, q.offset, q.value));
+            match (q.window, q.offset) {
+                ("ecam", COMMAND) => {
+                    self.command = q.value;
+                    true
+                }
+                ("bar", DEV_CTL) if self.command & pci::MEMORY != 0 => {
+                    self.reset = q.value & 1 != 0 && self.acknowledges;
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn confirmed(&mut self, _: &Record, c: Confirm) -> bool {
+            self.log.push(format!("confirm {:#x}", c.offset));
+            self.dev_sts() & c.mask == c.value
+        }
+
+        fn gate_open(&mut self, _: &Record, _: crate::table::Gate) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_restarted_service_finds_decoding_and_bus_mastering_on() {
+        let mut device = Model::new();
+        assert!(crate::device::stop(&NET, &mut device));
+        assert_eq!(device.command, 0);
+        // Without the start the next instance reads all ones from BAR 0.
+        assert_eq!(device.dev_sts(), 0xFFFF_FFFF);
+        assert!(crate::device::start(&NET, &mut device));
+        assert_eq!(device.command & (pci::MEMORY | pci::BUS_MASTER), 0x6);
+        assert_ne!(device.dev_sts(), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn a_stop_whose_confirmation_fails_still_turns_bus_mastering_off() {
+        let mut device = Model::new();
+        device.acknowledges = false;
+        assert!(!crate::device::stop(&NET, &mut device));
+        assert_eq!(device.command & pci::BUS_MASTER, 0);
+        assert_eq!(device.command, 0);
+        // The first reset step did not confirm, so the second never went.
+        assert_eq!(
+            device.log,
+            ["bar@0x54=0xb0000001", "confirm 0x58", "ecam@0x4=0x0"]
+        );
     }
 
     #[test]

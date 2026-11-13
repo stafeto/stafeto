@@ -427,6 +427,14 @@ pub struct Record {
     pub dma: &'static [Dma],
     /// The writes that stop its device once an instance ended.
     pub quiesce: &'static [Write],
+    /// The writes init applies before each load of an instance, in their order:
+    /// what a stop undoes, such as the command word of a function the stop
+    /// cleared.
+    pub start: &'static [Write],
+    /// The writes that go after `quiesce` even when a step of it did not settle
+    /// or confirm: what must hold whatever the device did, such as bus
+    /// mastering off.
+    pub release: &'static [Write],
     /// A driver of a device that masters the bus with no SMMU between
     /// them: it can write any memory, so it is in the trusted base (spec
     /// 9; spec 2, section 4). Only such a record has DMA objects.
@@ -501,6 +509,8 @@ impl Record {
         args: &[],
         dma: &[],
         quiesce: &[],
+        start: &[],
+        release: &[],
         trusted: false,
         root: false,
         shares: Shares::CREATOR,
@@ -1091,7 +1101,7 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
             });
         }
     }
-    for q in r.quiesce {
+    for q in r.quiesce.iter().chain(r.start).chain(r.release) {
         let window = r.windows.iter().find(|w| w.name == q.window);
         let bytes = u64::from(q.bits / 8);
         let width = matches!(q.bits, 8 | 32) && (q.bits == 32 || q.value <= 0xFF);
@@ -1575,6 +1585,8 @@ mod tests {
             args: &[],
             dma: &[],
             quiesce: &[],
+            start: &[],
+            release: &[],
             trusted: false,
             root: false,
             shares: Shares::CREATOR,

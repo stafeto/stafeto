@@ -30,6 +30,8 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         args: b"e",
         dma: &[],
         quiesce: &[],
+        start: &[],
+        release: &[],
         trusted: false,
         root: false,
         shares: Shares::CREATOR,

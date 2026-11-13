@@ -11,6 +11,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod device;
 pub mod labels;
 pub mod quota;
 pub mod resolve;

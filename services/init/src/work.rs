@@ -203,6 +203,8 @@ mod tests {
             args: &[],
             dma: &[],
             quiesce: &[],
+            start: &[],
+            release: &[],
             trusted: false,
             root: false,
             shares: Shares::CREATOR,

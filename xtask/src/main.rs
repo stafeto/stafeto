@@ -2587,7 +2587,7 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// init's table (`cargo xtask ena-breaks`): each is a feature of its crate that
 /// does one wrong thing, and the host tests of the crate pass without it and
 /// fail with it.
-const ENA_BREAKS: [(&str, &str); 19] = [
+const ENA_BREAKS: [(&str, &str); 24] = [
     ("pci", "break-measure-console"),
     ("pci", "break-restore-command"),
     ("pci", "break-multifunction"),
@@ -2605,8 +2605,13 @@ const ENA_BREAKS: [(&str, &str); 19] = [
     ("ena", "break-read-retry"),
     ("ena", "break-ask-lost"),
     ("ena", "break-eni-gate"),
+    ("ena", "break-ask-kept"),
+    ("ena", "break-tried-kept"),
     ("init", "break-measure-twice"),
     ("init", "break-no-enable"),
+    ("init", "break-no-start"),
+    ("init", "break-keep-master"),
+    ("init", "break-master-left"),
 ];
 
 fn ena_breaks() -> Result<(), String> {

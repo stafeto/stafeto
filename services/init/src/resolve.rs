@@ -295,6 +295,12 @@ fn place(
                 };
                 enable(config, f.at);
                 if size < w.base + w.len && !cfg!(feature = "break-bar-size") {
+                    // The function was enabled above (and perhaps by an earlier
+                    // window of the record): a record that is left out leaves
+                    // its device unable to master the bus.
+                    if !cfg!(feature = "break-master-left") {
+                        pci::disable_master(config, f.at);
+                    }
                     return Err(refuse(
                         w.name,
                         Cause::Short {
@@ -574,6 +580,28 @@ mod tests {
         assert!(e.to_string().contains("BAR 0 for regs is 0x4000 bytes"));
     }
 
+    /// Fails under `break-master-left`.
+    #[test]
+    fn a_record_that_fails_after_the_enable_leaves_bus_mastering_off() {
+        let mut config = t4g();
+        config.words.insert((ENA, pci::COMMAND), 0);
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0x2000,
+            0x4000,
+            At::Bar {
+                id: 0x1d0f_ec20,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        let e = resolve_one(&[record("net", w, &[])], &mut config)
+            .err()
+            .unwrap();
+        assert!(matches!(e.cause, Cause::Short { .. }));
+        assert_eq!(config.words[&(ENA, pci::COMMAND)] & pci::BUS_MASTER, 0);
+    }
+
     #[test]
     fn a_bar_the_firmware_left_empty_or_missing_is_refused() {
         let w: &'static [Window] = Box::leak(Box::new([window(
@@ -764,7 +792,7 @@ mod tests {
             .filter(|(_, off, v)| *off == pci::BAR0 && *v == 0xFFFF_FFFF)
             .count();
         assert_eq!(ones, 1);
-        // Only the ENA's function was written to: not the disks, not the console.
+        // Only the ENA's function was written to; the disks and the console were left alone.
         assert!(config.log.iter().all(|(at, _, _)| *at == ENA));
     }
 

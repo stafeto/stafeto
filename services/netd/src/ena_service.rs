@@ -30,16 +30,30 @@ const TIMER_LABEL: u64 = 1;
 const TICK_NS: u64 = 50_000_000;
 /// The tick while the device comes up: a read through memory takes a step each.
 const BRINGUP_TICK_NS: u64 = 1_000_000;
-/// The steps one notification takes at most. A step makes at most
-/// `REG_ACCESSES_PER_STEP` access to a register, reads at most `EVENTS_PER_STEP` event
-/// entries and a few of the admin queue, and never waits (`ena::Ena::poll`), so a
-/// notification is 8 steps of some 50 accesses to memory the device writes at most:
-/// far below the step bound of the service (18 369 ticks) at 1 us an access. The
-/// driver runs in this record's own thread; the switch of the network service
-/// does not call it.
+/// The steps one notification takes at most. A step never waits
+/// (`ena::Ena::poll`) and makes at most `REG_ACCESSES_PER_STEP` access to a register
+/// and reads at most `EVENTS_PER_STEP` event entries (`LOADS_PER_ENTRY` loads of the
+/// device's memory each) and a few admin entries (`LOADS_PER_ADMIN`). Two steps
+/// store besides: the one after a reset zeroes the admin structures with
+/// `RESET_ZERO_STORES` 64-bit stores, and the one that gives the host info writes
+/// `HOST_STORES` stores (its page zeroed by 64-bit stores and the bytes of its
+/// fields). A notification of 8 steps is bounded by every step reading and both
+/// storing steps, 1 us an access at most, under a quarter of the step bound of the
+/// service (18 369 ticks). The driver runs in this record's own thread; the switch of the
+/// network service does not call it.
 const STEPS: u32 = 8;
-const _: () =
-    assert!(STEPS * (ena::device::REG_ACCESSES_PER_STEP + ena::device::EVENTS_PER_STEP + 4) <= 100);
+const LOADS_PER_ENTRY: u32 = 16;
+const LOADS_PER_ADMIN: u32 = 16;
+const STEP_BOUND: u32 = 18_369;
+const _: () = assert!(
+    STEPS
+        * (ena::device::REG_ACCESSES_PER_STEP
+            + ena::device::EVENTS_PER_STEP * LOADS_PER_ENTRY
+            + LOADS_PER_ADMIN)
+        + ena::device::RESET_ZERO_STORES
+        + ena::device::HOST_STORES
+        <= STEP_BOUND / 4
+);
 const NOT_REGISTERED: u64 = 3;
 const NOT_MAPPED: u64 = 4;
 const NO_DEVICE: u64 = 6;

@@ -689,3 +689,51 @@ fn the_host_info_and_the_link_speed_are_given_and_read_before_the_device_is_up()
     assert_eq!(&page[4..11], b"stafeto");
     assert_eq!(ena.info().speed_mbps, 25_000);
 }
+
+/// Fails under `break-ask-kept`: a request for a reset that waits for the device to
+/// be up is answered by a reset that starts on its own, so that one fault does not
+/// cost two of the three attempts.
+#[test]
+fn a_reset_that_starts_on_its_own_drops_the_request_waiting_for_it() {
+    let (model, mut ena) = rig(1);
+    while !has_line(&model, "ena: reset ok") {
+        ena.poll();
+        model.advance(MS);
+    }
+    // The first admin answer comes after its deadline, and the reset ends the delay.
+    model.set(|s| {
+        s.answer_delay_ns = 2 * S;
+        s.delay_ends_at_reset = true;
+    });
+    ena.request_reset(regs::RESET_OS_TRIGGER);
+    run(&model, &mut ena, 8 * S);
+    assert!(ena.is_up(), "{:#?}", model.log_lines());
+    assert_eq!(
+        ena.resets().by_reason[regs::RESET_INIT_ERR as usize],
+        1,
+        "{:#?}",
+        model.log_lines()
+    );
+    assert_eq!(
+        ena.resets().by_reason[regs::RESET_OS_TRIGGER as usize],
+        0,
+        "{:#?}",
+        model.log_lines()
+    );
+    assert_eq!(ena.resets().count, 1);
+}
+
+/// Fails under `break-tried-kept`: once the device is up, the other read mode is
+/// open to a later trouble again.
+#[test]
+fn the_other_read_mode_is_open_again_once_the_device_is_up() {
+    let s = Scenario {
+        readless_drop: 3,
+        ..Scenario::default()
+    };
+    let (model, mut ena) = rig_at(0, s, 0x4_3000_0000);
+    run(&model, &mut ena, 6 * S);
+    assert!(ena.is_up(), "{:#?}", model.log_lines());
+    assert!(has_line(&model, "trying"), "{:#?}", model.log_lines());
+    assert!(!ena.tried_other());
+}
