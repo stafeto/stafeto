@@ -7,7 +7,9 @@
 //! device besides the ENA's service `net` (polled, optional): no entropy
 //! service, no Virtio window.
 
-use super::{At, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write};
+use super::{
+    At, Binding, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write,
+};
 use crate::PAGE;
 use crate::resolve::Platform;
 use crate::watch::Watch;
@@ -114,14 +116,33 @@ static ENA_START: [Write; 1] = [Write {
     only_if: None,
     confirm: None,
 }];
-/// The memory of the admin structures: one uncached object of 128 KiB (order
-/// 5), where the queue pairs of the next step go too.
-const ENA_DMA: &[Dma] = &[Dma {
-    name: "ena",
-    size: 32 * PAGE,
-    uncached: true,
-    duplicate: false,
-}];
+/// The memory of the device: the admin structures and the queue pair in one uncached
+/// object of 128 KiB (order 5; the admin structures take 12 KiB and the pair 16 KiB
+/// from 16 KiB), and the 512 buffers of frames (`net`, 1 MiB, cached: the t4g has no
+/// SMMU, the device addresses physical memory, and its DMA is coherent). The device
+/// addresses both as the physical addresses init gives the service, `ena` first.
+const ENA_DMA: &[Dma] = &[
+    Dma {
+        name: "ena",
+        size: 32 * PAGE,
+        uncached: true,
+        duplicate: false,
+    },
+    Dma {
+        name: "net",
+        size: 256 * PAGE,
+        uncached: false,
+        duplicate: false,
+    },
+];
+
+/// The two MSI-X vectors of the function: 0 for the admin queue and its events, 1 for
+/// the pair. Each is an event of the function's MSI device, bound through the
+/// switch thread's channel with the label of its binding.
+const ENA_BINDINGS: &[Binding] = &[
+    Binding::msi_of("irq0", ENA_ID, 0, 0),
+    Binding::msi_of("irq1", ENA_ID, 0, 1),
+];
 
 /// The network service with the ENA of the instance: the windows are found
 /// by the walk of the function (`At`), no interrupt is bound (the device is
@@ -150,8 +171,9 @@ pub const NET: Record = Record {
             },
         },
     ],
-    bindings: &[],
-    connects: &[],
+    bindings: ENA_BINDINGS,
+    // `/etc/netd.conf` and `/etc/resolv.conf` (the boot profile of the file service).
+    connects: &["ramfs"],
     args: &[],
     dma: ENA_DMA,
     quiesce: &ENA_STOP,
@@ -248,18 +270,26 @@ const fn named(table: &[Record], name: &str) -> Record {
 
 const DIALOG: &[Record] = super::ramfs::BUSYBOX_DIALOG_TABLE;
 
+/// The launcher of the shell with a session with the network service: the shell and its
+/// commands get the same (the launcher's connections are the shell's), and the quota of a
+/// command that links OpenSSL. No entropy service on EC2: the launcher does not name it.
+const LAUNCHER: Record = Record {
+    connects: &["ramfs", "tty", "pipe", "clock", "posix", super::NET_SERVICE],
+    quota: super::net::NET_COMMAND_QUOTA,
+    ..named(DIALOG, "busybox-probe")
+};
+
 pub const TABLE: &[Record] = &[
     CONSOLE,
     named(DIALOG, "ramfs"),
-    named(DIALOG, "posix"),
+    // The process service with the pool of the shell's image with the network: `httpd` forks
+    // a child for each connection.
+    super::net::NET_PROCESS_SERVICE,
     // No PL031 on EC2: the clock starts at the time the image was built.
     named(super::ramfs::POSIX_ABI_TABLE, "clock"),
     named(DIALOG, "pipe"),
     // The image of this table has no entropy service.
-    Record {
-        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
-        ..named(DIALOG, "busybox-probe")
-    },
+    LAUNCHER,
     named(DIALOG, "tty"),
     NET,
 ];
@@ -311,9 +341,15 @@ mod tests {
     }
 
     #[test]
-    fn no_record_connects_to_net_or_entropy_and_only_net_has_pci_windows() {
+    fn only_the_launcher_connects_to_net_none_to_entropy_and_only_net_has_pci_windows() {
         for r in TABLE {
-            assert!(!r.connects.contains(&"net") && !r.connects.contains(&"entropy"));
+            assert!(!r.connects.contains(&"entropy"));
+            assert_eq!(
+                r.connects.contains(&"net"),
+                r.name == "busybox-probe",
+                "{}",
+                r.name
+            );
             if r.name == "net" {
                 assert!(r.windows.iter().all(|w| w.at != At::Fixed));
             } else {
@@ -373,6 +409,42 @@ mod tests {
         assert!(crate::table::check(found.table).is_ok());
         assert_eq!(found.table.len(), TABLE.len());
         assert!(found.skipped.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn the_net_record_has_the_queues_object_the_buffers_and_the_two_vectors_of_the_function() {
+        let mut config = pci::fake::t4g();
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
+        let net = found.table.iter().find(|r| r.name == "net").unwrap();
+        // The objects, in the order the service reads their addresses: the queues' memory
+        // (uncached) and the 512 buffers (cached, 1 MiB).
+        let names: Vec<_> = net
+            .dma
+            .iter()
+            .map(|d| (d.name, d.size, d.uncached))
+            .collect();
+        assert_eq!(
+            names,
+            [("ena", 32 * PAGE, true), ("net", 256 * PAGE, false)]
+        );
+        // The admin structures (12 KiB) and the pair's queues (16 KiB from 16 KiB) fit the
+        // first object.
+        assert!(0x4000 + 0x4000 <= (32 * PAGE) as usize);
+        // Two events of the MSI device of the function at 00:05.0 (RID 0x28), bound by
+        // their order: vector 0 for the admin queue, vector 1 for the pair.
+        let events: Vec<_> = net.bindings.iter().map(|b| (b.name, b.event())).collect();
+        assert_eq!(
+            events,
+            [("irq0", Some((0x28, 0))), ("irq1", Some((0x28, 1)))]
+        );
+        assert_eq!(crate::table::msi_events(net, 0x28), 2);
+        // The service has the second channel for them, and the file service for its settings.
+        assert!(crate::table::line_thread(net));
+        assert_eq!(net.connects, ["ramfs"]);
+        // The 128 LPIs the kernel allows (a t4g gives 3 to this record at most).
+        assert!(net.bindings.len() <= 128);
     }
 
     #[test]

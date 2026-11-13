@@ -407,6 +407,8 @@ fn an_smmu_between_the_root_complex_and_the_its_folds_into_one_map_with_a_warnin
     ];
     let p = m.platform().unwrap();
     assert!(p.warnings.iter().any(|w| w.contains("SMMU")));
+    // The loader refuses a machine whose devices may see translated addresses.
+    assert!(p.dma_translated, "fails under break-smmu-ignore");
     let (_, info) = run(&m).unwrap();
     assert_eq!(info.device_id(0), Some(0x2000));
     assert_eq!(info.device_id(0xFF), Some(0x20FF));

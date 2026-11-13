@@ -53,6 +53,7 @@ mod consumers;
 mod device;
 mod dma;
 mod ena_service;
+mod ena_switch;
 mod fast;
 mod files;
 mod instance;

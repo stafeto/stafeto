@@ -20,6 +20,7 @@ extern crate std;
 
 use crate::admin as adm;
 use crate::device::{Platform, Region};
+use crate::io;
 use crate::regs;
 use core::fmt;
 use std::cell::RefCell;
@@ -94,6 +95,37 @@ impl Default for Scenario {
     }
 }
 
+/// The registers of BAR 0 the model gives the queues (a real device tells the
+/// owner where its doorbells are in the answer of CREATE_SQ and CREATE_CQ).
+pub const DB_TX: u32 = 0x1000;
+pub const DB_RX: u32 = 0x1004;
+pub const HEAD_TX: u32 = 0x1008;
+pub const HEAD_RX: u32 = 0x100c;
+pub const UNMASK_RX: u32 = 0x1010;
+/// Where the model's MSI-X table is in BAR 0.
+pub const MSIX_TABLE: u32 = 0x2000;
+
+#[derive(Clone, Copy, Default)]
+struct Cq {
+    base: u64,
+    interrupt: bool,
+    vector: u32,
+    words: u8,
+    /// Completions the device posted, and the head the driver last wrote.
+    tail: u16,
+    head_seen: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Sq {
+    base: u64,
+    cq: u16,
+    rx: bool,
+    /// The descriptors the device has taken, and the tail the driver last rang.
+    head: u16,
+    tail: u16,
+}
+
 struct Answer {
     due_ns: u64,
     entry: [u8; adm::ENTRY],
@@ -102,6 +134,8 @@ struct Answer {
 pub struct Inner {
     pub scenario: Scenario,
     region: Region,
+    /// The regions after the first the device may address (the buffers).
+    extra: Vec<Region>,
     now: u64,
     // The register file.
     aq_base: u64,
@@ -138,11 +172,38 @@ pub struct Inner {
     pub read_requests: u32,
     /// Plain reads of a register.
     pub reg_reads: u32,
+    /// Writes to a register (the doorbells, the heads, the table).
+    pub reg_writes: u32,
     pub reset_sequence: Vec<&'static str>,
     revision: u8,
     link_pending: bool,
     stale_due: Option<u64>,
     host_info: Option<[u8; 16]>,
+    // The pair.
+    cqs: Vec<Cq>,
+    sqs: Vec<Sq>,
+    /// The MSI-X table as written, four words a vector, and whether it is on.
+    pub table: [[u32; 4]; 2],
+    pub msix_on: bool,
+    /// Function Mask of the capability, and the calls of `msix_control` in order.
+    pub msix_fm: bool,
+    pub msix_ctl: Vec<(bool, bool)>,
+    /// The device gives no head doorbell for the completion queues (offset 0).
+    pub zero_head_db: bool,
+    /// The addresses and data the driver can take from the owner: vector 0 and 1.
+    pub vectors: [Option<(u64, u32)>; 2],
+    /// Each vector's mask: raised by an interrupt, lowered by the driver's write.
+    vector_masked: [bool; 2],
+    /// The MSI the device wrote, in order: (address, data).
+    pub fired: Vec<(u64, u32)>,
+    /// Frames the device took from the queue of sending.
+    pub sent: Vec<Vec<u8>>,
+    /// Frames the device dropped for want of a buffer of receiving.
+    pub rx_dropped: u32,
+    /// The states the driver reported to the owner of the pair.
+    pub io_states: Vec<bool>,
+    /// Whether received frames have their L4 sum checked and good.
+    pub sum_checked: bool,
 }
 
 /// The model, shared by the test and the platform the driver holds.
@@ -155,6 +216,7 @@ impl Model {
         Model(Rc::new(RefCell::new(Inner {
             scenario,
             region,
+            extra: Vec::new(),
             now: 1_000 * MS,
             aq_base: 0,
             acq_base: 0,
@@ -185,12 +247,82 @@ impl Model {
             resets: Vec::new(),
             read_requests: 0,
             reg_reads: 0,
+            reg_writes: 0,
             reset_sequence: Vec::new(),
             revision,
             link_pending: false,
             stale_due: None,
             host_info: None,
+            cqs: Vec::new(),
+            sqs: Vec::new(),
+            table: [[0; 4]; 2],
+            msix_on: false,
+            msix_fm: false,
+            msix_ctl: Vec::new(),
+            zero_head_db: false,
+            vectors: [None; 2],
+            vector_masked: [false, true],
+            fired: Vec::new(),
+            sent: Vec::new(),
+            rx_dropped: 0,
+            io_states: Vec::new(),
+            sum_checked: false,
         })))
+    }
+
+    /// A region besides the driver's, which the device may address (the buffers).
+    pub fn add_region(&self, r: Region) {
+        self.0.borrow_mut().extra.push(r);
+    }
+
+    /// The owner's vectors: what `Platform::msi` answers.
+    pub fn set_vectors(&self, v: [Option<(u64, u32)>; 2]) {
+        self.0.borrow_mut().vectors = v;
+    }
+
+    /// A frame arrives from the wire: the device puts it in the next buffer of
+    /// receiving, or drops it. True when it was taken.
+    pub fn inject(&self, frame: &[u8]) -> bool {
+        let mut m = self.0.borrow_mut();
+        let taken = m.receive(frame);
+        m.tick();
+        taken
+    }
+
+    pub fn sent_frames(&self) -> Vec<Vec<u8>> {
+        self.0.borrow().sent.clone()
+    }
+
+    pub fn fired(&self) -> Vec<(u64, u32)> {
+        self.0.borrow().fired.clone()
+    }
+
+    pub fn table(&self) -> [[u32; 4]; 2] {
+        self.0.borrow().table
+    }
+
+    pub fn msix_ctl(&self) -> Vec<(bool, bool)> {
+        self.0.borrow().msix_ctl.clone()
+    }
+
+    pub fn set_zero_head_db(&self, on: bool) {
+        self.0.borrow_mut().zero_head_db = on;
+    }
+
+    pub fn msix_on(&self) -> bool {
+        self.0.borrow().msix_on
+    }
+
+    pub fn io_states(&self) -> Vec<bool> {
+        self.0.borrow().io_states.clone()
+    }
+
+    pub fn rx_dropped(&self) -> u32 {
+        self.0.borrow().rx_dropped
+    }
+
+    pub fn set_sum_checked(&self, on: bool) {
+        self.0.borrow_mut().sum_checked = on;
     }
 
     /// The platform for the driver: the same model.
@@ -265,6 +397,7 @@ impl Platform for Model {
     fn write32(&self, offset: u32, value: u32) {
         let mut m = self.0.borrow_mut();
         m.tick();
+        m.reg_writes += 1;
         m.write_reg(offset, value);
     }
 
@@ -275,16 +408,37 @@ impl Platform for Model {
     fn log(&self, line: fmt::Arguments<'_>) {
         self.0.borrow_mut().log.push(line.to_string());
     }
+
+    fn msi(&self, vector: u16) -> Option<(u64, u32)> {
+        self.0
+            .borrow()
+            .vectors
+            .get(usize::from(vector))
+            .copied()
+            .flatten()
+    }
+
+    fn msix_control(&self, enable: bool, function_mask: bool) {
+        let mut m = self.0.borrow_mut();
+        m.msix_on = enable;
+        m.msix_fm = function_mask;
+        m.msix_ctl.push((enable, function_mask));
+    }
+
+    fn io_state(&self, up: Option<&io::Info>) {
+        self.0.borrow_mut().io_states.push(up.is_some());
+    }
 }
 
 impl Inner {
     fn va(&self, pa: u64) -> usize {
-        let top = self.region.pa + self.region.len as u64;
-        if pa < self.region.pa || pa >= top {
-            self.violations_push("DMA outside the driver's region");
-            return self.region.va;
+        for r in core::iter::once(&self.region).chain(&self.extra) {
+            if pa >= r.pa && pa < r.pa + r.len as u64 {
+                return r.va + (pa - r.pa) as usize;
+            }
         }
-        self.region.va + (pa - self.region.pa) as usize
+        self.violations_push("DMA outside the driver's regions");
+        self.region.va
     }
 
     fn violations_push(&self, what: &str) {
@@ -345,6 +499,10 @@ impl Inner {
             }
             regs::DEV_STS => self.status(),
             regs::DEV_CTL => self.dev_ctl,
+            o if (MSIX_TABLE..MSIX_TABLE + 32).contains(&o) => {
+                let i = (o - MSIX_TABLE) as usize;
+                self.table[i / 16][(i % 16) / 4]
+            }
             _ => 0,
         }
     }
@@ -403,6 +561,26 @@ impl Inner {
             regs::MMIO_RESP_HI => self.resp_hi = value,
             regs::MMIO_REG_READ => self.readless(value),
             regs::AQ_DB => self.doorbell(value as u16),
+            regs::VERSION => self.violations_push("a write to the VERSION register"),
+            DB_TX => self.sq_bell(false, value as u16),
+            DB_RX => self.sq_bell(true, value as u16),
+            HEAD_TX => self.cq_head(false, value as u16),
+            HEAD_RX => self.cq_head(true, value as u16),
+            UNMASK_RX => {
+                if value & io::INTR_UNMASK != 0 {
+                    self.vector_masked[1] = false;
+                }
+            }
+            o if (MSIX_TABLE..MSIX_TABLE + 32).contains(&o) => {
+                let i = (o - MSIX_TABLE) as usize;
+                let (v, w) = (i / 16, (i % 16) / 4);
+                if w < 3 && self.msix_on && !self.msix_fm && self.table[v][3] & 1 == 0 {
+                    self.violations_push(
+                        "an entry rewritten while enabled, unmasked and the function unmasked",
+                    );
+                }
+                self.table[v][w] = value;
+            }
             _ => {}
         }
     }
@@ -440,6 +618,9 @@ impl Inner {
         self.aenq_head_db = 0;
         self.enabled_groups = 0;
         self.answers.clear();
+        self.cqs.clear();
+        self.sqs.clear();
+        self.vector_masked = [false, true];
     }
 
     fn readless(&mut self, value: u32) {
@@ -522,6 +703,8 @@ impl Inner {
                     status = self.get_feature(cmd[adm::FEAT_ID], &mut out)
                 }
                 adm::SET_FEATURE => status = self.set_feature(cmd),
+                adm::CREATE_CQ => status = self.create_cq(cmd, &mut out),
+                adm::CREATE_SQ => status = self.create_sq(cmd, &mut out),
                 adm::GET_STATS => {
                     if cmd[adm::STATS_TYPE] == adm::STATS_TYPE_ENI {
                         for (i, n) in [11u64, 22, 33, 44, 55].iter().enumerate() {
@@ -534,6 +717,221 @@ impl Inner {
         }
         out[adm::ACQ_STATUS] = status;
         out
+    }
+
+    fn addr_at(cmd: &[u8; adm::ENTRY], at: usize) -> u64 {
+        u64::from(u32::from_le_bytes(cmd[at..at + 4].try_into().unwrap()))
+            | u64::from(u16::from_le_bytes([cmd[at + 4], cmd[at + 5]])) << 32
+    }
+
+    fn create_cq(&mut self, cmd: &[u8; adm::ENTRY], out: &mut [u8; adm::ENTRY]) -> u8 {
+        let depth = u16::from_le_bytes([cmd[adm::CQ_DEPTH], cmd[adm::CQ_DEPTH + 1]]);
+        let base = Self::addr_at(cmd, adm::CQ_BA);
+        let words = cmd[adm::CQ_CAPS_2] & 0x1F;
+        if depth != io::DEPTH || !(words == 2 || words == 4) || self.cqs.len() >= 2 {
+            self.violations_push("a completion queue asked for with a wrong depth or entry size");
+            return adm::ILLEGAL_PARAMETER;
+        }
+        self.check_pa(base, "a completion queue");
+        let interrupt = cmd[adm::CQ_CAPS_1] & adm::CQ_INTERRUPT_MODE != 0;
+        let vector = u32::from_le_bytes(
+            cmd[adm::CQ_MSIX_VECTOR..adm::CQ_MSIX_VECTOR + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let idx = self.cqs.len() as u16;
+        self.cqs.push(Cq {
+            base,
+            interrupt,
+            vector,
+            words,
+            ..Cq::default()
+        });
+        let body = &mut out[adm::ACQ_DATA..];
+        body[adm::CQ_RESP_IDX..][..2].copy_from_slice(&idx.to_le_bytes());
+        body[2..4].copy_from_slice(&depth.to_le_bytes());
+        let (head, unmask) = if words == 4 {
+            (HEAD_RX, UNMASK_RX)
+        } else {
+            (HEAD_TX, 0)
+        };
+        let head = if self.zero_head_db { 0 } else { head };
+        body[adm::CQ_RESP_HEAD_DB..][..4].copy_from_slice(&head.to_le_bytes());
+        body[adm::CQ_RESP_UNMASK..][..4].copy_from_slice(&unmask.to_le_bytes());
+        adm::SUCCESS
+    }
+
+    fn create_sq(&mut self, cmd: &[u8; adm::ENTRY], out: &mut [u8; adm::ENTRY]) -> u8 {
+        let direction = cmd[adm::SQ_IDENTITY] >> adm::SQ_DIRECTION_SHIFT;
+        let cq = u16::from_le_bytes([cmd[adm::SQ_CQ_IDX], cmd[adm::SQ_CQ_IDX + 1]]);
+        let depth = u16::from_le_bytes([cmd[adm::SQ_DEPTH], cmd[adm::SQ_DEPTH + 1]]);
+        let base = Self::addr_at(cmd, adm::SQ_BA);
+        let rx = direction == adm::SQ_DIRECTION_RX;
+        let cq_ok = self
+            .cqs
+            .get(usize::from(cq))
+            .is_some_and(|c| (c.words == 4) == rx);
+        if depth != io::DEPTH
+            || !(direction == adm::SQ_DIRECTION_TX || rx)
+            || !cq_ok
+            || cmd[adm::SQ_CAPS_2] & 0xF != adm::PLACEMENT_HOST
+            || cmd[adm::SQ_CAPS_3] & 1 != 1
+            || self.sqs.len() >= 2
+        {
+            self.violations_push("a submission queue asked for with a wrong field");
+            return adm::ILLEGAL_PARAMETER;
+        }
+        self.check_pa(base, "a submission queue");
+        let idx = self.sqs.len() as u16;
+        self.sqs.push(Sq {
+            base,
+            cq,
+            rx,
+            ..Sq::default()
+        });
+        let body = &mut out[adm::ACQ_DATA..];
+        body[adm::SQ_RESP_IDX..][..2].copy_from_slice(&idx.to_le_bytes());
+        let db = if rx { DB_RX } else { DB_TX };
+        body[adm::SQ_RESP_DB..][..4].copy_from_slice(&db.to_le_bytes());
+        adm::SUCCESS
+    }
+
+    fn sq_of(&self, rx: bool) -> Option<usize> {
+        self.sqs.iter().position(|q| q.rx == rx)
+    }
+
+    /// A completion into queue `cq`: the entry `bytes` (the phase is the
+    /// model's), and the interrupt it may raise.
+    fn post(&mut self, cq: usize, mut entry: Vec<u8>, phase_at: fn(&mut [u8], bool)) {
+        let c = self.cqs[cq];
+        let slot = usize::from(c.tail % io::DEPTH);
+        let size = usize::from(c.words) * 4;
+        let phase = (c.tail / io::DEPTH).is_multiple_of(2);
+        // The first pass is phase 1, and it turns at each wrap.
+        phase_at(&mut entry, phase);
+        if !self.zero_head_db && c.tail.wrapping_sub(c.head_seen) >= io::DEPTH {
+            self.violations_push("a completion queue overrun: the head was not told");
+        }
+        let va = self.va(c.base) + slot * size;
+        self.mem_put(va, &entry);
+        self.cqs[cq].tail = c.tail.wrapping_add(1);
+        if c.interrupt {
+            self.raise(c.vector as usize);
+        }
+    }
+
+    /// The device writes the MSI of `vector` once, until it is unmasked.
+    fn raise(&mut self, vector: usize) {
+        let t = self.table[vector];
+        // Raised only with MSI-X on, the entry unmasked, the admin vector's own
+        // mask (`INTR_MASK`) clear, and the pair's vector unmasked after its last.
+        if vector >= 2
+            || !self.msix_on
+            || self.msix_fm
+            || t[3] & 1 != 0
+            || self.vector_masked[vector]
+            || vector == 0 && self.intr_mask != 0
+        {
+            return;
+        }
+        if vector == 1 {
+            self.vector_masked[1] = true;
+        }
+        self.fired
+            .push((u64::from(t[0]) | u64::from(t[1]) << 32, t[2]));
+    }
+
+    fn cq_head(&mut self, rx: bool, head: u16) {
+        if let Some(c) = self.cqs.iter_mut().find(|c| (c.words == 4) == rx) {
+            c.head_seen = head;
+        }
+    }
+
+    fn sq_bell(&mut self, rx: bool, tail: u16) {
+        let Some(i) = self.sq_of(rx) else {
+            self.violations_push("a doorbell rang without a queue");
+            return;
+        };
+        self.sqs[i].tail = tail;
+        if rx {
+            return;
+        }
+        while self.sqs[i].head != self.sqs[i].tail {
+            let q = self.sqs[i];
+            let slot = usize::from(q.head % io::DEPTH);
+            let va = self.va(q.base) + slot * io::TX_DESC;
+            let d = self.mem_get(va, io::TX_DESC);
+            let word = |at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
+            let phase = u32::from((q.head / io::DEPTH).is_multiple_of(2));
+            if word(0) >> io::TX_PHASE_SHIFT & 1 != phase {
+                self.violations_push("a descriptor of sending with the wrong phase");
+                return;
+            }
+            let flags = word(0);
+            if flags & io::TX_FIRST == 0 || flags & io::TX_LAST == 0 || flags & io::TX_COMP_REQ == 0
+            {
+                self.violations_push("a descriptor of sending without first, last or completion");
+            }
+            let len = (flags & io::TX_LEN_MASK) as usize;
+            let req = (word(4) & io::TX_REQ_ID_LO_MASK) >> io::TX_REQ_ID_LO_SHIFT
+                | (flags & io::TX_REQ_ID_HI_MASK) >> io::TX_REQ_ID_HI_SHIFT << 10;
+            let pa = u64::from(word(8)) | u64::from(word(12) & io::TX_ADDR_HI_MASK) << 32;
+            self.check_pa(pa, "a buffer of sending");
+            let frame = self.mem_get(self.va(pa), len);
+            self.sent.push(frame);
+            self.sqs[i].head = q.head.wrapping_add(1);
+            let mut c = vec_of(io::TX_CDESC);
+            c[io::TX_CDESC_REQ_ID..][..2].copy_from_slice(&(req as u16).to_le_bytes());
+            self.post(usize::from(q.cq), c, |e, p| {
+                e[io::TX_CDESC_FLAGS] = u8::from(p);
+            });
+        }
+    }
+
+    /// A frame from the wire into the next descriptor of receiving.
+    fn receive(&mut self, frame: &[u8]) -> bool {
+        let Some(i) = self.sq_of(true) else {
+            return false;
+        };
+        let q = self.sqs[i];
+        if q.head == q.tail {
+            self.rx_dropped += 1;
+            return false;
+        }
+        let slot = usize::from(q.head % io::DEPTH);
+        let va = self.va(q.base) + slot * io::RX_DESC;
+        let d = self.mem_get(va, io::RX_DESC);
+        let phase = u8::from((q.head / io::DEPTH).is_multiple_of(2));
+        if d[io::RX_DESC_CTRL] & io::RX_CTRL_PHASE != phase {
+            self.violations_push("a descriptor of receiving with the wrong phase");
+            return false;
+        }
+        let length = usize::from(u16::from_le_bytes([d[0], d[1]]));
+        let req = u16::from_le_bytes([d[io::RX_DESC_REQ_ID], d[io::RX_DESC_REQ_ID + 1]]);
+        let pa = u64::from(u32::from_le_bytes(d[8..12].try_into().unwrap()))
+            | u64::from(u16::from_le_bytes([d[12], d[13]])) << 32;
+        self.check_pa(pa, "a buffer of receiving");
+        if frame.len() > length {
+            self.rx_dropped += 1;
+            return false;
+        }
+        let at = self.va(pa);
+        self.mem_put(at, frame);
+        self.sqs[i].head = q.head.wrapping_add(1);
+        let mut c = vec_of(io::RX_CDESC);
+        c[io::RX_CDESC_LENGTH..][..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
+        c[io::RX_CDESC_REQ_ID..][..2].copy_from_slice(&req.to_le_bytes());
+        let mut status = io::RX_STATUS_FIRST | io::RX_STATUS_LAST;
+        if self.sum_checked {
+            status |= io::RX_STATUS_L4_CSUM_CHECKED;
+        }
+        c[0..4].copy_from_slice(&status.to_le_bytes());
+        self.post(usize::from(q.cq), c, |e, p| {
+            let mut w = u32::from_le_bytes(e[0..4].try_into().unwrap());
+            w = w & !io::RX_STATUS_PHASE | u32::from(p) << 24;
+            e[0..4].copy_from_slice(&w.to_le_bytes());
+        });
+        true
     }
 
     fn get_feature(&mut self, id: u8, out: &mut [u8; adm::ENTRY]) -> u8 {
@@ -681,6 +1079,7 @@ impl Inner {
         if self.aenq_tail & (adm::EVENT_DEPTH - 1) == 0 {
             self.aenq_phase ^= 1;
         }
+        self.raise(0);
         true
     }
 
@@ -746,4 +1145,8 @@ pub fn region(len: usize, pa: u64) -> Region {
         pa,
         len,
     }
+}
+
+fn vec_of(n: usize) -> Vec<u8> {
+    std::vec![0u8; n]
 }

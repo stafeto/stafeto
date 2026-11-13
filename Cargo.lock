@@ -416,6 +416,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "ena",
+ "pci",
  "posix-fs",
  "posix-random",
  "proto-entropy",

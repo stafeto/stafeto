@@ -132,6 +132,24 @@ fn the_interrupt_controller_has_one_distributor_one_redistributor_range_and_one_
 }
 
 #[test]
+fn the_iort_has_no_smmu_so_the_devices_address_physical_memory() {
+    let p = Platform::from_tables(&tables()).unwrap();
+    assert!(!p.dma_translated);
+    // The two nodes of the fixture's IORT are the ITS group (type 0) and the root complex
+    // (type 2); no SMMU node (3 or 4) is there.
+    let iort = file("06-IORT.bin");
+    let count = u32::from_le_bytes(iort[36..40].try_into().unwrap());
+    let first = u32::from_le_bytes(iort[40..44].try_into().unwrap()) as usize;
+    let mut at = first;
+    let mut kinds = Vec::new();
+    for _ in 0..count {
+        kinds.push(iort[at]);
+        at += usize::from(u16::from_le_bytes(iort[at + 1..at + 3].try_into().unwrap()));
+    }
+    assert_eq!(kinds, [0, 2]);
+}
+
+#[test]
 fn the_pci_host_is_ecam_at_0x20000000_for_buses_0_to_255() {
     let p = Platform::from_tables(&tables()).unwrap();
     assert_eq!(p.ecam.len(), 1);
