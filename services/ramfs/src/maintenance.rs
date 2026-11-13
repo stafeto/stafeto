@@ -413,6 +413,93 @@ impl<const WORDS: usize> Departures<WORDS> {
     }
 }
 
+/// A session of `label` is gone: when its custody is not empty its departure
+/// (indexed by its place) is admitted, with one hold on the place. A label with
+/// no place has no departure of its own: its index would be birth 0's.
+pub fn session_gone<const W: usize>(
+    places: &crate::places::Places,
+    departures: &mut Departures<W>,
+    label: u64,
+    custody_empty: bool,
+) {
+    let place = places.place(label);
+    if place < crate::places::COUNT && !custody_empty && !departures.contains(place) {
+        places.hold(label);
+        departures.admit(place);
+    }
+}
+
+/// The label was closed (its birth, if any, is in `births[index]`).
+/// `birth_custody_empty` cleans the birth's fields and tells whether its custody
+/// is empty. A birth whose custody is not empty departs (index `sessions + index`)
+/// with a hold of its own, next to a departure of the session that may be running.
+/// Returns true when nothing of the label is left to wait for here: the caller
+/// forgets the clone; the place itself goes back only after its last departure.
+pub fn label_closed<const W: usize, T>(
+    places: &crate::places::Places,
+    departures: &mut Departures<W>,
+    sessions: usize,
+    births: &mut [Option<(u64, T)>],
+    index: usize,
+    label: u64,
+    birth_custody_empty: impl FnOnce(&mut T) -> bool,
+) -> bool {
+    let session_running = departures.contains(places.place(label));
+    if let Some(Some((l, birth))) = births.get_mut(index)
+        && *l == label
+    {
+        if !birth_custody_empty(birth) {
+            if !departures.contains(sessions + index) {
+                places.hold(label);
+                departures.admit(sessions + index);
+            }
+            return false;
+        }
+        births[index] = None;
+    } else if session_running {
+        return false;
+    }
+    places.release(label);
+    true
+}
+
+/// The slot of births that the new `label` (index `index`) would take is occupied.
+/// A stale birth (its label has no place) goes on the departures, so that it is
+/// cleaned and its slot freed; a live one is left alone. Either way the new label
+/// goes back to the free list and the caller refuses, with an error that ends when
+/// the departure does. False when the slot is free.
+pub fn birth_taken<const W: usize, T>(
+    places: &crate::places::Places,
+    departures: &mut Departures<W>,
+    sessions: usize,
+    births: &mut [Option<(u64, T)>],
+    index: usize,
+    label: u64,
+    depart: impl FnOnce(&mut T),
+) -> bool {
+    let Some(Some((old, birth))) = births.get_mut(index) else {
+        return false;
+    };
+    if places.place(*old) >= crate::places::COUNT && !departures.contains(sessions + index) {
+        depart(birth);
+        departures.admit(sessions + index);
+    }
+    places.release(label);
+    true
+}
+
+/// A departure of `label` at `index` ended: the slot is emptied by the caller, the
+/// departure and one hold go, and the place is freed by the last one.
+pub fn departure_finished<const W: usize>(
+    places: &crate::places::Places,
+    departures: &mut Departures<W>,
+    index: usize,
+    label: u64,
+) {
+    departures.release(index);
+    places.finish(label);
+}
+
 #[cfg(test)]
 mod departure_tests {
     use super::*;
@@ -454,6 +541,97 @@ mod departure_tests {
         queue.release(0);
         queue.admit(128);
         assert_eq!(queue.next_place(), Some(128));
+    }
+    #[test]
+    fn gone_then_closed_cleans_the_birth_and_frees_the_place_once() {
+        use crate::places::{COUNT, Places};
+        let places = Places::new();
+        let mut departures = Departures::<13>::new(COUNT + 512);
+        let mut births: Vec<Option<(u64, u32)>> = (0..512).map(|_| None).collect();
+        let label = places.issue(3).unwrap();
+        let index = (label & 511) as usize;
+        births[index] = Some((label, 1));
+        // `gone`: the session has custody left, its departure runs.
+        session_gone(&places, &mut departures, label, false);
+        assert!(departures.contains(index));
+        // `closed` while that departure runs: the birth departs too (custody left).
+        let done = label_closed(
+            &places,
+            &mut departures,
+            COUNT,
+            &mut births,
+            index,
+            label,
+            |_| false,
+        );
+        assert!(!done && departures.contains(COUNT + index));
+        // Its custody ends: the birth is emptied, and the place waits for the session.
+        births[index] = None;
+        departure_finished(&places, &mut departures, COUNT + index, label);
+        assert_eq!(places.used(), 1);
+        departure_finished(&places, &mut departures, index, label);
+        assert_eq!(places.used(), 0);
+        assert!(births[index].is_none() && !departures.pending());
+        // A birth with no custody left is cleaned at once, with the session running.
+        let label = places.issue(4).unwrap();
+        let index = (label & 511) as usize;
+        births[index] = Some((label, 1));
+        session_gone(&places, &mut departures, label, false);
+        assert!(label_closed(
+            &places,
+            &mut departures,
+            COUNT,
+            &mut births,
+            index,
+            label,
+            |_| true
+        ));
+        assert!(births[index].is_none());
+        assert_eq!(places.used(), 1);
+        departure_finished(&places, &mut departures, index, label);
+        assert_eq!(places.used(), 0);
+    }
+    #[test]
+    fn a_stale_birth_is_cleaned_and_clone_is_refused_only_until_then() {
+        use crate::places::{COUNT, Places};
+        let places = Places::new();
+        let mut departures = Departures::<13>::new(COUNT + 512);
+        let mut births: Vec<Option<(u64, u32)>> = (0..512).map(|_| None).collect();
+        let old = places.issue(1).unwrap();
+        let index = (old & 511) as usize;
+        births[index] = Some((old, 1));
+        // The old place went back while its birth stayed (the defect of #700).
+        places.release(old);
+        let new = places.issue(2).unwrap();
+        assert_eq!(new & 511, old & 511);
+        let mut departed = 0;
+        assert!(birth_taken(
+            &places,
+            &mut departures,
+            COUNT,
+            &mut births,
+            index,
+            new,
+            |_| departed += 1
+        ));
+        assert_eq!(departed, 1);
+        assert!(departures.contains(COUNT + index));
+        assert_eq!(places.used(), 0);
+        // The departure ends and empties the slot: the next clone is served.
+        births[index] = None;
+        departure_finished(&places, &mut departures, COUNT + index, old);
+        let next = places.issue(3).unwrap();
+        assert_eq!(next & 511, old & 511);
+        assert!(!birth_taken(
+            &places,
+            &mut departures,
+            COUNT,
+            &mut births,
+            index,
+            next,
+            |_| {}
+        ));
+        assert_eq!(places.used(), 1);
     }
     #[test]
     #[should_panic]

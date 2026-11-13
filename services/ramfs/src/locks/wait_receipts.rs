@@ -144,8 +144,9 @@ impl Queue {
         }
     }
     pub fn retains(&self, place: usize, owner: u64) -> bool {
-        // A label with no place (the table of places was full for a named label) never
-        // held a job: `slot` refuses such a place. The assertion that stood here caught
+        // A label with no place (the table of places was full for a named label, or an
+        // issued label whose place was freed and maybe taken again) has no jobs left:
+        // `slot` refuses such a place. The assertion that stood here caught
         // a place released under a departure still running (stafeto-design#700); the
         // places now stay until their last departure ends, and a full table is no
         // reason to stop the service.
