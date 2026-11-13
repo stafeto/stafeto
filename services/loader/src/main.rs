@@ -2194,18 +2194,23 @@ fn at_random(entropy: &Handle<Channel>) -> Option<[u8; 16]> {
     }
     .write(&mut request)
     .ok()?;
-    let reply = sys::send(entropy, request.as_bytes()).ok()?;
-    let mut buffer = [0; MESSAGE_MAX];
+    let mut reply = sys::send(entropy, request.as_bytes()).ok()?;
+    // The key comes in the registers of the reply (40 bytes), so no buffer of
+    // the message is read; the copies in the stack and in the reply go.
+    let mut bytes = abi::inline_bytes(&reply.words);
     let mut random = None;
-    if let Ok(long::Reply::Ready(key)) = long::Reply::read(reply.bytes(&mut buffer))
+    if reply.len <= abi::INLINE_MAX
+        && let Ok(long::Reply::Ready(key)) = long::Reply::read(&bytes[..reply.len])
         && key.len() == proto_entropy::SEED_LEN
     {
-        let mut bytes = [0; 16];
+        let mut first = [0; 16];
         #[cfg(not(feature = "break-at-random"))]
-        bytes.copy_from_slice(&key[..16]);
-        random = Some(bytes);
+        first.copy_from_slice(&key[..16]);
+        random = Some(first);
     }
-    posix_random::erase(&mut buffer);
+    posix_random::erase(&mut bytes);
+    reply.words = [0; 8];
+    core::hint::black_box(&reply.words);
     random
 }
 

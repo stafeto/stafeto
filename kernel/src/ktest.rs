@@ -1043,6 +1043,7 @@ fn boot_seed_is_taken_and_cleared_in_the_tree(boot: &Boot) -> Result<(), &'stati
     // SAFETY: the page is aligned to 4 bytes and has room for the length
     // and SEED_MAX bytes; nothing else uses it.
     unsafe { crate::boot::take_seed(boot, page.as_mut_ptr().cast()) };
+    // SAFETY: the page holds 4 + 64 bytes and `take_seed` wrote its first 36.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(page.as_ptr().cast(), 4 + 32) };
     if bytes[..4] != 32u32.to_le_bytes() || bytes[4..] != before {
         return Err("the page does not hold the length and the seed");

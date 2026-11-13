@@ -96,9 +96,8 @@ impl Source {
         } else {
             self.reseeds += 1;
         }
-        for chunk in rest.chunks_exact(KEY) {
-            half.copy_from_slice(chunk);
-            self.generator.reseed(&half);
+        for chunk in rest.as_chunks::<KEY>().0 {
+            self.generator.reseed(chunk);
         }
         posix_random::erase(&mut half);
         first
@@ -267,12 +266,6 @@ mod tests {
         assert!(looks_constant(&[]));
         assert!(!looks_constant(&device(64, 5)));
         assert!(!looks_constant(&device(32, 9)));
-    }
-
-    fn seeded(fill: u8) -> Source {
-        let mut s = Source::new();
-        assert!(s.seed_from(&device(32, fill)));
-        s
     }
 
     #[test]
