@@ -1036,6 +1036,9 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
         programs.extend(package_programs(&packages));
         programs.extend(SHELL_SERVICES_LAST.iter().take(2));
+        // The entropy service seeds from the boot page (init's `entropy::SEED_TABLE`);
+        // EC2 has no Virtio RNG, so `virtio-rng` stays out.
+        programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "entropy"));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -15534,6 +15537,27 @@ mod entropy_in_images_tests {
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
+            // The images whose lists are built at run time, EC2's among them.
+            ("main::shell_programs", shell_programs()),
+            ("main::aws_programs", aws_programs()),
+            ("net::programs", crate::net::programs()),
+            ("net::its_programs", crate::net::its_programs()),
+            ("net::vz_programs(one)", crate::net::vz_programs(false)),
+            ("net::vz_programs(two)", crate::net::vz_programs(true)),
+            (
+                "net::vz_steps_programs(one)",
+                crate::net::vz_steps_programs(false),
+            ),
+            (
+                "net::vz_steps_programs(two)",
+                crate::net::vz_steps_programs(true),
+            ),
+            ("doom::programs", crate::doom::programs()),
+            ("doom::steps_programs", crate::doom::steps_programs()),
+            (
+                "nginx_probe::steps_programs",
+                crate::nginx_probe::steps_programs(),
+            ),
         ];
         let root = root();
         assert!(
