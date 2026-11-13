@@ -6,7 +6,7 @@
 //! loader passes in x1 the physical address of a 16550 with byte registers
 //! one apart. `head.S` writes `A` (the first instruction), `B` (at EL1),
 //! `C` (the MMU is on) and keeps the address in `EARLY_PORT_PA`; this file
-//! writes `D` to `F` from `kernel_main`. A mark waits for room in the
+//! writes `D` to `F` from `kernel_main` and `G` to `K` after later steps. A mark waits for room in the
 //! transmitter for at most 1000 reads of LSR, then writes anyway.
 
 use core::arch::asm;
@@ -24,8 +24,14 @@ pub fn port() -> Option<u64> {
     (pa != 0).then_some(pa)
 }
 
-/// Writes the letter `c` to the port through the linear map.
+/// Writes the letter `c` and a line end to the port through the linear map:
+/// the console of EC2 shows a line once it is complete.
 pub fn mark(c: u8) {
+    put(c);
+    put(b'\n');
+}
+
+fn put(c: u8) {
     let Some(pa) = port() else { return };
     let base = LINEAR_BASE + pa as usize;
     let mut spins = 0;
@@ -45,4 +51,22 @@ pub fn mark(c: u8) {
     unsafe {
         asm!("strb {v:w}, [{a}]", a = in(reg) base, v = in(reg) u32::from(c), options(nostack, preserves_flags))
     };
+}
+
+struct Line;
+
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        s.bytes().for_each(put);
+        Ok(())
+    }
+}
+
+/// `P` and the panic's message with its place, on one line.
+pub fn panic_line(info: &core::panic::PanicInfo<'_>) {
+    use core::fmt::Write as _;
+    put(b'P');
+    put(b' ');
+    let _ = write!(Line, "{info}");
+    put(b'\n');
 }

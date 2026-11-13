@@ -83,16 +83,26 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     #[cfg(feature = "early-marks")]
     arch::marks::mark(b'F');
     console::set_port(&boot.info);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'G');
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
     mm::aspace::init(boot);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'H');
     arch::gic::init(&boot.info);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'I');
     memory::forbid(&boot.info);
     let clock = arch::timer::init();
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'J');
     sched::init(clock);
     idle::init();
     smp::start(boot);
+    #[cfg(feature = "early-marks")]
+    arch::marks::mark(b'K');
     #[cfg(feature = "stamps")]
     stamps::init(0);
     report(boot, clock, &init);

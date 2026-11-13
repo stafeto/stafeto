@@ -35,8 +35,7 @@
 // letter \ch goes to the byte 16550 whose physical address the loader left in
 // x22, by polling LSR at most 1000 times. MARK_PA runs with the MMU off,
 // MARK_VA with the linear map. Clobbers x16 and x17.
-.macro MARK_PA ch
-    cbz     x22, .Lmark\@
+.macro PUT_PA ch
     mov     x17, #1000
 .Lpoll\@:
     ldrb    w16, [x22, #5]
@@ -46,12 +45,8 @@
 .Lroom\@:
     mov     w16, #\ch
     strb    w16, [x22]
-.Lmark\@:
 .endm
-.macro MARK_VA ch
-    cbz     x22, .Lmark\@
-    movz    x16, #0xFFFF, lsl #48
-    add     x16, x16, x22
+.macro PUT_VA ch
     mov     x17, #1000
 .Lpoll\@:
     ldrb    w15, [x16, #5]
@@ -61,6 +56,20 @@
 .Lroom\@:
     mov     w15, #\ch
     strb    w15, [x16]
+.endm
+// The console of EC2 shows a line once it is complete: a letter is followed by a line end.
+.macro MARK_PA ch
+    cbz     x22, .Lmark\@
+    PUT_PA  \ch
+    PUT_PA  10
+.Lmark\@:
+.endm
+.macro MARK_VA ch
+    cbz     x22, .Lmark\@
+    movz    x16, #0xFFFF, lsl #48
+    add     x16, x16, x22
+    PUT_VA  \ch
+    PUT_VA  10
 .Lmark\@:
 .endm
 .else

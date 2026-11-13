@@ -656,6 +656,8 @@ fn main() -> Status {
         say("efi-loader: jumping\n");
         #[cfg(feature = "early-marks")]
         let mark_port = port::mark_base();
+        #[cfg(feature = "early-marks")]
+        say(&format!("efi-loader: stage marks to {mark_port:#x}\n"));
         #[cfg(not(feature = "early-marks"))]
         let mark_port = 0;
         cpu::enter_kernel(loaded.kernel.base, loaded.tree.base, mark_port)
