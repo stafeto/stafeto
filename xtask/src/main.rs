@@ -2597,6 +2597,7 @@ fn its_breaks() -> Result<(), String> {
         "break-its-keep",
         "break-its-step-resend",
         "break-its-step-early",
+        "break-its-stall-clock",
     ] {
         let mut broken = cargo();
         broken.args([

@@ -9132,6 +9132,18 @@ pub fn waits_for_the_its_are_one_segment_and_portions_do_not_wait(
             arch::its::slow_left() == 4 * arch::its::SEGMENT_READS,
             "irq_bind did not wait exactly one segment",
         )?;
+        // x4 says whether the ITS ran the mapping; irq_ack waits for it.
+        #[cfg(feature = "its-slow")]
+        {
+            check(x[4] == 0, "irq_bind said the mapping was in force")?;
+            c.fails(Call::IrqAck.number(), &[x[1]], Error::WouldBlock)?;
+        }
+        #[cfg(not(feature = "its-slow"))]
+        {
+            check(x[4] == 1, "irq_bind said the mapping was not in force")?;
+            let acked = c.call(Call::IrqAck.number(), &[x[1]]);
+            check(acked[0] == 0, "irq_ack of a mapped event failed")?;
+        }
         let (devices, bindings) = (crate::msi::in_use(), irq::in_use());
         c.close(Handle(x[1]))?;
         cleanup::portion();

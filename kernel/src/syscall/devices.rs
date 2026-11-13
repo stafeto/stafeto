@@ -88,7 +88,11 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     // at its queues once (spec 9).
     if let Some(pos) = commands {
         its::ring();
-        let _ = its::wait_once(pos);
+        let mapped = its::wait_once(pos);
+        return result.map(|mut values| {
+            values.push(u64::from(mapped));
+            values
+        });
     }
     result
 }
@@ -130,7 +134,8 @@ fn irq_bind_line(thread: NonNull<Thread>, a: &Args, cpu: u32) -> Result<Values, 
 /// (LIMIT_REACHED), the room for its commands in the ITS queue
 /// (LIMIT_REACHED), a page of the caller's pool of bindings and a block of
 /// its table (NO_MEMORY). Returns x1 the binding, x2 the MSI address, x3
-/// the MSI data, and in `commands` the count the commands of the ITS are
+/// the MSI data, x4 (added by `irq_bind`) 1 when the ITS ran the commands
+/// of the mapping and 0 when it did not yet, and in `commands` the count the commands of the ITS are
 /// at in the queue.
 fn irq_bind_event(
     thread: NonNull<Thread>,
@@ -217,10 +222,20 @@ pub(super) fn msi_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Er
 
 /// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens
 /// again (spec 9); an open line stays open, 0 all the same. PEER_CLOSED once
-/// the binding's channel closed, and the line stays masked.
+/// the binding's channel closed, and the line stays masked. For an event of
+/// an MSI device WOULD_BLOCK while the ITS has not run the commands of its
+/// mapping (irq_bind returned x4 = 0): the driver asks again before it
+/// unmasks its vector (spec 9). The check reads a register of the ITS and
+/// goes after the section.
 #[inline(never)]
 pub(super) fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
-    irq::ack(b)?;
+    let mut mapping = None;
+    super::objects(|| {
+        let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
+        irq::ack(b, &mut mapping)
+    })?;
+    if mapping.is_some_and(|at| !its::mapped(at)) {
+        return Err(Error::WouldBlock);
+    }
     Ok(Values::none())
 }

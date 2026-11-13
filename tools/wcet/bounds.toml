@@ -1015,7 +1015,7 @@ why = "the places of DEVICES, the table of MSI devices by DeviceID: msi::MAX_DEV
 
 [[loop]]
 function = "kernel::arch::aarch64::its::wait_once"
-at = "0x2c"
+at = "0x30"
 bound = 1001
 why = "one segment of a wait for the ITS: POLLS = 1000 reads of GITS_CREADR and the look that ends the loop (decision K3, section 5; irq_bind waits one segment and no more, a portion of cleanup looks once)"
 

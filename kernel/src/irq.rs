@@ -83,6 +83,10 @@ pub struct Irq {
     level: u8,
     /// The wait of its portion for the DISCARD of its event to run.
     wait: Wait,
+    /// The count of commands its mapping is at in the ITS queue: the
+    /// mapping is in force once the ITS has run that many (`ack`); 0 for a
+    /// binding of a line.
+    mapped_at: u64,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
     /// The binding waits in the list of retired objects for the end of a
@@ -114,6 +118,7 @@ impl Irq {
             payer,
             level: 0,
             wait: Wait::new(),
+            mapped_at: 0,
             cleanup: Item::new(),
             deferred: Deferred::new(),
         }
@@ -263,6 +268,8 @@ pub fn bind_event(
         Command::inv(device_id, event),
         Command::sync(its::rdbase(cpu as usize)),
     ]);
+    // SAFETY: the binding was just made, and nothing else refers to it.
+    unsafe { (*b.as_ptr()).mapped_at = pos.count() };
     Ok((b, pos))
 }
 
@@ -360,16 +367,23 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
 }
 
 /// irq_ack (spec 9) of `b`, which the caller's handle holds: PEER_CLOSED
-/// once the channel closed, and the line stays masked for good; otherwise
+/// once the channel closed, and the line stays masked for good; for an event
+/// the count its mapping is at goes to `mapping`; otherwise
 /// a line an interrupt masked opens again, and a line that is open stays
 /// so. O(1).
-pub fn ack(b: NonNull<Irq>) -> Result<(), Error> {
+pub fn ack(b: NonNull<Irq>, mapping: &mut Option<u64>) -> Result<(), Error> {
     let p = b.as_ptr();
     // SAFETY: the caller's handle holds the binding, which holds its
     // channel; only the fields are touched.
     unsafe {
         if channel::is_closed((*p).source.channel()) {
             return Err(Error::PeerClosed);
+        }
+        // An event: the count its mapping is at, which the caller compares
+        // with the commands run once its section ended, since that reads a
+        // register of the ITS.
+        if (*p).event.is_some() {
+            *mapping = Some((*p).mapped_at);
         }
         if (*p).masked {
             (*p).masked = false;

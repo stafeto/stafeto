@@ -40,9 +40,11 @@ break-stamps-portion = []
 # the host tests that must catch them (xtask its-breaks): a counter of 32 bits, a
 # target compared by its place on the ring, a sender outside `OBJ` that takes the
 # slots a section reserved, a wait that sends its commands again at each step, and
-# a wait that takes the commands for run once they are sent.
+# a wait that takes the commands for run once they are sent, and a stall clock
+# that ignores the advances of the ITS.
 break-its-counter-32 = []
 break-its-ring-position = []
 break-its-keep = []
 break-its-step-resend = []
 break-its-step-early = []
+break-its-stall-clock = []
