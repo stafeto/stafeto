@@ -40,6 +40,21 @@ its-int = []
 # collection of CPU 0, so that the LPI of another CPU's event must not arrive
 # there (xtask its-int).
 break-its-int-collection = ["its-int"]
+# The boot self-test of the ITS (every kernel has it): with `its-int-drop` its
+# events go to a collection no CPU has, so the LPI cannot arrive and MSI must
+# go off with the line `its off: LPI 8192 did not reach CPU 0` (xtask its-drop);
+# `break-its-selftest-ignore` leaves the ITS on after that failure.
+its-int-drop = []
+break-its-selftest-ignore = ["its-int-drop"]
+# Every redistributor comes with tables of its own and EnableLPIs set, as
+# firmware that used LPIs would leave it: the kernel clears the bit and sets
+# its own tables (xtask its-lpis); `break-its-keep-firmware-lpis` does not
+# clear it, and the LPI cannot arrive.
+its-lpis-preset = ["its-int"]
+break-its-keep-firmware-lpis = ["its-lpis-preset"]
+# The command queue and the property table on the 4 KiB and 8 KiB blocks of
+# before the fix (the diagnostic kernel of the session on EC2).
+break-its-align-4k = ["kcore/break-its-align-4k"]
 fault-probe = []
 # CPU 1 fails a check right after it is up: the report of the panic must carry
 # a backtrace of CPU 1's own stack (xtask smp-cpu-check).

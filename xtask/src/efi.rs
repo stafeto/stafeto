@@ -180,9 +180,20 @@ pub fn command(
 /// timer's frequency. The memory and the boot image lines differ with the
 /// places the loader and QEMU chose.
 fn alike(line: &str) -> bool {
+    // The lines of the ITS with a table address or a tick count in them (the
+    // diagnostic lines of the tables and of the self-test) differ with the
+    // places and the speed of each run.
+    let by_run = [
+        "its tables",
+        "its cbaser",
+        "its baser",
+        "its mapc",
+        "its self-test",
+    ];
     ["gic ", "its ", "cpu ", "psci ", "timer ", "sgi ", "pl011 "]
         .iter()
         .any(|p| line.starts_with(p))
+        && !by_run.iter().any(|p| line.starts_with(p))
 }
 
 fn report_lines(lines: &[String]) -> Vec<String> {
@@ -624,6 +635,11 @@ mod tests {
             "gic        v3 distributor 0x8000000, redistributor 0x80a0000"
         ));
         assert!(!alike("memory     0x40000000..0x60000000"));
+        assert!(!alike("its tables queue 0x78730000 prop 0x78620000"));
+        assert!(!alike(
+            "its self-test: LPI 8192 reached CPU 0 after 566 ticks"
+        ));
+        assert!(alike("its off: LPI 8192 did not reach CPU 0"));
         assert!(!alike("boot image 0x48000000..0x48005000"));
     }
 
