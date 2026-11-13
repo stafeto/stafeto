@@ -1834,12 +1834,13 @@ static void *many_waiter(void *arg) {
     return NULL;
 }
 
-/* Thirty-six threads of three processes wait on a semaphore of a shared page;
+/* A hundred and twenty-six threads of six processes (the table of waiters
+ * holds 128, the service's own steps are measured with it full) wait on a semaphore of a shared page;
  * a post wakes one of them. Then they wait on a condition, and a broadcast
  * wakes all (the service wakes a list at a time; xtask measures its longest
  * step). */
 static int shared_many(void) {
-    enum { EACH = 20, CHILDREN = 2, ALL = EACH * (CHILDREN + 1) };
+    enum { EACH = 21, CHILDREN = 5, ALL = EACH * (CHILDREN + 1) };
     many_page = shared_page(0);
     struct shared *s = many_page;
     CHECK(s != NULL);
@@ -1868,7 +1869,7 @@ static int shared_many(void) {
     }
     pthread_t threads[EACH];
     for (int i = 0; i < EACH; i++) CHECK(pthread_create(&threads[i], NULL, many_waiter, NULL) == 0);
-    for (int i = 0; i < 1000 && s->started != ALL; i++) pause_ms(10);
+    for (int i = 0; i < 3000 && s->started != ALL; i++) pause_ms(10);
     CHECK(s->started == ALL);
     pause_ms(300);
     CHECK(s->done == 0);
