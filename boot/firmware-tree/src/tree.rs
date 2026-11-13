@@ -18,18 +18,6 @@ use kcore::fdt::Builder;
 /// The phandle of the ITS node, which the `msi-map` entries name.
 pub const ITS_PHANDLE: u32 = 1;
 
-/// A window of a PCI host as the firmware set it up: `kind` is the space
-/// code of the `ranges` cell (1 I/O, 2 memory 32-bit, 3 memory 64-bit),
-/// `prefetchable` sets bit 30.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PciWindow {
-    pub kind: u8,
-    pub prefetchable: bool,
-    pub pci_base: u64,
-    pub cpu_base: u64,
-    pub size: u64,
-}
-
 pub struct Input<'a> {
     pub platform: &'a Platform,
     pub memory: &'a Classified,
@@ -37,7 +25,6 @@ pub struct Input<'a> {
     /// MPIDR_EL1 of the CPU the loader runs on (affinity fields): it goes
     /// first in `/cpus`.
     pub boot_mpidr: u64,
-    pub pci_windows: &'a [PciWindow],
 }
 
 fn hi(v: u64) -> u32 {
@@ -175,10 +162,22 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
     }
 
     // /intc with the ITS the IORT leads a root complex to.
+    // The kernel keeps one ITS: the IORT must lead to one, and the MADT must
+    // list it (an MSI map with no ITS to name would vanish silently).
+    if p.msi.iter().any(|m| m.its_id != p.msi[0].its_id) {
+        return Err(Error::Unsupported(
+            "the IORT leads root complexes to more than one ITS (the kernel keeps one)",
+        ));
+    }
     let its = p
         .msi
         .first()
         .and_then(|m| p.its.iter().find(|i| i.id == m.its_id));
+    if !p.msi.is_empty() && its.is_none() {
+        return Err(Error::Unsupported(
+            "the IORT names an ITS the MADT does not list",
+        ));
+    }
     let &[(redist_base, redist_len)] = gic.redistributors.as_slice() else {
         return Err(Error::Unsupported("GIC redistributor range"));
     };
@@ -206,6 +205,7 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
 
     // The console.
     if let Some((name, u)) = &console {
+        let (shift, width) = u.regs()?;
         b = b.begin(name);
         b = match u.kind {
             UartKind::Pl011 => b.prop("compatible", b"arm,pl011\0arm,primecell\0"),
@@ -213,13 +213,13 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
         };
         let size = match u.kind {
             UartKind::Pl011 => 0x1000,
-            UartKind::Ns16550 => 8 << shift_of(u),
+            UartKind::Ns16550 => 8 << shift,
         };
         b = wide(b, "reg", &[u.base, size]);
         if u.kind == UartKind::Ns16550 {
             b = b
-                .cells("reg-shift", &[shift_of(u)])
-                .cells("reg-io-width", &[width_of(u)]);
+                .cells("reg-shift", &[u32::from(shift)])
+                .cells("reg-io-width", &[u32::from(width)]);
             if u.clock_hz != 0 {
                 b = b.cells("clock-frequency", &[u.clock_hz]);
             }
@@ -250,20 +250,6 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
         );
         b = b.cells("linux,pci-domain", &[u32::from(e.segment)]);
         b = b.cells("#address-cells", &[3]).cells("#size-cells", &[2]);
-        let mut ranges = Vec::new();
-        for w in input.pci_windows {
-            let space = (u32::from(w.kind) << 24) | (u32::from(w.prefetchable) << 30);
-            ranges.extend([
-                space,
-                hi(w.pci_base),
-                lo(w.pci_base),
-                hi(w.cpu_base),
-                lo(w.cpu_base),
-                hi(w.size),
-                lo(w.size),
-            ]);
-        }
-        b = b.cells("ranges", &ranges);
         let mut map = Vec::new();
         for m in p.msi.iter().filter(|m| m.segment == u32::from(e.segment)) {
             if its.is_some_and(|i| i.id == m.its_id) {
@@ -281,18 +267,6 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
     Ok(b.end().finish())
 }
 
-fn shift_of(u: &Uart) -> u32 {
-    if u.bit_width == 32 { 2 } else { 0 }
-}
-
-fn width_of(u: &Uart) -> u32 {
-    match (u.access_size, u.bit_width) {
-        (1, _) | (0, 8) => 1,
-        (3, _) | (0, 32) => 4,
-        _ => 1,
-    }
-}
-
 fn baud(code: u8) -> Option<u32> {
     match code {
         3 => Some(9600),
@@ -303,12 +277,8 @@ fn baud(code: u8) -> Option<u32> {
     }
 }
 
-/// The node name and port of the console, or None when the port cannot be
-/// described (a 16550 whose access size is a word).
+/// The node name and port of the console.
 fn console_node(u: &Uart) -> Option<(String, Uart)> {
-    if u.kind == UartKind::Ns16550 && matches!(u.access_size, 2 | 4) {
-        return None;
-    }
     #[cfg(feature = "break-spcr")]
     let kind = match u.kind {
         UartKind::Pl011 => UartKind::Ns16550,

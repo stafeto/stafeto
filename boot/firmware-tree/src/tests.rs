@@ -273,7 +273,6 @@ fn tree_of(p: &Platform, memory: &Classified) -> Result<Vec<u8>, Error> {
         memory,
         initrd: IMAGE,
         boot_mpidr: 0,
-        pci_windows: &[],
     })
 }
 
@@ -351,7 +350,6 @@ fn the_boot_cpu_goes_first_and_an_unknown_one_is_refused() {
         memory: &memory(),
         initrd: IMAGE,
         boot_mpidr: 1,
-        pci_windows: &[],
     })
     .unwrap();
     assert_eq!(
@@ -363,7 +361,6 @@ fn the_boot_cpu_goes_first_and_an_unknown_one_is_refused() {
         memory: &memory(),
         initrd: IMAGE,
         boot_mpidr: 7,
-        pci_windows: &[],
     });
     assert!(matches!(refused, Err(Error::Unsupported(_))));
 }
@@ -589,4 +586,65 @@ fn damaged_tables_leave_the_kernel_what_it_needs_or_stop() {
     assert_eq!(read.rejected.len(), 1);
     assert_eq!(Platform::from_tables(&read), Err(Error::Missing("MADT")));
     let _ = finish;
+}
+
+#[test]
+fn more_than_one_its_warns_and_two_in_the_iort_are_refused() {
+    let mut m = Machine::qemu();
+    m.madt.push(its(1, 0x0810_0000));
+    assert!(
+        m.platform()
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("more than one ITS"))
+    );
+    m.iort = vec![
+        its_group(&[0]),
+        its_group(&[1]),
+        root_complex(0, vec![(0, 0xFF, 0, 0, 0), (0x100, 0xFF, 0x100, 1, 0)]),
+    ];
+    let p = m.platform().unwrap();
+    assert!(
+        matches!(tree_of(&p, &memory()), Err(Error::Unsupported(w)) if w.contains("more than one ITS"))
+    );
+    // An ITS the MADT does not list.
+    m.madt.truncate(5);
+    m.iort = vec![its_group(&[7]), root_complex(0, vec![(0, 0xFF, 0, 0, 0)])];
+    let p = m.platform().unwrap();
+    assert!(
+        matches!(tree_of(&p, &memory()), Err(Error::Unsupported(w)) if w.contains("does not list"))
+    );
+}
+
+#[test]
+fn a_gicd_of_version_0_takes_its_version_from_pidr2() {
+    let mut m = Machine::qemu();
+    m.madt[2] = gicd(0);
+    m.madt[4] = its(0, ITS);
+    let mut p = m.platform().unwrap();
+    assert_eq!(p.gic.as_ref().unwrap().version, 0);
+    let mut asked = 0;
+    p.resolve_gic_version(|a| {
+        asked = a;
+        3 << 4
+    })
+    .unwrap();
+    assert_eq!(asked, GICD + 0xFFE8);
+    assert_eq!(p.gic.as_ref().unwrap().version, 3);
+    assert!(tree_of(&p, &memory()).is_ok());
+    // A hardware that reports v2 is refused; a known version is not read again.
+    let mut p = m.platform().unwrap();
+    assert!(p.resolve_gic_version(|_| 2 << 4).is_err());
+    let mut p = Machine::qemu().platform().unwrap();
+    p.resolve_gic_version(|_| unreachable!()).unwrap();
+}
+
+#[test]
+fn a_16550_with_contradictory_access_fields_is_refused_when_the_tables_are_read() {
+    let mut m = Machine::qemu();
+    m.spcr = (0, 0x7000_0000, 8, 3);
+    assert!(matches!(m.platform(), Err(Error::Unsupported(w)) if w.contains("disagree")));
+    m.spcr = (0, 0x7000_0000, 8, 2);
+    assert!(matches!(m.platform(), Err(Error::Unsupported(w)) if w.contains("access size")));
 }

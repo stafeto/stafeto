@@ -107,7 +107,8 @@ stafeto_enter:
     bic     x5, x5, x6
     msr     sctlr_el1, x5
     b       2f
-1:  mrs     x5, sctlr_el2
+1:  msr     cnthp_ctl_el2, xzr
+    mrs     x5, sctlr_el2
     bic     x5, x5, x6
     msr     sctlr_el2, x5
 2:  isb

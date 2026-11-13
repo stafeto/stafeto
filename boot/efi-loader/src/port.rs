@@ -1,83 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! A refusal after `ExitBootServices` goes straight to the console port the
+//! A line after `ExitBootServices` goes straight to the console port the
 //! SPCR names, by polling: the firmware's console is gone, and a panic of
 //! the kernel before it reads the tree is not visible on EC2 (spec 3.2).
+//! The register arithmetic is `firmware_tree::console`, tested on the host;
+//! this file adds the volatile accesses.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, Ordering};
-use firmware_tree::platform::{Uart, UartKind};
+use firmware_tree::console::{Bus, Port};
+use firmware_tree::platform::Uart;
 
-static BASE: AtomicU64 = AtomicU64::new(0);
-/// 0 PL011; else the 16550's register shift + 1 (so that 1 is shift 0).
-static KIND: AtomicU64 = AtomicU64::new(0);
-static WIDTH: AtomicU64 = AtomicU64::new(1);
+static mut PORT: Option<Port> = None;
 
-pub fn remember(u: &Uart) {
-    BASE.store(u.base, Ordering::Relaxed);
-    match u.kind {
-        UartKind::Pl011 => KIND.store(0, Ordering::Relaxed),
-        UartKind::Ns16550 => {
-            KIND.store(if u.bit_width == 32 { 3 } else { 1 }, Ordering::Relaxed);
-            WIDTH.store(
-                if u.access_size == 3 || u.bit_width == 32 {
-                    4
-                } else {
-                    1
-                },
-                Ordering::Relaxed,
-            );
-        }
-    }
-}
+struct Mmio;
 
-fn put(byte: u8) {
-    let base = BASE.load(Ordering::Relaxed);
-    if base == 0 {
-        return;
-    }
-    let kind = KIND.load(Ordering::Relaxed);
-    let wide = WIDTH.load(Ordering::Relaxed) == 4;
-    // SAFETY: the port's registers at the address the SPCR gave, with the
-    // access width it gave.
-    unsafe {
-        if kind == 0 {
-            // PL011: FR (0x18) bit 5 TXFF, DR (0x00).
-            let mut spins = 0u32;
-            while read_volatile((base + 0x18) as *const u32) & (1 << 5) != 0 && spins < 1_000_000 {
-                spins += 1;
-            }
-            write_volatile(base as *mut u32, u32::from(byte));
-        } else {
-            let shift = kind - 1;
-            let reg = |n: u64| base + (n << shift);
-            let rd = |n: u64| {
-                if wide {
-                    read_volatile(reg(n) as *const u32) as u8
-                } else {
-                    read_volatile(reg(n) as *const u8)
-                }
-            };
-            let mut spins = 0u32;
-            // LSR (5) bit 5 THRE.
-            while rd(5) & (1 << 5) == 0 && spins < 1_000_000 {
-                spins += 1;
-            }
-            if wide {
-                write_volatile(reg(0) as *mut u32, u32::from(byte));
+impl Bus for Mmio {
+    fn read(&mut self, address: u64, width: u8) -> u32 {
+        // SAFETY: a register of the port at the address and with the access
+        // width the SPCR gave (`Uart::regs`).
+        unsafe {
+            if width == 4 {
+                read_volatile(address as *const u32)
             } else {
-                write_volatile(reg(0) as *mut u8, byte);
+                u32::from(read_volatile(address as *const u8))
+            }
+        }
+    }
+
+    fn write(&mut self, address: u64, width: u8, value: u32) {
+        // SAFETY: as above.
+        unsafe {
+            if width == 4 {
+                write_volatile(address as *mut u32, value);
+            } else {
+                write_volatile(address as *mut u8, value as u8);
             }
         }
     }
 }
 
-pub fn puts(s: &str) {
-    for b in s.bytes() {
-        if b == b'\n' {
-            put(b'\r');
-        }
-        put(b);
+/// Remembers the console port; the SPCR was checked when the tables were read.
+pub fn remember(u: &Uart) {
+    if let Ok(p) = Port::new(u) {
+        // SAFETY: the loader runs on one CPU and writes this once, before
+        // the exit, and reads it after.
+        unsafe { PORT = Some(p) };
+    }
+}
+
+pub fn puts(text: &str) {
+    // SAFETY: see `remember`.
+    if let Some(port) = unsafe { *core::ptr::addr_of!(PORT) } {
+        port.puts(&mut Mmio, text);
     }
 }

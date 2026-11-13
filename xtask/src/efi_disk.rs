@@ -117,6 +117,8 @@ fn gpt(disk: [u8; 16], part: [u8; 16]) -> (Vec<u8>, Vec<u8>) {
     // The protective MBR: one partition of type 0xEE over the rest of the disk.
     front[446 + 4] = 0xEE;
     front[446 + 2] = 2;
+    // End CHS of a disk too big for it: 0xFFFFFF.
+    front[446 + 5..446 + 8].fill(0xFF);
     put32(&mut front, 446 + 8, 1);
     put32(&mut front, 446 + 12, (SECTORS - 1).min(0xFFFF_FFFF) as u32);
     front[510] = 0x55;

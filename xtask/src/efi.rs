@@ -528,6 +528,8 @@ fn ring_panic(a: &Artifacts, feature: &str, text: &str) -> Result<(), String> {
 /// loader refuse or the kernel stay silent; the stale key of the exit is
 /// survived and, without the retry, refused.
 pub fn breaks() -> Result<(), String> {
+    // The edk2 files first: a QEMU without them fails here with the path.
+    firmware()?;
     let a = build(Variant::Normal)?;
     for b in &BREAKS {
         if b.host_fails && !host_tests_fail(b.feature)? {
@@ -574,7 +576,7 @@ pub fn breaks() -> Result<(), String> {
         || !o
             .lines
             .iter()
-            .any(|l| l.contains("ExitBootServices took 2 attempts"))
+            .any(|l| l.contains("boot services left after 2 attempt"))
     {
         return Err("stale-key: the exit did not retry and succeed".into());
     }

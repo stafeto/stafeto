@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod check;
+pub mod console;
 pub mod efimap;
 pub mod error;
 pub mod platform;

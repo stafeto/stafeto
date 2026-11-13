@@ -63,6 +63,8 @@ pub enum UartKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Uart {
     pub kind: UartKind,
+    /// The SPCR's interface type (a DBG2 port subtype).
+    pub interface_type: u8,
     pub base: u64,
     /// Bits of one register in the GAS: 8 or 32 (0 when the table leaves it).
     pub bit_width: u8,
@@ -94,6 +96,34 @@ pub struct MsiRange {
     pub count: u32,
 }
 
+impl Uart {
+    /// Register shift and access width in bytes of a 16550, decided from the
+    /// access size alone as Linux does (`drivers/acpi/spcr.c`: byte is
+    /// `mmio`, dword is `mmio32`, which is shift 2); a bit width that
+    /// contradicts it is refused, as are word and qword accesses, which a
+    /// 16550 driver does not make. PL011 gives (2, 4).
+    pub fn regs(&self) -> Result<(u8, u8), Error> {
+        if self.kind == UartKind::Pl011 {
+            return Ok((2, 4));
+        }
+        let (shift, width) = match self.access_size {
+            0 | 1 => (0, 1),
+            3 => (2, 4),
+            _ => {
+                return Err(Error::Unsupported(
+                    "SPCR 16550 access size (byte or dword only)",
+                ));
+            }
+        };
+        if self.bit_width != 0 && self.bit_width != width * 8 {
+            return Err(Error::Unsupported(
+                "SPCR register bit width and access size disagree",
+            ));
+        }
+        Ok((shift, width))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Platform {
     pub cpus: Vec<Cpu>,
@@ -107,6 +137,8 @@ pub struct Platform {
     pub msi: Vec<MsiRange>,
     /// What was accepted with a caveat, for the loader's summary.
     pub warnings: Vec<&'static str>,
+    /// The GICR base of every enabled GICC, until the version is known.
+    gicc_gicr: Vec<u64>,
 }
 
 impl Platform {
@@ -114,6 +146,10 @@ impl Platform {
         let mut p = Platform::default();
         let madt = tables.find(b"APIC").ok_or(Error::Missing("MADT"))?;
         p.read_madt(madt)?;
+        if p.its.len() > 1 {
+            p.warnings
+                .push("MADT lists more than one ITS (the kernel keeps one)");
+        }
         if let Some(fadt) = tables.find(b"FACP") {
             p.read_fadt(fadt)?;
         }
@@ -176,13 +212,26 @@ impl Platform {
         }
         let gic = self.gic.as_mut().ok_or(Error::Missing("MADT GICD"))?;
         gic.redistributors = gicr_ranges;
+        if self.cpus.is_empty() {
+            return Err(Error::Missing("MADT enabled GICC"));
+        }
+        self.gicc_gicr = gicr_bases;
+        // Version 0 means "discover from the hardware" (ACPI 6.5, GICD
+        // structure): the loader reads GICD_PIDR2 and calls
+        // `resolve_gic_version` before anything uses the version.
+        if self.gic.as_ref().is_some_and(|g| g.version != 0) {
+            self.finish_gic()?;
+        }
+        Ok(())
+    }
+
+    /// The checks and the GICC-derived range that need the version.
+    fn finish_gic(&mut self) -> Result<(), Error> {
+        let gic = self.gic.as_mut().ok_or(Error::Missing("MADT GICD"))?;
         if !matches!(gic.version, 3 | 4) {
             return Err(Error::Unsupported(
                 "GIC version (the kernel drives v3 and v4 under ACPI)",
             ));
-        }
-        if self.cpus.is_empty() {
-            return Err(Error::Missing("MADT enabled GICC"));
         }
         if gic.redistributors.len() > 1 {
             return Err(Error::Unsupported(
@@ -196,26 +245,37 @@ impl Platform {
             } else {
                 GICR_FRAME_V3
             };
-            gicr_bases.sort_unstable();
-            let first = gicr_bases[0];
+            let mut bases = self.gicc_gicr.clone();
+            bases.sort_unstable();
+            let first = bases[0];
             if first == 0 {
                 return Err(Error::Missing(
                     "GICR base (no GICR structure, GICC has none)",
                 ));
             }
-            for (i, b) in gicr_bases.iter().enumerate() {
+            for (i, b) in bases.iter().enumerate() {
                 if *b != first + i as u64 * frame {
                     return Err(Error::Unsupported(
                         "GICC redistributor bases are not one range",
                     ));
                 }
             }
-            gic.redistributors
-                .push((first, frame * gicr_bases.len() as u64));
+            gic.redistributors.push((first, frame * bases.len() as u64));
             self.warnings
                 .push("GICR range built from the GICC structures");
         }
         Ok(())
+    }
+
+    /// A GICD of version 0 takes its version from the hardware: `read(address)`
+    /// reads the 32-bit register at the physical address, `GICD_PIDR2` at
+    /// the distributor + 0xFFE8, whose bits [7:4] are ArchRev.
+    pub fn resolve_gic_version(&mut self, read: impl FnOnce(u64) -> u32) -> Result<(), Error> {
+        let Some(g) = self.gic.as_mut().filter(|g| g.version == 0) else {
+            return Ok(());
+        };
+        g.version = ((read(g.distributor + 0xFFE8) >> 4) & 0xF) as u8;
+        self.finish_gic()
     }
 
     /// FADT `ARM_BOOT_ARCH` at byte 129 (ACPI 6.5, "ARM Architecture Boot
@@ -263,8 +323,10 @@ impl Platform {
         let gsiv = (*d.get(52).ok_or(ERR)? & 8 != 0)
             .then(|| u32_at(d, 54).ok_or(ERR))
             .transpose()?;
-        self.uart = Some(Uart {
+        let interface_type = d[36];
+        let uart = Uart {
             kind,
+            interface_type,
             base: u64_at(d, 44).ok_or(ERR)?,
             bit_width: *d.get(41).ok_or(ERR)?,
             access_size: *d.get(43).ok_or(ERR)?,
@@ -275,7 +337,11 @@ impl Platform {
             } else {
                 0
             },
-        });
+        };
+        // A 16550 with contradictory access fields is refused here, before
+        // the exit, where the message can still be read.
+        uart.regs()?;
+        self.uart = Some(uart);
         Ok(())
     }
 

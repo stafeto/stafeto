@@ -28,7 +28,7 @@ use firmware_tree::acpi::{self, Tables};
 use firmware_tree::check::{self, Placement};
 use firmware_tree::efimap::{self, Classified, Desc};
 use firmware_tree::platform::Platform;
-use firmware_tree::tree::{self, PciWindow};
+use firmware_tree::tree;
 use kcore::bootinfo::{MPIDR_AFFINITY, Region};
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::prelude::*;
@@ -49,15 +49,39 @@ const BELOW_512_GIB: u64 = 512 << 30;
 
 static EXITED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The line a refusal ends with, fixed so that `get-console-output` and the
+/// instance's state can be searched for it.
+const FAILED_MARKER: &str = "STAFETO-EFI-LOADER-FAILED";
+
+/// 0 no PSCI, 1 over HVC, 2 over SMC (the FADT's).
+static CONDUIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Ends a failed run: PSCI `SYSTEM_OFF` when the FADT names a conduit, so
+/// that the instance stops and says so, otherwise a wait for events.
+fn halt() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    const SYSTEM_OFF: u64 = 0x8400_0008;
+    // SAFETY: PSCI SYSTEM_OFF does not return; x0 is the function id.
+    unsafe {
+        match CONDUIT.load(Relaxed) {
+            1 => core::arch::asm!("hvc #0", in("x0") SYSTEM_OFF, options(nostack)),
+            2 => core::arch::asm!("smc #0", in("x0") SYSTEM_OFF, options(nostack)),
+            _ => {}
+        }
+    }
+    loop {
+        // SAFETY: waits for an event.
+        unsafe { core::arch::asm!("wfe") };
+    }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut text = String::new();
     let _ = writeln!(text, "efi-loader: panic: {info}");
     say(&text);
-    loop {
-        // SAFETY: waits for an event.
-        unsafe { core::arch::asm!("wfe") };
-    }
+    say(&format!("{FAILED_MARKER}\n"));
+    halt()
 }
 
 /// A line to the firmware's console, or to the port after the exit.
@@ -69,16 +93,15 @@ fn say(text: &str) {
     }
 }
 
-/// A refusal: said, then the loop that a hung machine ends in.
+/// A refusal: said with the fixed marker, then the machine is powered off
+/// (the console keeps the text) or, with no PSCI, waits.
 fn refuse(why: &dyn core::fmt::Display) -> ! {
     say(&format!("efi-loader: refused: {why}\n"));
+    say(&format!("{FAILED_MARKER}\n"));
     if !EXITED.load(core::sync::atomic::Ordering::Relaxed) {
         boot::stall(core::time::Duration::from_secs(5));
     }
-    loop {
-        // SAFETY: waits for an event.
-        unsafe { core::arch::asm!("wfe") };
-    }
+    halt()
 }
 
 macro_rules! ensure {
@@ -255,7 +278,7 @@ fn read_acpi() -> Acpi {
     let header = at(xsdt_at, acpi::HEADER_SIZE).unwrap_or_else(|| refuse(&"no XSDT"));
     let xsdt_len = acpi::u32_at(header, 4).unwrap_or(0) as usize;
     ensure!(
-        xsdt_len >= acpi::HEADER_SIZE,
+        (acpi::HEADER_SIZE..=acpi::MAX_TABLE).contains(&xsdt_len),
         "the XSDT's length is {xsdt_len}"
     );
     let xsdt = at(xsdt_at, xsdt_len).unwrap_or_else(|| refuse(&"no XSDT"));
@@ -271,55 +294,6 @@ fn read_acpi() -> Acpi {
         tables: kept,
         rejected: tables.rejected.clone(),
     }
-}
-
-/// The windows the firmware set the PCI root bridges up with (UEFI 2.10,
-/// "PCI Root Bridge I/O Protocol", `Configuration()`): the memory and I/O
-/// ranges as `ranges` cells. Absent or unreadable: no windows, which nothing
-/// reads in this part (the note, section 3).
-fn pci_windows() -> Vec<PciWindow> {
-    use uefi::proto::pci::configuration::ResourceRangeType;
-    use uefi::proto::pci::root_bridge::PciRootBridgeIo;
-    let mut out = Vec::new();
-    let Ok(handles) = boot::find_handles::<PciRootBridgeIo>() else {
-        return out;
-    };
-    for h in handles {
-        // Not exclusive: an exclusive open of a root bridge stops the drivers
-        // under it, the disk the loader reads from among them.
-        // SAFETY: a handle the firmware listed, used until the function ends.
-        let Ok(rb) = (unsafe {
-            boot::open_protocol::<PciRootBridgeIo>(
-                boot::OpenProtocolParams {
-                    handle: h,
-                    agent: boot::image_handle(),
-                    controller: None,
-                },
-                boot::OpenProtocolAttributes::GetProtocol,
-            )
-        }) else {
-            continue;
-        };
-        let Ok(list) = rb.configuration() else {
-            continue;
-        };
-        for d in list {
-            let kind = match (d.resource_range_type, d.granularity) {
-                (ResourceRangeType::Io, _) => 1,
-                (ResourceRangeType::Memory, 32) => 2,
-                (ResourceRangeType::Memory, _) => 3,
-                _ => continue,
-            };
-            out.push(PciWindow {
-                kind,
-                prefetchable: d.type_specific_flags & 0x6 == 0x6,
-                pci_base: d.address_min,
-                cpu_base: d.address_min.wrapping_add(d.translation_offset),
-                size: d.address_length,
-            });
-        }
-    }
-    out
 }
 
 // ---- the summary --------------------------------------------------------------
@@ -431,7 +405,6 @@ fn write_tree(blob: &[u8], at: Region) {
 /// The tree for `map`, checked as the kernel will read it.
 fn make_tree(
     platform: &Platform,
-    windows: &[PciWindow],
     map: &[Desc],
     loaded: &Loaded,
     boot_mpidr: u64,
@@ -450,7 +423,6 @@ fn make_tree(
         memory: &classified,
         initrd: loaded.image,
         boot_mpidr,
-        pci_windows: windows,
     })
     .unwrap_or_else(|e| refuse(&e));
     let at = Placement {
@@ -480,6 +452,48 @@ fn report(platform: &Platform, classified: &Classified, s: &check::Summary, tree
     }
 }
 
+/// What the tables said, for the first boot on a machine nobody can look at:
+/// the console, the interrupt controller, PSCI.
+fn describe(p: &Platform) {
+    match &p.uart {
+        Some(u) => say(&format!(
+            "efi-loader: SPCR type {:#x} space 0 bit width {} access size {} address {:#x}, {}\n",
+            u.interface_type,
+            u.bit_width,
+            u.access_size,
+            u.base,
+            match u.kind {
+                firmware_tree::platform::UartKind::Pl011 => String::from("PL011"),
+                firmware_tree::platform::UartKind::Ns16550 => {
+                    let (shift, width) = u.regs().unwrap_or((0, 0));
+                    format!("16550 shift {shift} width {width}")
+                }
+            }
+        )),
+        None => say("efi-loader: no SPCR console\n"),
+    }
+    if let Some(g) = &p.gic {
+        say(&format!(
+            "efi-loader: GICD {:#x} version {}; GICR ranges {:x?}\n",
+            g.distributor, g.version, g.redistributors
+        ));
+    }
+    for its in &p.its {
+        say(&format!(
+            "efi-loader: ITS id {} at {:#x}\n",
+            its.id, its.base
+        ));
+    }
+    say(&format!(
+        "efi-loader: PSCI {}\n",
+        match p.psci_hvc {
+            Some(true) => "HVC",
+            Some(false) => "SMC",
+            None => "absent",
+        }
+    ));
+}
+
 #[entry]
 fn main() -> Status {
     say("efi-loader: stafeto EFI loader\n");
@@ -498,10 +512,26 @@ fn main() -> Status {
     );
 
     let Acpi {
-        platform,
+        mut platform,
         tables,
         rejected,
     } = read_acpi();
+    CONDUIT.store(
+        match platform.psci_hvc {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    // A GICD of version 0 takes its version from GICD_PIDR2 (ACPI 6.5).
+    platform
+        .resolve_gic_version(|address| {
+            // SAFETY: the distributor's register block, which the firmware maps.
+            unsafe { core::ptr::read_volatile(address as *const u32) }
+        })
+        .unwrap_or_else(|e| refuse(&e));
+    describe(&platform);
     for (sig, e) in &rejected {
         say(&format!(
             "efi-loader: warning: table {}: {e}\n",
@@ -511,7 +541,6 @@ fn main() -> Status {
     if let Some(u) = &platform.uart {
         port::remember(u);
     }
-    let windows = pci_windows();
 
     // The buffers first, then the map that finds the slot: an allocation
     // after the map could take the slot's pages.
@@ -549,7 +578,7 @@ fn main() -> Status {
         boot::allocate_pages(
             AllocateType::Address(tree_base & !(PAGE - 1)),
             MemoryType::LOADER_DATA,
-            32,
+            (efimap::TREE_ROOM / PAGE) as usize,
         )
         .unwrap_or_else(|e| refuse(&format!("cannot take {tree_base:#x} for the tree: {e}")));
     }
@@ -591,8 +620,7 @@ fn main() -> Status {
 
     // The trial tree from the map as it is now, with the boot services alive.
     let trial = snapshot(buf);
-    let (blob, classified, summary) =
-        make_tree(&platform, &windows, &trial.descs, &loaded, boot_mpidr);
+    let (blob, classified, summary) = make_tree(&platform, &trial.descs, &loaded, boot_mpidr);
     report(&platform, &classified, &summary, blob.len());
     write_tree(&blob, loaded.tree);
 
@@ -601,12 +629,12 @@ fn main() -> Status {
     say("efi-loader: leaving the boot services\n");
     let (final_map, tries) = exit_boot_services(buf);
     EXITED.store(true, core::sync::atomic::Ordering::Relaxed);
-    if tries > 1 {
-        say(&format!(
-            "efi-loader: ExitBootServices took {tries} attempts\n"
-        ));
-    }
-    let (blob, _, _) = make_tree(&platform, &windows, &final_map, &loaded, boot_mpidr);
+    // The first line through the port: if the console is silent from here on,
+    // this is the one that shows the exit worked.
+    say(&format!(
+        "efi-loader: boot services left after {tries} attempt(s)\n"
+    ));
+    let (blob, _, _) = make_tree(&platform, &final_map, &loaded, boot_mpidr);
     write_tree(&blob, loaded.tree);
     // The part of the kernel's own check that the tree's size decides was
     // done with this blob: the tree region is now the final one.
@@ -614,6 +642,10 @@ fn main() -> Status {
     // The hand-over (the note, 2.2 items 3 to 5).
     // SAFETY: the ranges are the loader's own allocations, and boot services are gone.
     unsafe {
+        say(&format!(
+            "efi-loader: entering kernel at {:#x}, tree {:#x}\n",
+            loaded.kernel.base, loaded.tree.base
+        ));
         if !cfg!(feature = "break-clean") {
             cpu::clean_range(loaded.kernel.base, loaded.kernel.size + efimap::TREE_ROOM);
             cpu::clean_range(loaded.tree.base, efimap::TREE_ROOM);
@@ -621,6 +653,7 @@ fn main() -> Status {
             let (t, len) = cpu::trampoline();
             cpu::clean_range(t, len);
         }
+        say("efi-loader: jumping\n");
         cpu::enter_kernel(loaded.kernel.base, loaded.tree.base)
     }
 }

@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 pub const HEADER_SIZE: usize = 36;
 
 /// The largest table accepted: a DSDT of a big machine is a few hundred KiB.
-const MAX_TABLE: usize = 16 << 20;
+pub const MAX_TABLE: usize = 16 << 20;
 
 pub fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
