@@ -61,18 +61,21 @@ pub const CONSOLE: Record = Record {
             base: FUNCTION,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
         Window {
             name: "bar",
             base: BAR,
             len: 16 * PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         },
     ],
     bindings: &[Binding {
         name: "irq",
         line: LINE,
         edge: false,
+        of: None,
     }],
     connects: &[],
     args: &FUNCTION.to_le_bytes(),
@@ -98,6 +101,7 @@ pub const CONSOLE: Record = Record {
                 offset: COMMAND,
                 bits: MEMORY,
             }),
+            confirm: None,
         },
         // The command word; its status half reads back what it holds. VZ
         // stops the machine at a byte write to the configuration space.
@@ -108,8 +112,11 @@ pub const CONSOLE: Record = Record {
             value: 0,
             settled: 0xFFFF,
             only_if: None,
+            confirm: None,
         },
     ],
+    start: &[],
+    release: &[],
     trusted: true,
     root: false,
     shares: Shares::CREATOR,
@@ -132,11 +139,14 @@ pub const PCI_WALK: Record = Record {
         base: 0x4000_0000,
         len: 0x10_0000,
         duplicate: false,
+        at: crate::table::At::Fixed,
     }],
     bindings: &[],
     args: &[],
     dma: &[],
     quiesce: &[],
+    start: &[],
+    release: &[],
     ..super::entropy::RNG_VZ
 };
 

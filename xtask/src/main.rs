@@ -992,13 +992,52 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
         programs.extend(package_programs(&packages));
         programs.extend(SHELL_SERVICES_LAST.iter().take(2));
+        // The network service with the ENA of the instance (init's record `net`).
+        // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
+        // queue on purpose (`aws image --ena-break-aenq`).
+        let break_aenq: &'static [&'static str] =
+            match std::env::var("STAFETO_ENA_BREAK").as_deref() {
+                Ok("exit") => &["ena-break-exit"],
+                Ok(_) => &["ena-break-aenq"],
+                Err(_) => &[],
+            };
+        programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
         programs
     })
 }
 
 /// The boot image of the shell on EC2.
 pub(crate) fn aws_boot_image() -> Result<PathBuf, String> {
-    build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)
+    let path = build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)?;
+    image_has_ena_notice(&path)?;
+    Ok(path)
+}
+
+/// Fails unless the boot image at `path` carries the notice of the ENA driver
+/// as a file and in its table of files under `rootfs::ENA_NOTICE`.
+fn image_has_ena_notice(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let notice = include_bytes!("../../lib/ena/NOTICE");
+    let table = image
+        .files()
+        .find(|f| f.name == "rootfs")
+        .ok_or_else(|| format!("{}: no table of files", path.display()))?;
+    let table = bootimg::rootfs::Rootfs::parse(table.data, image.count())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let held = table
+        .find(rootfs::ENA_NOTICE)
+        .and_then(|n| image.file_at(table.entry(n as u32).file))
+        .is_some_and(|f| f.data == notice.as_slice());
+    if !held {
+        return Err(format!(
+            "{} carries no {} with the text of lib/ena/NOTICE",
+            path.display(),
+            rootfs::ENA_NOTICE
+        ));
+    }
+    Ok(())
 }
 
 /// The builds of the programs that `packages` name (PACKAGE_PROGRAMS).
@@ -2062,6 +2101,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   its-int   boot the self-test of the ITS in QEMU on four CPUs: an event mapped to each CPU's collection, raised by INT, received there; with the break (every event on CPU 0) the run must report the failure
   its-slow  the kernel tests under -icount with an ITS that seems slow: every bound holds (B_4 under 32 000), and with the teardown that waits in one portion a test fails
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
@@ -2080,6 +2120,7 @@ fn main() {
         Some("aws") => aws::run(&args[1..]),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
+        Some("ena-breaks") => ena_breaks(),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
         Some("its-breaks") => its_breaks(),
@@ -2542,6 +2583,57 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// The kernel image of `variant` and the boot image of the normal build,
 /// each built once in a run of xtask, whatever number of checks takes
 /// them.
+/// The deliberate breaks of the PCI library, the ENA driver and the places of
+/// init's table (`cargo xtask ena-breaks`): each is a feature of its crate that
+/// does one wrong thing, and the host tests of the crate pass without it and
+/// fail with it.
+const ENA_BREAKS: [(&str, &str); 24] = [
+    ("pci", "break-measure-console"),
+    ("pci", "break-restore-command"),
+    ("pci", "break-multifunction"),
+    ("pci", "break-cap-limit"),
+    ("init", "break-bar-size"),
+    ("init", "break-bar-offset"),
+    ("ena", "break-acq-phase"),
+    ("ena", "break-aenq-head"),
+    ("ena", "break-reset-wait"),
+    ("ena", "break-dma-width"),
+    ("ena", "break-resp-rewrite"),
+    ("ena", "break-zero-early"),
+    ("ena", "break-reset-reason"),
+    ("ena", "break-read-hint"),
+    ("ena", "break-read-retry"),
+    ("ena", "break-ask-lost"),
+    ("ena", "break-eni-gate"),
+    ("ena", "break-ask-kept"),
+    ("ena", "break-tried-kept"),
+    ("init", "break-measure-twice"),
+    ("init", "break-no-enable"),
+    ("init", "break-no-start"),
+    ("init", "break-keep-master"),
+    ("init", "break-master-left"),
+];
+
+fn ena_breaks() -> Result<(), String> {
+    for package in ["pci", "ena", "init"] {
+        let mut ok = cargo();
+        ok.args(["test", "--package", package, "--lib"]);
+        run_cmd(&mut ok)?;
+    }
+    for (package, feature) in ENA_BREAKS {
+        let mut broken = cargo();
+        broken.args(["test", "--package", package, "--lib", "--features", feature]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => {
+                println!("ena-breaks: {feature} is caught by the host tests of {package}");
+            }
+            Ok(_) => return Err(format!("{feature} passed the host tests of {package}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// `cargo xtask uart-breaks`: the host tests of the driver pass, and fail
 /// under the feature `break-uart-poll`, which leaves a 16550 console with
 /// no poll.
@@ -3156,6 +3248,18 @@ fn write_elf_image(
         }
     }
     listed.extend(extra);
+    // An image with `netd` carries the ENA driver, whose numbers come from
+    // BSD-3-Clause headers: the notice goes in under the licences of the system.
+    if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "netd"))
+    {
+        for f in rootfs::ena_notice() {
+            if !listed.iter().any(|g| g.path == f.path) {
+                listed.push(f);
+            }
+        }
+    }
     // A program that asks for the dynamic linker needs the library the loader
     // opens for it (spec 2, 3.12.4).
     if dynamic && !listed.iter().any(|f| f.path == rootfs::LIBRARY) {
@@ -9778,6 +9882,10 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "virtio-pci",
         "--package",
+        "pci",
+        "--package",
+        "ena",
+        "--package",
         "proto-entropy",
         "--package",
         "virtio-rng",
@@ -12549,6 +12657,10 @@ fn ci_lints() -> Result<(), String> {
         "proto-tty",
         "--package",
         "virtio-pci",
+        "--package",
+        "pci",
+        "--package",
+        "ena",
         "--package",
         "proto-entropy",
         "--package",

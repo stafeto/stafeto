@@ -1,0 +1,84 @@
+The numeric definitions in src/regs.rs and src/admin.rs (register offsets,
+masks, shifts, command and feature codes, the layout of the admin, event and
+statistics structures) are taken from these header files of the ENA device
+definitions, distributed under the BSD 3-Clause license, at the revisions
+named (the latest commit of each file when they were read, 2026-11-13):
+
+  FreeBSD sys/contrib/ena-com/ena_defs/ena_regs_defs.h
+    commit f5f8d7c9cdf0341f7c5fdb3a7c3358ec0ed67a0c (2024-10-15)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
+  FreeBSD sys/contrib/ena-com/ena_defs/ena_admin_defs.h
+    commit 0f6f75189f5e55a5846e3b20eec18db93cfafa89 (2026-10-29)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
+  FreeBSD sys/contrib/ena-com/ena_defs/ena_common_defs.h
+    commit adfed2d835a7f9382941896d15a487dac6fe659c (2023-12-28)
+    Copyright (c) 2015-2023 Amazon.com, Inc. or its affiliates.
+  DPDK drivers/net/ena/base/ena_defs/ena_regs_defs.h
+    commit 95eaa71c66eadb6a6924cc5241e02d3dcc58217c (2024-07-08)
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) Amazon.com, Inc. or its affiliates. All rights reserved.
+  DPDK drivers/net/ena/base/ena_defs/ena_admin_defs.h
+    commit 5bf30b41705a95578d515c50b04bafce75437b1d (2025-10-21)
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) Amazon.com, Inc. or its affiliates. All rights reserved.
+
+Only numbers were carried over: no function body and no comment of those
+trees is part of this library. The depths, timeouts and the INTR_MASK value
+in the driver are its own choices.
+
+The license text of the FreeBSD headers:
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+* Neither the name of copyright holder nor the names of its contributors may
+  be used to endorse or promote products derived from this software without
+  specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The DPDK headers carry the SPDX tag BSD-3-Clause only. The standard text of
+that license, for those files:
+
+Copyright (c) Amazon.com, Inc. or its affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

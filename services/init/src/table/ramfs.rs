@@ -58,6 +58,8 @@ const RAM_BASE: Record = Record {
     args: &[],
     dma: &[],
     quiesce: &[],
+    start: &[],
+    release: &[],
     trusted: false,
     root: false,
     shares: Shares::CREATOR,
@@ -104,6 +106,8 @@ pub const TABLE: &[Record] = &[
         args: &[],
         dma: &[],
         quiesce: &[],
+        start: &[],
+        release: &[],
         trusted: false,
         root: false,
         shares: Shares::CREATOR,
@@ -219,6 +223,7 @@ const RTC: Window = Window {
     base: 0x0901_0000,
     len: PAGE,
     duplicate: false,
+    at: crate::table::At::Fixed,
 };
 
 /// The clock service with the window over the PL031, for the machines that

@@ -160,6 +160,47 @@ pub struct Window {
     pub base: u64,
     pub len: u64,
     pub duplicate: bool,
+    /// Where `base` counts from.
+    pub at: At,
+}
+
+/// How a window finds its place. `Fixed` windows lie where `base` says. The
+/// other forms name a PCI function, which init finds when it starts
+/// (`resolve`): the `index`-th function in the order of the walk of the buses
+/// whose vendor and device are `id` (`vendor << 16 | device`), and the
+/// window takes the place the firmware gave it, so that no table holds an
+/// address the firmware chose. For them `len` is the bytes the record
+/// wants (the BAR measured at start must hold them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    Fixed,
+    /// `base` is the offset in BAR `bar` of the function; the window is
+    /// `base` bytes past the BAR as the firmware set it, plus the platform's
+    /// shift for the kind of the BAR.
+    Bar {
+        id: u32,
+        index: u8,
+        bar: u8,
+    },
+    /// The page of the function's configuration in ECAM; `base` is 0 and
+    /// `len` one page.
+    Config {
+        id: u32,
+        index: u8,
+    },
+}
+
+impl Window {
+    /// A window at `base`.
+    pub const fn fixed(name: &'static str, base: u64, len: u64, duplicate: bool) -> Window {
+        Window {
+            name,
+            base,
+            len,
+            duplicate,
+            at: At::Fixed,
+        }
+    }
 }
 
 /// An interrupt binding init makes for a service through its registered
@@ -174,6 +215,9 @@ pub struct Binding {
     pub line: u32,
     /// Edge-triggered; level-triggered otherwise.
     pub edge: bool,
+    /// The function whose RID an MSI binding takes (`Binding::msi_of`): the
+    /// `index`-th function with PCI id `id`, which init finds when it starts.
+    pub of: Option<(u32, u8)>,
 }
 
 /// The mark of a `line` that names an MSI event: the RID of the function
@@ -188,6 +232,17 @@ impl Binding {
             name,
             line: MSI_EVENT | rid << 8 | event,
             edge: false,
+            of: None,
+        }
+    }
+
+    /// The binding `name` of event `event` of the function the table names
+    /// by its PCI id and index (`At::Bar`): init puts its RID in when it
+    /// starts, from the walk of the buses.
+    pub const fn msi_of(name: &'static str, id: u32, index: u8, event: u32) -> Binding {
+        Binding {
+            of: Some((id, index)),
+            ..Binding::msi(name, 0, event)
         }
     }
 
@@ -245,8 +300,24 @@ pub struct Write {
     pub offset: u64,
     pub bits: u8,
     pub value: u32,
+    /// The bits of the register that must read back as `value` (0: no read-back,
+    /// for a register that does not hold what is written).
     pub settled: u32,
     pub only_if: Option<Gate>,
+    /// A register that must show a state before the next write goes: the device's
+    /// own acknowledgement of this one.
+    pub confirm: Option<Confirm>,
+}
+
+/// A 32-bit register read through the record's window `window` at word `offset`
+/// until its bits `mask` show `value`, at most worker::SETTLE_READS times; the
+/// stop failed otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Confirm {
+    pub window: &'static str,
+    pub offset: u64,
+    pub mask: u32,
+    pub value: u32,
 }
 
 /// A 32-bit register a Write depends on: at word `offset` of the record's
@@ -356,6 +427,14 @@ pub struct Record {
     pub dma: &'static [Dma],
     /// The writes that stop its device once an instance ended.
     pub quiesce: &'static [Write],
+    /// The writes init applies before each load of an instance, in their order:
+    /// what a stop undoes, such as the command word of a function the stop
+    /// cleared.
+    pub start: &'static [Write],
+    /// The writes that go after `quiesce` even when a step of it did not settle
+    /// or confirm: what must hold whatever the device did, such as bus
+    /// mastering off.
+    pub release: &'static [Write],
     /// A driver of a device that masters the bus with no SMMU between
     /// them: it can write any memory, so it is in the trusted base (spec
     /// 9; spec 2, section 4). Only such a record has DMA objects.
@@ -411,6 +490,34 @@ pub fn first_cpu(log: bool, mask: u8) -> u8 {
 }
 
 impl Record {
+    /// A record of nothing: the filler of the buffers of a resolved table.
+    pub const EMPTY: Record = Record {
+        name: "",
+        program: "",
+        kind: Kind::Client,
+        priority: 1,
+        ceiling: 1,
+        quota: MIN_QUOTA,
+        handle_limit: 1,
+        restart: Restart::Never,
+        console: false,
+        log: false,
+        trace: false,
+        windows: &[],
+        bindings: &[],
+        connects: &[],
+        args: &[],
+        dma: &[],
+        quiesce: &[],
+        start: &[],
+        release: &[],
+        trusted: false,
+        root: false,
+        shares: Shares::CREATOR,
+        cpus: 1,
+        waits: &[],
+    };
+
     /// The watchdog of a service; None for a client.
     pub const fn watch(&self) -> Option<Watch> {
         match self.kind {
@@ -994,7 +1101,7 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
             });
         }
     }
-    for q in r.quiesce {
+    for q in r.quiesce.iter().chain(r.start).chain(r.release) {
         let window = r.windows.iter().find(|w| w.name == q.window);
         let bytes = u64::from(q.bits / 8);
         let width = matches!(q.bits, 8 | 32) && (q.bits == 32 || q.value <= 0xFF);
@@ -1003,8 +1110,14 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
                 .iter()
                 .any(|w| w.name == g.window && g.offset.is_multiple_of(4) && g.offset + 4 <= w.len)
         });
+        let confirm = q.confirm.is_none_or(|c| {
+            r.windows
+                .iter()
+                .any(|w| w.name == c.window && c.offset.is_multiple_of(4) && c.offset + 4 <= w.len)
+        });
         let within = width
             && gate
+            && confirm
             && window.is_some_and(|w| q.offset.is_multiple_of(bytes) && q.offset + bytes <= w.len);
         if !within {
             return Err(TableError::Quiesce {
@@ -1341,6 +1454,12 @@ pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-aws")]
 pub const TABLE: &[Record] = aws::TABLE;
+pub use crate::resolve::table;
+/// The platform a table with places by function (`At`) resolves them on.
+#[cfg(feature = "table-aws")]
+pub const PLATFORM: Option<crate::resolve::Platform> = Some(aws::PLATFORM);
+#[cfg(not(feature = "table-aws"))]
+pub const PLATFORM: Option<crate::resolve::Platform> = None;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
 #[cfg(feature = "table-rtbench-posix")]
@@ -1466,6 +1585,8 @@ mod tests {
             args: &[],
             dma: &[],
             quiesce: &[],
+            start: &[],
+            release: &[],
             trusted: false,
             root: false,
             shares: Shares::CREATOR,
@@ -1495,11 +1616,13 @@ mod tests {
         base: 0x0901_0000,
         len: PAGE,
         duplicate: false,
+        at: crate::table::At::Fixed,
     };
     const RTC_IRQ: Binding = Binding {
         name: "rtc-irq",
         line: 34,
         edge: false,
+        of: None,
     };
 
     /// The layer session goes to one named client that connects to the RAM service.
@@ -1875,17 +1998,20 @@ mod tests {
             base: 0x0902_0000,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         };
         const W3: Window = Window {
             name: "rtc3",
             base: 0x0903_0000,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         };
         const B2: Binding = Binding {
             name: "irq2",
             line: 1019,
             edge: true,
+            of: None,
         };
         let with = |windows: &'static [Window], bindings: &'static [Binding]| {
             [Record {
@@ -1949,6 +2075,7 @@ mod tests {
                 base,
                 len,
                 duplicate: false,
+                at: crate::table::At::Fixed,
             }];
             check_one(Record {
                 windows: Box::leak(Box::new(w)),
@@ -2065,6 +2192,7 @@ mod tests {
             value: 0,
             settled: u32::MAX,
             only_if: None,
+            confirm: None,
         };
         let driver = |dma: &'static [Dma], trusted| Record {
             windows: &[RTC],
@@ -3545,5 +3673,29 @@ mod tests {
         assert_eq!(on_cpus(GENERAL_CPUS, 0b0001), (0b0001, true));
         // None of its CPUs is up: all that are, and the line says so.
         assert_eq!(on_cpus(RT_CPUS, 0b0011), (0b0011, false));
+    }
+
+    /// A confirmation names a word of a window of the record.
+    #[test]
+    fn a_confirmation_outside_the_windows_of_the_record_is_refused() {
+        let good = aws::NET;
+        assert!(check_record(&good).is_ok());
+        static BAD: [Write; 1] = [Write {
+            confirm: Some(Confirm {
+                window: "bar",
+                offset: 0x4000,
+                mask: 8,
+                value: 8,
+            }),
+            ..aws::NET.quiesce[0]
+        }];
+        let bad = Record {
+            quiesce: &BAD,
+            ..aws::NET
+        };
+        assert!(matches!(
+            check_record(&bad),
+            Err(TableError::Quiesce { window: "bar", .. })
+        ));
     }
 }

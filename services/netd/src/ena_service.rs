@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The network service with an ENA device (`kind` of its table record: the
+//! start data holds the object `ena` and neither `dma` nor `net`): the
+//! second kind of device after Virtio. At this step the service brings the
+//! device up on polling (`ena::Ena`), prints its version, MAC, link and
+//! keep-alive counts, watches it and resets it in place; there is no data
+//! path yet, so it serves no client. The driver's logic is in the library
+//! `ena`, tested on the host against a model of the device; this file holds
+//! the calls: the windows, the object, the timer and the heartbeat.
+
+use abi::{Access, Source};
+use core::fmt;
+use ena::mmio::Bar;
+use ena::{Ena, Event, Platform, Region};
+use proto_init::ServiceArgs;
+use proto_wire::Status;
+use rt::handle::{Memory, Timer};
+use rt::service::{Answer, Config, Heartbeat, Notice, Request, Service, Session};
+use rt::{Handle, sys, time};
+
+/// Where the service maps what init gives it.
+const ENA_AT: usize = 0x10_0000_0000;
+const BAR_AT: usize = 0x10_1000_0000;
+const ECAM_AT: usize = 0x10_2000_0000;
+const PAGE: u64 = 4096;
+const TIMER_LABEL: u64 = 1;
+/// The step of the service: half the watchdog's 100 ms.
+const TICK_NS: u64 = 50_000_000;
+/// The tick while the device comes up: a read through memory takes a step each.
+const BRINGUP_TICK_NS: u64 = 1_000_000;
+/// The steps one notification takes at most. A step never waits
+/// (`ena::Ena::poll`) and makes at most `REG_ACCESSES_PER_STEP` access to a register
+/// and reads at most `EVENTS_PER_STEP` event entries (`LOADS_PER_ENTRY` loads of the
+/// device's memory each) and a few admin entries (`LOADS_PER_ADMIN`). Two steps
+/// store besides: the one after a reset zeroes the admin structures with
+/// `RESET_ZERO_STORES` 64-bit stores, and the one that gives the host info writes
+/// `HOST_STORES` stores (its page zeroed by 64-bit stores and the bytes of its
+/// fields). A notification of 8 steps is bounded by every step reading and both
+/// storing steps, 1 us an access at most, under a quarter of the step bound of the
+/// service (18 369 ticks). The driver runs in this record's own thread; the switch of the
+/// network service does not call it.
+const STEPS: u32 = 8;
+const LOADS_PER_ENTRY: u32 = 16;
+const LOADS_PER_ADMIN: u32 = 16;
+const STEP_BOUND: u32 = 18_369;
+const _: () = assert!(
+    STEPS
+        * (ena::device::REG_ACCESSES_PER_STEP
+            + ena::device::EVENTS_PER_STEP * LOADS_PER_ENTRY
+            + LOADS_PER_ADMIN)
+        + ena::device::RESET_ZERO_STORES
+        + ena::device::HOST_STORES
+        <= STEP_BOUND / 4
+);
+const NOT_REGISTERED: u64 = 3;
+const NOT_MAPPED: u64 = 4;
+const NO_DEVICE: u64 = 6;
+/// The code the service ends with when the device cannot be recovered (three
+/// failed resets in a minute); init stops the device and starts the service again.
+const FAILED: u64 = 8;
+
+struct Hw {
+    bar: Bar,
+}
+
+impl Platform for Hw {
+    fn read32(&self, offset: u32) -> u32 {
+        self.bar.read32(offset)
+    }
+
+    fn write32(&self, offset: u32, value: u32) {
+        self.bar.write32(offset, value);
+    }
+
+    fn now_ns(&self) -> u64 {
+        time::ticks_to_ns(time::now())
+    }
+
+    fn wmb(&self) {
+        rt::dma::wmb();
+    }
+
+    fn rmb(&self) {
+        rt::dma::rmb();
+    }
+
+    fn log(&self, line: fmt::Arguments<'_>) {
+        rt::println!("{line}");
+    }
+}
+
+struct EnaService {
+    ena: Ena<Hw>,
+    timer: Handle<Timer>,
+    deadline: u64,
+    /// The probe's deliberate break: after the first start the head of the
+    /// event queue is not written back, until the reset it causes.
+    #[cfg(feature = "ena-break-aenq")]
+    broken: bool,
+    /// The probe of a restart (`ena-break-exit`): the uptime at which this instance
+    /// began.
+    #[cfg(feature = "ena-break-exit")]
+    born_ns: u64,
+}
+
+/// The probe of a restart (`ena-break-exit`): the instance that began before this uptime
+/// exits with FAILED once the device is up and the uptime reaches it, so init stops
+/// the device and starts the service again; the next instance begins after it and runs on.
+#[cfg(feature = "ena-break-exit")]
+const BREAK_EXIT_NS: u64 = 40_000_000_000;
+
+impl EnaService {
+    fn arm(&mut self) {
+        let now = time::ticks_to_ns(time::now());
+        let tick = if self.ena.is_up() {
+            TICK_NS
+        } else {
+            BRINGUP_TICK_NS
+        };
+        self.deadline = now + tick;
+        let _ = sys::timer_set(&self.timer, self.deadline);
+    }
+
+    fn step(&mut self) {
+        for _ in 0..STEPS {
+            match self.ena.poll() {
+                Event::Idle => break,
+                Event::Failed(_) => sys::process_exit(FAILED),
+                #[cfg(feature = "ena-break-aenq")]
+                Event::Up if !self.broken => {
+                    self.broken = true;
+                    self.ena.hold_event_head(true);
+                    rt::println!("ena: break: the event head is held");
+                }
+                #[cfg(feature = "ena-break-aenq")]
+                Event::Resetting(_) => self.ena.hold_event_head(false),
+                _ => {}
+            }
+        }
+        #[cfg(feature = "ena-break-exit")]
+        {
+            let now = time::ticks_to_ns(time::now());
+            if self.ena.is_up() && self.born_ns < BREAK_EXIT_NS && now >= BREAK_EXIT_NS {
+                rt::println!(
+                    "ena: break: the service exits, uptime {} s",
+                    now / 1_000_000_000
+                );
+                sys::process_exit(FAILED);
+            }
+        }
+    }
+}
+
+impl Service<1> for EnaService {
+    const VERSION: u16 = 1;
+    const METHODS: &'static [u16] = &[];
+    type Data = ();
+
+    fn request(&mut self, _: &mut Session<(), 1>, _: &mut Request<'_>) -> Answer {
+        Answer::Status(Status::UnknownMethod)
+    }
+
+    fn notification(&mut self, n: Notice) {
+        if let (Source::Timer, TIMER_LABEL) = (n.source, n.label)
+            && time::reached(self.deadline)
+        {
+            self.step();
+            self.arm();
+        }
+    }
+}
+
+/// Runs the service for the device whose objects the start data holds: the
+/// object `ena` (its physical address is the first word of the record's own
+/// arguments), the windows `bar` (BAR 0) and `ecam` (the page of the
+/// function, whose revision byte picks the way registers are read).
+pub fn run(s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
+    let args = ServiceArgs::read(s.args()).ok();
+    let own = args.map_or(&[][..], |a| a.own);
+    let pa = own
+        .get(..8)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u64::from_le_bytes);
+    let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
+    let Ok(channel) = sys::channel_create(level) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(mut got) = rt::service::register(&s.parent, &channel) else {
+        return NOT_REGISTERED;
+    };
+    let (Ok(bar), Ok(ecam)) = (got.take::<Memory>("bar"), got.take::<Memory>("ecam")) else {
+        return NO_DEVICE;
+    };
+    let len = sys::memory_info(&object).map_or(0, |info| info.size);
+    let rw = Access::ReadWrite;
+    if pa == 0
+        || sys::mem_map(&s.process, &object, 0, len, ENA_AT, rw).is_err()
+        || sys::mem_map(&s.process, &bar, 0, 4 * PAGE, BAR_AT, rw).is_err()
+        || sys::mem_map(&s.process, &ecam, 0, PAGE, ECAM_AT, Access::Read).is_err()
+    {
+        return NOT_MAPPED;
+    }
+    // SAFETY: the page of the function is mapped at ECAM_AT, read-only, as device
+    // memory; offset 8 is its revision and class word. Memory decoding and bus
+    // mastering were turned on by init when it found the function.
+    let revision = unsafe { rt::mmio::read32(ECAM_AT + 8) } as u8;
+    let region = Region {
+        va: ENA_AT,
+        pa,
+        len: len as usize,
+    };
+    // SAFETY: the object is mapped at ENA_AT for `len` bytes, uncached, and
+    // this service alone uses it; the device addresses it at `pa`, as init's
+    // reply to the creation of the object says.
+    let opened = unsafe {
+        Ena::open(
+            Hw {
+                bar: Bar::new(BAR_AT, 4 * PAGE as usize),
+            },
+            region,
+            revision,
+        )
+    };
+    let Ok(mut ena) = opened else {
+        rt::println!("ena: the object does not fit the driver");
+        return NO_DEVICE;
+    };
+    // The host info names the CPUs of the service; the function's bus, device and
+    // function number are not known here (init finds the function), so 0.
+    ena.set_host(0, 2);
+    rt::println!("ena: pci revision {revision:#x}, object {pa:#x}+{len:#x}");
+    let Ok(view) = sys::handle_label(&channel, abi::Rights::RECEIVE, TIMER_LABEL, level) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(timer) = sys::timer_create(&view, level) else {
+        return NOT_REGISTERED;
+    };
+    let mut service = EnaService {
+        ena,
+        timer,
+        deadline: 0,
+        #[cfg(feature = "ena-break-aenq")]
+        broken: false,
+        #[cfg(feature = "ena-break-exit")]
+        born_ns: time::ticks_to_ns(time::now()),
+    };
+    #[cfg(feature = "ena-break-exit")]
+    rt::println!(
+        "ena: break armed, uptime {} s",
+        service.born_ns / 1_000_000_000
+    );
+    service.arm();
+    let heartbeat = Heartbeat {
+        to: &s.parent,
+        period_ns: args.map_or(0, |a| a.period_ns),
+        priority: level,
+    };
+    let config = Config {
+        issued: 0,
+        heartbeat: Some(heartbeat),
+    };
+    let _ = rt::service::run::<EnaService, 2, 1>(&channel, &mut service, config);
+    NO_DEVICE
+}

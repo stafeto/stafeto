@@ -42,7 +42,7 @@ use init::PAGE;
 use init::labels::Labels;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
-use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
+use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
@@ -362,8 +362,13 @@ impl Init {
     /// its record, and in the order of the table within a level. With an
     /// empty table the services started at once.
     pub fn start(&mut self, channel: &Handle<Channel>, order: &table::Order) {
-        for (place, entry) in self.entries.iter_mut().enumerate().take(TABLE.len()) {
-            let ceiling = TABLE[place].ceiling;
+        for (place, entry) in self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .take(table::table().len())
+        {
+            let ceiling = table::table()[place].ceiling;
             let label = self.labels.next().expect("init gave every label");
             let view = sys::handle_label(channel, Rights::RECEIVE, label, ceiling)
                 .expect("init labels a channel view for each timer");
@@ -376,7 +381,7 @@ impl Init {
         for &place in order.as_slice() {
             self.launch(place);
         }
-        if TABLE.is_empty() {
+        if table::table().is_empty() {
             println!("{STARTED}");
         }
     }
@@ -386,11 +391,11 @@ impl Init {
     /// and loads its process and pays for it (`offer`).
     fn launch(&mut self, place: usize) {
         self.entries[place].state = State::Loading;
-        if !TABLE[place].waits.is_empty() && !self.entries[place].passed {
+        if !table::table()[place].waits.is_empty() && !self.entries[place].passed {
             self.hold(place);
             return;
         }
-        if TABLE[place].is_posix() {
+        if table::table()[place].is_posix() {
             let entry = &mut self.entries[place];
             entry.adopting = true;
             entry.offered = false;
@@ -402,12 +407,12 @@ impl Init {
             }
             return;
         }
-        self.push(Job::new(Work::Load, place, &TABLE[place]));
+        self.push(Job::new(Work::Load, place, &table::table()[place]));
     }
 
     /// What init knows of the service `name` for a record at its gate.
     fn standing(&self, name: &str) -> Standing {
-        let Some(service) = table::find(TABLE, name.as_bytes()) else {
+        let Some(service) = table::find(table::table(), name.as_bytes()) else {
             return Standing::Over;
         };
         let entry = &self.entries[service];
@@ -423,7 +428,7 @@ impl Init {
     /// with the record's timer at the deadline, or starts at once when the
     /// services are ready already or over.
     fn hold(&mut self, place: usize) {
-        match Gate::open(&TABLE[place], now(), |name| self.standing(name)) {
+        match Gate::open(&table::table()[place], now(), |name| self.standing(name)) {
             Err(why) => self.release(place, why),
             Ok(gate) => {
                 let at = gate.deadline();
@@ -449,8 +454,8 @@ impl Init {
     /// What the gates make of an event of the service at `place`: its READY
     /// or the end of its instance; the records whose waits it settles start.
     fn gates(&mut self, place: usize, ready: bool) {
-        let name = TABLE[place].name;
-        for waiter in 0..TABLE.len() {
+        let name = table::table()[place].name;
+        for waiter in 0..table::table().len() {
             let step = match self.entries[waiter].gate.as_mut() {
                 Some(gate) if ready => gate.ready(name),
                 Some(gate) => gate.ended(name),
@@ -470,7 +475,7 @@ impl Init {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         if !waits::ready_taken(!record.is_client(), self.entries[place].state) {
             return refuse(Error::BadState);
         }
@@ -487,14 +492,14 @@ impl Init {
     /// the table takes from it (quota::need_pages), since the service
     /// creates and loads their processes.
     fn quota_of(&self, place: usize) -> u64 {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         if record.name != table::PROCESS_SERVICE {
             return record.quota;
         }
-        let posix = (0..TABLE.len()).filter(|&p| TABLE[p].is_posix());
+        let posix = (0..table::table().len()).filter(|&p| table::table()[p].is_posix());
         let children: u64 = posix
             .filter_map(|p| {
-                self.programs[p].map(|program| quota::need_pages(TABLE[p].quota, &program))
+                self.programs[p].map(|program| quota::need_pages(table::table()[p].quota, &program))
             })
             .sum();
         record.quota + children * PAGE
@@ -561,7 +566,7 @@ impl Init {
     /// QUOTA, the record's timer at twice the pause it waited last, from
     /// 100 ms up to 5 s, no failure; the first wait in a row prints a line.
     fn quota_fits(&mut self, place: usize) -> bool {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         let quota = self.quota_of(place);
         let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p));
         let memory = sys::process_memory(&self.own);
@@ -620,7 +625,7 @@ impl Init {
         }
         entry.begun = true;
         self.started += 1;
-        if self.started == TABLE.len() {
+        if self.started == table::table().len() {
             println!("{STARTED}");
             // What is left of init's own quota once every record has its
             // own: the base and the full image watch it (cargo xtask
@@ -676,7 +681,7 @@ impl Init {
     /// The thread of the instance of the record at `place` starts: a
     /// client runs from then on, a service is STARTING until it registers.
     fn run(&mut self, place: usize) {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         let Some(instance) = self.entries[place].held.running_mut() else {
             return;
         };
@@ -712,7 +717,7 @@ impl Init {
             if self.adoption.is_none() {
                 return;
             }
-            let waiting = (0..TABLE.len()).find(|&p| {
+            let waiting = (0..table::table().len()).find(|&p| {
                 let e = &self.entries[p];
                 e.adopting && !e.offered
             });
@@ -728,7 +733,7 @@ impl Init {
     /// Whether the process service ended or broke for good: its record
     /// does not restart, and no ADOPT comes any more.
     fn process_service_over(&self) -> bool {
-        table::find(TABLE, table::PROCESS_SERVICE.as_bytes())
+        table::find(table::table(), table::PROCESS_SERVICE.as_bytes())
             .is_none_or(|p| matches!(self.entries[p].state, State::Ended | State::Broken))
     }
 
@@ -766,7 +771,7 @@ impl Init {
         place: usize,
         w: &mut proto_wire::Writer,
     ) -> Result<[Handle<Channel>; 2], Error> {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         let ticket = self.labels.next().expect("init gave every label");
         let rights = Rights::SEND | Rights::TRANSFER;
         let start = sys::handle_label(&self.channel, rights, ticket, record.priority)?;
@@ -796,7 +801,7 @@ impl Init {
     /// from the new one (`ended`). BAD_STATE for another caller, BAD_SIZE
     /// out of the layout, INVALID_ARGS for a ticket no running instance has.
     fn replaced(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        if TABLE[place].name != table::PROCESS_SERVICE {
+        if table::table()[place].name != table::PROCESS_SERVICE {
             return refuse(Error::BadState);
         }
         let mut body = r.body();
@@ -809,8 +814,10 @@ impl Init {
         let Ok(process) = r.handles.take::<Process>(0) else {
             return Answer::Status(Status::BadSize);
         };
-        let Some(instance) = (0..TABLE.len())
-            .find(|&p| TABLE[p].is_posix() && self.entries[p].ticket == ticket && ticket != 0)
+        let Some(instance) = (0..table::table().len())
+            .find(|&p| {
+                table::table()[p].is_posix() && self.entries[p].ticket == ticket && ticket != 0
+            })
             .and_then(|p| self.entries[p].held.running_mut())
         else {
             return refuse(Error::InvalidArgs);
@@ -840,7 +847,7 @@ impl Init {
     /// for a second); BAD_SIZE for bytes after the header. Init holds it
     /// until a POSIX record waits for its process (`offer`).
     fn adopt(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        if TABLE[place].name != table::PROCESS_SERVICE {
+        if table::table()[place].name != table::PROCESS_SERVICE {
             return refuse(Error::BadState);
         }
         if r.body().finish().is_err() {
@@ -867,7 +874,7 @@ impl Init {
     /// handles and the error of a copy, which fail the record, and the
     /// service kills the process.
     fn adopted(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        if TABLE[place].name != table::PROCESS_SERVICE {
+        if table::table()[place].name != table::PROCESS_SERVICE {
             return refuse(Error::BadState);
         }
         let mut body = r.body();
@@ -877,7 +884,7 @@ impl Init {
         if body.finish().is_err() || r.handles.len() > 4 {
             return Answer::Status(Status::BadSize);
         }
-        let waiting = (0..TABLE.len()).find(|&p| {
+        let waiting = (0..table::table().len()).find(|&p| {
             let e = &self.entries[p];
             e.adopting && e.offered && e.ticket == ticket
         });
@@ -887,7 +894,7 @@ impl Init {
         if status != 0 {
             println!(
                 "init: the process service made no process for {}: status {status}",
-                TABLE[place].name
+                table::table()[place].name
             );
             self.adoption_failed(place, "no process of the process service");
             return Answer::Status(Status::Ok);
@@ -931,7 +938,7 @@ impl Init {
         process: Handle<Process>,
         thread: Handle<Any>,
     ) -> Result<Instance, Error> {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         let watched = sys::handle_duplicate(&process, Rights::NONE)?;
         let mut giver = Giver::new();
         // An empty giver has room for the three and the resources
@@ -972,7 +979,7 @@ impl Init {
         let lived = now().saturating_sub(instance.started);
         let end = End(
             sys::process_state(instance.process()),
-            TABLE[place].is_posix(),
+            table::table()[place].is_posix(),
         );
         let what = format_args!("ended: {end}");
         self.failed(place, Some(instance), lived, what, Work::Teardown);
@@ -983,7 +990,7 @@ impl Init {
     /// instance from, above its ceiling and below its clients (init::work).
     /// Its later exit notification is skipped (`ended`).
     fn silent(&mut self, place: usize) {
-        let job = Job::new(Work::Kill, place, &TABLE[place]);
+        let job = Job::new(Work::Kill, place, &table::table()[place]);
         let level = worker_level(Some(job), self.jobs.queue());
         let Some(instance) = self.entries[place].held.take_running() else {
             return;
@@ -1009,7 +1016,7 @@ impl Init {
         what: fmt::Arguments,
         work: Work,
     ) {
-        let name = TABLE[place].name;
+        let name = table::table()[place].name;
         let now = now();
         let verdict = self.accrue(place, now, lived);
         match verdict {
@@ -1029,7 +1036,7 @@ impl Init {
     /// that lived `lived` ns: a verdict for a record that restarts, None
     /// for one whose policy is never (init::restart).
     fn accrue(&mut self, place: usize, now: u64, lived: u64) -> Option<Verdict> {
-        match TABLE[place].restart {
+        match table::table()[place].restart {
             Restart::Always => Some(self.entries[place].failures.failed(now, lived)),
             Restart::Never => None,
         }
@@ -1048,7 +1055,7 @@ impl Init {
         work: Work,
     ) {
         let now = now();
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         let entry = &mut self.entries[place];
         // Its READY goes with the instance, and its own record stands at its
         // gate again for the next start; the records that wait for it and
@@ -1099,7 +1106,7 @@ impl Init {
         let over = matches!(self.entries[place].state, State::Ended | State::Broken);
         if record.name == table::PROCESS_SERVICE {
             self.adoption = None;
-            for p in 0..TABLE.len() {
+            for p in 0..table::table().len() {
                 if over && self.entries[p].adopting {
                     self.adoption_failed(p, "the process service ended");
                 } else {
@@ -1122,11 +1129,11 @@ impl Init {
             entry.deadline = None;
             println!(
                 "init: {} did not stop; broken, its DMA memory stays with init",
-                TABLE[place].name
+                table::table()[place].name
             );
         }
         let entry = &mut self.entries[place];
-        if matches!(entry.state, State::Broken | State::Ended) && TABLE[place].log {
+        if matches!(entry.state, State::Broken | State::Ended) && table::table()[place].log {
             // Ceiling 0: the worker goes to WORKER_IDLE for it (init::work).
             let job = Job {
                 work: Work::ShowLog,
@@ -1186,13 +1193,13 @@ impl Init {
     /// The place of the record whose timer carries `label` (spec 13.4).
     fn timed(&self, label: u64) -> Option<usize> {
         let timed = |e: &Entry| e.timer_label == label;
-        self.entries[..TABLE.len()].iter().position(timed)
+        self.entries[..table::table().len()].iter().position(timed)
     }
 
     /// The place of the record whose instance has `label`.
     fn caller(&self, label: u64) -> Option<usize> {
         let named = |e: &Entry| e.held.running().is_some_and(|i| i.label == label);
-        self.entries[..TABLE.len()].iter().position(named)
+        self.entries[..table::table().len()].iter().position(named)
     }
 
     /// START: the next piece of the start data of the instance at `place`.
@@ -1218,7 +1225,7 @@ impl Init {
     /// the service runs from then on, and the CONNECT requests that wait
     /// for it get their sessions.
     fn register(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        let record = &TABLE[place];
+        let record = &table::table()[place];
         if record.is_client() || self.entries[place].state != State::Starting {
             return refuse(Error::BadState);
         }
@@ -1383,7 +1390,7 @@ impl Init {
         let Ok(Connect { name }) = Connect::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        let client = &TABLE[place];
+        let client = &table::table()[place];
         // The layer session of the RAM service is the RAM service under another name and
         // another mark, for the one client the table names (table::LAYER_CLIENTS).
         let layers = table::layer_grant(client, name.as_bytes());
@@ -1454,7 +1461,7 @@ impl Init {
                     .iter()
                     .any(|to| to.as_bytes() == name.as_bytes()));
         let Some(to) = allowed
-            .then(|| table::find(TABLE, name.as_bytes()))
+            .then(|| table::find(table::table(), name.as_bytes()))
             .flatten()
         else {
             return refuse(Error::AccessDenied);
@@ -1494,7 +1501,7 @@ impl Init {
             return Answer::Status(Status::BadSize);
         }
         let entry = &mut self.entries[place];
-        let registered = !TABLE[place].is_client() && entry.state == State::Running;
+        let registered = !table::table()[place].is_client() && entry.state == State::Running;
         if !registered {
             return refuse(Error::BadState);
         }
@@ -1516,7 +1523,7 @@ impl Init {
         let Ok(ListRequest { first }) = ListRequest::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        let total = TABLE.len() + 1;
+        let total = table::table().len() + 1;
         let mut page = ListReply::new(total as u16);
         let first = usize::from(first);
         for n in first..total.min(first.saturating_add(LIST_PAGE)) {
@@ -1538,7 +1545,7 @@ impl Init {
         let (name, state, priority, ceiling, client, process) = match n.checked_sub(1) {
             None => ("init", State::Running, MAIN, MAIN, false, Some(&self.own)),
             Some(place) => {
-                let (record, entry) = (&TABLE[place], &self.entries[place]);
+                let (record, entry) = (&table::table()[place], &self.entries[place]);
                 (failures, restarts) = (entry.failures.recent(now()), entry.restarts);
                 let process = entry.held.running().map(Instance::process);
                 let (p, c) = (record.priority, record.ceiling);
@@ -1711,9 +1718,9 @@ impl Service<1> for Init {
     /// record. The start channel's own CLIENT_GONE tells nothing of a POSIX
     /// process, which may close it or give it away before it ends.
     fn closed(&mut self, label: u64) {
-        let Some(place) = (0..TABLE.len())
-            .find(|&p| TABLE[p].is_posix() && self.entries[p].witness == label && label != 0)
-        else {
+        let Some(place) = (0..table::table().len()).find(|&p| {
+            table::table()[p].is_posix() && self.entries[p].witness == label && label != 0
+        }) else {
             return;
         };
         self.entries[place].witness = 0;

@@ -28,8 +28,8 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use init::table::{
-    BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE, RAM_SERVICE,
-    Record, TABLE,
+    self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE,
+    RAM_SERVICE, Record, Write,
 };
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
@@ -295,7 +295,7 @@ extern "C" fn work(_: u64) -> ! {
                 label,
                 program,
                 quota,
-            } => Some(load(&TABLE[place], label, &program, quota)),
+            } => Some(load(&table::table()[place], label, &program, quota)),
             Order::Teardown { place } => {
                 // The handles close here, the cleanup at the worker's level,
                 // once the device stopped.
@@ -348,6 +348,13 @@ pub fn cpus_of(record: &Record) -> u8 {
 /// (spec 13.4), and its start data (`start_data`). An instance whose start
 /// data could not be made is killed; its thread never ran.
 fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> Loaded {
+    // A device a stop turned off comes back before its next instance runs.
+    if !init::device::start(record, &mut Hw) {
+        return Err(Error::BadState);
+    }
+    if !record.start.is_empty() {
+        rt::println!("init: {} device command word written", record.name);
+    }
     let channel = view::<Channel>(CHANNEL);
     let cpus = cpus_of(record);
     let params = SpawnParams {
@@ -496,8 +503,17 @@ pub fn take_stuck(place: usize) -> bool {
 /// to the allocator while the device may still write them, and the record
 /// is marked broken (`take_stuck`).
 fn stop(place: usize, mut gone: Instance) {
-    let record = &TABLE[place];
-    if quiesce(record) {
+    let record = &table::table()[place];
+    let stopped = init::device::stop(record, &mut Hw);
+    if !record.release.is_empty() {
+        let what = if stopped {
+            "stopped and confirmed"
+        } else {
+            "did not stop, its DMA memory stays kept"
+        };
+        rt::println!("init: {} device {what}", record.name);
+    }
+    if stopped {
         #[cfg(feature = "dma-watch")]
         watch(record, &gone);
     } else {
@@ -507,23 +523,21 @@ fn stop(place: usize, mut gone: Instance) {
     gone.release();
 }
 
-/// Stops the device of `record` once an instance ended (Record::quiesce,
-/// spec 2 section 4): each write, in its order, goes through a window init
-/// makes over the page of the record's window that holds it, mapped at
-/// QUIESCE_WINDOW, and is read back until its settled bits show its value,
-/// so that it
-/// reached the device and the device finished it [G34]; a write whose
-/// register of Write::only_if shows none of its bits is skipped. False
-/// when a window does not come or a write does not settle.
-fn quiesce(record: &Record) -> bool {
-    let resource = view::<Resource>(RESOURCE);
-    let own = view::<Process>(OWN);
-    for q in record.quiesce {
-        if let Some(g) = q.only_if
-            && !gate_open(record, g)
-        {
-            continue;
-        }
+/// The longest the worker waits for the register of a confirmation
+/// (Write::confirm): above the 2000 ms reset timeout an ENA reports in its
+/// capabilities (t4g), so a device that is slow but alive confirms, and a dead
+/// one lets the stop go on after a bounded wait. The wait is the worker's: init's
+/// main thread does not wait for it.
+const CONFIRM_NS: u64 = 2_500_000_000;
+
+/// The register access of the worker (init::device::Regs): each access maps the
+/// page of the record's window that holds the register at QUIESCE_WINDOW.
+struct Hw;
+
+impl init::device::Regs for Hw {
+    fn write(&mut self, record: &Record, q: &Write) -> bool {
+        let resource = view::<Resource>(RESOURCE);
+        let own = view::<Process>(OWN);
         let Some(w) = record.windows.iter().find(|w| w.name == q.window) else {
             return false;
         };
@@ -544,41 +558,71 @@ fn quiesce(record: &Record) -> bool {
                 (0..SETTLE_READS).any(|_| u32::from(mmio::read8(at)) & q.settled == q.value)
             } else {
                 mmio::write32(at, q.value);
-                (0..SETTLE_READS).any(|_| mmio::read32(at) & q.settled == q.value)
+                q.settled == 0 || (0..SETTLE_READS).any(|_| mmio::read32(at) & q.settled == q.value)
             }
         };
         // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
         let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
-        if !settled {
+        settled
+    }
+
+    /// Reads the register of `c` through a window of init's own at QUIESCE_WINDOW
+    /// until it shows its state or CONFIRM_NS passed.
+    fn confirmed(&mut self, record: &Record, c: Confirm) -> bool {
+        let Some(w) = record.windows.iter().find(|w| w.name == c.window) else {
+            return false;
+        };
+        let page = c.offset & !(PAGE - 1);
+        let resource = view::<Resource>(RESOURCE);
+        let own = view::<Process>(OWN);
+        let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+            return false;
+        };
+        if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
             return false;
         }
+        let at = QUIESCE_WINDOW + (c.offset - page) as usize;
+        let began = rt::time::now();
+        let shown = loop {
+            // SAFETY: the window maps the register's page at QUIESCE_WINDOW as
+            // device memory, read; the register is a word within it (the checks
+            // of the table).
+            if unsafe { mmio::read32(at) } & c.mask == c.value {
+                break true;
+            }
+            if rt::time::ticks_to_ns(rt::time::now().wrapping_sub(began)) >= CONFIRM_NS {
+                break false;
+            }
+        };
+        // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+        let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+        shown
     }
-    true
-}
 
-/// Whether the register of `g` shows one of its bits (Write::only_if),
-/// read through a window of init's own at QUIESCE_WINDOW; a register that
-/// cannot be read counts as open, so the write goes and must settle.
-fn gate_open(record: &Record, g: Gate) -> bool {
-    let Some(w) = record.windows.iter().find(|w| w.name == g.window) else {
-        return true;
-    };
-    let page = g.offset & !(PAGE - 1);
-    let resource = view::<Resource>(RESOURCE);
-    let own = view::<Process>(OWN);
-    let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
-        return true;
-    };
-    if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
-        return true;
+    /// Reads the register of `g` through a window of init's own at
+    /// QUIESCE_WINDOW; a register that cannot be read counts as open, so the
+    /// write goes and must settle.
+    fn gate_open(&mut self, record: &Record, g: Gate) -> bool {
+        let Some(w) = record.windows.iter().find(|w| w.name == g.window) else {
+            return true;
+        };
+        let page = g.offset & !(PAGE - 1);
+        let resource = view::<Resource>(RESOURCE);
+        let own = view::<Process>(OWN);
+        let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+            return true;
+        };
+        if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
+            return true;
+        }
+        // SAFETY: the window maps the register's page at QUIESCE_WINDOW as
+        // device memory; the register is a word within it (the checks of the
+        // table).
+        let value = unsafe { mmio::read32(QUIESCE_WINDOW + (g.offset - page) as usize) };
+        // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+        let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+        value & g.bits != 0
     }
-    // SAFETY: the window maps the register's page at QUIESCE_WINDOW as
-    // device memory; the register is a word within it (the checks of the
-    // table).
-    let value = unsafe { mmio::read32(QUIESCE_WINDOW + (g.offset - page) as usize) };
-    // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
-    let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
-    value & g.bits != 0
 }
 
 /// Where the worker maps a DMA object it watches (`watch`).
