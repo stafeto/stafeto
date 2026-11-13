@@ -371,12 +371,13 @@ pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
 /// A step of the sweep of the flow table (128 places, up to 32 removals) costs up to 7 200 ticks
 /// under -icount. The switch makes it at the end of a step that is inside the soft share
-/// (`SWEEP_SOFT`), so the worst step with a sweep is the share, the sweep and a tail of 1 500.
+/// (`SWEEP_SOFT`, the share of the image: `SWITCH_SOFT`), so the worst step with a sweep in the
+/// images that count steps is the share, the sweep and a tail of 1 500.
 /// A sweep that is overdue (`SWEEP_OVERDUE_NS` since the last) is made in pieces of
 /// `SWEEP_PIECE` places (up to `SWEEP_PIECE_TICKS`) at the start of the step, which counts
 /// toward the soft share, so that sustained load cannot keep the sweep off for good.
 pub const SWEEP_TICKS: usize = 7_200;
-pub const SWEEP_SOFT: u64 = SOFT_MEASURED;
+pub const SWEEP_SOFT: u64 = SWITCH_SOFT;
 pub const SWEEP_OVERDUE_NS: u64 = 10 * SWEEP_EVERY_NS;
 pub const SWEEP_PIECE: usize = 32;
 pub const SWEEP_PIECE_TICKS: usize = 1_800;
@@ -1198,6 +1199,8 @@ mod tests {
         } else {
             assert_eq!((SWITCH_SOFT, RX_SOFT), (SOFT_MEASURED, RX_SOFT_MEASURED));
         }
+        // The sweep at the end of a step follows the share of the image.
+        assert_eq!(SWEEP_SOFT, SWITCH_SOFT);
     }
 
     /// Under a load that keeps every step over its soft share the sweep still goes: a piece
