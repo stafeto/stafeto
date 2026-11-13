@@ -404,7 +404,9 @@ impl Driver<'_> {
                     reuse: false,
                     share_uid: shared.then_some(uid),
                 };
-                if conflicts(&new, self.inst.net.bindings(port, usize::MAX, true)) {
+                if conflicts(&new, self.inst.net.bindings(port, usize::MAX, true))
+                    || self.inst.net.ports(proto).held_elsewhere(port)
+                {
                     return refuse(proto_net::IN_USE);
                 }
             }
@@ -445,7 +447,7 @@ impl Driver<'_> {
             udp_ports,
             ..
         } = &mut *self.inst.net;
-        holds.add(
+        let taken = holds.add(
             group,
             book,
             if proto == Proto::Tcp {
@@ -454,6 +456,14 @@ impl Driver<'_> {
                 udp_ports
             },
         );
+        if !taken {
+            // Another instance took a port of the group after the check above: the switch's
+            // group goes at once (a holder less), and the call fails.
+            let _ = switch::command(Command::Release { group });
+            self.inst.net.places.free(place);
+            self.inst.net.socks[place] = crate::net::Sock::EMPTY;
+            return refuse(proto_net::IN_USE);
+        }
         self.inst.net.places.hold(place);
         s.data.held.add(place);
         match sw::write_place_reply(self.inst.net.places.name(place), r.reply()) {

@@ -21,7 +21,7 @@ pub struct Boot {
     pub kernel_image: Region,
     pub dtb: Region,
     /// RAM nothing uses yet, in whole pages, sorted.
-    pub usable: RegionList<32>,
+    pub usable: RegionList<{ bootinfo::USABLE_REGIONS }>,
 }
 
 /// What `collect` found. Static: every entry from EL0 starts over at the top
@@ -67,7 +67,7 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
         base: dtb_pa as u64,
         size: total as u64,
     };
-    let mut taken: RegionList<24> = RegionList::new();
+    let mut taken: RegionList<{ bootinfo::BOOT_TAKEN }> = RegionList::new();
     let boot_regions = [Some(kernel_image), Some(dtb), info.initrd];
     for r in boot_regions
         .into_iter()

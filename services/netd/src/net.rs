@@ -39,6 +39,10 @@ fn peer_of(end: smoltcp::wire::IpEndpoint) -> ([u8; 4], u16) {
     (a.octets(), end.port)
 }
 
+/// How many times a choice of an ephemeral port tries again after another instance took the
+/// port it chose.
+const EPHEMERAL_RETRIES: u32 = 8;
+
 /// The sessions of the service's channel: room for the records of the
 /// process service and the services beside them, as the pipe service has.
 pub const SESSIONS: usize = 320;
@@ -105,6 +109,8 @@ pub struct Client {
     pub long: LongSession,
     /// Whether the session took the descriptions Clone made it with.
     pub claimed: bool,
+    /// The session's home is settled (HOME): it was asked, or it was made at the home.
+    pub homed: bool,
     /// The label of init's client whose process this chain of clones
     /// belongs to: the clones of one root are counted together.
     pub root: u64,
@@ -320,6 +326,10 @@ impl Mask {
 /// The counters of the probe's line.
 #[derive(Clone, Copy, Default)]
 pub struct Counters {
+    /// The requests the instance answered.
+    pub calls: u64,
+    /// The sessions another instance made here for processes whose home this is (HOME_MAKE).
+    pub homed: u64,
     /// Members of a queue that `accept` could not replace.
     pub listen_short: u64,
     /// SYNs dropped for want of room in the queue of a listening description.
@@ -477,6 +487,9 @@ pub struct Net {
     counter: u32,
     /// The interface's external address, when it has one.
     pub external: Option<[u8; 4]>,
+    /// The number of this instance, and the CPU it stands on.
+    pub instance: u8,
+    pub cpu: u8,
     /// The connection to init, for the notary session.
     parent: Option<ManuallyDrop<Handle<Channel>>>,
     /// The service's channel, which its own sessions are copies of, and the
@@ -532,7 +545,9 @@ impl Net {
         channel: &Handle<Channel>,
         level: u8,
         process: &Handle<Process>,
-        buffers: u16,
+        buffers: Buffers,
+        (claims, who): (&'static netd::ports::Claims, u8),
+        cpu: u8,
     ) {
         use core::ptr::addr_of_mut;
         // SAFETY: each field is in bounds and written once; `parent` is
@@ -556,10 +571,15 @@ impl Net {
             addr_of_mut!((*at).profile_due).write(false);
             addr_of_mut!((*at).channel).write(Handle::borrowed(channel.raw()));
             addr_of_mut!((*at).external).write(None);
+            addr_of_mut!((*at).instance).write(who);
+            addr_of_mut!((*at).cpu).write(cpu);
             addr_of_mut!((*at).syn_member).write(None);
             addr_of_mut!((*at).level).write(level);
             addr_of_mut!((*at).process).write(Some(Handle::borrowed(process.raw())));
-            addr_of_mut!((*at).buffers).write(Buffers::new(buffers));
+            addr_of_mut!((*at).buffers).write(buffers);
+            // The ports are the service's, for all its instances (`ports::CLAIMS`).
+            (*at).tcp_ports.share(claims, who, Proto::Tcp);
+            (*at).udp_ports.share(claims, who, Proto::Udp);
         }
     }
 
@@ -872,15 +892,21 @@ impl Net {
         remote: ([u8; 4], u16),
     ) -> Option<u16> {
         let offset = netd::ports::offset(&self.key, proto, local, remote.0, remote.1);
-        self.counter = self.counter.wrapping_add(1);
-        let counter = self.counter;
-        let map = match proto {
-            Proto::Tcp => &self.tcp_ports,
-            Proto::Udp => &self.udp_ports,
-        };
-        let port = netd::ports::ephemeral(offset, counter, map)?;
-        self.ports(proto).hold(port);
-        Some(port)
+        // Another instance may take the port between the choice and the claim: the next
+        // counter chooses again.
+        for _ in 0..EPHEMERAL_RETRIES {
+            self.counter = self.counter.wrapping_add(1);
+            let counter = self.counter;
+            let map = match proto {
+                Proto::Tcp => &self.tcp_ports,
+                Proto::Udp => &self.udp_ports,
+            };
+            let port = netd::ports::ephemeral(offset, counter, map)?;
+            if self.ports(proto).try_hold(port) {
+                return Some(port);
+            }
+        }
+        None
     }
 
     /// The description `d` of a session that holds it.

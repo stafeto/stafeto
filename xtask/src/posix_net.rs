@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 67] = [
+pub const CHECKS: [&str; 68] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -94,7 +94,14 @@ pub const CHECKS: [&str; 67] = [
     "epoll-rdhup-unix",
     "fast-claim-off",
     "wait-churn",
+    "home-fork",
 ];
+
+/// The check of the stack instances (`cargo xtask posix-net instances`): one worker on each CPU
+/// of the process makes sockets, connects to the next worker's listener on the loopback and
+/// answers it, and each says the instance that holds its session (the one on its CPU) and how many
+/// of its calls came from another CPU (none).
+pub const SOLO: &str = "instances";
 
 /// The image of the run with the counted steps of the network service and
 /// the pipe service (the passes of SCM_RIGHTS wait there).
@@ -147,11 +154,17 @@ fn checks(
     within: Duration,
     only: Option<String>,
 ) -> Result<(), String> {
-    let wanted: Vec<&str> = CHECKS
-        .iter()
-        .copied()
-        .filter(|name| only.as_deref().is_none_or(|only| only == *name))
-        .collect();
+    // The check `instances` runs alone, in a process that has made no socket (it is no member
+    // of the list of the full run).
+    let wanted: Vec<&str> = if only.as_deref() == Some(SOLO) {
+        vec![SOLO]
+    } else {
+        CHECKS
+            .iter()
+            .copied()
+            .filter(|name| only.as_deref().is_none_or(|only| only == *name))
+            .collect()
+    };
     match &only {
         Some(name) => run.send(&format!("posix-net {address} {name}"))?,
         None => run.send(&format!("posix-net {address}"))?,
@@ -193,6 +206,9 @@ fn checks(
 
 /// `cargo xtask posix-net [steps] [MACHINE]`.
 pub fn command(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some(SOLO) {
+        return instances_smp();
+    }
     let (steps, rest) = match args.first().map(String::as_str) {
         Some("steps") => (true, &args[1..]),
         _ => (false, args),
@@ -219,6 +235,12 @@ pub fn wait_churn_smp() -> Result<(), String> {
     qemu::on_cpus(2, || {
         probe_only(&qemu::VIRT, false, Some("wait-churn".to_owned()))
     })
+}
+
+/// The check `instances` on two CPUs: the stack of the service has an instance on each, and one
+/// worker stands on each.
+pub fn instances_smp() -> Result<(), String> {
+    qemu::on_cpus(2, || probe_only(&qemu::VIRT, false, Some(SOLO.to_owned())))
 }
 
 fn probe_only(

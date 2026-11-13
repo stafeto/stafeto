@@ -109,14 +109,31 @@ impl Chunks {
 pub const NETD_MAPPINGS: u32 = 108;
 const _: () = assert!(NETD_MAPPINGS + 20 <= abi::MAX_MAPPINGS);
 
+/// What every instance's `Mappings::shared` draws on: the service has one process and one
+/// budget, whatever the number of its instances.
+static SHARED_USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// The mappings reserved from the budget: one for each buffer, one for each chunk of a ring.
 pub struct Mappings {
     used: u32,
+    /// The budget is the service's (`SHARED_USED`), and `used` counts what this table took.
+    shared: bool,
 }
 
 impl Mappings {
     pub const fn new() -> Mappings {
-        Mappings { used: 0 }
+        Mappings {
+            used: 0,
+            shared: false,
+        }
+    }
+
+    /// A table that draws on the budget of the whole service.
+    pub const fn shared() -> Mappings {
+        Mappings {
+            used: 0,
+            shared: true,
+        }
     }
 
     /// The mappings a ring of `bytes` bytes takes when it is mapped `chunk_pages` pages at a time.
@@ -126,6 +143,17 @@ impl Mappings {
 
     /// Takes `n` mappings, or none when the budget lacks them.
     pub fn reserve(&mut self, n: u32) -> bool {
+        use core::sync::atomic::Ordering;
+        if self.shared {
+            let taken = SHARED_USED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&sum| sum <= NETD_MAPPINGS)
+            });
+            if taken.is_err() {
+                return false;
+            }
+            self.used += n;
+            return true;
+        }
         match self.used.checked_add(n) {
             Some(sum) if sum <= NETD_MAPPINGS => {
                 self.used = sum;
@@ -136,7 +164,12 @@ impl Mappings {
     }
 
     pub fn release(&mut self, n: u32) {
-        self.used = self.used.saturating_sub(n);
+        use core::sync::atomic::Ordering;
+        let n = n.min(self.used);
+        if self.shared {
+            SHARED_USED.fetch_sub(n, Ordering::AcqRel);
+        }
+        self.used -= n;
     }
 
     pub fn used(&self) -> u32 {
@@ -299,21 +332,29 @@ impl Holds {
     }
 
     /// A description joined group `group` (1-based): one more holder, or a new group whose
-    /// ports the registry takes.
-    pub fn add(&mut self, group: u8, h: Hold, ports: &mut PortMap) {
+    /// ports the registry takes. False, and no group, when another instance holds one of the
+    /// ports.
+    #[must_use]
+    pub fn add(&mut self, group: u8, h: Hold, ports: &mut PortMap) -> bool {
         let book = &mut self.list[usize::from(group) - 1];
         if book.used {
             book.holders += 1;
-        } else {
-            *book = Hold {
-                used: true,
-                holders: 1,
-                ..h
-            };
-            for port in hold_ports(h.first, h.count) {
-                ports.hold(port);
+            return true;
+        }
+        for port in hold_ports(h.first, h.count) {
+            if !ports.hold(port) {
+                for taken in h.first..port {
+                    ports.release(taken);
+                }
+                return false;
             }
         }
+        *book = Hold {
+            used: true,
+            holders: 1,
+            ..h
+        };
+        true
     }
 
     /// The group is gone from the switch's tables: the slot and the ports go.
@@ -639,7 +680,7 @@ mod tests {
             first: 65535,
             ..Hold::default()
         };
-        holds.add(1, h, &mut tcp);
+        assert!(holds.add(1, h, &mut tcp));
         assert!(tcp.held(65535) && !tcp.held(0));
         holds.freed(1, &mut tcp, &mut udp);
         assert!(!tcp.held(65535) && !tcp.held(0));
@@ -690,6 +731,32 @@ mod tests {
     }
 
     #[test]
+    fn a_group_over_a_port_of_another_instance_is_refused_whole() {
+        let claims: &'static crate::ports::Claims =
+            Box::leak(Box::new(crate::ports::Claims::new()));
+        let (mut mine, mut other) = (Box::new(PortMap::new()), Box::new(PortMap::new()));
+        mine.share(claims, 0, crate::ports::Proto::Tcp);
+        other.share(claims, 1, crate::ports::Proto::Tcp);
+        assert!(other.hold(8002));
+        let mut holds = Holds::new();
+        let h = Hold {
+            proto: 6,
+            count: 4,
+            first: 8000,
+            ..Hold::default()
+        };
+        assert!(!holds.add(1, h, &mut mine));
+        // Nothing of the group is held, the slot is free, and the other's port stays its own.
+        assert!(holds.free_slot() == Some(0) && !holds.list[0].used);
+        assert!(!mine.held(8000) && !mine.held(8001) && !mine.held(8003));
+        assert_eq!(claims.owner(crate::ports::Proto::Tcp, 8002), Some(1));
+        assert_eq!(claims.owner(crate::ports::Proto::Tcp, 8000), None);
+        other.release(8002);
+        assert!(holds.add(1, h, &mut mine));
+        assert!(!other.hold(8001) && claims.owner(crate::ports::Proto::Tcp, 8001) == Some(0));
+    }
+
+    #[test]
     fn a_failed_hold_gives_back_its_group_every_time() {
         let mut holds = Holds::new();
         let (mut tcp, mut udp) = (PortMap::new(), PortMap::new());
@@ -703,7 +770,7 @@ mod tests {
                 first: 8000,
                 ..Hold::default()
             };
-            holds.add(slot as u8 + 1, h, &mut tcp);
+            assert!(holds.add(slot as u8 + 1, h, &mut tcp));
             assert!(tcp.held(8000));
             holds.failed(slot as u8 + 1, &mut tcp, &mut udp);
             assert!(!tcp.held(8000) && !tcp.held(8001));
@@ -727,9 +794,9 @@ mod tests {
             first: 80,
             ..Hold::default()
         };
-        holds.add(1, h, &mut tcp);
+        assert!(holds.add(1, h, &mut tcp));
         for _ in 1..300 {
-            holds.add(1, h, &mut tcp);
+            assert!(holds.add(1, h, &mut tcp));
         }
         for _ in 0..300 {
             holds.closed(1);

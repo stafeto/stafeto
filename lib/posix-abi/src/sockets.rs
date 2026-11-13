@@ -59,6 +59,20 @@ pub const SO_STAFETO_BUFFERS: i32 = 0x7351;
 /// The KiB that went through the shared buffers of the network service
 /// since it started (wrapping), on any socket of the service.
 pub const SO_STAFETO_BUFFERED: i32 = 0x7352;
+/// The stack instance of the network service that holds the session of the process, on any
+/// socket of the service (its home, chosen from the CPU of the first call).
+pub const SO_STAFETO_HOME: i32 = 0x7353;
+/// The requests the instance that holds the session has answered since the service started
+/// (wrapping), on any socket of the service.
+pub const SO_STAFETO_CALLS: i32 = 0x7354;
+/// The calls the process made to the service from a CPU other than the home instance's since
+/// the count was set on (the layer's own count, which answers a read of this option).
+pub const SO_STAFETO_REMOTE: i32 = 0x7355;
+/// Sets the count of the calls from other CPUs on (1) or off and clears it.
+pub const SO_STAFETO_COUNT: i32 = 0x7356;
+/// The state of the flag of the session's home (probe of the fork rule): reads 0 not asked,
+/// 1 asking, 2 done; a write of 1 sets asking, of 0 sets done.
+pub const SO_STAFETO_HOMING: i32 = 0x7357;
 pub const SO_REUSEPORT: i32 = 15;
 pub const SO_LINGER: i32 = 13;
 pub const SO_RCVTIMEO: i32 = 20;

@@ -325,6 +325,11 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
 
 /// `cargo xtask fast-probe nginx [crash|steps] [tcg|hvf]`.
 pub fn command(args: &[String]) -> Result<(), String> {
+    // On two CPUs the service has two stack instances and the worker may stand on CPU 1: the
+    // stack of the worker starts all the same (its ATTACH and CLAIM reach the first instance).
+    if args.first().map(String::as_str) == Some("smp") && args.len() == 1 {
+        return qemu::on_cpus(2, || probe(&qemu::VIRT, Kind::Plain));
+    }
     let (kind, rest) = match args.first().map(String::as_str) {
         Some("crash") => (Kind::Crash, &args[1..]),
         Some("steps") => (Kind::Steps, &args[1..]),
@@ -1669,7 +1674,7 @@ mod tests {
         let netd = |kind| programs(kind).iter().find(|p| p.0 == "netd").unwrap().3;
         assert_eq!(netd(Kind::Crash), &["probe"]);
         assert_eq!(netd(Kind::Steps), &["steps"]);
-        assert!(netd(Kind::Plain).is_empty());
+        assert_eq!(netd(Kind::Plain), &["instances-2"]);
     }
 
     #[test]

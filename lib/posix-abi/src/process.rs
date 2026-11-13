@@ -2150,7 +2150,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Terminal, moved(terminal)),
             (Slot::Entropy, moved(crate::random::session())),
             (Slot::Display, moved(crate::display::session())),
-            (Slot::Net, moved(crate::net::session())),
+            (Slot::Net, moved(crate::net::session_passive())),
             (Slot::Packages, moved(crate::packages::session())),
         ],
     ) == 0
