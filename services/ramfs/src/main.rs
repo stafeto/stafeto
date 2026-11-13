@@ -155,6 +155,11 @@ const AUDIT_EMPTY_RUN: usize = 160;
 /// the clients below its priority run, however many inodes hold locks.
 const LOCK_WINDOW_NS: u64 = 10_000_000;
 const LOCK_BUDGET_NS: u64 = 2_500_000;
+/// The longest idle time between two turns of the lock work that still counts
+/// as one run: the time from the end of one turn to the start of the next
+/// (empty turns of other work, the round trips of the own notification) is
+/// charged to the share. A longer gap means the service idled.
+const LOCK_GAP_NS: u64 = 1_000_000;
 /// Inodes without locks that one turn of the lock sweep passes. The circle
 /// has 1285 inodes and restarts every period of the wait timer; a turn per
 /// inode kept the service runnable for the whole period and held back the
@@ -2363,70 +2368,7 @@ impl Service<0> for Fs {
         }
         self.lock_maintenance_turn = !self.lock_maintenance_turn && self.lock_work_pending();
         if self.lock_maintenance_turn {
-            let began = rt::time::ticks_to_ns(rt::time::now());
-            self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 2;
-            let page = self.lifetimes.as_ref();
-            let (storage, descriptions) = self.ram.lock_parts();
-            if self.lock_maintenance_work == 0 && self.lock_sweep_pending {
-                self.locks
-                    .sweep_run(
-                        storage,
-                        &mut self.lock_sweep,
-                        SWEEP_EMPTY_RUN,
-                        |owner| match owner {
-                            Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-                            Owner::Description { slot, generation } => {
-                                descriptions.live(Token { slot, generation })
-                            }
-                        },
-                    );
-                self.lock_sweep_pending = self.locks.has_locks() && self.lock_sweep.pending();
-                if !self.locks.has_locks() {
-                    self.lock_sweep.stop();
-                }
-            }
-            if self.lock_maintenance_work == 1 {
-                let births = &*self.births;
-                let places = self.places;
-                self.waits.maintenance(
-                    self.wait_jobs,
-                    self.locks,
-                    storage,
-                    |captured, owner| {
-                        let source = sessions
-                            .get(places.place(owner))
-                            .and_then(Option::as_ref)
-                            .filter(|session| session.label() == owner && session.data.claimed)
-                            .map(|session| &session.data)
-                            .or_else(|| {
-                                births
-                                    .get(Self::birth_index(owner))
-                                    .and_then(Option::as_ref)
-                                    .filter(|(label, _)| *label == owner)
-                                    .map(|(_, fds)| fds)
-                            });
-                        source.is_some_and(|fds| descriptions.source_live(fds, captured.source))
-                    },
-                    |owner| match owner {
-                        Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-                        Owner::Description { slot, generation } => {
-                            descriptions.live(Token { slot, generation })
-                        }
-                    },
-                    |handle| {
-                        let _ = sys::notify(handle, 1);
-                    },
-                );
-            }
-            let ended = rt::time::ticks_to_ns(rt::time::now());
-            if let Some(until) = self.lock_share.charge(ended, ended.saturating_sub(began))
-                && self.lock_work_pending()
-            {
-                // The budget of this window is spent: sleep to its end.
-                self.lock_paused = sys::timer_set(&self.pace_timer, until).is_ok();
-            }
-            self.refresh_wait_timer();
-            self.notify_maintenance();
+            self.lock_turn(sessions);
             return;
         }
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
@@ -2520,6 +2462,14 @@ impl Service<0> for Fs {
                 work || self.departures.pending() || self.orphan_count != 0,
             );
             self.notify_maintenance();
+            return;
+        }
+        // A closed round of the audit has nothing to do: with lock work
+        // waiting, the turn of the lock work follows at once and the empty
+        // step takes no dispatch of its own.
+        if self.maintenance.remaining == 0 && !work && self.lock_work_pending() {
+            self.lock_maintenance_turn = true;
+            self.lock_turn(sessions);
             return;
         }
         // The slots with no session and no birth pass in this step.
@@ -4038,6 +3988,74 @@ impl Fs {
             let _ = sys::notify(&self.channel, 1);
         }
     }
+    /// One turn of the maintenance of locks: the sweep or the waits, and the
+    /// charge of every nanosecond the service held the CPU for them.
+    fn lock_turn(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        let began = rt::time::ticks_to_ns(rt::time::now());
+        self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 2;
+        let page = self.lifetimes.as_ref();
+        let (storage, descriptions) = self.ram.lock_parts();
+        if self.lock_maintenance_work == 0 && self.lock_sweep_pending {
+            self.locks.sweep_run(
+                storage,
+                &mut self.lock_sweep,
+                SWEEP_EMPTY_RUN,
+                |owner| match owner {
+                    Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
+                    Owner::Description { slot, generation } => {
+                        descriptions.live(Token { slot, generation })
+                    }
+                },
+            );
+            self.lock_sweep_pending = self.locks.has_locks() && self.lock_sweep.pending();
+            if !self.locks.has_locks() {
+                self.lock_sweep.stop();
+            }
+        }
+        if self.lock_maintenance_work == 1 {
+            let births = &*self.births;
+            let places = self.places;
+            self.waits.maintenance(
+                self.wait_jobs,
+                self.locks,
+                storage,
+                |captured, owner| {
+                    let source = sessions
+                        .get(places.place(owner))
+                        .and_then(Option::as_ref)
+                        .filter(|session| session.label() == owner && session.data.claimed)
+                        .map(|session| &session.data)
+                        .or_else(|| {
+                            births
+                                .get(Self::birth_index(owner))
+                                .and_then(Option::as_ref)
+                                .filter(|(label, _)| *label == owner)
+                                .map(|(_, fds)| fds)
+                        });
+                    source.is_some_and(|fds| descriptions.source_live(fds, captured.source))
+                },
+                |owner| match owner {
+                    Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
+                    Owner::Description { slot, generation } => {
+                        descriptions.live(Token { slot, generation })
+                    }
+                },
+                |handle| {
+                    let _ = sys::notify(handle, 1);
+                },
+            );
+        }
+        let ended = rt::time::ticks_to_ns(rt::time::now());
+        if let Some(until) = self.lock_share.turn(began, ended, LOCK_GAP_NS)
+            && self.lock_work_pending()
+        {
+            // The budget of this window is spent: sleep to its end.
+            self.lock_paused = sys::timer_set(&self.pace_timer, until).is_ok();
+        }
+        self.refresh_wait_timer();
+        self.notify_maintenance();
+    }
+
     fn lock_work_pending(&self) -> bool {
         !self.lock_paused && (self.waits.needs_work() || self.lock_sweep_pending)
     }
