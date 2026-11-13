@@ -290,7 +290,7 @@ mod tests {
         known.credentials(generation, || Some(answer(0, 5)));
         let rights = Cell::new(Held::Read);
         let calls = Cell::new(0);
-        let mut ask = |known: &mut Known| {
+        let ask = |known: &mut Known| {
             known.held(generation, 0, 9, |_, _| {
                 calls.set(calls.get() + 1);
                 Some(rights.get())
