@@ -38,7 +38,7 @@ const BLOCK: usize = 512 * 1024;
 const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--its-int] [--session S]
+       xtask aws image [--dump] [--marks] [--its-int] [--ena-break-aenq] [--ena-break-exit] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
@@ -982,6 +982,13 @@ fn make_disk(features: &[&str], variant: Variant, out: &Path) -> Result<Artifact
 fn image(args: &[String]) -> Result<(), String> {
     let dump = args.iter().any(|a| a == "--dump");
     let marks = args.iter().any(|a| a == "--marks");
+    let broken = args.iter().any(|a| a == "--ena-break-aenq");
+    let exits = args.iter().any(|a| a == "--ena-break-exit");
+    if broken || exits {
+        // Read once, where the program list of the image is made.
+        // SAFETY: xtask is single-threaded here, before the image is built.
+        unsafe { std::env::set_var("STAFETO_ENA_BREAK", if exits { "exit" } else { "1" }) };
+    }
     let its_int = args.iter().any(|a| a == "--its-int");
     let s = Session::open(flag(args, "--session"))?;
     let mut features = Vec::new();
@@ -1007,6 +1014,10 @@ fn image(args: &[String]) -> Result<(), String> {
         "dump"
     } else if marks {
         "marks"
+    } else if exits {
+        "ena-exit"
+    } else if broken {
+        "ena-break"
     } else if its_int {
         "its-int"
     } else {
@@ -1115,6 +1126,12 @@ fn boot(args: &[String]) -> Result<(), String> {
         },
     )?;
     let result = (|| {
+        // The MAC of the instance's interface, to compare with the one the
+        // device reports: the last three octets only.
+        match eni_mac(&id) {
+            Ok(mac) => println!("interface mac ..:..:..:{}", last_octets(&mac)),
+            Err(e) => println!("interface mac: {e}"),
+        }
         if let Some(n) = flag(args, "--serial").and_then(|n| n.parse().ok()) {
             for _ in 0..40 {
                 if state(&id)? == "running" {
@@ -1160,6 +1177,29 @@ fn boot(args: &[String]) -> Result<(), String> {
         cost(started.elapsed(), PRICE_SMALL)
     );
     result
+}
+
+/// The MAC address of the first interface of the instance, as EC2 has it.
+fn eni_mac(id: &str) -> Result<String, String> {
+    let q = "Reservations[0].Instances[0].NetworkInterfaces[0].MacAddress";
+    Ok(aws(&[
+        "ec2",
+        "describe-instances",
+        "--instance-ids",
+        id,
+        "--query",
+        q,
+        "--output",
+        "text",
+    ])?
+    .trim()
+    .to_string())
+}
+
+/// The last three octets of a MAC address, `aa:bb:cc:dd:ee:ff` giving `dd:ee:ff`.
+fn last_octets(mac: &str) -> String {
+    let octets: Vec<&str> = mac.split(':').collect();
+    octets[octets.len().saturating_sub(3)..].join(":")
 }
 
 // ---- the serial console -----------------------------------------------------------------
@@ -1544,6 +1584,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_is_cut_to_its_last_three_octets() {
+        assert_eq!(last_octets("06:1b:2c:3d:4e:5f"), "3d:4e:5f");
+        assert_eq!(last_octets("4e:5f"), "4e:5f");
+        assert_eq!(last_octets(""), "");
+    }
 
     #[test]
     fn redact_hides_identifiers_and_accounts() {

@@ -24,6 +24,10 @@ bench = false
 # `batch-N` and `send-N`: the frames of a step of receiving and of sending,
 # for the measurement that chose them (the defaults are the chosen ones).
 [features]
+# The ENA kind of device breaks its keep-alives on purpose after the first start (the probe of the reset in place on EC2, `cargo xtask aws boot --ena-break-aenq`).
+ena-break-aenq = []
+# The ENA service exits once, 40 s into the uptime, so that init stops the device and starts it again (`cargo xtask aws image --ena-break-exit`).
+ena-break-exit = []
 probe = []
 batch-16 = []
 batch-8 = []
@@ -72,6 +76,8 @@ virtio-mmio = { path = "../../lib/virtio-mmio" }
 # The driver of the two devices: frames, books, rings, DMA, transports.
 virtio-net = { path = "../../lib/virtio-net" }
 virtio-pci = { path = "../../lib/virtio-pci" }
+# The driver of the ENA device (ena_service.rs).
+ena = { path = "../../lib/ena" }
 trace = { path = "../../lib/trace", optional = true }
 
 # The numbers of the neighbours on VZ's bus that the BARs of `pci` go past.

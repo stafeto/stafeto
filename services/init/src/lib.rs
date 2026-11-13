@@ -11,8 +11,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod device;
 pub mod labels;
 pub mod quota;
+pub mod resolve;
 pub mod restart;
 pub mod table;
 pub mod waits;

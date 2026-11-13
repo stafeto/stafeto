@@ -351,6 +351,9 @@ const SYSTEM_PATHS: [&str; 65] = [
 /// nodes below /dev.
 pub fn is_system(path: &str) -> bool {
     SYSTEM_PATHS.contains(&path)
+        || path == ENA_NOTICE
+        || path == "/usr/share/licenses"
+        || path == "/usr/share/licenses/stafeto"
         || path.starts_with("/dev/")
         // The sets W1 and W2 of the load, in the image of the measurement
         // of stage P7 (`net_bench_files`).
@@ -720,6 +723,28 @@ pub fn layered(name: &str) -> Result<Layered, String> {
         packages: layers,
     })
 }
+
+/// The notice of the ENA driver (`lib/ena/NOTICE`: the BSD-3-Clause text of the
+/// headers whose numbers the driver carries, which its second condition asks
+/// every binary distribution to reproduce): the directories and the file an
+/// image with `netd` holds under `/usr/share/licenses/stafeto/`.
+pub fn ena_notice() -> Vec<RootFile> {
+    vec![
+        dir("/usr"),
+        dir("/usr/share"),
+        dir("/usr/share/licenses"),
+        dir("/usr/share/licenses/stafeto"),
+        of(
+            ENA_NOTICE,
+            0o644,
+            ROOT,
+            Source::Bytes("ENA-NOTICE", include_bytes!("../../lib/ena/NOTICE")),
+        ),
+    ]
+}
+
+/// Where the notice of the ENA driver lies in an image.
+pub const ENA_NOTICE: &str = "/usr/share/licenses/stafeto/ena-NOTICE";
 
 /// The directories and files of the notices of the system, which an image
 /// with layers holds under `/usr/share/licenses/stafeto/`: the licences of
@@ -3002,5 +3027,22 @@ mod tests {
             0x1100
         );
         assert!(Source::Bytes("x", b"y").bytes(|_| Err("no".into())).is_ok());
+    }
+
+    /// Fails if the notice of the ENA driver is left out of the files an image with
+    /// `netd` holds: the BSD-3-Clause text must go with the binary.
+    #[test]
+    fn the_notice_of_the_ena_driver_is_a_file_of_the_system_with_its_text() {
+        let files = ena_notice();
+        let f = files.iter().find(|f| f.path == ENA_NOTICE).unwrap();
+        let Some(Source::Bytes(_, bytes)) = &f.source else {
+            panic!("the notice is bytes");
+        };
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.contains("BSD 3-Clause") && text.contains("Redistributions in binary form"));
+        assert!(is_system(ENA_NOTICE));
+        // The directories come before the file.
+        let at = |p: &str| files.iter().position(|f| f.path == p).unwrap();
+        assert!(at("/usr/share/licenses/stafeto") < at(ENA_NOTICE));
     }
 }

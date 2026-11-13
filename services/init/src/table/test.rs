@@ -42,6 +42,8 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         args,
         dma: &[],
         quiesce: &[],
+        start: &[],
+        release: &[],
         trusted: false,
         root: false,
         shares: Shares::CREATOR,
@@ -76,11 +78,13 @@ pub const TABLE: &[Record] = &[
             base: 0x0901_0000,
             len: PAGE,
             duplicate: false,
+            at: crate::table::At::Fixed,
         }],
         bindings: &[Binding {
             name: "rtc-irq",
             line: 34,
             edge: false,
+            of: None,
         }],
         ..echo("device", 40, WATCH, b"d")
     },

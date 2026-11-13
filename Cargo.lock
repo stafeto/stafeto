@@ -152,6 +152,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ena"
+version = "0.1.0"
+
+[[package]]
 name = "entries"
 version = "0.1.0"
 
@@ -294,6 +298,7 @@ dependencies = [
  "abi",
  "bootimg",
  "netd",
+ "pci",
  "proto-fs",
  "proto-init",
  "proto-pipe",
@@ -410,6 +415,7 @@ name = "netd"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "ena",
  "posix-fs",
  "posix-random",
  "proto-entropy",
@@ -443,6 +449,10 @@ version = "0.1.0"
 dependencies = [
  "posix-crt",
 ]
+
+[[package]]
+name = "pci"
+version = "0.1.0"
 
 [[package]]
 name = "pci-walk"
@@ -1561,6 +1571,9 @@ dependencies = [
 [[package]]
 name = "virtio-pci"
 version = "0.1.0"
+dependencies = [
+ "pci",
+]
 
 [[package]]
 name = "virtio-rng"
