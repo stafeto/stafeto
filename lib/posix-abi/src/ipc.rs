@@ -282,6 +282,64 @@ pub fn wait_address(
     result.map(drop)
 }
 
+/// The deadline `ms` milliseconds from now, in ns of the monotonic clock.
+fn deadline_in(ms: u64) -> u64 {
+    rt::time::ticks_to_ns(rt::time::now()).saturating_add(ms.saturating_mul(1_000_000))
+}
+
+/// The words a wait by address on `word` sends, as the layer sends them but
+/// with `level` as given: for the probe of a process that names a key it
+/// does not hold. Ok when a wake came, ETIMEDOUT after `ms`, EPERM when the
+/// pipe service refuses the caller.
+pub fn probe_addr_wait(word: (u64, u64, u64), level: u64, ms: u64) -> Result<(), i32> {
+    let words = [word.0, word.1, word.2, level];
+    let mut out = [0u8; 16];
+    call(op::ADDR_WAIT, &words, None, b"", &mut out, deadline_in(ms)).map(drop)
+}
+
+/// A wake by address on `word` that tells how the service answered: how many
+/// it woke, or the errno it refused with (EPERM for a caller that holds no
+/// right to the object).
+pub fn probe_addr_wake(word: (u64, u64, u64), count: u64) -> Result<u64, i32> {
+    let words = [word.0, word.1, word.2, count];
+    let mut out = [0u8; 16];
+    call(op::ADDR_WAKE, &words, None, b"", &mut out, NO_DEADLINE).map(|r| r.words[0])
+}
+
+/// Opens (makes, with value 1) the named semaphore `name` ("/x") and gives
+/// its number, which is all a session needs to name it in the service.
+pub fn probe_nsem_open(name: &[u8]) -> Result<u64, i32> {
+    const O_CREAT: u64 = 0o100;
+    let words = [O_CREAT, 0o600, 1, 0];
+    let mut out = [0u8; 16];
+    call(op::NSEM_OPEN, &words, Some(3), name, &mut out, NO_DEADLINE).map(|r| r.words[0])
+}
+
+/// `sem_wait` on the named semaphore of number `id` from a session that may
+/// not have opened it, at `level`: Ok, ETIMEDOUT after `ms`, EPERM when the
+/// service refuses the caller.
+pub fn probe_nsem_wait(id: u64, level: u64, ms: u64) -> Result<(), i32> {
+    let words = [id, 0, 0, level];
+    let mut out = [0u8; 16];
+    call(
+        op::NSEM_WAIT,
+        &words,
+        Some(2),
+        b"",
+        &mut out,
+        deadline_in(ms),
+    )
+    .map(drop)
+}
+
+/// `sem_post` on the named semaphore of number `id` (EPERM for a session
+/// that has not opened it).
+pub fn probe_nsem_post(id: u64) -> Result<(), i32> {
+    let words = [id, 0];
+    let mut out = [0u8; 16];
+    call(op::NSEM_POST, &words, Some(1), b"", &mut out, NO_DEADLINE).map(drop)
+}
+
 /// A wake by address on the word: up to `count` waiters, the highest level
 /// first. How many woke (0 when the service cannot be asked).
 pub fn wake_address(word: (u64, u64, u64), count: u32) -> u32 {

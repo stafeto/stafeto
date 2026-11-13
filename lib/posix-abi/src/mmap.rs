@@ -615,6 +615,12 @@ pub(crate) fn wait_word(address: usize) -> Option<(u64, u64, u64)> {
     })
 }
 
+/// The triple `wait_word` gives for `address`, for the probes: None for a
+/// word the layer does not wait on through the service.
+pub fn probe_wait_word(address: usize) -> Option<(u64, u64, u64)> {
+    wait_word(address)
+}
+
 /// A wait by address on a word of shared memory through the pipe service
 /// (`posix_sync::set_remote`).
 pub(crate) fn wait_remote(
