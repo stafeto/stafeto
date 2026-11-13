@@ -139,7 +139,8 @@ pub mod op {
     /// sem_post: w0 id. EPERM for a session that has not opened the
     /// semaphore.
     pub const NSEM_POST: u32 = 36;
-    /// sem_getvalue: w0 id. => the value.
+    /// sem_getvalue: w0 id. => the value. EPERM for a session that has not
+    /// opened a named semaphore.
     pub const NSEM_VALUE: u32 = 37;
 
     /// A wait by address on a word of memory several processes share (long):

@@ -2696,6 +2696,10 @@ impl Pipes {
             op::NSEM_VALUE => {
                 need(1)?;
                 let s = self.ipc.sem_set(w[0], false)?;
+                // The value of a named semaphore is its openers' to read.
+                if self.ipc.sems[s].named {
+                    self.ipc.nsem_held(label, s)?;
+                }
                 out.word(u64::from(self.ipc.sems[s].vals[0]));
                 Ok(Flow::Done)
             }
@@ -4015,6 +4019,12 @@ mod tests {
             r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0],
             1,
             "untouched"
+        );
+        let (flow, _) = r.call(&mut p, 2, op::NSEM_VALUE, &[id], b"", None);
+        assert_eq!(
+            flow,
+            Err(proto_pipe::ipc::ERRNO + EPERM),
+            "no value to a stranger"
         );
         assert_eq!(p.ipc.counted, 0);
         // The opener may, and a session that opened it after may too.
