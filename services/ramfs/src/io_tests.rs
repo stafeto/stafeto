@@ -799,6 +799,7 @@ fn process_fsize(fds: &mut Fds, soft: u64) {
     limits.values[proto_process::FSIZE].soft = soft;
     limits.values[proto_process::FSIZE].hard = u64::MAX;
     fds.binding = Binding::Active(WhoReply {
+        ceiling: 31,
         pid: 300,
         credentials: Credentials::ROOT,
         generation: 1,

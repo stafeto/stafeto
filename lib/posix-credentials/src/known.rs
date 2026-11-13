@@ -71,6 +71,7 @@ mod tests {
         let mut credentials = Credentials::NOBODY;
         credentials.euid = euid;
         WhoReply {
+            ceiling: 31,
             pid: 300,
             credentials,
             generation,

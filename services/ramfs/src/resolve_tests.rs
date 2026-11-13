@@ -204,6 +204,7 @@ fn exclusive_intent_captures_dangling_symlink_and_existing_naming_edge() {
 }
 fn who() -> WhoReply {
     WhoReply {
+        ceiling: 31,
         pid: 300,
         credentials: Credentials::NOBODY,
         generation: 1,
@@ -476,9 +477,21 @@ fn binding_retains_vouched_identity_image_and_root() {
     binding.bind(Some(w), false).unwrap();
     assert_eq!(binding.identity(false).unwrap().uid, 11);
     for changed in [
-        WhoReply { pid: 301, ..w },
-        WhoReply { image: 2, ..w },
-        WhoReply { index: 45, ..w },
+        WhoReply {
+            ceiling: 31,
+            pid: 301,
+            ..w
+        },
+        WhoReply {
+            ceiling: 31,
+            image: 2,
+            ..w
+        },
+        WhoReply {
+            ceiling: 31,
+            index: 45,
+            ..w
+        },
         WhoReply {
             root: ExpenditureRoot {
                 pid: 301,
