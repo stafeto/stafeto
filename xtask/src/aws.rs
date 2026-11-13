@@ -38,7 +38,7 @@ const BLOCK: usize = 512 * 1024;
 const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--its-int] [--ena-break-aenq] [--ena-break-exit] [--session S]
+       xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
@@ -989,7 +989,10 @@ fn image(args: &[String]) -> Result<(), String> {
         // SAFETY: xtask is single-threaded here, before the image is built.
         unsafe { std::env::set_var("STAFETO_ENA_BREAK", if exits { "exit" } else { "1" }) };
     }
-    let its_int = args.iter().any(|a| a == "--its-int");
+    let its_align = args.iter().any(|a| a == "--its-align-4k");
+    let its_int = its_align || args.iter().any(|a| a == "--its-int");
+    // A disk built before: registered as it is, nothing is built.
+    let old_disk = flag(args, "--disk").map(PathBuf::from);
     let s = Session::open(flag(args, "--session"))?;
     let mut features = Vec::new();
     if dump {
@@ -998,6 +1001,10 @@ fn image(args: &[String]) -> Result<(), String> {
     let variant = if marks {
         features.push("early-marks");
         Variant::EarlyMarks
+    } else if its_align {
+        // The self-test image with the queue and the property table on the
+        // 4 KiB and 8 KiB blocks of before the fix.
+        Variant::ItsIntAlign4k
     } else if its_int {
         // The kernel runs the self-test of the ITS before init starts and
         // prints one line for each CPU's LPI (`its-int:` in the console).
@@ -1005,12 +1012,18 @@ fn image(args: &[String]) -> Result<(), String> {
     } else {
         Variant::Normal
     };
-    let disk = s.dir.join("disk.raw");
+    let disk = old_disk.clone().unwrap_or_else(|| s.dir.join("disk.raw"));
     let t = Instant::now();
-    make_disk(&features, variant, &disk)?;
-    println!("disk built in {:.1} s", t.elapsed().as_secs_f64());
+    if old_disk.is_none() {
+        make_disk(&features, variant, &disk)?;
+        println!("disk built in {:.1} s", t.elapsed().as_secs_f64());
+    }
     let t = Instant::now();
-    let flavour = if dump {
+    let flavour = if old_disk.is_some() {
+        "old-disk"
+    } else if its_align {
+        "its-align4k"
+    } else if dump {
         "dump"
     } else if marks {
         "marks"

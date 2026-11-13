@@ -48,3 +48,10 @@ break-its-keep = []
 break-its-step-resend = []
 break-its-step-early = []
 break-its-stall-clock = []
+# Deliberate breaks of the tables and registers of the ITS (xtask its-breaks):
+# the command queue and the property table back on 4 KiB and 8 KiB blocks, a
+# GITS_BASER read-back that leaves the address out, and a line `its tables`
+# that shows virtual addresses.
+break-its-align-4k = []
+break-its-readback-mask = []
+break-its-print-pa = []

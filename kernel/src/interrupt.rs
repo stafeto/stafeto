@@ -43,8 +43,7 @@ pub fn handle(ack: Ack) {
         // An LPI has no line to mask and no active state: the EOI below
         // ends it, delivered or not (spec 9).
         crate::obj::serving(crate::obj::ENTRY_INTERRUPT);
-        #[cfg(feature = "its-int")]
-        gic_its_seen(intid);
+        crate::arch::its::seen(intid);
         let _ = irq::deliver_lpi(intid);
     } else {
         // `deliver` looks the line up without a lock and enters the section
@@ -58,9 +57,4 @@ pub fn handle(ack: Ack) {
         }
     }
     gic::end(ack);
-}
-
-#[cfg(feature = "its-int")]
-fn gic_its_seen(intid: u32) {
-    crate::arch::its::int_probe::seen(intid);
 }

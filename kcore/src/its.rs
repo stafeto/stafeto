@@ -592,6 +592,166 @@ impl Default for LpiMap {
     }
 }
 
+// The tables of the ITS on 64 KiB blocks, the read-back of every register
+// and the self-test of the delivery (decision 2026-11-13, tasks/
+// 2026-11-13-its-lpi-lost.md).
+
+/// The granule a virtual ITS reads the addresses of the command queue and
+/// the property table with: 64 KiB, as Linux allocates them.
+pub const TABLE_ALIGN: u64 = 0x1_0000;
+
+/// Whether a table at `pa` starts on a `TABLE_ALIGN` boundary.
+pub const fn table_aligned(pa: u64) -> bool {
+    pa.is_multiple_of(TABLE_ALIGN)
+}
+
+/// The allocator order of the command queue and of the property table: 16
+/// frames of 4 KiB each, so that the blocks lie on 64 KiB. The break
+/// `break-its-align-4k` returns to the 4 KiB and 8 KiB blocks of before.
+pub const QUEUE_ORDER: u8 = if cfg!(feature = "break-its-align-4k") {
+    0
+} else {
+    4
+};
+pub const PROP_ORDER: u8 = if cfg!(feature = "break-its-align-4k") {
+    1
+} else {
+    4
+};
+
+const ADDR_4K: u64 = 0x000F_FFFF_FFFF_F000;
+const ADDR_64K: u64 = 0x000F_FFFF_FFFF_0000;
+/// The bits of GITS_CBASER that must read as written: Valid, the address
+/// and Size.
+pub const CBASER_CHECK: u64 = (1 << 63) | ADDR_4K | 0xFF;
+/// The bits of GICR_PROPBASER that must read as written: the address and IDbits.
+pub const PROPBASER_CHECK: u64 = ADDR_4K | 0x1F;
+/// The bits of GICR_PENDBASER that must read as written: the address (PTZ
+/// reads as 0).
+pub const PENDBASER_CHECK: u64 = ADDR_64K;
+/// The bits of a GITS_BASER that must read as written: Page_Size, Size,
+/// Valid and the address field for pages of `page` bytes. The break
+/// `break-its-readback-mask` keeps the mask of before, with no address.
+pub const fn baser_check(page: u64) -> u64 {
+    let base = (3 << 8) | 0xFF | (1 << 63);
+    if cfg!(feature = "break-its-readback-mask") {
+        base
+    } else {
+        base | baser_address(0x000F_FFFF_FFFF_FFFF, page)
+    }
+}
+
+/// A register that did not read back as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBack {
+    pub reg: &'static str,
+    pub wrote: u64,
+    pub read: u64,
+}
+
+impl core::fmt::Display for ReadBack {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} reads back {:#x} (wrote {:#x})",
+            self.reg, self.read, self.wrote
+        )
+    }
+}
+
+/// Ok when the bits of `mask` read as written.
+pub fn verify(reg: &'static str, wrote: u64, read: u64, mask: u64) -> Result<(), ReadBack> {
+    if (wrote ^ read) & mask == 0 {
+        Ok(())
+    } else {
+        Err(ReadBack { reg, wrote, read })
+    }
+}
+
+/// The physical addresses of the tables, for the line `its tables`.
+pub struct Tables<'a> {
+    pub queue: u64,
+    pub prop: u64,
+    pub pend: &'a [u64],
+    pub dt: u64,
+    pub ct: u64,
+}
+
+/// The address a line shows: the physical one. The break
+/// `break-its-print-pa` shows the kernel's virtual address.
+fn shown(pa: u64) -> u64 {
+    if cfg!(feature = "break-its-print-pa") {
+        crate::layout::LINEAR_BASE as u64 + pa
+    } else {
+        pa
+    }
+}
+
+impl core::fmt::Display for Tables<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "its tables queue {:#x} prop {:#x}",
+            shown(self.queue),
+            shown(self.prop)
+        )?;
+        for (n, pa) in self.pend.iter().enumerate() {
+            write!(f, " pend{n} {:#x}", shown(*pa))?;
+        }
+        write!(f, " dt {:#x} ct {:#x}", shown(self.dt), shown(self.ct))
+    }
+}
+
+/// An LPI of the boot self-test that did not arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotDelivered {
+    pub cpu: usize,
+    pub lpi: u32,
+}
+
+impl core::fmt::Display for NotDelivered {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "LPI {} did not reach CPU {}", self.lpi, self.cpu)
+    }
+}
+
+/// The verdict of the self-test: `arrived[c]` is the ticks the LPI of CPU
+/// `c` (FIRST_LPI + c) took, None when it did not arrive in time.
+pub fn verdict(arrived: &[Option<u64>]) -> Result<(), NotDelivered> {
+    for (cpu, ticks) in arrived.iter().enumerate() {
+        if ticks.is_none() {
+            return Err(NotDelivered {
+                cpu,
+                lpi: FIRST_LPI + cpu as u32,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Clears EnableLPIs at entry, as Linux does for a kernel that finds it set:
+/// write the register without the bit, wait for Register Write Pending
+/// (`settle`, bounded by its caller), read again. Err(ctlr) when the bit is
+/// still set, which leaves the tables of the firmware in use.
+pub fn clear_enable_lpis(
+    mut read: impl FnMut() -> u32,
+    mut write: impl FnMut(u32),
+    mut settle: impl FnMut(),
+) -> Result<(), u32> {
+    let ctlr = read();
+    if ctlr & GICR_CTLR_ENABLE_LPIS == 0 {
+        return Ok(());
+    }
+    write(ctlr & !GICR_CTLR_ENABLE_LPIS);
+    settle();
+    let after = read();
+    if after & GICR_CTLR_ENABLE_LPIS == 0 {
+        Ok(())
+    } else {
+        Err(after)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1161,127 @@ mod tests {
         let n = m.take().unwrap();
         m.give(n);
         m.give(n);
+    }
+
+    /// A virtual ITS that takes the addresses of the command queue and the
+    /// property table with the accuracy of 64 KiB, as the one of EC2 seems to.
+    struct Vits64k;
+
+    impl Vits64k {
+        fn seen(reg: u64) -> u64 {
+            reg & 0x000F_FFFF_FFFF_0000
+        }
+    }
+
+    /// The allocator the kernel takes its blocks from: a block of `order` on
+    /// the first boundary of its own size at or after `cursor`.
+    fn take(cursor: &mut u64, order: u8) -> u64 {
+        let size = 0x1000u64 << order;
+        let pa = cursor.next_multiple_of(size);
+        *cursor = pa + size;
+        pa
+    }
+
+    #[test]
+    fn the_queue_and_the_property_table_lie_where_a_64k_reader_looks() {
+        // Free memory that starts at an address of the layout of run 1201,
+        // which is a multiple of 4 KiB only.
+        for start in [0x77bf_1000u64, 0x77bf_2000, 0x781d_e000, 0x77bf_9000] {
+            let mut cursor = start;
+            let queue = take(&mut cursor, QUEUE_ORDER);
+            let prop = take(&mut cursor, PROP_ORDER);
+            let cb = cbaser(queue, 1, SHARE_INNER, CACHE_RAWAWB);
+            let pb = propbaser(prop, ID_BITS, SHARE_INNER, CACHE_RAWAWB);
+            assert_eq!(Vits64k::seen(cb), queue, "commands are read elsewhere");
+            assert_eq!(Vits64k::seen(pb), prop, "properties are read elsewhere");
+            assert!(table_aligned(queue) && table_aligned(prop));
+        }
+    }
+
+    #[test]
+    fn the_read_back_sees_an_address_the_register_does_not_hold() {
+        let wrote = cbaser(0x77bf_9000, 1, SHARE_INNER, CACHE_RAWAWB);
+        let read = (wrote & !ADDR_4K) | Vits64k::seen(wrote);
+        let err = verify("GITS_CBASER", wrote, read, CBASER_CHECK).unwrap_err();
+        assert_eq!(err.reg, "GITS_CBASER");
+        assert!(
+            err.to_string().starts_with("GITS_CBASER reads back 0x"),
+            "{err}"
+        );
+        verify("GITS_CBASER", wrote, wrote, CBASER_CHECK).unwrap();
+        // The shareability fields may differ.
+        verify("GITS_CBASER", wrote, wrote & !(3 << 10), CBASER_CHECK).unwrap();
+    }
+
+    #[test]
+    fn a_baser_that_drops_bits_15_to_12_of_a_64k_table_reads_back_wrong() {
+        let old = (BASER_TYPE_DEVICE << 56) | (7 << 48) | (2 << 8);
+        let pa = 0x7_8863_0000 | (0x1 << 48);
+        let wrote = baser(old, pa, 1, 0x1_0000, SHARE_INNER, CACHE_RAWAWB);
+        let read = wrote & !(0xF << 12);
+        assert!(verify("GITS_BASER0", wrote, read, baser_check(0x1_0000)).is_err());
+        assert!(verify("GITS_BASER0", wrote, wrote, baser_check(0x1_0000)).is_ok());
+        // A 4 KiB page keeps the whole address.
+        let w4 = baser(old, 0x7_8863_2000, 1, 0x1000, SHARE_INNER, CACHE_RAWAWB);
+        assert!(verify("GITS_BASER0", w4, w4 & !(1 << 13), baser_check(0x1000)).is_err());
+    }
+
+    #[test]
+    fn the_propbaser_and_pendbaser_addresses_are_read_back() {
+        let p = propbaser(0x77bf_2000, ID_BITS, SHARE_INNER, CACHE_RAWAWB);
+        let low = p & !(0xF << 12);
+        assert!(verify("GICR_PROPBASER", p, low, PROPBASER_CHECK).is_err());
+        let q = pendbaser(0x77c1_0000, SHARE_INNER, CACHE_RAWAWB);
+        // PTZ reads as 0.
+        assert!(verify("GICR_PENDBASER", q, q & !(1 << 62), PENDBASER_CHECK).is_ok());
+        assert!(verify("GICR_PENDBASER", q, q ^ (1 << 16), PENDBASER_CHECK).is_err());
+    }
+
+    #[test]
+    fn the_tables_line_shows_physical_addresses() {
+        let t = Tables {
+            queue: 0x77c0_0000,
+            prop: 0x77c1_0000,
+            pend: &[0x77c2_0000, 0x77c3_0000],
+            dt: 0x77c4_0000,
+            ct: 0x77c5_0000,
+        };
+        let line = format!("{t}");
+        assert_eq!(
+            line,
+            "its tables queue 0x77c00000 prop 0x77c10000 pend0 0x77c20000 pend1 0x77c30000 dt 0x77c40000 ct 0x77c50000"
+        );
+    }
+
+    #[test]
+    fn a_self_test_that_lost_an_lpi_names_the_cpu() {
+        assert_eq!(verdict(&[Some(10), Some(20)]), Ok(()));
+        assert_eq!(verdict(&[]), Ok(()));
+        let err = verdict(&[Some(10), None]).unwrap_err();
+        assert_eq!(err, NotDelivered { cpu: 1, lpi: 8193 });
+        assert_eq!(format!("{err}"), "LPI 8193 did not reach CPU 1");
+        assert_eq!(
+            format!("{}", verdict(&[None, None]).unwrap_err()),
+            "LPI 8192 did not reach CPU 0"
+        );
+    }
+
+    #[test]
+    fn enable_lpis_left_by_the_firmware_is_cleared_or_the_its_stays_off() {
+        use core::cell::Cell;
+        // A redistributor that takes the write.
+        let reg = Cell::new(GICR_CTLR_ENABLE_LPIS | 0x10);
+        let waits = Cell::new(0);
+        let r = clear_enable_lpis(|| reg.get(), |v| reg.set(v), || waits.set(waits.get() + 1));
+        assert_eq!(r, Ok(()));
+        assert_eq!(reg.get(), 0x10, "the other bits stay");
+        assert_eq!(waits.get(), 1);
+        // Clear at entry: no write and no wait.
+        let r = clear_enable_lpis(|| reg.get(), |_| panic!("no write"), || panic!("no wait"));
+        assert_eq!(r, Ok(()));
+        // A redistributor that keeps the bit.
+        let stuck = Cell::new(GICR_CTLR_ENABLE_LPIS);
+        let r = clear_enable_lpis(|| stuck.get(), |_| {}, || {});
+        assert_eq!(r, Err(GICR_CTLR_ENABLE_LPIS));
     }
 }

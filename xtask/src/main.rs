@@ -1538,10 +1538,23 @@ enum Variant {
     /// with every event mapped to CPU 0's collection.
     ItsInt,
     ItsIntBreak,
+    /// The boot self-test of the ITS with events that cannot arrive (kernel
+    /// feature `its-int-drop`, `cargo xtask its-drop`): MSI must go off with
+    /// a line; with `break-its-selftest-ignore` it stays on.
+    ItsDrop,
+    ItsDropIgnore,
+    /// Every redistributor comes with EnableLPIs and tables of its own (kernel
+    /// feature `its-lpis-preset`, `cargo xtask its-lpis`), and the break that
+    /// does not clear the bit.
+    ItsPreset,
+    ItsPresetBreak,
+    /// The self-test image of EC2 with the queue and the property table back on
+    /// 4 KiB and 8 KiB blocks (`cargo xtask aws image --its-align-4k`).
+    ItsIntAlign4k,
 }
 
 impl Variant {
-    const ALL: [Variant; 43] = [
+    const ALL: [Variant; 48] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1585,6 +1598,11 @@ impl Variant {
         Variant::TestIcountItsLoopEl0,
         Variant::ItsInt,
         Variant::ItsIntBreak,
+        Variant::ItsDrop,
+        Variant::ItsDropIgnore,
+        Variant::ItsPreset,
+        Variant::ItsPresetBreak,
+        Variant::ItsIntAlign4k,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1636,6 +1654,11 @@ impl Variant {
             Variant::TestIcountItsLoopEl0 => Some("icount,its-slow,break-its-loop,el0-half"),
             Variant::ItsInt => Some("its-int"),
             Variant::ItsIntBreak => Some("break-its-int-collection"),
+            Variant::ItsDrop => Some("its-int-drop"),
+            Variant::ItsDropIgnore => Some("break-its-selftest-ignore"),
+            Variant::ItsPreset => Some("its-lpis-preset"),
+            Variant::ItsPresetBreak => Some("break-its-keep-firmware-lpis"),
+            Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
         }
     }
 
@@ -1671,6 +1694,11 @@ impl Variant {
             | Variant::ItsProbe
             | Variant::ItsInt
             | Variant::ItsIntBreak
+            | Variant::ItsDrop
+            | Variant::ItsDropIgnore
+            | Variant::ItsPreset
+            | Variant::ItsPresetBreak
+            | Variant::ItsIntAlign4k
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1756,6 +1784,11 @@ impl Variant {
             Variant::TestIcountItsLoopEl0 => "stafeto-ktest-icount-its-loop-el0",
             Variant::ItsInt => "stafeto-its-int",
             Variant::ItsIntBreak => "stafeto-its-int-break",
+            Variant::ItsDrop => "stafeto-its-drop",
+            Variant::ItsDropIgnore => "stafeto-its-drop-ignore",
+            Variant::ItsPreset => "stafeto-its-preset",
+            Variant::ItsPresetBreak => "stafeto-its-preset-break",
+            Variant::ItsIntAlign4k => "stafeto-its-int-align4k",
         }
     }
 }
@@ -2102,6 +2135,8 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
+  its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
+  its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
   its-int   boot the self-test of the ITS in QEMU on four CPUs: an event mapped to each CPU's collection, raised by INT, received there; with the break (every event on CPU 0) the run must report the failure
   its-slow  the kernel tests under -icount with an ITS that seems slow: every bound holds (B_4 under 32 000), and with the teardown that waits in one portion a test fails
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
@@ -2123,6 +2158,8 @@ fn main() {
         Some("ena-breaks") => ena_breaks(),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
+        Some("its-drop") => its_drop(),
+        Some("its-lpis") => its_lpis(),
         Some("its-breaks") => its_breaks(),
         Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
@@ -2690,6 +2727,9 @@ fn its_breaks() -> Result<(), String> {
         "break-its-step-resend",
         "break-its-step-early",
         "break-its-stall-clock",
+        "break-its-align-4k",
+        "break-its-readback-mask",
+        "break-its-print-pa",
     ] {
         let mut broken = cargo();
         broken.args([
@@ -2710,8 +2750,9 @@ fn its_breaks() -> Result<(), String> {
     Ok(())
 }
 
-/// What the self-test of the ITS prints, on `cpus` CPUs: the device line, one
-/// line for each CPU's event, and the verdict.
+/// What the self-test of the ITS prints, on `cpus` CPUs, with the feature
+/// `its-int`: the device line, one line for each CPU's event, and no
+/// `its off`.
 fn its_int_lines(lines: &[String], cpus: usize) -> Result<(), String> {
     let has = |p: &str| lines.iter().any(|l| l.starts_with(p));
     if !has("its-int: device ") {
@@ -2719,16 +2760,12 @@ fn its_int_lines(lines: &[String], cpus: usize) -> Result<(), String> {
     }
     for e in 0..cpus {
         let lpi = 8192 + e;
-        if !has(&format!(
-            "its-int: event {e}: LPI {lpi} reached CPU {e} after "
-        )) {
+        if !has(&format!("its self-test: LPI {lpi} reached CPU {e} after ")) {
             return Err(format!("the LPI of event {e} did not reach CPU {e}"));
         }
     }
-    if !has(&format!(
-        "its-int: ok, {cpus} LPIs delivered, one to each of {cpus} CPUs"
-    )) {
-        return Err("the self-test of the ITS gave no verdict ok".into());
+    if has("its off") {
+        return Err("the self-test of the ITS turned the ITS off".into());
     }
     Ok(())
 }
@@ -2747,9 +2784,12 @@ fn its_int() -> Result<(), String> {
         let o = run_until(cmd, BOOT_TIMEOUT, Some("boot complete"), &a.elf)?;
         qemu::expect_stopped_on(&o, "boot complete")?;
         let result = its_int_lines(&o.lines, SMP_CPUS);
+        if !broken {
+            its_boot_lines(&o.lines, SMP_CPUS)?;
+        }
         match (broken, result) {
             (false, Ok(())) => {
-                for l in o.lines.iter().filter(|l| l.starts_with("its-int: ")) {
+                for l in o.lines.iter().filter(|l| l.starts_with("its")) {
                     println!("{l}");
                 }
             }
@@ -2758,11 +2798,140 @@ fn its_int() -> Result<(), String> {
                 return Err("the break (every event on CPU 0) passed the self-test".into());
             }
             (true, Err(_)) => {
-                if !o.lines.iter().any(|l| l.starts_with("its-int: FAILED")) {
-                    return Err("the break did not make the self-test say FAILED".into());
+                if !o
+                    .lines
+                    .iter()
+                    .any(|l| l == "its off: LPI 8193 did not reach CPU 1")
+                {
+                    return Err("the break did not make the self-test say `its off`".into());
                 }
                 println!("its-int: the break (every event on CPU 0) is reported");
             }
+        }
+    }
+    Ok(())
+}
+
+/// A hexadecimal value after `key` in `line`.
+fn hex_after(line: &str, key: &str) -> Option<u64> {
+    let rest = line.split(key).nth(1)?.trim_start();
+    let word = rest.split_whitespace().next()?;
+    u64::from_str_radix(word.strip_prefix("0x")?, 16).ok()
+}
+
+/// The lines every boot of a kernel with an ITS prints (decision 2026-11-13,
+/// task 1): the tables on 64 KiB, the read-back of the registers, one
+/// self-test line for each CPU that says the LPI arrived.
+fn its_boot_lines(lines: &[String], cpus: usize) -> Result<(), String> {
+    let find = |p: &str| lines.iter().find(|l| l.starts_with(p));
+    let tables = find("its tables ").ok_or("no line `its tables`")?;
+    for key in ["queue ", "prop ", "pend0 ", "dt ", "ct "] {
+        let pa = hex_after(tables, key).ok_or(format!("no {key}address in `{tables}`"))?;
+        if matches!(key, "queue " | "prop " | "pend0 ") && pa % 0x1_0000 != 0 {
+            return Err(format!("{key}table at {pa:#x} is not on 64 KiB"));
+        }
+    }
+    for p in ["its cbaser wrote ", "its baser0 type ", "its typer "] {
+        if find(p).is_none() {
+            return Err(format!("no line `{p}`"));
+        }
+    }
+    for cpu in 0..cpus {
+        for p in [
+            format!("gicr cpu {cpu} entry ctlr "),
+            format!("gicr cpu {cpu} set propbaser "),
+            format!("its mapc cpu {cpu} target "),
+            format!("its self-test: LPI {} reached CPU {cpu} after ", 8192 + cpu),
+        ] {
+            if find(&p).is_none() {
+                return Err(format!("no line `{p}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `cargo xtask its-drop`: the self-test of every boot. With events that
+/// cannot arrive (`its-int-drop`) the kernel says `its off: LPI 8192 did not
+/// reach CPU 0`, turns MSI off and boots on; with the break that ignores the
+/// result (`break-its-selftest-ignore`) MSI stays on and the run fails.
+fn its_drop() -> Result<(), String> {
+    let machine = &qemu::VIRT_ITS;
+    for (variant, broken) in [(Variant::ItsDrop, false), (Variant::ItsDropIgnore, true)] {
+        let a = build(variant)?;
+        let mut cmd = qemu::command(machine, &a.image, Some(&a.boot_image));
+        cmd.args(["-smp", &SMP_CPUS.to_string()]);
+        cmd.args(qemu::HEADLESS);
+        let o = run_until(cmd, BOOT_TIMEOUT, Some("boot complete"), &a.elf)?;
+        qemu::expect_stopped_on(&o, "boot complete")?;
+        let has = |p: &str| o.lines.iter().any(|l| l.starts_with(p));
+        let verdict = if !has("its off: LPI 8192 did not reach CPU 0") {
+            Err("no line `its off: LPI 8192 did not reach CPU 0`".to_owned())
+        } else if !has("its self-test: MSI is off, drivers poll") {
+            Err("the ITS stays on after a failed self-test".to_owned())
+        } else {
+            Ok(())
+        };
+        match (broken, verdict) {
+            (false, Ok(())) => {
+                println!("its-drop: a lost LPI turns MSI off and the kernel boots on")
+            }
+            (false, Err(e)) => return Err(e),
+            (true, Ok(())) => return Err("the break (result ignored) passed".into()),
+            (true, Err(_)) => println!("its-drop: the break that ignores the result is caught"),
+        }
+    }
+    Ok(())
+}
+
+/// `cargo xtask its-lpis`: every redistributor comes with EnableLPIs set and
+/// tables of its own (`its-lpis-preset`); the kernel clears the bit, sets its
+/// own tables and the self-test passes. With the break that leaves the bit
+/// (`break-its-keep-firmware-lpis`) the LPI cannot arrive.
+fn its_lpis() -> Result<(), String> {
+    let machine = &qemu::VIRT_ITS;
+    for (variant, broken) in [(Variant::ItsPreset, false), (Variant::ItsPresetBreak, true)] {
+        let a = build(variant)?;
+        let mut cmd = qemu::command(machine, &a.image, Some(&a.boot_image));
+        cmd.args(["-smp", &SMP_CPUS.to_string()]);
+        cmd.args(qemu::HEADLESS);
+        let o = run_until(cmd, BOOT_TIMEOUT, Some("boot complete"), &a.elf)?;
+        qemu::expect_stopped_on(&o, "boot complete")?;
+        let entry = o
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("gicr cpu ") && l.contains(" entry "))
+            .filter(|l| hex_after(l, " ctlr ").is_some_and(|c| c & 1 != 0))
+            .count();
+        if entry != SMP_CPUS {
+            return Err(format!(
+                "the preset reached {entry} of {SMP_CPUS} CPUs (EnableLPIs at entry)"
+            ));
+        }
+        // The kernel says on each CPU whether it cleared the bit. QEMU takes
+        // writes of the tables with EnableLPIs set, so the LPIs arrive with the
+        // break as well, and this line tells the two apart.
+        let cleared = o
+            .lines
+            .iter()
+            .filter(|l| {
+                l.starts_with("gicr cpu ") && l.contains(" set ") && l.ends_with(" cleared 0x1")
+            })
+            .count();
+        let verdict = if cleared == SMP_CPUS {
+            its_boot_lines(&o.lines, SMP_CPUS)
+        } else {
+            Err(format!(
+                "EnableLPIs was cleared on {cleared} of {SMP_CPUS} CPUs"
+            ))
+        };
+        match (broken, verdict) {
+            (false, Ok(())) => {
+                println!("its-lpis: EnableLPIs of the firmware is cleared and the LPIs arrive")
+            }
+            (false, Err(e)) => return Err(e),
+            (true, Ok(())) => return Err("the break (bit kept) passed".into()),
+            (true, Err(_)) => println!("its-lpis: the break that keeps the bit is caught"),
         }
     }
     Ok(())
@@ -9539,6 +9708,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("smp 4 CPU_ON refused", smp_cpu_on),
         job("its int", its_int),
+        job("its drop", its_drop),
+        job("its lpis", its_lpis),
         job("its breaks", its_breaks),
         job("its slow", its_slow),
         job("smp 4 window", smp_window),
