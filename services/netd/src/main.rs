@@ -1386,17 +1386,62 @@ impl<'a> Driver<'a> {
     }
 }
 
+/// What each instance leaves for the profile record (`profile_snapshot`).
+#[cfg(feature = "profile")]
+struct Snapshot {
+    ran: core::sync::atomic::AtomicU64,
+    calls: core::sync::atomic::AtomicU64,
+    members: [core::sync::atomic::AtomicU64; 8],
+}
+
+#[cfg(feature = "profile")]
+static SNAPSHOT: [Snapshot; MAX_INSTANCES] = [const {
+    Snapshot {
+        ran: core::sync::atomic::AtomicU64::new(0),
+        calls: core::sync::atomic::AtomicU64::new(0),
+        members: [const { core::sync::atomic::AtomicU64::new(0) }; 8],
+    }
+}; MAX_INSTANCES];
+
 impl Driver<'_> {
     /// The profile's totals as records of the console (builds with the
     /// feature `profile`): the service's own time first, then the maxima
     /// start anew for the next snapshot.
     #[cfg(feature = "profile")]
     fn profile_snapshot(&self) {
-        profile::store(Counter::Ran, self.ran());
+        // The groups and the thread's time belong to the instance that snapshots: each one
+        // leaves its own in `SNAPSHOT` and the record carries the sums over all instances.
+        let own = &SNAPSHOT[self.index];
+        own.ran
+            .store(self.ran(), core::sync::atomic::Ordering::Relaxed);
+        own.calls.store(
+            self.inst.net.counters.calls,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        let served = self.inst.net.groups.served_by_position();
+        for (cell, n) in own.members.iter().zip(served) {
+            cell.store(n, core::sync::atomic::Ordering::Relaxed);
+        }
+        let load =
+            |cell: &core::sync::atomic::AtomicU64| cell.load(core::sync::atomic::Ordering::Relaxed);
+        profile::store(Counter::Ran, SNAPSHOT.iter().map(|i| load(&i.ran)).sum());
         // How the load is shared: the SYNs of each member of a group, the frames of each
         // consumer of the switch.
-        for (at, n) in self.inst.net.groups.served_by_position().iter().enumerate() {
-            profile::store_at(Counter::Member0, at, *n);
+        for at in 0..own.members.len() {
+            let sum: u64 = SNAPSHOT.iter().map(|i| load(&i.members[at])).sum();
+            profile::store_at(Counter::Member0, at, sum);
+        }
+        // What each instance answered and ran: which instance serves which calls.
+        for (k, i) in SNAPSHOT.iter().enumerate().take(self.instances) {
+            let mut members = [0u64; 8];
+            for (m, cell) in members.iter_mut().zip(&i.members) {
+                *m = load(cell);
+            }
+            rt::println!(
+                "net: instance {k} calls {} ran {} members {members:?}",
+                load(&i.calls),
+                load(&i.ran)
+            );
         }
         for (at, n) in switch::INNER.stats.rx_by.iter().enumerate() {
             profile::store_at(
@@ -1983,7 +2028,11 @@ impl Driver<'_> {
             Err(status) => return Answer::Status(status),
         };
         let here = u32::from(self.inst.net.cpu);
-        if self.index != 0 || s.data.homed || s.data.held.count() > 0 {
+        // The methods of the switch (ATTACH, PORT_HOLD, JOIN) and of the second device (CLAIM)
+        // are the first instance's alone: where the service has either, no session moves away
+        // from it, so that a program that attaches or claims later finds them.
+        let owner_methods = self.side.max > 0 || self.second.is_some();
+        if self.index != 0 || s.data.homed || s.data.held.count() > 0 || owner_methods {
             return stays(s, r, here);
         }
         let home = netd::home::choose(self.cpus, cpu, allowed);
