@@ -405,6 +405,9 @@ fn main(_: u64) -> u64 {
         segment_refusals: 0,
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
+        lock_busy: 0,
+        lock_turn_ran: false,
+        request_began: 0,
         lock_maintenance_work: 0,
         lifetimes: None,
         legacy_pending: true,
@@ -566,6 +569,11 @@ struct Fs {
     lock_sweep: SweepCursor,
     lock_sweep_pending: bool,
     lock_maintenance_turn: bool,
+    /// Nanoseconds the service spent in dispatches other than lock turns
+    /// since the last lock turn ended.
+    lock_busy: u64,
+    lock_turn_ran: bool,
+    request_began: u64,
     lock_maintenance_work: u8,
     lifetimes: Option<lifetime_page::Lifetimes>,
     legacy_pending: bool,
@@ -2286,227 +2294,26 @@ impl Service<0> for Fs {
         sessions: &mut [Option<Session<Fds, 0>>],
         notice: rt::service::Notice,
     ) {
-        #[cfg(feature = "profile")]
-        calls::flush();
-        if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
-            self.wait_timer_armed = false;
-            self.waits.poll();
-            self.lock_sweep.poll();
-            self.lock_sweep_pending = self.locks.has_locks();
-            if !self.lock_sweep_pending {
-                self.lock_sweep.stop();
-            }
-            self.maintenance_burst.restart();
-            self.legacy_pending = true;
-            self.refresh_wait_timer();
-            self.notify_maintenance();
-            return;
+        let began = rt::time::ticks_to_ns(rt::time::now());
+        self.lock_turn_ran = false;
+        self.maintenance_dispatch(sessions, notice);
+        // The time of a dispatch that ran no lock turn is busy time between
+        // lock turns: the share charges it when the gap is long.
+        if !self.lock_turn_ran {
+            let ended = rt::time::ticks_to_ns(rt::time::now());
+            self.lock_busy = self.lock_busy.saturating_add(ended.saturating_sub(began));
         }
-        if notice.source == rt::abi::Source::Timer && notice.label == AUDIT_TIMER_LABEL {
-            self.audit_armed = false;
-            self.maintenance_burst.restart();
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        if notice.source == rt::abi::Source::Timer && notice.label == PACE_TIMER_LABEL {
-            self.lock_paused = false;
-            self.notify_maintenance();
-            return;
-        }
-        if notice.label == mapper::LABEL {
-            self.mapper_done();
-            self.maintenance_burst.restart();
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        if notice.label == IPC_JOBS_LABEL {
-            self.ipc_jobs_pending = true;
-            self.maintenance_burst.restart();
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
-            self.maintenance_burst.restart();
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        rt::service::step_own();
-        // The pipe service is given the channel it tells of jobs with, once
-        // (a few tries), and the jobs it told of are taken, four to a turn.
-        if self.pipe_broker.is_some()
-            && (self.ipc_jobs_pending || (!self.ipc_armed && self.ipc_arm_tries < 3))
-        {
-            self.ipc_arm_tries = self.ipc_arm_tries.saturating_add(1);
-            self.ipc_jobs_pending = self.ipc_jobs_round().unwrap_or(false);
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        if self.ram.cancel_refusals != self.cancel_reported {
-            self.cancel_reported = self.ram.cancel_refusals;
-            rt::println!(
-                "ramfs: {} steps of a cancel were refused",
-                self.cancel_reported
-            );
-        }
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        // A turn of the work of locks only while it has work (and is not
-        // paused): a round of the circle of the sessions has no turn of
-        // an empty sweep or of waits that wait for nothing.
-        self.layer_pump();
-        if self.ram.storage.layer_work() {
-            let now = self.time_source.now();
-            self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
-            self.layer_pump();
-            self.legacy_pending = true;
-            self.notify_maintenance();
-            return;
-        }
-        self.lock_maintenance_turn = !self.lock_maintenance_turn && self.lock_work_pending();
-        if self.lock_maintenance_turn {
-            self.lock_turn(sessions);
-            return;
-        }
-        if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
-            self.next_audit_ns = now.saturating_add(250_000_000);
-            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
-        }
-        let mut work = false;
-        self.maintenance_jobs = !self.maintenance_jobs;
-        if self.maintenance_jobs {
-            self.data_gc_turn = !self.data_gc_turn;
-            if self.data_gc_turn && self.orphan_count != 0 {
-                let slot = self.orphan_cursor as usize;
-                self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
-                if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
-                    let (id, owner) = (job.id, job.owner);
-                    let before = (self.orphan_count, self.ram.storage.available().pages);
-                    self.cancel_job(id, owner, None);
-                    let after = (self.orphan_count, self.ram.storage.available().pages);
-                    work = ramfs::maintenance::orphan_progress(before, after);
-                }
-            } else {
-                #[cfg(feature = "steps")]
-                let retained = self.steps_reclaim_owner.is_some();
-                #[cfg(not(feature = "steps"))]
-                let retained = false;
-                if !retained {
-                    work = self.ram.storage.reclaim_step();
-                }
-            }
-            // A turn of jobs that found no work and has no orphan to wait
-            // for goes on to the departures and the audit in the same
-            // step: it is no step of its own.
-            if work || self.orphan_count != 0 {
-                self.legacy_pending = self.maintenance_burst.again(
-                    work,
-                    work || self.departures.pending()
-                        || self.audit_pending()
-                        || self.orphan_count != 0,
-                );
-                self.notify_maintenance();
-                return;
-            }
-        }
-        self.departure_turn = !self.departure_turn;
-        if self.departure_turn
-            && let Some(i) = self.departures.next_place()
-        {
-            let (label, complete) = if i < SESSIONS {
-                let s = sessions[i].as_mut().expect("retained departed session");
-                let label = s.label();
-                work = self.cleanup_step(&mut s.data, label);
-                (
-                    label,
-                    Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
-                )
-            } else {
-                let birth = &mut self.births[i - SESSIONS];
-                let (label, mut fds) = birth.take().expect("retained departed birth");
-                work = self.cleanup_step(&mut fds, label);
-                let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
-                self.births[i - SESSIONS] = Some((label, fds));
-                (label, complete)
-            };
-            if complete {
-                if i < SESSIONS {
-                    sessions[i] = None;
-                } else {
-                    self.births[i - SESSIONS] = None;
-                }
-                self.departures.release(i);
-                self.places.release(label);
-                self.clones.gone(label);
-                work = true;
-            }
-            self.legacy_pending = self.maintenance_burst.again(
-                work,
-                work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
-            );
-            self.notify_maintenance();
-            return;
-        }
-        if self.maintenance.remaining != 0
-            && now < self.audit_ready_ns
-            && (self.audit_armed || sys::timer_set(&self.audit_timer, self.audit_ready_ns).is_ok())
-        {
-            // The next step of the audit waits for its time: the service
-            // idles, and the clients below it run.
-            self.audit_armed = true;
-            self.legacy_pending = self.maintenance_burst.again(
-                work,
-                work || self.departures.pending() || self.orphan_count != 0,
-            );
-            self.notify_maintenance();
-            return;
-        }
-        // A closed round of the audit has nothing to do: with lock work
-        // waiting, the turn of the lock work follows at once and the empty
-        // step takes no dispatch of its own.
-        if self.maintenance.remaining == 0 && !work && self.lock_work_pending() {
-            self.lock_maintenance_turn = true;
-            self.lock_turn(sessions);
-            return;
-        }
-        // The slots with no session and no birth pass in this step.
-        let departures = &self.departures;
-        let births = &*self.births;
-        self.maintenance
-            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
-                Self::slot_empty(departures, births, sessions, i)
-            });
-        self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
-        let mut client_work = false;
-        let i = self.maintenance.position;
-        if self.departures.contains(i) {
-            // Queued cells receive separate fair bounded cleanup turns.
-        } else if i < SESSIONS {
-            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
-                let label = s.label();
-                client_work = self.cleanup_step(&mut s.data, label);
-            }
-        } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
-            client_work = self.cleanup_step(&mut fds, label);
-            self.births[i - SESSIONS] = Some((label, fds));
-        }
-        work |= client_work;
-        let round_open = self.maintenance.remaining != 0;
-        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
-        if round_open && self.maintenance.remaining == 0 {
-            self.audit_rounds = self.audit_rounds.wrapping_add(1);
-            #[cfg(feature = "steps")]
-            rt::println!("ramfs: audit round {}", self.audit_rounds);
-        }
-        // A maintenance notification makes reclamation progress with no client request.
-        self.legacy_pending = self.maintenance_burst.again(
-            work,
-            work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
-        );
-        self.notify_maintenance();
+    }
+
+    fn before_request(&mut self) {
+        self.request_began = rt::time::ticks_to_ns(rt::time::now());
+    }
+
+    fn between_requests(&mut self) {
+        let ended = rt::time::ticks_to_ns(rt::time::now());
+        self.lock_busy = self
+            .lock_busy
+            .saturating_add(ended.saturating_sub(self.request_began));
     }
 
     fn between_notifications(&mut self, notice: rt::service::Notice) {
@@ -3988,6 +3795,234 @@ impl Fs {
             let _ = sys::notify(&self.channel, 1);
         }
     }
+    fn maintenance_dispatch(
+        &mut self,
+        sessions: &mut [Option<Session<Fds, 0>>],
+        notice: rt::service::Notice,
+    ) {
+        #[cfg(feature = "profile")]
+        calls::flush();
+        if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
+            self.wait_timer_armed = false;
+            self.waits.poll();
+            self.lock_sweep.poll();
+            self.lock_sweep_pending = self.locks.has_locks();
+            if !self.lock_sweep_pending {
+                self.lock_sweep.stop();
+            }
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.refresh_wait_timer();
+            self.notify_maintenance();
+            return;
+        }
+        if notice.source == rt::abi::Source::Timer && notice.label == AUDIT_TIMER_LABEL {
+            self.audit_armed = false;
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        if notice.source == rt::abi::Source::Timer && notice.label == PACE_TIMER_LABEL {
+            self.lock_paused = false;
+            self.notify_maintenance();
+            return;
+        }
+        if notice.label == mapper::LABEL {
+            self.mapper_done();
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        if notice.label == IPC_JOBS_LABEL {
+            self.ipc_jobs_pending = true;
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        rt::service::step_own();
+        // The pipe service is given the channel it tells of jobs with, once
+        // (a few tries), and the jobs it told of are taken, four to a turn.
+        if self.pipe_broker.is_some()
+            && (self.ipc_jobs_pending || (!self.ipc_armed && self.ipc_arm_tries < 3))
+        {
+            self.ipc_arm_tries = self.ipc_arm_tries.saturating_add(1);
+            self.ipc_jobs_pending = self.ipc_jobs_round().unwrap_or(false);
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        if self.ram.cancel_refusals != self.cancel_reported {
+            self.cancel_reported = self.ram.cancel_refusals;
+            rt::println!(
+                "ramfs: {} steps of a cancel were refused",
+                self.cancel_reported
+            );
+        }
+        let now = rt::time::ticks_to_ns(rt::time::now());
+        // A turn of the work of locks only while it has work (and is not
+        // paused): a round of the circle of the sessions has no turn of
+        // an empty sweep or of waits that wait for nothing.
+        self.layer_pump();
+        if self.ram.storage.layer_work() {
+            let now = self.time_source.now();
+            self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
+            self.layer_pump();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        self.lock_maintenance_turn = !self.lock_maintenance_turn && self.lock_work_pending();
+        if self.lock_maintenance_turn {
+            self.lock_turn(sessions);
+            return;
+        }
+        if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
+            self.next_audit_ns = now.saturating_add(250_000_000);
+            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
+        }
+        let mut work = false;
+        self.maintenance_jobs = !self.maintenance_jobs;
+        if self.maintenance_jobs {
+            self.data_gc_turn = !self.data_gc_turn;
+            if self.data_gc_turn && self.orphan_count != 0 {
+                let slot = self.orphan_cursor as usize;
+                self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
+                if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
+                    let (id, owner) = (job.id, job.owner);
+                    let before = (self.orphan_count, self.ram.storage.available().pages);
+                    self.cancel_job(id, owner, None);
+                    let after = (self.orphan_count, self.ram.storage.available().pages);
+                    work = ramfs::maintenance::orphan_progress(before, after);
+                }
+            } else {
+                #[cfg(feature = "steps")]
+                let retained = self.steps_reclaim_owner.is_some();
+                #[cfg(not(feature = "steps"))]
+                let retained = false;
+                if !retained {
+                    work = self.ram.storage.reclaim_step();
+                }
+            }
+            // A turn of jobs that found no work and has no orphan to wait
+            // for goes on to the departures and the audit in the same
+            // step: it is no step of its own.
+            if work || self.orphan_count != 0 {
+                self.legacy_pending = self.maintenance_burst.again(
+                    work,
+                    work || self.departures.pending()
+                        || self.audit_pending()
+                        || self.orphan_count != 0,
+                );
+                self.notify_maintenance();
+                return;
+            }
+        }
+        self.departure_turn = !self.departure_turn;
+        if self.departure_turn
+            && let Some(i) = self.departures.next_place()
+        {
+            let (label, complete) = if i < SESSIONS {
+                let s = sessions[i].as_mut().expect("retained departed session");
+                let label = s.label();
+                work = self.cleanup_step(&mut s.data, label);
+                (
+                    label,
+                    Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
+                )
+            } else {
+                let birth = &mut self.births[i - SESSIONS];
+                let (label, mut fds) = birth.take().expect("retained departed birth");
+                work = self.cleanup_step(&mut fds, label);
+                let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
+                self.births[i - SESSIONS] = Some((label, fds));
+                (label, complete)
+            };
+            if complete {
+                if i < SESSIONS {
+                    sessions[i] = None;
+                } else {
+                    self.births[i - SESSIONS] = None;
+                }
+                self.departures.release(i);
+                self.places.release(label);
+                self.clones.gone(label);
+                work = true;
+            }
+            self.legacy_pending = self.maintenance_burst.again(
+                work,
+                work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
+            return;
+        }
+        if self.maintenance.remaining != 0
+            && now < self.audit_ready_ns
+            && (self.audit_armed || sys::timer_set(&self.audit_timer, self.audit_ready_ns).is_ok())
+        {
+            // The next step of the audit waits for its time: the service
+            // idles, and the clients below it run.
+            self.audit_armed = true;
+            self.legacy_pending = self.maintenance_burst.again(
+                work,
+                work || self.departures.pending() || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
+            return;
+        }
+        // A closed round of the audit has nothing to do: with lock work
+        // waiting, the turn of the lock work follows at once and the empty
+        // step takes no dispatch of its own.
+        if self.maintenance.remaining == 0 && !work && self.lock_work_pending() {
+            self.lock_maintenance_turn = true;
+            self.lock_turn(sessions);
+            return;
+        }
+        // The slots with no session and no birth pass in this step.
+        let departures = &self.departures;
+        let births = &*self.births;
+        self.maintenance
+            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
+                Self::slot_empty(departures, births, sessions, i)
+            });
+        self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
+        let mut client_work = false;
+        let i = self.maintenance.position;
+        if self.departures.contains(i) {
+            // Queued cells receive separate fair bounded cleanup turns.
+        } else if i < SESSIONS {
+            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
+                let label = s.label();
+                client_work = self.cleanup_step(&mut s.data, label);
+            }
+        } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
+            client_work = self.cleanup_step(&mut fds, label);
+            self.births[i - SESSIONS] = Some((label, fds));
+        }
+        work |= client_work;
+        let round_open = self.maintenance.remaining != 0;
+        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+        if round_open && self.maintenance.remaining == 0 {
+            self.audit_rounds = self.audit_rounds.wrapping_add(1);
+            #[cfg(feature = "steps")]
+            rt::println!("ramfs: audit round {}", self.audit_rounds);
+        }
+        // A maintenance notification makes reclamation progress with no client request.
+        self.legacy_pending = self.maintenance_burst.again(
+            work,
+            work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
+        );
+        self.notify_maintenance();
+    }
+
     /// One turn of the maintenance of locks: the sweep or the waits, and the
     /// charge of every nanosecond the service held the CPU for them.
     fn lock_turn(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
@@ -4046,7 +4081,9 @@ impl Fs {
             );
         }
         let ended = rt::time::ticks_to_ns(rt::time::now());
-        if let Some(until) = self.lock_share.turn(began, ended, LOCK_GAP_NS)
+        self.lock_turn_ran = true;
+        let busy = core::mem::take(&mut self.lock_busy);
+        if let Some(until) = self.lock_share.turn(began, ended, LOCK_GAP_NS, busy)
             && self.lock_work_pending()
         {
             // The budget of this window is spent: sleep to its end.
