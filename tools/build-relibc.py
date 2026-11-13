@@ -166,7 +166,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # without both), mkstemp and its kin, tmpnam, tempnam, the DNS transaction
 # number and shmget fail with ENOSYS without entropy and draw nothing from
 # the clock; tagged pin-d8004483, merged as 760f2515.
-COMMIT = "760f2515c4b01e93e3ec394c896c6ec6fea565b5"
+# Salts of crypt from getrandom (ENOSYS without entropy), whole reads of
+# getrandom, the spare bytes of AT_RANDOM in the first arc4random, a line on
+# a long wait for the first seed, before the abort of a start without entropy
+# and before the abort of __stack_chk_fail; tagged pin-1b20cd22.
+COMMIT = "1b20cd22ed9a4f14c1b114cc805e780f9be06b8e"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

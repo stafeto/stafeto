@@ -1601,8 +1601,87 @@ pub const TABLE: &[Record] = fstack::FAST_SWITCH_SCALE_VZ_TABLE;
 #[cfg(feature = "table-posix-map-big")]
 pub const TABLE: &[Record] = ramfs::POSIX_MAP_BIG_TABLE;
 
+/// Every table of the images but the bench table and the ring of locks
+/// (feature-gated tables are listed as they stand in a build with no
+/// feature).
+pub const ALL_TABLES: &[&[Record]] = &[
+    normal::TABLE,
+    cycle::TABLE,
+    ceiling::TABLE,
+    test::TABLE,
+    doom::TABLE,
+    base::BASE_TABLE,
+    gpu::TABLE,
+    input::TABLE,
+    entropy::TABLE,
+    entropy::VZ_TABLE,
+    fstack::FSTACK_TABLE,
+    fstack::FSTACK_DEVICE_TABLE,
+    fstack::FAST_NGINX_TABLE,
+    fstack::FAST_NGINX_VZ_TABLE,
+    fstack::FAST_SCALE_TABLE,
+    fstack::FAST_SCALE_VZ_TABLE,
+    fstack::FAST_SWITCH_TABLE,
+    fstack::FAST_SWITCH_VZ_TABLE,
+    fstack::FAST_SWITCH_SCALE_TABLE,
+    fstack::FAST_SWITCH_SCALE_VZ_TABLE,
+    ramfs::POSIX_MAP_BIG_TABLE,
+    net::NET_TABLE,
+    net::NET_TWO_TABLE,
+    net::NET_VZ_TABLE,
+    net::NET_VZ2_TABLE,
+    net::NET_PROBE_TABLE,
+    net::NET_PROBE_TWO_TABLE,
+    vz::TABLE,
+    vz::PCI_WALK_TABLE,
+    pkg::PCI_WALK_QEMU_TABLE,
+    pkg::BLK_PROBE_TABLE,
+    vz::POSIX_ABI_TABLE,
+    vz::POSIX_NATIVE_TABLE,
+    vz::BUSYBOX_DIALOG_TABLE,
+    vz::POSIX_TTY_TABLE,
+    vz::POSIX_DIALOG_TABLE,
+    vz::RTBENCH_TABLE,
+    vz::RTBENCH_POSIX_TABLE,
+    vz::TTY_TABLE,
+    ramfs::TABLE,
+    ramfs::BUSYBOX_TABLE,
+    ramfs::BUSYBOX_DIALOG_TABLE,
+    ramfs::POSIX_TTY_TABLE,
+    ramfs::POSIX_DIALOG_TABLE,
+    ramfs::POSIX_FILES_TABLE,
+    ramfs::LAYER_PROBE_TABLE,
+    ramfs::POSIX_ABI_TABLE,
+    ramfs::RELIBC_TABLE,
+    ramfs::POSIX_PROCS_TABLE,
+    ramfs::POSIX_SHARES_TABLE,
+    ramfs::POSIX_STEPS_TABLE,
+    ramfs::OS_TEST_TABLE,
+    ramfs::RELIBC_THREADS_TABLE,
+    ramfs::RTBENCH_POSIX_TABLE,
+    ramfs::TTY_TABLE,
+    ramfs::TTY_STEPS_TABLE,
+    ramfs::POSIX_RANDOM_TABLE,
+    net::POSIX_RANDOM_NET_TABLE,
+    net::POSIX_RANDOM_NET2_TABLE,
+    ramfs::POSIX_DISPLAY_TABLE,
+    ramfs::DISPLAY_TABLE,
+    ramfs::LOADER_CHANNELS_TABLE,
+    ramfs::POSIX_POLL_TABLE,
+    ramfs::POSIX_SOCK_TABLE,
+    ramfs::POSIX_IPC_TABLE,
+    ramfs::POSIX_PTY_TABLE,
+];
+
 #[cfg(test)]
 mod tests {
+    /// `ALL_TABLES` and the ring of locks, whose module only a test build or its feature has.
+    fn all_tables() -> Vec<&'static [Record]> {
+        let mut tables = ALL_TABLES.to_vec();
+        tables.push(lock_ring::TABLE);
+        tables
+    }
+
     use super::*;
 
     const MS: u64 = 1_000_000;
@@ -3000,80 +3079,6 @@ mod tests {
         }
     }
 
-    /// Every table of the images but the bench table (feature-gated tables
-    /// are listed as they stand in a test build).
-    fn all_tables() -> Vec<&'static [Record]> {
-        vec![
-            normal::TABLE,
-            cycle::TABLE,
-            ceiling::TABLE,
-            test::TABLE,
-            lock_ring::TABLE,
-            doom::TABLE,
-            base::BASE_TABLE,
-            gpu::TABLE,
-            input::TABLE,
-            entropy::TABLE,
-            entropy::VZ_TABLE,
-            fstack::FSTACK_TABLE,
-            fstack::FSTACK_DEVICE_TABLE,
-            fstack::FAST_NGINX_TABLE,
-            fstack::FAST_NGINX_VZ_TABLE,
-            fstack::FAST_SCALE_TABLE,
-            fstack::FAST_SCALE_VZ_TABLE,
-            fstack::FAST_SWITCH_TABLE,
-            fstack::FAST_SWITCH_VZ_TABLE,
-            fstack::FAST_SWITCH_SCALE_TABLE,
-            fstack::FAST_SWITCH_SCALE_VZ_TABLE,
-            ramfs::POSIX_MAP_BIG_TABLE,
-            net::NET_TABLE,
-            net::NET_TWO_TABLE,
-            net::NET_VZ_TABLE,
-            net::NET_VZ2_TABLE,
-            net::NET_PROBE_TABLE,
-            net::NET_PROBE_TWO_TABLE,
-            vz::TABLE,
-            vz::PCI_WALK_TABLE,
-            pkg::PCI_WALK_QEMU_TABLE,
-            pkg::BLK_PROBE_TABLE,
-            vz::POSIX_ABI_TABLE,
-            vz::POSIX_NATIVE_TABLE,
-            vz::BUSYBOX_DIALOG_TABLE,
-            vz::POSIX_TTY_TABLE,
-            vz::POSIX_DIALOG_TABLE,
-            vz::RTBENCH_TABLE,
-            vz::RTBENCH_POSIX_TABLE,
-            vz::TTY_TABLE,
-            ramfs::TABLE,
-            ramfs::BUSYBOX_TABLE,
-            ramfs::BUSYBOX_DIALOG_TABLE,
-            ramfs::POSIX_TTY_TABLE,
-            ramfs::POSIX_DIALOG_TABLE,
-            ramfs::POSIX_FILES_TABLE,
-            ramfs::LAYER_PROBE_TABLE,
-            ramfs::POSIX_ABI_TABLE,
-            ramfs::RELIBC_TABLE,
-            ramfs::POSIX_PROCS_TABLE,
-            ramfs::POSIX_SHARES_TABLE,
-            ramfs::POSIX_STEPS_TABLE,
-            ramfs::OS_TEST_TABLE,
-            ramfs::RELIBC_THREADS_TABLE,
-            ramfs::RTBENCH_POSIX_TABLE,
-            ramfs::TTY_TABLE,
-            ramfs::TTY_STEPS_TABLE,
-            ramfs::POSIX_RANDOM_TABLE,
-            net::POSIX_RANDOM_NET_TABLE,
-            net::POSIX_RANDOM_NET2_TABLE,
-            ramfs::POSIX_DISPLAY_TABLE,
-            ramfs::DISPLAY_TABLE,
-            ramfs::LOADER_CHANNELS_TABLE,
-            ramfs::POSIX_POLL_TABLE,
-            ramfs::POSIX_SOCK_TABLE,
-            ramfs::POSIX_IPC_TABLE,
-            ramfs::POSIX_PTY_TABLE,
-        ]
-    }
-
     /// A record that connects to the entropy service has one in its image,
     /// the service of the table's own name, that gets the page of the boot
     /// seed (`start_data_names`); one that connects to no driver (`rng`)
@@ -3110,31 +3115,6 @@ mod tests {
             }
         }
         assert_eq!(seed_only, 2, "EC2's image and the probe of the seed");
-    }
-
-    /// A program on relibc takes its stack canary from AT_RANDOM, or, where
-    /// the loader gave none, from a blocking `getrandom`, and ends if it has
-    /// neither: every image that starts a program on relibc has the entropy
-    /// service, and the program connects to it.
-    #[test]
-    fn a_posix_process_connects_to_the_entropy_service() {
-        let mut lacking = Vec::new();
-        let tables = all_tables().into_iter().chain([
-            aws::TABLE,
-            pkg::PKG_SLOT_TABLE,
-            pkg::STORE_PROBE_TABLE,
-            pkg::INIT_WAIT_TABLE,
-        ]);
-        for (index, table) in tables.enumerate() {
-            for r in table.iter().filter(|r| r.connects.contains(&"posix")) {
-                // These two do not depend on posix-crt, which starts relibc and takes the canary.
-                const RUST_ONLY: [&str; 2] = ["posix-clock-peer", "svc"];
-                if !r.connects.contains(&ENTROPY_SERVICE) && !RUST_ONLY.contains(&r.program) {
-                    lacking.push(format!("table {index}: {} ({})", r.name, r.program));
-                }
-            }
-        }
-        assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
     }
 
     #[test]

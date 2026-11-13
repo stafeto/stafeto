@@ -388,7 +388,6 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
     },
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 4096 * PAGE + 384 * PAGE,
-        ceiling: 40,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],

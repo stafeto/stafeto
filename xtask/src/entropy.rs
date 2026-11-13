@@ -433,7 +433,7 @@ static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"], &[
 static RANDOM_BREAK_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &["break-at-random"]);
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 27] = [
+const RANDOM_LINES: [&str; 28] = [
     "posix-random: the start waited for the first seed, so getrandom with GRND_NONBLOCK gave every byte in main",
     "posix-random: getentropy with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
@@ -450,11 +450,12 @@ const RANDOM_LINES: [&str; 27] = [
     "posix-random: a dup of a device reads",
     "posix-random: arc4random, arc4random_buf and arc4random_uniform",
     "posix-random: mkstemp gave",
+    "posix-random: crypt drew the salts",
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
     "posix-random: AT_RANDOM gave 16 bytes to each of two programs, they differ and are not zero",
     "posix-random: the stack canary differs in each of three programs, is not zero and has a zero low byte",
-    "posix-random: a stack overflow in a protected function ended the program by SIGABRT",
+    "posix-random: a stack overflow in a protected function printed \"stack smashing detected\" and ended the program by SIGABRT",
     "posix-random: without entropy mkstemp, mkostemp, mkdtemp, mktemp, tmpnam, tempnam and shmget of a new segment failed with ENOSYS and left no name",
     "posix-random: a lookup without entropy failed with EAI_SYSTEM and ENOSYS",
     "posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request",

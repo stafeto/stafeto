@@ -144,7 +144,11 @@ impl Queue {
         }
     }
     pub fn retains(&self, place: usize, owner: u64) -> bool {
-        assert!(place < crate::places::COUNT);
+        // A label with no place (the table of places was full, or its place is
+        // already retired) never held a job: `slot` refuses such a place.
+        if place >= crate::places::COUNT {
+            return false;
+        }
         self.jobs[place * SHARE..(place + 1) * SHARE]
             .iter()
             .flatten()

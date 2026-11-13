@@ -3175,24 +3175,45 @@ fn build_boot_image(
     })
 }
 
-/// The packages of the tests and apps that run on relibc: their build script
-/// names relibc or they depend on `posix-crt`, which starts it. Their start takes the stack canary from
-/// AT_RANDOM, or from a blocking `getrandom`, and ends the program with abort
-/// when it has neither.
+/// The packages that run on relibc, from how they link: those that depend on
+/// `posix-crt`, directly or through another package (cargo's own tree of the
+/// dependencies, for every target), and those whose build script names relibc.
+/// Their start takes the stack canary from AT_RANDOM, or from a blocking
+/// `getrandom`, and ends the program with abort when it has neither.
 fn relibc_packages(root: &Path) -> Vec<String> {
     let mut names = Vec::new();
-    for group in ["tests", "apps"] {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let tree = std::process::Command::new(cargo)
+        .args(["tree", "--invert", "posix-crt", "--workspace"])
+        .args(["--edges", "normal", "--target", "all", "--offline"])
+        .args(["--prefix", "depth"])
+        .current_dir(root)
+        .output();
+    if let Some(tree) = tree.ok().filter(|t| t.status.success()) {
+        // "<depth><name> v<version> (<path>)": the workspace's own packages
+        // carry a path, and the root of the tree (depth 0) is posix-crt.
+        for line in String::from_utf8_lossy(&tree.stdout).lines() {
+            let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+            if line.starts_with('0') {
+                continue;
+            }
+            if let (Some(name), true) = (rest.split(' ').next(), rest.contains(" (/")) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    // A build script that builds against relibc, in any package.
+    for group in ["tests", "apps", "services", "lib"] {
         let Ok(entries) = std::fs::read_dir(root.join(group)) else {
             continue;
         };
         for entry in entries.flatten() {
             let build = std::fs::read_to_string(entry.path().join("build.rs")).unwrap_or_default();
-            let manifest =
-                std::fs::read_to_string(entry.path().join("Cargo.toml")).unwrap_or_default();
-            // posix-crt starts relibc for the program, whatever its language.
-            if !build.contains("relibc") && !manifest.contains("posix-crt") {
+            if !build.contains("relibc") {
                 continue;
             }
+            let manifest =
+                std::fs::read_to_string(entry.path().join("Cargo.toml")).unwrap_or_default();
             let name = manifest
                 .lines()
                 .find_map(|l| l.strip_prefix("name = \""))
@@ -3202,6 +3223,8 @@ fn relibc_packages(root: &Path) -> Vec<String> {
             }
         }
     }
+    names.sort();
+    names.dedup();
     names
 }
 
@@ -9875,6 +9898,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
+        job("image-gates", || image_gates_probe(false, false)),
+        job("ramfs-cleanup", ramfs_cleanup_probe),
         job("posix-poll", posix_poll_probe),
         job("layer-probe", || layer_probe::dispatch(&[])),
         job("layer-probe steps", || {
@@ -15370,11 +15395,8 @@ mod workspace_root_tests {
 mod entropy_in_images_tests {
     use super::*;
 
-    /// "Posix means entropy": an image that starts a program on relibc has the
-    /// entropy service, since the start of such a program takes its stack
-    /// canary from it and ends without one.
-    #[test]
-    fn an_image_with_a_program_on_relibc_has_the_entropy_service() {
+    /// The program tables of the images, by name.
+    fn image_program_tables() -> Vec<(&'static str, &'static [ImageProgram])> {
         let tables: &[(&str, &[ImageProgram])] = &[
             ("blk_probe::PROGRAMS", &crate::blk_probe::PROGRAMS),
             ("display_probe::PROGRAMS", &crate::display_probe::PROGRAMS),
@@ -15516,6 +15538,15 @@ mod entropy_in_images_tests {
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
         ];
+        tables.to_vec()
+    }
+
+    /// "Posix means entropy": an image that starts a program on relibc has the
+    /// entropy service, since the start of such a program takes its stack
+    /// canary from it and ends without one.
+    #[test]
+    fn an_image_with_a_program_on_relibc_has_the_entropy_service() {
+        let tables = image_program_tables();
         let root = root();
         assert!(
             relibc_packages(&root).len() > 10,
@@ -15527,6 +15558,46 @@ mod entropy_in_images_tests {
                 without_entropy(&root, programs).map(|p| format!("{name}: {p}"))
             })
             .collect();
+        assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
+    }
+
+    /// A POSIX process of an init table takes its stack canary from AT_RANDOM,
+    /// or, where the loader gave none, from a blocking `getrandom`, and ends if
+    /// it has neither: when the program of the record links relibc (it depends
+    /// on posix-crt, or its build script names relibc) the record connects to
+    /// the entropy service. The program's package comes from the program tables
+    /// of the images; a program that no table names is taken to be on relibc.
+    #[test]
+    fn a_posix_process_connects_to_the_entropy_service() {
+        use init::table::{ALL_TABLES, aws, pkg};
+        let root = root();
+        let relibc = relibc_packages(&root);
+        assert!(relibc.len() > 10, "the packages on relibc were not found");
+        let images = image_program_tables();
+        let package_of = |program: &str| {
+            images
+                .iter()
+                .flat_map(|(_, programs)| programs.iter())
+                .find(|p| p.0 == program)
+                .map(|p| p.1)
+        };
+        let mut lacking = Vec::new();
+        let tables = ALL_TABLES.iter().copied().chain([
+            aws::TABLE,
+            pkg::PKG_SLOT_TABLE,
+            pkg::STORE_PROBE_TABLE,
+            pkg::INIT_WAIT_TABLE,
+        ]);
+        for (index, table) in tables.enumerate() {
+            for r in table.iter().filter(|r| r.connects.contains(&"posix")) {
+                let on_relibc = package_of(r.program)
+                    .map(|package| relibc.iter().any(|name| name == package))
+                    .unwrap_or(true);
+                if on_relibc && !r.connects.contains(&"entropy") {
+                    lacking.push(format!("table {index}: {} ({})", r.name, r.program));
+                }
+            }
+        }
         assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
     }
 

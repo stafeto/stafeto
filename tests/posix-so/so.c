@@ -47,6 +47,7 @@ static int start(struct child *c, char *const argv[]) {
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, in[0], 0);
     posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 2);
     posix_spawn_file_actions_addclose(&actions, in[0]);
     posix_spawn_file_actions_addclose(&actions, in[1]);
     posix_spawn_file_actions_addclose(&actions, out[0]);
@@ -388,6 +389,8 @@ static void stack_protector(void) {
     error = run(smash_argv, buf, sizeof buf, &status);
     check(8192, "an overflow in a protected function of so-hello ends it by SIGABRT",
           error == 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    check(8192, "the dynamic program says stack smashing detected before it aborts",
+          strstr(buf, "stack smashing detected\n") != NULL);
     if (!(bits & 8192))
         printf("posix-so: a stack overflow in a protected function of a dynamic program ended it by SIGABRT\n");
 }

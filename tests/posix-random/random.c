@@ -24,6 +24,7 @@
  */
 
 #define _GNU_SOURCE
+#include <crypt.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -310,15 +311,58 @@ static int smash_role(void) {
     return 0;
 }
 
-/* The program that smashed its stack ends by SIGABRT and its parent sees the signal. */
+/* The program that smashed its stack says so on its standard error and ends by SIGABRT, which
+ * its parent sees. */
 static int smash(void) {
     char *argv[] = {"posix-random", (char *)"smash", NULL};
+    int ends[2];
+    CHECK(pipe(ends) == 0);
+    posix_spawn_file_actions_t actions;
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_adddup2(&actions, ends[1], 2) == 0);
     pid_t pid = 0;
-    CHECK(posix_spawn(&pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    CHECK(posix_spawn(&pid, "/bin/posix-random", &actions, NULL, argv, environ) == 0);
+    posix_spawn_file_actions_destroy(&actions);
+    CHECK(close(ends[1]) == 0);
+    char text[128];
+    size_t have = 0;
+    for (;;) {
+        ssize_t n = read(ends[0], text + have, sizeof text - 1 - have);
+        if (n <= 0) break;
+        have += (size_t)n;
+    }
+    text[have] = 0;
+    CHECK(close(ends[0]) == 0);
     int status = 0;
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
-    printf("posix-random: a stack overflow in a protected function ended the program by SIGABRT\n");
+    CHECK(strcmp(text, "stack smashing detected\n") == 0);
+    printf("posix-random: a stack overflow in a protected function printed \"stack smashing "
+           "detected\" and ended the program by SIGABRT\n");
+    return 0;
+}
+
+/* crypt takes the salt of an empty setting from the generator: two calls give two salts, and the
+ * caller's rand sequence goes on as if crypt had not run. */
+static int crypt_salts(void) {
+    srand(7);
+    int first = rand();
+    srand(7);
+    char *one = crypt("password", "$8$1000$");
+    CHECK(one != NULL);
+    char a[128];
+    CHECK(strlen(one) < sizeof a);
+    strcpy(a, one);
+    char *two = crypt("password", "$8$1000$");
+    CHECK(two != NULL);
+    CHECK(rand() == first);
+    CHECK(strncmp(a, "$8$1000$", 8) == 0 && strlen(a) > 9);
+    CHECK(strcmp(a, two) != 0);
+    char salt_a[64], salt_b[64];
+    CHECK(sscanf(a, "$8$1000$%63[^$]$", salt_a) == 1);
+    CHECK(sscanf(two, "$8$1000$%63[^$]$", salt_b) == 1);
+    CHECK(strcmp(salt_a, salt_b) != 0);
+    printf("posix-random: crypt drew the salts %s and %s, and rand went on\n", salt_a, salt_b);
     return 0;
 }
 
@@ -372,6 +416,10 @@ static int no_entropy_role(void) {
                errno);
     }
 
+    errno = 0;
+    CHECK(crypt("password", "$8$1000$") == NULL && errno == ENOSYS);
+    errno = 0;
+    CHECK(crypt("password", "$7$C6..../....") == NULL && errno == ENOSYS);
     errno = 0;
     CHECK(shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600) == -1 && errno == ENOSYS);
     errno = 0;
@@ -873,6 +921,7 @@ static int first(void) {
     CHECK(devices() == 0);
     CHECK(arc4() == 0);
     CHECK(temporary() == 0);
+    CHECK(crypt_salts() == 0);
     CHECK(descriptor() == 0);
     CHECK(at_random() == 0);
     CHECK(canary() == 0);
