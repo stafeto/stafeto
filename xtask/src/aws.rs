@@ -30,7 +30,7 @@ const REGION: &str = "eu-central-1";
 /// smallest type of the same family for the Linux neighbour that reads the
 /// firmware's tables.
 const ALLOWED_TYPES: [&str; 2] = ["t4g.small", "t4g.nano"];
-const MAX_LIVE: usize = 2;
+const MAX_LIVE: usize = 4;
 const BLOCK: usize = 512 * 1024;
 /// The on-demand price of a t4g.small in eu-central-1 in USD per hour, as the
 /// price list showed it when this was written (unverified: it only sizes the
@@ -42,7 +42,7 @@ const USAGE: &str = "usage: xtask aws check
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
-       xtask aws pair --ami AMI [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
+       xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
        xtask aws clean --session S
        xtask aws sweep [--remove]";
 
@@ -1829,22 +1829,27 @@ fn neighbour_address(cidr: &str) -> Result<String, String> {
 /// What the neighbour does as its user data: serves a page on port 8080 for stafeto's `wget`,
 /// pings stafeto and fetches its page with `curl`, every 15 s, and says what it got on its
 /// console in lines that begin with `NEIGHBOUR-`.
-fn pair_neighbour_script(stafeto: &str) -> String {
+fn pair_neighbour_script(stafetos: &[String]) -> String {
+    let list = stafetos.join(" ");
     format!(
         r#"#!/bin/bash
 exec 2>/dev/null
 O=/dev/console
-STAF={stafeto}
+HOSTS="{list}"
 mkdir -p /srv/n
 echo stafeto-neighbour-page > /srv/n/index.html
 (cd /srv/n && python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 &)
 echo "NEIGHBOUR-START" > $O
 sleep 45
 for i in $(seq 1 60); do
-  p=$(ping -c 3 -W 2 $STAF | grep -E 'transmitted|rtt' | tr '\n' ' ')
-  echo "NEIGHBOUR-PING $i $p" > $O
-  c=$(curl -m 5 -s -o /tmp/page -w '%{{http_code}}' http://$STAF/)
-  echo "NEIGHBOUR-CURL $i $c $(head -c 80 /tmp/page | tr -d '\r\n')" > $O
+  k=0
+  for STAF in $HOSTS; do
+    k=$((k + 1))
+    p=$(ping -c 3 -W 2 $STAF | grep -E 'transmitted|rtt' | tr '\n' ' ')
+    echo "NEIGHBOUR-PING $i host$k $p" > $O
+    c=$(curl -m 5 -s -o /tmp/page -w '%{{http_code}}' http://$STAF/)
+    echo "NEIGHBOUR-CURL $i host$k $c $(head -c 80 /tmp/page | tr -d '\r\n')" > $O
+  done
   sleep 15
 done
 echo "NEIGHBOUR-DONE" > $O
@@ -1911,6 +1916,10 @@ fn subnet_cidr() -> Result<String, String> {
 fn pair(args: &[String]) -> Result<(), String> {
     let ami = flag(args, "--ami").ok_or("pair needs --ami")?;
     let internet = args.iter().any(|a| a == "--internet");
+    let count: usize = flag(args, "--count")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 3);
     let seconds: u64 = flag(args, "--serial")
         .and_then(|n| n.parse().ok())
         .unwrap_or(330);
@@ -1923,28 +1932,34 @@ fn pair(args: &[String]) -> Result<(), String> {
     let s = Session::open(flag(args, "--session"))?;
     let group = pair_group(&s, internet)?;
     assert_pair(&group, internet)?;
-    let (sid, started) = launch(
-        &s,
-        &Launch {
-            ami: &ami,
-            ty: "t4g.small",
-            user_data: None,
-            extra_snapshot: None,
-            group: Some(&group),
-            public_ip: internet,
-            private_ip: None,
-        },
-    )?;
+    let mut stafetos: Vec<(String, Instant)> = Vec::new();
     let mut neighbour: Option<(String, Instant)> = None;
     let result = (|| {
-        match eni_mac(&sid) {
-            Ok(mac) => println!("interface mac ..:..:..:{}", last_octets(&mac)),
-            Err(e) => println!("interface mac: {e}"),
+        for _ in 0..count {
+            stafetos.push(launch(
+                &s,
+                &Launch {
+                    ami: &ami,
+                    ty: "t4g.small",
+                    user_data: None,
+                    extra_snapshot: None,
+                    group: Some(&group),
+                    public_ip: internet,
+                    private_ip: None,
+                },
+            )?);
         }
-        let stafeto = instance_ip(&sid)?;
+        let mut ips = Vec::new();
+        for (sid, _) in &stafetos {
+            match eni_mac(sid) {
+                Ok(mac) => println!("interface mac ..:..:..:{}", last_octets(&mac)),
+                Err(e) => println!("interface mac: {e}"),
+            }
+            ips.push(instance_ip(sid)?);
+        }
         let nip = neighbour_address(&subnet_cidr()?)?;
         let script = s.dir.join("pair-neighbour.sh");
-        std::fs::write(&script, pair_neighbour_script(&stafeto)).map_err(|e| e.to_string())?;
+        std::fs::write(&script, pair_neighbour_script(&ips)).map_err(|e| e.to_string())?;
         let nami = neighbour_ami()?;
         neighbour = Some(launch(
             &s,
@@ -1962,22 +1977,38 @@ fn pair(args: &[String]) -> Result<(), String> {
             .as_ref()
             .map(|(i, _)| i.clone())
             .unwrap_or_default();
-        for _ in 0..40 {
-            if state(&sid)? == "running" {
-                break;
+        for (sid, _) in &stafetos {
+            for _ in 0..40 {
+                if state(sid)? == "running" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(3));
             }
-            std::thread::sleep(Duration::from_secs(3));
         }
         let commands = pair_commands(internet);
         let typing = typed(&commands, &nip, delay, gap);
-        let text = serial_typing(&s, &sid, seconds, &typing)?;
-        println!("--- stafeto, serial console, {seconds} s ---");
-        for l in text.lines() {
-            println!("{}", redact(l));
+        // The serial consoles of all the instances at once, one thread each.
+        let texts: Vec<Result<String, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = stafetos
+                .iter()
+                .map(|(sid, _)| {
+                    let (s, typing) = (&s, &typing);
+                    scope.spawn(move || serial_typing(s, sid, seconds, typing))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("serial thread".into())))
+                .collect()
+        });
+        for (k, t) in texts.iter().enumerate() {
+            println!("--- stafeto {}, serial console, {seconds} s ---", k + 1);
+            match t {
+                Ok(text) => text.lines().for_each(|l| println!("{}", redact(l))),
+                Err(e) => println!("serial: {e}"),
+            }
+            println!("--- end of serial console ---");
         }
-        println!("--- end of serial console ---");
-        // The neighbour's side: its console, until it has said a page of stafeto's or 150 s
-        // have passed.
         let begun = Instant::now();
         let mut ntext = String::new();
         loop {
@@ -1988,8 +2019,9 @@ fn pair(args: &[String]) -> Result<(), String> {
             }
             let got = ntext
                 .lines()
-                .any(|l| l.contains("NEIGHBOUR-CURL") && l.contains(" 200 "));
-            if got || begun.elapsed() > Duration::from_secs(150) {
+                .filter(|l| l.contains("NEIGHBOUR-CURL") && l.contains(" 200 "))
+                .count();
+            if got >= count || begun.elapsed() > Duration::from_secs(120) {
                 break;
             }
             std::thread::sleep(Duration::from_secs(10));
@@ -1999,10 +2031,20 @@ fn pair(args: &[String]) -> Result<(), String> {
             println!("{}", redact(l));
         }
         println!("--- end of neighbour ---");
-        let slog = s.dir.join("console.log");
-        let sconsole = console(&sid).unwrap_or_default();
-        let _ = std::fs::write(&slog, &sconsole);
-        print_console(&sconsole);
+        for (k, (sid, _)) in stafetos.iter().enumerate() {
+            let sconsole = console(sid).unwrap_or_default();
+            let _ = std::fs::write(s.dir.join(format!("console-{}.log", k + 1)), &sconsole);
+            println!("--- stafeto {} console (its, ena, net lines) ---", k + 1);
+            for l in sconsole.lines().filter(|l| {
+                l.contains("its-int")
+                    || l.contains("ena:")
+                    || l.starts_with("net:")
+                    || l.contains("iidr")
+            }) {
+                println!("{}", redact(l));
+            }
+            println!("--- end of console ---");
+        }
         Ok(())
     })();
     let mut result = result;
@@ -2013,11 +2055,13 @@ fn pair(args: &[String]) -> Result<(), String> {
             cost(nstart.elapsed(), PRICE_SMALL)
         );
     }
-    result = release(&s, Kind::Instance, &sid, result);
-    println!(
-        "estimated cost of stafeto: {:.3} USD",
-        cost(started.elapsed(), PRICE_SMALL)
-    );
+    for (sid, started) in stafetos {
+        result = release(&s, Kind::Instance, &sid, result);
+        println!(
+            "estimated cost of a stafeto: {:.3} USD",
+            cost(started.elapsed(), PRICE_SMALL)
+        );
+    }
     result
 }
 
@@ -2097,8 +2141,8 @@ mod tests {
 
     #[test]
     fn the_neighbour_script_carries_the_address_it_is_given_and_says_its_lines_on_the_console() {
-        let t = pair_neighbour_script("172.31.9.9");
-        assert!(t.contains("STAF=172.31.9.9"));
+        let t = pair_neighbour_script(&["172.31.9.9".to_string(), "172.31.9.10".to_string()]);
+        assert!(t.contains("HOSTS=\"172.31.9.9 172.31.9.10\""));
         assert!(t.starts_with("#!/bin/bash"));
         for word in [
             "NEIGHBOUR-PING",
