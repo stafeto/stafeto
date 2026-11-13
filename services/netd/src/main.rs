@@ -1275,6 +1275,9 @@ struct Driver<'a> {
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
     neighbours_at: u64,
+    /// When the instance next leaves its counters for the profile record.
+    #[cfg(feature = "profile")]
+    snapshot_at: u64,
     /// The gateway and the name servers are to be asked for their hardware
     /// addresses (a lease came, or the renewal is due).
     ask_due: bool,
@@ -1356,6 +1359,8 @@ impl<'a> Driver<'a> {
             armed: None,
             last_step: 0,
             neighbours_at: 0,
+            #[cfg(feature = "profile")]
+            snapshot_at: 0,
             ask_due: false,
             asked: 0,
             ask_at: None,
@@ -1407,9 +1412,9 @@ impl Driver<'_> {
     /// feature `profile`): the service's own time first, then the maxima
     /// start anew for the next snapshot.
     #[cfg(feature = "profile")]
-    fn profile_snapshot(&self) {
-        // The groups and the thread's time belong to the instance that snapshots: each one
-        // leaves its own in `SNAPSHOT` and the record carries the sums over all instances.
+    fn leave_snapshot(&self) {
+        // The groups and the thread's time belong to the instance: each one leaves its own in
+        // `SNAPSHOT` (the steps do it every 50 ms) and the record carries the sums.
         let own = &SNAPSHOT[self.index];
         own.ran
             .store(self.ran(), core::sync::atomic::Ordering::Relaxed);
@@ -1421,6 +1426,13 @@ impl Driver<'_> {
         for (cell, n) in own.members.iter().zip(served) {
             cell.store(n, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The profile's totals as records of the console (builds with the feature `profile`).
+    #[cfg(feature = "profile")]
+    fn profile_snapshot(&self) {
+        let own = &SNAPSHOT[self.index];
+        self.leave_snapshot();
         let load =
             |cell: &core::sync::atomic::AtomicU64| cell.load(core::sync::atomic::Ordering::Relaxed);
         profile::store(Counter::Ran, SNAPSHOT.iter().map(|i| load(&i.ran)).sum());
@@ -1627,6 +1639,11 @@ impl Driver<'_> {
         self.events(now);
         if now >= self.neighbours_at {
             self.addresses();
+        }
+        #[cfg(feature = "profile")]
+        if now >= self.snapshot_at {
+            self.snapshot_at = now + 50_000_000;
+            self.leave_snapshot();
         }
         if self.ask_due {
             self.ask_at = None;
