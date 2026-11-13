@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The network service with an ENA device (`kind` of its table record: the
-//! start data holds the object `ena` instead of `dma` and `net`): the
+//! start data holds the object `ena` and neither `dma` nor `net`): the
 //! second kind of device after Virtio. At this step the service brings the
 //! device up on polling (`ena::Ena`), prints its version, MAC, link and
 //! keep-alive counts, watches it and resets it in place; there is no data

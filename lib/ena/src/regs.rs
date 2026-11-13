@@ -79,8 +79,7 @@ pub const MMIO_REG_READ_REQ_ID_MASK: u32 = 0xffff;
 pub const MMIO_REG_READ_REG_OFF_SHIFT: u32 = 16;
 pub const MMIO_REG_READ_REG_OFF_MASK: u32 = 0xffff_0000;
 
-// `ENA_REGS_ADMIN_INTR_MASK` of ena_com.c (a plain `#define`, not an enum
-// member): the value that masks the admin interrupt in INTR_MASK, which a
+// `ENA_REGS_ADMIN_INTR_MASK` of ena_com.c (a plain `#define` outside the enums): the value that masks the admin interrupt in INTR_MASK, which a
 // poller writes so that the device never raises it.
 pub const ADMIN_INTR_MASK: u32 = 1;
 

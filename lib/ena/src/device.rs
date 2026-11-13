@@ -834,7 +834,7 @@ impl<P: Platform> Ena<P> {
         let (id, _) = FEATURES[at];
         // Features other than the attributes are asked only when the device
         // lists them (`supported_features` bit `id`), with the legacy queue
-        // limits in place of the extended when those are missing.
+        // limits when the extended are missing.
         let listed = id == adm::DEVICE_ATTRIBUTES || self.info.supported & (1 << id) != 0;
         if !listed {
             if id == adm::MAX_QUEUES_EXT && self.info.supported & (1 << adm::MAX_QUEUES_NUM) != 0 {
