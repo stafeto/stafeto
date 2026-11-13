@@ -901,109 +901,103 @@ why = "the loops of a turn of the way out that frees retired objects: the epochs
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x6b0"
+at = "0x5b0"
 bound = 9
 why = "the waiters of one portion of the stage Close of a channel: CLOSE_PORTION = 8 units, one for each head at least, and the look that ends the loop (channel::clean)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x8b4"
+at = "0x7b4"
 bound = 4
 why = "the handles a message carries: abi::MESSAGE_HANDLES = 4"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x8c4"
+at = "0x7c4"
 bound = 4
 why = "the handles a message carries: abi::MESSAGE_HANDLES = 4 (the walk over the empty places of the array)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xae4"
+at = "0x9e4"
 bound = 7
 why = "the frames one step of a page list gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (kcore::pagelist::PageList::release_collect)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xb88"
+at = "0xa88"
 bound = 7
 why = "the pages one step of a page log gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (the stage Shell)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xf14"
+at = "0xe14"
 bound = 64
 why = "the entries of one chunk of the handle table that a step of the stage Handles looks at: CHUNK = 64"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x19f8"
+at = "0x1858"
 bound = 8
 why = "the epochs of the CPUs a retired object waits for: at most MAX_CPUS = 8 (qsbr::GRACE)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1a24"
+at = "0x1884"
 bound = 8
 why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xf88"
+at = "0x1ec0"
 bound = 8
 why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x2060"
-bound = 8
-why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1ad8"
+at = "0x1938"
 bound = 7
 why = "the frames of one portion that go back to the allocator: FRAMES_PER_SECTION = 6 (memory::clean, the stage Shell)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1b3c"
+at = "0x199c"
 bound = 8
 why = "the units of one portion of the stage Buffers: BUFFERS_PORTION = 8 (a thread is two units at least)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1be8"
+at = "0x1a48"
 bound = 8
 why = "looks again at the queue of the CPU that owns the item, which another CPU may have changed meanwhile: at most one change for each of the 8 CPUs (cleanup::lift, process::begin)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1c4c"
+at = "0x1aac"
 bound = 128
 why = "the entries of the table of mappings that the stage Mappings looks at in a portion: abi::MAX_MAPPINGS = 128"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1cbc"
+at = "0x1b1c"
 bound = 33
 why = "the clients of one portion of the stage Replies: REPLIES_PORTION = 32 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x2114"
+at = "0x1f74"
 bound = 13
 why = "the units of one portion of the stage Threads: THREADS_PORTION = 12 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x21c0"
+at = "0x2020"
 bound = 33
 why = "the threads of one portion of the continuation of a suspended process: UNPARK_PORTION = 32 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1eb0"
+at = "0x1d10"
 bound = 128
 why = "the slots of one page of a pool that the stage Shell looks at before the page goes back: a page of 4096 bytes holds at most 128 slots of 32 bytes (kcore::slab)"
 
@@ -1020,16 +1014,22 @@ bound = 65
 why = "the places of DEVICES, the table of MSI devices by DeviceID: msi::MAX_DEVICES = 64 and the look that ends the loop"
 
 [[loop]]
-function = "kernel::arch::aarch64::its::wait"
-at = "0x3c"
+function = "kernel::arch::aarch64::its::wait_once"
+at = "0x2c"
 bound = 1001
-why = "one segment of a wait for the ITS: POLLS = 1000 reads of GITS_CREADR and the look that ends the loop (decision K3, section 5)"
+why = "one segment of a wait for the ITS: POLLS = 1000 reads of GITS_CREADR and the look that ends the loop (decision K3, section 5; irq_bind waits one segment and no more, a portion of cleanup looks once)"
 
 [[loop]]
-function = "kernel::arch::aarch64::its::wait"
-at = "0x30"
-bound = 1
-why = "the segments past the first of a wait for the ITS: the device's time, which a stop of the kernel ends after STALL_SECONDS of the counter; B holds one segment (`its command ticks: max`)"
+function = "kernel::irq::clean"
+at = "0xf4"
+bound = 8
+why = "one ring (idle::ring: a bell, and an SGI when the CPU does not poll) for each CPU that has something to take: at most MAX_CPUS = 8"
+
+[[loop]]
+function = "kernel::irq::clean"
+at = "0x114"
+bound = 8
+why = "the second header of the loop over the CPUs that has something to take (the one at 0xf4): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
 
 [[loop]]
 function = "kernel::arch::aarch64::cache::clean_to_memory"
@@ -1039,30 +1039,24 @@ why = "cleans at most 1 KiB (an ITT, kcore::its::ITT_MAX_BYTES; a command of the
 
 [[loop]]
 function = "kernel::syscall::devices::msi_create"
-at = "0x42c"
+at = "0x4dc"
 bound = 65
 why = "looks for the DeviceID among the places of DEVICES (msi::create): msi::MAX_DEVICES = 64 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::syscall::devices::msi_create"
-at = "0x454"
+at = "0x504"
 bound = 65
 why = "looks for a free place of DEVICES (msi::create): msi::MAX_DEVICES = 64 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xfa8"
+at = "0x18a4"
 bound = 8
-why = "the second header of the loop over the CPUs that has something to take (the one at 0xf88): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
+why = "the second header of the loop over the CPUs that has something to take (the one at 0x1884): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1a44"
+at = "0x1ee0"
 bound = 8
-why = "the second header of the loop over the CPUs that has something to take (the one at 0x1a24): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x2080"
-bound = 8
-why = "the second header of the loop over the CPUs that has something to take (the one at 0x2060): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
+why = "the second header of the loop over the CPUs that has something to take (the one at 0x1ec0): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"

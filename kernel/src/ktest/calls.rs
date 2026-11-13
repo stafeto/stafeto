@@ -9041,6 +9041,132 @@ pub fn lpis_run_out_and_come_back(_: &Boot) -> Result<(), &'static str> {
     })
 }
 
+/// A full ITS queue is LIMIT_REACHED for msi_create and irq_bind of an
+/// event, and nothing changes: no device, no binding, no LPI. A sender
+/// outside `OBJ` leaves QUEUE_KEEP slots, which a section may still fill:
+/// with that many free, `try_send` finds no room and msi_create goes
+/// through (spec 8.1).
+pub fn a_full_its_queue_fails_the_calls_that_need_it(_: &Boot) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    let sync = [kcore::its::Command::sync(arch::its::rdbase(0))];
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 2])?;
+        let (devices, bindings) = (crate::msi::in_use(), irq::in_use());
+        // One slot is free: neither call has room for its commands.
+        arch::its::hold_back(kcore::its::QUEUE_SLOTS - 2);
+        c.fails(
+            Call::MsiCreate.number(),
+            &[r.0, RID + 8, 1],
+            Error::LimitReached,
+        )?;
+        c.fails(
+            Call::IrqBind.number(),
+            &[m.0, 0, copy.0, 20, 0, 0],
+            Error::LimitReached,
+        )?;
+        check(
+            crate::msi::in_use() == devices && irq::in_use() == bindings,
+            "a call that found no room left an object",
+        )?;
+        check(
+            msi_info_of(c, m)?.bound == 0,
+            "a call that found no room took an event",
+        )?;
+        arch::its::ring();
+        check(
+            arch::its::drained(),
+            "the ITS did not run the held-back commands",
+        )?;
+        // QUEUE_KEEP slots are free: a sender outside OBJ finds no room, the
+        // MAPD of a section does.
+        arch::its::hold_back(kcore::its::QUEUE_SLOTS - 1 - kcore::its::QUEUE_KEEP);
+        check(
+            arch::its::try_send(&sync).is_none(),
+            "a sender outside OBJ took the slots a section keeps",
+        )?;
+        let second = c.created(Call::MsiCreate.number(), &[r.0, RID + 8, 1])?;
+        arch::its::ring();
+        check(
+            arch::its::try_send(&sync).is_some(),
+            "the queue stayed full after the ITS ran it",
+        )?;
+        let x = c.call(Call::IrqBind.number(), &[m.0, 0, copy.0, 20, 0, 0]);
+        check(x[0] == 0, "irq_bind failed on an empty queue")?;
+        for handle in [Handle(x[1]), second, m, copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        Ok(())
+    })
+}
+
+/// msi_create does not wait for the ITS and irq_bind of an event waits one
+/// segment at most, and the portion of a binding or a device whose
+/// commands the ITS has not run queues it again and returns, so that no
+/// portion waits. With the feature `its-slow` the ITS runs a command's
+/// count only after five segments of reads, which shows each of them; in
+/// the other builds the portion finds the commands run and ends the
+/// object.
+pub fn waits_for_the_its_are_one_segment_and_portions_do_not_wait(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    if !arch::its::present() {
+        return Ok(());
+    }
+    cleanup::drain();
+    with_caller(|c| {
+        let (r, h, copy) = resource_and_channel(c)?;
+        let m = c.created(Call::MsiCreate.number(), &[r.0, RID, 1])?;
+        #[cfg(feature = "its-slow")]
+        check(
+            arch::its::slow_left() == 5 * arch::its::SEGMENT_READS,
+            "msi_create waited for the ITS",
+        )?;
+        let x = c.call(Call::IrqBind.number(), &[m.0, 0, copy.0, 20, 0, 0]);
+        check(x[0] == 0, "irq_bind of an event failed")?;
+        #[cfg(feature = "its-slow")]
+        check(
+            arch::its::slow_left() == 4 * arch::its::SEGMENT_READS,
+            "irq_bind did not wait exactly one segment",
+        )?;
+        let (devices, bindings) = (crate::msi::in_use(), irq::in_use());
+        c.close(Handle(x[1]))?;
+        cleanup::portion();
+        #[cfg(feature = "its-slow")]
+        {
+            check(
+                cleanup::len() == 1 && irq::in_use() == bindings,
+                "a portion waited for the ITS or ended the binding early",
+            )?;
+        }
+        cleanup::drain();
+        check(
+            irq::in_use() == bindings - 1 && crate::msi::in_use() == devices,
+            "the binding did not end once the ITS ran its commands",
+        )?;
+        c.close(m)?;
+        #[cfg(feature = "its-slow")]
+        {
+            cleanup::portion();
+            check(
+                cleanup::len() == 1 && crate::msi::in_use() == devices,
+                "the portion of a device waited for the ITS",
+            )?;
+        }
+        for handle in [copy, h, r] {
+            c.close(handle)?;
+        }
+        cleanup::drain();
+        check(
+            crate::msi::in_use() == devices - 1,
+            "the device did not end once the ITS ran its commands",
+        )
+    })
+}
+
 /// irq_bind of a shared line takes the CPU in x5 (spec 9): a CPU that is
 /// not up, or past the CPUs the kernel starts, is INVALID_ARGS; CPU 0 routes
 /// the line to the boot CPU (its GICD_IROUTER or GICD_ITARGETSR), as a call

@@ -36,3 +36,13 @@ break-aside = []
 # over, and a portion whose cursor jumps a record.
 break-stamps-wrap = []
 break-stamps-portion = []
+# Deliberate breaks of the ITS command counter and the portions of teardown, for
+# the host tests that must catch them (xtask its-breaks): a counter of 32 bits, a
+# target compared by its place on the ring, a sender outside `OBJ` that takes the
+# slots a section reserved, a wait that sends its commands again at each step, and
+# a wait that takes the commands for run once they are sent.
+break-its-counter-32 = []
+break-its-ring-position = []
+break-its-keep = []
+break-its-step-resend = []
+break-its-step-early = []

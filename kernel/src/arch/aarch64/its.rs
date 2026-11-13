@@ -4,11 +4,19 @@
 //! The GICv3 ITS and the LPI tables (spec 9, 8.1; [G40]-[G48]): the tables
 //! the redistributors and the ITS read, taken from RAM at boot outside
 //! every quota (spec 7.8), the command queue, and the collection of each
-//! CPU. The queue is written under `ITS_LOCK`, which is never held with
-//! `OBJ`, and only while commands go into it; the wait for the ITS to run
-//! them is outside the lock, in segments of POLLS reads of GITS_CREADR.
-//! Programs never reach the registers or the tables: the ITS maps events of
-//! a device to LPIs on behalf of the kernel alone.
+//! CPU. The queue is written under `ITS_LOCK`, a leaf: a section under
+//! `OBJ` puts the commands of a call into the queue in the order of the
+//! sections (`enqueue`), which keeps a MAPTI behind the MAPD of its device
+//! and a teardown behind the mapping it ends, and a sender outside `OBJ`
+//! puts them in the same way (`try_send`); the write of GITS_CWRITER that
+//! starts them (`ring`) and the wait for the ITS to run them are outside
+//! the lock and outside `OBJ`. Commands are counted in 64 bits (`SENT`):
+//! a call waits for a count, and what the ITS has run is that count less
+//! the commands it has still to read (kcore::its::done). A wait is one
+//! segment of POLLS reads of GITS_CREADR at most in a call (`wait_once`),
+//! and in a portion of cleanup one look at the count (`step`). Programs
+//! never reach the registers or the tables: the ITS maps events of a
+//! device to LPIs on behalf of the kernel alone.
 
 use super::cpu;
 use super::mmio;
@@ -58,14 +66,12 @@ static LONGEST: AtomicU64 = AtomicU64::new(0);
 /// A wait that took more than one segment, and the commands that went.
 #[cfg(feature = "ktest")]
 static LONG_WAITS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ktest")]
-static COMMANDS: AtomicU64 = AtomicU64::new(0);
 
-/// The queue: its virtual address and the offset the next command goes
-/// to, which `ITS_LOCK` guards.
+/// The queue: its virtual address and the count of commands GITS_CWRITER
+/// shows the ITS, which `ITS_LOCK` guards.
 struct Queue {
     va: usize,
-    write: usize,
+    rung: u64,
 }
 
 struct Guarded(UnsafeCell<Queue>);
@@ -74,12 +80,20 @@ struct Guarded(UnsafeCell<Queue>);
 unsafe impl Sync for Guarded {}
 
 static ITS_LOCK: Ticket = Ticket::new();
-static QUEUE: Guarded = Guarded(UnsafeCell::new(Queue { va: 0, write: 0 }));
+static QUEUE: Guarded = Guarded(UnsafeCell::new(Queue { va: 0, rung: 0 }));
+/// The commands put in the queue so far: written under `ITS_LOCK`, read
+/// without it. The queue starts empty at offset 0, so the offset of the
+/// next command follows from it (kcore::its::write_offset).
+static SENT: AtomicU64 = AtomicU64::new(0);
+/// With the feature `its-slow`: the reads the ITS still seems slow for,
+/// set at each send.
+#[cfg(feature = "its-slow")]
+static SLOW_LEFT: AtomicU32 = AtomicU32::new(0);
 
-/// Where the commands of a `send` end in the queue: the CREADR offset
-/// `wait` waits for.
+/// The count of commands sent when the commands of a call had gone in:
+/// what `wait` and `reached` wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Position(usize);
+pub struct Position(u64);
 
 /// The device tree's `msi-map`, which msi_create translates requester IDs
 /// with, and the tree it came from.
@@ -227,8 +241,8 @@ fn setup(
     TRANSLATER.store(regs + its::GITS_TRANSLATER, Ordering::Relaxed);
     let typer = read64(its::GITS_TYPER);
     let gicd = info.gic.as_ref().map(|g| g.mapped()[0].base).unwrap_or(0);
-    // SAFETY: GICD_TYPER is a 32-bit register of the distributor, mapped.
     let gicd_typer = if gicd != 0 {
+        // SAFETY: GICD_TYPER is a 32-bit register of the distributor, mapped.
         unsafe { mmio::read32(LINEAR_BASE + gicd as usize + 0x4) }
     } else {
         0
@@ -455,94 +469,236 @@ pub fn rdbase(cpu: usize) -> u64 {
     RDBASE[cpu].load(Ordering::Relaxed)
 }
 
-/// Puts `commands` (at most MAX_BATCH) into the queue and tells the ITS:
-/// `ITS_LOCK` is held for the writes and the write of GITS_CWRITER, no
-/// longer (spec 8.1). The caller holds no `OBJ`, and `wait`s for the
-/// position.
-#[must_use = "the commands run when `wait` has seen them done"]
-#[inline(never)]
-pub fn send(commands: &[Command]) -> Position {
-    crate::obj::assert_not_held();
-    assert!(commands.len() <= its::MAX_BATCH, "too many ITS commands");
+/// A consistent look at the queue without the lock: the commands sent and
+/// the offset the ITS has read up to. The offset is read between two reads
+/// of the count, and the look is None when a command went in meanwhile,
+/// which the caller takes as "not yet": it looks again at its next poll.
+/// The ITS cannot have passed the count it was read against, so a look
+/// never shows more commands run than there are.
+fn snapshot() -> Option<(u64, usize)> {
+    let sent = SENT.load(Ordering::Acquire);
+    let creadr = (read64(its::GITS_CREADR) & its::OFFSET_MASK) as usize;
+    (SENT.load(Ordering::Acquire) == sent).then_some((sent, creadr))
+}
+
+/// Whether a section's `commands` commands fit: the call that is about to
+/// change something asks before it does (LIMIT_REACHED otherwise), and its
+/// `enqueue` then finds the room, since a sender outside `OBJ` leaves
+/// QUEUE_KEEP slots and only a section at a time is in `OBJ`. `ITS_LOCK`
+/// is held for the two reads, a leaf under `OBJ`.
+pub fn room(commands: usize) -> bool {
+    crate::obj::assert_held();
     let ticket = ITS_LOCK.lock();
+    let sent = SENT.load(Ordering::Relaxed);
+    let creadr = (read64(its::GITS_CREADR) & its::OFFSET_MASK) as usize;
+    ITS_LOCK.unlock(ticket);
+    its::room(sent, creadr, commands, 0)
+}
+
+/// Writes `commands` into the queue, counts them and returns the count;
+/// `ITS_LOCK` is held, and `keep` slots stay free after them (None when
+/// they do not fit).
+fn put(commands: &[Command], keep: usize) -> Option<Position> {
+    assert!(commands.len() <= its::MAX_BATCH, "too many ITS commands");
     // SAFETY: `ITS_LOCK` is held.
     let queue = unsafe { &mut *QUEUE.0.get() };
+    let sent = SENT.load(Ordering::Relaxed);
     let creadr = (read64(its::GITS_CREADR) & its::OFFSET_MASK) as usize;
-    assert!(
-        its::free_slots(creadr, queue.write) >= commands.len(),
-        "the ITS command queue is full"
-    );
-    for command in commands {
-        let at = queue.va + queue.write;
+    if !its::room(sent, creadr, commands.len(), keep) {
+        return None;
+    }
+    for (n, command) in commands.iter().enumerate() {
+        let at = queue.va + its::write_offset(sent + n as u64);
         for (i, word) in command.0.iter().enumerate() {
             // SAFETY: the slot is inside the queue page and the ITS does
             // not read it before CWRITER moves.
             unsafe { core::ptr::write_volatile((at + 8 * i) as *mut u64, *word) };
         }
         publish(at, its::COMMAND_BYTES);
-        queue.write = its::next_offset(queue.write);
+    }
+    let end = sent + commands.len() as u64;
+    SENT.store(end, Ordering::Release);
+    #[cfg(feature = "its-slow")]
+    SLOW_LEFT.store(SLOW_READS, Ordering::Relaxed);
+    Some(Position(end))
+}
+
+/// Tells the ITS about the commands written so far: GITS_CWRITER, with
+/// `ITS_LOCK` held. A write that shows nothing new is not made.
+fn ring_locked() {
+    // SAFETY: `ITS_LOCK` is held.
+    let queue = unsafe { &mut *QUEUE.0.get() };
+    let sent = SENT.load(Ordering::Relaxed);
+    if queue.rung == sent {
+        return;
     }
     // SAFETY: the stores to the queue reach memory before the register
     // write that tells the ITS.
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-    write64(its::GITS_CWRITER, queue.write as u64);
-    #[cfg(feature = "ktest")]
-    COMMANDS.fetch_add(commands.len() as u64, Ordering::Relaxed);
-    let end = queue.write;
-    ITS_LOCK.unlock(ticket);
-    Position(end)
+    write64(its::GITS_CWRITER, its::write_offset(sent) as u64);
+    queue.rung = sent;
 }
 
-/// True once the ITS has read up to `pos`: the commands before it ran.
+/// Puts `commands` (at most MAX_BATCH) into the queue in a section under
+/// `OBJ`, after `room` said they fit: the order of the queue is then the
+/// order of the sections, so a MAPTI never stands before the MAPD of its
+/// device, and the teardown of an event never before its MAPTI. `ITS_LOCK`
+/// is a leaf under `OBJ` and is held for the writes alone (spec 8.1).
+/// The ITS does not read them until `ring`, which the call makes after its
+/// section.
+#[must_use = "the call rings the ITS after its section and may wait for the count"]
+#[inline(never)]
+pub fn enqueue(commands: &[Command]) -> Position {
+    crate::obj::assert_held();
+    let ticket = ITS_LOCK.lock();
+    let pos = put(commands, 0);
+    ITS_LOCK.unlock(ticket);
+    pos.expect("a section found the room it asked for")
+}
+
+/// Tells the ITS about the commands `enqueue` put in, outside `OBJ`.
+#[inline(never)]
+pub fn ring() {
+    crate::obj::assert_not_held();
+    let ticket = ITS_LOCK.lock();
+    ring_locked();
+    ITS_LOCK.unlock(ticket);
+}
+
+/// Puts `commands` into the queue and tells the ITS, outside `OBJ`: None
+/// when fewer than QUEUE_KEEP slots would stay free, which the caller
+/// meets by asking again later (a portion of cleanup queues its object
+/// again, `step`).
+#[must_use = "the commands run when the count is reached"]
+#[inline(never)]
+pub fn try_send(commands: &[Command]) -> Option<Position> {
+    crate::obj::assert_not_held();
+    let ticket = ITS_LOCK.lock();
+    let pos = put(commands, its::QUEUE_KEEP);
+    if pos.is_some() {
+        ring_locked();
+    }
+    ITS_LOCK.unlock(ticket);
+    pos
+}
+
+/// `try_send` that waits for room: the boot's commands and the kernel
+/// tests', which no portion of cleanup serves. The queue not moving for
+/// STALL_SECONDS is a stopped ITS.
+#[must_use = "the commands run when `wait` has seen them done"]
+pub fn send(commands: &[Command]) -> Position {
+    let limit = timer::frequency() * STALL_SECONDS;
+    let began = timer::now();
+    loop {
+        if let Some(pos) = try_send(commands) {
+            return pos;
+        }
+        if timer::now() - began > limit {
+            ::core::panic!("the ITS command queue stayed full");
+        }
+    }
+}
+
+/// True once the ITS has run the commands up to `pos`.
 fn reached(pos: Position) -> bool {
-    let creadr = (read64(its::GITS_CREADR) & its::OFFSET_MASK) as usize;
-    // Commands between the ITS's position and the end of the batch are
-    // still to run. At most MAX_BATCH of each CPU wait in the queue, so a
-    // distance past the rest of the ring means the ITS is ahead of `pos`
-    // already.
-    let left = its::pending(creadr, pos.0);
-    left == 0 || left > its::QUEUE_SLOTS - its::MAX_BATCH * cpu::MAX_CPUS
+    #[cfg(feature = "its-slow")]
+    if SLOW_LEFT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        return false;
+    }
+    snapshot().is_some_and(|(sent, creadr)| its::reached(sent, creadr, pos.0))
 }
 
 /// Waits for the commands up to `pos` in segments of POLLS reads of
 /// GITS_CREADR; the longest segment is counted (`longest`). A queue that
 /// does not move for STALL_SECONDS is a stopped ITS: the kernel stops,
-/// naming the command (`what`).
+/// naming the command (`what`). For the boot and the kernel tests, which
+/// hold nothing; a call of a program waits one segment (`wait_once`).
 #[inline(never)]
 pub fn wait(pos: Position, what: &str) {
     let limit = timer::frequency() * STALL_SECONDS;
     let began = timer::now();
-    #[cfg(feature = "its-slow")]
-    let mut slow = SLOW_READS;
     loop {
-        #[cfg(feature = "ktest")]
-        let segment = timer::now();
-        for _ in 0..POLLS {
-            #[cfg(feature = "its-slow")]
-            if slow > 0 {
-                slow -= 1;
-                let _ = reached(pos);
-                continue;
-            }
-            if reached(pos) {
-                #[cfg(feature = "ktest")]
-                let took = timer::now() - segment;
-                #[cfg(feature = "ktest")]
-                LONGEST.fetch_max(took, Ordering::Relaxed);
-                return;
-            }
-        }
-        #[cfg(feature = "ktest")]
-        let took = timer::now() - segment;
-        #[cfg(feature = "ktest")]
-        {
-            LONGEST.fetch_max(took, Ordering::Relaxed);
-            LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+        if wait_once(pos) {
+            return;
         }
         if timer::now() - began > limit {
             ::core::panic!("the ITS stopped at {what}");
         }
     }
+}
+
+/// One segment of a wait: POLLS reads of GITS_CREADR at most, outside
+/// `OBJ` (spec 8.1), counted for the longest segment. True when the
+/// commands up to `pos` ran. The call of a program that waited for its
+/// event to be mapped goes on either way: the mapping takes effect when
+/// the ITS has run the commands, and the driver unmasks its vector and
+/// looks at its queues once after it (spec 9).
+#[inline(never)]
+pub fn wait_once(pos: Position) -> bool {
+    crate::obj::assert_not_held();
+    #[cfg(feature = "ktest")]
+    let segment = timer::now();
+    let mut seen = false;
+    for _ in 0..POLLS {
+        if reached(pos) {
+            seen = true;
+            break;
+        }
+    }
+    #[cfg(feature = "ktest")]
+    {
+        LONGEST.fetch_max(timer::now() - segment, Ordering::Relaxed);
+        if !seen {
+            LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    seen
+}
+
+/// One step of the wait of a portion of cleanup for the commands of its
+/// object's teardown (spec 7.7, 8.1): the commands go in at the first step
+/// the queue has room for them, and each step looks once at the count. A
+/// portion that is not `Done` queues its object again and returns, so no
+/// portion waits for the ITS. An ITS that does not run them in
+/// STALL_SECONDS stops the kernel naming `what`.
+#[inline(never)]
+pub fn step(wait: &mut its::Wait, commands: &[Command], what: &str) -> its::Step {
+    // The deliberate break: the portion waits for the ITS in a loop.
+    #[cfg(feature = "break-its-loop")]
+    loop {
+        let step = step_once(wait, commands, what);
+        if step != its::Step::Again {
+            return step;
+        }
+    }
+    #[cfg(not(feature = "break-its-loop"))]
+    step_once(wait, commands, what)
+}
+
+fn step_once(wait: &mut its::Wait, commands: &[Command], what: &str) -> its::Step {
+    let limit = timer::frequency() * STALL_SECONDS;
+    let step = wait.step(
+        timer::now(),
+        limit,
+        || try_send(commands).map(|p| p.0),
+        || {
+            #[cfg(feature = "its-slow")]
+            if SLOW_LEFT
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return 0;
+            }
+            snapshot().map_or(0, |(sent, creadr)| its::done(sent, creadr))
+        },
+    );
+    if step == its::Step::Stalled {
+        ::core::panic!("the ITS stopped at {what}");
+    }
+    step
 }
 
 /// Writes the property byte of LPI `intid`: `Some(priority)` enables it,
@@ -565,6 +721,36 @@ pub fn publish_itt(va: usize, len: usize) {
     publish(va, len);
 }
 
+/// Fills the queue with `n` SYNCs the ITS is not told about (`ring`
+/// tells it): the room a call finds is what is left.
+#[cfg(feature = "ktest")]
+pub fn hold_back(mut n: usize) {
+    while n > 0 {
+        let batch = n.min(its::MAX_BATCH);
+        let sync = [Command::sync(rdbase(0)); its::MAX_BATCH];
+        let ticket = ITS_LOCK.lock();
+        let _ = put(&sync[..batch], 0).expect("room for the held-back commands");
+        ITS_LOCK.unlock(ticket);
+        n -= batch;
+    }
+}
+
+/// Whether the ITS has run every command sent.
+#[cfg(feature = "ktest")]
+pub fn drained() -> bool {
+    snapshot().is_some_and(|(sent, creadr)| its::done(sent, creadr) == sent)
+}
+
+/// The reads the ITS still seems slow for (`its-slow`).
+#[cfg(all(feature = "ktest", feature = "its-slow"))]
+pub fn slow_left() -> u32 {
+    SLOW_LEFT.load(Ordering::Relaxed)
+}
+
+/// The reads of a segment of a wait, for the tests.
+#[cfg(feature = "ktest")]
+pub const SEGMENT_READS: u32 = POLLS;
+
 /// The longest segment of a wait, the waits that took more than one, and
 /// the commands sent: the `its command ticks` line of the probe.
 #[cfg(feature = "ktest")]
@@ -572,6 +758,157 @@ pub fn stats() -> (u64, u64, u64) {
     (
         LONGEST.load(Ordering::Relaxed),
         LONG_WAITS.load(Ordering::Relaxed),
-        COMMANDS.load(Ordering::Relaxed),
+        SENT.load(Ordering::Relaxed),
     )
+}
+
+/// The self-test of the ITS on a machine that has one (kernel feature
+/// `its-int`, xtask its-int): what the first run of MSI on Graviton needs to
+/// know before a driver asks for a vector. The kernel maps an event of a
+/// DeviceID of its own to each CPU's collection, has the ITS raise it with
+/// INT [G46], and prints which CPU got the LPI and after how many ticks.
+/// Runs on CPU 0 once every CPU is up, before init starts; it stops nothing
+/// when an LPI does not arrive, it says so, and unmaps the device at the end.
+#[cfg(feature = "its-int")]
+pub mod int_probe {
+    use super::*;
+    use kcore::gic::FIRST_LPI;
+
+    /// Which LPI each CPU took last, and when, in counter ticks.
+    static SEEN: [AtomicU64; cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; cpu::MAX_CPUS];
+    static SEEN_AT: [AtomicU64; cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; cpu::MAX_CPUS];
+
+    /// Called by the interrupt handler of any CPU for each LPI.
+    pub fn seen(intid: u32) {
+        let cpu = cpu::this().index();
+        SEEN_AT[cpu].store(timer::now(), Ordering::Relaxed);
+        SEEN[cpu].store(u64::from(intid), Ordering::Release);
+    }
+
+    /// A command sent and waited for, or the line that says it stopped.
+    fn run(commands: &[Command], what: &str) -> bool {
+        let pos = send(commands);
+        let limit = timer::frequency();
+        let began = timer::now();
+        while !reached(pos) {
+            if timer::now() - began > limit {
+                kprintln!("its-int: {what} did not run in 1 s");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Waits for the LPI on `cpu`; CPU 0 serves its own interrupts by
+    /// polling, the others in their idle loops. The ticks from `since`.
+    fn wait_for(cpu: usize, lpi: u32, since: u64) -> Option<u64> {
+        let limit = timer::frequency();
+        loop {
+            // CPU 0 takes whatever reaches it, which shows an LPI that went
+            // to the wrong CPU.
+            if super::super::irq_pending()
+                && let Some(ack) = super::super::gic::acknowledge()
+            {
+                crate::interrupt::handle(ack);
+            }
+            if SEEN[cpu].load(Ordering::Acquire) == u64::from(lpi) {
+                return Some(SEEN_AT[cpu].load(Ordering::Relaxed).saturating_sub(since));
+            }
+            if timer::now() - since > limit {
+                if cpu != 0 && SEEN[0].load(Ordering::Acquire) == u64::from(lpi) {
+                    kprintln!("its-int: LPI {lpi} reached CPU 0 instead");
+                }
+                return None;
+            }
+        }
+    }
+
+    pub fn run_probe() {
+        if !present() {
+            kprintln!("its-int: no ITS");
+            return;
+        }
+        let cpus = crate::smp::cpus();
+        let device = max_device_id();
+        let (itt_va, itt_pa) = boot_block(0);
+        publish(itt_va, its::ITT_MAX_BYTES);
+        let bits = its::event_bits(cpus as u64);
+        kprintln!(
+            "its-int: device {device:#x}, {cpus} events, ITT {itt_pa:#x}, non-shareable {}",
+            NON_SHAREABLE.load(Ordering::Relaxed)
+        );
+        let mut ok = run(
+            &[
+                Command::mapd(device, itt_pa, bits, true),
+                Command::sync(rdbase(0)),
+            ],
+            "MAPD",
+        );
+        for e in 0..cpus {
+            let lpi = FIRST_LPI + e as u32;
+            set_property(lpi, Some(kcore::gic::DEFAULT_PRIORITY));
+            ok &= run(
+                &[
+                    Command::mapti(
+                        device,
+                        e as u32,
+                        lpi,
+                        if cfg!(feature = "break-its-int-collection") {
+                            0
+                        } else {
+                            e as u16
+                        },
+                    ),
+                    Command::inv(device, e as u32),
+                    Command::sync(rdbase(e)),
+                ],
+                "MAPTI",
+            );
+        }
+        let mut delivered = 0;
+        for e in 0..cpus {
+            let lpi = FIRST_LPI + e as u32;
+            let since = timer::now();
+            if !run(
+                &[Command::int(device, e as u32), Command::sync(rdbase(e))],
+                "INT",
+            ) {
+                ok = false;
+                continue;
+            }
+            match wait_for(e, lpi, since) {
+                Some(ticks) => {
+                    delivered += 1;
+                    kprintln!("its-int: event {e}: LPI {lpi} reached CPU {e} after {ticks} ticks");
+                }
+                None => {
+                    ok = false;
+                    kprintln!("its-int: event {e}: LPI {lpi} did not reach CPU {e} in 1 s");
+                }
+            }
+        }
+        for e in 0..cpus {
+            set_property(FIRST_LPI + e as u32, None);
+            ok &= run(
+                &[
+                    Command::inv(device, e as u32),
+                    Command::discard(device, e as u32),
+                    Command::sync(rdbase(e)),
+                ],
+                "DISCARD",
+            );
+        }
+        ok &= run(
+            &[
+                Command::mapd(device, itt_pa, bits, false),
+                Command::sync(rdbase(0)),
+            ],
+            "MAPD off",
+        );
+        if ok && delivered == cpus {
+            kprintln!("its-int: ok, {delivered} LPIs delivered, one to each of {cpus} CPUs");
+        } else {
+            kprintln!("its-int: FAILED, {delivered} of {cpus} LPIs delivered");
+        }
+    }
 }

@@ -1485,10 +1485,24 @@ enum Variant {
     /// treated as non-shareable (kernel features `its-page-64k`,
     /// `its-nonshare`; `cargo xtask efi EFI its-64k`).
     ItsProbe,
+    /// The kernel tests under `-icount` with an ITS that seems slow (kernel
+    /// feature `its-slow`): the bounds must hold when the commands of
+    /// teardown run late (`cargo xtask its-slow`), and with the break that
+    /// waits for them in one portion (`break-its-loop`) the bound that
+    /// guards B_4 must fail.
+    TestIcountItsSlow,
+    TestIcountItsLoop,
+    TestIcountItsSlowEl0,
+    TestIcountItsLoopEl0,
+    /// The self-test of the ITS (kernel feature `its-int`, `cargo xtask
+    /// its-int`; `cargo xtask aws image --its-int` for EC2), and the same
+    /// with every event mapped to CPU 0's collection.
+    ItsInt,
+    ItsIntBreak,
 }
 
 impl Variant {
-    const ALL: [Variant; 37] = [
+    const ALL: [Variant; 43] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1526,6 +1540,12 @@ impl Variant {
         Variant::IdleNoIrq,
         Variant::EarlyMarks,
         Variant::ItsProbe,
+        Variant::TestIcountItsSlow,
+        Variant::TestIcountItsLoop,
+        Variant::TestIcountItsSlowEl0,
+        Variant::TestIcountItsLoopEl0,
+        Variant::ItsInt,
+        Variant::ItsIntBreak,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1571,6 +1591,12 @@ impl Variant {
             Variant::IdleNoIrq => Some("break-idle-irq"),
             Variant::EarlyMarks => Some("early-marks"),
             Variant::ItsProbe => Some("its-page-64k,its-nonshare"),
+            Variant::TestIcountItsSlow => Some("icount,its-slow"),
+            Variant::TestIcountItsLoop => Some("icount,its-slow,break-its-loop"),
+            Variant::TestIcountItsSlowEl0 => Some("icount,its-slow,el0-half"),
+            Variant::TestIcountItsLoopEl0 => Some("icount,its-slow,break-its-loop,el0-half"),
+            Variant::ItsInt => Some("its-int"),
+            Variant::ItsIntBreak => Some("break-its-int-collection"),
         }
     }
 
@@ -1604,6 +1630,8 @@ impl Variant {
             | Variant::IdleNoIrq
             | Variant::EarlyMarks
             | Variant::ItsProbe
+            | Variant::ItsInt
+            | Variant::ItsIntBreak
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1613,6 +1641,10 @@ impl Variant {
             | Variant::BaselineEl0
             | Variant::TraceEl0
             | Variant::TestIcountEl0
+            | Variant::TestIcountItsSlow
+            | Variant::TestIcountItsLoop
+            | Variant::TestIcountItsSlowEl0
+            | Variant::TestIcountItsLoopEl0
             | Variant::TestIcountStamps
             | Variant::TestIcountStampsEl0
             | Variant::SmpMeasure
@@ -1630,6 +1662,8 @@ impl Variant {
             Variant::Trace => Some(Variant::TraceEl0),
             Variant::TestIcount => Some(Variant::TestIcountEl0),
             Variant::TestIcountStamps => Some(Variant::TestIcountStampsEl0),
+            Variant::TestIcountItsSlow => Some(Variant::TestIcountItsSlowEl0),
+            Variant::TestIcountItsLoop => Some(Variant::TestIcountItsLoopEl0),
             _ => None,
         }
     }
@@ -1677,6 +1711,12 @@ impl Variant {
             Variant::IdleNoIrq => "stafeto-idle-no-irq",
             Variant::EarlyMarks => "stafeto-early-marks",
             Variant::ItsProbe => "stafeto-its-probe",
+            Variant::TestIcountItsSlow => "stafeto-ktest-icount-its-slow",
+            Variant::TestIcountItsLoop => "stafeto-ktest-icount-its-loop",
+            Variant::TestIcountItsSlowEl0 => "stafeto-ktest-icount-its-slow-el0",
+            Variant::TestIcountItsLoopEl0 => "stafeto-ktest-icount-its-loop-el0",
+            Variant::ItsInt => "stafeto-its-int",
+            Variant::ItsIntBreak => "stafeto-its-int-break",
         }
     }
 }
@@ -1692,7 +1732,7 @@ commands:
   test [--jobs N] host tests, then boot checks, the console dialog, init
             tests and kernel tests in QEMU; N boots at a time (half the
             cores by default; 1 runs them one after the other)
-  kernel-test [machine [icount|icount-stamps]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`, with the time stamps of the kernel in as well with `icount-stamps`
+  kernel-test [machine [icount|icount-stamps|icount-its-slow|icount-its-loop]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`, with the time stamps of the kernel in as well with `icount-stamps`, with an ITS that seems slow with `icount-its-slow` (the bounds hold), and with that ITS and a teardown that waits in one portion with `icount-its-loop` (a bound fails)
   init-test [machine] run only the EL0 init test image in QEMU (512M by default)
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci [--jobs N] formatting, clippy, then everything `test` does
@@ -2022,6 +2062,9 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  its-int   boot the self-test of the ITS in QEMU on four CPUs: an event mapped to each CPU's collection, raised by INT, received there; with the break (every event on CPU 0) the run must report the failure
+  its-slow  the kernel tests under -icount with an ITS that seems slow: every bound holds (B_4 under 32 000), and with the teardown that waits in one portion a test fails
+  its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
   help      this text";
@@ -2038,6 +2081,9 @@ fn main() {
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
         Some("uart-breaks") => uart_breaks(),
+        Some("its-int") => its_int(),
+        Some("its-breaks") => its_breaks(),
+        Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
@@ -2047,6 +2093,10 @@ fn main() {
                 Variant::TestIcount
             } else if args.get(2).is_some_and(|a| a == "icount-stamps") {
                 Variant::TestIcountStamps
+            } else if args.get(2).is_some_and(|a| a == "icount-its-slow") {
+                Variant::TestIcountItsSlow
+            } else if args.get(2).is_some_and(|a| a == "icount-its-loop") {
+                Variant::TestIcountItsLoop
             } else {
                 Variant::Test
             };
@@ -2516,6 +2566,113 @@ fn uart_breaks() -> Result<(), String> {
         Ok(_) => Err("break-uart-poll passed the host tests".into()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// `cargo xtask its-slow`: the kernel tests under `-icount` on the machine
+/// with an ITS whose commands run five segments of reads late: the tests
+/// and the bounds (B_4 with the takes, the segment of a wait, the longest
+/// stretch) hold, because a portion looks at the count once and queues its
+/// object again. With the portion that waits in a loop (`break-its-loop`) the
+/// run fails.
+fn its_slow() -> Result<(), String> {
+    kernel_tests(&qemu::VIRT_ITS, Variant::TestIcountItsSlow)?;
+    match kernel_tests(&qemu::VIRT_ITS, Variant::TestIcountItsLoop) {
+        Err(why) => {
+            println!("its-slow: the teardown that waits in one portion is caught: {why}");
+            Ok(())
+        }
+        Ok(_) => Err("the teardown that waits in one portion passed the kernel tests".into()),
+    }
+}
+
+/// `cargo xtask its-breaks`: the host tests of the ITS counter and of the
+/// portions of teardown pass, and each deliberate break of kcore fails them.
+fn its_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "kcore", "--lib", "its::"]);
+    run_cmd(&mut ok)?;
+    for feature in [
+        "break-its-counter-32",
+        "break-its-ring-position",
+        "break-its-keep",
+        "break-its-step-resend",
+        "break-its-step-early",
+    ] {
+        let mut broken = cargo();
+        broken.args([
+            "test",
+            "--package",
+            "kcore",
+            "--lib",
+            "--features",
+            feature,
+            "its::",
+        ]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => println!("its-breaks: {feature} is caught"),
+            Ok(_) => return Err(format!("{feature} passed the host tests")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// What the self-test of the ITS prints, on `cpus` CPUs: the device line, one
+/// line for each CPU's event, and the verdict.
+fn its_int_lines(lines: &[String], cpus: usize) -> Result<(), String> {
+    let has = |p: &str| lines.iter().any(|l| l.starts_with(p));
+    if !has("its-int: device ") {
+        return Err("the self-test of the ITS did not start".into());
+    }
+    for e in 0..cpus {
+        let lpi = 8192 + e;
+        if !has(&format!(
+            "its-int: event {e}: LPI {lpi} reached CPU {e} after "
+        )) {
+            return Err(format!("the LPI of event {e} did not reach CPU {e}"));
+        }
+    }
+    if !has(&format!(
+        "its-int: ok, {cpus} LPIs delivered, one to each of {cpus} CPUs"
+    )) {
+        return Err("the self-test of the ITS gave no verdict ok".into());
+    }
+    Ok(())
+}
+
+/// `cargo xtask its-int`: the kernel with the self-test of the ITS on four
+/// CPUs of the machine with an ITS; each CPU receives the LPI of its own
+/// event. The kernel with every event on CPU 0's collection reports the
+/// failure.
+fn its_int() -> Result<(), String> {
+    let machine = &qemu::VIRT_ITS;
+    for (variant, broken) in [(Variant::ItsInt, false), (Variant::ItsIntBreak, true)] {
+        let a = build(variant)?;
+        let mut cmd = qemu::command(machine, &a.image, Some(&a.boot_image));
+        cmd.args(["-smp", &SMP_CPUS.to_string()]);
+        cmd.args(qemu::HEADLESS);
+        let o = run_until(cmd, BOOT_TIMEOUT, Some("boot complete"), &a.elf)?;
+        qemu::expect_stopped_on(&o, "boot complete")?;
+        let result = its_int_lines(&o.lines, SMP_CPUS);
+        match (broken, result) {
+            (false, Ok(())) => {
+                for l in o.lines.iter().filter(|l| l.starts_with("its-int: ")) {
+                    println!("{l}");
+                }
+            }
+            (false, Err(e)) => return Err(e),
+            (true, Ok(())) => {
+                return Err("the break (every event on CPU 0) passed the self-test".into());
+            }
+            (true, Err(_)) => {
+                if !o.lines.iter().any(|l| l.starts_with("its-int: FAILED")) {
+                    return Err("the break did not make the self-test say FAILED".into());
+                }
+                println!("its-int: the break (every event on CPU 0) is reported");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build(variant: Variant) -> Result<Artifacts, String> {
@@ -9250,6 +9407,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             smp_boot(&qemu::VIRT_EL2_V3, GIC_V3_LINE)
         }),
         job("smp 4 CPU_ON refused", smp_cpu_on),
+        job("its int", its_int),
+        job("its breaks", its_breaks),
+        job("its slow", its_slow),
         job("smp 4 window", smp_window),
         job("smp 4 asid", || smp_asid(None)),
         // The tests of SMP stage 4 on four CPUs, with the whole test init
@@ -10689,7 +10849,13 @@ fn stack_overflow_report() -> Result<(), String> {
 /// of tests that passed. The boot report names `m`'s PSCI conduit, as
 /// the kernel took it from the device tree (on VIRT_EL2 SMC).
 fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
-    let icount = matches!(variant, Variant::TestIcount | Variant::TestIcountStamps);
+    let icount = matches!(
+        variant,
+        Variant::TestIcount
+            | Variant::TestIcountStamps
+            | Variant::TestIcountItsSlow
+            | Variant::TestIcountItsLoop
+    );
     // The tests of a kind of build run in two images: the first holds the
     // tests of the calls, the second the EL0 tests (Variant::el0_half).
     // Each is judged by its own count; the lines and the passes join.
@@ -10793,7 +10959,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         Variant::Trace => measure::record_as(m, &lines, "trace "),
         Variant::TestIcount => measure::record_as(m, &lines, measure::ICOUNT),
         // The numbers of a debug build stay out of the files of measures.
-        Variant::TestIcountStamps => {}
+        Variant::TestIcountStamps | Variant::TestIcountItsSlow | Variant::TestIcountItsLoop => {}
         _ => measure::record(m, &lines),
     }
     Ok(passed.len())

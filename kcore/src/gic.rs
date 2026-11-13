@@ -127,6 +127,14 @@ pub const fn sgi1r(mpidr: u64, intid: u32) -> u64 {
 /// GICC_IAR reads 1020..=1023 when there is nothing to acknowledge.
 pub const FIRST_SPURIOUS: u32 = 1020;
 
+/// Whether the distributor has a mask bit for `intid`: SGIs, PPIs and the
+/// shared lines below FIRST_SPURIOUS. INTIDs of 1024 up to the LPIs are
+/// the extended ranges of GICv3.1, which the kernel does not enable, and a
+/// write at their offsets would land on other registers (spec 9).
+pub const fn has_mask(intid: u32) -> bool {
+    intid < FIRST_SPURIOUS
+}
+
 /// GICv2 GICC_IAR: the INTID is bits [9:0], bits [12:10] name the CPU
 /// interface that sent an SGI [G26].
 const INTID_MASK: u32 = 0x3FF;
@@ -309,6 +317,16 @@ impl Ack {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_intids_below_the_spurious_ones_have_a_mask() {
+        assert!(has_mask(16));
+        assert!(has_mask(1019));
+        assert!(!has_mask(FIRST_SPURIOUS));
+        assert!(!has_mask(1024));
+        assert!(!has_mask(4096));
+        assert!(!has_mask(8191));
+    }
+
     use super::*;
 
     #[test]
