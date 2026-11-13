@@ -22,6 +22,9 @@ pub const MAX_WINDOWS: usize = 24;
 pub const MAX_BINDINGS: usize = 24;
 /// The records an optional rule may leave out of a table at most.
 pub const MAX_SKIPPED: usize = 4;
+/// The names of services the records that remain keep in their lists of
+/// connections after the records that were left out are taken off them.
+pub const MAX_NAMES: usize = 64;
 
 /// What the platform gives the walk: the ECAM of the MCFG, the last bus
 /// init walks (the buses of the firmware's numbering that hold functions;
@@ -113,6 +116,7 @@ pub struct Store {
     pub records: [Record; MAX_RECORDS],
     pub windows: [Window; MAX_WINDOWS],
     pub bindings: [Binding; MAX_BINDINGS],
+    pub names: [&'static str; MAX_NAMES],
 }
 
 impl Store {
@@ -120,6 +124,7 @@ impl Store {
         records: [Record::EMPTY; MAX_RECORDS],
         windows: [Window::fixed("", 0, 0, false); MAX_WINDOWS],
         bindings: [Binding::msi("", 0, 0); MAX_BINDINGS],
+        names: [""; MAX_NAMES],
     };
 }
 
@@ -175,6 +180,7 @@ pub fn resolve(
         records,
         windows,
         bindings,
+        names,
     } = store;
     let (mut r_at, mut w_at, mut b_at) = (0, 0, 0);
     let mut ranges = [(0, 0, 0, 0); MAX_RECORDS];
@@ -206,12 +212,37 @@ pub fn resolve(
             Err(refusal) => return Err(refusal),
         }
     }
+    // A record that connects to a service that was left out would make the table whole
+    // no more: its list of connections goes on without that name.
+    let mut name_ranges: [Option<(usize, usize)>; MAX_RECORDS] = [None; MAX_RECORDS];
+    if left_out > 0 {
+        let gone = |name: &str| skipped.iter().flatten().any(|s| s.record == name);
+        let mut at = 0;
+        for (record, range) in records.iter().zip(name_ranges.iter_mut()).take(r_at) {
+            if record.connects.iter().any(|c| gone(c)) {
+                let from = at;
+                for c in record.connects.iter().filter(|c| !gone(c)) {
+                    if let Some(slot) = names.get_mut(at) {
+                        *slot = c;
+                        at += 1;
+                    }
+                }
+                *range = Some((from, at));
+            }
+        }
+    }
     // The buffers are done with: from here they are shared and live on.
+    let names: &'static [&'static str] = names;
     let windows: &'static [Window] = windows;
     let bindings: &'static [Binding] = bindings;
-    for (record, (w_from, w_to, b_from, b_to)) in records.iter_mut().zip(ranges) {
+    for (record, ((w_from, w_to, b_from, b_to), n_range)) in
+        records.iter_mut().zip(ranges.into_iter().zip(name_ranges))
+    {
         record.windows = &windows[w_from..w_to];
         record.bindings = &bindings[b_from..b_to];
+        if let Some((from, to)) = n_range {
+            record.connects = &names[from..to];
+        }
     }
     let records: &'static [Record] = records;
     Ok(Resolved {
@@ -246,6 +277,22 @@ fn enable(config: &mut impl Config, at: pci::Address) {
     }
 }
 
+/// The functions `place` turned on for a record, so that a record left out (whatever step
+/// of it failed after the first window) leaves none of them able to master the bus.
+struct Enabled {
+    at: [Option<pci::Address>; MAX_WINDOWS],
+    count: usize,
+}
+
+impl Enabled {
+    fn note(&mut self, at: pci::Address) {
+        if self.at.iter().flatten().all(|a| *a != at) && self.count < MAX_WINDOWS {
+            self.at[self.count] = Some(at);
+            self.count += 1;
+        }
+    }
+}
+
 // The buffers and their fill counts are the caller's; a struct for them would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn place(
@@ -257,6 +304,43 @@ fn place(
     bindings: &mut [Binding; MAX_BINDINGS],
     b_at: &mut usize,
     measured: &mut Measured,
+) -> Result<(), Refusal> {
+    let mut enabled = Enabled {
+        at: [None; MAX_WINDOWS],
+        count: 0,
+    };
+    let placed = place_in(
+        r,
+        platform,
+        config,
+        windows,
+        w_at,
+        bindings,
+        b_at,
+        measured,
+        &mut enabled,
+    );
+    // An error after the first enable (a short BAR, a binding without its function, any
+    // later step): the record is left out and its devices stop mastering the bus.
+    if placed.is_err() && !cfg!(feature = "break-master-left") {
+        for at in enabled.at.iter().flatten() {
+            pci::disable_master(config, *at);
+        }
+    }
+    placed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_in(
+    r: &Record,
+    platform: &Platform,
+    config: &mut impl Config,
+    windows: &mut [Window; MAX_WINDOWS],
+    w_at: &mut usize,
+    bindings: &mut [Binding; MAX_BINDINGS],
+    b_at: &mut usize,
+    measured: &mut Measured,
+    enabled: &mut Enabled,
 ) -> Result<(), Refusal> {
     let refuse = |window, cause| Refusal {
         record: r.name,
@@ -270,6 +354,7 @@ fn place(
                 let f = locate(config, platform, id, index)
                     .ok_or(refuse(w.name, Cause::NoFunction { id, index }))?;
                 enable(config, f.at);
+                enabled.note(f.at);
                 Window {
                     base: platform.ecam.address(f.at).unwrap_or(0),
                     len: PAGE,
@@ -294,13 +379,8 @@ fn place(
                     }
                 };
                 enable(config, f.at);
+                enabled.note(f.at);
                 if size < w.base + w.len && !cfg!(feature = "break-bar-size") {
-                    // The function was enabled above (and perhaps by an earlier
-                    // window of the record): a record that is left out leaves
-                    // its device unable to master the bus.
-                    if !cfg!(feature = "break-master-left") {
-                        pci::disable_master(config, f.at);
-                    }
                     return Err(refuse(
                         w.name,
                         Cause::Short {
@@ -602,6 +682,35 @@ mod tests {
         assert_eq!(config.words[&(ENA, pci::COMMAND)] & pci::BUS_MASTER, 0);
     }
 
+    /// Fails under `break-master-left`.
+    #[test]
+    fn a_record_whose_binding_fails_after_the_windows_leaves_bus_mastering_off() {
+        let mut config = t4g();
+        config.words.insert((ENA, pci::COMMAND), 0);
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x1000,
+            At::Bar {
+                id: 0x1d0f_ec20,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        // The vector belongs to a function the instance does not have.
+        let b: &'static [Binding] =
+            Box::leak(Box::new([Binding::msi_of("irq0", 0x1d0f_ffff, 0, 0)]));
+        let e = resolve_one(&[record("net", w, b)], &mut config)
+            .err()
+            .unwrap();
+        assert!(matches!(e.cause, Cause::NoFunction { .. }));
+        assert_eq!(
+            config.words[&(ENA, pci::COMMAND)] & pci::BUS_MASTER,
+            0,
+            "the window turned the function on and the binding failed after it"
+        );
+    }
+
     #[test]
     fn a_bar_the_firmware_left_empty_or_missing_is_refused() {
         let w: &'static [Window] = Box::leak(Box::new([window(
@@ -643,6 +752,45 @@ mod tests {
             }
         );
         assert!(config.log.is_empty());
+    }
+
+    #[test]
+    fn a_record_that_connects_to_a_service_left_out_goes_on_without_that_name() {
+        let w: &'static [Window] = Box::leak(Box::new([window(
+            "regs",
+            0,
+            0x1000,
+            At::Bar {
+                id: 0x1d0f_ffff,
+                index: 0,
+                bar: 0,
+            },
+        )]));
+        let t = [
+            record("optional", w, &[]),
+            Record {
+                connects: &["a", "optional", "b"],
+                ..record("one", &[], &[])
+            },
+            Record {
+                connects: &["optional"],
+                ..record("only", &[], &[])
+            },
+            Record {
+                connects: &["a"],
+                ..record("clean", &[], &[])
+            },
+        ];
+        let found = resolve_one(&t, &mut t4g()).unwrap();
+        let connects: Vec<_> = found.table.iter().map(|r| (r.name, r.connects)).collect();
+        assert_eq!(
+            connects,
+            [
+                ("one", &["a", "b"][..]),
+                ("only", &[][..]),
+                ("clean", &["a"][..])
+            ]
+        );
     }
 
     #[test]

@@ -737,3 +737,429 @@ fn the_other_read_mode_is_open_again_once_the_device_is_up() {
     assert!(has_line(&model, "trying"), "{:#?}", model.log_lines());
     assert!(!ena.tried_other());
 }
+
+// The data path: one queue pair against the model.
+
+mod data {
+    use super::*;
+    use crate::io::{self, BUFFER_LEN, Buffers, HDR_LEN, Io};
+    use crate::model::{self, MSIX_TABLE};
+
+    const BUF_PA: u64 = 0x4_3200_0000;
+    const MSI: [Option<(u64, u32)>; 2] = [Some((0x0801_0040, 5)), Some((0x0801_0040, 6))];
+
+    struct Rig {
+        model: Model,
+        ena: Ena<Model>,
+        bufs: Buffers,
+        mem: Region,
+    }
+
+    fn rig_with(vectors: [Option<(u64, u32)>; 2], scenario: Scenario) -> Rig {
+        let mem = region(io::IO_END, 0x4_3000_0000);
+        let model = Model::new(mem, 0, scenario);
+        let buffers = region(512 * BUFFER_LEN, BUF_PA);
+        model.add_region(buffers);
+        model.set_vectors(vectors);
+        let bufs = Buffers {
+            va: buffers.va,
+            pa: buffers.pa,
+            count: 512,
+        };
+        // SAFETY: the region is the model's heap block, which lives on.
+        let mut ena = unsafe { Ena::open(model.platform(), mem, 0) }.unwrap();
+        ena.set_data_path(bufs, Some(MSIX_TABLE)).unwrap();
+        Rig {
+            model,
+            ena,
+            bufs,
+            mem,
+        }
+    }
+
+    fn rig() -> Rig {
+        rig_with(MSI, Scenario::default())
+    }
+
+    impl Rig {
+        fn up(&mut self) -> Io<Model> {
+            run(&self.model, &mut self.ena, 2 * S);
+            assert!(self.ena.is_up(), "{:?}", self.model.log_lines());
+            let info = self.ena.io_info().expect("the pair is made");
+            // SAFETY: the model's blocks live on, and the test alone uses the pair.
+            unsafe { Io::new(self.model.platform(), self.mem, self.bufs, info) }
+        }
+
+        fn frame_at(&self, n: u16, len: usize) -> Vec<u8> {
+            let at = self.bufs.va + usize::from(n) * BUFFER_LEN + HDR_LEN;
+            // SAFETY: inside the buffers' block.
+            unsafe { core::slice::from_raw_parts(at as *const u8, len) }.to_vec()
+        }
+
+        fn fill_frame(&self, n: u16, bytes: &[u8]) {
+            let at = self.bufs.va + usize::from(n) * BUFFER_LEN + HDR_LEN;
+            // SAFETY: inside the buffers' block.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        }
+    }
+
+    /// The MSI of the pair's vector (the admin vector fires with the keep-alive).
+    fn pair(r: &Rig) -> Vec<(u64, u32)> {
+        r.model
+            .fired()
+            .into_iter()
+            .filter(|&(_, d)| d == 6)
+            .collect()
+    }
+
+    fn frame(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    #[test]
+    fn the_four_queues_are_made_after_the_features_and_before_the_device_is_up() {
+        let mut r = rig();
+        let _io = r.up();
+        let commands = r.model.commands();
+        let cq = commands.iter().position(|&c| c == adm::CREATE_CQ).unwrap();
+        assert_eq!(
+            &commands[cq..cq + 4],
+            [
+                adm::CREATE_CQ,
+                adm::CREATE_CQ,
+                adm::CREATE_SQ,
+                adm::CREATE_SQ
+            ]
+        );
+        assert!(
+            commands[..cq].contains(&adm::SET_FEATURE),
+            "the features come first"
+        );
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.io_states(), [true]);
+    }
+
+    #[test]
+    fn frames_arrive_in_the_buffers_given_through_two_wraps_of_the_queue() {
+        let mut r = rig();
+        let mut io = r.up();
+        for n in 0..256 {
+            assert!(io.rx_give(n));
+        }
+        assert!(!io.rx_give(300), "the queue holds 256");
+        assert!(io.rx_bell());
+        assert!(!io.rx_bell(), "one ring for the tail");
+        for i in 0..600u32 {
+            let f = frame(i as u8, 60 + (i as usize % 1400));
+            assert!(r.model.inject(&f), "frame {i}");
+            let got = io.rx_pop().unwrap().expect("a completion");
+            assert_eq!(usize::from(got.len), f.len());
+            assert!(got.whole && !got.sum_ok);
+            assert_eq!(r.frame_at(got.n, f.len()), f, "frame {i}");
+            assert!(io.rx_pop().unwrap().is_none());
+            // The buffer goes back to the device at once.
+            assert!(io.rx_give(got.n));
+            io.rx_bell();
+        }
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.rx_dropped(), 0);
+    }
+
+    #[test]
+    fn a_frame_with_no_buffer_in_the_queue_is_dropped_by_the_device() {
+        let mut r = rig();
+        let mut io = r.up();
+        assert!(!r.model.inject(&frame(1, 64)));
+        assert_eq!(r.model.rx_dropped(), 1);
+        assert!(io.rx_pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_sum_the_device_checked_is_reported_and_one_it_did_not_is_not() {
+        let mut r = rig();
+        let mut io = r.up();
+        io.rx_give(7);
+        io.rx_give(8);
+        io.rx_bell();
+        r.model.inject(&frame(1, 64));
+        assert!(!io.rx_pop().unwrap().unwrap().sum_ok);
+        r.model.set_sum_checked(true);
+        r.model.inject(&frame(2, 64));
+        assert!(io.rx_pop().unwrap().unwrap().sum_ok);
+    }
+
+    #[test]
+    fn frames_go_out_whole_and_their_buffers_come_back_through_two_wraps() {
+        let mut r = rig();
+        let mut io = r.up();
+        let mut sent = 0;
+        while sent < 600u32 {
+            let n = 256 + (sent % 200) as u16;
+            let f = frame(sent as u8, 60 + (sent as usize % 1400));
+            r.fill_frame(n, &f);
+            assert!(io.tx_submit(n, f.len() as u16), "frame {sent}");
+            assert!(io.tx_bell());
+            let mut back = Vec::new();
+            assert_eq!(io.tx_reclaim(8, |b| back.push(b)).unwrap(), 1);
+            assert_eq!(back, [n]);
+            assert_eq!(r.model.sent_frames().last().unwrap(), &f);
+            sent += 1;
+        }
+        assert_eq!(r.model.sent_frames().len(), 600);
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_queue_of_sending_is_full_at_256_and_the_completions_free_it() {
+        let mut r = rig();
+        let mut io = r.up();
+        for n in 256..512 {
+            r.fill_frame(n, &frame(n as u8, 64));
+            assert!(io.tx_submit(n, 64));
+        }
+        assert!(!io.tx_submit(300, 64));
+        assert!(!io.tx_submit(1, 0), "an empty frame is no frame");
+        io.tx_bell();
+        assert_eq!(io.tx_reclaim(1000, |_| {}).unwrap(), 256);
+        assert!(io.tx_submit(300, 64));
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_completion_that_names_no_buffer_is_refused() {
+        let mut r = rig();
+        let mut io = r.up();
+        r.fill_frame(260, &frame(1, 64));
+        io.tx_submit(260, 64);
+        io.tx_bell();
+        // A completion of sending whose request number is past the buffers.
+        let at = r.mem.va + io::TX_CQ_AT + io::TX_CDESC_REQ_ID;
+        // SAFETY: the completion queue's first entry in the model's block.
+        unsafe { core::ptr::write_volatile(at as *mut u16, 900) };
+        assert_eq!(
+            io.tx_reclaim(8, |_| {}),
+            Err(crate::io::Bad::Unknown),
+            "the buffer count is 512"
+        );
+    }
+
+    #[test]
+    fn the_table_holds_the_address_and_data_of_each_vector_and_msix_is_on() {
+        let mut r = rig();
+        let _io = r.up();
+        let t = r.model.table();
+        assert_eq!(t[0], [0x0801_0040, 0, 5, 0]);
+        assert_eq!(t[1], [0x0801_0040, 0, 6, 0]);
+        assert!(r.model.msix_on());
+        assert_eq!(r.model.intr_mask(), 0, "the admin vector is unmasked");
+        let log = r.model.log_lines();
+        assert!(log.iter().any(|l| l.contains("ena: io tx db")), "{log:?}");
+    }
+
+    #[test]
+    fn the_table_is_filled_one_register_a_step() {
+        let mut r = rig();
+        let mut at_table = 0;
+        let mut steps_with_two = 0;
+        let end = r.model.now() + 2 * S;
+        while r.model.now() < end {
+            for _ in 0..200 {
+                let before = r.model.table();
+                let reads = r.model.0.borrow().reg_reads;
+                if matches!(r.ena.poll(), Event::Idle) {
+                    break;
+                }
+                let after = r.model.table();
+                let changed: usize = before
+                    .iter()
+                    .flatten()
+                    .zip(after.iter().flatten())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                at_table += changed;
+                let _ = reads;
+                if changed > 1 {
+                    steps_with_two += 1;
+                }
+            }
+            r.model.advance(MS);
+        }
+        assert_eq!(steps_with_two, 0);
+        assert!(at_table >= 4);
+    }
+
+    #[test]
+    fn a_device_without_vectors_runs_on_polling_and_the_table_stays_empty() {
+        let mut r = rig_with([None, None], Scenario::default());
+        let mut io = r.up();
+        assert_eq!(r.model.table(), [[0; 4]; 2]);
+        assert!(!r.model.msix_on());
+        io.rx_give(0);
+        io.rx_bell();
+        r.model.inject(&frame(1, 64));
+        assert!(r.model.fired().is_empty());
+        assert!(io.rx_pop().unwrap().is_some());
+    }
+
+    #[test]
+    fn the_vector_of_the_pair_fires_once_until_it_is_unmasked() {
+        let mut r = rig();
+        let mut io = r.up();
+        for n in 0..4 {
+            io.rx_give(n);
+        }
+        io.rx_bell();
+        // The device starts with the vector masked until the driver unmasks it.
+        r.model.inject(&frame(1, 64));
+        assert!(pair(&r).is_empty(), "masked until unmasked");
+        io.rx_pop().unwrap();
+        io.unmask_rx();
+        r.model.inject(&frame(2, 64));
+        assert_eq!(pair(&r), [(0x0801_0040, 6)]);
+        r.model.inject(&frame(3, 64));
+        assert_eq!(pair(&r).len(), 1, "masked after the interrupt");
+        io.rx_pop().unwrap();
+        io.rx_pop().unwrap();
+        io.unmask_rx();
+        r.model.inject(&frame(4, 64));
+        assert_eq!(pair(&r).len(), 2);
+    }
+
+    #[test]
+    fn a_device_with_no_head_doorbell_is_never_written_at_offset_0() {
+        let mut r = rig();
+        r.model.set_zero_head_db(true);
+        let mut io = r.up();
+        for n in 0..256 {
+            io.rx_give(n);
+        }
+        io.rx_bell();
+        for i in 0..300u32 {
+            let f = frame(i as u8, 64);
+            assert!(r.model.inject(&f));
+            let got = io.rx_pop().unwrap().unwrap();
+            io.rx_give(got.n);
+            io.rx_bell();
+            r.fill_frame(300, &f);
+            assert!(io.tx_submit(300, 64));
+            io.tx_bell();
+            assert_eq!(io.tx_reclaim(8, |_| {}).unwrap(), 1);
+        }
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn msix_is_enabled_with_the_function_mask_and_unmasked_last() {
+        let mut r = rig();
+        let _io = r.up();
+        // Enable and Function Mask together first, the mask cleared last; no entry was
+        // rewritten while it was unmasked in an enabled function (a violation otherwise).
+        assert_eq!(r.model.msix_ctl(), [(true, true), (true, false)]);
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.table()[1], [0x0801_0040, 0, 6, 0]);
+    }
+
+    #[test]
+    fn a_toggle_masks_rewrites_and_unmasks_again_without_a_violation() {
+        let mut r = rig();
+        let mut io = r.up();
+        r.ena.request_msix_toggle();
+        run(&r.model, &mut r.ena, S);
+        assert!(r.ena.is_up());
+        assert!(has_line(&r.model, "ena: msix toggle done"));
+        assert_eq!(
+            r.model.msix_ctl(),
+            [(true, true), (true, false), (true, true), (true, false)]
+        );
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.table()[0], [0x0801_0040, 0, 5, 0]);
+        // The pair still works, and the vector fires once it is unmasked.
+        io.rx_give(1);
+        io.rx_bell();
+        io.unmask_rx();
+        r.model.inject(&frame(1, 64));
+        assert_eq!(pair(&r).len(), 1);
+    }
+
+    #[test]
+    fn the_keep_alive_raises_the_admin_vector() {
+        let mut r = rig();
+        let _io = r.up();
+        assert!(
+            r.model.fired().iter().any(|&(_, data)| data == 5),
+            "{:?}",
+            r.model.fired()
+        );
+    }
+
+    #[test]
+    fn a_reset_in_place_tells_the_owner_and_makes_the_pair_again() {
+        let mut r = rig();
+        let _io = r.up();
+        r.ena.request_reset(regs::RESET_DRIVER_INVALID_STATE);
+        run(&r.model, &mut r.ena, 3 * S);
+        assert!(r.ena.is_up());
+        assert_eq!(r.model.io_states(), [true, false, true]);
+        let commands = r.model.commands();
+        assert_eq!(
+            commands.iter().filter(|&&c| c == adm::CREATE_SQ).count(),
+            4,
+            "two pairs of queues over the run"
+        );
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn buffers_above_the_dma_width_are_refused() {
+        let mem = region(io::IO_END, 0x3000_0000);
+        let model = Model::new(
+            mem,
+            0,
+            Scenario {
+                dma_width: 32,
+                ..Scenario::default()
+            },
+        );
+        let bufs = region(512 * BUFFER_LEN, 0x1_0000_0000);
+        model.add_region(bufs);
+        // SAFETY: the region is the model's heap block.
+        let mut ena = unsafe { Ena::open(model.platform(), mem, 0) }.unwrap();
+        ena.set_data_path(
+            Buffers {
+                va: bufs.va,
+                pa: bufs.pa,
+                count: 512,
+            },
+            None,
+        )
+        .unwrap();
+        run(&model, &mut ena, 2 * S);
+        assert!(matches!(ena.failure(), Some(Failure::DmaWidth { .. })));
+    }
+
+    #[test]
+    fn the_numbers_of_the_descriptors_are_the_ones_of_the_header() {
+        // ena_eth_io_defs.h: 16-byte descriptors of sending and receiving, an
+        // 8-byte completion of sending and a 16-byte one of receiving.
+        assert_eq!(
+            (io::TX_DESC, io::RX_DESC, io::TX_CDESC, io::RX_CDESC),
+            (16, 16, 8, 16)
+        );
+        assert_eq!(io::TX_LEN_MASK, 0xFFFF);
+        assert_eq!(io::TX_REQ_ID_HI_MASK, 0x3F_0000);
+        assert_eq!(io::TX_REQ_ID_LO_MASK, 0xFFC0_0000);
+        assert_eq!(
+            (io::TX_FIRST, io::TX_LAST, io::TX_COMP_REQ),
+            (1 << 26, 1 << 27, 1 << 28)
+        );
+        assert_eq!(io::TX_PHASE_SHIFT, 24);
+        assert_eq!(
+            (io::RX_CTRL_PHASE, io::RX_CTRL_FIRST, io::RX_CTRL_LAST),
+            (1, 4, 8)
+        );
+        assert_eq!(io::RX_STATUS_PHASE, 1 << 24);
+        assert_eq!(io::RX_STATUS_L4_CSUM_CHECKED, 1 << 16);
+        assert_eq!(io::INTR_UNMASK, 1 << 30);
+        assert_eq!(model::MSIX_TABLE, 0x2000);
+    }
+}

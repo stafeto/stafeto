@@ -19,4 +19,5 @@ kcore = { path = "../../kcore", features = ["builder"] }
 break-merge = []
 break-spcr = []
 break-iort-count = []
+break-smmu-ignore = []
 break-dtb-gib = []

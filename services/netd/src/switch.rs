@@ -113,7 +113,7 @@ pub struct Lane {
     /// The stack's run of steps, and what the switch holds for its end.
     pub run: Run,
     /// The stack found no buffer of sending free.
-    starved: AtomicBool,
+    pub(crate) starved: AtomicBool,
     /// The channel of the instance, raw, for NOTIFY.
     stack_channel: AtomicU64,
     /// The switch put an answer in `COMMANDS.to_stack` and the stack has not looked.
@@ -448,7 +448,7 @@ impl Lane {
 
     /// The switch wakes the stack with `bits` (RX or TX): a run of steps of
     /// the stack follows, and the switch holds its doorbell until it ends.
-    fn wake_stack(&self, bits: u64) {
+    pub(crate) fn wake_stack(&self, bits: u64) {
         self.run.begin();
         profile::count(Counter::WakeStack);
         trace::point(P_N_WAKE_STACK, bits as u32);
@@ -462,6 +462,12 @@ impl Lane {
 }
 
 impl Inner {
+    /// The channel of the switch thread, raw, for the notifications of the stack (`Lane::poke`):
+    /// the ENA kind's switch thread (`ena_switch.rs`) sets it as `start` does here.
+    pub(crate) fn set_switch_channel(&self, raw: u64) {
+        self.switch_channel.store(raw, Ordering::Release);
+    }
+
     const fn new() -> Inner {
         Inner {
             lanes: [const { Lane::new() }; MAX_INSTANCES],
