@@ -5821,21 +5821,33 @@ fn check_lock_steps(
             ));
         }
     }
-    // Every step of the service stays under 0.9 of term B (the bound of the netd probes); the
-    // three longest kinds and a warning for each kind above the margin go to the console.
+    // Every step of the service stays under 0.9 of term B (the bound of the netd probes) and
+    // the lock request under the margin; the three longest kinds and a warning for each kind
+    // above the margin go to the console.
     net_probe::say_margin(name, steps);
     ram_step_verdict(name, steps)
 }
 
-/// Fails when a step of the RAM file service passes 0.9 of term B.
+/// The longest step the guard allows for a kind of the RAM file service: 0.9 of term B, and for
+/// the lock request (kind 50) the margin 16 500 as well, which the work per lock of an inode
+/// with 64 locks stays under.
+fn ram_step_limit(kind: usize) -> u64 {
+    if kind == 50 {
+        net_probe::STEP_MARGIN
+    } else {
+        net_probe::STEP_MAX
+    }
+}
+
+/// Fails when a step of the RAM file service passes its limit (`ram_step_limit`).
 fn ram_step_verdict(name: &str, steps: &[(usize, u64, u64)]) -> Result<(), String> {
     match steps
         .iter()
-        .find(|(_, ticks, _)| *ticks > net_probe::STEP_MAX)
+        .find(|(kind, ticks, _)| *ticks > ram_step_limit(*kind))
     {
         Some((kind, ticks, detail)) => Err(format!(
-            "{name}: the RAM step of kind {kind} takes {ticks} ticks (detail {detail}), past 0.9 of term B ({}): {steps:?}",
-            net_probe::STEP_MAX
+            "{name}: the RAM step of kind {kind} takes {ticks} ticks (detail {detail}), past its limit ({}): {steps:?}",
+            ram_step_limit(*kind)
         )),
         None => Ok(()),
     }
@@ -13474,12 +13486,19 @@ mod tests {
         let bound = super::net_probe::STEP_MAX;
         let margin = super::net_probe::STEP_MARGIN;
         assert_eq!((margin, bound), (16_500, 18_369));
-        let at_bound = [(65, bound, 3), (50, 9_000, 0)];
+        let at_bound = [(65, bound, 3), (50, margin, 0)];
         assert!(super::ram_step_verdict("pages", &at_bound).is_ok());
         let past = [(65, bound + 1, 3), (50, 9_000, 0)];
         let error = super::ram_step_verdict("pages", &past).unwrap_err();
         assert!(
             error.contains("kind 65") && error.contains("18369"),
+            "{error}"
+        );
+        // The lock request is held to the margin: above it the guard fails.
+        let request = [(65, 100, 0), (50, margin + 1, 0)];
+        let error = super::ram_step_verdict("pages", &request).unwrap_err();
+        assert!(
+            error.contains("kind 50") && error.contains("16500"),
             "{error}"
         );
         let warned =
@@ -13493,7 +13512,7 @@ mod tests {
 
     #[test]
     fn lock_budget_requires_actual_measurements() {
-        let measured = [(50, 18_336, 0), (65, 15_419, 0)];
+        let measured = [(50, 16_500, 0), (65, 18_336, 0)];
         assert!(super::check_lock_steps("pages", &measured, &[50, 65]).is_ok());
         assert!(super::check_lock_steps("pages", &[], &[50, 65]).is_err());
         assert!(super::check_lock_steps("pages", &measured[..1], &[50, 65]).is_err());
