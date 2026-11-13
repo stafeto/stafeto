@@ -36,6 +36,8 @@ pub struct Send {
     pub nbuf: usize,
     /// The frame waited for its buffers (said once, so the counter counts frames).
     pub waited: bool,
+    /// The consumer it came from.
+    pub consumer: usize,
 }
 
 impl Send {
@@ -55,6 +57,7 @@ impl Send {
             bufs: [0; CHAIN_MAX],
             nbuf: 0,
             waited: false,
+            consumer: 0,
         }
     }
 

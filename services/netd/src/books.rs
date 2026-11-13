@@ -479,6 +479,26 @@ pub fn has_work(
             .any(|(pending, inflight)| pending && !blocked(inflight, cap, free))
 }
 
+/// What a frame of the segmentation offload that the switch holds says to `has_work`, apart
+/// from the other consumers' entries (their `blocked` rule is about buffers of one frame and does
+/// not fit a frame that needs a chain): `copying` (its chain is taken, so a chunk is to copy),
+/// `can_take` (the chain can be taken now), `completed` (the device posted used buffers that the
+/// next step gives back, which may be what the frame waits for), `period_left`. A waiting frame
+/// counts as work whenever `completed`, whatever `free` is: a step that gave the buffers to the
+/// stack leaves `free` at 0 and the used entries that remain raise no interrupt of their own.
+pub const fn tso_work(copying: bool, can_take: bool, completed: bool, period_left: bool) -> bool {
+    period_left && (copying || can_take || completed)
+}
+
+/// Whether the entry of a consumer that holds no frame of the offload may take a buffer while a
+/// frame of the offload of another waits for its chain (`waiting`): none may, so that the buffers
+/// the device returns gather up to the chain. The device returns what it holds in finite time, and
+/// the pool (`TX_BUFFERS - STACK_SHARE`, 64) is above the nine buffers of the longest chain, so a
+/// waiting frame gets its chain after the buffers in flight return, however many consumers send.
+pub const fn may_send_small(waiting: bool) -> bool {
+    !waiting
+}
+
 /// Whether a step that has taken `taken` frames may take another: the first `base` go
 /// whatever the time, the rest only while the step is short.
 pub const fn may_take(taken: usize, base: usize, over_soft: bool) -> bool {
@@ -772,5 +792,54 @@ mod tests {
         assert!(may_take(0, 3, true) && may_take(2, 3, true));
         assert!(!may_take(3, 3, true));
         assert!(may_take(3, 3, false) && may_take(7, 3, false));
+    }
+
+    #[test]
+    fn a_waiting_frame_of_the_offload_is_work_while_used_buffers_wait_even_with_none_free() {
+        // The interleaving: the device posted 30 buffers, the step took 16 and the stack got them,
+        // `free` is 0, 14 used entries are left. The old rule (the frame as an entry of a consumer
+        // with 0 in flight) said "no work" and the switch slept with them posted.
+        assert!(!has_work([(true, 0)], 21, 0, false));
+        assert!(tso_work(false, false, true, true));
+        // Nothing posted, no chain to take: the frame waits for an interrupt and the switch sleeps.
+        assert!(!tso_work(false, false, false, true));
+        assert!(tso_work(false, true, false, true), "the chain can be taken");
+        assert!(tso_work(true, false, false, true), "a chunk is to copy");
+        // The share of the period spent: the timer of the next period looks again.
+        assert!(!tso_work(true, true, true, false));
+    }
+
+    #[test]
+    fn small_entries_wait_while_a_frame_of_the_offload_gathers_its_chain() {
+        // 64 buffers in the pool, seven consumers keep one-buffer frames in flight, the device
+        // returns eight in a round; the frame of nine needs nine free.
+        let rounds = |reserve: bool| {
+            let (mut free, mut flight) = (0usize, 56usize);
+            for round in 1..=100 {
+                let returned = flight.min(8);
+                flight -= returned;
+                free += returned;
+                if free >= 9 {
+                    return Some(round);
+                }
+                for _ in 0..7 {
+                    if may_send_small(reserve) {
+                        // They send while buffers are free, as seven consumers keep doing.
+                        while free > 0 && flight < 56 {
+                            free -= 1;
+                            flight += 1;
+                        }
+                    }
+                }
+            }
+            None
+        };
+        assert_eq!(
+            rounds(true),
+            Some(2),
+            "with the reserve it has its chain in two rounds"
+        );
+        assert_eq!(rounds(false), None, "without it the frame starves");
+        assert!(!may_send_small(true) && may_send_small(false));
     }
 }

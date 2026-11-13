@@ -775,6 +775,11 @@ impl Switch {
     /// Lends each instance free buffers of sending up to its share. The set of the instances
     /// (bit k for instance k) that were out of them and have some now.
     fn lend(&mut self) -> u8 {
+        // The buffers the device returns gather for a frame of the offload that waits for its
+        // chain; the stack gets them after.
+        if self.tso.iter().flatten().any(|s| s.nbuf == 0) {
+            return 0;
+        }
         let share = self.share();
         let mut lent = 0;
         for (k, lane) in INNER.lanes[..INSTANCES].iter().enumerate() {
@@ -1113,29 +1118,31 @@ impl Switch {
         // (the 1 ms timer and the returned buffers look at it again); counting it would
         // make the switch run again at once, above the stack, and spin.
         let (cap, free) = (self.consumer_cap(), self.tx.book.free());
-        let work = netd::books::has_work(
-            t.consumers.iter().enumerate().filter_map(|(c, x)| {
-                x.as_ref().map(|x| {
-                    // A frame of the offload with its chain taken is copied whatever the
-                    // share of the queue; one that waits for its chain is work only when the
-                    // chain can be taken (else the switch would spin on it).
-                    if let Some(s) = self.tso[c].as_ref() {
-                        let can = s.nbuf > 0
-                            || s.may_take(self.tx.book.free(), usize::from(self.inflight[c]), cap)
-                            || self.tx.queue.can_pop();
-                        (can && self.period.left(), 0)
-                    } else {
+        // A frame of the offload the switch holds is work by its own rule (`tso_work`): a chunk
+        // to copy, a chain that can be taken, or used buffers posted that the next step gives
+        // back; the entries of such a consumer wait behind it.
+        let tso_work = self.tso.iter().flatten().any(|s| {
+            netd::books::tso_work(
+                s.nbuf > 0,
+                s.may_take(free, usize::from(self.inflight[s.consumer]), cap),
+                self.tx.queue.can_pop(),
+                self.period.left(),
+            )
+        });
+        let work = tso_work
+            || netd::books::has_work(
+                t.consumers.iter().enumerate().filter_map(|(c, x)| {
+                    x.as_ref().filter(|_| self.tso[c].is_none()).map(|x| {
                         (
                             x.ring.tx_pending() && self.period.left(),
                             usize::from(self.inflight[c]),
                         )
-                    }
-                })
-            }),
-            cap,
-            free,
-            !COMMANDS.to_switch.is_empty(),
-        );
+                    })
+                }),
+                cap,
+                free,
+                !COMMANDS.to_switch.is_empty(),
+            );
         if work {
             self.clear_idle();
         }
@@ -1262,6 +1269,14 @@ impl Switch {
                 let c = (usize::from(self.next_c) + k) % MAX_CONSUMERS;
                 // A frame of the segmentation offload the switch holds goes on a chunk at a
                 // time, in the share of its consumer's turn.
+                // While a frame of the offload waits for its chain the entries of the other
+                // consumers wait too, so the buffers the device returns gather (`may_send_small`).
+                if self.tso[c].is_none()
+                    && !netd::books::may_send_small(self.tso.iter().flatten().any(|s| s.nbuf == 0))
+                {
+                    blocked = true;
+                    continue;
+                }
                 if self.tso[c].is_some() {
                     if !self.period.left() {
                         blocked = true;
@@ -1397,7 +1412,9 @@ impl Switch {
         }
         if let Some(x) = t.consumers[usize::from(c)].as_ref() {
             self.tso_gen[usize::from(c)] = x.generation;
-            self.tso[usize::from(c)] = Some(TsoSend::new(&self.scratch, len, mss, h));
+            let mut held = TsoSend::new(&self.scratch, len, mss, h);
+            held.consumer = usize::from(c);
+            self.tso[usize::from(c)] = Some(held);
         }
     }
 
@@ -1709,11 +1726,16 @@ impl Switch {
         // A merged frame waiting for the stack's ring or a buffer of sending is looked at again
         // by the same timer, so that it does not wait for the next event of another kind.
         let cutting = self.big.is_some() && INNER.cut_wait.load(Ordering::Relaxed);
-        if (sweeping || self.blocked || cutting) && (!self.armed || waits_for_period) {
+        // A frame of the offload waiting for its chain moves a timer armed for later (the
+        // sweep's) to 1 ms: used buffers may be posted without a new interrupt.
+        let tso_waits = self.tso.iter().flatten().any(|s| s.nbuf == 0);
+        if (sweeping || self.blocked || cutting || tso_waits)
+            && (!self.armed || waits_for_period || tso_waits)
+        {
             let after = if self.blocked && self.budget_hit {
                 // The entries wait for the next period.
                 self.period.remaining(now_ns()).max(20_000)
-            } else if self.blocked || cutting {
+            } else if self.blocked || cutting || tso_waits {
                 1_000_000
             } else if settling {
                 2_000_000
