@@ -5,7 +5,8 @@
 //! Sh4): the consumers' rings (`ring`), the tables (`tables`), where a
 //! frame goes and what a consumer may send (`route`), and the commands
 //! between the stack thread and the switch thread (`commands`), and which
-//! frames carry a sum a stack need not check (`sums`). Nothing
+//! frames carry a sum a stack need not check (`sums`), and the frames of the segmentation
+//! offload the switch holds across steps (`tso`). Nothing
 //! here allocates or touches a device; the host tests run all of it.
 
 pub mod commands;
@@ -13,3 +14,4 @@ pub mod ring;
 pub mod route;
 pub mod sums;
 pub mod tables;
+pub mod tso;

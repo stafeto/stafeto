@@ -77,6 +77,8 @@ struct ff_stafeto_device_stats {
     /* TCP segments sent without their sum (TX_SUM), and frames received whose sum the
      * switch said was good (DONE_SUM_OK). */
     uint64_t tx_sum, rx_sum_ok;
+    /* Frames of TCP handed to the device whole, to be cut into segments (TX_TSO). */
+    uint64_t tx_tso;
 };
 void ff_stafeto_device_stats(struct ff_stafeto_device_stats *out);
 

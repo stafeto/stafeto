@@ -175,6 +175,44 @@ impl Port {
         Some(unsafe { self.base.add(self.layout.tx_cell(self.tx_next)) })
     }
 
+    /// The cells for a frame of the segmentation offload of `len` bytes (`TX_SUM | TX_TSO`):
+    /// `cells(len)` in a row, behind a `TX_PAD` entry that skips the end of the array when the run
+    /// would cross it. The first cell, or None when TX has no room for the pad and the run (after
+    /// one look at `tx_tail`) or `len` is past `TSO_FRAME_MAX`.
+    pub fn tx_span(&mut self, len: usize) -> Option<*mut u8> {
+        if len == 0 || len > sw::TSO_FRAME_MAX {
+            return None;
+        }
+        let k = sw::cells(len);
+        let pad = if self.layout.tx_run_fits(self.tx_next, k) {
+            0
+        } else {
+            self.layout.tx_to_end(self.tx_next)
+        };
+        let cap = self.layout.tx_slots;
+        let used = |p: &Port| p.tx_next.wrapping_sub(p.tx_tail);
+        if cap.saturating_sub(used(self)) < pad + k && self.tx_room() < pad + k {
+            return None;
+        }
+        if pad > 0 {
+            self.tx_entry(sw::TX_PAD, 0, pad);
+            self.tx_next = self.tx_next.wrapping_add(pad);
+        }
+        // SAFETY: the run lies inside the object (`tx_run_fits`).
+        Some(unsafe { self.base.add(self.layout.tx_cell(self.tx_next)) })
+    }
+
+    /// The frame of `len` bytes in the cells `tx_span` gave becomes entries: the first says
+    /// `TX_SUM | TX_TSO` with the MSS in its spare, the `cells(len) - 1` after it are zero.
+    pub fn tx_submit_tso(&mut self, len: usize, mss: u16) {
+        self.tx_entry(sw::TX_SUM | sw::TX_TSO, len as u16, u32::from(mss));
+        self.tx_next = self.tx_next.wrapping_add(1);
+        for _ in 1..sw::cells(len) {
+            self.tx_entry(0, 0, 0);
+            self.tx_next = self.tx_next.wrapping_add(1);
+        }
+    }
+
     /// The frame of `len` bytes in the cell `tx_cell` gave becomes an entry
     /// (flags and spare 0). It is published by `tx_flush`.
     pub fn tx_submit(&mut self, len: u32) {
@@ -193,18 +231,18 @@ impl Port {
     }
 
     fn tx_submit_flags(&mut self, len: u32, flags: u16) {
-        let raw = TxEntry {
-            len: len as u16,
-            flags,
-            spare: 0,
-        }
-        .to_bytes();
+        self.tx_entry(flags, len as u16, 0);
+        self.tx_next = self.tx_next.wrapping_add(1);
+    }
+
+    /// Writes the entry at `tx_next`.
+    fn tx_entry(&mut self, flags: u16, len: u16, spare: u32) {
+        let raw = TxEntry { len, flags, spare }.to_bytes();
         let at = self.layout.tx_entry(self.tx_next);
         for (i, chunk) in raw.chunks(4).enumerate() {
             let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             self.word(at + 4 * i).store(w, Ordering::Relaxed);
         }
-        self.tx_next = self.tx_next.wrapping_add(1);
     }
 
     /// Entries written and not published.
@@ -374,6 +412,25 @@ mod c {
     pub extern "C" fn vnet_port_tx_submit_sum(len: u32) {
         if let Some(p) = port() {
             p.tx_submit_sum(len);
+        }
+    }
+
+    /// The first of `cells(len)` cells in a row for a frame of the segmentation offload of
+    /// `len` bytes (a `TX_PAD` entry is written first when the run would cross the end of the
+    /// array), NULL when TX has no room for it.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_tx_span(len: u32) -> *mut u8 {
+        port()
+            .and_then(|p| p.tx_span(len as usize))
+            .unwrap_or(core::ptr::null_mut())
+    }
+
+    /// The entries for the frame in the cells `vnet_port_tx_span` gave: `TX_SUM | TX_TSO`, the
+    /// MSS in the first.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn vnet_port_tx_submit_tso(len: u32, mss: u32) {
+        if let Some(p) = port() {
+            p.tx_submit_tso(len as usize, mss as u16);
         }
     }
 
@@ -603,6 +660,78 @@ mod tests {
         let mut out = empty();
         assert_eq!(p.rx_burst(&mut out), Ok(1));
         assert_eq!(out[0].flags, u32::from(sw::DONE_SUM_OK | sw::DONE_LOOP));
+    }
+
+    #[test]
+    fn a_frame_of_the_offload_takes_cells_in_a_row_with_a_pad_before_the_end() {
+        let (mut m, l, mut p) = rig();
+        let word = |m: &mut Mem, at: usize| m.word(at).load(Ordering::Relaxed);
+        let first = p.tx_span(10_300).unwrap();
+        assert_eq!(first as usize - m.base() as usize, l.tx_cell(0));
+        p.tx_submit_tso(10_300, 1448);
+        assert_eq!(p.tx_pending(), 6, "a frame of six cells is six entries");
+        assert_eq!(
+            word(&mut m, l.tx_entry(0)),
+            10_300 | u32::from(sw::TX_SUM | sw::TX_TSO) << 16
+        );
+        assert_eq!(word(&mut m, l.tx_entry(0) + 4), 1448);
+        for i in 1..6 {
+            assert_eq!(
+                (word(&mut m, l.tx_entry(i)), word(&mut m, l.tx_entry(i) + 4)),
+                (0, 0)
+            );
+        }
+        // The consumer sends small frames up to three cells from the end, then a frame of
+        // five cells: it does not fit, a pad skips the three and the frame starts at cell 0.
+        let (mut m, l, mut p) = rig();
+        for _ in 0..253 {
+            assert!(p.tx_cell().is_some());
+            p.tx_submit(60);
+        }
+        m.word(TX_TAIL).store(253, Ordering::Release);
+        let span = p.tx_span(9_000).unwrap();
+        assert_eq!(
+            span as usize - m.base() as usize,
+            l.tx_cell(256),
+            "the frame starts at the first cell of the array"
+        );
+        assert_eq!(
+            (
+                word(&mut m, l.tx_entry(253)),
+                word(&mut m, l.tx_entry(253) + 4)
+            ),
+            (u32::from(sw::TX_PAD) << 16, 3),
+            "the pad names the entries it skips"
+        );
+        p.tx_submit_tso(9_000, 1448);
+        assert_eq!(p.tx_pending(), 253 + 3 + 5);
+        // A frame past the offload's bound and an empty one have no cells.
+        assert!(p.tx_span(sw::TSO_FRAME_MAX + 1).is_none());
+        assert!(p.tx_span(0).is_none());
+    }
+
+    #[test]
+    fn a_frame_of_the_offload_waits_for_the_room_of_its_cells_and_its_pad() {
+        let (mut m, _l, mut p) = rig();
+        for _ in 0..250 {
+            assert!(p.tx_cell().is_some());
+            p.tx_submit(60);
+        }
+        // Six entries are free (250 to 255): a pad of six and a frame of nine cells (16 500 bytes) need 15.
+        assert!(p.tx_span(16_500).is_none());
+        m.word(TX_TAIL).store(8, Ordering::Release);
+        assert!(p.tx_span(16_500).is_none(), "14 free, 15 needed");
+        m.word(TX_TAIL).store(9, Ordering::Release);
+        assert!(p.tx_span(16_500).is_some());
+        // A frame of six cells or fewer fits in the 6 entries to the end: no pad.
+        let (mut m, _l, mut p) = rig();
+        for _ in 0..250 {
+            assert!(p.tx_cell().is_some());
+            p.tx_submit(60);
+        }
+        m.word(TX_TAIL).store(0, Ordering::Release);
+        assert!(p.tx_span(12_288).is_some());
+        assert_eq!(p.tx_pending(), 250, "no pad entry");
     }
 
     #[test]

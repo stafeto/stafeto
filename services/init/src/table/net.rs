@@ -301,8 +301,9 @@ pub const NETD_VZ: Record = Record {
 };
 
 /// `NETD_VZ` with the tails of the chains of receiving: the image that asks the service for the
-/// segmentation offload (`tso 1` in its `netd.conf`) has this record. The other images of VZ do
-/// not carry the 4 MiB, and a service that finds no `tails` keeps the pair of sums whatever
+/// segmentation offload (`tso 1` in its `netd.conf`) has this record, and so has the VZ record of
+/// the switch (`NETD_VZ_SWITCH`), whose consumers get the offload on sending. The other images of
+/// VZ do not carry the 4 MiB, and a service that finds no `tails` keeps the pair of sums whatever
 /// `netd.conf` says.
 pub const NETD_VZ_TSO: Record = Record {
     dma: DMA_TAILS,
@@ -482,8 +483,10 @@ const fn switch_quota(base: Record, pages: u64) -> Record {
 /// switch); the ring of a consumer is the consumer's own memory.
 pub const NETD_SWITCH: Record = switch_quota(NETD, SWITCH_QUOTA_PAGES);
 pub const NETD_SWITCH_SCALE: Record = switch_quota(NETD, SWITCH_SCALE_QUOTA_PAGES);
-/// The same on VZ.
-pub const NETD_VZ_SWITCH: Record = switch_quota(NETD_VZ, SWITCH_QUOTA_PAGES);
+/// The same on VZ, with the tails of the chains of receiving (`NETD_VZ_TSO`): the service maps
+/// them only when `netd.conf` asks for the segmentation offload (`tso 1`) and the device takes
+/// it, so the images of `nginx-fast` on the switch can ask for it.
+pub const NETD_VZ_SWITCH: Record = switch_quota(NETD_VZ_TSO, SWITCH_QUOTA_PAGES);
 pub const NETD_VZ_SWITCH_SCALE: Record = switch_quota(NETD_VZ, SWITCH_SCALE_QUOTA_PAGES);
 
 /// The roles of the probe (tests/net-probe): `c` the interface's address and

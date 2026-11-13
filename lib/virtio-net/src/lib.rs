@@ -9,7 +9,8 @@
 //! (`transport`, with the configuration space of a function from a copy,
 //! `Snapshot`), the start of a device (`open`), the accesses to its
 //! registers and the barriers of its rings (`mmio`, `barrier`), the copy
-//! of a frame (`copy`) and the cut of a merged frame (`cut`).
+//! of a frame (`copy`), the cut of a merged frame (`cut`) and the frame of the
+//! segmentation offload on sending (`tso`).
 //!
 //! It makes no call of the kernel and holds no stack: whoever maps the
 //! objects and the window, and owns the line, uses it. The network service
@@ -33,6 +34,7 @@ pub mod open;
 pub mod port;
 pub mod rings;
 pub mod transport;
+pub mod tso;
 
 pub use host::{Host, Region};
 pub use open::{OpenFailure, Opened, open, open_offload};

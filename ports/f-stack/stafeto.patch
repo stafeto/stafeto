@@ -963,7 +963,23 @@
  kern_fail:
 --- a/lib/ff_veth.c
 +++ b/lib/ff_veth.c
-@@ -1025,10 +1025,17 @@
+@@ -994,7 +994,15 @@
+     if (cfg->hw_features.tx_tso) {
+         if_setcapabilitiesbit(ifp, IFCAP_TSO, 0);
+         if_sethwassistbits(ifp, CSUM_TSO, 0);
++#ifdef FF_STAFETO
++        /*
++         * The switch of the network service takes a frame of 16 KiB of data at most (its
++         * cells), and a frame is gathered from at most 35 segments of the mbuf chain.
++         */
++        if_sethwtsomax(ifp, 16384);
++#else
+         if_sethwtsomax(ifp, IP_MAXPACKET);
++#endif
+         if_sethwtsomaxsegcount(ifp, 35);
+         if_sethwtsomaxsegsize(ifp, 2048);
+     }
+@@ -1025,10 +1033,17 @@
              printf("%s: ff_veth_setaddr failed\n", sc->host_ifname);
          }
  
@@ -981,6 +997,24 @@
  
          if (sc->nb_vip) {
              ret = ff_veth_setvaddr(sc, cfg, NULL);
+--- a/freebsd/netinet/tcp_subr.c
++++ b/freebsd/netinet/tcp_subr.c
+@@ -3654,6 +3654,15 @@
+ 
+ 		/* Report additional interface capabilities. */
+ 		if (cap != NULL) {
++#ifdef FF_STAFETO
++			/*
++			 * A frame for one of the stack's own addresses is turned round by the
++			 * switch of the network service, which does not cut frames: no TSO to
++			 * such a peer.
++			 */
++			if (in_localip(inc->inc_faddr))
++				return (maxmtu);
++#endif
+ 			if (ifp->if_capenable & IFCAP_TSO4 &&
+ 			    ifp->if_hwassist & CSUM_TSO) {
+ 				cap->ifcap |= CSUM_TSO;
 --- a/lib/include/amd64/include/pcpu.h
 +++ b/lib/include/amd64/include/pcpu.h
 @@ -55,7 +55,12 @@

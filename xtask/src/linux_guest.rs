@@ -184,6 +184,13 @@ pub fn bench_switch_programs() -> &'static [ImageProgram] {
             if program.0 == "init" {
                 program.3 = &["table-bench-fast-switch-vz"];
             }
+            // `STAFETO_SWITCH_STEPS=1` in the environment of the build: the service counts its
+            // steps (the longest of each kind goes to the console).
+            if program.0 == "netd"
+                && std::env::var_os("STAFETO_SWITCH_STEPS").is_some_and(|v| v == "1")
+            {
+                program.3 = &["steps"];
+            }
         }
         programs
     })
