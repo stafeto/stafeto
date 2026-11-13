@@ -35,6 +35,17 @@
 //! one handle, a new session (SEND, TRANSFER) with a label of the
 //! service's own, for a child of the client (posix_spawn, fork, exec).
 //!
+//! VERIFY_SESSION (9), through the service's root session (`ROOT`), which the
+//! service registers with the process service (Register with the ENTROPY
+//! mark): the header alone and one channel with SEND and TRANSFER, which a
+//! loader sends for the entropy session of a set-ID program. The reply is
+//! status 0 and the channel itself when it is a live session of the service
+//! (a copy of its channel with the label of an init client's session or of a
+//! clone), and a new clone otherwise, so that a channel that is not the
+//! service's never receives a request. BAD_SIZE for a body, no channel or
+//! more than one, or a channel without the two rights; ACCESS_DENIED from
+//! any session other than the root, and for any other method through the root.
+//!
 //! | Request | Bytes after the header |
 //! |---|---|
 //! | FILL_START | 0..4 `n`, 4..8 zero |
@@ -47,7 +58,15 @@ use abi::Error;
 use proto_wire::{Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 1;
+///
+/// Version 2: VERIFY_SESSION (the root's one request).
+pub const VERSION: u16 = 2;
+
+/// The label of the service's root session, which it registers with the
+/// process service and the loaders send VERIFY_SESSION: no other request goes
+/// through it. Bit 63 marks the labels the service gives itself, and bit 60
+/// lies above any place or generation of its clones.
+pub const ROOT: u64 = 1 << 63 | 1 << 60;
 
 /// The fewest and the most bytes one fill asks for.
 pub const FILL_MIN: u32 = 32;
@@ -71,10 +90,11 @@ pub enum Method {
     SeedTake = 6,
     SeedCancel = 7,
     Clone = 8,
+    VerifySession = 9,
 }
 
 impl Method {
-    pub const ALL: [Method; 8] = [
+    pub const ALL: [Method; 9] = [
         Method::FillStart,
         Method::FillTake,
         Method::FillCancel,
@@ -83,6 +103,7 @@ impl Method {
         Method::SeedTake,
         Method::SeedCancel,
         Method::Clone,
+        Method::VerifySession,
     ];
 
     pub const fn number(self) -> u16 {
@@ -209,14 +230,14 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed() {
-        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(9), None);
-        assert_eq!(Method::Crash.header().bytes(), [4, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::from_number(10), None);
+        assert_eq!(Method::Crash.header().bytes(), [4, 0, 2, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -225,7 +246,7 @@ mod tests {
         Fill { n: 64 }.write(&mut w).unwrap();
         assert_eq!(
             w.as_bytes(),
-            [1, 0, 1, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0]
+            [1, 0, 2, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
             Fill::read(Reader::new(&w.as_bytes()[8..])),
@@ -268,7 +289,7 @@ mod tests {
             key.write(method, &mut w).unwrap();
             assert_eq!(
                 w.as_bytes(),
-                [number, 0, 1, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+                [number, 0, 2, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
             );
             assert_eq!(Key::read(Reader::new(&w.as_bytes()[8..])), Ok(key));
         }
@@ -296,7 +317,7 @@ mod tests {
             Seed { flags }.write(&mut w).unwrap();
             assert_eq!(
                 w.as_bytes(),
-                [5, 0, 1, 0, 0, 0, 0, 0, flags as u8, 0, 0, 0, 0, 0, 0, 0]
+                [5, 0, 2, 0, 0, 0, 0, 0, flags as u8, 0, 0, 0, 0, 0, 0, 0]
             );
             assert_eq!(
                 Seed::read(Reader::new(&w.as_bytes()[8..])),

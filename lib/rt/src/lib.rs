@@ -30,6 +30,7 @@ pub mod loader;
 pub mod mmio;
 pub mod msgbuf;
 pub mod pipe;
+pub mod roots;
 pub mod service;
 pub mod startup;
 pub mod sys;

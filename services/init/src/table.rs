@@ -59,6 +59,8 @@ pub const CLOCK_SERVICE: &str = "clock";
 pub const PIPE_SERVICE: &str = "pipe";
 /// The network service's name.
 pub const NET_SERVICE: &str = "net";
+/// The entropy service's name.
+pub const ENTROPY_SERVICE: &str = "entropy";
 /// The clients init gives the RAM file service's boot profile
 /// (proto_fs::BOOT_PROFILE): the diagnostic client of the RAM service and
 /// the network service, which reads `/etc/netd.conf` as the boot root.
@@ -110,6 +112,7 @@ pub const VOUCHERS: &[&str] = &[
     TERMINAL_SERVICE,
     PIPE_SERVICE,
     NET_SERVICE,
+    ENTROPY_SERVICE,
     PACKAGE_SERVICE,
 ];
 /// The vouchers whose notary session may tell the process service that a
@@ -124,12 +127,13 @@ pub const PACKAGE_SERVICE: &str = "pkgd";
 pub const TERMINAL_SERVICE: &str = "tty";
 /// The services that send their root to the process service with Register
 /// (proto_process::ROOT_MARKS), each with the mark init gives its notary
-/// session and no other entry: the terminal, channel and network services.
-/// The entropy service takes its place here with its own part.
+/// session and no other entry: the terminal, channel, network and entropy
+/// services.
 pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (TERMINAL_SERVICE, proto_process::TERMINAL),
     (PIPE_SERVICE, proto_process::PIPE),
     (NET_SERVICE, proto_process::NET),
+    (ENTROPY_SERVICE, proto_process::ENTROPY),
 ];
 
 /// The label mark of the notary session of the voucher `name`: NOTARY, with
@@ -1325,6 +1329,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
+    + cfg!(feature = "table-posix-random-net") as usize
+    + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
@@ -1407,6 +1413,8 @@ const _: () = assert!(
     feature = "table-net-two",
     feature = "table-input",
     feature = "table-posix-random",
+    feature = "table-posix-random-net",
+    feature = "table-posix-random-net2",
     feature = "table-posix-display",
     feature = "table-display",
     feature = "table-fstack-probe",
@@ -1551,6 +1559,10 @@ pub const TABLE: &[Record] = pkg::PKG_SLOT_TABLE;
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
+#[cfg(feature = "table-posix-random-net")]
+pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
+#[cfg(feature = "table-posix-random-net2")]
+pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 #[cfg(feature = "table-display")]
@@ -3039,6 +3051,8 @@ mod tests {
             ramfs::TTY_TABLE,
             ramfs::TTY_STEPS_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
+            net::POSIX_RANDOM_NET_TABLE,
+            net::POSIX_RANDOM_NET2_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
             ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,

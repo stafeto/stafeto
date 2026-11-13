@@ -1306,7 +1306,7 @@ mod tests {
     #[test]
     fn a_foreign_version_is_refused() {
         let mut bytes = written(&Request::Abandon);
-        bytes[2] = 2;
+        bytes[2] = 3;
         assert_eq!(parsed(&bytes), Err(Status::BadVersion));
     }
 

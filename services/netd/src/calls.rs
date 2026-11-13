@@ -18,7 +18,7 @@ use crate::net::{
 };
 use crate::split;
 use crate::stack::{GROUP, Stack, listen_endpoint};
-use abi::{Error, MESSAGE_MAX, Rights};
+use abi::{Error, MESSAGE_MAX, ObjectKind, Rights};
 use netd::births;
 use netd::demux::Key;
 use netd::passes::Passes;
@@ -2124,6 +2124,67 @@ impl Net {
             Ok(root) if r.handles.is_empty() => root,
             _ => return Answer::Status(Status::BadSize),
         };
+        let answer = self.empty_session(s, r, root, true);
+        if matches!(answer, Answer::Reply(_)) {
+            self.counters.homed += 1;
+        }
+        answer
+    }
+
+    /// VERIFY_SESSION through the root session (or, from the first instance to
+    /// the home of a session, `HOME_LABEL`): the offered channel comes back when
+    /// it is a live session of a client of this instance, with the descriptions
+    /// it holds. Any other goes to `elsewhere`, which may know it for a session
+    /// of another instance and answers for it (the first instance forwards it
+    /// there); when it does not, the offered channel is let go of with no
+    /// request sent through it and a new session with no descriptions takes its
+    /// place. Every step is O(1).
+    pub fn verify_session(
+        &mut self,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        elsewhere: impl FnOnce(Handle<Channel>, &mut Request<'_>) -> Result<Answer, Handle<Channel>>,
+    ) -> Answer {
+        if s.label() != proto_net::ROOT && s.label() != HOME_LABEL {
+            return refuse(proto_net::NOT_ALLOWED);
+        }
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if !matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::TRANSFER))
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(offered) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let label = sys::copy_label(&self.channel, &offered).ok();
+        if netd::verify::genuine(&self.clones, label, &[HOME_LABEL]) {
+            return match r.reply().u32(Status::Ok.code()) {
+                Ok(()) => Answer::Reply([offered.erase()].into()),
+                Err(status) => Answer::Status(status),
+            };
+        }
+        match elsewhere(offered, r) {
+            Ok(answer) => answer,
+            Err(offered) => {
+                drop(offered);
+                self.empty_session(s, r, proto_net::ROOT, false)
+            }
+        }
+    }
+
+    /// A new session of `root` with no descriptions, counted with the root's
+    /// clones; it takes the root's name at its first request (`claim`). The
+    /// reply of HOME_MAKE (`home`) has the word of a birth after the status,
+    /// that of VERIFY_SESSION the status alone.
+    fn empty_session(
+        &mut self,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        root: u64,
+        home: bool,
+    ) -> Answer {
         if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
@@ -2143,8 +2204,12 @@ impl Net {
                 if let Some(birth) = self.clones.place_of(label) {
                     self.births[birth] = Some((label, Held::EMPTY, root, s.label()));
                 }
-                self.counters.homed += 1;
-                match sockets::write_cloned(r.reply(), 0) {
+                let written = if home {
+                    sockets::write_cloned(r.reply(), 0)
+                } else {
+                    r.reply().u32(Status::Ok.code())
+                };
+                match written {
                     Ok(()) => Answer::Reply([session.erase()].into()),
                     Err(status) => Answer::Status(status),
                 }

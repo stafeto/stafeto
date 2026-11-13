@@ -37,7 +37,9 @@ proto-clock = { path = "../../proto/clock" }
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 dynlink = { path = "../../lib/dynlink" }
+proto-entropy = { path = "../../proto/entropy" }
 proto-fs = { path = "../../proto/fs" }
+proto-net = { path = "../../proto/net" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-loader = { path = "../../proto/loader" }
 proto-process = { path = "../../proto/process" }

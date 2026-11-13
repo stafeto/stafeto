@@ -37,6 +37,7 @@ abi = { path = "../abi" }
 entries = { path = "../entries" }
 bootimg = { path = "../bootimg" }
 proto-pipe = { path = "../../proto/pipe" }
+proto-process = { path = "../../proto/process" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }

@@ -52,6 +52,7 @@
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
 //! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address), 3 drops the next frame the stack sends to itself (a test of the timers); only a service built with the feature `probe` has it | status |
 //! | PING_WIRE (31) | as PING; the echo request carries 1 472 bytes, a frame of 1 514; only a service built with the feature `probe` has it | as PING |
+//! | VERIFY_SESSION (43) | the header alone and one channel with SEND and TRANSFER, through the root session (`ROOT`) alone | status 0 and the channel itself when it is a live session of the service (a copy of its channel with the label of an init client's session or of a clone), a new clone with no descriptions otherwise, so that a channel that is not the service's never receives a request; BAD_SIZE for a body, no channel or more than one, or a channel without the two rights; NOT_ALLOWED from any session other than the root, and for any other method through the root |
 //! | CRASH (63) | the header alone | none: the service ends with a fault; only a service built with the feature `probe` has it |
 //!
 //! An address on the wire is the family (u32, INET = 2 for IPv4; 0 for
@@ -69,7 +70,16 @@ use abi::Error;
 use proto_wire::{Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 1;
+///
+/// Version 2: VERIFY_SESSION (the root's one request).
+pub const VERSION: u16 = 2;
+
+/// The label of the service's root session, which it registers with the
+/// process service (Register with the NET mark) and the loaders send
+/// VERIFY_SESSION: no other request goes through it. Bit 63 marks the labels
+/// the service gives itself (`proto_pipe::OWN`), and bit 60 lies above any
+/// place or generation of its clones.
+pub const ROOT: u64 = 1 << 63 | 1 << 60;
 
 /// The methods with their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,12 +126,13 @@ pub enum Method {
     Join = 40,
     Home = 41,
     HomeMake = 42,
+    VerifySession = 43,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 44] = [
+    pub const ALL: [Method; 45] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -164,6 +175,7 @@ impl Method {
         Method::Join,
         Method::Home,
         Method::HomeMake,
+        Method::VerifySession,
         Method::Ping,
         Method::Crash,
     ];
@@ -585,14 +597,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=42).collect();
+        let mut expected: Vec<u16> = (1..=43).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(43), None);
+        assert_eq!(Method::from_number(44), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
@@ -801,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_request_of_the_header_alone_is_eight_bytes() {
-        assert_eq!(Method::Config.header().bytes(), [21, 0, 1, 0, 0, 0, 0, 0]);
-        assert_eq!(Method::Crash.header().bytes(), [63, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::Config.header().bytes(), [21, 0, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::Crash.header().bytes(), [63, 0, 2, 0, 0, 0, 0, 0]);
     }
 }

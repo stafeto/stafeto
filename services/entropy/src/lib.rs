@@ -11,6 +11,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod verify;
+
 use posix_random::{Generator, KEY};
 use proto_entropy::{NONBLOCK, SEED_LEN};
 

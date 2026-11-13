@@ -378,8 +378,10 @@ dependencies = [
  "bootimg",
  "dynlink",
  "proto-clock",
+ "proto-entropy",
  "proto-fs",
  "proto-loader",
+ "proto-net",
  "proto-pipe",
  "proto-process",
  "proto-tty",
@@ -1183,6 +1185,7 @@ dependencies = [
  "proto-fs",
  "proto-init",
  "proto-pipe",
+ "proto-process",
  "proto-uart",
  "proto-wire",
 ]

@@ -819,6 +819,8 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     if instance::start(launch, &s.process, level, 0, None).is_err() {
         return NOT_STARTED;
     }
+    // The root for the loaders goes to the process service from a thread of its own.
+    crate::roots::start(&s.process, &s.parent, &channel, level);
     // The first thread is the admin thread from here on.
     let admin = Admin {
         ena,

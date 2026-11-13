@@ -167,15 +167,10 @@ fn main(_: u64) -> u64 {
     let Ok(step) = sys::handle_label(&channel, Rights::NOTIFY, STEP, level) else {
         return 5;
     };
-    // The root of the service goes to the process service with the PIPE
-    // mark of the notary session, for the loaders to verify the Pipes
-    // session of a set-ID program with: at every start, so that an instance
-    // after a restart replaces the root of the one that went. A startup that
-    // waits for the process service to register, as the terminal service's.
+    // The notary session with the process service, for the root of the
+    // service (below) and the credentials: a startup that waits for the
+    // process service to register, as the terminal service's.
     let notary = rt::service::connect(&start.parent, "posix").ok();
-    if let Some(notary) = notary.as_ref() {
-        let _ = register_root(notary, &channel, level);
-    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -213,6 +208,33 @@ fn main(_: u64) -> u64 {
         step_due: false,
         files_notify: None,
     };
+    // The root of the service goes to the process service with the PIPE mark of the notary
+    // session, for the loaders to verify the Pipes session of a set-ID program with: at every
+    // start, so that an instance after a restart replaces the root of the one that went. A
+    // thread of its own makes it and tries again until it succeeds (`rt::roots::keep`), so a
+    // process service that is late or refuses never holds a request of this loop.
+    PARENT.store(start.parent.raw().0, Ordering::Release);
+    CHANNEL.store(channel.raw().0, Ordering::Release);
+    LEVEL.store(u64::from(level), Ordering::Release);
+    // SAFETY: REGISTRAR is the registrar's alone, and the page after the main thread's message
+    // buffer is free.
+    let registrar = unsafe {
+        sys::thread_create(
+            &start.process,
+            register_root,
+            REGISTRAR.top(),
+            0,
+            level,
+            rt::abi::Policy::Fifo,
+            REGISTRAR_BUFFER,
+        )
+    };
+    match registrar {
+        Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
+        _ => rt::println!(
+            "pipe: no thread to register the root; set-ID starts are refused until it is registered"
+        ),
+    }
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(4);
@@ -220,30 +242,6 @@ fn main(_: u64) -> u64 {
     rt::service::quiet_steps();
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
     4
-}
-
-/// Register with the root of the service (label `proto_pipe::ROOT`, SEND,
-/// DUPLICATE and TRANSFER) through the notary session: the process service
-/// keeps it for its loaders, and a later Register replaces it.
-fn register_root(
-    notary: &Handle<Channel>,
-    channel: &Handle<Channel>,
-    level: u8,
-) -> Result<(), Error> {
-    let root = sys::handle_label(
-        channel,
-        Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
-        proto_pipe::ROOT,
-        level,
-    )?;
-    let request = proto_process::Method::Register.header().bytes();
-    let reply =
-        sys::send_handles(notary, &request, [root.erase()]).map_err(|refused| refused.error)?;
-    let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
-        Ok(0) => Ok(()),
-        _ => Err(Error::BadState),
-    }
 }
 
 struct PipeService {
@@ -286,6 +284,22 @@ struct PipeService {
     /// A copy of the file service's channel with NOTIFY alone, which its
     /// first BROKER_JOBS brought: told of a job nobody asked it for.
     files_notify: Option<Handle<Channel>>,
+}
+
+/// The registrar thread: the connection to init, the loop's channel and its level, which the
+/// root is made from, and the thread's stack and message buffer (the page after the main
+/// thread's).
+static PARENT: AtomicU64 = AtomicU64::new(0);
+static CHANNEL: AtomicU64 = AtomicU64::new(0);
+static LEVEL: AtomicU64 = AtomicU64::new(1);
+static REGISTRAR: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+const REGISTRAR_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+
+extern "C" fn register_root(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)));
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(CHANNEL.load(Ordering::Acquire)));
+    let level = LEVEL.load(Ordering::Acquire) as u8;
+    rt::roots::keep(&parent, &channel, proto_pipe::ROOT, level, "pipe")
 }
 
 /// Where the service maps the process service's page of the credentials

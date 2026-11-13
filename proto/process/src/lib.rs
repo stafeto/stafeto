@@ -214,6 +214,7 @@ use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
+pub mod retry;
 
 /// Version 13: LoaderRoot (number 43, which LoaderTerminal had) names the
 /// slot whose root it asks for in a body, and the notary marks PIPE, NET and
