@@ -33,5 +33,7 @@ break-cq-phase = []
 break-cq-head = []
 break-no-unmask = []
 break-msix-data = []
+break-head-zero = []
+break-msix-order = []
 # The model of the device for the tests of a service (`ena::model`).
 model = []

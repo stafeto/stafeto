@@ -185,6 +185,11 @@ pub struct Inner {
     /// The MSI-X table as written, four words a vector, and whether it is on.
     pub table: [[u32; 4]; 2],
     pub msix_on: bool,
+    /// Function Mask of the capability, and the calls of `msix_control` in order.
+    pub msix_fm: bool,
+    pub msix_ctl: Vec<(bool, bool)>,
+    /// The device gives no head doorbell for the completion queues (offset 0).
+    pub zero_head_db: bool,
     /// The addresses and data the driver can take from the owner: vector 0 and 1.
     pub vectors: [Option<(u64, u32)>; 2],
     /// Each vector's mask: raised by an interrupt, lowered by the driver's write.
@@ -252,6 +257,9 @@ impl Model {
             sqs: Vec::new(),
             table: [[0; 4]; 2],
             msix_on: false,
+            msix_fm: false,
+            msix_ctl: Vec::new(),
+            zero_head_db: false,
             vectors: [None; 2],
             vector_masked: [false, true],
             fired: Vec::new(),
@@ -291,6 +299,14 @@ impl Model {
 
     pub fn table(&self) -> [[u32; 4]; 2] {
         self.0.borrow().table
+    }
+
+    pub fn msix_ctl(&self) -> Vec<(bool, bool)> {
+        self.0.borrow().msix_ctl.clone()
+    }
+
+    pub fn set_zero_head_db(&self, on: bool) {
+        self.0.borrow_mut().zero_head_db = on;
     }
 
     pub fn msix_on(&self) -> bool {
@@ -402,8 +418,11 @@ impl Platform for Model {
             .flatten()
     }
 
-    fn msix_enable(&self) {
-        self.0.borrow_mut().msix_on = true;
+    fn msix_control(&self, enable: bool, function_mask: bool) {
+        let mut m = self.0.borrow_mut();
+        m.msix_on = enable;
+        m.msix_fm = function_mask;
+        m.msix_ctl.push((enable, function_mask));
     }
 
     fn io_state(&self, up: Option<&io::Info>) {
@@ -480,6 +499,10 @@ impl Inner {
             }
             regs::DEV_STS => self.status(),
             regs::DEV_CTL => self.dev_ctl,
+            o if (MSIX_TABLE..MSIX_TABLE + 32).contains(&o) => {
+                let i = (o - MSIX_TABLE) as usize;
+                self.table[i / 16][(i % 16) / 4]
+            }
             _ => 0,
         }
     }
@@ -538,6 +561,7 @@ impl Inner {
             regs::MMIO_RESP_HI => self.resp_hi = value,
             regs::MMIO_REG_READ => self.readless(value),
             regs::AQ_DB => self.doorbell(value as u16),
+            regs::VERSION => self.violations_push("a write to the VERSION register"),
             DB_TX => self.sq_bell(false, value as u16),
             DB_RX => self.sq_bell(true, value as u16),
             HEAD_TX => self.cq_head(false, value as u16),
@@ -549,7 +573,13 @@ impl Inner {
             }
             o if (MSIX_TABLE..MSIX_TABLE + 32).contains(&o) => {
                 let i = (o - MSIX_TABLE) as usize;
-                self.table[i / 16][(i % 16) / 4] = value;
+                let (v, w) = (i / 16, (i % 16) / 4);
+                if w < 3 && self.msix_on && !self.msix_fm && self.table[v][3] & 1 == 0 {
+                    self.violations_push(
+                        "an entry rewritten while enabled, unmasked and the function unmasked",
+                    );
+                }
+                self.table[v][w] = value;
             }
             _ => {}
         }
@@ -725,6 +755,7 @@ impl Inner {
         } else {
             (HEAD_TX, 0)
         };
+        let head = if self.zero_head_db { 0 } else { head };
         body[adm::CQ_RESP_HEAD_DB..][..4].copy_from_slice(&head.to_le_bytes());
         body[adm::CQ_RESP_UNMASK..][..4].copy_from_slice(&unmask.to_le_bytes());
         adm::SUCCESS
@@ -778,7 +809,7 @@ impl Inner {
         let phase = (c.tail / io::DEPTH).is_multiple_of(2);
         // The first pass is phase 1, and it turns at each wrap.
         phase_at(&mut entry, phase);
-        if c.tail.wrapping_sub(c.head_seen) >= io::DEPTH {
+        if !self.zero_head_db && c.tail.wrapping_sub(c.head_seen) >= io::DEPTH {
             self.violations_push("a completion queue overrun: the head was not told");
         }
         let va = self.va(c.base) + slot * size;
@@ -796,6 +827,7 @@ impl Inner {
         // mask (`INTR_MASK`) clear, and the pair's vector unmasked after its last.
         if vector >= 2
             || !self.msix_on
+            || self.msix_fm
             || t[3] & 1 != 0
             || self.vector_masked[vector]
             || vector == 0 && self.intr_mask != 0

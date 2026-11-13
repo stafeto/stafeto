@@ -260,7 +260,7 @@ impl<P: Platform> Io<P> {
         self.rx_out
     }
 
-    /// Descriptors of sending the device holds (submitted, not yet completed).
+    /// Descriptors of sending the device holds (submitted and waiting for their completions).
     pub fn tx_held(&self) -> u16 {
         self.tx_out
     }
@@ -398,8 +398,11 @@ impl<P: Platform> Io<P> {
         self.rx_unreported += 1;
         if self.rx_unreported >= HEAD_EVERY && !cfg!(feature = "break-cq-head") {
             self.rx_unreported = 0;
-            self.p
-                .write32(self.info.rx_cq_head_db, u32::from(self.rx_head));
+            // The device may give no head doorbell (offset 0, which is VERSION): no write.
+            if self.info.rx_cq_head_db != 0 || cfg!(feature = "break-head-zero") {
+                self.p
+                    .write32(self.info.rx_cq_head_db, u32::from(self.rx_head));
+            }
         }
         let whole = status & RX_STATUS_FIRST != 0 && status & RX_STATUS_LAST != 0;
         let sum_ok = status & RX_STATUS_L4_CSUM_CHECKED != 0
@@ -439,8 +442,10 @@ impl<P: Platform> Io<P> {
         }
         if self.tx_unreported >= HEAD_EVERY && !cfg!(feature = "break-cq-head") {
             self.tx_unreported = 0;
-            self.p
-                .write32(self.info.tx_cq_head_db, u32::from(self.tx_head));
+            if self.info.tx_cq_head_db != 0 || cfg!(feature = "break-head-zero") {
+                self.p
+                    .write32(self.info.tx_cq_head_db, u32::from(self.tx_head));
+            }
         }
         Ok(taken)
     }

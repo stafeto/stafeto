@@ -159,6 +159,8 @@ pub struct Hw {
     bar: Bar,
     msi: [Option<(u64, u32)>; 2],
     msix_at: Option<usize>,
+    /// The pending bit array of the vectors: its offset in BAR 0.
+    pba: Option<u32>,
 }
 
 impl Platform for Hw {
@@ -190,7 +192,7 @@ impl Platform for Hw {
         self.msi.get(usize::from(vector)).copied().flatten()
     }
 
-    fn msix_enable(&self) {
+    fn msix_control(&self, enable: bool, function_mask: bool) {
         let Some(at) = self.msix_at else {
             return;
         };
@@ -198,8 +200,15 @@ impl Platform for Hw {
         // memory (`run`); `at` is the first word of its MSI-X capability, which `pci::msix`
         // found. Memory decoding and bus mastering were turned on by init; INTx stays off.
         unsafe {
-            let head = rt::mmio::read32(ECAM_AT + at);
-            rt::mmio::write32(ECAM_AT + at, ::pci::Msix::enabled(head));
+            let mut word = rt::mmio::read32(ECAM_AT + at);
+            word &= !(::pci::MSIX_ENABLE | ::pci::MSIX_FUNCTION_MASK);
+            if enable {
+                word |= ::pci::MSIX_ENABLE;
+            }
+            if function_mask {
+                word |= ::pci::MSIX_FUNCTION_MASK;
+            }
+            rt::mmio::write32(ECAM_AT + at, word);
         }
     }
 
@@ -256,10 +265,14 @@ fn heartbeat(parent: &Handle<Channel>) {
     let _ = sys::send(parent, &proto_init::Method::Heartbeat.header().bytes());
 }
 
+/// The messages of the vectors, the place of the capability in the page of the function and
+/// the offset of the pending bit array.
+type MsiPlan = ([Option<(u64, u32)>; 2], Option<usize>, Option<u32>);
+
 /// The messages of the vectors from the bindings, and whether the table can be used: the
 /// capability must be where the driver writes (BAR 0, offset 0x2000) and hold both vectors.
-fn msi_plan(irq: &[Option<Handle<Interrupt>>; 2]) -> ([Option<(u64, u32)>; 2], Option<usize>) {
-    let none = ([None, None], None);
+fn msi_plan(irq: &[Option<Handle<Interrupt>>; 2]) -> MsiPlan {
+    let none = ([None, None], None, None);
     // SAFETY: the page of the function is mapped at ECAM_AT as device memory; the offsets the
     // capability list gives are inside it (`pci::msix` stops at 48 capabilities).
     let found = ::pci::msix(|offset| unsafe { rt::mmio::read32(ECAM_AT + offset) });
@@ -285,12 +298,16 @@ fn msi_plan(irq: &[Option<Handle<Interrupt>>; 2]) -> ([Option<(u64, u32)>; 2], O
             }
         }
     }
-    (messages, Some(msix.at))
+    (
+        messages,
+        Some(msix.at),
+        (msix.pba_bar == 0).then_some(msix.pba_offset),
+    )
 }
 
 /// Waits (at most `MAPPED_LIMIT_NS`, with a heartbeat on the way) until the ITS has run the
 /// commands of each binding's event: `irq_ack` says `WOULD_BLOCK` until it has. A message the
-/// device writes before that is lost, so the table is programmed after it, not before.
+/// device writes before that is lost, so the table is programmed once it is done.
 fn wait_mapped(
     irq: &[Option<Handle<Interrupt>>; 2],
     parent: &Handle<Channel>,
@@ -329,6 +346,7 @@ fn say_msix(hw: &Hw, irq: &[Option<Handle<Interrupt>>; 2]) {
     // SAFETY: the page of the function is mapped at ECAM_AT as device memory (`run`); `at` is
     // the MSI-X capability the walk found.
     let head = unsafe { rt::mmio::read32(ECAM_AT + at) };
+    // SAFETY: as above; offset 4 is the command word of the function.
     let command = unsafe { rt::mmio::read32(ECAM_AT + 4) };
     rt::println!("ena: msix cap {head:#x} command {command:#x}");
     for v in 0..2u32 {
@@ -455,15 +473,15 @@ impl Admin {
     }
 
     /// The device has vectors, has said keep-alives for a while and no interrupt came: the
-    /// table is written again by a rebuild, once (the messages the device wrote before the ITS
-    /// had mapped the events were lost; a later pair works).
+    /// table is written again once with the sequence of the first fill (masked, rewritten,
+    /// unmasked), which makes the hypervisor install the route of the messages again.
     fn check_silence(&mut self) {
         if !self.msi || !self.ena.is_up() {
             return;
         }
         let heard = STATS.irq[0].load(Ordering::Relaxed) + STATS.irq[1].load(Ordering::Relaxed);
         if self.silent_tried {
-            // Still silent after the rebuild: poll quickly from now on.
+            // Still silent after the toggle: poll quickly from now on.
             if heard == 0
                 && self.ena.keep_alive().count >= 2 * SILENCE_KEEPALIVES
                 && !POLL_FALLBACK.swap(true, Ordering::AcqRel)
@@ -475,10 +493,9 @@ impl Admin {
         if heard == 0 && self.ena.keep_alive().count >= SILENCE_KEEPALIVES {
             self.silent_tried = true;
             rt::println!(
-                "ena: no interrupt after {} keep-alives: the device is rebuilt once",
-                SILENCE_KEEPALIVES
+                "ena: no interrupt after {SILENCE_KEEPALIVES} keep-alives: the table is toggled"
             );
-            self.ena.request_reset(ena::regs::RESET_NORMAL);
+            self.ena.request_msix_toggle();
         }
     }
 
@@ -496,6 +513,11 @@ impl Admin {
         self.stats_at = now;
         self.stats_count += 1;
         let ka = self.ena.keep_alive();
+        // The pending bits of the vectors: set while an interrupt is held back by a mask.
+        if let Some(pba) = self.ena.platform().pba {
+            let bar = self.ena.platform().bar;
+            rt::println!("ena: pba {:#x} {:#x}", bar.read32(pba), bar.read32(pba + 4));
+        }
         rt::println!(
             "ena: stats irq0 {} irq1 {} rx by irq {} timer {} other {} keepalive {} resets {}",
             STATS.irq[0].load(Ordering::Relaxed),
@@ -625,7 +647,7 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // revision and class word. Memory decoding and bus mastering were turned on by init when
     // it started this instance.
     let revision = unsafe { rt::mmio::read32(ECAM_AT + 8) } as u8;
-    let (messages, msix_at) = msi_plan(&irq);
+    let (messages, msix_at, pba) = msi_plan(&irq);
     let msi = msix_at.is_some();
     if msix_at.is_some() {
         wait_mapped(&irq, &s.parent, &admin_channel, &admin_timer);
@@ -637,6 +659,7 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         },
         msi: messages,
         msix_at,
+        pba,
     };
     let region = Region {
         va: ENA_AT,

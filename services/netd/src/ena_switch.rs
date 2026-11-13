@@ -133,6 +133,11 @@ impl EnaSwitch {
         profile::count(Counter::StepSwitch);
         trace::point(P_N_STEP, 0);
         let _ = interrupt;
+        // The switch thread does not acknowledge an epoch change to the admin thread: the
+        // admin side may zero the rings of a pair this thread is about to leave only because
+        // both threads stand on CPU 0 and this one runs at the higher priority, so it is not
+        // inside a step while the admin side runs. A second CPU for either thread needs an
+        // acknowledgement (the epoch of step g).
         let epoch = svc::IO_EPOCH.load(Ordering::Acquire);
         self.wire.sync(epoch, svc::io_info());
         // The admin vector: acknowledged here, handled by the admin thread.

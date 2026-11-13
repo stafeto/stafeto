@@ -307,3 +307,5 @@ pub const SQ_RESP_DB: usize = 4;
 
 /// An entry of an MSI-X table is 16 bytes (PCI Local Bus 3.0, 6.8.2).
 pub const MSIX_ENTRY: usize = 16;
+/// The mask bit of the control word (the fourth) of a table entry.
+pub const MSIX_MASKED: u32 = 1;

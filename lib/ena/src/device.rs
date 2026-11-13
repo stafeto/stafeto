@@ -39,8 +39,8 @@ pub trait Platform {
     fn msi(&self, _vector: u16) -> Option<(u64, u32)> {
         None
     }
-    /// Turns MSI-X on in the function's capability (the table is filled).
-    fn msix_enable(&self) {}
+    /// Sets the Enable and Function Mask bits of the function's MSI-X capability.
+    fn msix_control(&self, _enable: bool, _function_mask: bool) {}
     /// The data path's state: `Some` once the queues are made (the owner of the
     /// pair may use them), `None` the moment the driver starts a reset or fails
     /// (before it touches the rings). Called from the admin side's thread.
@@ -371,6 +371,9 @@ pub struct Ena<P: Platform> {
     io_info: io::Info,
     cq_tx: u16,
     cq_rx: u16,
+    /// A toggle of the MSI-X table was asked for, and is running.
+    toggle_asked: bool,
+    toggling: bool,
 }
 
 impl<P: Platform> Ena<P> {
@@ -446,6 +449,8 @@ impl<P: Platform> Ena<P> {
             io_info: io::Info::default(),
             cq_tx: 0,
             cq_rx: 0,
+            toggle_asked: false,
+            toggling: false,
         })
     }
 
@@ -507,6 +512,12 @@ impl<P: Platform> Ena<P> {
         self.bufs = Some(bufs);
         self.msix_table = msix_table;
         Ok(())
+    }
+
+    /// Writes the MSI-X table again once, with the sequence of the first fill (everything
+    /// masked, rewritten, unmasked): the next step of a running device starts it.
+    pub fn request_msix_toggle(&mut self) {
+        self.toggle_asked = true;
     }
 
     /// The doorbells and registers of the pair, once it is made.
@@ -754,6 +765,8 @@ impl<P: Platform> Ena<P> {
 
     fn begin(&mut self, now: u64) -> Event {
         self.began_ns = now;
+        self.toggling = false;
+        self.toggle_asked = false;
         // Fresh books for the queues. The memory is zeroed once the reset is
         // over (`released`): an old device may still post into it until then.
         self.aq_tail = 0;
@@ -1456,41 +1469,81 @@ impl<P: Platform> Ena<P> {
         Event::Progress
     }
 
-    /// The table of MSI-X: vector `v` has its entry at `table + 16 v`, the
-    /// address (low, high), the data and the control word (0: unmasked), one
-    /// register a step; then MSI-X on in the capability and the admin vector
-    /// unmasked.
+    /// The MSI-X table with the sequence of a driver that leaves nothing to the device's
+    /// guess, one register access a step: Enable together with Function Mask; for each
+    /// vector its entry masked (control word 1), the address (low, high) and the data written,
+    /// the data read back; then each entry unmasked (control word 0), Function Mask cleared
+    /// and the admin vector unmasked. An entry is never rewritten while it is unmasked and
+    /// the function is enabled without the function mask (a toggle runs the same steps).
     fn msix(&mut self, at: usize) -> Event {
         let table = self.msix_table.expect("asked for");
         const VECTORS: usize = 2;
-        if at < VECTORS * 4 {
-            let (v, word) = (at / 4, at % 4);
+        const PER: usize = 5;
+        let entry = |v: usize, word: usize| table + (v * adm::MSIX_ENTRY + 4 * word) as u32;
+        let unmask_from = 1 + PER * VECTORS;
+        let clear_at = unmask_from + VECTORS;
+        if at == 0 {
+            // `break-msix-order`: enabled with no function mask and no masked entry.
+            self.p
+                .msix_control(true, !cfg!(feature = "break-msix-order"));
+            self.stage = Stage::Msix { at: 1 };
+            return Event::Progress;
+        }
+        if at < unmask_from {
+            let (v, k) = ((at - 1) / PER, (at - 1) % PER);
             let Some((addr, data)) = self.p.msi(v as u16) else {
                 // A vector without an event: the pair runs on polling.
-                self.stage = Stage::Msix { at: (v + 1) * 4 };
+                self.stage = Stage::Msix {
+                    at: 1 + PER * (v + 1),
+                };
                 return Event::Progress;
             };
-            let value = match word {
-                0 => addr as u32,
-                1 => (addr >> 32) as u32,
-                2 if cfg!(feature = "break-msix-data") => data ^ 1,
-                2 => data,
-                _ => 0,
+            let data = if cfg!(feature = "break-msix-data") {
+                data ^ 1
+            } else {
+                data
             };
-            self.p.write32(
-                table + (v * adm::MSIX_ENTRY) as u32 + 4 * word as u32,
-                value,
-            );
+            match k {
+                0 if !cfg!(feature = "break-msix-order") => {
+                    self.p.write32(entry(v, 3), adm::MSIX_MASKED)
+                }
+                0 => {}
+                1 => self.p.write32(entry(v, 0), addr as u32),
+                2 => self.p.write32(entry(v, 1), (addr >> 32) as u32),
+                3 => self.p.write32(entry(v, 2), data),
+                _ => {
+                    let back = self.p.read32(entry(v, 2));
+                    if back != data {
+                        self.p.log(format_args!(
+                            "ena: msix vector {v} data reads back {back:#x}, wrote {data:#x}"
+                        ));
+                    }
+                }
+            }
             self.stage = Stage::Msix { at: at + 1 };
             return Event::Progress;
         }
-        if at == VECTORS * 4 {
-            self.p.msix_enable();
+        if at < clear_at {
+            let v = at - unmask_from;
+            if self.p.msi(v as u16).is_some() {
+                self.p.write32(entry(v, 3), 0);
+            }
+            self.stage = Stage::Msix { at: at + 1 };
+            return Event::Progress;
+        }
+        if at == clear_at {
+            self.p.msix_control(true, false);
             self.stage = Stage::Msix { at: at + 1 };
             return Event::Progress;
         }
         // The admin vector: the device raises it for the events and the answers.
         self.p.write32(regs::INTR_MASK, 0);
+        if self.toggling {
+            self.toggling = false;
+            self.p.log(format_args!("ena: msix toggle done"));
+            self.stage = Stage::Running;
+            return Event::Progress;
+        }
         let now = self.p.now_ns();
         self.up(now)
     }
@@ -1523,6 +1576,13 @@ impl<P: Platform> Ena<P> {
     // Running.
 
     fn running(&mut self, now: u64) -> Event {
+        if self.toggle_asked && self.msix_table.is_some() && self.p.msi(0).is_some() {
+            self.toggle_asked = false;
+            self.toggling = true;
+            self.p.log(format_args!("ena: msix toggle"));
+            self.stage = Stage::Msix { at: 0 };
+            return Event::Progress;
+        }
         if let Some(command) = self.command {
             if let Some((c, status, body)) = self.complete() {
                 self.stats_done(c, status, body);

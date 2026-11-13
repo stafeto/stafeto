@@ -1026,6 +1026,62 @@ mod data {
     }
 
     #[test]
+    fn a_device_with_no_head_doorbell_is_never_written_at_offset_0() {
+        let mut r = rig();
+        r.model.set_zero_head_db(true);
+        let mut io = r.up();
+        for n in 0..256 {
+            io.rx_give(n);
+        }
+        io.rx_bell();
+        for i in 0..300u32 {
+            let f = frame(i as u8, 64);
+            assert!(r.model.inject(&f));
+            let got = io.rx_pop().unwrap().unwrap();
+            io.rx_give(got.n);
+            io.rx_bell();
+            r.fill_frame(300, &f);
+            assert!(io.tx_submit(300, 64));
+            io.tx_bell();
+            assert_eq!(io.tx_reclaim(8, |_| {}).unwrap(), 1);
+        }
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn msix_is_enabled_with_the_function_mask_and_unmasked_last() {
+        let mut r = rig();
+        let _io = r.up();
+        // Enable and Function Mask together first, the mask cleared last; no entry was
+        // rewritten while it was unmasked in an enabled function (a violation otherwise).
+        assert_eq!(r.model.msix_ctl(), [(true, true), (true, false)]);
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.table()[1], [0x0801_0040, 0, 6, 0]);
+    }
+
+    #[test]
+    fn a_toggle_masks_rewrites_and_unmasks_again_without_a_violation() {
+        let mut r = rig();
+        let mut io = r.up();
+        r.ena.request_msix_toggle();
+        run(&r.model, &mut r.ena, S);
+        assert!(r.ena.is_up());
+        assert!(has_line(&r.model, "ena: msix toggle done"));
+        assert_eq!(
+            r.model.msix_ctl(),
+            [(true, true), (true, false), (true, true), (true, false)]
+        );
+        assert_eq!(r.model.violations(), Vec::<String>::new());
+        assert_eq!(r.model.table()[0], [0x0801_0040, 0, 5, 0]);
+        // The pair still works, and the vector fires once it is unmasked.
+        io.rx_give(1);
+        io.rx_bell();
+        io.unmask_rx();
+        r.model.inject(&frame(1, 64));
+        assert_eq!(pair(&r).len(), 1);
+    }
+
+    #[test]
     fn the_keep_alive_raises_the_admin_vector() {
         let mut r = rig();
         let _io = r.up();
