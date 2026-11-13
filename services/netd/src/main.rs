@@ -348,6 +348,8 @@ fn main(_: u64) -> u64 {
     // are the secret of the choice of ports (RFC 6056), and the rest is
     // erased.
     let Ok(entropy) = rt::service::connect(&s.parent, "entropy") else {
+        rt::println!("net: no entropy service in this image");
+        rt::println!("{}", seed::GIVES_UP);
         return NO_ENTROPY;
     };
     let mut key = match seed::take(&entropy, &channel, level, (&timer, TIMER_LABEL)) {

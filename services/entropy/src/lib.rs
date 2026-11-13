@@ -168,8 +168,7 @@ impl<'a> Page<'a> {
         n
     }
 
-    /// Puts `key` in the page for the next instance, in the place of what
-    /// was there.
+    /// Puts `key` in the page for the next instance; what was there goes.
     pub fn keep(&mut self, key: &[u8; KEY]) {
         posix_random::erase(&mut self.0[..4 + SEED_MAX]);
         #[cfg(not(feature = "break-page-keep"))]

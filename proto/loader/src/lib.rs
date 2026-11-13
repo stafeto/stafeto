@@ -1142,7 +1142,7 @@ pub mod auxv {
 /// program headers in memory (`phdr`), the bytes of one (`phent`), their
 /// count, the secure mode (0 or 1), libc.so's base address, the address of
 /// its TLS header and, with `random`, that of the 16 bytes of AT_RANDOM
-/// (`RANDOM_AT`; AT_NULL takes the place of the pair without them).
+/// (`RANDOM_AT`; without them the pair is AT_NULL).
 /// AT_ENTRY is not passed: the start jumps to the program itself.
 pub const fn dynamic_auxv(
     phdr: u64,

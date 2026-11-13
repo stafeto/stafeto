@@ -58,8 +58,13 @@ pub enum Failure {
     Timeout,
 }
 
+/// The line after a key that did not come: the service ends with NO_ENTROPY,
+/// and init's restart policy (services/init restart.rs) starts it again after
+/// a pause, until 5 failures within 60 s mark it broken for good.
+pub const GIVES_UP: &str = "net: no key, so no network: init restarts the service, and marks it broken after 5 failures in 60 s";
+
 impl Failure {
-    /// The console line for a key that did not come.
+    /// The console lines for a key that did not come.
     pub fn say(&self) {
         match self {
             Failure::Gone => rt::println!("net: no key from the entropy service (gone)"),
@@ -68,6 +73,7 @@ impl Failure {
                 rt::println!("net: no key from the entropy service ({status:?})")
             }
         }
+        rt::println!("{GIVES_UP}");
     }
 }
 

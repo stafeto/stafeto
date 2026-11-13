@@ -70,7 +70,8 @@ fn trng(conduit: u8) -> Option<Vec<u8>> {
     if (version[0] as u32 as i32) < 0 {
         return None;
     }
-    let mut bytes = Vec::new();
+    // Room for every answer: a growing vector would leave copies in the heap.
+    let mut bytes = Vec::with_capacity(TRNG_WANTED * 24);
     let mut answers = 0;
     for _ in 0..TRNG_CALLS {
         let Some(r) = call(conduit, TRNG_RND64, TRNG_BITS) else {
@@ -106,7 +107,7 @@ fn rndr() -> Option<Vec<u8>> {
     if !has_rndr() {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(seed::SEED_BYTES);
     for _ in 0..seed::SEED_BYTES / 8 {
         let mut word = None;
         for _ in 0..16 {

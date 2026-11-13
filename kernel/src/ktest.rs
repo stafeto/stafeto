@@ -1016,12 +1016,6 @@ fn qemu_psci_conduit(pfr0: u64) -> PsciConduit {
     }
 }
 
-/// The GIC runs as the device tree names it (spec 9): the driver's version
-/// is the node's, and the priority mask lets DEFAULT_PRIORITY through; on
-/// a GICv3 the CPU interface is reached through system registers
-/// (ICC_SRE_EL1.SRE), Group 1 is on at the CPU interface
-/// (ICC_IGRPEN1_EL1) and at the distributor, with affinity routing
-/// (GICD_CTLR).
 /// QEMU writes 32 random bytes to `/chosen/rng-seed`. `boot::take_seed`
 /// moves them to the page of init's seed (abi::INIT_SEED), with their
 /// length first, and leaves zeros in the tree (spec 13.3): nothing in the
@@ -1055,6 +1049,12 @@ fn boot_seed_is_taken_and_cleared_in_the_tree(boot: &Boot) -> Result<(), &'stati
     Ok(())
 }
 
+/// The GIC runs as the device tree names it (spec 9): the driver's version
+/// is the node's, and the priority mask lets DEFAULT_PRIORITY through; on
+/// a GICv3 the CPU interface is reached through system registers
+/// (ICC_SRE_EL1.SRE), Group 1 is on at the CPU interface
+/// (ICC_IGRPEN1_EL1) and at the distributor, with affinity routing
+/// (GICD_CTLR).
 fn gic_matches_the_device_tree(boot: &Boot) -> Result<(), &'static str> {
     let gic = boot.info.gic.ok_or("no GIC in the device tree")?;
     check(

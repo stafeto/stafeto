@@ -2772,6 +2772,27 @@ fn seed_breaks() -> Result<(), String> {
         [] => return Err("the break (no wipe) passed the kernel tests".into()),
         other => return Err(format!("the break failed other tests: {other:?}")),
     }
+    // The loader's heap holds no byte of the seed (a heap that never frees,
+    // scanned after the loader's steps); the tree built with the seed itself
+    // leaves copies in it.
+    let mut heap = cargo();
+    heap.args(["test", "--package", "firmware-tree", "--test", "seed_heap"]);
+    run_cmd(&mut heap)?;
+    let mut broken = cargo();
+    broken.args([
+        "test",
+        "--package",
+        "firmware-tree",
+        "--test",
+        "seed_heap",
+        "--features",
+        "break-seed-in-heap",
+    ]);
+    match broken.output() {
+        Ok(o) if !o.status.success() => println!("seed-breaks: break-seed-in-heap is caught"),
+        Ok(_) => return Err("break-seed-in-heap passed the heap test".into()),
+        Err(e) => return Err(e.to_string()),
+    }
     // The page of the entropy service: the host tests pass, and each break
     // fails them.
     let mut ok = cargo();

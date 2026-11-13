@@ -74,6 +74,14 @@ fn main(_: u64) -> u64 {
             return REFUSED;
         }
     };
+    // An image with no entropy service has no use for the boot seed: the page
+    // is wiped and its handle closed.
+    let seed = if table.iter().any(|r| r.name == table::ENTROPY_SERVICE) {
+        Some(init.seed)
+    } else {
+        wipe_seed(&init.process, init.seed);
+        None
+    };
     let programs = match programs(&init.process, &init.boot_image) {
         Ok(programs) => programs,
         Err(r) => {
@@ -93,7 +101,7 @@ fn main(_: u64) -> u64 {
         &init.resource,
         label,
         init.boot_image,
-        init.seed,
+        seed,
     )
     .expect("init starts its worker thread");
     let mut service = serve::Init::new(
@@ -113,6 +121,24 @@ fn main(_: u64) -> u64 {
     };
     let error = rt::service::run::<_, SESSIONS, 1>(&channel, &mut service, config);
     panic!("init stopped serving its channel: {error:?}")
+}
+
+/// Where init maps the page of the boot seed to wipe it.
+const SEED_WINDOW: usize = 0x64_0000_0000;
+
+/// Zeros the page of the boot seed and closes its handle (the image has no
+/// entropy service to give it to). A page that cannot be mapped is closed
+/// all the same; the kernel kept no other copy.
+fn wipe_seed(process: &Handle<Process>, seed: Handle<Memory>) {
+    if sys::mem_map(process, &seed, 0, 4096, SEED_WINDOW, Access::ReadWrite).is_ok() {
+        for i in 0..4096 {
+            // SAFETY: the page is mapped read and write at SEED_WINDOW, 4096 bytes.
+            unsafe { ((SEED_WINDOW + i) as *mut u8).write_volatile(0) };
+        }
+        // SAFETY: the window is init's own and nothing else uses it.
+        let _ = unsafe { sys::mem_unmap(process, SEED_WINDOW, 4096) };
+    }
+    drop(seed);
 }
 
 /// Where init maps the ECAM it walks to find the functions the table names

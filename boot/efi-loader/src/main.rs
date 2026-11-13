@@ -414,7 +414,7 @@ fn make_tree(
     loaded: &Loaded,
     boot_mpidr: u64,
     seed: &[u8],
-) -> (Vec<u8>, Classified, check::Summary) {
+) -> (Vec<u8>, Classified, check::Summary, Option<Region>) {
     let protect = [
         Region {
             base: loaded.kernel.base,
@@ -440,8 +440,8 @@ fn make_tree(
         },
         boot_image: loaded.image,
     };
-    let (summary, _) = check::check(&blob, &at).unwrap_or_else(|e| refuse(&e));
-    (blob, classified, summary)
+    let (summary, info) = check::check(&blob, &at).unwrap_or_else(|e| refuse(&e));
+    (blob, classified, summary, info.seed)
 }
 
 fn report(platform: &Platform, classified: &Classified, s: &check::Summary, tree_bytes: usize) {
@@ -639,17 +639,20 @@ fn main() -> Status {
             "efi-loader: no source of random bytes (efi-rng, smccc-trng, rndr): the kernel gets no boot seed\n",
         ),
     }
-    let mut seed: Vec<u8> = found.seed.map_or_else(Vec::new, |s| s.to_vec());
-    if let Some(bytes) = found.seed.as_mut() {
-        posix_random::erase(bytes);
-    }
+    // The heap never frees: the tree is built with a placeholder of zeros, and
+    // the seed is written into the tree's room as the last step.
+    let mut seed = found.seed.take();
+    let placeholder: Vec<u8> = seed
+        .as_ref()
+        .map_or_else(Vec::new, |s| firmware_tree::seed::for_tree(s).to_vec());
 
     // The trial tree from the map as it is now, with the boot services alive.
     let trial = snapshot(buf);
-    let (blob, classified, summary) =
-        make_tree(&platform, &trial.descs, &loaded, boot_mpidr, &seed);
+    let (mut blob, classified, summary, _) =
+        make_tree(&platform, &trial.descs, &loaded, boot_mpidr, &placeholder);
     report(&platform, &classified, &summary, blob.len());
     write_tree(&blob, loaded.tree);
+    posix_random::erase(&mut blob);
 
     // The exit, with the 64 KiB buffer allocated for the map (a few hundred
     // descriptors fit; the call reports BUFFER_TOO_SMALL otherwise).
@@ -661,9 +664,23 @@ fn main() -> Status {
     say(&format!(
         "efi-loader: boot services left after {tries} attempt(s)\n"
     ));
-    let (blob, _, _) = make_tree(&platform, &final_map, &loaded, boot_mpidr, &seed);
+    let (mut blob, _, _, at) = make_tree(&platform, &final_map, &loaded, boot_mpidr, &placeholder);
     write_tree(&blob, loaded.tree);
-    posix_random::erase(&mut seed);
+    posix_random::erase(&mut blob);
+    if let Some(bytes) = seed.as_mut() {
+        let Some(at) = at else {
+            refuse(&"the tree has no rng-seed to patch")
+        };
+        // SAFETY: the tree's room, allocated for it and ours.
+        let room = unsafe {
+            core::slice::from_raw_parts_mut(loaded.tree.base as *mut u8, efimap::TREE_ROOM as usize)
+        };
+        ensure!(
+            firmware_tree::seed::patch(room, at.base as usize, bytes),
+            "the seed does not fit the tree"
+        );
+        posix_random::erase(bytes);
+    }
     // The part of the kernel's own check that the tree's size decides was
     // done with this blob: the tree region is now the final one.
 

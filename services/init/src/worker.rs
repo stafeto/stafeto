@@ -161,7 +161,7 @@ impl Worker {
         resource: &Handle<Resource>,
         label: u64,
         boot: Handle<Memory>,
-        seed: Handle<Memory>,
+        seed: Option<Handle<Memory>>,
     ) -> Result<Worker, Error> {
         if STARTED.swap(true, Ordering::AcqRel) {
             return Err(Error::BadState);
@@ -175,7 +175,7 @@ impl Worker {
             (WAKE, wake.raw()),
             (TELL, tell.into_raw()),
             (BOOT, boot.into_raw()),
-            (SEED_PAGE, seed.into_raw()),
+            (SEED_PAGE, seed.map_or(abi::Handle(0), Handle::into_raw)),
         ] {
             HANDLES[i].store(raw.0, Ordering::Relaxed);
         }
@@ -415,7 +415,7 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
         // The checks of the table keep the name apart from the others.
         let _ = spawned.giver.give(BOOT_IMAGE, image.erase());
     }
-    if record.name == ENTROPY_SERVICE {
+    if record.name == ENTROPY_SERVICE && HANDLES[SEED_PAGE].load(Ordering::Relaxed) != 0 {
         let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
         let page = sys::handle_duplicate(&view::<Memory>(SEED_PAGE), rights)?;
         // The checks of the table keep the name apart from the others.

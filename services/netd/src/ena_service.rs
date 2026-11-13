@@ -589,6 +589,7 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // before the registration, so that nothing else reaches the channel meanwhile.
     let Ok(entropy) = rt::service::connect(&s.parent, "entropy") else {
         rt::println!("net: no entropy service in this image; the network stays down");
+        rt::println!("{}", crate::seed::GIVES_UP);
         return NO_ENTROPY;
     };
     let mut key = match crate::seed::take(&entropy, &channel, level, (&timer, crate::TIMER_LABEL)) {

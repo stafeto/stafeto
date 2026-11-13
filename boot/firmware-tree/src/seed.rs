@@ -13,6 +13,31 @@ use posix_random::{Generator, KEY};
 /// service takes its first bytes (`entropy::FIRST_BYTES`).
 pub const SEED_BYTES: usize = 2 * KEY;
 
+/// What goes into the tree while it is built: zeros the length of the seed.
+/// The loader's heap never frees, and every blob and every reallocation of
+/// the builder stays in it, so the tree is built with this placeholder and
+/// the real bytes are written into the tree's room as the last step
+/// (`patch`). The break `break-seed-in-heap` puts the seed itself in.
+pub fn for_tree(seed: &[u8; SEED_BYTES]) -> [u8; SEED_BYTES] {
+    if cfg!(feature = "break-seed-in-heap") {
+        *seed
+    } else {
+        [0; SEED_BYTES]
+    }
+}
+
+/// Writes `seed` over the placeholder at `at` in `room`, the tree's room.
+/// False when the seed does not fit there.
+pub fn patch(room: &mut [u8], at: usize, seed: &[u8; SEED_BYTES]) -> bool {
+    match room.get_mut(at..at + SEED_BYTES) {
+        Some(dest) => {
+            dest.copy_from_slice(seed);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The least bytes a source must give to count: 128 bits.
 pub const MIN_SOURCE: usize = 16;
 
@@ -51,14 +76,18 @@ pub fn mix(sources: &[&[u8]]) -> Option<[u8; SEED_BYTES]> {
                 generator.seed(&block);
                 any = true;
             }
+            posix_random::erase(&mut block);
         }
     }
-    any.then(|| {
+    let out = any.then(|| {
         let mut out = [0u8; SEED_BYTES];
         let filled = generator.fill(&mut out);
         debug_assert!(filled);
         out
-    })
+    });
+    // The key and the buffer of the generator go with volatile stores.
+    generator.forget();
+    out
 }
 
 #[cfg(test)]
