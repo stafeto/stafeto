@@ -204,12 +204,22 @@ pub const STEP_MARGIN: usize = 16_500;
 pub const SWITCH_RX: usize = 8;
 pub const SWITCH_TX: usize = 16;
 /// The time in ticks a step of receiving may have used when it takes another frame of the wire:
-/// a frame of the wire costs up to 7 200 ticks under -icount (the answer to it, a copy and the
-/// sum, included) and the rest of the step 3 000, so two of them past the soft share would go
-/// over the margin. Past it the frame waits for the next step, which the stack tells itself.
-/// On a real clock a step is far under it and takes its `STEP_RX` frames whatever they are.
-pub const RX_SOFT: u64 = 6_000;
-const _: () = assert!(RX_SOFT as usize + 7_200 + 3_000 <= STEP_MARGIN);
+/// past it the frame waits for the next step, which the stack tells itself. The share belongs to
+/// the step rule under -icount (the images that count steps, feature `steps`, where a frame of
+/// the wire costs up to `WIRE_FRAME_TICKS` and two of them past `RX_SOFT_MEASURED` would go over
+/// the margin). The other images keep the old behaviour on a real clock, where a tick is
+/// 41.67 ns and a loaded step runs 3 500 to 9 000 of them: no limit.
+pub const RX_SOFT_MEASURED: u64 = 6_000;
+pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
+    RX_SOFT_MEASURED
+} else {
+    u64::MAX
+};
+/// A frame of the wire in a step of receiving (the answer to it, a copy and the sum included)
+/// and the rest of any step of the service (the notification, the bell, the tail), in ticks
+/// under -icount.
+pub const WIRE_FRAME_TICKS: usize = 7_200;
+pub const STEP_TAIL_TICKS: usize = 3_000;
 /// The buffers the stack gave back (of receiving, of sending) the switch
 /// takes in a step, each.
 pub const SWITCH_BACK: usize = 32;
@@ -240,7 +250,8 @@ pub const PARK_GIVE: usize = 2;
 // step, the base frames of every kind and the tail, still fits the bound.
 const _: () = assert!(
     PARK_GIVE <= SWITCH_BASE
-        && 3_300 + PARK_GIVE * 900 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
+        && 3_300 + PARK_GIVE * 900 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + STEP_TAIL_TICKS
+            <= 18_369
 );
 /// The frames of each kind a step always takes, and the time in clock ticks beyond which it
 /// takes no more. Under -icount (the steps probes) a tick is an instruction-scale unit and the
@@ -341,21 +352,65 @@ const _: () = assert!(
 pub const TSO_TICKS: usize = 3_100;
 pub const TSO_SMALL_TICKS: usize = 1_300;
 pub const TSO_WEIGHT: usize = SWITCH_BASE;
-pub const SWITCH_SOFT: u64 = 5_600;
+/// The soft share of the step of the switch: the frames past `SWITCH_BASE` wait for the next
+/// step once the step has used it. 5 600 ticks hold the step under the margin under -icount
+/// (`SOFT_MEASURED`, the images that count steps); the other images keep the 7 000 the share
+/// had, since a tick of a real clock is 41.67 ns and a loaded step of TSO runs 3 500 to 9 000.
+pub const SOFT_MEASURED: u64 = 5_600;
+pub const SWITCH_SOFT: u64 = if cfg!(feature = "steps") {
+    SOFT_MEASURED
+} else {
+    7_000
+};
 const _: () = assert!(
-    TSO_SMALL_TICKS <= 1_800
-        && SWITCH_BASE.div_ceil(TSO_WEIGHT) * TSO_TICKS <= SWITCH_BASE * 1_800
-        && SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000 <= STEP_MARGIN
+    TSO_SMALL_TICKS <= 1_800 && SWITCH_BASE.div_ceil(TSO_WEIGHT) * TSO_TICKS <= SWITCH_BASE * 1_800
 );
 /// The least time between two steps of the sweep of the flow table, in nanoseconds, and the
 /// period of its timer when the line is quiet.
 pub const SWEEP_EVERY_NS: u64 = 1_000_000;
 pub const SWEEP_IDLE_NS: u64 = 100_000_000;
 /// A step of the sweep of the flow table (128 places, up to 32 removals) costs up to 7 200 ticks
-/// under -icount. The switch makes it only in a step that is inside its soft share, so the
-/// worst step with a sweep is the soft share, the sweep and the tail of 1 500 ticks.
+/// under -icount. The switch makes it at the end of a step that is inside the soft share
+/// (`SWEEP_SOFT`), so the worst step with a sweep is the share, the sweep and a tail of 1 500.
+/// A sweep that is overdue (`SWEEP_OVERDUE_NS` since the last) is made in pieces of
+/// `SWEEP_PIECE` places (up to `SWEEP_PIECE_TICKS`) at the start of the step, which counts
+/// toward the soft share, so that sustained load cannot keep the sweep off for good.
 pub const SWEEP_TICKS: usize = 7_200;
-const _: () = assert!(SWITCH_SOFT as usize + SWEEP_TICKS + 1_500 <= STEP_MARGIN);
+pub const SWEEP_SOFT: u64 = SOFT_MEASURED;
+pub const SWEEP_OVERDUE_NS: u64 = 10 * SWEEP_EVERY_NS;
+pub const SWEEP_PIECE: usize = 32;
+pub const SWEEP_PIECE_TICKS: usize = 1_800;
+/// Whether the sweep of a whole step goes at the end of a step, `since` nanoseconds after the
+/// last one, the step being over its soft share or not.
+pub const fn sweep_at_end(since: u64, over_soft: bool) -> bool {
+    since >= SWEEP_EVERY_NS && !over_soft
+}
+/// Whether a piece of the sweep goes at the start of the step.
+pub const fn sweep_piece_due(since: u64) -> bool {
+    since >= SWEEP_OVERDUE_NS
+}
+/// The map of a buffer of a session (`cells::Net::map_waiting`): the call of the kernel for 64
+/// pages and the rest of the step (the notification and the bookkeeping), in ticks under
+/// -icount. The call grows by about 9 ticks for each mapping the service has.
+pub const MAP_CALL_TICKS: usize = 12_000;
+pub const MAP_STEP_TICKS: usize = 2_500;
+/// The worst step of each part of the service by the sums of the step rule, in ticks: the
+/// switch with a chunk of the offload past the soft share (a piece of the sweep at the start of
+/// the step counts toward the share, so this sum covers it), the switch with its sweep, the stack
+/// receiving, and the step of a map.
+pub const WORST_STEPS: [usize; 4] = [
+    SOFT_MEASURED as usize + TSO_TICKS + SWITCH_BASE * 1_500 + STEP_TAIL_TICKS,
+    SOFT_MEASURED as usize + SWEEP_TICKS + 1_500,
+    RX_SOFT_MEASURED as usize + WIRE_FRAME_TICKS + STEP_TAIL_TICKS,
+    MAP_CALL_TICKS + MAP_STEP_TICKS,
+];
+const _: () = {
+    let mut i = 0;
+    while i < WORST_STEPS.len() {
+        assert!(WORST_STEPS[i] <= STEP_MARGIN);
+        i += 1;
+    }
+};
 /// The CPU the switch thread leaves to the levels below it, two parts.
 ///
 /// The budget (`Period`): the thread spends at most `CONSUMER_BUDGET_NS` of each
@@ -567,8 +622,8 @@ const _: () = assert!(SWITCH_STEP_REST + SWITCH_RX * SWITCH_STEP_RX_FRAME <= 12_
 /// 3 300. The worst case is the soft share, one more frame, the base frames of the second
 /// kind and the tail.
 const _: () = assert!(
-    SWITCH_SOFT as usize + 1_800 + SWITCH_BASE * 1_500 + 3_000 <= STEP_MARGIN
-        && 3_300 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + 3_000 <= 18_369
+    SOFT_MEASURED as usize + 1_800 + SWITCH_BASE * 1_500 + STEP_TAIL_TICKS <= STEP_MARGIN
+        && 3_300 + SWITCH_BASE * 1_500 + SWITCH_BASE * 1_800 + STEP_TAIL_TICKS <= 18_369
 );
 
 /// The end of a run of steps for the interrupts of receiving: while steps
@@ -1127,19 +1182,44 @@ mod tests {
     fn the_step_rule_constants_hold_the_margin() {
         assert_eq!(STEP_MARGIN, 16_500);
         assert_eq!(SWITCH_BASE, 3);
-        assert_eq!(SWITCH_SOFT, 5_600);
-        assert_eq!(RX_SOFT, 6_000);
+        assert_eq!(SOFT_MEASURED, 5_600);
+        assert_eq!(RX_SOFT_MEASURED, 6_000);
         assert_eq!(SWEEP_TICKS, 7_200);
-        // The sums that hold them to the margin are asserts at the constants (they fail the
-        // build); the sums are pinned here too, so that a change of one number shows as a change
-        // of the rule.
-        let worst = [
-            SWITCH_SOFT as usize + TSO_TICKS + SWITCH_BASE * 1_500 + 3_000,
-            SWITCH_SOFT as usize + SWEEP_TICKS + 1_500,
-            RX_SOFT as usize + 7_200 + 3_000,
-        ];
-        assert_eq!(worst, [16_200, 14_300, 16_200]);
-        assert!(worst.iter().all(|&w| w <= STEP_MARGIN));
+        assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
+        // The sums of the rule are held to the margin at the constants too (the build fails);
+        // here each sum is compared with the margin and with its value.
+        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_200, 14_500]);
+        for worst in WORST_STEPS {
+            assert!(worst <= STEP_MARGIN, "{worst} over the margin");
+        }
+        // The images that do not count steps keep the shares of a real clock.
+        if !cfg!(feature = "steps") {
+            assert_eq!((SWITCH_SOFT, RX_SOFT), (7_000, u64::MAX));
+        } else {
+            assert_eq!((SWITCH_SOFT, RX_SOFT), (SOFT_MEASURED, RX_SOFT_MEASURED));
+        }
+    }
+
+    /// Under a load that keeps every step over its soft share the sweep still goes: a piece
+    /// at the start of the step once it is overdue, and the whole table is covered.
+    #[test]
+    fn sustained_load_cannot_keep_the_sweep_off() {
+        let (mut last, mut whole, mut pieces) = (0u64, 0, 0);
+        for step in 1..=2_000u64 {
+            let now = step * 100_000; // a step every 100 us
+            let since = now - last;
+            if sweep_piece_due(since) {
+                last = now;
+                pieces += 1;
+            } else if sweep_at_end(since, true) {
+                whole += 1;
+            }
+        }
+        assert_eq!(whole, 0, "no whole sweep past the soft share");
+        // 200 ms of load: a piece every 10 ms.
+        assert_eq!(pieces, 20);
+        // Inside the share a whole sweep goes once a millisecond, as before.
+        assert!(sweep_at_end(SWEEP_EVERY_NS, false) && !sweep_at_end(SWEEP_EVERY_NS - 1, false));
     }
 
     use super::*;

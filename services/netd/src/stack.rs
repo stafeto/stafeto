@@ -599,13 +599,16 @@ impl<'a> Stack<'a> {
 pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net, now_ns: u64) {
     let now = instant(now_ns);
     let mut first = true;
+    #[cfg(feature = "steps")]
     let entered = rt::time::now();
     loop {
         let began = split::now();
         let sent = split::get(&split::TX);
         let Some(dest) = device.stage() else { break };
-        // A frame of the wire that comes after the soft share of the step (`RX_SOFT`) waits for
-        // the next step, as one the stack answers does: two full frames never make one step.
+        // A frame of the wire that comes after the soft share of the step (`RX_SOFT`, measured
+        // images only) waits for the next step, as one the stack answers does: two full frames
+        // never make one step under -icount.
+        #[cfg(feature = "steps")]
         if !first
             && device.held_is_wire()
             && rt::time::now().saturating_sub(entered) > netd::ring::RX_SOFT

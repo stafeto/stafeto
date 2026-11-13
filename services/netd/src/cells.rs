@@ -15,7 +15,7 @@
 use crate::dma;
 use crate::net::{Client, Net};
 use abi::{Access, Error, Rights};
-use netd::buffers::{Refusal, copy_portion};
+use netd::buffers::{Part, Refusal, copy_portion};
 use netd::ring::BUFFER_PORTION;
 use proto_net::{BUFFER_SIZE, code};
 use proto_wire::Status;
@@ -97,11 +97,12 @@ impl Net {
     }
 
     /// The step of a BUFFER that waits, one part a step: the map of the first entry whose
-    /// object is not mapped, else the answer of the first whose map was made (the close of the
+    /// object is not mapped, after the answer of the first whose map was made (the answers go first: with many BUFFERs at once each is answered two steps after its map) (the close of the
     /// handle and the reply are calls of the kernel of their own, and the map needs the step to
     /// itself). True when more is to do.
     pub fn map_waiting(&mut self) -> bool {
-        if let Some(i) = self.waiting_map() {
+        let part = netd::buffers::next_part(self.waiting_answer(), self.waiting_map());
+        if let Some(Part::Map(i)) = part {
             let at = dma::buffer_at(self.buffers.address_of(i));
             let status = match (self.process.as_deref(), self.waiting[i].as_ref()) {
                 (Some(process), Some(w)) => {
@@ -137,7 +138,7 @@ impl Net {
             }
             return true;
         }
-        let Some(i) = self.waiting_answer() else {
+        let Some(Part::Answer(i)) = part else {
             return false;
         };
         if let Some(Waiting {

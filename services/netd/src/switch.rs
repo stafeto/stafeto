@@ -67,10 +67,9 @@ use netd::lanes as lane_rules;
 use netd::profile::{self, Counter};
 use netd::ring::{
     CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
-    STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_EVERY_NS, SWEEP_IDLE_NS, SWITCH_BACK,
-    SWITCH_BASE, SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT,
-    SWITCH_TX, Stepper, TSO_WEIGHT, TX_BUFFERS, TX_SHARE, bell_due, charge, drive,
-    for_each_arp_copy,
+    STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE,
+    SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX,
+    Stepper, TSO_WEIGHT, TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -956,6 +955,15 @@ impl Switch {
                 .fetch_add(given as u32, Ordering::Relaxed);
             more_park = given == PARK_GIVE;
         }
+        // Sustained load that keeps every step over its soft share would keep the sweep off,
+        // and with it the eviction of closed flows: once it is overdue a piece goes in first,
+        // and counts toward the step's soft share.
+        if netd::ring::sweep_piece_due(now.wrapping_sub(self.last_sweep))
+            && let Some(t) = self.tables.as_mut()
+        {
+            self.last_sweep = now;
+            t.sweep_piece(netd::ring::SWEEP_PIECE);
+        }
         #[cfg(feature = "steps")]
         self.part(0, self.ran().saturating_sub(began));
         // What the stack passed: buffers of receiving, buffers of sending
@@ -1046,14 +1054,15 @@ impl Switch {
         self.receive(lane_rules::widest(&room).min(budget), &mut room);
         #[cfg(feature = "steps")]
         let before_sweep = self.ran();
-        // The sweep (128 places, up to 7 000 ticks under -icount) goes only into a step that is
+        // The sweep (128 places, up to `SWEEP_TICKS` under -icount) goes only into a step that is
         // inside its soft share, so that it never comes on top of a step full of frames; a step
-        // that is over it leaves the sweep to the next one (`last_sweep` stays).
-        let sweep_now = !self.over_soft();
-        if sweep_now
-            && let Some(t) = self.tables.as_mut()
-            && now.wrapping_sub(self.last_sweep) >= SWEEP_EVERY_NS
-        {
+        // that is over it leaves the sweep to the next one (`last_sweep` stays). A sweep that
+        // is overdue was made in a piece at the start of the step.
+        let sweep_now = netd::ring::sweep_at_end(
+            now.wrapping_sub(self.last_sweep),
+            self.over_time(netd::ring::SWEEP_SOFT),
+        );
+        if sweep_now && let Some(t) = self.tables.as_mut() {
             self.last_sweep = now;
             t.sweep();
         }
@@ -1135,7 +1144,12 @@ impl Switch {
     /// The step has used up its soft share of time: the frames past `SWITCH_BASE` wait for
     /// the next step.
     fn over_soft(&self) -> bool {
-        rt::time::now().saturating_sub(self.step_began) > SWITCH_SOFT
+        self.over_time(SWITCH_SOFT)
+    }
+
+    /// The step has run longer than `ticks`.
+    fn over_time(&self, ticks: u64) -> bool {
+        rt::time::now().saturating_sub(self.step_began) > ticks
     }
 
     #[cfg(feature = "steps")]

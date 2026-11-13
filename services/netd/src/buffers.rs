@@ -36,6 +36,19 @@ pub enum Refusal {
     Full,
 }
 
+/// The part of a BUFFER the next step does: an answer that is due goes before a map, so that a
+/// client is answered right after its own map, whatever the number of the maps that wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Answer(usize),
+    Map(usize),
+}
+
+/// The part to do, given the first entry whose answer is due and the first whose map waits.
+pub fn next_part(answer: Option<usize>, map: Option<usize>) -> Option<Part> {
+    answer.map(Part::Answer).or(map.map(Part::Map))
+}
+
 /// The table of the shared buffers.
 pub struct Buffers {
     entries: [Entry; BUFFER_SESSIONS],
@@ -313,6 +326,32 @@ mod tests {
         b.free(j);
         b.wait(j);
         assert_eq!(b.next_waiting(), None);
+    }
+
+    #[test]
+    fn answers_go_before_maps_so_sixty_four_clients_are_each_answered_after_their_own_map() {
+        // 64 BUFFERs at once: the steps alternate map, answer, map, answer; no answer waits for
+        // another client's map.
+        let mut map: Vec<usize> = (0..64).collect();
+        let mut answer: Vec<usize> = Vec::new();
+        let mut order = Vec::new();
+        while let Some(part) = next_part(answer.first().copied(), map.first().copied()) {
+            match part {
+                Part::Answer(i) => {
+                    answer.remove(0);
+                    order.push(('a', i));
+                }
+                Part::Map(i) => {
+                    map.remove(0);
+                    answer.push(i);
+                    order.push(('m', i));
+                }
+            }
+        }
+        for (k, pair) in order.chunks(2).enumerate() {
+            assert_eq!(pair, [('m', k), ('a', k)]);
+        }
+        assert_eq!(next_part(None, None), None);
     }
 
     #[test]
