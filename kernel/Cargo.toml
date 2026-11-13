@@ -54,6 +54,10 @@ break-alive-check = ["window-probe"]
 # No second look at x3 and x5 of process_create after the gap between its sections.
 break-spawn-check = ["window-probe"]
 measure = []
+# The first boot on a machine whose console the kernel cannot write yet (EC2):
+# the loader passes the address of a byte 16550 in x1 and the kernel writes one
+# letter to it at each stage (arch/aarch64/marks.rs). Never in a shipped kernel.
+early-marks = []
 # The checks of OBJ (obj.rs) in an image that runs the test init on several
 # CPUs: the places that change a link outside a section stop the kernel
 # (xtask smp-probe).

@@ -30,6 +30,46 @@
     add     \reg, \reg, :lo12:\sym
 .endm
 
+.ifdef EARLY_MARKS
+// The stage marks of the first boot on EC2 (kernel feature `early-marks`): the
+// letter \ch goes to the byte 16550 whose physical address the loader left in
+// x22, by polling LSR at most 1000 times. MARK_PA runs with the MMU off,
+// MARK_VA with the linear map. Clobbers x16 and x17.
+.macro MARK_PA ch
+    cbz     x22, .Lmark\@
+    mov     x17, #1000
+.Lpoll\@:
+    ldrb    w16, [x22, #5]
+    tbnz    w16, #5, .Lroom\@
+    subs    x17, x17, #1
+    b.ne    .Lpoll\@
+.Lroom\@:
+    mov     w16, #\ch
+    strb    w16, [x22]
+.Lmark\@:
+.endm
+.macro MARK_VA ch
+    cbz     x22, .Lmark\@
+    movz    x16, #0xFFFF, lsl #48
+    add     x16, x16, x22
+    mov     x17, #1000
+.Lpoll\@:
+    ldrb    w15, [x16, #5]
+    tbnz    w15, #5, .Lroom\@
+    subs    x17, x17, #1
+    b.ne    .Lpoll\@
+.Lroom\@:
+    mov     w15, #\ch
+    strb    w15, [x16]
+.Lmark\@:
+.endm
+.else
+.macro MARK_PA ch
+.endm
+.macro MARK_VA ch
+.endm
+.endif
+
 .section .text.head, "ax"
 .global _head
 _head:
@@ -46,6 +86,10 @@ _head:
 
 .section .text.boot, "ax"
 primary_entry:
+.ifdef EARLY_MARKS
+    mov     x22, x1                 // the loader's port of the stage marks, or 0
+.endif
+    MARK_PA 'A'
     msr     daifset, #0xf
     mov     x19, x0                 // device tree PA (0 when QEMU boots the ELF)
     adr     x20, _head              // kernel image PA
@@ -63,6 +107,7 @@ primary_entry:
     b       el2_drop
 
 at_el1:
+    MARK_PA 'B'
     msr     spsel, #1
     ldr     x1, =SCTLR_MMU_OFF      // known state: MMU, caches and alignment checks off
     msr     sctlr_el1, x1
@@ -117,6 +162,25 @@ at_el1:
     orr     x11, x11, x9
     str     x11, [x3, x10, lsl #3]
 3:
+.ifdef EARLY_MARKS
+    // The GiB of the marks' port, as device memory unless it is GiB 0 (mapped above) or one of RAM.
+    cbz     x22, .Lmarks_mapped
+    lsr     x10, x22, #30
+    cbz     x10, .Lmarks_mapped
+    cmp     x10, #511
+    b.hi    .Lmarks_mapped
+    lsr     x12, x20, #30
+    cmp     x10, x12
+    b.eq    .Lmarks_mapped
+    lsr     x12, x19, #30
+    cmp     x10, x12
+    b.eq    .Lmarks_mapped
+    ldr     x11, =BLOCK_DEVICE
+    lsl     x12, x10, #30
+    orr     x11, x11, x12
+    str     x11, [x3, x10, lsl #3]
+.Lmarks_mapped:
+.endif
     // Kernel image: 2 MiB blocks from the load address, which the loaders align to 2 MiB.
     ldr     x9, =BLOCK_KERNEL
     ldr     x12, =__image_size
@@ -181,6 +245,7 @@ at_el1:
     br      x1
 
 upper_half:
+    MARK_VA 'C'
     msr     ttbr0_el1, x21          // drop the identity map
     isb
     tlbi    vmalle1
@@ -195,7 +260,12 @@ upper_half:
     b.hs    8f
     stp     xzr, xzr, [x0], #16
     b       7b
-8:  mov     x0, x19
+8:
+.ifdef EARLY_MARKS
+    ldr     x0, =EARLY_PORT_PA
+    str     x22, [x0]
+.endif
+    mov     x0, x19
     mov     x1, x20
     mov     x29, xzr                // the frame-record chain ends here
     bl      kernel_main

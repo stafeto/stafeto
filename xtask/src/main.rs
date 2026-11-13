@@ -41,6 +41,7 @@ mod owner_lifetime;
 mod service_sample;
 
 mod abi_fingerprint;
+mod aws;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
@@ -1456,10 +1457,13 @@ enum Variant {
     IdleNoBell,
     IdleNoDrain,
     IdleNoIrq,
+    /// The stage marks of the first boot on EC2 (kernel feature `early-marks`,
+    /// `xtask aws`).
+    EarlyMarks,
 }
 
 impl Variant {
-    const ALL: [Variant; 35] = [
+    const ALL: [Variant; 36] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1495,6 +1499,7 @@ impl Variant {
         Variant::IdleNoBell,
         Variant::IdleNoDrain,
         Variant::IdleNoIrq,
+        Variant::EarlyMarks,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1538,6 +1543,7 @@ impl Variant {
             Variant::IdleNoBell => Some("break-idle-bell"),
             Variant::IdleNoDrain => Some("break-idle-drain"),
             Variant::IdleNoIrq => Some("break-idle-irq"),
+            Variant::EarlyMarks => Some("early-marks"),
         }
     }
 
@@ -1569,6 +1575,7 @@ impl Variant {
             | Variant::IdleNoBell
             | Variant::IdleNoDrain
             | Variant::IdleNoIrq
+            | Variant::EarlyMarks
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1640,6 +1647,7 @@ impl Variant {
             Variant::IdleNoBell => "stafeto-idle-no-bell",
             Variant::IdleNoDrain => "stafeto-idle-no-drain",
             Variant::IdleNoIrq => "stafeto-idle-no-irq",
+            Variant::EarlyMarks => "stafeto-early-marks",
         }
     }
 }
@@ -1984,6 +1992,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
   help      this text";
 
 fn main() {
@@ -1994,6 +2003,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
+        Some("aws") => aws::run(&args[1..]),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
         Some("efi-vz") => efi::vz(),

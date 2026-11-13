@@ -174,6 +174,19 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 "device",
             );
         }
+        #[cfg(feature = "early-marks")]
+        if let Some(pa) = crate::arch::marks::port() {
+            let page = pa & !(PAGE_SIZE - 1);
+            map(
+                &mut pt,
+                &mut mem,
+                LINEAR_BASE + page as usize,
+                page,
+                PAGE_SIZE,
+                Attrs::DEVICE,
+                "early mark port",
+            );
+        }
         pt.root()
     };
     // SAFETY: the new tables map the image at the same addresses with W^X,

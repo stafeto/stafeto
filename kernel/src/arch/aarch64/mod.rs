@@ -7,6 +7,8 @@ pub mod cpu;
 pub mod exceptions;
 pub mod gic;
 pub mod its;
+#[cfg(feature = "early-marks")]
+pub mod marks;
 pub mod mmio;
 pub mod mmu;
 #[cfg(any(feature = "fault-probe", feature = "overflow-probe"))]
@@ -16,6 +18,8 @@ pub mod symbols;
 pub mod timer;
 pub mod user;
 
+#[cfg(feature = "early-marks")]
+core::arch::global_asm!(".equ EARLY_MARKS, 1", options(raw));
 core::arch::global_asm!(include_str!("head.S"), options(raw));
 core::arch::global_asm!(include_str!("vectors.S"), options(raw));
 core::arch::global_asm!(include_str!("mmu.S"), options(raw));

@@ -528,7 +528,7 @@ fn main() -> Status {
     platform
         .resolve_gic_version(|address| {
             // SAFETY: the distributor's register block, which the firmware maps.
-            unsafe { core::ptr::read_volatile(address as *const u32) }
+            unsafe { port::read32(address) }
         })
         .unwrap_or_else(|e| refuse(&e));
     describe(&platform);
@@ -654,7 +654,11 @@ fn main() -> Status {
             cpu::clean_range(t, len);
         }
         say("efi-loader: jumping\n");
-        cpu::enter_kernel(loaded.kernel.base, loaded.tree.base)
+        #[cfg(feature = "early-marks")]
+        let mark_port = port::mark_base();
+        #[cfg(not(feature = "early-marks"))]
+        let mark_port = 0;
+        cpu::enter_kernel(loaded.kernel.base, loaded.tree.base, mark_port)
     }
 }
 
