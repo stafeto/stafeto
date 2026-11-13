@@ -165,8 +165,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # The stack canary from AT_RANDOM (a blocking getrandom without it, abort
 # without both), mkstemp and its kin, tmpnam, tempnam, the DNS transaction
 # number and shmget fail with ENOSYS without entropy and draw nothing from
-# the clock; tagged pin-d8004483.
-COMMIT = "d800448337c09899ac9f6622ac519647a3cd8fbd"
+# the clock; tagged pin-d8004483, merged as 760f2515.
+COMMIT = "760f2515c4b01e93e3ec394c896c6ec6fea565b5"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

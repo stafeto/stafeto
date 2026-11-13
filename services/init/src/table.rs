@@ -3127,8 +3127,8 @@ mod tests {
         ]);
         for (index, table) in tables.enumerate() {
             for r in table.iter().filter(|r| r.connects.contains(&"posix")) {
-                // The probes of the layer in Rust link no relibc and take no canary.
-                const RUST_ONLY: [&str; 3] = ["posix-clock-peer", "svc", "store-probe"];
+                // These two do not depend on posix-crt, which starts relibc and takes the canary.
+                const RUST_ONLY: [&str; 2] = ["posix-clock-peer", "svc"];
                 if !r.connects.contains(&ENTROPY_SERVICE) && !RUST_ONLY.contains(&r.program) {
                     lacking.push(format!("table {index}: {} ({})", r.name, r.program));
                 }

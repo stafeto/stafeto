@@ -3175,8 +3175,8 @@ fn build_boot_image(
     })
 }
 
-/// The packages of the tests and apps that link relibc's `libc.a` (their
-/// build script names relibc). Their start takes the stack canary from
+/// The packages of the tests and apps that run on relibc: their build script
+/// names relibc or they depend on `posix-crt`, which starts it. Their start takes the stack canary from
 /// AT_RANDOM, or from a blocking `getrandom`, and ends the program with abort
 /// when it has neither.
 fn relibc_packages(root: &Path) -> Vec<String> {
@@ -3189,7 +3189,8 @@ fn relibc_packages(root: &Path) -> Vec<String> {
             let build = std::fs::read_to_string(entry.path().join("build.rs")).unwrap_or_default();
             let manifest =
                 std::fs::read_to_string(entry.path().join("Cargo.toml")).unwrap_or_default();
-            if !build.contains("relibc") {
+            // posix-crt starts relibc for the program, whatever its language.
+            if !build.contains("relibc") && !manifest.contains("posix-crt") {
                 continue;
             }
             let name = manifest

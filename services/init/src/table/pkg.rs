@@ -234,7 +234,7 @@ pub const STORE_PROBE: Record = Record {
     name: "store-probe",
     program: "store-probe",
     args: b"store-probe\0",
-    connects: &["ramfs", "clock", "posix", "pkgd"],
+    connects: &["ramfs", "clock", "posix", "pkgd", "entropy"],
     root: true,
     quota: super::ramfs::PROCS_QUOTA,
     ..super::ramfs::POSIX
@@ -254,6 +254,8 @@ pub const STORE_PROBE_TABLE: &[Record] = &[
     BLK,
     PKGD,
     STORE_PROBE,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the place `Packages` (tests/pkg-slot): the first POSIX process, root, with a
@@ -309,6 +311,8 @@ pub const INIT_WAIT_TABLE: &[Record] = &[
     BLK,
     PKGD,
     INIT_WAIT_CLIENT,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 #[cfg(test)]

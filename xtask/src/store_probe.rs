@@ -68,7 +68,7 @@ const ENDED: &str = "init: store-probe ended: exit code 0, not restarted";
 
 /// The programs of the image: the services with the features of the run (`steps` for the
 /// measurement, `crash` for the crash points).
-const fn programs(steps: bool, crash: bool) -> [ImageProgram; 10] {
+const fn programs(steps: bool, crash: bool) -> [ImageProgram; 12] {
     let more: &'static [&'static str] = if steps { &["steps"] } else { &[] };
     let pkgd: &'static [&'static str] = if crash { &["crash"] } else { more };
     [
@@ -87,11 +87,23 @@ const fn programs(steps: bool, crash: bool) -> [ImageProgram; 10] {
         ("pkgd", "pkgd", PKGD_STACK_SIZE, pkgd),
         ("store-probe", "store-probe", 4 * POSIX_STACK_SIZE, &[]),
         ("loader", "loader", 0, &[]),
+        (
+            "virtio-rng",
+            "virtio-rng",
+            crate::entropy::RNG_STACK_SIZE,
+            &[],
+        ),
+        (
+            "entropy",
+            "entropy",
+            crate::entropy::ENTROPY_STACK_SIZE,
+            &[],
+        ),
     ]
 }
-pub const PROGRAMS: [ImageProgram; 10] = programs(false, false);
-const PROGRAMS_STEPS: [ImageProgram; 10] = programs(true, false);
-const PROGRAMS_CRASH: [ImageProgram; 10] = programs(false, true);
+pub const PROGRAMS: [ImageProgram; 12] = programs(false, false);
+const PROGRAMS_STEPS: [ImageProgram; 12] = programs(true, false);
+const PROGRAMS_CRASH: [ImageProgram; 12] = programs(false, true);
 
 pub fn command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {

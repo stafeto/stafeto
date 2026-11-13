@@ -754,8 +754,11 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// near the cost of a thread of the volley (20 pages). The steps probe
 /// reserves 250 of them on the 2 GiB machine, 24 MiB more. The sockets of the
 /// network service (the layer's `net.rs`, the session in fork and spawn)
-/// added 22: 521 measured, and 608 pages leave 14.3%, 26 pages to 90%.
-const STEPS_QUOTA: u64 = 608 * PAGE;
+/// added 22: 521 measured, and 608 pages leave 14.3%, 26 pages to 90%. The
+/// relibc that takes its stack canary from AT_RANDOM (stafeto-design#697) grew
+/// the probe by one page: 548 measured against 547 before, one page over 90%
+/// of 608 (547.2). With 640 pages the 548 leave 14.4%, 28 pages to 90%.
+const STEPS_QUOTA: u64 = 640 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retained 572 charged pages when it was set to 704. The
