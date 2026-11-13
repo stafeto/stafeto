@@ -3823,6 +3823,7 @@ mod tests {
             ticket: 3 << 8 | 2,
         };
         let who = WhoReply {
+            ceiling: 31,
             pid: 300,
             credentials: Credentials {
                 euid: 0,

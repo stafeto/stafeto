@@ -1399,6 +1399,73 @@ pub unsafe extern "C" fn stafeto_thread_create(stack: *mut usize, block: *mut c_
     }
 }
 
+/// The key of the word at `address` as the layer names it to the pipe
+/// service, into `out` (kind, key, offset): 0, or 1 for a word it does not
+/// wait on through the service (probes of waits by address).
+///
+/// # Safety
+/// `out` has room for 3 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_wait_word(address: usize, out: *mut u64) -> c_int {
+    match posix_abi::mmap::probe_wait_word(address) {
+        Some(word) => {
+            // SAFETY: the caller gives room for 3 words.
+            unsafe { out.copy_from_nonoverlapping([word.0, word.1, word.2].as_ptr(), 3) };
+            0
+        }
+        None => 1,
+    }
+}
+
+/// A wait by address on (`kind`, `key`, `offset`) at `level`, as a process
+/// that names a key it does not hold would send it: 0 when woken, else the
+/// errno (EPERM when refused, ETIMEDOUT after `ms`).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_addr_wait(
+    kind: u64,
+    key: u64,
+    offset: u64,
+    level: u64,
+    ms: u64,
+) -> c_int {
+    posix_abi::ipc::probe_addr_wait((kind, key, offset), level, ms).map_or_else(|e| e, |()| 0)
+}
+
+/// A wake by address as `stafeto_probe_addr_wait` sends its wait: the count
+/// woken, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_addr_wake(kind: u64, key: u64, offset: u64, count: u64) -> i64 {
+    match posix_abi::ipc::probe_addr_wake((kind, key, offset), count) {
+        Ok(woken) => woken as i64,
+        Err(errno) => -i64::from(errno),
+    }
+}
+
+/// Opens the named semaphore `name` (made with value 1) and gives its number
+/// in the service, or 0.
+///
+/// # Safety
+/// `name` is a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_nsem_open(name: *const core::ffi::c_char) -> u64 {
+    // SAFETY: the caller's promise.
+    let name = unsafe { core::ffi::CStr::from_ptr(name) };
+    posix_abi::ipc::probe_nsem_open(name.to_bytes()).unwrap_or(0)
+}
+
+/// `sem_wait` on the named semaphore `id` as a session that did not open it
+/// would send it: 0, or the errno (EPERM when refused, ETIMEDOUT after `ms`).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_nsem_wait(id: u64, level: u64, ms: u64) -> c_int {
+    posix_abi::ipc::probe_nsem_wait(id, level, ms).map_or_else(|e| e, |()| 0)
+}
+
+/// `sem_post` on the named semaphore `id`: 0, or the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_nsem_post(id: u64) -> c_int {
+    posix_abi::ipc::probe_nsem_post(id).map_or_else(|e| e, |()| 0)
+}
+
 /// The waits on shared words that fell back to the poll (probes).
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_shared_polls() -> u32 {

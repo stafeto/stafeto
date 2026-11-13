@@ -102,6 +102,20 @@ fn grant_with(transport: posix_fs::Transport, target: posix_fs::Target) -> Resul
         })
 }
 
+/// The key of a new anonymous shared object (MAP_SHARED with no file): the
+/// service makes it and enters the caller as its writer, which is what lets
+/// the caller wait on the object's words through the pipe service. None
+/// when the service has no place for one more (the object then has no key
+/// and its words wait by polling) or cannot be asked.
+pub fn anon() -> Option<u64> {
+    let w = request(proto_process::SHARE_ANON, 0, 0).ok()?;
+    let reply = exchange(&w, None).ok()?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut r = Reader::new(reply.bytes(&mut buffer));
+    let (status, key) = (r.u32().ok()?, r.u64().ok()?);
+    (status == 0 && key != 0).then_some(key)
+}
+
 /// The object of `key`, or the right to make it.
 pub fn get(key: u64) -> Result<Got, i32> {
     let w = request(proto_process::SHARE_GET, key, 0)?;

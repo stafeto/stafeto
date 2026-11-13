@@ -128,6 +128,7 @@ mod tests {
     }
     fn who() -> proto_process::WhoReply {
         proto_process::WhoReply {
+            ceiling: 31,
             pid: 257,
             credentials: proto_process::Credentials::NOBODY,
             generation: 1,

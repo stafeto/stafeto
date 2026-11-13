@@ -51,7 +51,10 @@
 //! label (object_info LABEL, which answers the owner of the channel alone,
 //! O(1)), so a channel of anyone else proves nothing (PERMISSION); the reply
 //! (`WhoReply`) is that record's PID, its six credentials and the
-//! generation of its credentials. Register, no body; the reply is a copy
+//! generation of its credentials and its ceiling. ShareHeld (`ShareHeld`):
+//! does the record the Vouch named hold the shared object of a key (a
+//! file's or an anonymous one's), and for writing; the reply is the status
+//! and `Held`, STALE when the record's generation moved on. Register, no body; the reply is a copy
 //! of the page of the credentials generations with MAP_READ and TRANSFER
 //! (`GENERATIONS_SIZE` bytes, a u64 per record index, which the service
 //! raises with Release before it answers a Change and when it makes a
@@ -203,7 +206,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 
-pub const VERSION: u16 = 11;
+pub const VERSION: u16 = 12;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -230,6 +233,9 @@ pub const ACCESS: u32 = 507;
 pub const NOT_FOUND: u32 = 508;
 /// A terminal stop was refused for an orphaned group.
 pub const ORPHAN: u32 = 509;
+/// ShareHeld: the record's generation is not the one asked about; the client
+/// the question was for is gone (it asks Vouch again).
+pub const STALE: u32 = 510;
 
 /// The flags of Spawn: those of posix_spawnattr_setflags (Linux values).
 pub const SPAWN_SETPGROUP: u32 = 0x02;
@@ -449,6 +455,11 @@ pub enum Method {
     SetSid = 16,
     GetPgid = 17,
     GetSid = 18,
+    /// Through a notary session: does the process of a record hold the shared
+    /// object of a key, and for writing (`ShareHeld`)? Reply: status u32 and
+    /// `held` u32 (`HELD_NONE`, `HELD_READ`, `HELD_WRITE`); STALE when the
+    /// record's generation is another than the one named.
+    ShareHeld = 19,
     Register = 20,
     Vouch = 21,
     SpawnStart = 22,
@@ -595,6 +606,24 @@ pub const SHARE_PUT: u32 = 2;
 pub const SHARE_ATTACH: u32 = 3;
 /// Share: the caller maps the object no more, or could not make it (Detach).
 pub const SHARE_DETACH: u32 = 4;
+/// Share: the caller maps an anonymous shared object (MAP_SHARED with no
+/// file) and asks for its key; the service makes the key itself and enters the
+/// caller as the writer. The body's key and pages are 0. Reply: status u32
+/// and the key u64; FULL when the table has no place (the object then has no
+/// key and its words wait by polling).
+pub const SHARE_ANON: u32 = 5;
+/// ShareHeld: the kind of an object that is a file or a segment of one
+/// (its key is `share_key`).
+pub const HELD_KIND_FILE: u32 = 0;
+/// ShareHeld: the kind of an anonymous shared object (its key is the
+/// service's).
+pub const HELD_KIND_ANON: u32 = 1;
+/// ShareHeld reply: the record holds no such object.
+pub const HELD_NONE: u32 = 0;
+/// ShareHeld reply: the record holds it for reading only.
+pub const HELD_READ: u32 = 1;
+/// ShareHeld reply: the record holds it for writing.
+pub const HELD_WRITE: u32 = 2;
 /// Reply to Get: the object comes with the reply.
 pub const SHARED_FOUND: u32 = 0;
 /// Reply to Get: the caller makes the object and then Puts it.
@@ -681,9 +710,9 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
-    57, 58, 59, 60, 61, 62, 63,
+    1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+    56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -859,7 +888,9 @@ pub const fn generation_room(old: u64, steps: u64) -> bool {
 /// credentials u32, the generation of the credentials u64, then 1 u32
 /// for the identity of a loader (0 for a process's), the image u32 and the
 /// ticket of the loader's place u64 (zeros for a process), the record's
-/// index u32 and a zero u32, then the terminal u32 and its generation u64
+/// index u32 and the ceiling u32 (1 to 63: the highest level the record's
+/// process may have, which the services that order waiters cut a client's
+/// claim to), then the terminal u32 and its generation u64
 /// (u32::MAX and 0 for no attachment), current image, groups, finite limits and expenditure root: 252 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoReply {
@@ -868,6 +899,8 @@ pub struct WhoReply {
     pub generation: u64,
     pub loader: Option<LoaderOf>,
     pub index: u32,
+    /// The ceiling of the record's process (1 to 63).
+    pub ceiling: u8,
     /// Controlling terminal attachment; invalidated by its exact departure.
     pub ctty: Option<(u32, u64)>,
     pub image: u32,
@@ -891,6 +924,7 @@ pub struct Vouch<'a> {
     pub generation: u64,
     pub loader: Option<LoaderOf>,
     pub index: u32,
+    pub ceiling: u8,
     pub ctty: Option<(u32, u64)>,
     pub image: u32,
     pub groups: &'a Groups,
@@ -909,6 +943,7 @@ impl Vouch<'_> {
         words[11] = image;
         words[12..14].copy_from_slice(&pair(ticket));
         words[14] = self.index;
+        words[15] = u32::from(self.ceiling);
         let (terminal, generation) = self.ctty.unwrap_or((u32::MAX, 0));
         words[16] = terminal;
         words[17..19].copy_from_slice(&pair(generation));
@@ -934,6 +969,7 @@ impl WhoReply {
             generation: self.generation,
             loader: self.loader,
             index: self.index,
+            ceiling: self.ceiling,
             ctty: self.ctty,
             image: self.image,
             groups: &self.groups,
@@ -972,7 +1008,7 @@ impl WhoReply {
         words.copy_from_slice(&wire[2..8]);
         let generation = wide(8);
         let (mark, loader_image, ticket) = (wire[10], wire[11], wide(12));
-        let (index, zero) = (wire[14], wire[15]);
+        let (index, ceiling) = (wire[14], wire[15]);
         let (terminal, ctty_generation) = (wire[16], wide(17));
         let ctty = match (terminal, ctty_generation) {
             (u32::MAX, 0) => None,
@@ -1012,7 +1048,8 @@ impl WhoReply {
             || pid > i32::MAX as u32
             || words.contains(&u32::MAX)
             || index as usize >= RECORDS
-            || zero != 0
+            || ceiling == 0
+            || ceiling > 63
         {
             return Err(Status::BadSize);
         }
@@ -1030,6 +1067,7 @@ impl WhoReply {
             generation,
             loader,
             index,
+            ceiling: ceiling as u8,
             ctty,
             image,
             groups,
@@ -1602,6 +1640,82 @@ impl SetId {
     }
 }
 
+/// The body of ShareHeld: the record's index u32 and generation u64 (what
+/// Vouch said), the kind u32 (`HELD_KIND_FILE`, `HELD_KIND_ANON`) and the
+/// key u64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareHeld {
+    pub index: u32,
+    pub generation: u64,
+    pub kind: u32,
+    pub key: u64,
+}
+
+impl ShareHeld {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.index)?;
+        w.u64(self.generation)?;
+        w.u32(self.kind)?;
+        w.u64(self.key)
+    }
+
+    /// BAD_SIZE out of the layout, for an index past the table, a kind
+    /// other than the two or a key of 0.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let index = r.u32()?;
+        let generation = r.u64()?;
+        let (kind, key) = (r.u32()?, r.u64()?);
+        r.finish()?;
+        if index as usize >= RECORDS || kind > HELD_KIND_ANON || key == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self {
+            index,
+            generation,
+            kind,
+            key,
+        })
+    }
+}
+
+/// What the reply to ShareHeld says: the right the record has to the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    None,
+    Read,
+    Write,
+}
+
+impl Held {
+    pub const fn word(self) -> u32 {
+        match self {
+            Held::None => HELD_NONE,
+            Held::Read => HELD_READ,
+            Held::Write => HELD_WRITE,
+        }
+    }
+
+    /// The reply bytes (the status u32 and the right u32): 8 bytes, a held
+    /// past 2 is BAD_SIZE; a refusal is the status alone (4 bytes), which
+    /// comes back as that status (STALE for another generation).
+    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
+        let mut r = Reader::new(bytes);
+        let status = r.u32()?;
+        if status != 0 {
+            r.finish()?;
+            return Err(Status::from_code(status));
+        }
+        let held = r.u32()?;
+        r.finish()?;
+        match held {
+            HELD_NONE => Ok(Held::None),
+            HELD_READ => Ok(Held::Read),
+            HELD_WRITE => Ok(Held::Write),
+            _ => Err(Status::BadSize),
+        }
+    }
+}
+
 /// How a process ended, as wait reports it (spec 2, section 3.1): the
 /// kernel's reason read with PROCESS_STATE. The layer's `_exit(s)` exits
 /// with `s & 0xFF`, its death by signal `n` with `0x100 | n`.
@@ -1776,6 +1890,7 @@ mod tests {
             Method::SetSid,
             Method::GetPgid,
             Method::GetSid,
+            Method::ShareHeld,
             Method::Register,
             Method::Vouch,
             Method::SpawnStart,
@@ -1946,6 +2061,7 @@ mod tests {
             generation: 1 << 40 | 7,
             loader: None,
             index: 44,
+            ceiling: 31,
             ctty: Some((0, 5)),
             image: 1,
             groups: Groups::EMPTY,
@@ -1995,6 +2111,27 @@ mod tests {
         let mut bytes = w.as_bytes().to_vec();
         bytes[40] = 2;
         assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "mark 2");
+        // The ceiling is the word after the index, 1 to 63.
+        assert_eq!(&w.as_bytes()[56..64], &[44, 0, 0, 0, 31, 0, 0, 0][..]);
+        for bad in [0u32, 64, u32::MAX] {
+            let mut bytes = w.as_bytes().to_vec();
+            bytes[60..64].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(
+                WhoReply::read(&bytes),
+                Err(Status::BadSize),
+                "ceiling {bad}"
+            );
+        }
+        for ceiling in [1u8, 63] {
+            let mut again = WhoReply { ceiling, ..loader };
+            let mut w = Writer::new();
+            again.write(&mut w).unwrap();
+            assert_eq!(WhoReply::read(w.as_bytes()).unwrap().ceiling, ceiling);
+            again.ceiling = 0;
+            let mut w = Writer::new();
+            again.write(&mut w).unwrap();
+            assert_eq!(WhoReply::read(w.as_bytes()), Err(Status::BadSize));
+        }
         assert_eq!(GENERATIONS_SIZE, 2048);
         assert_eq!(GROUPS_AT + RECORDS * 8, 4096, "both halves in a page");
         assert_eq!(groups_of(groups_word(300, 257)), Some((300, 257)));
@@ -2002,6 +2139,70 @@ mod tests {
         assert!(is_terminal(NOTARY | TERMINAL));
         assert!(!is_terminal(NOTARY));
         assert!(!is_terminal(1 << 63 | NOTARY | TERMINAL));
+    }
+
+    #[test]
+    fn share_held_has_one_layout() {
+        let ask = ShareHeld {
+            index: 12,
+            generation: 1 << 40 | 3,
+            kind: HELD_KIND_ANON,
+            key: 0x0000_0007_0000_0001,
+        };
+        let mut w = Writer::new();
+        ask.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 24);
+        assert_eq!(ShareHeld::read(Reader::new(w.as_bytes())), Ok(ask));
+        for cut in [0, 4, 23] {
+            assert_eq!(
+                ShareHeld::read(Reader::new(&w.as_bytes()[..cut])),
+                Err(Status::BadSize),
+                "cut {cut}"
+            );
+        }
+        let mut long = w.as_bytes().to_vec();
+        long.push(0);
+        assert_eq!(ShareHeld::read(Reader::new(&long)), Err(Status::BadSize));
+        let bad = |ask: ShareHeld| {
+            let mut w = Writer::new();
+            ask.write(&mut w).unwrap();
+            ShareHeld::read(Reader::new(w.as_bytes()))
+        };
+        assert_eq!(bad(ShareHeld { kind: 2, ..ask }), Err(Status::BadSize));
+        assert_eq!(bad(ShareHeld { key: 0, ..ask }), Err(Status::BadSize));
+        assert_eq!(
+            bad(ShareHeld {
+                index: RECORDS as u32,
+                ..ask
+            }),
+            Err(Status::BadSize)
+        );
+        let reply = |status: u32, held: Option<u32>| {
+            let mut w = Writer::new();
+            w.u32(status).unwrap();
+            if let Some(held) = held {
+                w.u32(held).unwrap();
+            }
+            w.as_bytes().to_vec()
+        };
+        assert_eq!(Held::read(&reply(0, Some(0))), Ok(Held::None));
+        assert_eq!(Held::read(&reply(0, Some(1))), Ok(Held::Read));
+        assert_eq!(Held::read(&reply(0, Some(2))), Ok(Held::Write));
+        assert_eq!(
+            Held::read(&reply(0, Some(3))),
+            Err(Status::BadSize),
+            "held 3"
+        );
+        assert_eq!(Held::read(&reply(0, None)), Err(Status::BadSize));
+        assert_eq!(
+            Held::read(&reply(STALE, None)),
+            Err(Status::from_code(STALE))
+        );
+        let mut long = reply(0, Some(2));
+        long.push(0);
+        assert_eq!(Held::read(&long), Err(Status::BadSize));
+        assert_eq!(Held::Write.word(), HELD_WRITE);
+        assert_eq!(VERSION, 12);
     }
 
     #[test]

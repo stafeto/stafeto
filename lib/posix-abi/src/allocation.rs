@@ -606,23 +606,38 @@ impl State {
                 .map
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
-            if let Some(back) = gone.and_then(|object| object.back) {
+            if let Some(object) = gone {
                 // Each object holds one reference of its pin, and gives it
                 // back with its last piece. The key is told to the process
                 // service with the last object that has it registered. The
                 // list holds an entry for every object of the map at most,
-                // since the caller empties it after each call.
-                let key_used = self
-                    .map
-                    .objects()
-                    .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key && b.registered));
-                if self.closed_len < self.closed.len() {
-                    self.closed[self.closed_len] = (
-                        back.pin,
-                        back.pin_generation,
-                        back.key,
-                        back.registered && !key_used,
-                    );
+                // since the caller empties it after each call. An anonymous
+                // shared object has a key of the service's and no pin.
+                let entry = match object.back {
+                    Some(back) => {
+                        let key_used = self.map.objects().any(|(_, o)| {
+                            o.back.is_some_and(|b| b.key == back.key && b.registered)
+                        });
+                        Some((
+                            back.pin,
+                            back.pin_generation,
+                            back.key,
+                            back.registered && !key_used,
+                        ))
+                    }
+                    None if object.shared && object.wait_key != 0 => {
+                        let key_used = self
+                            .map
+                            .objects()
+                            .any(|(_, o)| o.back.is_none() && o.wait_key == object.wait_key);
+                        Some((-1, 0, object.wait_key, !key_used))
+                    }
+                    None => None,
+                };
+                if let Some(entry) = entry
+                    && self.closed_len < self.closed.len()
+                {
+                    self.closed[self.closed_len] = entry;
                     self.closed_len += 1;
                     CLOSED_PENDING.store(self.closed_len, core::sync::atomic::Ordering::Release);
                 }

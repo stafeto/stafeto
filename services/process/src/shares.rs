@@ -10,12 +10,28 @@
 //! that unmaps its last piece detaches, and the end of a process (or the
 //! exec of a new image in it) detaches it from every entry; the last to go
 //! frees the entry and the service's handle, so the object goes with the
-//! last mapping. O(SHARES) a call, with SHARES = 16 entries.
+//! last mapping. O(SHARES) a call, with SHARES = 48 entries.
+//!
+//! An entry has a kind. The entries of files carry the object. The entries
+//! of anonymous shared objects (`MAP_SHARED` with no file) carry none: the
+//! object lives in the processes that map it, the key is made here
+//! (`anon`) and the entry lives while a process uses it. Besides the users
+//! an entry keeps its writers (a file's grant said write, or the object is
+//! the process's own), and `held` tells what right a record has to a
+//! key: that is the right the services that wait on an address ask for
+//! (`Method::ShareHeld`).
 
 use proto_process::RECORDS;
 
 /// The entries of the table.
-pub const SHARES: usize = 16;
+pub const SHARES: usize = 48;
+
+/// The anonymous objects one process is a user of at most, a sixth of the
+/// table: a program has a few anonymous shared pages (a lock, a ring), so
+/// eight is room enough, and six processes must work together to take the
+/// whole table, which one process alone cannot do to make every writable
+/// shared mapping of the others fail.
+pub const ANON_PER_PROCESS: usize = 8;
 
 const WORDS: usize = RECORDS.div_ceil(64);
 
@@ -41,12 +57,32 @@ enum State<T> {
         pages: u32,
         memory: T,
     },
+    /// An anonymous shared object: the processes that map it keep it, the
+    /// entry only says who they are.
+    Anon,
 }
 
 struct Entry<T> {
     key: u64,
     state: State<T>,
     users: [u64; WORDS],
+    /// The users that may write the object.
+    writers: [u64; WORDS],
+}
+
+/// What right a record has to an object, as `held` tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    None,
+    Read,
+    Write,
+}
+
+/// What kind of object a key names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Anon,
 }
 
 /// The grants at most, and the most one process holds: a grant is for one
@@ -97,6 +133,10 @@ pub struct Shares<T, W> {
     grants: [Option<Grant>; GRANTS],
     waiting: [Option<Waiting<W>>; WAITING],
     ages: u32,
+    /// The last key `anon` made: keys count up from 1 and never repeat
+    /// while the service runs; bit 63, which the keys of files have, stays
+    /// clear.
+    anon_keys: u64,
 }
 
 impl<T, W> Shares<T, W> {
@@ -122,6 +162,7 @@ impl<T, W> Shares<T, W> {
             grants: [const { None }; GRANTS],
             waiting: [const { None }; WAITING],
             ages: 0,
+            anon_keys: 0,
         }
     }
 
@@ -211,8 +252,75 @@ impl<T, W> Shares<T, W> {
             .position(|e| e.as_ref().is_some_and(|e| e.key == key))
     }
 
-    fn add_user(entry: &mut Entry<T>, record: usize) {
+    fn add_user(entry: &mut Entry<T>, record: usize, write: bool) {
         entry.users[record / 64] |= 1 << (record % 64);
+        if write {
+            entry.writers[record / 64] |= 1 << (record % 64);
+        }
+    }
+
+    fn has(mask: &[u64; WORDS], record: usize) -> bool {
+        mask[record / 64] & (1 << (record % 64)) != 0
+    }
+
+    /// The caller in `record` maps a new anonymous shared object: its key
+    /// (made here), with the caller as its user and writer. None when the
+    /// table has no place or the caller is a user of `ANON_PER_PROCESS`
+    /// anonymous objects already (the object then has no key, and the
+    /// request of that process alone is refused).
+    pub fn anon(&mut self, record: usize) -> Option<u64> {
+        let own = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state, State::Anon) && Self::has(&e.users, record))
+            .count();
+        if own >= ANON_PER_PROCESS {
+            return None;
+        }
+        let place = self.entries.iter().position(Option::is_none)?;
+        self.anon_keys += 1;
+        let mut entry = Entry {
+            key: self.anon_keys,
+            state: State::Anon,
+            users: [0; WORDS],
+            writers: [0; WORDS],
+        };
+        Self::add_user(&mut entry, record, true);
+        self.entries[place] = Some(entry);
+        Some(self.anon_keys)
+    }
+
+    /// What right the process in `record` has to the object of `key`.
+    pub fn held(&self, record: usize, kind: Kind, key: u64) -> Held {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| e.key == key && matches!(e.state, State::Anon) == (kind == Kind::Anon))
+        else {
+            return Held::None;
+        };
+        if Self::has(&entry.writers, record) {
+            Held::Write
+        } else if Self::has(&entry.users, record) {
+            Held::Read
+        } else {
+            Held::None
+        }
+    }
+
+    /// A forked child takes the membership its parent has in the anonymous
+    /// objects, as writer when the parent is. The entries of files stay as
+    /// they are: the child joins them with an Attach the file service
+    /// vouched for.
+    pub fn fork_anon(&mut self, parent: usize, child: usize) {
+        for entry in self.entries.iter_mut().flatten() {
+            if matches!(entry.state, State::Anon) && Self::has(&entry.users, parent) {
+                let write = Self::has(&entry.writers, parent);
+                Self::add_user(entry, child, write);
+            }
+        }
     }
 
     /// The caller in `record` asks for the object of `key`; it is a user of
@@ -226,8 +334,10 @@ impl<T, W> Shares<T, W> {
                     // threads: two threads that map one file together make
                     // one object.
                     State::Making(_) => Got::Busy,
+                    // The key of an anonymous object is no file's.
+                    State::Anon => Got::Full,
                     State::Ready { .. } => {
-                        Self::add_user(entry, record);
+                        Self::add_user(entry, record, may_make);
                         let State::Ready { pages, memory } = &entry.state else {
                             unreachable!()
                         };
@@ -246,8 +356,9 @@ impl<T, W> Shares<T, W> {
                     key,
                     state: State::Making(record),
                     users: [0; WORDS],
+                    writers: [0; WORDS],
                 };
-                Self::add_user(&mut entry, record);
+                Self::add_user(&mut entry, record, true);
                 self.entries[place] = Some(entry);
                 Got::Reserved
             }
@@ -382,7 +493,7 @@ impl<T, W> Shares<T, W> {
             Some(i) => {
                 let entry = self.entries[i].as_mut().expect("an entry");
                 if matches!(entry.state, State::Ready { .. }) {
-                    Self::add_user(entry, record);
+                    Self::add_user(entry, record, write);
                 }
             }
             None => {
@@ -394,8 +505,9 @@ impl<T, W> Shares<T, W> {
                         key,
                         state: State::Ready { pages, memory },
                         users: [0; WORDS],
+                        writers: [0; WORDS],
                     };
-                    Self::add_user(&mut entry, record);
+                    Self::add_user(&mut entry, record, true);
                     self.entries[place] = Some(entry);
                 }
             }
@@ -412,18 +524,25 @@ impl<T, W> Shares<T, W> {
     }
 
     /// The caller gives up what it reserved (it could not make the object) or
-    /// unmapped the last piece of it.
-    pub fn detach(&mut self, key: u64, record: usize) {
-        if let Some(i) = self.find(key) {
-            let entry = self.entries[i].as_mut().expect("an entry");
-            entry.users[record / 64] &= !(1 << (record % 64));
-            self.settle(i);
-        }
+    /// unmapped the last piece of it. True when it was a user: its right
+    /// is lost, and the services that remember it must ask again.
+    pub fn detach(&mut self, key: u64, record: usize) -> bool {
+        let Some(i) = self.find(key) else {
+            return false;
+        };
+        let entry = self.entries[i].as_mut().expect("an entry");
+        let was = Self::has(&entry.users, record);
+        entry.users[record / 64] &= !(1 << (record % 64));
+        entry.writers[record / 64] &= !(1 << (record % 64));
+        self.settle(i);
+        was
     }
 
     /// The process in `record` is gone (or its image is): it uses nothing,
-    /// and its requests that wait go (their replies with them).
-    pub fn drop_user(&mut self, record: usize) {
+    /// and its requests that wait go (their replies with them). True when
+    /// it was a user of an entry (its right is lost, as in `detach`).
+    pub fn drop_user(&mut self, record: usize) -> bool {
+        let mut lost = false;
         for request in &mut self.waiting {
             if request
                 .as_ref()
@@ -439,10 +558,13 @@ impl<T, W> Shares<T, W> {
         }
         for i in 0..SHARES {
             if let Some(entry) = self.entries[i].as_mut() {
+                lost |= Self::has(&entry.users, record);
                 entry.users[record / 64] &= !(1 << (record % 64));
+                entry.writers[record / 64] &= !(1 << (record % 64));
                 self.settle(i);
             }
         }
+        lost
     }
 
     /// The entries in use.
@@ -714,5 +836,131 @@ mod tests {
         t.drop_user(4);
         t.drop_user(5);
         assert_eq!(t.len(), SHARES - 1);
+    }
+
+    /// The right of a record to a key: the writer of a file, the reader of
+    /// it, the maker of an anonymous object, and nobody else.
+    #[test]
+    fn held_tells_the_right_of_a_record() {
+        let mut t = Shares::<u32, u32>::new();
+        let file = proto_process::share_key(3, 9);
+        assert_eq!(t.get(file, 1, true), Got::Reserved);
+        assert_eq!(t.put(file, 1, 1, 10), Ok(()));
+        assert_eq!(t.get(file, 2, false), Got::Found(1, &10));
+        assert_eq!(t.held(1, Kind::File, file), Held::Write);
+        assert_eq!(
+            t.held(2, Kind::File, file),
+            Held::Read,
+            "a reader is no writer"
+        );
+        assert_eq!(t.held(3, Kind::File, file), Held::None, "a stranger");
+        assert_eq!(t.held(1, Kind::File, file + 1), Held::None, "another key");
+        let key = t.anon(4).expect("a place");
+        assert_eq!(t.held(4, Kind::Anon, key), Held::Write);
+        assert_eq!(t.held(1, Kind::Anon, key), Held::None, "a stranger");
+        assert_eq!(
+            t.held(4, Kind::File, key),
+            Held::None,
+            "the kind is part of the key"
+        );
+        assert_eq!(t.held(1, Kind::Anon, file), Held::None);
+        // A reader's right is lost with its detach, once.
+        assert!(t.detach(file, 2));
+        assert!(!t.detach(file, 2), "nothing more to lose");
+        assert_eq!(t.held(2, Kind::File, file), Held::None);
+        assert!(t.detach(key, 4));
+        assert_eq!(t.held(4, Kind::Anon, key), Held::None, "after the unmap");
+        assert!(
+            t.is_empty() || t.len() == 1,
+            "the anonymous entry went with its user"
+        );
+        assert_eq!(t.len(), 1);
+        // The end of a process loses what it held, and says so.
+        assert!(t.drop_user(1));
+        assert!(!t.drop_user(1));
+        assert!(t.is_empty());
+        // An attach of a reader is a reader, of a writer a writer.
+        t.attach(file, 6, 1, 10, true);
+        t.attach(file, 7, 1, 10, false);
+        assert_eq!(t.held(6, Kind::File, file), Held::Write);
+        assert_eq!(t.held(7, Kind::File, file), Held::Read);
+    }
+
+    /// A fork gives the child the parent's membership in the anonymous
+    /// objects only, and only the parent's.
+    #[test]
+    fn a_fork_carries_the_anonymous_objects_of_the_parent() {
+        let mut t = Shares::<u32, u32>::new();
+        let file = proto_process::share_key(1, 1);
+        assert_eq!(t.get(file, 1, true), Got::Reserved);
+        assert_eq!(t.put(file, 1, 1, 10), Ok(()));
+        let mine = t.anon(1).expect("a place");
+        let other = t.anon(2).expect("a place");
+        t.fork_anon(1, 5);
+        assert_eq!(t.held(5, Kind::Anon, mine), Held::Write);
+        assert_eq!(
+            t.held(5, Kind::Anon, other),
+            Held::None,
+            "another process's"
+        );
+        assert_eq!(
+            t.held(5, Kind::File, file),
+            Held::None,
+            "files wait for an Attach"
+        );
+        assert_eq!(t.held(1, Kind::Anon, mine), Held::Write);
+        // The child's own end takes its membership, and the parent keeps its.
+        assert!(t.drop_user(5));
+        assert_eq!(t.held(1, Kind::Anon, mine), Held::Write);
+        // A parent that lost the object has nothing to give.
+        assert!(t.detach(mine, 1));
+        t.fork_anon(1, 6);
+        assert_eq!(t.held(6, Kind::Anon, mine), Held::None);
+    }
+
+    /// The keys of anonymous objects are not those of files and do not
+    /// repeat; a full table gives none.
+    #[test]
+    fn anonymous_keys_are_the_services_and_the_table_is_finite() {
+        let mut t = Shares::<u32, u32>::new();
+        let mut seen = [0u64; SHARES];
+        for (n, slot) in seen.iter_mut().enumerate() {
+            let key = t.anon(n / ANON_PER_PROCESS).expect("a place");
+            assert_eq!(key & 1 << 63, 0, "no file's bit");
+            assert_ne!(key, 0);
+            *slot = key;
+        }
+        assert_eq!(t.anon(99), None, "the table is full");
+        let mut sorted = seen;
+        sorted.sort_unstable();
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "no repeats");
+        // A key that went is not made again.
+        assert!(t.detach(seen[0], 0));
+        let again = t.anon(0).expect("a place");
+        assert!(!seen.contains(&again));
+        // A file's Get of an anonymous key finds no file.
+        assert_eq!(t.get(seen[1], 2, true), Got::Full);
+        assert_eq!(t.held(2, Kind::Anon, seen[1]), Held::None);
+    }
+
+    /// One process cannot fill the table with anonymous objects: past
+    /// `ANON_PER_PROCESS` its own request is refused, the others still get
+    /// theirs, and what it gives back is its room again.
+    #[test]
+    fn a_process_has_a_share_of_the_anonymous_places() {
+        let mut t = Shares::<u32, u32>::new();
+        let mine: Vec<u64> = (0..ANON_PER_PROCESS)
+            .map(|_| t.anon(1).expect("within the share"))
+            .collect();
+        assert_eq!(t.anon(1), None, "past the share");
+        assert_eq!(t.len(), ANON_PER_PROCESS);
+        for record in 2..2 + (SHARES - ANON_PER_PROCESS) / ANON_PER_PROCESS {
+            assert!(t.anon(record).is_some(), "another process still gets one");
+        }
+        assert!(t.detach(mine[0], 1));
+        assert!(t.anon(1).is_some(), "a place given back is room again");
+        // A forked child's membership counts for the child.
+        t.fork_anon(1, 40);
+        assert_eq!(t.anon(40), None, "the child holds as many as its parent");
     }
 }

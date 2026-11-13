@@ -4736,6 +4736,25 @@ fn posix_ipc_steps() -> Result<(), String> {
         .map(|r| r.1)
         .max()
         .unwrap_or(0);
+    // The process service answers ShareHeld (kind 19, O(SHARES)) inside a
+    // step of the pipe service on a miss of its memory of answers; its
+    // steps stay under 0.9 of B too.
+    let process = longest_steps(&lines, "1");
+    if let Some(row) = process.iter().find(|r| r.0 == 19) {
+        println!("process service ShareHeld: {} ticks, B {TERM_B}", row.1);
+    } else {
+        return Err(format!(
+            "the process service ran no ShareHeld step: {process:?}"
+        ));
+    }
+    if let Some(row) = process.iter().find(|r| r.0 != 64 && r.1 > TERM_B * 9 / 10) {
+        return Err(format!(
+            "the process service: a step past 0.9 of B: {row:?}"
+        ));
+    }
+    if let Some(row) = rows.iter().find(|r| r.0 != 64 && r.1 > TERM_B * 9 / 10) {
+        return Err(format!("the pipe service: a step past 0.9 of B: {row:?}"));
+    }
     // The file service takes the jobs for the files of segments (IPC_JOBS, kind
     // 63): its step waits in `send` for the pipe service's BROKER_JOBS (kind 45,
     // in the rows above) and runs one job or one portion of a removal.
@@ -4766,7 +4785,14 @@ const fn ipc_programs(steps: &'static [&'static str]) -> [ImageProgram; 11] {
         ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
         ("ramfs", "ramfs", RAMFS_STACK_SIZE, steps),
         ("pipe", "pipe", PIPE_STACK_SIZE, steps),
-        POSIX_PROCS_PROGRAMS[3],
+        // The process service counts its steps in the measuring image: the
+        // ShareHeld a wait by address asks of it is one of them.
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            steps,
+        ),
         POSIX_PROCS_PROGRAMS[4],
         ("posix-ipc", "posix-ipc", POSIX_STACK_SIZE, &[]),
         POSIX_PROCS_PROGRAMS[6],
