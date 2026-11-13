@@ -179,6 +179,16 @@ static int public_lock_page_fragments(void) {
     PF_CHECK(kill(children[PF_WORKERS].pid, SIGKILL) == 0);
     PF_CHECK(pf_wait(children[PF_WORKERS].pid, 1) == 0);
     PF_CHECK(process_lifetime(children[PF_WORKERS].pid) == 0);
+    /* A request that sets finds all 64 records dead: its step is the longest
+     * the file service has for a full inode of dead records. */
+    {
+        struct flock set = {0};
+        set.l_type = F_WRLCK; set.l_whence = SEEK_SET;
+        set.l_start = 1000; set.l_len = 1;
+        PF_CHECK(fcntl(target, F_SETLK, &set) == 0);
+        set.l_type = F_UNLCK;
+        PF_CHECK(fcntl(target, F_SETLK, &set) == 0);
+    }
     unsigned dead[5];
     PF_CHECK(ring_identity((unsigned)children[PF_WORKERS].pid, dead) == 0 && dead[1] == 0);
     children[PF_WORKERS].pid = -1;
