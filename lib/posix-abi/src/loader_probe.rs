@@ -14,11 +14,12 @@ static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static MODE: AtomicU32 = AtomicU32::new(0);
 
 /// Modes 1 and 2 replace Files and Clock with a receiving channel;
-/// modes 3 and 4 use a closed endpoint for Files and Clock respectively.
+/// modes 3 and 4 use a closed endpoint for Files and Clock respectively;
+/// mode 5 puts a receiving channel in the Entropy place, a forged service.
 pub fn start(mode: u32) -> i32 {
     let result = (|| {
         let root = sys::channel_create(1)?;
-        let endpoint = if mode >= 3 {
+        let endpoint = if closed(mode) {
             sys::handle_label(
                 &root,
                 Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE,
@@ -39,19 +40,27 @@ pub fn start(mode: u32) -> i32 {
     }
 }
 
+/// Modes 3 and 4 give a closed endpoint, the others a live one.
+fn closed(mode: u32) -> bool {
+    matches!(mode, 3 | 4)
+}
+
 pub fn disable() {
     MODE.store(0, Ordering::Release);
 }
 
 pub(crate) fn replace(slot: Slot, offered: Handle<Channel>) -> Result<Handle<Channel>, Error> {
     let mode = MODE.load(Ordering::Acquire);
-    let selected = matches!((mode, slot), (1 | 3, Slot::Files) | (2 | 4, Slot::Clock));
+    let selected = matches!(
+        (mode, slot),
+        (1 | 3, Slot::Files) | (2 | 4, Slot::Clock) | (5, Slot::Entropy)
+    );
     if !selected {
         return Ok(offered);
     }
     let root = Handle::<Channel>::borrowed(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire)));
     let rights = Rights::SEND | Rights::TRANSFER;
-    if mode >= 3 {
+    if closed(mode) {
         sys::handle_duplicate(&root, rights)
     } else {
         sys::handle_label(&root, rights, 1, 1)
@@ -87,7 +96,7 @@ pub fn stop() -> u32 {
         return 1;
     }
     let root = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
-    if mode < 3 {
+    if !closed(mode) {
         let request = proto_wire::Header::new(u16::MAX, proto_clock::VERSION).bytes();
         if sys::send(&root, &request).is_err() {
             return 1;

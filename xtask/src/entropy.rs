@@ -320,7 +320,7 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 19] = [
+const RANDOM_LINES: [&str; 20] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
@@ -339,6 +339,7 @@ const RANDOM_LINES: [&str; 19] = [
     "posix-random: mkstemp gave",
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
+    "posix-random: a set-ID program takes no entropy session from its caller, and gives ENOSYS",
     "posix-random: ok",
 ];
 
