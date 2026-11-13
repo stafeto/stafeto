@@ -62,3 +62,29 @@ pub unsafe fn write64(addr: usize, value: u64) {
         asm!("str {v}, [{a}]", a = in(reg) addr, v = in(reg) value, options(nostack, preserves_flags))
     };
 }
+
+/// Reads the byte register at `addr`.
+///
+/// # Safety
+///
+/// `addr` is a byte register of a device the kernel tables map as device memory.
+pub unsafe fn read8(addr: usize) -> u8 {
+    let value: u32;
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("ldrb {v:w}, [{a}]", a = in(reg) addr, v = out(reg) value, options(nostack, preserves_flags))
+    };
+    value as u8
+}
+
+/// Writes the byte register at `addr`.
+///
+/// # Safety
+///
+/// As for `read8`.
+pub unsafe fn write8(addr: usize, value: u8) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("strb {v:w}, [{a}]", a = in(reg) addr, v = in(reg) u32::from(value), options(nostack, preserves_flags))
+    };
+}

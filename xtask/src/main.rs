@@ -41,6 +41,7 @@ mod owner_lifetime;
 mod service_sample;
 
 mod abi_fingerprint;
+mod aws;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
@@ -979,6 +980,27 @@ fn shell_program_list() -> Vec<ImageProgram> {
     programs
 }
 
+/// The programs of the shell on EC2 (init's table `table-aws`): the shell
+/// image's services and BusyBox, with init's table for the 16550 of the
+/// SPCR and no entropy service.
+fn aws_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let packages =
+            packages::of_image("boot-aws.img").unwrap_or_else(|e| panic!("the image of EC2: {e}"));
+        let mut programs = SHELL_SERVICES.to_vec();
+        programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
+        programs.extend(package_programs(&packages));
+        programs.extend(SHELL_SERVICES_LAST.iter().take(2));
+        programs
+    })
+}
+
+/// The boot image of the shell on EC2.
+pub(crate) fn aws_boot_image() -> Result<PathBuf, String> {
+    build_boot_image("boot-aws.img", aws_programs(), BOOT_PROFILE)
+}
+
 /// The builds of the programs that `packages` name (PACKAGE_PROGRAMS).
 fn package_programs(packages: &[packages::Package]) -> Vec<ImageProgram> {
     packages
@@ -1456,10 +1478,17 @@ enum Variant {
     IdleNoBell,
     IdleNoDrain,
     IdleNoIrq,
+    /// The stage marks of the first boot on EC2 (kernel feature `early-marks`,
+    /// `xtask aws`).
+    EarlyMarks,
+    /// The ITS with the ladder of page sizes from 64 KiB and the tables
+    /// treated as non-shareable (kernel features `its-page-64k`,
+    /// `its-nonshare`; `cargo xtask efi EFI its-64k`).
+    ItsProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 35] = [
+    const ALL: [Variant; 37] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1495,6 +1524,8 @@ impl Variant {
         Variant::IdleNoBell,
         Variant::IdleNoDrain,
         Variant::IdleNoIrq,
+        Variant::EarlyMarks,
+        Variant::ItsProbe,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1538,6 +1569,8 @@ impl Variant {
             Variant::IdleNoBell => Some("break-idle-bell"),
             Variant::IdleNoDrain => Some("break-idle-drain"),
             Variant::IdleNoIrq => Some("break-idle-irq"),
+            Variant::EarlyMarks => Some("early-marks"),
+            Variant::ItsProbe => Some("its-page-64k,its-nonshare"),
         }
     }
 
@@ -1569,6 +1602,8 @@ impl Variant {
             | Variant::IdleNoBell
             | Variant::IdleNoDrain
             | Variant::IdleNoIrq
+            | Variant::EarlyMarks
+            | Variant::ItsProbe
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1640,6 +1675,8 @@ impl Variant {
             Variant::IdleNoBell => "stafeto-idle-no-bell",
             Variant::IdleNoDrain => "stafeto-idle-no-drain",
             Variant::IdleNoIrq => "stafeto-idle-no-irq",
+            Variant::EarlyMarks => "stafeto-early-marks",
+            Variant::ItsProbe => "stafeto-its-probe",
         }
     }
 }
@@ -1985,6 +2022,8 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
+  aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
   help      this text";
 
 fn main() {
@@ -1995,8 +2034,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
+        Some("aws") => aws::run(&args[1..]),
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
+        Some("uart-breaks") => uart_breaks(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
@@ -2451,7 +2492,41 @@ static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new())
 /// The kernel image of `variant` and the boot image of the normal build,
 /// each built once in a run of xtask, whatever number of checks takes
 /// them.
+/// `cargo xtask uart-breaks`: the host tests of the driver pass, and fail
+/// under the feature `break-uart-poll`, which leaves a 16550 console with
+/// no poll.
+fn uart_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "uart", "--lib"]);
+    run_cmd(&mut ok)?;
+    let mut broken = cargo();
+    broken.args([
+        "test",
+        "--package",
+        "uart",
+        "--lib",
+        "--features",
+        "break-uart-poll",
+    ]);
+    match broken.output() {
+        Ok(o) if !o.status.success() => {
+            println!("uart-breaks: break-uart-poll is caught by the host tests");
+            Ok(())
+        }
+        Ok(_) => Err("break-uart-poll passed the host tests".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn build(variant: Variant) -> Result<Artifacts, String> {
+    // STAFETO_ITS_PROBE=1 runs the probes of the ITS (`net-probe ITS`,
+    // `net-curl ITS`) on the kernel with the 64 KiB ladder and the tables
+    // treated as non-shareable (Variant::ItsProbe).
+    let variant = if variant == Variant::Normal && std::env::var_os("STAFETO_ITS_PROBE").is_some() {
+        Variant::ItsProbe
+    } else {
+        variant
+    };
     once(&BUILDS, variant, || build_kernel(variant))
 }
 

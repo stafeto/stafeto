@@ -105,15 +105,124 @@ pub const fn baser_page_size(baser: u64) -> u64 {
         _ => 0x1_0000,
     }
 }
-/// A GITS_BASER value for a flat table of `pages` pages of 4 KiB at `pa`,
-/// of the type and entry size `old` read back, valid [G45].
-pub const fn baser(old: u64, pa: u64, pages: u32, share: u64, cache: u64) -> u64 {
+/// The Page_Size field [9:8] for `page` bytes (4, 16 or 64 KiB) [G45, G49].
+pub const fn baser_page_code(page: u64) -> u64 {
+    match page {
+        0x1000 => 0,
+        0x4000 => 1,
+        _ => 2,
+    }
+}
+/// The page sizes the kernel tries, in order [G49].
+pub const BASER_PAGES: [u64; 3] = [0x1000, 0x4000, 0x1_0000];
+/// The value written to find out whether the register holds `page`: the
+/// type and entry size it read, the page size, no table, not valid.
+pub const fn baser_probe(old: u64, page: u64) -> u64 {
+    (old & (0x1F << 48 | 7 << 56)) | (baser_page_code(page) << 8)
+}
+/// The first of the sizes in `BASER_PAGES` from `first` on that the
+/// register read back as written; `hold` writes the probe and reads. None:
+/// the ITS takes no page size.
+pub fn pick_page(old: u64, first: u64, mut hold: impl FnMut(u64) -> u64) -> Option<u64> {
+    BASER_PAGES.into_iter().filter(|p| *p >= first).find(|p| {
+        let probe = baser_probe(old, *p);
+        (hold(probe) >> 8) & 3 == baser_page_code(*p)
+    })
+}
+/// The address field of a GITS_BASER for a table at `pa` aligned to `page`:
+/// PA[47:12] for 4 and 16 KiB, and for 64 KiB PA[47:16] in [47:16] and
+/// PA[51:48] in [15:12] [G45, G49].
+pub const fn baser_address(pa: u64, page: u64) -> u64 {
+    if page == 0x1_0000 {
+        (pa & 0x0000_FFFF_FFFF_0000) | (((pa >> 48) & 0xF) << 12)
+    } else {
+        pa & 0x0000_FFFF_FFFF_F000
+    }
+}
+/// A GITS_BASER value for a flat table of `pages` pages of `page` bytes at
+/// `pa`, of the type and entry size `old` read back, valid [G45]. Size
+/// counts pages of `page`.
+pub const fn baser(old: u64, pa: u64, pages: u32, page: u64, share: u64, cache: u64) -> u64 {
     (old & (0x1F << 48 | 7 << 56))
-        | (pa & 0x000F_FFFF_FFFF_F000)
+        | baser_address(pa, page)
+        | (baser_page_code(page) << 8)
         | (cache << 59)
         | (share << 10)
         | (pages as u64 - 1)
         | (1 << 63)
+}
+/// What a boot-time table needs: how many entries it holds, in how many
+/// pages of the ITS, and the bytes the allocator gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Table {
+    pub entries: u32,
+    pub pages: u32,
+    pub bytes: usize,
+}
+/// The largest flat device table.
+pub const DEVICE_TABLE_MAX: u64 = 0x1_0000;
+/// The device table: DeviceIDs up to `max_device_id`, cut to what
+/// `device_bits` bits and `DEVICE_TABLE_MAX` bytes hold, in pages of `page`.
+pub fn device_table(max_device_id: u32, entry: u64, device_bits: u32, page: u64) -> Table {
+    let by_bits = 1u64 << device_bits.min(32);
+    let entries = (u64::from(max_device_id) + 1)
+        .min(by_bits)
+        .min(DEVICE_TABLE_MAX / entry);
+    let pages = (entries * entry).div_ceil(page) as u32;
+    Table {
+        entries: entries as u32,
+        pages,
+        bytes: pages as usize * page as usize,
+    }
+}
+/// The collection table for `cpus` collections, in pages of `page`.
+pub fn collection_table(cpus: usize, entry: u64, page: u64) -> Table {
+    let pages = (cpus as u64 * entry).div_ceil(page).max(1) as u32;
+    Table {
+        entries: cpus as u32,
+        pages,
+        bytes: pages as usize * page as usize,
+    }
+}
+/// The order of the allocator block for `bytes`, in frames of 4 KiB.
+pub const fn block_order(bytes: usize) -> u8 {
+    (bytes.div_ceil(0x1000).next_power_of_two()).trailing_zeros() as u8
+}
+
+/// GICD_TYPER's LPI fields [G50]: LPIS [17], IDbits [23:19] (plus one),
+/// num_LPIs [15:11].
+pub const fn gicd_lpis(typer: u32) -> bool {
+    typer & (1 << 17) != 0
+}
+pub const fn gicd_id_bits(typer: u32) -> u32 {
+    ((typer >> 19) & 0x1F) + 1
+}
+/// The LPIs the distributor gives, from INTID 8192: 2^(num_LPIs + 1) when
+/// the field is not 0, else None (the range IDbits give).
+pub const fn gicd_num_lpis(typer: u32) -> Option<u32> {
+    let n = (typer >> 11) & 0x1F;
+    if n == 0 {
+        None
+    } else if n >= 31 {
+        Some(u32::MAX)
+    } else {
+        Some(1 << (n + 1))
+    }
+}
+/// The LPIs the kernel hands out on a distributor with `typer` in
+/// GICD_TYPER: MAX_LPIS, or fewer when the distributor restricts the range
+/// (`num_LPIs`, 128 on a t4g) [G50].
+pub const fn lpi_limit(typer: u32) -> u32 {
+    match gicd_num_lpis(typer) {
+        Some(n) if n < MAX_LPIS as u32 => n,
+        _ => MAX_LPIS as u32,
+    }
+}
+
+/// Whether the registers hold the shareability and cacheability written:
+/// Shareability [11:10] not 0 and Inner Cache [9:7] not 0 or 1 [G51].
+pub const fn holds_shareability(read: u64) -> bool {
+    (read >> 10) & 3 != 0 && (read >> 7) & 7 > 1
 }
 
 /// GITS_TYPER fields [G43].
@@ -311,11 +420,22 @@ impl LpiMap {
 
     /// The lowest free LPI, taken; None when all MAX_LPIS are in use.
     pub fn take(&mut self) -> Option<u32> {
+        self.take_within(MAX_LPIS as u32)
+    }
+
+    /// The lowest free LPI below `limit` LPIs from INTID 8192, taken; None
+    /// when they are all in use. The limit is what the distributor gives
+    /// (`lpi_limit`).
+    pub fn take_within(&mut self, limit: u32) -> Option<u32> {
         for (i, word) in self.taken.iter_mut().enumerate() {
             if *word != u64::MAX {
                 let bit = (!*word).trailing_zeros();
+                let n = (i as u32) * 64 + bit;
+                if n >= limit {
+                    return None;
+                }
                 *word |= 1 << bit;
-                return Some(FIRST_LPI + (i as u32) * 64 + bit);
+                return Some(FIRST_LPI + n);
             }
         }
         None
@@ -384,14 +504,92 @@ mod tests {
         assert_eq!(c >> 63, 1);
         assert_eq!((c >> 59) & 7, 7);
         let old = (BASER_TYPE_DEVICE << 56) | (7 << 48) | (2 << 8);
-        let b = baser(old, 0x4803_0000, 2, SHARE_INNER, CACHE_RAWAWB);
+        let b = baser(old, 0x4803_0000, 2, 0x1000, SHARE_INNER, CACHE_RAWAWB);
         assert_eq!(baser_type(b), BASER_TYPE_DEVICE);
         assert_eq!(baser_entry_size(b), 8);
         assert_eq!(b & 0xFF, 1);
         assert_eq!(b >> 63, 1);
-        // The page size field is the caller's to set; the helper leaves 4 KiB.
         assert_eq!(baser_page_size(b), 0x1000);
         assert_eq!(baser_page_size(old), 0x1_0000);
+    }
+
+    #[test]
+    fn the_page_size_is_the_first_the_register_reads_back() {
+        let old = (BASER_TYPE_DEVICE << 56) | (7 << 48);
+        assert_eq!(pick_page(old, 0x1000, |v| v), Some(0x1000));
+        assert_eq!(pick_page(old, 0x1_0000, |v| v), Some(0x1_0000));
+        // Graviton holds 64 KiB only; a register that holds 4 KiB reads 0 for it.
+        let graviton = |v: u64| {
+            if (v >> 8) & 3 == 2 {
+                v
+            } else {
+                v & !(3 << 8) | (2 << 8)
+            }
+        };
+        assert_eq!(pick_page(old, 0x1000, graviton), Some(0x1_0000));
+        let sixteen = |v: u64| {
+            if (v >> 8) & 3 == 1 {
+                v
+            } else {
+                v & !(3 << 8) | (1 << 8)
+            }
+        };
+        assert_eq!(pick_page(old, 0x1000, sixteen), Some(0x4000));
+        // Nothing held: a register that reads 3 (reserved) for every try.
+        assert_eq!(pick_page(old, 0x1000, |v| v | (3 << 8)), None);
+    }
+
+    #[test]
+    fn the_address_of_a_64k_table_keeps_pa_51_to_48_in_bits_15_to_12() {
+        assert_eq!(baser_address(0x4_0001_0000, 0x1_0000), 0x4_0001_0000);
+        assert_eq!(
+            baser_address(0x000A_0000_4001_0000, 0x1_0000),
+            0x0000_0000_4001_0000 | (0xA << 12)
+        );
+        assert_eq!(baser_address(0x4_0001_2000, 0x1000), 0x4_0001_2000);
+        let b = baser(
+            BASER_TYPE_DEVICE << 56,
+            0x4_0001_0000,
+            1,
+            0x1_0000,
+            SHARE_INNER,
+            CACHE_RAWAWB,
+        );
+        assert_eq!(baser_page_size(b), 0x1_0000);
+        assert_eq!(b & 0xFF, 0, "Size counts pages of 64 KiB: one page is 0");
+    }
+
+    #[test]
+    fn tables_are_counted_in_pages_of_the_chosen_size() {
+        // QEMU: 4 KiB pages, 8-byte entries, every ID of the map: 16 pages, IDs up to 0x1FFF.
+        let q = device_table(0xFFFF, 8, 16, 0x1000);
+        assert_eq!((q.entries, q.pages, q.bytes), (0x2000, 16, 0x1_0000));
+        assert_eq!(block_order(q.bytes), 4);
+        // Graviton: one 64 KiB page, the same IDs.
+        let g = device_table(0xFFFF, 8, 16, 0x1_0000);
+        assert_eq!((g.entries, g.pages, g.bytes), (0x2000, 1, 0x1_0000));
+        // 16-byte entries at 64 KiB: one page, IDs up to 0xFFF.
+        assert_eq!(device_table(0xFFFF, 16, 16, 0x1_0000).entries, 0x1000);
+        // Devbits 8 cuts to 0xFF.
+        assert_eq!(device_table(0xFFFF, 8, 8, 0x1_0000).entries, 0x100);
+        // A small map needs little.
+        assert_eq!(device_table(0x3F, 8, 16, 0x1000).pages, 1);
+        // Collections of two CPUs at 64 KiB: one page.
+        let c = collection_table(2, 8, 0x1_0000);
+        assert_eq!((c.pages, c.bytes), (1, 0x1_0000));
+        assert_eq!(block_order(c.bytes), 4);
+    }
+
+    #[test]
+    fn gicd_typer_of_a_restricted_lpi_range_and_the_shareability_decision() {
+        let t = (1 << 17) | (13 << 19) | (6 << 11);
+        assert!(gicd_lpis(t));
+        assert_eq!(gicd_id_bits(t), 14);
+        assert_eq!(gicd_num_lpis(t), Some(128));
+        assert_eq!(gicd_num_lpis(1 << 17), None);
+        assert!(holds_shareability((1 << 10) | (7 << 7)));
+        assert!(!holds_shareability(7 << 7), "shareability 0");
+        assert!(!holds_shareability((1 << 10) | (1 << 7)), "inner cache 1");
     }
 
     #[test]

@@ -26,6 +26,9 @@ dump = []
 # Allocates a page between the memory map and ExitBootServices, so that the
 # first attempt meets a stale key.
 stale-key = []
+# The first boot on a machine nobody can look at: x1 of the entry carries the
+# address of a byte 16550 for the stage marks of the kernel's feature of the same name.
+early-marks = []
 # Deliberate breaks (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 7).
 break-ebs-retry = []
 break-clean = []

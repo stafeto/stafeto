@@ -246,6 +246,9 @@ fn wait_for_quiet_mac() -> Result<(), String> {
 /// `-kernel`, then the boot through the loader and edk2 from the disk, and
 /// the comparison of the boot reports.
 pub fn run(names: &[String]) -> Result<(), String> {
+    let its = names.iter().any(|n| n == "its-64k");
+    let names: Vec<String> = names.iter().filter(|n| *n != "its-64k").cloned().collect();
+    let names = &names[..];
     let fw = firmware()?;
     let machines: Vec<&Machine> = if names.is_empty() {
         MACHINES.to_vec()
@@ -260,7 +263,11 @@ pub fn run(names: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, _>>()?
     };
-    let a = build(Variant::Normal)?;
+    let a = build(if its {
+        Variant::ItsProbe
+    } else {
+        Variant::Normal
+    })?;
     let loader = build_loader(&[])?;
     for m in machines {
         let disk = crate::target_dir().join(format!("efi-disk-{}.raw", m.name));
@@ -432,8 +439,8 @@ enum Expect {
     /// The loader refuses, saying a text with this fragment, and the shell
     /// never comes.
     Refused(&'static str),
-    /// The kernel's boot report lacks its `pl011` line: the tree has no
-    /// PL011 node, as the kernel reads the console from it.
+    /// The kernel's boot report lacks its `pl011` line and its boot line: the
+    /// tree names a 16550 where the PL011 is, and the kernel drives that.
     NoPl011,
     /// The kernel panics before it knows its port; the text is read from
     /// the log ring in RAM through the monitor (spec 3.2).
@@ -563,8 +570,15 @@ pub fn breaks() -> Result<(), String> {
             }
             Expect::KernelPanic(_) => unreachable!(),
             Expect::NoPl011 => {
-                if o.lines.iter().any(|l| l.starts_with("pl011 ")) || !booted {
-                    return Err(format!("{}: the kernel still reports its PL011", b.feature));
+                // The tree names a 16550 at the PL011's address: the kernel
+                // drives the wrong device (its LSR never shows room) and its
+                // report, boot line included, is lost; the PL011 of the
+                // driver still works, so the shell connects.
+                if o.lines.iter().any(|l| l.starts_with("pl011 ")) || booted || !shell {
+                    return Err(format!(
+                        "{}: the kernel still reports its PL011, or the system did not come up",
+                        b.feature
+                    ));
                 }
             }
         }
