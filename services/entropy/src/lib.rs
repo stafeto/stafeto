@@ -24,6 +24,11 @@ pub const RESEED_NS: u64 = 60_000_000_000;
 
 const _: () = assert!(SEED_LEN == KEY);
 
+/// The least bytes of a boot seed that count: 128 bits.
+pub const MIN_SEED: usize = 16;
+/// The most bytes of a boot seed, the room of the page's seed (abi::INIT_SEED_MAX).
+pub const SEED_MAX: usize = FIRST_BYTES;
+
 /// What a SEED gets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Start {
@@ -83,16 +88,38 @@ impl Source {
         }
         let first = !self.ready();
         let mut half = [0; KEY];
+        let mut rest = bytes;
         if first {
             half.copy_from_slice(&bytes[..KEY]);
             self.generator.seed(&half);
-            half.copy_from_slice(&bytes[KEY..2 * KEY]);
+            rest = &bytes[KEY..];
         } else {
-            half.copy_from_slice(&bytes[..KEY]);
             self.reseeds += 1;
         }
-        self.generator.reseed(&half);
+        for chunk in rest.as_chunks::<KEY>().0 {
+            self.generator.reseed(chunk);
+        }
         posix_random::erase(&mut half);
+        first
+    }
+
+    /// The seed of the boot (the device tree's `rng-seed`, or the key the
+    /// service before this one left): MIN_SEED to SEED_MAX bytes, taken
+    /// as FIRST_BYTES, the end of a short one zero. A seed that is too short
+    /// or looks constant changes nothing. Gives whether the generator
+    /// just became ready.
+    pub fn seed_from(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() < MIN_SEED || bytes.len() > SEED_MAX {
+            return false;
+        }
+        #[cfg(not(feature = "break-seed-constant"))]
+        if looks_constant(bytes) {
+            return false;
+        }
+        let mut block = [0; FIRST_BYTES];
+        block[..bytes.len()].copy_from_slice(bytes);
+        let first = self.feed(&block);
+        posix_random::erase(&mut block);
         first
     }
 
@@ -111,6 +138,46 @@ impl Source {
             None if flags & NONBLOCK != 0 => Start::NotReady,
             None => Start::Wait,
         }
+    }
+}
+
+/// The page of the boot seed (abi::INIT_SEED), which init gives every
+/// instance of the service: a u32 length in little endian, then that many
+/// bytes. The first instance finds the kernel's seed there; each takes
+/// what is there, leaves zeros, and keeps a key for the next instance in
+/// its place (`keep`), so that a restart does not lose the seed. Nothing
+/// of the boot seed itself ever goes back.
+pub struct Page<'a>(&'a mut [u8]);
+
+impl<'a> Page<'a> {
+    /// The page over `bytes`, which have room for the length and SEED_MAX
+    /// bytes.
+    pub fn new(bytes: &'a mut [u8]) -> Option<Page<'a>> {
+        (bytes.len() >= 4 + SEED_MAX).then_some(Page(bytes))
+    }
+
+    /// Moves the bytes out of the page into `out` and leaves zeros in it;
+    /// gives their number, at most SEED_MAX (a length past it counts as
+    /// SEED_MAX).
+    pub fn take(&mut self, out: &mut [u8; SEED_MAX]) -> usize {
+        let len = u32::from_le_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) as usize;
+        let n = len.min(SEED_MAX);
+        out[..n].copy_from_slice(&self.0[4..4 + n]);
+        #[cfg(not(feature = "break-page-wipe"))]
+        posix_random::erase(&mut self.0[..4 + SEED_MAX]);
+        n
+    }
+
+    /// Puts `key` in the page for the next instance; what was there goes.
+    pub fn keep(&mut self, key: &[u8; KEY]) {
+        posix_random::erase(&mut self.0[..4 + SEED_MAX]);
+        #[cfg(not(feature = "break-page-keep"))]
+        {
+            self.0[4..4 + KEY].copy_from_slice(key);
+            self.0[..4].copy_from_slice(&(KEY as u32).to_le_bytes());
+        }
+        #[cfg(feature = "break-page-keep")]
+        let _ = key;
     }
 }
 
@@ -198,6 +265,91 @@ mod tests {
         assert!(looks_constant(&[]));
         assert!(!looks_constant(&device(64, 5)));
         assert!(!looks_constant(&device(32, 9)));
+    }
+
+    #[test]
+    fn a_boot_seed_seeds_before_the_device() {
+        let mut s = Source::new();
+        assert!(!s.ready());
+        assert!(s.seed_from(&device(32, 1)));
+        assert!(s.ready());
+        assert!(matches!(s.start(NONBLOCK), Start::Ready(_)));
+        // The device's first bytes then mix in as a reseed, whole.
+        assert!(!s.feed(&device(FIRST_BYTES, 9)));
+        assert_eq!(s.reseeds(), 1);
+    }
+
+    #[test]
+    fn a_boot_seed_that_is_short_long_or_constant_seeds_nothing() {
+        for bytes in [
+            device(MIN_SEED - 1, 1),
+            device(SEED_MAX + 1, 1),
+            vec![0; 32],
+            vec![0x5a; 64],
+            vec![],
+        ] {
+            let mut s = Source::new();
+            assert!(!s.seed_from(&bytes));
+            assert!(!s.ready());
+        }
+        assert!(Source::new().seed_from(&device(MIN_SEED, 1)));
+        assert!(Source::new().seed_from(&device(SEED_MAX, 1)));
+    }
+
+    #[test]
+    fn keys_follow_the_boot_seed_and_every_byte_of_it_counts() {
+        let key = |bytes: &[u8]| {
+            let mut s = Source::new();
+            assert!(s.seed_from(bytes));
+            s.take().unwrap()
+        };
+        let base = device(32, 4);
+        assert_eq!(key(&base), key(&base));
+        for i in [0, 15, 16, 31] {
+            let mut other = base.clone();
+            other[i] ^= 1;
+            assert_ne!(key(&base), key(&other), "byte {i}");
+        }
+        assert_ne!(key(&device(32, 4)), key(&device(48, 4)));
+    }
+
+    #[test]
+    fn the_page_gives_the_seed_once_and_keeps_a_key_for_the_next_instance() {
+        let mut memory = vec![0u8; 4096];
+        let seed = device(32, 7);
+        memory[..4].copy_from_slice(&32u32.to_le_bytes());
+        memory[4..36].copy_from_slice(&seed);
+        // The first instance: the kernel's seed, which leaves no trace.
+        let mut first = Source::new();
+        let mut out = [0; SEED_MAX];
+        let n = Page::new(&mut memory).unwrap().take(&mut out);
+        assert_eq!(&out[..n], &seed[..]);
+        assert!(memory.iter().all(|&b| b == 0), "the page keeps the seed");
+        assert!(first.seed_from(&out[..n]));
+        let key = first.take().unwrap();
+        Page::new(&mut memory).unwrap().keep(&key);
+        assert!(!memory.windows(32).any(|w| w == &seed[..]));
+        // The next instance seeds from the key and leaves its own.
+        let mut second = Source::new();
+        let mut page = Page::new(&mut memory).unwrap();
+        let n = page.take(&mut out);
+        assert_eq!(&out[..n], &key[..]);
+        assert!(second.seed_from(&out[..n]));
+        assert!(memory.iter().all(|&b| b == 0));
+        let (a, b) = (first.take().unwrap(), second.take().unwrap());
+        assert_ne!(a, b);
+        assert_ne!(b, key);
+    }
+
+    #[test]
+    fn an_empty_page_gives_nothing_and_a_long_length_is_cut() {
+        let mut memory = vec![0u8; 4096];
+        let mut out = [0; SEED_MAX];
+        assert_eq!(Page::new(&mut memory).unwrap().take(&mut out), 0);
+        memory[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        memory[4..4 + SEED_MAX].fill(3);
+        assert_eq!(Page::new(&mut memory).unwrap().take(&mut out), SEED_MAX);
+        assert!(Page::new(&mut memory[..64]).is_none());
     }
 
     #[test]

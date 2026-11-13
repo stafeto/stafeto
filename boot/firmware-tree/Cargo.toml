@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 kcore = { path = "../../kcore", features = ["builder"] }
+posix-random = { path = "../../lib/posix-random" }
 
 [features]
 # Deliberate breaks, for the tests and the loader runs that must catch them
@@ -21,3 +22,7 @@ break-spcr = []
 break-iort-count = []
 break-smmu-ignore = []
 break-dtb-gib = []
+# The tree leaves out `rng-seed`, whatever the loader found.
+break-no-seed = []
+# The tree is built with the seed itself, which leaves copies in the heap (the test of the heap fails).
+break-seed-in-heap = []

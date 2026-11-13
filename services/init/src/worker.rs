@@ -28,8 +28,8 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use init::table::{
-    self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE,
-    RAM_SERVICE, Record, Write,
+    self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, ENTROPY_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE,
+    PROCESS_SERVICE, RAM_SERVICE, Record, SEED, Write,
 };
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
@@ -122,15 +122,16 @@ static CELL: Cell = Cell {
 
 /// The values of the handles the worker uses: init's process, init's
 /// channel, the system resource, the worker's channel, its copy of init's
-/// channel and the boot image. The main thread keeps the first four for
-/// good; the worker owns the last two.
-static HANDLES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// channel, the boot image and the page of the boot seed. The main thread
+/// keeps the first four for good; the worker owns the last three.
+static HANDLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 const OWN: usize = 0;
 const CHANNEL: usize = 1;
 const RESOURCE: usize = 2;
 const WAKE: usize = 3;
 const TELL: usize = 4;
 const BOOT: usize = 5;
+const SEED_PAGE: usize = 6;
 
 fn view<K>(i: usize) -> ManuallyDrop<Handle<K>> {
     Handle::borrowed(abi::Handle(HANDLES[i].load(Ordering::Relaxed)))
@@ -151,7 +152,8 @@ impl Worker {
     /// label 0 is at WORKER_IDLE, so a wake lifts it no higher, and tells
     /// the main thread through a copy of `channel` with NOTIFY and `label`;
     /// it keeps `boot`, the boot image, for the start data of the process
-    /// service. BAD_STATE once a worker started: the cell is one; the
+    /// service, and `seed`, the page of the boot seed, for that of the
+    /// entropy service. BAD_STATE once a worker started: the cell is one; the
     /// other errors are those of the calls.
     pub fn start(
         own: &Handle<Process>,
@@ -159,6 +161,7 @@ impl Worker {
         resource: &Handle<Resource>,
         label: u64,
         boot: Handle<Memory>,
+        seed: Option<Handle<Memory>>,
     ) -> Result<Worker, Error> {
         if STARTED.swap(true, Ordering::AcqRel) {
             return Err(Error::BadState);
@@ -172,6 +175,7 @@ impl Worker {
             (WAKE, wake.raw()),
             (TELL, tell.into_raw()),
             (BOOT, boot.into_raw()),
+            (SEED_PAGE, seed.map_or(abi::Handle(0), Handle::into_raw)),
         ] {
             HANDLES[i].store(raw.0, Ordering::Relaxed);
         }
@@ -393,7 +397,8 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
 /// thread (spec 13.3): the copies of the system resource of `resources`;
 /// a copy of each of its DMA objects, made here (`dma`), under its name;
 /// the boot image, read-only, for the process service, the RAM file
-/// service, the clock service and the package service (BOOT_IMAGE); and
+/// service, the clock service and the package service (BOOT_IMAGE); the
+/// page of the boot seed for the entropy service (SEED); and
 /// the arguments (`set_args`) with the physical address of each DMA
 /// object, 8 bytes little-endian, before the record's. Returns init's own
 /// handles to the DMA objects.
@@ -409,6 +414,12 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
             sys::handle_duplicate(&view::<Memory>(BOOT), Rights::MAP_READ | Rights::TRANSFER)?;
         // The checks of the table keep the name apart from the others.
         let _ = spawned.giver.give(BOOT_IMAGE, image.erase());
+    }
+    if record.name == ENTROPY_SERVICE && HANDLES[SEED_PAGE].load(Ordering::Relaxed) != 0 {
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let page = sys::handle_duplicate(&view::<Memory>(SEED_PAGE), rights)?;
+        // The checks of the table keep the name apart from the others.
+        let _ = spawned.giver.give(SEED, page.erase());
     }
     let mut own = [0; OWN_ARGS_MAX];
     let mut kept: Kept = [const { None }; MAX_DMA];

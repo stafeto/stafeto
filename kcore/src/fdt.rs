@@ -124,6 +124,11 @@ impl<'a> Fdt<'a> {
         }
     }
 
+    /// The offset in the blob of `value`, a slice `walk` gave out.
+    pub(crate) fn offset_of(&self, value: &[u8]) -> usize {
+        value.as_ptr() as usize - self.data.as_ptr() as usize
+    }
+
     /// Walks the structure block depth first, calling `f` for every node start,
     /// property and node end.
     pub fn walk(&self, mut f: impl FnMut(Event<'a>)) -> Result<(), FdtError> {

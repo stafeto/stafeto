@@ -40,7 +40,7 @@ use proto_loader::{
     self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, Fork, LOADER_BASE, MAP_ENTRIES, MapEntry,
     Method, PROGRAM_ROOM, REGIONS_MAX, Region, SLOTS, START_AREA, Slot, TRANSFER_SIZE,
 };
-use proto_wire::{Header, Reader, Status, Writer};
+use proto_wire::{Header, Reader, Status, Writer, long};
 use rt::abi::{Access, Error};
 use rt::handle::{Channel, Handle, Memory, Process, Resource, Thread};
 use rt::sys::{self, Received, Token};
@@ -2181,6 +2181,39 @@ fn keep<K>(h: Handle<K>) -> u64 {
     h.into_raw().0
 }
 
+/// The 16 bytes of AT_RANDOM: the first of one SEED of `entropy`, sent with
+/// NONBLOCK, so that a service that is not seeded yet (no source, or the
+/// device's first bytes still to come) neither holds the start nor gives
+/// weak bytes: the program then has no AT_RANDOM, and its C library takes
+/// what it needs from getrandom, which waits. The other 16 bytes of the
+/// key and every copy of them are erased here. None for any refusal.
+fn at_random(entropy: &Handle<Channel>) -> Option<[u8; 16]> {
+    let mut request = Writer::new();
+    proto_entropy::Seed {
+        flags: proto_entropy::NONBLOCK,
+    }
+    .write(&mut request)
+    .ok()?;
+    let mut reply = sys::send(entropy, request.as_bytes()).ok()?;
+    // The key comes in the registers of the reply (40 bytes), so no buffer of
+    // the message is read; the copies in the stack and in the reply go.
+    let mut bytes = abi::inline_bytes(&reply.words);
+    let mut random = None;
+    if reply.len <= abi::INLINE_MAX
+        && let Ok(long::Reply::Ready(key)) = long::Reply::read(&bytes[..reply.len])
+        && key.len() == proto_entropy::SEED_LEN
+    {
+        let mut first = [0; 16];
+        #[cfg(not(feature = "break-at-random"))]
+        first.copy_from_slice(&key[..16]);
+        random = Some(first);
+    }
+    posix_random::erase(&mut bytes);
+    reply.words = [0; 8];
+    core::hint::black_box(&reply.words);
+    random
+}
+
 /// The end: the start area, then every handle of the loader's own closes
 /// (C, the session with the service, the session of the loaders, its
 /// identity, the image session), and the jump.
@@ -2219,6 +2252,9 @@ fn finish(
             }
         }
     }
+    // AT_RANDOM: 16 bytes of one SEED of the program's Entropy session, the
+    // service's own for a set-ID program (verified above).
+    let random = given[Slot::Entropy as usize].as_ref().and_then(at_random);
     let flags =
         if secure { pl::SECURE } else { 0 } | if dynamic.is_some() { pl::DYNAMIC } else { 0 };
     let process = own.process.raw().0;
@@ -2254,6 +2290,13 @@ fn finish(
     if pl::write_area(area, START_AREA, &block, flags, handles, &entries[..count]).is_err() {
         return GAVE_UP;
     }
+    if let Some(mut bytes) = random {
+        let set = pl::set_random(area, &bytes);
+        posix_random::erase(&mut bytes);
+        if !set {
+            return GAVE_UP;
+        }
+    }
     let library = match dynamic {
         None => None,
         Some(d) => {
@@ -2264,7 +2307,14 @@ fn finish(
             else {
                 return GAVE_UP;
             };
-            let pairs = pl::dynamic_auxv(d.phdr, PHDR_SIZE, d.phnum, secure, d.tls_header);
+            let pairs = pl::dynamic_auxv(
+                d.phdr,
+                PHDR_SIZE,
+                d.phnum,
+                secure,
+                d.tls_header,
+                random.is_some(),
+            );
             let Some(room) = area.get_mut(at..at + 16 * pairs.len()) else {
                 return GAVE_UP;
             };

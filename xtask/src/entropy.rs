@@ -51,6 +51,32 @@ pub const PROGRAMS: [ImageProgram; 4] = [
     ),
 ];
 
+/// The image of the boot seed with no device (`cargo xtask entropy-seed`):
+/// init gives the entropy service the page of the seed, no driver is
+/// started, and the service, built with CRASH, is ended by the probe once.
+pub const SEED_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-entropy-seed"]),
+    ("entropy-probe", "entropy-probe", CHILD_STACK_SIZE, &[]),
+    (
+        "entropy",
+        "entropy",
+        ENTROPY_STACK_SIZE,
+        &["crash", "report"],
+    ),
+];
+
+/// The same image with a service that never reads the page.
+pub const SEED_BREAK_PROGRAMS: [ImageProgram; 3] = [
+    SEED_PROGRAMS[0],
+    SEED_PROGRAMS[1],
+    (
+        "entropy",
+        "entropy",
+        ENTROPY_STACK_SIZE,
+        &["crash", "report", "break-seed-page"],
+    ),
+];
+
 /// The probe's image on VZ: the console's driver shows the lines, and init
 /// watches the old DMA object of the driver that ended.
 pub const VZ_PROGRAMS: [ImageProgram; 5] = [
@@ -274,6 +300,82 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The line of an instance seeded from the page of the boot seed (the
+/// bytes are not printed), and of one with no source at all.
+const BOOT_PAGE: &str = "entropy: seeded from the boot page (32 bytes)";
+const NO_SOURCE: &str = "entropy: no source on this boot; keys wait";
+const KEYS_AFTER: &str = "entropy-probe: 32 keys from the service after its restart";
+
+/// What the run of the image of the boot seed printed, judged: both
+/// instances (before and after the CRASH) seeded from the page with 32
+/// bytes, the keys came at once, new after the restart, no line says the
+/// device or `no source`, and the probe ended well.
+pub fn seed_verdict(lines: &[String]) -> Result<(), String> {
+    let count = |marker: &str| lines.iter().filter(|l| l.starts_with(marker)).count();
+    for (marker, n) in [
+        (BOOT_PAGE, 2),
+        (AT_ONCE, 1),
+        (FLAG, 1),
+        (KEYS_AFTER, 1),
+        (OK, 1),
+        (NO_SOURCE, 0),
+        (SEEDED, 0),
+    ] {
+        if count(marker) != n {
+            let failed = lines
+                .iter()
+                .find(|l| l.starts_with("entropy-probe: failed"));
+            return Err(format!(
+                "{} lines {marker:?}, {n} expected; a failure: {failed:?}",
+                count(marker)
+            ));
+        }
+    }
+    let keys: Vec<_> = lines.iter().filter_map(|l| l.strip_prefix(KEY)).collect();
+    if keys.len() != 1 || keys[0].len() != 64 {
+        return Err(format!("the key of the probe: {keys:?}"));
+    }
+    Ok(())
+}
+
+/// `cargo xtask entropy-seed`: the image with no device of random bytes
+/// and the page of the boot seed that QEMU's tree gives (the kernel takes
+/// `/chosen/rng-seed`, init gives the page to the service). The service
+/// seeds from it before it serves; the probe ends it with CRASH, and the
+/// instance init starts seeds from the key the first one left in the page,
+/// so that its keys come at once and differ from every key before. The
+/// break, a service that never reads the page, finds no source, says so,
+/// and the probe waits for its first key until the run is cut.
+pub fn seed_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-entropy-seed.img", &SEED_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, crate::BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    seed_verdict(&output.lines).map_err(|e| format!("entropy-seed: {e}"))?;
+    println!(
+        "entropy-seed: seeded from the boot page with no device, keys at once, and again after a restart of the service: ok"
+    );
+    let image = build_boot_image(
+        "boot-entropy-seed-break.img",
+        &SEED_BREAK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, Duration::from_secs(10), Some(ENDED), &kernel.elf)?;
+    let said = output.lines.iter().any(|l| l.starts_with(NO_SOURCE));
+    if output.stopped_on_marker || !output.timed_out || !said {
+        return Err(format!(
+            "the break (the service ignores the page) was not caught: ended {}, timed out {}, line {said}",
+            output.stopped_on_marker, output.timed_out
+        ));
+    }
+    println!("entropy-seed: the break that ignores the page is caught: no source, the probe waits");
+    Ok(())
+}
+
 /// `cargo xtask entropy-vz`: the probe on Apple VZ, where the driver goes
 /// through the Virtio PCI function, and init watches the old DMA object.
 pub fn probe_vz() -> Result<(), String> {
@@ -296,7 +398,10 @@ pub fn probe_vz() -> Result<(), String> {
 /// The C probe of the layer's generator (tests/posix-random): the POSIX
 /// services, the loader, the entropy device's driver and service, and the
 /// probe, which starts its own file once.
-pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9] {
+pub const fn random_programs(
+    pipe: &'static [&'static str],
+    loader: &'static [&'static str],
+) -> [ImageProgram; 9] {
     [
         ("init", "init", INIT_STACK_SIZE, &["table-posix-random"]),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
@@ -308,7 +413,7 @@ pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9]
         ),
         ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
         ("pipe", "pipe", crate::PIPE_STACK_SIZE, pipe),
-        ("loader", "loader", 0, &[]),
+        ("loader", "loader", 0, loader),
         ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
         // The first fill waits 500 ms: the probe meets the wait for it.
         ("entropy", "entropy", ENTROPY_STACK_SIZE, &["slow-start"]),
@@ -322,11 +427,13 @@ pub const fn random_programs(pipe: &'static [&'static str]) -> [ImageProgram; 9]
 }
 
 /// The probe's image with the steps of the pipe service counted.
-static RANDOM_PROGRAMS: [ImageProgram; 9] = random_programs(&[]);
-static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"]);
+static RANDOM_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &[]);
+static RANDOM_PROGRAMS_STEPS: [ImageProgram; 9] = random_programs(&["steps"], &[]);
+/// The same with a loader that gives AT_RANDOM as zeros (feature `break-at-random`).
+static RANDOM_BREAK_PROGRAMS: [ImageProgram; 9] = random_programs(&[], &["break-at-random"]);
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 21] = [
+const RANDOM_LINES: [&str; 23] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
@@ -345,7 +452,9 @@ const RANDOM_LINES: [&str; 21] = [
     "posix-random: mkstemp gave",
     "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
     "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
+    "posix-random: AT_RANDOM gave 16 bytes to each of two programs, they differ and are not zero",
     "posix-random: a set-ID program takes its entropy session from the service, and a forged one gets no request",
+    "posix-random: a set-ID program has AT_RANDOM from its verified session",
     "posix-random: a set-ID program takes its pipe session from the service, and a forged one gets no request",
     "posix-random: ok",
 ];
@@ -384,7 +493,7 @@ const fn random_net_programs(
     table: &'static [&'static str],
     netd: &'static [&'static str],
 ) -> [ImageProgram; 10] {
-    let base = random_programs(&[]);
+    let base = random_programs(&[], &[]);
     [
         ("init", "init", INIT_STACK_SIZE, table),
         base[1],
@@ -531,6 +640,34 @@ fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
         "posix-random-net{}: a set-ID program takes its net session from the service, keeps an inherited socket: ok",
         if two { "-two" } else { "" }
     );
+    Ok(())
+}
+
+/// `cargo xtask random-breaks`: the probe of AT_RANDOM with a loader that
+/// gives zeros fails (the probe's check of the bytes; its exit code 20), and
+/// no line `posix-random: ok` comes.
+pub fn random_breaks() -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-random-break.img",
+        &RANDOM_BREAK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(
+        cmd,
+        crate::BOOT_TIMEOUT,
+        Some("init: posix-random ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "init: posix-random ended: exit code 20")?;
+    if output.lines.iter().any(|l| l == "posix-random: ok") {
+        return Err("the loader that gives zeros passed the probe".into());
+    }
+    qemu::expect_marker(&output, "check failed at line")?;
+    println!("random-breaks: a loader that gives AT_RANDOM as zeros is caught");
     Ok(())
 }
 

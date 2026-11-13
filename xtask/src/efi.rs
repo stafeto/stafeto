@@ -196,6 +196,38 @@ fn alike(line: &str) -> bool {
         && !by_run.iter().any(|p| line.starts_with(p))
 }
 
+/// What the loader says of the boot seed and what the kernel reports of it:
+/// the bytes the loader says it put in `/chosen/rng-seed` (0 for `no
+/// source`) and those the kernel's line `seed       N bytes` says it found
+/// in the tree. The two lines hold no byte of the seed.
+pub fn seed_lengths(lines: &[String]) -> Result<(usize, usize), String> {
+    let loader = lines
+        .iter()
+        .find_map(|l| {
+            let rest = l
+                .split("efi-loader: boot seed ")
+                .nth(1)
+                .map(|r| r.split(' ').next().unwrap_or(""));
+            match rest {
+                Some(n) => Some(n.parse::<usize>().map_err(|_| format!("a seed line {l:?}"))),
+                None => l
+                    .contains("efi-loader: no source of random bytes")
+                    .then_some(Ok(0)),
+            }
+        })
+        .ok_or("the loader said nothing of the boot seed")??;
+    let kernel = lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("seed       ")
+                .and_then(|r| r.strip_suffix(" bytes"))
+        })
+        .ok_or("the kernel's report has no seed line")?
+        .parse::<usize>()
+        .map_err(|_| "the kernel's seed line has no number")?;
+    Ok((loader, kernel))
+}
+
 fn report_lines(lines: &[String]) -> Vec<String> {
     lines.iter().filter(|l| alike(l)).cloned().collect()
 }
@@ -294,6 +326,13 @@ pub fn run(names: &[String]) -> Result<(), String> {
         if w.is_empty() || w != g {
             return Err(format!(
                 "{}: the boot report differs:\n-kernel: {w:#?}\nloader:  {g:#?}",
+                m.name
+            ));
+        }
+        let (said, found) = seed_lengths(&got.lines).map_err(|e| format!("{}: {e}", m.name))?;
+        if said != found {
+            return Err(format!(
+                "{}: the loader put {said} bytes of seed in the tree, the kernel found {found}",
                 m.name
             ));
         }
@@ -456,9 +495,12 @@ enum Expect {
     /// The kernel panics before it knows its port; the text is read from
     /// the log ring in RAM through the monitor (spec 3.2).
     KernelPanic(&'static str),
+    /// The loader says it put a seed in the tree and the kernel finds none
+    /// (its line says 0 bytes): the system comes up all the same.
+    NoSeed,
 }
 
-const BREAKS: [Break; 4] = [
+const BREAKS: [Break; 5] = [
     Break {
         feature: "break-merge",
         host_fails: true,
@@ -478,6 +520,11 @@ const BREAKS: [Break; 4] = [
         feature: "break-dtb-gib",
         host_fails: true,
         run: Some(Expect::KernelPanic("crosses a GiB boundary")),
+    },
+    Break {
+        feature: "break-no-seed",
+        host_fails: true,
+        run: Some(Expect::NoSeed),
     },
 ];
 
@@ -580,6 +627,15 @@ pub fn breaks() -> Result<(), String> {
                 }
             }
             Expect::KernelPanic(_) => unreachable!(),
+            Expect::NoSeed => {
+                let (said, found) = seed_lengths(&o.lines)?;
+                if said == 0 || found != 0 || !shell {
+                    return Err(format!(
+                        "{}: the loader said {said} bytes, the kernel found {found}: the break was not caught as it must",
+                        b.feature
+                    ));
+                }
+            }
             Expect::NoPl011 => {
                 // The tree names a 16550 at the PL011's address: the kernel
                 // drives the wrong device (its LSR never shows room) and its
@@ -628,6 +684,28 @@ pub fn breaks() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seed_lines_of_the_loader_and_the_kernel_are_read() {
+        let lines = |text: &[&str]| -> Vec<String> { text.iter().map(|l| l.to_string()).collect() };
+        let ok = lines(&[
+            "efi-loader: boot seed 64 bytes (efi-rng, smccc-trng)",
+            "seed       64 bytes",
+        ]);
+        assert_eq!(seed_lengths(&ok), Ok((64, 64)));
+        let none = lines(&[
+            "efi-loader: no source of random bytes (efi-rng, smccc-trng, rndr): the kernel gets no boot seed",
+            "seed       0 bytes",
+        ]);
+        assert_eq!(seed_lengths(&none), Ok((0, 0)));
+        let lost = lines(&[
+            "EFI: efi-loader: boot seed 64 bytes (efi-rng)",
+            "seed       0 bytes",
+        ]);
+        assert_eq!(seed_lengths(&lost), Ok((64, 0)));
+        assert!(seed_lengths(&lines(&["seed       64 bytes"])).is_err());
+        assert!(seed_lengths(&lines(&["efi-loader: boot seed 64 bytes (rndr)"])).is_err());
+    }
 
     #[test]
     fn only_the_lines_of_the_hardware_are_compared() {

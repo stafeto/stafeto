@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 42] = [
+pub(crate) const TESTS: [Test; 43] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -23,6 +23,10 @@ pub(crate) const TESTS: [Test; 42] = [
     (
         "boot_image_is_a_read_only_memory_object",
         boot_image_is_a_read_only_memory_object,
+    ),
+    (
+        "init_seed_page_holds_the_boot_seed",
+        init_seed_page_holds_the_boot_seed,
     ),
     ("init_has_its_message_buffer", init_has_its_message_buffer),
     (
@@ -252,6 +256,40 @@ fn boot_image_is_a_read_only_memory_object() -> Outcome {
         counts()? == before,
         "the close of a copy of the boot image gave frames back",
     )
+}
+
+/// INIT_SEED is one page of memory with the seed of the boot (spec 13.3):
+/// the u32 length 32, the 32 bytes QEMU puts in `/chosen/rng-seed` (not
+/// all zero), then zeros. The rights are those abi gives it: it maps RW
+/// and travels. Mapped RX it fails with ACCESS_DENIED.
+fn init_seed_page_holds_the_boot_seed() -> Outcome {
+    let seed = seed();
+    let info = sys::memory_info(&seed).map_err(|_| "MEMORY of INIT_SEED failed")?;
+    check(
+        info.size == PAGE as u64 && info.pages == 1,
+        "INIT_SEED is not one page of frames it owns",
+    )?;
+    map(&seed, 0, PAGE as u64, WINDOW, Access::ReadWrite)?;
+    // SAFETY: the window maps the seed page, which init alone holds.
+    let page = unsafe { (WINDOW as *const [u8; PAGE]).read_volatile() };
+    let exec = sys::mem_map(
+        &own(),
+        &seed,
+        0,
+        PAGE as u64,
+        WINDOW + PAGE,
+        Access::ReadExec,
+    );
+    unmap(WINDOW, PAGE as u64)?;
+    check(
+        page[..4] == 32u32.to_le_bytes(),
+        "the seed page does not start with the length 32",
+    )?;
+    check(
+        page[4..36].iter().any(|&b| b != 0) && page[36..].iter().all(|&b| b == 0),
+        "the seed page does not hold 32 bytes and zeros",
+    )?;
+    check(exec.is_err(), "the seed page mapped RX")
 }
 
 /// The kernel mapped the first thread's message buffer at abi::INIT_MSGBUF:

@@ -25,6 +25,8 @@ pub struct Input<'a> {
     /// MPIDR_EL1 of the CPU the loader runs on (affinity fields): it goes
     /// first in `/cpus`.
     pub boot_mpidr: u64,
+    /// The seed for `/chosen/rng-seed` (`seed::mix`); empty for none.
+    pub seed: &'a [u8],
 }
 
 fn hi(v: u64) -> u32 {
@@ -72,6 +74,9 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
     b = b.begin("chosen");
     b = wide(b, "linux,initrd-start", &[input.initrd.base]);
     b = wide(b, "linux,initrd-end", &[input.initrd.end()]);
+    if !input.seed.is_empty() && !cfg!(feature = "break-no-seed") {
+        b = b.prop("rng-seed", input.seed);
+    }
     let console = p.uart.as_ref().and_then(console_node);
     if let Some((name, _)) = &console {
         b = strz(b, "stdout-path", &format!("/{name}"));

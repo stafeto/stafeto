@@ -212,6 +212,9 @@ impl Default for CpuList {
     }
 }
 
+/// The most bytes of `/chosen/rng-seed` the kernel keeps for init.
+pub const SEED_MAX: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootInfo {
     pub memory: RegionList<MEMORY_REGIONS>,
@@ -219,6 +222,11 @@ pub struct BootInfo {
     /// Reserved regions marked `no-map`: never allocated and never mapped.
     pub no_map: RegionList<8>,
     pub initrd: Option<Region>,
+    /// The value of `/chosen/rng-seed` as a range of the device tree blob
+    /// (`base` is the offset in the blob), None when the property is
+    /// missing or empty. The kernel copies up to `SEED_MAX` bytes of it
+    /// and clears the whole range (spec 13.3).
+    pub seed: Option<Region>,
     pub uart_pl011: Option<Region>,
     /// The first 16550 node, the console of a machine without a PL011
     /// (the loader writes it from the SPCR).
@@ -288,6 +296,7 @@ struct Node<'a> {
     initrd_start: Option<u64>,
     initrd_end: Option<u64>,
     no_map: bool,
+    rng_seed: Option<Region>,
 }
 
 impl<'a> Node<'a> {
@@ -306,6 +315,7 @@ impl<'a> Node<'a> {
             initrd_start: None,
             initrd_end: None,
             no_map: false,
+            rng_seed: None,
         }
     }
 
@@ -442,6 +452,9 @@ fn classify(
             _ => None,
         };
     }
+    if top && node.name == "chosen" {
+        info.seed = node.rng_seed;
+    }
     if top && node.named("psci") {
         info.psci = match node.method {
             b"hvc\0" => PsciConduit::Hvc,
@@ -512,6 +525,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
         reserved: RegionList::new(),
         no_map: RegionList::new(),
         initrd: None,
+        seed: None,
         uart_pl011: None,
         uart_16550: None,
         gic: None,
@@ -553,6 +567,12 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
                     "linux,initrd-start" => node.initrd_start = number(value),
                     "linux,initrd-end" => node.initrd_end = number(value),
                     "no-map" => node.no_map = true,
+                    "rng-seed" if !value.is_empty() => {
+                        node.rng_seed = Some(Region {
+                            base: fdt.offset_of(value) as u64,
+                            size: value.len() as u64,
+                        })
+                    }
                     _ => {}
                 }
             }
@@ -918,6 +938,64 @@ mod tests {
         let i = info(&tree_with_half_an_initrd("linux,initrd-end")).unwrap();
         assert_eq!(i.initrd, None);
         assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x400_0000)]);
+    }
+
+    /// A tree with 64 MiB of RAM whose `chosen` node has `rng-seed` with
+    /// `value`.
+    fn tree_with_seed(value: &[u8]) -> Vec<u8> {
+        Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &[0, 0x4000_0000, 0, 0x400_0000])
+            .end()
+            .begin("chosen")
+            .prop("rng-seed", value)
+            .end()
+            .end()
+            .finish()
+    }
+
+    #[test]
+    fn rng_seed_is_a_range_of_the_blob() {
+        let value: Vec<u8> = (1..=32).collect();
+        let tree = tree_with_seed(&value);
+        let seed = info(&tree).unwrap().seed.unwrap();
+        assert_eq!(seed.size, 32);
+        let at = seed.base as usize;
+        assert_eq!(&tree[at..at + 32], &value[..]);
+    }
+
+    #[test]
+    fn rng_seed_longer_than_the_kernel_keeps_is_whole_in_the_range() {
+        let value = [7u8; SEED_MAX + 10];
+        let seed = info(&tree_with_seed(&value)).unwrap().seed.unwrap();
+        assert_eq!(seed.size, (SEED_MAX + 10) as u64);
+    }
+
+    #[test]
+    fn empty_or_missing_rng_seed_is_none() {
+        assert_eq!(info(&tree_with_seed(&[])).unwrap().seed, None);
+        assert_eq!(info(VIRT).unwrap().seed, None);
+        assert_eq!(info(APPLE_VZ).unwrap().seed, None);
+    }
+
+    #[test]
+    fn rng_seed_outside_chosen_is_ignored() {
+        let tree = Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &[0, 0x4000_0000, 0, 0x400_0000])
+            .prop("rng-seed", &[1; 32])
+            .end()
+            .end()
+            .finish();
+        assert_eq!(info(&tree).unwrap().seed, None);
     }
 
     #[test]

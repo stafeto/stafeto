@@ -40,14 +40,21 @@ pub const MAX_DMA: usize = 8;
 pub const START_DATA_MAX: usize = 8;
 /// The names init gives in start data besides the DMA objects (worker.rs):
 /// no window, binding or DMA object takes one.
-pub const START_DATA_NAMES: [&str; 6] = [
+pub const START_DATA_NAMES: [&str; 7] = [
     "console",
     "log",
     "trace",
     PROCESS_SERVICE,
     BOOT_IMAGE,
     IDENTITY_SESSION,
+    SEED,
 ];
+/// The name of the page of the boot seed (abi::INIT_SEED) in the start
+/// data of the entropy service: a copy with MAP_READ, MAP_WRITE and
+/// TRANSFER, for every instance. The page stays with init, which never
+/// maps it; the service takes the seed from it and keeps a key for the
+/// next instance there (services/entropy).
+pub const SEED: &str = "seed";
 /// The name of the boot image, read-only, in the start data of the
 /// process service, which loads the POSIX processes from there (serve.rs),
 /// of the RAM file service, which shows the files of its table, and of the
@@ -986,7 +993,7 @@ pub fn start_data_names(r: &Record) -> usize {
     let resources = usize::from(r.console) + usize::from(r.log) + usize::from(r.trace);
     let image = [PROCESS_SERVICE, RAM_SERVICE, CLOCK_SERVICE].contains(&r.name);
     let posix = if r.is_posix() { 2 } else { 0 };
-    resources + usize::from(image) + r.dma.len() + posix
+    resources + usize::from(image) + usize::from(r.name == ENTROPY_SERVICE) + r.dma.len() + posix
 }
 
 /// The label init binds line `i` of `r` through (serve.rs, `objects`):
@@ -1308,6 +1315,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-tty-vz") as usize
     + cfg!(feature = "table-entropy") as usize
     + cfg!(feature = "table-entropy-vz") as usize
+    + cfg!(feature = "table-entropy-seed") as usize
     + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
@@ -1392,6 +1400,7 @@ const _: () = assert!(
     feature = "table-posix-tty-vz",
     feature = "table-entropy",
     feature = "table-entropy-vz",
+    feature = "table-entropy-seed",
     feature = "table-gpu",
     feature = "table-net",
     feature = "table-net-probe",
@@ -1517,6 +1526,8 @@ pub const TABLE: &[Record] = vz::POSIX_TTY_TABLE;
 pub const TABLE: &[Record] = entropy::TABLE;
 #[cfg(feature = "table-entropy-vz")]
 pub const TABLE: &[Record] = entropy::VZ_TABLE;
+#[cfg(feature = "table-entropy-seed")]
+pub const TABLE: &[Record] = entropy::SEED_TABLE;
 #[cfg(feature = "table-gpu")]
 pub const TABLE: &[Record] = gpu::TABLE;
 #[cfg(feature = "table-net")]
@@ -3061,6 +3072,44 @@ mod tests {
             ramfs::POSIX_IPC_TABLE,
             ramfs::POSIX_PTY_TABLE,
         ]
+    }
+
+    /// A record that connects to the entropy service has one in its image,
+    /// the service of the table's own name, that gets the page of the boot
+    /// seed (`start_data_names`); one that connects to no driver (`rng`)
+    /// lives on that seed alone, and only the images that are meant to
+    /// (EC2's, the probe of the boot seed) have it so. The network service
+    /// takes its key from it, so a network service has the entropy
+    /// service in its image, and a POSIX process that asks for it too.
+    #[test]
+    fn a_client_of_the_entropy_service_has_it_and_only_two_images_go_without_a_driver() {
+        let mut seed_only = 0;
+        let tables = all_tables()
+            .into_iter()
+            .chain([aws::TABLE, entropy::SEED_TABLE]);
+        for table in tables {
+            let wants = table.iter().any(|r| r.connects.contains(&ENTROPY_SERVICE));
+            let service = table.iter().find(|r| r.name == ENTROPY_SERVICE);
+            if wants {
+                let service =
+                    service.expect("a client of the entropy service, and none in the image");
+                assert_eq!(start_data_names(service), 2, "console and the seed page");
+                if !service.connects.contains(&"rng") {
+                    seed_only += 1;
+                }
+            }
+            // The network service of any image takes its key from the service.
+            if table.iter().any(|r| r.name == NET_SERVICE) {
+                assert!(
+                    table
+                        .iter()
+                        .find(|r| r.name == NET_SERVICE)
+                        .is_some_and(|r| r.connects.contains(&ENTROPY_SERVICE)),
+                    "a network service without a key"
+                );
+            }
+        }
+        assert_eq!(seed_only, 2, "EC2's image and the probe of the seed");
     }
 
     #[test]

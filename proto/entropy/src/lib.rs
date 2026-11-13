@@ -22,7 +22,8 @@
 //! driver loads from address 0, which ends it with a fault while the
 //! device may hold a request, so that init stops the device and starts
 //! the driver again. Only a driver built with the feature `crash` has the
-//! method.
+//! method; the service built with it has the method too (the probe of the
+//! restart with the boot seed ends the service, and init starts it again).
 //!
 //! SEED (5), SEED_TAKE (6) and SEED_CANCEL (7): a key of SEED_LEN bytes of
 //! the service's generator, in two steps as a fill. Once the device fed

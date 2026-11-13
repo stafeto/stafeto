@@ -21,6 +21,16 @@
 //! first bytes hear of them TELLS a step. CLONE gives a child of a client
 //! a session of the service's own label.
 //!
+//! Two inputs. The device is the second. The first is the boot seed: init
+//! gives every instance a copy of the page of its own seed (`seed`,
+//! abi::INIT_SEED), where the kernel put the device tree's `rng-seed`.
+//! The instance mixes what the page holds before it serves (`entropy::Page`),
+//! erases it, and keeps a key of its generator there for the instance after
+//! it, at the start and at every reseed, so that a restart with no device
+//! does not lose the seed. A system with neither the seed nor the device
+//! prints `entropy: no source on this boot; keys wait` once: SEED waits,
+//! and no key is made of anything weaker.
+//!
 //! The service's root (proto_entropy::ROOT) goes to the process service with
 //! Register, for a loader to send VERIFY_SESSION for the Entropy session of a
 //! set-ID program: the session comes back when it is a live session of the
@@ -38,17 +48,17 @@
 #![no_std]
 #![no_main]
 
-use abi::{Error, MESSAGE_MAX, ObjectKind, Rights, Source as From};
+use abi::{Access, Error, MESSAGE_MAX, ObjectKind, Rights, Source as From};
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use entropy::verify;
-use entropy::{FIRST_BYTES, RESEED_NS, Source, Start};
+use entropy::{FIRST_BYTES, Page, RESEED_NS, SEED_MAX, Source, Start};
 use proto_entropy::{Fill, Key, Method, NOT_READY, Seed, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
-use rt::handle::{Channel, Outgoing, Resource, Thread};
+use rt::handle::{Channel, Memory, Outgoing, Resource, Thread};
 use rt::service::{
     Answer, Config, Heartbeat, LongOps, LongSession, Notice, Request, Service, Session,
 };
@@ -87,6 +97,15 @@ const NO_FEEDER_WAITS: u64 = 6;
 /// to a driver that broke.
 const FILL_NS: u64 = 1_000_000_000;
 const RETRY_NS: u64 = 1_000_000_000;
+
+/// Where the page of the boot seed is mapped (read and write), for the
+/// life of the service.
+const SEED_AT: usize = 0x70_0000_0000;
+/// Whether the boot seed seeded the generator at the start: the feeder
+/// says that no source is there only when it did not and the device is
+/// not either.
+static BOOT_SEEDED: AtomicBool = AtomicBool::new(false);
+static NO_SOURCE_SAID: AtomicBool = AtomicBool::new(false);
 
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;
@@ -155,8 +174,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let args = ServiceArgs::read(s.args()).ok();
+    let period_ns = ServiceArgs::read(s.args()).map_or(0, |a| a.period_ns);
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
+    let mut source = Source::new();
+    let mut page = seed_page(&mut s);
+    if let Some(mem) = page.as_deref_mut() {
+        boot_seed(mem, &mut source);
+    }
     let Ok(channel) = sys::channel_create(1) else {
         return NOT_REGISTERED;
     };
@@ -209,7 +233,8 @@ fn main(_: u64) -> u64 {
         ),
     }
     let mut service = Entropy {
-        source: Source::new(),
+        source,
+        page,
         ops: LongOps::new(),
         // SAFETY: only the main thread reaches CLONE_TABLE, here once.
         clones: unsafe { &mut *CLONE_TABLE.0.get() },
@@ -227,7 +252,7 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(Heartbeat {
             to: &s.parent,
-            period_ns: args.map_or(0, |a| a.period_ns),
+            period_ns,
             priority: level,
         }),
     };
@@ -237,10 +262,56 @@ fn main(_: u64) -> u64 {
     STOPPED
 }
 
+/// The page of the boot seed of the instance, mapped for good: None in an
+/// image whose record has none (no `seed` in its start data), and in the
+/// builds for the probes that wait for the device's first bytes
+/// (`slow-start`) or ignore the page (`break-seed-page`).
+fn seed_page(s: &mut rt::startup::Startup) -> Option<&'static mut [u8]> {
+    if cfg!(any(feature = "slow-start", feature = "break-seed-page")) {
+        return None;
+    }
+    let seed = s.take::<Memory>("seed").ok()?;
+    sys::mem_map(&s.process, &seed, 0, 4096, SEED_AT, Access::ReadWrite).ok()?;
+    // SAFETY: the page is mapped read and write at SEED_AT for the life of
+    // the service; only the main thread, before the loop and then the loop,
+    // reaches it, and the instance before this one has ended.
+    Some(unsafe { core::slice::from_raw_parts_mut(SEED_AT as *mut u8, 4096) })
+}
+
+/// Seeds `source` from what the page holds, erases it from the page, and
+/// keeps a key of the generator in its place.
+fn boot_seed(mem: &mut [u8], source: &mut Source) {
+    let Some(mut page) = Page::new(mem) else {
+        return;
+    };
+    let mut bytes = [0; SEED_MAX];
+    let n = page.take(&mut bytes);
+    let seeded = source.seed_from(&bytes[..n]);
+    posix_random::erase(&mut bytes);
+    if seeded {
+        BOOT_SEEDED.store(true, Ordering::Release);
+        rt::println!("entropy: seeded from the boot page ({n} bytes)");
+        keep_key(mem, source);
+    }
+}
+
+/// Keeps a key of the generator in the page for the next instance, once
+/// the generator is seeded.
+fn keep_key(mem: &mut [u8], source: &mut Source) {
+    if let Some(mut page) = Page::new(mem)
+        && let Some(mut key) = source.take()
+    {
+        page.keep(&key);
+        posix_random::erase(&mut key);
+    }
+}
+
 /// The loop: the generator, the seeds that wait for its first bytes, and
 /// the feeder, which lives as long as the service.
 struct Entropy {
     source: Source,
+    /// The page of the boot seed, where the key for the next instance goes.
+    page: Option<&'static mut [u8]>,
     ops: LongOps<WAITING>,
     /// The sessions CLONE gave that live, bounded for each client; the
     /// channel they are copies of.
@@ -413,6 +484,9 @@ impl Entropy {
         let first = self.source.feed(&bytes[..len.min(FIRST_BYTES)]);
         posix_random::erase(bytes);
         FEED.full.store(false, Ordering::Release);
+        if let Some(mem) = self.page.as_deref_mut() {
+            keep_key(mem, &mut self.source);
+        }
         if first {
             rt::println!("entropy: seeded from the device");
             self.to_tell = 0;
@@ -432,12 +506,24 @@ impl Entropy {
     }
 }
 
+#[cfg(not(feature = "crash"))]
 const METHODS: &[u16] = &[
     Method::Seed.number(),
     Method::SeedTake.number(),
     Method::SeedCancel.number(),
     Method::Clone.number(),
     Method::VerifySession.number(),
+];
+/// With the feature `crash`, CRASH too (as the driver has it): the probe of
+/// the restart ends the service with a fault.
+#[cfg(feature = "crash")]
+const METHODS: &[u16] = &[
+    Method::Seed.number(),
+    Method::SeedTake.number(),
+    Method::SeedCancel.number(),
+    Method::Clone.number(),
+    Method::VerifySession.number(),
+    Method::Crash.number(),
 ];
 
 impl Service<1> for Entropy {
@@ -457,6 +543,8 @@ impl Service<1> for Entropy {
             Some(Method::SeedCancel) => self.take(s, r, true),
             Some(Method::Clone) => self.clone_session(r),
             Some(Method::VerifySession) => self.verify_session(r),
+            #[cfg(feature = "crash")]
+            Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -478,6 +566,26 @@ impl Service<1> for Entropy {
             self.tell();
         }
     }
+}
+
+/// CRASH: a load from page 0 ends the service with a fault, and init starts
+/// it again (the probe of the restart with the boot seed).
+#[cfg(feature = "crash")]
+fn crash(r: &Request<'_>) -> Answer {
+    if r.body().finish().is_err() {
+        return Answer::Status(Status::BadSize);
+    }
+    // SAFETY: the load is the fault the method exists for; the thread
+    // never runs after it.
+    unsafe {
+        core::arch::asm!(
+            "ldr {t}, [{a}]",
+            t = out(reg) _,
+            a = in(reg) 0_usize,
+            options(nostack, readonly),
+        )
+    };
+    Answer::Status(Status::Kernel(Error::BadState))
 }
 
 /// The reply of a long operation, through the request's reply buffer.
@@ -521,6 +629,12 @@ extern "C" fn feed(_: u64) -> ! {
     let mut bytes = [0; FIRST_BYTES];
     loop {
         let Ok(rng) = rt::service::connect(&parent, "rng") else {
+            if !fed
+                && !BOOT_SEEDED.load(Ordering::Acquire)
+                && !NO_SOURCE_SAID.swap(true, Ordering::AcqRel)
+            {
+                rt::println!("entropy: no source on this boot; keys wait");
+            }
             feeder.sleep(RETRY_NS);
             continue;
         };

@@ -4,8 +4,11 @@
 //! The table of the shell on EC2 (t4g.small): the dialog of
 //! `ramfs::BUSYBOX_DIALOG_TABLE` with the 16550 the SPCR names for the
 //! console, polled, and nothing that needs Virtio, NVMe or the network
-//! device besides the ENA's service `net` (polled, optional): no entropy
-//! service, no Virtio window.
+//! device besides the ENA's service `net` (polled, optional): no Virtio
+//! window. The entropy service has no driver here (the t4g has no device of
+//! random bytes): the boot loader puts the seed it took from the firmware
+//! in the device tree, the kernel gives it to init, and init to the
+//! service (`ENTROPY`).
 
 use super::{
     At, Binding, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write,
@@ -172,8 +175,9 @@ pub const NET: Record = Record {
         },
     ],
     bindings: ENA_BINDINGS,
-    // `/etc/netd.conf` and `/etc/resolv.conf` (the boot profile of the file service).
-    connects: &["ramfs"],
+    // `/etc/netd.conf` and `/etc/resolv.conf` (the boot profile of the file service), and
+    // the key of the stack from the entropy service.
+    connects: &["ramfs", "entropy"],
     args: &[],
     dma: ENA_DMA,
     quiesce: &ENA_STOP,
@@ -270,11 +274,27 @@ const fn named(table: &[Record], name: &str) -> Record {
 
 const DIALOG: &[Record] = super::ramfs::BUSYBOX_DIALOG_TABLE;
 
+/// The entropy service with no driver to connect to: its source is the boot seed. With
+/// no seed either, it says so and keeps every key waiting.
+pub const ENTROPY: Record = Record {
+    connects: &[],
+    ..super::entropy::ENTROPY
+};
+
 /// The launcher of the shell with a session with the network service: the shell and its
 /// commands get the same (the launcher's connections are the shell's), and the quota of a
-/// command that links OpenSSL. No entropy service on EC2: the launcher does not name it.
+/// command that links OpenSSL; and the entropy service, for getrandom and the keys of the
+/// shell's programs.
 const LAUNCHER: Record = Record {
-    connects: &["ramfs", "tty", "pipe", "clock", "posix", super::NET_SERVICE],
+    connects: &[
+        "ramfs",
+        "tty",
+        "pipe",
+        "clock",
+        "posix",
+        "entropy",
+        super::NET_SERVICE,
+    ],
     quota: super::net::NET_COMMAND_QUOTA,
     ..named(DIALOG, "busybox-probe")
 };
@@ -288,7 +308,7 @@ pub const TABLE: &[Record] = &[
     // No PL031 on EC2: the clock starts at the time the image was built.
     named(super::ramfs::POSIX_ABI_TABLE, "clock"),
     named(DIALOG, "pipe"),
-    // The image of this table has no entropy service.
+    ENTROPY,
     LAUNCHER,
     named(DIALOG, "tty"),
     NET,
@@ -325,6 +345,7 @@ mod tests {
                 "posix",
                 "clock",
                 "pipe",
+                "entropy",
                 "busybox-probe",
                 "tty",
                 "net"
@@ -341,9 +362,17 @@ mod tests {
     }
 
     #[test]
-    fn only_the_launcher_connects_to_net_none_to_entropy_and_only_net_has_pci_windows() {
+    fn only_the_launcher_connects_to_net_the_launcher_and_net_to_entropy_and_only_net_has_pci_windows()
+     {
         for r in TABLE {
-            assert!(!r.connects.contains(&"entropy"));
+            // No driver of random bytes: the boot seed is the source.
+            assert!(!r.connects.contains(&"rng"));
+            assert_eq!(
+                r.connects.contains(&"entropy"),
+                r.name == "busybox-probe" || r.name == "net",
+                "{}",
+                r.name
+            );
             assert_eq!(
                 r.connects.contains(&"net"),
                 r.name == "busybox-probe",
@@ -440,9 +469,10 @@ mod tests {
             [("irq0", Some((0x28, 0))), ("irq1", Some((0x28, 1)))]
         );
         assert_eq!(crate::table::msi_events(net, 0x28), 2);
-        // The service has the second channel for them, and the file service for its settings.
+        // The service has the second channel for them, the file service for its settings and
+        // the entropy service for its key.
         assert!(crate::table::line_thread(net));
-        assert_eq!(net.connects, ["ramfs"]);
+        assert_eq!(net.connects, ["ramfs", "entropy"]);
         // The 128 LPIs the kernel allows (a t4g gives 3 to this record at most).
         assert!(net.bindings.len() <= 128);
     }

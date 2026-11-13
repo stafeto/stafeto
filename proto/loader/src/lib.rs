@@ -918,20 +918,30 @@ pub struct Start {
     pub timers: u64,
     pub alarm: u64,
     pub map: u64,
+    /// AT_RANDOM: 16 random bytes of the entropy service, which the loader
+    /// took with one SEED of the program's verified Entropy session, when
+    /// the flag RANDOM is set; zero otherwise.
+    pub random: [u8; 16],
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 8;
+pub const START_VERSION: u32 = 9;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
 /// and builds none.
 pub const DYNAMIC: u32 = 2;
+/// `Start.random` holds the 16 bytes of AT_RANDOM (`set_random`): the
+/// auxiliary vector gives their address, `RANDOM_AT`.
+pub const RANDOM: u32 = 4;
 /// The pairs of the auxiliary vector the start may fill.
-pub const AUXV_PAIRS: usize = 8;
+pub const AUXV_PAIRS: usize = 9;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 208);
+const _: () = assert!(START_SIZE == 224);
+/// Where `Start.random` lies in the area, and its address in the program.
+pub const RANDOM_OFFSET: usize = core::mem::offset_of!(Start, random);
+pub const RANDOM_AT: u64 = START_AREA + RANDOM_OFFSET as u64;
 /// Where the initial stack starts in the area: the header rounded up to 16,
 /// the alignment the stack needs.
 const STACK_AT: usize = START_SIZE.next_multiple_of(16);
@@ -1076,12 +1086,26 @@ pub fn write_area(
         timers: block.carried.timers,
         alarm: block.carried.alarm,
         map: at + maps_at as u64,
+        random: [0; 16],
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
     let bytes: [u8; START_SIZE] = unsafe { core::mem::transmute(header) };
     area[..START_SIZE].copy_from_slice(&bytes);
     Ok(())
+}
+
+/// Puts `random`, the bytes of AT_RANDOM, in the header of the start area
+/// `area` that `write_area` wrote, and sets the flag RANDOM. False when
+/// the area is shorter than the header.
+pub fn set_random(area: &mut [u8], random: &[u8; 16]) -> bool {
+    let Some(header) = area.get_mut(..START_SIZE) else {
+        return false;
+    };
+    header[RANDOM_OFFSET..RANDOM_OFFSET + 16].copy_from_slice(random);
+    let flags = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) | RANDOM;
+    header[12..16].copy_from_slice(&flags.to_le_bytes());
+    true
 }
 
 impl Start {
@@ -1106,22 +1130,27 @@ pub mod auxv {
     pub const AT_PAGESZ: u64 = 6;
     pub const AT_BASE: u64 = 7;
     pub const AT_SECURE: u64 = 23;
+    /// The address of 16 random bytes (Linux's AT_RANDOM): `Start.random`.
+    pub const AT_RANDOM: u64 = 25;
     /// The address of the `PT_TLS` header of libc.so in its space (the one
     /// static TLS module); the number is the C library's too.
     pub const AT_STAFETO_TLS: u64 = 0x7374_0001;
 }
 
 /// The pairs of the auxiliary vector of a dynamic program, in the order
-/// PHDR, PHENT, PHNUM, PAGESZ, SECURE, BASE, STAFETO_TLS, NULL: the program
-/// headers in memory (`phdr`), the bytes of one (`phent`), their count, the
-/// secure mode (0 or 1), libc.so's base address and the address of its TLS
-/// header. AT_ENTRY is not passed: the start jumps to the program itself.
+/// PHDR, PHENT, PHNUM, PAGESZ, SECURE, BASE, STAFETO_TLS, RANDOM, NULL: the
+/// program headers in memory (`phdr`), the bytes of one (`phent`), their
+/// count, the secure mode (0 or 1), libc.so's base address, the address of
+/// its TLS header and, with `random`, that of the 16 bytes of AT_RANDOM
+/// (`RANDOM_AT`; without them the pair is AT_NULL).
+/// AT_ENTRY is not passed: the start jumps to the program itself.
 pub const fn dynamic_auxv(
     phdr: u64,
     phent: u64,
     phnum: u64,
     secure: bool,
     tls_header: u64,
+    random: bool,
 ) -> [(u64, u64); AUXV_PAIRS] {
     [
         (auxv::AT_PHDR, phdr),
@@ -1131,6 +1160,11 @@ pub const fn dynamic_auxv(
         (auxv::AT_SECURE, secure as u64),
         (auxv::AT_BASE, LIBRARY_BASE),
         (auxv::AT_STAFETO_TLS, tls_header),
+        if random {
+            (auxv::AT_RANDOM, RANDOM_AT)
+        } else {
+            (auxv::AT_NULL, 0)
+        },
         (auxv::AT_NULL, 0),
     ]
 }
@@ -2118,7 +2152,7 @@ mod tests {
         assert_eq!(Slot::given(14), None);
         assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Packages);
         assert_eq!((Slot::Packages as usize) + 1, SLOTS);
-        assert_eq!(START_VERSION, 8);
+        assert_eq!(START_VERSION, 9);
         for (n, ok) in [(13, true), (14, false)] {
             let mut w = Writer::new();
             w.u32(n).unwrap();
@@ -2248,7 +2282,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (8, 8, 8));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (9, 8, 9));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];
@@ -2271,13 +2305,43 @@ mod tests {
         assert!(Start::read(&area).is_none());
     }
 
+    /// AT_RANDOM: 16 bytes in the header, at the address the vector gives,
+    /// with the flag; an area with none has zeros and no flag.
+    #[test]
+    fn random_bytes_lie_in_the_header_with_a_flag() {
+        let mut out = vec![0; BLOCK_MAX];
+        let len = block(&mut out, &[b"a"], &[]);
+        let read = Block::read(&out[..len]).unwrap();
+        let mut area = vec![0; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, SECURE, [0; SLOTS], &[]).unwrap();
+        let before = Start::read(&area).unwrap();
+        assert_eq!((before.flags & RANDOM, before.random), (0, [0; 16]));
+        let bytes: [u8; 16] = core::array::from_fn(|i| 0xa0 + i as u8);
+        assert!(set_random(&mut area, &bytes));
+        let after = Start::read(&area).unwrap();
+        assert_eq!(after.random, bytes);
+        assert_eq!(after.flags, SECURE | RANDOM);
+        let at = (RANDOM_AT - START_AREA) as usize;
+        assert_eq!(&area[at..at + 16], &bytes);
+        // Nothing else of the header moved.
+        assert_eq!(
+            (after.argc, after.cwd, after.stack),
+            (before.argc, before.cwd, before.stack)
+        );
+        assert!(!set_random(&mut area[..START_SIZE - 1], &bytes));
+    }
+
     /// The vector of a dynamic program: the keys in the order the start
     /// reads them, the last pair AT_NULL, as many pairs as the area holds.
     #[test]
     fn the_dynamic_vector_is_in_order() {
-        let pairs = dynamic_auxv(0x20_0040, 56, 7, true, 0x0440_0000);
+        let pairs = dynamic_auxv(0x20_0040, 56, 7, true, 0x0440_0000, true);
         let keys: Vec<u64> = pairs.iter().map(|p| p.0).collect();
-        assert_eq!(keys, [3, 4, 5, 6, 23, 7, 0x7374_0001, 0]);
+        assert_eq!(keys, [3, 4, 5, 6, 23, 7, 0x7374_0001, 25, 0]);
+        assert_eq!(pairs[7].1, RANDOM_AT);
+        // Without the bytes the pair is AT_NULL, and the vector ends there.
+        let none = dynamic_auxv(0x20_0040, 56, 7, true, 0x0440_0000, false);
+        assert_eq!((none[7], none[8]), ((0, 0), (0, 0)));
         assert_eq!(pairs.last(), Some(&(auxv::AT_NULL, 0)));
         assert_eq!(pairs[0].1, 0x20_0040);
         assert_eq!((pairs[1].1, pairs[2].1, pairs[3].1), (56, 7, 4096));
@@ -2285,7 +2349,10 @@ mod tests {
             (pairs[4].1, pairs[5].1, pairs[6].1),
             (1, LIBRARY_BASE, 0x0440_0000)
         );
-        assert_eq!(dynamic_auxv(0, 56, 1, false, 0)[4], (auxv::AT_SECURE, 0));
+        assert_eq!(
+            dynamic_auxv(0, 56, 1, false, 0, false)[4],
+            (auxv::AT_SECURE, 0)
+        );
         assert_eq!(pairs.len(), AUXV_PAIRS);
         // The vector fits the words the area reserves for it.
         let mut out = vec![0; BLOCK_MAX];

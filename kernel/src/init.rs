@@ -8,7 +8,8 @@
 //! the access its place in the program gives it (W^X); the stack the same
 //! way right under abi::INIT_STACK_TOP, with an unmapped guard page below;
 //! the first thread with its message buffer at abi::INIT_MSGBUF; init's
-//! first handles, the boot image among them as a memory object; and the
+//! first handles, the boot image and the page of the boot seed among them as
+//! memory objects; and the
 //! thread started at the entry, FIFO at 63 with x0 = 0. Init has four
 //! mappings, or fewer when its program has no read-only data or data.
 //! bootimg::Program::parse checked that the segments, the stack and the
@@ -45,7 +46,7 @@ fn failed(what: &str, error: abi::Error) -> ! {
 /// to any process, its memory objects too; it has no parent to give the
 /// quota back to.
 #[cfg(not(feature = "ktest"))]
-pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
+pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region, boot: &crate::boot::Boot) -> ! {
     use crate::thread;
     use abi::Policy;
     // The other CPUs are in their loop of the way out already: whatever
@@ -73,8 +74,9 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
         }
     }
     let pages = (image.size / PAGE_SIZE) as usize;
+    let seed = seed_page(p, boot);
     let section = crate::obj::lock();
-    let boot = memory::create_boot(p, image.base, pages)
+    let image_object = memory::create_boot(p, image.base, pages)
         .unwrap_or_else(|e| failed("no memory object for the boot image", e));
     let t = thread::create(
         p,
@@ -87,18 +89,35 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     .unwrap_or_else(|e| failed("no thread", e));
     thread::give_buffer(t, abi::INIT_MSGBUF as usize)
         .unwrap_or_else(|e| failed("no message buffer", e));
-    process::install_init_handles(p, t, boot).unwrap_or_else(|e| failed("no handles", e));
+    process::install_init_handles(p, t, image_object, seed)
+        .unwrap_or_else(|e| failed("no handles", e));
     thread::start(t).unwrap_or_else(|e| failed("its thread did not start", e));
     // SAFETY: the references `create`, `create_boot` and `create_init` handed
     // out go; init's handles, its thread and the scheduler hold init from
     // now on, and its handle holds the boot image, so none is the last and
     // nothing is queued for cleanup.
     unsafe {
-        memory::release(boot, PRIORITY);
+        memory::release(image_object, PRIORITY);
+        memory::release(seed, PRIORITY);
         thread::release(t, PRIORITY);
         process::release(p, PRIORITY);
     }
     crate::sched::resume_from(section)
+}
+
+/// The page of the boot seed (abi::INIT_SEED), a memory object that init
+/// pays for: the u32 length of the seed, then its bytes, zero after them.
+/// The seed leaves the device tree (boot::take_seed), and the kernel keeps
+/// no copy.
+#[cfg(not(feature = "ktest"))]
+fn seed_page(p: NonNull<Process>, boot: &crate::boot::Boot) -> NonNull<memory::Memory> {
+    let m = memory::create_whole(p, 1).unwrap_or_else(|e| failed("no seed page", e));
+    let at = (LINEAR_BASE + memory::frame(m, 0) as usize) as *mut u8;
+    // SAFETY: the frame is the object's, zeroed and a page long, and the
+    // linear map reaches it; init has not started, and nothing else refers
+    // to the object.
+    unsafe { crate::boot::take_seed(boot, at) };
+    m
 }
 
 /// What of a program did not load (`load`): its part, its size in bytes,

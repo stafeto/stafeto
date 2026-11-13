@@ -29,8 +29,8 @@ pub(crate) type Test = (&'static str, fn() -> Outcome);
 
 /// The values of init's first handles (rt::init_handles), which `main`
 /// keeps for the whole run: the system resource, which the console owns,
-/// init's process, its first thread and the boot image.
-static INIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// init's process, its first thread, the boot image and the seed page.
+static INIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Keeps init's first handles for the whole run; the resource goes to the
 /// console, which owns it from then on.
@@ -39,6 +39,7 @@ pub(crate) fn keep(init: rt::InitHandles) {
     INIT[1].store(init.process.into_raw().0, Relaxed);
     INIT[2].store(init.thread.into_raw().0, Relaxed);
     INIT[3].store(init.boot_image.into_raw().0, Relaxed);
+    INIT[4].store(init.seed.into_raw().0, Relaxed);
     rt::console::set(init.resource);
 }
 
@@ -65,6 +66,11 @@ pub(crate) fn me() -> ManuallyDrop<Handle<Thread>> {
 /// A view of the boot image.
 pub(crate) fn image() -> ManuallyDrop<Handle<Memory>> {
     kept(3)
+}
+
+/// A view of the page of the boot seed.
+pub(crate) fn seed() -> ManuallyDrop<Handle<Memory>> {
+    kept(4)
 }
 
 /// Counter ticks of the counted loop the run starts with (main.rs,

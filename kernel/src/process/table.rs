@@ -174,31 +174,61 @@ pub fn put_handles(
 /// Puts init's first handles in the fresh table of `init` (spec 13.3): the
 /// system resource with every right, init's process and its `first`
 /// thread, and the memory object over the boot image, `boot`, with
-/// abi::INIT_BOOT_IMAGE_RIGHTS. The values follow from the order in a
+/// abi::INIT_BOOT_IMAGE_RIGHTS, and the page of the boot seed, `seed`,
+/// with abi::INIT_SEED_RIGHTS. The values follow from the order in a
 /// fresh table and are those abi fixes. Test builds have no init.
 #[cfg(not(feature = "ktest"))]
 pub fn install_init_handles(
     init: NonNull<Process>,
     first: NonNull<super::Thread>,
     boot: NonNull<super::Memory>,
+    seed: NonNull<super::Memory>,
 ) -> Result<(), Error> {
     crate::obj::assert_held();
-    let handles = [
-        insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,
-        insert_handle(init, Object::Process(init), abi::OWNER_RIGHTS)?,
-        insert_handle(init, Object::Thread(first), abi::OWNER_RIGHTS)?,
-        insert_handle(init, Object::Memory(boot), abi::INIT_BOOT_IMAGE_RIGHTS)?,
-    ];
-    assert!(
-        handles
-            == [
-                abi::INIT_RESOURCE,
-                abi::INIT_PROCESS,
-                abi::INIT_THREAD,
-                abi::INIT_BOOT_IMAGE
-            ],
-        "init's handles went into a table that was not fresh"
-    );
+    // One copy of the insertion for all of them: each inlined copy costs a
+    // hundred bytes of the kernel image.
+    #[inline(never)]
+    fn put(
+        init: NonNull<Process>,
+        object: Object,
+        rights: Rights,
+        want: Handle,
+    ) -> Result<(), Error> {
+        if insert_handle(init, object, rights)? != want {
+            kcore::must::fail("init's handles went into a table that was not fresh");
+        }
+        Ok(())
+    }
+    put(
+        init,
+        Object::Resource,
+        abi::INIT_RESOURCE_RIGHTS,
+        abi::INIT_RESOURCE,
+    )?;
+    put(
+        init,
+        Object::Process(init),
+        abi::OWNER_RIGHTS,
+        abi::INIT_PROCESS,
+    )?;
+    put(
+        init,
+        Object::Thread(first),
+        abi::OWNER_RIGHTS,
+        abi::INIT_THREAD,
+    )?;
+    put(
+        init,
+        Object::Memory(boot),
+        abi::INIT_BOOT_IMAGE_RIGHTS,
+        abi::INIT_BOOT_IMAGE,
+    )?;
+    put(
+        init,
+        Object::Memory(seed),
+        abi::INIT_SEED_RIGHTS,
+        abi::INIT_SEED,
+    )?;
     Ok(())
 }
 

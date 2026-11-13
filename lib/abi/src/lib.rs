@@ -146,6 +146,19 @@ pub const INIT_THREAD: Handle = Handle::new(2, 1);
 /// The boot image as a memory object over its frames, whole pages, with
 /// INIT_BOOT_IMAGE_RIGHTS.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
+/// One page of memory with the boot seed (spec 13.3): a u32 length in
+/// little endian at offset 0, then that many bytes from the
+/// `/chosen/rng-seed` of the device tree, at most `INIT_SEED_MAX`. The
+/// handle is there on every platform, with length 0 when the tree has no
+/// seed; the rest of the page is zero. The kernel clears the seed in the
+/// tree and in its own memory before init runs. With INIT_SEED_RIGHTS.
+pub const INIT_SEED: Handle = Handle::new(4, 1);
+/// The most seed bytes in the page of INIT_SEED.
+pub const INIT_SEED_MAX: usize = 64;
+/// Rights of INIT_SEED: maps R or RW and travels, so that init can pass
+/// the page to the entropy service and take it back to wipe.
+pub const INIT_SEED_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
 
 /// The first handle of a process that `process_create` made (spec 13.3):
 /// entry 0 of its fresh table. The sixth argument of `process_create`, a
@@ -1775,6 +1788,7 @@ mod tests {
         assert_eq!(INIT_PROCESS, Handle::new(1, 1));
         assert_eq!(INIT_THREAD, Handle::new(2, 1));
         assert_eq!(INIT_BOOT_IMAGE, Handle::new(3, 1));
+        assert_eq!(INIT_SEED, Handle::new(4, 1));
     }
 
     #[test]
