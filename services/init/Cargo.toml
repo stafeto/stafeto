@@ -91,6 +91,8 @@ table-posix-tty-vz = []
 # The probes of the entropy device's driver (xtask entropy, entropy-vz).
 table-entropy = []
 table-entropy-vz = []
+# The image of the boot seed with no device (xtask entropy-seed).
+table-entropy-seed = []
 # The probe of the display service (xtask gpu-probe).
 table-gpu = []
 # The network service in the image of the shell, and the image of its probe

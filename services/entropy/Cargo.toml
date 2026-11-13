@@ -24,6 +24,16 @@ bench = false
 steps = ["rt/step-stats"]
 report = []
 slow-start = []
+# `crash`: the method CRASH of proto_entropy, for the probe of the restart.
+crash = []
+# Deliberate breakage only (cargo xtask seed-breaks): the page of the boot
+# seed keeps the seed, keeps no key for the next instance, and a constant
+# boot seed seeds; `break-seed-page` is the service that never reads the
+# page.
+break-page-wipe = []
+break-page-keep = []
+break-seed-constant = []
+break-seed-page = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

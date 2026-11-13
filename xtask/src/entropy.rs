@@ -51,6 +51,32 @@ pub const PROGRAMS: [ImageProgram; 4] = [
     ),
 ];
 
+/// The image of the boot seed with no device (`cargo xtask entropy-seed`):
+/// init gives the entropy service the page of the seed, no driver is
+/// started, and the service, built with CRASH, is ended by the probe once.
+pub const SEED_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-entropy-seed"]),
+    ("entropy-probe", "entropy-probe", CHILD_STACK_SIZE, &[]),
+    (
+        "entropy",
+        "entropy",
+        ENTROPY_STACK_SIZE,
+        &["crash", "report"],
+    ),
+];
+
+/// The same image with a service that never reads the page.
+pub const SEED_BREAK_PROGRAMS: [ImageProgram; 3] = [
+    SEED_PROGRAMS[0],
+    SEED_PROGRAMS[1],
+    (
+        "entropy",
+        "entropy",
+        ENTROPY_STACK_SIZE,
+        &["crash", "report", "break-seed-page"],
+    ),
+];
+
 /// The probe's image on VZ: the console's driver shows the lines, and init
 /// watches the old DMA object of the driver that ended.
 pub const VZ_PROGRAMS: [ImageProgram; 5] = [
@@ -271,6 +297,82 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         "entropy on {}: keys of two clients, keys during a restart of the driver, a reseed, fills, the device reset: ok",
         machine.name
     );
+    Ok(())
+}
+
+/// The line of an instance seeded from the page of the boot seed (the
+/// bytes are not printed), and of one with no source at all.
+const BOOT_PAGE: &str = "entropy: seeded from the boot page (32 bytes)";
+const NO_SOURCE: &str = "entropy: no source on this boot; keys wait";
+const KEYS_AFTER: &str = "entropy-probe: 32 keys from the service after its restart";
+
+/// What the run of the image of the boot seed printed, judged: both
+/// instances (before and after the CRASH) seeded from the page with 32
+/// bytes, the keys came at once, new after the restart, no line says the
+/// device or `no source`, and the probe ended well.
+pub fn seed_verdict(lines: &[String]) -> Result<(), String> {
+    let count = |marker: &str| lines.iter().filter(|l| l.starts_with(marker)).count();
+    for (marker, n) in [
+        (BOOT_PAGE, 2),
+        (AT_ONCE, 1),
+        (FLAG, 1),
+        (KEYS_AFTER, 1),
+        (OK, 1),
+        (NO_SOURCE, 0),
+        (SEEDED, 0),
+    ] {
+        if count(marker) != n {
+            let failed = lines
+                .iter()
+                .find(|l| l.starts_with("entropy-probe: failed"));
+            return Err(format!(
+                "{} lines {marker:?}, {n} expected; a failure: {failed:?}",
+                count(marker)
+            ));
+        }
+    }
+    let keys: Vec<_> = lines.iter().filter_map(|l| l.strip_prefix(KEY)).collect();
+    if keys.len() != 1 || keys[0].len() != 64 {
+        return Err(format!("the key of the probe: {keys:?}"));
+    }
+    Ok(())
+}
+
+/// `cargo xtask entropy-seed`: the image with no device of random bytes
+/// and the page of the boot seed that QEMU's tree gives (the kernel takes
+/// `/chosen/rng-seed`, init gives the page to the service). The service
+/// seeds from it before it serves; the probe ends it with CRASH, and the
+/// instance init starts seeds from the key the first one left in the page,
+/// so that its keys come at once and differ from every key before. The
+/// break, a service that never reads the page, finds no source, says so,
+/// and the probe waits for its first key until the run is cut.
+pub fn seed_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-entropy-seed.img", &SEED_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, crate::BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    seed_verdict(&output.lines).map_err(|e| format!("entropy-seed: {e}"))?;
+    println!(
+        "entropy-seed: seeded from the boot page with no device, keys at once, and again after a restart of the service: ok"
+    );
+    let image = build_boot_image(
+        "boot-entropy-seed-break.img",
+        &SEED_BREAK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, Duration::from_secs(10), Some(ENDED), &kernel.elf)?;
+    let said = output.lines.iter().any(|l| l.starts_with(NO_SOURCE));
+    if output.stopped_on_marker || !output.timed_out || !said {
+        return Err(format!(
+            "the break (the service ignores the page) was not caught: ended {}, timed out {}, line {said}",
+            output.stopped_on_marker, output.timed_out
+        ));
+    }
+    println!("entropy-seed: the break that ignores the page is caught: no source, the probe waits");
     Ok(())
 }
 

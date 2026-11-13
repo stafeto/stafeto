@@ -58,6 +58,19 @@ pub enum Failure {
     Timeout,
 }
 
+impl Failure {
+    /// The console line for a key that did not come.
+    pub fn say(&self) {
+        match self {
+            Failure::Gone => rt::println!("net: no key from the entropy service (gone)"),
+            Failure::Timeout => rt::println!("net: no key from the entropy service (timeout)"),
+            Failure::Refused(status) => {
+                rt::println!("net: no key from the entropy service ({status:?})")
+            }
+        }
+    }
+}
+
 impl From<Status> for Failure {
     fn from(status: Status) -> Failure {
         Failure::Refused(status)

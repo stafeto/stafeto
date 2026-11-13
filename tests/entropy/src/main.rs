@@ -14,6 +14,10 @@
 //! - `c`: CRASH of the driver; 32 SEED with NONBLOCK while init restarts
 //!   it, all answered at once (after `s`); a new session with the driver,
 //!   and a fill.
+//! - `k`: CRASH of the entropy service (after `s`); 32 SEED with NONBLOCK
+//!   from the instance init starts, all answered at once and none like a key
+//!   before: the new instance has the service's seed, which the one before
+//!   left in the page of the boot seed, and its keys are its own.
 //! - `w`: a wait of 61 s, past the service's reseed, then a SEED with
 //!   NONBLOCK.
 //! - `x`: CLONE until the service refuses: the clones of a session, then
@@ -88,6 +92,7 @@ fn main(_: u64) -> u64 {
             b's' => probe.seeds(),
             b'f' => probe.fills().map(drop),
             b'c' => probe.crash(),
+            b'k' => probe.restart(),
             b'w' => probe.later(),
             b'p' => probe.waiters(),
             b'x' => probe.clones(),
@@ -233,6 +238,24 @@ impl Probe<'_> {
             "entropy-probe: a fill after the restart ({:016x})",
             head(&c)
         );
+        Ok(())
+    }
+
+    /// Role `k`: CRASH of the entropy service, then keys from the new
+    /// instance, each answered at once and each new.
+    fn restart(&mut self) -> Result<(), &'static str> {
+        rt::println!("entropy-probe: crashing the entropy service");
+        let request = Method::Crash.header().bytes();
+        let service = self.entropy.as_ref().ok_or("no session with the service")?;
+        // The service never replies: its end gives PEER_CLOSED.
+        if sys::send(service, &request).is_ok() {
+            return Err("CRASH answered");
+        }
+        self.entropy = None;
+        for _ in 0..DURING_RESTART {
+            self.seed(true)?;
+        }
+        rt::println!("entropy-probe: {DURING_RESTART} keys from the service after its restart");
         Ok(())
     }
 

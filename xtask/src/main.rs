@@ -2151,6 +2151,7 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
+  entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   seed-breaks run the kernel tests with the boot seed left in the device tree: the test of the wipe must fail, and only it
   its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
@@ -2179,6 +2180,7 @@ fn main() {
         Some("its-lpis") => its_lpis(),
         Some("its-breaks") => its_breaks(),
         Some("seed-breaks") => seed_breaks(),
+        Some("entropy-seed") => entropy::seed_probe(),
         Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
@@ -2754,7 +2756,7 @@ const SEED_TEST: &str = "boot_seed_is_taken_and_cleared_in_the_tree";
 /// `cargo xtask seed-breaks`: the kernel tests of the first image with the
 /// boot seed left in the device tree (`break-seed-wipe`) fail the test of
 /// the wipe and no other; the same test passes in every other run of the
-/// kernel tests.
+/// kernel tests. Then the breaks of the page of the entropy service.
 fn seed_breaks() -> Result<(), String> {
     let a = build(Variant::SeedNoWipe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
@@ -2764,11 +2766,32 @@ fn seed_breaks() -> Result<(), String> {
     match r.failed.as_slice() {
         [(name, why)] if name == SEED_TEST => {
             println!("seed-breaks: the seed left in the tree is caught ({why})");
-            Ok(())
         }
-        [] => Err("the break (no wipe) passed the kernel tests".into()),
-        other => Err(format!("the break failed other tests: {other:?}")),
+        [] => return Err("the break (no wipe) passed the kernel tests".into()),
+        other => return Err(format!("the break failed other tests: {other:?}")),
     }
+    // The page of the entropy service: the host tests pass, and each break
+    // fails them.
+    let mut ok = cargo();
+    ok.args(["test", "--package", "entropy", "--lib"]);
+    run_cmd(&mut ok)?;
+    for feature in ["break-page-wipe", "break-page-keep", "break-seed-constant"] {
+        let mut broken = cargo();
+        broken.args([
+            "test",
+            "--package",
+            "entropy",
+            "--lib",
+            "--features",
+            feature,
+        ]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => println!("seed-breaks: {feature} is caught"),
+            Ok(_) => return Err(format!("{feature} passed the host tests")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// `cargo xtask its-breaks`: the host tests of the ITS counter and of the
@@ -9791,6 +9814,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("its lpis", its_lpis),
         job("its breaks", its_breaks),
         job("seed breaks", seed_breaks),
+        job("entropy seed", entropy::seed_probe),
         job("its slow", its_slow),
         job("smp 4 window", smp_window),
         job("smp 4 asid", || smp_asid(None)),

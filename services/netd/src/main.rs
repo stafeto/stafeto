@@ -353,17 +353,7 @@ fn main(_: u64) -> u64 {
     let mut key = match seed::take(&entropy, &channel, level, (&timer, TIMER_LABEL)) {
         Ok(key) => key,
         Err(failure) => {
-            match failure {
-                seed::Failure::Gone => {
-                    rt::println!("net: no key from the entropy service (gone)")
-                }
-                seed::Failure::Timeout => {
-                    rt::println!("net: no key from the entropy service (timeout)")
-                }
-                seed::Failure::Refused(status) => {
-                    rt::println!("net: no key from the entropy service ({status:?})")
-                }
-            }
+            failure.say();
             return NO_ENTROPY;
         }
     };

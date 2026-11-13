@@ -93,6 +93,7 @@ fn main(_: u64) -> u64 {
         &init.resource,
         label,
         init.boot_image,
+        init.seed,
     )
     .expect("init starts its worker thread");
     let mut service = serve::Init::new(

@@ -17,18 +17,21 @@
 //!
 //! The device is brought up before the stack is built, since the stack takes
 //! the device's MAC: the first thread runs the admin side to `Up` with a
-//! heartbeat to init on the way. The key of the stack has no entropy service on
-//! EC2 (the t4g has no device of random bytes): `local_key` mixes the counters
-//! of the machine, and the PR of this step says it is weak.
+//! heartbeat to init on the way. The key of the stack comes from the entropy
+//! service, as for the Virtio kinds, before the service registers; the
+//! t4g has no device of random bytes, so the service is seeded from the
+//! boot seed the loader took from the firmware (`/chosen/rng-seed`). With
+//! no seed the key never comes, the service ends with NO_ENTROPY after
+//! KEY_WAIT_NS, and the network stays down: no key of anything weaker is made.
 
 use crate::device::{NetDevice, RxRing, TxRing};
 use crate::dma::net_at;
 use crate::ena_switch::{self, EnaSwitch};
 use crate::instance::{self, Instance};
 use crate::{
-    DRIVERS, Driver, NO_CONFIG, NO_DEVICE, NO_START_DATA, NOT_MAPPED, NOT_REGISTERED, NOT_STARTED,
-    TABLES, Tables, announce_static, demux_secret, instance_entry, make_pause, plan_instances,
-    word,
+    DRIVERS, Driver, NO_CONFIG, NO_DEVICE, NO_ENTROPY, NO_START_DATA, NOT_MAPPED, NOT_REGISTERED,
+    NOT_STARTED, TABLES, Tables, announce_static, demux_secret, instance_entry, make_pause,
+    plan_instances, word,
 };
 use abi::{Access, Rights, Source};
 use core::fmt;
@@ -238,27 +241,6 @@ impl Platform for Hw {
         }
         wake_switch();
     }
-}
-
-/// The key of the stack from the counters of the machine and the MAC: the t4g has no device
-/// of random bytes and the image has no entropy service. Weak: the sequence numbers and the
-/// ports it seeds are guessable by an attacker who knows the boot time.
-fn local_key(mac: [u8; 6]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let mut sample = [0u8; 16];
-    for (n, chunk) in out.chunks_mut(16).enumerate() {
-        // The counter read a few times, each after some work of the thread.
-        let mut a = time::now();
-        for _ in 0..64 {
-            a = a.rotate_left(7) ^ time::now();
-        }
-        sample[..8].copy_from_slice(&a.to_le_bytes());
-        sample[8..14].copy_from_slice(&mac);
-        sample[14] = n as u8;
-        sample[15] = (core::ptr::addr_of!(sample) as usize >> 4) as u8;
-        chunk.copy_from_slice(&demux_secret(&sample, b"ena-local-key"));
-    }
-    out
 }
 
 fn heartbeat(parent: &Handle<Channel>) {
@@ -602,6 +584,21 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     let Ok(wake_switch) = sys::handle_duplicate(&switch_channel, Rights::NOTIFY) else {
         return NOT_REGISTERED;
     };
+    // The key of the stack: its first 8 bytes seed the stack, the next 16 are the secret of
+    // the choice of ports, and the rest is mixed into the table of destinations. It comes
+    // before the registration, so that nothing else reaches the channel meanwhile.
+    let Ok(entropy) = rt::service::connect(&s.parent, "entropy") else {
+        rt::println!("net: no entropy service in this image; the network stays down");
+        return NO_ENTROPY;
+    };
+    let mut key = match crate::seed::take(&entropy, &channel, level, (&timer, crate::TIMER_LABEL)) {
+        Ok(key) => key,
+        Err(failure) => {
+            failure.say();
+            return NO_ENTROPY;
+        }
+    };
+    drop(entropy);
     let settings = match crate::files::read(&s.parent) {
         Ok(settings) => settings,
         Err(crate::files::Failure::Refused(error)) => {
@@ -716,7 +713,6 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         Err(code) => return code,
     };
     debug_assert!(instances == 1 && extra.iter().all(Option::is_none));
-    let key = local_key(mac);
     let mut first = [0; 8];
     first.copy_from_slice(&key[..8]);
     let random_seed = u64::from_le_bytes(first);
@@ -741,6 +737,7 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         &mut *pointer
     };
     posix_random::erase(&mut ports_key);
+    posix_random::erase(&mut key);
     let Tables {
         nets,
         storages,

@@ -238,6 +238,27 @@ const PROBE_B: Record = Record {
     ..PROBE
 };
 
+/// The entropy service of an image with no device of random bytes: the
+/// boot seed is its only source (`SEED_TABLE`, and EC2's table).
+const ENTROPY_NO_DEVICE: Record = Record {
+    connects: &[],
+    ..ENTROPY
+};
+
+/// The probe of the boot seed (roles `sk`): a key, 16 more at once, then
+/// CRASH of the service and 32 keys from the instance init starts, which
+/// differ from every key before.
+const SEED_PROBE: Record = Record {
+    connects: &["entropy"],
+    args: b"sk",
+    ..PROBE
+};
+
+/// The image of the boot seed with no device: the service and the probe,
+/// the driver of the device not started (the machine still has the
+/// device, which nothing drives).
+pub const SEED_TABLE: &[Record] = &[ENTROPY_NO_DEVICE, SEED_PROBE];
+
 /// The probe's image on QEMU.
 pub const TABLE: &[Record] = &[RNG, ENTROPY, PROBE, PROBE_B];
 
