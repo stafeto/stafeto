@@ -26,6 +26,13 @@ use proto_process::RECORDS;
 /// The entries of the table.
 pub const SHARES: usize = 48;
 
+/// The anonymous objects one process is a user of at most, a sixth of the
+/// table: a program has a few anonymous shared pages (a lock, a ring), so
+/// eight is room enough, and six processes must work together to take the
+/// whole table, which one process alone cannot do to make every writable
+/// shared mapping of the others fail.
+pub const ANON_PER_PROCESS: usize = 8;
+
 const WORDS: usize = RECORDS.div_ceil(64);
 
 /// What the table answers to Get.
@@ -258,8 +265,19 @@ impl<T, W> Shares<T, W> {
 
     /// The caller in `record` maps a new anonymous shared object: its key
     /// (made here), with the caller as its user and writer. None when the
-    /// table has no place; the object then has no key.
+    /// table has no place or the caller is a user of `ANON_PER_PROCESS`
+    /// anonymous objects already (the object then has no key, and the
+    /// request of that process alone is refused).
     pub fn anon(&mut self, record: usize) -> Option<u64> {
+        let own = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state, State::Anon) && Self::has(&e.users, record))
+            .count();
+        if own >= ANON_PER_PROCESS {
+            return None;
+        }
         let place = self.entries.iter().position(Option::is_none)?;
         self.anon_keys += 1;
         let mut entry = Entry {
@@ -906,22 +924,43 @@ mod tests {
     fn anonymous_keys_are_the_services_and_the_table_is_finite() {
         let mut t = Shares::<u32, u32>::new();
         let mut seen = [0u64; SHARES];
-        for slot in &mut seen {
-            let key = t.anon(1).expect("a place");
+        for (n, slot) in seen.iter_mut().enumerate() {
+            let key = t.anon(n / ANON_PER_PROCESS).expect("a place");
             assert_eq!(key & 1 << 63, 0, "no file's bit");
             assert_ne!(key, 0);
             *slot = key;
         }
-        assert_eq!(t.anon(1), None, "the table is full");
+        assert_eq!(t.anon(99), None, "the table is full");
         let mut sorted = seen;
         sorted.sort_unstable();
         assert!(sorted.windows(2).all(|w| w[0] != w[1]), "no repeats");
         // A key that went is not made again.
-        assert!(t.detach(seen[0], 1));
-        let again = t.anon(1).expect("a place");
+        assert!(t.detach(seen[0], 0));
+        let again = t.anon(0).expect("a place");
         assert!(!seen.contains(&again));
         // A file's Get of an anonymous key finds no file.
         assert_eq!(t.get(seen[1], 2, true), Got::Full);
         assert_eq!(t.held(2, Kind::Anon, seen[1]), Held::None);
+    }
+
+    /// One process cannot fill the table with anonymous objects: past
+    /// `ANON_PER_PROCESS` its own request is refused, the others still get
+    /// theirs, and what it gives back is its room again.
+    #[test]
+    fn a_process_has_a_share_of_the_anonymous_places() {
+        let mut t = Shares::<u32, u32>::new();
+        let mine: Vec<u64> = (0..ANON_PER_PROCESS)
+            .map(|_| t.anon(1).expect("within the share"))
+            .collect();
+        assert_eq!(t.anon(1), None, "past the share");
+        assert_eq!(t.len(), ANON_PER_PROCESS);
+        for record in 2..2 + (SHARES - ANON_PER_PROCESS) / ANON_PER_PROCESS {
+            assert!(t.anon(record).is_some(), "another process still gets one");
+        }
+        assert!(t.detach(mine[0], 1));
+        assert!(t.anon(1).is_some(), "a place given back is room again");
+        // A forked child's membership counts for the child.
+        t.fork_anon(1, 40);
+        assert_eq!(t.anon(40), None, "the child holds as many as its parent");
     }
 }
