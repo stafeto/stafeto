@@ -50,8 +50,10 @@ pub const AQ_AT: usize = 0;
 pub const ACQ_AT: usize = 0x800;
 pub const AENQ_AT: usize = 0x1000;
 pub const READLESS_AT: usize = 0x1400;
-/// The bytes the admin structures take.
-pub const ADMIN_BYTES: usize = 0x1408;
+/// The page of the host info (`ena_admin_host_info`, 4 KiB).
+pub const HOST_AT: usize = 0x2000;
+/// The bytes the admin structures and the host info take.
+pub const ADMIN_BYTES: usize = 0x3000;
 
 const NS_PER_MS: u64 = 1_000_000;
 /// How long a read through memory waits for its answer, and the most
@@ -76,6 +78,25 @@ const FAILURES: usize = 3;
 const FAILURE_WINDOW_NS: u64 = 60_000 * NS_PER_MS;
 /// The MTU the device is given (the stack runs at 1 500).
 pub const MTU: u32 = 1500;
+
+/// What the host says of itself in the host info: the OS type, the function's
+/// bus, device and function number in 16 bits (`Address::rid`), and the CPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostInfo {
+    pub os_type: u32,
+    pub bdf: u16,
+    pub cpus: u16,
+}
+
+impl Default for HostInfo {
+    fn default() -> HostInfo {
+        HostInfo {
+            os_type: 0,
+            bdf: 0,
+            cpus: 1,
+        }
+    }
+}
 
 /// How a register is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +218,8 @@ enum Stage {
         since: u64,
     },
     Identify,
+    /// The host info and attributes, set before the features.
+    Host,
     /// The feature `FEATURES[at]`, asked or being answered.
     Features {
         at: usize,
@@ -227,6 +250,7 @@ enum Pending {
     Feature { id: u8 },
     Set { id: u8 },
     Stats,
+    Host,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +300,12 @@ pub struct Ena<P: Platform> {
     asked: Option<u32>,
     /// The head of the event queue is not written back (a deliberate break).
     hold_head: bool,
+    /// What the host tells the device about itself (`Host`).
+    host: HostInfo,
+    /// A trial of the bring-up, which later steps of the probe pick by what works
+    /// (`set_variant`): bit 0 sends the host info, bit 1 leaves the admin
+    /// interrupt unmasked.
+    variant: u32,
 }
 
 impl<P: Platform> Ena<P> {
@@ -337,6 +367,8 @@ impl<P: Platform> Ena<P> {
             up_once: false,
             asked: None,
             hold_head: cfg!(feature = "break-aenq-head"),
+            host: HostInfo::default(),
+            variant: 0,
         })
     }
 
@@ -377,6 +409,21 @@ impl<P: Platform> Ena<P> {
     /// device (`ena-break-aenq`).
     pub fn hold_event_head(&mut self, hold: bool) {
         self.hold_head = hold;
+    }
+
+    pub fn set_host(&mut self, host: HostInfo) {
+        self.host = host;
+    }
+
+    /// Forgets the resets counted against the limit of three a minute, for a
+    /// probe that resets on purpose to try the ways of bringing the device up.
+    pub fn forgive_resets(&mut self) {
+        self.failures = [0; FAILURES];
+    }
+
+    /// Picks the trial the next bring-up runs.
+    pub fn set_variant(&mut self, variant: u32) {
+        self.variant = variant;
     }
 
     /// Asks for a reset with `reason`: the next step starts it.
@@ -481,6 +528,7 @@ impl<P: Platform> Ena<P> {
             Stage::Asserted { since } => self.asserted(now, since),
             Stage::Released { since } => self.released(now, since),
             Stage::Identify => self.identify(now),
+            Stage::Host => self.host(now),
             Stage::Features { at } => self.features(now, at),
             Stage::Configure { at } => self.configure(now, at),
             Stage::Running => self.running(now),
@@ -501,6 +549,15 @@ impl<P: Platform> Ena<P> {
             "ena: reset reason {reason} after {} s",
             (now - self.up_ns) / (1000 * NS_PER_MS)
         ));
+        if reason == regs::RESET_KEEP_ALIVE_TO {
+            // What the device posted: its tail and the first entry.
+            let tail = self.read_reg(regs::AENQ_TAIL);
+            let words = [0, 4, 8, 12].map(|i| self.read_u32(AENQ_AT + i));
+            self.p.log(format_args!(
+                "ena: no keep-alive; variant {} aenq tail {tail:?} head {} entry0 {:#x} {:#x} {:#x} {:#x}",
+                self.variant, self.aenq_head, words[0], words[1], words[2], words[3]
+            ));
+        }
         self.resets.count += 1;
         self.resets.last_reason = reason;
         if let Some(n) = self.resets.by_reason.get_mut(reason as usize) {
@@ -701,8 +758,17 @@ impl<P: Platform> Ena<P> {
         self.aenq_phase = 1;
         self.p.wmb();
         self.write_reg(regs::AENQ_HEAD_DB, u32::from(self.aenq_head));
-        self.write_reg(regs::INTR_MASK, regs::ADMIN_INTR_MASK);
-        self.stage = Stage::Features { at: 0 };
+        let mask = if self.variant & 2 == 0 {
+            regs::ADMIN_INTR_MASK
+        } else {
+            0
+        };
+        self.write_reg(regs::INTR_MASK, mask);
+        self.stage = if self.variant & 1 != 0 {
+            Stage::Host
+        } else {
+            Stage::Features { at: 0 }
+        };
         let _ = now;
         Event::Progress
     }
@@ -771,6 +837,67 @@ impl<P: Platform> Ena<P> {
         } else {
             ms * NS_PER_MS
         }
+    }
+
+    /// The host info: written into its page, then given to the device with
+    /// SET_FEATURE `HOST_ATTR_CONFIG`. A refusal is logged and goes on.
+    fn host(&mut self, now: u64) -> Event {
+        let Some(command) = self.command else {
+            let at = HOST_AT;
+            self.zero(at, 4096);
+            let w32 = |s: &Self, off: usize, v: u32| {
+                for (i, b) in v.to_le_bytes().iter().enumerate() {
+                    s.write_u8(at + off + i, *b);
+                }
+            };
+            let w16 = |s: &Self, off: usize, v: u16| {
+                for (i, b) in v.to_le_bytes().iter().enumerate() {
+                    s.write_u8(at + off + i, *b);
+                }
+            };
+            w32(self, adm::HOST_INFO_OS_TYPE, self.host.os_type);
+            for (i, b) in b"stafeto".iter().enumerate() {
+                self.write_u8(at + adm::HOST_INFO_OS_DIST_STR + i, *b);
+            }
+            for (i, b) in b"0.2.0".iter().enumerate() {
+                self.write_u8(at + adm::HOST_INFO_KERNEL_VER_STR + i, *b);
+            }
+            w32(self, adm::HOST_INFO_DRIVER_VERSION, 1);
+            w16(
+                self,
+                adm::HOST_INFO_SPEC_VERSION,
+                adm::SPEC_VERSION_MAJOR << 8 | adm::SPEC_VERSION_MINOR,
+            );
+            w16(self, adm::HOST_INFO_BDF, self.host.bdf);
+            w16(self, adm::HOST_INFO_NUM_CPUS, self.host.cpus);
+            let pa = self.region.pa + HOST_AT as u64;
+            self.p.wmb();
+            self.submit(adm::SET_FEATURE, Pending::Host, now, |e| {
+                e[adm::FEAT_ID] = adm::HOST_ATTR_CONFIG;
+                e[adm::FEAT_DATA + adm::HOST_OS_INFO_BA..][..4]
+                    .copy_from_slice(&(pa as u32).to_le_bytes());
+                e[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 4..][..2]
+                    .copy_from_slice(&((pa >> 32) as u16).to_le_bytes());
+            });
+            return Event::Progress;
+        };
+        let Some((_, status, _)) = self.complete() else {
+            if now - command.sent_ns > self.admin_limit_ns() {
+                return self.fail(Failure::Admin {
+                    opcode: adm::SET_FEATURE,
+                    status: 0xFF,
+                });
+            }
+            return Event::Idle;
+        };
+        if status != adm::SUCCESS {
+            self.p
+                .log(format_args!("ena: host info refused, status {status}"));
+        } else {
+            self.p.log(format_args!("ena: host info set"));
+        }
+        self.stage = Stage::Features { at: 0 };
+        Event::Progress
     }
 
     // The features.

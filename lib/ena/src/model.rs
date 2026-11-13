@@ -54,6 +54,10 @@ pub struct Scenario {
     pub wrong_command_id: bool,
     /// The next reset ends the delay of the answers.
     pub delay_ends_at_reset: bool,
+    /// The device sends no event until the host info was set.
+    pub needs_host_info: bool,
+    /// The device sends no event while its admin interrupt is masked.
+    pub needs_unmasked: bool,
     /// The device posts a link-change event (up) once the groups are set.
     pub link_event: bool,
     /// The device says it needs no hint-less commands: LLQ is listed.
@@ -74,6 +78,8 @@ impl Default for Scenario {
             reset_ns: 5 * MS,
             wrong_command_id: false,
             delay_ends_at_reset: false,
+            needs_host_info: false,
+            needs_unmasked: false,
             link_event: true,
             llq: false,
         }
@@ -124,6 +130,7 @@ pub struct Inner {
     pub read_requests: u32,
     pub reset_sequence: Vec<&'static str>,
     revision: u8,
+    host_info: Option<[u8; 16]>,
 }
 
 /// The model, shared by the test and the platform the driver holds.
@@ -167,6 +174,7 @@ impl Model {
             read_requests: 0,
             reset_sequence: Vec::new(),
             revision,
+            host_info: None,
         })))
     }
 
@@ -216,6 +224,14 @@ impl Model {
 
     pub fn keep_alives_sent(&self) -> u64 {
         self.0.borrow().keep_sent
+    }
+
+    pub fn intr_mask(&self) -> u32 {
+        self.0.borrow().intr_mask
+    }
+
+    pub fn host_info(&self) -> Option<[u8; 16]> {
+        self.0.borrow().host_info
     }
 
     pub fn mtu(&self) -> u32 {
@@ -394,6 +410,7 @@ impl Inner {
         self.aenq_head_db = 0;
         self.enabled_groups = 0;
         self.answers.clear();
+        self.host_info = None;
     }
 
     fn readless(&mut self, value: u32) {
@@ -566,6 +583,15 @@ impl Inner {
                 self.next_keep_ns = self.now + 1_000 * MS;
             }
             adm::MTU => self.mtu = word(adm::FEAT_DATA + adm::MTU_VALUE),
+            adm::HOST_ATTR_CONFIG => {
+                let pa = u64::from(word(adm::FEAT_DATA + adm::HOST_OS_INFO_BA))
+                    | u64::from(u16::from_le_bytes([
+                        cmd[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 4],
+                        cmd[adm::FEAT_DATA + adm::HOST_OS_INFO_BA + 5],
+                    ])) << 32;
+                let page = self.mem_get(self.va(pa), 16);
+                self.host_info = Some(page.try_into().unwrap());
+            }
             _ => return adm::UNSUPPORTED_OPCODE,
         }
         adm::SUCCESS
@@ -623,7 +649,9 @@ impl Inner {
             return;
         }
         self.deliver();
-        let groups = self.enabled_groups;
+        let blocked = self.scenario.needs_host_info && self.host_info.is_none()
+            || self.scenario.needs_unmasked && self.intr_mask != 0;
+        let groups = if blocked { 0 } else { self.enabled_groups };
         if groups & 1 << adm::AENQ_KEEP_ALIVE != 0
             && !self.scenario.no_keep_alive
             && self.now >= self.next_keep_ns

@@ -12,6 +12,7 @@
 
 use abi::{Access, Source};
 use core::fmt;
+use ena::device::HostInfo;
 use ena::mmio::Bar;
 use ena::{Ena, Event, Platform, Region};
 use proto_init::ServiceArgs;
@@ -30,6 +31,14 @@ const TIMER_LABEL: u64 = 1;
 const TICK_NS: u64 = 50_000_000;
 /// The steps one notification takes at most.
 const STEPS: u32 = 64;
+/// The command word of the function: the firmware leaves memory decoding off
+/// until the owner of the function turns it on, and DMA needs bus mastering;
+/// INTx stays off (the device is polled). Written as a whole word with the
+/// status half 0, which clears nothing [G34].
+const COMMAND: usize = 4;
+const MEMORY: u32 = 1 << 1;
+const BUS_MASTER: u32 = 1 << 2;
+const INTX_DISABLE: u32 = 1 << 10;
 const NOT_REGISTERED: u64 = 3;
 const NOT_MAPPED: u64 = 4;
 const NO_DEVICE: u64 = 6;
@@ -67,8 +76,14 @@ impl Platform for Hw {
     }
 }
 
+/// The trials of the bring-up, one per reset until the device sends its
+/// keep-alives (`Ena::set_variant`): bit 0 sends the host info, bit 1 leaves
+/// the admin interrupt unmasked, bit 2 gives the host info another OS type.
+const TRIALS: [u32; 6] = [0, 1, 2, 3, 5, 7];
+
 struct EnaService {
     ena: Ena<Hw>,
+    trial: usize,
     timer: Handle<Timer>,
     deadline: u64,
     /// The probe's deliberate break: after the first start the head of the
@@ -84,19 +99,37 @@ impl EnaService {
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
 
+    fn set_trial(&mut self) {
+        let variant = TRIALS[self.trial % TRIALS.len()];
+        let os_type = if variant & 4 != 0 { 4 } else { 0 };
+        self.ena.set_host(HostInfo {
+            os_type,
+            bdf: 0,
+            cpus: 2,
+        });
+        self.ena.set_variant(variant);
+        rt::println!("ena: trial variant {variant}");
+        #[cfg(feature = "ena-break-aenq")]
+        self.ena.hold_event_head(false);
+    }
+
     fn step(&mut self) {
         for _ in 0..STEPS {
             match self.ena.poll() {
                 Event::Idle => break,
                 Event::Failed(_) => sys::process_exit(FAILED),
+                Event::Resetting(_) => {
+                    // A reset because no keep-alive came: the next trial.
+                    self.trial += 1;
+                    self.ena.forgive_resets();
+                    self.set_trial();
+                }
                 #[cfg(feature = "ena-break-aenq")]
                 Event::Up if !self.broken => {
                     self.broken = true;
                     self.ena.hold_event_head(true);
                     rt::println!("ena: break: the event head is held");
                 }
-                #[cfg(feature = "ena-break-aenq")]
-                Event::Resetting(_) => self.ena.hold_event_head(false),
                 _ => {}
             }
         }
@@ -148,13 +181,21 @@ pub fn run(s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     if pa == 0
         || sys::mem_map(&s.process, &object, 0, len, ENA_AT, rw).is_err()
         || sys::mem_map(&s.process, &bar, 0, 4 * PAGE, BAR_AT, rw).is_err()
-        || sys::mem_map(&s.process, &ecam, 0, PAGE, ECAM_AT, Access::Read).is_err()
+        || sys::mem_map(&s.process, &ecam, 0, PAGE, ECAM_AT, rw).is_err()
     {
         return NOT_MAPPED;
     }
-    // SAFETY: the page of the function is mapped at ECAM_AT, read-only, as
-    // device memory; offset 8 is its revision and class word.
-    let revision = unsafe { rt::mmio::read32(ECAM_AT + 8) } as u8;
+    // SAFETY: the page of the function is mapped at ECAM_AT, read and write,
+    // as device memory; offset 8 is its revision and class word, offset 4 its
+    // command word.
+    let revision = unsafe {
+        let command = rt::mmio::read32(ECAM_AT + COMMAND) & 0xFFFF;
+        rt::mmio::write32(
+            ECAM_AT + COMMAND,
+            command | MEMORY | BUS_MASTER | INTX_DISABLE,
+        );
+        rt::mmio::read32(ECAM_AT + 8) as u8
+    };
     let region = Region {
         va: ENA_AT,
         pa,
@@ -185,11 +226,13 @@ pub fn run(s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     };
     let mut service = EnaService {
         ena,
+        trial: 0,
         timer,
         deadline: 0,
         #[cfg(feature = "ena-break-aenq")]
         broken: false,
     };
+    service.set_trial();
     service.arm();
     let heartbeat = Heartbeat {
         to: &s.parent,
