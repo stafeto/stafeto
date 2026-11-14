@@ -9518,7 +9518,7 @@ pub fn a_thread_with_no_budget_works_at_the_free_level(_: &Boot) -> Result<(), &
     let result = match &callers {
         [Ok(c), Ok(low)] => {
             process::set_free(low.process, 7);
-            free_level_cases(c, low.process)
+            free_level_cases(c, low.process).and_then(|()| child_free_cases(low))
         }
         _ => Err("no process or thread"),
     };
@@ -9645,4 +9645,43 @@ pub fn budget_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
     c.release();
     cleanup::drain();
     result
+}
+
+/// A child never has more `free` than its creator, whatever it asks, or a
+/// process held to 7 would make a child at 30 that runs unbudgeted threads
+/// there: the creator `low` has ceiling 30 and `free` 7.
+fn child_free_cases(low: &Caller) -> Result<(), &'static str> {
+    let n = Call::ProcessCreate.number();
+    let q = CHILD_QUOTA;
+    low.fails(
+        n,
+        &[q, 16, 30 | 8 << 8, 0, 0, 0, 0, 0, 0],
+        Error::AccessDenied,
+    )?;
+    low.fails(
+        n,
+        &[q, 16, 30 | 30 << 8, 0, 0, 0, 0, 0, 0],
+        Error::AccessDenied,
+    )?;
+    let level = |h: Handle| {
+        // SAFETY: the caller's process is the test's.
+        unsafe { low.process.as_ref() }
+            .lookup(h, Rights::NONE, Object::process)
+            .map(|p| {
+                // SAFETY: the handle holds the process.
+                unsafe { p.as_ref() }.free()
+            })
+            .map_err(|_| "the handle does not name the child")
+    };
+    for (x2, want) in [(30, 7), (30 | 7 << 8, 7), (30 | 3 << 8, 3), (5, 5)] {
+        let child = low.created(n, &[q, 16, x2, 0, 0, 0, 0, 0, 0])?;
+        let got = level(child);
+        low.close(child)?;
+        cleanup::drain();
+        check(
+            got? == want,
+            "a child has more free level than its creator, or not the level it asked",
+        )?;
+    }
+    Ok(())
 }

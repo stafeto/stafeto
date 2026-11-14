@@ -1625,10 +1625,11 @@ enum Variant {
     BudgetRefill,
     BudgetKeepLevel,
     BudgetNoFree,
+    BudgetChildFree,
 }
 
 impl Variant {
-    const ALL: [Variant; 55] = [
+    const ALL: [Variant; 56] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1684,6 +1685,7 @@ impl Variant {
         Variant::BudgetRefill,
         Variant::BudgetKeepLevel,
         Variant::BudgetNoFree,
+        Variant::BudgetChildFree,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1747,6 +1749,7 @@ impl Variant {
             Variant::BudgetRefill => Some("break-budget-refill"),
             Variant::BudgetKeepLevel => Some("break-budget-keep-level"),
             Variant::BudgetNoFree => Some("ktest,break-budget-no-free"),
+            Variant::BudgetChildFree => Some("ktest,break-budget-child-free"),
         }
     }
 
@@ -1826,6 +1829,7 @@ impl Variant {
             Variant::BudgetRefill => "stafeto-budget-refill",
             Variant::BudgetKeepLevel => "stafeto-budget-keep-level",
             Variant::BudgetNoFree => "stafeto-budget-no-free",
+            Variant::BudgetChildFree => "stafeto-budget-child-free",
         }
     }
 }
@@ -6752,7 +6756,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// (`give_number`: the process, the payer, one subtraction), 8 instructions
 /// a thread for the 12 of the portion; 3 111 measured, 96 over the 3 015
 /// before. The path of a thread that is ready stays one take of `OBJ`.
-/// `THREADS_READY_MAX` 3 115 -> 3 250 (time budgets, stages 1 and 2): the end
+/// `THREADS_READY_MAX` 3 115 -> 3 200 (time budgets, stages 1 and 2; review: 3 250 -> 3 200): the end
 /// of a thread looks at its budget (`sched::exit` reads where the budget is,
 /// the scheduler lets it go, `budget::unbound` drops the binding's reference
 /// when there is one) and the scheduler's `exit` leaves the budget's event
@@ -6807,7 +6811,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_250;
+const THREADS_READY_MAX: u64 = 3_200;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),

@@ -216,8 +216,12 @@ impl Server {
         if self.capacity(now) > 0 {
             return;
         }
-        // An overrun beyond a whole budget is charged as one budget.
-        self.usage = self.usage.min(2 * self.c);
+        // The usage the passes below can take in is two budgets; what lies
+        // above is charged at once by the same shift of the head that charges
+        // an overrun (the correction of the budget amplification), so that
+        // no usage is forgiven and no loop is longer.
+        let excess = self.usage.saturating_sub(2 * self.c);
+        self.usage -= excess;
         for _ in 0..2 * MAX_REPLENISHMENTS {
             if self.q[0].amount > self.usage {
                 break;
@@ -233,6 +237,10 @@ impl Server {
                 r.time += self.t;
             }
             self.add(r);
+        }
+        #[cfg(not(feature = "break-budget-forgive-overrun"))]
+        {
+            self.q[0].time += excess;
         }
         if self.usage > 0 {
             // The overrun is time received early: the next chunk comes
@@ -450,14 +458,20 @@ mod tests {
                 s.run(now);
             }
             if running {
-                // The budget ends exactly: the timer of the kernel.
+                // The budget ends exactly: the timer of the kernel. A chunk
+                // that is available already goes on in the same tick.
                 if now >= s.exhaust_at() {
-                    running = false;
                     s.stop(now, false);
                     if let Some(change) = s.event_change() {
                         heap = change;
                     }
-                } else {
+                    if s.background() || gone {
+                        running = false;
+                    } else {
+                        s.run(now);
+                    }
+                }
+                if running {
                     fg[now as usize] = 1;
                     work -= 1;
                 }
@@ -513,20 +527,20 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_that_blocks_and_wakes_gets_one_budget_more_than_its_periods_at_most() {
-        // A thread that sleeps between its bursts may run the chunks of
-        // consecutive periods one after the other: a window of `m` periods
-        // holds `m + 1` budgets at most.
+    fn a_thread_that_blocks_and_wakes_never_gets_more_than_the_budget_in_a_period() {
+        // Alone on its CPU, with bursts of work and sleeps between them: a
+        // window of `l` ticks holds at most the budget for each period it
+        // touches.
         for seed in 1..400u64 {
             let t = 20 + (seed * 7) % 180;
             let c = 1 + (seed * 13) % t;
             for bursts in [2, 5, 20] {
                 let (fg, _) = simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 8_000, bursts, false);
-                for m in [1, 2, 5, 10] {
-                    let most = busiest(&fg, m * t);
+                for l in [t / 2, t, 2 * t, 5 * t, 10 * t] {
+                    let most = busiest(&fg, l);
                     assert!(
-                        most <= (m + 1) * c,
-                        "C {c} T {t} seed {seed} bursts {bursts}: {most} ticks in {m} periods"
+                        most <= l.div_ceil(t) * c,
+                        "C {c} T {t} seed {seed} bursts {bursts}: {most} ticks in {l}"
                     );
                 }
             }
@@ -678,6 +692,27 @@ mod tests {
             total <= (now / t + 1) * c + 3 * (now / t + 1) / 10 + 3,
             "total {total} in {now} ticks"
         );
+    }
+
+    #[test]
+    fn a_usage_beyond_two_budgets_is_charged_whole() {
+        // C 10 per T 50, and the thread ran 100 ticks before the kernel
+        // looked: the passes take 20 of them, and the 80 above shift the next
+        // replenishment as an overrun does, so nothing is forgiven.
+        let mut s = Server::new(10, 50, 1, 0);
+        s.unblock(0);
+        s.run(0);
+        s.stop(100, false);
+        assert!(s.background());
+        assert_eq!(
+            s.queue(),
+            &[Replenishment {
+                time: 180,
+                amount: 10
+            }]
+        );
+        assert_eq!(s.event_change(), Some(Some(180)));
+        assert_eq!(s.capacity(179), 0);
     }
 
     #[test]

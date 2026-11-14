@@ -661,6 +661,17 @@ impl<T: Linked> Default for ReadyQueue<T> {
     }
 }
 
+/// What the scheduler does to the budget of a thread (`with_server`).
+#[derive(Clone, Copy)]
+enum Op {
+    Stop(bool),
+    Unblock,
+    UnblockRun,
+    Run,
+    Replenish,
+    Off,
+}
+
 /// How a thread leaves the CPU, for its budget: it waits (a block, a
 /// park), it is taken off while it stays ready (the end of a quantum, a
 /// higher level, `yield`), or it ends.
@@ -742,7 +753,12 @@ impl<T: Schedulable> Scheduler<T> {
             if leave == Leave::Exit {
                 return false;
             }
-            let changed = Self::with_server(r, |s| s.stop(now, leave == Leave::Block));
+            // The break: a thread that runs above its base, boosted by a
+            // client, is charged nothing.
+            if cfg!(feature = "break-budget-skip-boosted") && n.effective() > n.base {
+                return false;
+            }
+            let changed = Self::with_server(r, Op::Stop(leave == Leave::Block), now);
             if changed {
                 Self::apply_level(r);
             }
@@ -750,21 +766,45 @@ impl<T: Schedulable> Scheduler<T> {
         }
     }
 
-    /// Runs `f` on the budget of `t`, if it has one, and passes the change of
-    /// the replenishment event on to the kernel. True when the budget went
-    /// into the background or came out of it.
+    /// Does `op` to the budget of `t`, if it has one, and passes the change
+    /// of the replenishment event on to the kernel. True when the budget went
+    /// into the background or came out of it. A thread with no budget costs
+    /// a look here; the rest is one function, out of line.
     ///
     /// # Safety
     /// `t` is alive; no borrow of its node is alive.
-    unsafe fn with_server(t: NonNull<T>, f: impl FnOnce(&mut Server)) -> bool {
+    #[inline(always)]
+    unsafe fn with_server(t: NonNull<T>, op: Op, now: u64) -> bool {
+        // SAFETY: the caller's promise.
+        if unsafe { node(t) }.server.is_none() {
+            return false;
+        }
+        // SAFETY: as above.
+        unsafe { Self::server_op(t, op, now) }
+    }
+
+    /// `with_server` for a thread that has a budget.
+    ///
+    /// # Safety
+    /// As for `with_server`; `t` has a budget.
+    #[inline(never)]
+    unsafe fn server_op(t: NonNull<T>, op: Op, now: u64) -> bool {
         // SAFETY: the caller's promise; the budget lives while `t` is bound.
         unsafe {
-            let Some(mut server) = node(t).server else {
-                return false;
-            };
+            let mut server = node(t).server.must("a budget");
             let s = server.as_mut();
             let was = s.background();
-            f(s);
+            match op {
+                Op::Stop(blocked) => s.stop(now, blocked),
+                Op::Unblock => s.unblock(now),
+                Op::UnblockRun => {
+                    s.unblock(now);
+                    s.run(now)
+                }
+                Op::Run => s.run(now),
+                Op::Replenish => s.replenish(now),
+                Op::Off => s.event_off(),
+            }
             let changed = s.background() != was;
             if let Some(at) = s.event_change() {
                 T::budget_event(t, at);
@@ -835,7 +875,7 @@ impl<T: Schedulable> Scheduler<T> {
             }
             n.state = State::Ready;
             n.stamp = self.quantum;
-            Self::with_server(t, |s| s.unblock(now));
+            Self::with_server(t, Op::Unblock, now);
             Self::apply_level(t);
             self.ready.push_tail(t);
         }
@@ -884,7 +924,7 @@ impl<T: Schedulable> Scheduler<T> {
             // The field counts the quantum only while the thread is ready:
             // whatever puts it back gives it a quantum or the rest of this one.
             n.stamp = now | RUNNING;
-            Self::with_server(next, |s| s.run(now));
+            Self::with_server(next, Op::Run, now);
         }
         self.running = Some(next);
         Decision::Run(next)
@@ -949,7 +989,7 @@ impl<T: Schedulable> Scheduler<T> {
             if !slice_over && !demoted {
                 // The next replenishment of the budget was due already: the
                 // thread goes on, with a budget that ends later.
-                Self::with_server(r, |s| s.run(now));
+                Self::with_server(r, Op::Run, now);
                 node(r).stamp = now | RUNNING;
                 return;
             }
@@ -1177,7 +1217,7 @@ impl<T: Schedulable> Scheduler<T> {
             );
             n.state = State::Ready;
             n.stamp = self.quantum;
-            Self::with_server(t, |s| s.unblock(now));
+            Self::with_server(t, Op::Unblock, now);
             Self::apply_level(t);
             self.ready.push_tail(t);
         }
@@ -1228,7 +1268,7 @@ impl<T: Schedulable> Scheduler<T> {
                 node(t).state == State::Waiting,
                 "a thread that does not wait takes the CPU"
             );
-            Self::with_server(t, |s| s.unblock(now));
+            Self::with_server(t, Op::Unblock, now);
             Self::apply_level(t);
             let n = node(t);
             assert!(
@@ -1239,7 +1279,7 @@ impl<T: Schedulable> Scheduler<T> {
             n.stamp = now | RUNNING;
             self.slice_end = now.saturating_add(self.quantum);
             self.running = Some(t);
-            Self::with_server(t, |s| s.run(now));
+            Self::with_server(t, Op::Run, now);
         }
     }
 
@@ -1289,7 +1329,7 @@ impl<T: Schedulable> Scheduler<T> {
             if node(t).server.is_none() {
                 return;
             }
-            Self::with_server(t, |s| s.event_off());
+            Self::with_server(t, Op::Off, 0);
             node(t).server = None;
         }
     }
@@ -1324,13 +1364,10 @@ impl<T: Schedulable> Scheduler<T> {
             match state {
                 State::Stopped | State::Dead => {}
                 State::Running => {
-                    Self::with_server(t, |s| {
-                        s.unblock(now);
-                        s.run(now)
-                    });
+                    Self::with_server(t, Op::UnblockRun, now);
                 }
                 State::Ready | State::Waiting | State::Parked => {
-                    Self::with_server(t, |s| s.unblock(now));
+                    Self::with_server(t, Op::Unblock, now);
                 }
             }
             self.relevel(t, level);
@@ -1351,14 +1388,14 @@ impl<T: Schedulable> Scheduler<T> {
             if node(t).state == State::Dead || node(t).server.is_none() {
                 return;
             }
-            Self::with_server(t, |s| s.replenish(now));
+            Self::with_server(t, Op::Replenish, now);
             (node(t).state, node(t).effective())
         };
         // SAFETY: the caller's promise.
         unsafe {
             self.relevel(t, level);
             if state == State::Running {
-                Self::with_server(t, |s| s.run(now));
+                Self::with_server(t, Op::Run, now);
             }
         }
     }
@@ -3047,11 +3084,13 @@ mod tests {
         assert!(node(hog).is_demoted());
         // The event is the replenishment of the budget one period after the
         // thread's activation.
+        // SAFETY: the world keeps its threads alive; only the event is read.
         assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
         assert_eq!(w.s.deadline(None), None);
         w.events(10 * MS);
         assert_eq!(w.pick(10 * MS), 'h');
         assert_eq!(node(hog).priority(), 50);
+        // SAFETY: the world keeps its threads alive; only the event is read.
         assert_eq!(unsafe { hog.as_ref() }.event, None);
         assert_eq!(w.s.deadline(None), Some(12 * MS));
         let _ = victim;
@@ -3069,6 +3108,7 @@ mod tests {
         let mut running = w.pick(now);
         while now < 100 * MS {
             // Time passes to the nearer of the deadline and the event.
+            // SAFETY: the world keeps its threads alive; only the event is read.
             let event = unsafe { hog.as_ref() }.event;
             let next = [w.s.deadline(None), event]
                 .into_iter()
@@ -3187,8 +3227,10 @@ mod tests {
         w.started('v', 10, FIFO);
         assert_eq!(w.pick(0), 'h');
         assert_eq!(w.tick(2 * MS), 'v');
+        // SAFETY: the world keeps its threads alive; only the event is read.
         assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
         w.exit(hog);
+        // SAFETY: the world keeps its threads alive; only the event is read.
         assert_eq!(unsafe { hog.as_ref() }.event, None);
         assert!(!node(hog).has_budget());
     }
@@ -3225,8 +3267,37 @@ mod tests {
         w.wake(hog);
         assert_eq!(node(hog).priority(), 1);
         assert_eq!(w.level(1), "h");
+        // SAFETY: the world keeps its threads alive; only the event is read.
         assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
         w.events(10 * MS);
         assert_eq!(node(hog).priority(), 50);
+    }
+
+    #[test]
+    fn a_server_boosted_by_a_client_is_charged_for_its_own_time() {
+        let mut w = World::new();
+        // `c` sends a request and waits; `s`, a service with a budget of
+        // 2 ms, works on it at the level of `c`, past its budget by 0.3 ms.
+        let c = w.started('c', 50, FIFO);
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, 2 * MS, 10 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 'c');
+        w.now = MS;
+        w.block();
+        let client_ran = node(c).ran();
+        w.boost(s, 50, 63);
+        assert_eq!(w.pick(MS), 's');
+        assert_eq!(w.s.deadline(None), Some(3 * MS));
+        // The timer's interrupt comes 0.3 ms late.
+        let late = 3 * MS + MS * 3 / 10;
+        assert_eq!(w.tick(late), 's', "the client's boost keeps it running");
+        // SAFETY: the world keeps its budgets alive.
+        let server = unsafe { s.as_ref() }.node.server().unwrap();
+        // SAFETY: as above.
+        let server = unsafe { server.as_ref() };
+        assert_eq!(server.ran(), 2 * MS + MS * 3 / 10, "C and the overrun");
+        assert_eq!(server.overruns(), 1);
+        assert_eq!(node(c).ran(), client_ran, "the client is charged nothing");
     }
 }

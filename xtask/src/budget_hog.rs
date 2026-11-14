@@ -226,19 +226,28 @@ pub fn breaks() -> Result<(), String> {
             Ok(()) => return Err(format!("the break ({what}) passed the probe")),
         }
     }
-    let a = build(Variant::BudgetNoFree)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
-    let report = qemu::parse_report(&o.lines);
-    if !report
-        .failed
-        .iter()
-        .any(|(name, _)| name == "a_thread_with_no_budget_works_at_the_free_level")
-    {
-        return Err("the kernel that ignores the level of a process passed its test".into());
+    for (variant, test, what) in [
+        (
+            Variant::BudgetNoFree,
+            "a_thread_with_no_budget_works_at_the_free_level",
+            "a thread with no budget above the level of its process",
+        ),
+        (
+            Variant::BudgetChildFree,
+            "a_thread_with_no_budget_works_at_the_free_level",
+            "a child with more free level than its creator",
+        ),
+    ] {
+        let a = build(variant)?;
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
+        let report = qemu::parse_report(&o.lines);
+        if !report.failed.iter().any(|(name, _)| name == test) {
+            return Err(format!("the kernel with {what} passed its test"));
+        }
+        println!("budget-breaks: {what} is caught");
     }
-    println!("budget-breaks: a thread with no budget above the level of its process is caught");
     for feature in [
         "break-budget-refill",
         "break-budget-short-period",
@@ -247,11 +256,14 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-keep-level",
         "break-budget-keep-slot",
         "break-budget-no-free",
+        "break-budget-child-free",
+        "break-budget-forgive-overrun",
+        "break-budget-skip-boosted",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
                 .current_dir(crate::root())
-                .args(["test", "-p", "kcore", "--features", feature, "budget"])
+                .args(["test", "-p", "kcore", "--features", feature])
                 .output()
                 .map_err(|e| format!("cargo test: {e}"))?;
         if out.status.success() {

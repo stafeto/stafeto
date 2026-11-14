@@ -879,7 +879,7 @@ why = "the halt after a call that never returns (wfe, b): a stop of the kernel, 
 
 [[loop]]
 function = "kernel::timer::post_fired"
-at = "0x50"
+at = "0x4c"
 bound = 8
 why = "the timers of one portion of a level's firing: kcore::timer::FIRE_PORTION = 8"
 
