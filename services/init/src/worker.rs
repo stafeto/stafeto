@@ -696,15 +696,19 @@ fn watch(record: &Record, gone: &Instance) {
 fn show_log() {
     let resource = view::<Resource>(RESOURCE);
     let mut records = [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
+    let mut lines = console_line::Lines::new();
     for _ in 0..64 / abi::LOG_BATCH + 1 {
         let Ok(batch) = sys::log_take(&resource, &mut records) else {
-            return;
+            break;
         };
-        uart::log::text(&records, batch, |bytes| {
+        uart::log::text(&records, batch, &mut lines, |bytes| {
             let _ = sys::debug_write(&resource, bytes);
         });
         if batch.left == 0 {
-            return;
+            break;
         }
     }
+    lines.finish(&mut |bytes| {
+        let _ = sys::debug_write(&resource, bytes);
+    });
 }

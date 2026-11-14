@@ -121,6 +121,7 @@ mod smpmeasure;
 mod store_probe;
 mod stubs;
 mod symbolize;
+mod untag;
 mod vz;
 mod wcet;
 mod window;
@@ -10309,6 +10310,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "entries",
         "--package",
+        "console-line",
+        "--package",
         "rtc",
         "--package",
         "posix-credentials",
@@ -13100,6 +13103,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-signal-queue",
         "--package",
         "entries",
+        "--package",
+        "console-line",
         "--package",
         "rtc",
         "--package",

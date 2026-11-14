@@ -68,8 +68,16 @@ impl Write for Line {
 /// a piece at a time to `put`: `[kernel log: N records lost]` on a line
 /// of its own when records were lost, then the texts of the records of
 /// abi::LOG_TEXT_KIND and abi::LOG_KERNEL_KIND among the first
-/// `batch.count`, in their order.
-pub fn text(records: &Records, batch: LogBatch, mut put: impl FnMut(&[u8])) {
+/// `batch.count`, in their order. The pieces of a line longer than a record
+/// (console_line) wait in `lines` until the line is whole, so a text of
+/// the batch can be up to console_line::RECORD_OUT bytes; an empty batch
+/// lets `lines` put out the lines whose writers stopped.
+pub fn text(
+    records: &Records,
+    batch: LogBatch,
+    lines: &mut console_line::Lines,
+    mut put: impl FnMut(&[u8]),
+) {
     if batch.lost > 0 {
         let mut line = Line {
             bytes: [0; LOST_LINE],
@@ -83,9 +91,13 @@ pub fn text(records: &Records, batch: LogBatch, mut put: impl FnMut(&[u8])) {
     let count = (batch.count as usize).min(LOG_BATCH);
     for bytes in &records[..count] {
         match record(bytes) {
-            Ok(r) if r.kind == LOG_TEXT_KIND || r.kind == LOG_KERNEL_KIND => put(r.text),
+            Ok(r) if r.kind == LOG_TEXT_KIND => lines.record(r.text, &mut put),
+            Ok(r) if r.kind == LOG_KERNEL_KIND => put(r.text),
             _ => {}
         }
+    }
+    if count == 0 && batch.lost == 0 {
+        lines.quiet(&mut put);
     }
 }
 
@@ -290,7 +302,9 @@ mod tests {
             left: 0,
         };
         let mut out = Vec::new();
-        text(&batch, info, |piece| out.extend_from_slice(piece));
+        text(&batch, info, &mut console_line::Lines::new(), |piece| {
+            out.extend_from_slice(piece)
+        });
         out
     }
 
@@ -372,7 +386,9 @@ mod tests {
         let mut out: Records = [[0; LOG_RECORD]; LOG_BATCH];
         let batch = sources.batch(&mut ring(&rings), &mut out);
         let mut texts = Vec::new();
-        text(&out, batch, |p| texts.extend_from_slice(p));
+        text(&out, batch, &mut console_line::Lines::new(), |p| {
+            texts.extend_from_slice(p)
+        });
         assert_eq!(texts, b"c0a0b0b1a1c1");
         assert_eq!((batch.count, batch.left), (6, 0));
         assert!(!sources.more());
@@ -413,7 +429,9 @@ mod tests {
         };
         let batch = sources.next(&mut take, &mut peek, &mut out);
         let mut texts = Vec::new();
-        text(&out, batch, |p| texts.extend_from_slice(p));
+        text(&out, batch, &mut console_line::Lines::new(), |p| {
+            texts.extend_from_slice(p)
+        });
         assert_eq!(texts, b"earlylate");
         // The next look goes on where the last stopped: nothing new.
         let again = sources.next(&mut take, &mut peek, &mut out);
@@ -434,5 +452,45 @@ mod tests {
         let second = sources.batch(&mut fetch, &mut out);
         assert_eq!(first.count + second.count, 21);
         assert!(!sources.more());
+    }
+
+    #[test]
+    fn the_pieces_of_two_writers_come_out_as_whole_lines() {
+        let a: &[u8] = b"service step: 12 kind 64 3480 ticks of 23806, the longest of its loop\n";
+        let b: &[u8] = b"store-probe: refused TOO_LONG, the receipt is gone, nothing changed\n";
+        let pieces = |id: u32, line: &[u8]| -> Vec<Vec<u8>> {
+            let n = line.chunks(console_line::PAYLOAD).count();
+            line.chunks(console_line::PAYLOAD)
+                .enumerate()
+                .map(|(k, c)| {
+                    let mut out = [0; 64];
+                    let len = console_line::piece(id, k + 1 == n, c, &mut out);
+                    out[..len].to_vec()
+                })
+                .collect()
+        };
+        let records = [pieces(7, a), pieces(11, b)];
+        // B's first piece, A's first piece, a whole line, then the rest.
+        let order = [
+            records[1][0].clone(),
+            records[0][0].clone(),
+            b"entropy: seeded from the boot page (32 bytes)\n".to_vec(),
+            records[0][1].clone(),
+            records[1][1].clone(),
+        ];
+        let raws: Vec<_> = order.iter().map(|t| raw(1, LOG_TEXT_KIND, t)).collect();
+        let mut batch: Records = [[0; LOG_RECORD]; LOG_BATCH];
+        batch[..raws.len()].copy_from_slice(&raws);
+        let info = LogBatch {
+            count: raws.len() as u64,
+            lost: 0,
+            left: 0,
+        };
+        let mut lines = console_line::Lines::new();
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        text(&batch, info, &mut lines, |p| out.push(p.to_vec()));
+        assert!(out.contains(&a.to_vec()), "{out:?}");
+        assert!(out.contains(&b.to_vec()), "{out:?}");
+        assert!(out.contains(&b"entropy: seeded from the boot page (32 bytes)\n".to_vec()));
     }
 }

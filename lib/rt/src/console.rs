@@ -6,12 +6,16 @@
 //! `print!` and `println!` then send what they get in pieces of at most
 //! abi::INLINE_MAX bytes, one call per piece. A line of up to 64 bytes,
 //! its newline included, is never split between calls, whatever text
-//! comes with it in one `write`, so lines of threads do not mix. A longer
-//! line goes in pieces of 64 bytes.
+//! comes with it in one `write`, so lines of threads and processes do not
+//! mix. A longer line goes in tagged pieces of console_line::PAYLOAD
+//! bytes (console_line): the console's driver puts them out as one line
+//! once its last piece comes, however the pieces of other writers lie
+//! between them.
 
 use crate::handle::{Handle, Resource};
 use crate::sys;
 use abi::{Error, INLINE_MAX};
+use console_line::PAYLOAD;
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -42,8 +46,7 @@ fn resource() -> Result<ManuallyDrop<Handle<Resource>>, Error> {
 }
 
 /// The length of the piece that starts `bytes` (not empty): the lines
-/// that fit whole in abi::INLINE_MAX bytes, or the first abi::INLINE_MAX
-/// bytes of a first line that is longer.
+/// that fit whole in abi::INLINE_MAX bytes; 0 when the first line is longer.
 fn piece_len(bytes: &[u8]) -> usize {
     let mut len = 0;
     for line in bytes.split_inclusive(|&b| b == b'\n') {
@@ -52,21 +55,56 @@ fn piece_len(bytes: &[u8]) -> usize {
         }
         len += line.len();
     }
-    if len == 0 {
-        INLINE_MAX.min(bytes.len())
-    } else {
-        len
+    len
+}
+
+/// A new identifier for a line that goes in tagged pieces.
+fn line_id() -> u32 {
+    console_line::id_from(crate::time::now())
+}
+
+/// Sends the tagged pieces of `line` (the text of one line, or the tail of
+/// one, up to abi::INLINE_MAX bytes beyond the pieces sent) as the line
+/// `id`: the last piece carries the mark of the end.
+fn send_tagged(
+    resource: &Handle<Resource>,
+    id: u32,
+    mut line: &[u8],
+    last: bool,
+) -> Result<(), Error> {
+    let mut out = [0; INLINE_MAX];
+    loop {
+        let n = line.len().min(PAYLOAD);
+        let (now, rest) = line.split_at(n);
+        let len = console_line::piece(id, last && rest.is_empty(), now, &mut out);
+        sys::debug_write(resource, &out[..len])?;
+        if rest.is_empty() {
+            return Ok(());
+        }
+        line = rest;
     }
 }
 
 /// Writes `bytes` in pieces of at most abi::INLINE_MAX that cut no line
-/// of up to abi::INLINE_MAX bytes; stops at the first call that fails.
+/// of up to abi::INLINE_MAX bytes, a longer line in tagged pieces; stops
+/// at the first call that fails.
 pub fn write(mut bytes: &[u8]) -> Result<(), Error> {
     let resource = resource()?;
     while !bytes.is_empty() {
-        let (piece, rest) = bytes.split_at(piece_len(bytes));
-        sys::debug_write(&resource, piece)?;
-        bytes = rest;
+        let n = piece_len(bytes);
+        if n == 0 {
+            let end = bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |i| i + 1);
+            let (line, rest) = bytes.split_at(end);
+            send_tagged(&resource, line_id(), line, true)?;
+            bytes = rest;
+        } else {
+            let (piece, rest) = bytes.split_at(n);
+            sys::debug_write(&resource, piece)?;
+            bytes = rest;
+        }
     }
     Ok(())
 }
@@ -78,6 +116,7 @@ pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {
         resource: resource()?,
         buf: [0; INLINE_MAX],
         len: 0,
+        line: None,
         error: None,
     };
     // A formatting error that no failed call caused comes from a Display
@@ -92,19 +131,47 @@ struct Pieces {
     resource: ManuallyDrop<Handle<Resource>>,
     buf: [u8; INLINE_MAX],
     len: usize,
+    /// The identifier of the line that goes in tagged pieces, once the
+    /// line is longer than abi::INLINE_MAX bytes.
+    line: Option<u32>,
     /// The first call that failed; nothing is written after it.
     error: Option<Error>,
 }
 
 impl Pieces {
+    /// Sends the bytes the buffer holds: a line that fits, as one call; the
+    /// tail of a long line, as its last pieces.
     fn flush(&mut self) {
-        if self.len > 0
-            && self.error.is_none()
-            && let Err(e) = sys::debug_write(&self.resource, &self.buf[..self.len])
-        {
+        let (len, line) = (self.len, self.line.take());
+        self.len = 0;
+        if (len == 0 && line.is_none()) || self.error.is_some() {
+            return;
+        }
+        let result = match line {
+            None => sys::debug_write(&self.resource, &self.buf[..len]).map(|_| ()),
+            Some(id) => send_tagged(&self.resource, id, &self.buf[..len], true),
+        };
+        if let Err(e) = result {
             self.error = Some(e);
         }
-        self.len = 0;
+    }
+
+    /// The buffer is full and a byte more comes: the line is longer than a
+    /// call holds, and goes in tagged pieces from here. The first
+    /// PAYLOAD bytes go out and the rest stay.
+    fn spill(&mut self) {
+        if self.error.is_some() {
+            self.len = 0;
+            return;
+        }
+        let id = *self.line.get_or_insert_with(line_id);
+        let mut out = [0; INLINE_MAX];
+        let len = console_line::piece(id, false, &self.buf[..PAYLOAD], &mut out);
+        if let Err(e) = sys::debug_write(&self.resource, &out[..len]) {
+            self.error = Some(e);
+        }
+        self.buf.copy_within(PAYLOAD..INLINE_MAX, 0);
+        self.len = INLINE_MAX - PAYLOAD;
     }
 }
 
@@ -112,7 +179,7 @@ impl fmt::Write for Pieces {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
             if self.len == INLINE_MAX {
-                self.flush();
+                self.spill();
             }
             self.buf[self.len] = b;
             self.len += 1;

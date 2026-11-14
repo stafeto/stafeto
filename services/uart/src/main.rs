@@ -91,6 +91,8 @@ struct State {
     records: [[u8; LOG_RECORD]; LOG_BATCH],
     /// The rings of the CPUs, merged into `records` (uart::log::Sources).
     sources: uart::log::Sources,
+    /// The lines of the kernel log that go in pieces, until they are whole.
+    lines: console_line::Lines,
     read: [u8; RX_RING],
 }
 
@@ -127,6 +129,7 @@ fn state() -> Option<&'static mut State> {
         input: Input::new(),
         records: [[0; LOG_RECORD]; LOG_BATCH],
         sources: uart::log::Sources::new(),
+        lines: console_line::Lines::new(),
         read: [0; RX_RING],
     }))
 }
@@ -508,6 +511,7 @@ impl Uart {
                 output,
                 records,
                 sources,
+                lines,
                 ..
             } = &mut *self.state;
             if !output.log_done() || !output.accepts_log() {
@@ -528,8 +532,8 @@ impl Uart {
             };
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
-            uart::log::text(records, batch, |bytes| {
-                // A batch fits: twelve records and the line of those lost.
+            uart::log::text(records, batch, lines, |bytes| {
+                // A batch fits (uart::output::LOG_BYTES).
                 let _ = output.put_log(bytes);
             });
             self.kick();

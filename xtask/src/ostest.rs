@@ -116,6 +116,29 @@ pub enum Ended {
     Failed(String),
 }
 
+/// Whether `line` (with or without its newline) is a whole line of a
+/// service of the image or of the kernel: they print at any moment, also
+/// between the marks of a test, and are not the test's output. A line a
+/// test writes never starts with these.
+pub fn service_line(line: &str) -> bool {
+    const PREFIXES: [&str; 12] = [
+        "init: ",
+        "ramfs: ",
+        "entropy: ",
+        "virtio-rng: ",
+        "posix-process: ",
+        "clock: ",
+        "process fault: ",
+        "service step: ",
+        "service wait",
+        "service gap: ",
+        "pkgd: ",
+        "net: ",
+    ];
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line == "pipe: ready" || line == "tty: ready" || PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
 /// The end of the test `name` in `log`, the lines of a boot joined: the
 /// output between its marks (the services' and the kernel's own lines left
 /// out) and `exit: N` as misc/run.sh adds it, for an empty output or a
@@ -133,21 +156,9 @@ pub fn outcome(log: &str, name: &str) -> Ended {
         return Ended::Failed("timeout: no end of the test\n".to_owned());
     };
     let how = rest[end + mark.len()..].lines().next().unwrap_or("");
-    let service = |line: &str| {
-        let line = line.strip_suffix('\n').unwrap_or(line);
-        line.starts_with("init: ")
-            || line.starts_with("ramfs: ")
-            || line == "pipe: ready"
-            || line == "tty: ready"
-            || line == "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0"
-            || line == "entropy: seeded from the device"
-            || line.starts_with("posix-process: ")
-            || line.starts_with("clock: ")
-            || line.starts_with("process fault: ")
-    };
     let mut text = String::new();
     for line in rest[..end].split_inclusive('\n') {
-        if !(line.ends_with('\n') && service(line)) {
+        if !(line.ends_with('\n') && service_line(line)) {
             text.push_str(line);
         }
     }
@@ -1728,7 +1739,25 @@ mod tests {
             "@@os-test begin io/unexpected",
             "tty: unexpected failure",
             "@@os-test end io/unexpected exit 1",
+            "@@os-test begin basic/service-lines",
+            "entropy: seeded from the boot page (32 bytes)",
+            "service step: 12 kind 64 3480 ticks detail 3",
+            "service wait: 15 kind 64 3480 ticks of 23806",
+            "service gap: 9 kind 1 120 ticks of 900",
+            "@@os-test end basic/service-lines exit 0",
+            "@@os-test begin basic/service-lines-fail",
+            "entropy: seeded from the boot page (32 bytes)",
+            "ASSERT failed",
+            "@@os-test end basic/service-lines-fail exit 1",
         ]);
+        assert_eq!(
+            outcome(&log, "basic/service-lines"),
+            Ended::Exited("exit: 0\n".to_owned(), 0)
+        );
+        assert_eq!(
+            outcome(&log, "basic/service-lines-fail"),
+            Ended::Exited("ASSERT failed\n".to_owned(), 1)
+        );
         assert_eq!(
             outcome(&log, "io/open"),
             Ended::Exited("open: EISDIR\n".to_owned(), 1)

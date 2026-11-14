@@ -1,0 +1,18 @@
+[package]
+name = "console-line"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Lines longer than one record of the kernel log: how a writer tags their pieces and how the console assembles them whole"
+
+[lib]
+bench = false
+
+# A deliberate break (the host test of the assembly must fail with it): all
+# writers share one slot.
+[features]
+break-line-assembly = []
+
+[dependencies]

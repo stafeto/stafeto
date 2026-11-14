@@ -16,9 +16,10 @@
 
 /// The bytes of the ring of the clients.
 pub const TX_RING: usize = 4096;
-/// The bytes of the text of one batch of the log at most: twelve records
-/// of 64 bytes and the line of the records lost.
-pub const LOG_BYTES: usize = 1024;
+/// The bytes of the text of one batch of the log at most: twelve records,
+/// each putting out console_line::RECORD_OUT bytes at most, and the line
+/// of the records lost (uart::log::LOST_LINE).
+pub const LOG_BYTES: usize = 12 * console_line::RECORD_OUT + crate::log::LOST_LINE;
 /// The longest part of a line of the clients that goes out again.
 pub const REPEAT_MAX: usize = 128;
 
