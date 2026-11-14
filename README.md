@@ -2,7 +2,7 @@
 
 A POSIX operating system on its own capability microkernel, written in Rust for AArch64.
 
-Every path inside the kernel is bounded in time, and every driver and service runs as an ordinary isolated process. These are the properties that embedded, robotic and mobile devices need: predictable timing, and a fault in a driver that ends only that driver. The goal is a system that runs ordinary POSIX software (shells, editors, system tools) on top of a kernel small enough to reason about.
+Every path inside the kernel is bounded in time, and every driver and service runs as an ordinary isolated process. These are the properties that real-time, embedded and server systems need: predictable timing, and a fault in a driver that ends only that driver. The goal is a system that runs ordinary POSIX software (shells, editors, system tools) on top of a kernel small enough to reason about.
 
 *Stafeto* is Esperanto for "messenger" and "relay": the system is built around messages that pass control from hand to hand.
 
@@ -38,14 +38,14 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) a
 
 **Next, in this order**
 
-- Reliability: the defects that tests and audits find, before new parts.
-- Scheduler time budgets.
+- Reliability: every service step held to its bound and checked in CI, the defects that reviews find fixed before new parts.
+- Scheduler time budgets: a thread runs within a budget per period, so an overrun stays inside its own process.
 - AWS step g1: two ENA queues with RSS, one stack instance per queue, and measurements against Linux on network-optimised Graviton instances.
 - Then the rest of the list below.
 - Shared libraries: `libc.so` and a dynamic loader are in; next come `dlopen` of new libraries and more sharing of data pages between processes.
 - The nine POSIX utilities that need services of their own: `at`, `batch`, `lp`, `mailx`, `locale`, `localedef`, `gettext`, `ngettext` and `msgfmt`.
 - System integrity: every program carries an Ed25519 signature from the release key or from an approved developer. A program with a broken or foreign signature does not start, and a manual scan checks the whole system against a signed manifest, in the spirit of `sfc /scannow`.
-- Hardware: Allwinner A64 boards (the PinePhone and the PINE A64-LTS) with U-Boot, the 16550 UART and real-time measurements on the board; then the STM32MP2.
+- Hardware boards, later: the Allwinner A64 (the PINE A64-LTS) with U-Boot, the 16550 UART and real-time measurements on the board; then the STM32MP2.
 
 **Later subprojects**
 
