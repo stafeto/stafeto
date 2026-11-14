@@ -3,13 +3,13 @@
 
 //! The calls of channels and messages (spec 6, 11): channel_create, notify, receive, send and reply.
 
-use super::{Args, Values, caller, caller_ceiling, cause, lookup, set_result};
+use super::{Args, Values, caller, caller_ceiling, cause, lookup, objects, set_result};
 use crate::channel::Via;
 use crate::obj::Section;
 use crate::object::Object;
 use crate::process;
-use crate::thread::{self, Thread};
-use crate::{channel, session};
+use crate::thread::{self, Long, Thread};
+use crate::{arch, channel, cleanup, sched, session};
 use abi::{CHANNEL_RIGHTS, Error, Rights};
 use core::ptr::NonNull;
 use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceilings, wait_arg};
@@ -81,13 +81,107 @@ pub(super) fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error>
 /// its (channel::receive).
 #[inline(never)]
 pub(super) fn receive(thread: NonNull<Thread>, a: &Args) {
-    let taken = wait_arg(a[1]).and_then(|wait| {
-        let c = lookup(thread, a[0], Rights::RECEIVE, Object::channel)?;
-        channel::receive(thread, c, wait)
-    });
+    let taken = wait_arg(a[1]).and_then(|wait| receive_from(thread, a[0], wait));
     if let Err(e) = taken {
         set_result(thread, Err(e));
     }
+}
+
+/// The receive of `handle`, a handle with RECEIVE, that waits (`receive`,
+/// the second half of `reply_receive`); an error is written as the call's
+/// result.
+fn receive_on(thread: NonNull<Thread>, handle: u64) {
+    if let Err(e) = receive_from(thread, handle, true) {
+        set_result(thread, Err(e));
+    }
+}
+
+fn receive_from(thread: NonNull<Thread>, handle: u64, wait: bool) -> Result<(), Error> {
+    let c = lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
+    channel::receive(thread, c, wait)
+}
+
+/// reply_receive(x0 token, x1 description, x2-x9 bytes 0-63 of the reply,
+/// the word at abi::msgbuf::CHANNEL a handle with RECEIVE): the reply of
+/// `reply` and then the wait of `receive`, always waiting, in one entry
+/// and as two separate sections under OBJ, so that a server whose budget
+/// is gone does not sit at EL0 between its reply and its next request.
+/// The checks come first, and nothing changes when one fails: the
+/// description and the values of its handles (INVALID_ARGS), the channel
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED), the handles of the reply. Then
+/// the reply, by the rules of `reply`: PEER_CLOSED of it goes on to the
+/// receive, since the reply went as far as it could; any other error is
+/// the call's, in x0 alone, and the receive does not run. The receive
+/// writes the result itself (x0-x11), an error of it in x0 alone.
+#[inline(never)]
+pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
+    let entry = crate::arch::timer::now();
+    let replied = objects(|| {
+        let desc = Desc::from_reply(a[1])?;
+        let values = message_handles(thread, desc, None)?;
+        let values = &values[..desc.handles];
+        let handle = thread::channel_word(thread).ok_or(Error::InvalidArgs)?;
+        lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
+        check_handles(thread, values)?;
+        match channel::reply(thread, a[0], desc, values) {
+            Ok(()) | Err(Error::PeerClosed) => {
+                // Set in this section, which the receive half's closes: a
+                // thread of another CPU reads it under OBJ (`channel::holder`).
+                thread::begin_long(thread, Long::Receive(handle));
+                Ok(handle)
+            }
+            Err(e) => Err(e),
+        }
+    });
+    let handle = match replied {
+        Ok(handle) => handle,
+        Err(e) => return set_result(thread, Err(e)),
+    };
+    // The reply is a stretch of its own, as a portion of a long call is: the
+    // poll for an interrupt follows it. With one pending the call starts over
+    // at its `svc` (the interrupt is taken on the way out, and the thread goes
+    // on with its receive when it runs, `Long::Receive`); otherwise the
+    // receive follows at once, and the thread does not leave the kernel
+    // between the two. The deliberate break always starts over.
+    cleanup::count_portion(entry);
+    sched::entry_polled();
+    if cfg!(feature = "break-reply-receive-split") || arch::irq_pending() || forced_poll() {
+        return super::restart(thread);
+    }
+    sched::entry_started();
+    receive_second(thread, handle, crate::arch::timer::now());
+}
+
+/// The kernel tests make the next poll between the halves of `reply_receive`
+/// find an interrupt pending.
+#[cfg(feature = "ktest")]
+static FORCED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "ktest")]
+pub fn force_poll() {
+    FORCED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "ktest")]
+fn forced_poll() -> bool {
+    FORCED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "ktest"))]
+fn forced_poll() -> bool {
+    false
+}
+
+/// The receive half of `reply_receive` (spec 6.1) on `handle`, a handle with
+/// RECEIVE the first half looked up: a stretch of its own, which began at
+/// `start`.
+#[inline(never)]
+pub(super) fn receive_second(thread: NonNull<Thread>, handle: u64, start: u64) {
+    objects(|| {
+        thread::end_long(thread);
+        receive_on(thread, handle)
+    });
+    cleanup::count_portion(start);
 }
 
 /// The values of the handles of the message the caller sends or answers

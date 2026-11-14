@@ -181,6 +181,10 @@ pub enum Long {
     /// `limit` on the counter. The call starts over between the looks, so
     /// that the scheduler and the interrupts of this CPU run in between.
     Quiet { epoch: u64, limit: u64 },
+    /// reply_receive between its reply and its receive, which an interrupt
+    /// that was pending at the poll between them (or the deliberate break)
+    /// sent through EL0: the handle value of the channel to receive on.
+    Receive(u64),
 }
 
 impl Long {
@@ -191,6 +195,7 @@ impl Long {
             Long::Change(on) => on.call(),
             Long::Spawn(_) => Call::ProcessCreate,
             Long::Quiet { .. } => Call::ProcessControl,
+            Long::Receive(_) => Call::ReplyReceive,
         }
     }
 }
@@ -288,6 +293,15 @@ pub fn set_cpu(t: NonNull<Thread>, cpu: usize) {
         );
         (*t.as_ptr()).numbers.cpu = cpu as u8;
     }
+}
+
+/// A test thread that waits and stands in no ready queue answers as a
+/// thread of CPU `cpu` for the code that tells where a command goes: the
+/// scheduler of CPU 0 still holds it.
+#[cfg(feature = "ktest")]
+pub fn pretend_cpu(t: NonNull<Thread>, cpu: usize) {
+    // SAFETY: the caller holds the thread; only the field is written.
+    unsafe { (*t.as_ptr()).numbers.cpu = cpu as u8 };
 }
 
 /// Whether `t` started, whether or not it ended since. Read under OBJ.
@@ -889,6 +903,8 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
             }
         }
         Some(Long::Quiet { .. }) => crate::qsbr::end_wait(),
+        // The reply was made, and the receive goes with the thread's end.
+        Some(Long::Receive(_)) => {}
         None => {}
     }
 }
@@ -907,6 +923,15 @@ pub fn handle_values(t: NonNull<Thread>, n: usize) -> [u64; MESSAGE_HANDLES] {
         *v = buffer.frame.word(msgbuf::HANDLES + 8 * i);
     }
     values
+}
+
+/// The handle value `reply_receive` of `t` receives on, the word of its
+/// message buffer at abi::msgbuf::CHANNEL (spec 6.1); None for a thread
+/// with no buffer.
+pub fn channel_word(t: NonNull<Thread>) -> Option<u64> {
+    // SAFETY: the caller holds the thread; only the field is borrowed.
+    let buffer = unsafe { &(*t.as_ptr()).buffer }.as_ref()?;
+    Some(buffer.frame.word(msgbuf::CHANNEL))
 }
 
 /// Writes the handles a message brought to `t`, their values and info
