@@ -15,6 +15,7 @@ bench = false
 [dependencies]
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg" }
+console-line = { path = "../lib/console-line" }
 kcore = { path = "../kcore" }
 
 [features]
@@ -126,6 +127,9 @@ idle-probe = ["idle-poll"]
 # with no drain of the queues, and the poll does not read ISR_EL1.
 # Deliberate breakage: the kernel leaves the boot seed in the device tree.
 break-seed-wipe = []
+# Deliberate breakage only: the port the kernel holds shows the headers of the
+# pieces of long lines (xtask console-strip-break).
+break-console-strip = ["console-line/break-line-strip"]
 break-idle-bell = ["idle-probe", "window-probe"]
 break-idle-drain = ["idle-probe", "window-probe"]
 break-idle-irq = ["idle-probe", "window-probe"]

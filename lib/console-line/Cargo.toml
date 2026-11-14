@@ -1,0 +1,27 @@
+[package]
+name = "console-line"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Lines longer than one record of the kernel log: how a writer tags their pieces and how the console assembles them whole"
+
+[lib]
+bench = false
+
+# A deliberate break (the host test of the assembly must fail with it): all
+# writers share one slot.
+[features]
+break-line-assembly = []
+# A deliberate break: the kernel's port shows the headers (`strip` gives the
+# text as it is).
+break-line-strip = []
+# A deliberate break: `calls` cuts text in pieces a debug_write refuses.
+break-line-split = []
+# A deliberate break: a tail whose head was lost is put out unmarked.
+break-line-cut = []
+# A deliberate break: a line that opens with a middle piece is put out unmarked.
+break-line-first = []
+
+[dependencies]

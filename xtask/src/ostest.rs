@@ -116,6 +116,86 @@ pub enum Ended {
     Failed(String),
 }
 
+/// Whether `line` (with or without its newline) is a whole line of a
+/// service of the image or of the kernel, in the exact form that service
+/// prints it: they print at any moment, also between the marks of a test, and
+/// are not the test's output. A line a test writes, even one that starts
+/// with the name of a service, is not skipped unless it has such a form.
+pub fn service_line(line: &str) -> bool {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    const EXACT: [&str; 8] = [
+        "init: services started",
+        "ramfs: ready",
+        "posix-process: ready (records with their processes, root by init's table)",
+        "posix-process: loader ready",
+        "clock: ready (unsynchronized start)",
+        "pipe: ready",
+        "tty: ready",
+        "entropy: seeded from the device",
+    ];
+    if EXACT.contains(&line) {
+        return true;
+    }
+    // `virtio-rng: virtio-mmio at 0xADDRESS, line N, status 0xS`
+    if let Some(r) = line.strip_prefix("virtio-rng: virtio-mmio at 0x")
+        && let Some((at, r)) = r.split_once(", line ")
+        && let Some((n, status)) = r.split_once(", status 0x")
+    {
+        let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+        return hex(at) && number(n) && hex(status);
+    }
+    // `entropy: seeded from the boot page (N bytes)`
+    if let Some(n) = line
+        .strip_prefix("entropy: seeded from the boot page (")
+        .and_then(|r| r.strip_suffix(" bytes)"))
+    {
+        return number(n);
+    }
+    // `init: NAME ended: WHY` and the end of the policy that follows it
+    if let Some(r) = line.strip_prefix("init: ")
+        && let Some(r) = r.strip_suffix("not restarted")
+        && let Some(r) = r.strip_suffix(", ")
+        && let Some((name, why)) = r.split_once(" ended: ")
+    {
+        return !name.is_empty() && !name.contains(' ') && !why.is_empty();
+    }
+    // `ramfs: storage pages=N tables=N bytes`, `ramfs: layers bytes=N`
+    if let Some(r) = line.strip_prefix("ramfs: storage pages=")
+        && let Some(r) = r.strip_suffix(" bytes")
+        && let Some((pages, tables)) = r.split_once(" tables=")
+    {
+        return number(pages) && number(tables);
+    }
+    if let Some(n) = line.strip_prefix("ramfs: layers bytes=") {
+        return number(n);
+    }
+    // `clock: ready (started at S from F)`
+    if line.starts_with("clock: ready (started at ") && line.ends_with(')') {
+        return true;
+    }
+    // `process fault: ...` is the kernel's line about a program's fault.
+    if line.starts_with("process fault: ") {
+        return true;
+    }
+    // `service step|wait|wait cut|gap|preempt: T kind K N ticks ...`
+    // (rt::service)
+    for kind in ["step", "wait", "wait cut", "gap", "preempt"] {
+        if let Some(r) = line
+            .strip_prefix("service ")
+            .and_then(|r| r.strip_prefix(kind))
+            .and_then(|r| r.strip_prefix(": "))
+        {
+            let mut words = r.split(' ');
+            return matches!(
+                (words.next(), words.next(), words.next(), words.next(), words.next()),
+                (Some(t), Some("kind"), Some(k), Some(n), Some("ticks")) if number(t) && number(k) && number(n)
+            );
+        }
+    }
+    false
+}
+
 /// The end of the test `name` in `log`, the lines of a boot joined: the
 /// output between its marks (the services' and the kernel's own lines left
 /// out) and `exit: N` as misc/run.sh adds it, for an empty output or a
@@ -133,21 +213,9 @@ pub fn outcome(log: &str, name: &str) -> Ended {
         return Ended::Failed("timeout: no end of the test\n".to_owned());
     };
     let how = rest[end + mark.len()..].lines().next().unwrap_or("");
-    let service = |line: &str| {
-        let line = line.strip_suffix('\n').unwrap_or(line);
-        line.starts_with("init: ")
-            || line.starts_with("ramfs: ")
-            || line == "pipe: ready"
-            || line == "tty: ready"
-            || line == "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0"
-            || line == "entropy: seeded from the device"
-            || line.starts_with("posix-process: ")
-            || line.starts_with("clock: ")
-            || line.starts_with("process fault: ")
-    };
     let mut text = String::new();
     for line in rest[..end].split_inclusive('\n') {
-        if !(line.ends_with('\n') && service(line)) {
+        if !(line.ends_with('\n') && service_line(line)) {
             text.push_str(line);
         }
     }
@@ -1716,7 +1784,6 @@ mod tests {
             "@@os-test begin io/open",
             "pipe: ready",
             "tty: ready",
-            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
             "entropy: seeded from the device",
             "open: EISDIR",
             "@@os-test end io/open exit 1",
@@ -1728,7 +1795,48 @@ mod tests {
             "@@os-test begin io/unexpected",
             "tty: unexpected failure",
             "@@os-test end io/unexpected exit 1",
+            "@@os-test begin basic/service-lines",
+            "entropy: seeded from the boot page (32 bytes)",
+            "service step: 12 kind 64 3480 ticks detail 3",
+            "service wait: 15 kind 64 3480 ticks of 23806",
+            "service gap: 9 kind 1 120 ticks of 900",
+            "@@os-test end basic/service-lines exit 0",
+            "@@os-test begin basic/service-lines-fail",
+            "entropy: seeded from the boot page (32 bytes)",
+            "ASSERT failed",
+            "@@os-test end basic/service-lines-fail exit 1",
+            "@@os-test begin basic/wait-cut",
+            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
+            "virtio-rng: virtio-mmio at 0x10001000, line 5, status 0x1",
+            "service wait cut: 15 kind 64 3480 ticks of 23806",
+            "@@os-test end basic/wait-cut exit 0",
+            "@@os-test begin basic/own-lines",
+            "net: something failed",
+            "clock: ready twice",
+            "init: oops",
+            "service step: x kind 1 2 ticks",
+            "@@os-test end basic/own-lines exit 1",
         ]);
+        assert_eq!(
+            outcome(&log, "basic/wait-cut"),
+            Ended::Exited("exit: 0\n".to_owned(), 0)
+        );
+        assert_eq!(
+            outcome(&log, "basic/own-lines"),
+            Ended::Exited(
+                "net: something failed\nclock: ready twice\ninit: oops\nservice step: x kind 1 2 ticks\n"
+                    .to_owned(),
+                1
+            )
+        );
+        assert_eq!(
+            outcome(&log, "basic/service-lines"),
+            Ended::Exited("exit: 0\n".to_owned(), 0)
+        );
+        assert_eq!(
+            outcome(&log, "basic/service-lines-fail"),
+            Ended::Exited("ASSERT failed\n".to_owned(), 1)
+        );
         assert_eq!(
             outcome(&log, "io/open"),
             Ended::Exited("open: EISDIR\n".to_owned(), 1)
@@ -1758,7 +1866,7 @@ mod tests {
             "@@os-test begin signal/fault",
             "partial",
             "process fault: data abort from EL0 (EC 0x24) ESR=0x92000006 FAR=0x0 ELR=0x22f244",
-            "clock: tick",
+            "clock: ready (unsynchronized start)",
             "@@os-test end signal/fault signal 11",
         ]);
         assert_eq!(

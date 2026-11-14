@@ -512,6 +512,9 @@ pub struct Outcome {
     pub status: Option<ExitStatus>,
     pub timed_out: bool,
     pub stopped_on_marker: bool,
+    /// The pieces of tagged lines (lib/console-line) that came on the wire:
+    /// the kernel writes none, and the driver puts them back whole.
+    pub tagged: usize,
 }
 
 /// What a run's child reads on its stdin.
@@ -637,6 +640,8 @@ pub struct Run {
     #[cfg(test)]
     ended: Arc<AtomicBool>,
     transcript: Transcript,
+    /// Puts back the lines the kernel wrote in tagged pieces.
+    untag: crate::untag::Untag,
     /// The lines that ended so far, a CR before the LF cut, and where the
     /// line that has not ended starts.
     lines: Vec<String>,
@@ -705,6 +710,7 @@ impl Run {
             #[cfg(test)]
             ended,
             transcript: Transcript::new(&[]),
+            untag: crate::untag::Untag::default(),
             lines: Vec::new(),
             line_start: 0,
             echo,
@@ -713,7 +719,8 @@ impl Run {
 
     /// Takes in a piece of output: the lines it ends are kept and echoed.
     fn take(&mut self, piece: &[u8]) {
-        self.transcript.extend(piece);
+        let piece = self.untag.feed(piece);
+        self.transcript.extend(&piece);
         let bytes = &self.transcript.bytes;
         while let Some(len) = bytes[self.line_start..].iter().position(|&b| b == b'\n') {
             let raw = &bytes[self.line_start..self.line_start + len];
@@ -727,6 +734,8 @@ impl Run {
     /// The line that no LF ended yet, if there are bytes of it: it ends
     /// with the output, and is kept and echoed.
     fn end_line(&mut self) {
+        let rest = self.untag.finish();
+        self.transcript.extend(&rest);
         let bytes = &self.transcript.bytes;
         if self.line_start < bytes.len() {
             let raw = &bytes[self.line_start..];
@@ -922,6 +931,7 @@ impl Run {
             status,
             timed_out: matches!(end, End::TimedOut),
             stopped_on_marker: matches!(end, End::Marker(_)),
+            tagged: self.untag.pieces(),
         }
     }
 }
@@ -1676,6 +1686,7 @@ ffffffffc0009000 T __text_end
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(expect_powered_off(&off).is_ok());
         let failed = Outcome {
@@ -1893,6 +1904,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: false,
             stopped_on_marker: true,
+            tagged: 0,
         };
         let started = stopped(&["boot complete", "init: services started"]);
         assert_eq!(
@@ -1904,6 +1916,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         let off = Outcome {
             status: Some(ExitStatus::from_raw(0)),
             stopped_on_marker: false,
+            tagged: 0,
             ..started.clone()
         };
         assert!(expect_stopped_on(&off, "init: services started").is_err());
@@ -1922,6 +1935,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert!(judge(&crashed).is_err());
         let exit = Outcome {
             stopped_on_marker: false,
+            tagged: 0,
             ..done.clone()
         };
         assert!(judge(&exit).is_err());
@@ -1949,6 +1963,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: true,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(expect_marker(&o, "no device tree").is_err());
     }
@@ -1980,6 +1995,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(verdict(&o, &parse_report(&o.lines), None).is_ok());
     }
@@ -1991,6 +2007,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         let with = |l: &[&str]| Outcome {
             lines: lines(l),
@@ -2026,6 +2043,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: true,
             stopped_on_marker: false,
+            tagged: 0,
         };
         let why = verdict(&hung, &parse_report(&hung.lines), None).unwrap_err();
         assert!(why.contains("timed out"), "{why}");
@@ -2194,6 +2212,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         }
     }
 
@@ -2340,5 +2359,21 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert!(expect_line(&o, "TEST a ok").is_ok());
         assert!(expect_line(&o, "TEST a").is_err());
         assert!(expect_line(&o, "debug_write stops at its length").is_err());
+    }
+
+    #[test]
+    fn a_probe_line_is_found_among_whole_service_lines() {
+        let line = "store-probe: refused TOO_LONG, the receipt is gone, nothing changed";
+        let o = finished(&[
+            "service wait: 15 kind 64 3480 ticks of 23806",
+            line,
+            "entropy: seeded from the boot page (32 bytes)",
+        ]);
+        assert!(expect_line(&o, line).is_ok());
+        // A line cut by another writer's bytes is not the line.
+        let cut = finished(&[
+            "store-probe: refused TOO_LONG, the receipt is gone, nothing chanservice wait: 15 kind 64",
+        ]);
+        assert!(expect_line(&cut, line).is_err());
     }
 }
