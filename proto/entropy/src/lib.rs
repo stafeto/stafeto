@@ -58,6 +58,8 @@
 use abi::Error;
 use proto_wire::{Header, Reader, Status, Writer};
 
+pub mod reconnect;
+
 /// The version of the protocol, in the header of each request.
 ///
 /// Version 2: VERIFY_SESSION (the root's one request).

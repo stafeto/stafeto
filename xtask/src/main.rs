@@ -2202,6 +2202,8 @@ commands:
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
+  random-restart-breaks run the probe of the restart of the entropy service with a loader that keeps a closed session, a layer that never reconnects, and both: each must fail
+  posix-random-restart end the entropy service while programs start, on one CPU and on four: every program has AT_RANDOM and getentropy
   seed-breaks run the kernel tests with the boot seed left in the device tree: the test of the wipe must fail, and only it
   its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
@@ -2231,6 +2233,7 @@ fn main() {
         Some("its-breaks") => its_breaks(),
         Some("seed-breaks") => seed_breaks(),
         Some("random-breaks") => entropy::random_breaks(),
+        Some("random-restart-breaks") => entropy::random_restart_breaks(),
         Some("entropy-seed") => entropy::seed_probe(),
         Some("its-slow") => its_slow(),
         Some("efi-vz") => efi::vz(),
@@ -2528,6 +2531,7 @@ fn main() {
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("posix-random-steps") => entropy::random_steps(),
+        Some("posix-random-restart") => entropy::random_restart(),
         Some("posix-random-net") => entropy::random_net(false),
         Some("posix-random-net-steps") => entropy::random_net(true),
         Some("posix-random-net-two") => entropy::random_net_two(false),
@@ -9979,6 +9983,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("its breaks", its_breaks),
         job("seed breaks", seed_breaks),
         job("random breaks", entropy::random_breaks),
+        job("random restart breaks", entropy::random_restart_breaks),
         job("entropy seed", entropy::seed_probe),
         job("its slow", its_slow),
         job("smp 4 window", smp_window),
@@ -10124,6 +10129,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("pkg-slot", || pkg_slot::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-random-steps", entropy::random_steps),
+        job("posix-random-restart", entropy::random_restart),
         job("posix-random-net", || entropy::random_net(false)),
         job("posix-random-net-steps", || entropy::random_net(true)),
         job("posix-random-net-two", || entropy::random_net_two(false)),

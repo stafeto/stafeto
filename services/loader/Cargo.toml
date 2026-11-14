@@ -21,6 +21,9 @@ bench = false
 auth-probe = []
 # Deliberate breakage (cargo xtask random-breaks): AT_RANDOM is 16 bytes of zeros.
 break-at-random = []
+# Deliberate breakage (cargo xtask random-restart): a start whose entropy
+# session died with its instance keeps it.
+break-no-heal = []
 image-gates = ["auth-probe"]
 image-info-probe = ["image-gates"]
 # The probes of the copy of a fork (posix-procs): pieces of 64 KiB, so

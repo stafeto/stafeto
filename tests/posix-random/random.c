@@ -56,6 +56,8 @@
 extern char **environ;
 extern uint64_t random_probe_calls(void);
 extern void random_probe_drop_session(void);
+extern int random_probe_crash(void);
+extern int random_probe_session_open(void);
 extern int stafeto_probe_loader_start(unsigned mode);
 extern unsigned stafeto_probe_loader_stop(void);
 extern unsigned stafeto_probe_loader_listen(void);
@@ -1036,8 +1038,67 @@ static int fd_closed(const char *number) {
     return 0;
 }
 
+/* The role `fresh`: a program that started after the entropy service's instance ended has what
+ * every program has: 16 bytes of AT_RANDOM that are not zero, and bytes of getentropy. */
+static int fresh_role(void) {
+    const unsigned char *at = (const unsigned char *)getauxval(AT_RANDOM);
+    CHECK(at != NULL);
+    unsigned char aux[16], bytes[32];
+    for (int i = 0; i < 16; i++) aux[i] = at[i];
+    CHECK(!all_zero(aux, sizeof aux));
+    CHECK(getentropy(bytes, sizeof bytes) == 0);
+    CHECK(!all_zero(bytes, sizeof bytes));
+    return 0;
+}
+
+/* The role `holder`: started before the service's instance ended, so its session is the old
+ * instance's and it has no way to init. It waits for a byte on the descriptor `number`, then
+ * starts a `fresh` program, whose entropy session the loader takes from the new instance. */
+static int holder_role(const char *number) {
+    char go;
+    CHECK(read(atoi(number), &go, 1) == 1);
+    CHECK(spawn_role("fresh", -1) == 0);
+    return 0;
+}
+
+/* Programs keep starting while the entropy service ends with a fault and init starts it again
+ * (the entropy service of this image has CRASH). Every one has AT_RANDOM and getentropy; a
+ * program that outlived the old instance starts one that has them too; and the probe's own
+ * session is open, a session of the new instance. */
+#define RESTART_STARTS 60
+static int restart_run(void) {
+    int go[2];
+    CHECK(pipe(go) == 0);
+    char number[16];
+    CHECK(snprintf(number, sizeof number, "%d", go[0]) > 0);
+    char *argv[] = {"posix-random", "holder", number, NULL};
+    pid_t holder = 0;
+    CHECK(posix_spawn(&holder, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    CHECK(random_probe_session_open() == 1);
+    CHECK(random_probe_crash() == 0);
+    for (int i = 0; i < RESTART_STARTS; i++) CHECK(spawn_role("fresh", -1) == 0);
+    printf("posix-random: %d programs started while the entropy service restarted each had "
+           "AT_RANDOM and getentropy\n", RESTART_STARTS);
+    CHECK(random_probe_session_open() == 1);
+    printf("posix-random: the probe's own session is a session of the new instance\n");
+    CHECK(write(go[1], "g", 1) == 1);
+    int status = 0;
+    CHECK(waitpid(holder, &status, 0) == holder);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-random: a program that outlived the old instance started one that has "
+           "AT_RANDOM and getentropy\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int status;
+    if (argc > 1 && strcmp(argv[1], "fresh") == 0) return fresh_role();
+    if (argc > 2 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2]);
+    if (argc > 1 && strcmp(argv[1], "restart") == 0) {
+        status = restart_run();
+        if (status == 0) printf("posix-random: restart ok\n");
+        return status;
+    }
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 1 && strcmp(argv[1], "descendant") == 0) return descendant_role();

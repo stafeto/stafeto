@@ -242,7 +242,12 @@ pub unsafe fn posix_init_process(
         .map_err(|_| "files failed")?;
     // The entropy service, when the record names it; none otherwise, and
     // getentropy gives ENOSYS. SAFETY: startup, on the only thread.
-    unsafe { posix_abi::random::init(rt::service::connect(parent, "entropy").ok()) };
+    unsafe {
+        posix_abi::random::init(rt::service::connect(parent, "entropy").ok());
+        // Init's channel stays open for the program's life: a session that
+        // dies with the service's instance is replaced through it.
+        posix_abi::random::keep_parent(parent.raw());
+    };
     // The display service, when the record names it ("gpu"); none otherwise,
     // and the screen calls give ENODEV. SAFETY: as above.
     unsafe { posix_abi::display::init(rt::service::connect(parent, "gpu").ok()) };

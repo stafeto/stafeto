@@ -649,6 +649,147 @@ fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The probe of the restart of the entropy service (tests/posix-random, role
+/// `restart`): the image of the probe of getentropy whose entropy service has
+/// CRASH and no slow start, so that the new instance seeds from the boot
+/// page at once. `loader` and `probe` are the features of the loader and of
+/// the probe (the breaks).
+const fn random_restart_programs(
+    loader: &'static [&'static str],
+    probe: &'static [&'static str],
+) -> [ImageProgram; 9] {
+    let base = random_programs(&[], loader);
+    [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-random-restart"],
+        ),
+        base[1],
+        base[2],
+        base[3],
+        base[4],
+        base[5],
+        base[6],
+        ("entropy", "entropy", ENTROPY_STACK_SIZE, &["crash"]),
+        (
+            "posix-random",
+            "posix-random-probe",
+            crate::POSIX_STACK_SIZE,
+            probe,
+        ),
+    ]
+}
+
+static RESTART_PROGRAMS: [ImageProgram; 9] = random_restart_programs(&[], &[]);
+/// Without the loader's replacement of a closed entropy session.
+static RESTART_BREAK_LOADER: [ImageProgram; 9] = random_restart_programs(&["break-no-heal"], &[]);
+/// Without the layer's reconnection through init.
+static RESTART_BREAK_LAYER: [ImageProgram; 9] =
+    random_restart_programs(&[], &["break-no-reconnect"]);
+/// Without either.
+static RESTART_BREAK_BOTH: [ImageProgram; 9] =
+    random_restart_programs(&["break-no-heal"], &["break-no-reconnect"]);
+
+/// The lines of the role `restart`, each a check that passed.
+const RESTART_LINES: [&str; 4] = [
+    "posix-random: 60 programs started while the entropy service restarted each had AT_RANDOM and getentropy",
+    "posix-random: the probe's own session is a session of the new instance",
+    "posix-random: a program that outlived the old instance started one that has AT_RANDOM and getentropy",
+    "posix-random: restart ok",
+];
+
+/// The machine's run of the image `programs` of the restart probe: its lines.
+fn restart_boot(
+    programs: &'static [ImageProgram],
+    name: &'static str,
+    timeout: Duration,
+) -> Result<qemu::Outcome, String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    run_until(
+        cmd,
+        timeout,
+        Some("init: posix-random ended: "),
+        &kernel.elf,
+    )
+}
+
+/// `cargo xtask posix-random-restart`: programs keep starting while the
+/// entropy service ends with a fault and init starts it again, on one CPU and
+/// on four. Every program started after the end has AT_RANDOM and bytes of
+/// getentropy; one that outlived the old instance starts a program that
+/// has them too; the probe's own session is replaced. The service is seen to
+/// have ended and to have started twice.
+pub fn random_restart() -> Result<(), String> {
+    crate::relibc()?;
+    for cpus in [1, 4] {
+        let output = qemu::on_cpus(cpus, || {
+            restart_boot(
+                &RESTART_PROGRAMS,
+                "boot-posix-random-restart.img",
+                crate::BOOT_TIMEOUT * 2,
+            )
+        })?;
+        for line in RESTART_LINES {
+            qemu::expect_marker(&output, line)?;
+        }
+        qemu::expect_stopped_on(
+            &output,
+            "init: posix-random ended: exit code 0, not restarted",
+        )?;
+        let seeded = output
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("entropy: seeded from the boot page"))
+            .count();
+        if seeded != 2
+            || !output
+                .lines
+                .iter()
+                .any(|l| l.starts_with("init: entropy ended"))
+        {
+            return Err(format!(
+                "the entropy service did not end and start again once: {seeded} starts"
+            ));
+        }
+        println!(
+            "posix-random-restart ({cpus} CPUs): programs started across a restart of the entropy service, from the probe and from a program that outlived the old instance, all had AT_RANDOM and getentropy: ok"
+        );
+    }
+    Ok(())
+}
+
+/// `cargo xtask random-restart-breaks`: the probe of the restart with the
+/// loader that keeps a closed entropy session, with the layer that never
+/// reconnects through init, and with both, must fail, each.
+pub fn random_restart_breaks() -> Result<(), String> {
+    crate::relibc()?;
+    for (what, programs) in [
+        (
+            "a loader that keeps a closed session",
+            &RESTART_BREAK_LOADER,
+        ),
+        ("a layer that never reconnects", &RESTART_BREAK_LAYER),
+        ("both", &RESTART_BREAK_BOTH),
+    ] {
+        let output = restart_boot(
+            programs,
+            "boot-posix-random-restart-break.img",
+            crate::BOOT_TIMEOUT,
+        )?;
+        qemu::expect_marker(&output, "init: posix-random ended: exit code 20")?;
+        if output.lines.iter().any(|l| l == "posix-random: restart ok") {
+            return Err(format!("the probe passed with {what}"));
+        }
+        println!("random-restart-breaks: {what} is caught");
+    }
+    Ok(())
+}
+
 /// `cargo xtask random-breaks`: the probe of AT_RANDOM with a loader that
 /// gives zeros fails (the probe's check of the bytes; its exit code 20), and
 /// no line `posix-random: ok` comes.

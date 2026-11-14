@@ -39,6 +39,9 @@ wait-probe = []
 # `epoll_pwait`, and the dump of the ring to the console when the process exits
 # (the image of the measurement, `cargo xtask net-trace`).
 trace = ["trace/on"]
+# Deliberate breakage (cargo xtask random-restart): a session of the entropy
+# service that died with its instance is never replaced through init.
+break-no-reconnect = []
 
 [dependencies]
 trace = { path = "../trace" }
