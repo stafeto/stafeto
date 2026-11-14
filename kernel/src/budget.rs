@@ -178,6 +178,10 @@ pub fn bind(t: NonNull<Thread>, b: NonNull<Budget>) -> Result<(), Error> {
             return Err(Error::BadState);
         }
     }
+    // The break: the bind goes through and binds nothing.
+    if cfg!(feature = "break-budget-off") {
+        return Ok(());
+    }
     crate::sched::bind_budget(t, server_of(b))?;
     // SAFETY: as above.
     unsafe { (*b.as_ptr()).thread = Some(t) };

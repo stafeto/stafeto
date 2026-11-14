@@ -9560,3 +9560,89 @@ fn free_level_cases(c: &Caller, low: NonNull<Process>) -> Result<(), &'static st
     cleanup::drain();
     Ok(())
 }
+
+/// The firing of the replenishments of budgets in one portion, under -icount
+/// (spec 10, 15.3): `FIRE_PORTION` threads of one level, each with a budget
+/// that ran out (the thread is ready at `low`, the event is in the heap of
+/// its level), come back to their level in the portion of that level's firing,
+/// which holds OBJ once. The test prints the portion's ticks in the line
+/// `budget firing ticks: eight=N`; the hold of OBJ is the kind 51 of the
+/// run's report.
+#[cfg(feature = "icount")]
+pub fn budget_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    let c = Caller::new()?;
+    let mut threads = [None; WOKEN];
+    let mut budgets = [None; WOKEN];
+    let mut made = Ok(());
+    for (t, b) in threads.iter_mut().zip(&mut budgets) {
+        match thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo) {
+            Ok(n) => *t = Some(n),
+            Err(_) => made = Err("no thread"),
+        }
+        match // 100 us for each 1 ms at 62.5 MHz, in ticks.
+        crate::budget::create(c.process, 0, 6_250, 62_500, 1) {
+            Ok(n) => *b = Some(n),
+            Err(_) => made = Err("no budget"),
+        }
+    }
+    let result = made.and_then(|()| {
+        let now = timer::now();
+        for (t, b) in threads.iter().zip(&budgets) {
+            let (t, b) = (t.expect("a thread"), b.expect("a budget"));
+            crate::budget::bind(t, b).map_err(|_| "a budget did not bind")?;
+        }
+        // Each thread runs in its turn, and its budget ends at the timer's
+        // interrupt: it falls to `low`, and its event stands in the heap.
+        for t in threads.iter().flatten() {
+            sched::start(*t).map_err(|_| "a thread did not start")?;
+        }
+        for t in threads.iter().flatten() {
+            // SAFETY: the scheduler's threads are alive.
+            let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+            check(
+                matches!(picked, kcore::sched::Decision::Run(r) if r == *t),
+                "a thread did not run",
+            )?;
+            // 125 us on: past the budget of 100 us, and short of its period.
+            let at = timer::now() + timer::frequency() / 8_000;
+            // SAFETY: as above.
+            sched::locked(|k| unsafe { k.s.tick(at) });
+            // SAFETY: the thread is alive: the test holds its reference.
+            let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+            check(demoted, "the budget did not run out")?;
+        }
+        // The replenishments are a period (1 ms) after the activations: the
+        // virtual time passes 2 ms, an instruction for each tick.
+        let far = timer::now() + timer::frequency() / 500;
+        while timer::now() < far {
+            core::hint::spin_loop();
+        }
+        let began = timer::now();
+        timers::fire_at(LEVEL, far);
+        let took = timer::now() - began;
+        kprintln!("budget firing ticks: eight={took}");
+        for t in threads.iter().flatten() {
+            // SAFETY: as above.
+            let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+            check(!demoted, "a budget did not come back")?;
+        }
+        let _ = now;
+        Ok(())
+    });
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's reference goes, and the kernel's first: the
+        // thread leaves the scheduler.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for b in budgets.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    c.release();
+    cleanup::drain();
+    result
+}

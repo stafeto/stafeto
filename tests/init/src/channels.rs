@@ -649,7 +649,7 @@ fn duplicate_narrows_rights() -> Outcome {
     let got = take_one(&c);
     let y = duplicate_regs(c.raw(), CHANNEL_RIGHTS | Rights::MANAGE, 0, 0);
     let wider = raw_duplicate(y);
-    let odd = [1 << 12, 1 << 32].map(|rights| {
+    let odd = [1 << 13, 1 << 32].map(|rights| {
         let mut z = x;
         z[..2].copy_from_slice(&[0, rights]);
         let after = raw_duplicate(z);

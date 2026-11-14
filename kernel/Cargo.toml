@@ -130,6 +130,15 @@ break-seed-wipe = []
 # Deliberate breakage only: the port the kernel holds shows the headers of the
 # pieces of long lines (xtask console-strip-break).
 break-console-strip = ["console-line/break-line-strip"]
+# Deliberate breakage of the time budgets (xtask budget-breaks): a bind that
+# binds nothing, a boost by a notification slot that survives the exhaustion,
+# a replenishment that never applies, and a thread with no budget that ignores
+# the level its process allows (with the kernel tests, which must catch it).
+break-budget-off = []
+break-budget-slot-keeps = ["kcore/break-budget-keep-slot"]
+break-budget-refill = ["kcore/break-budget-refill"]
+break-budget-keep-level = ["kcore/break-budget-keep-level"]
+break-budget-no-free = ["kcore/break-budget-no-free"]
 break-idle-bell = ["idle-probe", "window-probe"]
 break-idle-drain = ["idle-probe", "window-probe"]
 break-idle-irq = ["idle-probe", "window-probe"]

@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(rights_arg(0), Ok(Rights::NONE));
         assert_eq!(rights_arg(Rights::ALL.0.into()), Ok(Rights::ALL));
         assert_eq!(rights_arg(0b1001), Ok(Rights::DUPLICATE | Rights::NOTIFY));
-        for raw in [1 << 12, 1 << 31, 1 << 32, u64::MAX] {
+        for raw in [1 << 13, 1 << 31, 1 << 32, u64::MAX] {
             assert_eq!(rights_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
     }

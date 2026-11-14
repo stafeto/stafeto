@@ -1073,71 +1073,36 @@ why = "the second header of the loop over the CPUs that has something to take (t
 # holds MAX_REPLENISHMENTS = 4 entries, so every loop over it runs 4 times at
 # most and the pass that ends it (the merge of the chunks that arrive while a
 # thread runs, `Server::unblock`, at most three; the passes of the exhaustion,
-# `Server::check`, twice the queue; the insertion in time order, `Server::add`).
-
-[[loop]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::wake"
-at = "0x80"
-bound = 4
-why = "the replenishments of a budget that arrive while its thread runs merge into the first one: at most three, and the look that ends the loop (Server::unblock, MAX_REPLENISHMENTS = 4)"
-
-[[loop]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::start"
-at = "0x88"
-bound = 4
-why = "the replenishments of a budget that arrive while its thread runs merge into the first one: at most three, and the look that ends the loop (Server::unblock, MAX_REPLENISHMENTS = 4)"
+# `Server::check`, twice the queue; the insertion in time order, `Server::add`,
+# inlined in `check` and `split`). The move of the queue by one place when its
+# head leaves is three fixed moves.
 
 [[loop]]
 function = "<kcore::budget::Server>::unblock"
-at = "0x4c"
+at = "0xc0"
 bound = 4
 why = "the replenishments of a budget that arrive while its thread runs merge into the first one: at most three, and the look that ends the loop (Server::unblock, MAX_REPLENISHMENTS = 4)"
 
 [[loop]]
 function = "<kcore::budget::Server>::check"
-at = "0x7c"
+at = "0x6c"
 bound = 9
 why = "the chunks the usage of a budget used up go back at the tail: at most twice the queue, 2 * MAX_REPLENISHMENTS = 8, and the look that ends the loop (Server::check)"
 
 [[loop]]
 function = "<kcore::budget::Server>::check"
-at = "0xdc"
+at = "0xc0"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
 
 [[loop]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::charge"
-at = "0x130"
+function = "<kcore::budget::Server>::split"
+at = "0x94"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
 
 [[loop]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::charge"
-at = "0x1ac"
+function = "<kcore::budget::Server>::split"
+at = "0x110"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
-
-[[copy]]
-function = "<kcore::budget::Server>::check"
-bytes = 48
-why = "the queue of replenishments moves up by one place when its head leaves: at most three entries of 16 bytes (Server::pop)"
-
-[[copy]]
-function = "<kcore::budget::Server>::unblock"
-bytes = 48
-why = "the queue of replenishments moves up by one place when its head leaves: at most three entries of 16 bytes (Server::pop)"
-
-[[copy]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::charge"
-bytes = 48
-why = "the queue of replenishments moves up by one place when its head leaves: at most three entries of 16 bytes (Server::pop)"
-
-[[copy]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::wake"
-bytes = 48
-why = "the queue of replenishments moves up by one place when its head leaves: at most three entries of 16 bytes (Server::pop)"
-
-[[copy]]
-function = "<kcore::sched::Scheduler<kernel::thread::Thread>>::start"
-bytes = 48
-why = "the queue of replenishments moves up by one place when its head leaves: at most three entries of 16 bytes (Server::pop)"

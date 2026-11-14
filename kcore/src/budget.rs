@@ -189,7 +189,11 @@ impl Server {
 
     fn pop(&mut self) -> Replenishment {
         let head = self.q[0];
-        self.q.copy_within(1..usize::from(self.len), 0);
+        // The whole array moves up by one, whatever `len` is: three fixed
+        // moves are less code than a call of memmove for a size that varies.
+        self.q[0] = self.q[1];
+        self.q[1] = self.q[2];
+        self.q[2] = self.q[3];
         self.len -= 1;
         head
     }
@@ -207,6 +211,7 @@ impl Server {
     }
 
     /// Budget_Check (figure 6.3): the usage is up to date at `now`.
+    #[inline(never)]
     fn check(&mut self, now: u64, blocked: bool) {
         if self.capacity(now) > 0 {
             return;
@@ -264,6 +269,7 @@ impl Server {
     }
 
     /// Split_Check (figure 6.4): the thread blocked at `now`.
+    #[inline(never)]
     fn split(&mut self, now: u64) {
         if self.usage == 0 || self.q[0].time > now {
             return;
@@ -297,6 +303,7 @@ impl Server {
     /// The thread leaves the CPU at `now`, `blocked` when it waits (Budget_
     /// Check, and Split_Check for a block). Its stint counts when it ran at
     /// its own level; the time in the background counts nowhere.
+    #[inline(never)]
     pub fn stop(&mut self, now: u64, blocked: bool) {
         if self.background {
             return;
@@ -312,6 +319,7 @@ impl Server {
     }
 
     /// The thread becomes ready at `now` (Unblock_Check, figure 6.5).
+    #[inline(never)]
     pub fn unblock(&mut self, now: u64) {
         if self.capacity(now) > 0 {
             self.background = false;
@@ -336,6 +344,7 @@ impl Server {
 
     /// The replenishment event at `now`: the thread returns to its own
     /// level when it has capacity.
+    #[inline(never)]
     pub fn replenish(&mut self, now: u64) {
         self.armed = 0;
         self.event = 0;
