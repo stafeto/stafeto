@@ -156,6 +156,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    // The kernel time budget of the request thread (init's table), bound below before the
+    // loop starts to serve.
+    let serve = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::SERVE)
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -234,6 +241,11 @@ fn main(_: u64) -> u64 {
         _ => rt::println!(
             "pipe: no thread to register the root; set-ID starts are refused until it is registered"
         ),
+    }
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    if rt::budget::bind("pipe", "serve", serve, &start.thread).is_err() {
+        return 6;
     }
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]

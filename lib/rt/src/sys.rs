@@ -232,8 +232,17 @@ pub fn process_create(
     handle_limit: u32,
     ceiling: u8,
 ) -> Result<Handle<Process>, Error> {
-    process_create_with(quota, handle_limit, ceiling, None, None, Shares::CREATOR, 0)
-        .map_err(|(e, _)| e)
+    process_create_with(
+        quota,
+        handle_limit,
+        ceiling,
+        None,
+        None,
+        Shares::CREATOR,
+        0,
+        0,
+    )
+    .map_err(|(e, _)| e)
 }
 
 /// process_create with channels (spec 7.9, 13.3). `exit`, a channel handle
@@ -244,7 +253,11 @@ pub fn process_create(
 /// (abi::START_CHANNEL) with its rights, label and all; when the call
 /// fails it stays the caller's and comes back with the error. `shares` are
 /// x6 and x7 (spec 7.5) and `cpus` is x8, the CPUs of the process's
-/// threads, a subset of the caller's: 0 for the caller's own.
+/// threads, a subset of the caller's: 0 for the caller's own. `free` is the
+/// level its threads without a budget work at, at most (x2, bits 8-15; spec
+/// 8): 0 for the ceiling, or a priority of 1 up to the ceiling that does not
+/// lie above the creator's own.
+#[allow(clippy::too_many_arguments)]
 pub fn process_create_with(
     quota: u64,
     handle_limit: u32,
@@ -253,13 +266,14 @@ pub fn process_create_with(
     start: Option<Handle<Channel>>,
     shares: Shares,
     cpus: u8,
+    free: u8,
 ) -> Result<Handle<Process>, (Error, Option<Handle<Channel>>)> {
     let (x3, x4) = exit.map_or((0, 0), |(c, priority)| (c.raw().0, priority.into()));
     let x5 = start.as_ref().map_or(0, |c| c.raw().0);
     let args = [
         quota,
         handle_limit.into(),
-        ceiling.into(),
+        u64::from(ceiling) | u64::from(free) << 8,
         x3,
         x4,
         x5,
@@ -1192,6 +1206,14 @@ impl Token {
 
 /// Token::reply_receive, below.
 impl Token {
+    /// A second value for the same token, for the one thing a caller does
+    /// with a token its call used: a reply that fails with BAD_STATE when the
+    /// kernel used the token up, and reaches the request when the kernel
+    /// refused the call before it did (`service::Owed`).
+    pub(crate) const fn again(&self) -> Token {
+        Token(self.0)
+    }
+
     /// reply with `bytes`, up to abi::MESSAGE_MAX and no handles, and then
     /// receive on `channel`, a handle with RECEIVE, in one entry into the
     /// kernel (`Call::ReplyReceive`): the thread does not come back to its
@@ -1203,10 +1225,28 @@ impl Token {
     /// as `receive` does. Any other error is the call's: the reply, or the
     /// receive after it, failed with it.
     pub fn reply_receive(self, channel: &Handle<Channel>, bytes: &[u8]) -> Result<Received, Error> {
+        self.reply_receive_handles(channel, bytes, Outgoing::new())
+    }
+
+    /// reply_receive with `handles` in the reply, an `Outgoing` of at most
+    /// abi::MESSAGE_HANDLES, each with TRANSFER: they move as `reply_handles`
+    /// moves them. The kernel checks the message and its handles before it
+    /// replies, and nothing changes when a check fails; the handles then stay
+    /// in the caller's table and close here, with the error as the call's
+    /// result (INVALID_ARGS, BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). The
+    /// error of a reply that went as far as it could (LIMIT_REACHED and
+    /// NO_MEMORY, the client's table had no room) is the call's too, and the
+    /// handles are gone; with PEER_CLOSED the receive follows.
+    pub fn reply_receive_handles(
+        self,
+        channel: &Handle<Channel>,
+        bytes: &[u8],
+        handles: Outgoing,
+    ) -> Result<Received, Error> {
         if bytes.len() > MESSAGE_MAX {
             return Err(Error::InvalidArgs);
         }
-        let Ok(regs) = message_regs(self.0, bytes, &[], 0) else {
+        let Ok(regs) = message_regs(self.0, bytes, handles.values(), 0) else {
             return Err(Error::InvalidArgs);
         };
         msgbuf::set_channel(channel.raw().0);
@@ -1215,7 +1255,14 @@ impl Token {
         // SAFETY: reply_receive uses no memory of the program but its own
         // message buffer; it writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
-        match received(x) {
+        let result = received(x);
+        match &result {
+            // The handles stay in the table and close with `handles`, but for
+            // an error that took them (`Error::keeps_handles`), or a success.
+            Err(e) if e.keeps_handles() => {}
+            _ => handles.sent(),
+        }
+        match result {
             Err(Error::BadState) => receive(channel),
             r => r,
         }

@@ -94,6 +94,7 @@ pub const INPUT: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The display service as the images that take keys have it: its session
@@ -132,6 +133,7 @@ const PROBE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// A program the table gives no connection to the input service (role

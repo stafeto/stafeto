@@ -409,7 +409,8 @@ pub fn breaks() -> Result<(), String> {
         return Err("the host tests of init passed with break-budget-share".into());
     }
     println!("budget-breaks: break-budget-share fails the host tests of init");
-    Ok(())
+    // The three services with their request threads unbound, and init with no `free` level.
+    crate::service_budget::breaks(None)
 }
 
 #[cfg(test)]

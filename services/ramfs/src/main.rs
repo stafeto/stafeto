@@ -265,6 +265,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    // The kernel time budget of the request thread (init's table), bound below before the
+    // loop starts to serve.
+    let serve = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::SERVE)
+    };
     // Legacy diagnostic timestamp source; clocked profiles replace this at startup.
     let Ok(args) = ServiceArgs::read(start.args()) else {
         return 7;
@@ -400,6 +407,11 @@ fn main(_: u64) -> u64 {
         "ramfs: layers bytes={}",
         ramfs::storage::layers::LAYERS_BYTES
     );
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    if rt::budget::bind("ramfs", "serve", serve, &start.thread).is_err() {
+        return 10;
+    }
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe {

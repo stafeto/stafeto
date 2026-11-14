@@ -2027,7 +2027,8 @@ fn rates(machine: &qemu::Machine) -> Result<(), String> {
 
 /// The network service has told that its switch thread and its stack run under their kernel
 /// budgets (`budgets.rs`): a service whose budget is refused does not start, and one that took
-/// none would leave the levels below it without protection.
+/// none would leave the levels below it without protection; the same for the request threads of
+/// the RAM file, pipe and terminal services (`rt::budget`).
 pub fn require_budget_lines(lines: &[String]) -> Result<(), String> {
     for what in ["the switch", "the stack"] {
         let wanted = format!("net: {what} runs under its budget");
@@ -2035,7 +2036,8 @@ pub fn require_budget_lines(lines: &[String]) -> Result<(), String> {
             return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
         }
     }
-    Ok(())
+    // The RAM, pipe and terminal services of the image tell the same of their request threads.
+    crate::service_budget::require_service_budget_lines(lines)
 }
 
 #[cfg(test)]

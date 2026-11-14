@@ -84,6 +84,7 @@ const NOT_REGISTERED: u64 = 3;
 const NO_DRIVER: u64 = 4;
 const NO_PLACES: u64 = 5;
 const STOPPED: u64 = 6;
+const NO_BUDGET: u64 = 7;
 
 /// What the service keeps for a client: its long operations, and the
 /// root of its chain of clones: the label of init's client whose process
@@ -214,6 +215,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<rt::handle::Resource>("console") {
         rt::console::set(console);
     }
+    // The kernel time budget of the request thread (init's table), bound below before the
+    // loop starts to serve.
+    let serve = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::SERVE)
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -312,6 +320,11 @@ fn main(_: u64) -> u64 {
         }
     }
     let _ = service.pull();
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    if rt::budget::bind("tty", "serve", serve, &start.thread).is_err() {
+        return NO_BUDGET;
+    }
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(5);

@@ -3,7 +3,7 @@
 
 //! RAM file service and its guest probe in a dedicated boot image.
 
-use super::{ALL_CPUS, GENERAL_CPUS, Kind, POSIX_SHARES, Record, Restart, Shares, Window};
+use super::{ALL_CPUS, Budget, GENERAL_CPUS, Kind, POSIX_SHARES, Record, Restart, Shares, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -20,6 +20,51 @@ const TABLES: u64 = 915 + 392 + 336 + 160 + 5;
 pub const SERVICE_LEVEL: u8 = 48;
 /// The level of the process service, the highest of the POSIX services.
 pub const PROCESS_LEVEL: u8 = 52;
+
+/// The level the threads of the RAM, pipe and terminal services work at while they have no
+/// budget (`Record::free`): the highest level of the POSIX processes (their ceiling is 31). The
+/// request thread binds its budget before it serves, so it works at its own level (48 or 50)
+/// for its C of each T and at `low` after; a thread of these services that has none (the one
+/// that maps layers, the one that registers the root of the pipes) and the request thread of
+/// a service that does not bind never work above the POSIX processes.
+pub const SERVICE_FREE: u8 = 31;
+
+/// The period of the budgets of the three services, 5 ms: the longest line of budgets of
+/// services one after the other above the network service is the sum of their C, 0.4 ms,
+/// under the period of its switch (1 ms for 0.4) and well inside the ring that takes the
+/// frames meanwhile.
+const SERVICE_PERIOD_NS: u64 = 5 * MS;
+
+/// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
+/// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
+/// longest and the most frequent of the three. The thread works at `low` 1 after that, where a
+/// request of a client costs at the client's own level (spec 8, the loan).
+pub const RAM_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 250_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: 1,
+}];
+
+/// The budget of the pipe service's request thread: 75 us of each 5 ms (1.5 %).
+pub const PIPE_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 75_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: 1,
+}];
+
+/// The budget of the terminal service's request thread: 75 us of each 5 ms (1.5 %), the output
+/// being bound by the driver as well.
+pub const TTY_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 75_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: 1,
+}];
 
 const RAM_BASE: Record = Record {
     name: "ramfs",
@@ -66,11 +111,14 @@ const RAM_BASE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// Standalone RAM probes use an explicit deterministic source.
 pub const RAM_LEGACY: Record = Record {
     args: proto_fs::RAM_TIME_LEGACY,
+    budgets: RAM_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -78,6 +126,8 @@ pub const RAM_LEGACY: Record = Record {
 pub const RAM_CLOCKED: Record = Record {
     args: proto_fs::RAM_TIME_CLOCKED,
     connects: &["clock"],
+    budgets: RAM_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -115,6 +165,7 @@ pub const TABLE: &[Record] = &[
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     },
 ];
 
@@ -578,6 +629,8 @@ pub const PIPE: Record = Record {
     quota: 160 * PAGE,
     handle_limit: 224,
     restart: Restart::Never,
+    budgets: PIPE_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -951,6 +1004,8 @@ pub const TTY: Record = Record {
     handle_limit: 192,
     restart: Restart::Never,
     connects: &["uart"],
+    budgets: TTY_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -999,6 +1054,29 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
         handle_limit: 320,
         quota: 64 * PAGE,
         ..TTY_TABLE[2]
+    },
+];
+
+/// The probe of the time budgets of the RAM, pipe and terminal services (tests/service-budget,
+/// xtask service-budget, under -icount with two CPUs): the three services as the shell image
+/// has them, with their budgets; the console's driver as the quiet stub of the steps of the
+/// terminal; and the probe at 40, whose threads stand at 20 (on CPU 1), 25 and 40.
+pub const SERVICE_BUDGET_TABLE: &[Record] = &[
+    TTY_STEPS_TABLE[0],
+    RAM_LEGACY,
+    PIPE,
+    TTY,
+    Record {
+        // The name of the diagnostic client of the RAM service, which init gives the boot profile
+        // (`BOOT_PROFILE_CLIENTS`): the probe's lookups of paths need it.
+        name: "ramfs-probe",
+        program: "service-budget",
+        priority: 40,
+        ceiling: 40,
+        quota: 128 * PAGE,
+        handle_limit: 64,
+        connects: &["ramfs", "pipe", "tty"],
+        ..TABLE[1]
     },
 ];
 

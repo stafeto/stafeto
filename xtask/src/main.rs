@@ -119,6 +119,7 @@ mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod rtbench_check;
+mod service_budget;
 mod smpmeasure;
 mod store_probe;
 mod stubs;
@@ -195,6 +196,27 @@ const VZ_PROGRAMS: [ImageProgram; 3] = [
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
 /// The probe of the time budgets (budget_hog.rs), as init.
 const BUDGET_HOG_PROGRAMS: [ImageProgram; 1] = [("init", "budget-hog", INIT_STACK_SIZE, &[])];
+/// The probe of the time budgets of the RAM, pipe and terminal services (service_budget.rs):
+/// the three services, the quiet driver of the console (the program of the probe of the
+/// terminal, role `S`) and the probe.
+const SERVICE_BUDGET_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-service-budget"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+    ("service-budget", "service-budget", SVC_STACK_SIZE, &[]),
+];
+/// The same with the service at index `at` of the list binding no budget
+/// (`break-budget-unbound`, `cargo xtask budget-breaks`).
+const fn service_budget_unbound(at: usize) -> [ImageProgram; 6] {
+    let mut programs = SERVICE_BUDGET_PROGRAMS;
+    programs[at].3 = &["break-budget-unbound"];
+    programs
+}
+const SERVICE_BUDGET_RAMFS_UNBOUND: [ImageProgram; 6] = service_budget_unbound(1);
+const SERVICE_BUDGET_PIPE_UNBOUND: [ImageProgram; 6] = service_budget_unbound(2);
+const SERVICE_BUDGET_TTY_UNBOUND: [ImageProgram; 6] = service_budget_unbound(3);
 /// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
@@ -2294,6 +2316,7 @@ fn main() {
         Some("smp-vz") => vz::smp_boot(),
         Some("smp-asid-vz") => vz::smp_asid(),
         Some("budget-hog") => budget_hog::run(&args[1..]),
+        Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
@@ -13417,6 +13440,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "ramfs-probe",
         "--package",
+        "service-budget",
+        "--package",
         "test-svc",
         "--package",
         "rtbench",
@@ -15537,6 +15562,19 @@ mod entropy_in_images_tests {
             ),
             ("main::EXT4RO_PROGRAMS", &EXT4RO_PROGRAMS),
             ("main::RAMFS_PROGRAMS", &RAMFS_PROGRAMS),
+            ("main::SERVICE_BUDGET_PROGRAMS", &SERVICE_BUDGET_PROGRAMS),
+            (
+                "main::SERVICE_BUDGET_RAMFS_UNBOUND",
+                &SERVICE_BUDGET_RAMFS_UNBOUND,
+            ),
+            (
+                "main::SERVICE_BUDGET_PIPE_UNBOUND",
+                &SERVICE_BUDGET_PIPE_UNBOUND,
+            ),
+            (
+                "main::SERVICE_BUDGET_TTY_UNBOUND",
+                &SERVICE_BUDGET_TTY_UNBOUND,
+            ),
             ("main::POSIX_FILES_PROGRAMS", &POSIX_FILES_PROGRAMS),
             ("main::LOADER_ABORT_PROGRAMS", &LOADER_ABORT_PROGRAMS),
             ("main::IMAGE_GATES_PROGRAMS", &IMAGE_GATES_PROGRAMS),

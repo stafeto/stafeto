@@ -211,6 +211,7 @@ mod tests {
             cpus: GENERAL_CPUS,
             waits: &[],
             budgets: &[],
+            free: 0,
         }
     }
 

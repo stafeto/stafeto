@@ -1,0 +1,20 @@
+[package]
+name = "service-budget"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Probe of the time budgets of the RAM file, pipe and terminal services: a greedy client on another CPU must leave a victim below the service its share, and a client above get its answer in time"
+
+[[bin]]
+name = "service-budget"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-pipe = { path = "../../proto/pipe" }
+proto-tty = { path = "../../proto/tty" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

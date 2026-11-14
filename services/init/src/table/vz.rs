@@ -123,6 +123,7 @@ pub const CONSOLE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of

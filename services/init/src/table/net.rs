@@ -192,6 +192,7 @@ pub const NETD: Record = Record {
     cpus: NETD_CPUS,
     waits: &[],
     budgets: NETD_BUDGETS,
+    free: 0,
 };
 
 /// The PCI devices of the network on VZ's bus 0 (services/netd/src/pci.rs).
@@ -405,6 +406,7 @@ pub const NETD_VZ2: Record = Record {
     // The eight names of the start data are taken (`DMA_TWO` and `console`). With no budgets
     // and no pause the levels below this service are not protected.
     budgets: &[],
+    free: 0,
     ..NETD
 };
 
@@ -531,6 +533,7 @@ pub const NETD_TWO: Record = Record {
     ],
     dma: DMA_TWO,
     budgets: &[],
+    free: 0,
     ..NETD
 };
 
@@ -651,6 +654,7 @@ pub const PROBE: Record = Record {
     cpus: super::GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 // NET_TABLE copies the records of the shell's table by number: a table that
