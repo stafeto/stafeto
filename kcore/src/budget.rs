@@ -32,8 +32,12 @@
 //!   constraint holds).
 //! - `replenish` (the event): the thread returns to its own level.
 //!
-//! The time the thread runs in the background is not charged: it costs the
-//! levels at `low` and below, which the budget does not promise anything.
+//! The time the thread runs in the background is not charged to it: it costs
+//! the levels at `low` and below, which the budget does not promise anything.
+//! The time it runs there for a client above `low` is lent: the reply (or the
+//! next receive) gives it to the client's own server (`take_loan`, `owe`), so
+//! that a client with a budget pays for the work it asked for. A client that
+//! is itself a server on loan passes it on along the chain of requests.
 //! Every loop is bounded by `MAX_REPLENISHMENTS`. The scheduler
 //! (kcore::sched) applies the levels; the kernel keeps the event in the
 //! heaps of the timers.
@@ -69,6 +73,9 @@ pub struct Server {
     armed: u64,
     /// The sum of the ticks that were charged, and the budgets that ran out.
     ran: u64,
+    /// The ticks the thread ran in the background for a client that stands
+    /// above `low` and has not yet been given to that client (`take_loan`).
+    lent: u64,
     overruns: u32,
     low: u8,
     background: bool,
@@ -99,6 +106,7 @@ impl Server {
             event: 0,
             armed: 0,
             ran: 0,
+            lent: 0,
             overruns: 0,
             low,
             background: false,
@@ -165,9 +173,50 @@ impl Server {
     /// budget came back while it runs): its time counts from here, and the
     /// budget ends at `now` plus the capacity.
     pub fn run(&mut self, now: u64) {
+        self.fg_since = now;
         if !self.background {
-            self.fg_since = now;
             self.exhaust_at = now.saturating_add(self.capacity(now));
+        }
+    }
+
+    /// The ticks lent to the client of the request the thread works on and
+    /// not yet given back.
+    pub fn lent(&self) -> u64 {
+        self.lent
+    }
+
+    /// The thread hands the work of a request back (a reply, or the next
+    /// receive): the ticks it ran in the background for the client, with the
+    /// running stint closed at `now` when `loan` says the thread works at
+    /// its client's level. They are the client's debt (`owe`), and the loan
+    /// is empty after this call.
+    #[inline(never)]
+    pub fn take_loan(&mut self, now: u64, loan: bool) -> u64 {
+        if self.background {
+            #[cfg(not(feature = "break-budget-forgive-loan"))]
+            if loan {
+                self.lent = self.lent.saturating_add(now.saturating_sub(self.fg_since));
+            }
+            #[cfg(feature = "break-budget-forgive-loan")]
+            let _ = loan;
+            self.fg_since = now;
+        }
+        core::mem::take(&mut self.lent)
+    }
+
+    /// `ticks` of a server's work for a request of this thread, which waits
+    /// for the reply, are this thread's time. A thread that works for a
+    /// client of its own (`on_loan`) passes them on in its loan. Any other
+    /// pays them as usage at `now`; a thread in the background pays nothing,
+    /// since the time it spends there is never charged (the work ran at its
+    /// own `low` or below).
+    #[inline(never)]
+    pub fn owe(&mut self, ticks: u64, now: u64, on_loan: bool) {
+        if on_loan {
+            self.lent = self.lent.saturating_add(ticks);
+        } else if !self.background {
+            self.usage = self.usage.saturating_add(ticks);
+            self.check(now, true);
         }
     }
 
@@ -310,10 +359,21 @@ impl Server {
 
     /// The thread leaves the CPU at `now`, `blocked` when it waits (Budget_
     /// Check, and Split_Check for a block). Its stint counts when it ran at
-    /// its own level; the time in the background counts nowhere.
+    /// its own level; the time in the background counts nowhere, except that
+    /// with `loan` (the thread works at the level of a client above `low`)
+    /// it is lent to that client.
     #[inline(never)]
-    pub fn stop(&mut self, now: u64, blocked: bool) {
+    pub fn stop(&mut self, now: u64, blocked: bool, loan: bool) {
         if self.background {
+            // The stint is a client's when the thread works at its level:
+            // it goes into the loan.
+            #[cfg(not(feature = "break-budget-forgive-loan"))]
+            if loan {
+                self.lent = self.lent.saturating_add(now.saturating_sub(self.fg_since));
+            }
+            #[cfg(feature = "break-budget-forgive-loan")]
+            let _ = loan;
+            self.fg_since = now;
             return;
         }
         let ran = now.saturating_sub(self.fg_since);
@@ -445,7 +505,7 @@ mod tests {
             let gone = away > 0;
             if running && (gone || work == 0) {
                 running = false;
-                s.stop(now, work == 0);
+                s.stop(now, work == 0, false);
                 if let Some(change) = s.event_change() {
                     heap = change;
                 }
@@ -461,7 +521,7 @@ mod tests {
                 // The budget ends exactly: the timer of the kernel. A chunk
                 // that is available already goes on in the same tick.
                 if now >= s.exhaust_at() {
-                    s.stop(now, false);
+                    s.stop(now, false, false);
                     if let Some(change) = s.event_change() {
                         heap = change;
                     }
@@ -570,7 +630,7 @@ mod tests {
         s.unblock(0);
         s.run(0);
         assert_eq!(s.exhaust_at(), 30);
-        s.stop(30, false);
+        s.stop(30, false, false);
         assert!(s.background());
         assert_eq!(
             s.queue(),
@@ -591,7 +651,7 @@ mod tests {
         let mut s = Server::new(30, 100, 1, 0);
         s.unblock(10);
         s.run(10);
-        s.stop(20, true);
+        s.stop(20, true, false);
         assert!(!s.background());
         // 10 ticks used from the activation at 10 return at 110; the rest
         // of the chunk, 20 ticks, is available from 20 on.
@@ -621,7 +681,7 @@ mod tests {
             s.unblock(now);
             s.run(now);
             now += 5;
-            s.stop(now, true);
+            s.stop(now, true, false);
             assert!(s.queue().len() <= MAX_REPLENISHMENTS, "round {i}");
             assert_eq!(s.sum(), c);
             now += 5;
@@ -641,7 +701,7 @@ mod tests {
         s.run(0);
         // The thread ran on for 7 ticks past its budget before the kernel
         // looked (a poll of the way out of the kernel).
-        s.stop(37, false);
+        s.stop(37, false, false);
         assert!(s.background());
         // The chunk comes back at 100, and the overrun moves it by 7.
         assert_eq!(
@@ -684,7 +744,7 @@ mod tests {
             let len = s.capacity(now) + 3;
             now += len;
             total += len;
-            s.stop(now, false);
+            s.stop(now, false, false);
         }
         // Whole run: `now` ticks, in periods of 100; the work per period
         // averages the budget.
@@ -702,7 +762,7 @@ mod tests {
         let mut s = Server::new(10, 50, 1, 0);
         s.unblock(0);
         s.run(0);
-        s.stop(100, false);
+        s.stop(100, false, false);
         assert!(s.background());
         assert_eq!(
             s.queue(),
@@ -720,11 +780,11 @@ mod tests {
         let mut s = Server::new(30, 100, 1, 0);
         s.unblock(0);
         s.run(0);
-        s.stop(30, false);
+        s.stop(30, false, false);
         assert!(s.background());
         let before = (s.usage(), s.ran());
-        s.stop(80, false);
-        s.stop(90, true);
+        s.stop(80, false, false);
+        s.stop(90, true, false);
         assert_eq!((s.usage(), s.ran()), before);
     }
 
@@ -733,7 +793,7 @@ mod tests {
         let mut s = Server::new(30, 100, 1, 0);
         s.unblock(0);
         s.run(0);
-        s.stop(30, true);
+        s.stop(30, true, false);
         assert!(s.background());
         assert_eq!(s.event_change(), None, "a blocked thread has no event yet");
         s.unblock(50);
@@ -748,7 +808,7 @@ mod tests {
         let mut s = Server::new(40, 100, 1, 0);
         s.unblock(0);
         s.run(0);
-        s.stop(10, true);
+        s.stop(10, true, false);
         // 10 used: (10, 30) and (100, 10); the thread wakes at 95 and the
         // second chunk arrives within the 30 it can run.
         s.unblock(95);

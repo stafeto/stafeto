@@ -41,12 +41,19 @@ pub struct Numbers {
     /// The same windows on CPU 1, when the machine has one.
     pub cpu1: Vec<(u64, u64, u64, u64, u64)>,
     pub cpu1_gap_us: u64,
+    /// The requests a client with a budget made of a service whose budget
+    /// was gone, and the times its budget ran out, with the service on its
+    /// own CPU and on another ((0, 0) when the phase did not run).
+    pub loan_same: (u64, u64),
+    pub loan_other: (u64, u64),
 }
 
 /// The budget of the hog, 300 us for each 1 ms, and the longest stretch the
 /// kernel runs with interrupts masked (B), in microseconds under -icount: the
 /// 8 865 instructions measured (kernel-test icount) of 16 ns each, with a
 /// little room.
+/// The most requests of the loan phase its budget pays for.
+const LOAN_MOST: u64 = 32;
 const HOG_US: u64 = 300;
 const B_US: u64 = 150;
 
@@ -90,12 +97,20 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
         } else if line.starts_with("budget boost ") {
             n.boost_n = number(line, "n=")?;
             n.boost_max_us = number(line, "max_round_trip_us=")?;
+        } else if line.starts_with("budget loan same ") {
+            n.loan_same = (number(line, "requests=")?, number(line, "overruns=")?);
+        } else if line.starts_with("budget loan other ") {
+            n.loan_other = (number(line, "requests=")?, number(line, "overruns=")?);
         } else if line.starts_with("budget slot ") {
             n.slot_share = number(line, "min_share=")?;
             n.slot_gap_us = number(line, "max_gap_us=")?;
         }
     }
-    if n.windows.len() != 3 || n.boost_n == 0 || n.slot_share == 0 && n.slot_gap_us == 0 {
+    if n.windows.len() != 3
+        || n.boost_n == 0
+        || n.loan_same.0 == 0
+        || n.slot_share == 0 && n.slot_gap_us == 0
+    {
         return Err(format!("the probe's lines are incomplete: {n:?}"));
     }
     Ok(n)
@@ -149,6 +164,29 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
         return Err(format!(
             "a request took {} us: the boost of its client did not stay with the budget gone",
             n.boost_max_us
+        ));
+    }
+    // The loan: the 500 us of each request of a service whose budget is
+    // gone are time of the client, whose budget of 600 us for each 2 ms then
+    // runs out, and it makes at most 32 requests in the 50 ms of the phase
+    // (a client that is not charged makes about 90 with the service on
+    // another CPU).
+    let mut loans = vec![("on its CPU", n.loan_same)];
+    if cpus >= 2 {
+        loans.push(("on another", n.loan_other));
+    }
+    let mut lost = Vec::new();
+    for (what, (requests, overruns)) in loans {
+        if overruns == 0 || !(1..=LOAN_MOST).contains(&requests) {
+            lost.push(format!(
+                "a client made {requests} requests of a service {what} whose budget was gone and its budget ran out {overruns} times"
+            ));
+        }
+    }
+    if !lost.is_empty() {
+        return Err(format!(
+            "{}: its work was not lent to the client (1 to {LOAN_MOST} requests, at least one overrun)",
+            lost.join("; ")
         ));
     }
     // The worker at 55 for each notification gets its 200 us of each
@@ -220,8 +258,19 @@ pub fn breaks() -> Result<(), String> {
             Variant::BudgetKeepLevel,
             "a thread that keeps its level when its budget is gone",
         ),
+        (
+            Variant::BudgetForgiveLoan,
+            "a server whose work for a client is not lent to it",
+        ),
     ] {
-        match probe(variant, 1).and_then(|n| verdict(&n, 1)) {
+        // On four CPUs, so that the loan phase with the service on another
+        // CPU runs on the break too.
+        let cpus = if variant == Variant::BudgetForgiveLoan {
+            4
+        } else {
+            1
+        };
+        match probe(variant, cpus).and_then(|n| verdict(&n, cpus)) {
             Err(e) => println!("budget-breaks: {what} is caught ({e})"),
             Ok(()) => return Err(format!("the break ({what}) passed the probe")),
         }
@@ -260,6 +309,7 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-forgive-overrun",
         "break-budget-skip-boosted",
         "break-budget-handoff",
+        "break-budget-forgive-loan",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -293,6 +343,8 @@ mod tests {
             ),
             "budget gaps victim_us=500 hog_us=100".into(),
             format!("budget boost n=40 max_round_trip_us={boost}"),
+            "budget loan same requests=2 overruns=1".into(),
+            "budget loan other requests=9 overruns=8".into(),
             format!("budget slot min_share={} max_gap_us={}", slot.0, slot.1),
             "budget DONE".into(),
         ]
