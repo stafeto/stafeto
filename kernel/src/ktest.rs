@@ -710,6 +710,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::msi_create_checks_in_order,
     ),
     (
+        "budget_create_checks_in_order",
+        calls::budget_create_checks_in_order,
+    ),
+    (
+        "thread_bind_budget_checks_and_binds",
+        calls::thread_bind_budget_checks_and_binds,
+    ),
+    (
+        "a_thread_with_no_budget_works_at_the_free_level",
+        calls::a_thread_with_no_budget_works_at_the_free_level,
+    ),
+    (
         "irq_bind_event_checks_and_reports",
         calls::irq_bind_event_checks_and_reports,
     ),
@@ -766,7 +778,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// of the long calls of memory objects, the timers of programs, device
 /// windows, the calls of upcalls and process_kill with a level, whose
 /// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 8 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 9 } else { 0 };
 
 /// The tests of a build come in two images, which keep each under the size
 /// a test image may have: the first runs TESTS and, with `icount`, the
@@ -810,6 +822,10 @@ pub fn run(boot: &Boot) -> ! {
         report(
             "timer_firing_is_measured",
             calls::timer_firing_is_measured(boot),
+        );
+        report(
+            "budget_firing_is_measured",
+            calls::budget_firing_is_measured(boot),
         );
         report(
             "device_windows_are_measured",

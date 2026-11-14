@@ -59,6 +59,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "budget-hog"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
+]
+
+[[package]]
 name = "busybox-probe"
 version = "0.1.0"
 dependencies = [

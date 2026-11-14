@@ -2,4 +2,4 @@
 # The kernel has no size limit. `cargo xtask build` and the host test
 # `kernel_size_record` print the difference from these numbers, and flag
 # a growth of more than 4 KiB. Update the line when the size changes on purpose.
-stafeto 192517
+stafeto 204805

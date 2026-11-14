@@ -65,9 +65,13 @@ impl Rights {
     pub const DEVICE: Rights = Rights(1 << 9);
     pub const DEBUG: Rights = Rights(1 << 10);
     pub const KSTATS: Rights = Rights(1 << 11);
+    /// On the system resource: the right to make time budgets (spec 8,
+    /// `budget_create`). On a budget: the right to bind it to a thread.
+    /// Only init's handle to the system resource has it at boot.
+    pub const BUDGET: Rights = Rights(1 << 12);
     /// Every right there is: `handle_duplicate` fails any other bit with
     /// INVALID_ARGS.
-    pub const ALL: Rights = Rights((1 << 12) - 1);
+    pub const ALL: Rights = Rights((1 << 13) - 1);
 
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
@@ -134,9 +138,20 @@ pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
     Rights::DEVICE.0
         | Rights::DEBUG.0
         | Rights::KSTATS.0
+        | Rights::BUDGET.0
         | Rights::DUPLICATE.0
         | Rights::TRANSFER.0,
 );
+
+/// Rights of the handle that `budget_create` returns (spec 8): to bind the
+/// budget to a thread, and to pass it on.
+pub const BUDGET_RIGHTS: Rights =
+    Rights(Rights::BUDGET.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
+/// The least budget and the least period `budget_create` accepts, in
+/// nanoseconds (spec 8).
+pub const MIN_BUDGET_NS: u64 = 10_000;
+pub const MIN_PERIOD_NS: u64 = 100_000;
 
 /// Init's first handles (spec 13.3): the kernel puts them in the first
 /// entries of init's table, so each has generation 1.
@@ -333,11 +348,24 @@ pub enum Call {
     /// MSI device of the function; x1 returns a handle to it with
     /// OWNER_RIGHTS (spec 9, 11).
     MsiCreate = 37,
+    /// x0 system resource with BUDGET, x1 CPU, x2 budget in ns, x3 period
+    /// in ns, x4 the level `low` the thread falls to when its budget is
+    /// gone: makes a time budget (spec 8); x1 returns a handle to it with
+    /// `BUDGET_RIGHTS`. INVALID_ARGS for a CPU that is not up, a budget
+    /// below `MIN_BUDGET_NS` or above the period, a period below
+    /// `MIN_PERIOD_NS`, or a level outside 1-63.
+    BudgetCreate = 38,
+    /// x0 thread with MANAGE, x1 budget with BUDGET: the thread works under
+    /// the budget from now on (spec 8). INVALID_ARGS for a thread of
+    /// another CPU than the budget's, BAD_STATE for a thread that has a
+    /// budget or ended, a budget that a thread has, or a thread of another
+    /// CPU that has started.
+    ThreadBindBudget = 39,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 35] = [
+    pub const ALL: [Call; 37] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -373,6 +401,8 @@ impl Call {
         Call::ThreadUpcallReturn,
         Call::ProcessControl,
         Call::MsiCreate,
+        Call::BudgetCreate,
+        Call::ThreadBindBudget,
     ];
 
     pub const fn number(self) -> u16 {
@@ -385,17 +415,17 @@ impl Call {
         match number {
             1..=28 => Some(Self::ALL[number as usize - 1]),
             30..=34 => Some(Self::ALL[number as usize - 2]),
-            36..=37 => Some(Self::ALL[number as usize - 3]),
+            36..=39 => Some(Self::ALL[number as usize - 3]),
             _ => None,
         }
     }
 
     /// The highest number of a call.
-    pub const HIGHEST: u16 = Call::MsiCreate.number();
+    pub const HIGHEST: u16 = Call::ThreadBindBudget.number();
 }
 
 /// Numbers of calls that went, never given again (spec 11): 29,
-/// console_poll, and 35, request_identity. The next new call takes 38.
+/// console_poll, and 35, request_identity. The next new call takes 40.
 pub const RETIRED_CALLS: [u16; 2] = [29, 35];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
@@ -487,6 +517,8 @@ pub enum ObjectKind {
     DeviceWindow,
     /// The MSI device of a PCI function (spec 9).
     MsiDevice,
+    /// A time budget (spec 8).
+    Budget,
     /// A kind this abi does not know, which a later kernel may give: its
     /// code.
     Unknown(u8),
@@ -505,6 +537,7 @@ impl ObjectKind {
             ObjectKind::Interrupt => 7,
             ObjectKind::DeviceWindow => 8,
             ObjectKind::MsiDevice => 9,
+            ObjectKind::Budget => 10,
             ObjectKind::Unknown(code) => code,
         }
     }
@@ -522,6 +555,7 @@ impl ObjectKind {
             7 => ObjectKind::Interrupt,
             8 => ObjectKind::DeviceWindow,
             9 => ObjectKind::MsiDevice,
+            10 => ObjectKind::Budget,
             _ => ObjectKind::Unknown(code),
         }
     }
@@ -858,6 +892,9 @@ pub const INFO_MSI_DEVICE: u64 = 17;
 /// them). A first record older than the ring holds starts at the oldest one.
 /// INVALID_ARGS for a CPU that is not up or whose ring has no memory.
 pub const INFO_STAMPS: u64 = 18;
+/// BUDGET takes a budget's handle, with no right needed, and returns
+/// `BudgetInfo::to_words` in x1-x8.
+pub const INFO_BUDGET: u64 = 19;
 /// object_info STAMPS x2: the CPU number goes in the bits from this one up.
 pub const STAMPS_CPU_SHIFT: u32 = 48;
 /// object_info STAMPS x2: with this bit set, every ring stops taking records
@@ -1164,6 +1201,59 @@ impl MsiInfo {
             device_id: words[0],
             events: words[1],
             bound: words[2],
+        }
+    }
+}
+
+/// A time budget (spec 8, 11), in counter ticks: the budget for each period,
+/// the period, the level its thread falls to, the ticks it has left now, the
+/// state (`BUDGET_FREE` for a budget no thread has, `BUDGET_FULL` for a
+/// thread that works at its own level, `BUDGET_GONE` for one that works at
+/// `low`), the sum of the ticks charged, the times the budget ran out and the
+/// replenishments pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetInfo {
+    pub budget: u64,
+    pub period: u64,
+    pub low: u64,
+    pub left: u64,
+    pub state: u64,
+    pub ran: u64,
+    pub overruns: u64,
+    pub pending: u64,
+}
+
+/// `BudgetInfo::state`: no thread has the budget.
+pub const BUDGET_FREE: u64 = 0;
+/// `BudgetInfo::state`: its thread works at its own level.
+pub const BUDGET_FULL: u64 = 1;
+/// `BudgetInfo::state`: its thread works at `low` until a replenishment.
+pub const BUDGET_GONE: u64 = 2;
+
+impl BudgetInfo {
+    pub const fn to_words(self) -> [u64; 8] {
+        [
+            self.budget,
+            self.period,
+            self.low,
+            self.left,
+            self.state,
+            self.ran,
+            self.overruns,
+            self.pending,
+        ]
+    }
+
+    pub const fn from_words(words: [u64; 8]) -> BudgetInfo {
+        BudgetInfo {
+            budget: words[0],
+            period: words[1],
+            low: words[2],
+            left: words[3],
+            state: words[4],
+            ran: words[5],
+            overruns: words[6],
+            pending: words[7],
         }
     }
 }
@@ -1659,7 +1749,7 @@ mod tests {
         assert_eq!((INFO_PROCESS_TIME, POLICY_TAIL), (14, 256));
         assert_eq!(INFO_LABEL, 11);
         assert_eq!(Call::ObjectInfo.number(), 27);
-        assert_eq!(Call::ALL.len(), 35);
+        assert_eq!(Call::ALL.len(), 37);
     }
 
     #[test]
@@ -1715,15 +1805,16 @@ mod tests {
             Rights::DEVICE,
             Rights::DEBUG,
             Rights::KSTATS,
+            Rights::BUDGET,
         ];
         let union = all.iter().fold(Rights::NONE, |a, b| a | *b);
-        assert_eq!(union.0.count_ones(), 12);
+        assert_eq!(union.0.count_ones(), 13);
         assert_eq!(union, Rights::ALL);
     }
 
     #[test]
     fn call_numbers_are_dense_from_one_but_the_retired() {
-        assert_eq!(Call::ALL.len(), 35);
+        assert_eq!(Call::ALL.len(), 37);
         let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
         for (call, n) in Call::ALL.iter().zip(numbers) {
             assert_eq!(call.number(), n);
@@ -1734,14 +1825,14 @@ mod tests {
             0,
             29,
             35,
-            38,
+            40,
             0xFEFF,
             *TEST_CALLS.start(),
             *TEST_CALLS.end(),
         ] {
             assert_eq!(Call::from_number(n), None);
         }
-        assert_eq!(KERNEL_CALL_SLOTS, 38);
+        assert_eq!(KERNEL_CALL_SLOTS, 40);
     }
 
     #[test]
@@ -1758,6 +1849,8 @@ mod tests {
         assert_eq!(Call::ThreadUpcallBind.number(), 31);
         assert_eq!(Call::ThreadUpcallControl.number(), 32);
         assert_eq!(Call::ThreadUpcallRequest.number(), 33);
+        assert_eq!(Call::BudgetCreate.number(), 38);
+        assert_eq!(Call::ThreadBindBudget.number(), 39);
         assert_eq!(Call::ThreadUpcallReturn.number(), 34);
         assert_eq!(RESULT_VALUES, 9);
         assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);
@@ -1801,7 +1894,12 @@ mod tests {
     fn handles_from_the_kernel_carry_fixed_rights() {
         assert_eq!(
             INIT_RESOURCE_RIGHTS,
-            Rights::DEVICE | Rights::DEBUG | Rights::KSTATS | Rights::DUPLICATE | Rights::TRANSFER
+            Rights::DEVICE
+                | Rights::DEBUG
+                | Rights::KSTATS
+                | Rights::BUDGET
+                | Rights::DUPLICATE
+                | Rights::TRANSFER
         );
         assert_eq!(
             OWNER_RIGHTS,
@@ -1873,7 +1971,7 @@ mod tests {
             parse_info(word),
             (ObjectKind::Channel, Rights::SEND | Rights::TRANSFER)
         );
-        for code in 1..=9 {
+        for code in 1..=10 {
             let kind = ObjectKind::from_code(code);
             assert_ne!(kind, ObjectKind::Unknown(code));
             assert_eq!(kind.code(), code);
@@ -1881,8 +1979,30 @@ mod tests {
         }
         assert_eq!(ObjectKind::from_code(0), ObjectKind::Unknown(0));
         assert_eq!(
-            parse_info(10 << 32 | 0b100),
-            (ObjectKind::Unknown(10), Rights::SEND)
+            parse_info(11 << 32 | 0b100),
+            (ObjectKind::Unknown(11), Rights::SEND)
+        );
+    }
+
+    #[test]
+    fn budgets_travel_in_eight_words() {
+        let info = BudgetInfo {
+            budget: 1,
+            period: 2,
+            low: 3,
+            left: 4,
+            state: BUDGET_GONE,
+            ran: 6,
+            overruns: 7,
+            pending: 8,
+        };
+        assert_eq!(info.to_words(), [1, 2, 3, 4, 2, 6, 7, 8]);
+        assert_eq!(BudgetInfo::from_words(info.to_words()), info);
+        assert_eq!((INFO_BUDGET, BUDGET_FREE, BUDGET_FULL), (19, 0, 1));
+        const { assert!(RESULT_VALUES >= 8) };
+        assert_eq!(
+            BUDGET_RIGHTS,
+            Rights::BUDGET | Rights::DUPLICATE | Rights::TRANSFER
         );
     }
 

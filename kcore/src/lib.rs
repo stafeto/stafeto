@@ -17,6 +17,7 @@ pub mod args;
 pub mod asid;
 pub mod backtrace;
 pub mod bootinfo;
+pub mod budget;
 pub mod console;
 pub mod esr;
 pub mod fdt;

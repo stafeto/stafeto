@@ -13,7 +13,7 @@ on three kinds of machine:
   with the Virtio PCI console driven by a user-space service
   (`cargo xtask vz`).
 
-**Kernel.** 35 system calls, the same on every machine, over 64-bit handles
+**Kernel.** 37 system calls, the same on every machine, over 64-bit handles
 with rights: processes, threads, channels, sessions, timers, memory
 objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
 four handles; a service runs at its client's priority under its own
@@ -24,7 +24,7 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 192,517 bytes on QEMU and on Apple VZ, as measured; it has no size
+image is 204,805 bytes on QEMU and on Apple VZ, as measured; it has no size
 limit. `cargo xtask build` prints the size and its difference from the record
 in `kernel/size.txt`, and flags a growth of more than 4 KiB.
 The longest stretch the kernel runs without taking an interrupt (term B of the

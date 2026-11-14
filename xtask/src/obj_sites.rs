@@ -23,9 +23,10 @@ pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/arch/aarch64/exceptions.rs", 1),
     ("kernel/src/channel/mod.rs", 1),
     // The portions of a binding and of an MSI device take it after their
-    // ITS commands (decision K3, section 5): one take a portion, whichever
-    // kind it serves (`wcet bound`: portion of cleanup k = 1).
-    ("kernel/src/cleanup.rs", 5),
+    // ITS commands (decision K3, section 5), and that of a time budget takes
+    // it once like the others: one take a portion, whichever kind it serves
+    // (`wcet bound`: portion of cleanup k = 1).
+    ("kernel/src/cleanup.rs", 6),
     ("kernel/src/cmd.rs", 1),
     ("kernel/src/init.rs", 3),
     // The delivery of a line and that of an LPI, one take an interrupt

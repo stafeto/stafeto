@@ -18,8 +18,8 @@
 //! of the program and panics (spec 5.4); `raw` returns it as it is.
 
 use crate::handle::{
-    Channel, Handle, Incoming, Interrupt, Memory, MsiDevice, Outgoing, Process, Resource, Thread,
-    Timer,
+    Budget, Channel, Handle, Incoming, Interrupt, Memory, MsiDevice, Outgoing, Process, Resource,
+    Thread, Timer,
 };
 use crate::msgbuf;
 use abi::{
@@ -819,6 +819,44 @@ pub fn msi_info(device: &Handle<MsiDevice>) -> Result<abi::MsiInfo, Error> {
     let args = [device.raw().0, abi::INFO_MSI_DEVICE, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(abi::MsiInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(BUDGET): the budget, the period and the state of a time
+/// budget, in counter ticks.
+pub fn budget_info(budget: &Handle<Budget>) -> Result<abi::BudgetInfo, Error> {
+    let args = [budget.raw().0, abi::INFO_BUDGET, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(abi::BudgetInfo::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+    ]))
+}
+
+/// budget_create through the system resource with BUDGET (init's alone):
+/// a time budget of `budget_ns` for each `period_ns` for the threads of CPU
+/// `cpu`, whose thread works at `low` once the budget is gone (spec 8). The
+/// handle carries abi::BUDGET_RIGHTS.
+pub fn budget_create(
+    resource: &Handle<Resource>,
+    cpu: u32,
+    budget_ns: u64,
+    period_ns: u64,
+    low: u8,
+) -> Result<Handle<Budget>, Error> {
+    let args = [
+        resource.raw().0,
+        cpu.into(),
+        budget_ns,
+        period_ns,
+        low.into(),
+    ];
+    let x = call::<{ Call::BudgetCreate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// thread_bind_budget: `thread` (MANAGE) works under `budget` from now on.
+pub fn thread_bind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
+    let args = [thread.raw().0, budget.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
 }
 
 /// msi_create through the system resource with DEVICE: the MSI device of

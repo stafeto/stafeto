@@ -1,0 +1,17 @@
+[package]
+name = "budget-hog"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Probe of the time budgets of threads: a hog at a high level must leave a lower level its share"
+
+[[bin]]
+name = "budget-hog"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+rt = { path = "../../lib/rt" }

@@ -1539,7 +1539,8 @@ fn process_create_checks_its_arguments() -> Outcome {
         [page, 1 << 32 | 16, 20],
         [page, 16, 0],
         [page, 16, 64],
-        [page, 16, 0x100 | 20],
+        [page, 16, 1 << 16 | 20],
+        [page, 16, 21 << 8 | 20],
     ]
     .into_iter()
     .all(|[quota, limit, ceiling]| {

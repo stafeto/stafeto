@@ -26,6 +26,36 @@ pub fn priority_arg(raw: u64) -> Result<u8, Error> {
     }
 }
 
+/// The level `free` of `process_create` (spec 8) from its register and the
+/// ceiling of the child: 0 is the ceiling itself, and any other value is a
+/// priority, 1-63, that the ceiling does not lie under. INVALID_ARGS
+/// otherwise.
+pub fn free_arg(raw: u64, ceiling: u8) -> Result<u8, Error> {
+    if raw == 0 {
+        return Ok(ceiling);
+    }
+    match priority_arg(raw) {
+        Ok(free) if free <= ceiling => Ok(free),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// The level `free` of a child (spec 8) from its register, the child's
+/// ceiling and the `free` of its creator: a child works with no budget at
+/// the creator's level at most, so 0 is the ceiling or the creator's `free`,
+/// whichever is lower, and a level above the creator's is ACCESS_DENIED, as a
+/// ceiling above the creator's is. Otherwise as `free_arg`.
+pub fn child_free(raw: u64, ceiling: u8, creator_free: u8) -> Result<u8, Error> {
+    let free = free_arg(raw, ceiling)?;
+    if cfg!(feature = "break-budget-child-free") {
+        return Ok(free);
+    }
+    if raw == 0 {
+        return Ok(free.min(creator_free));
+    }
+    under_ceilings(free, &[creator_free]).map(|()| free)
+}
+
 /// The line of `irq_bind` from a register (spec 9): a shared line, INTID
 /// 32 up to `lines`, the lines of the GIC (kcore::gic::lines, at most
 /// 1020), less one; the line of the console's port among them, which its
@@ -402,6 +432,27 @@ mod tests {
     }
 
     #[test]
+    fn a_child_has_no_more_free_level_than_its_creator() {
+        assert_eq!(child_free(0, 50, 10), Ok(10));
+        assert_eq!(child_free(0, 5, 10), Ok(5));
+        assert_eq!(child_free(10, 50, 10), Ok(10));
+        assert_eq!(child_free(3, 50, 10), Ok(3));
+        assert_eq!(child_free(11, 50, 10), Err(Error::AccessDenied));
+        assert_eq!(child_free(50, 50, 10), Err(Error::AccessDenied));
+        assert_eq!(child_free(51, 50, 63), Err(Error::InvalidArgs));
+    }
+
+    #[test]
+    fn the_free_level_is_the_ceiling_or_a_priority_below_it() {
+        assert_eq!(free_arg(0, 40), Ok(40));
+        assert_eq!(free_arg(40, 40), Ok(40));
+        assert_eq!(free_arg(1, 40), Ok(1));
+        for raw in [41, 63, 64, 1 << 8 | 10, u64::MAX] {
+            assert_eq!(free_arg(raw, 40), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    #[test]
     fn priority_arguments() {
         assert_eq!(priority_arg(1), Ok(1));
         assert_eq!(priority_arg(63), Ok(63));
@@ -471,7 +522,7 @@ mod tests {
         assert_eq!(rights_arg(0), Ok(Rights::NONE));
         assert_eq!(rights_arg(Rights::ALL.0.into()), Ok(Rights::ALL));
         assert_eq!(rights_arg(0b1001), Ok(Rights::DUPLICATE | Rights::NOTIFY));
-        for raw in [1 << 12, 1 << 31, 1 << 32, u64::MAX] {
+        for raw in [1 << 13, 1 << 31, 1 << 32, u64::MAX] {
             assert_eq!(rights_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
     }

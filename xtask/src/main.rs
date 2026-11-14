@@ -45,6 +45,7 @@ mod aws;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
+mod budget_hog;
 mod carry;
 mod ci;
 mod clock_probe;
@@ -192,6 +193,8 @@ const VZ_PROGRAMS: [ImageProgram; 3] = [
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
+/// The probe of the time budgets (budget_hog.rs), as init.
+const BUDGET_HOG_PROGRAMS: [ImageProgram; 1] = [("init", "budget-hog", INIT_STACK_SIZE, &[])];
 /// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
@@ -1203,11 +1206,12 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// image of the kernel tests (`Variant::el0_half`) must have run.
 const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
 const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
-const ICOUNT_TESTS: [&str; 18] = [
+const ICOUNT_TESTS: [&str; 19] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
     "timer_firing_is_measured",
+    "budget_firing_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "fast_path_arms_the_timer",
@@ -1610,10 +1614,23 @@ enum Variant {
     /// lines (kernel feature `break-console-strip`, `cargo xtask
     /// console-strip-break`): the init tests must fail on the wire.
     ConsoleNoStrip,
+    /// The normal kernel with one deliberate break of the time budgets each
+    /// (kernel features `break-budget-*`, `cargo xtask budget-breaks`): a bind
+    /// that binds nothing, a boost of a notification slot that survives the
+    /// exhaustion, a thread that keeps its level when its budget is gone and
+    /// a replenishment that never applies, which the probe
+    /// `budget-hog` must catch, and with the kernel tests a thread with no
+    /// budget that ignores the level of its process, which they must catch.
+    BudgetOff,
+    BudgetSlotKeeps,
+    BudgetRefill,
+    BudgetKeepLevel,
+    BudgetNoFree,
+    BudgetChildFree,
 }
 
 impl Variant {
-    const ALL: [Variant; 50] = [
+    const ALL: [Variant; 56] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1664,6 +1681,12 @@ impl Variant {
         Variant::ItsIntAlign4k,
         Variant::SeedNoWipe,
         Variant::ConsoleNoStrip,
+        Variant::BudgetOff,
+        Variant::BudgetSlotKeeps,
+        Variant::BudgetRefill,
+        Variant::BudgetKeepLevel,
+        Variant::BudgetNoFree,
+        Variant::BudgetChildFree,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1722,6 +1745,12 @@ impl Variant {
             Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
             Variant::SeedNoWipe => Some("ktest,break-seed-wipe"),
             Variant::ConsoleNoStrip => Some("break-console-strip"),
+            Variant::BudgetOff => Some("break-budget-off"),
+            Variant::BudgetSlotKeeps => Some("break-budget-slot-keeps"),
+            Variant::BudgetRefill => Some("break-budget-refill"),
+            Variant::BudgetKeepLevel => Some("break-budget-keep-level"),
+            Variant::BudgetNoFree => Some("ktest,break-budget-no-free"),
+            Variant::BudgetChildFree => Some("ktest,break-budget-child-free"),
         }
     }
 
@@ -1796,6 +1825,12 @@ impl Variant {
             Variant::ItsIntAlign4k => "stafeto-its-int-align4k",
             Variant::SeedNoWipe => "stafeto-ktest-seed-no-wipe",
             Variant::ConsoleNoStrip => "stafeto-console-no-strip",
+            Variant::BudgetOff => "stafeto-budget-off",
+            Variant::BudgetSlotKeeps => "stafeto-budget-slot-keeps",
+            Variant::BudgetRefill => "stafeto-budget-refill",
+            Variant::BudgetKeepLevel => "stafeto-budget-keep-level",
+            Variant::BudgetNoFree => "stafeto-budget-no-free",
+            Variant::BudgetChildFree => "stafeto-budget-child-free",
         }
     }
 }
@@ -2160,6 +2195,10 @@ commands:
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
   its-int   boot the self-test of the ITS in QEMU on four CPUs: an event mapped to each CPU's collection, raised by INT, received there; with the break (every event on CPU 0) the run must report the failure
   its-slow  the kernel tests under -icount with an ITS that seems slow: every bound holds (B_4 under 32 000), and with the teardown that waits in one portion a test fails
+  budget-hog [--cpus N] the probe of the time budgets under -icount on one CPU and on four (a hog at a high
+            level with a budget leaves a lower level its share; the boost of a request stays and a
+            notification's goes with the budget)
+  budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
@@ -2227,6 +2266,8 @@ fn main() {
         Some("vz") => vz::run(),
         Some("smp-vz") => vz::smp_boot(),
         Some("smp-asid-vz") => vz::smp_asid(),
+        Some("budget-hog") => budget_hog::run(&args[1..]),
+        Some("budget-breaks") => budget_hog::breaks(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
@@ -6721,6 +6762,14 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// (`give_number`: the process, the payer, one subtraction), 8 instructions
 /// a thread for the 12 of the portion; 3 111 measured, 96 over the 3 015
 /// before. The path of a thread that is ready stays one take of `OBJ`.
+/// `THREADS_READY_MAX` 3 115 -> 3 200 (time budgets, stages 1 and 2; review: 3 250 -> 3 200): the end
+/// of a thread looks at its budget (`sched::exit` reads where the budget is,
+/// the scheduler lets it go, `budget::unbound` drops the binding's reference
+/// when there is one) and the scheduler's `exit` leaves the budget's event
+/// and rules with the thread; 3 176 measured, 132 over the 3 044 before, 11
+/// instructions a thread for the 12 of the portion. The path of a thread
+/// that is ready stays one take of `OBJ`. The reviewer of the kernel decides
+/// whether it stays.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -6768,7 +6817,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_115;
+const THREADS_READY_MAX: u64 = 3_200;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -11537,7 +11586,7 @@ const PORTION_LINES: [&str; 7] = [
 /// (kernel/src/obj.rs): a call by its number below 40, then the entries
 /// and the cleanup of each kind of object.
 fn obj_kind_name(kind: usize) -> String {
-    const ENTRIES: [&str; 16] = [
+    const ENTRIES: [&str; 18] = [
         "interrupt",
         "cleanup",
         "fault",
@@ -11554,6 +11603,8 @@ fn obj_kind_name(kind: usize) -> String {
         "teardown stage",
         "reclaim",
         "drain",
+        "clean msi",
+        "clean budget",
     ];
     match kind {
         0..40 => abi::Call::from_number(kind as u16)

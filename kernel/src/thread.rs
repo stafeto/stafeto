@@ -236,6 +236,11 @@ unsafe impl Schedulable for Thread {
         // SAFETY: `this` points at a live thread.
         unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).sched) }
     }
+
+    unsafe fn budget_event(this: NonNull<Thread>, at: Option<u64>) {
+        // SAFETY: the caller's promise.
+        unsafe { crate::budget::arm(this, at) };
+    }
 }
 
 /// Threads whose slots have not gone back.
@@ -365,6 +370,8 @@ pub fn create_with_exit(
     kcore::args::check_start(entry as u64, stack as u64, priority)?;
     // SAFETY: the caller holds a reference to the process.
     let ceiling = unsafe { process.as_ref() }.ceiling();
+    // SAFETY: as above.
+    let free = unsafe { process.as_ref() }.free();
     assert!(
         priority <= ceiling,
         "a thread above the ceiling of its process; the call checks it first"
@@ -381,14 +388,18 @@ pub fn create_with_exit(
     if let Some((c, _, _)) = exit {
         channel::reserve_source(c).inspect_err(|_| process::refund_thread(process))?;
     }
+    // A thread with no budget works at `free` of its process at most.
+    let mut node = Node::new(priority, policy);
+    node.set_cap(free);
+    let level = node.priority();
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
         upcall: kcore::upcall::State::new(),
-        sched: Node::new(priority, policy),
+        sched: node,
         waits: None,
         // The owner is the thread's own place, known once it has one.
-        slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
+        slot: Slot::new(level, Owner::Thread(NonNull::dangling())),
         transit: [None; MESSAGE_HANDLES],
         long: None,
         numbers: Numbers {
@@ -418,7 +429,7 @@ pub fn create_with_exit(
     // SAFETY: the thread was just made, nothing else refers to it, and its
     // slot is in no queue.
     unsafe {
-        (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
+        (*thread.as_ptr()).slot = Slot::new(level, Owner::Thread(thread));
         (*thread.as_ptr()).numbers.index = index;
         if let (Some(source), Some((_, label, notice))) = ((*thread.as_ptr()).exit.as_mut(), exit) {
             source.attach(Owner::ThreadEnd(thread), notice, label);
@@ -1109,7 +1120,8 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
 }
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes with
-/// the handles of a request it made, released at `level`, its number goes
+/// the handles of a request it made, released at `level`, the budget it took
+/// before it started goes, its number goes
 /// back to the system table with its count if it never started (spec 6.1),
 /// it leaves its process's list if it is still there, its slot
 /// goes back to its process's pool, and then its reference to its process,
@@ -1128,6 +1140,12 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
     // process's list before its slot goes.
     unsafe {
         drop_buffer(thread, level);
+        // A thread that never started and had a budget bound keeps it until
+        // now: the scheduler never let it go (`sched::exit` drops the budget
+        // of the others).
+        if let Some(server) = (*thread.as_ptr()).sched.server() {
+            crate::budget::unbound(server, level);
+        }
         sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
         // Its slot is in no queue: a queued slot holds the thread.

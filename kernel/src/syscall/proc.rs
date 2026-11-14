@@ -15,13 +15,14 @@ use crate::{arch, channel, cleanup, sched, session};
 use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::args::{
-    check_buffer, check_start, cpu_mask_arg, handle_limit_arg, notify_priority_arg, policy_arg,
-    policy_tail_arg, priority_arg, quota_arg, shares_arg, under_ceilings,
+    check_buffer, check_start, child_free, cpu_mask_arg, free_arg, handle_limit_arg,
+    notify_priority_arg, policy_arg, policy_tail_arg, priority_arg, quota_arg, shares_arg,
+    under_ceilings,
 };
 
-/// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
-/// x3 exit channel, x4 notification priority, x5 start channel, x6 thread
-/// numbers, x7 timer places, x8 CPU mask): a new
+/// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling and
+/// free level, x3 exit channel, x4 notification priority, x5 start channel,
+/// x6 thread numbers, x7 timer places, x8 CPU mask): a new
 /// process with an empty address space and handle table; x1 returns a
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
@@ -32,7 +33,11 @@ use kcore::args::{
 /// timer places, taken off that payer for the child's own shares (spec
 /// 7.5; INVALID_ARGS for one alone or a value above). x8, the CPUs of the
 /// child's threads, is 0 for the caller's own, or bits 0-7 (INVALID_ARGS
-/// above) that are a subset of the caller's (ACCESS_DENIED). x3, a channel handle
+/// above) that are a subset of the caller's (ACCESS_DENIED). x2 holds the
+/// ceiling in bits 0-7 and in bits 8-15 the level a thread of the child works
+/// at most while it has no time budget (spec 8): 0 for the child's ceiling,
+/// or a priority 1-63 no higher than it (INVALID_ARGS); either is cut to the
+/// creator's own `free`, and a level above that is ACCESS_DENIED. x3, a channel handle
 /// with NOTIFY, with a label or none, or 0, hears of the child's end once
 /// the child gave its quota back (spec 7.9): a notification of priority
 /// x4, 1-63 and no higher than the caller's ceiling, exactly 0 without x3,
@@ -118,7 +123,10 @@ pub(super) fn process_create_second(thread: NonNull<Thread>, child: NonNull<Proc
 fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
-    let ceiling = priority_arg(a[2])?;
+    // x2: the ceiling in bits 0-7 and the level `free` in bits 8-15 (0 for
+    // the ceiling); a bit above them is INVALID_ARGS.
+    let ceiling = priority_arg(a[2] & 0xff)?;
+    free_arg(a[2] >> 8, ceiling)?;
     let notify = notify_priority_arg(a[4], a[3] != 0)?;
     let shares = shares_arg(
         a[6],
@@ -145,6 +153,14 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
     };
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
+    // A child with no budget works at its creator's level at most, or the
+    // creator would raise it by making a child (spec 8).
+    // SAFETY: the calling thread holds its process.
+    let free = child_free(
+        a[2] >> 8,
+        ceiling,
+        unsafe { caller(thread).as_ref() }.free(),
+    )?;
     under_ceilings(notify, &[own])?;
     // The CPU mask is a ceiling too: the child runs on CPUs of its
     // creator's only (spec 8).
@@ -175,6 +191,7 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
                 return Err(e);
             }
         };
+    process::set_free(child, free);
     match start {
         Some((object, rights)) => process::move_start(child, object, rights),
         None => process::reserve_start(child),

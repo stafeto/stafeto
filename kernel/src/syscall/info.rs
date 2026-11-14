@@ -69,6 +69,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_CHANNEL => channel_info(thread, a),
         abi::INFO_IRQ => irq_info(thread, a),
         abi::INFO_MSI_DEVICE => msi_info(thread, a),
+        abi::INFO_BUDGET => budget_info(thread, a),
         abi::INFO_LABEL => label_info(thread, a),
         abi::INFO_LOG => log_info(thread, a),
         abi::INFO_CPU => cpu_info(thread, a),
@@ -191,6 +192,13 @@ fn irq_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;
     Ok(Values::new(&irq::info(b).to_words()))
+}
+
+/// BUDGET: x2 reserved; a time budget's words (abi::BudgetInfo).
+fn budget_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    reserved_arg(a[2])?;
+    let b = lookup(thread, a[0], Rights::NONE, Object::budget)?;
+    Ok(Values::new(&crate::budget::info(b).to_words()))
 }
 
 /// MSI_DEVICE: x2 reserved; the DeviceID, the events and the bound events.

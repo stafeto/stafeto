@@ -12,6 +12,7 @@
 //! the handle's rights. Every kind of object keeps its count in a `Refs`
 //! and its number in a `Live`.
 
+use crate::budget::{self, Budget};
 use crate::channel::{self, Channel};
 use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
@@ -47,6 +48,8 @@ pub enum Object {
     Irq(NonNull<Irq>),
     /// The MSI device of a PCI function (spec 9).
     Msi(NonNull<Msi>),
+    /// A time budget (spec 8).
+    Budget(NonNull<Budget>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -126,6 +129,14 @@ impl Object {
         }
     }
 
+    /// The time budget, for a lookup that needs one.
+    pub fn budget(&self) -> Option<NonNull<Budget>> {
+        match *self {
+            Object::Budget(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
@@ -144,6 +155,7 @@ impl Object {
             Object::Memory(_) => ObjectKind::Memory,
             Object::Irq(_) => ObjectKind::Interrupt,
             Object::Msi(_) => ObjectKind::MsiDevice,
+            Object::Budget(_) => ObjectKind::Budget,
             Object::Resource => ObjectKind::Resource,
         }
     }
@@ -306,6 +318,7 @@ pub fn retain(object: Object, rights: Rights) {
         Object::Memory(m) => memory::retain(m),
         Object::Irq(b) => irq::retain_handle(b),
         Object::Msi(m) => msi::retain(m),
+        Object::Budget(b) => budget::retain(b),
         Object::Resource => {}
     }
 }
@@ -331,6 +344,7 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Memory(m) => memory::release(m, cause),
             Object::Irq(b) => irq::release_handle(b, cause),
             Object::Msi(m) => msi::release(m, cause),
+            Object::Budget(b) => budget::release(b, cause),
             Object::Resource => {}
         }
     }

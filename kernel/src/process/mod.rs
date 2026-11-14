@@ -34,6 +34,7 @@
 //! (spec 4, 6.8); once it ended, its stage Replies wakes their clients with
 //! PEER_CLOSED.
 
+use crate::budget::Budget;
 use crate::channel::{Channel, Owner, Source};
 use crate::cleanup::{self, Item};
 use crate::irq::Irq;
@@ -165,6 +166,9 @@ pub struct Process {
     pools: Pools,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
+    /// A thread of the process with no budget works at this level at most
+    /// (spec 8): the ceiling unless its creator gave less (`set_free`).
+    free: u8,
     /// Counter ticks the threads that left its list have run (`fold_time`);
     /// the time of the threads still in the list is in their nodes, and
     /// `cpu_time` adds it all up. A change of thread writes the thread's
@@ -274,6 +278,8 @@ pub struct Pools {
     irqs: Pool<Irq>,
     /// The MSI devices it made (spec 9).
     msis: Pool<Msi>,
+    /// The time budgets it made (spec 8).
+    budgets: Pool<Budget>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -331,6 +337,12 @@ impl Process {
     /// The highest base priority a thread of the process may have.
     pub fn ceiling(&self) -> u8 {
         self.ceiling
+    }
+
+    /// The level at which a thread of the process with no budget works at
+    /// most (spec 8).
+    pub fn free(&self) -> u8 {
+        self.free
     }
 
     /// The thread `t` leaves the list with the ticks it ran: they stay in
@@ -418,8 +430,10 @@ fn create(
             memories: Pool::new(),
             irqs: Pool::new(),
             msis: Pool::new(),
+            budgets: Pool::new(),
         },
         ceiling,
+        free: ceiling,
         cpu_ticks: 0,
         user_ticks: 0,
         life: Life::new(),
@@ -522,6 +536,12 @@ impl Paid for Irq {
 impl Paid for Msi {
     fn pool(pools: &mut Pools) -> &mut Pool<Msi> {
         &mut pools.msis
+    }
+}
+
+impl Paid for Budget {
+    fn pool(pools: &mut Pools) -> &mut Pool<Budget> {
+        &mut pools.budgets
     }
 }
 
@@ -643,6 +663,20 @@ pub fn create_child_with(
     })?;
     adopt(parent, child);
     Ok(child)
+}
+
+/// Sets the level `free` of the child `p`, which no thread of it uses yet
+/// (process_create, spec 8): at most its ceiling.
+pub fn set_free(p: NonNull<Process>, free: u8) {
+    // SAFETY: the caller holds the only reference to a process that was just
+    // made; the field changes before any thread of it exists.
+    unsafe {
+        assert!(
+            free <= (*p.as_ptr()).ceiling,
+            "a free level above the ceiling"
+        );
+        (*p.as_ptr()).free = free;
+    }
 }
 
 /// The process whose shares `process` spends (`Process::share_payer`).

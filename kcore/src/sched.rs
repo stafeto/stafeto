@@ -34,13 +34,29 @@
 //! | effective priority raised (base or boost) | tail of the new level | new; a running thread keeps its rest |
 //! | priority unchanged | stays | kept; new when FIFO becomes round robin |
 //! | effective priority lowered (base, the end of a boost) | head of the new level | keeps the rest |
+//! | budget exhausted (kcore::budget) | tail of its low level | new |
+//! | budget replenished | tail of the new level | new; a running thread keeps its rest |
+//!
+//! A thread may have a time budget (kcore::budget::Server), a sporadic
+//! server of the budget `c` for each period `t`. While the thread has
+//! capacity its level is the effective priority above. When the budget is
+//! gone the thread falls to the higher of its level `low` and the boost of
+//! the client of a request it took (spec 6.6), the boost of a notification
+//! slot taken away, and stays there until the server's replenishment
+//! (`replenish`). The time charged is always the running thread's own:
+//! `charge` is the one place a stint ends. A thread with no budget works
+//! at the level `cap` of its process at most (`free`, spec 8).
 
+use crate::budget::Server;
 use crate::must::Must;
 use abi::{Error, PRIORITY_LEVELS, Policy};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const LEVELS: usize = PRIORITY_LEVELS as usize;
+
+/// The tag of `Node::stamp` that says the thread runs; no counter reaches it.
+const RUNNING: u64 = 1 << 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -232,19 +248,29 @@ impl<T: Linked> Default for ParkedList<T> {
 pub struct Node<T> {
     policy: Policy,
     state: State,
-    /// Ticks left of a round-robin quantum while the thread is ready.
-    slice_left: u64,
     /// The base priority.
     base: u8,
     /// The boost by a notification slot or a request (spec 6.6), already
     /// cut down to the ceiling of the thread's process; 0 for none.
     boost: u8,
+    /// The part of the boost that came from the client of a request: 0 for
+    /// none. It outlives the thread's budget, the rest does not.
+    client: u8,
+    /// The level a thread with no budget works at most: `free` of its
+    /// process, spec 8. 63 for a thread with a budget.
+    cap: u8,
+    /// The thread's budget, which lives while the thread is bound to it.
+    server: Option<NonNull<Server>>,
     /// Ticks the thread has run, summed over its finished stints on the
     /// CPU (spec 8: the CPU time `object_info` reports).
     ran: u64,
-    /// The counter value at which the current stint began; meaningful
-    /// while the thread is the running one.
-    since: u64,
+    /// While the thread runs, the counter value at which its stint began
+    /// with `RUNNING` set; otherwise the ticks left of a round-robin quantum
+    /// while it is ready. One word for both keeps the node, and so the
+    /// thread, in the size the pool of threads needs: a page holds three. A
+    /// reader on another CPU takes the stint from the tag in the word
+    /// itself, never from the state.
+    stamp: u64,
     /// The level is the effective priority.
     link: Link<T>,
 }
@@ -256,11 +282,13 @@ impl<T> Node<T> {
         Node {
             policy,
             state: State::Stopped,
-            slice_left: 0,
             base: priority,
             boost: 0,
+            client: 0,
+            cap: PRIORITY_LEVELS - 1,
+            server: None,
             ran: 0,
-            since: 0,
+            stamp: 0,
             link: Link::new(priority),
         }
     }
@@ -282,9 +310,69 @@ impl<T> Node<T> {
     }
 
     /// The level the base and the boost make, which `relevel` gives the
-    /// link.
+    /// link: with the budget gone, the higher of `low` and the boost of a
+    /// client, never above what the base and the boost make; and never
+    /// above `cap`.
     fn effective(&self) -> u8 {
-        self.base.max(self.boost)
+        self.level_with(self.boost, self.client)
+    }
+
+    /// `effective` with the boost `boost` and the client part `client`.
+    fn level_with(&self, boost: u8, client: u8) -> u8 {
+        let level = self.base.max(boost);
+        #[cfg(not(feature = "break-budget-keep-level"))]
+        let level = match self.server {
+            // SAFETY: the budget lives while the thread is bound to it.
+            Some(s) if unsafe { s.as_ref() }.background() => {
+                // SAFETY: as above.
+                let low = unsafe { s.as_ref() }.low();
+                #[cfg(not(feature = "break-budget-keep-slot"))]
+                let kept = client;
+                #[cfg(feature = "break-budget-keep-slot")]
+                let kept = boost.max(client);
+                level.min(low.max(kept))
+            }
+            _ => level,
+        };
+        #[cfg(feature = "break-budget-keep-level")]
+        let _ = client;
+        #[cfg(not(feature = "break-budget-no-free"))]
+        let level = level.min(self.cap);
+        level
+    }
+
+    /// The effective priority after a boost of `level` by the client of a
+    /// request, cut to `ceiling` (`Scheduler::boost`): what the thread's
+    /// level will be, for the decision that comes before the boost.
+    pub fn level_after_client_boost(&self, level: u8, ceiling: u8) -> u8 {
+        let level = level.min(ceiling);
+        self.level_with(self.boost.max(level), self.client.max(level))
+    }
+
+    /// Whether the thread's budget is gone and it works at `low`.
+    pub fn is_demoted(&self) -> bool {
+        // SAFETY: the budget lives while the thread is bound to it.
+        self.server
+            .is_some_and(|s| unsafe { s.as_ref() }.background())
+    }
+
+    /// Whether the thread has a budget.
+    pub fn has_budget(&self) -> bool {
+        self.server.is_some()
+    }
+
+    /// The rules of the thread's budget, while it has one.
+    pub fn server(&self) -> Option<NonNull<Server>> {
+        self.server
+    }
+
+    /// The level a thread with no budget works at most (`free` of its
+    /// process), for a thread that has not started: its level follows.
+    pub fn set_cap(&mut self, cap: u8) {
+        assert!(self.state == State::Stopped, "a started thread's cap moves");
+        self.cap = cap;
+        let level = self.effective();
+        self.link.set_level(level);
     }
 
     pub fn policy(&self) -> Policy {
@@ -296,9 +384,10 @@ impl<T> Node<T> {
         self.ran
     }
 
-    /// The counter value at which the current stint began.
+    /// The counter value at which the current stint began, for the running
+    /// thread.
     pub fn since(&self) -> u64 {
-        self.since
+        self.stamp & !RUNNING
     }
 
     /// Ticks the thread has run at `now`: the finished stints and, for the
@@ -309,8 +398,10 @@ impl<T> Node<T> {
     /// the first by the length of one stint's end. Each reading is right
     /// to within that, and the sum of a thread that is not running is exact.
     pub fn ran_at(&self, now: u64) -> u64 {
-        if self.state == State::Running {
-            self.ran.saturating_add(now.saturating_sub(self.since))
+        let stamp = self.stamp;
+        if stamp & RUNNING != 0 {
+            self.ran
+                .saturating_add(now.saturating_sub(stamp & !RUNNING))
         } else {
             self.ran
         }
@@ -328,9 +419,14 @@ impl<T> Node<T> {
         !self.link.is_queued() && self.link.next.is_some()
     }
 
-    /// Ticks left of the quantum of a ready round-robin thread.
+    /// Ticks left of the quantum of a ready round-robin thread; 0 for a
+    /// thread that runs.
     pub fn slice_left(&self) -> u64 {
-        self.slice_left
+        if self.stamp & RUNNING != 0 {
+            0
+        } else {
+            self.stamp
+        }
     }
 }
 
@@ -341,6 +437,14 @@ impl<T> Node<T> {
 /// at, valid as long as that object lives.
 pub unsafe trait Schedulable: Sized {
     fn node(this: NonNull<Self>) -> NonNull<Node<Self>>;
+
+    /// The replenishment event of the budget of `this` is wanted at the
+    /// counter value `at` (an earlier one goes), or not at all for None:
+    /// the kernel keeps it in the heaps of the timers of its CPU.
+    ///
+    /// # Safety
+    /// `this` is alive and has a budget; no borrow of its node is alive.
+    unsafe fn budget_event(_this: NonNull<Self>, _at: Option<u64>) {}
 }
 
 // SAFETY: the link is a field of the node, which lives as long as the
@@ -557,6 +661,27 @@ impl<T: Linked> Default for ReadyQueue<T> {
     }
 }
 
+/// What the scheduler does to the budget of a thread (`with_server`).
+#[derive(Clone, Copy)]
+enum Op {
+    Stop(bool),
+    Unblock,
+    UnblockRun,
+    Run,
+    Replenish,
+    Off,
+}
+
+/// How a thread leaves the CPU, for its budget: it waits (a block, a
+/// park), it is taken off while it stays ready (the end of a quantum, a
+/// higher level, `yield`), or it ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    Block,
+    Preempt,
+    Exit,
+}
+
 /// What the kernel does next, from a decision.
 pub enum Decision<T> {
     /// This thread runs.
@@ -608,17 +733,96 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     /// The stint of the running thread `r` ends at `now`: its length goes
-    /// to the thread's `ran` and nowhere else; the time of a process is the
-    /// sum of its threads', which the process adds up when it is asked and
-    /// when a thread leaves it. Every way off the CPU comes here, once.
+    /// to the thread's `ran`, and to its own budget, if it has one and the
+    /// thread ran at its own level, and to nothing else; the time of a
+    /// process is the sum of its threads', which the process adds up when it
+    /// is asked and when a thread leaves it. Every way off the CPU comes
+    /// here, once. True when the budget ran out and the thread's level
+    /// changed with it: it goes to the tail of the new level with a new
+    /// quantum.
     ///
     /// # Safety
     /// `r` is alive and was the running thread.
-    unsafe fn charge(r: NonNull<T>, now: u64) {
+    unsafe fn charge(r: NonNull<T>, now: u64, leave: Leave) -> bool {
         // SAFETY: the caller's promise.
         unsafe {
             let n = node(r);
-            n.ran = n.ran.saturating_add(now.saturating_sub(n.since));
+            n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
+            // The stint is over: the word holds no counter value any more.
+            n.stamp = 0;
+            if leave == Leave::Exit {
+                return false;
+            }
+            // The break: a thread that runs above its base, boosted by a
+            // client, is charged nothing.
+            if cfg!(feature = "break-budget-skip-boosted") && n.effective() > n.base {
+                return false;
+            }
+            let changed = Self::with_server(r, Op::Stop(leave == Leave::Block), now);
+            if changed {
+                Self::apply_level(r);
+            }
+            changed
+        }
+    }
+
+    /// Does `op` to the budget of `t`, if it has one, and passes the change
+    /// of the replenishment event on to the kernel. True when the budget went
+    /// into the background or came out of it. A thread with no budget costs
+    /// a look here; the rest is one function, out of line.
+    ///
+    /// # Safety
+    /// `t` is alive; no borrow of its node is alive.
+    #[inline(always)]
+    unsafe fn with_server(t: NonNull<T>, op: Op, now: u64) -> bool {
+        // SAFETY: the caller's promise.
+        if unsafe { node(t) }.server.is_none() {
+            return false;
+        }
+        // SAFETY: as above.
+        unsafe { Self::server_op(t, op, now) }
+    }
+
+    /// `with_server` for a thread that has a budget.
+    ///
+    /// # Safety
+    /// As for `with_server`; `t` has a budget.
+    #[inline(never)]
+    unsafe fn server_op(t: NonNull<T>, op: Op, now: u64) -> bool {
+        // SAFETY: the caller's promise; the budget lives while `t` is bound.
+        unsafe {
+            let mut server = node(t).server.must("a budget");
+            let s = server.as_mut();
+            let was = s.background();
+            match op {
+                Op::Stop(blocked) => s.stop(now, blocked),
+                Op::Unblock => s.unblock(now),
+                Op::UnblockRun => {
+                    s.unblock(now);
+                    s.run(now)
+                }
+                Op::Run => s.run(now),
+                Op::Replenish => s.replenish(now),
+                Op::Off => s.event_off(),
+            }
+            let changed = s.background() != was;
+            if let Some(at) = s.event_change() {
+                T::budget_event(t, at);
+            }
+            changed
+        }
+    }
+
+    /// The level of `t`, which is in no list, from its state.
+    ///
+    /// # Safety
+    /// `t` is alive and stands in no ready queue.
+    unsafe fn apply_level(t: NonNull<T>) {
+        // SAFETY: the caller's promise.
+        unsafe {
+            let n = node(t);
+            let level = n.effective();
+            n.link.set_level(level);
         }
     }
 
@@ -627,20 +831,29 @@ impl<T: Schedulable> Scheduler<T> {
         self.running
     }
 
-    /// The deadline the timer needs (spec 8): the nearer of the end of the
-    /// running thread's quantum, when it is round robin, and `next_timer`,
+    /// The deadline the timer needs (spec 8): the nearest of the end of the
+    /// running thread's quantum, when it is round robin, the end of its
+    /// budget, when it has one and runs at its own level, and `next_timer`,
     /// the earliest timer of a program (timer::Heap::first). For a FIFO
-    /// thread and while idle only `next_timer` counts.
+    /// thread with no budget and while idle only `next_timer` counts.
     pub fn deadline(&self, next_timer: Option<u64>) -> Option<u64> {
         let slice = self.running.and_then(|r| {
             // SAFETY: the running thread is alive (the contract of `start`).
             let policy = unsafe { node(r) }.policy;
             (policy == Policy::RoundRobin).then_some(self.slice_end)
         });
-        match (slice, next_timer) {
-            (Some(s), Some(t)) => Some(s.min(t)),
-            (s, t) => s.or(t),
-        }
+        let budget = self.running.and_then(|r| {
+            // SAFETY: the running thread is alive, and so is its budget.
+            let server = unsafe { node(r) }.server?;
+            // SAFETY: as above.
+            let server = unsafe { server.as_ref() };
+            (!server.background()).then(|| server.exhaust_at())
+        });
+        let first = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        first(first(slice, budget), next_timer)
     }
 
     /// A stopped thread becomes ready: the tail of its level with a new
@@ -649,7 +862,7 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// `t` is alive and stays alive and in place until `exit`.
-    pub unsafe fn start(&mut self, t: NonNull<T>) -> Result<(), Error> {
+    pub unsafe fn start(&mut self, t: NonNull<T>, now: u64) -> Result<(), Error> {
         assert!(
             self.quantum > 0,
             "a thread started before the quantum was set"
@@ -661,7 +874,9 @@ impl<T: Schedulable> Scheduler<T> {
                 return Err(Error::BadState);
             }
             n.state = State::Ready;
-            n.slice_left = self.quantum;
+            n.stamp = self.quantum;
+            Self::with_server(t, Op::Unblock, now);
+            Self::apply_level(t);
             self.ready.push_tail(t);
         }
         Ok(())
@@ -705,11 +920,11 @@ impl<T: Schedulable> Scheduler<T> {
             self.ready.remove(next);
             let n = node(next);
             n.state = State::Running;
-            n.since = now;
-            self.slice_end = now.saturating_add(n.slice_left);
-            // The field counts only while the thread is ready: whatever
-            // puts it back gives it a quantum or the rest of this one.
-            n.slice_left = 0;
+            self.slice_end = now.saturating_add(n.stamp);
+            // The field counts the quantum only while the thread is ready:
+            // whatever puts it back gives it a quantum or the rest of this one.
+            n.stamp = now | RUNNING;
+            Self::with_server(next, Op::Run, now);
         }
         self.running = Some(next);
         Decision::Run(next)
@@ -733,11 +948,11 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise; the node's borrow ends before the
         // list takes the thread.
         unsafe {
-            Self::charge(r, now);
+            let demoted = Self::charge(r, now, Leave::Preempt);
             let n = node(r);
-            let ended = n.policy == Policy::RoundRobin && rest == 0;
+            let ended = demoted || n.policy == Policy::RoundRobin && rest == 0;
             n.state = State::Ready;
-            n.slice_left = if ended { self.quantum } else { rest };
+            n.stamp = if ended { self.quantum } else { rest };
             if ended {
                 self.ready.push_tail(r);
             } else {
@@ -748,8 +963,10 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     /// The timer's interrupt at `now`: a round-robin thread whose quantum
-    /// is over goes to the tail of its level with a new quantum. Nothing
-    /// else looks at the quantum, so a decision elsewhere never ends it.
+    /// is over, or a thread whose budget ran out, goes to the tail of its
+    /// level with a new quantum, the budget's thread to the level it falls
+    /// to. Nothing else looks at the quantum, so a decision elsewhere never
+    /// ends it.
     /// `pick` comes next; a thread alone at its level gets itself back.
     ///
     /// # Safety
@@ -761,13 +978,24 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the running thread is alive.
         unsafe {
             let n = node(r);
-            if n.policy != Policy::RoundRobin || now < self.slice_end {
+            let slice_over = n.policy == Policy::RoundRobin && now >= self.slice_end;
+            let exhausted = n
+                .server
+                .is_some_and(|s| !s.as_ref().background() && now >= s.as_ref().exhaust_at());
+            if !slice_over && !exhausted {
                 return;
             }
-            Self::charge(r, now);
+            let demoted = Self::charge(r, now, Leave::Preempt);
+            if !slice_over && !demoted {
+                // The next replenishment of the budget was due already: the
+                // thread goes on, with a budget that ends later.
+                Self::with_server(r, Op::Run, now);
+                node(r).stamp = now | RUNNING;
+                return;
+            }
             let n = node(r);
             n.state = State::Ready;
-            n.slice_left = self.quantum;
+            n.stamp = self.quantum;
             self.ready.push_tail(r);
         }
         self.running = None;
@@ -786,10 +1014,10 @@ impl<T: Schedulable> Scheduler<T> {
         };
         // SAFETY: the running thread is alive.
         unsafe {
-            Self::charge(r, now);
+            Self::charge(r, now, Leave::Preempt);
             let n = node(r);
             n.state = State::Ready;
-            n.slice_left = self.quantum;
+            n.stamp = self.quantum;
             self.ready.push_tail(r);
         }
     }
@@ -837,7 +1065,7 @@ impl<T: Schedulable> Scheduler<T> {
         match state {
             State::Dead => return Err(Error::BadState),
             // SAFETY: the caller's promise.
-            State::Ready if to_round_robin => unsafe { node(t) }.slice_left = self.quantum,
+            State::Ready if to_round_robin => unsafe { node(t) }.stamp = self.quantum,
             State::Running if to_round_robin => {
                 self.slice_end = now.saturating_add(self.quantum);
             }
@@ -857,15 +1085,15 @@ impl<T: Schedulable> Scheduler<T> {
                     self.ready.remove(t);
                     let n = node(t);
                     n.link.set_level(level);
-                    n.slice_left = self.quantum;
+                    n.stamp = self.quantum;
                     self.ready.push_tail(t);
                 }
                 (true, State::Running) => {
-                    Self::charge(t, now);
+                    Self::charge(t, now, Leave::Preempt);
                     let n = node(t);
-                    n.link.set_level(level);
+                    n.link.set_level(n.effective());
                     n.state = State::Ready;
-                    n.slice_left = self.quantum;
+                    n.stamp = self.quantum;
                     self.running = None;
                     self.ready.push_tail(t);
                 }
@@ -884,13 +1112,20 @@ impl<T: Schedulable> Scheduler<T> {
     /// tail of its new level with a new quantum; waiting and out of every
     /// queue, it takes the level, and `wake` puts it there.
     ///
+    /// `client` says the boost is the client of a request's: it stays when
+    /// the thread's budget is gone, and a notification's does not.
+    ///
     /// # Safety
     /// As for `set_priority`; a waiting `t` stands in no queue.
-    pub unsafe fn boost(&mut self, t: NonNull<T>, level: u8, ceiling: u8) {
+    pub unsafe fn boost(&mut self, t: NonNull<T>, level: u8, ceiling: u8, client: bool) {
         // SAFETY: the caller's promise; the borrow ends before the move.
         let level = unsafe {
             let n = node(t);
-            n.boost = n.boost.max(level.min(ceiling));
+            let cut = level.min(ceiling);
+            n.boost = n.boost.max(cut);
+            if client {
+                n.client = n.client.max(cut);
+            }
             n.effective()
         };
         // SAFETY: the caller's promise.
@@ -910,6 +1145,7 @@ impl<T: Schedulable> Scheduler<T> {
         let level = unsafe {
             let n = node(t);
             n.boost = 0;
+            n.client = 0;
             n.effective()
         };
         // SAFETY: the caller's promise.
@@ -938,7 +1174,7 @@ impl<T: Schedulable> Scheduler<T> {
                 return;
             }
             if level > old {
-                node(t).slice_left = self.quantum;
+                node(t).stamp = self.quantum;
             }
             self.ready.move_to(t, level);
         }
@@ -955,7 +1191,7 @@ impl<T: Schedulable> Scheduler<T> {
         let r = self.running.take().must("no thread runs to wait");
         // SAFETY: the running thread is alive.
         unsafe {
-            Self::charge(r, now);
+            Self::charge(r, now, Leave::Block);
             node(r).state = State::Waiting;
         }
         r
@@ -966,9 +1202,11 @@ impl<T: Schedulable> Scheduler<T> {
     /// at the next `pick` only when its level is above the running
     /// thread's.
     ///
+    /// The activation of the thread's budget is at `now`.
+    ///
     /// # Safety
     /// `t` is alive and in no queue; the scheduler's threads are alive.
-    pub unsafe fn wake(&mut self, t: NonNull<T>) {
+    pub unsafe fn wake(&mut self, t: NonNull<T>, now: u64) {
         // SAFETY: the caller's promise; the borrow ends before the list
         // takes the thread.
         unsafe {
@@ -978,7 +1216,9 @@ impl<T: Schedulable> Scheduler<T> {
                 "a thread that does not wait wakes"
             );
             n.state = State::Ready;
-            n.slice_left = self.quantum;
+            n.stamp = self.quantum;
+            Self::with_server(t, Op::Unblock, now);
+            Self::apply_level(t);
             self.ready.push_tail(t);
         }
     }
@@ -992,7 +1232,7 @@ impl<T: Schedulable> Scheduler<T> {
         self.running = None;
         // SAFETY: the caller holds the running thread.
         unsafe {
-            Self::charge(t, now);
+            Self::charge(t, now, Leave::Block);
             node(t).state = State::Parked;
         }
     }
@@ -1001,13 +1241,13 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// `t` is alive, parked, and has left its process list.
-    pub unsafe fn unpark(&mut self, t: NonNull<T>) {
+    pub unsafe fn unpark(&mut self, t: NonNull<T>, now: u64) {
         // SAFETY: the caller's promise.
         unsafe {
             let n = node(t);
             assert!(n.state == State::Parked, "continuing an active thread");
             n.state = State::Waiting;
-            self.wake(t);
+            self.wake(t, now);
         }
     }
 
@@ -1023,20 +1263,24 @@ impl<T: Schedulable> Scheduler<T> {
     pub unsafe fn hand_off(&mut self, t: NonNull<T>, now: u64) {
         assert!(self.running.is_none(), "a thread runs at a hand-off");
         // SAFETY: the caller's promise.
-        let n = unsafe { node(t) };
-        assert!(
-            n.state == State::Waiting,
-            "a thread that does not wait takes the CPU"
-        );
-        assert!(
-            self.can_hand_off(n.priority(), None),
-            "a hand-off passes a ready thread"
-        );
-        n.state = State::Running;
-        n.since = now;
-        n.slice_left = 0;
-        self.slice_end = now.saturating_add(self.quantum);
-        self.running = Some(t);
+        unsafe {
+            assert!(
+                node(t).state == State::Waiting,
+                "a thread that does not wait takes the CPU"
+            );
+            Self::with_server(t, Op::Unblock, now);
+            Self::apply_level(t);
+            let n = node(t);
+            assert!(
+                self.can_hand_off(n.priority(), None),
+                "a hand-off passes a ready thread"
+            );
+            n.state = State::Running;
+            n.stamp = now | RUNNING;
+            self.slice_end = now.saturating_add(self.quantum);
+            self.running = Some(t);
+            Self::with_server(t, Op::Run, now);
+        }
     }
 
     /// The thread ends (thread_exit, process_kill, a fault, the stop
@@ -1060,7 +1304,7 @@ impl<T: Schedulable> Scheduler<T> {
                 );
                 self.running = None;
                 // SAFETY: the caller's promise.
-                unsafe { Self::charge(t, now) };
+                unsafe { Self::charge(t, now, Leave::Exit) };
             }
             // SAFETY: a ready thread is in the queue.
             State::Ready => unsafe { self.ready.remove(t) },
@@ -1068,7 +1312,92 @@ impl<T: Schedulable> Scheduler<T> {
             State::Stopped | State::Dead => {}
         }
         // SAFETY: the caller's promise.
-        unsafe { node(t) }.state = State::Dead;
+        unsafe {
+            Self::unbind(t);
+            node(t).state = State::Dead;
+        }
+    }
+
+    /// The budget of `t` leaves it: its replenishment event goes, and the
+    /// thread has no budget. The kernel drops its reference to the budget.
+    ///
+    /// # Safety
+    /// `t` is alive, and no borrow of its node is alive.
+    unsafe fn unbind(t: NonNull<T>) {
+        // SAFETY: the caller's promise.
+        unsafe {
+            if node(t).server.is_none() {
+                return;
+            }
+            Self::with_server(t, Op::Off, 0);
+            node(t).server = None;
+        }
+    }
+
+    /// The thread `t` gets the budget `server`, which no thread has: its
+    /// capacity is whole from `now`, and the thread no longer works under
+    /// the cap `free` gave it. A running thread's time counts from here. `t`
+    /// stays in the list it was in, moved to the level it now has. BAD_STATE
+    /// for a thread that has a budget or ended.
+    ///
+    /// # Safety
+    /// `t` is alive; `server` is alive until `unbind` (`exit`) and is
+    /// bound to no thread.
+    pub unsafe fn bind(
+        &mut self,
+        t: NonNull<T>,
+        server: NonNull<Server>,
+        now: u64,
+    ) -> Result<(), Error> {
+        // SAFETY: the caller's promise; the borrow ends before the move.
+        let (state, level) = unsafe {
+            let n = node(t);
+            if n.server.is_some() || n.state == State::Dead {
+                return Err(Error::BadState);
+            }
+            n.server = Some(server);
+            n.cap = PRIORITY_LEVELS - 1;
+            (n.state, n.effective())
+        };
+        // SAFETY: the caller's promise.
+        unsafe {
+            match state {
+                State::Stopped | State::Dead => {}
+                State::Running => {
+                    Self::with_server(t, Op::UnblockRun, now);
+                }
+                State::Ready | State::Waiting | State::Parked => {
+                    Self::with_server(t, Op::Unblock, now);
+                }
+            }
+            self.relevel(t, level);
+        }
+        Ok(())
+    }
+
+    /// The replenishment event of the budget of `t` at `now`: the thread
+    /// goes back to its own level when its budget has capacity, to the
+    /// tail with a new quantum when it is ready, with the rest of its
+    /// quantum and the CPU when it runs.
+    ///
+    /// # Safety
+    /// `t` is alive.
+    pub unsafe fn replenish(&mut self, t: NonNull<T>, now: u64) {
+        // SAFETY: the caller's promise; the borrow ends before the move.
+        let (state, level) = unsafe {
+            if node(t).state == State::Dead || node(t).server.is_none() {
+                return;
+            }
+            Self::with_server(t, Op::Replenish, now);
+            (node(t).state, node(t).effective())
+        };
+        // SAFETY: the caller's promise.
+        unsafe {
+            self.relevel(t, level);
+            if state == State::Running {
+                Self::with_server(t, Op::Run, now);
+            }
+        }
     }
 }
 
@@ -1165,14 +1494,14 @@ mod tests {
             // SAFETY: the list holds the thread until remove; unpark queues it.
             unsafe {
                 parked.remove(t);
-                w.s.unpark(t);
+                w.s.unpark(t, 0);
             }
         }
         assert_eq!(w.pick(100), 'c');
         assert_eq!(w.s.deadline(None), Some(100 + Q));
         assert_eq!(w.level(40), "a");
         assert_eq!(node(threads[1]).state(), State::Dead);
-        assert_eq!(unsafe { w.s.start(threads[0]) }, Err(Error::BadState));
+        assert_eq!(unsafe { w.s.start(threads[0], 0) }, Err(Error::BadState));
     }
 
     /// Counter ticks per millisecond at QEMU's 62.5 MHz.
@@ -1185,6 +1514,8 @@ mod tests {
     struct Fake {
         node: Node<Fake>,
         name: char,
+        /// The replenishment event of its budget, as the kernel's heap holds it.
+        event: Option<u64>,
     }
 
     // SAFETY: the node is a field of the fake thread.
@@ -1192,6 +1523,12 @@ mod tests {
         fn node(this: NonNull<Fake>) -> NonNull<Node<Fake>> {
             // SAFETY: `this` points at a live fake thread.
             unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).node) }
+        }
+
+        unsafe fn budget_event(this: NonNull<Fake>, at: Option<u64>) {
+            // SAFETY: `this` points at a live fake thread, and no borrow of
+            // its event is alive.
+            unsafe { (*this.as_ptr()).event = at };
         }
     }
 
@@ -1203,6 +1540,11 @@ mod tests {
             reason = "each fake thread keeps its address while the vector grows"
         )]
         threads: Vec<Box<Fake>>,
+        #[expect(
+            clippy::vec_box,
+            reason = "each budget keeps its address while the vector grows"
+        )]
+        servers: Vec<Box<Server>>,
         s: Scheduler<Fake>,
         /// The time of the last decision, tick or yield: the moment the
         /// helpers that take no time end a stint at.
@@ -1213,8 +1555,37 @@ mod tests {
         fn new() -> World {
             World {
                 threads: Vec::new(),
+                servers: Vec::new(),
                 s: Scheduler::new(Q),
                 now: 0,
+            }
+        }
+
+        /// A budget of `c` ticks for each `t`, falling to `low`, for `thread`.
+        fn budget(&mut self, thread: NonNull<Fake>, c: u64, t: u64, low: u8) {
+            let mut server = Box::new(Server::new(c, t, low, self.now));
+            let p = NonNull::from(&mut *server);
+            self.servers.push(server);
+            // SAFETY: the world keeps its budgets and threads alive.
+            unsafe { self.s.bind(thread, p, self.now) }.unwrap();
+        }
+
+        /// The kernel's heap of replenishment events at `now`: each budget
+        /// whose event is due goes back to its level.
+        fn events(&mut self, now: u64) {
+            self.now = now;
+            let due: Vec<_> = self
+                .threads
+                .iter_mut()
+                .filter(|t| t.event.is_some_and(|at| at <= now))
+                .map(|t| NonNull::from(&mut **t))
+                .collect();
+            for t in due {
+                // SAFETY: as above; the event leaves the heap as it fires.
+                unsafe {
+                    (*t.as_ptr()).event = None;
+                    self.s.replenish(t, now);
+                }
             }
         }
 
@@ -1223,6 +1594,7 @@ mod tests {
             let mut b = Box::new(Fake {
                 node: Node::new(priority, policy),
                 name,
+                event: None,
             });
             let t = NonNull::from(&mut *b);
             self.threads.push(b);
@@ -1238,7 +1610,7 @@ mod tests {
 
         fn start(&mut self, t: NonNull<Fake>) {
             // SAFETY: the world keeps its threads alive.
-            unsafe { self.s.start(t) }.unwrap();
+            unsafe { self.s.start(t, self.now) }.unwrap();
         }
 
         /// The name of the thread `pick` chooses at `now` with an empty
@@ -1292,12 +1664,19 @@ mod tests {
 
         fn wake(&mut self, t: NonNull<Fake>) {
             // SAFETY: as above; the tests wake threads that are in no queue.
-            unsafe { self.s.wake(t) };
+            unsafe { self.s.wake(t, self.now) };
         }
 
+        /// The boost of the client of a request.
         fn boost(&mut self, t: NonNull<Fake>, level: u8, ceiling: u8) {
             // SAFETY: as above.
-            unsafe { self.s.boost(t, level, ceiling) };
+            unsafe { self.s.boost(t, level, ceiling, true) };
+        }
+
+        /// The boost of a notification slot.
+        fn boost_slot(&mut self, t: NonNull<Fake>, level: u8) {
+            // SAFETY: as above.
+            unsafe { self.s.boost(t, level, 63, false) };
         }
 
         fn unboost(&mut self, t: NonNull<Fake>) {
@@ -1346,11 +1725,12 @@ mod tests {
         let mut a = Box::new(Fake {
             node: Node::new(10, RR),
             name: 'a',
+            event: None,
         });
         let t = NonNull::from(&mut *a);
         // SAFETY: the thread outlives its time in the scheduler.
         unsafe {
-            s.start(t).unwrap();
+            s.start(t, 0).unwrap();
             assert!(matches!(s.pick(MS, None), Decision::Run(r) if r == t));
             assert_eq!(s.deadline(None), Some(5 * MS));
             s.exit(t, 2 * MS);
@@ -1738,7 +2118,7 @@ mod tests {
         // A thread starts once.
         for t in [a, b, h] {
             // SAFETY: the world keeps its threads alive.
-            assert_eq!(unsafe { w.s.start(t) }, Err(Error::BadState));
+            assert_eq!(unsafe { w.s.start(t, 0) }, Err(Error::BadState));
         }
     }
 
@@ -1761,7 +2141,7 @@ mod tests {
         assert_eq!(w.pick(MS), '-');
         assert_eq!(w.s.deadline(None), None);
         // SAFETY: the world keeps its threads alive.
-        assert_eq!(unsafe { w.s.start(stopped) }, Err(Error::BadState));
+        assert_eq!(unsafe { w.s.start(stopped, 0) }, Err(Error::BadState));
     }
 
     #[test]
@@ -1824,7 +2204,7 @@ mod tests {
         assert_eq!(node(a).state(), State::Dead);
         assert_eq!((w.level(10), w.s.running()), ("c".into(), Some(b)));
         // SAFETY: the world keeps its threads alive.
-        assert_eq!(unsafe { w.s.start(a) }, Err(Error::BadState));
+        assert_eq!(unsafe { w.s.start(a, 0) }, Err(Error::BadState));
     }
 
     #[test]
@@ -2027,7 +2407,13 @@ mod tests {
         }
         for t in &w.threads {
             let n = &t.node;
-            s += &format!("{}{:?}{}/{} ", t.name, n.state, n.priority(), n.slice_left);
+            s += &format!(
+                "{}{:?}{}/{} ",
+                t.name,
+                n.state,
+                n.priority(),
+                n.slice_left()
+            );
         }
         s
     }
@@ -2678,5 +3064,240 @@ mod tests {
         w.unboost(a);
         assert_eq!(w.level(10), "ab");
         let _ = (r, b);
+    }
+
+    // The budgets of threads (kcore::budget): the rules of the scheduler.
+
+    #[test]
+    fn a_thread_whose_budget_is_gone_falls_to_low_and_comes_back_with_the_replenishment() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 2 * MS, 10 * MS, 1);
+        w.start(hog);
+        let victim = w.started('v', 10, FIFO);
+        assert_eq!(w.pick(0), 'h');
+        // The deadline is the end of the budget.
+        assert_eq!(w.s.deadline(None), Some(2 * MS));
+        assert_eq!(w.tick(2 * MS), 'v');
+        assert_eq!(node(hog).priority(), 1);
+        assert_eq!(w.level(1), "h");
+        assert!(node(hog).is_demoted());
+        // The event is the replenishment of the budget one period after the
+        // thread's activation.
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
+        assert_eq!(w.s.deadline(None), None);
+        w.events(10 * MS);
+        assert_eq!(w.pick(10 * MS), 'h');
+        assert_eq!(node(hog).priority(), 50);
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, None);
+        assert_eq!(w.s.deadline(None), Some(12 * MS));
+        let _ = victim;
+    }
+
+    #[test]
+    fn a_hog_with_a_budget_leaves_the_lower_level_the_rest_of_every_period() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 3 * MS, 10 * MS, 1);
+        w.start(hog);
+        let victim = w.started('v', 10, FIFO);
+        let (mut hog_ticks, mut victim_ticks) = (0, 0);
+        let mut now = 0;
+        let mut running = w.pick(now);
+        while now < 100 * MS {
+            // Time passes to the nearer of the deadline and the event.
+            // SAFETY: the world keeps its threads alive; only the event is read.
+            let event = unsafe { hog.as_ref() }.event;
+            let next = [w.s.deadline(None), event]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(now + MS);
+            match running {
+                'h' => hog_ticks += next - now,
+                _ => victim_ticks += next - now,
+            }
+            now = next;
+            w.events(now);
+            running = w.tick(now);
+        }
+        assert_eq!(hog_ticks, 30 * MS, "3 ms of every 10 ms");
+        assert_eq!(victim_ticks, 70 * MS);
+        let _ = victim;
+    }
+
+    #[test]
+    fn the_boost_of_a_notification_is_taken_away_with_the_budget_and_a_clients_stays() {
+        let mut w = World::new();
+        let a = w.thread('a', 20, FIFO);
+        w.budget(a, 2 * MS, 10 * MS, 1);
+        w.start(a);
+        let b = w.thread('b', 20, FIFO);
+        w.budget(b, 2 * MS, 10 * MS, 1);
+        w.start(b);
+        // `a` is boosted by a notification slot to 40, `b` by a client to 30.
+        w.boost_slot(a, 40);
+        w.boost(b, 30, 63);
+        assert_eq!(node(a).priority(), 40);
+        assert_eq!(node(b).priority(), 30);
+        assert_eq!(w.pick(0), 'a');
+        assert_eq!(w.tick(2 * MS), 'b');
+        assert_eq!(
+            node(a).priority(),
+            1,
+            "the slot's boost is gone with the budget"
+        );
+        // `b` runs its 2 ms and its budget is gone too; it still works at
+        // the level of its client, above `a`, which is at `low`.
+        assert_eq!(w.tick(4 * MS), 'b');
+        assert_eq!(node(b).priority(), 30, "the client's boost stays");
+        assert!(node(b).is_demoted());
+        // The end of the boosts: the thread works at `low`.
+        w.unboost(b);
+        assert_eq!(node(b).priority(), 1);
+        // The replenishment gives the base and the boost back.
+        w.events(10 * MS);
+        assert_eq!(node(a).priority(), 40);
+        assert_eq!(node(b).priority(), 20);
+    }
+
+    #[test]
+    fn the_time_is_charged_to_the_thread_that_runs() {
+        let mut w = World::new();
+        // `c` has a budget and sends a request to `s`, which has none and
+        // runs at the level of `c`.
+        let c = w.thread('c', 50, FIFO);
+        w.budget(c, 2 * MS, 10 * MS, 1);
+        w.start(c);
+        let s = w.started('s', 5, FIFO);
+        assert_eq!(w.pick(0), 'c');
+        w.now = MS;
+        let sent = w.block();
+        assert_eq!(sent, c);
+        w.boost(s, 50, 63);
+        assert_eq!(w.pick(MS), 's');
+        // `s` runs 6 ms at the level of `c`.
+        assert_eq!(w.yield_at(7 * MS), 's');
+        // SAFETY: the world keeps its budgets alive.
+        let server = unsafe { c.as_ref() }.node.server.unwrap();
+        // SAFETY: as above.
+        let server = unsafe { server.as_ref() };
+        assert_eq!(server.ran(), MS, "only the ms `c` ran itself");
+        assert!(!server.background());
+        assert_eq!(node(s).ran(), 6 * MS);
+        // And the budget of `c` is its own: it runs the other ms when it wakes.
+        w.wake(c);
+        w.unboost(s);
+        assert_eq!(w.pick(7 * MS), 'c');
+        assert_eq!(w.s.deadline(None), Some(8 * MS));
+    }
+
+    #[test]
+    fn a_thread_with_no_budget_works_at_the_level_of_its_process_at_most() {
+        let mut w = World::new();
+        let a = w.thread('a', 50, FIFO);
+        // SAFETY: the thread is alive and stopped.
+        unsafe { (*a.as_ptr()).node.set_cap(40) };
+        assert_eq!(node(a).priority(), 40);
+        assert_eq!(node(a).base(), 50);
+        let b = w.thread('b', 45, FIFO);
+        w.start(a);
+        w.start(b);
+        // `b` has no cap lower than its level; `a` is at 40 and `b` at 63.
+        assert_eq!(w.level(40), "a");
+        // A boost does not lift it past the cap either.
+        w.boost(a, 60, 63);
+        assert_eq!(node(a).priority(), 40);
+        // With a budget it works at its level: the cap is the budget's.
+        w.unboost(a);
+        w.budget(a, 2 * MS, 10 * MS, 1);
+        assert_eq!(node(a).priority(), 50);
+        assert_eq!(w.level(50), "a");
+        let _ = b;
+    }
+
+    #[test]
+    fn the_end_of_a_thread_takes_its_event_off_the_heap() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 2 * MS, 10 * MS, 1);
+        w.start(hog);
+        w.started('v', 10, FIFO);
+        assert_eq!(w.pick(0), 'h');
+        assert_eq!(w.tick(2 * MS), 'v');
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
+        w.exit(hog);
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, None);
+        assert!(!node(hog).has_budget());
+    }
+
+    #[test]
+    fn a_budget_binds_to_one_thread_at_a_time_and_a_thread_has_one() {
+        let mut w = World::new();
+        let a = w.started('a', 20, FIFO);
+        w.budget(a, 2 * MS, 10 * MS, 1);
+        let mut other = Box::new(Server::new(MS, 10 * MS, 1, 0));
+        let p = NonNull::from(&mut *other);
+        // SAFETY: the world keeps its threads alive.
+        assert_eq!(unsafe { w.s.bind(a, p, 0) }, Err(Error::BadState));
+        let d = w.thread('d', 20, FIFO);
+        w.exit(d);
+        // SAFETY: as above.
+        assert_eq!(unsafe { w.s.bind(d, p, 0) }, Err(Error::BadState));
+    }
+
+    #[test]
+    fn a_blocked_thread_wakes_in_the_background_when_it_blocked_with_no_budget() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 2 * MS, 10 * MS, 1);
+        w.start(hog);
+        w.started('v', 10, FIFO);
+        assert_eq!(w.pick(0), 'h');
+        // It runs 2 ms and blocks at the end of its budget.
+        w.now = 2 * MS;
+        let h = w.block();
+        assert_eq!(h, hog);
+        assert!(node(hog).is_demoted());
+        // The wake finds no capacity: the thread is ready at `low`.
+        w.wake(hog);
+        assert_eq!(node(hog).priority(), 1);
+        assert_eq!(w.level(1), "h");
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, Some(10 * MS));
+        w.events(10 * MS);
+        assert_eq!(node(hog).priority(), 50);
+    }
+
+    #[test]
+    fn a_server_boosted_by_a_client_is_charged_for_its_own_time() {
+        let mut w = World::new();
+        // `c` sends a request and waits; `s`, a service with a budget of
+        // 2 ms, works on it at the level of `c`, past its budget by 0.3 ms.
+        let c = w.started('c', 50, FIFO);
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, 2 * MS, 10 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 'c');
+        w.now = MS;
+        w.block();
+        let client_ran = node(c).ran();
+        w.boost(s, 50, 63);
+        assert_eq!(w.pick(MS), 's');
+        assert_eq!(w.s.deadline(None), Some(3 * MS));
+        // The timer's interrupt comes 0.3 ms late.
+        let late = 3 * MS + MS * 3 / 10;
+        assert_eq!(w.tick(late), 's', "the client's boost keeps it running");
+        // SAFETY: the world keeps its budgets alive.
+        let server = unsafe { s.as_ref() }.node.server().unwrap();
+        // SAFETY: as above.
+        let server = unsafe { server.as_ref() };
+        assert_eq!(server.ran(), 2 * MS + MS * 3 / 10, "C and the overrun");
+        assert_eq!(server.overruns(), 1);
+        assert_eq!(node(c).ran(), client_ran, "the client is charged nothing");
     }
 }
