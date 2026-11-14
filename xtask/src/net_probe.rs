@@ -2623,4 +2623,3 @@ mod tests {
         assert_eq!(PROGRAMS[0].3, &["table-net-probe"]);
     }
 }
-
