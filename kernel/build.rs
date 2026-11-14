@@ -23,9 +23,5 @@ fn main() {
         println!("cargo:rustc-cfg=section_marks");
     }
     println!("cargo:rerun-if-changed=kernel.ld");
-    println!("cargo:rerun-if-changed=src/arch/aarch64/head.S");
-    println!("cargo:rerun-if-changed=src/arch/aarch64/vectors.S");
-    println!("cargo:rerun-if-changed=src/arch/aarch64/mmu.S");
-    println!("cargo:rerun-if-changed=src/arch/aarch64/fpsimd.S");
     println!("cargo:rerun-if-changed=src/ktest/el0.S");
 }

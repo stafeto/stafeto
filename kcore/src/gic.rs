@@ -83,12 +83,6 @@ pub const FIRST_SPI: u32 = 32;
 /// The EL1 virtual timer: PPI 11.
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 
-/// The bytes at the start of the first redistributor region of a GICv3
-/// that the kernel maps and searches for the redistributor of its CPU
-/// (spec 9) for the redistributor of each CPU it starts: two frames of 128
-/// KiB, or one of 256 KiB with vLPIs, for each of MAX_CPUS CPUs.
-pub const REDISTRIBUTOR_WINDOW: u64 = 0x20_0000;
-
 /// GICD_SGIR (GICv2): software-generated interrupts [G25].
 pub const GICD_SGIR: usize = 0xF00;
 

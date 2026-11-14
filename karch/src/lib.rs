@@ -1,12 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-pub mod backtrace;
+//! The AArch64 layer of the kernel: what touches the machine. The boot code
+//! (head.S), the exception vectors (vectors.S), the MMU, the caches, the
+//! registers, the GIC and the timer live here, and almost every `unsafe` of
+//! the hardware with them. The crate knows no kernel object: it uses `kcore`
+//! for the rules and `kboot` for the boot facts, and the kernel supplies
+//! what it needs from outside through closures and the symbols the assembly
+//! names (`kernel_main`, `secondary_main`, `handle_exception`,
+//! `handle_user_exception`).
+
+#![no_std]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+#[macro_use]
+mod failure;
+
 pub mod cache;
 pub mod cpu;
 pub mod exceptions;
 pub mod gic;
-pub mod its;
 #[cfg(feature = "early-marks")]
 pub mod marks;
 pub mod mmio;

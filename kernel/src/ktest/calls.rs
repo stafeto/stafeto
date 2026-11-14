@@ -9187,7 +9187,7 @@ pub fn irq_bind_takes_the_cpu_of_a_line(_: &Boot) -> Result<(), &'static str> {
     let n = Call::IrqBind.number();
     with_caller(|c| {
         let (r, h, copy) = resource_and_channel(c)?;
-        let down = (0..kcore::bootinfo::MAX_CPUS as u64).find(|&i| !arch::cpu::is_up(i as usize));
+        let down = (0..kboot::bootinfo::MAX_CPUS as u64).find(|&i| !arch::cpu::is_up(i as usize));
         if let Some(down) = down {
             c.fails(
                 n,
@@ -9203,7 +9203,7 @@ pub fn irq_bind_takes_the_cpu_of_a_line(_: &Boot) -> Result<(), &'static str> {
                 copy.0,
                 20,
                 0,
-                kcore::bootinfo::MAX_CPUS as u64,
+                kboot::bootinfo::MAX_CPUS as u64,
             ],
             Error::InvalidArgs,
         )?;

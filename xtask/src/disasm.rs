@@ -176,7 +176,7 @@ fn check_smp_order(text: &str) -> Result<(), String> {
     let need = |symbol: &str| {
         body(text, symbol).ok_or_else(|| format!("{symbol} is missing from the kernel"))
     };
-    let clean = need("kernel::arch::aarch64::cache::clean_to_memory")?;
+    let clean = need("karch::cache::clean_to_memory")?;
     let last_dc = clean
         .iter()
         .rposition(|l| instruction(l).is_some_and(|(m, o)| m == "dc" && o.starts_with("cvac")))
@@ -204,7 +204,7 @@ fn check_smp_order(text: &str) -> Result<(), String> {
     if cleaned > call {
         return Err("start_one calls PSCI CPU_ON before it cleans the start block".into());
     }
-    let v2 = need("kernel::arch::aarch64::gic::send_sgi_v2")?;
+    let v2 = need("karch::gic::send_sgi_v2")?;
     let barrier = position(&v2, "dmb", "ishst").ok_or("send_sgi_v2 has no dmb ishst")?;
     let write = v2
         .iter()
@@ -213,7 +213,7 @@ fn check_smp_order(text: &str) -> Result<(), String> {
     if barrier > write {
         return Err("send_sgi_v2 writes GICD_SGIR before its dmb ishst".into());
     }
-    let ack = need("kernel::arch::aarch64::gic::acknowledge_v2")?;
+    let ack = need("karch::gic::acknowledge_v2")?;
     let read = ack
         .iter()
         .position(|l| instruction(l).is_some_and(|(m, _)| m.starts_with("ldr")))
@@ -233,7 +233,7 @@ fn check_smp_order(text: &str) -> Result<(), String> {
     if fence < store {
         return Err("qsbr::awake stores its epoch after its dmb ish".into());
     }
-    let v3 = need("kernel::arch::aarch64::gic::send_sgi_v3")?;
+    let v3 = need("karch::gic::send_sgi_v3")?;
     let dsb = position(&v3, "dsb", "ishst").ok_or("send_sgi_v3 has no dsb ishst")?;
     let msr = v3
         .iter()
@@ -415,7 +415,7 @@ fn counter_read_sites_in(
 pub fn counter_read_sites(root: &Path) -> Result<Vec<(String, usize)>, String> {
     let mut found = Vec::new();
     for top in [
-        "kernel", "kcore", "lib", "services", "apps", "proto", "tests",
+        "kernel", "karch", "kboot", "kcore", "lib", "services", "apps", "proto", "tests",
     ] {
         let dir = root.join(top);
         if dir.is_dir() {
@@ -431,7 +431,7 @@ pub fn counter_read_sites(root: &Path) -> Result<Vec<(String, usize)>, String> {
 /// user space. The rest are tests and benchmarks that time themselves, and
 /// the time stamps of `lib/trace`, which only measurement images build.
 pub const COUNTER_READ_SITES: [(&str, usize); 11] = [
-    ("kernel/src/arch/aarch64/timer.rs", 1),
+    ("karch/src/timer.rs", 1),
     ("kernel/src/ktest.rs", 2),
     ("kernel/src/ktest/el0.S", 8),
     ("lib/posix-abi/src/signals.rs", 1),
@@ -679,16 +679,16 @@ mod tests {
     /// the lines of `broken` replaced by the text given for them.
     fn smp_text(replace: &[(&str, &str)]) -> String {
         let mut text = String::from(
-            "0 <kernel::arch::aarch64::cache::clean_to_memory>:\n\
+            "0 <karch::cache::clean_to_memory>:\n\
              0: \tdc\tcvac, x8\n4: \tdsb\tish\n8: \tret\n\n\
              10 <kernel::smp::start_one>:\n\
-             10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>\n\
+             10: \tbl\t0x0 <karch::cache::clean_to_memory>\n\
              14: \tsmc\t#0x0\n\n\
-             20 <kernel::arch::aarch64::gic::send_sgi_v2>:\n\
+             20 <karch::gic::send_sgi_v2>:\n\
              20: \tdmb\tishst\n24: \tstr\tw1, [x8, #0xf00]\n28: \tret\n\n\
-             30 <kernel::arch::aarch64::gic::send_sgi_v3>:\n\
+             30 <karch::gic::send_sgi_v3>:\n\
              30: \tdsb\tishst\n34: \tmsr\tICC_SGI1R_EL1, x8\n38: \tisb\n3c: \tret\n\n\
-             40 <kernel::arch::aarch64::gic::acknowledge_v2>:\n\
+             40 <karch::gic::acknowledge_v2>:\n\
              40: \tldr\tw0, [x8, #0xc]\n44: \tdmb\tishld\n48: \tret\n\n\
              50 <kernel::qsbr::awake>:\n\
              50: \tstlr\tx9, [x8]\n54: \tdmb\tish\n58: \tret\n\n",
@@ -705,16 +705,13 @@ mod tests {
         let broken = |replace: &[(&str, &str)]| check_smp_order(&smp_text(replace)).unwrap_err();
         // The clean of the start block gone, or after the PSCI call.
         assert!(
-            broken(&[(
-                "10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>",
-                "10: \tnop"
-            )])
-            .contains("does not clean the start block")
+            broken(&[("10: \tbl\t0x0 <karch::cache::clean_to_memory>", "10: \tnop")])
+                .contains("does not clean the start block")
         );
         assert!(
             broken(&[(
-                "10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>\n14: \tsmc\t#0x0",
-                "10: \tsmc\t#0x0\n14: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>"
+                "10: \tbl\t0x0 <karch::cache::clean_to_memory>\n14: \tsmc\t#0x0",
+                "10: \tsmc\t#0x0\n14: \tbl\t0x0 <karch::cache::clean_to_memory>"
             )])
             .contains("before it cleans")
         );

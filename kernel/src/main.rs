@@ -57,8 +57,8 @@ mod window;
 
 use boot::Boot;
 use bootimg::Program;
+use kboot::bootinfo::GicVersion;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::GicVersion;
 use kcore::layout::KERNEL_VIRT;
 use kcore::must::Must;
 use kcore::time::Clock;

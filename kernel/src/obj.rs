@@ -11,7 +11,7 @@
 //! The order of locks is this module's: `OBJ` first, then the ticket lock
 //! of a CPU's cleanup queue (`Local::queue_spin`), the only other lock CPUs
 //! share, which a section may take and whose holder takes nothing. A third,
-//! `ITS_LOCK` (arch/aarch64/its.rs), guards the ITS command queue: it is
+//! `ITS_LOCK` (arch/its.rs), guards the ITS command queue: it is
 //! never taken inside a section, and its holder takes nothing. What a
 //! CPU alone owns (its scheduler, timers and log ring, `local`) has no
 //! lock, since nothing but that CPU reaches it, and a section under `OBJ`
