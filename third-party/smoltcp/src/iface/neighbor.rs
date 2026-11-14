@@ -92,6 +92,31 @@ impl Cache {
         self.fill_with_expiration(protocol_addr, hardware_addr, expires_at);
     }
 
+    /// Inserts the entry only when the address has none (or an expired one) and the cache has a
+    /// free slot: it never overwrites a live entry and never evicts (the patch of stafeto,
+    /// PATCH.md).
+    pub fn fill_if_vacant(
+        &mut self,
+        protocol_addr: IpAddress,
+        hardware_addr: HardwareAddress,
+        timestamp: Instant,
+    ) {
+        if let Some(neighbor) = self.storage.get(&protocol_addr)
+            && timestamp < neighbor.expires_at
+        {
+            return;
+        }
+        if self.storage.get(&protocol_addr).is_none() && self.storage.len() >= self.storage.capacity()
+        {
+            return;
+        }
+        let neighbor = Neighbor {
+            expires_at: timestamp + Self::ENTRY_LIFETIME,
+            hardware_addr,
+        };
+        let _ = self.storage.insert(protocol_addr, neighbor);
+    }
+
     pub fn fill_with_expiration(
         &mut self,
         protocol_addr: IpAddress,
