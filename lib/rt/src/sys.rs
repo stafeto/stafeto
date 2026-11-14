@@ -1190,6 +1190,38 @@ impl Token {
     }
 }
 
+/// Token::reply_receive, below.
+impl Token {
+    /// reply with `bytes`, up to abi::MESSAGE_MAX and no handles, and then
+    /// receive on `channel`, a handle with RECEIVE, in one entry into the
+    /// kernel (`Call::ReplyReceive`): the thread does not come back to its
+    /// own code between the two, so a server whose budget is gone does not
+    /// wait at its low level for the CPU between a reply and its next
+    /// request. What comes back is what `receive` returns. A reply the
+    /// client could not take (PEER_CLOSED) goes on to the receive; with
+    /// BAD_STATE, the token named no request that waited, the call receives
+    /// as `receive` does. Any other error is the call's: the reply, or the
+    /// receive after it, failed with it.
+    pub fn reply_receive(self, channel: &Handle<Channel>, bytes: &[u8]) -> Result<Received, Error> {
+        if bytes.len() > MESSAGE_MAX {
+            return Err(Error::InvalidArgs);
+        }
+        let Ok(regs) = message_regs(self.0, bytes, &[], 0) else {
+            return Err(Error::InvalidArgs);
+        };
+        msgbuf::set_channel(channel.raw().0);
+        let mut x = [0; 12];
+        x[..10].copy_from_slice(&regs);
+        // SAFETY: reply_receive uses no memory of the program but its own
+        // message buffer; it writes x0-x11 only.
+        unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
+        match received(x) {
+            Err(Error::BadState) => receive(channel),
+            r => r,
+        }
+    }
+}
+
 /// A send or a reply with handles that failed (spec 6.1): its error, and
 /// the handles when they stayed in the caller's table
 /// (abi::Error::keeps_handles). Handles that did not come back are gone.

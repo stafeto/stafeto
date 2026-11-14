@@ -62,6 +62,13 @@ pub trait Service<const K: usize> {
         None
     }
 
+    /// Whether the loop may keep the answer of a request that carries no
+    /// handles for its next receive (`Token::reply_receive`). A service
+    /// whose `between_requests` does work the client should not wait for, as
+    /// printing to the console, says false: the loop then sends each answer
+    /// at once.
+    const OWES_REPLY: bool = true;
+
     /// Answers `r`, a request of the client of `s` with a header of this
     /// version and one of METHODS; the handler checks the body. What it
     /// returns goes to the client, unless the handler took the token
@@ -116,7 +123,9 @@ pub trait Service<const K: usize> {
     fn before_request(&mut self) {}
 
     /// After every request the loop took, one the library refused for its
-    /// header or its session as well.
+    /// header or its session as well. The reply of a request with no
+    /// handles goes with the next receive, in one call (`Token::
+    /// reply_receive`), so this runs before the reply goes: keep it short.
     fn between_requests(&mut self) {}
 
     /// A notification other than CLIENT_GONE and the heartbeat's timer:
@@ -430,11 +439,18 @@ pub fn run_in<S: Service<K>, const K: usize>(
     // paths fill all `len` bytes, so no byte of an earlier client reaches
     // the next request.
     let mut buffer = [0; MESSAGE_MAX];
+    // The reply the last request left to go with the next receive: its
+    // token and its length, its bytes at the start of `buffer`.
+    #[cfg_attr(feature = "step-stats", allow(unused_mut, unused_variables))]
+    let mut owed: Option<Owed> = None;
     loop {
         #[cfg(feature = "step-stats")]
         let (began, incoming) = sys::receive_measured(channel);
         #[cfg(not(feature = "step-stats"))]
-        let incoming = sys::receive(channel);
+        let incoming = match owed.take() {
+            Some((token, held, len)) => token.reply_receive(channel, &held[..len]),
+            None => sys::receive(channel),
+        };
         steps::restart();
         #[cfg(feature = "step-stats")]
         service.measured_begin();
@@ -447,7 +463,8 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 token,
                 words,
             }) => {
-                let bytes = &mut buffer[..len.min(MESSAGE_MAX)];
+                let len = len.min(MESSAGE_MAX);
+                let bytes = &mut buffer[..len];
                 if len <= INLINE_MAX {
                     bytes.copy_from_slice(&abi::inline_bytes(&words)[..len]);
                 } else {
@@ -460,14 +477,25 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 #[cfg(feature = "step-stats")]
                 {
                     let sample = sample::finish_after(
-                        || request(service, table, config.issued, label, bytes, handles, token),
+                        || {
+                            // With the feature the step sends its reply.
+                            let _ = request(
+                                service,
+                                table,
+                                config.issued,
+                                label,
+                                bytes,
+                                handles,
+                                token,
+                            );
+                        },
                         || steps::end(began, kind),
                     );
                     service.measured_step(sample, table);
                 }
                 #[cfg(not(feature = "step-stats"))]
                 {
-                    request(service, table, config.issued, label, bytes, handles, token);
+                    owed = request(service, table, config.issued, label, bytes, handles, token);
                     steps::end(began, kind);
                 }
                 service.between_requests();
@@ -906,8 +934,16 @@ pub fn step_detail(value: u64) {
     steps::detail(value);
 }
 
+/// A reply of at most INLINE_MAX bytes with no handles that waits for the
+/// next receive (`Token::reply_receive`): its token, its bytes and their
+/// count.
+type Owed = (Token, [u8; INLINE_MAX], usize);
+
 /// Hands the request in `bytes` of the client `label` to `service`, and
-/// sends its answer. A request refused for its header makes no session.
+/// sends its answer. A request refused for its header makes no session. The
+/// answer of a request that needs no handles and no more than INLINE_MAX
+/// bytes is not sent here: it comes back for the loop to send with its next
+/// receive (`owe`).
 fn request<S: Service<K>, const K: usize>(
     service: &mut S,
     table: &mut [Option<Session<S::Data, K>>],
@@ -916,7 +952,7 @@ fn request<S: Service<K>, const K: usize>(
     bytes: &[u8],
     handles: Incoming,
     token: Token,
-) {
+) -> Option<Owed> {
     let header = match Header::read(&mut Reader::new(bytes)) {
         Ok(header) if header.version != S::VERSION => Err(Status::BadVersion),
         Ok(header) if !S::METHODS.contains(&header.method) => Err(Status::UnknownMethod),
@@ -926,8 +962,11 @@ fn request<S: Service<K>, const K: usize>(
     let (header, s) =
         match header.map(|h| (h, session::<S, K>(service, table, label, place, issued))) {
             Ok((header, Some(s))) => (header, s),
-            Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
-            Err(status) => return refuse(token, status),
+            Ok((_, None)) => {
+                let status = Status::Kernel(Error::LimitReached);
+                return owe(token, &proto_wire::reply(status), Outgoing::new(), false);
+            }
+            Err(status) => return owe(token, &proto_wire::reply(status), Outgoing::new(), false),
         };
     let mut r = Request {
         label,
@@ -938,29 +977,43 @@ fn request<S: Service<K>, const K: usize>(
         reply: None,
     };
     let answer = service.request(s, &mut r);
-    let Some(token) = r.token.take() else {
-        return;
-    };
+    let token = r.token.take()?;
+    // Handles the request brought and the handler left close when `r` goes,
+    // which is after the reply: such a reply is sent here, and so is every
+    // reply of a service that says it owes none.
+    let held = !r.handles.is_empty() || !S::OWES_REPLY;
     // A reply the client could not take is no error of the service; one
     // the kernel refused for the service's own handles, the client gets
     // as its status.
-    let _ = match answer {
-        Answer::Status(status) => reply(token, &proto_wire::reply(status), Outgoing::new()),
+    match answer {
+        Answer::Status(status) => owe(token, &proto_wire::reply(status), Outgoing::new(), held),
         Answer::Reply(handles) => {
             let bytes = r.reply.as_ref().map_or(&[][..], Writer::as_bytes);
-            reply(token, bytes, handles)
+            owe(token, bytes, handles, held)
         }
-        Answer::Deferred => reply(
+        Answer::Deferred => owe(
             token,
             &proto_wire::reply(Status::Kernel(Error::BadState)),
             Outgoing::new(),
+            held,
         ),
-    };
+    }
 }
 
-/// Refuses a request with `status` alone.
-fn refuse(token: Token, status: Status) {
-    let _ = reply(token, &proto_wire::reply(status), Outgoing::new());
+/// The reply `bytes` with `handles` to the request `token` names. With no
+/// handles, no incoming handle left (`held`) and INLINE_MAX bytes at most it waits for the next receive (the
+/// loop's `owed`); otherwise, or with the feature `step-stats`, which counts
+/// the reply in the step, it goes at once and None comes back.
+fn owe(token: Token, bytes: &[u8], handles: Outgoing, held: bool) -> Option<Owed> {
+    #[cfg(not(feature = "step-stats"))]
+    if !held && handles.is_empty() && bytes.len() <= INLINE_MAX {
+        let mut kept = [0; INLINE_MAX];
+        kept[..bytes.len()].copy_from_slice(bytes);
+        return Some((token, kept, bytes.len()));
+    }
+    let _ = held;
+    let _ = reply(token, bytes, handles);
+    None
 }
 
 /// End logical ownership without discarding retained physical cleanup debt.

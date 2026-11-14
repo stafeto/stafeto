@@ -361,11 +361,24 @@ pub enum Call {
     /// budget or ended, a budget that a thread has, or a thread of another
     /// CPU that has started.
     ThreadBindBudget = 39,
+    /// x0 token, x1 description, x2-x9 bytes 0-63 of the reply, as `Reply`;
+    /// the word at `msgbuf::CHANNEL` of the caller's message buffer holds a
+    /// handle with RECEIVE to the channel to receive on, as x0 of `Receive`.
+    /// One entry into the kernel makes the reply and then waits for the
+    /// next request or notification, as two separate sections under the
+    /// object lock (spec 6.1, 6.6): a server whose budget is gone never
+    /// stays at EL0 between its reply and its receive. The checks of
+    /// `Reply` come first, then those of the handle, with no effect before
+    /// they pass. PEER_CLOSED of the reply half goes on to the receive; any
+    /// other error of the reply half returns in x0 and the receive does not
+    /// run. Once the reply half is done, the call ends as `Receive` does
+    /// (x0-x11), always waiting.
+    ReplyReceive = 40,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 37] = [
+    pub const ALL: [Call; 38] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -403,6 +416,7 @@ impl Call {
         Call::MsiCreate,
         Call::BudgetCreate,
         Call::ThreadBindBudget,
+        Call::ReplyReceive,
     ];
 
     pub const fn number(self) -> u16 {
@@ -415,17 +429,17 @@ impl Call {
         match number {
             1..=28 => Some(Self::ALL[number as usize - 1]),
             30..=34 => Some(Self::ALL[number as usize - 2]),
-            36..=39 => Some(Self::ALL[number as usize - 3]),
+            36..=40 => Some(Self::ALL[number as usize - 3]),
             _ => None,
         }
     }
 
     /// The highest number of a call.
-    pub const HIGHEST: u16 = Call::ThreadBindBudget.number();
+    pub const HIGHEST: u16 = Call::ReplyReceive.number();
 }
 
 /// Numbers of calls that went, never given again (spec 11): 29,
-/// console_poll, and 35, request_identity. The next new call takes 40.
+/// console_poll, and 35, request_identity. The next new call takes 41.
 pub const RETIRED_CALLS: [u16; 2] = [29, 35];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
@@ -572,7 +586,8 @@ impl ObjectKind {
 /// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel); the kernel also writes the records of `object_info` `LOG` (up to 960 bytes) and `KERNEL_STATS` with x2 = 1 (296 bytes) here, from offset 0 |
 /// | 1024-1055 | `HANDLES` | the handle values of a message |
 /// | 1056-1087 | `INFO` | an info word for each handle that came |
-/// | 1088-1119 | | unused |
+/// | 1088-1095 | `CHANNEL` | the handle `reply_receive` receives on, read once |
+/// | 1096-1119 | | unused |
 /// | 1120-1935 | `CONTEXT` | the saved context of an entry, read at its return |
 /// | 1936-1999 | `ENTRIES` | the entry record of `rt`, which the kernel never touches |
 /// | 2000-4095 | | unused |
@@ -589,6 +604,12 @@ pub mod msgbuf {
     /// An info word for each handle that came (`info`), MESSAGE_HANDLES
     /// words, written by the kernel at delivery.
     pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
+    /// The handle of the channel `reply_receive` receives on, one word: the
+    /// caller puts it there before the call, which reads it once (spec 6.1).
+    /// It lies past `RESERVED`, outside the part of the buffer an entry
+    /// saves and restores (the dispatcher of `rt::upcall`), so a handler
+    /// that calls `reply_receive` on another channel changes it.
+    pub const CHANNEL: usize = RESERVED;
     /// The end of the part a message uses: the offsets of `DATA` up to
     /// here are those of messages, handles and info words.
     pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
@@ -1749,7 +1770,7 @@ mod tests {
         assert_eq!((INFO_PROCESS_TIME, POLICY_TAIL), (14, 256));
         assert_eq!(INFO_LABEL, 11);
         assert_eq!(Call::ObjectInfo.number(), 27);
-        assert_eq!(Call::ALL.len(), 37);
+        assert_eq!(Call::ALL.len(), 38);
     }
 
     #[test]
@@ -1814,7 +1835,7 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one_but_the_retired() {
-        assert_eq!(Call::ALL.len(), 37);
+        assert_eq!(Call::ALL.len(), 38);
         let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
         for (call, n) in Call::ALL.iter().zip(numbers) {
             assert_eq!(call.number(), n);
@@ -1825,14 +1846,14 @@ mod tests {
             0,
             29,
             35,
-            40,
+            41,
             0xFEFF,
             *TEST_CALLS.start(),
             *TEST_CALLS.end(),
         ] {
             assert_eq!(Call::from_number(n), None);
         }
-        assert_eq!(KERNEL_CALL_SLOTS, 40);
+        assert_eq!(KERNEL_CALL_SLOTS, 41);
     }
 
     #[test]
@@ -1851,6 +1872,7 @@ mod tests {
         assert_eq!(Call::ThreadUpcallRequest.number(), 33);
         assert_eq!(Call::BudgetCreate.number(), 38);
         assert_eq!(Call::ThreadBindBudget.number(), 39);
+        assert_eq!(Call::ReplyReceive.number(), 40);
         assert_eq!(Call::ThreadUpcallReturn.number(), 34);
         assert_eq!(RESULT_VALUES, 9);
         assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);

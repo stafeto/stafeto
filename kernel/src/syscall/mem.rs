@@ -52,6 +52,7 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
         Long::Change(on) => portions(thread, on, entry, None),
         Long::Spawn(child) => super::proc::process_create_second(thread, child, entry),
         Long::Quiet { epoch, limit } => quiet(thread, epoch, limit),
+        Long::Receive(handle) => super::messages::receive_second(thread, handle, entry),
     }
 }
 
