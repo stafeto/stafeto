@@ -29,6 +29,12 @@ impl Budgets {
     /// Takes them from the start data. A record without budgets (a service with two devices)
     /// has none, and the threads run without.
     pub fn take(s: &mut Startup) -> Budgets {
+        if cfg!(feature = "break-budget-unbound") {
+            return Budgets {
+                switch: None,
+                stacks: [const { None }; STACKS.len()],
+            };
+        }
         Budgets {
             switch: s.take::<Budget>("switch").ok(),
             stacks: STACKS.map(|name| s.take::<Budget>(name).ok()),

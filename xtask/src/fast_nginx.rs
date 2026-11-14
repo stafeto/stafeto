@@ -75,6 +75,7 @@ pub const VZ_STEPS_IMAGE: &str = "boot-fast-nginx-vz-steps.img";
 /// The images of the switch: one device, nginx-fast under nobody on the shared address.
 pub const SWITCH_IMAGE: &str = "boot-fast-switch.img";
 pub const SWITCH_STEPS_IMAGE: &str = "boot-fast-switch-steps.img";
+pub const SWITCH_UNBOUND_IMAGE: &str = "boot-fast-switch-unbound.img";
 pub const SWITCH_VZ_IMAGE: &str = "boot-fast-switch-vz.img";
 
 /// The settings of the package.
@@ -257,6 +258,8 @@ pub enum Kind {
     Switch,
     /// The switch, the service counting its steps.
     SwitchSteps,
+    /// The switch with the deliberate break `break-budget-unbound` (`cargo xtask budget-breaks`).
+    SwitchUnbound,
     /// The switch on Apple VZ (the measurement of F1 through the switch builds it).
     #[allow(dead_code)]
     SwitchVz,
@@ -265,7 +268,8 @@ pub enum Kind {
 /// The programs of the image: those of the image with the network and both
 /// devices, init's table for the program, and `nginx-fast`.
 pub fn programs(kind: Kind) -> &'static [ImageProgram] {
-    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 9] = [
+    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 10] = [
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
@@ -286,6 +290,7 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
         Kind::Switch => 6,
         Kind::SwitchSteps => 7,
         Kind::SwitchVz => 8,
+        Kind::SwitchUnbound => 9,
     };
     LISTS[at].get_or_init(|| {
         let vz = matches!(kind, Kind::Vz | Kind::VzSteps | Kind::SwitchVz);
@@ -297,7 +302,7 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
         };
         let table: &'static [&'static str] = match kind {
             Kind::SwitchVz => &["table-fast-switch-vz"],
-            Kind::Switch | Kind::SwitchSteps => &["table-fast-switch"],
+            Kind::Switch | Kind::SwitchSteps | Kind::SwitchUnbound => &["table-fast-switch"],
             Kind::Scale => &["table-fast-switch-scale"],
             _ if vz => &["table-fast-nginx-vz"],
             _ => &["table-fast-nginx"],
@@ -308,6 +313,7 @@ pub fn programs(kind: Kind) -> &'static [ImageProgram] {
                 ("netd", Kind::Crash) => program.3 = &["probe"],
                 ("netd", Kind::Steps | Kind::SwitchSteps) => program.3 = &["steps"],
                 ("netd", Kind::Switch | Kind::Scale) => program.3 = &["probe"],
+                ("netd", Kind::SwitchUnbound) => program.3 = &["probe", "break-budget-unbound"],
                 // The calls of the file service are counted and printed (step 3, `calls`).
                 ("ramfs", Kind::Plain) => program.3 = &["profile"],
                 _ => {}
@@ -363,6 +369,7 @@ fn image_of(kind: Kind) -> &'static str {
         Kind::Scale => crate::fast_scale::IMAGE,
         Kind::Switch => SWITCH_IMAGE,
         Kind::SwitchSteps => SWITCH_STEPS_IMAGE,
+        Kind::SwitchUnbound => SWITCH_UNBOUND_IMAGE,
         Kind::SwitchVz => SWITCH_VZ_IMAGE,
     }
 }

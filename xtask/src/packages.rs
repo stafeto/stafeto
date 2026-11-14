@@ -788,6 +788,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-fast-scale.img"
         | "boot-fast-switch.img"
         | "boot-fast-switch-steps.img"
+        | "boot-fast-switch-unbound.img"
         | "boot-fast-switch-vz.img"
         | "boot-net-bench-switch.img"
         | "boot-net-bench-switch-profile.img"
@@ -1193,6 +1194,7 @@ files = [
             "boot-fast-scale.img",
             "boot-fast-switch.img",
             "boot-fast-switch-steps.img",
+            "boot-fast-switch-unbound.img",
             "boot-fast-switch-vz.img",
             "boot-net-bench-fast.img",
             "boot-net-bench-switch.img",

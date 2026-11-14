@@ -90,13 +90,10 @@ pub const DMA_TAILS: &[Dma] = &[
 /// in stafeto-design `tasks/2026-11-14-sched-budgets-design.md`, the column
 /// without sound, which no image of this table has on CPU 0): the switch thread,
 /// a level above the stack, takes 400 us of each millisecond of CPU 0, and the
-/// stack instance on each CPU 400 us of each 2 ms (the same 20 %: in a window of 10 ms the
+/// stack instance on each CPU 200 us of each millisecond (20 %: in a window of 10 ms the
 /// stack takes 2 ms at most, `ceil(L/T) * C`). With the trusted work (5 %) that leaves
 /// the levels below the service 35 % of CPU 0 in every window of 10 ms however much the
-/// wire and the consumers send. The stack's period is 2 ms because a period of 1 ms stalls
-/// the loopback connect of the run `r` of `net-probe steps` (the image of the choice
-/// `batch-1 egress-1`; a budget of 35 % at 1 ms stalls it as well, a level of `low` equal to
-/// the stack's own does too, and 1.3 ms, 2 ms and 10 ms do not): the cause is not found.
+/// wire and the consumers send.
 /// A thread whose budget is gone works at level 1 until the
 /// next replenishment, so it still runs when nothing else wants the CPU. The
 /// names are those the service takes in its start data
@@ -114,15 +111,15 @@ pub const NETD_BUDGETS: &[Budget] = &[
     Budget {
         name: "stack0",
         cpu: 0,
-        c_ns: 400_000,
-        t_ns: 2_000_000,
+        c_ns: 200_000,
+        t_ns: 1_000_000,
         low: 1,
     },
     Budget {
         name: "stack1",
         cpu: 1,
-        c_ns: 400_000,
-        t_ns: 2_000_000,
+        c_ns: 200_000,
+        t_ns: 1_000_000,
         low: 1,
     },
 ];

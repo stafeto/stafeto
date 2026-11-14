@@ -174,6 +174,8 @@ pub enum Scenario {
     /// `share`: datagrams from the host keep the network service busy on its CPU under
     /// -icount; the share of that CPU a loop below the switch keeps is checked.
     Share,
+    /// `share` on the service with the deliberate break `break-budget-unbound`: the probe must fail.
+    ShareUnbound,
 }
 
 /// A counter of a line of the service after `key`.
@@ -283,6 +285,7 @@ pub(crate) fn booted(run: &mut qemu::Run) -> Result<(), String> {
 fn kind_of(s: Scenario) -> Kind {
     match s {
         Scenario::Steps => Kind::SwitchSteps,
+        Scenario::ShareUnbound => Kind::SwitchUnbound,
         _ => Kind::Switch,
     }
 }
@@ -297,10 +300,10 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     let kind = kind_of(scenario);
     let (name, programs) = (
-        if kind == Kind::SwitchSteps {
-            fast_nginx::SWITCH_STEPS_IMAGE
-        } else {
-            fast_nginx::SWITCH_IMAGE
+        match kind {
+            Kind::SwitchSteps => fast_nginx::SWITCH_STEPS_IMAGE,
+            Kind::SwitchUnbound => fast_nginx::SWITCH_UNBOUND_IMAGE,
+            _ => fast_nginx::SWITCH_IMAGE,
         },
         fast_nginx::programs(kind),
     );
@@ -328,7 +331,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
             guest: 8080,
         },
     ];
-    if scenario == Scenario::Share {
+    if matches!(scenario, Scenario::Share | Scenario::ShareUnbound) {
         // The flood: datagrams to a port nobody holds, which the stack answers.
         forwards.push(Forward {
             proto: Proto::Udp,
@@ -344,7 +347,10 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         ]);
     }
     cmd.args(net);
-    if matches!(scenario, Scenario::Steps | Scenario::Share) {
+    if matches!(
+        scenario,
+        Scenario::Steps | Scenario::Share | Scenario::ShareUnbound
+    ) {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
     // The flood needs CPUs besides the switch's for the programs that make it.
@@ -364,7 +370,8 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
         Scenario::Saturate => saturate(&mut run, &mut notes),
-        Scenario::Share => share(&mut run, udp_port, &mut notes),
+        Scenario::Share => share(&mut run, udp_port, &mut notes, false),
+        Scenario::ShareUnbound => share(&mut run, udp_port, &mut notes, true),
     };
     let output = run.stop();
     crate::symbolize::backtrace(&output.lines, &kernel.elf);
@@ -1477,7 +1484,15 @@ const FLOOD_FROM: u64 = 5;
 /// not looked into here); `saturate` checks the answers with a flood of the consumers' rings.
 /// The numbers print before the check, so that a build without the kernel budgets shows its
 /// share.
-fn share(run: &mut qemu::Run, udp_port: u16, notes: &mut Vec<String>) -> Result<(), String> {
+fn share(
+    run: &mut qemu::Run,
+    udp_port: u16,
+    notes: &mut Vec<String>,
+    unbound: bool,
+) -> Result<(), String> {
+    // A loop that gets no time under the flood (the service unbound) says nothing for minutes:
+    // that is the failure, so the break is not waited for as long.
+    let per_second = Duration::from_secs(if unbound { 150 } else { 900 });
     booted(run)?;
     let quiet_stat = stat(run, "quiet")?;
     run.send(&format!("switch-probe spin {SPIN_TOTAL} &"))?;
@@ -1489,7 +1504,7 @@ fn share(run: &mut qemu::Run, udp_port: u16, notes: &mut Vec<String>) -> Result<
         let line = run.expect_line(
             "a second of the loop below the switch",
             |l| l.contains("switch-probe: spin sec ") || l.contains("switch-probe: spin rate "),
-            Duration::from_secs(900),
+            per_second,
         )?;
         let Some(second) = parse_second(&line) else {
             break;
