@@ -665,6 +665,9 @@ impl<T: Linked> Default for ReadyQueue<T> {
 #[derive(Clone, Copy)]
 enum Op {
     Stop(bool),
+    /// The stint that is ending, above `low` with the budget gone, counts as
+    /// an overrun of the ticks it lasted (`Server::debit`).
+    Debit,
     Unblock,
     UnblockRun,
     Run,
@@ -748,6 +751,22 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe {
             let n = node(r);
             n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
+            // The budget is gone and the thread worked above `low`, at the
+            // level of the client of a request: the stint, which the stamp
+            // still holds, is charged to the budget as an overrun that the
+            // next replenishment pays; no stint at a client's level is free.
+            #[cfg(not(feature = "break-budget-leak"))]
+            if leave != Leave::Exit
+                && n.server.is_some_and(|s| {
+                    // The budget lives while the thread is bound to it.
+                    let s = s.as_ref();
+                    s.background() && n.link.level > s.low()
+                })
+            {
+                Self::with_server(r, Op::Debit, now);
+                node(r).stamp = 0;
+                return false;
+            }
             // The stint is over: the word holds no counter value any more.
             n.stamp = 0;
             if leave == Leave::Exit {
@@ -796,6 +815,7 @@ impl<T: Schedulable> Scheduler<T> {
             let was = s.background();
             match op {
                 Op::Stop(blocked) => s.stop(now, blocked),
+                Op::Debit => s.debit(now.saturating_sub(node(t).stamp & !RUNNING)),
                 Op::Unblock => s.unblock(now),
                 Op::UnblockRun => {
                     s.unblock(now);
@@ -1254,13 +1274,21 @@ impl<T: Schedulable> Scheduler<T> {
     /// The fast path of `send` (spec 6.4): `t`, which waits, runs at once
     /// in place of the thread that just began to wait (`block`), with a new
     /// quantum from `now`: the state `wake` and then `pick` at `now` leave
-    /// when `t`'s level is above every ready thread's and the cleanup's.
-    /// The caller checked the cleanup; a ready thread at or above `t`'s
-    /// level, a running thread or a `t` that does not wait stop the kernel.
+    /// when `t`'s level is above every ready thread's and the cleanup's
+    /// (`cleanup`, the top level of the cleanup queue). The caller checked
+    /// the level it expected (`can_hand_off`), but the level it works at
+    /// is the one the budget of `t` gives it at `now` (the activation can
+    /// find no capacity, and the sender's own stop, which came before, can
+    /// have put the boost of the request at `low`), so the check is made
+    /// here again. True when `t` runs. When a ready thread or the cleanup
+    /// stands at or above that level, `t` is ready at the tail of its
+    /// level with a new quantum, as `wake` leaves it, and nothing runs
+    /// until `pick`: false. A running thread or a `t` that does not wait
+    /// stop the kernel.
     ///
     /// # Safety
     /// As for `wake`.
-    pub unsafe fn hand_off(&mut self, t: NonNull<T>, now: u64) {
+    pub unsafe fn hand_off(&mut self, t: NonNull<T>, now: u64, cleanup: Option<u8>) -> bool {
         assert!(self.running.is_none(), "a thread runs at a hand-off");
         // SAFETY: the caller's promise.
         unsafe {
@@ -1271,15 +1299,19 @@ impl<T: Schedulable> Scheduler<T> {
             Self::with_server(t, Op::Unblock, now);
             Self::apply_level(t);
             let n = node(t);
-            assert!(
-                self.can_hand_off(n.priority(), None),
-                "a hand-off passes a ready thread"
-            );
+            #[cfg(not(feature = "break-budget-handoff"))]
+            if !self.can_hand_off(n.priority(), cleanup) {
+                n.state = State::Ready;
+                n.stamp = self.quantum;
+                self.ready.push_tail(t);
+                return false;
+            }
             n.state = State::Running;
             n.stamp = now | RUNNING;
             self.slice_end = now.saturating_add(self.quantum);
             self.running = Some(t);
             Self::with_server(t, Op::Run, now);
+            true
         }
     }
 
@@ -2435,7 +2467,7 @@ mod tests {
             slow.wake(r);
             assert_eq!(slow.decide(now, cleanup), 'r', "seed {seed:#x}");
             // SAFETY: the world keeps its threads alive; R waits.
-            unsafe { fast.s.hand_off(r2, now) };
+            assert!(unsafe { fast.s.hand_off(r2, now, cleanup) });
             assert_eq!(snapshot(&slow), snapshot(&fast), "seed {seed:#x}");
             cases += 1;
         }
@@ -2473,7 +2505,7 @@ mod tests {
             assert_eq!(w.pick(MS), 'c');
             w.block();
             // SAFETY: the world keeps its threads alive; R waits.
-            unsafe { w.s.hand_off(r, 3 * MS) };
+            assert!(unsafe { w.s.hand_off(r, 3 * MS, None) });
             assert_eq!(
                 (w.s.running(), node(r).state(), node(r).slice_left()),
                 (Some(r), State::Running, 0)
@@ -2992,7 +3024,7 @@ mod tests {
         assert_eq!(w.block(), sender);
         // The sender sent, so the receiver runs at once.
         // SAFETY: the receiver waits, above every ready thread.
-        unsafe { w.s.hand_off(receiver, 2 * MS) };
+        assert!(unsafe { w.s.hand_off(receiver, 2 * MS, None) });
         assert_eq!(node(receiver).ran_at(5 * MS), MS + 3 * MS);
         assert_eq!(node(sender).ran(), MS);
     }
@@ -3299,5 +3331,91 @@ mod tests {
         assert_eq!(server.ran(), 2 * MS + MS * 3 / 10, "C and the overrun");
         assert_eq!(server.overruns(), 1);
         assert_eq!(node(c).ran(), client_ran, "the client is charged nothing");
+    }
+
+    /// A thread blocks with a part of its budget used while its queue of
+    /// replenishments is full: the remnant merges into a later entry, the
+    /// head lies ahead and the budget has no capacity, though its flag says
+    /// the thread works at its own level. The activation of the receiver
+    /// finds that out after the sender's `send` looked at its level: the
+    /// hand-off passes a ready thread unless it checks again.
+    #[test]
+    fn a_hand_off_to_a_receiver_that_the_activation_demotes_wakes_it_instead_of_running_it() {
+        let mut w = World::new();
+        let r = w.thread('r', 40, FIFO);
+        w.budget(r, 2 * MS, 10 * MS, 1);
+        w.start(r);
+        let v = w.started('v', 10, FIFO);
+        // Four stints of 0.1 ms, each ending in a wait: the queue fills
+        // (one entry and three remnants), and the fourth wait merges.
+        let mut now = 0;
+        for i in 0..4 {
+            assert_eq!(w.pick(now), 'r');
+            now += MS / 10;
+            w.now = now;
+            w.block();
+            if i < 3 {
+                now += MS;
+                w.wake(r);
+            }
+        }
+        assert!(!node(r).is_demoted(), "the flag is stale");
+        // SAFETY: the world keeps its budgets alive.
+        let server = unsafe { node(r).server().unwrap().as_ref() };
+        assert_eq!(server.capacity(now), 0);
+        assert!(w.s.can_hand_off(node(r).priority(), None));
+        // SAFETY: the world keeps its threads alive; R waits.
+        assert!(!unsafe { w.s.hand_off(r, now, None) });
+        assert_eq!(node(r).state(), State::Ready);
+        assert_eq!(node(r).priority(), 1);
+        assert_eq!(w.level(1), "r");
+        assert_eq!(w.s.running(), None);
+        assert_eq!(w.pick(now), 'v');
+        let _ = v;
+    }
+
+    /// The cleanup queue counts at the level the activation leaves.
+    #[test]
+    fn a_hand_off_yields_to_cleanup_at_the_level_the_budget_leaves() {
+        let mut w = World::new();
+        let r = w.thread('r', 40, FIFO);
+        w.budget(r, 2 * MS, 10 * MS, 1);
+        w.start(r);
+        assert_eq!(w.pick(0), 'r');
+        w.now = 2 * MS;
+        w.block();
+        // The budget is gone: R works at `low` = 1, and a portion of
+        // cleanup at level 1 stands at its level.
+        // SAFETY: the world keeps its threads alive; R waits.
+        assert!(!unsafe { w.s.hand_off(r, 2 * MS, Some(1)) });
+        assert_eq!(node(r).state(), State::Ready);
+    }
+
+    /// A service with its budget gone works at the level of its client and
+    /// is charged to nobody: the time above `low` is an overrun of its own
+    /// budget, and the replenishment comes later by as much.
+    #[test]
+    fn an_exhausted_server_at_its_clients_level_pays_for_the_time_with_its_own_budget() {
+        let mut w = World::new();
+        let c = w.started('c', 50, FIFO);
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, 2 * MS, 10 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 'c');
+        w.now = MS;
+        w.block();
+        w.boost(s, 50, 63);
+        assert_eq!(w.pick(MS), 's');
+        // The budget ends at 3 ms; the client's level keeps `s` running.
+        assert_eq!(w.tick(3 * MS), 's');
+        assert!(node(s).is_demoted());
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { s.as_ref() }.event, Some(10 * MS));
+        // Three more ms at the client's level: the replenishment goes 3 ms
+        // later.
+        assert_eq!(w.yield_at(6 * MS), 's');
+        // SAFETY: as above.
+        assert_eq!(unsafe { s.as_ref() }.event, Some(13 * MS));
+        let _ = c;
     }
 }

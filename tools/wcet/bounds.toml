@@ -1074,7 +1074,7 @@ why = "the second header of the loop over the CPUs that has something to take (t
 # most and the pass that ends it (the merge of the chunks that arrive while a
 # thread runs, `Server::unblock`, at most three; the passes of the exhaustion,
 # `Server::check`, twice the queue; the insertion in time order, `Server::add`,
-# inlined in `check` and `split`). The move of the queue by one place when its
+# inlined in `check`, `split` and `debit`). The move of the queue by one place when its
 # head leaves is three fixed moves.
 
 [[loop]]
@@ -1094,6 +1094,12 @@ function = "<kcore::budget::Server>::check"
 at = "0xc0"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
+
+[[loop]]
+function = "<kcore::budget::Server>::debit"
+at = "0x54"
+bound = 5
+why = "the insertion of a replenishment in time order, when the head moves later by the time an exhausted thread ran at its client's level: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
 
 [[loop]]
 function = "<kcore::budget::Server>::split"
