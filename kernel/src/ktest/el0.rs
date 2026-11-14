@@ -881,7 +881,7 @@ fn make_stale(s: &mut Server) -> bool {
         s.unblock(at);
         s.run(at);
         at += step;
-        s.stop(at, true);
+        s.stop(at, true, false);
         at += step;
         if !s.background() && s.capacity(now) == 0 {
             return true;

@@ -1627,10 +1627,14 @@ enum Variant {
     BudgetKeepLevel,
     BudgetNoFree,
     BudgetChildFree,
+    /// A server whose work for a client is never lent to the client
+    /// (`break-budget-forgive-loan`): the loan phase of the probe
+    /// `budget-hog` must catch it.
+    BudgetForgiveLoan,
 }
 
 impl Variant {
-    const ALL: [Variant; 56] = [
+    const ALL: [Variant; 57] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1687,6 +1691,7 @@ impl Variant {
         Variant::BudgetKeepLevel,
         Variant::BudgetNoFree,
         Variant::BudgetChildFree,
+        Variant::BudgetForgiveLoan,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1751,6 +1756,7 @@ impl Variant {
             Variant::BudgetKeepLevel => Some("break-budget-keep-level"),
             Variant::BudgetNoFree => Some("ktest,break-budget-no-free"),
             Variant::BudgetChildFree => Some("ktest,break-budget-child-free"),
+            Variant::BudgetForgiveLoan => Some("break-budget-forgive-loan"),
         }
     }
 
@@ -1831,6 +1837,7 @@ impl Variant {
             Variant::BudgetKeepLevel => "stafeto-budget-keep-level",
             Variant::BudgetNoFree => "stafeto-budget-no-free",
             Variant::BudgetChildFree => "stafeto-budget-child-free",
+            Variant::BudgetForgiveLoan => "stafeto-budget-forgive-loan",
         }
     }
 }
