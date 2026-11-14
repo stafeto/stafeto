@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
 //! The race of stafeto-design#730: a SYN of the host for a port with no listener arrives
 //! before the guest knows the host's hardware address (its own ARP request is still
 //! unanswered, or the stack's one request a second went to another neighbour). smoltcp sends
