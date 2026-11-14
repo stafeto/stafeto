@@ -782,11 +782,17 @@ pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
 /// quantum when the receiver is round robin and `next_timer`, the nearest
 /// timer of a program (timer::first), which the caller read before the lock
 /// (spec 8, 10). The state is the one `wake` and the next decision would
-/// leave; the caller runs the receiver (thread::run). O(1).
+/// leave; the caller runs the receiver (thread::run). The check of the
+/// receiver's level is made once more after the budgets' operations of the
+/// meeting (Scheduler::hand_off): a receiver that no longer stands above
+/// every ready thread and the cleanup `cleanup` is woken as the slow path
+/// wakes it, and the result is Some(None): the meeting is made, nothing
+/// runs at once. O(1).
 pub fn hand_off(
     next_timer: Option<u64>,
+    cleanup: Option<u8>,
     meet: impl FnOnce(&mut Locked<'_>, u64) -> Option<NonNull<Thread>>,
-) -> Option<NonNull<Thread>> {
+) -> Option<Option<NonNull<Thread>>> {
     let now = timer::now();
     crate::obj::assert_held();
     let mut g = local().sched.lock();
@@ -804,11 +810,14 @@ pub fn hand_off(
         now,
     )?;
     // SAFETY: the receiver is alive, and `meet` made it the meeting's: it
-    // waits in no queue, above every ready thread and the cleanup.
-    unsafe { g.s.hand_off(r, now) };
+    // waits in no queue.
+    if !unsafe { g.s.hand_off(r, now, cleanup) } {
+        crate::stamps::ready(r, abi::WAKE_REQUEST);
+        return Some(None);
+    }
     let deadline = g.s.deadline(next_timer);
     g.armed.set(&mut VirtualTimer, deadline);
-    Some(r)
+    Some(Some(r))
 }
 
 /// The timer's interrupt, before its EOI: the timer goes off, since its
