@@ -975,7 +975,7 @@ pub fn random_restart_breaks() -> Result<(), String> {
         (
             "a layer whose threads ask for a session at once",
             &REJOIN_BREAK_RACE,
-            "pair_result == 1",
+            "ok && pair_result == 1",
         ),
         (
             "a process service with no limit on the sessions of a generation",
