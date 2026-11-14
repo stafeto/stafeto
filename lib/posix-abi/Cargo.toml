@@ -42,6 +42,13 @@ trace = ["trace/on"]
 # Deliberate breakage (cargo xtask random-restart): a session of the entropy
 # service that died with its instance is never replaced through init.
 break-no-reconnect = []
+# Deliberate breakage (cargo xtask random-restart-breaks): a process with no
+# channel to init never asks the process service for a new session
+# (EntropyRejoin).
+break-no-rejoin = []
+# Deliberate breakage: the threads of a process ask for a new session at once
+# (the second gets PERMISSION).
+break-rejoin-race = []
 
 [dependencies]
 trace = { path = "../trace" }

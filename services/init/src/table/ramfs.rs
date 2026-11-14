@@ -957,6 +957,11 @@ pub const TTY: Record = Record {
 // terminal runs ahead of the walk. Spec 2, 2.
 const _: () = assert!(PROCESS_LEVEL - proto_process::TTY_STEP_BELOW < TTY.priority);
 
+// The thread of the process service that takes the sessions of EntropyRejoin
+// from the entropy service's root works at the entropy service's level, so
+// that the loop of the process service never waits for it (spec 2, 2).
+const _: () = assert!(super::entropy::ENTROPY.priority == proto_process::REJOIN_LEVEL);
+
 /// The probe of the terminal service (tests/tty, xtask tty): the console's
 /// driver, the service and the probe, a client of it.
 pub const TTY_TABLE: &[Record] = &[
@@ -1033,6 +1038,42 @@ pub const POSIX_RANDOM_RESTART_TABLE: &[Record] = &[
     POSIX_RANDOM_TABLE[5],
     Record {
         args: b"posix-random\0restart\0",
+        ..POSIX_RANDOM_TABLE[6]
+    },
+];
+
+/// The probe of EntropyRejoin (tests/posix-random, role `rejoin`, `cargo xtask
+/// posix-random-restart`): the table of the probe of the restart with the
+/// room of the processes it keeps alive at once (a spawned program, an
+/// unseeded one, a forked child and its own child, then a program born after
+/// the restart).
+pub const POSIX_RANDOM_REJOIN_TABLE: &[Record] = &[
+    POSIX_RANDOM_TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 9 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_RANDOM_TABLE[2],
+    POSIX_RANDOM_TABLE[3],
+    POSIX_RANDOM_TABLE[4],
+    POSIX_RANDOM_TABLE[5],
+    Record {
+        args: b"posix-random\0rejoin\0",
+        ..POSIX_RANDOM_TABLE[6]
+    },
+];
+
+/// The probe of the limit of EntropyRejoin (tests/posix-random, role `limit`):
+/// four programs that outlive the old instance and a set-ID one.
+pub const POSIX_RANDOM_LIMIT_TABLE: &[Record] = &[
+    POSIX_RANDOM_REJOIN_TABLE[0],
+    POSIX_RANDOM_REJOIN_TABLE[1],
+    POSIX_RANDOM_REJOIN_TABLE[2],
+    POSIX_RANDOM_REJOIN_TABLE[3],
+    POSIX_RANDOM_REJOIN_TABLE[4],
+    POSIX_RANDOM_REJOIN_TABLE[5],
+    Record {
+        args: b"posix-random\0limit\0",
         ..POSIX_RANDOM_TABLE[6]
     },
 ];

@@ -400,6 +400,12 @@ pub fn getsid(pid: i32) -> Result<i32, i32> {
     i32::try_from(sid).map_err(|_| crate::constants::EIO)
 }
 
+/// The client of the process's record, or None before startup published it.
+pub fn try_client() -> Option<&'static Client> {
+    // SAFETY: as for `client`: only startup writes, before C entry.
+    unsafe { &*STATE.0.get() }.as_ref()
+}
+
 /// The client of the process's record, which startup published.
 pub fn client() -> &'static Client {
     // SAFETY: startup finished publishing before C entry and application threads.

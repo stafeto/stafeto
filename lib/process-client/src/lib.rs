@@ -87,6 +87,28 @@ impl Client {
             credentials: Credentials::from_words(words),
         })
     }
+    /// EntropyRejoin: a new session with the entropy service for a process
+    /// that has no channel to init, whose old one died with the service's
+    /// instance. AGAIN (`proto_process::AGAIN`) asks to try again after a
+    /// pause; PERMISSION and the kernel's LimitReached end the attempts.
+    pub fn entropy_rejoin(&self) -> Result<Handle<Channel>, Status> {
+        let request = Method::EntropyRejoin.header().bytes();
+        let mut reply = loop {
+            match sys::send(&self.channel, &request) {
+                Err(Error::Interrupted) => continue,
+                other => break other.map_err(Status::Kernel)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        match Status::from_code(Reader::new(bytes).u32()?) {
+            Status::Ok if bytes.len() == 4 && reply.handles.len() == 1 => {
+                reply.handles.take::<Channel>(0).map_err(Status::Kernel)
+            }
+            Status::Ok => Err(Status::BadSize),
+            error => Err(error),
+        }
+    }
     pub fn query(&self) -> Result<Snapshot, Status> {
         let mut buffer = [0; 64];
         Self::snapshot(self.call(&Method::Query.header().bytes(), &mut buffer)?)

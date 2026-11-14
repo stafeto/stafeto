@@ -54,7 +54,7 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use entropy::verify;
 use entropy::{FIRST_BYTES, Page, RESEED_NS, SEED_MAX, Source, Start};
-use proto_entropy::{Fill, Key, Method, NOT_READY, Seed, VERSION};
+use proto_entropy::{Fill, Key, Method, NOT_READY, ROOT_CLONES, Seed, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
@@ -144,9 +144,6 @@ const REGISTRAR_STACK: usize = 16 * 1024;
 static REGISTRAR: Stack<REGISTRAR_STACK> = Stack::new();
 const REGISTRAR_BUFFER: usize = abi::INIT_MSGBUF as usize + 2 * 4096;
 static CHANNEL: AtomicU64 = AtomicU64::new(0);
-/// The clones the root's VERIFY_SESSION gives at most, for all the programs
-/// that start with a session that is not the service's.
-const ROOT_CLONES: usize = 255;
 /// The feeder's message buffer, the page after the main thread's.
 const FEEDER_BUFFER: usize = abi::INIT_MSGBUF as usize + 4096;
 

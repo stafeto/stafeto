@@ -2157,6 +2157,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-random.img"
         | "boot-posix-random-break.img"
         | "boot-posix-random-restart.img"
+        | "boot-posix-random-rejoin.img"
+        | "boot-posix-random-limit.img"
+        | "boot-posix-random-rejoin-steps.img"
         | "boot-posix-random-restart-break.img"
         | "boot-posix-random-net.img"
         | "boot-posix-random-net2.img" => {
@@ -2978,6 +2981,9 @@ mod tests {
             "boot-posix-shares.img",
             "boot-posix-random.img",
             "boot-posix-random-restart.img",
+            "boot-posix-random-rejoin.img",
+            "boot-posix-random-limit.img",
+            "boot-posix-random-rejoin-steps.img",
             "boot-posix-display.img",
             "boot-pkg-slot.img",
             "boot-display.img",
