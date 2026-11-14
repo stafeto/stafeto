@@ -852,19 +852,21 @@ fn sessions() -> Result<Sessions, i32> {
 /// A clone of the process's session with the entropy service for a child
 /// (proto_entropy CLONE), when it has one. A session that died with the
 /// service's instance is replaced first when the process can (it started
-/// from init: `random::live_session`); one that cannot hands a copy of the
-/// closed session on without a request, and the loader of the child gives it a
+/// from init: `random::live_session`); one that cannot hands a closed channel
+/// on without a request, and the loader of the child gives it a
 /// session of the new instance. Any other refusal (the service at its limit)
 /// fails no fork or spawn: the child gets no session, and its getentropy
 /// gives ENOSYS; the line says so.
 pub(crate) fn entropy_clone() -> Option<Handle<Channel>> {
     let entropy = crate::random::live_session()?;
     let service = Handle::<Channel>::borrowed(entropy);
-    // A copy of the closed session: the child's loader sees it closed and
-    // gives the child a session of the new instance, so a start that needs
-    // the slot (a descriptor of /dev/urandom) is not refused.
+    // A closed channel as the child's session (the process's own session has
+    // no right to be duplicated): the child's loader sees that a session was
+    // given and died, and gives the child one of the new instance, so a start
+    // that needs the slot (a descriptor of /dev/urandom) is not refused.
     let dead_copy = || {
-        rt::sys::handle_duplicate(&service, rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER).ok()
+        let own = rt::sys::channel_create(1).ok()?;
+        rt::sys::handle_duplicate(&own, rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER).ok()
     };
     if rt::sys::channel_info(&service).is_ok_and(|info| info.closed) {
         return dead_copy();

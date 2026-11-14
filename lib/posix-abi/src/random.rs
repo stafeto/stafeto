@@ -139,7 +139,7 @@ pub fn live_session() -> Option<rt::abi::Handle> {
     Some(reconnect(old).unwrap_or(old))
 }
 
-/// A new session from init in the place of the closed `old`. The old
+/// A new session from init that replaces the closed `old`. The old
 /// handle stays open (its number could meet another object if it went while
 /// another thread still sends through it), one handle for each restart.
 fn reconnect(old: rt::abi::Handle) -> Option<rt::abi::Handle> {

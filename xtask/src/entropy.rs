@@ -688,15 +688,21 @@ static RESTART_BREAK_LOADER: [ImageProgram; 9] = random_restart_programs(&["brea
 /// Without the layer's reconnection through init.
 static RESTART_BREAK_LAYER: [ImageProgram; 9] =
     random_restart_programs(&[], &["break-no-reconnect"]);
+/// Without the replacement in a fork's copy alone.
+static RESTART_BREAK_FORK: [ImageProgram; 9] =
+    random_restart_programs(&["break-no-heal-fork"], &[]);
+/// With a clone from the root for a slot the parent left empty.
+static RESTART_BREAK_EMPTY: [ImageProgram; 9] = random_restart_programs(&["break-heal-empty"], &[]);
 /// Without either.
 static RESTART_BREAK_BOTH: [ImageProgram; 9] =
     random_restart_programs(&["break-no-heal"], &["break-no-reconnect"]);
 
 /// The lines of the role `restart`, each a check that passed.
-const RESTART_LINES: [&str; 4] = [
+const RESTART_LINES: [&str; 5] = [
     "posix-random: 60 programs started while the entropy service restarted each had AT_RANDOM and getentropy",
     "posix-random: the probe's own session is a session of the new instance",
-    "posix-random: a program that outlived the old instance started one that has AT_RANDOM and getentropy",
+    "posix-random: a program that outlived the old instance forked a child that has bytes, started a program and a set-ID program and ran exec, each with AT_RANDOM and getentropy",
+    "posix-random: a parent with no session gave its child none",
     "posix-random: restart ok",
 ];
 
@@ -774,6 +780,11 @@ pub fn random_restart_breaks() -> Result<(), String> {
             &RESTART_BREAK_LOADER,
         ),
         ("a layer that never reconnects", &RESTART_BREAK_LAYER),
+        (
+            "a loader that keeps a closed session in a fork",
+            &RESTART_BREAK_FORK,
+        ),
+        ("a loader that heals an empty slot", &RESTART_BREAK_EMPTY),
         ("both", &RESTART_BREAK_BOTH),
     ] {
         let output = restart_boot(

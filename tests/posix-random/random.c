@@ -1053,13 +1053,48 @@ static int fresh_role(void) {
 
 /* The role `holder`: started before the service's instance ended, so its session is the old
  * instance's and it has no way to init. It says it is running (a byte on the descriptor `ready`),
- * waits for a byte on the descriptor `go`, then starts a `fresh` program, whose entropy session
- * the loader takes from the new instance. */
+ * waits for a byte on the descriptor `go`, and then, each with the dead session: forks a child
+ * that takes bytes (the copy of a fork), starts a `fresh` program, starts a set-ID program that
+ * takes bytes of its verified session, and execs a `fresh` program. The loader gives each a
+ * session of the new instance. The status is that of the exec. */
 static int holder_role(const char *go, const char *ready) {
     char byte = 'r';
     CHECK(write(atoi(ready), &byte, 1) == 1);
     CHECK(read(atoi(go), &byte, 1) == 1);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        unsigned char child[32];
+        if (getentropy(child, sizeof child) != 0) _exit(100 + errno);
+        if (all_zero(child, sizeof child)) _exit(4);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    if (status != 0) printf("posix-random: the forked child ended with status 0x%x\n", status);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(spawn_role("fresh", -1) == 0);
+    char *argv[] = {"posix-random", "setid", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random-suid", NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char *exec_argv[] = {"posix-random", "fresh", NULL};
+    execv("/bin/posix-random", exec_argv);
+    return 21;
+}
+
+/* The role `nosession`: a process with no session with the entropy service starts a program.
+ * The parent has none to give, so the child has none either, and its start ends in abort ("no
+ * AT_RANDOM and no entropy"): the loader gives no clone of the root to a slot left empty. */
+static int no_session_role(void) {
+    random_probe_drop_session();
+    pid_t pid = 0;
+    char *argv[] = {"posix-random", "fresh", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+          (WIFEXITED(status) && WEXITSTATUS(status) == 134));
     return 0;
 }
 
@@ -1092,14 +1127,18 @@ static int restart_run(void) {
     int status = 0;
     CHECK(waitpid(holder, &status, 0) == holder);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    printf("posix-random: a program that outlived the old instance started one that has "
+    printf("posix-random: a program that outlived the old instance forked a child that has "
+           "bytes, started a program and a set-ID program and ran exec, each with "
            "AT_RANDOM and getentropy\n");
+    CHECK(spawn_role("nosession", -1) == 0);
+    printf("posix-random: a parent with no session gave its child none\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
     int status;
     if (argc > 1 && strcmp(argv[1], "fresh") == 0) return fresh_role();
+    if (argc > 1 && strcmp(argv[1], "nosession") == 0) return no_session_role();
     if (argc > 3 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2], argv[3]);
     if (argc > 1 && strcmp(argv[1], "restart") == 0) {
         status = restart_run();

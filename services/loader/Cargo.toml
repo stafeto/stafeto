@@ -24,6 +24,10 @@ break-at-random = []
 # Deliberate breakage (cargo xtask random-restart): a start whose entropy
 # session died with its instance keeps it.
 break-no-heal = []
+# The same for a fork's copy alone.
+break-no-heal-fork = []
+# A start whose parent gave no session gets one from the root.
+break-heal-empty = []
 image-gates = ["auth-probe"]
 image-info-probe = ["image-gates"]
 # The probes of the copy of a fork (posix-procs): pieces of 64 KiB, so
