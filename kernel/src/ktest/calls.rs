@@ -8057,7 +8057,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
         sched::set_priority(t, 40, Policy::Fifo, false).map_err(|_| "parked priority failed")?;
         // SAFETY: The scheduler lock guards this retained thread during boosts.
         sched::locked(|k| unsafe {
-            k.s.boost(t, 60, 63);
+            k.s.boost(t, 60, 63, true);
             k.s.unboost(t);
         });
         let start = timer::now();

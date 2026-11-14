@@ -57,3 +57,16 @@ break-its-readback-mask = []
 break-its-print-pa = []
 # A wait for Register Write Pending that timed out is taken as done.
 break-its-rwp-ignore = []
+# Deliberate breaks of the time budget, for the host tests and the probe that
+# must catch them (xtask budget-breaks): a replenishment that never applies, a
+# period that comes back too soon, chunks that merge whatever their times, an
+# overrun that is not charged, an exhausted thread that keeps its level, a
+# boost by a notification slot that survives the exhaustion, and a thread with
+# no budget that ignores the level its process allows.
+break-budget-refill = []
+break-budget-short-period = []
+break-budget-merge-always = []
+break-budget-no-overrun = []
+break-budget-keep-level = []
+break-budget-keep-slot = []
+break-budget-no-free = []

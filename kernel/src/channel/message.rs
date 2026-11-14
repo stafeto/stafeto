@@ -171,7 +171,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                 let (n, priority) = notice(slot);
                 syscall::set_notification(t, n);
                 if lends(c) {
-                    sched::boost_in_place(k, t, priority, ceiling);
+                    sched::boost_in_place(k, t, priority, ceiling, false);
                 }
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
@@ -424,8 +424,7 @@ fn fast_send(
                 return None;
             }
             let n = &r.as_ref().sched;
-            let boost = n.boost().max(t.as_ref().priority().min(ceiling(r)));
-            let level = n.base().max(boost);
+            let level = n.level_after_client_boost(t.as_ref().priority(), ceiling(r));
             if !k.s.can_hand_off(level, cleanup) || arch::irq_pending() || !testpoint::fast_path() {
                 return None;
             }
@@ -552,7 +551,7 @@ unsafe fn accept(
         let to = &mut (*r.as_ptr()).regs.x;
         to[10] = via.label();
         to[11] = token;
-        sched::boost_in_place(k, r, (*slot.as_ptr()).priority(), ceiling(r));
+        sched::boost_in_place(k, r, (*slot.as_ptr()).priority(), ceiling(r), true);
         (*r.as_ptr()).boost_token = token;
         thread::set_server(client, r);
     }

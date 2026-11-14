@@ -242,7 +242,7 @@ pub unsafe fn post(
             (*t.as_ptr()).waits = None;
             syscall::set_notification(t, n);
             if lends(c) {
-                sched::boost_in_place(k, t, priority, ceiling(t));
+                sched::boost_in_place(k, t, priority, ceiling(t), false);
             }
             sched::wake(k, t, abi::WAKE_NOTIFY);
         }
