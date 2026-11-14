@@ -83,11 +83,6 @@ mod points {
         false
     }
 
-    /// After the instruction cache was made coherent for the code in
-    /// `frames` (arch::cache::sync_icache_frames).
-    #[inline(always)]
-    pub fn code_synced(_: &[u64]) {}
-
     /// After the descriptors that let a program execute the pages of
     /// `frames` were written (process::maps).
     #[inline(always)]
@@ -200,8 +195,12 @@ mod points {
         el0::fast_path()
     }
 
-    /// A test watches the order of the two (ktest::calls).
-    pub fn code_synced(frames: &[u64]) {
+    /// After the instruction cache was made coherent for the code in
+    /// `frames` (karch::cache::sync_icache_frames, which calls this by its
+    /// symbol in the kernel tests' builds): a test watches the order of the
+    /// two (ktest::calls).
+    #[unsafe(no_mangle)]
+    fn karch_code_synced(frames: &[u64]) {
         ktest::calls::code_synced(frames);
     }
 

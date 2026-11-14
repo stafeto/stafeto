@@ -425,7 +425,7 @@ bound = 16
 why = "checks the window against the regions the kernel keeps for itself: RAM regions and the GIC, at most 16"
 
 [[loop]]
-function = "kernel::arch::aarch64::gic::mask"
+function = "karch::gic::mask"
 at = "*"
 bound = 1
 why = "polls the register that says the write is done: the write is done at the first look; the count of 10^6 looks is the guard of a failure, which stops the kernel"
@@ -605,7 +605,7 @@ why = "one item of the cleanup queue for each level that expired: at most 63 (sp
 
 [[loop]]
 function = "kernel::smp::handle"
-at = "0xb0"
+at = "0xac"
 bound = 1
 why = "a wait for another CPU (a command or an acknowledgement it owes), which its own hold bounds: not work of this CPU"
 
@@ -699,55 +699,55 @@ why = "`dc civac` on the lines of the frames of one portion of a contiguous obje
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x1b8"
+at = "0x1b4"
 bound = 6
 why = "the frames of one portion of a contiguous object: CREATE_PORTION = 6"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x160"
+at = "0x15c"
 bound = 8
 why = "zeroes a frame by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x214"
+at = "0x210"
 bound = 256
 why = "zeroes a frame 16 bytes at a time (stp of two zero registers): 4096 / 16"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x22c"
+at = "0x228"
 bound = 64
 why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x380"
+at = "0x37c"
 bound = 8
 why = "the frames one portion of an object of pages takes: FRAMES_PER_SECTION = 6 pages and the 2 nodes of their list (memory::Taken)"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x330"
+at = "0x32c"
 bound = 8
 why = "zeroes a frame by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x3d8"
+at = "0x3d4"
 bound = 256
 why = "zeroes a frame 16 bytes at a time (stp of two zero registers): 4096 / 16"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x3f0"
+at = "0x3ec"
 bound = 64
 why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
 
 [[loop]]
 function = "kernel::memory::fill"
-at = "0x4bc"
+at = "0x4b8"
 bound = 8
 why = "the pages and nodes one portion adds to a list: CREATE_PORTION = 6 pages and the 2 nodes (kcore::pagelist::PageList::fill)"
 
@@ -848,25 +848,25 @@ bound = 16
 why = "the frames of one portion of a change of a mapping: PORTION = 16 (a contiguous object)"
 
 [[loop]]
-function = "kernel::arch::aarch64::cache::sync_icache_frames"
+function = "karch::cache::sync_icache_frames"
 at = "0x50"
 bound = 8
 why = "the frames of one executable portion: EXEC_PORTION = 8"
 
 [[loop]]
-function = "kernel::arch::aarch64::cache::sync_icache_frames"
+function = "karch::cache::sync_icache_frames"
 at = "0x74"
 bound = 64
 why = "the 64 cache lines of one page"
 
 [[loop]]
-function = "kernel::arch::aarch64::cache::sync_icache_frames"
+function = "karch::cache::sync_icache_frames"
 at = "0xb0"
 bound = 8
 why = "the frames of one executable portion: EXEC_PORTION = 8"
 
 [[loop]]
-function = "kernel::arch::aarch64::cache::sync_icache_frames"
+function = "karch::cache::sync_icache_frames"
 at = "0xd4"
 bound = 64
 why = "the 64 cache lines of one page"
@@ -1022,7 +1022,7 @@ bound = 65
 why = "the places of DEVICES, the table of MSI devices by DeviceID: msi::MAX_DEVICES = 64 and the look that ends the loop"
 
 [[loop]]
-function = "kernel::arch::aarch64::its::wait_once"
+function = "kernel::arch::its::wait_once"
 at = "0x30"
 bound = 1001
 why = "one segment of a wait for the ITS: POLLS = 1000 reads of GITS_CREADR and the look that ends the loop (decision K3, section 5; irq_bind waits one segment and no more, a portion of cleanup looks once)"
@@ -1040,7 +1040,7 @@ bound = 8
 why = "the second header of the loop over the CPUs that has something to take (the one at 0xf4): the same counter below MAX_CPUS = 8, entered a second way after a CPU that holds nothing"
 
 [[loop]]
-function = "kernel::arch::aarch64::cache::clean_to_memory"
+function = "karch::cache::clean_to_memory"
 at = "0x2c"
 bound = 65
 why = "cleans at most 1 KiB (an ITT, kcore::its::ITT_MAX_BYTES; a command of the ITS is 32 bytes and a byte of the property table one) in lines of at least 16 bytes, and the look that ends the loop"

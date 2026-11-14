@@ -2,16 +2,16 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The loader's check of its own tree and placement with the kernel's code
-//! (`kcore::bootinfo::parse`, `kcore::memmap`, `kcore::layout`), repeating
+//! (`kboot::bootinfo::parse`, `kboot::memmap`, `kcore::layout`), repeating
 //! what `kernel::boot::collect` and `boot::init_program` do. A panic of the
 //! kernel before it reads the tree is not visible on EC2 (spec 3.2), so the
 //! loader finds every such panic first and prints it (the note, 2.2).
 
 use crate::error::Error;
-use kcore::bootinfo::{BOOT_TAKEN, BootInfo, BootInfoError, Region, RegionList, USABLE_REGIONS};
-use kcore::fdt::{self, Fdt};
+use kboot::bootinfo::{BOOT_TAKEN, BootInfo, BootInfoError, Region, RegionList, USABLE_REGIONS};
+use kboot::fdt::{self, Fdt};
+use kboot::memmap;
 use kcore::layout::{dtb_gib_is_mappable, fits_in_one_gib};
-use kcore::memmap;
 
 // The arm64 Image header (Linux booting.rst), as `xtask::image` checks it.
 const IMAGE_SIZE_OFFSET: usize = 0x10;
@@ -104,7 +104,7 @@ pub fn check(blob: &[u8], at: &Placement) -> Result<(Summary, BootInfo), Error> 
         }
     }
     let tree = Fdt::new(blob).map_err(|_| Error::Check("the tree is not a valid device tree"))?;
-    let info = kcore::bootinfo::parse(&tree).map_err(describe)?;
+    let info = kboot::bootinfo::parse(&tree).map_err(describe)?;
     if info.gic.is_none() {
         return Err(Error::Check("the tree has no interrupt controller"));
     }

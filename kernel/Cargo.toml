@@ -16,17 +16,19 @@ bench = false
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg" }
 console-line = { path = "../lib/console-line" }
+karch = { path = "../karch" }
+kboot = { path = "../kboot" }
 kcore = { path = "../kcore" }
 
 [features]
-ktest = []
+ktest = ["karch/ktest"]
 # The kernel tests with those that need `-icount` added (ktest::el0).
 icount = ["ktest", "measure"]
 # The second image of the kernel tests: the EL0 tests alone (ktest::EL0_HALF).
 el0-half = ["ktest"]
 # Deliberate breakage only, never in a shipped kernel: the ITS seems slow, each
 # wait for its commands reads GITS_CREADR SLOW_READS more times before it
-# believes it (arch/aarch64/its.rs), so that a wait spans several segments.
+# believes it (arch/its.rs), so that a wait spans several segments.
 its-slow = []
 # The portion of a binding or a device that waits for the ITS to run its
 # teardown commands waits in one portion, in a loop, as the first version did:
@@ -56,11 +58,11 @@ break-its-keep-firmware-lpis = ["its-lpis-preset"]
 # The command queue and the property table on the 4 KiB and 8 KiB blocks of
 # before the fix (the diagnostic kernel of the session on EC2).
 break-its-align-4k = ["kcore/break-its-align-4k"]
-fault-probe = []
+fault-probe = ["karch/fault-probe"]
 # CPU 1 fails a check right after it is up: the report of the panic must carry
 # a backtrace of CPU 1's own stack (xtask smp-cpu-check).
 cpu1-check-probe = []
-overflow-probe = []
+overflow-probe = ["karch/overflow-probe"]
 # The kernel acts as if PSCI refused CPU_ON for the third CPU (xtask smp-cpu-on).
 cpu-on-refused = []
 # The kernel widens the window between the section that posts a command and
@@ -85,8 +87,8 @@ break-spawn-check = ["window-probe"]
 measure = []
 # The first boot on a machine whose console the kernel cannot write yet (EC2):
 # the loader passes the address of a byte 16550 in x1 and the kernel writes one
-# letter to it at each stage (arch/aarch64/marks.rs). Never in a shipped kernel.
-early-marks = []
+# letter to it at each stage (karch/src/marks.rs). Never in a shipped kernel.
+early-marks = ["karch/early-marks"]
 # Probe images of the ITS: the ladder of page sizes starts at 64 KiB, as on
 # Graviton (QEMU takes all three), and the tables are treated as non-shareable
 # (cleaned to the point of coherency by hand).
@@ -113,7 +115,7 @@ break-asid-reserved = ["asid-probe", "kcore/break-reserved"]
 break-asid-flush = ["asid-probe", "kcore/break-flush"]
 break-asid-aside = ["asid-probe", "kcore/break-aside"]
 break-asid-retire = ["asid-probe"]
-break-unmap-local = []
+break-unmap-local = ["karch/break-unmap-local"]
 # The CPUs poll in the idle loop everywhere (idle-poll), or nowhere
 # (no-idle-poll); with neither, where kcore::idlepoll::enabled says (the MIDR
 # of a guest of Apple's hypervisor).

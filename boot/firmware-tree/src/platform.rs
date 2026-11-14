@@ -184,7 +184,7 @@ impl Platform {
                 0xB if r.len() >= 76 => {
                     if u32_at(r, 12).ok_or(ERR)? & 1 != 0 {
                         self.cpus.push(Cpu {
-                            mpidr: u64_at(r, 68).ok_or(ERR)? & kcore::bootinfo::MPIDR_AFFINITY,
+                            mpidr: u64_at(r, 68).ok_or(ERR)? & kboot::bootinfo::MPIDR_AFFINITY,
                             gicr: u64_at(r, 60).ok_or(ERR)?,
                         });
                         gicr_bases.push(u64_at(r, 60).ok_or(ERR)?);

@@ -4,7 +4,7 @@
 //! The tree built from the ACPI tables and the memory map of edk2 on QEMU
 //! (samples of `cargo xtask efi-fixtures`) against the tree QEMU builds
 //! for the same machine (`-machine ...,dumpdtb=`), compared by what the
-//! kernel reads from each (`kcore::bootinfo::BootInfo`) and by the PPIs of
+//! kernel reads from each (`kboot::bootinfo::BootInfo`) and by the PPIs of
 //! the timer.
 
 use firmware_tree::acpi::{Table, Tables};
@@ -12,8 +12,8 @@ use firmware_tree::check::{Placement, check};
 use firmware_tree::efimap::{Desc, classify};
 use firmware_tree::platform::Platform;
 use firmware_tree::tree::{Input, build};
-use kcore::bootinfo::{BootInfo, Region, parse, pci_hosts};
-use kcore::fdt::{Event, Fdt};
+use kboot::bootinfo::{BootInfo, Region, parse, pci_hosts};
+use kboot::fdt::{Event, Fdt};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qemu-efi");
 const DTB: &[u8] = include_bytes!("fixtures/qemu-efi/virt.dtb");

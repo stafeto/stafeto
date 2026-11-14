@@ -1674,7 +1674,7 @@ mod tests {
     }
 
     const NM: &str = "\
-ffffffffc0003a0c 0000000000000014 t kernel::arch::aarch64::probe::recurse
+ffffffffc0003a0c 0000000000000014 t karch::probe::recurse
 ffffffffc00042f0 0000000000000438 T handle_exception
 ffffffffc0009000 T __text_end
 ";

@@ -17,13 +17,13 @@
 //! through `AsidAllocator`, under the lock of the objects, for a time that
 //! does not depend on the number of ASIDs.
 
-use crate::bootinfo::MAX_CPUS;
 use crate::must::Must;
 use crate::paging::TTBR_ROOT_MASK;
 use core::sync::atomic::{
     AtomicU32, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
 };
+use kboot::bootinfo::MAX_CPUS;
 
 /// The widest ASID the architecture has.
 const MAX_BITS: u32 = 16;

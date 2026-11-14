@@ -18,7 +18,7 @@ use firmware_tree::efimap::{Desc, classify};
 use firmware_tree::platform::Platform;
 use firmware_tree::seed::{self, SEED_BYTES};
 use firmware_tree::tree::{Input, build};
-use kcore::bootinfo::Region;
+use kboot::bootinfo::Region;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qemu-efi");
 const MAP: &[u8] = include_bytes!("fixtures/qemu-efi/memmap.bin");

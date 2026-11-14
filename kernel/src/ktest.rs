@@ -53,8 +53,9 @@ use crate::{process, sched, session, thread, timer as timers};
 use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kboot::bootinfo::{Gic, GicVersion, PsciConduit, Region};
+use kboot::memmap;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::{Gic, GicVersion, PsciConduit, Region};
 use kcore::frames::{MAX_ORDER, PhysMem};
 use kcore::gic::{
     Ack, DEFAULT_PRIORITY, FIRST_SPI, GICD_CTLR_V3, ICC_SRE_SRE, IROUTER_ANY, PRIORITY_MASK,
@@ -64,7 +65,6 @@ use kcore::handles::{CHUNK, MAX_HANDLES};
 use kcore::layout::{
     GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, USER_END, frame_fits, image_pa,
 };
-use kcore::memmap;
 use kcore::paging::{
     Attrs, MAIR_DEVICE, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };

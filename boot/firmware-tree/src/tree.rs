@@ -3,7 +3,7 @@
 
 //! The device tree for stafeto from a `Platform` and the classified memory
 //! map (stafeto-design tasks/2026-11-12-aws-efi-loader.md, section 3). It is written for the
-//! kernel's `kcore::bootinfo::parse` and for nothing else: loading Linux with
+//! kernel's `kboot::bootinfo::parse` and for nothing else: loading Linux with
 //! it is not a goal.
 
 use crate::efimap::Classified;
@@ -12,8 +12,8 @@ use crate::platform::{Platform, Uart, UartKind};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kcore::bootinfo::Region;
-use kcore::fdt::Builder;
+use kboot::bootinfo::Region;
+use kboot::fdt::Builder;
 
 /// The phandle of the ITS node, which the `msi-map` entries name.
 pub const ITS_PHANDLE: u32 = 1;
@@ -261,7 +261,7 @@ pub fn build(input: &Input<'_>) -> Result<Vec<u8>, Error> {
                 map.extend([m.rid_base, ITS_PHANDLE, m.device_base, m.count]);
             }
         }
-        if map.len() / 4 > kcore::bootinfo::MSI_MAP_ENTRIES {
+        if map.len() / 4 > kboot::bootinfo::MSI_MAP_ENTRIES {
             return Err(Error::TooManyRegions("msi-map entries after the merge"));
         }
         if !map.is_empty() {
