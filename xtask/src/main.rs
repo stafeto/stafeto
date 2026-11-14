@@ -10251,11 +10251,16 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("fast-switch-steps", || {
             fast_switch::probe(fast_switch::Scenario::Steps)
         }),
-        // Three consumers keep their rings full while the probe samples the stack: the switch, a level above the stack
-        // and the services on its CPU, pauses so that they run (the stack answers, init's
-        // watchdog kills nothing).
+        // Three consumers keep their rings full while the probe samples the stack: the switch, a
+        // level above the stack and the services on its CPU, holds a kernel time budget, so that
+        // they run (the stack answers, init's watchdog kills nothing).
         job("fast-switch-saturate", || {
             fast_switch::probe(fast_switch::Scenario::Saturate)
+        }),
+        // Datagrams from the host keep the network service busy on its one CPU under -icount: a
+        // loop below the switch keeps at least a fifth of its rate in every window of 10 ms.
+        job("fast-switch-share", || {
+            fast_switch::probe(fast_switch::Scenario::Share)
         }),
         job("switch-probe", || {
             fast_switch::probe(fast_switch::Scenario::Frames)

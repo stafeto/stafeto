@@ -616,11 +616,23 @@ pub const CONNECT_MAX_US: u64 = 200_000;
 /// The longest chain the table of destinations may walk in a run.
 const DEMUX_PROBE_MAX: u64 = netd::demux::PROBE_LIMIT as u64;
 
+/// Whether `line` holds the line `marker`. The service works under a time budget, so a program
+/// below it can run while it is part way through a line of the console, and a line is written in
+/// pieces of at most 64 bytes: a line of the client may come after the start of a line of the
+/// service (the marker ends the line), and one of the client that the service cut in two has
+/// its first 48 bytes whole.
+fn marker_in(line: &str, marker: &str) -> bool {
+    line == marker
+        || line.ends_with(marker)
+        || (marker.len() > 48 && marker.is_char_boundary(48) && line.contains(&marker[..48]))
+}
+
 /// Judges the lines of a run: the device started twice, the address came
 /// each time as `mode` says, the client printed every line once and did
 /// not fail, and the service was killed once and restarted by init.
 pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String> {
-    let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
+    let count = |marker: &str| lines.iter().filter(|l| marker_in(l, marker)).count();
+    let has_prefix = |prefix: &str| lines.iter().any(|l| l.contains(prefix));
     if let Some(failed) = lines.iter().find(|l| l.starts_with("net-probe: failed")) {
         return Err(failed.clone());
     }
@@ -666,7 +678,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.listeners {
         once.push((LISTENERS, 1));
     }
-    if roles.wire && !lines.iter().any(|l| l.starts_with(WIRE_PREFIX)) {
+    if roles.wire && !has_prefix(WIRE_PREFIX) {
         return Err(format!("no line {WIRE_PREFIX:?}"));
     }
     if roles.wire_echo {
@@ -691,12 +703,12 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     }
     if roles.buffers {
         for prefix in [PORTION_PREFIX, BUFFERS_PREFIX] {
-            if !lines.iter().any(|l| l.starts_with(prefix)) {
+            if !has_prefix(prefix) {
                 return Err(format!("no line {prefix:?}"));
             }
         }
     }
-    if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
+    if roles.timers && !has_prefix(TIMERS_PREFIX) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
     }
     if let Some(sockets) = &sockets {
@@ -2035,6 +2047,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_line_of_the_client_cut_or_glued_by_the_service_still_holds_its_marker() {
+        let long = "net-probe: after restart config 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 mac 52:54:00:12:34:56";
+        // Whole, after the start of a line of the service, and cut in the middle by one.
+        assert!(marker_in(long, long));
+        assert!(marker_in(
+            &format!("net: frames rx 304 tx 307 listen{long}"),
+            long
+        ));
+        assert!(marker_in(
+            "net-probe: after restart config 10.0.2.15/24 gw 10.0.2.2 dnnet: frames rx 2 tx 4",
+            long
+        ));
+        // Another line of the client, or a short line cut short, is not it.
+        assert!(!marker_in(
+            "net-probe: config 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3",
+            long
+        ));
+        assert!(!marker_in("net-probe: timers", "net-probe: timers ok"));
+    }
 
     const COUNTERS: &str = "martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 orphan_reused 0 bad_sum 0 demux_probe 2";
 

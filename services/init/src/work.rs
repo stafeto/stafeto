@@ -210,6 +210,7 @@ mod tests {
             shares: Shares::CREATOR,
             cpus: GENERAL_CPUS,
             waits: &[],
+            budgets: &[],
         }
     }
 

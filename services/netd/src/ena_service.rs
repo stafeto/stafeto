@@ -30,8 +30,8 @@ use crate::ena_switch::{self, EnaSwitch};
 use crate::instance::{self, Instance};
 use crate::{
     DRIVERS, Driver, NO_CONFIG, NO_DEVICE, NO_ENTROPY, NO_START_DATA, NOT_MAPPED, NOT_REGISTERED,
-    NOT_STARTED, TABLES, Tables, announce_static, demux_secret, instance_entry, make_pause,
-    plan_instances, word,
+    NOT_STARTED, TABLES, Tables, announce_static, demux_secret, instance_entry, plan_instances,
+    word,
 };
 use abi::{Access, Rights, Source};
 use core::fmt;
@@ -544,6 +544,8 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     let Ok(net_object) = s.take::<Memory>("net") else {
         return NO_START_DATA;
     };
+    // The time budgets of the switch and the stack (init's table), bound before the threads start.
+    let budgets = crate::budgets::Budgets::take(&mut s);
     let args = ServiceArgs::read(s.args()).ok();
     let own = args.map_or(&[][..], |a| a.own);
     let (ena_pa, net_pa) = (word(own, 0), word(own, 8));
@@ -777,7 +779,13 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     let Some(switch) = EnaSwitch::new(wire, switch_channel, irq, msi, level + 1) else {
         return NOT_STARTED;
     };
-    let Ok(switch_thread) = ena_switch::start(switch, &s.process, level + 1, &wake_switch) else {
+    let Ok(switch_thread) = ena_switch::start(
+        switch,
+        &s.process,
+        level + 1,
+        &wake_switch,
+        budgets.switch(),
+    ) else {
         return NOT_STARTED;
     };
     let mut driver0 = Driver::new(
@@ -792,7 +800,6 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         #[cfg(feature = "trace")]
         crate::kdump::KernelDump::new(None),
     );
-    driver0.pause = make_pause(level);
     driver0.cpus = cpus;
     driver0.instances = instances;
     driver0.routed = false;
@@ -814,7 +821,8 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         entry: instance_entry,
     });
     let launch = launch.as_mut().expect("made");
-    if instance::start(launch, &s.process, level, 0, None).is_err() {
+    let budget = budgets.stack_on(netd::home::cpu_of(cpus, 0));
+    if instance::start(launch, &s.process, level, 0, None, budget).is_err() {
         return NOT_STARTED;
     }
     // The root for the loaders goes to the process service from a thread of its own.

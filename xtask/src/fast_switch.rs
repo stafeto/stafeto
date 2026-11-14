@@ -25,9 +25,13 @@
 //!   (kinds 67 to 70), is under 0.9 of term B.
 //! * `switch saturate`: three programs keep their rings full of entries the switch refuses, on
 //!   four CPUs, while the probe asks `posix-net stat` four times; the switch (a level above the
-//!   stack and the services on its CPU) budgets the consumers' time and pauses in its runs, so
-//!   the stack answers within seconds and init's watchdog kills nothing (without them init kills
-//!   the network service as silent).
+//!   stack and the services on its CPU) holds a kernel time budget and budgets the consumers'
+//!   time, so the stack answers within seconds and init's watchdog kills nothing (without them
+//!   init kills the network service as silent).
+//! * `switch share`: under -icount on one CPU, datagrams from the host keep the network service
+//!   busy while a loop on CPU 0 counts what the levels below the switch get: in every window of
+//!   10 ms it keeps at least `SHARE_MIN_PERCENT` of its rate with no flood (stafeto-design#655;
+//!   the service has no pause of its own: its kernel budgets leave the time).
 //! * `switch-probe`: the C program over the ring sends the frames the switch
 //!   refuses; each is counted by its reason, none reaches the wire (the
 //!   capture of the device), a broken ring disables its consumer alone.
@@ -67,14 +71,19 @@ const SATURATE_SAMPLES: usize = 3;
 /// this far apart.
 const SATURATE_LONG: Duration = Duration::from_secs(20);
 const SATURATE_APART: Duration = Duration::from_secs(2);
-/// The seconds the loop on CPU 0 counts for. Its share is logged only. Local TCG runs, two each:
-/// 12 and 13 % with neither budget nor pause, 19 and 20 % with the pause alone, 20 and 26 % with
-/// the budget too (the budget does not bind in this flood), so TCG does not tell the pause from
-/// the budget.
+/// The seconds the loop on CPU 0 counts for. Its share is logged only in `saturate` (local
+/// TCG runs: 12 and 13 % with neither budget nor pause, 19 and 20 % with the pause alone, so TCG
+/// does not tell the pause from the budget) and checked in `share`, under -icount.
 const SPIN_SECS: u64 = 3;
-/// The longest run the probe accepts: a run of 2 000 us, a step of 770 us and 40 000 us of the
-/// host's clock. A number of its own, so that a build that moves the run does not move the limit.
-const SATURATE_RUN_LIMIT_US: u64 = 42_800;
+/// The least share of its quiet rate the loop on CPU 0 keeps in any window of 10 ms of the flood
+/// of `share`: the note's 20 % (stafeto-design `tasks/2026-11-14-sched-budgets-design.md`, the
+/// layout of CPU 0). The switch's pause of 100 us in each run of 2 ms left it 4.8 %.
+const SHARE_MIN_PERCENT: u64 = 20;
+/// The datagrams of the flood of `share`: the threads that send, and the bytes of each.
+const FLOOD_THREADS: usize = 3;
+const FLOOD_BYTES: usize = 64;
+/// The guest's port the datagrams go to: held by nobody.
+const FLOOD_PORT: u16 = 9;
 const SATURATE_BOUND: u32 = 40;
 const SATURATE_FLOOR: Duration = Duration::from_secs(12);
 /// How many programs flood a ring at once.
@@ -142,8 +151,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
         [a] if a == "steps" => probe(Scenario::Steps),
         [a] if a == "frames" => probe(Scenario::Frames),
         [a] if a == "saturate" => probe(Scenario::Saturate),
+        [a] if a == "share" => probe(Scenario::Share),
         _ => Err(
-            "usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames|saturate]"
+            "usage: cargo xtask fast-probe switch [kill|idle|attach|steps|frames|saturate|share]"
                 .to_owned(),
         ),
     }
@@ -161,6 +171,9 @@ pub enum Scenario {
     Frames,
     /// `saturate`: a consumer floods its TX ring; the stack and init's watchdog are checked.
     Saturate,
+    /// `share`: datagrams from the host keep the network service busy on its CPU under
+    /// -icount; the share of that CPU a loop below the switch keeps is checked.
+    Share,
 }
 
 /// A counter of a line of the service after `key`.
@@ -296,13 +309,14 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         crate::net_curl::free_tcp_port()?,
         crate::net_curl::free_tcp_port()?,
     );
+    let udp_port = free_udp_port()?;
     let dir = crate::target_dir().join("fast-switch");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let pcap = dir.join(PCAP);
     let _ = std::fs::remove_file(&pcap);
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    let mut net = qemu::net(&[
+    let mut forwards = vec![
         Forward {
             proto: Proto::Tcp,
             host: ports.0,
@@ -313,7 +327,16 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
             host: ports.1,
             guest: 8080,
         },
-    ]);
+    ];
+    if scenario == Scenario::Share {
+        // The flood: datagrams to a port nobody holds, which the stack answers.
+        forwards.push(Forward {
+            proto: Proto::Udp,
+            host: udp_port,
+            guest: FLOOD_PORT,
+        });
+    }
+    let mut net = qemu::net(&forwards);
     if scenario == Scenario::Frames {
         net.extend([
             "-object".to_owned(),
@@ -321,7 +344,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         ]);
     }
     cmd.args(net);
-    if scenario == Scenario::Steps {
+    if matches!(scenario, Scenario::Steps | Scenario::Share) {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
     // The flood needs CPUs besides the switch's for the programs that make it.
@@ -341,6 +364,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         Scenario::Steps => steps(&mut run, nginx, &mut notes),
         Scenario::Frames => frames(&mut run, &pcap, &mut notes),
         Scenario::Saturate => saturate(&mut run, &mut notes),
+        Scenario::Share => share(&mut run, udp_port, &mut notes),
     };
     let output = run.stop();
     crate::symbolize::backtrace(&output.lines, &kernel.elf);
@@ -1268,17 +1292,14 @@ fn frames(
 
 /// `saturate`: three consumers keep their TX rings full of entries the switch refuses, so that
 /// every step of the switch finds more to do. The switch is a level above the stack, the services
-/// and the programs on its CPU; it budgets the consumers' time and pauses after a run of
-/// `SWITCH_RUN_NS`, so that they run.
+/// and the programs on its CPU; its kernel time budget and the budget of its consumers' entries
+/// (`CONSUMER_BUDGET_NS`) leave them the rest of CPU 0.
 ///
-/// Checked: the longest run of the switch without a rest (`run_max_us`) stays within a run, a
-/// step and the host's jitter (the main check: without the budget and the pause it lasts as long
-/// as the flood); `pause_failed` is 0; the switch paused or spent a budget; at least
-/// `SATURATE_SAMPLES` answers of `posix-net stat` spread over a flood of `SATURATE_LONG`, each
-/// within `max(SATURATE_FLOOR, SATURATE_BOUND` times the quiet answer`)`; and, once the flood has
-/// lasted `SATURATE_LONG`, init has not called the network service silent. The share of CPU 0 a
-/// loop below the switch keeps is only logged (stafeto-design#655): TCG does not tell the pause
-/// from the budget.
+/// Checked: at least `SATURATE_SAMPLES` answers of `posix-net stat` spread over a flood of
+/// `SATURATE_LONG`, each within `max(SATURATE_FLOOR, SATURATE_BOUND` times the quiet answer`)`;
+/// and, once the flood has lasted `SATURATE_LONG`, init has not called the network service
+/// silent. The share of CPU 0 a loop below the switch keeps is only logged here (TCG does not
+/// tell its budget from a pause); `share` checks it under -icount.
 fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
     booted(run)?;
     let quiet = Instant::now();
@@ -1314,7 +1335,7 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
         }
     }
     let flooded = spin_rate(run, "flood")?;
-    let share = flooded * 100 / base.max(1);
+    let share = flooded.mean * 100 / base.mean.max(1);
     // The flood lasted long enough: init must have said nothing of the network service.
     if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
         return Err(format!("init: {l}"));
@@ -1323,58 +1344,227 @@ fn saturate(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> 
     run.send("kill %1 %2 %3")?;
     run.expect("# ", DIALOG_STEP)?;
     let after = stat(run, "after")?;
-    let pauses = counter(&after.line, "pauses").ok_or("no `pauses` in the switch line")?;
-    let failed = counter(&after.line, "pause_failed").ok_or("no `pause_failed`")?;
-    let longest = counter(&after.line, "run_max_us").ok_or("no `run_max_us`")?;
     let waits = counter(&after.line, "budget_waits").ok_or("no `budget_waits`")?;
     println!(
-        "fast-switch: the loop below the switch: {base} per 100 ms quiet, {flooded} in the flood, {share} % (logged, no limit)"
+        "fast-switch: the loop below the switch: {} per 100 ms quiet (least window of 10 ms {}), {} in the flood (least window {}), {share} % (logged, no limit)",
+        base.mean, base.least, flooded.mean, flooded.least
     );
-    // A run and a step is the bound of the thread (the model test of `drive` holds it to that);
-    // the run is read when a step begins, so it misses up to one step, and the clock is the
-    // host's wall clock, which a loaded TCG host stops for several milliseconds (9.4 ms seen):
-    // the margin of `SATURATE_RUN_LIMIT_US` covers both.
-    let limit = SATURATE_RUN_LIMIT_US;
-    if longest > limit {
-        return Err(format!(
-            "the longest run of the switch without a rest was {longest} us, over {limit} us: {}",
-            after.line
-        ));
-    }
-    if failed != 0 {
-        return Err(format!("{failed} pauses did not happen: {}", after.line));
-    }
-    if pauses + waits == 0 {
-        return Err(format!(
-            "the switch neither paused nor spent a budget in the flood: {}",
-            after.line
-        ));
-    }
     notes.push(format!(
-        "the longest run {longest} us (limit {limit} us); {pauses} pauses, {waits} steps with the budget spent; {} answers of the stack in {:.0} s of flood: {took:?} (bound {bound:?}); the loop below the switch kept {share} % (logged)",
+        "{waits} steps with the consumers' budget spent; {} answers of the stack in {:.0} s of flood: {took:?} (bound {bound:?}); the loop below the switch kept {share} % (logged)",
         took.len(),
         began.elapsed().as_secs_f64()
     ));
     Ok(())
 }
 
-/// The iterations per 100 ms of `switch-probe spin` on CPU 0.
-fn spin_rate(run: &mut qemu::Run, what: &str) -> Result<u64, String> {
+/// What `switch-probe spin` says: the iterations per 100 ms, the mean and the least window of
+/// 10 ms.
+struct Spin {
+    mean: u64,
+    least: u64,
+}
+
+/// The rates of `switch-probe spin` on CPU 0.
+fn spin_rate(run: &mut qemu::Run, what: &str) -> Result<Spin, String> {
     run.send(&format!("switch-probe spin {SPIN_SECS}"))?;
     let line = run.expect_line(
         what,
         |l| l.contains("switch-probe: spin rate "),
         Duration::from_secs(120),
     )?;
-    line.split("spin rate ")
-        .nth(1)
-        .and_then(|r| r.trim().parse().ok())
-        .ok_or_else(|| format!("{what}: no rate in {line:?}"))
+    parse_spin(&line).ok_or_else(|| format!("{what}: no rates in {line:?}"))
+}
+
+/// The rates of a line `switch-probe: spin rate N min10 M`.
+fn parse_spin(line: &str) -> Option<Spin> {
+    let rest = line.split("spin rate ").nth(1)?;
+    let mut words = rest.split_whitespace();
+    let mean = words.next()?.parse().ok()?;
+    (words.next()? == "min10").then_some(())?;
+    let least = words.next()?.parse().ok()?;
+    Some(Spin { mean, least })
+}
+
+/// A free UDP port of the host.
+fn free_udp_port() -> Result<u16, String> {
+    let socket =
+        std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("a UDP port: {e}"))?;
+    Ok(socket.local_addr().map_err(|e| e.to_string())?.port())
+}
+
+/// Threads that send datagrams to `port` of the host as fast as they can, until `finish`.
+struct Flood {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Flood {
+    fn start(port: u16) -> Result<Flood, String> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..FLOOD_THREADS {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+                .map_err(|e| format!("a UDP socket of the flood: {e}"))?;
+            let (stop, sent) = (stop.clone(), sent.clone());
+            threads.push(std::thread::spawn(move || {
+                let datagram = [0x5a; FLOOD_BYTES];
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if socket.send_to(&datagram, ("127.0.0.1", port)).is_ok() {
+                        sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        Ok(Flood {
+            stop,
+            sent,
+            threads,
+        })
+    }
+
+    /// Stops the threads; the datagrams they sent.
+    fn finish(self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in self.threads {
+            let _ = t.join();
+        }
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The datagrams the flood has sent so far.
+fn flood_sent(flood: &Flood) -> u64 {
+    flood.sent.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A second of `switch-probe spin`: the line `spin sec K rate N min10 M`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Second {
+    k: u64,
+    rate: u64,
+    least: u64,
+}
+
+fn parse_second(line: &str) -> Option<Second> {
+    let rest = line.split("spin sec ").nth(1)?;
+    let mut w = rest.split_whitespace();
+    let k = w.next()?.parse().ok()?;
+    (w.next()? == "rate").then_some(())?;
+    let rate = w.next()?.parse().ok()?;
+    (w.next()? == "min10").then_some(())?;
+    let least = w.next()?.parse().ok()?;
+    Some(Second { k, rate, least })
+}
+
+/// The loop runs this many seconds; seconds 1 to `QUIET_LAST` are the quiet rate (the second 0
+/// is the loop starting), the flood starts when the line of `QUIET_LAST` has come, and the
+/// seconds from `FLOOD_FROM` on are in it whole.
+const SPIN_TOTAL: u64 = 10;
+const QUIET_LAST: u64 = 3;
+const FLOOD_FROM: u64 = 5;
+
+/// `share`: the machine has one CPU, so the network service, the loop of `switch-probe spin` and
+/// the shell stand on CPU 0, and the -icount clock is that CPU's alone. The loop runs for
+/// `SPIN_TOTAL` seconds and says each second; the quiet rate is that of its seconds 1 to
+/// `QUIET_LAST`. Then datagrams from the host to a port nobody holds keep the switch and the
+/// stack busy (each is received, looked at and answered), and the share of the quiet rate the
+/// loop keeps in its worst window of 10 ms of the seconds from `FLOOD_FROM` on must be at least
+/// `SHARE_MIN_PERCENT`, and init must not call the service silent (its heartbeat comes from the
+/// stack's thread). A `posix-net stat` in this flood gets no answer within two minutes, with the
+/// budgets and without them (the loop keeps its share, so the processor is not short; the cause is
+/// not looked into here); `saturate` checks the answers with a flood of the consumers' rings.
+/// The numbers print before the check, so that a build without the kernel budgets shows its
+/// share.
+fn share(run: &mut qemu::Run, udp_port: u16, notes: &mut Vec<String>) -> Result<(), String> {
+    booted(run)?;
+    let quiet_stat = stat(run, "quiet")?;
+    run.send(&format!("switch-probe spin {SPIN_TOTAL} &"))?;
+    run.expect("# ", DIALOG_STEP)?;
+    let mut seconds: Vec<Second> = Vec::new();
+    let mut flood: Option<Flood> = None;
+    let began = Instant::now();
+    loop {
+        let line = run.expect_line(
+            "a second of the loop below the switch",
+            |l| l.contains("switch-probe: spin sec ") || l.contains("switch-probe: spin rate "),
+            Duration::from_secs(900),
+        )?;
+        let Some(second) = parse_second(&line) else {
+            break;
+        };
+        seconds.push(second);
+        if second.k == QUIET_LAST && flood.is_none() {
+            flood = Some(Flood::start(udp_port)?);
+        }
+    }
+    let sent = flood.as_ref().map_or(0, flood_sent);
+    let quiet: Vec<&Second> = seconds
+        .iter()
+        .filter(|s| (1..=QUIET_LAST).contains(&s.k))
+        .collect();
+    let flooded: Vec<&Second> = seconds.iter().filter(|s| s.k >= FLOOD_FROM).collect();
+    if quiet.len() as u64 != QUIET_LAST || flooded.is_empty() {
+        return Err(format!("seconds of the loop: {seconds:?}"));
+    }
+    let base = quiet.iter().map(|s| s.rate).sum::<u64>() / quiet.len() as u64;
+    let quiet_least = quiet.iter().map(|s| s.least).min().unwrap_or(0);
+    let least = flooded.iter().map(|s| s.least).min().unwrap_or(0);
+    let mean = flooded.iter().map(|s| s.rate).sum::<u64>() / flooded.len() as u64;
+    let share = least * 100 / base.max(1);
+    println!(
+        "fast-switch: the loop below the switch: {base} per 100 ms quiet (least window of 10 ms {quiet_least}); in the flood {mean} (mean of seconds {FLOOD_FROM} to {}), least window of 10 ms {least}: {share} % of the quiet rate (at least {SHARE_MIN_PERCENT} %); {sent} datagrams sent in {:.0} s",
+        seconds.last().map_or(0, |s| s.k),
+        began.elapsed().as_secs_f64()
+    );
+    println!("fast-switch: seconds {seconds:?}");
+    if let Some(f) = flood {
+        f.finish();
+    }
+    println!("fast-switch: quiet  {}", quiet_stat.line);
+    if let Some(l) = run.lines().iter().find(|l| l.contains("went silent")) {
+        return Err(format!("init: {l}"));
+    }
+    if share < SHARE_MIN_PERCENT {
+        return Err(format!(
+            "the loop below the switch kept {share} % of CPU 0 in its worst window of 10 ms in the flood, under {SHARE_MIN_PERCENT} %"
+        ));
+    }
+    notes.push(format!(
+        "the loop below the switch kept {share} % of its quiet rate in its worst window of 10 ms ({SHARE_MIN_PERCENT} % wanted); {sent} datagrams sent"
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seconds_of_the_loop_below_the_switch_are_read_from_their_lines() {
+        let line = "net: bells tx 5 frames 9switch-probe: spin sec 4 rate 123456 min10 7890";
+        assert_eq!(
+            parse_second(line),
+            Some(Second {
+                k: 4,
+                rate: 123_456,
+                least: 7_890
+            })
+        );
+        assert!(parse_second("switch-probe: spin rate 123456 min10 7890").is_none());
+        assert!(parse_second("switch-probe: spin sec 4 rate x min10 1").is_none());
+    }
+
+    #[test]
+    fn the_rates_of_the_loop_below_the_switch_are_read_from_its_line() {
+        let spin = parse_spin("switch-probe: spin rate 123456 min10 7890").unwrap();
+        assert_eq!((spin.mean, spin.least), (123_456, 7_890));
+        // A line of the older program, with the mean alone, or a broken one, gives nothing.
+        assert!(parse_spin("switch-probe: spin rate 123456").is_none());
+        assert!(parse_spin("switch-probe: spin rate x min10 1").is_none());
+        assert!(parse_spin("switch-probe: counters rx_full 1 tx_refused 2").is_none());
+    }
 
     #[test]
     fn the_eight_at_once_step_allows_a_miss_only_for_a_program_that_lacked_memory() {

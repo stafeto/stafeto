@@ -20,7 +20,7 @@ use crate::net::{Client, Net};
 use crate::stack::Stack;
 use crate::switch::Lane;
 use netd::switchlogic::tables::MAX_INSTANCES;
-use rt::handle::{Channel, Process};
+use rt::handle::{Budget, Channel, Process};
 use rt::service::{Config, Session};
 use rt::{Handle, Stack as ThreadStack, sys};
 
@@ -77,13 +77,15 @@ pub struct NotStarted;
 
 /// Starts the thread of instance `k` on CPU `cpu` (the kernel's choice when none) at
 /// `priority` over `launch`, which stays where it is until the service ends. The thread runs
-/// `launch.entry` and ends the program with its code.
+/// `launch.entry` and ends the program with its code, under `budget` from its first instruction
+/// (`budgets`: the budget of the CPU the thread stands on).
 pub fn start<D>(
     launch: &mut Launch<'_, D>,
     process: &Handle<Process>,
     priority: u8,
     k: usize,
     cpu: Option<u32>,
+    budget: Option<&Handle<Budget>>,
 ) -> Result<(), NotStarted> {
     let arg = core::ptr::from_mut(launch) as u64;
     // SAFETY: the stack of `k` is the thread's alone, and the page of its message buffer is
@@ -104,6 +106,7 @@ pub fn start<D>(
         )
     }
     .map_err(|_| NotStarted)?;
+    crate::budgets::bind("the stack", budget, &thread);
     sys::thread_start(&thread).map_err(|_| NotStarted)?;
     // The thread runs as long as the program does; its handle is not needed.
     core::mem::forget(thread);

@@ -47,6 +47,7 @@
 #![no_std]
 #![no_main]
 
+mod budgets;
 mod calls;
 mod cells;
 mod consumers;
@@ -275,6 +276,9 @@ fn main(_: u64) -> u64 {
     if let Ok(object) = s.take::<Memory>("ena") {
         return ena_service::run(s, object);
     }
+    // The time budgets of the switch and the stack instances (init's table); each thread is
+    // bound to its own before it starts.
+    let budgets = budgets::Budgets::take(&mut s);
     #[cfg(feature = "trace")]
     let kernel_stamps = s.take::<Resource>("trace").ok();
     let (Ok(dma_object), Ok(net_object)) = (s.take::<Memory>("dma"), s.take::<Memory>("net"))
@@ -668,7 +672,13 @@ fn main(_: u64) -> u64 {
     }
     // The switch thread starts now: the stack and its tables are built, and
     // from here the device is the switch's.
-    let Ok(switch_thread) = switch::start(switch, &s.process, level + 1, &wake_switch) else {
+    let Ok(switch_thread) = switch::start(
+        switch,
+        &s.process,
+        level + 1,
+        &wake_switch,
+        budgets.switch(),
+    ) else {
         return NOT_STARTED;
     };
     let mut driver0 = Driver::new(
@@ -683,7 +693,6 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "trace")]
         kdump::KernelDump::new(kernel_stamps),
     );
-    driver0.pause = make_pause(level);
     driver0.cpus = cpus;
     driver0.instances = instances;
     driver0.routed = settings.consumers() > 0 || instances > 1;
@@ -741,7 +750,6 @@ fn main(_: u64) -> u64 {
             #[cfg(feature = "trace")]
             kdump::KernelDump::new(None),
         );
-        driver.pause = make_pause(level);
         driver.cpus = cpus;
         driver.instances = instances;
         driver.routed = true;
@@ -790,7 +798,8 @@ fn main(_: u64) -> u64 {
     for (k, launch) in launches.iter_mut().enumerate().take(instances) {
         let cpu = (k > 0).then(|| netd::home::cpu_of(cpus, k)).flatten();
         let launch = launch.as_mut().expect("made");
-        if instance::start(launch, &s.process, level, k, cpu).is_err() {
+        let budget = budgets.stack_on(cpu.or_else(|| netd::home::cpu_of(cpus, 0)));
+        if instance::start(launch, &s.process, level, k, cpu, budget).is_err() {
             return NOT_STARTED;
         }
     }
@@ -1227,15 +1236,6 @@ fn plan_instances(
     Ok((cpus, instances, extra))
 }
 
-/// The channel and timer of an instance's pauses: a wait channel, so that the pause lends no
-/// priority.
-#[inline(never)]
-fn make_pause(level: u8) -> Option<(Handle<Channel>, Handle<Timer>)> {
-    sys::channel_create_wait(level)
-        .and_then(|channel| sys::timer_create(&channel, level).map(|timer| (channel, timer)))
-        .ok()
-}
-
 struct Extra {
     channel: Handle<Channel>,
     notify: Handle<Channel>,
@@ -1319,10 +1319,6 @@ struct Driver<'a> {
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
     neighbours_at: u64,
-    /// The run of the thread and the channel and timer of its pauses.
-    guard: netd::ring::RunGuard,
-    pause: Option<(Handle<Channel>, Handle<Timer>)>,
-    counters_pause_failed: u32,
     /// When the instance next leaves its counters for the profile record.
     #[cfg(feature = "profile")]
     snapshot_at: u64,
@@ -1411,9 +1407,6 @@ impl<'a> Driver<'a> {
             armed: None,
             last_step: 0,
             neighbours_at: 0,
-            guard: netd::ring::RunGuard::new(),
-            pause: None,
-            counters_pause_failed: 0,
             #[cfg(feature = "profile")]
             snapshot_at: 0,
             ask_due: false,
@@ -2260,7 +2253,7 @@ impl Driver<'_> {
         let st = &switch::INNER.stats;
         let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
         rt::println!(
-            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} pauses {} pause_failed {} run_max_us {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
             get(&st.consumers),
             get(&st.flows),
             get(&st.unconfirmed),
@@ -2275,9 +2268,6 @@ impl Driver<'_> {
             get(&st.park_given),
             get(&st.left),
             get(&st.looped),
-            get(&st.pauses),
-            get(&st.pause_failed),
-            get(&st.run_max_us),
             get(&st.budget_waits),
             get(&st.sum_tx),
             get(&st.sum_rx),
@@ -2404,35 +2394,6 @@ const METHODS: &[u16] = &[
 ];
 
 impl Driver<'_> {
-    /// An item of work (a request or a notification) begins: the run of the thread goes on
-    /// through items that follow one another, and once it has lasted `SWITCH_RUN_NS` the thread
-    /// pauses `SWITCH_PAUSE_NS` on a wait channel, as the switch does, so that a flood of SYNs
-    /// or datagrams for this instance cannot hold its CPU from the processes below its level
-    /// (the worker that stands on the same CPU).
-    fn begin_item(&mut self) {
-        if self.guard.begin(now_ns()) {
-            self.pause();
-            self.guard.paused(now_ns());
-        }
-    }
-
-    fn end_item(&mut self) {
-        self.guard.end(now_ns());
-    }
-
-    fn pause(&mut self) {
-        let waited = match &self.pause {
-            Some((channel, timer)) => {
-                sys::timer_set(timer, now_ns() + netd::ring::SWITCH_PAUSE_NS).is_ok()
-                    && sys::receive(channel).is_ok()
-            }
-            None => false,
-        };
-        if !waited {
-            self.counters_pause_failed += 1;
-        }
-    }
-
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
@@ -2609,10 +2570,7 @@ impl Service<0> for Driver<'_> {
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
-        self.begin_item();
-        let answer = self.handle_request(s, r);
-        self.end_item();
-        answer
+        self.handle_request(s, r)
     }
 
     /// The client of `s` went: its operations go, and its descriptions are
@@ -2691,9 +2649,7 @@ impl Service<0> for Driver<'_> {
     }
 
     fn notification(&mut self, n: Notice) {
-        self.begin_item();
         self.handle_notification(n);
-        self.end_item();
     }
 }
 

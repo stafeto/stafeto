@@ -105,6 +105,7 @@ pub const GPU: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
+    budgets: &[],
 };
 
 /// The first probe, the owner (role `o`): opens the screen, draws and
@@ -134,6 +135,7 @@ const PROBE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
+    budgets: &[],
 };
 
 /// The second probe (role `s`): takes the screen once the first ended,

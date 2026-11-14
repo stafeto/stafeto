@@ -28,10 +28,12 @@
  *                                seconds, so that the switch has work at every step:
  *                                `saturate ok N` (N entries written); it runs on CPUs 1 to 3
  *   switch-probe spin SECS       count the iterations of a loop for SECS seconds on CPU 0, a
- *                                level below the switch, and say them per 100 ms
- *                                (`spin rate N`): the share of CPU 0 the levels below the
- *                                switch get is this rate in a flood against the rate of a
- *                                quiet system
+ *                                level below the switch, and say them per 100 ms: each second
+ *                                (`spin sec K rate N min10 M`: N the mean of the second, M the
+ *                                least of its windows of 10 ms, in the same unit) and at the
+ *                                end the whole run (`spin rate N min10 M`): the share of CPU 0
+ *                                the levels below the switch get is this rate in a flood
+ *                                against the rate of a quiet system
  *
  * Lines: `switch-probe: attached c N g G addr A/P mac M block F+C`,
  * `switch-probe: MODE refused K` (K frames refused by the switch since the
@@ -288,27 +290,68 @@ static void pin(unsigned mask)
 		fail("sched_setaffinity");
 }
 
+/* The iterations and the least window of the second that ends with window `w`. */
+static uint64_t sec_iterations, sec_least = UINT64_MAX;
+
+/* Window `w` of 10 ms ended with `iterations` counted in it. After the last of a second's 100
+ * windows the loop says that second: `spin sec K rate N min10 M`, N the iterations of the second
+ * per 100 ms and M the least window of it in the same unit. The first window, which the loop
+ * enters part way, stays out of M. */
+static void end_window(uint64_t w, uint64_t iterations)
+{
+	sec_iterations += iterations;
+	if (w > 0 && iterations < sec_least)
+		sec_least = iterations;
+	if (w % 100 == 99) {
+		printf("switch-probe: spin sec %llu rate %llu min10 %llu\n", (unsigned long long)(w / 100),
+		       (unsigned long long)(sec_iterations / 10),
+		       (unsigned long long)(sec_least == UINT64_MAX ? 0 : sec_least * 10));
+		fflush(stdout);
+		sec_iterations = 0;
+		sec_least = UINT64_MAX;
+	}
+}
+
 /* A loop that counts its iterations for `secs` seconds on CPU 0; what it gets of that CPU
- * is its rate. The clock is read every 4 096 iterations, so a starved loop takes longer than
- * `secs` to end, and the rate is the iterations over the time they took. */
+ * is its rate. The clock is read every 1 024 iterations, so a starved loop takes longer than
+ * `secs` to end, and the rate is the iterations over the time they took. Each second says its
+ * rate and its least window of 10 ms (`end_window`); a window that saw no read counts 0. The
+ * last line is `spin rate N min10 M` for the whole run (the last, partial second left out of M). */
 static void spin(unsigned secs)
 {
+	enum { CHUNK = 1024 };
+	const uint64_t window_ns = 10000000ull;
 	struct timespec t0, t;
 	volatile uint64_t acc = 0;
-	uint64_t iterations = 0, ns;
+	uint64_t iterations = 0, ns, window = 0, in_window = 0, least = UINT64_MAX;
 
 	pin(1);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (;;) {
-		for (unsigned i = 0; i < 4096; i++)
+		for (unsigned i = 0; i < CHUNK; i++)
 			acc += i;
-		iterations += 4096;
+		iterations += CHUNK;
 		clock_gettime(CLOCK_MONOTONIC, &t);
 		ns = (uint64_t)(t.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t.tv_nsec - t0.tv_nsec);
+		if (ns / window_ns != window) {
+			uint64_t now = ns / window_ns;
+
+			if (window > 0 && in_window < least)
+				least = in_window;
+			end_window(window, in_window);
+			for (uint64_t w = window + 1; w < now; w++) {
+				least = 0;
+				end_window(w, 0);
+			}
+			window = now;
+			in_window = 0;
+		}
+		in_window += CHUNK;
 		if (ns >= (uint64_t)secs * 1000000000ull)
 			break;
 	}
-	printf("switch-probe: spin rate %llu\n", (unsigned long long)(iterations * 100000000ull / ns));
+	printf("switch-probe: spin rate %llu min10 %llu\n", (unsigned long long)(iterations * 100000000ull / ns),
+	       (unsigned long long)(least == UINT64_MAX ? 0 : least * 10));
 	fflush(stdout);
 }
 
