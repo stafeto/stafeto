@@ -20,7 +20,7 @@ You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` a
 
 ## What works today
 
-- **Kernel.** A capability microkernel of about 188 KiB with 35 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
+- **Kernel.** A capability microkernel of about 200 KiB (204,805 bytes as measured, with no size limit) with 37 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
 - **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (8,870 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
 - **Several CPUs.** Up to 4 CPUs are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.

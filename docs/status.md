@@ -24,7 +24,9 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 192,517 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+image is 204,805 bytes on QEMU and on Apple VZ, as measured; it has no size
+limit. `cargo xtask build` prints the size and its difference from the record
+in `kernel/size.txt`, and flags a growth of more than 4 KiB.
 The longest stretch the kernel runs without taking an interrupt (term B of the
 kernel) stays below the limit of 18,000 ticks that `xtask` enforces under
 `-icount`; teardown of a session and its message buffers runs in
@@ -183,8 +185,8 @@ exercise the terminal APIs, and readiness tests cover all four waiting
 interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
 (1,035 of 1,035), and no required function only returns `ENOSYS`. The
 `unistd.h` macros and `sysconf` agree and claim only what exists. relibc
-builds at its own level 3: user-space programs have no size limit, only
-the kernel has one. Coverage details are in
+builds at its own level 3: neither user-space programs nor the kernel
+have a size limit. Coverage details are in
 [posix-coverage.md](posix-coverage.md).
 
 **Files, locks and memory.** The RAM file service creates files,
