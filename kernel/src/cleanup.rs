@@ -447,6 +447,13 @@ pub fn portion() {
                     enqueue(crate::msi::cleanup_item(m), Object::Msi(m), level)
                 }
             }
+            Work::Object(Object::Budget(b)) => {
+                crate::obj::serving(crate::obj::CLEAN_BUDGET);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_BUDGET);
+                let _section = crate::obj::lock();
+                crate::budget::clean(b, level)
+            }
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")
             }

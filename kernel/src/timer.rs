@@ -13,7 +13,10 @@
 //! inside the timer (kcore::timer::Levels): arming and cancelling take
 //! O(log n) and allocate nothing, and the nearest deadline of the levels
 //! whose firing is not queued, O(1), joins the end of a quantum in the
-//! kernel's timer (sched::decide). The kernel's timer interrupt takes no
+//! kernel's timer (sched::decide). The replenishment event of a time budget
+//! (budget.rs) stands in the same heaps: a timer and a budget each embed an
+//! `Entry`, the node of the heap, and the portion of a level fires an entry
+//! of a budget as it fires one of a timer. The kernel's timer interrupt takes no
 //! timer off: each level whose top expired queues its own item of the
 //! cleanup queue at that level (`expire`), and the item's portion takes up
 //! to FIRE_PORTION expired timers of the level, each posting bit 0 into its
@@ -47,9 +50,50 @@ const NO_CPU: u8 = u8::MAX;
 /// The bits of an expiry (spec 6.5): bit 0, once.
 const TIMER_BITS: u64 = 1;
 
+/// What stands in the heaps of the levels: the node, with the deadline in
+/// ticks, and the kind of the object that embeds it, a timer or the budget
+/// of a thread.
+pub struct Entry {
+    node: HeapLink<Entry>,
+    budget: bool,
+}
+
+impl Entry {
+    pub const fn new(budget: bool) -> Entry {
+        Entry {
+            node: HeapLink::new(),
+            budget,
+        }
+    }
+
+    /// Whether a budget embeds the entry.
+    pub fn is_budget(&self) -> bool {
+        self.budget
+    }
+
+    /// Whether the entry stands in a heap.
+    pub fn is_linked(&self) -> bool {
+        self.node.is_linked()
+    }
+
+    /// The deadline the entry was put in a heap for last.
+    #[cfg(feature = "ktest")]
+    pub fn deadline(&self) -> u64 {
+        self.node.deadline()
+    }
+}
+
+// SAFETY: the node is a field of the entry.
+unsafe impl HeapNode for Entry {
+    fn heap_link(this: NonNull<Entry>) -> NonNull<HeapLink<Entry>> {
+        // SAFETY: `this` points at a live entry.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).node) }
+    }
+}
+
 pub struct Timer {
-    /// Its node in the heap while it is armed, with the deadline in ticks.
-    node: HeapLink<Timer>,
+    /// Its entry in the heap while it is armed, with the deadline in ticks.
+    entry: Entry,
     /// Its source of notifications: the slot of its expiries, the label of
     /// the handle it was made through (spec 5.3) and the channel.
     source: Source,
@@ -80,18 +124,53 @@ pub struct Timer {
 // interrupts masked inside the kernel.
 unsafe impl Send for Timer {}
 
-// SAFETY: the node is a field of the timer.
-unsafe impl HeapNode for Timer {
-    fn heap_link(this: NonNull<Timer>) -> NonNull<HeapLink<Timer>> {
-        // SAFETY: `this` points at a live timer.
-        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).node) }
+/// The entry of `t`.
+fn entry(t: NonNull<Timer>) -> NonNull<Entry> {
+    // SAFETY: the caller holds a reference to the timer, or the heap does;
+    // only the field's address is taken.
+    unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).entry) }
+}
+
+/// The timer whose entry is `e`, which no budget embeds.
+///
+/// # Safety
+/// `e` is the entry of a live timer.
+unsafe fn timer_of(e: NonNull<Entry>) -> NonNull<Timer> {
+    // SAFETY: the caller's promise; the entry is a field of the timer.
+    unsafe {
+        NonNull::new_unchecked(
+            e.as_ptr()
+                .byte_sub(core::mem::offset_of!(Timer, entry))
+                .cast(),
+        )
+    }
+}
+
+/// Puts the entry `e` of a budget in the heap of level `to` for the counter
+/// value `at`, or takes it out for None, wherever it stands now (in the heap
+/// of level `from` while it is linked): O(log n), up to 13 steps, for the
+/// budget of the thread of this CPU (budget.rs).
+///
+/// # Safety
+/// `e` is the entry of a live budget of a thread of this CPU, in the heap of
+/// `from` if it is linked.
+pub unsafe fn rearm(e: NonNull<Entry>, from: u8, to: u8, at: Option<u64>) {
+    let mut g = local().timers.lock();
+    // SAFETY: the caller's promise.
+    unsafe {
+        if (*e.as_ptr()).node.is_linked() {
+            g.levels.remove(from, e);
+        }
+        if let Some(at) = at {
+            g.levels.insert(to, e, at);
+        }
     }
 }
 
 /// The armed timers of the system by level, and the longest portion of
 /// firings so far in ticks, for KSTATS.
 pub(crate) struct Timers {
-    levels: Levels<Timer>,
+    levels: Levels<Entry>,
     longest_firing: u64,
 }
 
@@ -124,6 +203,17 @@ static LIVE: Live = Live::new();
 /// changed with interrupts masked inside the kernel (spec 8.1).
 static CREATED: Budget = Budget::new();
 
+/// A place in the system's count of timers for a time budget, whose event
+/// stands in the same heaps (budget.rs): false when the count is full.
+pub fn take_place() -> bool {
+    CREATED.take(MAX_SYSTEM_TIMERS)
+}
+
+/// Gives the place of a budget back.
+pub fn give_place() {
+    CREATED.give();
+}
+
 /// A timer of `payer`, the process of the thread that makes it, on `c`,
 /// an open channel, whose slot has `priority` and `label`, as timer_create
 /// checked them (spec 10): LIMIT_REACHED when the payer has
@@ -155,7 +245,7 @@ pub fn create(
         process::refund_timer(payer);
     })?;
     let timer = Timer {
-        node: HeapLink::new(),
+        entry: Entry::new(false),
         source: Source::new(c),
         refs: Refs::one(),
         payer,
@@ -271,11 +361,11 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
         // SAFETY: the timer is alive; one in the heap of its level stays in
         // place until it leaves, and its portion takes it out first.
         unsafe {
-            if (*t.as_ptr()).node.is_linked() {
-                g.levels.remove(level, t);
+            if (*t.as_ptr()).entry.is_linked() {
+                g.levels.remove(level, entry(t));
             }
             if deadline > now {
-                g.levels.insert(level, t, deadline);
+                g.levels.insert(level, entry(t), deadline);
                 return Ok(());
             }
         }
@@ -301,8 +391,8 @@ pub fn cancel(t: NonNull<Timer>) -> Result<(), Error> {
     let mut g = local().timers.lock();
     // SAFETY: the timer is alive and, if linked, in the heap of its level.
     unsafe {
-        if (*t.as_ptr()).node.is_linked() {
-            g.levels.remove(level, t);
+        if (*t.as_ptr()).entry.is_linked() {
+            g.levels.remove(level, entry(t));
         }
     }
     Ok(())
@@ -436,7 +526,7 @@ pub fn fire_at(level: u8, now: u64) {
     let mut step = Firing::new(level);
     // The timers leave the heap, which is this CPU's own, outside any
     // section.
-    let mut batch = [None; FIRE_PORTION];
+    let mut batch: [Option<NonNull<Entry>>; FIRE_PORTION] = [None; FIRE_PORTION];
     let mut n = 0;
     while let Some(t) = step.next(&mut local().timers.lock().levels, now) {
         batch[n] = Some(t);
@@ -462,10 +552,19 @@ pub fn fire_at(level: u8, now: u64) {
 /// The posts of a portion of firings in one section: bit 0 into the slot of
 /// each timer of `batch` that is not dying, at `level`.
 #[inline(never)]
-fn post_fired(batch: &[Option<NonNull<Timer>>; FIRE_PORTION], level: u8) {
+fn post_fired(batch: &[Option<NonNull<Entry>>; FIRE_PORTION], level: u8) {
     crate::obj::serving(crate::obj::CLEAN_FIRE);
     let _section = crate::obj::lock();
-    for t in batch.iter().flatten() {
+    for e in batch.iter().flatten() {
+        // SAFETY: the entry is alive, off its heap: a budget's, whose thread
+        // the budget names while it is bound, or a timer's.
+        if unsafe { e.as_ref() }.is_budget() {
+            // SAFETY: as above; the section is OBJ.
+            unsafe { crate::budget::fire(*e) };
+            continue;
+        }
+        // SAFETY: as above.
+        let t = &unsafe { timer_of(*e) };
         // SAFETY: a timer off its heap is alive until its portion, which
         // runs on this CPU after this one and needs a reference gone and
         // no queue; a timer that is not dying holds its channel and has
@@ -503,8 +602,8 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
         // SAFETY: the caller's promise; the timer is in the heap of its
         // level if linked.
         unsafe {
-            if (*t.as_ptr()).node.is_linked() {
-                g.levels.remove(own, t);
+            if (*t.as_ptr()).entry.is_linked() {
+                g.levels.remove(own, entry(t));
             }
         }
     }
@@ -541,9 +640,9 @@ mod test_access {
     /// The deadline of `t`, which the test knows alive, in ticks while it is
     /// armed.
     pub fn deadline(t: NonNull<Timer>) -> Option<u64> {
-        // SAFETY: the test knows the timer alive; only the node is read.
-        let node = unsafe { &(*t.as_ptr()).node };
-        node.is_linked().then(|| node.deadline())
+        // SAFETY: the test knows the timer alive; only the entry is read.
+        let entry = unsafe { &(*t.as_ptr()).entry };
+        entry.is_linked().then(|| entry.deadline())
     }
 
     /// Whether the slot of `t`, which is alive, stands in its channel's queue:

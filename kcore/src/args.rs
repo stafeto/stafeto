@@ -26,6 +26,20 @@ pub fn priority_arg(raw: u64) -> Result<u8, Error> {
     }
 }
 
+/// The level `free` of `process_create` (spec 8) from its register and the
+/// ceiling of the child: 0 is the ceiling itself, and any other value is a
+/// priority, 1-63, that the ceiling does not lie under. INVALID_ARGS
+/// otherwise.
+pub fn free_arg(raw: u64, ceiling: u8) -> Result<u8, Error> {
+    if raw == 0 {
+        return Ok(ceiling);
+    }
+    match priority_arg(raw) {
+        Ok(free) if free <= ceiling => Ok(free),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
 /// The line of `irq_bind` from a register (spec 9): a shared line, INTID
 /// 32 up to `lines`, the lines of the GIC (kcore::gic::lines, at most
 /// 1020), less one; the line of the console's port among them, which its
@@ -399,6 +413,16 @@ mod tests {
         assert_eq!(cpu_arg(3, 4), Ok(3));
         assert_eq!(cpu_arg(4, 4), Err(Error::InvalidArgs));
         assert_eq!(cpu_arg(1 << 32, 4), Err(Error::InvalidArgs));
+    }
+
+    #[test]
+    fn the_free_level_is_the_ceiling_or_a_priority_below_it() {
+        assert_eq!(free_arg(0, 40), Ok(40));
+        assert_eq!(free_arg(40, 40), Ok(40));
+        assert_eq!(free_arg(1, 40), Ok(1));
+        for raw in [41, 63, 64, 1 << 8 | 10, u64::MAX] {
+            assert_eq!(free_arg(raw, 40), Err(Error::InvalidArgs), "{raw:#x}");
+        }
     }
 
     #[test]

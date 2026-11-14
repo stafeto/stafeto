@@ -37,6 +37,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
+mod budget;
 mod devices;
 mod handles;
 mod info;
@@ -46,6 +47,7 @@ mod proc;
 mod time;
 mod upcall;
 
+use budget::{budget_create, thread_bind_budget};
 use devices::{device_window_create, irq_ack, irq_bind, msi_create};
 use handles::{handle_close, handle_duplicate};
 use info::{debug_write, object_info};
@@ -275,6 +277,8 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::DeviceWindowCreate) => objects(|| device_window_create(thread, &args)),
         Some(Call::IrqBind) => irq_bind(thread, &args),
         Some(Call::MsiCreate) => msi_create(thread, &args),
+        Some(Call::BudgetCreate) => objects(|| budget_create(thread, &args)),
+        Some(Call::ThreadBindBudget) => objects(|| thread_bind_budget(thread, &args)),
         Some(Call::IrqAck) => irq_ack(thread, &args),
         Some(Call::ClockNow) => clock_now(),
         Some(Call::TimerCreate) => {

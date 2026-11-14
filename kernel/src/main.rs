@@ -22,6 +22,7 @@ mod console;
 mod log;
 mod arch;
 mod boot;
+mod budget;
 mod channel;
 mod cleanup;
 mod cmd;

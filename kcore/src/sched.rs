@@ -361,6 +361,11 @@ impl<T> Node<T> {
         self.server.is_some()
     }
 
+    /// The rules of the thread's budget, while it has one.
+    pub fn server(&self) -> Option<NonNull<Server>> {
+        self.server
+    }
+
     /// The level a thread with no budget works at most (`free` of its
     /// process), for a thread that has not started: its level follows.
     pub fn set_cap(&mut self, cap: u8) {
@@ -1281,6 +1286,9 @@ impl<T: Schedulable> Scheduler<T> {
     unsafe fn unbind(t: NonNull<T>) {
         // SAFETY: the caller's promise.
         unsafe {
+            if node(t).server.is_none() {
+                return;
+            }
             Self::with_server(t, |s| s.event_off());
             node(t).server = None;
         }

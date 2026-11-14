@@ -48,10 +48,9 @@ pub struct Replenishment {
     pub amount: u64,
 }
 
-/// The least budget and period the kernel accepts, in nanoseconds, and the
-/// range of `low`: budget_create checks them (spec 11).
-pub const MIN_BUDGET_NS: u64 = 10_000;
-pub const MIN_PERIOD_NS: u64 = 100_000;
+/// The least budget and period the kernel accepts, in nanoseconds:
+/// budget_create checks them (spec 11).
+pub use abi::{MIN_BUDGET_NS, MIN_PERIOD_NS};
 
 /// The sporadic server of one thread, in counter ticks.
 pub struct Server {

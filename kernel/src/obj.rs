@@ -68,7 +68,7 @@ static BY_KIND: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 /// The kinds: calls by number (below 40), then the entries other than a
 /// call, as `serving` names them.
 #[cfg(feature = "measure")]
-pub const KINDS: usize = 57;
+pub const KINDS: usize = 58;
 pub const ENTRY_INTERRUPT: u64 = 40;
 pub const ENTRY_CLEANUP: u64 = 41;
 pub const ENTRY_FAULT: u64 = 42;
@@ -90,6 +90,8 @@ pub const ENTRY_RECLAIM: u64 = 54;
 pub const ENTRY_DRAIN: u64 = 55;
 /// The cleanup of an MSI device (cleanup.rs).
 pub const CLEAN_MSI: u64 = 56;
+/// The cleanup of a time budget (cleanup.rs).
+pub const CLEAN_BUDGET: u64 = 57;
 
 /// Names what the section being entered serves, for the longest hold's
 /// report: only the images that measure keep it. A section that is not

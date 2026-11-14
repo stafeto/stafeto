@@ -9300,3 +9300,263 @@ pub fn a_discarded_event_raises_nothing(_: &Boot) -> Result<(), &'static str> {
         quiesce_every_cpu()
     })
 }
+
+/// What OBJECT_INFO BUDGET reports for the caller's budget `b`.
+fn budget_info_of(c: &Caller, b: Handle) -> Result<abi::BudgetInfo, &'static str> {
+    let x = c.call(Call::ObjectInfo.number(), &[b.0, abi::INFO_BUDGET, 0]);
+    if x[0] != 0 {
+        return Err("object_info BUDGET failed");
+    }
+    Ok(abi::BudgetInfo::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+    ]))
+}
+
+/// budget_create (spec 8, 11) checks its arguments in the order of spec 11
+/// (values, then x0, then the CPU, then the resources), and only the system
+/// resource with BUDGET makes a budget: a copy with the other rights, which
+/// every process but init gets, is refused with ACCESS_DENIED. A good call
+/// returns a handle with abi::BUDGET_RIGHTS whose budget is whole, has no
+/// thread and one replenishment; its place goes back with its last handle.
+pub fn budget_create_checks_in_order(_: &Boot) -> Result<(), &'static str> {
+    let n = Call::BudgetCreate.number();
+    with_caller(|c| {
+        let r = c.insert(Object::Resource, abi::INIT_RESOURCE_RIGHTS)?;
+        let plain = c.insert(
+            Object::Resource,
+            Rights::DEVICE | Rights::KSTATS | Rights::DEBUG,
+        )?;
+        let ok = [r.0, 0, 200_000, 1_000_000, 1];
+        let with = |i: usize, v: u64| {
+            let mut a = ok;
+            a[i] = v;
+            a
+        };
+        let budgets = crate::budget::in_use();
+        // The values come first: a bad handle does not hide them.
+        for (i, v) in [
+            (1, arch::cpu::MAX_CPUS as u64),
+            (1, 1 << 32),
+            (2, abi::MIN_BUDGET_NS - 1),
+            (2, 0),
+            (2, 2_000_000),
+            (3, abi::MIN_PERIOD_NS - 1),
+            (3, 61_000_000_000),
+            (4, 0),
+            (4, 64),
+            (4, 1 << 8 | 1),
+        ] {
+            let mut a = with(i, v);
+            a[0] = 0x7777;
+            c.fails(n, &a, Error::InvalidArgs)?;
+        }
+        c.fails(n, &with(0, 0x7777), Error::BadHandle)?;
+        let ch = c.created(Call::CreateChannel.number(), &[10, 0])?;
+        c.fails(n, &with(0, ch.0), Error::WrongType)?;
+        // Only the resource with BUDGET makes one: init's at boot.
+        c.fails(n, &with(0, plain.0), Error::AccessDenied)?;
+        if let Some(down) = (0..arch::cpu::MAX_CPUS).find(|&i| !arch::cpu::is_up(i)) {
+            c.fails(n, &with(1, down as u64), Error::InvalidArgs)?;
+        }
+        let b = c.created(n, &ok)?;
+        let clock = arch::timer::clock();
+        let whole = clock.ns_to_ticks(200_000);
+        check(
+            budget_info_of(c, b)?
+                == abi::BudgetInfo {
+                    budget: whole,
+                    period: clock.ns_to_ticks(1_000_000),
+                    low: 1,
+                    left: whole,
+                    state: abi::BUDGET_FREE,
+                    ran: 0,
+                    overruns: 0,
+                    pending: 1,
+                },
+            "OBJECT_INFO BUDGET does not report a whole budget with no thread",
+        )?;
+        check(
+            crate::budget::in_use() == budgets + 1,
+            "the budget was not counted",
+        )?;
+        c.close(b)?;
+        c.close(ch)?;
+        cleanup::drain();
+        check(
+            crate::budget::in_use() == budgets,
+            "the budget stayed in its pool",
+        )?;
+        c.close(plain)?;
+        c.close(r)?;
+        Ok(())
+    })
+}
+
+/// thread_bind_budget (spec 8, 11): x0 then x1 are looked up (BAD_HANDLE,
+/// WRONG_TYPE, ACCESS_DENIED without MANAGE and BUDGET), a budget that a
+/// thread has and a thread that has one are BAD_STATE, and a good bind makes
+/// the budget the thread's: OBJECT_INFO says so. The binding holds the
+/// budget when its handles go, and lets it go with the thread.
+pub fn thread_bind_budget_checks_and_binds(_: &Boot) -> Result<(), &'static str> {
+    let n = Call::ThreadBindBudget.number();
+    with_caller(|c| {
+        let r = c.insert(Object::Resource, abi::INIT_RESOURCE_RIGHTS)?;
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let args = thread_args(own.0, USER_VA as u64, 0x80_1000, 20, FIFO, BUFFER);
+        let t = c.created(Call::ThreadCreate.number(), &args)?;
+        let mut args = args;
+        args[6] = BUFFER + PAGE as u64;
+        let other = c.created(Call::ThreadCreate.number(), &args)?;
+        let make = Call::BudgetCreate.number();
+        let b = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1])?;
+        let spare = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1])?;
+        let budgets = crate::budget::in_use();
+        c.fails(n, &[0x7777, b.0], Error::BadHandle)?;
+        c.fails(n, &[b.0, b.0], Error::WrongType)?;
+        c.fails(n, &[t.0, 0x7777], Error::BadHandle)?;
+        c.fails(n, &[t.0, t.0], Error::WrongType)?;
+        // A handle to the budget without the right to bind it, and one to the
+        // thread without MANAGE.
+        let weak_budget = c.created(
+            Call::HandleDuplicate.number(),
+            &[b.0, Rights::DUPLICATE.0.into(), 0, 0],
+        )?;
+        c.fails(n, &[t.0, weak_budget.0], Error::AccessDenied)?;
+        let weak_thread = c.created(
+            Call::HandleDuplicate.number(),
+            &[t.0, Rights::DUPLICATE.0.into(), 0, 0],
+        )?;
+        c.fails(n, &[weak_thread.0, b.0], Error::AccessDenied)?;
+        c.succeeds(n, &[t.0, b.0], &[])?;
+        check(
+            budget_info_of(c, b)?.state == abi::BUDGET_FULL,
+            "the budget of a thread is not whole",
+        )?;
+        // SAFETY: the caller's process is the test's, and its handle holds the thread.
+        let thread = unsafe { c.process.as_ref() }
+            .lookup(t, Rights::NONE, Object::thread)
+            .map_err(|_| "the handle does not name the thread")?;
+        // SAFETY: the handle holds the thread, which never runs.
+        let bound = unsafe { thread.as_ref() }.sched.has_budget();
+        check(bound, "the thread has no budget after the bind")?;
+        c.fails(n, &[t.0, b.0], Error::BadState)?;
+        c.fails(n, &[other.0, b.0], Error::BadState)?;
+        c.fails(n, &[t.0, spare.0], Error::BadState)?;
+        c.succeeds(n, &[other.0, spare.0], &[])?;
+        // The binding holds the budget when its handles go.
+        for h in [b, spare, weak_budget] {
+            c.close(h)?;
+        }
+        cleanup::drain();
+        check(
+            crate::budget::in_use() == budgets,
+            "a budget a thread has went with its handles",
+        )?;
+        for h in [t, other, weak_thread, own] {
+            c.close(h)?;
+        }
+        cleanup::drain();
+        check(
+            crate::budget::in_use() == budgets - 2,
+            "the budgets stayed when their threads went",
+        )?;
+        c.close(r)
+    })
+}
+
+/// process_create takes the level `free` of the child in bits 8-15 of x2: a
+/// thread of the child with no budget works at it at most, whatever base
+/// priority it was given, and a budget lifts that. 0 is the ceiling itself,
+/// and a value above the ceiling is INVALID_ARGS.
+pub fn a_thread_with_no_budget_works_at_the_free_level(_: &Boot) -> Result<(), &'static str> {
+    let n = Call::ProcessCreate.number();
+    with_caller(|c| {
+        let q = CHILD_QUOTA;
+        c.fails(
+            n,
+            &[q, 16, 30 | 31 << 8, 0, 0, 0, 0, 0, 0],
+            Error::InvalidArgs,
+        )?;
+        c.fails(
+            n,
+            &[q, 16, 30 | 64 << 8, 0, 0, 0, 0, 0, 0],
+            Error::InvalidArgs,
+        )?;
+        c.fails(
+            n,
+            &[q, 16, 30 | 1 << 16, 0, 0, 0, 0, 0, 0],
+            Error::InvalidArgs,
+        )?;
+        let child = c.created(n, &[q, 16, 30 | 7 << 8, 0, 0, 0, 0, 0, 0])?;
+        let plain = c.created(n, &[q, 16, 30, 0, 0, 0, 0, 0, 0])?;
+        let level = |h: Handle| {
+            // SAFETY: the caller's process is the test's.
+            unsafe { c.process.as_ref() }
+                .lookup(h, Rights::NONE, Object::process)
+                .map(|p| {
+                    // SAFETY: the handle holds the process.
+                    let p = unsafe { p.as_ref() };
+                    (p.ceiling(), p.free())
+                })
+                .map_err(|_| "the handle does not name the child")
+        };
+        check(
+            level(child)? == (30, 7),
+            "the child has not the level it was given",
+        )?;
+        check(
+            level(plain)? == (30, 30),
+            "a child with no level has not its ceiling",
+        )?;
+        c.close(child)?;
+        c.close(plain)?;
+        cleanup::drain();
+        Ok(())
+    })?;
+    // Threads of a process with the level 7 under ceiling 30.
+    let callers = [63, 30].map(Caller::with_ceiling);
+    let result = match &callers {
+        [Ok(c), Ok(low)] => {
+            process::set_free(low.process, 7);
+            free_level_cases(c, low.process)
+        }
+        _ => Err("no process or thread"),
+    };
+    for caller in callers.into_iter().flatten() {
+        caller.release();
+    }
+    result
+}
+
+fn free_level_cases(c: &Caller, low: NonNull<Process>) -> Result<(), &'static str> {
+    let to_low = c.insert(Object::Process(low), Rights::MANAGE)?;
+    let args = thread_args(to_low.0, USER_VA as u64, 0x80_1000, 20, FIFO, BUFFER);
+    let t = c.created(Call::ThreadCreate.number(), &args)?;
+    // SAFETY: the caller's process is the test's, and the handle holds the thread.
+    let thread = unsafe { c.process.as_ref() }
+        .lookup(t, Rights::NONE, Object::thread)
+        .map_err(|_| "the handle does not name the thread")?;
+    // SAFETY: the handle holds the thread, which never runs.
+    let node = unsafe { &thread.as_ref().sched };
+    check(
+        node.base() == 20 && node.priority() == 7,
+        "a thread with no budget is not held to the level of its process",
+    )?;
+    let r = c.insert(Object::Resource, abi::INIT_RESOURCE_RIGHTS)?;
+    let b = c.created(
+        Call::BudgetCreate.number(),
+        &[r.0, 0, 200_000, 1_000_000, 1],
+    )?;
+    c.succeeds(Call::ThreadBindBudget.number(), &[t.0, b.0], &[])?;
+    // SAFETY: as above.
+    let level = unsafe { &thread.as_ref().sched }.priority();
+    check(
+        level == 20,
+        "a thread with a budget is held to the level of its process",
+    )?;
+    for h in [b, r, t, to_low] {
+        c.close(h)?;
+    }
+    cleanup::drain();
+    Ok(())
+}

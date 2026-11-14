@@ -710,6 +710,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::msi_create_checks_in_order,
     ),
     (
+        "budget_create_checks_in_order",
+        calls::budget_create_checks_in_order,
+    ),
+    (
+        "thread_bind_budget_checks_and_binds",
+        calls::thread_bind_budget_checks_and_binds,
+    ),
+    (
+        "a_thread_with_no_budget_works_at_the_free_level",
+        calls::a_thread_with_no_budget_works_at_the_free_level,
+    ),
+    (
         "irq_bind_event_checks_and_reports",
         calls::irq_bind_event_checks_and_reports,
     ),

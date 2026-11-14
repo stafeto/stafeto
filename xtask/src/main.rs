@@ -6787,6 +6787,14 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// (`give_number`: the process, the payer, one subtraction), 8 instructions
 /// a thread for the 12 of the portion; 3 111 measured, 96 over the 3 015
 /// before. The path of a thread that is ready stays one take of `OBJ`.
+/// `THREADS_READY_MAX` 3 115 -> 3 250 (time budgets, stages 1 and 2): the end
+/// of a thread looks at its budget (`sched::exit` reads where the budget is,
+/// the scheduler lets it go, `budget::unbound` drops the binding's reference
+/// when there is one) and the scheduler's `exit` leaves the budget's event
+/// and rules with the thread; 3 176 measured, 132 over the 3 044 before, 11
+/// instructions a thread for the 12 of the portion. The path of a thread
+/// that is ready stays one take of `OBJ`. The reviewer of the kernel decides
+/// whether it stays.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -6834,7 +6842,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_115;
+const THREADS_READY_MAX: u64 = 3_250;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -11602,7 +11610,7 @@ const PORTION_LINES: [&str; 7] = [
 /// (kernel/src/obj.rs): a call by its number below 40, then the entries
 /// and the cleanup of each kind of object.
 fn obj_kind_name(kind: usize) -> String {
-    const ENTRIES: [&str; 16] = [
+    const ENTRIES: [&str; 18] = [
         "interrupt",
         "cleanup",
         "fault",
@@ -11619,6 +11627,8 @@ fn obj_kind_name(kind: usize) -> String {
         "teardown stage",
         "reclaim",
         "drain",
+        "clean msi",
+        "clean budget",
     ];
     match kind {
         0..40 => abi::Call::from_number(kind as u16)
