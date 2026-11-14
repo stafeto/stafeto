@@ -542,6 +542,9 @@ const CONSOLE: u64 = 0x0900_0000;
 /// xtask finds the second on the console, whole, and not the first.
 const BEHIND: &[u8] = b"log marker: behind the window\n";
 const IN_FRONT: &[u8] = b"log marker: in front of the window\n";
+/// A line longer than a record, which a writer sends in tagged pieces
+/// (console_line); the kernel writes them to its port without their headers.
+const LONG: &[u8] = b"log marker: a line longer than one record, written in pieces while the kernel holds the port\n";
 
 /// The records of a batch of object_info LOG (rt::sys::log_take).
 type Records = [[u8; LOG_RECORD]; LOG_BATCH];
@@ -627,7 +630,23 @@ fn window_over_the_console_sends_debug_write_to_the_log() -> Outcome {
     check(
         in_front.is_ok_and(|b| b.count == 0 && b.left == 0),
         "the record written with the port back was not shown",
-    )
+    )?;
+    // The kernel holds the port: the pieces of a long line go out as text,
+    // and xtask finds the line whole and no header on the wire.
+    let mut out = [0; abi::INLINE_MAX];
+    let pieces = LONG.chunks(console_line::PAYLOAD).count();
+    for (i, chunk) in LONG.chunks(console_line::PAYLOAD).enumerate() {
+        let len = if i == 0 {
+            console_line::first_piece(0x2A5, chunk, &mut out)
+        } else {
+            console_line::piece(0x2A5, i + 1 == pieces, chunk, &mut out)
+        };
+        check(
+            sys::debug_write(&resource(), &out[..len]) == Ok(len),
+            "debug_write did not write a piece of a long line",
+        )?;
+    }
+    Ok(())
 }
 
 /// A line with the number `n`, as log_counts_what_it_lost writes them.

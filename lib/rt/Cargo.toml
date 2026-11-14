@@ -34,6 +34,7 @@ beat-grid = []
 
 [dependencies]
 abi = { path = "../abi" }
+console-line = { path = "../console-line" }
 entries = { path = "../entries" }
 bootimg = { path = "../bootimg" }
 proto-pipe = { path = "../../proto/pipe" }

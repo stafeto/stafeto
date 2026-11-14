@@ -9,7 +9,10 @@
 //! and is marked shown; otherwise it waits for the port's driver, which
 //! takes records with object_info LOG (`take`). The panic shows what
 //! nobody showed or took (`show_unshown`). What the kernel said before
-//! it knew its port goes there once it does (`show_early`).
+//! it knew its port goes there once it does (`show_early`). On the port
+//! the kernel writes a piece of a line longer than a record without its
+//! header (console_line::strip): no driver is there to assemble the pieces.
+//! The ring keeps the record as it came.
 
 use crate::arch::timer;
 use crate::console;
@@ -28,6 +31,14 @@ pub const LOG_RECORDS: usize = 64;
 #[cfg(feature = "trace")]
 pub const LOG_RECORDS: usize = 256;
 
+/// A record's `bytes` on the kernel's port: a piece of a line longer than a
+/// record without its header (console_line::strip). A function of its own,
+/// so that the code of `record` keeps its form for `wcet bound`.
+#[inline(never)]
+fn port(bytes: &[u8]) {
+    console::write_bytes(console_line::strip(bytes));
+}
+
 /// Writes a record of `kind` with `bytes`, 1 to abi::LOG_TEXT of them, at
 /// the counter's time now: to the port as well, and shown, while the
 /// kernel has the port (spec 3.2). O(1) but for the port, which it waits
@@ -36,7 +47,7 @@ fn record(kind: u8, bytes: &[u8]) {
     let time = timer::now();
     let shown = console::is_kernels();
     if shown {
-        console::write_bytes(bytes);
+        port(bytes);
     }
     local().ring.lock().push(time, kind, bytes, shown);
 }
@@ -137,7 +148,7 @@ pub fn interrupt(line: u32) {
 /// What the kernel said before it had its port goes out on the port, in
 /// its order, and counts as shown (console::set_port, spec 3.2). O(64).
 pub fn show_early() {
-    local().ring.lock().show(|r| console::write_bytes(r.text()));
+    local().ring.lock().show(|r| port(r.text()));
 }
 
 /// The panic shows what nobody showed or took, oldest first, on the port
@@ -153,7 +164,7 @@ pub fn show_unshown() {
     // lock; see above.
     let ring = unsafe { &*local().ring.as_ptr() };
     for r in ring.unshown() {
-        console::write_bytes(r.text());
+        port(r.text());
     }
 }
 
