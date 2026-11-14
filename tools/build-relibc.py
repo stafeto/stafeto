@@ -170,7 +170,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # getrandom, the spare bytes of AT_RANDOM in the first arc4random, a line on
 # a long wait for the first seed, before the abort of a start without entropy
 # and before the abort of __stack_chk_fail; tagged pin-1b20cd22; then the fork child clears the spare AT_RANDOM word, tagged pin-2ae5cdf6.
-COMMIT = "2ae5cdf6e4271dc149b1e5af4f20acd716c8ab18"
+# Layouts before the freeze of series 0.5 (stafeto-design#734): struct
+# sched_param has the sporadic server members (48 bytes), pthread_attr_t and
+# posix_spawnattr_t hold it whole (80 bytes each); SCHED_SPORADIC and the
+# option macros wait for the implementation; tagged pin-533ab5bd.
+COMMIT = "533ab5bdeb56165e245263dcf4972de74529c6ca"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

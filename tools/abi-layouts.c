@@ -33,6 +33,8 @@
 #include <dirent.h>
 #include <setjmp.h>
 #include <pthread.h>
+#include <sched.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stafeto/display.h>
 #include <stafeto/fast.h>
@@ -64,7 +66,7 @@ const struct row stafeto_abi[] __attribute__((section(".stafeto_abi"), used)) = 
     S(struct tm)
     S(jmp_buf)
     S(sigjmp_buf)
-    S(pthread_attr_t)
+    S(pthread_attr_t) S(posix_spawnattr_t) S(struct sched_param)
     S(pthread_mutex_t)
     S(pthread_cond_t)
     S(pthread_rwlock_t)
@@ -77,6 +79,10 @@ const struct row stafeto_abi[] __attribute__((section(".stafeto_abi"), used)) = 
     O(struct stat, st_rdev) O(struct stat, st_size) O(struct stat, st_blksize)
     O(struct stat, st_blocks) O(struct stat, st_atim) O(struct stat, st_mtim)
     O(struct stat, st_ctim)
+    /* Short names: a row's name holds 47 characters. */
+#define SP(f) V("offsetof sched_param." #f, __builtin_offsetof(struct sched_param, f))
+    SP(sched_priority) SP(sched_ss_low_priority) SP(sched_ss_repl_period)
+    SP(sched_ss_init_budget) SP(sched_ss_max_repl)
     O(struct sigaction, sa_handler) O(struct sigaction, sa_mask) O(struct sigaction, sa_flags)
     C(AF_INET) C(AF_INET6) C(AF_LOCAL) C(AF_UNIX) C(AF_UNSPEC) C(AT_EACCESS) C(AT_EMPTY_PATH)
     C(AT_FDCWD) C(AT_REMOVEDIR) C(AT_SYMLINK_FOLLOW) C(AT_SYMLINK_NOFOLLOW) C(CLOCK_BOOTTIME)

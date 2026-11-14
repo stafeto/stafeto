@@ -164,10 +164,15 @@ pub unsafe fn cleanup_pop(_node: *mut Cleanup, execute: c_int) {
     unsafe { __relibc_internal_pthread_cleanup_pop(execute) }
 }
 
-/// `struct sched_param`.
+/// `struct sched_param` (48 bytes), with the members of the sporadic server
+/// option; a `timespec` is two 64-bit words here.
 #[repr(C)]
 pub struct SchedParam {
     pub sched_priority: c_int,
+    pub sched_ss_low_priority: c_int,
+    pub sched_ss_repl_period: [i64; 2],
+    pub sched_ss_init_budget: [i64; 2],
+    pub sched_ss_max_repl: c_int,
 }
 
 unsafe extern "C" {

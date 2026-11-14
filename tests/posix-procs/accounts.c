@@ -68,7 +68,7 @@ static int sched_role(void) {
 static void spawned_scheduling(void) {
     char *argv[] = {"procs-child", "schedchild", NULL};
     char *envp[] = {NULL};
-    struct sched_param param = {7};
+    struct sched_param param = {.sched_priority = 7};
     posix_spawnattr_t attr;
     pid_t pid = -1;
     posix_spawnattr_init(&attr);
@@ -122,7 +122,7 @@ static void clock_is_cpu_time(void) {
 static void spawned_scheduling_refused(void) {
     char *argv[] = {"procs-child", "schedchild", NULL};
     char *envp[] = {NULL};
-    struct sched_param param = {7};
+    struct sched_param param = {.sched_priority = 7};
     posix_spawnattr_t attr;
     pid_t pid = -1;
     posix_spawnattr_init(&attr);
