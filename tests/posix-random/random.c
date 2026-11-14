@@ -58,6 +58,9 @@ extern uint64_t random_probe_calls(void);
 extern void random_probe_drop_session(void);
 extern int random_probe_crash(void);
 extern int random_probe_session_open(void);
+/* One EntropyRejoin request of the process service, a call that bypasses the layer: 0 for a new
+ * session, 501 PERMISSION, 506 AGAIN, 1000 the limit of the generation's sessions, -1 any other. */
+extern int random_probe_rejoin(void);
 extern int stafeto_probe_loader_start(unsigned mode);
 extern unsigned stafeto_probe_loader_stop(void);
 extern unsigned stafeto_probe_loader_listen(void);
@@ -1135,8 +1138,282 @@ static int restart_run(void) {
     return 0;
 }
 
+/*
+ * Processes with no channel to init rejoin the entropy service after a restart (EntropyRejoin).
+ * Role `rejoin`: the probe (init's program) starts a long-lived program L with posix_spawn (the
+ * loader's path, so it has no channel to init) and an unseeded one U; L forks a child F. L and
+ * F take bytes of the old instance, U takes none yet. The probe ends the entropy service. After
+ * the restart each takes bytes again (U its first, which needs the service), then enough bytes
+ * to ask for a new key, which lies past the generator's REKEY_BYTES: the process must then
+ * hold a session of the new instance, and no wait lasts past 3 s. A request of the same process
+ * for a second session is PERMISSION, a process born after the restart gets PERMISSION too, and
+ * L's own child, forked after the restart, has bytes.
+ *
+ * Role `rejoinlimit` (the process service of the image gives 2 sessions in a generation): four
+ * old programs ask in turn; the third gets the limit, the fourth is served once the first ended,
+ * and a set-ID program and a plain program still start with their verified sessions.
+ */
+#define REPORT 34
+#define REJOIN_ELAPSED_MS 3500
+
+static void report(int fd, char tag, char stage, const unsigned char *bytes) {
+    unsigned char message[REPORT];
+    message[0] = (unsigned char)tag;
+    message[1] = (unsigned char)stage;
+    memcpy(message + 2, bytes, 32);
+    if (write(fd, message, sizeof message) != (ssize_t)sizeof message) _exit(31);
+}
+
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+/* Bytes enough that the generator asks for a new key (REKEY_BYTES is 1 MiB). */
+static int draw_past_rekey(void) {
+    unsigned char bytes[256];
+    for (int i = 0; i < 4200; i++) CHECK(getentropy(bytes, sizeof bytes) == 0);
+    return 0;
+}
+
+/* A member of the rejoin: `tag`; `seeded` takes bytes before the restart. Reports on `up`, waits
+ * for a byte on `go`, takes bytes again. 0 or a failure. */
+static int rejoin_member(char tag, int seeded, int up, int go) {
+    unsigned char bytes[32];
+    if (seeded) {
+        CHECK(getentropy(bytes, sizeof bytes) == 0);
+        CHECK(!all_zero(bytes, sizeof bytes));
+        report(up, tag, 'b', bytes);
+    } else {
+        report(up, tag, 'r', bytes);
+    }
+    char byte;
+    CHECK(read(go, &byte, 1) == 1);
+    long began = now_ms();
+    CHECK(getentropy(bytes, sizeof bytes) == 0);
+    long waited = now_ms() - began;
+    if (waited >= REJOIN_ELAPSED_MS) printf("posix-random: %c waited %ld ms\n", tag, waited);
+    CHECK(waited < REJOIN_ELAPSED_MS);
+    CHECK(!all_zero(bytes, sizeof bytes));
+    CHECK(draw_past_rekey() == 0);
+    /* The key of the new instance came through a session of it. */
+    CHECK(random_probe_session_open() == 1);
+    CHECK(getentropy(bytes, sizeof bytes) == 0);
+    report(up, tag, 'a', bytes);
+    return 0;
+}
+
+/* The role `rejoinlong` (L, seeded) and `rejoinfresh` (U, unseeded): a member; L also asks for a
+ * second session, which is PERMISSION, and forks a child that has bytes. */
+static int rejoin_long_role(int seeded, const char *up_text, const char *go_text) {
+    int up = atoi(up_text), go = atoi(go_text);
+    /* The forked child is a program of this one, taking its bytes before and after as the others
+     * do (a program init started has no code of its own to copy: fork is for the spawned one). */
+    pid_t f = 0;
+    if (seeded) {
+        f = fork();
+        CHECK(f >= 0);
+        if (f == 0) _exit(rejoin_member('F', 1, up, go));
+    }
+    CHECK(rejoin_member(seeded ? 'L' : 'U', seeded, up, go) == 0);
+    int status = 0;
+    CHECK(random_probe_rejoin() == 501);
+    if (!seeded) return 0;
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        unsigned char bytes[32];
+        if (getentropy(bytes, sizeof bytes) != 0 || all_zero(bytes, sizeof bytes)) _exit(32);
+        report(up, 'G', 'a', bytes);
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(waitpid(f, &status, 0) == f);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
+/* The role `rejoinborn`: started after the restart, with a session of the new instance. It has
+ * nothing to replace, so the service refuses. */
+static int rejoin_born_role(void) {
+    unsigned char bytes[32];
+    CHECK(getentropy(bytes, sizeof bytes) == 0);
+    CHECK(random_probe_session_open() == 1);
+    int code = random_probe_rejoin();
+    CHECK(code == 501);
+    return 0;
+}
+
+/* Reads one report. */
+static int read_report(int fd, char *tag, char *stage, unsigned char *bytes) {
+    unsigned char message[REPORT];
+    CHECK(read_all(fd, message, sizeof message) == (ssize_t)sizeof message);
+    *tag = (char)message[0];
+    *stage = (char)message[1];
+    memcpy(bytes, message + 2, 32);
+    return 0;
+}
+
+static int spawn_rejoin(const char *role, int up, int go, pid_t *pid) {
+    char up_text[16], go_text[16];
+    CHECK(snprintf(up_text, sizeof up_text, "%d", up) > 0);
+    CHECK(snprintf(go_text, sizeof go_text, "%d", go) > 0);
+    char *argv[] = {"posix-random", (char *)role, up_text, go_text, NULL};
+    CHECK(posix_spawn(pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    return 0;
+}
+
+static int rejoin_run(void) {
+    int up[2], go[2];
+    CHECK(pipe(up) == 0 && pipe(go) == 0);
+    pid_t l = 0, u = 0;
+    CHECK(spawn_rejoin("rejoinlong", up[1], go[0], &l) == 0);
+    CHECK(spawn_rejoin("rejoinfresh", up[1], go[0], &u) == 0);
+    /* The probe holds neither the writing end of the reports nor the reading end of the go: a
+     * member that failed and ended leaves the probe the end of the file. */
+    CHECK(close(up[1]) == 0 && close(go[0]) == 0);
+    /* Each reports once before the restart: L and F their bytes, U its readiness. */
+    unsigned char before[3][32];
+    int seen = 0;
+    for (int i = 0; i < 3; i++) {
+        char tag, stage;
+        unsigned char bytes[32];
+        CHECK(read_report(up[0], &tag, &stage, bytes) == 0);
+        if (tag == 'L' || tag == 'F') {
+            CHECK(stage == 'b');
+            memcpy(before[tag == 'L' ? 0 : 1], bytes, 32);
+            seen |= tag == 'L' ? 1 : 2;
+        } else {
+            CHECK(tag == 'U' && stage == 'r');
+            seen |= 4;
+        }
+    }
+    CHECK(seen == 7);
+    CHECK(memcmp(before[0], before[1], 32) != 0);
+    CHECK(random_probe_crash() == 0);
+    printf("posix-random: the entropy service ended with a spawned program, an unseeded one and a forked child that hold its old sessions\n");
+    CHECK(write(go[1], "ggg", 3) == 3);
+    /* After the restart: L, F and U report, then L's child G. */
+    unsigned char after[4][32];
+    int got = 0;
+    for (int i = 0; i < 4; i++) {
+        char tag, stage;
+        unsigned char bytes[32];
+        CHECK(read_report(up[0], &tag, &stage, bytes) == 0);
+        CHECK(stage == 'a');
+        CHECK(!all_zero(bytes, sizeof bytes));
+        int slot = tag == 'L' ? 0 : tag == 'F' ? 1 : tag == 'U' ? 2 : tag == 'G' ? 3 : -1;
+        CHECK(slot >= 0);
+        memcpy(after[slot], bytes, 32);
+        got |= 1 << slot;
+    }
+    CHECK(got == 15);
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++) CHECK(memcmp(after[i], after[j], 32) != 0);
+    CHECK(memcmp(after[0], before[0], 32) != 0 && memcmp(after[1], before[1], 32) != 0);
+    int status = 0;
+    CHECK(waitpid(l, &status, 0) == l && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(waitpid(u, &status, 0) == u && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-random: a spawned program, an unseeded one and a forked child, none with a channel to init, got bytes from the new instance within 3 s, through a session of it, and a child of the spawned one too\n");
+    printf("posix-random: a second request for a session in the same generation was refused\n");
+    char *argv[] = {"posix-random", "rejoinborn", NULL};
+    pid_t born = 0;
+    CHECK(posix_spawn(&born, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(born, &status, 0) == born && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-random: a program born after the restart was refused a session\n");
+    return 0;
+}
+
+/* The role `rejoinraw` (up, go, exit): waits for a byte on `go`, makes one request of the process
+ * service, with a pause of 20 ms for AGAIN up to 3 s, tells the code on `up` (a byte: 'o' a
+ * session, 'p' PERMISSION, 'l' the limit, 'x' any other) and waits for a byte on `exit`. */
+static int rejoin_raw_role(const char *up_text, const char *go_text, const char *exit_text) {
+    char byte;
+    CHECK(read(atoi(go_text), &byte, 1) == 1);
+    int code = 506;
+    for (int i = 0; i < 150 && code == 506; i++) {
+        code = random_probe_rejoin();
+        if (code == 506) pause_ms(20);
+    }
+    byte = code == 0 ? 'o' : code == 501 ? 'p' : code == 1000 ? 'l' : 'x';
+    CHECK(write(atoi(up_text), &byte, 1) == 1);
+    CHECK(read(atoi(exit_text), &byte, 1) == 1);
+    return 0;
+}
+
+static int spawn_raw(int up, int go, int exit_fd, pid_t *pid) {
+    char a[16], b[16], c[16];
+    CHECK(snprintf(a, sizeof a, "%d", up) > 0 && snprintf(b, sizeof b, "%d", go) > 0 &&
+          snprintf(c, sizeof c, "%d", exit_fd) > 0);
+    char *argv[] = {"posix-random", "rejoinraw", a, b, c, NULL};
+    CHECK(posix_spawn(pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    return 0;
+}
+
+/* Asks the member `i` to make its request: the byte of the answer. */
+static int raw_ask(int up, int go, char *answer) {
+    CHECK(write(go, "g", 1) == 1);
+    CHECK(read(up, answer, 1) == 1);
+    return 0;
+}
+
+static int rejoin_limit_run(void) {
+    int up[2], go[4][2], leave[4][2];
+    pid_t pid[4];
+    CHECK(pipe(up) == 0);
+    for (int i = 0; i < 4; i++) {
+        CHECK(pipe(go[i]) == 0 && pipe(leave[i]) == 0);
+        CHECK(spawn_raw(up[1], go[i][0], leave[i][0], &pid[i]) == 0);
+        CHECK(close(go[i][0]) == 0 && close(leave[i][0]) == 0);
+    }
+    CHECK(close(up[1]) == 0);
+    CHECK(random_probe_crash() == 0);
+    char answer = 0;
+    /* The first two take the sessions of the generation. */
+    CHECK(raw_ask(up[0], go[0][1], &answer) == 0 && answer == 'o');
+    CHECK(raw_ask(up[0], go[1][1], &answer) == 0 && answer == 'o');
+    /* The third finds them all given. */
+    CHECK(raw_ask(up[0], go[2][1], &answer) == 0 && answer == 'l');
+    printf("posix-random: the third request of a generation of 2 sessions got the limit\n");
+    /* The limit leaves the loaders their clones: a set-ID program and a plain one start, each
+     * with a verified session. */
+    int status = 0;
+    pid_t child = 0;
+    char *setid[] = {"posix-random", "setid", NULL};
+    CHECK(posix_spawn(&child, "/bin/posix-random-suid", NULL, NULL, setid, environ) == 0);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(spawn_role("fresh", -1) == 0);
+    printf("posix-random: after the limit a set-ID program and a plain program started with sessions of the new instance\n");
+    /* The end of a program that took a session gives it back to the count. */
+    CHECK(write(leave[0][1], "x", 1) == 1);
+    CHECK(waitpid(pid[0], &status, 0) == pid[0] && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(raw_ask(up[0], go[3][1], &answer) == 0 && answer == 'o');
+    printf("posix-random: a program that ended gave its session back, and the fourth request was served\n");
+    for (int i = 1; i < 4; i++) {
+        CHECK(write(leave[i][1], "x", 1) == 1);
+        CHECK(waitpid(pid[i], &status, 0) == pid[i] && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int status;
+    if (argc > 3 && strcmp(argv[1], "rejoinlong") == 0) return rejoin_long_role(1, argv[2], argv[3]);
+    if (argc > 3 && strcmp(argv[1], "rejoinfresh") == 0) return rejoin_long_role(0, argv[2], argv[3]);
+    if (argc > 1 && strcmp(argv[1], "rejoinborn") == 0) return rejoin_born_role();
+    if (argc > 4 && strcmp(argv[1], "rejoinraw") == 0) return rejoin_raw_role(argv[2], argv[3], argv[4]);
+    if (argc > 1 && strcmp(argv[1], "rejoin") == 0) {
+        status = rejoin_run();
+        if (status == 0) printf("posix-random: rejoin ok\n");
+        return status;
+    }
+    if (argc > 1 && strcmp(argv[1], "limit") == 0) {
+        status = rejoin_limit_run();
+        if (status == 0) printf("posix-random: limit ok\n");
+        return status;
+    }
     if (argc > 1 && strcmp(argv[1], "fresh") == 0) return fresh_role();
     if (argc > 1 && strcmp(argv[1], "nosession") == 0) return no_session_role();
     if (argc > 3 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2], argv[3]);

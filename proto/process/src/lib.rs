@@ -216,11 +216,13 @@ use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 pub mod retry;
 
-/// Version 13: LoaderRoot (number 43, which LoaderTerminal had) names the
-/// slot whose root it asks for in a body, and the notary marks PIPE, NET and
-/// ENTROPY join TERMINAL as the marks of a service that sends its root
-/// with Register.
-pub const VERSION: u16 = 13;
+/// Version 14: EntropyRejoin (number 4) gives a process that has no channel
+/// to init a new session with the entropy service after the service's
+/// instance ended. Version 13: LoaderRoot (number 43, which LoaderTerminal
+/// had) names the slot whose root it asks for in a body, and the notary marks
+/// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
+/// its root with Register.
+pub const VERSION: u16 = 14;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -270,6 +272,11 @@ pub const TTY_STEP_BELOW: u8 = 3;
 /// Generations of a record run from 1 to this. Exhausted indices retire,
 /// so a PID stays a positive i32 and an old endpoint never names a new record.
 pub const GENERATION_MAX: u32 = (1 << 23) - 1;
+/// The level of the thread of the process service that takes a session of the
+/// entropy service's root for EntropyRejoin: the entropy service's own, so
+/// that the service's step in the loop at its level never waits for the
+/// entropy service (the init table checks that the two are equal).
+pub const REJOIN_LEVEL: u8 = 36;
 /// The parent PID of a record that init created, and of an orphan: the
 /// service itself, the system process that adopts them.
 pub const INIT_PID: u32 = 1;
@@ -458,6 +465,18 @@ pub enum Method {
     Create = 1,
     Query = 2,
     Change = 3,
+    /// A process that has no channel to init asks for a new session with the
+    /// entropy service, which its old one lost when the service's instance
+    /// ended. The body is empty and no handles come. Reply: the status u32
+    /// and, for status 0, the session (SEND, TRANSFER). PERMISSION: the
+    /// process was born under the current instance, or has had its session
+    /// in this one. AGAIN: the service has no open root yet or its queue is
+    /// full, so the client asks again after a pause. LIMIT_REACHED (the
+    /// kernel's status): the service gave `REJOIN_MAX` sessions to this
+    /// instance's processes already. The number is one of the four below 64
+    /// that were never used: 64 and above name the service's own lines in
+    /// the step log.
+    EntropyRejoin = 4,
     Loaded = 6,
     Abandon = 7,
     WaitStart = 10,
@@ -727,9 +746,9 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-    30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-    56, 57, 58, 59, 60, 61, 62, 63,
+    1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+    55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1960,6 +1979,7 @@ mod tests {
             Method::Create,
             Method::Query,
             Method::Change,
+            Method::EntropyRejoin,
             Method::Loaded,
             Method::Abandon,
             Method::WaitStart,
@@ -2026,6 +2046,21 @@ mod tests {
         assert_eq!(Change::from_number(0), None);
         assert_eq!(Change::from_number(5), None);
         assert_eq!(Credentials::NOBODY.words(), [65534; 6]);
+    }
+
+    #[test]
+    fn entropy_rejoin_has_its_own_number_below_the_step_log() {
+        // The number is one of the gaps of the table, and below 64, where the
+        // lines of the step log of the service start (rt::service).
+        assert_eq!(Method::EntropyRejoin as u16, 4);
+        assert!(METHODS.contains(&4));
+        assert_eq!(METHODS.iter().filter(|&&m| m == 4).count(), 1);
+        assert!(METHODS.iter().all(|&m| m < 64));
+        // The request is a header and no body.
+        let header = Method::EntropyRejoin.header();
+        assert_eq!(header.version, 14);
+        assert_eq!(header.bytes().len(), 8);
+        assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
 
     #[test]
@@ -2323,7 +2358,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 13);
+        assert_eq!(VERSION, 14);
     }
 
     #[test]

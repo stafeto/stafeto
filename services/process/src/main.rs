@@ -32,6 +32,7 @@ use posix_process_service::placing::{self, Crowd};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
+use posix_process_service::rejoin::{self, Refusal, Rejoin};
 use posix_process_service::roots::{Registration, Roots, registration};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
@@ -63,6 +64,7 @@ mod lifetime_page;
 mod loader;
 mod make;
 mod pages;
+mod rejoiner;
 mod replace;
 use core::mem::{ManuallyDrop, MaybeUninit};
 rt::entry!(main);
@@ -211,6 +213,10 @@ const TTY_STEP_BELOW: u8 = proto_process::TTY_STEP_BELOW;
 /// The label of the service's timer of the processes' timers (`timers`),
 /// a service label no record has. The heartbeat's timer has label 0.
 const TIMERS: u64 = 1 << 63 | 0xFFFE;
+/// The label of the notice with which the thread of EntropyRejoin tells the
+/// loop that it made a session for a request or failed (`rejoin_answers`),
+/// a service label no record has.
+const REJOINED: u64 = 1 << 63 | 0xFFFB;
 /// The label of the notice that makes the next portion of a Create (the
 /// service's own place, as STEP is).
 const CREATING: u64 = 1 << 63 | 0xFFFD;
@@ -394,6 +400,11 @@ struct Processes {
     /// next one (CREATING).
     creating: Option<Creating>,
     creating_notice: Option<Handle<Channel>>,
+    /// The standing of the records in EntropyRejoin and its queue of requests
+    /// (rejoin.rs), and the copy of the channel that tells the thread that
+    /// serves them (rejoiner.rs); none when the thread did not start.
+    rejoin: Rejoin<Pending>,
+    rejoin_wake: Option<Handle<Channel>>,
     /// The loaders that run (5c), the loader's program, the session of the
     /// loaders with the RAM file service (proto_fs LOADERS) and a console
     /// for the programs they start.
@@ -436,6 +447,7 @@ impl Processes {
             rt::bss::fill_none(addr_of_mut!((*at).tty_walks));
             addr_of_mut!((*at).orphan_walk).write(None);
             addr_of_mut!((*at).creating).write(None);
+            addr_of_mut!((*at).rejoin).write(Rejoin::new());
             Shares::initialize_at(addr_of_mut!((*at).shares));
             Images::initialize_at(addr_of_mut!((*at).images));
             Loaders::initialize_at(addr_of_mut!((*at).loaders));
@@ -584,6 +596,15 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     owner.creating_notice = Some(creating);
+    // The thread that takes the sessions of EntropyRejoin from the entropy
+    // service's root, and the notice through which it tells the loop. A
+    // service without it refuses the request (UNREGISTERED) and runs on.
+    let started = sys::handle_label(&channel, Rights::NOTIFY, REJOINED, level)
+        .and_then(|tells| rejoiner::start(&start.process, tells));
+    match started {
+        Ok(wake) => owner.rejoin_wake = Some(wake),
+        Err(e) => rt::println!("posix-process: no thread for EntropyRejoin ({e:?})"),
+    }
     // The timers of the processes: one timer of the kernel on a labelled
     // copy of the channel, so that its notice comes apart from the
     // heartbeat's (label 0).
@@ -679,6 +700,91 @@ impl Processes {
                 .records
                 .get(record)
                 .is_some_and(|r| r.root == self.grant_scope[g])
+    }
+
+    /// EntropyRejoin of the record in `index` (rejoin.rs): the checks of
+    /// `Rejoin::admit`, a copy of the entropy service's root for the thread
+    /// of rejoiner.rs and a place in the queue, then the reply waits for the
+    /// thread (`rejoin_answers`). O(1): a read of the root's state, a copy of
+    /// it and one notification; the loop never sends to the entropy service.
+    fn entropy_rejoin(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(wake) = self.rejoin_wake.as_ref() else {
+            return refuse(proto_process::UNREGISTERED);
+        };
+        let root = self.loader_roots.get(proto_process::ROOT_ENTROPY);
+        let admitted = self.rejoin.admit(index, || {
+            root.is_some_and(|root| sys::channel_info(root).is_ok_and(|info| !info.closed))
+        });
+        let place = match admitted {
+            Ok(place) => place,
+            Err(Refusal::Permission) => return refuse(proto_process::PERMISSION),
+            Err(Refusal::Again) => return refuse(proto_process::AGAIN),
+            Err(Refusal::LimitReached) => {
+                return Answer::Status(Status::Kernel(abi::Error::LimitReached));
+            }
+        };
+        // The root is there: `admit` looked at it.
+        let Some(root) = root else {
+            return refuse(proto_process::AGAIN);
+        };
+        let Ok(copy) = sys::handle_duplicate(root, Rights::SEND | Rights::TRANSFER) else {
+            return refuse(proto_process::AGAIN);
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.rejoin.queue(place, index, pending);
+        if !rejoiner::give(wake, place, copy) {
+            // The thread is gone: the client may ask again.
+            if let Some((pending, true)) = self.rejoin.finish(place, false) {
+                let _ = pending.answer(
+                    &proto_wire::reply(Status::from_code(proto_process::AGAIN)),
+                    Outgoing::new(),
+                );
+            }
+        }
+        Answer::Deferred
+    }
+
+    /// The thread of rejoiner.rs made sessions or failed (REJOINED): the
+    /// requests it is done with are answered, at most `rejoin::QUEUE` of
+    /// them, one handle each. A request whose process ended has no taker:
+    /// its session closes, and the entropy service hears CLIENT_GONE of the
+    /// clone.
+    fn rejoin_answers(&mut self) {
+        rt::service::step_own();
+        // The detail of the step's line is the number of requests it answered.
+        let mut answered = 0u64;
+        for place in 0..rejoin::QUEUE {
+            if !self.rejoin.queued(place) {
+                continue;
+            }
+            let Some(session) = rejoiner::take(place) else {
+                continue;
+            };
+            let Some((pending, alive)) = self.rejoin.finish(place, session.is_some()) else {
+                continue;
+            };
+            answered += 1;
+            if !alive {
+                continue;
+            }
+            let _ = match session {
+                Some(session) => {
+                    let mut w = Writer::new();
+                    let _ = w.u32(0);
+                    pending.answer(w.as_bytes(), [session.erase()])
+                }
+                None => pending.answer(
+                    &proto_wire::reply(Status::from_code(proto_process::AGAIN)),
+                    Outgoing::new(),
+                ),
+            };
+        }
+        rt::service::step_detail(answered);
     }
 
     /// Create (label 0): a record of init's table, LOADING, of a new
@@ -777,6 +883,7 @@ impl Processes {
         }
         self.witnesses[index] = Some(witness);
         self.tickets[index] = create.ticket;
+        self.rejoin.born(index);
         // A record made in a used index never starts its generation over.
         self.generations.raise(index);
         self.publish_groups(index);
@@ -1243,6 +1350,11 @@ impl Processes {
                 }
                 if let Ok(kept) = r.handles.take::<Channel>(at) {
                     self.loader_roots.register(root, kept);
+                    // A new instance of the entropy service: the processes
+                    // that hold a session of the one before may rejoin.
+                    if root == proto_process::ROOT_ENTROPY {
+                        self.rejoin.registered();
+                    }
                 }
             }
             return Answer::Reply([copy.erase()].into());
@@ -3482,6 +3594,7 @@ impl Processes {
             create.ceiling,
             join,
         );
+        self.rejoin.born(child);
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
             record.process_quota = process_quota;
@@ -4723,6 +4836,9 @@ impl Service<0> for Processes {
         if method == Method::WaitTake as u16 {
             return self.wait_take(index, s, r);
         }
+        if method == Method::EntropyRejoin as u16 {
+            return self.entropy_rejoin(index, r);
+        }
         if method == Method::Router as u16 {
             return self.router(index, r);
         }
@@ -4919,6 +5035,10 @@ impl Service<0> for Processes {
             self.created();
             return;
         }
+        if n.source == Source::Session && n.label == REJOINED {
+            self.rejoin_answers();
+            return;
+        }
         if n.source == Source::Session && n.label & PORTION_MASK == PORTION {
             self.portion(n.label & !PORTION_MASK);
             return;
@@ -4995,6 +5115,7 @@ impl Service<0> for Processes {
         self.replace_queue.remove(index);
         self.finish_replace(index);
         self.tickets[index] = 0;
+        self.rejoin.ended(index);
         // Init reads the end once the witness closed.
         self.witnesses[index] = None;
         for &orphan in orphans.as_slice() {

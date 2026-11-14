@@ -682,6 +682,60 @@ const fn random_restart_programs(
     ]
 }
 
+/// The image of the probe of EntropyRejoin (tests/posix-random, roles `rejoin` and
+/// `limit`): the image of the restart with init's table of the role, the
+/// features of the process service (the limit of 2 sessions in a generation,
+/// the breaks) and those of the probe.
+const fn random_rejoin_programs(
+    table: &'static [&'static str],
+    process: &'static [&'static str],
+    probe: &'static [&'static str],
+) -> [ImageProgram; 9] {
+    let base = random_restart_programs(&[], probe);
+    [
+        ("init", "init", INIT_STACK_SIZE, table),
+        base[1],
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            process,
+        ),
+        base[3],
+        base[4],
+        base[5],
+        base[6],
+        base[7],
+        base[8],
+    ]
+}
+
+/// The image of the rejoin with the steps of the process service counted.
+static REJOIN_STEPS_PROGRAMS: [ImageProgram; 9] =
+    random_rejoin_programs(REJOIN_TABLE, &["steps"], &[]);
+
+const REJOIN_TABLE: &[&str] = &["table-posix-random-rejoin"];
+const LIMIT_TABLE: &[&str] = &["table-posix-random-limit"];
+const LIMIT_SERVICE: &[&str] = &["rejoin-max-2"];
+
+static REJOIN_PROGRAMS: [ImageProgram; 9] = random_rejoin_programs(REJOIN_TABLE, &[], &[]);
+static LIMIT_PROGRAMS: [ImageProgram; 9] = random_rejoin_programs(LIMIT_TABLE, LIMIT_SERVICE, &[]);
+/// Without the layer's request to the process service.
+static REJOIN_BREAK_LAYER: [ImageProgram; 9] =
+    random_rejoin_programs(REJOIN_TABLE, &[], &["break-no-rejoin"]);
+/// Without the service's check of the session a process took in the generation.
+static REJOIN_BREAK_TWICE: [ImageProgram; 9] =
+    random_rejoin_programs(REJOIN_TABLE, &["break-rejoin-twice"], &[]);
+/// Without the service's check that the process was born under an earlier instance.
+static REJOIN_BREAK_BORN: [ImageProgram; 9] =
+    random_rejoin_programs(REJOIN_TABLE, &["break-rejoin-born"], &[]);
+/// Without the limit of the generation's sessions.
+static LIMIT_BREAK_UNLIMITED: [ImageProgram; 9] = random_rejoin_programs(
+    LIMIT_TABLE,
+    &["rejoin-max-2", "break-rejoin-unlimited"],
+    &[],
+);
+
 static RESTART_PROGRAMS: [ImageProgram; 9] = random_restart_programs(&[], &[]);
 /// Without the loader's replacement of a closed entropy session.
 static RESTART_BREAK_LOADER: [ImageProgram; 9] = random_restart_programs(&["break-no-heal"], &[]);
@@ -704,6 +758,25 @@ const RESTART_LINES: [&str; 5] = [
     "posix-random: a program that outlived the old instance forked a child that has bytes, started a program and a set-ID program and ran exec, each with AT_RANDOM and getentropy",
     "posix-random: a parent with no session gave its child none",
     "posix-random: restart ok",
+];
+
+/// The lines of the role `rejoin`, each a check that passed.
+const REJOIN_LINES: [&str; 6] = [
+    "posix-random: the entropy service ended with a spawned program, an unseeded one and a forked child that hold its old sessions",
+    "posix-random: a spawned program, an unseeded one and a forked child, none with a channel to init, got bytes from the new instance within 3 s, through a session of it, and a child of the spawned one too",
+    "posix-random: a second request for a session in the same generation was refused",
+    "posix-random: a program born after the restart was refused a session",
+    "posix-random: rejoin ok",
+    "init: posix-random ended: exit code 0, not restarted",
+];
+
+/// The lines of the role `limit`, each a check that passed.
+const LIMIT_LINES: [&str; 5] = [
+    "posix-random: the third request of a generation of 2 sessions got the limit",
+    "posix-random: after the limit a set-ID program and a plain program started with sessions of the new instance",
+    "posix-random: a program that ended gave its session back, and the fourth request was served",
+    "posix-random: limit ok",
+    "init: posix-random ended: exit code 0, not restarted",
 ];
 
 /// The machine's run of the image `programs` of the restart probe: its lines.
@@ -765,6 +838,85 @@ pub fn random_restart() -> Result<(), String> {
         println!(
             "posix-random-restart ({cpus} CPUs): programs started across a restart of the entropy service, from the probe and from a program that outlived the old instance, all had AT_RANDOM and getentropy: ok"
         );
+        for (programs, name, lines, what) in [
+            (
+                &REJOIN_PROGRAMS,
+                "boot-posix-random-rejoin.img",
+                &REJOIN_LINES[..],
+                "rejoin",
+            ),
+            (
+                &LIMIT_PROGRAMS,
+                "boot-posix-random-limit.img",
+                &LIMIT_LINES[..],
+                "rejoin limit",
+            ),
+        ] {
+            let output = qemu::on_cpus(cpus, || {
+                restart_boot(programs, name, crate::BOOT_TIMEOUT * 2)
+            })?;
+            for line in lines {
+                qemu::expect_marker(&output, line)?;
+            }
+            if output
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("entropy: seeded from the boot page"))
+                .count()
+                != 2
+            {
+                return Err(format!("{what}: the entropy service did not restart once"));
+            }
+            println!(
+                "posix-random-restart ({cpus} CPUs): {what}: processes with no channel to init got new sessions of the entropy service after its restart, through the process service: ok"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `cargo xtask posix-random-rejoin-steps`: the probe of EntropyRejoin under
+/// -icount with the steps of the process service counted: the longest step
+/// of EntropyRejoin (kind 4, the checks, the copy of the root and one
+/// notification) and of the notifications of the service's own (kind 65,
+/// which hold the steps that answer the requests the thread of the service
+/// made sessions for, with the number answered as the detail of the line) are
+/// printed, and both stay under 0.9 of term B.
+pub fn random_rejoin_steps() -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-random-rejoin-steps.img",
+        &REJOIN_STEPS_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        crate::BOOT_TIMEOUT * 20,
+        Some("init: posix-random ended: "),
+        &kernel.elf,
+    )?;
+    for line in REJOIN_LINES {
+        qemu::expect_marker(&output, line)?;
+    }
+    let rows = longest_steps(&output.lines, "1");
+    let limit = RAM_STEP_MAX * 9 / 10;
+    let Some(request) = rows.iter().find(|r| r.0 == 4) else {
+        return Err("no step of EntropyRejoin (kind 4) was counted".into());
+    };
+    let own = rows.iter().find(|r| r.0 == 65);
+    println!(
+        "posix-random-rejoin-steps: EntropyRejoin {} ticks; the service's own notification steps {:?} ticks with the answers of the step as the detail; 0.9 of term B is {limit}",
+        request.1,
+        own.map(|r| (r.1, r.2))
+    );
+    if request.1 > limit || own.is_some_and(|r| r.1 > limit) {
+        return Err(format!(
+            "a step of the rejoin is past 0.9 of term B: {rows:?}"
+        ));
     }
     Ok(())
 }
@@ -794,6 +946,55 @@ pub fn random_restart_breaks() -> Result<(), String> {
         )?;
         qemu::expect_marker(&output, "init: posix-random ended: exit code 20")?;
         if output.lines.iter().any(|l| l == "posix-random: restart ok") {
+            return Err(format!("the probe passed with {what}"));
+        }
+        println!("random-restart-breaks: {what} is caught");
+    }
+    // The breaks of EntropyRejoin: each fails the probe at its own check.
+    for (what, programs, check) in [
+        (
+            "a layer that never asks the process service for a new session",
+            &REJOIN_BREAK_LAYER,
+            // The unseeded program has no key to go on with.
+            "getentropy(bytes, sizeof bytes) == 0",
+        ),
+        (
+            "a process service that gives a second session in a generation",
+            &REJOIN_BREAK_TWICE,
+            "random_probe_rejoin() == 501",
+        ),
+        (
+            "a process service that gives a session to a process born under the new instance",
+            &REJOIN_BREAK_BORN,
+            "code == 501",
+        ),
+        (
+            "a process service with no limit on the sessions of a generation",
+            &LIMIT_BREAK_UNLIMITED,
+            "answer == 'l'",
+        ),
+    ] {
+        let output = restart_boot(
+            programs,
+            "boot-posix-random-restart-break.img",
+            crate::BOOT_TIMEOUT,
+        )?;
+        qemu::expect_marker(&output, "init: posix-random ended: exit code 20")?;
+        qemu::expect_marker(&output, "check failed at line")?;
+        if !output
+            .lines
+            .iter()
+            .any(|l| l.contains("check failed at line") && l.contains(check))
+        {
+            return Err(format!(
+                "the probe with {what} failed, but not at the check {check:?}"
+            ));
+        }
+        if output
+            .lines
+            .iter()
+            .any(|l| l == "posix-random: rejoin ok" || l == "posix-random: limit ok")
+        {
             return Err(format!("the probe passed with {what}"));
         }
         println!("random-restart-breaks: {what} is caught");

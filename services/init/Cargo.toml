@@ -192,6 +192,10 @@ table-input = []
 table-posix-random = []
 # The same with the entropy service ended while programs start (xtask posix-random-restart).
 table-posix-random-restart = []
+# The same with the programs that have no channel to init asking for a new session after the restart (xtask posix-random-restart, role `rejoin`).
+table-posix-random-rejoin = []
+# The same with a process service that gives 2 sessions in a generation (role `limit`).
+table-posix-random-limit = []
 # The same with the network service (xtask posix-random-net).
 table-posix-random-net = []
 # The same with two stack instances of the network service (xtask posix-random-net-two).

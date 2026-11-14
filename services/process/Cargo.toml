@@ -32,12 +32,26 @@ tty-probe = []
 image-probe = []
 # Only the dedicated PID-lifetime image can query the shared page.
 lifetime-probe = []
+# The sessions EntropyRejoin gives at most are 2 and not 192, for the probe of
+# the limit (xtask posix-random-restart).
+rejoin-max-2 = []
+# Deliberate breakage of EntropyRejoin (xtask random-restart-breaks, and the
+# host tests of services/process/src/rejoin.rs): no check of the session a
+# process took in this generation, no check that it was born under an earlier
+# instance, no limit on the sessions of a generation, the end of a record that
+# gives its session back is not counted, a Register that leaves the count.
+break-rejoin-twice = []
+break-rejoin-born = []
+break-rejoin-unlimited = []
+break-rejoin-leak = []
+break-rejoin-keep-count = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 proto-init = { path = "../../proto/init" }
+proto-entropy = { path = "../../proto/entropy" }
 posix-credentials = { path = "../../lib/posix-credentials" }
 
 # The program alone runs on stafeto: the host tests of the library build

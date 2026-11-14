@@ -17,9 +17,14 @@ bench = false
 # Deliberate breakage (cargo xtask random-restart-breaks): a session that
 # died with the entropy service's instance is never replaced through init.
 break-no-reconnect = ["posix-abi/break-no-reconnect"]
+# Deliberate breakage (cargo xtask random-restart-breaks): a process with no
+# channel to init never asks the process service for a new session.
+break-no-rejoin = ["posix-abi/break-no-rejoin"]
 
 [dependencies]
 proto-entropy = { path = "../../proto/entropy" }
+proto-process = { path = "../../proto/process" }
+proto-wire = { path = "../../proto/wire" }
 posix-abi = { path = "../../lib/posix-abi" }
 posix-crt = { path = "../../lib/posix-crt" }
 rt = { path = "../../lib/rt", features = ["count-calls"] }

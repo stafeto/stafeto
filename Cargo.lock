@@ -767,6 +767,7 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-credentials",
+ "proto-entropy",
  "proto-init",
  "proto-loader",
  "proto-process",
@@ -815,6 +816,8 @@ dependencies = [
  "posix-abi",
  "posix-crt",
  "proto-entropy",
+ "proto-process",
+ "proto-wire",
  "rt",
 ]
 
