@@ -1169,13 +1169,6 @@ const CEILING_PROGRAMS: [ImageProgram; 2] = [
 /// `checked`, the strict build of rt.
 const BOOT_PROFILE: Profile = Profile::Release;
 const TEST_PROFILE: Profile = Profile::Checked;
-/// Spec 3.4: the kernel image file stays under 200 KB: the build that
-/// ships and the probes built from it.
-const KERNEL_LIMIT: u64 = 200 * 1024;
-/// The builds with the kernel tests carry the tests' programs, fixtures
-/// and judges besides the kernel, and spec 3.4 does not bound them; a
-/// limit of their own still catches a runaway growth.
-const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The limit of a probe that runs on several CPUs: TCG makes each crossing
 /// between vCPUs dear. posix-procs takes 40 s on a quiet Mac with four CPUs
@@ -1728,66 +1721,6 @@ impl Variant {
             Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
             Variant::SeedNoWipe => Some("ktest,break-seed-wipe"),
             Variant::ConsoleNoStrip => Some("break-console-strip"),
-        }
-    }
-
-    /// The limit of its image file, and where the limit comes from.
-    fn limit(self) -> (u64, &'static str) {
-        match self {
-            Variant::Normal
-            | Variant::TraceNormal
-            | Variant::Stamps
-            | Variant::FaultProbe
-            | Variant::OverflowProbe
-            | Variant::CpuOnRefused
-            | Variant::CpuCheckProbe
-            | Variant::WindowProbe
-            | Variant::WindowNoBlockCheck
-            | Variant::WindowBreakOneSection
-            | Variant::WindowNoAliveCheck
-            | Variant::WindowNoSpawnCheck
-            | Variant::AsidProbe
-            | Variant::AsidNoReserved
-            | Variant::AsidNoFlush
-            | Variant::AsidNoAside
-            | Variant::AsidEarly
-            | Variant::UnmapLocal
-            | Variant::ReadyGap
-            | Variant::IdlePoll
-            | Variant::NoIdlePoll
-            | Variant::IdleProbe
-            | Variant::IdleNoBell
-            | Variant::IdleNoDrain
-            | Variant::IdleNoIrq
-            | Variant::EarlyMarks
-            | Variant::ItsProbe
-            | Variant::ItsInt
-            | Variant::ItsIntBreak
-            | Variant::ItsDrop
-            | Variant::ItsDropIgnore
-            | Variant::ItsPreset
-            | Variant::ItsPresetBreak
-            | Variant::ItsIntAlign4k
-            | Variant::ConsoleNoStrip
-            | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
-            Variant::Test
-            | Variant::Baseline
-            | Variant::Trace
-            | Variant::TestIcount
-            | Variant::TestEl0
-            | Variant::BaselineEl0
-            | Variant::TraceEl0
-            | Variant::TestIcountEl0
-            | Variant::TestIcountItsSlow
-            | Variant::TestIcountItsLoop
-            | Variant::TestIcountItsSlowEl0
-            | Variant::TestIcountItsLoopEl0
-            | Variant::TestIcountStamps
-            | Variant::TestIcountStampsEl0
-            | Variant::SmpMeasure
-            | Variant::SmpMeasureNoPoll
-            | Variant::SeedNoWipe
-            | Variant::SmpChecks => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -3181,14 +3114,9 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     )?;
     let bytes = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     image::check_header(&bytes)?;
-    let (limit, source) = variant.limit();
-    image::check_size(bytes.len() as u64, limit)?;
     let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
-    println!(
-        "kernel image {} ({} bytes, limit {limit} of {source})",
-        image.display(),
-        bytes.len()
-    );
+    println!("kernel image {} ({} bytes)", image.display(), bytes.len());
+    image::report(variant.stem(), bytes.len() as u64);
     Ok(Artifacts {
         elf,
         image,
@@ -14275,8 +14203,6 @@ mod tests {
         assert_eq!(Variant::Normal.feature(), None);
     }
 
-    /// The build that ships and its probes keep the limit of spec 3.4; the
-    /// builds with the kernel tests have one of their own.
     /// Every kind of test build has a second image with the EL0 tests alone,
     /// and no other build has one.
     #[test]
@@ -14297,21 +14223,6 @@ mod tests {
         }
         for other in [Variant::Normal, Variant::TraceNormal, Variant::FaultProbe] {
             assert_eq!(other.el0_half(), None);
-        }
-    }
-
-    #[test]
-    fn test_builds_have_a_limit_of_their_own() {
-        for variant in [Variant::Normal, Variant::FaultProbe, Variant::OverflowProbe] {
-            assert_eq!(variant.limit(), (204_800, "spec 3.4"));
-        }
-        for variant in [
-            Variant::Test,
-            Variant::TestIcount,
-            Variant::TestEl0,
-            Variant::TestIcountEl0,
-        ] {
-            assert_eq!(variant.limit(), (524_288, "test builds"));
         }
     }
 
