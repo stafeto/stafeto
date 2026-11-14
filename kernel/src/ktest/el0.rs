@@ -846,8 +846,9 @@ pub fn fast_path() -> bool {
     }
     let client = OVERRUN_BUDGET.swap(core::ptr::null_mut(), Relaxed);
     if !client.is_null() {
-        // The client's stint began 20 ms ago, as if the timer's interrupt had
-        // not come for that long: its wait ends it with the budget gone.
+        // The client's stint began 20 ms ago, twice its budget, as if the
+        // timer's interrupt had not come: its wait ends it with the budget
+        // gone. The machine has run for longer than that.
         // SAFETY: as above.
         unsafe { (*client).run(timer::now().saturating_sub(timer::frequency() / 50)) };
     }
@@ -864,21 +865,24 @@ static OVERRUN_BUDGET: AtomicPtr<Server> = AtomicPtr::new(core::ptr::null_mut())
 /// Whether the hook found the budget in that state afterwards.
 static BUDGET_WENT_STALE: AtomicBool = AtomicBool::new(false);
 
-/// Stints of a tenth of a millisecond, each ending in a wait: the
+/// Stints of 50 ms, each ending in a wait: the
 /// queue of replenishments fills, and the fourth wait merges the remnant
 /// into a later entry, so that the head lies ahead of now (the budget has no
 /// capacity) while the flag of the budget still says the thread is not in
 /// the background. True when the budget is in that state.
 fn make_stale(s: &mut Server) -> bool {
     let mut at = timer::now();
-    let tenth = timer::frequency() / 10_000;
+    // The head of the queue ends up 50 ms ahead at least, so that its
+    // replenishment does not come while the test runs, whatever the speed
+    // of the machine.
+    let step = timer::frequency() / 20;
     let now = timer::now();
     for _ in 0..8 {
         s.unblock(at);
         s.run(at);
-        at += tenth;
+        at += step;
         s.stop(at, true);
-        at += tenth;
+        at += step;
         if !s.background() && s.capacity(now) == 0 {
             return true;
         }
@@ -4597,10 +4601,12 @@ fn start_budget_demotes(f: &mut Fixture) -> Result<(), &'static str> {
     set_args(server, &[h, 1]);
     set_args(client, &[h, REQUEST_LEN, REQUEST_WORD]);
     set_args(ready, &[word(0)]);
-    // 10 ms of budget in each 100 ms, the thread falling to level 1.
+    // The service has 1 s of budget in each 10 s (the hook fills its queue
+    // with stints of 50 ms), the client 10 ms in each 100 ms; both fall to
+    // level 1.
     let freq = timer::frequency();
-    for t in [server, client] {
-        let b = crate::budget::create(p, 0, freq / 100, freq / 10, 1).map_err(|_| "no budget")?;
+    for (t, c) in [(server, freq), (client, freq / 100)] {
+        let b = crate::budget::create(p, 0, c, 10 * c, 1).map_err(|_| "no budget")?;
         let bound = crate::budget::bind(t, b);
         // SAFETY: the reference `create` handed out goes; the binding, if
         // it went through, holds the budget.
@@ -4639,8 +4645,12 @@ fn done_budget_demotes(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
                 "the service did not take the request",
             )?;
             check(
-                snap.states[2] != Some(State::Ready) && shared(f, 0) == 1,
+                snap.states[2] != Some(State::Ready),
                 "the service ran before the thread above its level at `low`",
+            )?;
+            check(
+                shared(f, 0) == 1,
+                "the thread above the service at `low` did not run",
             )
         }
         1 => check(
