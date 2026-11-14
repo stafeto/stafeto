@@ -31,8 +31,9 @@ use abi::{
     Notification, OWNER_RIGHTS, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
 use kcore::PAGE_SIZE;
+use kcore::budget::Server;
 use kcore::esr;
 use kcore::gic::PRIORITY_MASK;
 use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
@@ -434,6 +435,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_equal_ready,
     },
     El0Test {
+        name: "fast_path_wakes_a_receiver_the_budget_demotes",
+        start: start_budget_demotes,
+        done: done_budget_demotes,
+    },
+    El0Test {
         name: "fast_path_skips_a_pending_interrupt",
         start: start_pending_interrupt,
         done: done_pending_interrupt,
@@ -831,7 +837,57 @@ pub fn fast_path() -> bool {
         return false;
     }
     FAST_PATH_HITS.fetch_add(1, Relaxed);
+    let server = STALE_BUDGET.swap(core::ptr::null_mut(), Relaxed);
+    if !server.is_null() {
+        // SAFETY: the receiver's budget lives while its thread does, and the
+        // hook runs under the scheduler's lock, which guards it.
+        let stale = unsafe { make_stale(&mut *server) };
+        BUDGET_WENT_STALE.store(stale, Relaxed);
+    }
+    let client = OVERRUN_BUDGET.swap(core::ptr::null_mut(), Relaxed);
+    if !client.is_null() {
+        // The client's stint began 20 ms ago, twice its budget, as if the
+        // timer's interrupt had not come: its wait ends it with the budget
+        // gone. The machine has run for longer than that.
+        // SAFETY: as above.
+        unsafe { (*client).run(timer::now().saturating_sub(timer::frequency() / 50)) };
+    }
     true
+}
+
+/// The budget of the receiver of the fast path that the test has the hook
+/// of `fast_path` bring into the state of a thread that waits with no
+/// capacity and a flag that says it works at its own level.
+static STALE_BUDGET: AtomicPtr<Server> = AtomicPtr::new(core::ptr::null_mut());
+/// The budget of the client, whose stint the hook makes longer than the
+/// budget.
+static OVERRUN_BUDGET: AtomicPtr<Server> = AtomicPtr::new(core::ptr::null_mut());
+/// Whether the hook found the budget in that state afterwards.
+static BUDGET_WENT_STALE: AtomicBool = AtomicBool::new(false);
+
+/// Stints of 50 ms, each ending in a wait: the
+/// queue of replenishments fills, and the fourth wait merges the remnant
+/// into a later entry, so that the head lies ahead of now (the budget has no
+/// capacity) while the flag of the budget still says the thread is not in
+/// the background. True when the budget is in that state.
+fn make_stale(s: &mut Server) -> bool {
+    let mut at = timer::now();
+    // The head of the queue ends up 50 ms ahead at least, so that its
+    // replenishment does not come while the test runs, whatever the speed
+    // of the machine.
+    let step = timer::frequency() / 20;
+    let now = timer::now();
+    for _ in 0..8 {
+        s.unblock(at);
+        s.run(at);
+        at += step;
+        s.stop(at, true);
+        at += step;
+        if !s.background() && s.capacity(now) == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Runs the EL0 tests and ends the run.
@@ -4518,6 +4574,89 @@ fn done_equal_ready(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
                 "the woken service ran before the ready thread of its level",
             )
         }
+        _ => Ok(()),
+    }
+}
+
+/// The fast path checks the receiver's level again after the budgets'
+/// operations of the meeting (Scheduler::hand_off): a service and a client
+/// at 12, both with a budget, and a thread at 10 of one process; the
+/// service waits. The hook of the fast path leaves the service's budget with
+/// no capacity and its flag as it was (what the waits of a busy service do
+/// when the queue of replenishments is full), and the client's stint longer
+/// than its budget. At the send the client's wait ends its budget, so the
+/// request comes at `low`, and the activation of the service finds no
+/// capacity: the service works at `low`, below the thread at 10, which runs
+/// first and leaves its mark; the service takes the request after it and
+/// the client gets its reply. A kernel that hands the CPU over by the level
+/// it saw before the budgets' operations stops at the hand-off.
+fn start_budget_demotes(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let level = PRIORITY + 2;
+    let server = sched_thread(f, 0, &raw const el0_serve_snap, level, FIFO)?;
+    let client = sched_thread(f, 1, &raw const el0_send, level, FIFO)?;
+    let ready = sched_thread(f, 2, &raw const el0_mark, PRIORITY, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    let h = own_channel(p, Rights::SEND | Rights::RECEIVE)?;
+    set_args(server, &[h, 1]);
+    set_args(client, &[h, REQUEST_LEN, REQUEST_WORD]);
+    set_args(ready, &[word(0)]);
+    // The service has 1 s of budget in each 10 s (the hook fills its queue
+    // with stints of 50 ms), the client 10 ms in each 100 ms; both fall to
+    // level 1.
+    let freq = timer::frequency();
+    for (t, c) in [(server, freq), (client, freq / 100)] {
+        let b = crate::budget::create(p, 0, c, 10 * c, 1).map_err(|_| "no budget")?;
+        let bound = crate::budget::bind(t, b);
+        // SAFETY: the reference `create` handed out goes; the binding, if
+        // it went through, holds the budget.
+        unsafe { crate::budget::release(b, CAUSE) };
+        bound.map_err(|_| "a budget did not bind")?;
+    }
+    // SAFETY: the server has a budget, which lives while the thread does.
+    let budget = unsafe { server.as_ref() }
+        .sched
+        .server()
+        .ok_or("no budget")?;
+    STALE_BUDGET.store(budget.as_ptr(), Relaxed);
+    // SAFETY: the client has a budget, as above.
+    let budget = unsafe { client.as_ref() }
+        .sched
+        .server()
+        .ok_or("no budget")?;
+    OVERRUN_BUDGET.store(budget.as_ptr(), Relaxed);
+    BUDGET_WENT_STALE.store(false, Relaxed);
+    Ok(())
+}
+
+fn done_budget_demotes(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => {
+            check(
+                BUDGET_WENT_STALE.load(Relaxed),
+                "the hook did not leave the budget with no capacity",
+            )?;
+            let Some(snap) = f.snaps[0] else {
+                return Err("the service noted no state");
+            };
+            check(
+                snap.regs[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+                "the service did not take the request",
+            )?;
+            check(
+                snap.states[2] != Some(State::Ready),
+                "the service ran before the thread above its level at `low`",
+            )?;
+            check(
+                shared(f, 0) == 1,
+                "the thread above the service at `low` did not run",
+            )
+        }
+        1 => check(
+            x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+            "the client did not get its request back",
+        ),
         _ => Ok(()),
     }
 }

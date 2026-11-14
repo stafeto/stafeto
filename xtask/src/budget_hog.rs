@@ -259,6 +259,7 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-child-free",
         "break-budget-forgive-overrun",
         "break-budget-skip-boosted",
+        "break-budget-handoff",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
