@@ -580,39 +580,6 @@ impl<const D: usize> NetDevice<D> {
         }
     }
 
-    /// Puts into the loop an ARP reply for each address of the interface, so
-    /// that the stack learns they are at its own MAC without asking: an ARP
-    /// request is rate limited for a second after any other (smoltcp's
-    /// neighbour cache), and the first connection on the loopback would wait
-    /// for that second.
-    pub fn seed_neighbours(&mut self) {
-        self.reclaim_loop();
-        for k in 0..self.own_len {
-            if !self.looped.room_to_send() {
-                break;
-            }
-            let (mac, ip) = (self.mac, self.own[k]);
-            let mut f = [0u8; 42];
-            f[..6].copy_from_slice(&mac);
-            f[6..12].copy_from_slice(&mac);
-            f[12..14].copy_from_slice(&[0x08, 0x06]);
-            f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 2]);
-            f[22..28].copy_from_slice(&mac);
-            f[28..32].copy_from_slice(&ip);
-            f[32..38].copy_from_slice(&mac);
-            f[38..42].copy_from_slice(&ip);
-            let Some(n) = self.tx.alloc() else {
-                continue;
-            };
-            // SAFETY: the buffer is the pool's and the device does not hold it.
-            let slice = unsafe { buffer_at::<D>(n) };
-            slice[HDR_LEN..HDR_LEN + f.len()].copy_from_slice(&f);
-            if !self.looped.push(n, f.len()) {
-                self.tx.release(n);
-            }
-        }
-    }
-
     /// Queues an ARP request on the wire for the first of `targets` that the
     /// share of the step and the pool of buffers allow, from the first address
     /// of the interface (`sender`): the answers fill the stack's neighbour

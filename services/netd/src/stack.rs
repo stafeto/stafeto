@@ -100,6 +100,32 @@ struct IcmpStorage {
     tx_data: *mut [u8; ICMP_BYTES],
 }
 
+impl IcmpStorage {
+    /// The ICMP socket over the buffers, bound to the identifier of PING. Called once at the start
+    /// and again when a PING gives up, after the socket that held the buffers is gone.
+    fn socket<'a>(&self) -> icmp::Socket<'a> {
+        // SAFETY: the buffers are parts of the storage the stack borrows for 'a, and no other
+        // reference to them is made after `Stack::new` (the destructuring there leaves them out);
+        // the previous socket, the only holder, is dropped before a new one is made.
+        let mut socket = unsafe {
+            icmp::Socket::new(
+                icmp::PacketBuffer::new(
+                    (&mut *self.rx_meta).as_mut_slice(),
+                    (&mut *self.rx_data).as_mut_slice(),
+                ),
+                icmp::PacketBuffer::new(
+                    (&mut *self.tx_meta).as_mut_slice(),
+                    (&mut *self.tx_data).as_mut_slice(),
+                ),
+            )
+        };
+        // A bind that fails would leave PING with no reply to see; the identifier is the only one
+        // on a fresh socket.
+        let _ = socket.bind(icmp::Endpoint::Ident(IDENT));
+        socket
+    }
+}
+
 /// The identifier of the echo requests of PING.
 const IDENT: u16 = 0x5354;
 /// The bytes of data in an echo request of PING.
@@ -160,7 +186,9 @@ pub struct Ping {
 pub enum PingEnd {
     /// The round-trip time in nanoseconds.
     Reply(u64),
-    TimedOut,
+    /// The echo requests left in the queue of the ICMP socket after the time ran out and the
+    /// socket was made again: none.
+    TimedOut(usize),
 }
 
 pub struct Stack<'a> {
@@ -237,26 +265,17 @@ impl<'a> Stack<'a> {
             tx_meta: &raw mut storage.tx_meta,
             tx_data: &raw mut storage.tx_data,
         };
+        // The four buffers of the ICMP socket are reached through these pointers alone, from here
+        // on (`IcmpStorage::socket`); the destructuring below leaves them out.
         let Storage {
-            sockets,
-            service,
-            rx_meta,
-            rx_data,
-            tx_meta,
-            tx_data,
+            sockets, service, ..
         } = storage;
         let mut chunks = sockets.chunks_mut(GROUP);
         let groups: [SocketSet<'a>; GROUPS] = core::array::from_fn(|_| {
             SocketSet::new(chunks.next().expect("the storage of a group"))
         });
         let mut set = SocketSet::new(&mut service[..]);
-        let mut icmp_socket = icmp::Socket::new(
-            icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
-            icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
-        );
-        // A bind that fails would leave PING with no reply to see; the
-        // identifier is the only one on a fresh socket.
-        let _ = icmp_socket.bind(icmp::Endpoint::Ident(IDENT));
+        let icmp_socket = icmp_storage.socket();
         let icmp = set.add(icmp_socket);
         let dhcp = dhcp.then(|| set.add(dhcpv4::Socket::new()));
         Stack {
@@ -582,22 +601,7 @@ impl<'a> Stack<'a> {
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     fn icmp_again(&mut self, now_ns: u64) {
         drop(self.service.remove(self.icmp));
-        let s = &self.icmp_storage;
-        // SAFETY: the buffers are the stack's storage, which lives as long as the
-        // stack; the socket that held them is gone, and the stack makes no other.
-        let mut socket = unsafe {
-            icmp::Socket::new(
-                icmp::PacketBuffer::new(
-                    (&mut *s.rx_meta).as_mut_slice(),
-                    (&mut *s.rx_data).as_mut_slice(),
-                ),
-                icmp::PacketBuffer::new(
-                    (&mut *s.tx_meta).as_mut_slice(),
-                    (&mut *s.tx_data).as_mut_slice(),
-                ),
-            )
-        };
-        let _ = socket.bind(icmp::Endpoint::Ident(IDENT));
+        let socket = self.icmp_storage.socket();
         self.icmp = self.service.add(socket);
         self.group_at[GROUPS] = Self::deadline(self.iface.poll_at(instant(now_ns), &self.service));
     }
@@ -633,7 +637,8 @@ impl<'a> Stack<'a> {
         if now_ns >= ping.deadline_ns {
             self.ping = None;
             self.icmp_again(now_ns);
-            return Some(PingEnd::TimedOut);
+            let queued = self.service.get::<icmp::Socket>(self.icmp).send_queue();
+            return Some(PingEnd::TimedOut(queued));
         }
         None
     }
