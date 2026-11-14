@@ -565,9 +565,9 @@ unsafe fn accept(
 /// the debt of the client's budget, or of the client's own client when the
 /// client is a server on loan in its turn, one hop along the chain for each
 /// hop of the request. The loan is gone from `t` in any case. The debt is
-/// dropped when the client has ended, no longer waits for a reply from
-/// `t`'s process (an interrupt withdrew it: it runs, and its budget is its
-/// CPU's to change), or has no budget. Call it before the boost ends. O(1):
+/// dropped when the client has ended or has no budget; with no token the
+/// stint that runs is closed and nobody pays it. Call it before the boost
+/// ends. O(1):
 /// one look at the token and one check of the client's budget (at most
 /// `2 * MAX_REPLENISHMENTS` passes).
 ///
@@ -578,21 +578,25 @@ unsafe fn settle_loan(k: &mut Locked<'_>, t: NonNull<Thread>) {
     // waits for a reply from `t`'s process is alive, and its CPU touches
     // nothing of its budget until its wake, which is under OBJ.
     unsafe {
+        if !(*t.as_ptr()).sched.has_budget() {
+            return;
+        }
         let token = (*t.as_ptr()).boost_token;
-        if token == 0 || !(*t.as_ptr()).sched.has_budget() {
-            return;
-        }
         let now = crate::arch::timer::now();
+        // The stint that runs is closed whatever the token: a thread that
+        // kept running at `low` after its reply must not have that time
+        // lent to the client of the request it takes next.
         let lent = k.s.take_loan(t, now);
-        if lent == 0 {
+        if token == 0 || lent == 0 {
             return;
         }
+        // A token that is still taken names a client that waits for a reply
+        // from `t`'s process: a wait for a reply is not withdrawn, and the
+        // reply that used the token up freed it.
         let Ok(client) = k.tokens.check(token) else {
             return;
         };
-        if (*client.as_ptr()).waits == Some(Wait::Reply(t.as_ref().process())) {
-            k.s.owe(client, lent, now);
-        }
+        k.s.owe(client, lent, now);
     }
 }
 

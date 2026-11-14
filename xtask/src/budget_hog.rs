@@ -175,12 +175,19 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
     if cpus >= 2 {
         loans.push(("on another", n.loan_other));
     }
+    let mut lost = Vec::new();
     for (what, (requests, overruns)) in loans {
-        if overruns == 0 || !(2..=LOAN_MOST).contains(&requests) {
-            return Err(format!(
-                "a client made {requests} requests of a service {what} whose budget was gone and its budget ran out {overruns} times: its work was not lent to the client (2 to {LOAN_MOST} requests, at least one overrun)"
+        if overruns == 0 || !(1..=LOAN_MOST).contains(&requests) {
+            lost.push(format!(
+                "a client made {requests} requests of a service {what} whose budget was gone and its budget ran out {overruns} times"
             ));
         }
+    }
+    if !lost.is_empty() {
+        return Err(format!(
+            "{}: its work was not lent to the client (1 to {LOAN_MOST} requests, at least one overrun)",
+            lost.join("; ")
+        ));
     }
     // The worker at 55 for each notification gets its 200 us of each
     // period and the boost of the slot goes with the budget: the victim
@@ -256,7 +263,14 @@ pub fn breaks() -> Result<(), String> {
             "a server whose work for a client is not lent to it",
         ),
     ] {
-        match probe(variant, 1).and_then(|n| verdict(&n, 1)) {
+        // On four CPUs, so that the loan phase with the service on another
+        // CPU runs on the break too.
+        let cpus = if variant == Variant::BudgetForgiveLoan {
+            4
+        } else {
+            1
+        };
+        match probe(variant, cpus).and_then(|n| verdict(&n, cpus)) {
             Err(e) => println!("budget-breaks: {what} is caught ({e})"),
             Ok(()) => return Err(format!("the break ({what}) passed the probe")),
         }

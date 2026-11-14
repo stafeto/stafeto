@@ -3703,7 +3703,39 @@ mod tests {
         w.events(10 * MS);
         assert!(!node(s).is_demoted());
         // The 7 ms before the replenishment are lent; the time after is S's.
+        // SAFETY: the world keeps its threads alive; `s` runs.
+        let lent = unsafe { w.s.take_loan(s, 12 * MS) };
+        assert_eq!(lent, 7 * MS);
+    }
+
+    #[test]
+    fn time_at_low_after_a_reply_is_not_lent_to_the_next_client() {
+        let mut w = World::new();
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, MS, 1000 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 's');
+        assert_eq!(w.tick(MS), 's');
+        w.now = 2 * MS;
+        w.block();
+        // A request at 3 ms from a client at 50, answered at 4 ms.
+        w.now = 3 * MS;
+        w.boost(s, 50, 63);
+        w.wake(s);
+        assert_eq!(w.pick(3 * MS), 's');
+        // SAFETY: the world keeps its threads alive; `s` runs.
+        assert_eq!(unsafe { w.s.take_loan(s, 4 * MS) }, MS);
+        w.unboost(s);
+        // It runs on at `low` until 14 ms, then takes the next request at
+        // once (receive with a request queued): the stint closes first, and
+        // the boost comes.
         // SAFETY: as above.
-        assert_eq!(unsafe { w.s.take_loan(s, 12 * MS) }, 7 * MS);
+        assert_eq!(unsafe { w.s.take_loan(s, 14 * MS) }, 0);
+        w.unboost(s);
+        w.boost(s, 50, 63);
+        // The next reply, 1 ms later, lends that 1 ms and no more.
+        // SAFETY: as above.
+        let lent = unsafe { w.s.take_loan(s, 15 * MS) };
+        assert_eq!(lent, MS);
     }
 }
