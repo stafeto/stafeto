@@ -1052,11 +1052,13 @@ static int fresh_role(void) {
 }
 
 /* The role `holder`: started before the service's instance ended, so its session is the old
- * instance's and it has no way to init. It waits for a byte on the descriptor `number`, then
- * starts a `fresh` program, whose entropy session the loader takes from the new instance. */
-static int holder_role(const char *number) {
-    char go;
-    CHECK(read(atoi(number), &go, 1) == 1);
+ * instance's and it has no way to init. It says it is running (a byte on the descriptor `ready`),
+ * waits for a byte on the descriptor `go`, then starts a `fresh` program, whose entropy session
+ * the loader takes from the new instance. */
+static int holder_role(const char *go, const char *ready) {
+    char byte = 'r';
+    CHECK(write(atoi(ready), &byte, 1) == 1);
+    CHECK(read(atoi(go), &byte, 1) == 1);
     CHECK(spawn_role("fresh", -1) == 0);
     return 0;
 }
@@ -1067,13 +1069,18 @@ static int holder_role(const char *number) {
  * session is open, a session of the new instance. */
 #define RESTART_STARTS 60
 static int restart_run(void) {
-    int go[2];
-    CHECK(pipe(go) == 0);
-    char number[16];
+    int go[2], ready[2];
+    CHECK(pipe(go) == 0 && pipe(ready) == 0);
+    char number[16], reply[16];
     CHECK(snprintf(number, sizeof number, "%d", go[0]) > 0);
-    char *argv[] = {"posix-random", "holder", number, NULL};
+    CHECK(snprintf(reply, sizeof reply, "%d", ready[1]) > 0);
+    char *argv[] = {"posix-random", "holder", number, reply, NULL};
     pid_t holder = 0;
-    CHECK(posix_spawn(&holder, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    int rc = posix_spawn(&holder, "/bin/posix-random", NULL, NULL, argv, environ);
+    if (rc != 0) printf("posix-random: spawn of the holder gave %d\n", rc);
+    CHECK(rc == 0);
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1);
     CHECK(random_probe_session_open() == 1);
     CHECK(random_probe_crash() == 0);
     for (int i = 0; i < RESTART_STARTS; i++) CHECK(spawn_role("fresh", -1) == 0);
@@ -1093,7 +1100,7 @@ static int restart_run(void) {
 int main(int argc, char **argv) {
     int status;
     if (argc > 1 && strcmp(argv[1], "fresh") == 0) return fresh_role();
-    if (argc > 2 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2]);
+    if (argc > 3 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2], argv[3]);
     if (argc > 1 && strcmp(argv[1], "restart") == 0) {
         status = restart_run();
         if (status == 0) printf("posix-random: restart ok\n");

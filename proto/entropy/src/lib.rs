@@ -47,6 +47,14 @@
 //! more than one, or a channel without the two rights; ACCESS_DENIED from
 //! any session other than the root, and for any other method through the root.
 //!
+//! A session dies with the instance of the service that gave it, and init
+//! starts a new instance. A holder that finds its session closed gets a new
+//! one the way a service is reached: a program init started asks init's
+//! CONNECT, which waits while the service restarts; a loader asks the process
+//! service for the root the new instance registered and sends it
+//! VERIFY_SESSION with a channel of its own, which comes back as a new clone
+//! (`reconnect` has the bound of that wait).
+//!
 //! | Request | Bytes after the header |
 //! |---|---|
 //! | FILL_START | 0..4 `n`, 4..8 zero |
