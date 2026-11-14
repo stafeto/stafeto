@@ -70,6 +70,9 @@ pub fn build_command(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     official_roots_only()?;
+    // Before the ABI check: it builds libc.so, once for the whole run, and
+    // that build must see the commit.
+    crate::pkg::export_commit()?;
     if check_abi {
         let mut abi = vec!["--check".to_string()];
         if is_final(version()) {
@@ -84,9 +87,7 @@ pub fn build_command(args: &[String]) -> Result<(), String> {
 pub fn build(previous: Option<String>) -> Result<(), String> {
     // The commit goes into the version field of `uname`; the builds below
     // see it through their environment.
-    let commit = crate::pkg::commit()?;
-    // SAFETY: xtask is one thread here, before any build starts.
-    unsafe { std::env::set_var("STAFETO_COMMIT", &commit[..8]) };
+    crate::pkg::export_commit()?;
     let out = directory();
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -292,6 +293,27 @@ mod tests {
             std::fs::write(dir.join(f), "x").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn the_release_build_sets_the_commit_before_its_first_build() {
+        // The check of the ABI builds libc.so, which holds the version field of
+        // `uname`; the commit must be set before it.
+        let source = include_str!("release.rs");
+        let body = &source[source.find("pub fn build_command").unwrap()..];
+        let set = body.find("export_commit()").unwrap();
+        let first_build = body.find("abi_fingerprint::command").unwrap();
+        assert!(set < first_build);
+        let build = &source[source.find("pub fn build(").unwrap()..];
+        assert!(build.find("export_commit()").unwrap() < build.find("repo::run").unwrap());
+    }
+
+    #[test]
+    fn the_commit_is_eight_hex_digits_of_head() {
+        crate::pkg::export_commit().unwrap();
+        let set = std::env::var("STAFETO_COMMIT").unwrap();
+        assert_eq!(set.len(), 8);
+        assert!(crate::pkg::commit().unwrap().starts_with(&set));
     }
 
     #[test]

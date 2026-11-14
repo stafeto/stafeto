@@ -8,7 +8,7 @@ Every path inside the kernel is bounded in time, and every driver and service ru
 
 ## Try it
 
-Download `stafeto-<version>-aarch64-virt.tar.xz` from the [latest release](https://github.com/stafeto/stafeto/releases), unpack it and run:
+Download `stafeto-<version>-aarch64-virt-base.tar.xz` (the shell and the package tool) or `stafeto-<version>-aarch64-virt-full.tar.xz` (every package, with the network programs; it needs 1024M of memory) from the [latest release](https://github.com/stafeto/stafeto/releases), unpack it and run:
 
 ```sh
 ./run.sh              # QEMU with emulation, any host
@@ -16,26 +16,32 @@ Download `stafeto-<version>-aarch64-virt.tar.xz` from the [latest release](https
 ./run.sh --hvf        # hardware virtualization on a Mac with Apple silicon
 ```
 
-You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` and `ncdu` are in the image; `exit` or Ctrl-A X ends QEMU. Files live in RAM, so changes are gone after a restart.
+You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` and `ncdu` are in the image; `exit` or Ctrl-A X ends QEMU. Files live in RAM, so changes are gone after a restart. The release notes also tell how to launch the system on an AWS EC2 Graviton instance.
 
 ## What works today
 
-- **Kernel.** A capability microkernel of about 190 KiB with 34 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
-- **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (8,870 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
+- **Kernel.** A capability microkernel of about 188 KiB with 34 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
+- **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (8,865 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
 - **Several CPUs.** Up to 4 CPUs are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.
 - **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,184 of 1,187 tests and the Open POSIX Test Suite 1,986 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
 - **Programs.** relibc is the C library. BusyBox 1.37 and the ready-made utilities linked into it give 103 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
-- **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, and Apple Virtualization.framework.
+- **Network.** A TCP/IP service in user space with sockets and epoll, DHCP, `wget` and `curl` over TLS, and nginx, also on a user-space FreeBSD stack (F-Stack).
+- **Security.** A set-ID program takes only verified sessions (pipes, network, entropy) from its caller, a wait on a shared-memory address needs the right to the object, the stack canary comes from `AT_RANDOM`, which the loader fills from a boot seed, all C code is built with `-fstack-protector-strong`, and `crypt` salts are random. Packages are signed, and releases carry a signed index.
+- **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, Apple Virtualization.framework, and AWS EC2 Graviton (t4g.small in `eu-central-1`, booted through an EFI loader, with the ENA network device).
 
 The details of each part and the known limits are in [docs/status.md](docs/status.md).
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) is done; subproject 2 (POSIX and services) ends with release 0.2.0.
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0.
 
-**Next**
+**Next, in this order**
 
+- Reliability: the defects that tests and audits find, before new parts.
+- Scheduler time budgets.
+- AWS step g1: two ENA queues with RSS, one stack instance per queue, and measurements against Linux on network-optimised Graviton instances.
+- Then the rest of the list below.
 - Shared libraries: `libc.so` and a dynamic loader are in; next come `dlopen` of new libraries and more sharing of data pages between processes.
 - The nine POSIX utilities that need services of their own: `at`, `batch`, `lp`, `mailx`, `locale`, `localedef`, `gettext`, `ngettext` and `msgfmt`.
 - System integrity: every program carries an Ed25519 signature from the release key or from an approved developer. A program with a broken or foreign signature does not start, and a manual scan checks the whole system against a signed manifest, in the spirit of `sfc /scannow`.
@@ -44,8 +50,8 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) i
 **Later subprojects**
 
 - Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way).
-- Network: virtio-net, a TCP/IP stack and IPv4 sockets (under way). BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
-- Packages and apps: a package format, signed packages, an app sandbox.
+- Network: IPv4 is in. BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
+- Apps: an app sandbox. The package format and signed packages are in.
 
 ## Build from source
 
@@ -118,8 +124,6 @@ with the `fts` of musl-fts (BSD), `newgrp` of util-linux (GPL-2.0-or-later)
 and `tput` and `tabs` of ncurses (MIT). Their licence texts and the exact
 sources travel in the image next to BusyBox's (`BUSYBOX-LICENSE`,
 `BUSYBOX-SOURCE`, `UTILITIES-LICENSE`).
-
-| `tools/` | relibc, BusyBox, ncurses, nano and bash builds, the VZ runner, licence check |
 
 Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
 ci` checks the licence of every crate and file, that the GPL-2.0-only

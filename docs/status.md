@@ -24,7 +24,7 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 193,216 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+image is 192,517 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
 The longest stretch the kernel runs without taking an interrupt (term B of the
 kernel) stays below the limit of 18,000 ticks that `xtask` enforces under
 `-icount`; teardown of a session and its message buffers runs in

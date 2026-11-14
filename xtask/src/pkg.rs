@@ -71,6 +71,20 @@ pub fn commit() -> Result<String, String> {
     Ok(c.trim().to_string())
 }
 
+/// Puts the short hash of the commit being built into `STAFETO_COMMIT`, which
+/// the version field of `uname` reads at build time. It runs before the first
+/// build of a run: libc.so is built once per run of xtask, and the first
+/// build decides what it holds.
+pub fn export_commit() -> Result<(), String> {
+    let commit = commit()?;
+    if commit.len() < 8 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("git rev-parse gave {commit:?}, no commit"));
+    }
+    // SAFETY: xtask is one thread here, before any build starts.
+    unsafe { std::env::set_var("STAFETO_COMMIT", &commit[..8]) };
+    Ok(())
+}
+
 /// `0.2` of the version `0.2.0` of the workspace.
 pub fn series() -> String {
     let v = env!("CARGO_PKG_VERSION");
