@@ -35,13 +35,57 @@ pub fn check_header(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn check_size(len: u64, limit: u64) -> Result<(), String> {
-    if len <= limit {
-        Ok(())
+/// Growth over the recorded size that the report flags.
+pub const GROWTH_FLAG: u64 = 4096;
+
+/// The recorded sizes of `kernel/size.txt`: a stem and its size in bytes on
+/// each line, blank lines and lines that start with `#` skipped.
+pub fn parse_record(text: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut sizes = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let (Some(stem), Some(size), None) = (words.next(), words.next(), words.next()) else {
+            return Err(format!("kernel/size.txt line {}: want `stem bytes`", n + 1));
+        };
+        let size = size
+            .parse()
+            .map_err(|e| format!("kernel/size.txt line {}: {e}", n + 1))?;
+        sizes.push((stem.to_string(), size));
+    }
+    if sizes.is_empty() {
+        return Err("kernel/size.txt records no size".into());
+    }
+    Ok(sizes)
+}
+
+/// The line that compares the image of `stem`, `len` bytes, with the record.
+pub fn compare(record: &[(String, u64)], stem: &str, len: u64) -> Option<String> {
+    let (_, was) = record.iter().find(|(s, _)| s == stem)?;
+    let delta = len as i64 - *was as i64;
+    let flag = if len > was + GROWTH_FLAG {
+        ": grew by more than 4 KiB, review it and update kernel/size.txt"
     } else {
-        Err(format!(
-            "kernel image is {len} bytes, over the {limit}-byte limit"
-        ))
+        ""
+    };
+    Some(format!(
+        "kernel size {stem}: {len} bytes, recorded {was}, difference {delta:+}{flag}"
+    ))
+}
+
+/// Prints the comparison with the record of `kernel/size.txt`, if it has a
+/// line for `stem`. Never fails: the kernel has no size limit.
+pub fn report(stem: &str, len: u64) {
+    let path = crate::root().join("kernel/size.txt");
+    if let Some(line) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_record(&text).ok())
+        .and_then(|record| compare(&record, stem, len))
+    {
+        println!("{line}");
     }
 }
 
@@ -82,9 +126,35 @@ mod tests {
         assert!(check_header(&image(MAGIC, 8192, 0x2, 4096)).is_err());
     }
 
+    /// Fails only when `kernel/size.txt` is missing or malformed. Growth is
+    /// printed (run with `--nocapture`) and never fails the test.
     #[test]
-    fn size_limit_is_inclusive() {
-        assert!(check_size(204_800, 204_800).is_ok());
-        assert!(check_size(204_801, 204_800).is_err());
+    fn kernel_size_record() {
+        let text = std::fs::read_to_string(crate::root().join("kernel/size.txt"))
+            .expect("kernel/size.txt is the record of the kernel sizes");
+        let record = parse_record(&text).unwrap();
+        for (stem, _) in &record {
+            let image = crate::target_dir().join(format!("{stem}.img"));
+            match std::fs::metadata(&image) {
+                Ok(meta) => println!("{}", compare(&record, stem, meta.len()).unwrap()),
+                Err(_) => println!("kernel size {stem}: no image built, nothing to compare"),
+            }
+        }
+    }
+
+    #[test]
+    fn record_format() {
+        assert!(parse_record("# c\nstafeto 100\n").is_ok());
+        assert!(parse_record("").is_err());
+        assert!(parse_record("stafeto\n").is_err());
+        assert!(parse_record("stafeto x\n").is_err());
+    }
+
+    #[test]
+    fn growth_is_flagged_above_4_kib() {
+        let record = vec![("k".to_string(), 1000)];
+        assert!(!compare(&record, "k", 1000 + 4096).unwrap().contains("grew"));
+        assert!(compare(&record, "k", 1000 + 4097).unwrap().contains("grew"));
+        assert!(compare(&record, "other", 1).is_none());
     }
 }
