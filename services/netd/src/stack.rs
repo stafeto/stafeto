@@ -93,17 +93,19 @@ impl Storage<'_> {
 
 /// Where the buffers of the ICMP socket are: they stay in the storage that the
 /// stack borrows, and the socket is made again over them when a PING gives up.
-struct IcmpStorage {
+struct IcmpStorage<'a> {
     rx_meta: *mut [icmp::PacketMetadata; 4],
     rx_data: *mut [u8; ICMP_BYTES],
     tx_meta: *mut [icmp::PacketMetadata; 4],
     tx_data: *mut [u8; ICMP_BYTES],
+    /// The buffers are borrowed from the storage for 'a: a socket made here cannot outlive it.
+    borrowed: core::marker::PhantomData<&'a mut ()>,
 }
 
-impl IcmpStorage {
+impl<'a> IcmpStorage<'a> {
     /// The ICMP socket over the buffers, bound to the identifier of PING. Called once at the start
     /// and again when a PING gives up, after the socket that held the buffers is gone.
-    fn socket<'a>(&self) -> icmp::Socket<'a> {
+    fn socket(&self) -> icmp::Socket<'a> {
         // SAFETY: the buffers are parts of the storage the stack borrows for 'a, and no other
         // reference to them is made after `Stack::new` (the destructuring there leaves them out);
         // the previous socket, the only holder, is dropped before a new one is made.
@@ -198,7 +200,7 @@ pub struct Stack<'a> {
     dhcp: Option<SocketHandle>,
     icmp: SocketHandle,
     /// The buffers of the ICMP socket, to make it again (`ping_end`).
-    icmp_storage: IcmpStorage,
+    icmp_storage: IcmpStorage<'a>,
     /// The next deadline of each set (`poll_at`), in nanoseconds of the
     /// counter: the groups, then the service's. None while it waits for a
     /// frame or a request.
@@ -264,6 +266,7 @@ impl<'a> Stack<'a> {
             rx_data: &raw mut storage.rx_data,
             tx_meta: &raw mut storage.tx_meta,
             tx_data: &raw mut storage.tx_data,
+            borrowed: core::marker::PhantomData,
         };
         // The four buffers of the ICMP socket are reached through these pointers alone, from here
         // on (`IcmpStorage::socket`); the destructuring below leaves them out.

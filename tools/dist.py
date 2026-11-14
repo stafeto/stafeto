@@ -136,7 +136,8 @@ def stage_licenses(stage: Path, version: str, licenses: Path) -> None:
              "GPL-3.0-or-later WITH GCC-exception-3.1",
              f"relibc (pin {relibc_commit()[:8]}): see relibc-THIRD-PARTY-NOTICES",
              "crates from crates.io that the services and programs link"
-             " (virtio-drivers, smoltcp and theirs): see relibc-THIRD-PARTY-NOTICES"]
+             " (virtio-drivers and theirs) and the patched copy of smoltcp in"
+             " third-party/smoltcp: see relibc-THIRD-PARTY-NOTICES"]
     # The notices of each package the image holds, as the package carries
     # them in /usr/share/licenses/<name>/ (xtask extracted them).
     for name, package_version, license_name in archive_packages(licenses):
