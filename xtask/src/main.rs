@@ -10424,6 +10424,8 @@ fn host_tests() -> Result<(), String> {
         "pkgd",
         "--package",
         "netd",
+        "--package",
+        "neighbour-learn",
         // The driver library with the functions of the C program that owns
         // the second network device.
         "--package",
@@ -13242,6 +13244,8 @@ fn ci_lints() -> Result<(), String> {
         "pkgd",
         "--package",
         "netd",
+        "--package",
+        "neighbour-learn",
         "--lib",
         "--tests",
         "--",

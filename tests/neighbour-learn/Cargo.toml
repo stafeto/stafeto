@@ -1,0 +1,22 @@
+[package]
+name = "neighbour-learn"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Host test of the patched smoltcp: the reset to a SYN for a closed port leaves at once when the neighbour is not yet known"
+publish = false
+
+[lib]
+bench = false
+
+[dependencies]
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "iface-neighbor-cache-count-16",
+] }
