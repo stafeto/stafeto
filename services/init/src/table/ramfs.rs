@@ -1050,7 +1050,7 @@ pub const POSIX_RANDOM_RESTART_TABLE: &[Record] = &[
 pub const POSIX_RANDOM_REJOIN_TABLE: &[Record] = &[
     POSIX_RANDOM_TABLE[0],
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 7 * PROCS_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 9 * PROCS_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_RANDOM_TABLE[2],

@@ -729,6 +729,9 @@ static REJOIN_BREAK_TWICE: [ImageProgram; 9] =
 /// Without the service's check that the process was born under an earlier instance.
 static REJOIN_BREAK_BORN: [ImageProgram; 9] =
     random_rejoin_programs(REJOIN_TABLE, &["break-rejoin-born"], &[]);
+/// With the threads of a process asking the process service at once.
+static REJOIN_BREAK_RACE: [ImageProgram; 9] =
+    random_rejoin_programs(REJOIN_TABLE, &[], &["break-rejoin-race"]);
 /// Without the limit of the generation's sessions.
 static LIMIT_BREAK_UNLIMITED: [ImageProgram; 9] = random_rejoin_programs(
     LIMIT_TABLE,
@@ -761,9 +764,10 @@ const RESTART_LINES: [&str; 5] = [
 ];
 
 /// The lines of the role `rejoin`, each a check that passed.
-const REJOIN_LINES: [&str; 6] = [
+const REJOIN_LINES: [&str; 7] = [
     "posix-random: the entropy service ended with a spawned program, an unseeded one and a forked child that hold its old sessions",
     "posix-random: a spawned program, an unseeded one and a forked child, none with a channel to init, got bytes from the new instance within 3 s, through a session of it, and a child of the spawned one too",
+    "posix-random: two threads of one process, with no key, asked for bytes at once and both had them; GRND_NONBLOCK gave bytes or EAGAIN",
     "posix-random: a second request for a session in the same generation was refused",
     "posix-random: a program born after the restart was refused a session",
     "posix-random: rejoin ok",
@@ -774,7 +778,7 @@ const REJOIN_LINES: [&str; 6] = [
 const LIMIT_LINES: [&str; 5] = [
     "posix-random: the third request of a generation of 2 sessions got the limit",
     "posix-random: after the limit a set-ID program and a plain program started with sessions of the new instance",
-    "posix-random: a program that ended gave its session back, and the fourth request was served",
+    "posix-random: the end of a program that took a session freed no place, and the fourth request got the limit",
     "posix-random: limit ok",
     "init: posix-random ended: exit code 0, not restarted",
 ];
@@ -967,6 +971,11 @@ pub fn random_restart_breaks() -> Result<(), String> {
             "a process service that gives a session to a process born under the new instance",
             &REJOIN_BREAK_BORN,
             "code == 501",
+        ),
+        (
+            "a layer whose threads ask for a session at once",
+            &REJOIN_BREAK_RACE,
+            "pair_result == 1",
         ),
         (
             "a process service with no limit on the sessions of a generation",

@@ -16,8 +16,8 @@
 //! are its own.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use posix_process_service::rejoin::QUEUE;
-use proto_wire::Reader;
+use posix_process_service::rejoin::{Outcome, QUEUE};
+use proto_wire::{Reader, Status};
 use rt::handle::{Channel, Handle, Process, Thread};
 use rt::sys::Received;
 use rt::{Stack, abi, sys};
@@ -35,6 +35,8 @@ const BUFFER: usize = abi::INIT_MSGBUF as usize + 4 * 4096;
 struct Place {
     root: AtomicU64,
     session: AtomicU64,
+    /// Set when the root refused for good (no clones left).
+    refused: AtomicBool,
     done: AtomicBool,
 }
 
@@ -42,6 +44,7 @@ static PLACES: [Place; QUEUE] = [const {
     Place {
         root: AtomicU64::new(0),
         session: AtomicU64::new(0),
+        refused: AtomicBool::new(false),
         done: AtomicBool::new(false),
     }
 }; QUEUE];
@@ -97,16 +100,24 @@ pub fn give(wake: &Handle<Channel>, place: usize, root: Handle<Channel>) -> bool
     true
 }
 
-/// What the thread made of the request in `place`: None while it works; the
-/// session for Some(Some), Some(None) for a failure.
-pub fn take(place: usize) -> Option<Option<Handle<Channel>>> {
+/// What the thread made of the request in `place`: None while it works; else
+/// the outcome and, for a new session, the session.
+pub fn take(place: usize) -> Option<(Outcome, Option<Handle<Channel>>)> {
     let slot = &PLACES[place];
     if !slot.done.load(Ordering::Acquire) {
         return None;
     }
     slot.done.store(false, Ordering::Relaxed);
     let raw = slot.session.swap(0, Ordering::Acquire);
-    Some((raw != 0).then(|| Handle::from_raw(abi::Handle(raw))))
+    if raw != 0 {
+        return Some((Outcome::Given, Some(Handle::from_raw(abi::Handle(raw)))));
+    }
+    let outcome = if slot.refused.swap(false, Ordering::Acquire) {
+        Outcome::Refused
+    } else {
+        Outcome::Failed
+    };
+    Some((outcome, None))
 }
 
 extern "C" fn serve(_: u64) -> ! {
@@ -138,23 +149,36 @@ fn attempt(place: usize, offer: &Handle<Channel>) {
     let root = Handle::<Channel>::from_raw(abi::Handle(slot.root.swap(0, Ordering::Acquire)));
     let session = verify(&root, offer);
     drop(root);
-    slot.session
-        .store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    match session {
+        Ok(session) => slot.session.store(session.into_raw().0, Ordering::Release),
+        Err(outcome) => slot
+            .refused
+            .store(outcome == Outcome::Refused, Ordering::Release),
+    }
     slot.done.store(true, Ordering::Release);
     let tells = Handle::<Channel>::borrowed(abi::Handle(TELLS.load(Ordering::Acquire)));
     let _ = sys::notify(&tells, 1);
 }
 
 /// VERIFY_SESSION through `root` with a copy of `offer`: the new session of
-/// the entropy service, or None for any refusal (the service's root closed
-/// with its instance, or it gave all its clones).
-fn verify(root: &Handle<Channel>, offer: &Handle<Channel>) -> Option<Handle<Channel>> {
-    let offered = sys::handle_duplicate(offer, abi::Rights::SEND | abi::Rights::TRANSFER).ok()?;
+/// the entropy service; `Refused` when the root says it has no clones left
+/// (the kernel's LimitReached, which reaches the client as it is); `Failed`
+/// for any other refusal (the root closed with its instance, a failed call).
+fn verify(root: &Handle<Channel>, offer: &Handle<Channel>) -> Result<Handle<Channel>, Outcome> {
+    let offered = sys::handle_duplicate(offer, abi::Rights::SEND | abi::Rights::TRANSFER)
+        .map_err(|_| Outcome::Failed)?;
     let request = proto_entropy::Method::VerifySession.header().bytes();
-    let mut reply = sys::send_handles(root, &request, [offered.erase()]).ok()?;
+    let mut reply =
+        sys::send_handles(root, &request, [offered.erase()]).map_err(|_| Outcome::Failed)?;
     let mut buffer = [0; abi::MESSAGE_MAX];
-    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
-        return None;
+    match Reader::new(reply.bytes(&mut buffer)).u32() {
+        Ok(0) => reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| Outcome::Failed),
+        Ok(code) if Status::from_code(code) == Status::Kernel(abi::Error::LimitReached) => {
+            Err(Outcome::Refused)
+        }
+        _ => Err(Outcome::Failed),
     }
-    reply.handles.take::<Channel>(0).ok()
 }

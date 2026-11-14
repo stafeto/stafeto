@@ -10,6 +10,11 @@ description = "The protocols of the entropy device's driver and of the entropy s
 [lib]
 bench = false
 
+# Deliberate breakage of the host test of `heal_or_once`: a call that must not
+# wait waits.
+[features]
+break-once-waits = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-wire = { path = "../wire" }

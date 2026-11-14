@@ -20,6 +20,7 @@ break-no-reconnect = ["posix-abi/break-no-reconnect"]
 # Deliberate breakage (cargo xtask random-restart-breaks): a process with no
 # channel to init never asks the process service for a new session.
 break-no-rejoin = ["posix-abi/break-no-rejoin"]
+break-rejoin-race = ["posix-abi/break-rejoin-race"]
 
 [dependencies]
 proto-entropy = { path = "../../proto/entropy" }

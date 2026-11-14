@@ -32,7 +32,7 @@ use posix_process_service::placing::{self, Crowd};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
-use posix_process_service::rejoin::{self, Refusal, Rejoin};
+use posix_process_service::rejoin::{self, Outcome, Refusal, Rejoin};
 use posix_process_service::roots::{Registration, Roots, registration};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
@@ -739,7 +739,7 @@ impl Processes {
         self.rejoin.queue(place, index, pending);
         if !rejoiner::give(wake, place, copy) {
             // The thread is gone: the client may ask again.
-            if let Some((pending, true)) = self.rejoin.finish(place, false) {
+            if let Some((pending, true)) = self.rejoin.finish(place, Outcome::Failed) {
                 let _ = pending.answer(
                     &proto_wire::reply(Status::from_code(proto_process::AGAIN)),
                     Outgoing::new(),
@@ -762,23 +762,29 @@ impl Processes {
             if !self.rejoin.queued(place) {
                 continue;
             }
-            let Some(session) = rejoiner::take(place) else {
+            let Some((outcome, session)) = rejoiner::take(place) else {
                 continue;
             };
-            let Some((pending, alive)) = self.rejoin.finish(place, session.is_some()) else {
+            let Some((pending, alive)) = self.rejoin.finish(place, outcome) else {
                 continue;
             };
             answered += 1;
             if !alive {
                 continue;
             }
-            let _ = match session {
-                Some(session) => {
+            let _ = match (outcome, session) {
+                (_, Some(session)) => {
                     let mut w = Writer::new();
                     let _ = w.u32(0);
                     pending.answer(w.as_bytes(), [session.erase()])
                 }
-                None => pending.answer(
+                // The root has no clones left: the client is told so, and
+                // asks no more.
+                (Outcome::Refused, None) => pending.answer(
+                    &proto_wire::reply(Status::Kernel(abi::Error::LimitReached)),
+                    Outgoing::new(),
+                ),
+                (_, None) => pending.answer(
                     &proto_wire::reply(Status::from_code(proto_process::AGAIN)),
                     Outgoing::new(),
                 ),
@@ -1348,12 +1354,18 @@ impl Processes {
                 if at == 1 {
                     self.terminal_notice = r.handles.take::<Channel>(0).ok();
                 }
+                // Whether the root this one replaces is open: a Register of
+                // the instance that is alive starts no generation.
+                let previous_open = self
+                    .loader_roots
+                    .get(root)
+                    .is_some_and(|old| sys::channel_info(old).is_ok_and(|info| !info.closed));
                 if let Ok(kept) = r.handles.take::<Channel>(at) {
                     self.loader_roots.register(root, kept);
                     // A new instance of the entropy service: the processes
                     // that hold a session of the one before may rejoin.
                     if root == proto_process::ROOT_ENTROPY {
-                        self.rejoin.registered();
+                        self.rejoin.registered(previous_open);
                     }
                 }
             }

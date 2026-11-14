@@ -46,6 +46,9 @@ break-no-reconnect = []
 # channel to init never asks the process service for a new session
 # (EntropyRejoin).
 break-no-rejoin = []
+# Deliberate breakage: the threads of a process ask for a new session at once
+# (the second gets PERMISSION).
+break-rejoin-race = []
 
 [dependencies]
 trace = { path = "../trace" }

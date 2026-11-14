@@ -46,6 +46,18 @@ pub enum Refusal {
     LimitReached,
 }
 
+/// What the thread made of a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A new session.
+    Given,
+    /// No session, for a reason of the moment (the root closed, a failed
+    /// call): the client asks again.
+    Failed,
+    /// The root has no clones left: the client is refused for good.
+    Refused,
+}
+
 /// A place of the queue.
 enum Place<P> {
     Free,
@@ -85,8 +97,14 @@ impl<P> Rejoin<P> {
     }
 
     /// The entropy service registered a root: its instance is the next
-    /// generation, and it has its own sessions to give.
-    pub fn registered(&mut self) {
+    /// generation, and it has its own sessions to give. `previous_open` says
+    /// whether the root it replaces is registered and open: a Register from
+    /// the instance that is alive already (a repeated one) starts nothing, or
+    /// every process of the current instance would look old.
+    pub fn registered(&mut self, previous_open: bool) {
+        if previous_open && !cfg!(feature = "break-rejoin-always-bump") {
+            return;
+        }
         self.generation = self.generation.saturating_add(1);
         if !cfg!(feature = "break-rejoin-keep-count") {
             self.rejoined = 0;
@@ -99,12 +117,16 @@ impl<P> Rejoin<P> {
         self.taken[index] = 0;
     }
 
-    /// The record `index` ended: the session it took in this generation goes
-    /// back to the count, and a request of it that waits has no taker.
+    /// The record `index` ended, and a request of it that waits has no taker.
+    /// The session it took stays counted: a session has TRANSFER, so a
+    /// process can hand its clone to another and end, and the clone lives on.
+    /// The processes that may ask are those of the old instance, fixed when
+    /// the next one registers, so the count is the most clones the generation
+    /// can hold.
     pub fn ended(&mut self, index: usize) {
         if self.generation != 0
             && self.taken[index] == self.generation
-            && !cfg!(feature = "break-rejoin-leak")
+            && cfg!(feature = "break-rejoin-leak")
         {
             self.rejoined = self.rejoined.saturating_sub(1);
         }
@@ -163,9 +185,11 @@ impl<P> Rejoin<P> {
 
     /// The thread is done with the request in `place`: the place is free and
     /// the request comes back, with whether its process is alive to be
-    /// answered. A request that got no session (`given` false) leaves its
-    /// record without one and returns its count, for a try after the pause.
-    pub fn finish(&mut self, place: usize, given: bool) -> Option<(P, bool)> {
+    /// answered. A request that failed leaves its record without a session
+    /// and returns its count, for a try after the pause. A request the root
+    /// refused keeps its count: the root has no clones left, and a retry
+    /// would only cost the root another request.
+    pub fn finish(&mut self, place: usize, outcome: Outcome) -> Option<(P, bool)> {
         let Place::Queued {
             index,
             generation,
@@ -175,7 +199,8 @@ impl<P> Rejoin<P> {
             return None;
         };
         if let Some(index) = index
-            && !given
+            && (outcome == Outcome::Failed
+                || (outcome == Outcome::Refused && cfg!(feature = "break-rejoin-refund-refused")))
             && generation == self.generation
             && self.taken[index] == generation
         {
@@ -206,12 +231,12 @@ mod tests {
     /// A table in generation 1 with the records `old` born before it.
     fn after_restart(old: &[usize]) -> Rejoin<u32> {
         let mut r = Rejoin::new();
-        r.registered();
+        r.registered(false);
         for &i in old {
             r.born(i);
         }
         // The next instance registers: the old records were born before it.
-        r.registered();
+        r.registered(false);
         r
     }
 
@@ -226,7 +251,7 @@ mod tests {
         let mut r = after_restart(&[3]);
         let place = ask(&mut r, 3).unwrap();
         assert!(r.queued(place));
-        assert_eq!(r.finish(place, true), Some((3, true)));
+        assert_eq!(r.finish(place, Outcome::Given), Some((3, true)));
         assert!(!r.queued(place));
         assert_eq!(r.standing(), (2, 1));
     }
@@ -235,7 +260,7 @@ mod tests {
     fn a_second_request_in_the_same_generation_is_refused() {
         let mut r = after_restart(&[3]);
         let place = ask(&mut r, 3).unwrap();
-        r.finish(place, true);
+        r.finish(place, Outcome::Given);
         assert_eq!(ask(&mut r, 3), Err(Refusal::Permission));
         // Also while the first still waits.
         let mut r = after_restart(&[3]);
@@ -252,7 +277,7 @@ mod tests {
         // before the first.
         let mut r = Rejoin::<u32>::new();
         r.born(5);
-        r.registered();
+        r.registered(false);
         assert!(ask(&mut r, 5).is_ok());
     }
 
@@ -277,7 +302,7 @@ mod tests {
         let mut r = after_restart(&all);
         for &i in &all[..MAX as usize] {
             let place = ask(&mut r, i).unwrap();
-            r.finish(place, true);
+            r.finish(place, Outcome::Given);
         }
         assert_eq!(r.standing().1, MAX);
         assert_eq!(ask(&mut r, MAX as usize), Err(Refusal::LimitReached));
@@ -287,31 +312,33 @@ mod tests {
     }
 
     #[test]
-    fn the_end_of_a_record_gives_its_session_back() {
+    fn the_end_of_a_record_keeps_its_session_counted() {
         let all: Vec<usize> = (0..MAX as usize + 1).collect();
         let mut r = after_restart(&all);
         for &i in &all[..MAX as usize] {
             let place = ask(&mut r, i).unwrap();
-            r.finish(place, true);
+            r.finish(place, Outcome::Given);
         }
         assert_eq!(ask(&mut r, MAX as usize), Err(Refusal::LimitReached));
+        // The clone may be in another process's hands: the end does not free
+        // a place, whoever ends.
         r.ended(0);
-        assert_eq!(r.standing().1, MAX - 1);
-        assert!(ask(&mut r, MAX as usize).is_ok());
-        // A record that never took one leaves the count as it is.
         r.ended(MAX as usize - 1);
+        assert_eq!(r.standing().1, MAX);
+        assert_eq!(ask(&mut r, MAX as usize), Err(Refusal::LimitReached));
+        // A record that never took one leaves the count as it is.
         r.born(250);
         r.ended(250);
-        assert_eq!(r.standing().1, MAX - 1);
+        assert_eq!(r.standing().1, MAX);
     }
 
     #[test]
     fn a_register_starts_a_generation_with_no_sessions_taken() {
         let mut r = after_restart(&[3, 4]);
         let place = ask(&mut r, 3).unwrap();
-        r.finish(place, true);
+        r.finish(place, Outcome::Given);
         assert_eq!(r.standing(), (2, 1));
-        r.registered();
+        r.registered(false);
         assert_eq!(r.standing(), (3, 0));
         // Both are of an older instance again, and may ask once more.
         assert!(ask(&mut r, 3).is_ok());
@@ -320,27 +347,56 @@ mod tests {
         // the register leaves the new count alone.
         let mut r = after_restart(&[3, 4]);
         let place = ask(&mut r, 3).unwrap();
-        r.finish(place, true);
-        r.registered();
+        r.finish(place, Outcome::Given);
+        r.registered(false);
         ask(&mut r, 4).unwrap();
         r.ended(3);
         assert_eq!(r.standing(), (3, 1));
     }
 
     #[test]
+    fn a_repeated_register_of_a_live_instance_starts_nothing() {
+        let mut r = after_restart(&[3]);
+        r.born(4);
+        let place = ask(&mut r, 3).unwrap();
+        r.finish(place, Outcome::Given);
+        // The previous root is open: the same instance registers again.
+        r.registered(true);
+        r.registered(true);
+        assert_eq!(r.standing(), (2, 1));
+        // The process born in this instance does not look old.
+        assert_eq!(ask(&mut r, 4), Err(Refusal::Permission));
+        // A register with no open root before it is a new instance.
+        r.registered(false);
+        assert_eq!(r.standing(), (3, 0));
+        assert!(ask(&mut r, 4).is_ok());
+    }
+
+    #[test]
+    fn a_request_the_root_refused_keeps_its_count_and_its_turn() {
+        let mut r = after_restart(&[3]);
+        let place = ask(&mut r, 3).unwrap();
+        assert_eq!(r.finish(place, Outcome::Refused), Some((3, true)));
+        // No refund: the root has no clones left, and the process does not
+        // ask again (PERMISSION), so the root is asked once for it.
+        assert_eq!(r.standing().1, 1);
+        assert_eq!(ask(&mut r, 3), Err(Refusal::Permission));
+    }
+
+    #[test]
     fn a_failed_request_gives_its_turn_back() {
         let mut r = after_restart(&[3]);
         let place = ask(&mut r, 3).unwrap();
-        assert_eq!(r.finish(place, false), Some((3, true)));
+        assert_eq!(r.finish(place, Outcome::Failed), Some((3, true)));
         assert_eq!(r.standing().1, 0);
         // The client asks again after its pause.
         assert!(ask(&mut r, 3).is_ok());
         // A failure that finishes after a register has no count to return.
         let mut r = after_restart(&[3, 4]);
         let place = ask(&mut r, 3).unwrap();
-        r.registered();
+        r.registered(false);
         ask(&mut r, 4).unwrap();
-        assert_eq!(r.finish(place, false), Some((3, true)));
+        assert_eq!(r.finish(place, Outcome::Failed), Some((3, true)));
         assert_eq!(r.standing(), (3, 1));
     }
 
@@ -349,11 +405,11 @@ mod tests {
         let mut r = after_restart(&[3]);
         let place = ask(&mut r, 3).unwrap();
         r.ended(3);
-        assert_eq!(r.standing().1, 0);
+        assert_eq!(r.standing().1, 1);
         // The record's index may belong to a new process already.
         r.born(3);
-        assert_eq!(r.finish(place, false), Some((3, false)));
-        assert_eq!(r.standing().1, 0);
+        assert_eq!(r.finish(place, Outcome::Failed), Some((3, false)));
+        assert_eq!(r.standing().1, 1);
     }
 
     #[test]
@@ -370,15 +426,15 @@ mod tests {
         assert_eq!(places.len(), QUEUE);
         assert_eq!(ask(&mut r, QUEUE), Err(Refusal::Again));
         assert_eq!(r.standing().1, QUEUE as u32);
-        r.finish(places[0], true);
+        r.finish(places[0], Outcome::Given);
         assert!(ask(&mut r, QUEUE).is_ok());
     }
 
     #[test]
     fn a_place_that_is_free_finishes_nothing() {
         let mut r = Rejoin::<u32>::new();
-        assert_eq!(r.finish(0, true), None);
-        assert_eq!(r.finish(QUEUE, true), None);
+        assert_eq!(r.finish(0, Outcome::Given), None);
+        assert_eq!(r.finish(QUEUE, Outcome::Given), None);
         assert!(!r.queued(QUEUE));
     }
 }
