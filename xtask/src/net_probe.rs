@@ -250,6 +250,7 @@ const WAKES: &str = "net-probe: wakes ok 16 and 128";
 const IDLE: &str = "net-probe: idle ok";
 const LISTENERS: &str = "net-probe: listeners ok";
 const TIMERS_PREFIX: &str = "net-probe: timers ok";
+const PING_TIMED_OUT: &str = "net: ping timed out, 0 echo requests queued";
 const WIRE_PREFIX: &str = "net-probe: wire ok 150";
 const WIRE_ECHO_READY: &str = "net-probe: wire echo ready 7000";
 const WIRE_ECHO_OK: &str = "net-probe: wire echo ok 2000";
@@ -710,6 +711,10 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     }
     if roles.timers && !has_prefix(TIMERS_PREFIX) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
+    }
+    // A PING that timed out leaves no echo request in the queue of the ICMP socket.
+    if roles.timers && !lines.iter().any(|l| l.contains(PING_TIMED_OUT)) {
+        return Err(format!("no line {PING_TIMED_OUT:?}"));
     }
     if let Some(sockets) = &sockets {
         once.push((sockets.as_str(), 1));
@@ -2367,6 +2372,13 @@ mod tests {
             lines.retain(|l| !l.starts_with("net-probe: sockets") && l != BIND);
             assert!(verdict(&lines, Mode::Dhcp, roles).is_err());
             lines.push(line.to_owned());
+            if roles.timers {
+                // A PING that timed out with a request left in the queue is no good.
+                assert!(verdict(&lines, Mode::Dhcp, roles).is_err());
+                lines.push("net: ping timed out, 1 echo requests queued".to_owned());
+                assert!(verdict(&lines, Mode::Dhcp, roles).is_err());
+                lines.push(PING_TIMED_OUT.to_owned());
+            }
             assert_eq!(verdict(&lines, Mode::Dhcp, roles), Ok(()));
         }
     }

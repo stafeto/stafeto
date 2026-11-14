@@ -690,6 +690,17 @@ impl Probe<'_> {
     /// with a queue of one, a client and the socket it accepted, 4 places of
     /// the table. The sessions that hold them are made as they are needed.
     fn open_pairs(&self, root: &Handle<Channel>, pairs: usize) -> Result<Pairs, &'static str> {
+        self.open_pairs_at(root, pairs, [127, 0, 0, 1], 9000)
+    }
+
+    /// `open_pairs` on the address `host` of the interface and the ports from `port`.
+    fn open_pairs_at(
+        &self,
+        root: &Handle<Channel>,
+        pairs: usize,
+        host: [u8; 4],
+        port: u32,
+    ) -> Result<Pairs, &'static str> {
         let mut p = Pairs {
             sessions: [const { None }; SESSIONS_MAX],
             held: [0; SESSIONS_MAX],
@@ -706,7 +717,7 @@ impl Probe<'_> {
             let d = self
                 .new_socket(net, sockets::STREAM)
                 .map_err(|_| "SOCKET failed")?;
-            self.bind(net, d, [127, 0, 0, 1], 9000 + i as u32)
+            self.bind(net, d, host, port + i as u32)
                 .map_err(|_| "BIND failed")?;
             self.plain(
                 net,
@@ -727,7 +738,7 @@ impl Probe<'_> {
                 .map_err(|_| "SOCKET failed")?;
             p.links[i].session[0] = session;
             p.links[i].description[0] = d;
-            let address = Address::v4([127, 0, 0, 1], 9000 + i as u32);
+            let address = Address::v4(host, port + i as u32);
             self.connect_wait(net, d, address)?;
         }
         // The accepted ends take the places of the queues; others listen in
@@ -1713,7 +1724,19 @@ impl Probe<'_> {
         }
         // A frame of the loopback that is dropped: the segment is sent again
         // by the retransmission timer (smoltcp waits a second at least).
+        let opened = self.now();
         let mut p = self.open_pairs(&root, 1)?;
+        // The echo request of the PING that timed out must not stay in the
+        // stack: it would ask for its neighbour every second and take the
+        // turn of the SYN of this connection to the loopback (the choice
+        // `batch-1 egress-1` of the measurement hung here).
+        let spent = self.now() - opened;
+        rt::println!("net-probe: pairs opened in {} us", spent / 1000);
+        if spent > 500_000_000 {
+            return Err(
+                "a CONNECT on the loopback after a PING that timed out waited for the neighbour",
+            );
+        }
         self.sleep(200_000_000);
         self.hold(&root, proto_net::HOLD_DROP)?;
         let net = p.sessions[p.links[0].session[0]]
@@ -1737,6 +1760,36 @@ impl Probe<'_> {
         }
         let after = (self.now() - began) / 1_000_000;
         self.close_pairs(&p)?;
+        // A SYN to an address nobody answers (10.0.2.99) waits for its neighbour and asks for it
+        // every second: it must not hold up a connection to an address of the interface itself (here
+        // the external one, which nothing has resolved yet), which is at the interface's own
+        // hardware address and asks for nobody.
+        let dead = self
+            .new_socket(&root, sockets::STREAM)
+            .map_err(|_| "SOCKET failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let request = Request::Connect {
+            key: None,
+            description: dead,
+            address: Address::v4([10, 0, 2, 99], 9),
+        };
+        match socket_call(&root, &request, &mut buffer) {
+            Err(fail) if is(&fail, proto_net::IN_PROGRESS) => {}
+            _ => return Err("CONNECT to a dead host was not in progress"),
+        }
+        self.sleep(20_000_000);
+        let opened = self.now();
+        let again = self.open_pairs_at(&root, 1, [10, 0, 2, 15], 9100)?;
+        let spent = self.now() - opened;
+        rt::println!(
+            "net-probe: pairs opened beside a dead host in {} us",
+            spent / 1000
+        );
+        if spent > 500_000_000 {
+            return Err("a CONNECT on the loopback waited for a SYN to a dead host");
+        }
+        self.close_pairs(&again)?;
+        self.close(&root, dead).map_err(|_| "CLOSE failed")?;
         // One datagram on a quiet service, between sockets of two groups: the
         // blocking RECV is woken within 50 ms. Nothing else touches the group
         // of the sender, so the SEND itself must ask for its pass.

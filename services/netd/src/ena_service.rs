@@ -769,7 +769,6 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     net0.external = stack.lease.map(|lease| lease.address);
     let (own_addresses, own_count) = stack.addresses();
     device.set_addresses(&own_addresses[..own_count]);
-    device.seed_neighbours();
     netd::published::ADDRESS.publish(crate::stack::record_of(stack.lease).as_ref());
     crate::switch::INNER.lanes[0].set_stack_channel(notify.raw().0);
 

@@ -30,7 +30,7 @@ use firmware_tree::check::{self, Placement};
 use firmware_tree::efimap::{self, Classified, Desc};
 use firmware_tree::platform::Platform;
 use firmware_tree::tree;
-use kcore::bootinfo::{MPIDR_AFFINITY, Region};
+use kboot::bootinfo::{MPIDR_AFFINITY, Region};
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::prelude::*;
 use uefi::proto::media::file::{

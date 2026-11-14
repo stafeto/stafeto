@@ -1258,8 +1258,8 @@ static int rejoin_pair_role(const char *up_text, const char *go_text) {
     int ok = getentropy(bytes, sizeof bytes) == 0 && !all_zero(bytes, sizeof bytes);
     CHECK(pthread_join(t, NULL) == 0);
     if (!ok || pair_result != 1) printf("posix-random: threads of one process: %d, %d\n", ok, pair_result);
-    CHECK(ok);
-    CHECK(pair_result == 1);
+    /* The race of the two threads shows on either of them, so one check holds both. */
+    CHECK(ok && pair_result == 1);
     CHECK(random_probe_session_open() == 1);
     report(up, 'V', 'a', bytes);
     return 0;

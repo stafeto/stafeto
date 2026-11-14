@@ -661,7 +661,6 @@ fn main(_: u64) -> u64 {
     net0.external = stack.lease.map(|lease| lease.address);
     let (own, own_count) = stack.addresses();
     device.set_addresses(&own[..own_count]);
-    device.seed_neighbours();
     // The address of the first instance is the service's: the others take it from here.
     published::ADDRESS.publish(stack::record_of(stack.lease).as_ref());
     // The lanes know the channels of their instances before the switch starts: it wakes
@@ -1900,11 +1899,12 @@ impl Driver<'_> {
         self.inst.net.touch_all();
     }
 
-    /// The frames to the addresses of the interface stay in the loop.
+    /// The device learns the addresses of the interface (the frames to them stay in the loop; the
+    /// stack sends them to its own hardware address), and the neighbours on the link are asked
+    /// again.
     fn addresses(&mut self) {
         let (own, count) = self.inst.stack.addresses();
         self.inst.device.set_addresses(&own[..count]);
-        self.inst.device.seed_neighbours();
         self.neighbours_at = now_ns() + NEIGHBOURS_NS;
         self.ask_due = true;
         self.asked = 0;
@@ -2003,10 +2003,15 @@ impl Driver<'_> {
         let answered = match end {
             PingEnd::Reply(nanos) => proto_net::write_ping_reply(nanos, &mut w)
                 .map(|()| pending.answer(w.as_bytes(), Outgoing::new())),
-            PingEnd::TimedOut => Ok(pending.answer(
-                &proto_wire::reply(code(proto_net::TIMEOUT)),
-                Outgoing::new(),
-            )),
+            PingEnd::TimedOut(queued) => {
+                // The probe reads this line: a request left in the queue asks for its neighbour
+                // every second (`Stack::icmp_again`).
+                rt::println!("net: ping timed out, {queued} echo requests queued");
+                Ok(pending.answer(
+                    &proto_wire::reply(code(proto_net::TIMEOUT)),
+                    Outgoing::new(),
+                ))
+            }
         };
         if answered.is_err() {
             rt::println!("net: a reply of PING could not be written");
@@ -2350,8 +2355,8 @@ fn stays(s: &mut Session<Client, 0>, r: &mut Request<'_>, here: u32) -> Answer {
     }
 }
 
-/// How often the stack is told again that its own addresses are at its own
-/// MAC: half the life of an entry of the neighbour cache (60 s).
+/// How often the gateway and the name servers are asked again for their hardware addresses: half
+/// the life of an entry of the neighbour cache (60 s).
 const NEIGHBOURS_NS: u64 = 30_000_000_000;
 
 /// The servers of `text` on one line, separated by spaces: the words after

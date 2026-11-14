@@ -13,8 +13,8 @@ use crate::efimap::{Classified, Desc, classify};
 use crate::platform::Platform;
 use crate::tree::{Input, build};
 use crate::{Error, efimap};
-use kcore::bootinfo::{BootInfo, PsciConduit, Region, parse, pci_hosts, uart_16550};
-use kcore::fdt::Fdt;
+use kboot::bootinfo::{BootInfo, PsciConduit, Region, parse, pci_hosts, uart_16550};
+use kboot::fdt::Fdt;
 
 const GICD: u64 = 0x0800_0000;
 const GICR: u64 = 0x080a_0000;
@@ -295,7 +295,7 @@ fn run(m: &Machine) -> Result<(Vec<u8>, BootInfo), Error> {
 fn qemu_shaped_tables_give_a_tree_the_kernel_reads_as_it_reads_qemus() {
     let (blob, info) = run(&Machine::qemu()).unwrap();
     let gic = info.gic.unwrap();
-    assert_eq!(gic.version, kcore::bootinfo::GicVersion::V3);
+    assert_eq!(gic.version, kboot::bootinfo::GicVersion::V3);
     assert_eq!(
         gic.mapped()[0],
         Region {

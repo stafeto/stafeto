@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Exception entry. A system call from EL0 goes to the dispatcher, an
+//! interrupt at EL0 to the way out of the kernel, which handles it, and
+//! any other synchronous exception at EL0 ends the program's process;
+//! every other exception is reported with
+//! its registers and stops the kernel. Test builds skip one BRK marker
+//! (testpoint::skip_brk) to prove the vectors and the return path work. An
+//! entry from EL1 that finds no room on the kernel stack runs on the
+//! emergency stack and never returns. The vector table and the trap frame
+//! are karch's (karch::exceptions).
+
+use super::registers;
+use super::symbols;
+use super::user::UserRegs;
+use crate::process;
+use crate::thread::{self, Thread};
+use abi::ProcessState;
+use core::fmt::Write;
+use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
+use karch::exceptions::{
+    ON_EMERGENCY, ON_EMERGENCY_STACK, TrapFrame, VECTOR_EL0_IRQ, VECTOR_EL0_SYNC, VECTOR_EL1H_SYNC,
+    VECTOR_NAMES,
+};
+use kcore::esr;
+
+pub use karch::exceptions::init;
+
+#[unsafe(no_mangle)]
+extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
+    let syndrome = registers::esr_el1();
+    // Only an entry on the kernel stack may return: after a switch to the
+    // emergency stack the vector has no way back to the interrupted SP.
+    if index == VECTOR_EL1H_SYNC
+        && let Some(imm) = esr::brk_immediate(syndrome)
+        && crate::testpoint::skip_brk(imm)
+    {
+        // A BRK exception returns to the BRK itself; step over it.
+        frame.elr += 4;
+        return;
+    }
+    crate::panicking::take_console();
+    let far = registers::far_el1();
+    let class = esr::ec(syndrome);
+    let guard = symbols::image_layout().stack_guard as u64;
+    if index & ON_EMERGENCY_STACK != 0 {
+        if ON_EMERGENCY.swap(true, Ordering::Relaxed) {
+            crate::panicking::stop()
+        }
+        let stack = symbols::boot_stack();
+        kprintln!(
+            "kernel stack overflow: no room for the trap frame at SP {:#x} (kernel stack {:#x}..{:#x}); reporting on the emergency stack",
+            frame.sp,
+            stack.start,
+            stack.end
+        );
+    } else if matches!(class, esr::EC_DABT_SAME | esr::EC_IABT_SAME)
+        && (guard..guard + kcore::PAGE_SIZE).contains(&far)
+    {
+        kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
+    }
+    print_x(&frame.x, &mut crate::console::writer());
+    kprintln!(
+        "\nsp  {:#018x}  sp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
+        frame.sp,
+        frame.sp_el0,
+        frame.elr,
+        frame.spsr
+    );
+    stop(index, syndrome, far, frame.elr)
+}
+
+/// Entry from EL0 (vectors.S): the program's registers are in the running
+/// thread. Any other synchronous exception than a system call is the
+/// program's fault and ends its process (spec 7.9); an interrupt stays
+/// pending, and sched::resume acknowledges and handles it first thing; an
+/// asynchronous exception that no handler takes is an error of the system
+/// and stops the machine. Then the scheduler decides who runs
+/// (sched::resume).
+#[unsafe(no_mangle)]
+extern "C" fn handle_user_exception(regs: *mut UserRegs, index: u64) -> ! {
+    let now = crate::sched::entry_started();
+    // SAFETY: vectors.S passes the register area of the running thread,
+    // the first field of the thread (TPIDR_EL1's block holds it).
+    let thread = unsafe { NonNull::new_unchecked(regs.cast::<Thread>()) };
+    thread::user_ran(thread, now);
+    let syndrome = registers::esr_el1();
+    match index {
+        VECTOR_EL0_SYNC => match esr::svc_immediate(syndrome) {
+            Some(number) => crate::syscall::dispatch(thread, number),
+            None => user_fault(thread, syndrome),
+        },
+        // PSTATE masks it now, and ISR_EL1 shows it to sched::resume.
+        VECTOR_EL0_IRQ => {}
+        // Not the program's fault: PSTATE masks SErrors inside the kernel,
+        // so one the kernel caused arrives at EL0 as well; FIQs never reach
+        // EL1.
+        _ => system_error(thread, index, syndrome),
+    }
+    crate::sched::resume()
+}
+
+/// Whether the fault of `thread`, the running one, enters its entry
+/// (kcore::upcall::State::fault): not during a long call, whose way back to
+/// its `svc` no entry can precede.
+#[inline(never)]
+pub fn fault_enters(mut thread: NonNull<Thread>, syndrome: u64, far: u64) -> bool {
+    let long = thread::long(thread).is_some();
+    // SAFETY: the running thread is alive; only its own entry state changes,
+    // under OBJ.
+    let upcall = &mut unsafe { thread.as_mut() }.upcall;
+    upcall.fault(syndrome, esr::fault_address(syndrome, far), long)
+}
+
+/// A fault of the program at EL0 enters the thread's open entry when the
+/// thread asked for faults (`ThreadUpcallControl` Faults): the thread goes
+/// on at the entry, with ESR and FAR for `Query` and the faulting PC for
+/// `Take` (spec 7.9). Any other fault ends its process (spec 7.9): the reason
+/// goes into the process, with FAR only where the fault sets it
+/// (kcore::esr::fault_address), and the kernel writes it on one line into
+/// its log, which shows it on the port while the kernel has the port
+/// (spec 3.2, 16.3); for init, whose end stops the machine, the program's
+/// registers follow there. The thread never runs again. In test builds a
+/// fault the running test does not expect stops the machine with the full
+/// report on the port instead, as before: a mistake in a test program
+/// shows at once.
+#[cold]
+#[inline(never)]
+fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
+    let far = registers::far_el1();
+    if fault_enters(thread, syndrome, far) {
+        return;
+    }
+    if !crate::testpoint::expects_fault() {
+        report_el0(thread, "program fault", VECTOR_EL0_SYNC, syndrome, far)
+    }
+    let far = esr::fault_address(syndrome, far);
+    // SAFETY: the running thread is alive and holds its process.
+    let (elr, p) = unsafe { (thread.as_ref().regs.elr, thread.as_ref().process()) };
+    let class = esr::ec(syndrome);
+    log_line!(
+        "process fault: {} (EC {class:#x}) ESR={syndrome:#x} FAR={far:#x} ELR={elr:#x}",
+        esr::class_name(class)
+    );
+    if process::is_init(p) {
+        // Init's end stops the machine, and the panic shows only the
+        // kernel: the program's registers go into the log first, and the
+        // panic shows them if nobody did.
+        // SAFETY: the running thread is alive; nothing else refers to it now.
+        let regs = unsafe { &thread.as_ref().regs };
+        crate::log::kernel(|w| print_program(regs, w));
+    }
+    let reason = ProcessState::Fault {
+        esr: syndrome,
+        far,
+        elr,
+    };
+    // SAFETY: the running thread is alive.
+    let cause = unsafe { thread.as_ref() }.priority();
+    crate::obj::serving(crate::obj::ENTRY_FAULT);
+    let _section = crate::obj::lock();
+    // SAFETY: the thread's reference keeps the process until the end takes
+    // its own; the thread is not used afterwards.
+    unsafe { process::end(p, reason, cause) };
+}
+
+/// An asynchronous exception at EL0 that no handler takes: an error of the
+/// system, such as an SError from a write of the kernel, which the running
+/// program did not cause. The report shows that program all the same, with
+/// the count of device windows it maps (spec 7.9): a write to
+/// Device-nGnRE memory is acknowledged early, and its error may come after
+/// a switch, so the count is a hint and names no culprit. The machine
+/// stops.
+fn system_error(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+    crate::panicking::take_console();
+    // SAFETY: the running thread is alive and holds its process.
+    let windows = process::device_windows(unsafe { thread.as_ref() }.process());
+    kprintln!(
+        "device windows mapped in the running process: {windows}; the error is asynchronous and may come from an earlier access"
+    );
+    report_el0(
+        thread,
+        "system error",
+        index,
+        syndrome,
+        registers::far_el1(),
+    )
+}
+
+/// Reports an exception taken at EL0 with the program's registers and
+/// stops the machine.
+fn report_el0(thread: NonNull<Thread>, what: &str, index: u64, syndrome: u64, far: u64) -> ! {
+    // SAFETY: the running thread is alive; nothing else refers to it now.
+    let regs: &UserRegs = unsafe { &thread.as_ref().regs };
+    crate::panicking::take_console();
+    kprintln!("{what} at EL0, thread {:#x}", thread.as_ptr() as usize);
+    print_program(regs, &mut crate::console::writer());
+    stop(index, syndrome, far, regs.elr)
+}
+
+/// A program's registers to `out`: x0-x30, then SP_EL0, ELR, SPSR and
+/// TPIDR_EL0 on a line of their own.
+fn print_program(regs: &UserRegs, out: &mut dyn Write) {
+    print_x(&regs.x, out);
+    let _ = writeln!(
+        out,
+        "\nsp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}  tpidr_el0 {:#018x}",
+        regs.sp, regs.elr, regs.spsr, regs.tpidr
+    );
+}
+
+fn print_x(x: &[u64; 31], out: &mut dyn Write) {
+    for (i, v) in x.iter().enumerate() {
+        let sep = if i % 4 == 3 { "\n" } else { "  " };
+        let _ = write!(out, "x{i:<2} {v:#018x}{sep}");
+    }
+}
+
+/// Names the fault of an abort and panics with the exception's syndrome.
+fn stop(index: u64, syndrome: u64, far: u64, elr: u64) -> ! {
+    let class = esr::ec(syndrome);
+    if matches!(
+        class,
+        esr::EC_IABT_LOWER | esr::EC_IABT_SAME | esr::EC_DABT_LOWER | esr::EC_DABT_SAME
+    ) {
+        match esr::fault_level(syndrome) {
+            Some(level) => kprintln!(
+                "abort: {} at level {level}, FAR={far:#x}",
+                esr::fault_status_name(syndrome)
+            ),
+            None => kprintln!("abort: {}, FAR={far:#x}", esr::fault_status_name(syndrome)),
+        }
+    }
+    ::core::panic!(
+        "unexpected exception {}: {} (EC {class:#x}) ESR={syndrome:#x} ELR={elr:#x} FAR={far:#x}",
+        VECTOR_NAMES[(index & 15) as usize],
+        esr::class_name(class),
+    );
+}

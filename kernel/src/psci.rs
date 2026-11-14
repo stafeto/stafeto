@@ -5,7 +5,7 @@
 //! the device tree; until it is known, power-off just parks the CPU.
 
 use core::sync::atomic::{AtomicU8, Ordering};
-use kcore::bootinfo::PsciConduit;
+use kboot::bootinfo::PsciConduit;
 
 const SYSTEM_OFF: u64 = 0x8400_0008;
 /// CPU_ON, SMC64 calling convention (PSCI 1.x, 5.6) [G37].

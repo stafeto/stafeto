@@ -5,6 +5,7 @@
 //! translations they look up, beside the kernel's own readers.
 
 pub use crate::arch::registers::*;
+use karch::read_sysreg;
 
 pub fn sctlr_el1() -> u64 {
     read_sysreg!("sctlr_el1")

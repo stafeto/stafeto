@@ -1,0 +1,28 @@
+[package]
+name = "karch"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The AArch64 layer of the stafeto kernel: boot code, exception vectors, MMU, caches, GIC and timer"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../lib/abi" }
+kboot = { path = "../kboot" }
+kcore = { path = "../kcore" }
+
+[features]
+# The kernel tests read and steer the GIC (gic::test_access) and the timer.
+ktest = []
+# Stage marks on a 16550 for the first boot on a machine whose console the
+# kernel cannot write yet (marks.rs, head.S).
+early-marks = []
+# Probes that fault on purpose, for the reports of a panic (probe.rs).
+fault-probe = []
+overflow-probe = []
+# Deliberate breakage: a TLBI of an unmapped page that stays on its own CPU.
+break-unmap-local = []

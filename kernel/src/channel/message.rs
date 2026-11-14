@@ -317,7 +317,7 @@ pub fn send(
         && values.is_empty()
         && let Some(r) = fast_send(t, via, desc, mark)
     {
-        return Ok(Some(r));
+        return Ok(r);
     }
     let receiver = sched::locked(|k| receiver_of(c, k));
     if desc.no_wait && receiver.is_none() {
@@ -397,19 +397,21 @@ fn receiver_of(c: NonNull<Channel>, k: &mut Locked<'_>) -> Option<NonNull<Thread
 /// gives it, no interrupt is pending, and that priority is above every
 /// ready thread's. The state is the one the slow path leaves. The
 /// reference of the receiver's wait goes inside the section of the call.
-/// Returns the receiver, which the caller runs; None, with nothing changed,
-/// when a condition fails. O(1).
+/// Returns Some(Some(receiver)), which the caller runs; Some(None) when the
+/// budgets' operations of the meeting put the receiver where a ready thread
+/// or the cleanup comes first, and it was woken as the slow path wakes it;
+/// None, with nothing changed, when a condition fails. O(1).
 fn fast_send(
     t: NonNull<Thread>,
     via: Via,
     desc: Desc,
     mark: crate::obj::Mark,
-) -> Option<NonNull<Thread>> {
+) -> Option<Option<NonNull<Thread>>> {
     let c = via.channel();
     // The hints are the CPU's own, read before the section.
     let cleanup = cleanup::top();
     let next_timer = timer::first();
-    let r = sched::hand_off(next_timer, |k, now| {
+    let r = sched::hand_off(next_timer, cleanup, |k, now| {
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive; a thread that waits in receive is alive, and
         // its slot lies in it.

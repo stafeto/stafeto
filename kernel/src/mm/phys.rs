@@ -11,11 +11,11 @@ use crate::boot::Boot;
 use crate::obj::Guarded;
 use abi::Error;
 use core::ops::Range;
+use kboot::bootinfo::{Region, RegionList};
+use kboot::memmap;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::{Region, RegionList};
 use kcore::frames::{FrameAllocator, PhysMem};
 use kcore::layout::{GIB, LINEAR_BASE};
-use kcore::memmap;
 use kcore::must::Must;
 use kcore::quota::Account;
 
@@ -371,7 +371,7 @@ static METADATA: Guarded<Region> = Guarded::new(Region { base: 0, size: 0 });
 
 /// Starts the allocator with the usable RAM that is mapped now; returns the
 /// rest, which becomes reachable with the kernel page tables.
-pub fn init(boot: &Boot) -> RegionList<{ kcore::bootinfo::USABLE_REGIONS }> {
+pub fn init(boot: &Boot) -> RegionList<{ kboot::bootinfo::USABLE_REGIONS }> {
     let memory = boot.info.memory.as_slice();
     let span_base = memory.iter().map(|r| r.base).min().must("no memory") / PAGE_SIZE * PAGE_SIZE;
     let span_end = memory.iter().map(|r| r.end()).max().must("no memory");

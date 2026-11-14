@@ -6,7 +6,7 @@
 //! for the port's transmitter before it powers off (spec 16.1).
 
 use crate::PAGE_SIZE;
-use crate::bootinfo::Region;
+use kboot::bootinfo::Region;
 
 /// FR, the flag register of the PL011, at offset 0x018: BUSY (bit 3) while
 /// the transmitter sends a character, from the FIFO or the shift register;
