@@ -86,7 +86,19 @@ pub fn sync_icache_frames(frames: &[u64]) {
     }
     // SAFETY: barriers have no other effect.
     unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
-    crate::testpoint::code_synced(frames);
+    #[cfg(feature = "ktest")]
+    // SAFETY: the kernel defines it with this signature in its test points
+    // (testpoint.rs); it only records the call.
+    unsafe {
+        karch_code_synced(frames)
+    };
+}
+
+#[cfg(feature = "ktest")]
+unsafe extern "Rust" {
+    /// The test point after the instruction cache was made coherent: the
+    /// kernel tests watch its order against the mapping of the code.
+    fn karch_code_synced(frames: &[u64]);
 }
 
 /// Cleans `len` bytes at the kernel address `addr` to memory, to the

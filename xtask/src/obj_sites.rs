@@ -20,7 +20,7 @@ use std::path::Path;
 /// commit and shows the takes of the stretches (`obj takes of kind`) with the
 /// new count.
 pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
-    ("kernel/src/arch/aarch64/exceptions.rs", 1),
+    ("kernel/src/arch/exceptions.rs", 1),
     ("kernel/src/channel/mod.rs", 1),
     // The portions of a binding and of an MSI device take it after their
     // ITS commands (decision K3, section 5), and that of a time budget takes

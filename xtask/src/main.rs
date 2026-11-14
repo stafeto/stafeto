@@ -1194,7 +1194,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// (a few seconds when it passes).
 const GONE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
-const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
+const OVERFLOW_PROBE_FN: &str = "karch::probe::recurse";
 /// Tests only the `icount` build has, where virtual time counts
 /// instructions and a stall of the host changes nothing: the check that the
 /// run is under -icount; the measurements of portions, calls, round trips
@@ -10343,6 +10343,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "init",
         "--package",
+        "kboot",
+        "--package",
         "kcore",
         "--package",
         "proto-init",
@@ -13142,6 +13144,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-process",
         "--package",
+        "kboot",
+        "--package",
         "kcore",
         "--package",
         "firmware-tree",
@@ -13275,7 +13279,23 @@ fn ci_lints() -> Result<(), String> {
     failed.lint(cargo().args([
         "clippy",
         "--package",
+        "kboot",
+        "--package",
         "kcore",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "clippy::undocumented_unsafe_blocks",
+    ]));
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "karch",
+        "--features",
+        "ktest,early-marks,fault-probe,overflow-probe,break-unmap-local",
         "--target",
         KERNEL_TARGET,
         "--",
@@ -14306,25 +14326,29 @@ mod tests {
     /// in the kernel would change a program's registers without a word.
     /// Only the thread switch and the EL0 test programs may assemble them.
     /// Every crate linked into the kernel is searched: the kernel itself,
-    /// kcore, abi and bootimg.
+    /// karch, kboot, kcore, abi and bootimg.
     #[test]
     fn only_the_thread_switch_uses_fp() {
-        let mut found: Vec<_> = texts(&["kernel", "kcore", "lib/abi", "lib/bootimg"])
-            .into_iter()
-            .filter(|(_, text)| {
-                text.lines().any(|l| {
-                    (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
-                        || ((l.contains("target_feature") || l.contains("target-feature"))
-                            && (l.contains("neon") || l.contains("fp-armv8")))
-                })
+        let mut found: Vec<_> = texts(&[
+            "kernel",
+            "karch",
+            "kboot",
+            "kcore",
+            "lib/abi",
+            "lib/bootimg",
+        ])
+        .into_iter()
+        .filter(|(_, text)| {
+            text.lines().any(|l| {
+                (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
+                    || ((l.contains("target_feature") || l.contains("target-feature"))
+                        && (l.contains("neon") || l.contains("fp-armv8")))
             })
-            .map(|(name, _)| name)
-            .collect();
+        })
+        .map(|(name, _)| name)
+        .collect();
         found.sort();
-        assert_eq!(
-            found,
-            ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
-        );
+        assert_eq!(found, ["karch/src/fpsimd.S", "kernel/src/ktest/el0.S"]);
     }
 
     /// Cargo writes under CARGO_TARGET_DIR when it is set, which cargo
@@ -14662,7 +14686,7 @@ mod tests {
     #[test]
     fn device_registers_go_through_mmio() {
         let listed = [
-            "kernel/src/arch/aarch64/gic.rs",
+            "karch/src/gic.rs",
             "kernel/src/console.rs",
             "tests/init/src/devices.rs",
             "tests/svc/src/device.rs",
@@ -14720,7 +14744,7 @@ mod tests {
             "str {v}, [{a}]",
             "dmb oshst",
         ];
-        for file in ["kernel/src/arch/aarch64/mmio.rs", "lib/rt/src/mmio.rs"] {
+        for file in ["karch/src/mmio.rs", "lib/rt/src/mmio.rs"] {
             let text = std::fs::read_to_string(root().join(file)).expect("an mmio file");
             let mut accesses = 0;
             for line in text.lines().filter(|line| line.contains("asm!(")) {
@@ -15074,6 +15098,8 @@ mod tests {
         let own_name = format!("fn no_{word}_left() {{");
         let mut found: Vec<_> = texts(&[
             "kernel",
+            "karch",
+            "kboot",
             "kcore",
             "lib",
             "services",
@@ -15227,8 +15253,8 @@ mod tests {
                 // queue (obj.rs).
                 let queue_lock = name == "kernel/src/local.rs" && line.contains("queue_spin");
                 // The third: ITS_LOCK of the ITS command queue, never taken
-                // with OBJ (arch/aarch64/its.rs, obj.rs).
-                let its_lock = name == "kernel/src/arch/aarch64/its.rs";
+                // with OBJ (arch/its.rs, obj.rs).
+                let its_lock = name == "kernel/src/arch/its.rs";
                 if name != "kernel/src/obj.rs"
                     && line.contains("Ticket")
                     && !queue_lock

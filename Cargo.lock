@@ -338,6 +338,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "karch"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "kboot",
+ "kcore",
+]
+
+[[package]]
 name = "kboot"
 version = "0.1.0"
 
@@ -356,6 +365,7 @@ dependencies = [
  "abi",
  "bootimg",
  "console-line",
+ "karch",
  "kboot",
  "kcore",
 ]

@@ -41,11 +41,12 @@ const BOOT_ONLY: &[&str] = &[
     "kernel::mm::aspace::init",
     "kernel::smp::start",
     "kernel::sched::init",
-    "kernel::arch::aarch64::gic::init",
-    "kernel::arch::aarch64::its::init",
-    "kernel::arch::aarch64::timer::init",
-    "kernel::arch::aarch64::cpu::init_boot",
-    "kernel::arch::aarch64::user::init",
+    "karch::gic::init",
+    "kernel::arch::gic::init",
+    "kernel::arch::its::init",
+    "karch::timer::init",
+    "kernel::arch::cpu::init_boot",
+    "karch::user::init",
 ];
 
 const ASSEMBLY: &str = "assembly (no line info)";

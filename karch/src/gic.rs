@@ -9,9 +9,10 @@
 //! pending interrupt ends all the same, and acknowledges the interrupt
 //! itself.
 
-use super::cpu;
+use super::cpu::{self, CpuHeader};
 use super::mmio;
-use super::registers::{self, read_sysreg};
+use super::registers;
+use crate::read_sysreg;
 use core::arch::asm;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -120,8 +121,10 @@ fn block(intid: u32) -> usize {
 /// Resets the GIC and turns it on, as the device tree names it (spec 9):
 /// every line masked, clear of pending and active state, at DEFAULT_PRIORITY; shared
 /// lines go to this CPU; the priority mask lets DEFAULT_PRIORITY through.
-/// Runs once, at boot.
-pub fn init(info: &BootInfo) {
+/// Runs once, at boot. On a GICv3 `redistributor_ready` runs once the
+/// redistributor of the CPU is woken and its SGIs and PPIs reset (see
+/// `init_v3_cpu`).
+pub fn init(info: &BootInfo, redistributor_ready: impl FnOnce(Option<&BootInfo>, usize)) {
     let gic = info.gic.must("no GIC in the device tree");
     let [dist, cpu] = gic.mapped();
     assert!(DIST.load(Ordering::Relaxed) == 0, "gic::init runs once");
@@ -129,7 +132,7 @@ pub fn init(info: &BootInfo) {
     DIST.store(LINEAR_BASE + dist.base as usize, Ordering::Relaxed);
     match gic.version {
         GicVersion::V2 => init_v2(cpu),
-        GicVersion::V3 => init_v3(cpu, info),
+        GicVersion::V3 => init_v3(cpu, info, redistributor_ready),
     }
     enable_ipi();
 }
@@ -191,7 +194,11 @@ fn enable_cpu_interface_v2() {
 /// affinity in `redistributors`, the first REDISTRIBUTOR_WINDOW bytes of
 /// the first redistributor region, and woken; then the CPU interface
 /// through its system registers, which head.S opened at EL2.
-fn init_v3(redistributors: Region, info: &BootInfo) {
+fn init_v3(
+    redistributors: Region,
+    info: &BootInfo,
+    redistributor_ready: impl FnOnce(Option<&BootInfo>, usize),
+) {
     let dist = base(&DIST);
     write(dist + GICD_CTLR, 0);
     wait_clear(dist + GICD_CTLR, GICD_CTLR_RWP, "GICD_CTLR.RWP");
@@ -216,16 +223,20 @@ fn init_v3(redistributors: Region, info: &BootInfo) {
         Ordering::Relaxed,
     );
     WINDOW_SIZE.store(redistributors.size as usize, Ordering::Relaxed);
-    init_v3_cpu(Some(info));
+    init_v3_cpu(Some(info), redistributor_ready);
 }
 
 /// This CPU's part of the GICv3: its redistributor, found by its
 /// affinity in the window over the redistributors, woken, its SGIs and
-/// PPIs reset; then the CPU interface through its system registers, which
-/// head.S opened at EL2. The boot CPU passes the device tree: it sets the
-/// ITS up (its::init) before its own LPIs and collection; every CPU then
-/// turns its LPIs on (its::init_cpu).
-fn init_v3_cpu(boot: Option<&BootInfo>) {
+/// PPIs reset; then `redistributor_ready` runs with the device tree (the boot
+/// CPU's call alone has it) and the address of the redistributor: the kernel
+/// sets the ITS up there, before its own LPIs and collection, and every CPU
+/// turns its LPIs on. Then the CPU interface through its system registers,
+/// which head.S opened at EL2.
+fn init_v3_cpu(
+    boot: Option<&BootInfo>,
+    redistributor_ready: impl FnOnce(Option<&BootInfo>, usize),
+) {
     let window = WINDOW.load(Ordering::Relaxed);
     let size = WINDOW_SIZE.load(Ordering::Relaxed) as u64;
     let mpidr = registers::mpidr_el1();
@@ -251,10 +262,7 @@ fn init_v3_cpu(boot: Option<&BootInfo>) {
     write(rd + SGI_FRAME + GICD_IGROUPR, u32::MAX);
     reset_lines(rd + SGI_FRAME, 0..FIRST_SPI);
     wait_clear(rd + GICR_CTLR, GICR_CTLR_RWP, "GICR_CTLR.RWP");
-    if let Some(info) = boot {
-        super::its::init(info, rd);
-    }
-    super::its::init_cpu(rd);
+    redistributor_ready(boot, rd);
     let sre = read_sysreg!("icc_sre_el1");
     write_icc!("icc_sre_el1", sre | ICC_SRE_SRE);
     assert!(
@@ -280,14 +288,14 @@ fn init_v3_cpu(boot: Option<&BootInfo>) {
 /// run on CPU 0: its banked lines, SGIs and PPIs reset, and its CPU
 /// interface (GICv2) or redistributor and system registers (GICv3), as
 /// `init` leaves CPU 0's. Then `enable_ipi` and the timer's PPI.
-pub fn init_secondary() {
+pub fn init_secondary(redistributor_ready: impl FnOnce(Option<&BootInfo>, usize)) {
     match kind() {
         GicVersion::V2 => {
             reset_lines(base(&DIST), 0..FIRST_SPI);
             own_interface();
             enable_cpu_interface_v2();
         }
-        GicVersion::V3 => init_v3_cpu(None),
+        GicVersion::V3 => init_v3_cpu(None, redistributor_ready),
     }
     enable_ipi();
 }
@@ -300,29 +308,27 @@ pub fn enable_ipi() {
     }
 }
 
-/// Sends SGI `intid` to CPU `target` (its number, arch::cpu), which is up.
+/// Sends SGI `intid` to the CPU of the block `target`, which is up.
 /// What the sender wrote for it first reaches it before the interrupt
 /// does, through the barrier the GIC's register needs [S2]: GICv2 `dmb
 /// ishst` before the write of GICD_SGIR; GICv3 `dsb ishst`, the write of
 /// ICC_SGI1R_EL1, `isb` (a system register write is not ordered by
 /// `dmb`).
-pub fn send_sgi(target: usize, intid: u32) {
-    let block = cpu::block(target);
+#[inline]
+pub fn send_sgi(target: &CpuHeader, intid: u32) {
     match kind() {
-        GicVersion::V2 => send_sgi_v2(block.gic.load(Ordering::Relaxed) as u32, intid),
-        GicVersion::V3 => send_sgi_v3(block.mpidr.load(Ordering::Relaxed), intid),
+        GicVersion::V2 => send_sgi_v2(target.gic.load(Ordering::Relaxed) as u32, intid),
+        GicVersion::V3 => send_sgi_v3(target.mpidr.load(Ordering::Relaxed), intid),
     }
 }
 
-/// Whether the SGI `ack` came from CPU `sender`. A GICv2 IAR names the
+/// Whether the SGI `ack` came from the CPU of the block `sender`. A GICv2 IAR names the
 /// sending CPU interface, which is compared with the one in the sender's
 /// block; a GICv3 IAR has no source, so the pair is checked by the flags the
 /// sender wrote (kernel::smp).
-pub fn sgi_from(ack: &Ack, sender: usize) -> bool {
+pub fn sgi_from(ack: &Ack, sender: &CpuHeader) -> bool {
     match kind() {
-        GicVersion::V2 => {
-            ack.is_from_interface(cpu::block(sender).gic.load(Ordering::Relaxed) as u32)
-        }
+        GicVersion::V2 => ack.is_from_interface(sender.gic.load(Ordering::Relaxed) as u32),
         GicVersion::V3 => true,
     }
 }
@@ -378,17 +384,16 @@ pub fn mask(intid: u32) {
     }
 }
 
-/// Sends the shared line `intid` to CPU `cpu`, which is up (spec 9):
+/// Sends the shared line `intid` to the CPU of the block `target`, which is up (spec 9):
 /// its byte of GICD_ITARGETSR with the CPU's interface bit on a GICv2, its
 /// GICD_IROUTER with the CPU's affinity on a GICv3. The line is masked
 /// meanwhile.
-pub fn set_route(intid: u32, cpu: usize) {
+pub fn set_route(intid: u32, target: &CpuHeader) {
     let dist = base(&DIST);
-    let block = cpu::block(cpu);
     match kind() {
         GicVersion::V2 => {
             let (offset, shift) = gic::byte(GICD_ITARGETSR, intid);
-            let bit = (block.gic.load(Ordering::Relaxed) as u32 & 0xFF) << shift;
+            let bit = (target.gic.load(Ordering::Relaxed) as u32 & 0xFF) << shift;
             write(
                 dist + offset,
                 (read(dist + offset) & !(0xFF << shift)) | bit,
@@ -397,7 +402,7 @@ pub fn set_route(intid: u32, cpu: usize) {
         GicVersion::V3 => {
             let at = dist + GICD_IROUTER + 8 * intid as usize;
             // SAFETY: GICD_IROUTER is a 64-bit register of the distributor.
-            unsafe { mmio::write64(at, gic::irouter(block.mpidr.load(Ordering::Relaxed))) };
+            unsafe { mmio::write64(at, gic::irouter(target.mpidr.load(Ordering::Relaxed))) };
         }
     }
 }
@@ -454,6 +459,7 @@ pub fn acknowledge() -> Option<Ack> {
 /// EOI: ends an acknowledged interrupt, its priority drop and its
 /// deactivation at once. A level-triggered source must be quiet by now, or
 /// the line fires again at once.
+#[inline]
 pub fn end(ack: Ack) {
     match kind() {
         GicVersion::V2 => write(base(&CPU) + GICC_EOIR, ack.eoi_value()),
@@ -461,17 +467,13 @@ pub fn end(ack: Ack) {
     }
 }
 
-/// Sleeps until an interrupt is pending at this CPU and acknowledges it.
-/// PSTATE keeps interrupts masked, so none is taken; `wfi` ends all the
-/// same. None when the wake-up brought nothing to acknowledge.
-#[must_use = "an acknowledged interrupt stays active until gic::end"]
-pub fn wait() -> Option<Ack> {
-    crate::stamps::wfi(false);
+/// Sleeps until an interrupt is pending at this CPU. PSTATE keeps interrupts
+/// masked, so none is taken; `wfi` ends all the same. The kernel's `wait`
+/// (kernel/src/arch/gic.rs) acknowledges what woke it.
+pub fn sleep() {
     // SAFETY: waiting for an interrupt has no side effects; the DSB lets
     // earlier stores (to the GIC and the timer) complete first.
     unsafe { asm!("dsb sy", "wfi", options(nostack, preserves_flags)) };
-    crate::stamps::wfi(true);
-    acknowledge()
 }
 
 #[cfg(feature = "ktest")]
