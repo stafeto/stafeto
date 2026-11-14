@@ -91,6 +91,15 @@ impl Storage<'_> {
     }
 }
 
+/// Where the buffers of the ICMP socket are: they stay in the storage that the
+/// stack borrows, and the socket is made again over them when a PING gives up.
+struct IcmpStorage {
+    rx_meta: *mut [icmp::PacketMetadata; 4],
+    rx_data: *mut [u8; ICMP_BYTES],
+    tx_meta: *mut [icmp::PacketMetadata; 4],
+    tx_data: *mut [u8; ICMP_BYTES],
+}
+
 /// The identifier of the echo requests of PING.
 const IDENT: u16 = 0x5354;
 /// The bytes of data in an echo request of PING.
@@ -160,6 +169,8 @@ pub struct Stack<'a> {
     service: SocketSet<'a>,
     dhcp: Option<SocketHandle>,
     icmp: SocketHandle,
+    /// The buffers of the ICMP socket, to make it again (`ping_end`).
+    icmp_storage: IcmpStorage,
     /// The next deadline of each set (`poll_at`), in nanoseconds of the
     /// counter: the groups, then the service's. None while it waits for a
     /// frame or a request.
@@ -220,6 +231,12 @@ impl<'a> Stack<'a> {
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
         });
+        let icmp_storage = IcmpStorage {
+            rx_meta: &raw mut storage.rx_meta,
+            rx_data: &raw mut storage.rx_data,
+            tx_meta: &raw mut storage.tx_meta,
+            tx_data: &raw mut storage.tx_data,
+        };
         let Storage {
             sockets,
             service,
@@ -248,6 +265,7 @@ impl<'a> Stack<'a> {
             service: set,
             dhcp,
             icmp,
+            icmp_storage,
             group_at: [None; GROUPS + 1],
             cursor: 0,
             earliest: u64::MAX,
@@ -555,6 +573,35 @@ impl<'a> Stack<'a> {
         true
     }
 
+    /// Makes the ICMP socket again, empty. An echo request whose neighbour
+    /// never answered stays in the socket's queue, and its set asks for the
+    /// neighbour again every second: smoltcp's neighbour cache sends one
+    /// request a second for the whole interface, so that request, made first
+    /// in each pass, takes the turn of a SYN to the loopback that waits for its
+    /// own neighbour and starves it.
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
+    fn icmp_again(&mut self, now_ns: u64) {
+        drop(self.service.remove(self.icmp));
+        let s = &self.icmp_storage;
+        // SAFETY: the buffers are the stack's storage, which lives as long as the
+        // stack; the socket that held them is gone, and the stack makes no other.
+        let mut socket = unsafe {
+            icmp::Socket::new(
+                icmp::PacketBuffer::new(
+                    (&mut *s.rx_meta).as_mut_slice(),
+                    (&mut *s.rx_data).as_mut_slice(),
+                ),
+                icmp::PacketBuffer::new(
+                    (&mut *s.tx_meta).as_mut_slice(),
+                    (&mut *s.tx_data).as_mut_slice(),
+                ),
+            )
+        };
+        let _ = socket.bind(icmp::Endpoint::Ident(IDENT));
+        self.icmp = self.service.add(socket);
+        self.group_at[GROUPS] = Self::deadline(self.iface.poll_at(instant(now_ns), &self.service));
+    }
+
     /// How the PING in flight ended, if it did: the reply is in the socket
     /// or its time ran out.
     pub fn ping_end(&mut self, now_ns: u64) -> Option<PingEnd> {
@@ -585,6 +632,7 @@ impl<'a> Stack<'a> {
         }
         if now_ns >= ping.deadline_ns {
             self.ping = None;
+            self.icmp_again(now_ns);
             return Some(PingEnd::TimedOut);
         }
         None

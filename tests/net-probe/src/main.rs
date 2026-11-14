@@ -1713,7 +1713,19 @@ impl Probe<'_> {
         }
         // A frame of the loopback that is dropped: the segment is sent again
         // by the retransmission timer (smoltcp waits a second at least).
+        let opened = self.now();
         let mut p = self.open_pairs(&root, 1)?;
+        // The echo request of the PING that timed out must not stay in the
+        // stack: it would ask for its neighbour every second and take the
+        // turn of the SYN of this connection to the loopback (the choice
+        // `batch-1 egress-1` of the measurement hung here).
+        let spent = self.now() - opened;
+        rt::println!("net-probe: pairs opened in {} us", spent / 1000);
+        if spent > 500_000_000 {
+            return Err(
+                "a CONNECT on the loopback after a PING that timed out waited for the neighbour",
+            );
+        }
         self.sleep(200_000_000);
         self.hold(&root, proto_net::HOLD_DROP)?;
         let net = p.sessions[p.links[0].session[0]]
