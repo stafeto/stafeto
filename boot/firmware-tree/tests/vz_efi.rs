@@ -4,7 +4,7 @@
 //! The same on Apple Virtualization.framework: the tables and the memory map
 //! of its EFI firmware (`vz-run --efi-writable` with the loader's `dump`, then
 //! `cargo xtask efi-fixtures vz DISK`) against the tree its Linux boot gives
-//! (`kcore/tests/fixtures/apple-vz.dtb`). VZ's firmware has no SPCR, IORT or
+//! (`kboot/tests/fixtures/apple-vz.dtb`). VZ's firmware has no SPCR, IORT or
 //! ITS, so the console, the ITS and the MSI map are not compared.
 
 use firmware_tree::acpi::{Table, Tables};
@@ -12,11 +12,11 @@ use firmware_tree::check::{Placement, check};
 use firmware_tree::efimap::{Desc, classify};
 use firmware_tree::platform::Platform;
 use firmware_tree::tree::{Input, build};
-use kcore::bootinfo::{BootInfo, Region, parse, pci_hosts};
-use kcore::fdt::{Event, Fdt};
+use kboot::bootinfo::{BootInfo, Region, parse, pci_hosts};
+use kboot::fdt::{Event, Fdt};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vz-efi");
-const DTB: &[u8] = include_bytes!("../../../kcore/tests/fixtures/apple-vz.dtb");
+const DTB: &[u8] = include_bytes!("../../../kboot/tests/fixtures/apple-vz.dtb");
 const MAP: &[u8] = include_bytes!("fixtures/vz-efi/memmap.bin");
 
 fn tables() -> Tables<'static> {

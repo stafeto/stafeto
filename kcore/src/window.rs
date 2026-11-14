@@ -10,8 +10,8 @@
 //! while it lives (spec 3.2, kcore::console::covers).
 
 use crate::PAGE_SIZE;
-use crate::bootinfo::{BootInfo, GIC_REGIONS, MEMORY_REGIONS, Region, RegionList};
 use abi::{Error, MAX_MEMORY};
+use kboot::bootinfo::{BootInfo, GIC_REGIONS, MEMORY_REGIONS, Region, RegionList};
 
 /// The end of the output addresses a descriptor holds (OA[47:12], [G8]).
 pub const OUTPUT_END: u64 = 1 << 48;
@@ -69,14 +69,14 @@ pub fn check(base: u64, pages: u64, forbidden: &[Region]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootinfo::parse;
-    use crate::fdt::Fdt;
+    use kboot::bootinfo::parse;
+    use kboot::fdt::Fdt;
 
-    const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
-    const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
-    const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
+    const VIRT: &[u8] = include_bytes!("../../kboot/tests/fixtures/virt.dtb");
+    const VIRT_GICV3: &[u8] = include_bytes!("../../kboot/tests/fixtures/virt-gicv3.dtb");
+    const A64: &[u8] = include_bytes!("../../kboot/tests/fixtures/a64-like.dtb");
     /// The tree Apple's Virtualization.framework gives a guest.
-    const VZ: &[u8] = include_bytes!("../tests/fixtures/apple-vz.dtb");
+    const VZ: &[u8] = include_bytes!("../../kboot/tests/fixtures/apple-vz.dtb");
 
     /// What windows may not touch on the machine of the fixture `blob`.
     fn forbidden_on(blob: &[u8]) -> Forbidden {

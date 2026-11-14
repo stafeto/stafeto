@@ -9,7 +9,7 @@
 
 use crate::error::Error;
 use alloc::vec::Vec;
-use kcore::bootinfo::{MEMORY_REGIONS, Region};
+use kboot::bootinfo::{MEMORY_REGIONS, Region};
 use kcore::layout::{GIB, fits_in_one_gib};
 
 /// `EFI_MEMORY_WB` (UEFI 2.10, "GetMemoryMap()").

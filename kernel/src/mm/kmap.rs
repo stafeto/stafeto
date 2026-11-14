@@ -9,11 +9,11 @@ use super::phys::{self, Frames, LinearMem};
 use crate::arch::cpu::SLOT;
 use crate::arch::{mmu, symbols};
 use crate::boot::Boot;
+use kboot::bootinfo::{Gic, MAX_CPUS, Region};
+use kboot::memmap;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::{Gic, MAX_CPUS, Region};
 use kcore::frames::PhysMem;
 use kcore::layout::{LINEAR_BASE, image_pa};
-use kcore::memmap;
 use kcore::paging::{Attrs, PageTable, TableMemory};
 
 /// Tables from the frame allocator, reached through the linear map.

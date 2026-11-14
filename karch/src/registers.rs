@@ -3,6 +3,9 @@
 
 //! Reads of the system registers the kernel needs.
 
+/// The GIC driver and the kernel tests (kernel/src/ktest/registers.rs) read
+/// more registers with it.
+#[macro_export]
 macro_rules! read_sysreg {
     ($name:literal) => {{
         let v: u64;
@@ -11,9 +14,6 @@ macro_rules! read_sysreg {
         v
     }};
 }
-/// The GIC driver and the kernel tests (crate::ktest::registers) read more
-/// registers with it.
-pub(crate) use read_sysreg;
 
 pub fn esr_el1() -> u64 {
     read_sysreg!("esr_el1")

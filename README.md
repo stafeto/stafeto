@@ -85,7 +85,9 @@ cargo xtask help         # every command
 
 | Directory | Contents |
 |---|---|
-| `kernel/` | the microkernel: boot, MMU, GIC, scheduler, system calls |
+| `kernel/` | the microkernel: objects, IPC, processes, threads, memory, SMP, system calls, the ITS, the entry of exceptions |
+| `karch/` | the AArch64 layer of the kernel: boot code, exception vectors, MMU, caches, GIC, timer |
+| `kboot/` | what the kernel reads at boot: device tree, boot information, memory map; no `unsafe`, tested on the host |
 | `kcore/` | kernel logic that builds and tests on the host |
 | `lib/` | `abi`, `rt`, `bootimg`, `ext4ro` and the `posix-*` crates |
 | `proto/` | message protocols between programs and services |
@@ -100,7 +102,7 @@ cargo xtask help         # every command
 
 ## License
 
-The kernel, `kcore`, services, drivers, the shell, `xtask`, the tests,
+The kernel, `karch`, `kboot`, `kcore`, services, drivers, the shell, `xtask`, the tests,
 `lib/ext4ro` and the POSIX crates that programs do not link
 (`lib/posix-signal-queue`, `lib/posix-credentials`) are under
 GPL-3.0-or-later ([LICENSE](LICENSE)). The libraries that programs link

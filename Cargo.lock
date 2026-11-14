@@ -158,7 +158,7 @@ name = "efi-loader"
 version = "0.1.0"
 dependencies = [
  "firmware-tree",
- "kcore",
+ "kboot",
  "posix-random",
  "uefi",
  "uefi-raw",
@@ -246,6 +246,7 @@ dependencies = [
 name = "firmware-tree"
 version = "0.1.0"
 dependencies = [
+ "kboot",
  "kcore",
  "posix-random",
 ]
@@ -337,10 +338,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "karch"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "kboot",
+ "kcore",
+]
+
+[[package]]
+name = "kboot"
+version = "0.1.0"
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "kboot",
 ]
 
 [[package]]
@@ -350,6 +365,8 @@ dependencies = [
  "abi",
  "bootimg",
  "console-line",
+ "karch",
+ "kboot",
  "kcore",
 ]
 

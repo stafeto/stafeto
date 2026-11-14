@@ -1,0 +1,16 @@
+[package]
+name = "kboot"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Boot-time parsing for the stafeto kernel: device tree, boot information and memory map, with no unsafe code, tested on the host"
+
+[lib]
+bench = false
+
+[features]
+# The writer of device trees (fdt::Builder), for the boot loader, which needs
+# `alloc`; the kernel leaves it off.
+builder = []

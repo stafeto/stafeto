@@ -6,7 +6,12 @@
 //! the PSCI conduit, the CPUs.
 
 use crate::fdt::{Event, Fdt, FdtError, MAX_DEPTH, be32, be64};
-use crate::gic::REDISTRIBUTOR_WINDOW;
+
+/// The bytes at the start of the first redistributor region of a GICv3
+/// that the kernel maps and searches for the redistributor of its CPU
+/// (spec 9) for the redistributor of each CPU it starts: two frames of 128
+/// KiB, or one of 256 KiB with vLPIs, for each of MAX_CPUS CPUs.
+pub const REDISTRIBUTOR_WINDOW: u64 = 0x20_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
@@ -117,7 +122,7 @@ impl Gic {
     /// the first redistributor region of a GICv3.
     pub fn mapped(&self) -> [Region; 2] {
         let &[dist, second, ..] = self.regs.as_slice() else {
-            crate::fail_here!("a GIC node has its distributor and a second block");
+            fail_here!("a GIC node has its distributor and a second block");
         };
         let cpu = match self.version {
             GicVersion::V2 => second,

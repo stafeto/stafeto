@@ -18,7 +18,7 @@ struct Mmio;
 /// One `ldr` or `ldrb` with the address in a register and no writeback: a
 /// hypervisor emulates an access to device memory from the syndrome of the
 /// fault, which holds for this form only [G34]. `read_volatile` does not
-/// promise it. The same text as `kernel/src/arch/aarch64/mmio.rs`.
+/// promise it. The same text as `karch/src/mmio.rs`.
 ///
 /// # Safety
 /// `address` is a register of the port, aligned to its width.

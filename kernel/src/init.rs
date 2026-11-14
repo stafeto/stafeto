@@ -46,7 +46,7 @@ fn failed(what: &str, error: abi::Error) -> ! {
 /// to any process, its memory objects too; it has no parent to give the
 /// quota back to.
 #[cfg(not(feature = "ktest"))]
-pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region, boot: &crate::boot::Boot) -> ! {
+pub fn start(program: &Program<'_>, image: kboot::bootinfo::Region, boot: &crate::boot::Boot) -> ! {
     use crate::thread;
     use abi::Policy;
     // The other CPUs are in their loop of the way out already: whatever
