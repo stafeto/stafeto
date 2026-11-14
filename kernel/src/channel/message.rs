@@ -148,7 +148,16 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
         unsafe {
             settle_loan(k, t);
             k.s.unboost(t);
-            (*t.as_ptr()).boost_token = 0;
+            // The break: a thread that takes a notification and then receives
+            // goes on holding it for the lift of the queue.
+            #[cfg(not(feature = "break-notice-holder-keeps"))]
+            {
+                (*t.as_ptr()).boost_token = 0;
+            }
+            #[cfg(feature = "break-notice-holder-keeps")]
+            if !is_notice((*t.as_ptr()).boost_token) {
+                (*t.as_ptr()).boost_token = 0;
+            }
             let q = queue(c, k.s);
             if !q.has_receivers()
                 && let Some(slot) = q.head()
@@ -174,6 +183,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                 if lends(c) {
                     sched::boost_in_place(k, t, priority, ceiling, false);
                 }
+                hold_notice(t, c);
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {
@@ -303,7 +313,12 @@ pub fn send(
     // The look at the queue and the meeting with the receiver are one
     // section (spec 6.1).
     let mark = crate::obj::mark();
-    sched::locked(|k| k.tokens.check_count(thread::index(t)))?;
+    sched::locked(|k| {
+        // A thread that sends waits: the lift it had from a notification ends.
+        // SAFETY: the running thread is alive.
+        unsafe { end_notice(t) };
+        k.tokens.check_count(thread::index(t))
+    })?;
     if is_closed(c) {
         drop_handles(t, values);
         return Err(Error::PeerClosed);
@@ -588,29 +603,106 @@ unsafe fn accept(
 /// # Safety
 /// `t` is the running thread and alive; `k` is the locked scheduler.
 unsafe fn settle_loan(k: &mut Locked<'_>, t: NonNull<Thread>) {
-    // SAFETY: the caller's promise; a client whose token is taken and that
-    // waits for a reply from `t`'s process is alive, and its CPU touches
-    // nothing of its budget until its wake, which is under OBJ.
+    // SAFETY: the caller's promise.
     unsafe {
         if !(*t.as_ptr()).sched.has_budget() {
             return;
         }
-        let token = (*t.as_ptr()).boost_token;
         let now = crate::arch::timer::now();
         // The stint that runs is closed whatever the token: a thread that
         // kept running at `low` after its reply must not have that time
         // lent to the client of the request it takes next.
         let lent = k.s.take_loan(t, now);
+        pay_loan(k, t, lent, now);
+    }
+}
+
+/// `lent` ticks that `t` ran in the background for the client its boost
+/// names are the debt of that client: of the sender that raised `t` for a
+/// notification it holds (`hold_notice`), or of the client of the request
+/// whose token the boost carries. Nobody pays a boost that came from neither
+/// (a notification no sender lifted for, a client that ended, a client with
+/// no budget): the time is S_srv for a request that outlived its client, at
+/// most one step S_n for a notification. O(1).
+///
+/// # Safety
+/// `t` is alive, with no stint open (`take_loan` or `unbind_budget` closed
+/// it); `k` is the locked scheduler.
+pub unsafe fn pay_loan(k: &mut Locked<'_>, t: NonNull<Thread>, lent: u64, now: u64) {
+    // SAFETY: the caller's promise; a client whose token is taken and that
+    // waits for a reply from `t`'s process is alive, and its CPU touches
+    // nothing of its budget until its wake, which is under OBJ.
+    unsafe {
+        let token = (*t.as_ptr()).boost_token;
         if token == 0 || lent == 0 {
             return;
         }
-        // A token that is still taken names a client that waits for a reply
-        // from `t`'s process: a wait for a reply is not withdrawn, and the
-        // reply that used the token up freed it.
-        let Ok(client) = k.tokens.check(token) else {
-            return;
+        let client = if is_notice(token) {
+            // The sender that queued and lifted `t` waits in `send`; a number
+            // that names another thread by now is one that waits there too, or
+            // nobody pays.
+            let Some(sender) = thread::payer(t).and_then(|n| k.tokens.thread(n)) else {
+                return;
+            };
+            if sender == t || !matches!((*sender.as_ptr()).waits, Some(Wait::Send(_))) {
+                return;
+            }
+            sender
+        } else {
+            // A token that is still taken names a client that waits for a
+            // reply from `t`'s process: a wait for a reply is not withdrawn,
+            // and the reply that used the token up freed it.
+            let Ok(client) = k.tokens.check(token) else {
+                return;
+            };
+            client
         };
         k.s.owe(client, lent, now);
+    }
+}
+
+/// The tag of the `boost_token` of a thread that holds a notification
+/// (`hold_notice`): bit 63, which a token of a request has once its count
+/// reaches 2^47 of one thread's requests; the rest names the channel.
+const NOTICE: u64 = 1 << 63;
+
+/// Whether `token`, a thread's `boost_token`, is a notification's.
+fn is_notice(token: u64) -> bool {
+    token & NOTICE != 0
+}
+
+/// The thread `t` took a notification from `c` (a receive, or a post to a
+/// receiver that waited): until it receives again or sends it is the holder
+/// of `c`, which a request that queues lifts (`holder`, `lift_holder`): the
+/// step of work the notification asks for runs at that sender's level, and
+/// the time of the lift is a loan of the sender's budget when it has one
+/// (`pay_loan`). The channel keeps this thread as the last one that took
+/// something from it, as `accept` does for a request. The token names the
+/// channel by its address, which the thread never dereferences. Under OBJ.
+///
+/// # Safety
+/// `t` is alive and `c` is its channel's, alive.
+pub unsafe fn hold_notice(t: NonNull<Thread>, c: NonNull<Channel>) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        let token = c.as_ptr() as u64 | NOTICE;
+        (*t.as_ptr()).boost_token = token;
+        thread::clear_payer(t);
+        (*c.as_ptr()).server = u32::from(thread::index(t));
+        (*c.as_ptr()).token = token;
+    }
+}
+
+/// `t` sends and waits: the lift of a notification it held ends.
+///
+/// # Safety
+/// `t` is alive.
+unsafe fn end_notice(t: NonNull<Thread>) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        if is_notice((*t.as_ptr()).boost_token) {
+            (*t.as_ptr()).boost_token = 0;
+        }
     }
 }
 
@@ -831,7 +923,10 @@ unsafe fn lift_servers(client: NonNull<Thread>, k: &mut Locked<'_>) {
 /// finds PEER_CLOSED and `settle_loan` charges no one. Otherwise that thread,
 /// when it is between the two halves of `reply_receive` (`Long::Receive`,
 /// set and cleared under OBJ) on a handle that names `c`: its reply went, and
-/// its receive on this channel is next. A number that names a thread now at
+/// its receive on this channel is next. Or else a thread that took a
+/// notification from `c` (`hold_notice`) and has neither received nor sent
+/// since: the work the notification asks for, a step of the service's own,
+/// lifts for the senders that queue as a request does. A number that names a thread now at
 /// work for another channel, or a thread of another process under a reused
 /// number, fits neither: a token names one request.
 ///
@@ -898,6 +993,11 @@ unsafe fn lift_holder(c: NonNull<Channel>, k: &mut Locked<'_>, t: NonNull<Thread
                 && (!server.as_ref().sched.is_demoted() || server.as_ref().priority() >= level)
         {
             return None;
+        }
+        // The holder of a notification works for no request: the sender that
+        // lifts it pays the lift (`pay_loan`).
+        if is_notice((*server.as_ptr()).boost_token) {
+            thread::set_payer(server, t);
         }
         if !sched::boost(k, server, level, ceiling(server)) {
             return None;

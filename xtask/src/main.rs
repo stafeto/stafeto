@@ -1642,10 +1642,24 @@ enum Variant {
     /// (`break-reply-receive-split`): the loan and queue phases of the probe
     /// `budget-hog` must catch it.
     ReplyReceiveSplit,
+    /// An overrun that posts nothing to the budget's place
+    /// (`break-budget-overrun-silent`): the overrun phase of the probe
+    /// `budget-hog` must catch it, and, with the kernel tests
+    /// (`BudgetOverrunSilentTest`), the test of the place.
+    BudgetOverrunSilent,
+    BudgetOverrunSilentTest,
+    /// An unbind that leaves the thread at the level its budget gave it
+    /// (`break-budget-unbind-keeps`): the kernel tests of the unbind must
+    /// catch it.
+    BudgetUnbindKeepsTest,
+    /// A thread that took a notification and received again goes on holding
+    /// it for the lift of the queue (`break-notice-holder-keeps`): the kernel
+    /// tests of the lift must catch it.
+    NoticeHolderKeepsTest,
 }
 
 impl Variant {
-    const ALL: [Variant; 60] = [
+    const ALL: [Variant; 64] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1706,6 +1720,10 @@ impl Variant {
         Variant::BudgetNoQueueLift,
         Variant::BudgetNoQueueLiftTest,
         Variant::ReplyReceiveSplit,
+        Variant::BudgetOverrunSilent,
+        Variant::BudgetOverrunSilentTest,
+        Variant::BudgetUnbindKeepsTest,
+        Variant::NoticeHolderKeepsTest,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1774,6 +1792,10 @@ impl Variant {
             Variant::BudgetNoQueueLift => Some("break-budget-no-queue-lift"),
             Variant::BudgetNoQueueLiftTest => Some("ktest,break-budget-no-queue-lift"),
             Variant::ReplyReceiveSplit => Some("break-reply-receive-split"),
+            Variant::BudgetOverrunSilent => Some("break-budget-overrun-silent"),
+            Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
+            Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
+            Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
         }
     }
 
@@ -1858,6 +1880,10 @@ impl Variant {
             Variant::BudgetNoQueueLift => "stafeto-budget-no-queue-lift",
             Variant::BudgetNoQueueLiftTest => "stafeto-ktest-budget-no-queue-lift",
             Variant::ReplyReceiveSplit => "stafeto-reply-receive-split",
+            Variant::BudgetOverrunSilent => "stafeto-budget-overrun-silent",
+            Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
+            Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
+            Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
         }
     }
 }

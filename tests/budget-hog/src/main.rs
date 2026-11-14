@@ -26,6 +26,14 @@
 //! 5. A worker at 5 with the budget of 200 us is notified through a channel
 //!    of 55 and spins 800 us for each notification: the boost of the slot
 //!    goes with the budget, and the victim at 10 keeps its share.
+//! 6. The overruns: a hog at 50 with the budget of 300 us for each 1 ms has a
+//!    place for the notifications of its overruns on a channel that a
+//!    receiver at 55 empties: one notification for each overrun, each of
+//!    count 1, as many as the budget counts. A thread at 40 of the same kind
+//!    that stays within its budget posts none to its own place. After the
+//!    phase the hog's budget leaves it (`thread_unbind_budget`), and the hog
+//!    is a thread with no budget at its level `free`: it does not overrun
+//!    any more and its place posts nothing.
 
 #![no_std]
 #![no_main]
@@ -521,6 +529,105 @@ fn phase_slot(process: &Handle<Process>, resource: &Handle<Resource>) {
     );
 }
 
+/// The notifications of the overrun phase: those that came, those whose count
+/// was not 1, and those of the kind that is not an overrun's (the end of the
+/// phase, which stops the receiver).
+static NOTES: AtomicU64 = AtomicU64::new(0);
+static NOTES_BAD: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn overrun_receiver(_: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    while let Ok(sys::Received::Notification { source, count, .. }) = sys::receive(&channel) {
+        if source != abi::Source::Budget {
+            break;
+        }
+        NOTES.fetch_add(1, Relaxed);
+        if count != 1 {
+            NOTES_BAD.fetch_add(1, Relaxed);
+        }
+    }
+    sys::thread_exit()
+}
+
+/// A thread of the overrun phase that stays within its budget: 100 us of
+/// work for each 1 ms, with a timer of its own for the rest.
+extern "C" fn polite(_: u64) -> ! {
+    let wait = sys::channel_create_wait(40).expect("channel");
+    let timer = sys::timer_create(&wait, 40).expect("timer");
+    let mut next = now_ns() + MS;
+    while time::now() < END.load(Relaxed) {
+        let until = time::now() + time::ns_to_ticks(100_000);
+        while time::now() < until {
+            black_box(0);
+        }
+        sleep_until(&wait, &timer, next);
+        next += MS;
+    }
+    sys::thread_exit()
+}
+
+/// The overruns (spec 6.5, 8): `PHASE_MS` of a hog at 50 with a place for its
+/// overrun notifications, and a polite thread at 40 with a place of its own
+/// that it never uses. Half way the hog's budget leaves it: the budget is
+/// free, a second unbind is BAD_STATE, and the hog, a thread with no budget,
+/// overruns no more. The lines give the notifications that came, those not of
+/// count 1, the overruns the budget counts, and what the polite thread's place
+/// holds, at the unbind and at the end.
+fn phase_overrun(process: &Handle<Process>, resource: &Handle<Resource>) {
+    begin(PHASE_MS);
+    NOTES.store(0, Relaxed);
+    NOTES_BAD.store(0, Relaxed);
+    let place = sys::channel_create_wait(60).expect("place of the hog");
+    let quiet = sys::channel_create_wait(60).expect("place of the polite thread");
+    CHANNEL.store(place.raw().0, Relaxed);
+    let hog_budget =
+        sys::budget_create_with_notice(resource, 0, 300_000, 1_000_000, 1, &place).expect("budget");
+    let polite_budget =
+        sys::budget_create_with_notice(resource, 0, 300_000, 1_000_000, 1, &quiet).expect("budget");
+    let receiver = spawn(process, 0, overrun_receiver, 55);
+    let victim = spawn(process, 3, victim, 10);
+    let hog = spawn(process, 1, hog, 50);
+    let nice = spawn(process, 2, polite, 40);
+    sys::thread_bind_budget(&hog, &hog_budget).expect("bind the hog's budget");
+    sys::thread_bind_budget(&nice, &polite_budget).expect("bind the polite budget");
+    sys::thread_start(&receiver).expect("start the receiver");
+    sys::thread_start(&victim).expect("start the victim");
+    sys::thread_start(&hog).expect("start the hog");
+    sys::thread_start(&nice).expect("start the polite thread");
+    let wait = sys::channel_create_wait(62).expect("channel");
+    let timer = sys::timer_create(&wait, 62).expect("timer");
+    sleep_until(&wait, &timer, now_ns() + PHASE_MS / 2 * MS);
+    let first = sys::thread_unbind_budget(&hog);
+    let second = sys::thread_unbind_budget(&hog);
+    // The receiver, at 55, takes what the unbind told its place.
+    sleep_until(&wait, &timer, now_ns() + 3 * MS);
+    let info = sys::budget_info(&hog_budget).expect("budget info");
+    println!(
+        "budget overrun unbind notes={} bad={} overruns={} first={} second_is_bad_state={} free={}",
+        NOTES.load(Relaxed),
+        NOTES_BAD.load(Relaxed),
+        info.overruns,
+        u64::from(first.is_ok()),
+        u64::from(second == Err(abi::Error::BadState)),
+        u64::from(info.state == abi::BUDGET_FREE)
+    );
+    sleep_until(&wait, &timer, now_ns() + (PHASE_MS / 2 + 5) * MS);
+    let end = sys::budget_info(&hog_budget).expect("budget info");
+    println!(
+        "budget overrun end notes={} bad={} overruns={} polite_overruns={} quiet={}",
+        NOTES.load(Relaxed),
+        NOTES_BAD.load(Relaxed),
+        end.overruns,
+        sys::budget_info(&polite_budget)
+            .expect("budget info")
+            .overruns,
+        u64::from(sys::try_receive(&quiet).is_ok())
+    );
+    // Stop the receiver.
+    sys::notify(&place, 1).expect("stop the receiver");
+    sleep_until(&wait, &timer, now_ns() + 2 * MS);
+}
+
 fn main(_: u64) -> u64 {
     let init = rt::init_handles().expect("init's handles");
     // The console takes the handle it prints through; the budgets need a
@@ -547,6 +654,7 @@ fn main(_: u64) -> u64 {
         println!("budget queue ran");
     }
     phase_slot(&process, &resource);
+    phase_overrun(&process, &resource);
     println!("budget DONE");
     loop {
         sys::yield_now().expect("wait for the host");

@@ -23,6 +23,7 @@
 //! for by the page from the pool of the process that made it (spec 7.8).
 
 use crate::arch::timer as clock;
+use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
@@ -51,9 +52,17 @@ pub struct Budget {
     cpu: u8,
     /// The level whose heap holds the entry while it is linked.
     level: u8,
+    /// The place of its overrun notifications (spec 6.5, 8): the slot that
+    /// the budget's creator attached, which holds the channel and one of its
+    /// slots until the budget's portion. None for a budget with no place.
+    notice: Option<Source>,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
 }
+
+/// The bits of an overrun notification: bit 0. Posts that stand in the
+/// slot together count as one notification with their count (spec 6.5).
+const NOTICE_BITS: u64 = 1;
 
 // The poison of a budget that went (Live::gone) reaches its count.
 const _: () = ::core::assert!(core::mem::offset_of!(Budget, refs) >= 8);
@@ -69,32 +78,75 @@ static LIVE: Live = Live::new();
 /// whose quota pays for a page when the pool grows (spec 7.8), as
 /// budget_create checked the values: LIMIT_REACHED when the system holds
 /// abi::MAX_SYSTEM_TIMERS timers and budgets together (the bound of the
-/// heaps), NO_MEMORY when the quota falls short; nothing changes then. The
-/// budget holds the payer's shell; the caller gets the first reference.
+/// heaps), then LIMIT_REACHED when the channel of `notice`, an open or closed
+/// channel with the label its handle gives, has no slot left (spec 6.5),
+/// NO_MEMORY when the quota falls short; nothing changes then. The budget
+/// holds the payer's shell and, with a place for notices, the channel; the
+/// caller gets the first reference.
 pub fn create(
     payer: NonNull<Process>,
     cpu: u8,
     c: u64,
     t: u64,
     low: u8,
+    notice: Option<(NonNull<Channel>, u64)>,
 ) -> Result<NonNull<Budget>, Error> {
     if !crate::timer::take_place() {
         return Err(Error::LimitReached);
     }
+    if let Some((channel, _)) = notice {
+        channel::reserve_source(channel).inspect_err(|_| crate::timer::give_place())?;
+    }
+    let mut server = Server::new(c, t, low, clock::now());
+    if notice.is_some() {
+        server.watch();
+    }
     let budget = Budget {
         entry: Entry::new(true),
-        server: Server::new(c, t, low, clock::now()),
+        server,
         refs: Refs::one(),
         thread: None,
         payer,
         cpu,
         level: 1,
+        notice: notice.map(|(channel, _)| Source::new(channel)),
         cleanup: Item::new(),
     };
-    let b = process::paid_alloc(payer, budget).inspect_err(|_| crate::timer::give_place())?;
+    let b = process::paid_alloc(payer, budget).inspect_err(|_| {
+        if let Some((channel, _)) = notice {
+            channel::remove_source(channel);
+        }
+        crate::timer::give_place();
+    })?;
+    if let Some((_, label)) = notice {
+        // SAFETY: the budget was just made, and nothing else refers to it;
+        // its slot has the level `low`, which the notifications of an overrun
+        // are posted at.
+        unsafe {
+            (*b.as_ptr())
+                .notice
+                .as_mut()
+                .unwrap_or_else(|| kcore::fail_here!("a budget with a place"))
+                .attach(Owner::Budget(b), low, label)
+        };
+    }
     process::retain_shell(payer);
     LIVE.made();
     Ok(b)
+}
+
+/// The label of the place of `b`, which receive reports with its slot: the
+/// label of the handle the creator gave.
+pub fn label(b: NonNull<Budget>) -> u64 {
+    // SAFETY: the slot of the budget is being taken, and it holds the budget;
+    // only the field is read.
+    unsafe {
+        (*b.as_ptr())
+            .notice
+            .as_ref()
+            .unwrap_or_else(|| kcore::fail_here!("a budget with a place"))
+            .label()
+    }
 }
 
 /// The count of references to `b`, through the raw pointer.
@@ -189,6 +241,38 @@ pub fn bind(t: NonNull<Thread>, b: NonNull<Budget>) -> Result<(), Error> {
     Ok(())
 }
 
+/// thread_bind_budget with no budget (spec 8): the budget of `t`, which the
+/// caller holds, leaves it; `cause` is the level a release of the budget may
+/// queue its cleanup at. The rules are `bind`'s: BAD_STATE for a thread that
+/// has no budget or ended, and for a thread of another CPU that started (its
+/// scheduler is that CPU's alone). The stint that runs is charged first; a
+/// thread that fell to `low` comes back to min(its base, `free` of its
+/// process); what the budget lent for a request is the client's debt, paid
+/// now (`channel::pay_loan`), and no debt comes after it; the servers the
+/// thread lifted follow its new level (`channel::requeue`); the event of the
+/// budget leaves the heap, so that its timer touches no thread (`fire`), and
+/// an overrun it had not told its place of is told here. The binding's
+/// reference goes. Under OBJ.
+pub fn unbind(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    crate::obj::assert_held();
+    let server = crate::sched::unbind_budget(t)?;
+    // SAFETY: the server was the thread's, which the budget's binding kept
+    // alive until here; the binding's reference is the one that goes.
+    unsafe {
+        let b = of_server(server);
+        (*b.as_ptr()).thread = None;
+        // The overrun whose event the unbind took out of the heap is told
+        // now: no overrun is lost for the place.
+        if (*b.as_ptr()).server.take_notice()
+            && let Some(source) = (*b.as_ptr()).notice.as_mut()
+        {
+            let _ = Source::post(NonNull::from(source), NOTICE_BITS, cause);
+        }
+        release(b, cause);
+    }
+    Ok(())
+}
+
 /// The server of `b`.
 fn server_of(b: NonNull<Budget>) -> NonNull<Server> {
     // SAFETY: the caller holds the budget; only the address of a field is
@@ -234,18 +318,34 @@ pub unsafe fn arm(t: NonNull<Thread>, at: Option<u64>) {
     }
 }
 
-/// The replenishment event of the budget whose entry is `e` fires, in the
-/// portion of a level of this CPU, under OBJ (timer::post_fired): its thread
-/// goes back to its own level.
+/// The event of the budget whose entry is `e` fires, in the portion of a
+/// level of this CPU, under OBJ (timer::post_fired): an overrun that the
+/// place has not been told of becomes a notification, one for each overrun
+/// the event finds (the scheduler asked for the event at once when the
+/// overrun came: `Server::check`), and the thread goes back to its own level
+/// when its replenishment is due. A budget with no thread, which `unbind` took
+/// out of the heap, never comes here, and one that has a thread of its own
+/// touches no other.
 ///
 /// # Safety
 /// `e` is the entry of a live budget, off its heap.
 pub unsafe fn fire(e: NonNull<Entry>) {
     crate::obj::assert_held();
-    // SAFETY: the caller's promise.
-    let thread = unsafe { (*of_entry(e).as_ptr()).thread };
-    if let Some(t) = thread {
-        crate::sched::replenish(t);
+    // SAFETY: the caller's promise; the budget lives, and the section is OBJ.
+    unsafe {
+        let b = of_entry(e);
+        let thread = (*b.as_ptr()).thread;
+        if thread.is_some()
+            && (*b.as_ptr()).server.take_notice()
+            && let Some(source) = (*b.as_ptr()).notice.as_mut()
+        {
+            // The slot lies in the budget, whose heap level this portion is;
+            // a closed channel drops the post.
+            let _ = Source::post(NonNull::from(source), NOTICE_BITS, (*b.as_ptr()).level);
+        }
+        if let Some(t) = thread {
+            crate::sched::replenish(t);
+        }
     }
 }
 
@@ -287,6 +387,10 @@ pub unsafe fn clean(b: NonNull<Budget>, level: u8) {
     // budget holds its shell, whose reference goes last.
     unsafe {
         debug_assert!(!(*b.as_ptr()).entry.is_linked());
+        if let Some(source) = (*b.as_ptr()).notice.as_mut() {
+            // Its slot is in no queue: a queued slot holds the budget.
+            source.detach(level);
+        }
         let payer = (*b.as_ptr()).payer;
         process::paid_free(payer, b);
         crate::timer::give_place();

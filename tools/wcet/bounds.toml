@@ -923,6 +923,18 @@ why = "the timers of one portion of a level's firing: kcore::timer::FIRE_PORTION
 
 [[loop]]
 function = "kernel::timer::fire_at"
+at = "0x64"
+bound = 9
+why = "the timers a portion of a level's firing takes out of the heap: kcore::timer::FIRE_PORTION = 8, and the look that ends the loop (Firing::next)"
+
+[[loop]]
+function = "kernel::timer::fire_at"
+at = "0x118"
+bound = 63
+why = "the walk over the levels that renews the nearest deadline once a level settles: at most 63 (spec 10), as in `Levels::left`"
+
+[[loop]]
+function = "kernel::timer::fire_at"
 at = "0x284"
 bound = 63
 why = "the levels 1-63 of the timers: at most 63 (spec 10)"
@@ -1117,7 +1129,7 @@ why = "the second header of the loop over the CPUs that has something to take (t
 
 [[loop]]
 function = "<kcore::budget::Server>::unblock"
-at = "0xc0"
+at = "0xf4"
 bound = 4
 why = "the replenishments of a budget that arrive while its thread runs merge into the first one: at most three, and the look that ends the loop (Server::unblock, MAX_REPLENISHMENTS = 4)"
 

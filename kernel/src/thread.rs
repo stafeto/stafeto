@@ -504,6 +504,33 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
     (n != NONE).then_some(n)
 }
 
+/// The sender that lifted `holder`, a thread that holds a notification
+/// (`channel::hold_notice`), is the one that pays the lift. The word is
+/// `served_by`, which a thread that waits for a reply uses and a holder does
+/// not: the hold ends before the thread sends, and a reply's wait sets the
+/// word again (`accept`).
+///
+/// # Safety
+/// Both are alive; `sender` holds its number; OBJ is held.
+pub unsafe fn set_payer(holder: NonNull<Thread>, sender: NonNull<Thread>) {
+    // SAFETY: the caller's promise; only the field is written.
+    unsafe { (*holder.as_ptr()).numbers.served_by = index(sender) };
+}
+
+/// No sender lifted `holder` yet.
+///
+/// # Safety
+/// `holder` is alive; OBJ is held.
+pub unsafe fn clear_payer(holder: NonNull<Thread>) {
+    // SAFETY: the caller's promise; only the field is written.
+    unsafe { (*holder.as_ptr()).numbers.served_by = NONE };
+}
+
+/// The number of the sender that lifted `holder` (`set_payer`), if one did.
+pub fn payer(holder: NonNull<Thread>) -> Option<u16> {
+    served_by(holder)
+}
+
 /// Gives the number of `t` back to the table of thread numbers `tokens`,
 /// unless it went back before (spec 6.1, 7.7): as the thread ends
 /// (sched::exit), or with the portion of a thread that never started.
@@ -923,15 +950,6 @@ pub fn handle_values(t: NonNull<Thread>, n: usize) -> [u64; MESSAGE_HANDLES] {
         *v = buffer.frame.word(msgbuf::HANDLES + 8 * i);
     }
     values
-}
-
-/// The handle value `reply_receive` of `t` receives on, the word of its
-/// message buffer at abi::msgbuf::CHANNEL (spec 6.1); None for a thread
-/// with no buffer.
-pub fn channel_word(t: NonNull<Thread>) -> Option<u64> {
-    // SAFETY: the caller holds the thread; only the field is borrowed.
-    let buffer = unsafe { &(*t.as_ptr()).buffer }.as_ref()?;
-    Some(buffer.frame.word(msgbuf::CHANNEL))
 }
 
 /// Writes the handles a message brought to `t`, their values and info

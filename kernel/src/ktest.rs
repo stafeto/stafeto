@@ -758,6 +758,50 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::reply_receive_refuses_before_it_replies,
     ),
     (
+        "reply_receive_reads_its_channel_from_x10",
+        calls::reply_receive_reads_its_channel_from_x10,
+    ),
+    (
+        "thread_bind_budget_with_no_budget_unbinds",
+        calls::thread_bind_budget_with_no_budget_unbinds,
+    ),
+    (
+        "unbinding_gives_a_thread_min_of_its_base_and_free",
+        calls::unbinding_gives_a_thread_min_of_its_base_and_free,
+    ),
+    (
+        "unbinding_a_server_on_loan_charges_the_open_stint_to_the_client",
+        calls::unbinding_a_server_on_loan_charges_the_open_stint_to_the_client,
+    ),
+    (
+        "unbinding_a_client_lifts_the_server_that_works_for_it",
+        calls::unbinding_a_client_lifts_the_server_that_works_for_it,
+    ),
+    (
+        "the_timer_of_an_unbound_budget_leaves_the_former_thread_alone",
+        calls::the_timer_of_an_unbound_budget_leaves_the_former_thread_alone,
+    ),
+    (
+        "budget_create_checks_its_place_for_overruns",
+        calls::budget_create_checks_its_place_for_overruns,
+    ),
+    (
+        "an_overrun_posts_one_notification_for_each_period",
+        calls::an_overrun_posts_one_notification_for_each_period,
+    ),
+    (
+        "a_request_that_queues_lifts_a_server_that_took_a_notification",
+        calls::a_request_that_queues_lifts_a_server_that_took_a_notification,
+    ),
+    (
+        "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
+        calls::a_notification_holder_is_not_lifted_after_its_next_receive_or_send,
+    ),
+    (
+        "a_request_that_queues_lifts_a_notification_holder_of_another_cpu",
+        calls::a_request_that_queues_lifts_a_notification_holder_of_another_cpu,
+    ),
+    (
         "a_thread_with_no_budget_works_at_the_free_level",
         calls::a_thread_with_no_budget_works_at_the_free_level,
     ),

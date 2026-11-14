@@ -77,8 +77,14 @@ pub struct Server {
     /// above `low` and has not yet been given to that client (`take_loan`).
     lent: u64,
     overruns: u32,
+    /// The overruns that the notification place has been told of
+    /// (`take_notice`).
+    told: u32,
     low: u8,
     background: bool,
+    /// The budget has a notification place: an overrun wants an event at
+    /// once, for the kernel to post it under OBJ (`check`).
+    watched: bool,
     len: u8,
 }
 
@@ -108,8 +114,10 @@ impl Server {
             ran: 0,
             lent: 0,
             overruns: 0,
+            told: 0,
             low,
             background: false,
+            watched: false,
             len: 1,
         }
     }
@@ -141,6 +149,22 @@ impl Server {
     /// The usage since the head's time.
     pub fn usage(&self) -> u64 {
         self.usage
+    }
+
+    /// The budget has a notification place from now on: each overrun asks
+    /// for an event at once, which `take_notice` answers.
+    pub fn watch(&mut self) {
+        self.watched = true;
+    }
+
+    /// The event of a watched budget fired: whether an overrun is not told
+    /// yet. Overruns that came together are one notification; the place
+    /// counts one post for each call that says true, so that a thread that
+    /// overruns once for each period gives one notification for each period.
+    pub fn take_notice(&mut self) -> bool {
+        let pending = self.overruns != self.told;
+        self.told = self.overruns;
+        pending
     }
 
     /// The sum of the ticks charged so far.
@@ -323,6 +347,23 @@ impl Server {
                 self.event = self.q[0].time;
             }
         }
+        self.want_notice(now);
+    }
+
+    /// An overrun that the place has not been told of: the kernel posts it
+    /// under OBJ, which a scheduler section cannot take, from the event of
+    /// this budget, asked for at once, or as it stands when that is earlier
+    /// already (a later check does not push it back).
+    fn want_notice(&mut self, now: u64) {
+        #[cfg(not(feature = "break-budget-overrun-silent"))]
+        if self.watched && self.overruns != self.told {
+            self.event = match self.armed {
+                0 => now,
+                armed => armed.min(now),
+            };
+        }
+        #[cfg(feature = "break-budget-overrun-silent")]
+        let _ = now;
     }
 
     /// Split_Check (figure 6.4): the thread blocked at `now`.
@@ -392,6 +433,8 @@ impl Server {
         if self.capacity(now) > 0 {
             self.background = false;
             self.event = 0;
+            // An overrun the place was not told of keeps its event.
+            self.want_notice(now);
             self.q[0].time = now;
             // The replenishments that arrive while the chunk runs are part
             // of it.
@@ -407,6 +450,7 @@ impl Server {
         } else {
             self.background = true;
             self.event = self.q[0].time;
+            self.want_notice(now);
         }
     }
 
@@ -416,6 +460,13 @@ impl Server {
     pub fn replenish(&mut self, now: u64) {
         self.armed = 0;
         self.event = 0;
+        // The event came for the place, before the replenishment: the head
+        // is not due, and the usage that `check` took in is not taken in
+        // twice. The event of the replenishment goes back.
+        if self.background && self.q[0].time > now {
+            self.event = self.q[0].time;
+            return;
+        }
         #[cfg(feature = "break-budget-refill")]
         {
             let _ = now;
@@ -439,6 +490,64 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One overrun of a watched server is one notice: its event is asked for
+    /// at once, `take_notice` answers it once, and the replenishment event
+    /// comes back with the replenishment at the head.
+    #[test]
+    fn a_watched_overrun_asks_for_one_notice_at_once() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.watch();
+        s.run(0);
+        s.stop(12, false, false);
+        assert!(s.background());
+        assert_eq!(s.overruns(), 1);
+        assert_eq!(s.event_change(), Some(Some(12)));
+        // The event fires early: the notice is told, the head is not due.
+        assert!(s.take_notice());
+        s.replenish(12);
+        assert!(s.background());
+        assert_eq!(s.event_change(), Some(Some(s.queue()[0].time)));
+        assert!(!s.take_notice());
+        // The head's time comes: the thread is back, and no notice is owed.
+        let at = s.queue()[0].time;
+        s.replenish(at);
+        assert!(!s.background());
+        assert!(!s.take_notice());
+        // The next period's overrun is the next notice.
+        s.unblock(at);
+        s.run(at);
+        s.stop(at + 11, false, false);
+        assert_eq!(s.overruns(), 2);
+        assert!(s.take_notice());
+        assert!(!s.take_notice());
+    }
+
+    /// A budget with no place keeps the events it had: an overrun asks for the
+    /// replenishment only.
+    #[test]
+    fn an_unwatched_overrun_asks_for_the_replenishment_only() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.run(0);
+        s.stop(12, false, false);
+        let head = s.queue()[0].time;
+        assert_eq!(s.event_change(), Some(Some(head)));
+        assert!(head > 12);
+    }
+
+    /// An overrun of a thread that blocks asks for its notice as well, and a
+    /// check that comes while the event stands does not push it later.
+    #[test]
+    fn a_blocked_overrun_is_told_and_a_later_check_leaves_the_event() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.watch();
+        s.run(0);
+        s.stop(12, true, false);
+        assert_eq!(s.event_change(), Some(Some(12)));
+        s.unblock(20);
+        assert_eq!(s.event_change(), None);
+        assert!(s.take_notice());
+    }
 
     /// Xorshift: the same numbers on every run.
     struct Rng(u64);

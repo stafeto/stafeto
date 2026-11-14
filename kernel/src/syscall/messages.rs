@@ -102,7 +102,7 @@ fn receive_from(thread: NonNull<Thread>, handle: u64, wait: bool) -> Result<(), 
 }
 
 /// reply_receive(x0 token, x1 description, x2-x9 bytes 0-63 of the reply,
-/// the word at abi::msgbuf::CHANNEL a handle with RECEIVE): the reply of
+/// x10 a handle with RECEIVE): the reply of
 /// `reply` and then the wait of `receive`, always waiting, in one entry
 /// and as two separate sections under OBJ, so that a server whose budget
 /// is gone does not sit at EL0 between its reply and its next request.
@@ -120,7 +120,7 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
         let desc = Desc::from_reply(a[1])?;
         let values = message_handles(thread, desc, None)?;
         let values = &values[..desc.handles];
-        let handle = thread::channel_word(thread).ok_or(Error::InvalidArgs)?;
+        let handle = channel_arg(thread);
         lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
         check_handles(thread, values)?;
         match channel::reply(thread, a[0], desc, values) {
@@ -150,6 +150,14 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
     }
     sched::entry_started();
     receive_second(thread, handle, crate::arch::timer::now());
+}
+
+/// x10 of the call, the handle `reply_receive` receives on: a register the
+/// kernel saves at an upcall like the others, so that a handler which makes
+/// a `reply_receive` of its own leaves it as the interrupted call set it.
+fn channel_arg(thread: NonNull<Thread>) -> u64 {
+    // SAFETY: the thread that made the call is alive and holds its registers.
+    unsafe { thread.as_ref() }.regs.x[10]
 }
 
 /// The kernel tests make the next poll between the halves of `reply_receive`

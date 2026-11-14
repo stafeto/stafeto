@@ -350,8 +350,11 @@ pub enum Call {
     MsiCreate = 37,
     /// x0 system resource with BUDGET, x1 CPU, x2 budget in ns, x3 period
     /// in ns, x4 the level `low` the thread falls to when its budget is
-    /// gone: makes a time budget (spec 8); x1 returns a handle to it with
-    /// `BUDGET_RIGHTS`. INVALID_ARGS for a CPU that is not up, a budget
+    /// gone, x5 a handle with NOTIFY to a channel, or 0: makes a time
+    /// budget (spec 8); x1 returns a handle to it with `BUDGET_RIGHTS`. With
+    /// x5 the budget posts one notification (source `Budget`, the label of
+    /// the handle, bit 0) to the channel for each overrun, at the level
+    /// `low`. INVALID_ARGS for a CPU that is not up, a budget
     /// below `MIN_BUDGET_NS` or above the period, a period below
     /// `MIN_PERIOD_NS`, or a level outside 1-63.
     BudgetCreate = 38,
@@ -359,11 +362,16 @@ pub enum Call {
     /// the budget from now on (spec 8). INVALID_ARGS for a thread of
     /// another CPU than the budget's, BAD_STATE for a thread that has a
     /// budget or ended, a budget that a thread has, or a thread of another
-    /// CPU that has started.
+    /// CPU that has started. With x1 = 0 the thread's budget leaves it:
+    /// the stint that runs is charged, and the thread works at min(its
+    /// base, `free` of its process) from now on; BAD_STATE for a thread
+    /// that has no budget or ended, or that started on another CPU.
     ThreadBindBudget = 39,
     /// x0 token, x1 description, x2-x9 bytes 0-63 of the reply, as `Reply`;
-    /// the word at `msgbuf::CHANNEL` of the caller's message buffer holds a
-    /// handle with RECEIVE to the channel to receive on, as x0 of `Receive`.
+    /// x10 a handle with RECEIVE to the channel to receive on, as x0 of
+    /// `Receive`. The kernel saves x10 at an upcall like every register, so
+    /// a handler that calls `reply_receive` on another channel leaves the
+    /// channel of the interrupted call as it was.
     /// One entry into the kernel makes the reply and then waits for the
     /// next request or notification, as two separate sections under the
     /// object lock (spec 6.1, 6.6): a server whose budget is gone never
@@ -586,8 +594,7 @@ impl ObjectKind {
 /// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel); the kernel also writes the records of `object_info` `LOG` (up to 960 bytes) and `KERNEL_STATS` with x2 = 1 (296 bytes) here, from offset 0 |
 /// | 1024-1055 | `HANDLES` | the handle values of a message |
 /// | 1056-1087 | `INFO` | an info word for each handle that came |
-/// | 1088-1095 | `CHANNEL` | the handle `reply_receive` receives on, read once |
-/// | 1096-1119 | | unused |
+/// | 1088-1119 | | unused |
 /// | 1120-1935 | `CONTEXT` | the saved context of an entry, read at its return |
 /// | 1936-1999 | `ENTRIES` | the entry record of `rt`, which the kernel never touches |
 /// | 2000-4095 | | unused |
@@ -604,12 +611,6 @@ pub mod msgbuf {
     /// An info word for each handle that came (`info`), MESSAGE_HANDLES
     /// words, written by the kernel at delivery.
     pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
-    /// The handle of the channel `reply_receive` receives on, one word: the
-    /// caller puts it there before the call, which reads it once (spec 6.1).
-    /// It lies past `RESERVED`, outside the part of the buffer an entry
-    /// saves and restores (the dispatcher of `rt::upcall`), so a handler
-    /// that calls `reply_receive` on another channel changes it.
-    pub const CHANNEL: usize = RESERVED;
     /// The end of the part a message uses: the offsets of `DATA` up to
     /// here are those of messages, handles and info words.
     pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
@@ -684,6 +685,9 @@ pub enum Source {
     Exit,
     /// An interrupt line (milestone 1.3e).
     Interrupt,
+    /// The overruns of a time budget: the place its creator gave it
+    /// (`budget_create` x5, spec 8); the label of the handle tells which.
+    Budget,
     /// A kind this abi does not know, which a later kernel may return: its
     /// code.
     Unknown(u64),
@@ -699,6 +703,7 @@ impl Source {
             Source::Timer => 3,
             Source::Exit => 4,
             Source::Interrupt => 5,
+            Source::Budget => 6,
             Source::Unknown(code) => code,
         }
     }
@@ -713,6 +718,7 @@ impl Source {
             3 => Source::Timer,
             4 => Source::Exit,
             5 => Source::Interrupt,
+            6 => Source::Budget,
             _ => Source::Unknown(code),
         }
     }
@@ -1965,6 +1971,7 @@ mod tests {
             (Source::Timer, 3),
             (Source::Exit, 4),
             (Source::Interrupt, 5),
+            (Source::Budget, 6),
         ];
         for (source, code) in known {
             assert_eq!(source.code(), code);
