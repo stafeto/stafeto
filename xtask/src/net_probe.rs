@@ -2610,3 +2610,16 @@ mod tests {
         assert_eq!(PROGRAMS[0].3, &["table-net-probe"]);
     }
 }
+
+/// The network service has told that its switch thread and its stack run under their kernel
+/// budgets (`budgets.rs`): a service whose budget is refused does not start, and one that took
+/// none would leave the levels below it without protection.
+pub fn require_budget_lines(lines: &[String]) -> Result<(), String> {
+    for what in ["the switch", "the stack"] {
+        let wanted = format!("net: {what} runs under its budget");
+        if !lines.iter().any(|l| l.contains(&wanted)) {
+            return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
+        }
+    }
+    Ok(())
+}

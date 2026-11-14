@@ -1494,6 +1494,10 @@ fn share(
     // that is the failure, so the break is not waited for as long.
     let per_second = Duration::from_secs(if unbound { 150 } else { 900 });
     booted(run)?;
+    // The unbound break has none of these lines, and is left to fail on the share itself.
+    if !unbound {
+        net_probe::require_budget_lines(run.lines())?;
+    }
     let quiet_stat = stat(run, "quiet")?;
     run.send(&format!("switch-probe spin {SPIN_TOTAL} &"))?;
     run.expect("# ", DIALOG_STEP)?;

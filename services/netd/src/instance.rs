@@ -106,7 +106,7 @@ pub fn start<D>(
         )
     }
     .map_err(|_| NotStarted)?;
-    crate::budgets::bind("the stack", budget, &thread);
+    crate::budgets::bind("the stack", budget, &thread).map_err(|()| NotStarted)?;
     sys::thread_start(&thread).map_err(|_| NotStarted)?;
     // The thread runs as long as the program does; its handle is not needed.
     core::mem::forget(thread);

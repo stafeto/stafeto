@@ -458,7 +458,10 @@ fn budgets(
         let budget = sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?;
         // The checks of the table keep the names apart from the others of the
         // start data, and START_DATA_MAX keeps all of them within the giver's.
-        let _ = giver.give(b.name, budget.erase());
+        // A budget the service cannot take is an error: the record would start unbudgeted.
+        giver
+            .give(b.name, budget.erase())
+            .map_err(|_| Error::InvalidArgs)?;
     }
     Ok(())
 }

@@ -92,8 +92,12 @@ pub const DMA_TAILS: &[Dma] = &[
 /// a level above the stack, takes 400 us of each millisecond of CPU 0, and the
 /// stack instance on each CPU 200 us of each millisecond (20 %: in a window of 10 ms the
 /// stack takes 2 ms at most, `ceil(L/T) * C`). With the trusted work (5 %) that leaves
-/// the levels below the service 35 % of CPU 0 in every window of 10 ms however much the
-/// wire and the consumers send.
+/// the levels below the service at least 25 % of CPU 0 in every window of 10 ms,
+/// (10 - 4 - 2 - 1 - 0.5) / 10 with the switch (0.4; 1), the stack (0.2; 1), the services
+/// (1; 10) and the trusted work, however much the wire and the consumers send. The bound holds
+/// while no busy client without a budget stands above the victim (the POSIX levels up to 31,
+/// stafeto-design#712). The records with two devices have no budgets and no pause, so the
+/// levels below them are not protected.
 /// A thread whose budget is gone works at level 1 until the
 /// next replenishment, so it still runs when nothing else wants the CPU. The
 /// names are those the service takes in its start data
@@ -398,7 +402,8 @@ pub const NETD_VZ2: Record = Record {
     args: &VZ2_ARGS,
     quiesce: &VZ2_STOP,
     dma: DMA_TWO,
-    // The eight names of the start data are taken (`DMA_TWO` and `console`).
+    // The eight names of the start data are taken (`DMA_TWO` and `console`). With no budgets
+    // and no pause the levels below this service are not protected.
     budgets: &[],
     ..NETD
 };

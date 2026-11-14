@@ -53,15 +53,27 @@ impl Budgets {
 }
 
 /// Binds `budget`, if there is one, to `thread`, which has not started: the kernel keeps the
-/// budget for the life of the thread, so the handle may go. The result is told in a line, since
-/// a thread that is not bound runs without a limit and nothing else shows it.
-pub fn bind(what: &str, budget: Option<&Handle<Budget>>, thread: &Handle<Thread>) {
+/// budget for the life of the thread, so the handle may go. The result is told in a line. A
+/// budget the kernel refuses (its CPU is not the thread's) is an error: the thread would run
+/// without a limit, and with no pause of its own in the service nothing else would protect the
+/// levels below it, so the caller does not start the thread and the service does not start.
+pub fn bind(
+    what: &str,
+    budget: Option<&Handle<Budget>>,
+    thread: &Handle<Thread>,
+) -> Result<(), ()> {
     let Some(budget) = budget else {
         rt::println!("net: {what} has no budget");
-        return;
+        return Ok(());
     };
     match sys::thread_bind_budget(thread, budget) {
-        Ok(()) => rt::println!("net: {what} runs under its budget"),
-        Err(e) => rt::println!("net: the budget of {what} is refused: {e:?}"),
+        Ok(()) => {
+            rt::println!("net: {what} runs under its budget");
+            Ok(())
+        }
+        Err(e) => {
+            rt::println!("net: the budget of {what} is refused: {e:?}");
+            Err(())
+        }
     }
 }

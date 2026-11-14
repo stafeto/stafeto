@@ -2273,7 +2273,7 @@ pub fn start(
         )
     }
     .map_err(|_| NotStarted)?;
-    crate::budgets::bind("the switch", budget, &thread);
+    crate::budgets::bind("the switch", budget, &thread).map_err(|()| NotStarted)?;
     sys::thread_start(&thread).map_err(|_| NotStarted)?;
     Ok(thread)
 }

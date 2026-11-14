@@ -419,7 +419,8 @@ pub const SWITCH_STEP_BOUND_NS: u64 = 770_000;
 /// The kernel's time budget of the thread (init's table, `NETD_BUDGETS`; `budgets.rs`): the
 /// thread runs at its own level for 400 us of each millisecond and at level 1 for the rest, so
 /// whatever the wire and the consumers send, the levels below the service keep what the budgets
-/// of the service and the trusted work leave of CPU 0 (35 %), and init's watchdog finds the
+/// of the service, the other services (1 ms of 10) and the trusted work leave of CPU 0 (at
+/// least 25 % in a window of 10 ms), and init's watchdog finds the
 /// stack and the entropy service alive (stafeto-design#653, #655). The service has no pause or
 /// clock of its own for this.
 ///
