@@ -247,17 +247,23 @@ def workspace() -> None:
     efi_loader(data, packages, named)
 
 
+def is_outside(package: dict) -> bool:
+    """A crate from outside the workspace: one of crates.io, or the patched copy
+    of one in third-party/ (a path crate that the workspace excludes)."""
+    return package["source"] is not None or "third-party" in Path(package["manifest_path"]).parts
+
+
 def drivers(data: dict, packages: dict, named: dict) -> None:
     """The kernel links no crate from outside the workspace; the Virtio
     console's driver links virtio-drivers (MIT) and crates under licences
     the GPL takes."""
     for package_id in closure(data, [named["kernel"]["id"]]):
-        if packages[package_id]["source"] is not None:
+        if is_outside(packages[package_id]):
             fail(f"the kernel links {packages[package_id]['name']}")
     outside = []
     for package_id in closure(data, [named["virtio-console"]["id"]]):
         package = packages[package_id]
-        if package["source"] is None:
+        if not is_outside(package):
             continue
         if package["license"] not in PERMISSIVE:
             fail(f"virtio-console links {package['name']} under {package['license']}")
@@ -271,7 +277,7 @@ def drivers(data: dict, packages: dict, named: dict) -> None:
     network = []
     for package_id in closure(data, [named["netd"]["id"]]):
         package = packages[package_id]
-        if package["source"] is None:
+        if not is_outside(package):
             continue
         if not allowed(package["license"] or ""):
             fail(f"netd links {package['name']} under {package['license']}")
@@ -291,7 +297,7 @@ def crypto(data: dict, packages: dict, named: dict) -> None:
     outside = []
     for package_id in closure(data, [pkgfmt["id"]]):
         package = packages[package_id]
-        if package["source"] is None:
+        if not is_outside(package):
             continue
         if package["license"] not in PERMISSIVE:
             fail(f"pkgfmt links {package['name']} under {package['license']}")
@@ -312,7 +318,7 @@ def efi_loader(data: dict, packages: dict, named: dict) -> None:
         outside = []
         for package_id in closure(data, [named[name]["id"]]):
             package = packages[package_id]
-            if package["source"] is None:
+            if not is_outside(package):
                 continue
             if not (allowed(package["license"] or "") or package["license"] in PERMISSIVE
                     or (name == "efi-loader" and package["license"] in WEAK_COPYLEFT)):
