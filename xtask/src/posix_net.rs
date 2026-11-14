@@ -275,6 +275,7 @@ fn probe_only(
         let lease = run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         let address = net_curl::lease_address(&lease).ok_or(format!("the lease line {lease:?}"))?;
         run.expect("# ", DIALOG_STEP)?;
+        net_probe::require_budget_lines(run.lines())?;
         checks(
             &mut run,
             &address,

@@ -66,10 +66,10 @@ use netd::gates::{Run, Told};
 use netd::lanes as lane_rules;
 use netd::profile::{self, Counter};
 use netd::ring::{
-    CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, RunClock,
+    CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS,
     STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE,
-    SWITCH_BELL, SWITCH_CTX, SWITCH_PAUSE_NS, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX,
-    Stepper, TSO_WEIGHT, TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
+    SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TSO_WEIGHT,
+    TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -79,7 +79,7 @@ use netd::switchlogic::sums;
 use netd::switchlogic::tables::{MAX_CONSUMERS, MAX_INSTANCES, Tables};
 use netd::switchlogic::tso::Send as TsoSend;
 use proto_net::switch::{CELL, TSO_HEAD_MAX, WAKE_RING};
-use rt::handle::{Channel, Interrupt, Process, Thread, Timer};
+use rt::handle::{Budget, Channel, Interrupt, Process, Thread, Timer};
 use rt::{Handle, Stack, sys};
 use virtio_drivers::transport::SomeTransport;
 use virtio_mmio::Isr;
@@ -180,12 +180,6 @@ pub struct Stats {
     pub looped: AtomicU32,
     /// Memberships ended by LEAVE.
     pub left: AtomicU32,
-    /// Pauses the thread took to leave the lower levels the processor (`SWITCH_RUN_NS`), and
-    /// the pauses that did not happen (the timer or the wait refused).
-    pub pauses: AtomicU32,
-    pub pause_failed: AtomicU32,
-    /// The longest run without a rest, in microseconds.
-    pub run_max_us: AtomicU32,
     /// Steps that found a consumer's entries waiting for the next period (the budget spent).
     pub budget_waits: AtomicU32,
     /// Frames of TCP the device completes the sum of, frames of the wire whose sum the device
@@ -232,9 +226,6 @@ impl Stats {
             park_given: AtomicU32::new(0),
             looped: AtomicU32::new(0),
             left: AtomicU32::new(0),
-            pauses: AtomicU32::new(0),
-            pause_failed: AtomicU32::new(0),
-            run_max_us: AtomicU32::new(0),
             budget_waits: AtomicU32::new(0),
             sum_tx: AtomicU32::new(0),
             sum_rx: AtomicU32::new(0),
@@ -643,8 +634,6 @@ pub struct Switch {
     woken: netd::books::Woken,
     /// The `switch_idle` flags are set in the rings.
     idle_set: bool,
-    /// The channel and timer of the pauses.
-    pause: Option<(Handle<Channel>, Handle<Timer>)>,
     /// The consumers' entries taken in this period (`Period`), and whether a consumer spent its
     /// share and waits for the next one.
     period: Period,
@@ -755,7 +744,6 @@ impl Switch {
             inflight: [0; MAX_CONSUMERS + MAX_INSTANCES],
             woken: netd::books::Woken::new(),
             idle_set: false,
-            pause: None,
             period: Period::new(),
             budget_hit: false,
             #[cfg(feature = "steps")]
@@ -886,26 +874,6 @@ impl Switch {
             self.link = up;
             rt::println!("virtio-net: link {}", if up { "up" } else { "down" });
         }
-    }
-
-    /// Gives the levels below the processor for `SWITCH_PAUSE_NS`: the thread waits on a timer of
-    /// its own (a wait on its main channel returns at once while a notification is pending). True
-    /// when the wait happened; a refusal of the timer or of the wait is counted apart.
-    fn pause(&mut self) -> bool {
-        let waited = match &self.pause {
-            Some((channel, timer)) => {
-                sys::timer_set(timer, now_ns() + SWITCH_PAUSE_NS).is_ok()
-                    && sys::receive(channel).is_ok()
-            }
-            None => false,
-        };
-        if waited {
-            INNER.stats.pauses.fetch_add(1, Ordering::Relaxed);
-            profile::count(Counter::Pause);
-        } else {
-            INNER.stats.pause_failed.fetch_add(1, Ordering::Relaxed);
-        }
-        waited
     }
 
     /// One step: the buffers and frames the stack passed go to the queues,
@@ -2232,9 +2200,6 @@ impl Switch {
 
 /// The switch's place in `.bss`, and its stack and message buffer.
 impl Stepper for Switch {
-    fn now(&mut self) -> u64 {
-        now_ns()
-    }
     fn step(&mut self, interrupt: bool) -> bool {
         #[cfg(feature = "steps")]
         let began = self.ran();
@@ -2250,14 +2215,6 @@ impl Stepper for Switch {
             }
         }
         more
-    }
-    fn pause(&mut self) -> bool {
-        Switch::pause(self)
-    }
-    fn longest(&mut self, ran: u64) {
-        let us = (ran / 1_000).min(u64::from(u32::MAX)) as u32;
-        INNER.stats.run_max_us.fetch_max(us, Ordering::Relaxed);
-        profile::max(Counter::RunMax, u64::from(us));
     }
 }
 
@@ -2290,17 +2247,14 @@ pub struct NotStarted;
 /// line and the stack's notifications. `wake` is the switch's channel copy
 /// with NOTIFY, which the instances wake it with, for the life of the
 /// service (the lanes know the channels of the instances, `Lane::set_stack_channel`).
+/// The thread works under `budget` from its first instruction (`budgets`).
 pub fn start(
-    mut switch: Switch,
+    switch: Switch,
     process: &Handle<Process>,
     priority: u8,
     wake: &Handle<Channel>,
+    budget: Option<&Handle<Budget>>,
 ) -> Result<Handle<Thread>, NotStarted> {
-    // The channel and timer of the pauses: a wait channel, so that the pause lends no priority.
-    let pause = sys::channel_create_wait(priority)
-        .and_then(|channel| sys::timer_create(&channel, priority).map(|timer| (channel, timer)))
-        .map_err(|_| NotStarted)?;
-    switch.pause = Some(pause);
     INNER.switch_channel.store(wake.raw().0, Ordering::Release);
     // SAFETY: the slot is empty and the thread that reads it does not exist
     // yet.
@@ -2319,6 +2273,7 @@ pub fn start(
         )
     }
     .map_err(|_| NotStarted)?;
+    crate::budgets::bind("the switch", budget, &thread).map_err(|()| NotStarted)?;
     sys::thread_start(&thread).map_err(|_| NotStarted)?;
     Ok(thread)
 }
@@ -2338,9 +2293,7 @@ extern "C" fn run(_: u64) -> ! {
     }
     // The line opens once the queues are up.
     virtio_mmio::reopen(&switch.irq);
-    let (mut clock, mut longest) = (RunClock::new(), 0);
     loop {
-        let waiting = now_ns();
         let interrupt = match sys::receive(&switch.channel) {
             Ok(sys::Received::Notification { source, label, .. }) => {
                 // Seen before the rings are looked at: a word pushed after
@@ -2364,9 +2317,7 @@ extern "C" fn run(_: u64) -> ! {
             profile::count(Counter::Irq);
         }
         trace::point(P_N_WAKE, 1 + u32::from(!interrupt));
-        let woke = now_ns();
-        clock.woke(woke, woke.wrapping_sub(waiting));
-        drive(switch, &mut clock, &mut longest, interrupt);
+        drive(switch, interrupt);
         // The probe's line, for the check that a doorbell serves many frames
         // of a burst (xtask `net_probe::bells_serve_frames`): every 500 frames.
         #[cfg(feature = "probe")]

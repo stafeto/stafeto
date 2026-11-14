@@ -122,6 +122,7 @@ pub const CONSOLE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
+    budgets: &[],
 };
 
 /// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of

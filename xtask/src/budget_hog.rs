@@ -245,7 +245,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// `cargo xtask budget-breaks`: the probe fails on each kernel with a
 /// break, the kernel tests fail the test of the level of a process on the
 /// kernel that ignores it, and the host tests of kcore fail on each break
-/// of the rules.
+/// of the rules, the share probe of the network service fails on a service with no budget
+/// bound (`break-budget-unbound`), and those of init fail the check of the shares of a CPU that lets a table
+/// pass whatever its budgets take (`break-budget-share`).
 pub fn breaks() -> Result<(), String> {
     for (variant, what) in [
         (Variant::BudgetOff, "a bind that binds nothing"),
@@ -322,6 +324,28 @@ pub fn breaks() -> Result<(), String> {
         }
         println!("budget-breaks: {feature} fails the host tests");
     }
+    // The network service with its threads unbound: the loop below the switch must lose the CPU.
+    match crate::fast_switch::probe(crate::fast_switch::Scenario::ShareUnbound) {
+        Err(e) => println!("budget-breaks: a network service that binds no budget is caught ({e})"),
+        Ok(()) => return Err("the break (budget-unbound) passed the share probe".into()),
+    }
+    // init's table check: budgets that take all of a CPU must be refused.
+    let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(crate::root())
+        .args([
+            "test",
+            "-p",
+            "init",
+            "--lib",
+            "--features",
+            "break-budget-share",
+        ])
+        .output()
+        .map_err(|e| format!("cargo test: {e}"))?;
+    if out.status.success() {
+        return Err("the host tests of init passed with break-budget-share".into());
+    }
+    println!("budget-breaks: break-budget-share fails the host tests of init");
     Ok(())
 }
 

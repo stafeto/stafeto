@@ -31,6 +31,8 @@ ena-break-exit = []
 # Deliberate break of the host tests (`cargo xtask ena-breaks`): an acknowledgement that
 # said WOULD_BLOCK counts as done.
 break-would-block = []
+# Deliberate break (`cargo xtask budget-breaks`): the service takes no budget from its start data, so its threads run unbound at their own levels.
+break-budget-unbound = []
 break-msix-offset = []
 probe = []
 batch-16 = []

@@ -1642,6 +1642,7 @@ pub const IMAGES: &[&str] = &[
     "boot-fast-scale.img",
     "boot-fast-switch.img",
     "boot-fast-switch-steps.img",
+    "boot-fast-switch-unbound.img",
     "boot-fast-switch-vz.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
@@ -1866,9 +1867,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-fast-scale.img" => crate::fast_scale::files(switch_files(name)),
-        "boot-fast-switch.img" | "boot-fast-switch-steps.img" | "boot-fast-switch-vz.img" => {
-            switch_files(name)
-        }
+        "boot-fast-switch.img"
+        | "boot-fast-switch-steps.img"
+        | "boot-fast-switch-unbound.img"
+        | "boot-fast-switch-vz.img" => switch_files(name),
         "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
@@ -2814,6 +2816,9 @@ mod tests {
                 }
                 "boot-fast-switch-steps.img" => {
                     crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchSteps)
+                }
+                "boot-fast-switch-unbound.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::SwitchUnbound)
                 }
                 "boot-net-bench-switch.img" | "boot-net-bench-trace-switch.img" => {
                     crate::linux_guest::bench_switch_programs()

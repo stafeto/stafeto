@@ -384,7 +384,7 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;
-    match start_data(record, &mut spawned) {
+    match start_data(record, cpus, &mut spawned) {
         Ok(kept) => Ok((spawned, kept)),
         Err(e) => {
             let _ = sys::process_kill(&spawned.process);
@@ -400,11 +400,13 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
 /// service, the clock service and the package service (BOOT_IMAGE); the
 /// page of the boot seed for the entropy service (SEED); and
 /// the arguments (`set_args`) with the physical address of each DMA
-/// object, 8 bytes little-endian, before the record's. Returns init's own
+/// object, 8 bytes little-endian, before the record's; and the time budgets
+/// of the record (`budgets`). Returns init's own
 /// handles to the DMA objects.
-fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
+fn start_data(record: &Record, cpus: u8, spawned: &mut Spawned) -> Result<Kept, Error> {
     let resource = view::<Resource>(RESOURCE);
     resources(record, &mut spawned.giver, &resource)?;
+    budgets(record, cpus, &mut spawned.giver, &resource)?;
     if record.name == PROCESS_SERVICE
         || record.name == RAM_SERVICE
         || record.name == CLOCK_SERVICE
@@ -439,6 +441,29 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     }
     set_args(record, &mut spawned.giver, &own[..8 * record.dma.len()])?;
     Ok(kept)
+}
+
+/// The time budgets of `record` for an instance on the CPUs `cpus`, made with
+/// `resource` (the right BUDGET is init's alone) and given under their names:
+/// the budgets whose CPU is not in the mask of the instance are left out, since
+/// the instance has no thread there for them. The instance binds each to a
+/// thread of its own; a budget it never binds does nothing, and ends with it.
+fn budgets(
+    record: &Record,
+    cpus: u8,
+    giver: &mut Giver,
+    resource: &Handle<Resource>,
+) -> Result<(), Error> {
+    for b in record.budgets.iter().filter(|b| cpus >> b.cpu & 1 != 0) {
+        let budget = sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?;
+        // The checks of the table keep the names apart from the others of the
+        // start data, and START_DATA_MAX keeps all of them within the giver's.
+        // A budget the service cannot take is an error: the record would start unbudgeted.
+        giver
+            .give(b.name, budget.erase())
+            .map_err(|_| Error::InvalidArgs)?;
+    }
+    Ok(())
 }
 
 /// Copies of `resource`, the system resource, in `giver` for `record`:

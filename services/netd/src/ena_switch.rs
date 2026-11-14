@@ -33,8 +33,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 use netd::enawire::{Ack, Rings, Vector, Wire};
 use netd::profile::{self, Counter};
-use netd::ring::{RunClock, SWITCH_PAUSE_NS, Stepper, drive};
-use rt::handle::{Channel, Interrupt, Process, Thread, Timer};
+use netd::ring::{Stepper, drive};
+use rt::handle::{Budget, Channel, Interrupt, Process, Thread, Timer};
 use rt::{Handle, Stack, sys};
 
 /// The labels of the timer of the thread.
@@ -68,7 +68,6 @@ pub struct EnaSwitch {
     msi: bool,
     wake: Wake,
     rx_seen: u64,
-    pause: Option<(Handle<Channel>, Handle<Timer>)>,
     said: [bool; 2],
 }
 
@@ -97,7 +96,6 @@ impl EnaSwitch {
             msi,
             wake: Wake::Other,
             rx_seen: 0,
-            pause: None,
             said: [false; 2],
         })
     }
@@ -209,20 +207,6 @@ impl EnaSwitch {
         false
     }
 
-    fn pause(&mut self) -> bool {
-        let waited = match &self.pause {
-            Some((channel, timer)) => {
-                sys::timer_set(timer, now_ns() + SWITCH_PAUSE_NS).is_ok()
-                    && sys::receive(channel).is_ok()
-            }
-            None => false,
-        };
-        if waited {
-            profile::count(Counter::Pause);
-        }
-        waited
-    }
-
     /// An interrupt of the vector whose binding carries `label`.
     fn interrupted(&mut self, label: u64) {
         let v = usize::from(label == proto_init::binding_label(1));
@@ -240,18 +224,8 @@ impl EnaSwitch {
 }
 
 impl Stepper for EnaSwitch {
-    fn now(&mut self) -> u64 {
-        now_ns()
-    }
     fn step(&mut self, interrupt: bool) -> bool {
         EnaSwitch::step(self, interrupt)
-    }
-    fn pause(&mut self) -> bool {
-        EnaSwitch::pause(self)
-    }
-    fn longest(&mut self, ran: u64) {
-        let us = (ran / 1_000).min(u64::from(u32::MAX)) as u32;
-        profile::max(Counter::RunMax, u64::from(us));
     }
 }
 
@@ -272,17 +246,15 @@ pub struct NotStarted;
 
 /// Starts the thread at `priority` over `switch`, which waits on its channel for the
 /// interrupts, the notifications of the stack and the admin side's; `wake` is the copy
-/// of the channel with NOTIFY the instances and the admin side wake it with.
+/// of the channel with NOTIFY the instances and the admin side wake it with. The thread works
+/// under `budget` from its first instruction (`budgets`).
 pub fn start(
-    mut switch: EnaSwitch,
+    switch: EnaSwitch,
     process: &Handle<Process>,
     priority: u8,
     wake: &Handle<Channel>,
+    budget: Option<&Handle<Budget>>,
 ) -> Result<Handle<Thread>, NotStarted> {
-    let pause = sys::channel_create_wait(priority)
-        .and_then(|channel| sys::timer_create(&channel, priority).map(|timer| (channel, timer)))
-        .map_err(|_| NotStarted)?;
-    switch.pause = Some(pause);
     INNER.set_switch_channel(wake.raw().0);
     svc::SWITCH_RAW.store(wake.raw().0, Ordering::Release);
     // SAFETY: the slot is empty and the thread that reads it does not exist yet.
@@ -301,6 +273,7 @@ pub fn start(
         )
     }
     .map_err(|_| NotStarted)?;
+    crate::budgets::bind("the switch", budget, &thread).map_err(|()| NotStarted)?;
     sys::thread_start(&thread).map_err(|_| NotStarted)?;
     Ok(thread)
 }
@@ -308,11 +281,9 @@ pub fn start(
 extern "C" fn run(_: u64) -> ! {
     // SAFETY: `start` wrote the slot before this thread was made, and this is its only user.
     let switch = unsafe { (*SLOT.0.get()).assume_init_mut() };
-    let (mut clock, mut longest) = (RunClock::new(), 0);
     // A first step: the pair may be up already.
-    drive(switch, &mut clock, &mut longest, false);
+    drive(switch, false);
     loop {
-        let waiting = now_ns();
         let interrupt = match sys::receive(&switch.channel) {
             Ok(sys::Received::Notification { source, label, .. }) => {
                 INNER.switch_told.seen();
@@ -332,8 +303,6 @@ extern "C" fn run(_: u64) -> ! {
             }
         };
         trace::point(P_N_WAKE, 1 + u32::from(!interrupt));
-        let woke = now_ns();
-        clock.woke(woke, woke.wrapping_sub(waiting));
-        drive(switch, &mut clock, &mut longest, interrupt);
+        drive(switch, interrupt);
     }
 }

@@ -37,6 +37,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
         waits: &[],
+        budgets: &[],
     }
 }
 

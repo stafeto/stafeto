@@ -241,6 +241,7 @@ pub const CONSOLE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
+    budgets: &[],
 };
 
 const fn same(a: &str, b: &str) -> bool {

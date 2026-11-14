@@ -364,6 +364,35 @@ pub struct Gate {
     pub bits: u32,
 }
 
+/// The shares a time budget may take of a CPU together, in parts per million:
+/// the sum of C/T of the budgets of the table on a CPU is at most this
+/// (spec 8). The rest is for the levels below the budgets and for the trusted
+/// work that has none (the kernel, the interrupts, the drivers, init), which
+/// the layout takes at 5 %.
+pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
+
+/// A time budget of one thread of a record (spec 8, `budget_create`):
+/// init makes it on `cpu` with the system resource's right `BUDGET`, and
+/// gives it to each instance of the record in its start data under `name`;
+/// the service binds it to its own thread (`rt::sys::thread_bind_budget`).
+/// The thread may run `c_ns` of each `t_ns` at its own level, and works at
+/// level `low` once that is spent, until the next replenishment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub name: &'static str,
+    pub cpu: u8,
+    pub c_ns: u64,
+    pub t_ns: u64,
+    pub low: u8,
+}
+
+impl Budget {
+    /// The share of its CPU the budget takes, in parts per million, rounded up.
+    pub const fn share_ppm(&self) -> u64 {
+        (self.c_ns * 1_000_000).div_ceil(self.t_ns)
+    }
+}
+
 /// The thread numbers and the timer places a record has of its own (spec
 /// 7.5, process_create x6 and x7), taken off init's: a record with none
 /// pays from init's own, which every record of the table shares. A share of
@@ -489,6 +518,9 @@ pub struct Record {
     /// (spec 5, section 4; `waits.rs`): at most two, each a service of the
     /// table with no waits of its own.
     pub waits: &'static [Wait],
+    /// The time budgets of its threads (`Budget`): init makes them on the
+    /// CPUs of the record that are up, for each instance.
+    pub budgets: &'static [Budget],
 }
 
 /// A service a record waits for: its name, and how long the record waits at
@@ -550,6 +582,7 @@ impl Record {
         shares: Shares::CREATOR,
         cpus: 1,
         waits: &[],
+        budgets: &[],
     };
 
     /// The watchdog of a service; None for a client.
@@ -717,6 +750,20 @@ pub enum TableError<'a> {
         record: &'static str,
         service: &'static str,
     },
+    /// A budget with a name that is no name or comes twice (or is the name of
+    /// another object of the record), a C under `abi::MIN_BUDGET_NS` or above
+    /// T, a T under `abi::MIN_PERIOD_NS`, a `low` outside 1 to the record's
+    /// priority, or a CPU past the eight.
+    Budget {
+        record: &'static str,
+        name: &'static str,
+    },
+    /// The budgets of the table take more than BUDGET_SHARE_MAX_PPM of a CPU
+    /// together.
+    BudgetShare {
+        cpu: u8,
+        ppm: u64,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -832,6 +879,16 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} waits for {service}: a wait names another record that is a service with no waits of its own, a deadline of 1 to {WAIT_MAX_MS} ms, and a record has {WAITS_MAX} waits at most, each service once"
             ),
+            TableError::Budget { record, name } => write!(
+                f,
+                "{record} has the budget {name:?} off the rules: a name of 1 to 16 bytes that is its own, a C of at least {} ns and at most T, a T of at least {} ns, `low` from 1 to the record's priority, a CPU of 0 to 7",
+                abi::MIN_BUDGET_NS,
+                abi::MIN_PERIOD_NS
+            ),
+            TableError::BudgetShare { cpu, ppm } => write!(
+                f,
+                "the budgets on CPU {cpu} take {ppm} parts per million of it, at most {BUDGET_SHARE_MAX_PPM}"
+            ),
         }
     }
 }
@@ -907,6 +964,7 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     check_cpus(table)?;
     check_layers(table)?;
     check_waits(table)?;
+    check_budgets(table)?;
     Ok(order(table))
 }
 
@@ -939,6 +997,47 @@ fn check_layers(table: &[Record]) -> Result<(), TableError<'static>> {
             return Err(TableError::Layers { record: r.name });
         }
         seen = true;
+    }
+    Ok(())
+}
+
+/// The time budgets of `table` (spec 8): each within the rules of the call
+/// that makes it, its name its own among the record's objects, and the shares
+/// of the budgets on a CPU at most BUDGET_SHARE_MAX_PPM of it together, so
+/// that the levels below the budgets keep the rest.
+fn check_budgets(table: &[Record]) -> Result<(), TableError<'static>> {
+    let mut ppm = [0u64; 8];
+    for r in table {
+        for (i, b) in r.budgets.iter().enumerate() {
+            let own = Name::new(b.name.as_bytes()).is_ok()
+                && !START_DATA_NAMES.contains(&b.name)
+                && !r.budgets[..i].iter().any(|o| o.name == b.name)
+                && !r.windows.iter().any(|w| w.name == b.name)
+                && !r.bindings.iter().any(|o| o.name == b.name)
+                && !r.dma.iter().any(|d| d.name == b.name);
+            let fine = own
+                && b.c_ns >= abi::MIN_BUDGET_NS
+                && b.c_ns <= b.t_ns
+                && b.t_ns >= abi::MIN_PERIOD_NS
+                && (1..=r.priority).contains(&b.low)
+                && usize::from(b.cpu) < ppm.len();
+            if !fine {
+                return Err(TableError::Budget {
+                    record: r.name,
+                    name: b.name,
+                });
+            }
+            ppm[usize::from(b.cpu)] += b.share_ppm();
+        }
+    }
+    for (cpu, &sum) in ppm.iter().enumerate() {
+        // The break: a table whose budgets take all of a CPU passes.
+        if cfg!(not(feature = "break-budget-share")) && sum > BUDGET_SHARE_MAX_PPM {
+            return Err(TableError::BudgetShare {
+                cpu: cpu as u8,
+                ppm: sum,
+            });
+        }
     }
     Ok(())
 }
@@ -986,14 +1085,19 @@ fn check_cpus(table: &[Record]) -> Result<(), TableError<'static>> {
 /// The names init gives an instance of `r` in its start data besides
 /// `process` and `thread` (worker.rs, `start_data`; serve.rs,
 /// `posix_instance`): the resources of `console`, `log` and `trace`, the
-/// boot image of the services that read it, the DMA objects, and for a
-/// POSIX process its sessions with the process service (the identity
+/// boot image of the services that read it, the DMA objects, the time
+/// budgets, and for a POSIX process its sessions with the process service (the identity
 /// session counted whether or not the instance gets one).
 pub fn start_data_names(r: &Record) -> usize {
     let resources = usize::from(r.console) + usize::from(r.log) + usize::from(r.trace);
     let image = [PROCESS_SERVICE, RAM_SERVICE, CLOCK_SERVICE].contains(&r.name);
     let posix = if r.is_posix() { 2 } else { 0 };
-    resources + usize::from(image) + usize::from(r.name == ENTROPY_SERVICE) + r.dma.len() + posix
+    resources
+        + usize::from(image)
+        + usize::from(r.name == ENTROPY_SERVICE)
+        + r.dma.len()
+        + r.budgets.len()
+        + posix
 }
 
 /// The label init binds line `i` of `r` through (serve.rs, `objects`):
@@ -1730,6 +1834,7 @@ mod tests {
             shares: Shares::CREATOR,
             cpus: GENERAL_CPUS,
             waits: &[],
+            budgets: &[],
         }
     }
 
@@ -2577,7 +2682,8 @@ mod tests {
             }
             assert!(record.dma[2..].iter().all(|d| d.duplicate));
             assert!(!record.dma[..2].iter().any(|d| d.duplicate));
-            // `console` and the seven objects: all the names start data has.
+            // `console` and the seven objects: all the names start data has, so the
+            // two-device records have no budgets (`net::NETD_VZ2`).
             assert_eq!(start_data_names(&record), START_DATA_MAX);
             // The window of the second device can be copied; the first's
             // window on QEMU cannot.
@@ -2715,9 +2821,25 @@ mod tests {
             uncached: false,
             duplicate: false,
         }; 8];
+        static BUDGETS: [Budget; 4] = {
+            let names = ["b0", "b1", "b2", "b3"];
+            let mut budgets = [Budget {
+                name: "",
+                cpu: 0,
+                c_ns: 100_000,
+                t_ns: 1_000_000,
+                low: 1,
+            }; 4];
+            let mut i = 0;
+            while i < 4 {
+                budgets[i].name = names[i];
+                i += 1;
+            }
+            budgets
+        };
         let objects = &OBJECTS;
         let names = ["o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7"];
-        let with = |count: usize, log: bool| {
+        let with = |count: usize, log: bool, budgets: usize| {
             let dma: Vec<Dma> = (0..count)
                 .map(|i| Dma {
                     name: names[i],
@@ -2726,6 +2848,7 @@ mod tests {
                 .collect();
             check_one(Record {
                 dma: Box::leak(dma.into_boxed_slice()),
+                budgets: &BUDGETS[..budgets],
                 console: true,
                 log,
                 trusted: true,
@@ -2739,22 +2862,32 @@ mod tests {
             ..service("driver", 40, 40)
         };
         assert_eq!(start_data_names(&record(7, false)), 8, "console and 7");
-        assert!(with(7, false).is_ok());
+        // The room is START_DATA_MAX (8): `console`, the DMA objects and the
+        // budgets share it.
+        assert!(with(7, false, 0).is_ok());
+        assert!(with(6, false, 1).is_ok());
+        assert!(with(5, true, 1).is_ok());
         assert_eq!(
-            with(7, true),
+            with(7, true, 0),
             Err(TableError::StartNames {
                 record: "driver",
                 count: 9
             })
         );
         assert_eq!(
-            with(8, false),
+            with(6, false, 2),
             Err(TableError::StartNames {
                 record: "driver",
                 count: 9
             })
         );
-        assert!(with(6, true).is_ok());
+        assert_eq!(
+            with(5, true, 3),
+            Err(TableError::StartNames {
+                record: "driver",
+                count: 10
+            })
+        );
     }
 
     #[test]
@@ -3856,6 +3989,158 @@ mod tests {
             for &(service, _) in ROOT_SERVICES {
                 let holders = table.iter().filter(|r| r.name == service).count();
                 assert!(holders <= 1, "{service}: {holders} records");
+            }
+        }
+    }
+
+    /// A record `name` with the budgets `budgets`, a service at level 40.
+    fn budgeted(name: &'static str, budgets: &'static [Budget]) -> Record {
+        Record {
+            budgets,
+            ..service(name, 40, 40)
+        }
+    }
+
+    const fn budget(name: &'static str, cpu: u8, c_ns: u64, t_ns: u64) -> Budget {
+        Budget {
+            name,
+            cpu,
+            c_ns,
+            t_ns,
+            low: 1,
+        }
+    }
+
+    #[test]
+    fn the_budgets_of_a_cpu_take_three_quarters_of_it_at_most() {
+        static HALF: [Budget; 1] = [budget("half", 0, 500_000, 1_000_000)];
+        static QUARTER: [Budget; 1] = [budget("quarter", 0, 1_250_000, 5_000_000)];
+        static MORE: [Budget; 1] = [budget("more", 0, 10_000, 1_000_000)];
+        static ON_ONE: [Budget; 1] = [budget("one", 1, 700_000, 1_000_000)];
+        let table = |a: Record, b: Record| -> Vec<Record> { vec![a, b] };
+        // 50 % and 25 % on CPU 0 are the 75 % the table allows.
+        let both = table(budgeted("a", &HALF), budgeted("b", &QUARTER));
+        assert!(check(&both).is_ok(), "{:?}", check(&both));
+        // A little more is refused, and the error says which CPU and how much.
+        let over = vec![
+            budgeted("a", &HALF),
+            budgeted("b", &QUARTER),
+            budgeted("c", &MORE),
+        ];
+        assert_eq!(
+            check(&over),
+            Err(TableError::BudgetShare {
+                cpu: 0,
+                ppm: 760_000
+            })
+        );
+        assert!(refused(&over).contains("CPU 0"), "{}", refused(&over));
+        // The sums are those of each CPU: 70 % more on CPU 1 does not count on CPU 0.
+        let apart = vec![budgeted("a", &HALF), budgeted("b", &ON_ONE)];
+        assert!(check(&apart).is_ok());
+        // Rounding goes up: a share a part per million over the limit is refused.
+        static EDGE: [Budget; 2] = [
+            budget("edge", 0, 750_001, 1_000_000),
+            budget("zero", 2, 10_000, 1_000_000),
+        ];
+        assert_eq!(
+            check(&[budgeted("a", &EDGE)]),
+            Err(TableError::BudgetShare {
+                cpu: 0,
+                ppm: 750_001
+            })
+        );
+    }
+
+    #[test]
+    fn a_budget_off_the_rules_of_the_call_is_refused() {
+        static BAD: [[Budget; 1]; 6] = [
+            [budget("short", 0, 9_999, 1_000_000)],
+            [budget("long", 0, 1_000_001, 1_000_000)],
+            [budget("fast", 0, 10_000, 99_999)],
+            [budget("a-name-over-sixteen-bytes", 0, 100_000, 1_000_000)],
+            [budget("console", 0, 100_000, 1_000_000)],
+            [budget("cpu", 8, 100_000, 1_000_000)],
+        ];
+        for bad in &BAD {
+            assert_eq!(
+                check_one(budgeted("svc", bad)),
+                Err(TableError::Budget {
+                    record: "svc",
+                    name: bad[0].name
+                })
+            );
+        }
+        static LOW: [Budget; 1] = [Budget {
+            low: 0,
+            ..budget("low", 0, 100_000, 1_000_000)
+        }];
+        static HIGH: [Budget; 1] = [Budget {
+            low: 41,
+            ..budget("high", 0, 100_000, 1_000_000)
+        }];
+        static TWICE: [Budget; 2] = [
+            budget("twice", 0, 100_000, 1_000_000),
+            budget("twice", 1, 100_000, 1_000_000),
+        ];
+        for bad in [&LOW[..], &HIGH[..], &TWICE[..]] {
+            assert!(matches!(
+                check_one(budgeted("svc", bad)),
+                Err(TableError::Budget { .. })
+            ));
+        }
+        // The rules' edges pass: the least C and T, C equal to T, `low` the record's level.
+        static EDGES: [Budget; 3] = [
+            budget("least", 0, 10_000, 100_000),
+            Budget {
+                low: 40,
+                ..budget("low-top", 1, 100_000, 100_000)
+            },
+            budget("whole", 2, 100_000, 100_000),
+        ];
+        assert!(
+            check_one(budgeted("svc", &EDGES)).is_err(),
+            "100 % on CPU 1"
+        );
+        assert!(check_one(budgeted("svc", &EDGES[..1])).is_ok());
+    }
+
+    #[test]
+    fn the_network_service_has_the_budgets_of_the_layout_in_the_images_of_one_device() {
+        let names: Vec<_> = net::NETD_BUDGETS.iter().map(|b| b.name).collect();
+        assert_eq!(names, ["switch", "stack0", "stack1"]);
+        let share = |cpu: u8| {
+            net::NETD_BUDGETS
+                .iter()
+                .filter(|b| b.cpu == cpu)
+                .map(Budget::share_ppm)
+                .sum::<u64>()
+        };
+        // The switch 40 % and the stack 20 % of CPU 0, within the 75 % of the
+        // table, and the stack 20 % of CPU 1.
+        assert_eq!((share(0), share(1)), (600_000, 200_000));
+        assert!(share(0) <= BUDGET_SHARE_MAX_PPM);
+        // The switch thread is a level above the stack, and both fall to level 1.
+        assert!(net::NETD_BUDGETS.iter().all(|b| b.low == 1));
+        // Every record of one device has them, and the instance on CPU 1 has its
+        // own: the budgets name the CPUs of NETD_CPUS. The records of two devices
+        // have no room for them in their start data and the probes of the claim
+        // of the second device run with none.
+        for record in [net::NETD_VZ2, net::NETD_TWO] {
+            assert!(record.budgets.is_empty());
+        }
+        for record in [
+            net::NETD,
+            net::NETD_VZ,
+            net::NETD_VZ_TSO,
+            net::NETD_SWITCH,
+            net::NETD_VZ_SWITCH,
+            aws::NET,
+        ] {
+            assert_eq!(record.budgets, net::NETD_BUDGETS);
+            assert!(start_data_names(&record) <= START_DATA_MAX);
+            for b in record.budgets {
+                assert!(record.cpus >> b.cpu & 1 != 0, "{}", b.name);
             }
         }
     }

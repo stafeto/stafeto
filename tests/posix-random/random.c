@@ -1381,11 +1381,14 @@ static int rejoin_run(void) {
     return 0;
 }
 
-/* The role `rejoinraw` (up, go, exit): waits for a byte on `go`, makes one request of the process
+/* The role `rejoinraw` (up, go, exit): tells `r` on `up` once started, waits for a byte on `go`, makes one request of the process
  * service, with a pause of 20 ms for AGAIN up to 3 s, tells the code on `up` (a byte: 'o' a
  * session, 'p' PERMISSION, 'l' the limit, 'x' any other) and waits for a byte on `exit`. */
 static int rejoin_raw_role(const char *up_text, const char *go_text, const char *exit_text) {
-    char byte;
+    char byte = 'r';
+    /* Up: the member has started (with its session of the instance that is up), so the probe may
+     * end the entropy service; one that starts after that has none. */
+    CHECK(write(atoi(up_text), &byte, 1) == 1);
     CHECK(read(atoi(go_text), &byte, 1) == 1);
     int code = 506;
     for (int i = 0; i < 150 && code == 506; i++) {
@@ -1424,8 +1427,12 @@ static int rejoin_limit_run(void) {
         CHECK(close(go[i][0]) == 0 && close(leave[i][0]) == 0);
     }
     CHECK(close(up[1]) == 0);
-    CHECK(random_probe_crash() == 0);
+    /* Each member says it has started before the service ends: a program that starts while the
+     * service is down (a slow runner) has no session and would end, and the probe would write to
+     * its closed pipe. */
     char answer = 0;
+    for (int i = 0; i < 4; i++) CHECK(read(up[0], &answer, 1) == 1 && answer == 'r');
+    CHECK(random_probe_crash() == 0);
     /* The first two take the sessions of the generation. */
     CHECK(raw_ask(up[0], go[0][1], &answer) == 0 && answer == 'o');
     CHECK(raw_ask(up[0], go[1][1], &answer) == 0 && answer == 'o');
