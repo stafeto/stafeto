@@ -2214,6 +2214,12 @@ impl Driver<'_> {
             self.inst.net.demux.probe_max
         );
         rt::println!(
+            "net: yield deferred {} idle {} served {}",
+            self.yielding.deferred,
+            self.yielding.idle,
+            self.yielding.served
+        );
+        rt::println!(
             "net: bells tx {} frames {}",
             switch::INNER.bells_tx(),
             tx.tx
@@ -2471,6 +2477,24 @@ impl Driver<'_> {
         }
     }
 
+    /// The counters of `Yielding`: steps put off, steps told again with no request served, and
+    /// after one.
+    fn yielding_counts(&self) -> [u32; 3] {
+        [
+            self.yielding.deferred,
+            self.yielding.idle,
+            self.yielding.served,
+        ]
+    }
+
+    /// The profile counts what `Yielding` counted since `before`.
+    fn count_yielding(&self, before: [u32; 3]) {
+        let now = self.yielding_counts();
+        profile::add(Counter::YieldDeferred, u64::from(now[0] - before[0]));
+        profile::add(Counter::YieldIdle, u64::from(now[1] - before[1]));
+        profile::add(Counter::YieldServed, u64::from(now[2] - before[2]));
+    }
+
     fn handle_notification(&mut self, mut n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
@@ -2487,7 +2511,9 @@ impl Driver<'_> {
                 // A request that waits in the queue goes ahead of the steps that follow one
                 // another (`netd::gates::Yielding`).
                 let notify = &self.notify;
+                let before = self.yielding_counts();
                 let steps = self.yielding.arrive(n.bits & STEP_BITS, || queued(notify));
+                self.count_yielding(before);
                 if steps == 0 {
                     return;
                 }
@@ -2648,14 +2674,18 @@ impl Service<0> for Driver<'_> {
         self.bell_release();
         self.bell_checked = false;
         let notify = &self.notify;
+        let before = self.yielding_counts();
         let owed = self.yielding.resume(false, || queued(notify));
+        self.count_yielding(before);
         self.tell_owed(owed);
     }
 
     fn between_requests(&mut self) {
         self.bell_release();
         self.bell_checked = false;
+        let before = self.yielding_counts();
         let owed = self.yielding.resume(true, || false);
+        self.count_yielding(before);
         self.tell_owed(owed);
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
         // answer went, so that the lines of the console do not count in the step.

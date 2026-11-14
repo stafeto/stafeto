@@ -132,6 +132,13 @@ pub const RUN_STEPS: u32 = 2;
 pub struct Yielding {
     run: u32,
     owed: u64,
+    /// The steps put off.
+    pub deferred: u32,
+    /// The times the steps owed were told with no request served (the queue held only
+    /// notifications): the cost of such a deferral is two system calls and a receive.
+    pub idle: u32,
+    /// The times the steps owed were told after a request was served.
+    pub served: u32,
 }
 
 impl Default for Yielding {
@@ -142,7 +149,13 @@ impl Default for Yielding {
 
 impl Yielding {
     pub const fn new() -> Yielding {
-        Yielding { run: 0, owed: 0 }
+        Yielding {
+            run: 0,
+            owed: 0,
+            deferred: 0,
+            idle: 0,
+            served: 0,
+        }
     }
 
     /// A notification of steps `bits` came. The steps to run now: `bits` (with those owed, when
@@ -155,9 +168,13 @@ impl Yielding {
         }
         if queued() {
             self.owed |= bits;
+            self.deferred += 1;
             return 0;
         }
         self.run = 0;
+        if self.owed != 0 {
+            self.idle += 1;
+        }
         bits | core::mem::take(&mut self.owed)
     }
 
@@ -173,7 +190,17 @@ impl Yielding {
             return 0;
         }
         self.run = 0;
+        if always {
+            self.served += 1;
+        } else {
+            self.idle += 1;
+        }
         core::mem::take(&mut self.owed)
+    }
+
+    /// The steps put off and not told yet.
+    pub fn owed(&self) -> u64 {
+        self.owed
     }
 }
 
@@ -332,5 +359,98 @@ mod tests {
         // It is empty now: the steps owed are told.
         assert_eq!(y.resume(false, || false), 0b1);
         assert_eq!(y.resume(false, || false), 0);
+    }
+
+    /// The queue of the loop in a model: one slot of label 0 (the stack's own bits and the
+    /// switch's, ORed, ahead of the request as a level above it) and the requests behind it.
+    /// The switch tells the stack every time it can, as under a full wire (the step of receiving
+    /// once until the stack looks, the step of sending at each turn); it can in three turns of
+    /// four, the fourth being the one its budget is spent in (the stack's turn in the period). A
+    /// request that comes in the middle is served within a few receives, the steps put off come
+    /// back after it, and when the wire stops no step is left owed.
+    #[test]
+    fn a_request_is_served_within_the_bound_under_a_full_wire_and_no_step_is_lost() {
+        const RX: u64 = 1;
+        const TX: u64 = 2;
+        let (mut slot, mut told, mut requests) = (0u64, 0u64, 0u32);
+        let (mut rx_left, mut tx_left) = (1_000_000u32, 1_000_000u32);
+        let mut switch_told = false;
+        let mut y = Yielding::new();
+        let (mut asked_at, mut served_at, mut rx_at_served) = (None, None, 0);
+        let mut progress_after = None;
+        for receive in 0..4_000u32 {
+            let flood = receive < 300;
+            if flood && receive % 4 != 3 {
+                // The switch, at a level above the stack, tells before each receive.
+                if !switch_told {
+                    switch_told = true;
+                    slot |= RX;
+                }
+                slot |= TX;
+            }
+            if receive == 300 {
+                (rx_left, tx_left) = (40, 40);
+            }
+            if receive == 50 {
+                requests += 1;
+                asked_at = Some(receive);
+            }
+            if slot != 0 {
+                let bits = core::mem::take(&mut slot);
+                let queued_now = requests > 0;
+                let run = y.arrive(bits, || queued_now);
+                if run != 0 {
+                    let first = run & run.wrapping_neg();
+                    told &= !first;
+                    if run & !first != 0 {
+                        slot |= run & !first;
+                    }
+                    let left = if first == RX {
+                        // The stack looks at its ring: the switch may tell it again.
+                        switch_told = false;
+                        &mut rx_left
+                    } else {
+                        &mut tx_left
+                    };
+                    *left = left.saturating_sub(1);
+                    if *left > 0 && told & first == 0 {
+                        told |= first;
+                        slot |= first;
+                    }
+                    if first == RX
+                        && served_at.is_some()
+                        && progress_after.is_none()
+                        && rx_left < rx_at_served
+                    {
+                        progress_after = Some(receive);
+                    }
+                }
+                let queued_end = slot != 0 || requests > 0;
+                slot |= y.resume(false, || queued_end);
+            } else if requests > 0 {
+                requests -= 1;
+                served_at = Some(receive);
+                rx_at_served = rx_left;
+                slot |= y.resume(true, || false);
+            } else if !flood {
+                break;
+            }
+        }
+        let (asked, served) = (asked_at.unwrap(), served_at.expect("the request is served"));
+        assert!(
+            served - asked <= 8,
+            "served after {} receives",
+            served - asked
+        );
+        // The steps put off come back right after it, while the wire is still full.
+        let progress = progress_after.expect("the steps run again after the request");
+        assert!(
+            progress - served <= 4,
+            "steps came back after {} receives",
+            progress - served
+        );
+        // Nothing is lost when the wire stops.
+        assert_eq!((rx_left, tx_left, y.owed(), told), (0, 0, 0, 0));
+        assert!(y.deferred > 0);
     }
 }
