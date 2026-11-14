@@ -2156,6 +2156,8 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         "boot-posix-random.img"
         | "boot-posix-random-break.img"
+        | "boot-posix-random-restart.img"
+        | "boot-posix-random-restart-break.img"
         | "boot-posix-random-net.img"
         | "boot-posix-random-net2.img" => {
             let mut files = vec![
@@ -2975,6 +2977,7 @@ mod tests {
             "boot-posix-lock-ring.img",
             "boot-posix-shares.img",
             "boot-posix-random.img",
+            "boot-posix-random-restart.img",
             "boot-posix-display.img",
             "boot-pkg-slot.img",
             "boot-display.img",

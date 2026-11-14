@@ -56,6 +56,8 @@
 extern char **environ;
 extern uint64_t random_probe_calls(void);
 extern void random_probe_drop_session(void);
+extern int random_probe_crash(void);
+extern int random_probe_session_open(void);
 extern int stafeto_probe_loader_start(unsigned mode);
 extern unsigned stafeto_probe_loader_stop(void);
 extern unsigned stafeto_probe_loader_listen(void);
@@ -1036,8 +1038,113 @@ static int fd_closed(const char *number) {
     return 0;
 }
 
+/* The role `fresh`: a program that started after the entropy service's instance ended has what
+ * every program has: 16 bytes of AT_RANDOM that are not zero, and bytes of getentropy. */
+static int fresh_role(void) {
+    const unsigned char *at = (const unsigned char *)getauxval(AT_RANDOM);
+    CHECK(at != NULL);
+    unsigned char aux[16], bytes[32];
+    for (int i = 0; i < 16; i++) aux[i] = at[i];
+    CHECK(!all_zero(aux, sizeof aux));
+    CHECK(getentropy(bytes, sizeof bytes) == 0);
+    CHECK(!all_zero(bytes, sizeof bytes));
+    return 0;
+}
+
+/* The role `holder`: started before the service's instance ended, so its session is the old
+ * instance's and it has no way to init. It says it is running (a byte on the descriptor `ready`),
+ * waits for a byte on the descriptor `go`, and then, each with the dead session: forks a child
+ * that takes bytes (the copy of a fork), starts a `fresh` program, starts a set-ID program that
+ * takes bytes of its verified session, and execs a `fresh` program. The loader gives each a
+ * session of the new instance. The status is that of the exec. */
+static int holder_role(const char *go, const char *ready) {
+    char byte = 'r';
+    CHECK(write(atoi(ready), &byte, 1) == 1);
+    CHECK(read(atoi(go), &byte, 1) == 1);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        unsigned char child[32];
+        if (getentropy(child, sizeof child) != 0) _exit(100 + errno);
+        if (all_zero(child, sizeof child)) _exit(4);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    if (status != 0) printf("posix-random: the forked child ended with status 0x%x\n", status);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(spawn_role("fresh", -1) == 0);
+    char *argv[] = {"posix-random", "setid", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random-suid", NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char *exec_argv[] = {"posix-random", "fresh", NULL};
+    execv("/bin/posix-random", exec_argv);
+    return 21;
+}
+
+/* The role `nosession`: a process with no session with the entropy service starts a program.
+ * The parent has none to give, so the child has none either, and its start ends in abort ("no
+ * AT_RANDOM and no entropy"): the loader gives no clone of the root to a slot left empty. */
+static int no_session_role(void) {
+    random_probe_drop_session();
+    pid_t pid = 0;
+    char *argv[] = {"posix-random", "fresh", NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-random", NULL, NULL, argv, environ) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK((WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+          (WIFEXITED(status) && WEXITSTATUS(status) == 134));
+    return 0;
+}
+
+/* Programs keep starting while the entropy service ends with a fault and init starts it again
+ * (the entropy service of this image has CRASH). Every one has AT_RANDOM and getentropy; a
+ * program that outlived the old instance starts one that has them too; and the probe's own
+ * session is open, a session of the new instance. */
+#define RESTART_STARTS 60
+static int restart_run(void) {
+    int go[2], ready[2];
+    CHECK(pipe(go) == 0 && pipe(ready) == 0);
+    char number[16], reply[16];
+    CHECK(snprintf(number, sizeof number, "%d", go[0]) > 0);
+    CHECK(snprintf(reply, sizeof reply, "%d", ready[1]) > 0);
+    char *argv[] = {"posix-random", "holder", number, reply, NULL};
+    pid_t holder = 0;
+    int rc = posix_spawn(&holder, "/bin/posix-random", NULL, NULL, argv, environ);
+    if (rc != 0) printf("posix-random: spawn of the holder gave %d\n", rc);
+    CHECK(rc == 0);
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1);
+    CHECK(random_probe_session_open() == 1);
+    CHECK(random_probe_crash() == 0);
+    for (int i = 0; i < RESTART_STARTS; i++) CHECK(spawn_role("fresh", -1) == 0);
+    printf("posix-random: %d programs started while the entropy service restarted each had "
+           "AT_RANDOM and getentropy\n", RESTART_STARTS);
+    CHECK(random_probe_session_open() == 1);
+    printf("posix-random: the probe's own session is a session of the new instance\n");
+    CHECK(write(go[1], "g", 1) == 1);
+    int status = 0;
+    CHECK(waitpid(holder, &status, 0) == holder);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-random: a program that outlived the old instance forked a child that has "
+           "bytes, started a program and a set-ID program and ran exec, each with "
+           "AT_RANDOM and getentropy\n");
+    CHECK(spawn_role("nosession", -1) == 0);
+    printf("posix-random: a parent with no session gave its child none\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int status;
+    if (argc > 1 && strcmp(argv[1], "fresh") == 0) return fresh_role();
+    if (argc > 1 && strcmp(argv[1], "nosession") == 0) return no_session_role();
+    if (argc > 3 && strcmp(argv[1], "holder") == 0) return holder_role(argv[2], argv[3]);
+    if (argc > 1 && strcmp(argv[1], "restart") == 0) {
+        status = restart_run();
+        if (status == 0) printf("posix-random: restart ok\n");
+        return status;
+    }
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 1 && strcmp(argv[1], "descendant") == 0) return descendant_role();

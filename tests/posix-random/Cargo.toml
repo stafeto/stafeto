@@ -13,7 +13,13 @@ name = "posix-random-probe"
 test = false
 bench = false
 
+[features]
+# Deliberate breakage (cargo xtask random-restart-breaks): a session that
+# died with the entropy service's instance is never replaced through init.
+break-no-reconnect = ["posix-abi/break-no-reconnect"]
+
 [dependencies]
+proto-entropy = { path = "../../proto/entropy" }
 posix-abi = { path = "../../lib/posix-abi" }
 posix-crt = { path = "../../lib/posix-crt" }
 rt = { path = "../../lib/rt", features = ["count-calls"] }

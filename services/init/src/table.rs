@@ -1337,6 +1337,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
+    + cfg!(feature = "table-posix-random-restart") as usize
     + cfg!(feature = "table-posix-random-net") as usize
     + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
@@ -1422,6 +1423,7 @@ const _: () = assert!(
     feature = "table-net-two",
     feature = "table-input",
     feature = "table-posix-random",
+    feature = "table-posix-random-restart",
     feature = "table-posix-random-net",
     feature = "table-posix-random-net2",
     feature = "table-posix-display",
@@ -1570,6 +1572,8 @@ pub const TABLE: &[Record] = pkg::PKG_SLOT_TABLE;
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
+#[cfg(feature = "table-posix-random-restart")]
+pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_RESTART_TABLE;
 #[cfg(feature = "table-posix-random-net")]
 pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
 #[cfg(feature = "table-posix-random-net2")]
@@ -1662,6 +1666,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::TTY_TABLE,
     ramfs::TTY_STEPS_TABLE,
     ramfs::POSIX_RANDOM_TABLE,
+    ramfs::POSIX_RANDOM_RESTART_TABLE,
     net::POSIX_RANDOM_NET_TABLE,
     net::POSIX_RANDOM_NET2_TABLE,
     ramfs::POSIX_DISPLAY_TABLE,
@@ -3204,6 +3209,7 @@ mod tests {
             ramfs::RELIBC_THREADS_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
+            ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
             ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,
@@ -3597,6 +3603,7 @@ mod tests {
             ramfs::RTBENCH_POSIX_TABLE,
             vz::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
+            ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
             ramfs::DISPLAY_TABLE,
         ];

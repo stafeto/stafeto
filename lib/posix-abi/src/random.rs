@@ -12,6 +12,13 @@
 //! key and the buffer (`after_fork`): its first call asks for a key of its
 //! own, so it never gives its parent's bytes. A process without a session
 //! with the service gets ENOSYS.
+//!
+//! The session dies with the service's instance. A program init started
+//! has init's channel (`keep_parent`) and asks init for a new session when
+//! it finds its own closed (`live_session`: a key, or a clone for a child);
+//! init's CONNECT waits while the service restarts. Any other process has no
+//! way to init, and hands its closed session on: the loader of a child that
+//! gets one replaces it with a session from the service's root (services/loader).
 
 use crate::constants::*;
 use core::cell::UnsafeCell;
@@ -59,6 +66,9 @@ static STATE: Cell = Cell(UnsafeCell::new(State {
 static LOCK: LayerLock = LayerLock::raising();
 /// The session with the entropy service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
+/// The channel to init the process started with, 0 for none (a program the
+/// loader started, and a forked child).
+static PARENT: AtomicU64 = AtomicU64::new(0);
 
 /// Runs `f` on the state under the lock.
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -76,6 +86,16 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
 }
 
+/// Keeps init's channel `parent` for the reconnection of a session that
+/// died with the service's instance.
+///
+/// # Safety
+/// Startup, on the only thread; the channel stays open for the life of
+/// the process.
+pub unsafe fn keep_parent(parent: rt::abi::Handle) {
+    PARENT.store(parent.0, Ordering::Release);
+}
+
 /// A forked child: the copy of the parent's key and buffer goes, and its
 /// own session (`session`, a clone the parent made) takes the place of the
 /// parent's.
@@ -88,6 +108,8 @@ pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     let state = unsafe { &mut *STATE.0.get() };
     state.generator.forget();
     state.given = 0;
+    // The child has no channel to init.
+    PARENT.store(0, Ordering::Release);
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
 }
 
@@ -99,11 +121,56 @@ pub fn session() -> Option<rt::abi::Handle> {
     }
 }
 
+/// Whether the channel `raw` is closed: its service's instance ended.
+fn closed(raw: rt::abi::Handle) -> bool {
+    rt::sys::channel_info(&Handle::<Channel>::borrowed(raw)).is_ok_and(|info| info.closed)
+}
+
+/// The process's session with a live instance of the service when it can
+/// get one: the session as it is when that is open; a new one from init
+/// (CONNECT, which waits while the service restarts) when it is closed and
+/// the process has init's channel; the closed one otherwise, for the
+/// loader of a child to replace. None for a process with no session.
+pub fn live_session() -> Option<rt::abi::Handle> {
+    let old = session()?;
+    if !closed(old) {
+        return Some(old);
+    }
+    Some(reconnect(old).unwrap_or(old))
+}
+
+/// A new session from init that replaces the closed `old`. The old
+/// handle stays open (its number could meet another object if it went while
+/// another thread still sends through it), one handle for each restart.
+fn reconnect(old: rt::abi::Handle) -> Option<rt::abi::Handle> {
+    if cfg!(feature = "break-no-reconnect") {
+        return None;
+    }
+    let parent = PARENT.load(Ordering::Acquire);
+    if parent == 0 {
+        return None;
+    }
+    let new = rt::service::connect(
+        &Handle::<Channel>::borrowed(rt::abi::Handle(parent)),
+        "entropy",
+    )
+    .ok()?;
+    let raw = new.raw();
+    match SESSION.compare_exchange(old.0, raw.0, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            let _ = new.into_raw();
+            Some(raw)
+        }
+        // Another thread was first: its session stands, this one closes.
+        Err(_) => session(),
+    }
+}
+
 /// A key of the service: it waits for the service's first bytes unless
 /// `nonblock` (EAGAIN then); EINTR when a signal handler without
 /// SA_RESTART ran meanwhile; ENOSYS without a session.
 fn key(nonblock: bool) -> Result<[u8; KEY], i32> {
-    let service = Handle::<Channel>::borrowed(session().ok_or(ENOSYS)?);
+    let service = Handle::<Channel>::borrowed(live_session().ok_or(ENOSYS)?);
     let mut start = Writer::new();
     let flags = if nonblock { NONBLOCK } else { 0 };
     Seed { flags }.write(&mut start).map_err(|_| EIO)?;

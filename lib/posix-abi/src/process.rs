@@ -2148,7 +2148,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Driver, moved(uart)),
             (Slot::Pipes, moved(pipes)),
             (Slot::Terminal, moved(terminal)),
-            (Slot::Entropy, moved(crate::random::session())),
+            (Slot::Entropy, moved(crate::random::live_session())),
             (Slot::Display, moved(crate::display::session())),
             (Slot::Net, moved(crate::net::session_passive())),
             (Slot::Packages, moved(crate::packages::session())),

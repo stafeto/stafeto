@@ -44,6 +44,7 @@ use proto_wire::{Header, Reader, Status, Writer, long};
 use rt::abi::{Access, Error};
 use rt::handle::{Channel, Handle, Memory, Process, Resource, Thread};
 use rt::sys::{self, Received, Token};
+use rt::wait::{Waited, Waiter};
 use rt::{loader, msgbuf};
 
 rt::entry!(main);
@@ -647,6 +648,12 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
                             |()| {
                                 if completed {
+                                    // The session of a parent that has no way to
+                                    // init, closed with the old instance, goes
+                                    // before Ready, after which no root is given.
+                                    if !cfg!(feature = "break-no-heal-fork") {
+                                        heal_entropy(session, own, &mut given, &mut roots)?;
+                                    }
                                     tell_ready(session, 0)
                                 } else {
                                     Ok(())
@@ -703,7 +710,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                         match load(own, &block, exec_source.take()).and_then(|done| {
                             if completed {
-                                roots_before_ready(session, &given, &mut roots)?;
+                                roots_before_ready(session, own, &mut given, &mut roots)?;
                                 tell_ready(session, image_pages(&done.2))?;
                             }
                             Ok(done)
@@ -778,8 +785,14 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 reply(token, Status::BadSize.code());
                                 return None;
                             }
-                            if loaded.is_some()
-                                && let Err(code) = roots_before_ready(session, &given, &mut roots)
+                            if (loaded.is_some() || copied)
+                                && let Err(code) = if loaded.is_some() {
+                                    roots_before_ready(session, own, &mut given, &mut roots)
+                                } else if cfg!(feature = "break-no-heal-fork") {
+                                    Ok(())
+                                } else {
+                                    heal_entropy(session, own, &mut given, &mut roots)
+                                }
                             {
                                 reply(token, code);
                                 return None;
@@ -1088,18 +1101,95 @@ type Roots = [Option<Handle<Channel>>; VERIFIED.len()];
 /// Before Ready, when the process service still answers a loader's request
 /// for a root: the roots of the sessions of a start that gives them, which
 /// `finish` needs if the start turns out to be a set-ID program (the
-/// credentials come after Ready).
+/// credentials come after Ready), and a session of the entropy service that
+/// replaces one that died with its instance (`heal_entropy`).
 fn roots_before_ready(
     session: &Handle<Channel>,
-    given: &[Option<Handle<Channel>>; SLOTS],
+    own: &Own,
+    given: &mut [Option<Handle<Channel>>; SLOTS],
     roots: &mut Roots,
 ) -> Result<(), u32> {
+    heal_entropy(session, own, given, roots)?;
     for (root, &(slot, which)) in roots.iter_mut().zip(&VERIFIED) {
         if given[slot as usize].is_some() && root.is_none() {
             *root = loader_root(session, which)?;
         }
     }
     Ok(())
+}
+
+/// Whether `session` is open: its service's instance has not ended.
+fn is_open(session: &Handle<Channel>) -> bool {
+    sys::channel_info(session).is_ok_and(|info| !info.closed)
+}
+
+/// The start's session with the entropy service, when the parent gave one
+/// that died with its instance: a new one from the root the process service
+/// keeps for the service, which every instance registers again. A slot the
+/// parent left empty stays empty (a parent with no session, or one whose
+/// CLONE hit its limit, gets no clone from the root's shared pool for its
+/// child). The root is asked for at each attempt, since the one the process
+/// service holds is the old instance's until the new one registers; the
+/// offered channel is a channel of the loader's own, which the root answers
+/// with a new clone as it does for any channel that is not its own. The
+/// attempts go every `proto_entropy::reconnect::PAUSE_NS` for `WAIT_NS`; a
+/// start whose session stays closed then ends with an error, so no program
+/// runs on a dead session.
+fn heal_entropy(
+    session: &Handle<Channel>,
+    own: &Own,
+    given: &mut [Option<Handle<Channel>>; SLOTS],
+    roots: &mut Roots,
+) -> Result<(), u32> {
+    let slot = Slot::Entropy as usize;
+    let held = given[slot].is_some();
+    if given[slot].as_ref().is_some_and(is_open) || cfg!(feature = "break-no-heal") {
+        return Ok(());
+    }
+    // The break: an empty slot gets a clone from the root too.
+    if !held && !cfg!(feature = "break-heal-empty") {
+        return Ok(());
+    }
+    let level = sys::thread_info(&own.thread).map_or(1, |info| info.base);
+    let own_channel = sys::channel_create(level).map_err(code)?;
+    let timer = Waiter::new(&own_channel, 0, level).map_err(code)?;
+    let at = VERIFIED
+        .iter()
+        .position(|&(slot, _)| slot as usize == Slot::Entropy as usize)
+        .expect("the entropy slot is verified");
+    enum Found {
+        Session(Handle<Channel>, Handle<Channel>),
+        Absent,
+    }
+    let found = proto_entropy::reconnect::heal(
+        || rt::time::ticks_to_ns(rt::time::now()),
+        || {
+            let root = match loader_root(session, proto_process::ROOT_ENTROPY) {
+                Ok(Some(root)) => root,
+                // The break only: no root and no session, an image with no
+                // entropy service.
+                Ok(None) if !held => return Some(Found::Absent),
+                _ => return None,
+            };
+            let offered =
+                sys::handle_duplicate(&own_channel, Rights::SEND | Rights::TRANSFER).ok()?;
+            let fresh = verify_slot(Slot::Entropy, Some(&root), offered).ok()?;
+            Some(Found::Session(fresh, root))
+        },
+        |ns| {
+            let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(ns);
+            while let Ok(Waited::Got(_)) = timer.receive_until(&own_channel, deadline) {}
+        },
+    );
+    match found {
+        Some(Found::Session(fresh, root)) => {
+            given[slot] = Some(fresh);
+            roots[at] = Some(root);
+            Ok(())
+        }
+        Some(Found::Absent) => Ok(()),
+        None => Err(pl::IO),
+    }
 }
 
 /// The header of VerifySession of the service of `slot`.

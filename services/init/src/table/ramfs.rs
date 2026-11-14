@@ -1020,6 +1020,23 @@ pub const POSIX_RANDOM_TABLE: &[Record] = &[
     },
 ];
 
+/// The probe of the restart of the entropy service (tests/posix-random, role
+/// `restart`, `cargo xtask posix-random-restart`): the table of the probe of
+/// getentropy, whose service is built with CRASH and starts at once from
+/// the boot seed.
+pub const POSIX_RANDOM_RESTART_TABLE: &[Record] = &[
+    POSIX_RANDOM_TABLE[0],
+    POSIX_RANDOM_TABLE[1],
+    POSIX_RANDOM_TABLE[2],
+    POSIX_RANDOM_TABLE[3],
+    POSIX_RANDOM_TABLE[4],
+    POSIX_RANDOM_TABLE[5],
+    Record {
+        args: b"posix-random\0restart\0",
+        ..POSIX_RANDOM_TABLE[6]
+    },
+];
+
 /// The probe of the display service's place in a process (tests/
 /// posix-display, sub-project 3 part 3a): the RAM files, the process and
 /// clock services, the pipe service and the display service (level 33,
