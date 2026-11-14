@@ -14,7 +14,7 @@
 //! stdout (a mark byte, three bytes of 0x40 to 0x7F and a length that
 //! fits); the probes do not print such bytes, so that is acceptable.
 
-use console_line::{HEADER, LAST, MORE};
+use console_line::{FIRST, HEADER, LAST, MORE};
 
 /// A decoder of the tagged pieces in a stream of bytes, fed as it comes.
 #[derive(Default)]
@@ -42,13 +42,13 @@ impl Untag {
         let mut i = 0;
         while i < input.len() {
             let rest = &input[i..];
-            if rest[0] != MORE && rest[0] != LAST {
+            if rest[0] != FIRST && rest[0] != MORE && rest[0] != LAST {
                 out.push(rest[0]);
                 i += 1;
                 continue;
             }
             match console_line::header(rest) {
-                Some((last, id, len)) => {
+                Some((mark, id, len)) => {
                     if rest.len() < HEADER + len {
                         self.held = rest.to_vec();
                         return out;
@@ -61,7 +61,7 @@ impl Untag {
                         self.open.len() - 1
                     });
                     self.open[at].1.extend_from_slice(text);
-                    if last {
+                    if mark == LAST {
                         out.extend_from_slice(&self.open.remove(at).1);
                     }
                     i += HEADER + len;
@@ -106,7 +106,11 @@ mod tests {
             .enumerate()
             .map(|(i, c)| {
                 let mut out = [0; 64];
-                let len = console_line::piece(id, i + 1 == n, c, &mut out);
+                let len = if i == 0 {
+                    console_line::first_piece(id, c, &mut out)
+                } else {
+                    console_line::piece(id, i + 1 == n, c, &mut out)
+                };
                 out[..len].to_vec()
             })
             .collect()

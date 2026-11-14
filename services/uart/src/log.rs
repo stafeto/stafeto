@@ -464,7 +464,11 @@ mod tests {
                 .enumerate()
                 .map(|(k, c)| {
                     let mut out = [0; 64];
-                    let len = console_line::piece(id, k + 1 == n, c, &mut out);
+                    let len = if k == 0 {
+                        console_line::first_piece(id, c, &mut out)
+                    } else {
+                        console_line::piece(id, k + 1 == n, c, &mut out)
+                    };
                     out[..len].to_vec()
                 })
                 .collect()

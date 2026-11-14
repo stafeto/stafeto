@@ -636,7 +636,11 @@ fn window_over_the_console_sends_debug_write_to_the_log() -> Outcome {
     let mut out = [0; abi::INLINE_MAX];
     let pieces = LONG.chunks(console_line::PAYLOAD).count();
     for (i, chunk) in LONG.chunks(console_line::PAYLOAD).enumerate() {
-        let len = console_line::piece(0x2A5, i + 1 == pieces, chunk, &mut out);
+        let len = if i == 0 {
+            console_line::first_piece(0x2A5, chunk, &mut out)
+        } else {
+            console_line::piece(0x2A5, i + 1 == pieces, chunk, &mut out)
+        };
         check(
             sys::debug_write(&resource(), &out[..len]) == Ok(len),
             "debug_write did not write a piece of a long line",

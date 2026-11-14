@@ -64,19 +64,24 @@ fn line_id() -> u32 {
 }
 
 /// Sends the tagged pieces of `line` (the text of one line, or the tail of
-/// one, up to abi::INLINE_MAX bytes beyond the pieces sent) as the line
-/// `id`: the last piece carries the mark of the end.
+/// one) as the line `id`: the first piece carries the mark of the start when
+/// `first` (the line has no piece sent yet), the last the mark of the end.
 fn send_tagged(
     resource: &Handle<Resource>,
     id: u32,
     mut line: &[u8],
-    last: bool,
+    mut first: bool,
 ) -> Result<(), Error> {
     let mut out = [0; INLINE_MAX];
     loop {
         let n = line.len().min(PAYLOAD);
         let (now, rest) = line.split_at(n);
-        let len = console_line::piece(id, last && rest.is_empty(), now, &mut out);
+        let len = if first {
+            console_line::first_piece(id, now, &mut out)
+        } else {
+            console_line::piece(id, rest.is_empty(), now, &mut out)
+        };
+        first = false;
         sys::debug_write(resource, &out[..len])?;
         if rest.is_empty() {
             return Ok(());
@@ -149,7 +154,7 @@ impl Pieces {
         }
         let result = match line {
             None => sys::debug_write(&self.resource, &self.buf[..len]).map(|_| ()),
-            Some(id) => send_tagged(&self.resource, id, &self.buf[..len], true),
+            Some(id) => send_tagged(&self.resource, id, &self.buf[..len], false),
         };
         if let Err(e) = result {
             self.error = Some(e);
@@ -164,9 +169,14 @@ impl Pieces {
             self.len = 0;
             return;
         }
+        let opens = self.line.is_none();
         let id = *self.line.get_or_insert_with(line_id);
         let mut out = [0; INLINE_MAX];
-        let len = console_line::piece(id, false, &self.buf[..PAYLOAD], &mut out);
+        let len = if opens {
+            console_line::first_piece(id, &self.buf[..PAYLOAD], &mut out)
+        } else {
+            console_line::piece(id, false, &self.buf[..PAYLOAD], &mut out)
+        };
         if let Err(e) = sys::debug_write(&self.resource, &out[..len]) {
             self.error = Some(e);
         }

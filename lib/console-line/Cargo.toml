@@ -21,5 +21,7 @@ break-line-strip = []
 break-line-split = []
 # A deliberate break: a tail whose head was lost is put out unmarked.
 break-line-cut = []
+# A deliberate break: a line that opens with a middle piece is put out unmarked.
+break-line-first = []
 
 [dependencies]

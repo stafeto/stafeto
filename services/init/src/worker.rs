@@ -697,7 +697,7 @@ fn show_log() {
     let resource = view::<Resource>(RESOURCE);
     let mut records = [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
     let mut lines = console_line::Lines::new();
-    // What could not be shown: the texts that debug_write refused, and a
+    // What could not be shown: the calls that debug_write refused, and a
     // batch that LOG did not give.
     let lost = core::cell::Cell::new(0u32);
     // An assembled line is up to console_line::LINE_MAX bytes, a call takes
@@ -721,6 +721,6 @@ fn show_log() {
     }
     lines.finish(&mut put);
     if lost.get() > 0 {
-        rt::println!("init: the log show lost {} texts", lost.get());
+        rt::println!("init: the log show lost {} calls", lost.get());
     }
 }

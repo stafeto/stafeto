@@ -124,7 +124,7 @@ pub enum Ended {
 pub fn service_line(line: &str) -> bool {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    const EXACT: [&str; 9] = [
+    const EXACT: [&str; 8] = [
         "init: services started",
         "ramfs: ready",
         "posix-process: ready (records with their processes, root by init's table)",
@@ -132,11 +132,18 @@ pub fn service_line(line: &str) -> bool {
         "clock: ready (unsynchronized start)",
         "pipe: ready",
         "tty: ready",
-        "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
         "entropy: seeded from the device",
     ];
     if EXACT.contains(&line) {
         return true;
+    }
+    // `virtio-rng: virtio-mmio at 0xADDRESS, line N, status 0xS`
+    if let Some(r) = line.strip_prefix("virtio-rng: virtio-mmio at 0x")
+        && let Some((at, r)) = r.split_once(", line ")
+        && let Some((n, status)) = r.split_once(", status 0x")
+    {
+        let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+        return hex(at) && number(n) && hex(status);
     }
     // `entropy: seeded from the boot page (N bytes)`
     if let Some(n) = line
@@ -171,8 +178,9 @@ pub fn service_line(line: &str) -> bool {
     if line.starts_with("process fault: ") {
         return true;
     }
-    // `service step|wait|gap|preempt: T kind K N ticks ...` (rt::service)
-    for kind in ["step", "wait", "gap", "preempt"] {
+    // `service step|wait|wait cut|gap|preempt: T kind K N ticks ...`
+    // (rt::service)
+    for kind in ["step", "wait", "wait cut", "gap", "preempt"] {
         if let Some(r) = line
             .strip_prefix("service ")
             .and_then(|r| r.strip_prefix(kind))
@@ -1776,7 +1784,6 @@ mod tests {
             "@@os-test begin io/open",
             "pipe: ready",
             "tty: ready",
-            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
             "entropy: seeded from the device",
             "open: EISDIR",
             "@@os-test end io/open exit 1",
@@ -1798,6 +1805,11 @@ mod tests {
             "entropy: seeded from the boot page (32 bytes)",
             "ASSERT failed",
             "@@os-test end basic/service-lines-fail exit 1",
+            "@@os-test begin basic/wait-cut",
+            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
+            "virtio-rng: virtio-mmio at 0x10001000, line 5, status 0x1",
+            "service wait cut: 15 kind 64 3480 ticks of 23806",
+            "@@os-test end basic/wait-cut exit 0",
             "@@os-test begin basic/own-lines",
             "net: something failed",
             "clock: ready twice",
@@ -1805,6 +1817,10 @@ mod tests {
             "service step: x kind 1 2 ticks",
             "@@os-test end basic/own-lines exit 1",
         ]);
+        assert_eq!(
+            outcome(&log, "basic/wait-cut"),
+            Ended::Exited("exit: 0\n".to_owned(), 0)
+        );
         assert_eq!(
             outcome(&log, "basic/own-lines"),
             Ended::Exited(

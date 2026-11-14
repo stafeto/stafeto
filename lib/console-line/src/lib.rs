@@ -26,6 +26,9 @@
 
 #![no_std]
 
+/// The mark of the first piece of a line (more follows: a tagged line has two
+/// pieces at least).
+pub const FIRST: u8 = 0x1C;
 /// The mark of a piece with more of its line to come.
 pub const MORE: u8 = 0x1E;
 /// The mark of the last piece of a line (or of a call's last bytes).
@@ -41,9 +44,11 @@ pub const SLOTS: usize = 4;
 pub const LINE_MAX: usize = 128;
 /// The empty batches of the log after which the lines still open go out.
 pub const QUIET: u8 = 2;
-/// What goes before the last piece of a line whose earlier pieces the driver
-/// does not hold: it ended and started again, or it put the line out early.
-pub const CUT: &[u8] = b"[console: the start of this line was lost] ";
+/// What goes before the text of a line whose first piece the driver did not
+/// see: the driver ended and started again, put the line out early, or took
+/// the port from the kernel in the middle of the line, whose start the kernel
+/// showed already.
+pub const CUT: &[u8] = b"[console: earlier part shown before or lost] ";
 /// The most bytes `Lines::record` puts out for one record: the oldest slot
 /// or a full line, then the line the record ends or the mark and the tail
 /// of a line whose start was lost.
@@ -57,8 +62,17 @@ const ID_BITS: u32 = 18;
 /// A piece of `payload` (up to PAYLOAD bytes) of the line `id`, `last` or
 /// not, in `out`: its length.
 pub fn piece(id: u32, last: bool, payload: &[u8], out: &mut [u8; 64]) -> usize {
+    mark_piece(if last { LAST } else { MORE }, id, payload, out)
+}
+
+/// The first piece of the line `id`.
+pub fn first_piece(id: u32, payload: &[u8], out: &mut [u8; 64]) -> usize {
+    mark_piece(FIRST, id, payload, out)
+}
+
+fn mark_piece(mark: u8, id: u32, payload: &[u8], out: &mut [u8; 64]) -> usize {
     assert!(payload.len() <= PAYLOAD, "a piece carries 59 bytes at most");
-    out[0] = if last { LAST } else { MORE };
+    out[0] = mark;
     out[1] = 0x40 | ((id >> 12) & 0x3F) as u8;
     out[2] = 0x40 | ((id >> 6) & 0x3F) as u8;
     out[3] = 0x40 | (id & 0x3F) as u8;
@@ -72,15 +86,16 @@ pub fn id_from(ticks: u64) -> u32 {
     ((ticks ^ (ticks >> ID_BITS) ^ (ticks >> (2 * ID_BITS))) & ((1 << ID_BITS) - 1)) as u32
 }
 
-/// The header at the start of `bytes`: whether the piece is the last, the
-/// identifier of its line and the length of its text. None when `bytes`
+/// The header at the start of `bytes`: the mark of the piece (FIRST, MORE or
+/// LAST), the identifier of its line and the length of its text. None when `bytes`
 /// does not start with a header.
-pub fn header(bytes: &[u8]) -> Option<(bool, u32, usize)> {
+pub fn header(bytes: &[u8]) -> Option<(u8, u32, usize)> {
     let [mark, a, b, c, n, ..] = *bytes else {
         return None;
     };
     let id_byte = |x: u8| (0x40..=0x7F).contains(&x);
-    if !(mark == MORE || mark == LAST) || !(id_byte(a) && id_byte(b) && id_byte(c)) {
+    if !(mark == FIRST || mark == MORE || mark == LAST) || !(id_byte(a) && id_byte(b) && id_byte(c))
+    {
         return None;
     }
     let len = usize::from(n.checked_sub(0x40)?);
@@ -88,7 +103,7 @@ pub fn header(bytes: &[u8]) -> Option<(bool, u32, usize)> {
         return None;
     }
     let id = (u32::from(a & 0x3F) << 12) | (u32::from(b & 0x3F) << 6) | u32::from(c & 0x3F);
-    Some((mark == LAST, id, len))
+    Some((mark, id, len))
 }
 
 /// The longest text of one debug_write call.
@@ -119,9 +134,9 @@ pub fn strip(text: &[u8]) -> &[u8] {
 }
 
 /// The tag of a record's `text`: a whole piece, header and text.
-fn tag(text: &[u8]) -> Option<(bool, u32)> {
-    let (last, id, len) = header(text)?;
-    (text.len() == HEADER + len).then_some((last, id))
+fn tag(text: &[u8]) -> Option<(u8, u32)> {
+    let (mark, id, len) = header(text)?;
+    (text.len() == HEADER + len).then_some((mark, id))
 }
 
 #[derive(Clone, Copy)]
@@ -161,15 +176,18 @@ impl Lines {
     /// line put out whole to `put` once its LAST piece comes.
     pub fn record(&mut self, text: &[u8], put: &mut impl FnMut(&[u8])) {
         self.quiet = 0;
-        let Some((last, id)) = tag(text) else {
+        let Some((mark, id)) = tag(text) else {
             put(text);
             return;
         };
+        let last = mark == LAST;
         #[cfg(feature = "break-line-assembly")]
         let id = 0;
         let payload = &text[HEADER..];
-        // The last piece of a line is never its only one: with no slot, the
-        // pieces before it went with an earlier driver or went out early.
+        // A line opens with its FIRST piece and has two pieces at least. The
+        // last piece with no slot comes alone; a piece that opens a slot and
+        // is not the first leaves its line without the start. Both go out
+        // after the mark CUT.
         #[cfg(not(feature = "break-line-cut"))]
         if last && !self.slots.iter().any(|s| s.open && s.id == id) {
             put(CUT);
@@ -195,6 +213,11 @@ impl Lines {
                 s.id = id;
                 s.seq = self.seq;
                 s.len = 0;
+                #[cfg(not(any(feature = "break-line-cut", feature = "break-line-first")))]
+                if mark != FIRST {
+                    s.buf[..CUT.len()].copy_from_slice(CUT);
+                    s.len = CUT.len();
+                }
                 at
             }
         };
@@ -264,7 +287,11 @@ mod tests {
             .enumerate()
             .map(|(i, c)| {
                 let mut out = [0; 64];
-                let len = piece(id, i + 1 == n, c, &mut out);
+                let len = if i == 0 {
+                    first_piece(id, c, &mut out)
+                } else {
+                    piece(id, i + 1 == n, c, &mut out)
+                };
                 out[..len].to_vec()
             })
             .collect()
@@ -306,6 +333,19 @@ mod tests {
             "a call is refused"
         );
         assert_eq!(calls.concat(), line);
+    }
+
+    #[test]
+    fn a_line_that_lost_its_first_of_three_pieces_is_marked() {
+        let line: Vec<u8> = (0..150).map(|i| b'a' + (i % 26) as u8).collect();
+        let p = pieces(8, &line);
+        assert_eq!(p.len(), 3);
+        let out = run(&p[1..]);
+        let mut want = CUT.to_vec();
+        want.extend_from_slice(&line[PAYLOAD..]);
+        assert_eq!(out.concat(), want);
+        // The whole line has no mark.
+        assert_eq!(run(&p).concat(), line);
     }
 
     #[test]
@@ -362,7 +402,7 @@ mod tests {
         let mut records = Vec::new();
         for id in 0..=SLOTS as u32 {
             let mut out = [0; 64];
-            let len = piece(id, false, b"half", &mut out);
+            let len = first_piece(id, b"half", &mut out);
             records.push(out[..len].to_vec());
         }
         let out = run(&records);
@@ -375,7 +415,7 @@ mod tests {
         let mut out = Vec::new();
         let mut put = |b: &[u8]| out.push(b.to_vec());
         let mut buf = [0; 64];
-        let len = piece(3, false, b"cut here", &mut buf);
+        let len = first_piece(3, b"cut here", &mut buf);
         lines.record(&buf[..len], &mut put);
         lines.quiet(&mut put);
         lines.record(b"x\n", &mut put);
