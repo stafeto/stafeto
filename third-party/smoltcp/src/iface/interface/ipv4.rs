@@ -212,6 +212,20 @@ impl InterfaceInner {
 
         #[cfg(feature = "medium-ethernet")]
         if self.is_unicast_v4(ipv4_repr.dst_addr) {
+            // The patch of stafeto (PATCH.md): a unicast packet of a source on the link teaches the
+            // neighbour cache the source's hardware address, so that the answer to it (the reset to
+            // a SYN for a closed port, which smoltcp sends once and never again) finds its entry.
+            if self.in_same_network(&IpAddress::Ipv4(ipv4_repr.src_addr))
+                && !ipv4_repr.src_addr.is_loopback()
+                && !self.ip_addrs.iter().any(|c| c.address() == IpAddress::Ipv4(ipv4_repr.src_addr))
+                && source_hardware_addr.is_unicast()
+            {
+                self.neighbor_cache.fill(
+                    IpAddress::Ipv4(ipv4_repr.src_addr),
+                    source_hardware_addr,
+                    self.now,
+                );
+            }
             self.neighbor_cache.reset_expiry_if_existing(
                 IpAddress::Ipv4(ipv4_repr.src_addr),
                 source_hardware_addr,

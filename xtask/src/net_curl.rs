@@ -97,10 +97,10 @@ const CLOSED_GUEST_PORT: u16 = 81;
 /// the step of receiving is for (netd::frames::answered).
 const ANSWERED_UDP: usize = 64;
 const ANSWERED_TCP: usize = 32;
-/// The reset of the guest to the very first connection reaches the host
-/// only when the service asked for its gateway's address before (the ARP
-/// request of the gateway every 30 s); while this is true a closed first
-/// connection that stays open is a warning.
+/// The patched stack learns the host's hardware address from the SYN itself
+/// (third-party/smoltcp/PATCH.md), so the reset to the very first connection
+/// no longer waits for the gateway's ARP answer; while this is true a closed
+/// first connection that stays open is a warning.
 pub const CLOSED_PORT_NEEDS_GATEWAY_REQUEST: bool = false;
 
 /// The image of the run with the counted steps.
