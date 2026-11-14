@@ -60,6 +60,9 @@ const REQUESTS: usize = 200;
 const PROXY_REQUESTS: usize = 600;
 /// The requests to nginx-fast's own port 80 through the proxy of the same worker.
 const SELF_REQUESTS: usize = 20;
+/// How long `posix-net stat` may take to answer in the flood of `share`: a process that starts
+/// beside the loop and the flood, on QEMU under -icount.
+const STAT_FLOOD_BOUND: Duration = Duration::from_secs(30);
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
@@ -205,6 +208,11 @@ struct Stat {
 }
 
 fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
+    stat_within(run, tag, Duration::from_secs(120))
+}
+
+/// `stat` with the time its answer may take.
+fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
     let from = run.lines().len();
     run.send("posix-net stat")?;
     // The service prints its counters when the request is over, so they may come after the
@@ -212,7 +220,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
     run.expect_line(
         "the counters of the switch",
         |l| l.contains("net: switch rx_by "),
-        Duration::from_secs(120),
+        within,
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
@@ -1538,6 +1546,22 @@ fn share(
         began.elapsed().as_secs_f64()
     );
     println!("fast-switch: seconds {seconds:?}");
+    // The loop has ended and the flood goes on. The break with the service unbound fails on the
+    // share, as it did.
+    if flood.is_some() && !unbound {
+        // A new process asks the network service for its session, and `posix-net stat` is
+        // such a process: under the flood the service must answer within a bound
+        // (stafeto-design#713: it waited behind the steps of the stack for as long as the
+        // flood lasted).
+        let asked = Instant::now();
+        stat_within(run, "flood", STAT_FLOOD_BOUND).map_err(|e| {
+            format!("`posix-net stat` got no answer within {STAT_FLOOD_BOUND:?} of the flood: {e}")
+        })?;
+        println!(
+            "fast-switch: `posix-net stat` answered in {:?} under the flood",
+            asked.elapsed()
+        );
+    }
     if let Some(f) = flood {
         f.finish();
     }

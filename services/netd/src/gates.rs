@@ -113,6 +113,70 @@ impl Default for Run {
     }
 }
 
+/// The steps in a row after which the loop looks at its queue for a request before the next
+/// step runs (`Yielding`).
+pub const RUN_STEPS: u32 = 2;
+
+/// The loop of the stack takes the head of its queue, and the queue gives the head to the
+/// notification with the higher level: a request of a client at a level below the stack's
+/// waits for as long as the stack tells itself the next step and the switch the next frames,
+/// which is as long as the wire has more (stafeto-design#713). So after `RUN_STEPS` steps in a
+/// row the loop looks at the queue before the next one: with anything queued the step is put
+/// off (`owed`; the caller leaves its bits in its own `told`, so that no one tells them again)
+/// and the loop takes what stands in the queue. A notification that stands ahead of a request
+/// was told before the step was put off: the stack's own and the switch's share one slot, and
+/// the timer's and each session's have one each, so the request is taken after the receives of
+/// those and of the notifications the switch tells meanwhile (it tells the step of sending for
+/// each lend of buffers, and each costs one cheap receive). When the queue is empty, or a
+/// request is served, the steps owed are told and the run starts again.
+pub struct Yielding {
+    run: u32,
+    owed: u64,
+}
+
+impl Default for Yielding {
+    fn default() -> Yielding {
+        Yielding::new()
+    }
+}
+
+impl Yielding {
+    pub const fn new() -> Yielding {
+        Yielding { run: 0, owed: 0 }
+    }
+
+    /// A notification of steps `bits` came. The steps to run now: `bits` (with those owed, when
+    /// the queue is seen empty), or 0 when they are put off. `queued` says whether anything
+    /// stands in the queue; it is asked only after `RUN_STEPS` steps in a row.
+    pub fn arrive(&mut self, bits: u64, queued: impl FnOnce() -> bool) -> u64 {
+        self.run = self.run.saturating_add(1);
+        if self.run <= RUN_STEPS {
+            return bits;
+        }
+        if queued() {
+            self.owed |= bits;
+            return 0;
+        }
+        self.run = 0;
+        bits | core::mem::take(&mut self.owed)
+    }
+
+    /// A request was served: the steps owed are to be told now (`always`), and the run starts
+    /// again. Without `always` (the end of a notification that no step took) the queue must be
+    /// empty for it, the steps owed are told then, so that none waits for a step that does not
+    /// follow.
+    pub fn resume(&mut self, always: bool, queued: impl FnOnce() -> bool) -> u64 {
+        if always {
+            self.run = 0;
+        }
+        if self.owed == 0 || (!always && queued()) {
+            return 0;
+        }
+        self.run = 0;
+        core::mem::take(&mut self.owed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +287,50 @@ mod tests {
                 assert!(told, "a doorbell was held and nobody was told");
             }
         }
+    }
+    #[test]
+    fn a_run_of_steps_puts_the_next_off_while_a_request_waits() {
+        let mut y = Yielding::new();
+        for _ in 0..RUN_STEPS {
+            assert_eq!(
+                y.arrive(0b1, || unreachable!("not asked in the first steps")),
+                0b1
+            );
+        }
+        // The next step, with a request queued, is put off and owed.
+        assert_eq!(y.arrive(0b1, || true), 0);
+        // The notifications of other steps that stand ahead of the request are put off too.
+        assert_eq!(y.arrive(0b10, || true), 0);
+        // The request is served: the steps owed come back together, and a run starts.
+        assert_eq!(y.resume(true, || unreachable!("always")), 0b11);
+        assert_eq!(y.arrive(0b1, || unreachable!("a new run")), 0b1);
+        // Nothing owed, nothing told.
+        assert_eq!(y.resume(true, || true), 0);
+    }
+
+    #[test]
+    fn an_empty_queue_takes_the_steps_owed_with_the_next_step() {
+        let mut y = Yielding::new();
+        for _ in 0..RUN_STEPS {
+            y.arrive(0b1, || false);
+        }
+        assert_eq!(y.arrive(0b1, || true), 0);
+        // What stood in the queue was no request; the next notification finds it empty.
+        assert_eq!(y.arrive(0b100, || false), 0b101);
+        assert_eq!(y.arrive(0b1, || unreachable!("a new run")), 0b1);
+    }
+
+    #[test]
+    fn steps_owed_are_told_when_no_step_follows_and_the_queue_is_empty() {
+        let mut y = Yielding::new();
+        for _ in 0..RUN_STEPS {
+            y.arrive(0b1, || false);
+        }
+        assert_eq!(y.arrive(0b1, || true), 0);
+        // The end of a notification that is no step: the queue still holds something.
+        assert_eq!(y.resume(false, || true), 0);
+        // It is empty now: the steps owed are told.
+        assert_eq!(y.resume(false, || false), 0b1);
+        assert_eq!(y.resume(false, || false), 0);
     }
 }

@@ -1301,6 +1301,9 @@ struct Driver<'a> {
     own_said: bool,
     /// The bits of the notifications to itself that are on their way.
     told: u64,
+    /// The steps in a row, and the steps put off for a request that waits in the queue. The
+    /// bits put off stay in `told`, so that neither the stack nor the switch tells them again.
+    yielding: netd::gates::Yielding,
     /// The doorbell held for the work queued behind a step.
     bell: netd::ring::Hold,
     /// The queue was looked at in the event that is on.
@@ -1398,6 +1401,7 @@ impl<'a> Driver<'a> {
             second: None,
             own_said: false,
             told: 0,
+            yielding: netd::gates::Yielding::new(),
             bell: netd::ring::Hold::new(),
             bell_checked: false,
             cleanup_due: false,
@@ -2458,7 +2462,16 @@ impl Driver<'_> {
         answer
     }
 
-    fn handle_notification(&mut self, n: Notice) {
+    /// Tells the steps put off (`netd::gates::Yielding`). Their bits are still in `told`, so
+    /// nobody told them again meanwhile.
+    fn tell_owed(&mut self, bits: u64) {
+        if bits != 0 && sys::notify(&self.notify, bits).is_err() {
+            self.told &= !bits;
+            self.cleanup_due |= bits & CLEANUP != 0;
+        }
+    }
+
+    fn handle_notification(&mut self, mut n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
             // (`proto_init::binding_label`): the line says whose interrupt it
@@ -2471,6 +2484,14 @@ impl Driver<'_> {
             // The first line's interrupts come to the switch thread.
             Source::Interrupt => {}
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
+                // A request that waits in the queue goes ahead of the steps that follow one
+                // another (`netd::gates::Yielding`).
+                let notify = &self.notify;
+                let steps = self.yielding.arrive(n.bits & STEP_BITS, || queued(notify));
+                if steps == 0 {
+                    return;
+                }
+                n.bits = steps | (n.bits & !STEP_BITS);
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
@@ -2626,11 +2647,16 @@ impl Service<0> for Driver<'_> {
     fn between_notifications(&mut self, _: Notice) {
         self.bell_release();
         self.bell_checked = false;
+        let notify = &self.notify;
+        let owed = self.yielding.resume(false, || queued(notify));
+        self.tell_owed(owed);
     }
 
     fn between_requests(&mut self) {
         self.bell_release();
         self.bell_checked = false;
+        let owed = self.yielding.resume(true, || false);
+        self.tell_owed(owed);
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
         // answer went, so that the lines of the console do not count in the step.
         #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
@@ -2656,6 +2682,11 @@ impl Service<0> for Driver<'_> {
     fn notification(&mut self, n: Notice) {
         self.handle_notification(n);
     }
+}
+
+/// Whether anything stands in the queue of the service's channel.
+fn queued(notify: &Handle<Channel>) -> bool {
+    sys::channel_info(notify).is_ok_and(|info| info.queued > 0)
 }
 
 /// The channels of the instances, by number, for the first instance to tell whose session a
