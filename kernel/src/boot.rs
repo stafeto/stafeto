@@ -7,10 +7,10 @@
 
 use crate::arch::symbols;
 use bootimg::{BootImage, Program};
-use kcore::bootinfo::{self, BootInfo, Region, RegionList, SEED_MAX};
-use kcore::fdt::{self, Fdt};
+use kboot::bootinfo::{self, BootInfo, Region, RegionList, SEED_MAX};
+use kboot::fdt::{self, Fdt};
+use kboot::memmap;
 use kcore::layout::{LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
-use kcore::memmap;
 use kcore::sync::SetOnce;
 
 pub struct Boot {

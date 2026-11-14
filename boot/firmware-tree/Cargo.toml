@@ -11,7 +11,8 @@ description = "ACPI tables and the EFI memory map into the device tree stafeto b
 bench = false
 
 [dependencies]
-kcore = { path = "../../kcore", features = ["builder"] }
+kboot = { path = "../../kboot", features = ["builder"] }
+kcore = { path = "../../kcore" }
 posix-random = { path = "../../lib/posix-random" }
 
 [features]

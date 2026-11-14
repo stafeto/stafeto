@@ -19,7 +19,7 @@ use crate::psci;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use cpu::{CpuBlock, MAX_CPUS, UP};
-use kcore::bootinfo::MPIDR_AFFINITY;
+use kboot::bootinfo::MPIDR_AFFINITY;
 use kcore::gic::{Ack, SGI_CMD, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
 use kcore::layout::image_pa;
 
@@ -101,7 +101,7 @@ pub fn start(boot: &Boot) {
     if others.peek().is_none() {
         return;
     }
-    if info.psci == kcore::bootinfo::PsciConduit::None {
+    if info.psci == kboot::bootinfo::PsciConduit::None {
         kprintln!("smp        no PSCI conduit: one CPU");
         return;
     }

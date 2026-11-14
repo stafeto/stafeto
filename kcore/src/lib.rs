@@ -7,20 +7,18 @@
 #![cfg_attr(not(test), no_std)]
 
 /// Pages of 4 KiB (spec 7.1, 7.2): frames, translation tables, pools and
-/// quotas all count in them.
-pub const PAGE_SHIFT: u32 = 12;
-pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
+/// quotas all count in them. The constants live in `kboot`, whose memory map
+/// counts in pages too.
+pub use kboot::{PAGE_SHIFT, PAGE_SIZE};
 
 #[macro_use]
 pub mod must;
 pub mod args;
 pub mod asid;
 pub mod backtrace;
-pub mod bootinfo;
 pub mod budget;
 pub mod console;
 pub mod esr;
-pub mod fdt;
 pub mod frames;
 pub mod gic;
 pub mod handles;
@@ -29,7 +27,6 @@ pub mod its;
 pub mod layout;
 pub mod log;
 pub mod maps;
-pub mod memmap;
 pub mod notify;
 pub mod pagelist;
 pub mod paging;
@@ -47,6 +44,3 @@ pub mod tlb;
 pub mod token;
 pub mod upcall;
 pub mod window;
-
-#[cfg(feature = "builder")]
-extern crate alloc;

@@ -8,15 +8,12 @@
 //! has no `Location` of its own, so the many inlined copies of a check
 //! stay small. The panic names its message; the backtrace names the place.
 
-/// The file of `fail`: the panic report leaves its place out.
+/// The file of `fail_at`: the panic report leaves its place out, as for
+/// `kboot::must::FILE`, where `fail` lives.
 pub const FILE: &str = file!();
 
-/// The panic of a check that failed.
-#[cold]
-#[inline(never)]
-pub fn fail(msg: &'static str) -> ! {
-    panic!("{msg}")
-}
+/// The panic of a check that failed: the one function of the crate below.
+pub use kboot::must::fail;
 
 /// The panic of a check of the macros below, with the line of the check.
 #[cold]

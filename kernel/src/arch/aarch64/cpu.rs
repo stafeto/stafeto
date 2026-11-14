@@ -13,7 +13,7 @@
 use super::user::UserRegs;
 use core::arch::asm;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-pub use kcore::bootinfo::MAX_CPUS;
+pub use kboot::bootinfo::MAX_CPUS;
 
 /// The bytes of one CPU's stack slot (kernel.ld): the stack, 64 KiB, and
 /// the same below it for its guard page and emergency stack.

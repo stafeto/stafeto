@@ -16,6 +16,7 @@ bench = false
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg" }
 console-line = { path = "../lib/console-line" }
+kboot = { path = "../kboot" }
 kcore = { path = "../kcore" }
 
 [features]

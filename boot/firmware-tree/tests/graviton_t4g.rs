@@ -12,8 +12,8 @@ use firmware_tree::check::{Placement, check};
 use firmware_tree::efimap::{Desc, classify};
 use firmware_tree::platform::{Platform, UartKind};
 use firmware_tree::tree::{Input, build};
-use kcore::bootinfo::{BootInfo, Region, parse};
-use kcore::fdt::Fdt;
+use kboot::bootinfo::{BootInfo, Region, parse};
+use kboot::fdt::Fdt;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/graviton-t4g");
 const MAP: &[u8] = include_bytes!("fixtures/graviton-t4g/memmap.bin");

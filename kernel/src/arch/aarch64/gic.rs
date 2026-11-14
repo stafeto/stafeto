@@ -15,7 +15,7 @@ use super::registers::{self, read_sysreg};
 use core::arch::asm;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use kcore::bootinfo::{BootInfo, GicVersion, Region};
+use kboot::bootinfo::{BootInfo, GicVersion, Region};
 use kcore::gic::{
     self, Ack, CTLR_ENABLE, DEFAULT_PRIORITY, FIRST_SPI, Frame, GICC_CTLR, GICC_EOIR, GICC_IAR,
     GICC_PMR, GICD_CTLR, GICD_CTLR_RWP, GICD_CTLR_V3, GICD_ICACTIVER, GICD_ICENABLER, GICD_ICPENDR,

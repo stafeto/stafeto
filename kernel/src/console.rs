@@ -24,7 +24,7 @@
 use crate::arch::{mmio, timer};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
-use kcore::bootinfo::{BootInfo, Region};
+use kboot::bootinfo::{BootInfo, Region};
 use kcore::console::{self as rules, FR_TXFF, covers};
 use kcore::layout::LINEAR_BASE;
 

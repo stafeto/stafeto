@@ -28,7 +28,7 @@ use super::{cache, timer};
 use crate::mm::phys;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use kcore::bootinfo::BootInfo;
+use kboot::bootinfo::BootInfo;
 use kcore::gic::FIRST_LPI;
 use kcore::its::{self, Command};
 use kcore::layout::LINEAR_BASE;
