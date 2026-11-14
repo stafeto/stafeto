@@ -52,7 +52,7 @@ use devices::{device_window_create, irq_ack, irq_bind, msi_create};
 use handles::{handle_close, handle_duplicate};
 use info::{debug_write, object_info};
 use mem::{change, change_map, go_on, mem_create, mem_protect, mem_unmap};
-use messages::{channel_create, notify, receive, reply, send};
+use messages::{channel_create, notify, receive, reply, reply_receive, send};
 use proc::{
     process_control, process_create, process_exit, process_kill, thread_create, thread_exit,
     thread_interrupt, thread_set_priority, thread_start, yield_now,
@@ -251,6 +251,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
             return objects(|| receive(thread, &args));
         }
         Some(Call::Reply) => objects(|| reply(thread, &args)),
+        Some(Call::ReplyReceive) => return reply_receive(thread, &args),
         Some(Call::Notify) => objects(|| notify(thread, &args)),
         Some(Call::MemCreate) => return mem_create(thread, &args),
         Some(Call::MemMap) => return change_map(thread, &args),

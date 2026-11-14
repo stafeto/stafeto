@@ -9685,3 +9685,471 @@ fn child_free_cases(low: &Caller) -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+/// A server of its own process at 5 that holds the request of a client at 5
+/// (spec 6.1, 6.6): the fixture of the tests of the lift of a server by a
+/// request that queues behind it, and of `reply_receive`.
+struct Holder {
+    service: NonNull<Process>,
+    client: NonNull<Process>,
+    channel: NonNull<Channel>,
+    /// The server's handle to the channel, with RECEIVE.
+    handle: Handle,
+    /// The server, whose message buffer the calls read.
+    r: NonNull<Thread>,
+    /// The client of the request it holds, and the request's token.
+    t: NonNull<Thread>,
+    token: u64,
+    /// The budgets of the server, short, and of the client, long.
+    server_budget: Option<NonNull<crate::budget::Budget>>,
+    client_budget: Option<NonNull<crate::budget::Budget>>,
+}
+
+/// Ticks the server's budget (100 us for each 1 ms) and the client's
+/// (1 ms for each 10 ms) hold, and a stretch the tests spin.
+const SERVER_C: u64 = 6_250;
+const CLIENT_C: u64 = 62_500;
+const SPIN: u64 = 3_125;
+
+/// Spins for `ticks` of the counter.
+fn spin(ticks: u64) {
+    let until = timer::now() + ticks;
+    while timer::now() < until {
+        core::hint::spin_loop();
+    }
+}
+
+/// A new thread of `p` at `level` that the scheduler picks next.
+fn running_at(p: NonNull<Process>, level: u8) -> Result<NonNull<Thread>, &'static str> {
+    let t = thread::create(p, USER_VA, USER_VA, 0, level, Policy::Fifo).map_err(|_| "no thread")?;
+    thread::start(t).map_err(|_| "a thread did not start")?;
+    pick(t)?;
+    Ok(t)
+}
+
+/// The scheduler picks `t` to run.
+fn pick(t: NonNull<Thread>) -> Result<(), &'static str> {
+    // SAFETY: the scheduler's threads are alive.
+    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+    check(
+        matches!(picked, kcore::sched::Decision::Run(r) if r == t),
+        "the thread that was to run did not",
+    )
+}
+
+/// Builds a Holder, with budgets when `budgets`, runs `body` and lets
+/// everything go. `others` are threads the body made: they go too.
+fn with_holder(
+    budgets: bool,
+    body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let counts = (
+        process::in_use(),
+        thread::in_use(),
+        channel::in_use(),
+        crate::budget::in_use(),
+    );
+    let made = [0; 2].map(|_| process::create_root(QUOTA, 16, CEILING));
+    let mut held: Option<Holder> = None;
+    let mut others = [None; 3];
+    let result = match made {
+        [Ok(service), Ok(client)] => (|| {
+            let channel = channel::create(service, FIRE_LEVEL).map_err(|_| "no channel")?;
+            let handle = process::insert_handle(service, Object::Channel(channel), Rights::RECEIVE);
+            // SAFETY: the reference `create` handed out goes; the handle, if
+            // it went in, holds the channel.
+            unsafe { channel::release(channel, Rights::NONE, CAUSE) };
+            let handle = handle.map_err(|_| "a handle did not go in")?;
+            let r = thread::create(service, USER_VA, USER_VA, 0, 5, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            let t = thread::create(client, USER_VA, USER_VA, 0, 5, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            let h = held.insert(Holder {
+                service,
+                client,
+                channel,
+                handle,
+                r,
+                t,
+                token: 0,
+                server_budget: None,
+                client_budget: None,
+            });
+            thread::give_buffer(r, BUFFER as usize).map_err(|_| "no buffer")?;
+            if budgets {
+                let s = crate::budget::create(service, 0, SERVER_C, 10 * SERVER_C, 1)
+                    .map_err(|_| "no budget")?;
+                h.server_budget = Some(s);
+                crate::budget::bind(r, s).map_err(|_| "the server's budget did not bind")?;
+                let c = crate::budget::create(client, 0, CLIENT_C, 10 * CLIENT_C, 1)
+                    .map_err(|_| "no budget")?;
+                h.client_budget = Some(c);
+                crate::budget::bind(t, c).map_err(|_| "the client's budget did not bind")?;
+            }
+            thread::start(r).map_err(|_| "a thread did not start")?;
+            pick(r)?;
+            channel::receive(r, channel, true).map_err(|_| "the receiver did not wait")?;
+            thread::start(t).map_err(|_| "a thread did not start")?;
+            pick(t)?;
+            let sent = channel::send(
+                t,
+                Via::Channel(channel),
+                Desc::from_send(0).expect("a send"),
+                &[],
+            );
+            check(sent == Ok(Some(r)), "the receiver did not take the request")?;
+            // SAFETY: the test holds the receiver.
+            h.token = unsafe { r.as_ref() }.regs.x[11];
+            body(h, &mut others)
+        })(),
+        _ => Err("no process"),
+    };
+    for t in others.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(h) = &held {
+        thread::pretend_cpu(h.r, 0);
+        for t in [h.r, h.t] {
+            // SAFETY: as above; a thread that ended already is left alone.
+            unsafe {
+                if !matches!(t.as_ref().sched.state(), State::Dead) {
+                    sched::exit(t, CAUSE);
+                }
+                thread::release(t, CAUSE);
+            }
+        }
+        for b in [h.server_budget, h.client_budget].into_iter().flatten() {
+            // SAFETY: the test's reference goes.
+            unsafe { crate::budget::release(b, CAUSE) };
+        }
+        // SAFETY: the handle holds the channel.
+        let _ = process::close_handle(h.service, h.handle, CAUSE);
+    }
+    for p in made.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(p, CAUSE) };
+    }
+    cleanup::drain();
+    timer::disarm();
+    result?;
+    check(
+        (
+            process::in_use(),
+            thread::in_use(),
+            channel::in_use(),
+            crate::budget::in_use(),
+        ) == counts,
+        "a process, a thread, a channel or a budget of the holder stayed",
+    )
+}
+
+impl Holder {
+    /// The server works for a stretch and its budget runs out.
+    fn demote(&self) -> Result<(), &'static str> {
+        spin(SERVER_C * 2);
+        // SAFETY: the scheduler's threads are alive; `r` runs.
+        sched::locked(|k| unsafe { k.s.tick(timer::now()) });
+        // The timer's deadline passed while the server spun, and it would
+        // stay pending: the fast path of send looks at it.
+        timer::disarm();
+        // SAFETY: the test holds the thread.
+        let demoted = unsafe { self.r.as_ref() }.sched.is_demoted();
+        check(demoted, "the server's budget did not run out")?;
+        check(
+            level_of(self.r) == 5,
+            "a server whose budget ran out lost the level its client gave it",
+        )
+    }
+
+    /// A request of `t2` into the channel: queues, with the server holding
+    /// its own.
+    fn queue(&self, t2: NonNull<Thread>) -> Result<(), &'static str> {
+        let sent = channel::send(
+            t2,
+            Via::Channel(self.channel),
+            Desc::from_send(0).expect("a send"),
+            &[],
+        );
+        check(
+            sent == Ok(None),
+            "a request did not queue behind the server",
+        )
+    }
+
+    /// The server replies to its request with the call `reply` from EL0.
+    fn reply(&self) -> Result<(), &'static str> {
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*self.r.as_ptr()).regs.x };
+        x[0] = self.token;
+        x[1] = 0;
+        syscall::dispatch(self.r, Call::Reply.number());
+        // SAFETY: as above.
+        check(
+            unsafe { self.r.as_ref() }.regs.x[0] == 0,
+            "the reply failed",
+        )
+    }
+}
+
+/// The ticks the client's budget has left, which the budget reports.
+fn left_of(b: NonNull<crate::budget::Budget>) -> u64 {
+    crate::budget::info(b).left
+}
+
+/// A server whose budget is gone serves a client at 5, and a request of a
+/// thread at 40 queues behind it in the same channel: the server is raised
+/// to 40 (`channel::lift_holder`), on its CPU at once. What it does at 40
+/// until its reply is the loan of the client it holds the request of, which
+/// the reply charges to that client's budget (settle_loan), so the client's
+/// budget has lost at least the stretch the server spun.
+pub fn a_request_that_queues_lifts_a_demoted_server_of_its_cpu(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        let c = h.client_budget.ok_or("no budget")?;
+        let before = left_of(c);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 that queued did not lift the server to 40",
+        )?;
+        pick(h.r)?;
+        spin(SPIN);
+        h.reply()?;
+        let after = left_of(c);
+        check(
+            before >= after + SPIN,
+            "the time the server worked at the lifted level was not charged to its client",
+        )?;
+        // Its budget is gone: it falls to its `low`, 1.
+        check(
+            level_of(h.r) == 1,
+            "the reply did not end the boost the lift made",
+        )
+    })
+}
+
+/// The same lift for a server of another CPU, as the command BOOST (the
+/// CPU of the thread serves it): the server waits, as it does when it
+/// waits for a reply of its own, so that the other CPU may change its
+/// level; the test says it is the other CPU's thread for the lift only.
+pub fn a_request_that_queues_lifts_a_demoted_server_of_another_cpu(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 2 {
+        return Ok(());
+    }
+    with_holder(true, |h, others| {
+        h.demote()?;
+        // The server waits, as a thread does that sends on, and another CPU
+        // may change its level.
+        pick(h.r)?;
+        // SAFETY: the scheduler's threads are alive; `r` runs.
+        sched::locked(|k| unsafe { k.s.block(timer::now()) });
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        thread::pretend_cpu(h.r, 1);
+        h.queue(t2)?;
+        // The command waits in the outbox until the section ends.
+        cmd::flush_posted();
+        let until = timer::now() + 2 * timer::frequency();
+        while level_of(h.r) != 40 && timer::now() < until {
+            core::hint::spin_loop();
+        }
+        thread::pretend_cpu(h.r, 0);
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 that queued did not lift the server of another CPU",
+        )
+    })
+}
+
+/// A server with its budget in hand keeps the level its client gave it,
+/// and the lift does not touch a thread that holds no request: the queue
+/// of a channel whose server has none is nobody's to lift.
+pub fn a_request_that_queues_leaves_a_server_with_a_budget(_: &Boot) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        // Its budget is whole: it is not demoted.
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 5,
+            "a server with a budget was lifted by a request that queued",
+        )
+    })?;
+    with_holder(false, |h, others| {
+        // No budget at all: nothing to lift.
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 5,
+            "a server with no budget was lifted by a request that queued",
+        )?;
+        // A server with no request is not lifted: its reply ended the boost.
+        h.reply()?;
+        let t3 = *others[1].insert(running_at(h.client, 50)?);
+        let sent = channel::send(
+            t3,
+            Via::Channel(h.channel),
+            Desc::from_send(0).expect("a send"),
+            &[],
+        );
+        check(sent == Ok(None), "a request did not queue")?;
+        check(
+            level_of(h.r) == 5,
+            "a server with no request was lifted by a request that queued",
+        )
+    })
+}
+
+/// The command BOOST holds one ask for each thread: of two lifts that
+/// arrive before the other CPU serves it, the larger stands, whatever the
+/// order, and a smaller one does not lower it.
+pub fn two_boost_asks_leave_the_larger(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let t = c.thread;
+        for order in [[40, 50, 45], [50, 40, 45], [45, 50, 40]] {
+            for level in order {
+                cmd::ask_boost(t, level, 63);
+            }
+            let (level, boost) = cmd::take_level(t);
+            check(
+                level == 0 && boost & 0x3f == 50 && (boost >> 6) & 0x3f == 63,
+                "two asks of the command BOOST did not leave the larger",
+            )?;
+        }
+        // A ceiling below the level is the ask's level: 20 for a ceiling
+        // of 20 stands against 30 under the ceiling 63 no more.
+        cmd::ask_boost(t, 30, 63);
+        cmd::ask_boost(t, 60, 20);
+        let (_, boost) = cmd::take_level(t);
+        check(
+            boost & 0x3f == 30 && (boost >> 6) & 0x3f == 63,
+            "an ask cut by its ceiling to a lower level replaced the larger one",
+        )
+    })
+}
+
+/// The server's message buffer gets the handle of the channel.
+fn give_channel(h: &Holder) {
+    thread::write_words(h.r, abi::msgbuf::CHANNEL, &[h.handle.0]);
+}
+
+/// reply_receive of the server (spec 6.1): the reply goes to the client of
+/// the request the token names, and then the call receives, in the same
+/// entry, the request that queued behind it at 40: the server works at 40
+/// at once, the token in x11 is the new request's, and the client of the
+/// first request is ready with its reply.
+pub fn reply_receive_takes_the_queued_request_at_its_level(_: &Boot) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        give_channel(h);
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let (r, t) = unsafe { (h.r.as_ref(), h.t.as_ref()) };
+        check(r.regs.x[0] == 0, "reply_receive failed")?;
+        check(
+            r.regs.x[11] != h.token && r.regs.x[11] != 0 && r.boost_token == r.regs.x[11],
+            "reply_receive did not take the queued request",
+        )?;
+        check(
+            level_of(h.r) == 40,
+            "reply_receive did not take the queued request at its sender's level",
+        )?;
+        check(
+            t.sched.state() == State::Ready && t.regs.x[0] == 0,
+            "the client of the first request did not get its reply",
+        )?;
+        check(
+            r.sched.state() == State::Running,
+            "the server left the CPU between its reply and its receive",
+        )
+    })
+}
+
+/// A client that ended while its request was served does not stop the
+/// receive: the reply is PEER_CLOSED, and the call goes on and takes the
+/// request that waits (spec 6.1, 6.8).
+pub fn reply_receive_goes_on_when_the_client_ended(_: &Boot) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        // The client ends: its wait for the reply is abandoned, and the
+        // number of its request is marked dead.
+        // SAFETY: the test's reference to the client goes, the kernel's
+        // first; the holder lets go of the thread afterwards.
+        unsafe { sched::exit(h.t, CAUSE) };
+        give_channel(h);
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let r = unsafe { h.r.as_ref() };
+        check(
+            r.regs.x[0] == 0 && r.regs.x[11] != h.token && r.boost_token == r.regs.x[11],
+            "a reply to a client that ended stopped the receive",
+        )
+    })
+}
+
+/// The checks of reply_receive come before its effects: a bad channel
+/// handle, a handle without RECEIVE, a bad description fail with their
+/// errors and the client still waits; a token that names no request is
+/// BAD_STATE and the request that waits in the queue stays there.
+pub fn reply_receive_refuses_before_it_replies(_: &Boot) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        let call = |token: u64, desc: u64| -> Error {
+            // SAFETY: the test holds the thread, which does not run.
+            let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+            x[0] = token;
+            x[1] = desc;
+            syscall::dispatch(h.r, Call::ReplyReceive.number());
+            // SAFETY: as above.
+            Error::from_code(unsafe { h.r.as_ref() }.regs.x[0]).unwrap_or(Error::Unknown(0))
+        };
+        let waits = |h: &Holder| {
+            // SAFETY: the test holds the thread.
+            let t = unsafe { h.t.as_ref() };
+            t.sched.state() == State::Waiting && t.waits == Some(channel::Wait::Reply(h.service))
+        };
+        // No buffer word: handle 0.
+        thread::write_words(h.r, abi::msgbuf::CHANNEL, &[0x7777]);
+        check(
+            call(h.token, 0) == Error::BadHandle && waits(h),
+            "a bad channel handle did not fail before the reply",
+        )?;
+        give_channel(h);
+        check(
+            call(h.token, 1 << 40) == Error::InvalidArgs && waits(h),
+            "a bad description did not fail before the reply",
+        )?;
+        check(
+            call(h.token, abi::NO_WAIT) == Error::InvalidArgs && waits(h),
+            "NO_WAIT was taken by a call that never waits",
+        )?;
+        // A token no request has: BAD_STATE, and the reply stays unmade.
+        check(
+            call(h.token ^ 1 << 40, 0) == Error::BadState && waits(h),
+            "a token that names no request was not BAD_STATE",
+        )?;
+        let queued = channel::info(h.channel).queued;
+        check(queued == 1, "the receive ran after a reply that failed")
+    })
+}

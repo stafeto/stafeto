@@ -1631,10 +1631,20 @@ enum Variant {
     /// (`break-budget-forgive-loan`): the loan phase of the probe
     /// `budget-hog` must catch it.
     BudgetForgiveLoan,
+    /// A request that queues behind a server whose budget is gone does not
+    /// lift it (`break-budget-no-queue-lift`): the queue phase of the probe
+    /// `budget-hog` must catch it, and, with the kernel tests
+    /// (`BudgetNoQueueLiftTest`), the tests of the lift.
+    BudgetNoQueueLift,
+    BudgetNoQueueLiftTest,
+    /// `reply_receive` that returns to EL0 between its reply and its receive
+    /// (`break-reply-receive-split`): the loan and queue phases of the probe
+    /// `budget-hog` must catch it.
+    ReplyReceiveSplit,
 }
 
 impl Variant {
-    const ALL: [Variant; 57] = [
+    const ALL: [Variant; 60] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1692,6 +1702,9 @@ impl Variant {
         Variant::BudgetNoFree,
         Variant::BudgetChildFree,
         Variant::BudgetForgiveLoan,
+        Variant::BudgetNoQueueLift,
+        Variant::BudgetNoQueueLiftTest,
+        Variant::ReplyReceiveSplit,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1757,6 +1770,9 @@ impl Variant {
             Variant::BudgetNoFree => Some("ktest,break-budget-no-free"),
             Variant::BudgetChildFree => Some("ktest,break-budget-child-free"),
             Variant::BudgetForgiveLoan => Some("break-budget-forgive-loan"),
+            Variant::BudgetNoQueueLift => Some("break-budget-no-queue-lift"),
+            Variant::BudgetNoQueueLiftTest => Some("ktest,break-budget-no-queue-lift"),
+            Variant::ReplyReceiveSplit => Some("break-reply-receive-split"),
         }
     }
 
@@ -1838,6 +1854,9 @@ impl Variant {
             Variant::BudgetNoFree => "stafeto-budget-no-free",
             Variant::BudgetChildFree => "stafeto-budget-child-free",
             Variant::BudgetForgiveLoan => "stafeto-budget-forgive-loan",
+            Variant::BudgetNoQueueLift => "stafeto-budget-no-queue-lift",
+            Variant::BudgetNoQueueLiftTest => "stafeto-ktest-budget-no-queue-lift",
+            Variant::ReplyReceiveSplit => "stafeto-reply-receive-split",
         }
     }
 }

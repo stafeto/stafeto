@@ -30,6 +30,10 @@ name = "Reply"
 handlers = ["kernel::syscall::messages::reply"]
 
 [[call]]
+name = "ReplyReceive"
+handlers = ["kernel::syscall::messages::reply_receive"]
+
+[[call]]
 name = "Notify"
 handlers = ["kernel::syscall::messages::notify"]
 
@@ -199,6 +203,10 @@ why = "the portions of mem_map, mem_unmap and mem_protect: the first entry calls
 [[stretch]]
 function = "kernel::syscall::mem::make"
 why = "the portions of mem_create: the first entry calls it after the poll for an interrupt that follows its checks (syscall::mem::mem_create), and go_on after the entry that starts over"
+
+[[stretch]]
+function = "kernel::syscall::messages::receive_second"
+why = "the receive half of reply_receive: the call polls for an interrupt after its reply half (syscall::messages::reply_receive), and starts over for a pending one (Long::Receive, go_on); the receive then follows at once, in a stretch of its own"
 
 [[stretch]]
 function = "kernel::syscall::proc::process_create_second"
@@ -377,6 +385,18 @@ bound = 4
 why = "a message carries up to four handles: the loops go over them (and over the slots that hold them), or retry the release of one"
 
 [[loop]]
+function = "kernel::syscall::messages::reply_receive"
+at = "*"
+bound = 4
+why = "the reply half of the call is the reply's: a message carries up to four handles, and the loops go over them (and over the slots that hold them)"
+
+[[loop]]
+function = "kernel::syscall::messages::receive_second"
+at = "*"
+bound = 4
+why = "the receive half of the call is the receive's: a message carries up to four handles"
+
+[[loop]]
 function = "kernel::channel::message::deliver"
 at = "*"
 bound = 4
@@ -405,6 +425,18 @@ function = "kernel::channel::message::requeue"
 at = "*"
 bound = 8
 why = "moves a slot behind at most LIFT_DEPTH = 8 servers (spec 6.6)"
+
+[[loop]]
+function = "kernel::channel::message::lift_servers"
+at = "*"
+bound = 8
+why = "moves a slot behind at most LIFT_DEPTH = 8 servers (spec 6.6): called from requeue, and from send when a request queues behind a server whose budget is gone (lift_holder)"
+
+[[loop]]
+function = "kernel::channel::message::reply"
+at = "*"
+bound = 4
+why = "a message carries up to four handles: the loops go over them (and over the slots that hold them), or retry the release of one"
 
 [[loop]]
 function = "kernel::syscall::upcall::thread_upcall_return"
@@ -582,6 +614,12 @@ complete = "yes"
 [[path]]
 name = "portion of mem_create"
 symbol = "kernel::syscall::mem::make"
+measured = []
+complete = "yes"
+
+[[path]]
+name = "receive half of reply_receive"
+symbol = "kernel::syscall::messages::receive_second"
 measured = []
 complete = "yes"
 
@@ -879,7 +917,7 @@ why = "the halt after a call that never returns (wfe, b): a stop of the kernel, 
 
 [[loop]]
 function = "kernel::timer::post_fired"
-at = "0x4c"
+at = "0x48"
 bound = 8
 why = "the timers of one portion of a level's firing: kcore::timer::FIRE_PORTION = 8"
 

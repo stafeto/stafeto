@@ -718,6 +718,34 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::thread_bind_budget_checks_and_binds,
     ),
     (
+        "a_request_that_queues_lifts_a_demoted_server_of_its_cpu",
+        calls::a_request_that_queues_lifts_a_demoted_server_of_its_cpu,
+    ),
+    (
+        "a_request_that_queues_lifts_a_demoted_server_of_another_cpu",
+        calls::a_request_that_queues_lifts_a_demoted_server_of_another_cpu,
+    ),
+    (
+        "a_request_that_queues_leaves_a_server_with_a_budget",
+        calls::a_request_that_queues_leaves_a_server_with_a_budget,
+    ),
+    (
+        "two_boost_asks_leave_the_larger",
+        calls::two_boost_asks_leave_the_larger,
+    ),
+    (
+        "reply_receive_takes_the_queued_request_at_its_level",
+        calls::reply_receive_takes_the_queued_request_at_its_level,
+    ),
+    (
+        "reply_receive_goes_on_when_the_client_ended",
+        calls::reply_receive_goes_on_when_the_client_ended,
+    ),
+    (
+        "reply_receive_refuses_before_it_replies",
+        calls::reply_receive_refuses_before_it_replies,
+    ),
+    (
         "a_thread_with_no_budget_works_at_the_free_level",
         calls::a_thread_with_no_budget_works_at_the_free_level,
     ),

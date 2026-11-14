@@ -46,14 +46,36 @@ pub struct Numbers {
     /// own CPU and on another ((0, 0) when the phase did not run).
     pub loan_same: (u64, u64),
     pub loan_other: (u64, u64),
+    /// The requests a client at 40 made of a service that held a request
+    /// of a client at 5 and had no budget, and the longest wait of one of
+    /// them for the service, its own work not counted, in microseconds,
+    /// with the service on its own CPU and on another ((0, 0) when the
+    /// phase did not run).
+    pub queue_same: (u64, u64),
+    pub queue_other: (u64, u64),
 }
 
 /// The budget of the hog, 300 us for each 1 ms, and the longest stretch the
 /// kernel runs with interrupts masked (B), in microseconds under -icount: the
 /// 8 865 instructions measured (kernel-test icount) of 16 ns each, with a
 /// little room.
-/// The most requests of the loan phase its budget pays for.
-const LOAN_MOST: u64 = 32;
+/// The most requests of the loan phase its budget pays for: 600 us for each
+/// 2 ms of the 100 ms, at 500 us a request, make 60 at most (52 measured; a
+/// client that is not charged makes 181 on its CPU).
+const LOAN_MOST: u64 = 64;
+/// The fewest requests the loan phase's client makes with the service on its
+/// own CPU: the service goes from its reply to its next receive in one entry
+/// (`reply_receive`), so it never waits at its low level behind the spinner
+/// between two requests, and the client gets one request for each 2 ms
+/// period (52 measured; two with a service that returns to EL0 between its
+/// reply and its receive).
+const LOAN_LEAST_SAME: u64 = 26;
+/// The longest wait of the client at 40 of the queue phase, its own 500 us of
+/// work not counted: the rest of the request in hand (500 us at most), B for
+/// the kernel's longest stretch, and 100 us for the entries and the lift.
+const QUEUE_WAIT_US: u64 = 500 + 150 + 100;
+/// The fewest requests the queue phase's client at 40 makes: one every 4 ms.
+const QUEUE_LEAST: u64 = 5;
 const HOG_US: u64 = 300;
 const B_US: u64 = 150;
 
@@ -101,6 +123,10 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
             n.loan_same = (number(line, "requests=")?, number(line, "overruns=")?);
         } else if line.starts_with("budget loan other ") {
             n.loan_other = (number(line, "requests=")?, number(line, "overruns=")?);
+        } else if line.starts_with("budget queue same ") {
+            n.queue_same = (number(line, "requests=")?, number(line, "wait_us=")?);
+        } else if line.starts_with("budget queue other ") {
+            n.queue_other = (number(line, "requests=")?, number(line, "wait_us=")?);
         } else if line.starts_with("budget slot ") {
             n.slot_share = number(line, "min_share=")?;
             n.slot_gap_us = number(line, "max_gap_us=")?;
@@ -109,6 +135,7 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
     if n.windows.len() != 3
         || n.boost_n == 0
         || n.loan_same.0 == 0
+        || n.queue_same.0 == 0
         || n.slot_share == 0 && n.slot_gap_us == 0
     {
         return Err(format!("the probe's lines are incomplete: {n:?}"));
@@ -177,7 +204,12 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
     }
     let mut lost = Vec::new();
     for (what, (requests, overruns)) in loans {
-        if overruns == 0 || !(1..=LOAN_MOST).contains(&requests) {
+        let least = if what == "on its CPU" {
+            LOAN_LEAST_SAME
+        } else {
+            1
+        };
+        if overruns == 0 || !(least..=LOAN_MOST).contains(&requests) {
             lost.push(format!(
                 "a client made {requests} requests of a service {what} whose budget was gone and its budget ran out {overruns} times"
             ));
@@ -185,9 +217,24 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
     }
     if !lost.is_empty() {
         return Err(format!(
-            "{}: its work was not lent to the client (1 to {LOAN_MOST} requests, at least one overrun)",
+            "{}: its work was not lent to the client ({LOAN_LEAST_SAME} to {LOAN_MOST} requests, at least one overrun)",
             lost.join("; ")
         ));
+    }
+    // The queue: a request at 40 that queues behind the request a service
+    // without a budget holds lifts the service, which ends that request and
+    // takes the next one in the same entry; the client waits for the rest of
+    // one request and for the kernel's longest stretch, not for the spinner.
+    let mut queues = vec![("on its CPU", n.queue_same)];
+    if cpus >= 2 {
+        queues.push(("on another", n.queue_other));
+    }
+    for (what, (requests, wait)) in queues {
+        if requests < QUEUE_LEAST || wait > QUEUE_WAIT_US {
+            return Err(format!(
+                "a client at 40 made {requests} requests of a service {what} that held a request of a client at 5 and waited up to {wait} us: the request that queued did not lift it (at least {QUEUE_LEAST} requests, at most {QUEUE_WAIT_US} us)"
+            ));
+        }
     }
     // The worker at 55 for each notification gets its 200 us of each
     // period and the boost of the slot goes with the budget: the victim
@@ -264,10 +311,21 @@ pub fn breaks() -> Result<(), String> {
             Variant::BudgetForgiveLoan,
             "a server whose work for a client is not lent to it",
         ),
+        (
+            Variant::BudgetNoQueueLift,
+            "a request that queues behind a server without a budget and does not lift it",
+        ),
+        (
+            Variant::ReplyReceiveSplit,
+            "a reply_receive that returns to EL0 between its reply and its receive",
+        ),
     ] {
         // On four CPUs, so that the loan phase with the service on another
         // CPU runs on the break too.
-        let cpus = if variant == Variant::BudgetForgiveLoan {
+        let cpus = if matches!(
+            variant,
+            Variant::BudgetForgiveLoan | Variant::BudgetNoQueueLift | Variant::ReplyReceiveSplit
+        ) {
             4
         } else {
             1
@@ -287,6 +345,11 @@ pub fn breaks() -> Result<(), String> {
             Variant::BudgetChildFree,
             "a_thread_with_no_budget_works_at_the_free_level",
             "a child with more free level than its creator",
+        ),
+        (
+            Variant::BudgetNoQueueLiftTest,
+            "a_request_that_queues_lifts_a_demoted_server_of_its_cpu",
+            "a request that queues and does not lift the server",
         ),
     ] {
         let a = build(variant)?;
@@ -367,8 +430,10 @@ mod tests {
             ),
             "budget gaps victim_us=500 hog_us=100".into(),
             format!("budget boost n=40 max_round_trip_us={boost}"),
-            "budget loan same requests=2 overruns=1".into(),
+            "budget loan same requests=52 overruns=50".into(),
             "budget loan other requests=9 overruns=8".into(),
+            "budget queue same requests=20 wait_us=400".into(),
+            "budget queue other requests=20 wait_us=400".into(),
             format!("budget slot min_share={} max_gap_us={}", slot.0, slot.1),
             "budget DONE".into(),
         ]
@@ -392,6 +457,26 @@ mod tests {
             let e = verdict(&parse(&case).unwrap(), 1).unwrap_err();
             assert!(e.contains(text), "{e}");
         }
+    }
+
+    #[test]
+    fn a_queue_wait_over_its_bound_fails() {
+        let mut l = lines(700, 300, 600, (800, 250));
+        for line in &mut l {
+            if line.starts_with("budget queue same ") {
+                *line = "budget queue same requests=20 wait_us=22000".into();
+            }
+        }
+        let e = verdict(&parse(&l).unwrap(), 1).unwrap_err();
+        assert!(e.contains("did not lift it"), "{e}");
+        let mut l = lines(700, 300, 600, (800, 250));
+        for line in &mut l {
+            if line.starts_with("budget loan same ") {
+                *line = "budget loan same requests=2 overruns=1".into();
+            }
+        }
+        let e = verdict(&parse(&l).unwrap(), 1).unwrap_err();
+        assert!(e.contains("not lent"), "{e}");
     }
 
     #[test]
