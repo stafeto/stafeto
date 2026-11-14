@@ -14,6 +14,7 @@ bench = false
 
 [dependencies]
 abi = { path = "../../lib/abi" }
+console-line = { path = "../../lib/console-line" }
 bootimg = { path = "../../lib/bootimg" }
 proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }

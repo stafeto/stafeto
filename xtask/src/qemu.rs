@@ -512,6 +512,9 @@ pub struct Outcome {
     pub status: Option<ExitStatus>,
     pub timed_out: bool,
     pub stopped_on_marker: bool,
+    /// The pieces of tagged lines (lib/console-line) that came on the wire:
+    /// the kernel writes none, and the driver puts them back whole.
+    pub tagged: usize,
 }
 
 /// What a run's child reads on its stdin.
@@ -928,6 +931,7 @@ impl Run {
             status,
             timed_out: matches!(end, End::TimedOut),
             stopped_on_marker: matches!(end, End::Marker(_)),
+            tagged: self.untag.pieces(),
         }
     }
 }
@@ -1682,6 +1686,7 @@ ffffffffc0009000 T __text_end
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(expect_powered_off(&off).is_ok());
         let failed = Outcome {
@@ -1899,6 +1904,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: false,
             stopped_on_marker: true,
+            tagged: 0,
         };
         let started = stopped(&["boot complete", "init: services started"]);
         assert_eq!(
@@ -1910,6 +1916,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         let off = Outcome {
             status: Some(ExitStatus::from_raw(0)),
             stopped_on_marker: false,
+            tagged: 0,
             ..started.clone()
         };
         assert!(expect_stopped_on(&off, "init: services started").is_err());
@@ -1928,6 +1935,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert!(judge(&crashed).is_err());
         let exit = Outcome {
             stopped_on_marker: false,
+            tagged: 0,
             ..done.clone()
         };
         assert!(judge(&exit).is_err());
@@ -1955,6 +1963,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: true,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(expect_marker(&o, "no device tree").is_err());
     }
@@ -1986,6 +1995,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         assert!(verdict(&o, &parse_report(&o.lines), None).is_ok());
     }
@@ -1997,6 +2007,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         let with = |l: &[&str]| Outcome {
             lines: lines(l),
@@ -2032,6 +2043,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: None,
             timed_out: true,
             stopped_on_marker: false,
+            tagged: 0,
         };
         let why = verdict(&hung, &parse_report(&hung.lines), None).unwrap_err();
         assert!(why.contains("timed out"), "{why}");
@@ -2200,6 +2212,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             status: Some(ExitStatus::from_raw(0)),
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         }
     }
 

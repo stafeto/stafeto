@@ -619,7 +619,7 @@ impl Driver {
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             uart::log::text(records, batch, lines, |bytes| {
-                // A batch fits: twelve records and the line of those lost.
+                // A batch fits (uart::output::LOG_BYTES).
                 let _ = output.put_log(bytes);
             });
             self.kick();

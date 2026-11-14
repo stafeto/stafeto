@@ -6,6 +6,13 @@
 //! kernel log comes in tagged pieces (lib/console-line) that other writers'
 //! text can lie between. `Untag` puts each such line back whole where its
 //! last piece stands.
+//!
+//! The kernel strips the header of a piece when it writes a record to its
+//! own port (console_line::strip), so no piece should come on the wire from
+//! it; `pieces` counts those that did, and a probe fails on one. The decoder
+//! rewrites any bytes that look like a piece, among them those of a client's
+//! stdout (a mark byte, three bytes of 0x40 to 0x7F and a length that
+//! fits); the probes do not print such bytes, so that is acceptable.
 
 use console_line::{HEADER, LAST, MORE};
 
@@ -16,9 +23,16 @@ pub struct Untag {
     held: Vec<u8>,
     /// The lines whose last piece did not come yet, by identifier.
     open: Vec<(u32, Vec<u8>)>,
+    /// The pieces taken so far.
+    count: usize,
 }
 
 impl Untag {
+    /// The pieces of tagged lines the stream held.
+    pub fn pieces(&self) -> usize {
+        self.count
+    }
+
     /// The bytes of `bytes` as the console shows them: text that is not a
     /// piece as it is, a line of pieces whole at its last piece.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
@@ -39,6 +53,7 @@ impl Untag {
                         self.held = rest.to_vec();
                         return out;
                     }
+                    self.count += 1;
                     let text = &rest[HEADER..HEADER + len];
                     let at = self.open.iter().position(|(k, _)| *k == id);
                     let at = at.unwrap_or_else(|| {

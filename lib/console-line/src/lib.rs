@@ -18,7 +18,11 @@
 //! line longer than LINE_MAX goes out in parts of LINE_MAX bytes at most,
 //! each whole in itself; a line whose writer stops (no LAST piece) goes
 //! out as it is after QUIET empty batches of the log; a fifth open line
-//! sends out the oldest slot first.
+//! sends out the oldest slot first. A driver that ended with lines open
+//! loses their held pieces (the pieces left its ring when it took them);
+//! the last piece of such a line, which comes to the next driver with no
+//! slot, goes out after the mark CUT. A line all of whose pieces the dead
+//! driver held leaves no trace but init's line that the driver ended.
 
 #![no_std]
 
@@ -37,9 +41,13 @@ pub const SLOTS: usize = 4;
 pub const LINE_MAX: usize = 128;
 /// The empty batches of the log after which the lines still open go out.
 pub const QUIET: u8 = 2;
+/// What goes before the last piece of a line whose earlier pieces the driver
+/// does not hold: it ended and started again, or it put the line out early.
+pub const CUT: &[u8] = b"[console: the start of this line was lost] ";
 /// The most bytes `Lines::record` puts out for one record: the oldest slot
-/// or a full line, then the line the record ends.
-pub const RECORD_OUT: usize = LINE_MAX + PAYLOAD;
+/// or a full line, then the line the record ends or the mark and the tail
+/// of a line whose start was lost.
+pub const RECORD_OUT: usize = LINE_MAX + PAYLOAD + CUT.len();
 /// The most bytes `Lines::quiet` puts out.
 pub const QUIET_OUT: usize = SLOTS * LINE_MAX;
 
@@ -72,7 +80,7 @@ pub fn header(bytes: &[u8]) -> Option<(bool, u32, usize)> {
         return None;
     };
     let id_byte = |x: u8| (0x40..=0x7F).contains(&x);
-    if !(mark == MORE || mark == LAST) || ![a, b, c].into_iter().all(id_byte) {
+    if !(mark == MORE || mark == LAST) || !(id_byte(a) && id_byte(b) && id_byte(c)) {
         return None;
     }
     let len = usize::from(n.checked_sub(0x40)?);
@@ -81,6 +89,33 @@ pub fn header(bytes: &[u8]) -> Option<(bool, u32, usize)> {
     }
     let id = (u32::from(a & 0x3F) << 12) | (u32::from(b & 0x3F) << 6) | u32::from(c & 0x3F);
     Some((mark == LAST, id, len))
+}
+
+/// The longest text of one debug_write call.
+pub const CALL_MAX: usize = 64;
+
+/// `text` (an assembled line, up to LINE_MAX bytes) in the pieces one
+/// debug_write call takes each, untagged: a program that shows text the
+/// driver assembled, with the port the kernel's, cuts it with this.
+pub fn calls(text: &[u8]) -> core::slice::Chunks<'_, u8> {
+    #[cfg(feature = "break-line-split")]
+    return text.chunks(2 * CALL_MAX);
+    #[cfg(not(feature = "break-line-split"))]
+    text.chunks(CALL_MAX)
+}
+
+/// `text` as a console that has no driver to assemble the pieces shows
+/// it: a whole tagged piece without its header, anything else as it is. It
+/// allocates nothing and keeps no state; the kernel calls it where it
+/// writes a record to its own port.
+pub fn strip(text: &[u8]) -> &[u8] {
+    #[cfg(feature = "break-line-strip")]
+    return text;
+    #[cfg(not(feature = "break-line-strip"))]
+    match tag(text) {
+        Some(_) => &text[HEADER..],
+        None => text,
+    }
 }
 
 /// The tag of a record's `text`: a whole piece, header and text.
@@ -133,6 +168,14 @@ impl Lines {
         #[cfg(feature = "break-line-assembly")]
         let id = 0;
         let payload = &text[HEADER..];
+        // The last piece of a line is never its only one: with no slot, the
+        // pieces before it went with an earlier driver or went out early.
+        #[cfg(not(feature = "break-line-cut"))]
+        if last && !self.slots.iter().any(|s| s.open && s.id == id) {
+            put(CUT);
+            put(payload);
+            return;
+        }
         let at = match self.slots.iter().position(|s| s.open && s.id == id) {
             Some(at) => at,
             None => {
@@ -239,6 +282,39 @@ mod tests {
     const A: &[u8] =
         b"service step: 12 kind 64 3480 ticks of 23806, the longest of its loop so far\n";
     const B: &[u8] = b"store-probe: refused TOO_LONG, the receipt is gone, nothing changed\n";
+
+    #[test]
+    fn strip_takes_the_header_of_a_whole_piece_and_nothing_else() {
+        let p = pieces(5, A);
+        assert!(p.len() > 1);
+        let text: Vec<u8> = p.iter().flat_map(|x| strip(x).to_vec()).collect();
+        assert_eq!(text, A);
+        assert_eq!(strip(b"plain line\n"), b"plain line\n");
+        // A header whose length does not match the record is text.
+        let mut cut = p[0].clone();
+        cut.pop();
+        assert_eq!(strip(&cut), &cut[..]);
+        assert_eq!(strip(&[MORE, b'a']), &[MORE, b'a']);
+    }
+
+    #[test]
+    fn an_assembled_line_goes_in_calls_of_64_bytes_at_most() {
+        let line = [b'x'; LINE_MAX];
+        let calls: Vec<&[u8]> = calls(&line).collect();
+        assert!(
+            calls.iter().all(|c| c.len() <= CALL_MAX),
+            "a call is refused"
+        );
+        assert_eq!(calls.concat(), line);
+    }
+
+    #[test]
+    fn a_tail_whose_start_was_lost_is_marked() {
+        let p = pieces(8, A);
+        let out = run(&p[p.len() - 1..]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], CUT);
+    }
 
     #[test]
     fn a_short_record_goes_as_it_is() {

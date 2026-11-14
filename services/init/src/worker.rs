@@ -689,7 +689,7 @@ fn watch(record: &Record, gone: &Instance) {
 /// Shows what is left of the kernel log once its reader, the console's
 /// driver, ended for good (spec 13.4, 16.3): batches of LOG through the
 /// system resource, then the line of the records lost and the text of each
-/// record (uart::log::text) through debug_write, a call each, while the
+/// record (uart::log::text) through debug_write, in calls of 64 bytes at most, while the
 /// kernel says records are left, a ring's worth at most. The main thread
 /// gives it at WORKER_IDLE, below every cleanup of the driver's instance,
 /// so the port is the kernel's and the texts go out at once (spec 3.2).
@@ -697,18 +697,30 @@ fn show_log() {
     let resource = view::<Resource>(RESOURCE);
     let mut records = [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
     let mut lines = console_line::Lines::new();
+    // What could not be shown: the texts that debug_write refused, and a
+    // batch that LOG did not give.
+    let lost = core::cell::Cell::new(0u32);
+    // An assembled line is up to console_line::LINE_MAX bytes, a call takes
+    // 64: the pieces go in calls of their own.
+    let mut put = |bytes: &[u8]| {
+        for piece in console_line::calls(bytes) {
+            if sys::debug_write(&resource, piece).is_err() {
+                lost.set(lost.get() + 1);
+            }
+        }
+    };
     for _ in 0..64 / abi::LOG_BATCH + 1 {
         let Ok(batch) = sys::log_take(&resource, &mut records) else {
+            lost.set(lost.get() + 1);
             break;
         };
-        uart::log::text(&records, batch, &mut lines, |bytes| {
-            let _ = sys::debug_write(&resource, bytes);
-        });
+        uart::log::text(&records, batch, &mut lines, &mut put);
         if batch.left == 0 {
             break;
         }
     }
-    lines.finish(&mut |bytes| {
-        let _ = sys::debug_write(&resource, bytes);
-    });
+    lines.finish(&mut put);
+    if lost.get() > 0 {
+        rt::println!("init: the log show lost {} texts", lost.get());
+    }
 }

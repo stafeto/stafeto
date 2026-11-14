@@ -14,5 +14,12 @@ bench = false
 # writers share one slot.
 [features]
 break-line-assembly = []
+# A deliberate break: the kernel's port shows the headers (`strip` gives the
+# text as it is).
+break-line-strip = []
+# A deliberate break: `calls` cuts text in pieces a debug_write refuses.
+break-line-split = []
+# A deliberate break: a tail whose head was lost is put out unmarked.
+break-line-cut = []
 
 [dependencies]

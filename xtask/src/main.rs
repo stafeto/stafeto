@@ -1436,6 +1436,10 @@ const INIT_TESTS: u32 = 271;
 /// the window went, comes whole.
 const LOG_BEHIND: &str = "log marker: behind the window";
 const LOG_IN_FRONT: &str = "log marker: in front of the window";
+/// The line of 93 bytes the test init writes in tagged pieces with the port
+/// the kernel's (tests/init/src/devices.rs, LONG).
+const LOG_LONG: &str =
+    "log marker: a line longer than one record, written in pieces while the kernel holds the port";
 /// The rows of the test init's line `log ticks:` under -icount (spec
 /// 15.3): a debug_write of 64 bytes into the kernel log and a read of a
 /// full batch of it.
@@ -1608,10 +1612,14 @@ enum Variant {
     /// device tree (kernel feature `break-seed-wipe`, `cargo xtask
     /// seed-breaks`): the test of the wipe must fail, and only it.
     SeedNoWipe,
+    /// The normal kernel whose port shows the headers of the pieces of long
+    /// lines (kernel feature `break-console-strip`, `cargo xtask
+    /// console-strip-break`): the init tests must fail on the wire.
+    ConsoleNoStrip,
 }
 
 impl Variant {
-    const ALL: [Variant; 49] = [
+    const ALL: [Variant; 50] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1661,6 +1669,7 @@ impl Variant {
         Variant::ItsPresetBreak,
         Variant::ItsIntAlign4k,
         Variant::SeedNoWipe,
+        Variant::ConsoleNoStrip,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1718,6 +1727,7 @@ impl Variant {
             Variant::ItsPresetBreak => Some("break-its-keep-firmware-lpis"),
             Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
             Variant::SeedNoWipe => Some("ktest,break-seed-wipe"),
+            Variant::ConsoleNoStrip => Some("break-console-strip"),
         }
     }
 
@@ -1758,6 +1768,7 @@ impl Variant {
             | Variant::ItsPreset
             | Variant::ItsPresetBreak
             | Variant::ItsIntAlign4k
+            | Variant::ConsoleNoStrip
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1850,6 +1861,7 @@ impl Variant {
             Variant::ItsPresetBreak => "stafeto-its-preset-break",
             Variant::ItsIntAlign4k => "stafeto-its-int-align4k",
             Variant::SeedNoWipe => "stafeto-ktest-seed-no-wipe",
+            Variant::ConsoleNoStrip => "stafeto-console-no-strip",
         }
     }
 }
@@ -2203,6 +2215,7 @@ commands:
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
+  console-strip-break the init tests on a kernel whose port shows the headers of the pieces of long lines: the check of the wire must fail
   seed-breaks run the kernel tests with the boot seed left in the device tree: the test of the wipe must fail, and only it
   its-drop  boot the kernel whose self-test events cannot arrive: MSI must go off with a line and the boot go on; the break that ignores the result must be caught
   its-lpis  boot with EnableLPIs and tables of the firmware preset on every redistributor: the kernel clears the bit and its LPIs arrive; the break that keeps the bit must be caught
@@ -2231,6 +2244,7 @@ fn main() {
         Some("its-lpis") => its_lpis(),
         Some("its-breaks") => its_breaks(),
         Some("seed-breaks") => seed_breaks(),
+        Some("console-strip-break") => console_strip_break(),
         Some("random-breaks") => entropy::random_breaks(),
         Some("entropy-seed") => entropy::seed_probe(),
         Some("its-slow") => its_slow(),
@@ -2799,6 +2813,20 @@ fn its_slow() -> Result<(), String> {
             Ok(())
         }
         Ok(_) => Err("the teardown that waits in one portion passed the kernel tests".into()),
+    }
+}
+
+/// `cargo xtask console-strip-break`: the init tests on a kernel that writes
+/// the headers of the pieces of long lines to its port
+/// (`break-console-strip`) fail on the check of the wire (`log_markers`).
+fn console_strip_break() -> Result<(), String> {
+    match init_tests_in(Variant::ConsoleNoStrip, &qemu::VIRT, false, 1) {
+        Err(e) if e.contains("tagged pieces") => {
+            println!("console-strip-break: the headers on the port are caught ({e})");
+            Ok(())
+        }
+        Err(e) => Err(format!("the break failed another way: {e}")),
+        Ok(_) => Err("the break (headers on the port) passed the init tests".into()),
     }
 }
 
@@ -9979,6 +10007,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("its lpis", its_lpis),
         job("its breaks", its_breaks),
         job("seed breaks", seed_breaks),
+        job("console strip break", console_strip_break),
         job("random breaks", entropy::random_breaks),
         job("entropy seed", entropy::seed_probe),
         job("its slow", its_slow),
@@ -12640,7 +12669,16 @@ fn log_markers(o: &qemu::Outcome) -> Result<(), String> {
     if let Some(l) = o.lines.iter().find(|l| l.contains(LOG_BEHIND)) {
         return Err(format!("a line behind the window reached the port: {l}"));
     }
-    qemu::expect_line(o, LOG_IN_FRONT)
+    qemu::expect_line(o, LOG_IN_FRONT)?;
+    // A line longer than a record, written in tagged pieces while the kernel
+    // holds the port: the kernel shows it as text, with no header on the wire.
+    if o.tagged > 0 {
+        return Err(format!(
+            "{} tagged pieces of long lines came on the port: the kernel did not strip their headers",
+            o.tagged
+        ));
+    }
+    qemu::expect_line(o, LOG_LONG)
 }
 
 /// The image of init's test table (spec 15.2): init built with
@@ -15330,6 +15368,7 @@ mod process_repeat_tests {
             status: None,
             timed_out: false,
             stopped_on_marker: false,
+            tagged: 0,
         };
         let mut visited = Vec::new();
         let result = process_repeat_each(4, |iteration| {
