@@ -91,8 +91,9 @@ pub struct Channel {
     /// The number of the thread that `accept` last gave a request of this
     /// channel to, or NO_SERVER, and the token of that request: the thread a
     /// sender that has to wait lifts (`message::lift_holder`). Either may be
-    /// stale, so the lift finds the holder through the token's client and
-    /// checks what the thread holds (`message::holder`).
+    /// stale, so the lift takes this thread only while its boost token equals
+    /// this token, or while it sits between the halves of `reply_receive` on
+    /// this channel (`message::holder`).
     server: u32,
     token: u64,
     /// The process whose pool of channels holds it, and whose shell it
