@@ -738,6 +738,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::a_request_that_queues_leaves_a_thread_that_went_to_another_channel,
     ),
     (
+        "a_request_that_queues_lifts_a_holder_whose_client_ended",
+        calls::a_request_that_queues_lifts_a_holder_whose_client_ended,
+    ),
+    (
         "two_boost_asks_leave_the_larger",
         calls::two_boost_asks_leave_the_larger,
     ),

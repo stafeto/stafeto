@@ -824,30 +824,30 @@ unsafe fn lift_servers(client: NonNull<Thread>, k: &mut Locked<'_>) {
 }
 
 /// The thread that holds the last request of `c`, if it still does: the
-/// client of the request `Channel::token` names waits for its reply, and the
-/// thread its server link names (`serving`) carries that token in its boost.
-/// Otherwise the thread that `accept` last gave a request of `c` to
-/// (`Channel::server`), when it is between the two halves of `reply_receive`
-/// (`Long::Receive`) on a handle that names `c`: its reply went, and its
-/// receive on this channel is next. A number that names a thread now at work
-/// for another channel, or a thread of another process under a reused
-/// number, fits neither.
+/// thread that `accept` last gave a request to (`Channel::server`) carries
+/// the token of that request (`Channel::token`) in its boost. The client may
+/// have ended meanwhile: the request is still the thread's work, which it
+/// finishes for nobody to pay, at most one request, S_srv, since its reply
+/// finds PEER_CLOSED and `settle_loan` charges no one. Otherwise that thread,
+/// when it is between the two halves of `reply_receive` (`Long::Receive`,
+/// set and cleared under OBJ) on a handle that names `c`: its reply went, and
+/// its receive on this channel is next. A number that names a thread now at
+/// work for another channel, or a thread of another process under a reused
+/// number, fits neither: a token names one request.
 ///
 /// # Safety
 /// `c` is alive; `k` is the locked scheduler.
 #[cfg_attr(feature = "break-budget-no-queue-lift", allow(dead_code))]
 unsafe fn holder(c: NonNull<Channel>, k: &Locked<'_>) -> Option<NonNull<Thread>> {
     // SAFETY: the caller's promise; a taken number names a live thread, and
-    // the tables and tokens are read under OBJ, which this section holds.
+    // the tokens, the tables and `long` are read under OBJ, which this
+    // section holds.
     unsafe {
         let (token, number) = ((*c.as_ptr()).token, (*c.as_ptr()).server);
-        if token != 0
-            && let Ok(client) = k.tokens.check(token)
-            && let Some(server) = serving(client, k)
-        {
+        let server = k.tokens.thread(u16::try_from(number).ok()?)?;
+        if token != 0 && (*server.as_ptr()).boost_token == token {
             return Some(server);
         }
-        let server = k.tokens.thread(u16::try_from(number).ok()?)?;
         let Some(thread::Long::Receive(handle)) = thread::long(server) else {
             return None;
         };
@@ -867,7 +867,9 @@ unsafe fn holder(c: NonNull<Channel>, k: &Locked<'_>) -> Option<NonNull<Thread>>
 /// when its budget is gone and its level is lower; a server with a budget
 /// keeps the level its client gave it. A holder of another CPU takes the
 /// command BOOST with no look at its budget or level, which that CPU
-/// changes under its own lock: the ask is cheap, the largest ask stands, and
+/// changes under its own lock and this CPU cannot read whole: a stale answer
+/// "not demoted" would lose the lift, so the remote path is wider than the
+/// local one; the ask is cheap, the largest ask stands, and
 /// the CPU that serves it drops an ask that comes too late (`serve_level`).
 /// A holder that has a request is a loan its client pays (`settle_loan`). A
 /// holder between the two halves of `reply_receive` holds none: its reply

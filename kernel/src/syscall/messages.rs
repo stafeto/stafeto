@@ -124,7 +124,12 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
         lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
         check_handles(thread, values)?;
         match channel::reply(thread, a[0], desc, values) {
-            Ok(()) | Err(Error::PeerClosed) => Ok(handle),
+            Ok(()) | Err(Error::PeerClosed) => {
+                // Set in this section, which the receive half's closes: a
+                // thread of another CPU reads it under OBJ (`channel::holder`).
+                thread::begin_long(thread, Long::Receive(handle));
+                Ok(handle)
+            }
             Err(e) => Err(e),
         }
     });
@@ -141,7 +146,6 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
     cleanup::count_portion(entry);
     sched::entry_polled();
     if cfg!(feature = "break-reply-receive-split") || arch::irq_pending() || forced_poll() {
-        thread::begin_long(thread, Long::Receive(handle));
         return super::restart(thread);
     }
     sched::entry_started();
@@ -173,7 +177,10 @@ fn forced_poll() -> bool {
 /// `start`.
 #[inline(never)]
 pub(super) fn receive_second(thread: NonNull<Thread>, handle: u64, start: u64) {
-    objects(|| receive_on(thread, handle));
+    objects(|| {
+        thread::end_long(thread);
+        receive_on(thread, handle)
+    });
     cleanup::count_portion(start);
 }
 

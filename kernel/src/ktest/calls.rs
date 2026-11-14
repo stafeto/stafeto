@@ -10264,3 +10264,23 @@ pub fn reply_receive_is_measured(_: &Boot) -> Result<(), &'static str> {
         Ok(())
     })
 }
+
+/// The client of the request a demoted server holds ends: the request is
+/// still the server's work, and a request at 40 that queues lifts it, so a
+/// low client that ends cannot keep the queue waiting for a replenishment.
+pub fn a_request_that_queues_lifts_a_holder_whose_client_ended(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        // SAFETY: the test's reference to the client goes, the kernel's
+        // first; the holder lets go of the thread afterwards.
+        unsafe { sched::exit(h.t, CAUSE) };
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request that queued did not lift a server whose client ended",
+        )
+    })
+}
