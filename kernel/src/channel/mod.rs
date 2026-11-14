@@ -89,11 +89,12 @@ pub struct Channel {
     /// higher of it and the top level of its queue (spec 7.7).
     cause: u8,
     /// The number of the thread that `accept` last gave a request of this
-    /// channel to, or NO_SERVER: the thread a sender that has to wait
-    /// lifts when it works at a level below the sender's
-    /// (`message::lift_holder`). The number may name another thread by now;
-    /// the lift looks at what the thread holds.
+    /// channel to, or NO_SERVER, and the token of that request: the thread a
+    /// sender that has to wait lifts (`message::lift_holder`). Either may be
+    /// stale, so the lift finds the holder through the token's client and
+    /// checks what the thread holds (`message::holder`).
     server: u32,
+    token: u64,
     /// The process whose pool of channels holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
@@ -141,6 +142,7 @@ pub fn create_with(
         closed: false,
         cause: 0,
         server: NO_SERVER,
+        token: 0,
         payer,
         cleanup: Item::new(),
     };

@@ -62,6 +62,13 @@ pub trait Service<const K: usize> {
         None
     }
 
+    /// Whether the loop may keep the answer of a request that carries no
+    /// handles for its next receive (`Token::reply_receive`). A service
+    /// whose `between_requests` does work the client should not wait for, as
+    /// printing to the console, says false: the loop then sends each answer
+    /// at once.
+    const OWES_REPLY: bool = true;
+
     /// Answers `r`, a request of the client of `s` with a header of this
     /// version and one of METHODS; the handler checks the body. What it
     /// returns goes to the client, unless the handler took the token
@@ -972,8 +979,9 @@ fn request<S: Service<K>, const K: usize>(
     let answer = service.request(s, &mut r);
     let token = r.token.take()?;
     // Handles the request brought and the handler left close when `r` goes,
-    // which is after the reply: such a reply is sent here, not owed.
-    let held = !r.handles.is_empty();
+    // which is after the reply: such a reply is sent here, and so is every
+    // reply of a service that says it owes none.
+    let held = !r.handles.is_empty() || !S::OWES_REPLY;
     // A reply the client could not take is no error of the service; one
     // the kernel refused for the service's own handles, the client gets
     // as its status.

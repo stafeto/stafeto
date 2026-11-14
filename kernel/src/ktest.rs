@@ -730,6 +730,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::a_request_that_queues_leaves_a_server_with_a_budget,
     ),
     (
+        "a_request_that_queues_lifts_a_server_between_the_halves_of_reply_receive",
+        calls::a_request_that_queues_lifts_a_server_between_the_halves_of_reply_receive,
+    ),
+    (
+        "a_request_that_queues_leaves_a_thread_that_went_to_another_channel",
+        calls::a_request_that_queues_leaves_a_thread_that_went_to_another_channel,
+    ),
+    (
         "two_boost_asks_leave_the_larger",
         calls::two_boost_asks_leave_the_larger,
     ),
@@ -806,7 +814,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// of the long calls of memory objects, the timers of programs, device
 /// windows, the calls of upcalls and process_kill with a level, whose
 /// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 9 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 10 } else { 0 };
 
 /// The tests of a build come in two images, which keep each under the size
 /// a test image may have: the first runs TESTS and, with `icount`, the
@@ -854,6 +862,10 @@ pub fn run(boot: &Boot) -> ! {
         report(
             "budget_firing_is_measured",
             calls::budget_firing_is_measured(boot),
+        );
+        report(
+            "reply_receive_is_measured",
+            calls::reply_receive_is_measured(boot),
         );
         report(
             "device_windows_are_measured",

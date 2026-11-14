@@ -568,7 +568,9 @@ unsafe fn accept(
         sched::boost_in_place(k, r, (*slot.as_ptr()).priority(), ceiling(r), true);
         (*r.as_ptr()).boost_token = token;
         thread::set_server(client, r);
-        (*via.channel().as_ptr()).server = u32::from(thread::index(r));
+        let ch = via.channel().as_ptr();
+        (*ch).server = u32::from(thread::index(r));
+        (*ch).token = token;
     }
 }
 
@@ -821,18 +823,59 @@ unsafe fn lift_servers(client: NonNull<Thread>, k: &mut Locked<'_>) {
     }
 }
 
+/// The thread that holds the last request of `c`, if it still does: the
+/// client of the request `Channel::token` names waits for its reply, and the
+/// thread its server link names (`serving`) carries that token in its boost.
+/// Otherwise the thread that `accept` last gave a request of `c` to
+/// (`Channel::server`), when it is between the two halves of `reply_receive`
+/// (`Long::Receive`) on a handle that names `c`: its reply went, and its
+/// receive on this channel is next. A number that names a thread now at work
+/// for another channel, or a thread of another process under a reused
+/// number, fits neither.
+///
+/// # Safety
+/// `c` is alive; `k` is the locked scheduler.
+#[cfg_attr(feature = "break-budget-no-queue-lift", allow(dead_code))]
+unsafe fn holder(c: NonNull<Channel>, k: &Locked<'_>) -> Option<NonNull<Thread>> {
+    // SAFETY: the caller's promise; a taken number names a live thread, and
+    // the tables and tokens are read under OBJ, which this section holds.
+    unsafe {
+        let (token, number) = ((*c.as_ptr()).token, (*c.as_ptr()).server);
+        if token != 0
+            && let Ok(client) = k.tokens.check(token)
+            && let Some(server) = serving(client, k)
+        {
+            return Some(server);
+        }
+        let server = k.tokens.thread(u16::try_from(number).ok()?)?;
+        let Some(thread::Long::Receive(handle)) = thread::long(server) else {
+            return None;
+        };
+        let named = server
+            .as_ref()
+            .process()
+            .as_ref()
+            .lookup(abi::Handle(handle), Rights::RECEIVE, Object::channel)
+            .ok()?;
+        (named == c).then_some(server)
+    }
+}
+
 /// The request of `t`, the running thread, waits in the queue of `c`: the
-/// thread that `accept` last gave a request of `c` to (`Channel::server`)
-/// works at the level of `t` at least, under its own ceiling, when it still
-/// holds a request (its boost carries a token), its budget is gone and its
-/// level is below `t`'s. A server with a budget keeps the level its client
-/// gave it, and one with no request has nothing to lift to: nobody could
-/// pay for its time, since the time of a thread that holds a request is a
-/// loan its client pays (`settle_loan`). The lift is the one `lift_servers`
-/// makes, so a server of another CPU takes the command BOOST, whose
-/// largest ask stands, and a server of this CPU that waits for a reply in
-/// its turn has its slot moved and the lift goes on along its chain.
-/// Returns the wait the slot moved in, for `raise` after OBJ. O(LIFT_DEPTH).
+/// thread that holds the last request of `c` (`holder`) works at the level
+/// of `t` at least, under its own ceiling. A holder of this CPU is lifted
+/// when its budget is gone and its level is lower; a server with a budget
+/// keeps the level its client gave it. A holder of another CPU takes the
+/// command BOOST with no look at its budget or level, which that CPU
+/// changes under its own lock: the ask is cheap, the largest ask stands, and
+/// the CPU that serves it drops an ask that comes too late (`serve_level`).
+/// A holder that has a request is a loan its client pays (`settle_loan`). A
+/// holder between the two halves of `reply_receive` holds none: its reply
+/// ended the boost, and its time until the receive, one exit from the kernel
+/// and one entry, is paid by nobody. The lift is the one `lift_servers`
+/// makes, so a holder of this CPU that waits for a reply in its turn has its
+/// slot moved and the lift goes on along its chain. Returns the wait the slot
+/// moved in, for `raise` after OBJ. O(LIFT_DEPTH).
 ///
 /// # Safety
 /// `c` is alive and `t` runs and sends into it; `k` is the locked scheduler.
@@ -842,18 +885,16 @@ unsafe fn lift_holder(c: NonNull<Channel>, k: &mut Locked<'_>, t: NonNull<Thread
         let _ = (c, k, t);
         None
     }
-    // SAFETY: the caller's promise; a taken number names a live thread. The
-    // token is changed under OBJ, which this section holds. The budget and
-    // the level of a thread of another CPU are read as `lift_servers` reads
-    // the level of a client: that CPU changes them under its own lock, and
-    // a stale answer costs one command or leaves the lift to the next
-    // sender.
+    // SAFETY: the caller's promise. The level and the budget of a holder of
+    // this CPU are the CPU's own.
     #[cfg(not(feature = "break-budget-no-queue-lift"))]
     unsafe {
         let level = t.as_ref().priority();
-        let server = k.tokens.thread(u16::try_from((*c.as_ptr()).server).ok()?)?;
-        let n = server.as_ref();
-        if server == t || n.boost_token == 0 || !n.sched.is_demoted() || n.priority() >= level {
+        let server = holder(c, k)?;
+        if server == t
+            || sched::is_local(server)
+                && (!server.as_ref().sched.is_demoted() || server.as_ref().priority() >= level)
+        {
             return None;
         }
         if !sched::boost(k, server, level, ceiling(server)) {

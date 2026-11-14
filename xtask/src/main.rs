@@ -1206,12 +1206,13 @@ const OVERFLOW_PROBE_FN: &str = "karch::probe::recurse";
 /// image of the kernel tests (`Variant::el0_half`) must have run.
 const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
 const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
-const ICOUNT_TESTS: [&str; 19] = [
+const ICOUNT_TESTS: [&str; 20] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
     "timer_firing_is_measured",
     "budget_firing_is_measured",
+    "reply_receive_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "fast_path_arms_the_timer",

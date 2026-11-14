@@ -466,7 +466,15 @@ pub fn serve_level(t: NonNull<Thread>) {
                 let (priority, policy, tail) = unpack_level(level);
                 let _ = k.s.set_priority(t, priority, policy, tail, now);
             }
-            if boost != 0 {
+            // The ask comes from a section that saw the thread hold a request
+            // (or sit between the halves of reply_receive); this CPU serves it
+            // later, and a thread that replied since works for nobody the
+            // ask was made for: it is dropped. One that took its next
+            // request meanwhile gets the larger level for that request.
+            if boost != 0
+                && (t.as_ref().boost_token != 0
+                    || matches!(thread::long(t), Some(thread::Long::Receive(_))))
+            {
                 k.s.boost(t, (boost & 0x3f) as u8, ((boost >> 6) & 0x3f) as u8, true);
             }
             channel::requeue(t, k)

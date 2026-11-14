@@ -224,7 +224,7 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
     // The queue: a request at 40 that queues behind the request a service
     // without a budget holds lifts the service, which ends that request and
     // takes the next one in the same entry; the client waits for the rest of
-    // one request and for the kernel's longest stretch, not for the spinner.
+    // one request and for the kernel's longest stretch; the spinner takes none of it.
     let mut queues = vec![("on its CPU", n.queue_same)];
     if cpus >= 2 {
         queues.push(("on another", n.queue_other));

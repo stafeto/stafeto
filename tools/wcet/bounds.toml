@@ -620,7 +620,7 @@ complete = "yes"
 [[path]]
 name = "receive half of reply_receive"
 symbol = "kernel::syscall::messages::receive_second"
-measured = []
+measured = ["reply_receive portions ticks: second"]
 complete = "yes"
 
 [[path]]

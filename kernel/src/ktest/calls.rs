@@ -10153,3 +10153,114 @@ pub fn reply_receive_refuses_before_it_replies(_: &Boot) -> Result<(), &'static 
         check(queued == 1, "the receive ran after a reply that failed")
     })
 }
+
+/// A server whose budget is gone takes an interrupt at the poll between the
+/// halves of `reply_receive`: its reply ended its boost, so it holds no
+/// request, and it waits at its `low` level for its receive. A request of a
+/// thread at 40 that queues then lifts it (`channel::holder`), and its receive
+/// on the next entry takes that request at 40.
+pub fn a_request_that_queues_lifts_a_server_between_the_halves_of_reply_receive(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        syscall::force_poll();
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        check(
+            thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+            "the poll with an interrupt pending did not start the call over",
+        )?;
+        check(
+            level_of(h.r) == 1,
+            "the reply did not end the boost of the server",
+        )?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request that queued did not lift a server between the halves of reply_receive",
+        )?;
+        pick(h.r)?;
+        // SAFETY: as above; the call starts over at its `svc`.
+        unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let r = unsafe { h.r.as_ref() };
+        check(
+            r.regs.x[0] == 0 && r.regs.x[11] != h.token && r.boost_token == r.regs.x[11],
+            "the receive after the restart did not take the queued request",
+        )?;
+        check(
+            level_of(h.r) == 40,
+            "the receive after the restart did not take the request at its level",
+        )
+    })
+}
+
+/// The number a channel remembers may name a thread that went on to the
+/// request of another channel: a request that queues in the first channel
+/// does not lift it.
+pub fn a_request_that_queues_leaves_a_thread_that_went_to_another_channel(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        pick(h.r)?;
+        h.reply()?;
+        let c2 = owned_channel(h.service)?;
+        channel::receive(h.r, c2, true).map_err(|_| "the server did not wait")?;
+        pick(h.t)?;
+        let sent = channel::send(
+            h.t,
+            Via::Channel(c2),
+            Desc::from_send(0).expect("a send"),
+            &[],
+        );
+        check(sent.is_ok(), "the request of the other channel failed")?;
+        // SAFETY: the test holds the thread.
+        check(
+            unsafe { h.r.as_ref() }.boost_token != 0,
+            "the server did not take the request of the other channel",
+        )?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 5,
+            "a request of one channel lifted a thread that works for another",
+        )
+    })
+}
+
+/// The two halves of `reply_receive` under -icount: the reply with a request
+/// queued behind the server and an interrupt at the poll, then the receive
+/// on the next entry. The test prints `reply_receive portions ticks:
+/// first=... second=...`; the second is the stretch of `receive_second`.
+#[cfg(feature = "icount")]
+pub fn reply_receive_is_measured(_: &Boot) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        give_channel(h);
+        syscall::force_poll();
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        let began = timer::now();
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        let first = timer::now() - began;
+        // SAFETY: as above; the call starts over at its `svc`.
+        unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+        let began = timer::now();
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        let second = timer::now() - began;
+        kprintln!("reply_receive portions ticks: first={first} second={second}");
+        Ok(())
+    })
+}

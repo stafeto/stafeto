@@ -140,12 +140,32 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
     // between the two. The deliberate break always starts over.
     cleanup::count_portion(entry);
     sched::entry_polled();
-    if cfg!(feature = "break-reply-receive-split") || arch::irq_pending() {
+    if cfg!(feature = "break-reply-receive-split") || arch::irq_pending() || forced_poll() {
         thread::begin_long(thread, Long::Receive(handle));
         return super::restart(thread);
     }
     sched::entry_started();
     receive_second(thread, handle, crate::arch::timer::now());
+}
+
+/// The kernel tests make the next poll between the halves of `reply_receive`
+/// find an interrupt pending.
+#[cfg(feature = "ktest")]
+static FORCED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "ktest")]
+pub fn force_poll() {
+    FORCED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "ktest")]
+fn forced_poll() -> bool {
+    FORCED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "ktest"))]
+fn forced_poll() -> bool {
+    false
 }
 
 /// The receive half of `reply_receive` (spec 6.1) on `handle`, a handle with
