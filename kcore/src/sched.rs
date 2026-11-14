@@ -665,9 +665,6 @@ impl<T: Linked> Default for ReadyQueue<T> {
 #[derive(Clone, Copy)]
 enum Op {
     Stop(bool),
-    /// The stint that is ending, above `low` with the budget gone, counts as
-    /// an overrun of the ticks it lasted (`Server::debit`).
-    Debit,
     Unblock,
     UnblockRun,
     Run,
@@ -751,22 +748,6 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe {
             let n = node(r);
             n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
-            // The budget is gone and the thread worked above `low`, at the
-            // level of the client of a request: the stint, which the stamp
-            // still holds, is charged to the budget as an overrun that the
-            // next replenishment pays; no stint at a client's level is free.
-            #[cfg(not(feature = "break-budget-leak"))]
-            if leave != Leave::Exit
-                && n.server.is_some_and(|s| {
-                    // The budget lives while the thread is bound to it.
-                    let s = s.as_ref();
-                    s.background() && n.link.level > s.low()
-                })
-            {
-                Self::with_server(r, Op::Debit, now);
-                node(r).stamp = 0;
-                return false;
-            }
             // The stint is over: the word holds no counter value any more.
             n.stamp = 0;
             if leave == Leave::Exit {
@@ -815,7 +796,6 @@ impl<T: Schedulable> Scheduler<T> {
             let was = s.background();
             match op {
                 Op::Stop(blocked) => s.stop(now, blocked),
-                Op::Debit => s.debit(now.saturating_sub(node(t).stamp & !RUNNING)),
                 Op::Unblock => s.unblock(now),
                 Op::UnblockRun => {
                     s.unblock(now);
@@ -3391,31 +3371,81 @@ mod tests {
         assert_eq!(node(r).state(), State::Ready);
     }
 
-    /// A service with its budget gone works at the level of its client and
-    /// is charged to nobody: the time above `low` is an overrun of its own
-    /// budget, and the replenishment comes later by as much.
+    /// A replenishment that lands while the receiver of a hand-off waits at
+    /// `low` in the ready queue (the second check woke it): it goes to the
+    /// tail of its own level once, with a new quantum, and the next decision
+    /// takes it above the thread that stood over it at `low`.
     #[test]
-    fn an_exhausted_server_at_its_clients_level_pays_for_the_time_with_its_own_budget() {
+    fn a_replenishment_after_a_woken_hand_off_moves_the_receiver_once() {
         let mut w = World::new();
-        let c = w.started('c', 50, FIFO);
-        let s = w.thread('s', 20, FIFO);
-        w.budget(s, 2 * MS, 10 * MS, 1);
-        w.start(s);
-        assert_eq!(w.pick(0), 'c');
-        w.now = MS;
+        let r = w.thread('r', 40, FIFO);
+        w.budget(r, 2 * MS, 10 * MS, 1);
+        w.start(r);
+        let v = w.started('v', 10, FIFO);
+        let mut now = 0;
+        for i in 0..4 {
+            assert_eq!(w.pick(now), 'r');
+            now += MS / 10;
+            w.now = now;
+            w.block();
+            if i < 3 {
+                now += MS;
+                w.wake(r);
+            }
+        }
+        w.now = now;
+        // SAFETY: the world keeps its threads alive; R waits.
+        assert!(!unsafe { w.s.hand_off(r, now, None) });
+        assert_eq!((node(r).state(), node(r).priority()), (State::Ready, 1));
+        assert_eq!(w.level(1), "r");
+        // SAFETY: the world keeps its budgets alive.
+        let due = unsafe { node(r).server().unwrap().as_ref() }.queue()[0].time;
+        assert_eq!(unsafe { r.as_ref() }.event, Some(due));
+        w.events(due);
+        assert!(!node(r).is_demoted());
+        assert_eq!((node(r).state(), node(r).priority()), (State::Ready, 40));
+        assert_eq!((w.level(1), w.level(40)), (String::new(), "r".into()));
+        assert_eq!(w.pick(due), 'r');
+        assert_eq!(w.level(40), "");
+        let _ = v;
+    }
+
+    /// A replenishment that lands in the middle of the stint of a receiver
+    /// the hand-off put on the CPU at `low`: it keeps the CPU at its own
+    /// level, the ready queue holds nothing twice, the time before the
+    /// replenishment is not charged, and the budget ends a capacity after
+    /// it.
+    #[test]
+    fn a_replenishment_in_the_middle_of_a_handed_off_stint_is_settled() {
+        let mut w = World::new();
+        let r = w.thread('r', 40, FIFO);
+        w.budget(r, 2 * MS, 10 * MS, 1);
+        w.start(r);
+        assert_eq!(w.pick(0), 'r');
+        // The budget ends at 2 ms; the thread works at `low`, and waits.
+        assert_eq!(w.tick(2 * MS), 'r');
+        assert!(node(r).is_demoted());
+        w.now = 3 * MS;
         w.block();
-        w.boost(s, 50, 63);
-        assert_eq!(w.pick(MS), 's');
-        // The budget ends at 3 ms; the client's level keeps `s` running.
-        assert_eq!(w.tick(3 * MS), 's');
-        assert!(node(s).is_demoted());
-        // SAFETY: the world keeps its threads alive; only the event is read.
-        assert_eq!(unsafe { s.as_ref() }.event, Some(10 * MS));
-        // Three more ms at the client's level: the replenishment goes 3 ms
-        // later.
-        assert_eq!(w.yield_at(6 * MS), 's');
-        // SAFETY: as above.
-        assert_eq!(unsafe { s.as_ref() }.event, Some(13 * MS));
-        let _ = c;
+        // Nothing is ready above `low`: the hand-off takes.
+        w.now = 5 * MS;
+        // SAFETY: the world keeps its threads alive; R waits.
+        assert!(unsafe { w.s.hand_off(r, 5 * MS, None) });
+        assert_eq!((node(r).state(), node(r).priority()), (State::Running, 1));
+        // The replenishment at 10 ms, in the middle of the stint.
+        w.events(10 * MS);
+        assert_eq!((node(r).state(), node(r).priority()), (State::Running, 40));
+        assert!(!node(r).is_demoted());
+        assert_eq!(w.s.deadline(None), Some(12 * MS));
+        let u = w.started('u', 30, FIFO);
+        assert_eq!(w.pick(11 * MS), 'r');
+        assert_eq!(w.level(30), "u");
+        // The budget ends at 12 ms; the 5 ms of the stint at `low` were free.
+        assert_eq!(w.tick(12 * MS), 'u');
+        assert_eq!(w.level(1), "r");
+        // SAFETY: the world keeps its budgets alive.
+        let server = unsafe { node(r).server().unwrap().as_ref() };
+        assert_eq!(server.ran(), 4 * MS);
+        let _ = u;
     }
 }

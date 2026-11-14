@@ -350,24 +350,6 @@ impl Server {
         }
     }
 
-    /// The thread ran `ran` ticks above `low` with its budget gone, at the
-    /// level of the client of a request (the background does not charge the
-    /// time at `low` and below, which promises nothing). It is time received
-    /// early, as an overrun is: the next chunk comes later by as much, and
-    /// the replenishment event with it. Bounded: one pop and one insertion.
-    #[inline(never)]
-    pub fn debit(&mut self, ran: u64) {
-        if !self.background {
-            return;
-        }
-        let mut head = self.pop();
-        head.time = head.time.saturating_add(ran);
-        self.add(head);
-        if self.event != 0 {
-            self.event = self.q[0].time;
-        }
-    }
-
     /// The replenishment event at `now`: the thread returns to its own
     /// level when it has capacity.
     #[inline(never)]
