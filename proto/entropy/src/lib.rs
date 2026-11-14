@@ -79,6 +79,12 @@ pub const VERSION: u16 = 2;
 /// lies above any place or generation of its clones.
 pub const ROOT: u64 = 1 << 63 | 1 << 60;
 
+/// The clones the root's VERIFY_SESSION gives at most, for all the programs
+/// that start with a session that is not the service's, and for the
+/// processes that rejoin after a restart (the process service keeps
+/// `REJOIN_MAX` of them and leaves the loaders the rest).
+pub const ROOT_CLONES: usize = 255;
+
 /// The fewest and the most bytes one fill asks for.
 pub const FILL_MIN: u32 = 32;
 pub const FILL_MAX: u32 = 256;

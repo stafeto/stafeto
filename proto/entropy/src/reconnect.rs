@@ -48,6 +48,20 @@ pub fn heal<T>(
     }
 }
 
+/// `heal`, or with `once` (a call that must not wait: GRND_NONBLOCK) one try
+/// of `attempt` and no pause.
+pub fn heal_or_once<T>(
+    once: bool,
+    now: impl FnMut() -> u64,
+    mut attempt: impl FnMut() -> Option<T>,
+    pause: impl FnMut(u64),
+) -> Option<T> {
+    if once && !cfg!(feature = "break-once-waits") {
+        return attempt();
+    }
+    heal(now, attempt, pause)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +150,39 @@ mod tests {
         );
         assert_eq!(got, None);
         assert_eq!(tries.get(), 2);
+    }
+
+    #[test]
+    fn a_call_that_must_not_wait_tries_once_and_never_pauses() {
+        let pauses = Cell::new(0);
+        let tries = Cell::new(0);
+        let clock = Cell::new(0);
+        let got: Option<u32> = heal_or_once(
+            true,
+            || clock.get(),
+            || {
+                tries.set(tries.get() + 1);
+                None
+            },
+            |ns| {
+                pauses.set(pauses.get() + 1);
+                clock.set(clock.get() + ns);
+            },
+        );
+        assert_eq!(got, None);
+        assert_eq!((tries.get(), pauses.get()), (1, 0));
+        // A try that succeeds gives its value, and a call that may wait waits.
+        assert_eq!(heal_or_once(true, || 0, || Some(5), |_| {}), Some(5));
+        let got: Option<u32> = heal_or_once(
+            false,
+            || clock.get(),
+            || {
+                tries.set(tries.get() + 1);
+                None
+            },
+            |ns| clock.set(clock.get() + ns),
+        );
+        assert_eq!(got, None);
+        assert!(tries.get() > 100);
     }
 }

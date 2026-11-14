@@ -54,3 +54,25 @@ pub extern "C" fn random_probe_session_open() -> i32 {
     .is_ok_and(|info| !info.closed);
     i32::from(open)
 }
+
+/// One EntropyRejoin request of the process service, a call that bypasses the
+/// layer (the layer asks for itself when it finds its session closed): 0 for
+/// a new session (which closes at once), 501 PERMISSION, 506 AGAIN, 1000 the
+/// limit of the generation's sessions, -1 for anything else.
+#[unsafe(no_mangle)]
+pub extern "C" fn random_probe_rejoin() -> i32 {
+    let Some(client) = posix_abi::process::try_client() else {
+        return -1;
+    };
+    match client.entropy_rejoin() {
+        Ok(_session) => 0,
+        Err(proto_wire::Status::Kernel(rt::abi::Error::LimitReached)) => 1000,
+        Err(status) if status == proto_wire::Status::from_code(proto_process::PERMISSION) => {
+            i32::try_from(proto_process::PERMISSION).unwrap_or(-1)
+        }
+        Err(status) if status == proto_wire::Status::from_code(proto_process::AGAIN) => {
+            i32::try_from(proto_process::AGAIN).unwrap_or(-1)
+        }
+        Err(_) => -1,
+    }
+}

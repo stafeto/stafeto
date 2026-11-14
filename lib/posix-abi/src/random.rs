@@ -17,8 +17,15 @@
 //! has init's channel (`keep_parent`) and asks init for a new session when
 //! it finds its own closed (`live_session`: a key, or a clone for a child);
 //! init's CONNECT waits while the service restarts. Any other process has no
-//! way to init, and hands its closed session on: the loader of a child that
-//! gets one replaces it with a session from the service's root (services/loader).
+//! way to init. For a child it starts, it hands its closed session on: the
+//! loader of a child that gets one replaces it with a session from the
+//! service's root (services/loader). For its own key it asks the process
+//! service for a new session (`rejoin`, EntropyRejoin): the service gives
+//! one to a process of the old instance once, and answers AGAIN while the
+//! new instance has not registered its root, which the process meets with
+//! pauses of `proto_entropy::reconnect::PAUSE_NS` until `WAIT_NS`; a refusal
+//! ends the attempts, and the call fails with ENOSYS as it does for a
+//! process with no session.
 
 use crate::constants::*;
 use core::cell::UnsafeCell;
@@ -155,6 +162,12 @@ fn reconnect(old: rt::abi::Handle) -> Option<rt::abi::Handle> {
         "entropy",
     )
     .ok()?;
+    replace(old, new)
+}
+
+/// `new` takes the place of the closed `old` as the process's session; the
+/// session that stands when another thread was first (None when none stands).
+fn replace(old: rt::abi::Handle, new: Handle<Channel>) -> Option<rt::abi::Handle> {
     let raw = new.raw();
     match SESSION.compare_exchange(old.0, raw.0, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
@@ -162,7 +175,100 @@ fn reconnect(old: rt::abi::Handle) -> Option<rt::abi::Handle> {
             Some(raw)
         }
         // Another thread was first: its session stands, this one closes.
-        Err(_) => session(),
+        Err(0) => None,
+        Err(now) => Some(rt::abi::Handle(now)),
+    }
+}
+
+/// A new session from the process service (EntropyRejoin) for a process
+/// with no channel to init, which replaces the closed `old`: AGAIN, which the
+/// service answers while it has no open root of the entropy service (its
+/// new instance has not registered it) or a full queue, is tried again after
+/// `PAUSE_NS` until `WAIT_NS`; any other refusal (PERMISSION: the process
+/// asked in this generation already, or was born under the instance that
+/// runs; LimitReached: the root has no clones left) ends the attempts, and
+/// the session another thread put in place meanwhile, if any, stands.
+/// With `nonblock` one attempt is made and AGAIN is EAGAIN. ENOSYS for no
+/// session, EINTR when a signal handler ran in a pause.
+fn rejoin(old: rt::abi::Handle, nonblock: bool) -> Result<rt::abi::Handle, i32> {
+    if cfg!(feature = "break-no-rejoin") {
+        return Err(ENOSYS);
+    }
+    let client = crate::process::try_client().ok_or(ENOSYS)?;
+    let again = Status::from_code(proto_process::AGAIN);
+    let interrupted = core::cell::Cell::new(None);
+    let busy = core::cell::Cell::new(false);
+    let found = proto_entropy::reconnect::heal_or_once(
+        nonblock,
+        || rt::time::ticks_to_ns(rt::time::now()),
+        || {
+            if interrupted.get().is_some() {
+                return Some(None);
+            }
+            match client.entropy_rejoin() {
+                Ok(session) => Some(Some(session)),
+                Err(status) if status == again => {
+                    busy.set(true);
+                    None
+                }
+                Err(_) => Some(None),
+            }
+        },
+        |ns| {
+            if let Err(errno) = crate::threads::sleep::pause(ns as i64) {
+                interrupted.set(Some(errno));
+            }
+        },
+    );
+    match (found.flatten(), interrupted.get()) {
+        (Some(session), _) => replace(old, session).ok_or(ENOSYS),
+        (None, Some(errno)) => Err(errno),
+        (None, None) => match session() {
+            // A refusal: the session another thread made stands.
+            Some(now) if now != old && !closed(now) && !cfg!(feature = "break-rejoin-race") => {
+                Ok(now)
+            }
+            _ if nonblock && busy.get() => Err(EAGAIN),
+            _ => Err(ENOSYS),
+        },
+    }
+}
+
+/// Set while a thread of the process asks the process service for a new
+/// session: the service gives one for each process in a generation, so the
+/// threads that find the session closed meanwhile wait for that request.
+static REJOINING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The process's session for a key (`key`): the session as it is when that
+/// is open; a new one from init (`reconnect`) or from the process service
+/// (`rejoin`) when it is closed, one thread asking at a time and the others
+/// waiting for its answer (EAGAIN at once with `nonblock`). ENOSYS for a
+/// process that has none, or whose session is closed and cannot be replaced.
+fn key_session(nonblock: bool) -> Result<rt::abi::Handle, i32> {
+    loop {
+        let old = session().ok_or(ENOSYS)?;
+        if !closed(old) {
+            return Ok(old);
+        }
+        if let Some(new) = reconnect(old) {
+            return if closed(new) { Err(ENOSYS) } else { Ok(new) };
+        }
+        if PARENT.load(Ordering::Acquire) != 0 {
+            return Err(ENOSYS);
+        }
+        let race = cfg!(feature = "break-rejoin-race");
+        if !race && REJOINING.swap(true, Ordering::AcqRel) {
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            crate::threads::sleep::pause(PAUSE_FIRST_MS * 1_000_000)?;
+            continue;
+        }
+        let result = rejoin(old, nonblock);
+        if !race {
+            REJOINING.store(false, Ordering::Release);
+        }
+        return result;
     }
 }
 
@@ -170,7 +276,7 @@ fn reconnect(old: rt::abi::Handle) -> Option<rt::abi::Handle> {
 /// `nonblock` (EAGAIN then); EINTR when a signal handler without
 /// SA_RESTART ran meanwhile; ENOSYS without a session.
 fn key(nonblock: bool) -> Result<[u8; KEY], i32> {
-    let service = Handle::<Channel>::borrowed(live_session().ok_or(ENOSYS)?);
+    let service = Handle::<Channel>::borrowed(key_session(nonblock)?);
     let mut start = Writer::new();
     let flags = if nonblock { NONBLOCK } else { 0 };
     Seed { flags }.write(&mut start).map_err(|_| EIO)?;

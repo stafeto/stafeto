@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.4.0"
+version = "0.5.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "pkg"
-version = "0.4.0"
+version = "0.5.0-pre.0"
 dependencies = [
  "libc-ffi",
  "pkgd",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "pkgd"
-version = "0.4.0"
+version = "0.5.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "posix-platform"
-version = "0.4.0"
+version = "0.5.0-pre.0"
 dependencies = [
  "dynlink",
  "posix-abi",
@@ -775,6 +775,7 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-credentials",
+ "proto-entropy",
  "proto-init",
  "proto-loader",
  "proto-process",
@@ -823,6 +824,8 @@ dependencies = [
  "posix-abi",
  "posix-crt",
  "proto-entropy",
+ "proto-process",
+ "proto-wire",
  "rt",
 ]
 
@@ -1619,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.5.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",
