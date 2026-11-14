@@ -1251,6 +1251,23 @@ impl Fs {
         made
     }
 
+    /// The slot of births that the new `label` would take is occupied: by a birth of an
+    /// earlier label whose place went back too early, or still departing. A stale one
+    /// (its label has no place) is put on the departures, so that it is cleaned and its
+    /// slot freed; the new label goes back to the free list and the caller refuses with
+    /// an error that ends when that departure does. A live one is left alone.
+    fn taken_birth(&mut self, label: u64) -> bool {
+        ramfs::maintenance::birth_taken(
+            self.places,
+            &mut self.departures,
+            SESSIONS,
+            &mut self.births[..],
+            Self::birth_index(label),
+            label,
+            |fds| Self::depart_fields(self.ram, self.locks, self.identities, fds),
+        )
+    }
+
     /// Prepayment retains one exact loading image before the SetId effect.
     fn prepare_image(
         &mut self,
@@ -1273,6 +1290,9 @@ impl Fs {
             .places
             .issue_image(self.given)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        if self.taken_birth(label) {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
         let mut child = Fds::default();
         child.binding = fds.binding;
         child.root = fds.root;
@@ -2161,6 +2181,10 @@ impl Fs {
             self.ram.release(&mut child);
             return status(proto_fs::TOO_MANY_OPEN_FILES);
         };
+        if self.taken_birth(label) {
+            self.ram.release(&mut child);
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        }
         if let Some(who) = fds.binding.snapshot() {
             child.binding = Binding::Inherited(who);
             let identity = self.identities[fds.authority_index as usize]
@@ -2279,9 +2303,8 @@ impl Service<0> for Fs {
         self.waits.poll();
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
-        if !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label()) {
-            self.departures.admit(self.places.place(s.label()));
-        }
+        let empty = Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label());
+        ramfs::maintenance::session_gone(self.places, &mut self.departures, s.label(), empty);
     }
 
     fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
@@ -2298,23 +2321,25 @@ impl Service<0> for Fs {
             self.steps_reclaim_owner = None;
             let _ = sys::notify(&self.channel, 1);
         }
-        if self.departures.contains(self.places.place(label)) {
-            return;
-        }
+        let index = Self::birth_index(label);
         if let Some(i) = self.birth_slot(label) {
             let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
             Self::depart_fields(self.ram, self.locks, self.identities, fds);
             self.waits.poll();
             self.lock_sweep.restart();
             self.lock_sweep_pending = self.locks.has_locks();
-            if !Self::lock_custody_empty(self.wait_jobs, self.places, fds, label) {
-                self.departures.admit(SESSIONS + i);
-                return;
-            }
-            self.births[i] = None;
         }
-        self.places.release(label);
-        self.clones.gone(label);
+        if ramfs::maintenance::label_closed(
+            self.places,
+            &mut self.departures,
+            SESSIONS,
+            &mut self.births[..],
+            index,
+            label,
+            |fds| Self::lock_custody_empty(self.wait_jobs, self.places, fds, label),
+        ) {
+            self.clones.gone(label);
+        }
     }
 
     fn maintenance(
@@ -3993,8 +4018,8 @@ impl Fs {
                 } else {
                     self.births[i - SESSIONS] = None;
                 }
-                self.departures.release(i);
-                self.places.release(label);
+                // The place of the label goes back after its last departure.
+                ramfs::maintenance::departure_finished(self.places, &mut self.departures, i, label);
                 self.clones.gone(label);
                 work = true;
             }
@@ -4641,6 +4666,10 @@ impl Fs {
             self.drop_identity(&mut child);
             return status(proto_fs::TOO_MANY_OPEN_FILES);
         };
+        if self.taken_birth(label) {
+            self.drop_identity(&mut child);
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        }
         let session = match self.session(label) {
             Ok(session) => session,
             Err(error) => {

@@ -190,6 +190,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-lock-queue-core", 24),
     ("posix-jobs", 18),
     ("loader-channels", 19),
+    ("image-gates", 5),
+    ("ramfs-cleanup", 4),
     ("posix-poll", 26),
     ("posix-sock", 25),
     ("posix-sock-steps", 11),

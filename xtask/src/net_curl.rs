@@ -759,7 +759,10 @@ mod tests {
         let clients: Vec<_> = (0..BURST)
             .map(|_| {
                 std::thread::spawn(move || -> Result<(), String> {
-                    let mut stream = connect_forwarded(&address, Duration::from_millis(500))
+                    // A reset on a full queue (macOS) fails at once whatever the limit;
+                    // a dropped SYN (Linux) is sent again after a second, so the limit
+                    // leaves room for that resend on a loaded machine.
+                    let mut stream = connect_forwarded(&address, Duration::from_secs(3))
                         .map_err(|e| format!("connect: {e}"))?;
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))

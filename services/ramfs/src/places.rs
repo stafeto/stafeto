@@ -14,6 +14,10 @@ const NONE: u16 = u16::MAX;
 pub struct Places {
     labels: [Cell<u64>; COUNT],
     next: [Cell<u16>; COUNT],
+    /// Departures of the label of each place that have not finished: one label can
+    /// have a departure of its session and one of its birth at once, and the place
+    /// goes back to the free list only after the last of them.
+    holds: [Cell<u8>; COUNT],
     head: Cell<u16>,
     used: Cell<u16>,
 }
@@ -28,6 +32,7 @@ impl Places {
         Self {
             labels: [const { Cell::new(0) }; COUNT],
             next,
+            holds: [const { Cell::new(0) }; COUNT],
             head: Cell::new(1),
             used: Cell::new(0),
         }
@@ -89,6 +94,22 @@ impl Places {
             slot as usize
         }
     }
+    /// A departure of `label` begins: its place stays until `finish` has been called for
+    /// every departure that began.
+    pub fn hold(&self, label: u64) {
+        let slot = self.place(label);
+        if slot < COUNT {
+            self.holds[slot].set(self.holds[slot].get() + 1);
+        }
+    }
+    /// A departure of `label` ended; the last one frees the place.
+    pub fn finish(&self, label: u64) {
+        let slot = self.place(label);
+        if slot < COUNT {
+            self.holds[slot].set(self.holds[slot].get().saturating_sub(1));
+        }
+        self.release(label);
+    }
     pub fn release(&self, label: u64) {
         let slot = if label & OWN != 0 {
             (label & 511) as usize
@@ -99,6 +120,10 @@ impl Places {
                 .unwrap_or(COUNT)
         };
         if slot == 0 || slot >= COUNT || self.labels[slot].get() != label {
+            return;
+        }
+        // A departure of this label is still under way and needs the place.
+        if self.holds[slot].get() != 0 {
             return;
         }
         self.labels[slot].set(0);
@@ -146,6 +171,25 @@ mod tests {
         places.release(fresh);
         places.release(17);
         assert_eq!(places.used(), 0);
+    }
+    #[test]
+    fn a_place_stays_until_the_last_departure_of_its_label_ends() {
+        let places = Places::new();
+        let label = places.issue(7).unwrap();
+        places.hold(label);
+        places.hold(label);
+        // The first departure to end frees nothing.
+        places.finish(label);
+        places.release(label);
+        assert_eq!(places.used(), 1);
+        // So the next label cannot take the place and meet the late departure.
+        let other = places.issue(8).unwrap();
+        assert_ne!(other & 511, label & 511);
+        places.finish(label);
+        assert_eq!(places.used(), 1);
+        assert_eq!(places.place(label), COUNT);
+        let reused = places.issue(9).unwrap();
+        assert_eq!(reused & 511, label & 511);
     }
     #[test]
     fn every_admitted_session_has_a_distinct_place_and_exhaustion_does_not_evict() {
