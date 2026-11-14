@@ -795,7 +795,12 @@ impl<T: Schedulable> Scheduler<T> {
             let s = server.as_mut();
             let was = s.background();
             match op {
-                Op::Stop(blocked) => s.stop(now, blocked),
+                Op::Stop(blocked) => {
+                    // The thread works at its client's level above `low`:
+                    // its time in the background is the client's (spec 8).
+                    let loan = node(t).client > s.low();
+                    s.stop(now, blocked, loan)
+                }
                 Op::Unblock => s.unblock(now),
                 Op::UnblockRun => {
                     s.unblock(now);
@@ -1400,6 +1405,11 @@ impl<T: Schedulable> Scheduler<T> {
             if node(t).state == State::Dead || node(t).server.is_none() {
                 return;
             }
+            // A stint that spans the replenishment ends at it: the time
+            // before it was the background's, the time after is not.
+            if node(t).state == State::Running {
+                Self::with_server(t, Op::Stop(false), now);
+            }
             Self::with_server(t, Op::Replenish, now);
             (node(t).state, node(t).effective())
         };
@@ -1409,6 +1419,48 @@ impl<T: Schedulable> Scheduler<T> {
             if state == State::Running {
                 Self::with_server(t, Op::Run, now);
             }
+        }
+    }
+}
+
+impl<T: Schedulable> Scheduler<T> {
+    /// The thread `t`, the running one, hands the work of a request back (a
+    /// reply, or the receive that takes the next one): what it ran in the
+    /// background for its client is the client's debt (`owe`). Zero for a
+    /// thread with no budget. Call it before the boost ends.
+    ///
+    /// # Safety
+    /// `t` is alive and runs on this CPU.
+    pub unsafe fn take_loan(&mut self, t: NonNull<T>, now: u64) -> u64 {
+        // SAFETY: the caller's promise; the budget lives while `t` has it.
+        unsafe {
+            let n = node(t);
+            let Some(mut server) = n.server else {
+                return 0;
+            };
+            let loan = n.client > server.as_ref().low();
+            server.as_mut().take_loan(now, loan)
+        }
+    }
+
+    /// The thread `t`, which waits for a reply, owes `ticks` of its server's
+    /// work: its budget pays them at `now`, or passes them on when `t` works
+    /// for a client in its turn. Nothing for a thread with no budget. `t`
+    /// may be on another CPU while it waits: its CPU touches nothing of it
+    /// until the wake, which is under OBJ in the kernel. No event moves: the
+    /// wake finds the budget as it is.
+    ///
+    /// # Safety
+    /// `t` is alive, waits, and no borrow of its node is alive.
+    pub unsafe fn owe(&mut self, t: NonNull<T>, ticks: u64, now: u64) {
+        // SAFETY: the caller's promise; the budget lives while `t` has it.
+        unsafe {
+            let n = node(t);
+            let Some(mut server) = n.server else {
+                return;
+            };
+            let on_loan = n.client > server.as_ref().low();
+            server.as_mut().owe(ticks, now, on_loan);
         }
     }
 }
@@ -3447,5 +3499,211 @@ mod tests {
         let server = unsafe { node(r).server().unwrap().as_ref() };
         assert_eq!(server.ran(), 4 * MS);
         let _ = u;
+    }
+
+    // The loan: the work of a server whose budget is gone, done for a client
+    // with a budget, is the client's time (kcore::budget::Server::take_loan).
+
+    /// The server `t` is exhausted and waits. The client `k` sends it a
+    /// request: `k` leaves the CPU and `t` works at the level of `k`.
+    fn call(w: &mut World, k: NonNull<Fake>, t: NonNull<Fake>, now: u64) {
+        w.now = now;
+        assert_eq!(w.block(), k);
+        let level = node(k).priority();
+        w.boost(t, level, 63);
+        w.wake(t);
+    }
+
+    /// The server `t` replies to `k`: its loan goes to the client's budget,
+    /// the boost ends, the client wakes and `t` waits for the next request.
+    fn answer(w: &mut World, t: NonNull<Fake>, k: NonNull<Fake>, now: u64) {
+        w.now = now;
+        // SAFETY: the world keeps its threads alive; `t` runs, `k` waits.
+        unsafe {
+            let lent = w.s.take_loan(t, now);
+            w.unboost(t);
+            w.s.owe(k, lent, now);
+        }
+        assert_eq!(w.block(), t);
+        w.wake(k);
+    }
+
+    /// A client at level 40 with a budget of `c` for each 10 ms calls a
+    /// server that has none left; a thread at level 10 wants the CPU all the
+    /// time. In any window of a period the levels above 10 hold at most the
+    /// budget and one step of the server.
+    fn loan_window(c: u64, own: u64, step: u64) -> (u64, u64) {
+        const STEP: u64 = MS / 10;
+        let mut w = World::new();
+        let v = w.started('v', 10, FIFO);
+        let k = w.thread('k', 40, FIFO);
+        w.budget(k, c * MS, 10 * MS, 1);
+        let s = w.thread('s', 20, FIFO);
+        // A budget of a step that comes back after the whole run: the
+        // server is exhausted by its first request.
+        w.budget(s, STEP, 100_000 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 's');
+        w.block();
+        w.start(k);
+        let (mut kw, mut sw) = (0, 0);
+        let mut high = Vec::new();
+        // The thread at level 10 sleeps for 5 steps in every 50, so that a
+        // request sent at the level of an exhausted client gets to run.
+        let mut asleep = false;
+        for n in 0..3_000u64 {
+            let now = n * STEP;
+            if asleep && n % 50 == 5 {
+                asleep = false;
+                w.now = now;
+                w.wake(v);
+            }
+            w.events(now);
+            let who = w.tick(now);
+            let t = match who {
+                'k' => k,
+                's' => s,
+                _ => v,
+            };
+            high.push(u64::from(who != 'v' && node(t).priority() > 10));
+            match who {
+                'k' => {
+                    kw += 1;
+                    if kw == own {
+                        kw = 0;
+                        call(&mut w, k, s, now + STEP);
+                    }
+                }
+                's' => {
+                    sw += 1;
+                    if sw == step {
+                        sw = 0;
+                        answer(&mut w, s, k, now + STEP);
+                    }
+                }
+                _ if n % 50 == 49 => {
+                    asleep = true;
+                    w.now = now + STEP;
+                    assert_eq!(w.block(), v);
+                }
+                _ => {}
+            }
+        }
+        let window = 100;
+        let mut sum: u64 = high[..window].iter().sum();
+        let mut most = sum;
+        for i in window..high.len() {
+            sum += high[i];
+            sum -= high[i - window];
+            most = most.max(sum);
+        }
+        (most * STEP, high.iter().sum::<u64>() * STEP)
+    }
+
+    #[test]
+    fn a_client_gets_at_most_its_budget_and_one_server_step_in_a_period() {
+        const STEP: u64 = MS / 10;
+        for (c, own, step) in [(2, 3, 10), (2, 1, 20), (3, 5, 5), (1, 2, 7), (4, 2, 30)] {
+            let (most, total) = loan_window(c, own, step);
+            assert!(
+                most <= c * MS + step * STEP,
+                "C {c} ms, own {own}, step {step}: {most} ticks in a period"
+            );
+            assert!(
+                total > 10 * MS,
+                "C {c} own {own} step {step}: the client ran {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loan_goes_to_the_client_through_two_hops() {
+        let mut w = World::new();
+        let (s1, s2) = (w.thread('1', 20, FIFO), w.thread('2', 20, FIFO));
+        for t in [s1, s2] {
+            w.budget(t, MS, 1000 * MS, 1);
+            w.start(t);
+        }
+        // Each runs its budget out and waits for a request.
+        assert_eq!(w.pick(0), '1');
+        assert_eq!(w.tick(MS), '2');
+        assert_eq!(w.tick(2 * MS), '1');
+        w.now = 3 * MS;
+        assert_eq!(w.block(), s1);
+        assert_eq!(w.pick(3 * MS), '2');
+        assert_eq!(w.block(), s2);
+        assert!(node(s1).is_demoted() && node(s2).is_demoted());
+        let t0 = 10 * MS;
+        w.now = t0;
+        let k = w.thread('k', 50, FIFO);
+        w.budget(k, 5 * MS, 20 * MS, 1);
+        w.start(k);
+        assert_eq!(w.pick(t0), 'k');
+        // K runs 1 ms, calls S1; S1 works 2 ms and calls S2; S2 works 1 ms.
+        call(&mut w, k, s1, t0 + MS);
+        assert_eq!(w.pick(t0 + MS), '1');
+        call(&mut w, s1, s2, t0 + 3 * MS);
+        assert_eq!(w.pick(t0 + 3 * MS), '2');
+        answer(&mut w, s2, s1, t0 + 4 * MS);
+        // S1 is on loan: it keeps the debt of S2.
+        // SAFETY: the world keeps its budgets alive.
+        let lent = unsafe { node(s1).server().unwrap().as_ref() }.lent();
+        assert_eq!(lent, 3 * MS, "its own 2 ms and the 1 ms of S2");
+        assert_eq!(w.pick(t0 + 4 * MS), '1');
+        answer(&mut w, s1, k, t0 + 5 * MS);
+        // SAFETY: as above.
+        let server = unsafe { node(k).server().unwrap().as_ref() };
+        assert_eq!(server.lent(), 0);
+        // K ran 1 ms itself, and owes the 4 ms of the chain: its 5 ms are
+        // gone, and it wakes in the background until its period is over.
+        assert!(server.background());
+        assert_eq!(server.queue()[0].time, t0 + 20 * MS);
+        assert_eq!(w.pick(t0 + 5 * MS), 'k');
+        assert_eq!(node(k).priority(), 1);
+        // SAFETY: as above.
+        for t in [s1, s2] {
+            assert_eq!(unsafe { node(t).server().unwrap().as_ref() }.lent(), 0);
+        }
+    }
+
+    #[test]
+    fn the_loan_of_a_server_with_no_client_above_low_is_nobodys_debt() {
+        let mut w = World::new();
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, MS, 1000 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 's');
+        assert_eq!(w.tick(MS), 's');
+        w.now = 2 * MS;
+        w.block();
+        // A client at the level of `low` asks: nothing is lent.
+        w.boost(s, 1, 63);
+        w.wake(s);
+        assert_eq!(w.pick(2 * MS), 's');
+        // SAFETY: the world keeps its threads alive; `s` runs.
+        assert_eq!(unsafe { w.s.take_loan(s, 9 * MS) }, 0);
+    }
+
+    #[test]
+    fn a_replenishment_in_the_middle_of_a_loan_ends_the_stint_of_the_loan() {
+        let mut w = World::new();
+        let s = w.thread('s', 20, FIFO);
+        w.budget(s, MS, 10 * MS, 1);
+        w.start(s);
+        assert_eq!(w.pick(0), 's');
+        assert_eq!(w.tick(MS), 's');
+        w.now = 2 * MS;
+        w.block();
+        // A request at 3 ms from a client at 50: S works on it at 50, in the
+        // background, until its budget comes back at 10 ms.
+        w.now = 3 * MS;
+        w.boost(s, 50, 63);
+        w.wake(s);
+        assert_eq!(w.pick(3 * MS), 's');
+        w.events(10 * MS);
+        assert!(!node(s).is_demoted());
+        // The 7 ms before the replenishment are lent; the time after is S's.
+        // SAFETY: as above.
+        assert_eq!(unsafe { w.s.take_loan(s, 12 * MS) }, 7 * MS);
     }
 }

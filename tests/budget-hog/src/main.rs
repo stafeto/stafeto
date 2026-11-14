@@ -4,7 +4,7 @@
 //! The probe of the time budgets of threads (spec 8), for QEMU under
 //! -icount, where the numbers of one build repeat to the tick. It runs as
 //! init and prints lines that `cargo xtask budget-hog` checks against their
-//! bounds. Three phases, on one CPU:
+//! bounds. Four phases, on one CPU unless a phase says another:
 //!
 //! 1. A hog at 50 with the budget of 300 us for each 1 ms, low 1, spins
 //!    against a victim at 10 with no budget. The victim notes the time it
@@ -14,7 +14,10 @@
 //! 2. A service at 20 with the budget of 200 us works 500 us for each
 //!    request of a client at 40: the boost of the client's request stays
 //!    when the budget is gone, so the request takes the work and no more.
-//! 3. A worker at 5 with the budget of 200 us is notified through a channel
+//! 3. The loan: a client at 40 with a budget calls a service whose budget is
+//!    gone, on its CPU and on another; the service's work is the client's
+//!    time, so the requests the client makes stay within its budget.
+//! 4. A worker at 5 with the budget of 200 us is notified through a channel
 //!    of 55 and spins 800 us for each notification: the boost of the slot
 //!    goes with the budget, and the victim at 10 keeps its share.
 
@@ -302,6 +305,67 @@ extern "C" fn client_entry(_: u64) -> ! {
     sys::thread_exit()
 }
 
+/// The requests of the loan phase: a client at 40 with a budget calls a
+/// service whose budget is gone as fast as it can until `END`; each request
+/// is work of the service that the client pays for.
+extern "C" fn loan_client(_: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    ROUND_N.store(0, Relaxed);
+    while time::now() < END.load(Relaxed) {
+        sys::send(&channel, b"work").expect("request");
+        ROUND_N.fetch_add(1, Relaxed);
+    }
+    sys::send(&channel, b"stop").expect("stop the service");
+    sys::thread_exit()
+}
+
+/// The loan: a client at 40 with the budget of 600 us for each 2 ms calls a
+/// service at 20 on CPU `server_cpu` whose budget of 100 us for 1 s is gone
+/// with its first request; every request is 500 us of the service's work, at
+/// the client's level. The work is the client's time: its budget runs out
+/// (`overruns`), and the client makes about 1.2 requests for each period at
+/// most. A victim at 10 shares the client's CPU: on that CPU it also holds
+/// the exhausted service, at level 1, away from its next `receive`, so the
+/// client's third request waits for the end of the phase. False when there
+/// is no such CPU.
+fn phase_loan(
+    process: &Handle<Process>,
+    resource: &Handle<Resource>,
+    server_cpu: u8,
+    tag: &str,
+) -> bool {
+    let Ok(service_budget) =
+        sys::budget_create(resource, server_cpu.into(), 100_000, 1_000_000_000, 1)
+    else {
+        return false;
+    };
+    let client_budget =
+        sys::budget_create(resource, 0, 600_000, 2_000_000, 1).expect("client budget");
+    begin(PHASE_MS / 2);
+    let channel = sys::channel_create(20).expect("service channel");
+    CHANNEL.store(channel.raw().0, Relaxed);
+    WORK.store(time::ns_to_ticks(500_000), Relaxed);
+    let spinner = spawn(process, 0, victim, 10);
+    let server = spawn_on(process, 1, service, 20, server_cpu);
+    sys::thread_bind_budget(&server, &service_budget).expect("bind the service's budget");
+    sys::thread_start(&spinner).expect("start the victim");
+    sys::thread_start(&server).expect("start the service");
+    let client = spawn(process, 2, loan_client, 40);
+    sys::thread_bind_budget(&client, &client_budget).expect("bind the client's budget");
+    sys::thread_start(&client).expect("start the client");
+    let wait = sys::channel_create_wait(62).expect("channel");
+    let timer = sys::timer_create(&wait, 62).expect("timer");
+    sleep_until(&wait, &timer, now_ns() + (PHASE_MS / 2 + 10) * MS);
+    let info = sys::budget_info(&client_budget).expect("budget info");
+    println!(
+        "budget loan {} requests={} overruns={}",
+        tag,
+        ROUND_N.load(Relaxed),
+        info.overruns
+    );
+    true
+}
+
 fn phase_slot(process: &Handle<Process>, resource: &Handle<Resource>) {
     begin(PHASE_MS);
     let channel = sys::channel_create(55).expect("worker channel");
@@ -354,6 +418,10 @@ fn main(_: u64) -> u64 {
         println!("budget cpu1 ran");
     }
     phase_boost(&process, &resource);
+    phase_loan(&process, &resource, 0, "same");
+    if phase_loan(&process, &resource, 1, "other") {
+        println!("budget loan ran");
+    }
     phase_slot(&process, &resource);
     println!("budget DONE");
     loop {

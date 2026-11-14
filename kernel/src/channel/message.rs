@@ -146,6 +146,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
         // holds, are alive; the sender of a queued request waits, so it is
         // alive, and its wait holds what it went through.
         unsafe {
+            settle_loan(k, t);
             k.s.unboost(t);
             (*t.as_ptr()).boost_token = 0;
             let q = queue(c, k.s);
@@ -559,6 +560,42 @@ unsafe fn accept(
     }
 }
 
+/// The work `t`, the running thread, did in the background for the client of
+/// the request its boost carries (spec 8): the ticks its budget lent become
+/// the debt of the client's budget, or of the client's own client when the
+/// client is a server on loan in its turn, one hop along the chain for each
+/// hop of the request. The loan is gone from `t` in any case. The debt is
+/// dropped when the client has ended, no longer waits for a reply from
+/// `t`'s process (an interrupt withdrew it: it runs, and its budget is its
+/// CPU's to change), or has no budget. Call it before the boost ends. O(1):
+/// one look at the token and one check of the client's budget (at most
+/// `2 * MAX_REPLENISHMENTS` passes).
+///
+/// # Safety
+/// `t` is the running thread and alive; `k` is the locked scheduler.
+unsafe fn settle_loan(k: &mut Locked<'_>, t: NonNull<Thread>) {
+    // SAFETY: the caller's promise; a client whose token is taken and that
+    // waits for a reply from `t`'s process is alive, and its CPU touches
+    // nothing of its budget until its wake, which is under OBJ.
+    unsafe {
+        let token = (*t.as_ptr()).boost_token;
+        if token == 0 || !(*t.as_ptr()).sched.has_budget() {
+            return;
+        }
+        let now = crate::arch::timer::now();
+        let lent = k.s.take_loan(t, now);
+        if lent == 0 {
+            return;
+        }
+        let Ok(client) = k.tokens.check(token) else {
+            return;
+        };
+        if (*client.as_ptr()).waits == Some(Wait::Reply(t.as_ref().process())) {
+            k.s.owe(client, lent, now);
+        }
+    }
+}
+
 /// reply (spec 6.1, 6.6) of `t`, the running thread, with its x1-x9, the
 /// description `desc` and the handles `values` of its process, all
 /// checked, to the request `token` names. A reply with the token of `t`'s
@@ -583,6 +620,7 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
         // waits is not `t`.
         unsafe {
             if token != 0 && (*t.as_ptr()).boost_token == token {
+                settle_loan(k, t);
                 k.s.unboost(t);
                 (*t.as_ptr()).boost_token = 0;
             }
