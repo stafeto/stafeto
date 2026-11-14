@@ -72,6 +72,7 @@ mod image_listing;
 mod init_wait;
 mod input_probe;
 mod jobs;
+mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
@@ -1954,6 +1955,8 @@ commands:
             build the images that hold packages and write the listing of the
             tree each shows (path, mode, owner, SHA-256), for comparing
             two builds
+  kernel-size  build the shipping kernel and print its .text per source file,
+            the boot-only part and the image size (docs/kernel-size.md)
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
@@ -2437,6 +2440,7 @@ fn main() {
         Some("ash-dialog") => ash_dialog(),
         Some("image") => base_image::command(&args[1..]),
         Some("image-listing") => image_listing::command(&args[1..]),
+        Some("kernel-size") => kernel_size::command(&args[1..]),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
         Some("pkg-build") => pkg::command(&args[1..]),
