@@ -62,6 +62,7 @@ impl Device for Wire {
 
 const GUEST_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 15]);
 const HOST_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 2]);
+const OTHER_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 9]);
 const GUEST: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const HOST: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 
@@ -129,6 +130,13 @@ fn resets_to(wire: &Wire, mac: EthernetAddress) -> usize {
         .count()
 }
 
+fn arp_requests(wire: &Wire) -> usize {
+    wire.tx
+        .iter()
+        .filter(|f| EthernetFrame::new_unchecked(&f[..]).ethertype() == EthernetProtocol::Arp)
+        .count()
+}
+
 #[test]
 fn the_reset_leaves_in_the_poll_that_took_the_syn_with_no_neighbour_entry() {
     let (mut iface, mut wire) = stack();
@@ -170,11 +178,70 @@ fn a_busy_arp_slot_does_not_hold_the_reset() {
 }
 
 #[test]
-fn a_source_outside_the_link_teaches_nothing() {
+fn a_source_outside_the_link_is_not_learned() {
     let (mut iface, mut wire) = stack();
+    // A default route through the host: the packet is accepted, its answer goes to the router.
+    iface.routes_mut().add_default_ipv4_route(HOST).unwrap();
     let mut sockets = SocketSet::new(vec![]);
+    // The frame comes from the router's hardware address with a source outside the link.
     wire.rx
         .push_back(syn(Ipv4Address::new(192, 168, 9, 9), HOST_MAC, 81));
     iface.poll(Instant::from_millis(5), &mut wire, &mut sockets);
-    assert_eq!(resets_to(&wire, HOST_MAC), 0);
+    assert_eq!(
+        resets_to(&wire, HOST_MAC),
+        0,
+        "nothing was learned for the router"
+    );
+    assert_eq!(arp_requests(&wire), 1, "the router is asked for");
+}
+
+#[test]
+fn a_live_entry_is_not_overwritten_by_an_ip_packet() {
+    let (mut iface, mut wire) = stack();
+    let mut sockets = SocketSet::new(vec![]);
+    wire.rx.push_back(syn(HOST, HOST_MAC, 81));
+    iface.poll(Instant::from_millis(5), &mut wire, &mut sockets);
+    assert_eq!(resets_to(&wire, HOST_MAC), 1);
+    wire.tx.clear();
+    // The same source from another hardware address (a spoofed packet through a router).
+    wire.rx.push_back(syn(HOST, OTHER_MAC, 81));
+    iface.poll(Instant::from_millis(10), &mut wire, &mut sockets);
+    assert_eq!(resets_to(&wire, OTHER_MAC), 0, "the entry was overwritten");
+    assert_eq!(
+        resets_to(&wire, HOST_MAC),
+        1,
+        "the reset goes to the known address"
+    );
+}
+
+#[test]
+fn a_full_cache_does_not_evict_the_entry_of_the_gateway() {
+    let (mut iface, mut wire) = stack();
+    let mut sockets = SocketSet::new(vec![]);
+    wire.rx.push_back(syn(HOST, HOST_MAC, 81));
+    iface.poll(Instant::from_millis(5), &mut wire, &mut sockets);
+    wire.tx.clear();
+    // Twenty other sources on the link, each with a hardware address of its own.
+    let mut taught = 0;
+    for n in 0..20u8 {
+        let mac = EthernetAddress([2, 0, 0, 0, 1, n]);
+        wire.rx
+            .push_back(syn(Ipv4Address::new(10, 0, 2, 100 + n), mac, 81));
+        iface.poll(
+            Instant::from_millis(10 + i64::from(n)),
+            &mut wire,
+            &mut sockets,
+        );
+        taught += resets_to(&wire, mac);
+        wire.tx.clear();
+    }
+    // The cache holds 16 entries, the gateway's among them: 15 sources fit.
+    assert_eq!(taught, 15);
+    wire.rx.push_back(syn(HOST, HOST_MAC, 81));
+    iface.poll(Instant::from_millis(100), &mut wire, &mut sockets);
+    assert_eq!(
+        resets_to(&wire, HOST_MAC),
+        1,
+        "the gateway's entry is still there"
+    );
 }
