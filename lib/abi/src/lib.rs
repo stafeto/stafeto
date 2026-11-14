@@ -604,13 +604,15 @@ pub mod msgbuf {
     /// An info word for each handle that came (`info`), MESSAGE_HANDLES
     /// words, written by the kernel at delivery.
     pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
-    /// The handle of the channel `reply_receive` receives on, one word:
-    /// the caller puts it there before the call, which reads it once
-    /// (spec 6.1).
-    pub const CHANNEL: usize = INFO + 8 * MESSAGE_HANDLES;
+    /// The handle of the channel `reply_receive` receives on, one word: the
+    /// caller puts it there before the call, which reads it once (spec 6.1).
+    /// It lies past `RESERVED`, outside the part of the buffer an entry
+    /// saves and restores (the dispatcher of `rt::upcall`), so a handler
+    /// that calls `reply_receive` on another channel changes it.
+    pub const CHANNEL: usize = RESERVED;
     /// The end of the part a message uses: the offsets of `DATA` up to
     /// here are those of messages, handles and info words.
-    pub const RESERVED: usize = CHANNEL + 8;
+    pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
     /// The saved context of an entry (`UPCALL_CONTEXT_OFFSET`).
     pub const CONTEXT: usize = crate::UPCALL_CONTEXT_OFFSET;
     /// The end of the saved context.
@@ -1979,7 +1981,7 @@ mod tests {
         use msgbuf::*;
         assert_eq!(
             (DATA, COPIED, HANDLES, INFO, RESERVED, SIZE),
-            (0, 64, 1024, 1056, 1096, 4096)
+            (0, 64, 1024, 1056, 1088, 4096)
         );
         assert_eq!(
             (CONTEXT, CONTEXT_END, ENTRIES, ENTRIES_SIZE),

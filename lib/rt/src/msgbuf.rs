@@ -88,3 +88,11 @@ pub fn handle(i: usize) -> (abi::Handle, (ObjectKind, Rights)) {
     read(INFO + 8 * i, &mut word);
     (value, abi::msgbuf::parse_info(u64::from_ne_bytes(word)))
 }
+
+/// Writes the handle `reply_receive` receives on into the calling thread's
+/// buffer, at abi::msgbuf::CHANNEL, which lies past the part a message uses.
+pub fn set_channel(handle: u64) {
+    // SAFETY: the buffer is the calling thread's page, mapped writable while
+    // the thread lives (spec 6.2); the word lies in it.
+    unsafe { core::ptr::write_volatile((address() + abi::msgbuf::CHANNEL) as *mut u64, handle) };
+}

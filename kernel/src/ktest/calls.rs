@@ -9743,6 +9743,17 @@ fn with_holder(
     budgets: bool,
     body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_holder_of(budgets, SERVER_C, body)
+}
+
+/// `with_holder` with the budget of the server `server_c` ticks for each ten
+/// times that: a test whose server must keep its budget on a slow clock gives
+/// it seconds.
+fn with_holder_of(
+    budgets: bool,
+    server_c: u64,
+    body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let counts = (
         process::in_use(),
         thread::in_use(),
@@ -9777,7 +9788,7 @@ fn with_holder(
             });
             thread::give_buffer(r, BUFFER as usize).map_err(|_| "no buffer")?;
             if budgets {
-                let s = crate::budget::create(service, 0, SERVER_C, 10 * SERVER_C, 1)
+                let s = crate::budget::create(service, 0, server_c, 10 * server_c, 1)
                     .map_err(|_| "no budget")?;
                 h.server_budget = Some(s);
                 crate::budget::bind(r, s).map_err(|_| "the server's budget did not bind")?;
@@ -9973,8 +9984,8 @@ pub fn a_request_that_queues_lifts_a_demoted_server_of_another_cpu(
 /// and the lift does not touch a thread that holds no request: the queue
 /// of a channel whose server has none is nobody's to lift.
 pub fn a_request_that_queues_leaves_a_server_with_a_budget(_: &Boot) -> Result<(), &'static str> {
-    with_holder(true, |h, others| {
-        // Its budget is whole: it is not demoted.
+    // Its budget is whole, and lasts 0.3 s of the counter: it is not demoted.
+    with_holder_of(true, 20_000_000, |h, others| {
         let t2 = *others[0].insert(running_at(h.client, 40)?);
         h.queue(t2)?;
         check(
@@ -10222,8 +10233,8 @@ pub fn a_request_that_queues_leaves_a_thread_that_went_to_another_channel(
             &[],
         );
         check(sent.is_ok(), "the request of the other channel failed")?;
-        // SAFETY: the test holds the thread.
         check(
+            // SAFETY: the test holds the thread.
             unsafe { h.r.as_ref() }.boost_token != 0,
             "the server did not take the request of the other channel",
         )?;

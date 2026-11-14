@@ -1209,7 +1209,7 @@ impl Token {
         let Ok(regs) = message_regs(self.0, bytes, &[], 0) else {
             return Err(Error::InvalidArgs);
         };
-        msgbuf::write(abi::msgbuf::CHANNEL, &channel.raw().0.to_le_bytes());
+        msgbuf::set_channel(channel.raw().0);
         let mut x = [0; 12];
         x[..10].copy_from_slice(&regs);
         // SAFETY: reply_receive uses no memory of the program but its own

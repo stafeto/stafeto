@@ -1007,10 +1007,11 @@ fn request<S: Service<K>, const K: usize>(
 fn owe(token: Token, bytes: &[u8], handles: Outgoing, held: bool) -> Option<Owed> {
     #[cfg(not(feature = "step-stats"))]
     if !held && handles.is_empty() && bytes.len() <= INLINE_MAX {
-        let mut held = [0; INLINE_MAX];
-        held[..bytes.len()].copy_from_slice(bytes);
-        return Some((token, held, bytes.len()));
+        let mut kept = [0; INLINE_MAX];
+        kept[..bytes.len()].copy_from_slice(bytes);
+        return Some((token, kept, bytes.len()));
     }
+    let _ = held;
     let _ = reply(token, bytes, handles);
     None
 }
