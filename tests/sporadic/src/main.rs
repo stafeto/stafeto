@@ -55,7 +55,10 @@ fn read(
 /// service's status.
 #[unsafe(no_mangle)]
 extern "C" fn sporadic_set(flags: u32) -> u32 {
-    let Ok(thread) = rt::sys::handle_duplicate(&*posix_abi::threads::main_handle(), Rights::MANAGE)
+    let Ok(thread) = rt::sys::handle_duplicate(
+        &*posix_abi::threads::main_handle(),
+        Rights::MANAGE | Rights::TRANSFER,
+    )
     else {
         return 7777;
     };

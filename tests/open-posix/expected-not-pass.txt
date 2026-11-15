@@ -1,0 +1,13 @@
+# Tests of the Open POSIX Test Suite that do not pass for a reason that is
+# not a defect, and what is expected of them (name, outcome, reason). The
+# outcome is the suite's own. SCHED_SPORADIC is defined for compilation in
+# 0.5.0 (the option macros are 0, sysconf says -1) and no thread can take it,
+# so a test that sets the policy and expects success cannot pass.
+conformance/interfaces/sched_setscheduler/1-1 UNRESOLVED the test sets SCHED_SPORADIC with only sched_priority filled in and expects success; the policy is refused (EINVAL) in 0.5.0, as it is for every program, root or not. It passed while the option macros were -1 and the test skipped the policy.
+conformance/interfaces/sched_setparam/23-2 UNRESOLVED the test sets SCHED_SPORADIC from the parameters of a SCHED_OTHER process (priority 0), and expects success.
+conformance/interfaces/sched_setparam/25-2 UNRESOLVED as 23-2.
+conformance/interfaces/sched_setparam/25-3 FAIL sched_setparam with bad members sched_ss_* of a thread that is not under SCHED_SPORADIC expects EINVAL; XSH 2.8.4 says the members "shall have no effect" under the other policies and the layer ignores them.
+conformance/interfaces/sched_setparam/23-5 BUILD the test uses SS_REPL_MAX without <limits.h>; the macro is in <limits.h> alone (XSH: the name ends in _MAX).
+conformance/interfaces/sched_setparam/25-4 BUILD as 23-5.
+conformance/interfaces/sched_setscheduler/19-4 BUILD as 23-5.
+conformance/interfaces/sched_setscheduler/19-2 UNSUPPORTED the test includes neither <unistd.h> nor <limits.h> and does not see _POSIX_SPORADIC_SERVER.
