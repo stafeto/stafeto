@@ -374,7 +374,7 @@ static void *forker_thread(void *arg) {
     struct sched_param p = ss_param(20, 5, c, 10 * MS, 4), got;
     CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
     pid_t child = fork();
-    CHECK(child >= 0);
+    if (child < 0) FAIL("fork gave -1, errno %d (CPU %d, the thread holds %ld ns)", errno, sched_getcpu(), c);
     if (child == 0) {
         /* The child's main thread runs under the same server. */
         if (sched_getscheduler(0) != SCHED_SPORADIC) _exit(41);
