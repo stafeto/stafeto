@@ -24,6 +24,8 @@ pub enum Owner {
     Timer(NonNull<Timer>),
     /// An interrupt binding (spec 9).
     Irq(NonNull<Irq>),
+    /// The overruns of a time budget (spec 8), which holds the slot.
+    Budget(NonNull<Budget>),
     /// A thread's own slot (spec 6.1), which lies in it: its place while
     /// it waits in receive, its request while it waits in send. It carries
     /// no notification, and its thread's wait holds what it needs.
@@ -38,6 +40,7 @@ impl Owner {
             Owner::Exit(_) | Owner::ThreadEnd(_) => abi::Source::Exit,
             Owner::Timer(_) => abi::Source::Timer,
             Owner::Irq(_) => abi::Source::Interrupt,
+            Owner::Budget(_) => abi::Source::Budget,
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -50,6 +53,7 @@ impl Owner {
             Owner::ThreadEnd(t) => thread::exit_label(t),
             Owner::Timer(t) => timer::label(t),
             Owner::Irq(b) => irq::label(b),
+            Owner::Budget(b) => budget::label(b),
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -65,6 +69,7 @@ impl Owner {
             Owner::ThreadEnd(t) => thread::retain(t),
             Owner::Timer(t) => timer::retain(t),
             Owner::Irq(b) => irq::retain(b),
+            Owner::Budget(b) => budget::retain(b),
             Owner::Thread(_) => unreachable!("a thread's slot is posted"),
         }
     }
@@ -87,6 +92,8 @@ impl Owner {
             Owner::Timer(t) => unsafe { timer::release(t, cause) },
             // SAFETY: as above.
             Owner::Irq(b) => unsafe { irq::release(b, cause) },
+            // SAFETY: as above.
+            Owner::Budget(b) => unsafe { budget::release(b, cause) },
         }
     }
 }
@@ -244,6 +251,7 @@ pub unsafe fn post(
             if lends(c) {
                 sched::boost_in_place(k, t, priority, ceiling(t), false);
             }
+            message::hold_notice(t, c);
             sched::wake(k, t, abi::WAKE_NOTIFY);
         }
         true

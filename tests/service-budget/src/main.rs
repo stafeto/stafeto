@@ -396,10 +396,18 @@ fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
     // The request the server refused to answer ends with the channel.
     drop(channel);
     sleep_until(wait, timer, now_ns() + 5 * MS);
+    // The handles of a failed reply_receive: x1 = 1 says the reply went, whatever the error.
+    use abi::Error::{BadHandle, InvalidArgs, LimitReached, PeerClosed};
+    let took = sys::reply_receive_took_handles(1, BadHandle)
+        && sys::reply_receive_took_handles(1, PeerClosed)
+        && !sys::reply_receive_took_handles(0, InvalidArgs)
+        && !sys::reply_receive_took_handles(0, BadHandle)
+        && sys::reply_receive_took_handles(0, LimitReached);
     println!(
-        "svcbudget replies whole_with_handle={} server_saw={}",
+        "svcbudget replies whole_with_handle={} server_saw={} took_handles={}",
         u8::from(whole),
-        REPLY_RESULT.load(Relaxed)
+        REPLY_RESULT.load(Relaxed),
+        u8::from(took)
     );
 }
 

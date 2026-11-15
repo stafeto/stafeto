@@ -40,6 +40,7 @@ fn measured_line(line: &str) -> bool {
         "process kill ticks:",
         "abandon change ticks:",
         "timer portions ticks:",
+        "budget notice firing ticks:",
         // Also the LPI's line (`interrupt path ticks: lpi=`).
         "interrupt path ticks:",
         "its command ticks:",

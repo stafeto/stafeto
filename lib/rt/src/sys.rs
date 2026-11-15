@@ -48,7 +48,8 @@ pub fn calls() -> u64 {
 }
 
 /// `svc #N`, the one place of a returning call: x0-x9 in and out, and
-/// x10, x11 out (`receive`, OUT11) or only changed (every other call).
+/// x10 in and out and x11 out (`receive` and `reply_receive`, OUT11) or
+/// only changed (every other call).
 ///
 /// # Safety
 /// As for `raw`.
@@ -72,7 +73,7 @@ unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
                 inout("x7") x[7],
                 inout("x8") x[8],
                 inout("x9") x[9],
-                lateout("x10") x[10],
+                inout("x10") x[10],
                 lateout("x11") x[11],
                 options(nostack),
             )
@@ -867,6 +868,51 @@ pub fn budget_create(
     Ok(returned(&x))
 }
 
+/// `budget_create` with a place for the notifications of overruns: `notice`,
+/// a handle with NOTIFY to a channel (a labelled one gives its label), gets
+/// one notification, source `Budget`, for each overrun of the budget, at the
+/// level `low`. The handle carries abi::BUDGET_RIGHTS.
+pub fn budget_create_with_notice(
+    resource: &Handle<Resource>,
+    cpu: u32,
+    budget_ns: u64,
+    period_ns: u64,
+    low: u8,
+    notice: &Handle<Channel>,
+) -> Result<Handle<Budget>, Error> {
+    let args = [
+        resource.raw().0,
+        cpu.into(),
+        budget_ns,
+        period_ns,
+        low.into(),
+        notice.raw().0,
+    ];
+    let x = call::<{ Call::BudgetCreate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// thread_bind_budget with x2: `budget`, which `thread` (MANAGE) has now, is
+/// the proof of what it gives up, and the thread works at min(its base, `free`
+/// of its process) from now on. BAD_STATE when `budget` is not the thread's
+/// (a thread with no budget among them), the thread ended, or it started on
+/// another CPU than the caller's.
+pub fn thread_unbind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
+    let args = [thread.raw().0, 0, budget.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
+}
+
+/// thread_bind_budget with both x1 and x2: `new` takes the place of `old`, the
+/// thread's budget, in one section; the thread is never at `free` between them.
+pub fn thread_rebind_budget(
+    thread: &Handle<Thread>,
+    new: &Handle<Budget>,
+    old: &Handle<Budget>,
+) -> Result<(), Error> {
+    let args = [thread.raw().0, new.raw().0, old.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
+}
+
 /// thread_bind_budget: `thread` (MANAGE) works under `budget` from now on.
 pub fn thread_bind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
     let args = [thread.raw().0, budget.raw().0];
@@ -1234,12 +1280,10 @@ impl Token {
     /// replies, and nothing changes when a check fails; the handles then stay
     /// in the caller's table and close here, with the error as the call's
     /// result (INVALID_ARGS, BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). The
-    /// Ownership hazard: when the reply half delivered the handles and the receive half then
-    /// fails, the handles are the client's. This function counts them as gone for every error
-    /// of `Error::keeps_handles() == false` and closes them only for an error that keeps them;
-    /// an error of the receive half that keeps handles (none today: the kernel checks the
-    /// channel before it replies) would close values that now name nothing of the caller's.
-    /// The kernel side of this is decided with the kernel part of the budgets.
+    /// On an error x1 of the call says which half failed (`reply_receive_took_handles`): when
+    /// the reply went (the error is the receive half's) its handles are the client's and are
+    /// never closed here; when nothing happened they close here unless the error is one that
+    /// took them (`Error::keeps_handles`).
     /// error of a reply that went as far as it could (LIMIT_REACHED and
     /// NO_MEMORY, the client's table had no room) is the call's too, and the
     /// handles are gone; with PEER_CLOSED the receive follows.
@@ -1255,24 +1299,34 @@ impl Token {
         let Ok(regs) = message_regs(self.0, bytes, handles.values(), 0) else {
             return Err(Error::InvalidArgs);
         };
-        msgbuf::set_channel(channel.raw().0);
         let mut x = [0; 12];
         x[..10].copy_from_slice(&regs);
+        x[10] = channel.raw().0;
         // SAFETY: reply_receive uses no memory of the program but its own
-        // message buffer; it writes x0-x11 only.
+        // message buffer; it reads x0-x10 and writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
         let result = received(x);
+        // x1 of an error says which half failed (abi::Call::ReplyReceive): 0, nothing
+        // happened (BAD_STATE is the reply's: the token named no request that waited, and the
+        // call receives as `receive` does); 1, the reply went and its handles are gone.
+        let half = x[1];
         match &result {
-            // The handles stay in the table and close with `handles`, but for
-            // an error that took them (`Error::keeps_handles`), or a success.
-            Err(e) if e.keeps_handles() => {}
+            Err(e) if !reply_receive_took_handles(half, *e) => {}
             _ => handles.sent(),
         }
         match result {
-            Err(Error::BadState) => receive(channel),
+            Err(Error::BadState) if half == 0 => receive(channel),
             r => r,
         }
     }
+}
+
+/// Whether the handles of the reply of a `reply_receive` that failed with `error` are gone: x1 of
+/// the error is 1 (the reply was delivered, the error is the receive half's) or the error is one
+/// that takes the handles (`Error::keeps_handles`, as for `reply`). With x1 = 0 and an error that
+/// keeps them, they stay with the caller.
+pub const fn reply_receive_took_handles(x1: u64, error: Error) -> bool {
+    x1 == 1 || !error.keeps_handles()
 }
 
 /// A send or a reply with handles that failed (spec 6.1): its error, and

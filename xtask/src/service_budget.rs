@@ -145,7 +145,7 @@ pub fn judge(lines: &[String]) -> Result<(), String> {
     // The loop's reply of the most bytes with a handle, and the refusal of one byte more.
     if !lines
         .iter()
-        .any(|l| l == "svcbudget replies whole_with_handle=1 server_saw=3")
+        .any(|l| l == "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1")
     {
         return Err(format!(
             "the replies phase: {:?}",
@@ -334,7 +334,7 @@ mod tests {
     fn lines(shares: [u64; 3]) -> Vec<String> {
         let mut out = vec![
             "svcbudget START hz=62500000".to_owned(),
-            "svcbudget replies whole_with_handle=1 server_saw=3".to_owned(),
+            "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1".to_owned(),
         ];
         for l in [1, 5, 10] {
             out.push(format!(

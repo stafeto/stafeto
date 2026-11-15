@@ -390,6 +390,48 @@ pub fn bind_budget(
     })
 }
 
+/// thread_bind_budget with no budget (spec 8): the budget of `t` leaves it
+/// (`budget::unbind`). The same CPU rule as `bind_budget`: BAD_STATE for a
+/// thread that started on another CPU, and for one that has no budget or
+/// ended. One section of the scheduler's lock closes and charges the stint
+/// that runs, takes the budget off the thread, sets its level (min of its
+/// base and `free` of its process) and pays what it lent to the client of
+/// its request; the servers it lifted follow its level once the lock is
+/// gone. Returns the server that was the thread's. Under OBJ.
+pub fn unbind_budget(
+    t: NonNull<Thread>,
+    new: Option<NonNull<kcore::budget::Server>>,
+) -> Result<NonNull<kcore::budget::Server>, Error> {
+    crate::obj::assert_held();
+    if thread::is_started(t) && !is_local(t) {
+        return Err(Error::BadState);
+    }
+    let now = timer::now();
+    // SAFETY: the caller holds the thread, which holds its process.
+    let free = unsafe { t.as_ref().process().as_ref() }.free();
+    let (server, waits) = locked(|k| {
+        // SAFETY: the thread is alive and its CPU is this one or it has not
+        // started, so no other scheduler holds it; no borrow of its node is
+        // alive.
+        unsafe {
+            let (server, lent) = k.s.unbind_budget(t, free, now)?;
+            channel::pay_loan(k, t, lent, now);
+            // A rebind is one section: the level is computed again for the new
+            // budget before anyone can see the one at `free`.
+            if let Some(new) = new {
+                k.s.bind(t, new, now)
+                    .unwrap_or_else(|_| kcore::fail_here!("a thread with no budget binds"));
+            }
+            Ok::<_, Error>((server, channel::requeue(t, k)))
+        }
+    })?;
+    if let Some(w) = waits {
+        // SAFETY: the thread still waits in `w`.
+        unsafe { channel::raise(w) };
+    }
+    Ok(server)
+}
+
 /// REPLENISH: the replenishment event of the budget of `t`, a thread of this
 /// CPU, fired (budget::fire): the thread goes back to its own level, and the
 /// slot of one that waits follows it in its queue, as after a change of its
