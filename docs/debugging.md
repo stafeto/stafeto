@@ -226,6 +226,19 @@ What differs from QEMU's own emulation:
 - The processor has no AArch32 at EL0 and holds `SCTLR_EL1.ITD` and
   `SED` at 1; the kernel writes them 1 on every machine.
 
+## Probes on GitHub runners
+
+The workflow `.github/workflows/probe.yml` runs one `cargo xtask` command on the arm64 runners of GitHub, so that targeted probes run in parallel and leave the developer's machine alone. It starts only by hand, on the branch it is given, and the branch must carry the workflow file and `tools/probe-validate.sh`. The inputs are `command` (the words after `cargo xtask`), `env` (optional `NAME=value` words), `repeat` (1 to 10, default 1) and `timeout` (minutes for all runs together, 1 to 60, default 30). The text of the inputs may hold letters, digits, space and `- _ . , = /` and `:` only; the tests of that check are `bash tools/test_probe_validate.sh`.
+
+```sh
+gh workflow run probe.yml --ref my-branch -f command="budget-breaks" -f repeat=3
+gh workflow run probe.yml --ref my-branch -f command="net-probe" -f env="NET_PROBE_RUNS=r"
+gh run watch          # pick the run; follows it to the end
+gh run view --log     # the log; each run is a group, and the end has one line per run
+```
+
+The job restores the caches of `ci`, runs `cargo xtask ci --group build` (which builds what a cache lacks) and then the command `repeat` times. The summary prints `run N: ok` or `run N: FAILED` for each, and the job fails when any run failed. A failed job uploads the logs of `target` as the artefact `probe-logs`. A second start of the same command on the same branch cancels the first.
+
 ## Debugger
 
 `cargo xtask gdb` starts QEMU stopped before the kernel starts: first a
