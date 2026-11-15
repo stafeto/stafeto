@@ -299,12 +299,15 @@ static void *ending_thread(void *arg) {
     return NULL;
 }
 static void endings(int cpu) {
-    for (int v = 0; v < (SS_REBIND ? 3 : 2); v++) {
+    static const int order[3] = {2, 0, 1};
+    for (int i = 0; i < (SS_REBIND ? 3 : 2); i++) {
+        int v = SS_REBIND ? order[i] : i;
         printf("sporadic: CPU %d: a thread ends, variant %d\n", cpu, v);
         int err;
         pthread_t t = make(ending_thread, (void *)(long)v, NULL, &err);
         CHECK(err == 0);
         CHECK(pthread_join(t, NULL) == 0);
+        printf("sporadic: CPU %d: variant %d joined\n", cpu, v);
     }
 }
 
