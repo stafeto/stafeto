@@ -2741,8 +2741,12 @@ impl Service<0> for Driver<'_> {
         self.bell_release();
         self.bell_checked = false;
         let notify = &self.notify;
+        // The slot of label 0 holds the steps the stack told itself (and the switch's): it is
+        // one of the notifications in the queue and no request. The steps put off stay in
+        // `told` and have no slot.
+        let own = u64::from(self.told & !self.yielding.owed() & STEP_BITS != 0);
         let before = self.yielding_counts();
-        let owed = self.yielding.after(now_ns(), || queued(notify));
+        let owed = self.yielding.after(now_ns(), || queued(notify, own));
         self.count_yielding(before);
         self.tell_owed(owed);
     }
@@ -2783,9 +2787,9 @@ impl Service<0> for Driver<'_> {
     }
 }
 
-/// Whether anything stands in the queue of the service's channel.
-fn queued(notify: &Handle<Channel>) -> bool {
-    sys::channel_info(notify).is_ok_and(|info| info.queued > 0)
+/// Whether more than `own` slots stand in the queue of the service's channel.
+fn queued(notify: &Handle<Channel>, own: u64) -> bool {
+    sys::channel_info(notify).is_ok_and(|info| info.queued > own)
 }
 
 /// The channels of the instances, by number, for the first instance to tell whose session a
