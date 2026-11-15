@@ -755,9 +755,10 @@ fn phase_carry(process: &Handle<Process>, resource: &Handle<Resource>) {
     // Two periods of the buckets, in us of each 100 us: where the hog and the
     // victim ran.
     for who in [HOG, VICTIM] {
-        let row: Vec<u64> = (6 * per_ms..10 * per_ms)
-            .map(|b| time::ticks_to_ns(SPENT[who][b].load(Relaxed)) / 1000)
-            .collect();
+        let mut row = [0u64; 40];
+        for (k, cell) in row.iter_mut().enumerate() {
+            *cell = time::ticks_to_ns(SPENT[who][6 * per_ms + k].load(Relaxed)) / 1000;
+        }
         println!(
             "budget carry trace {} us={:?}",
             if who == HOG { "hog" } else { "victim" },
