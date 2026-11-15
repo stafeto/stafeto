@@ -4904,8 +4904,8 @@ fn start_takes_alone(f: &mut Fixture) -> Result<(), &'static str> {
     let judge = sched_thread(f, 1, &raw const el0_takes_alone, PRIORITY, FIFO)?;
     set_args(looper, &[word(0), word(1)]);
     set_args(judge, &[word(0), word(1)]);
-    let other = if here() == 0 { 1 } else { 0 };
-    thread::set_cpu(looper, usize::from(other));
+    let other = usize::from(here() == 0);
+    thread::set_cpu(looper, other);
     f.ends[0] = true;
     Ok(())
 }
