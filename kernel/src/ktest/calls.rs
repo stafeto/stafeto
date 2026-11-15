@@ -11044,11 +11044,11 @@ pub fn a_receive_that_takes_a_notification_above_a_request_keeps_the_lift(
                 == Source::Unlabeled,
             "the server took the request before the notification",
         )?;
+        holder_precedes_a_lower_thread(h, others)?;
         check(
             level_of(h.r) == 40,
             "the receive that took a notification left the holder below the request at 40",
-        )?;
-        holder_precedes_a_lower_thread(h, others)
+        )
     })
 }
 
@@ -11079,11 +11079,11 @@ pub fn a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave(
             thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
             "the poll with an interrupt pending did not start the call over",
         )?;
+        holder_precedes_a_lower_thread(h, others)?;
         check(
             level_of(h.r) == 40,
             "the reply left the holder below the request at 40 between the halves",
-        )?;
-        holder_precedes_a_lower_thread(h, others)
+        )
     })
 }
 
