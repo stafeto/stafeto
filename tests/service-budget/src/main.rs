@@ -60,7 +60,7 @@ const DEPTH: usize = 8;
 
 /// The threads of a phase: the victim, the control server and the greedy clients, each on a
 /// stack of its own.
-static STACKS: [Stack<8192>; 3 + GREEDIES] = [const { Stack::new() }; 3 + GREEDIES];
+static STACKS: [Stack<8192>; 2 + GREEDIES] = [const { Stack::new() }; 2 + GREEDIES];
 /// The greedy clients of a phase, on CPU 1: more than one, so that the service has a request
 /// waiting when it ends one, whatever the wake of a client on the other CPU takes.
 const GREEDIES: usize = 24;
@@ -263,31 +263,11 @@ extern "C" fn local_server(channel: u64) -> ! {
     sys::thread_exit()
 }
 
-/// A spinner at 2 on CPU 1 until STOP: with it CPU 1 never halts, so a reply for a queued
-/// client does not wait for a halted CPU to be woken.
-extern "C" fn keep_awake(_: u64) -> ! {
-    let mut i = 0u64;
-    while !STOP.load(Relaxed) {
-        i = black_box(i.wrapping_add(1));
-    }
-    sys::thread_exit()
-}
-
-extern "C" fn idle_thread(_: u64) -> ! {
-    ENDED.fetch_add(0, Relaxed);
-    sys::thread_exit()
-}
-
-/// The queued greedy clients, stopped, on CPU 1 at 20, and the spinner.
-fn spawn_greedies(process: &Handle<Process>) -> [Handle<Thread>; GREEDIES + 1] {
-    core::array::from_fn(|i| {
-        if i < GREEDIES {
-            spawn_on(process, 2 + i, greedy, i as u64, 20, 1)
-        } else {
-            // The spinner is off: the machine stalls CPU 0 while CPU 1 spins (see the report).
-            spawn_on(process, 2 + i, idle_thread, 0, 2, 1)
-        }
-    })
+/// The queued greedy clients, stopped, on CPU 1 at 20. A spinner on CPU 1 that keeps it from
+/// halting makes QEMU under -icount stall CPU 0 (the victim of the control phase then keeps
+/// 649 per mille in 10 ms), so there is none; 24 clients keep a request queued instead.
+fn spawn_greedies(process: &Handle<Process>) -> [Handle<Thread>; GREEDIES] {
+    core::array::from_fn(|i| spawn_on(process, 2 + i, greedy, i as u64, 20, 1))
 }
 
 fn start_all(threads: &[Handle<Thread>]) {
