@@ -280,6 +280,30 @@ static void leaving_time(void) {
     CHECK(victim_pm >= 700);
 }
 
+/* Names what a hung join waits for: the thread's levels and kernel state. */
+int sporadic_info(unsigned long thread, int *base, int *priority, int *state);
+static volatile unsigned long watched;
+static void *watchdog(void *arg) {
+    (void)arg;
+    sleep_ms(3000);
+    int base = -1, priority = -1, state = -1;
+    int e = sporadic_info(watched, &base, &priority, &state);
+    printf("sporadic: WATCHDOG: the thread %lu: %d, base %d, working at %d, state %d\n", watched, e, base, priority, state);
+    exit(77);
+}
+static void watch(pthread_t target) {
+    watched = target;
+    pthread_attr_t attr;
+    struct sched_param p = {.sched_priority = 31};
+    pthread_t w;
+    CHECK(pthread_attr_init(&attr) == 0);
+    CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
+    CHECK(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0);
+    CHECK(pthread_attr_setschedparam(&attr, &p) == 0);
+    CHECK(pthread_create(&w, &attr, watchdog, NULL) == 0);
+    CHECK(pthread_detach(w) == 0);
+}
+
 /* A thread that ends under its budget: with it untouched, with it spent, and
  * after it left the policy. */
 static void *ending_thread(void *arg) {
@@ -306,6 +330,7 @@ static void endings(int cpu) {
         int err;
         pthread_t t = make(ending_thread, (void *)(long)v, NULL, &err);
         CHECK(err == 0);
+        if (v == 1) watch(t);
         CHECK(pthread_join(t, NULL) == 0);
         printf("sporadic: CPU %d: variant %d joined\n", cpu, v);
     }
