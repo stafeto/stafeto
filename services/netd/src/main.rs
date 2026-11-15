@@ -2409,15 +2409,17 @@ const METHODS: &[u16] = &[
 ];
 
 impl Driver<'_> {
-    /// A request that reads what the stack knows of the sockets (the wait of a set) does not
-    /// overtake the steps told before it: on the levels of the loop a step told by a request
-    /// ran before the next request of the same client, but a budget that is spent, another CPU
-    /// or a client above the stack's level can put the request first, and the data the client
-    /// just sent are not yet in the report. The steps of sending, receiving and waking that are
-    /// told (or put off) run here, once each, and in at most three rounds, for the sending
-    /// makes frames for the receiving and the receiving the events for the waking.
+    /// A request that reads readiness (the wait of a set) does not overtake the steps told
+    /// before it. On the levels of the loop a step told by a request ran before the next request
+    /// of the same client, and the report of the data a send brought relied on it. A budget that
+    /// is spent, another CPU, a client above the stack's level or the steps put off for this very
+    /// request (`Yielding`) can put the request first. So the steps of sending, receiving and
+    /// waking that are told, or put off, run here before the wait is answered, in at most three
+    /// rounds: the sending makes frames for the receiving and the receiving the events for the
+    /// waking. The steps put off are those of the wire (`RX`, `TX`, `WAKE`) alone: the answers
+    /// of the switch and the rest keep their order.
     fn settle(&mut self) {
-        const SETTLED: u64 = TX | RX | WAKE;
+        const CASCADE: u64 = TX | RX | WAKE;
         #[cfg(feature = "probe")]
         let held = core::mem::take(&mut self.hold);
         // The steps the probe's hold has kept back are the steps told before the request.
@@ -2433,30 +2435,25 @@ impl Driver<'_> {
         });
         #[cfg(not(feature = "probe"))]
         let kept = 0;
+        let mut pending = (self.told | self.yielding.owed() | kept) & CASCADE;
         for round in 0..3 {
-            let pending =
-                (self.told | self.yielding.owed() | if round == 0 { kept } else { 0 }) & SETTLED;
             if pending == 0 {
                 break;
             }
             self.yielding.settle(pending);
-            for bit in [TX, RX, WAKE] {
-                if pending & bit == 0 {
-                    continue;
-                }
-                self.told &= !bit;
-                match bit {
-                    TX => self.tx_step(false),
-                    RX => self.rx_step(),
-                    _ => {
-                        rt::service::step_own();
-                        profile::count(Counter::StepWake);
-                        if self.inst.net.wake(&mut self.inst.stack, now_ns()) {
-                            self.tell(WAKE);
-                        }
-                    }
+            for bit in [RX, TX, WAKE] {
+                if pending & bit != 0 {
+                    self.told &= !bit;
+                    self.run_step(bit);
                 }
             }
+            // The sending makes frames for the receiving and the receiving the events for the
+            // waking: those the steps told again are the next round.
+            pending = if round < 2 {
+                (self.told | self.yielding.owed()) & CASCADE
+            } else {
+                0
+            };
         }
         #[cfg(feature = "probe")]
         {
@@ -2467,10 +2464,11 @@ impl Driver<'_> {
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
-        if matches!(
+        let readiness = matches!(
             Method::from_number(method),
             Some(Method::EpollWait | Method::EpollWaitTake | Method::Watch | Method::WatchTake)
-        ) {
+        );
+        if readiness {
             self.settle();
         }
         // VERIFY_SESSION goes through the root alone, and the root has no
@@ -2556,6 +2554,60 @@ impl Driver<'_> {
         profile::add(Counter::YieldServed, u64::from(now[2] - before[2]));
     }
 
+    /// One step of the stack, by its bit.
+    fn run_step(&mut self, bit: u64) {
+        match bit {
+            RX => self.rx_step(),
+            RX1 => {
+                self.rx1_step(false);
+            }
+            RETURN => self.return_step(),
+            BACK => self.back_step(),
+            MAP => {
+                rt::service::step_own();
+                if self.inst.net.map_waiting() {
+                    self.tell(MAP);
+                }
+            }
+            TX => self.tx_step(false),
+            WAKE => {
+                rt::service::step_own();
+                profile::count(Counter::StepWake);
+                #[cfg(feature = "probe")]
+                let began = self.ran();
+                let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
+                #[cfg(feature = "probe")]
+                self.measured(0, began);
+                if left {
+                    self.tell(WAKE);
+                }
+            }
+            CLEANUP => {
+                rt::service::step_own();
+                profile::count(Counter::StepCleanup);
+                #[cfg(feature = "probe")]
+                let began = self.ran();
+                let more = self.inst.net.depart_step(&mut self.inst.stack);
+                #[cfg(feature = "probe")]
+                self.measured(1, began);
+                if more {
+                    self.cleanup();
+                }
+            }
+            RESOLV => {
+                profile::count(Counter::StepResolv);
+                self.resolv_step()
+            }
+            _ => {
+                rt::service::step_own();
+                profile::count(Counter::StepSweep);
+                if self.inst.net.sweep(&mut self.inst.stack, now_ns()) {
+                    self.tell(SWEEP);
+                }
+            }
+        }
+    }
+
     fn handle_notification(&mut self, mut n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
@@ -2572,7 +2624,7 @@ impl Driver<'_> {
                 // A request that waits in the queue goes ahead of the steps that follow one
                 // another (`netd::gates::Yielding`).
                 let before = self.yielding_counts();
-                let steps = self.yielding.arrive(n.bits & STEP_BITS);
+                let steps = self.yielding.arrive(n.bits & STEP_BITS, RX | TX | WAKE);
                 self.count_yielding(before);
                 if steps == 0 {
                     return;
@@ -2594,56 +2646,7 @@ impl Driver<'_> {
                 }
                 let began = profile::now();
                 trace::point(P_N_STK_BEGIN, bit as u32);
-                match bit {
-                    RX => self.rx_step(),
-                    RX1 => {
-                        self.rx1_step(false);
-                    }
-                    RETURN => self.return_step(),
-                    BACK => self.back_step(),
-                    MAP => {
-                        rt::service::step_own();
-                        if self.inst.net.map_waiting() {
-                            self.tell(MAP);
-                        }
-                    }
-                    TX => self.tx_step(false),
-                    WAKE => {
-                        rt::service::step_own();
-                        profile::count(Counter::StepWake);
-                        #[cfg(feature = "probe")]
-                        let began = self.ran();
-                        let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
-                        #[cfg(feature = "probe")]
-                        self.measured(0, began);
-                        if left {
-                            self.tell(WAKE);
-                        }
-                    }
-                    CLEANUP => {
-                        rt::service::step_own();
-                        profile::count(Counter::StepCleanup);
-                        #[cfg(feature = "probe")]
-                        let began = self.ran();
-                        let more = self.inst.net.depart_step(&mut self.inst.stack);
-                        #[cfg(feature = "probe")]
-                        self.measured(1, began);
-                        if more {
-                            self.cleanup();
-                        }
-                    }
-                    RESOLV => {
-                        profile::count(Counter::StepResolv);
-                        self.resolv_step()
-                    }
-                    _ => {
-                        rt::service::step_own();
-                        profile::count(Counter::StepSweep);
-                        if self.inst.net.sweep(&mut self.inst.stack, now_ns()) {
-                            self.tell(SWEEP);
-                        }
-                    }
-                }
+                self.run_step(bit);
                 let kind = match bit {
                     RX => Counter::StepRxTicks,
                     TX => Counter::StepTxTicks,

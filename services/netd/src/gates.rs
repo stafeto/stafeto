@@ -163,13 +163,14 @@ impl Yielding {
         }
     }
 
-    /// A notification of steps `bits` came. The steps to run now: `bits` with those owed, or 0
-    /// when they are put off.
-    pub fn arrive(&mut self, bits: u64) -> u64 {
-        if self.defer {
-            self.owed |= bits;
+    /// A notification of steps `bits` came. The steps to run now: `bits` with those owed, or,
+    /// when the next step is to be put off, the steps of `bits` outside `deferrable` (the others
+    /// are put off).
+    pub fn arrive(&mut self, bits: u64, deferrable: u64) -> u64 {
+        if self.defer && bits & deferrable != 0 {
+            self.owed |= bits & deferrable;
             self.deferred += 1;
-            return 0;
+            return bits & !deferrable;
         }
         bits | core::mem::take(&mut self.owed)
     }
@@ -329,6 +330,7 @@ mod tests {
         }
     }
     const MS: u64 = 1_000_000;
+    const ALL: u64 = u64::MAX;
 
     #[test]
     fn nothing_is_asked_while_requests_are_served_within_a_period() {
@@ -337,7 +339,7 @@ mod tests {
         for k in 1..8 {
             let now = 5 * MS + k * 100_000;
             assert_eq!(y.after(now, || unreachable!("served lately")), 0);
-            assert_eq!(y.arrive(0b1), 0b1);
+            assert_eq!(y.arrive(0b1, ALL), 0b1);
         }
         assert_eq!(y.deferred, 0);
     }
@@ -347,14 +349,14 @@ mod tests {
         let mut y = Yielding::new();
         y.served(5 * MS);
         assert_eq!(y.after(6 * MS + 1, || true), 0);
-        assert_eq!(y.arrive(0b1), 0);
+        assert_eq!(y.arrive(0b1, ALL), 0);
         // The notifications of other steps that stand ahead of the request are put off too.
         assert_eq!(y.after(6 * MS + 2, || true), 0);
-        assert_eq!(y.arrive(0b10), 0);
+        assert_eq!(y.arrive(0b10, ALL), 0);
         // The request is served: the steps owed come back together, and a period starts.
         assert_eq!(y.served(6 * MS + 3), 0b11);
         assert_eq!(y.after(6 * MS + 4, || unreachable!("a new period")), 0);
-        assert_eq!(y.arrive(0b1), 0b1);
+        assert_eq!(y.arrive(0b1, ALL), 0b1);
         assert_eq!((y.deferred, y.idle, y.served), (2, 0, 1));
     }
 
@@ -362,13 +364,25 @@ mod tests {
     fn an_empty_queue_tells_the_steps_owed() {
         let mut y = Yielding::new();
         assert_eq!(y.after(2 * MS, || true), 0);
-        assert_eq!(y.arrive(0b1), 0);
+        assert_eq!(y.arrive(0b1, ALL), 0);
         // What stood in the queue was no request; the end of the next notification finds it
         // empty.
         assert_eq!(y.after(2 * MS + 1, || false), 0b1);
-        assert_eq!(y.arrive(0b100), 0b100);
+        assert_eq!(y.arrive(0b100, ALL), 0b100);
         assert_eq!(y.after(2 * MS + 2, || unreachable!("a new period")), 0);
         assert_eq!((y.deferred, y.idle), (1, 1));
+    }
+
+    #[test]
+    fn only_the_deferrable_steps_are_put_off() {
+        let mut y = Yielding::new();
+        assert_eq!(y.after(2 * MS, || true), 0);
+        // The answers of the switch (0b1000) and the sweep (0b100) run; receiving (0b1) waits.
+        assert_eq!(y.arrive(0b1101, 0b11), 0b1100);
+        assert_eq!(y.owed(), 0b1);
+        assert_eq!(y.arrive(0b1000, 0b11), 0b1000);
+        assert_eq!(y.deferred, 1);
+        assert_eq!(y.served(2 * MS + 1), 0b1);
     }
 
     /// The queue of the loop in a model: one slot of label 0 (the stack's own bits and the
@@ -409,7 +423,7 @@ mod tests {
             }
             if slot != 0 {
                 let bits = core::mem::take(&mut slot);
-                let run = y.arrive(bits);
+                let run = y.arrive(bits, ALL);
                 if run != 0 {
                     let first = 1u64 << run.trailing_zeros();
                     told &= !first;
