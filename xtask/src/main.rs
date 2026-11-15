@@ -1710,10 +1710,14 @@ enum Variant {
     /// reply between the halves of `reply_receive` (`break-relift-reply`).
     LiftAgainNoticeTest,
     LiftAgainReplyTest,
+    /// The same two breaks in the kernel the probes of the budgets boot (`cargo xtask
+    /// budget-breaks`): the one-CPU level-40 check must fail on each.
+    LiftAgainNotice,
+    LiftAgainReply,
 }
 
 impl Variant {
-    const ALL: [Variant; 70] = [
+    const ALL: [Variant; 72] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1783,6 +1787,8 @@ impl Variant {
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
         Variant::LiftAgainNoticeTest,
+        Variant::LiftAgainNotice,
+        Variant::LiftAgainReply,
         Variant::LiftAgainReplyTest,
     ];
 
@@ -1862,6 +1868,8 @@ impl Variant {
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
             Variant::LiftAgainNoticeTest => Some("ktest,break-relift-notice"),
             Variant::LiftAgainReplyTest => Some("ktest,break-relift-reply"),
+            Variant::LiftAgainNotice => Some("break-relift-notice"),
+            Variant::LiftAgainReply => Some("break-relift-reply"),
         }
     }
 
@@ -1956,6 +1964,8 @@ impl Variant {
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
             Variant::LiftAgainNoticeTest => "stafeto-ktest-relift-notice",
             Variant::LiftAgainReplyTest => "stafeto-ktest-relift-reply",
+            Variant::LiftAgainNotice => "stafeto-relift-notice",
+            Variant::LiftAgainReply => "stafeto-relift-reply",
         }
     }
 }

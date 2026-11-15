@@ -707,8 +707,16 @@ fn main(_: u64) -> u64 {
 /// (`budget-hog`); the cost of one timer event is measured (`control_budget`).
 const C_US: [u64; 3] = [250, 75, 75];
 const B_K_US: u64 = 150;
-/// The entries of a request's calls and the lift of the service, as in `QUEUE_WAIT_US` of `budget-hog`.
-const ENTRY_US: u64 = 100;
+/// The period T of the three budgets, microseconds.
+const T_US: u64 = 5_000;
+/// One round trip of a call (C_ipc, about 2 000 ticks; the comment above `CALL_WAIT_MAX` in
+/// `xtask/src/main.rs`).
+const C_IPC_US: u64 = 32;
+/// What init (level 63, no budget) takes from one window of the level-40 phase for one service:
+/// the answer to its heartbeat (43 us: in the time stamps of the kernel, `STAMP_RUN` records of a
+/// window with a heartbeat of the RAM service, init ran 2 688 ticks) and up to two notifications
+/// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
+const INIT_PER_SERVICE_US: u64 = 70;
 /// What the explanation of the loss leaves unexplained, per service, as the gate allows it
 /// (measured on main; the remainder of the pipe and terminal services is an open issue).
 const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
@@ -923,10 +931,23 @@ fn starve(
 /// asks every 1037 us from absolute times, so that its release sweeps the budget period of 5 ms
 /// by 37 us a step, 200 times. `s_max` is the longest single request of the dear kind alone and
 /// `s0` that of the thread's own, both of the same build; a request of the thread must wait
-/// 1.10 * s_max + s0 + B + 2 e + ENTRY_US at most (one request in hand, the kernel's longest
-/// stretch, two timer events of the budget, and the entries of the calls and the lift of the
-/// service, 100 us as in `QUEUE_WAIT_US` of `budget-hog`; the pipe's worst request measured 527 us
-/// against 502 us without that term). A ping of the
+/// R at most, the fixed point of
+///
+///   R = 1.10 * s_max + s0 + B_k + C_ipc
+///       + sum over the three services j of ceil(R / T) * C_j
+///       + 2 * sum over the three budgets of e_j
+///       + 3 * INIT
+///
+/// (the request in hand, the thread's own request, the kernel's longest stretch, one round trip;
+/// the budgets of every service above 40 in that window, the target's included: after its reply
+/// the target keeps its own level, with the client at 40 ready, until its budget is gone (81 us
+/// of thread time in the stamps of a window against C = 75 us), and the RAM service, idle in this
+/// phase, ran 235 us (C = 250 us) after a timer wake and a call to init in the worst window the
+/// stamps showed; two timer events of each of the three budgets, e measured in the control
+/// phase; init at 63 for each service). The worst request moves by 176 us with the image alone
+/// (359 to 535 us of the pipe on the unbroken kernel), the timer wakes of the other services and
+/// the notifications of init landing in other places of the window; the bound holds them all.
+/// A ping of the
 /// RAM service is `requests` requests, each held to that.
 fn level40(
     process: &Handle<Process>,
@@ -1002,7 +1023,7 @@ fn level40(
     wait_ended_clients(wait, timer, n as u64);
     let us = |t: u64| time::ticks_to_ns(t) / 1000;
     let e = e_of(which);
-    let bound = us(s_max) * 110 / 100 + us(s0) + B_K_US + 2 * e + ENTRY_US;
+    let bound = level40_bound(us(s_max), us(s0), [e_of(0), e_of(1), e_of(2)]);
     println!(
         "svcbudget1 {name} level40 releases=200 requests_per_ping={requests} worst_request_us={} worst_wait_us={} s_max_us={} s0_us={} e_us={e} bound_us={bound}",
         us(worst_request),
@@ -1010,6 +1031,23 @@ fn level40(
         us(s_max),
         us(s0)
     );
+}
+
+/// The bound R of `level40` for the build's `s_max` and `s0` and the e of the three budgets
+/// (microseconds): the fixed point of the formula above, reached from below.
+fn level40_bound(s_max: u64, s0: u64, e: [u64; 3]) -> u64 {
+    let fixed = s_max * 110 / 100
+        + s0
+        + B_K_US
+        + C_IPC_US
+        + 2 * e.iter().sum::<u64>()
+        + 3 * INIT_PER_SERVICE_US;
+    let c: u64 = C_US.iter().sum();
+    let mut r = fixed;
+    for _ in 0..8 {
+        r = fixed + r.div_ceil(T_US) * c;
+    }
+    r
 }
 
 /// `wait_ended` without the victim (the level-40 phase has none).
