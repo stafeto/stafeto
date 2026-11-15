@@ -53,6 +53,26 @@ pub struct Numbers {
     /// phase did not run).
     pub queue_same: (u64, u64),
     pub queue_other: (u64, u64),
+    /// The overrun phase: the notifications that came, those not of count 1,
+    /// the overruns the hog's budget counted, at the unbind half way and at
+    /// the end; the unbind's results; the overruns of the polite thread and
+    /// what its place held.
+    pub overrun: Overrun,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Overrun {
+    pub seen: bool,
+    pub notes_at_unbind: u64,
+    pub overruns_at_unbind: u64,
+    pub bad: u64,
+    pub unbound: bool,
+    pub second_refused: bool,
+    pub free: bool,
+    pub notes_end: u64,
+    pub overruns_end: u64,
+    pub polite_overruns: u64,
+    pub quiet: u64,
 }
 
 /// The budget of the hog, 300 us for each 1 ms, and the longest stretch the
@@ -76,6 +96,9 @@ const LOAN_LEAST_SAME: u64 = 26;
 const QUEUE_WAIT_US: u64 = 500 + 150 + 100;
 /// The fewest requests the queue phase's client at 40 makes: one every 4 ms.
 const QUEUE_LEAST: u64 = 5;
+/// The fewest overruns of the hog of the overrun phase in its 100 ms before the
+/// unbind: one for each period of 1 ms, less the start.
+const OVERRUNS_LEAST: u64 = 80;
 const HOG_US: u64 = 300;
 const B_US: u64 = 150;
 
@@ -127,6 +150,20 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
             n.queue_same = (number(line, "requests=")?, number(line, "wait_us=")?);
         } else if line.starts_with("budget queue other ") {
             n.queue_other = (number(line, "requests=")?, number(line, "wait_us=")?);
+        } else if line.starts_with("budget overrun unbind ") {
+            n.overrun.seen = true;
+            n.overrun.notes_at_unbind = number(line, "notes=")?;
+            n.overrun.bad = number(line, "bad=")?;
+            n.overrun.overruns_at_unbind = number(line, "overruns=")?;
+            n.overrun.unbound = number(line, "first=")? == 1;
+            n.overrun.second_refused = number(line, "second_is_bad_state=")? == 1;
+            n.overrun.free = number(line, "free=")? == 1;
+        } else if line.starts_with("budget overrun end ") {
+            n.overrun.notes_end = number(line, "notes=")?;
+            n.overrun.bad = n.overrun.bad.max(number(line, "bad=")?);
+            n.overrun.overruns_end = number(line, "overruns=")?;
+            n.overrun.polite_overruns = number(line, "polite_overruns=")?;
+            n.overrun.quiet = number(line, "quiet=")?;
         } else if line.starts_with("budget slot ") {
             n.slot_share = number(line, "min_share=")?;
             n.slot_gap_us = number(line, "max_gap_us=")?;
@@ -136,6 +173,7 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
         || n.boost_n == 0
         || n.loan_same.0 == 0
         || n.queue_same.0 == 0
+        || !n.overrun.seen
         || n.slot_share == 0 && n.slot_gap_us == 0
     {
         return Err(format!("the probe's lines are incomplete: {n:?}"));
@@ -236,6 +274,38 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
             ));
         }
     }
+    // The overruns: one notification for each overrun the budget counts,
+    // each of count 1; the polite thread, which stays within its budget,
+    // posts none; the unbind frees the budget and the place posts nothing
+    // after it.
+    let o = &n.overrun;
+    if o.overruns_at_unbind < OVERRUNS_LEAST
+        || o.notes_at_unbind != o.overruns_at_unbind
+        || o.bad != 0
+    {
+        return Err(format!(
+            "the place of the hog's budget got {} notifications for {} overruns ({} not of count 1; at least {OVERRUNS_LEAST} overruns, one notification for each)",
+            o.notes_at_unbind, o.overruns_at_unbind, o.bad
+        ));
+    }
+    if o.polite_overruns != 0 || o.quiet != 0 {
+        return Err(format!(
+            "a thread within its budget overran {} times and its place got {}",
+            o.polite_overruns, o.quiet
+        ));
+    }
+    if !o.unbound || !o.second_refused || !o.free {
+        return Err(format!(
+            "the unbind of the hog's budget: done {}, second refused {}, budget free {}",
+            o.unbound, o.second_refused, o.free
+        ));
+    }
+    if o.notes_end != o.notes_at_unbind || o.overruns_end != o.overruns_at_unbind {
+        return Err(format!(
+            "the budget went on after its unbind: {} notifications and {} overruns, {} and {} at the unbind",
+            o.notes_end, o.overruns_end, o.notes_at_unbind, o.overruns_at_unbind
+        ));
+    }
     // The worker at 55 for each notification gets its 200 us of each
     // period and the boost of the slot goes with the budget: the victim
     // keeps 750 per mille at least, and no gap of its own passes 400 us.
@@ -319,12 +389,19 @@ pub fn breaks() -> Result<(), String> {
             Variant::ReplyReceiveSplit,
             "a reply_receive that returns to EL0 between its reply and its receive",
         ),
+        (
+            Variant::BudgetOverrunSilent,
+            "an overrun that posts nothing to the budget's place",
+        ),
     ] {
         // On four CPUs, so that the loan phase with the service on another
         // CPU runs on the break too.
         let cpus = if matches!(
             variant,
-            Variant::BudgetForgiveLoan | Variant::BudgetNoQueueLift | Variant::ReplyReceiveSplit
+            Variant::BudgetForgiveLoan
+                | Variant::BudgetNoQueueLift
+                | Variant::ReplyReceiveSplit
+                | Variant::BudgetOverrunSilent
         ) {
             4
         } else {
@@ -351,13 +428,58 @@ pub fn breaks() -> Result<(), String> {
             "a_request_that_queues_lifts_a_demoted_server_of_its_cpu",
             "a request that queues and does not lift the server",
         ),
+        (
+            Variant::BudgetOverrunSilentTest,
+            "an_overrun_posts_one_notification_for_each_period",
+            "an overrun that posts nothing to the budget's place",
+        ),
+        (
+            Variant::BudgetUnbindKeepsTest,
+            "unbinding_gives_a_thread_min_of_its_base_and_free",
+            "an unbind that leaves the thread at the level its budget gave it",
+        ),
+        (
+            Variant::NoticeHolderKeepsTest,
+            "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
+            "a thread that goes on holding a notification after its receive",
+        ),
+        (
+            Variant::NoticePayerNoneTest,
+            "a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel",
+            "a lift of a notification's holder that names no payer",
+        ),
+        (
+            Variant::BudgetUnbindNoChargeTest,
+            "unbinding_gives_a_thread_min_of_its_base_and_free",
+            "an unbind that does not charge the stint that runs",
+        ),
+        (
+            Variant::BudgetUnbindKeepsEventTest,
+            "the_timer_of_an_unbound_budget_leaves_the_former_thread_alone",
+            "an unbind that leaves the event of the budget in the heap",
+        ),
     ] {
         let a = build(variant)?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
         cmd.args(qemu::HEADLESS);
         let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
         let report = qemu::parse_report(&o.lines);
-        if !report.failed.iter().any(|(name, _)| name == test) {
+        // Only the break that leaves the event of an unbound budget in the heap
+        // stops the run with a panic, in the free of the budget's place after
+        // the named test; the test before it passed, the named one did not
+        // report. Every other break must fail its test cleanly.
+        let panicked = variant == Variant::BudgetUnbindKeepsEventTest
+            && o.lines
+                .iter()
+                .any(|l| l == "KERNEL PANIC: a timer where the count puts one")
+            && o.lines
+                .iter()
+                .any(|l| l == "TEST unbinding_a_client_lifts_the_server_that_works_for_it ok")
+            && !o
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("TEST {test} ")));
+        if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }
         println!("budget-breaks: {what} is caught");
@@ -375,6 +497,11 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-skip-boosted",
         "break-budget-handoff",
         "break-budget-forgive-loan",
+        "break-budget-overrun-silent",
+        "break-budget-unbind-keeps",
+        "break-budget-unbind-no-charge",
+        "break-budget-unbind-keeps-event",
+        "break-budget-early-replenish",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -435,6 +562,8 @@ mod tests {
             "budget queue same requests=20 wait_us=400".into(),
             "budget queue other requests=20 wait_us=400".into(),
             format!("budget slot min_share={} max_gap_us={}", slot.0, slot.1),
+            "budget overrun unbind notes=100 bad=0 overruns=100 first=1 second_is_bad_state=1 free=1".into(),
+            "budget overrun end notes=100 bad=0 overruns=100 polite_overruns=0 quiet=0".into(),
             "budget DONE".into(),
         ]
     }
@@ -477,6 +606,47 @@ mod tests {
         }
         let e = verdict(&parse(&l).unwrap(), 1).unwrap_err();
         assert!(e.contains("not lent"), "{e}");
+    }
+
+    #[test]
+    fn a_silent_place_or_a_budget_that_goes_on_after_its_unbind_fails() {
+        for (from, to, text) in [
+            (
+                "unbind notes=100 bad=0",
+                "unbind notes=0 bad=0",
+                "notifications for",
+            ),
+            (
+                "unbind notes=100 bad=0",
+                "unbind notes=100 bad=3",
+                "not of count 1",
+            ),
+            (
+                "polite_overruns=0 quiet=0",
+                "polite_overruns=0 quiet=1",
+                "within its budget",
+            ),
+            (
+                "second_is_bad_state=1",
+                "second_is_bad_state=0",
+                "unbind of the hog",
+            ),
+            (
+                "end notes=100 bad=0 overruns=100",
+                "end notes=140 bad=0 overruns=140",
+                "went on after",
+            ),
+        ] {
+            let mut l = lines(700, 300, 600, (800, 250));
+            for line in &mut l {
+                if line.contains(from) {
+                    *line = line.replace(from, to);
+                }
+            }
+            let e =
+                verdict(&parse(&l).unwrap(), 1).expect_err(&format!("{from} passed the verdict"));
+            assert!(e.contains(text), "{e}");
+        }
     }
 
     #[test]

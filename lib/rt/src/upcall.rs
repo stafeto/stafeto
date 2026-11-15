@@ -56,6 +56,16 @@ pub const FRAME_SIZE: usize = 1904;
 /// before the handler enables nested entries (a nested fault replaces them).
 pub const ENTRY_FAULT: u64 = abi::UPCALL_TAKE_FAULT;
 
+// The distributor copies abi::msgbuf::RESERVED bytes of the message buffer
+// into its frame, which starts 816 bytes up (`entry`), in steps of 16: the
+// frame holds exactly that part, and the length the copy takes is the
+// constant itself, so that a change of the layout of the buffer changes
+// both.
+const _: () = {
+    assert!(abi::msgbuf::RESERVED.is_multiple_of(16));
+    assert!(816 + abi::msgbuf::RESERVED == FRAME_SIZE);
+};
+
 // The record fills its eight words.
 const _: () = assert!(ENTRY_WORDS_END <= ENTRIES_SIZE);
 
@@ -448,7 +458,7 @@ unsafe extern "C" fn entry() {
         "stp q28, q29, [sp, #736]", "stp q30, q31, [sp, #768]",
         "mrs x10, fpcr", "str x10, [sp, #800]",
         "mrs x10, fpsr", "str x10, [sp, #808]",
-        "add x10, sp, #816", "mov x11, #1088",
+        "add x10, sp, #816", "mov x11, #{reserved}",
         "2:", "ldp x12, x13, [x9], #16", "stp x12, x13, [x10], #16",
         "subs x11, x11, #16", "b.ne 2b",
         "mov x0, #{take}", "svc #{control}", "cbnz x0, 9f",
@@ -483,7 +493,7 @@ unsafe extern "C" fn entry() {
         // `INIT_MSGBUF`, its parent's thread another, and the kernel's
         // return checks the word against the thread's own register.
         "mrs x9, tpidrro_el0", "str x9, [sp, #280]",
-        "add x10, sp, #816", "mov x11, #1088",
+        "add x10, sp, #816", "mov x11, #{reserved}",
         "3:", "ldp x12, x13, [x10], #16", "stp x12, x13, [x9], #16",
         "subs x11, x11, #16", "b.ne 3b",
         "mrs x9, tpidrro_el0", "add x9, x9, #{offset}",
@@ -498,6 +508,7 @@ unsafe extern "C" fn entry() {
         // path of a thread without a resident handler stays as it was.
         "8:", "mov x9, #1", "str x9, [x20, #{owed}]", "b 6b",
         frame = const FRAME_SIZE,
+        reserved = const abi::msgbuf::RESERVED,
         control = const Call::ThreadUpcallControl.number(),
         take = const UpcallControl::Take.raw(),
         mask = const UpcallControl::Mask.raw(),

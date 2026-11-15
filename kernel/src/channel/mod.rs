@@ -32,6 +32,7 @@
 //! waiter when that is above the cause (spec 7.7). A request a receiver
 //! took lives on without the channel.
 
+use crate::budget::{self, Budget};
 use crate::cleanup::{self, Item};
 use crate::irq::{self, Irq};
 use crate::object::{self, Live, Object, Refs};
@@ -52,7 +53,9 @@ use kcore::sched::Scheduler;
 mod message;
 mod source;
 
-pub use message::{Via, Wait, cancel, raise, receive, reply, requeue, send, withdraw};
+#[cfg(feature = "ktest")]
+pub use message::hold_notice;
+pub use message::{Via, Wait, cancel, pay_loan, raise, receive, reply, requeue, send, withdraw};
 pub use source::{Owner, Source, notify};
 
 /// The work a portion of the stage Close does, at most (spec 7.7): each
