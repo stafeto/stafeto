@@ -75,6 +75,9 @@ static GREEDY_SESSIONS: [AtomicU64; GREEDIES] = [const { AtomicU64::new(0) }; GR
 static STOP: AtomicBool = AtomicBool::new(false);
 static GREEDY_N: AtomicU64 = AtomicU64::new(0);
 static GREEDY_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Whether the victim of the phase ended: a starved victim (a service with no budget) ends late,
+/// and its slot is not reused before.
+static VICTIM_DONE: AtomicBool = AtomicBool::new(false);
 /// The greedy clients that ended.
 static ENDED: AtomicU64 = AtomicU64::new(0);
 /// The status of the last RAM request that failed, for the line of the phase.
@@ -228,6 +231,7 @@ extern "C" fn victim(_: u64) -> ! {
             }
         }
         if now >= end {
+            VICTIM_DONE.store(true, Relaxed);
             sys::thread_exit()
         }
     }
@@ -319,6 +323,7 @@ fn idle(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Timer>
     let victim = spawn_on(process, 0, victim, 0, 25, 0);
     sys::thread_start(&victim).expect("start the victim");
     sleep_until(wait, timer, now_ns() + (PHASE_MS + 5) * MS);
+    wait_ended(wait, timer, 0);
     print_windows("idle");
 }
 
@@ -426,11 +431,11 @@ fn start_all(threads: &[Handle<Thread>]) {
     }
 }
 
-/// Waits for the greedy clients to end after STOP, 500 ms at most.
-fn wait_ended(wait: &Handle<Channel>, timer: &Handle<Timer>) {
-    for _ in 0..100 {
+/// Waits for the greedy clients to end after STOP, 5 s at most.
+fn wait_ended(wait: &Handle<Channel>, timer: &Handle<Timer>, greedies: u64) {
+    for _ in 0..1000 {
         sleep_until(wait, timer, now_ns() + 5 * MS);
-        if ENDED.load(Relaxed) == GREEDIES as u64 {
+        if ENDED.load(Relaxed) == greedies && VICTIM_DONE.load(Relaxed) {
             return;
         }
     }
@@ -472,7 +477,7 @@ fn control(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
     start_all(&greedies);
     sleep_until(wait, timer, now_ns() + PHASE_MS * MS);
     STOP.store(true, Relaxed);
-    wait_ended(wait, timer);
+    wait_ended(wait, timer, GREEDIES as u64);
     print_windows("control");
     println!("svcbudget control share greedy={}", GREEDY_N.load(Relaxed));
     drop(channel);
@@ -487,6 +492,7 @@ fn reset() {
     GREEDY_N.store(0, Relaxed);
     GREEDY_FAILED.store(0, Relaxed);
     ENDED.store(0, Relaxed);
+    VICTIM_DONE.store(false, Relaxed);
     STOP.store(false, Relaxed);
     let now = time::now();
     START.store(now, Relaxed);
@@ -556,7 +562,7 @@ fn phase(
     }
     STOP.store(true, Relaxed);
     // The greedy clients end after the request in hand; the victim ended at END.
-    wait_ended(wait, timer);
+    wait_ended(wait, timer, GREEDIES as u64);
     if ping {
         println!(
             "svcbudget {name} ping n={n} failed={failed} max_us={} over_750us={over} mean_us={} worst_at_ms={worst_at} greedy={} greedy_failed={} status={}",

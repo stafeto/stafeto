@@ -200,9 +200,22 @@ fn run_image(
         qemu::run_until(cmd, TIMEOUT, Some("svcbudget DONE"))
     })?;
     if outcome.timed_out || !outcome.stopped_on_marker {
+        let why = outcome
+            .lines
+            .iter()
+            .position(|l| l.contains("panicked"))
+            .map(|i| {
+                outcome.lines[i..]
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
         return Err(format!(
-            "the probe did not finish: {:?}",
-            outcome.lines.last()
+            "the probe did not finish: {:?}{}",
+            outcome.lines.last(),
+            why.map_or(String::new(), |w| format!(" ({w})"))
         ));
     }
     for line in outcome
