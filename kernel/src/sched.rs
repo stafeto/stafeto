@@ -416,7 +416,8 @@ pub fn unbind_budget(
         unsafe {
             let (server, lent) = k.s.unbind_budget(t, free, now)?;
             channel::pay_loan(k, t, lent, now);
-            // A rebind is one section: the level is set once more at once.
+            // A rebind is one section: the level is computed again for the new
+            // budget before anyone can see the one at `free`.
             if let Some(new) = new {
                 k.s.bind(t, new, now)
                     .unwrap_or_else(|_| kcore::fail_here!("a thread with no budget binds"));

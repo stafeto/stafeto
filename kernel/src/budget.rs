@@ -253,8 +253,9 @@ pub fn bind(t: NonNull<Thread>, b: NonNull<Budget>) -> Result<(), Error> {
 /// scheduler is that CPU's alone) or ended. One section of the scheduler's
 /// lock (`sched::unbind_budget`) closes and charges the stint that runs, pays
 /// the loan to the client (`channel::pay_loan`), takes the old event out of
-/// the heap, binds `new`, if any, and sets the level once: min(base, `free`)
-/// when there is none, so no rebind leaves the thread at `free` in between;
+/// the heap, binds `new`, if any, and sets the level: min(base, `free`) when there is
+/// none; with `new` the level is computed for the unbound thread and again for
+/// the bound one inside the section, so no one sees the thread at `free`;
 /// the servers the thread lifted follow it (`channel::requeue`). An overrun
 /// the old place was not told of is told here, and the binding's reference to
 /// `old` goes; `new` is retained. Under OBJ.

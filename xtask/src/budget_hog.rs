@@ -464,9 +464,21 @@ pub fn breaks() -> Result<(), String> {
         cmd.args(qemu::HEADLESS);
         let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
         let report = qemu::parse_report(&o.lines);
-        // A break that corrupts the kernel's own structures may stop the run
-        // with a panic before the test reports: that is caught as well.
-        let panicked = o.lines.iter().any(|l| l.contains("KERNEL PANIC"));
+        // Only the break that leaves the event of an unbound budget in the heap
+        // stops the run with a panic, in the free of the budget's place after
+        // the named test; the test before it passed, the named one did not
+        // report. Every other break must fail its test cleanly.
+        let panicked = variant == Variant::BudgetUnbindKeepsEventTest
+            && o.lines
+                .iter()
+                .any(|l| l == "KERNEL PANIC: a timer where the count puts one")
+            && o.lines
+                .iter()
+                .any(|l| l == "TEST unbinding_a_client_lifts_the_server_that_works_for_it ok")
+            && !o
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("TEST {test} ")));
         if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }

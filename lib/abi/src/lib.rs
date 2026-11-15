@@ -383,8 +383,9 @@ pub enum Call {
     /// them), for a thread that ended, or that started on another CPU. Both
     /// set rebinds in one section: the old stint is charged, its loan paid,
     /// an overrun its place was not told of is posted, the old event goes,
-    /// and the new budget is bound and the level set once; the thread is
-    /// never at `free` in between. The errors of unbind and of bind both
+    /// and the new budget is bound; the level is computed for the thread
+    /// without a budget and again for the new one inside the same section, so
+    /// no other thread or CPU sees the thread at `free`. The errors of unbind and of bind both
     /// apply.
     ThreadBindBudget = 39,
     /// x0 token, x1 description, x2-x9 bytes 0-63 of the reply, as `Reply`;

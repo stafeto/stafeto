@@ -577,7 +577,7 @@ complete = "yes"
 [[path]]
 name = "firing of a level's timers"
 symbol = "kernel::timer::fire_at"
-measured = ["timer portions ticks: fire"]
+measured = ["timer portions ticks: fire", "budget notice firing ticks: eight"]
 complete = "yes"
 
 # The estimate covers `irq::deliver` and one turn that frees retired objects
