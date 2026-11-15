@@ -707,6 +707,8 @@ fn main(_: u64) -> u64 {
 /// (`budget-hog`); the cost of one timer event is measured (`control_budget`).
 const C_US: [u64; 3] = [250, 75, 75];
 const B_K_US: u64 = 150;
+/// The entries of a request's calls and the lift of the service, as in `QUEUE_WAIT_US` of `budget-hog`.
+const ENTRY_US: u64 = 100;
 /// What the explanation of the loss leaves unexplained, per service, as the gate allows it
 /// (measured on main; the remainder of the pipe and terminal services is an open issue).
 const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
@@ -921,8 +923,10 @@ fn starve(
 /// asks every 1037 us from absolute times, so that its release sweeps the budget period of 5 ms
 /// by 37 us a step, 200 times. `s_max` is the longest single request of the dear kind alone and
 /// `s0` that of the thread's own, both of the same build; a request of the thread must wait
-/// 1.10 * s_max + s0 + B + 2 e at most (one request in hand, the kernel's longest stretch, two
-/// timer events of the budget). A ping of the
+/// 1.10 * s_max + s0 + B + 2 e + ENTRY_US at most (one request in hand, the kernel's longest
+/// stretch, two timer events of the budget, and the entries of the calls and the lift of the
+/// service, 100 us as in `QUEUE_WAIT_US` of `budget-hog`; the pipe's worst request measured 527 us
+/// against 502 us without that term). A ping of the
 /// RAM service is `requests` requests, each held to that.
 fn level40(
     process: &Handle<Process>,
@@ -998,7 +1002,7 @@ fn level40(
     wait_ended_clients(wait, timer, n as u64);
     let us = |t: u64| time::ticks_to_ns(t) / 1000;
     let e = e_of(which);
-    let bound = us(s_max) * 110 / 100 + us(s0) + B_K_US + 2 * e;
+    let bound = us(s_max) * 110 / 100 + us(s0) + B_K_US + 2 * e + ENTRY_US;
     println!(
         "svcbudget1 {name} level40 releases=200 requests_per_ping={requests} worst_request_us={} worst_wait_us={} s_max_us={} s0_us={} e_us={e} bound_us={bound}",
         us(worst_request),

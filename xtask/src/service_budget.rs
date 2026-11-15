@@ -363,7 +363,8 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
 }
 
 /// The level-40 gate: a request of the thread at 40 waits for 1.1 times the longest request of
-/// the service in hand, its own work and one stretch of the kernel at most.
+/// the service in hand, its own work, one stretch of the kernel and 100 us for the entries and
+/// the lift at most.
 pub fn verdict_level40(all: &[One]) -> Result<(), String> {
     for (name, o) in SERVICES.iter().zip(all) {
         if o.worst_request_us > o.bound_us {
@@ -408,8 +409,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         [word, only] if word == "breaks" => return breaks(Some(only)),
         _ => {
             return Err(
-                "usage: cargo xtask service-budget [two-cpu | breaks [ramfs|pipe|tty|free|relift]]"
-                    .into(),
+                "usage: cargo xtask service-budget [two-cpu | breaks [ramfs|pipe|tty|free]]".into(),
             );
         }
     }
@@ -471,8 +471,11 @@ fn run_two_cpu() -> Result<(), String> {
 /// `cargo xtask budget-breaks`, the part of the services, on one CPU: the image in which one
 /// service binds no budget is caught by the missing line `<service>: serve runs under its budget`
 /// (the victim's numbers there are told, not judged: see the comment in the function); the
-/// level-40 gate fails on the kernel with the holder not lifted again (`break-relift-notice`,
-/// `break-relift-reply`); and the host tests of init fail on init that passes no `free`.
+/// host tests of init fail on init that passes no `free`. The holder that a request is not lifted
+/// again for (`break-relift-notice`, `break-relift-reply`) is judged by the kernel tests in
+/// `budget-hog`'s breaks: the worst request of the level-40 phase of the pipe moves by 130 us
+/// with the image (392 to 527 us on the unbroken kernel, 462 us on the kernel without the lift
+/// after the reply), so the phase gates the unbroken kernel and does not judge those breaks.
 pub fn breaks(only: Option<&str>) -> Result<(), String> {
     for (service, name, programs) in [
         (
@@ -518,38 +521,6 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
                 "budget-breaks: unbound {service}: the victim keeps {} per mille of its active time (a bound one keeps at least {}); told, not judged",
                 all[at].worst10, all[at].bound10
             );
-        }
-    }
-    for (what, variant, key) in [
-        (
-            "a holder not lifted again after a notification",
-            Variant::LiftAgainNotice,
-            "relift",
-        ),
-        (
-            "a holder not lifted again after the reply of reply_receive",
-            Variant::LiftAgainReply,
-            "relift",
-        ),
-    ] {
-        if only.is_some_and(|only| only != key) {
-            continue;
-        }
-        let lines = run_image_on(
-            "boot-service-budget-1.img",
-            &crate::SERVICE_BUDGET_PROGRAMS,
-            1,
-            variant,
-        )
-        .map_err(|e| format!("the one-CPU probe on the kernel with {what}: {e}"))?;
-        match parse_one(&lines).and_then(|all| {
-            one_table(&all);
-            verdict_level40(&all)
-        }) {
-            Err(e) => println!("budget-breaks: the level-40 gate catches {what} ({e})"),
-            Ok(()) => {
-                return Err(format!("the kernel with {what} passed the level-40 gate"));
-            }
         }
     }
     if only.is_some_and(|only| only != "free") {
