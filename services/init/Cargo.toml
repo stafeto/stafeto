@@ -19,6 +19,9 @@ bench = false
 # The table init starts (init::table::TABLE): the one that ships without
 # a feature; each test image builds with one of these, never two.
 [features]
+# Experiment for #360 (not for merge): the table's share check is off in every image, for the
+# budgets with ten times the C.
+default = ["break-budget-share"]
 # The longest step of init's loop for each method, printed when it grows
 # (rt feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]

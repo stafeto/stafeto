@@ -51,7 +51,7 @@ pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
     &[Budget {
         name: "serve",
         cpu: 0,
-        c_ns: 250_000,
+        c_ns: 2_500_000,
         t_ns: SERVICE_PERIOD_NS,
         low: 1,
     }]
@@ -63,7 +63,7 @@ pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
 pub const PIPE_BUDGETS: &[Budget] = &[Budget {
     name: "serve",
     cpu: 0,
-    c_ns: 75_000,
+    c_ns: 750_000,
     t_ns: SERVICE_PERIOD_NS,
     low: 1,
 }];
@@ -73,7 +73,7 @@ pub const PIPE_BUDGETS: &[Budget] = &[Budget {
 pub const TTY_BUDGETS: &[Budget] = &[Budget {
     name: "serve",
     cpu: 0,
-    c_ns: 75_000,
+    c_ns: 750_000,
     t_ns: SERVICE_PERIOD_NS,
     low: 1,
 }];
@@ -1094,14 +1094,14 @@ pub const SERVICE_BUDGET_TABLE: &[Record] = &[
             Budget {
                 name: "ctl-ramfs",
                 cpu: 0,
-                c_ns: 250_000,
+                c_ns: 2_500_000,
                 t_ns: SERVICE_PERIOD_NS,
                 low: 1,
             },
             Budget {
                 name: "ctl-pipe",
                 cpu: 0,
-                c_ns: 75_000,
+                c_ns: 750_000,
                 t_ns: SERVICE_PERIOD_NS,
                 low: 1,
             },
