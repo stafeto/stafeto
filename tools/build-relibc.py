@@ -180,7 +180,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # pthread_setschedparam, pthread_getschedparam, pthread_create and
 # posix_spawn, _POSIX_SPORADIC_SERVER and _POSIX_THREAD_SPORADIC_SERVER are
 # 202405L, SS_REPL_MAX is 4 (limits.h, sysconf), platform interface 24.
-COMMIT = "20c17fedb2e69adb0c88327edc54fa2108ef4830"
+COMMIT = "a2a22ee0bc8d5ee23c6978cc71b5aa90412dcc61"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
