@@ -752,6 +752,18 @@ fn phase_carry(process: &Handle<Process>, resource: &Handle<Resource>) {
     // The first 2 periods are the start of the threads, the last one is the
     // end.
     let (from, to) = (4 * per_ms, buckets - 2 * per_ms);
+    // Two periods of the buckets, in us of each 100 us: where the hog and the
+    // victim ran.
+    for who in [HOG, VICTIM] {
+        let row: Vec<u64> = (6 * per_ms..10 * per_ms)
+            .map(|b| time::ticks_to_ns(SPENT[who][b].load(Relaxed)) / 1000)
+            .collect();
+        println!(
+            "budget carry trace {} us={:?}",
+            if who == HOG { "hog" } else { "victim" },
+            row
+        );
+    }
     for l in [1usize, 2, 5, 10] {
         let (_, hog_most) = carry_windows(HOG, l * per_ms, from, to);
         let (victim_least, _) = carry_windows(VICTIM, l * per_ms, from, to);
