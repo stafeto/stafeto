@@ -6,8 +6,8 @@
 //! under a sporadic server: the thread's number in the layer's table, the
 //! number init gave its budget and the handle of the budget. The handle
 //! stays with the service, so that a program cannot shed the budget of its
-//! thread: it gets a copy with the right BUDGET alone for the time of one
-//! bind, and the service gives the current budget back only for a thread
+//! thread: it gets a copy with the rights BUDGET and TRANSFER (no DUPLICATE) for the
+//! time of one bind, and the service gives the current budget back only for a thread
 //! that leaves the policy through the service.
 //!
 //! The body of a request is the operation u32 (`ask`, `done`, ...) and its

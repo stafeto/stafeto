@@ -30,9 +30,10 @@ fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
 
-/// The copy of `budget` a program gets: the right BUDGET alone.
+/// The copy of `budget` a program gets: the right BUDGET to bind it and
+/// TRANSFER to carry it in the reply, no DUPLICATE.
 fn copy(budget: &Handle<Budget>) -> Result<Handle<Budget>, abi::Error> {
-    sys::handle_duplicate(budget, Rights::BUDGET)
+    sys::handle_duplicate(budget, Rights::BUDGET | Rights::TRANSFER)
 }
 
 impl Processes {
