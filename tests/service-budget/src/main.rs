@@ -9,12 +9,14 @@
 //! request their loop refuses for its header). The client sits on another CPU, so the service
 //! works for it at its own level on CPU 0, above whatever stands there:
 //!
-//! - `share`: a victim at 25 on CPU 0 spins and notes the time it runs in buckets of 1 ms. The
-//!   service without its budget works at its `free` level 31, above the victim, and starves it;
-//!   with its budget it works at its own level for C of each T and at the client's level, 20,
-//!   below the victim, for the rest. The line gives, for windows of 1, 5 and 10 ms, the least
-//!   share (per mille) the victim got;
-//! - `ping`: a spinner at 10 on CPU 0 keeps an exhausted service from running below it, and
+//! - `share`: a victim at 34 on CPU 0 spins and notes the time it runs in buckets of 1 ms. The
+//!   service works at its own level for C of each T and, with its budget spent, at its demoted
+//!   level 32, below the victim, for the rest: the guarantee of the budgets is that it takes at
+//!   most C of each T from the levels 33 and above, and for the levels at or below 32 it is a
+//!   service without a budget (a victim at 25 would be starved by the demoted service, which is
+//!   no breach). The line gives, for windows of 1, 5 and 10 ms, the least share (per mille) the
+//!   victim got;
+//! - `ping`: a spinner at 10 on CPU 0 (below the demoted level 32, so it is only a load) and
 //!   the probe's own thread at 40 asks the service every 2 ms; the line gives the longest round
 //!   trip of its request.
 //!
@@ -33,6 +35,11 @@ use rt::{Handle, Stack, println, sys, time};
 rt::entry!(main);
 
 const MS: u64 = 1_000_000;
+/// The level of the victims. The three services take at most C of each T from the levels 33 and
+/// above, and are services without a budget for the levels at or below 32 (the level they work
+/// at when their budget is spent, `low` in init's table: above every POSIX process, below the
+/// network service at 35), so the guarantee is judged for a victim above 32 and below 35.
+const VICTIM_LEVEL: u8 = 34;
 const PAGE: usize = 4096;
 /// The buckets of 1 ms the time of the victim is noted in.
 const BUCKETS: usize = 256;
@@ -352,7 +359,7 @@ fn print_windows(name: &str) {
 /// the probe's own thread) is told apart.
 fn idle(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Timer>) {
     reset();
-    let victim = spawn_on(process, 0, victim, 0, 25, 0);
+    let victim = spawn_on(process, 0, victim, 0, VICTIM_LEVEL, 0);
     sys::thread_start(&victim).expect("start the victim");
     sleep_until(wait, timer, now_ns() + (PHASE_MS + 5) * MS);
     wait_ended(wait, timer, 0);
@@ -476,7 +483,7 @@ fn wait_ended(wait: &Handle<Channel>, timer: &Handle<Timer>, greedies: u64) {
 }
 
 /// The control phase: the greedy client on CPU 1 asks a server of the probe at 5 on CPU 0, which
-/// has no budget and answers at the client's level (20), below the victim. What the victim
+/// has no budget and answers at the client's level (20), below the victim (34). What the victim
 /// loses here is what the greedy client costs it on its own (the interrupts, the rest of the
 /// machine's work across the two CPUs, which the 2-CPU machine under -icount makes), and the
 /// services' phases lose that and their budgets.
@@ -503,7 +510,7 @@ fn control(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
         )
     }
     .expect("create the control server");
-    let victim = spawn_on(process, 0, victim, 0, 25, 0);
+    let victim = spawn_on(process, 0, victim, 0, VICTIM_LEVEL, 0);
     let greedies = spawn_greedies(process, 1);
     sys::thread_start(&server).expect("start the control server");
     sys::thread_start(&victim).expect("start the victim");
@@ -533,7 +540,7 @@ fn reset() {
 }
 
 /// A phase against `SERVICES[which]`: the greedy client asks it through a session of its own.
-/// With `ping` false a victim at 25 spins and the lines give its shares; with `ping` true a
+/// With `ping` false a victim at 34 spins and the lines give its shares; with `ping` true a
 /// spinner at 10 does, and the probe's thread at 40 asks the service every 2 ms through its own
 /// session and notes the longest round trip.
 fn phase(
@@ -568,7 +575,14 @@ fn phase(
     let ping_session = sessions[GREEDIES]
         .as_ref()
         .expect("the session of the client at 40");
-    let spinner = spawn_on(process, 0, victim, 0, if ping { 10 } else { 25 }, 0);
+    let spinner = spawn_on(
+        process,
+        0,
+        victim,
+        0,
+        if ping { 10 } else { VICTIM_LEVEL },
+        0,
+    );
     let greedies = spawn_greedies(process, 1);
     sys::thread_start(&spinner).expect("start the victim");
     start_all(&greedies);
@@ -744,7 +758,7 @@ extern "C" fn busy(_: u64) -> ! {
     sys::thread_exit()
 }
 
-/// The control phase for C = `c_us`: the victim at 25 against a spinner at 40 under `budget`
+/// The control phase for C = `c_us`: the victim at 34 against a spinner at 40 under `budget`
 /// (that C for each 5 ms, `low` 1): the victim's worst window of 10 ms loses 2 C and four events
 /// (the exhaustion and the replenishment of each of its two periods), so
 /// e = (loss - 2 C) / 4. Told per C.
@@ -766,7 +780,7 @@ fn control_budget(
         println!("svcbudget1 control c_us={c_us} FAILED bind {e:?}");
         return;
     }
-    let victim_thread = spawn_on(process, 0, victim, 0, 25, 0);
+    let victim_thread = spawn_on(process, 0, victim, 0, VICTIM_LEVEL, 0);
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
@@ -798,10 +812,10 @@ extern "C" fn victim_duty(_: u64) -> ! {
     let end = END.load(Relaxed);
     let gap_ticks = time::ns_to_ticks(GAP_NS);
     let want = time::ns_to_ticks(800_000);
-    let Ok(channel) = sys::channel_create_wait(25) else {
+    let Ok(channel) = sys::channel_create_wait(VICTIM_LEVEL) else {
         sys::thread_exit()
     };
-    let Ok(timer) = sys::timer_create(&channel, 25) else {
+    let Ok(timer) = sys::timer_create(&channel, VICTIM_LEVEL) else {
         sys::thread_exit()
     };
     let mut i = 0u64;
@@ -867,10 +881,14 @@ fn duty_windows() -> (u64, u64, u64) {
 }
 
 /// The starvation phase against `SERVICES[which]`: 24 clients at 20 on CPU 0 ask the service the
-/// dear request without a pause, and the victim at 25 spins 0.8 ms and sleeps 0.2 ms; the
-/// clients refill the queue in each sleep. A service above the victim without a budget (level 31)
-/// empties the queue above it in each cycle, a bound one gets C for each T. The line gives the
-/// worst and the median share of the victim's own active time over 10 cycles.
+/// dear request without a pause, and the victim at 34 (`VICTIM_LEVEL`, above the demoted level
+/// 32) spins 0.8 ms and sleeps 0.2 ms; the clients refill the queue in each sleep. The service
+/// works above the victim for C of each T and at 32, below it, for the rest, so the victim loses
+/// what the budget and its events explain and no more: in 10 ms, two periods, 2 C, the two
+/// timer events of each period (4 e) and the 2 x 10 us of the kernel's entries. A victim at or
+/// below 32 would lose all of its time to the demoted service, which the guarantee does not
+/// cover. The line gives the worst and the median share of the victim's own active time over 10
+/// cycles.
 fn starve(
     process: &Handle<Process>,
     parent: &Handle<Channel>,
@@ -903,7 +921,7 @@ fn starve(
     CYCLES.store(0, Relaxed);
     CLIENTS.store(n, Relaxed);
     let clients = spawn_greedies(process, 0);
-    let victim_thread = spawn_on(process, 0, victim_duty, 0, 25, 0);
+    let victim_thread = spawn_on(process, 0, victim_duty, 0, VICTIM_LEVEL, 0);
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);

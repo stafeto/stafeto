@@ -4,8 +4,12 @@
 //! The probe of the time budgets of the RAM file, pipe and terminal services
 //! (`tests/service-budget`, `cargo xtask service-budget`, spec 8), under QEMU's -icount with
 //! two CPUs. The services run as init starts them, with the budgets of its table on CPU 0; a
-//! greedy client at 20 on CPU 1 asks one service without a pause while a victim at 25 on CPU 0
-//! spins and a client at 40 on CPU 0 asks every 2 ms. The lines the probe prints are checked
+//! greedy client at 20 on CPU 1 asks one service without a pause while a victim at 34 on CPU 0
+//! spins and a client at 40 on CPU 0 asks every 2 ms. The guarantee the probe judges: a service
+//! whose budget is spent works at level 32 and takes at most C of each T from the levels 33 and
+//! above, which is why the victim sits at 34 (below the network service at 35); for the levels
+//! at or below 32 the three services are services without a budget and the probe promises
+//! nothing. The lines the probe prints are checked
 //! against their bounds here. `breaks` runs the same probe on images in which one service
 //! binds no budget (`break-budget-unbound` of its crate), each of which must fail the check of
 //! the lines, and on init with no `free` level (`break-record-free`).
