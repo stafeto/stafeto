@@ -186,6 +186,17 @@ int main(int argc, char **argv) {
     struct sched_param top = {.sched_priority = 32};
     if (sched_setscheduler(0, SCHED_FIFO, &top) != 0)
         printf("os-test-run: SCHED_FIFO 32 for the runner failed: %s\n", strerror(errno));
+    /* On a machine of several CPUs the tests stand on CPUs 1 and up: CPU 0
+     * has no share for the sporadic server (SCHED_SPORADIC), so a test of it
+     * would find no budget there. */
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus > 1) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int c = 1; c < cpus && c < 8; c++) CPU_SET(c, &set);
+        if (sched_setaffinity(0, sizeof set, &set) != 0)
+            printf("os-test-run: the CPUs 1 and up for the tests failed: %s\n", strerror(errno));
+    }
     FILE *list = fopen("/os-test/list", "r");
     if (!list) {
         printf("os-test-run: no list: %s\n", strerror(errno));

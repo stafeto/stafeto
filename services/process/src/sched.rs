@@ -51,6 +51,7 @@ impl Processes {
         let Ok(op) = body.u32() else {
             return Answer::Status(Status::BadSize);
         };
+        rt::println!("DEBUG svc: budget op {op}");
         if op == sporadic::WORK {
             if r.label() != 0 {
                 return refuse(proto_process::PERMISSION);
