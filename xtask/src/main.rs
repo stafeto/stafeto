@@ -8227,13 +8227,15 @@ fn sporadic_probe() -> Result<(), String> {
 }
 
 /// What the probe prints when each of its stages held.
-const SPORADIC_MARKERS: [&str; 10] = [
+const SPORADIC_MARKERS: [&str; 12] = [
     "sporadic: the options, SS_REPL_MAX and the priority range of SCHED_SPORADIC ok",
     "sporadic: 10 parameters off the rules give EINVAL and leave the policy ok",
     "sporadic: CPU 0: set, read back, refused over its share, given back at the end of a thread ok",
     "sporadic: CPU 1: set, read back, refused over its share, given back at the end of a thread ok",
     "sporadic: CPU 2: set, read back, refused over its share, given back at the end of a thread ok",
     "sporadic: CPU 3: set, read back, refused over its share, given back at the end of a thread ok",
+    "sporadic: CPU 1: fork under a server gives the child its budget, EAGAIN when none is left ok",
+    "sporadic: CPU 3: fork under a server gives the child its budget, EAGAIN when none is left ok",
     "sporadic: CPU 2: the end of a process gave its share back ok",
     "sporadic: spin wall=",
     "sporadic: ok",
