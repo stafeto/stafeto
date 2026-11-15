@@ -580,7 +580,7 @@ impl Transcript {
 
     /// `find_line` for a wait that asks again and again with the one `wanted`: `seen` is where
     /// the lines it took a look at already end (0 to begin with), so that each ask reads only
-    /// the lines that came since and not all of them again.
+    /// the lines that came since.
     fn find_line_resuming(
         &mut self,
         wanted: impl Fn(&str) -> bool,
