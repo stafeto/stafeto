@@ -459,16 +459,42 @@ fn got(requests: &[(Instant, String)], what: &str) -> bool {
 fn store_of(run: &mut qemu::Run, marker: &str) -> Result<(Vec<String>, Vec<String>), String> {
     // The generation moves with a list of revocations that is taken again; the packages and the
     // free space do not.
-    let mut check = expect_code(run, "pkg check", &format!("{marker}c"), 0, DIALOG_STEP)?;
-    check.retain(|l| !l.starts_with("store generation") && !is_notice(l));
-    check.dedup();
-    let mut list = expect_code(run, "pkg list", &format!("{marker}l"), 0, DIALOG_STEP)?;
-    list.retain(|l| !is_notice(l));
-    // A notice that comes while the console writes a line makes it appear again after the notice
-    // (`busybox ...`, notice, `busybox ...`); with the notice gone the two are one line. Neither
-    // output has a line twice in a row.
-    list.dedup();
+    let mut check = without_notices(&expect_code(
+        run,
+        "pkg check",
+        &format!("{marker}c"),
+        0,
+        DIALOG_STEP,
+    )?);
+    check.retain(|l| !l.starts_with("store generation"));
+    let list = without_notices(&expect_code(
+        run,
+        "pkg list",
+        &format!("{marker}l"),
+        0,
+        DIALOG_STEP,
+    )?);
     Ok((check, list))
+}
+
+/// `lines` without the notices of init. A notice that comes while the console writes a line makes
+/// that line appear again after the notice (`busybox ...`, notice, `busybox ...`); the second
+/// copy is dropped with the notice, and only there: a line that stands twice with no notice
+/// between the two stays, since it may be a real duplicate in the store.
+fn without_notices(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut split = false;
+    for line in lines {
+        if is_notice(line) {
+            split = true;
+            continue;
+        }
+        if !(split && out.last() == Some(line)) {
+            out.push(line.clone());
+        }
+        split = false;
+    }
+    out
 }
 
 /// A line init writes to the console on its own account: the notice of the overruns of a time
@@ -1234,6 +1260,20 @@ mod tests {
         assert!(!is_notice(
             "init: posix-procs ended: exit code 0, not restarted"
         ));
+        // The line the console wrote again after a notice is one line; a genuine duplicate stays.
+        let lines = |l: &[&str]| l.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::without_notices(&lines(&["busybox 1", notice, "busybox 1", "ca-bundle 2"])),
+            lines(&["busybox 1", "ca-bundle 2"])
+        );
+        assert_eq!(
+            super::without_notices(&lines(&["busybox 1", "busybox 1", "ca-bundle 2"])),
+            lines(&["busybox 1", "busybox 1", "ca-bundle 2"])
+        );
+        assert_eq!(
+            super::without_notices(&lines(&[notice, "busybox 1", "ca-bundle 2", notice])),
+            lines(&["busybox 1", "ca-bundle 2"])
+        );
         let store = |lines: &[&str]| (lines.iter().map(|l| l.to_string()).collect(), Vec::new());
         let a = store(&["packages 2 on the disk"]);
         assert!(same_store("t", &a, &a.clone()).is_ok());
