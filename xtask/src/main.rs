@@ -46,6 +46,7 @@ mod base_image;
 mod bash_dialog;
 mod blk_probe;
 mod budget_hog;
+mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
@@ -1660,6 +1661,10 @@ enum Variant {
     /// it for the lift of the queue (`break-notice-holder-keeps`): the kernel
     /// tests of the lift must catch it.
     NoticeHolderKeepsTest,
+    /// A `reply_receive` that leaves the copy of its reply waiting while its
+    /// receive delivers a request (`break-reply-receive-copy`): the kernel
+    /// tests of the call must catch it.
+    ReplyReceiveCopyTest,
     /// Breaks the kernel tests of the rebind and the payer pin: a holder's lift
     /// that names no payer (`break-notice-payer-none`), an unbind that does not
     /// charge the stint that runs (`break-budget-unbind-no-charge`), and one
@@ -1671,7 +1676,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 67] = [
+    const ALL: [Variant; 68] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1736,6 +1741,7 @@ impl Variant {
         Variant::BudgetOverrunSilentTest,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
+        Variant::ReplyReceiveCopyTest,
         Variant::NoticePayerNoneTest,
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
@@ -1811,6 +1817,7 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
+            Variant::ReplyReceiveCopyTest => Some("ktest,break-reply-receive-copy"),
             Variant::NoticePayerNoneTest => Some("ktest,break-notice-payer-none"),
             Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
@@ -1902,6 +1909,7 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
+            Variant::ReplyReceiveCopyTest => "stafeto-ktest-reply-receive-copy",
             Variant::NoticePayerNoneTest => "stafeto-ktest-notice-payer-none",
             Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
@@ -2272,6 +2280,7 @@ commands:
   budget-hog [--cpus N] the probe of the time budgets under -icount on one CPU and on four (a hog at a high
             level with a budget leaves a lower level its share; the boost of a request stays and a
             notification's goes with the budget)
+  budget-journal the probe of the overruns in init's journal under -icount: one line in each 10 s for a budget that overruns in every period, none for one that does not
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
   budget-break-unbound the share probe of the network service fails on the image with no budget bound
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
@@ -2344,6 +2353,7 @@ fn main() {
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
         Some("budget-break-unbound") => budget_hog::unbound_break(),
+        Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()

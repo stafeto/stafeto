@@ -464,6 +464,11 @@ pub fn breaks() -> Result<(), String> {
             "a thread that goes on holding a notification after its receive",
         ),
         (
+            Variant::ReplyReceiveCopyTest,
+            "reply_receive_copies_a_long_reply_before_it_takes_a_long_request",
+            "a reply_receive that leaves the copy of its reply waiting while it takes a request",
+        ),
+        (
             Variant::NoticePayerNoneTest,
             "a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel",
             "a lift of a notification's holder that names no payer",
@@ -499,6 +504,21 @@ pub fn breaks() -> Result<(), String> {
                 .lines
                 .iter()
                 .any(|l| l.starts_with(&format!("TEST {test} ")));
+        // The break that leaves the copy of the reply waiting stops the run in
+        // the named test with the panic of `copy_later`.
+        // The test before it passed, and the named one did not report.
+        let panicked = panicked
+            || (variant == Variant::ReplyReceiveCopyTest
+                && o.lines
+                    .iter()
+                    .any(|l| l.starts_with("KERNEL PANIC: a message copy waits for another"))
+                && o.lines
+                    .iter()
+                    .any(|l| l == "TEST reply_receive_takes_the_queued_request_at_its_level ok")
+                && !o
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("TEST {test} "))));
         if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }
@@ -553,7 +573,8 @@ pub fn breaks() -> Result<(), String> {
         return Err("the host tests of init passed with break-budget-share".into());
     }
     println!("budget-breaks: break-budget-share fails the host tests of init");
-    Ok(())
+    // init's journal of the overruns.
+    crate::budget_journal::breaks()
 }
 
 #[cfg(test)]
