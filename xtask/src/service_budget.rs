@@ -169,7 +169,7 @@ pub fn verdict(all: &[Numbers], control: &[(u64, u64, u64)]) -> Result<(), Strin
         // budget being replenished and none waits long. The RAM service's path lookups are
         // jobs of several steps, which its loop does between requests at the level it has left;
         // the lift of that work waits for the kernel (stafeto-design plan of the budgets 4-5,
-        // question V1), so its pings are counted and told, not bounded.
+        // question V1), so its pings are counted and told without a bound.
         if name != &"ramfs" && (n.ping_over * 10 > n.pings || n.ping_max_us > PING_MAX_US) {
             return Err(format!(
                 "{name}: the client at 40 waited up to {} us for an answer, {} of {} over 750 us (at most 10 % and {PING_MAX_US} us)",
