@@ -27,6 +27,7 @@ use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use init::overrun;
 use init::table::{
     self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, ENTROPY_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE,
     PROCESS_SERVICE, RAM_SERVICE, Record, SEED, Write,
@@ -34,7 +35,7 @@ use init::table::{
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
-use rt::handle::{Channel, Memory, Process, Resource, Thread};
+use rt::handle::{Budget, Channel, Memory, Process, Resource, Thread};
 use rt::loader::{self, SpawnParams, Spawned};
 use rt::startup::Giver;
 use rt::{Handle, Stack, mmio, sys};
@@ -454,8 +455,17 @@ fn budgets(
     giver: &mut Giver,
     resource: &Handle<Resource>,
 ) -> Result<(), Error> {
-    for b in record.budgets.iter().filter(|b| cpus >> b.cpu & 1 != 0) {
-        let budget = sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?;
+    let place = table::table().iter().position(|r| r.name == record.name);
+    for (index, b) in record
+        .budgets
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| cpus >> b.cpu & 1 != 0)
+    {
+        let budget = match place.filter(|_| overrun::reports(record.name)) {
+            Some(place) => noticed(resource, overrun::label(place, index), b)?,
+            None => sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?,
+        };
         // The checks of the table keep the names apart from the others of the
         // start data, and START_DATA_MAX keeps all of them within the giver's.
         // A budget the service cannot take is an error: the record would start unbudgeted.
@@ -464,6 +474,20 @@ fn budgets(
             .map_err(|_| Error::InvalidArgs)?;
     }
     Ok(())
+}
+
+/// The budget `b` made with a place for the notifications of its overruns on
+/// init's channel, under `label` (init::overrun): the main thread counts
+/// them and writes the journal's lines. The copy of the channel that gives
+/// the label goes right after the call; the budget holds the place itself.
+fn noticed(
+    resource: &Handle<Resource>,
+    label: u64,
+    b: &table::Budget,
+) -> Result<Handle<Budget>, Error> {
+    let channel = view::<Channel>(CHANNEL);
+    let notice = sys::handle_label(&channel, Rights::NOTIFY, label, b.low)?;
+    sys::budget_create_with_notice(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low, &notice)
 }
 
 /// Copies of `resource`, the system resource, in `giver` for `record`:

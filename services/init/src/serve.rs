@@ -40,6 +40,7 @@ use core::mem;
 use core::mem::ManuallyDrop;
 use init::PAGE;
 use init::labels::Labels;
+use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::table::{self, MAX_RECORDS, Record, Restart};
@@ -310,6 +311,28 @@ fn now() -> u64 {
     time::ticks_to_ns(time::now())
 }
 
+/// The room of the counts of the overruns, which live as long as init: the
+/// table of the budgets is 4 KiB, more than the stack of the main thread
+/// can spare in `Init`.
+struct Counts(core::cell::UnsafeCell<Overruns>);
+
+// SAFETY: `counts` hands it out once, to init's main thread.
+unsafe impl Sync for Counts {}
+
+static COUNTS: Counts = Counts(core::cell::UnsafeCell::new(Overruns::new()));
+static COUNTS_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The counts of the overruns, for the one `Init`.
+fn counts() -> &'static mut Overruns {
+    assert!(
+        !COUNTS_TAKEN.swap(true, core::sync::atomic::Ordering::AcqRel),
+        "one init"
+    );
+    // SAFETY: the flag above lets this reference out once, and `Init`, which
+    // keeps it, runs on the main thread alone.
+    unsafe { &mut *COUNTS.0.get() }
+}
+
 /// Init as the service of its channel.
 pub struct Init {
     own: Handle<Process>,
@@ -327,6 +350,8 @@ pub struct Init {
     adoption: Option<Pending>,
     /// The records whose first start is done or waits for quota.
     started: usize,
+    /// The overruns of the budgets of the table, counted for the journal.
+    overruns: &'static mut Overruns,
 }
 
 impl Init {
@@ -352,6 +377,7 @@ impl Init {
             jobs: Jobs::new(),
             adoption: None,
             started: 0,
+            overruns: counts(),
         }
     }
 
@@ -1190,6 +1216,24 @@ impl Init {
         }
     }
 
+    /// The notification of an overrun of a budget of the table (init::overrun):
+    /// counts it, and writes the journal's line when one is due, with the
+    /// record, the budget, the overruns since the last line and the total.
+    /// The work is a lookup and two additions, whatever the count is.
+    fn overran(&mut self, n: Notice) {
+        let Some(line) = self.overruns.note(n.label, n.count, now()) else {
+            return;
+        };
+        let record = table::table().get(line.place);
+        let budget = record.and_then(|r| r.budgets.get(line.index));
+        if let (Some(record), Some(budget)) = (record, budget) {
+            println!(
+                "init: {} budget {}: {} overruns, {} in all",
+                record.name, budget.name, line.since, line.total
+            );
+        }
+    }
+
     /// The place of the record whose timer carries `label` (spec 13.4).
     fn timed(&self, label: u64) -> Option<usize> {
         let timed = |e: &Entry| e.timer_label == label;
@@ -1725,12 +1769,13 @@ impl Service<1> for Init {
     }
 
     /// The worker's notification: the outcome of its job; the end of an
-    /// instance (`ended`); an expiry of the timer of a record, which its
+    /// instance (`ended`); an overrun of a budget (`overran`); an expiry of the timer of a record, which its
     /// label names (`expired`).
     fn notification(&mut self, n: Notice) {
         match n.source {
             Source::Session if n.label == self.worker.label => self.accept(),
             Source::Exit => self.ended(n.label),
+            Source::Budget => self.overran(n),
             Source::Timer => {
                 if let Some(place) = self.timed(n.label) {
                     self.expired(place);

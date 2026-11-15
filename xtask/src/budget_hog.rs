@@ -536,7 +536,8 @@ pub fn breaks() -> Result<(), String> {
         return Err("the host tests of init passed with break-budget-share".into());
     }
     println!("budget-breaks: break-budget-share fails the host tests of init");
-    Ok(())
+    // init's journal of the overruns.
+    crate::budget_journal::breaks()
 }
 
 #[cfg(test)]

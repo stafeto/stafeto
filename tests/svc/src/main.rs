@@ -13,7 +13,9 @@
 //! service that never registers (`mute`), `c` the client that runs the
 //! tests of init as a service manager (checker.rs), `t` a POSIX process
 //! that gives the clock peer its session with the process service and
-//! ends (`sender`). A service registers
+//! ends (`sender`), `b` a client with two budgets, one that runs out in
+//! every period and one that never does (burner.rs, init's journal of
+//! overruns). A service registers
 //! its channel with init (rt::service::register) and serves it with its
 //! heartbeat (rt::service::run). The program ends with the code of its
 //! role, or FAILED when its start data did not come.
@@ -21,6 +23,7 @@
 #![no_std]
 #![no_main]
 
+mod burner;
 mod checker;
 mod device;
 mod echo;
@@ -49,6 +52,7 @@ const LONG: u8 = b'l';
 const MUTE: u8 = b'm';
 const CHECKER: u8 = b'c';
 const SENDER: u8 = b't';
+const BURNER: u8 = b'b';
 
 /// The code of a role that could not do its part.
 const FAILED: u64 = 1;
@@ -98,6 +102,7 @@ fn main(_: u64) -> u64 {
         Some(&MUTE) => mute(&s),
         Some(&CHECKER) => checker::run(s),
         Some(&SENDER) => sender(s),
+        Some(&BURNER) => burner::run(s),
         _ => FAILED,
     }
 }
