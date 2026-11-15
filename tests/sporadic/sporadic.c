@@ -281,8 +281,8 @@ static void leaving_time(void) {
 }
 
 /* Names what a hung join waits for: the thread's levels and kernel state. */
-int sporadic_info(unsigned long thread, int *base, int *priority, int *state);
-static volatile unsigned long watched;
+int sporadic_info(pthread_t thread, int *base, int *priority, int *state);
+static pthread_t watched;
 static volatile int watch_over;
 static void *watchdog(void *arg) {
     (void)arg;
@@ -290,7 +290,7 @@ static void *watchdog(void *arg) {
     if (watch_over) return NULL;
     int base = -1, priority = -1, state = -1;
     int e = sporadic_info(watched, &base, &priority, &state);
-    printf("sporadic: WATCHDOG: the thread %lu: %d, base %d, working at %d, state %d\n", watched, e, base, priority, state);
+    printf("sporadic: WATCHDOG: the thread: %d, base %d, working at %d, state %d\n", e, base, priority, state);
     exit(77);
 }
 static void watch(pthread_t target) {
