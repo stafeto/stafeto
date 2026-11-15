@@ -731,7 +731,7 @@ mod tests {
     /// No sender reads a freed resource. The rounds start after every
     /// sender has read once, and each round ends only after a read in it, so
     /// the outcome does not depend on when the host schedules the senders;
-    /// a wait that passes `WAIT` fails with a message instead of hanging.
+    /// a wait that passes `WAIT` ends with a failure message.
     #[test]
     fn senders_never_read_a_resource_the_collector_freed() {
         use std::sync::Arc;
