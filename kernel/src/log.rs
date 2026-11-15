@@ -12,6 +12,8 @@
 //! it knew its port goes there once it does (`show_early`). On the port
 //! the kernel writes a piece of a line longer than a record without its
 //! header (console_line::strip): no driver is there to assemble the pieces.
+//! The kernel feature `keep-pieces` leaves the headers on the port for the
+//! probe images, whose runner assembles the lines (xtask::untag).
 //! The ring keeps the record as it came.
 
 use crate::arch::timer;
