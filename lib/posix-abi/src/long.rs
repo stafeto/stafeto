@@ -692,7 +692,12 @@ fn run_in(
             Err(EINTR) if !stop() => {}
             // The handler ran on the way back from the send that ended. At most
             // `proto_wire::again::MAX` times in a row, so a flood of signals gives EINTR.
-            Err(EINTR) if start_again && proto_wire::again::ask_again(&mut tries) => {}
+            // Not while a cancellation of the thread is pending: a cancelled write must not
+            // complete by a resend.
+            Err(EINTR)
+                if start_again
+                    && !(point && crate::threads::cancel::requested())
+                    && proto_wire::again::ask_again(&mut tries) => {}
             Err(error) => return Err(error),
             Ok(_) => return Err(EIO),
         }
