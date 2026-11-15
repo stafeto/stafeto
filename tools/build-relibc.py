@@ -179,7 +179,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # layer in sched_setscheduler, sched_setparam, sched_getparam,
 # pthread_setschedparam, pthread_getschedparam, pthread_create and
 # posix_spawn, _POSIX_SPORADIC_SERVER and _POSIX_THREAD_SPORADIC_SERVER are
-# 202405L, SS_REPL_MAX is 4 (limits.h, sysconf), platform interface 24.
+# 202405L, SS_REPL_MAX is 4 (limits.h, sched.h, sysconf), platform interface
+# 24; tagged pin-a2a22ee0.
 COMMIT = "a2a22ee0bc8d5ee23c6978cc71b5aa90412dcc61"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
