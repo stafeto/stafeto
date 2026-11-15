@@ -27,7 +27,7 @@ pub const PROCESS_LEVEL: u8 = 52;
 /// for its C of each T and at `low` after; a thread of these services that has none (the one
 /// that maps layers, the one that registers the root of the pipes) and the request thread of
 /// a service that does not bind never work above the POSIX processes.
-pub const SERVICE_FREE: u8 = 31;
+pub const SERVICE_FREE: u8 = 0;
 
 /// The period of the budgets of the three services, 5 ms: the longest line of budgets of
 /// services one after the other above the network service is the sum of their C, 0.4 ms,

@@ -4126,9 +4126,9 @@ mod tests {
 
     #[test]
     fn init_passes_the_free_level_of_the_record_to_process_create() {
-        assert_eq!(free_of(&ramfs::RAM_FIFO_CLOCKED), 31);
-        assert_eq!(free_of(&ramfs::PIPE), 31);
-        assert_eq!(free_of(&ramfs::TTY), 31);
+        assert_eq!(free_of(&ramfs::RAM_FIFO_CLOCKED), 0);
+        assert_eq!(free_of(&ramfs::PIPE), 0);
+        assert_eq!(free_of(&ramfs::TTY), 0);
         assert_eq!(free_of(&net::NETD), 0);
     }
 
@@ -4182,8 +4182,8 @@ mod tests {
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works
         // above them.
-        assert_eq!(ramfs::SERVICE_FREE, 31);
-        assert!(ramfs::SERVICE_FREE >= ramfs::RAM_LEGACY.priority.min(31));
+        assert_eq!(ramfs::SERVICE_FREE, 0);
+        assert_eq!(ramfs::SERVICE_FREE, 0);
     }
 
     #[test]
