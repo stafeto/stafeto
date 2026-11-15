@@ -1471,6 +1471,21 @@ fn parse_second(line: &str) -> Option<Second> {
 const SPIN_TOTAL: u64 = 10;
 const QUIET_LAST: u64 = 3;
 const FLOOD_FROM: u64 = 5;
+/// The longest the unbound break waits for the seconds of the loop in all.
+const UNBOUND_TOTAL: Duration = Duration::from_secs(300);
+/// What the failure of the share says when the loop got no time in the flood.
+pub const UNBOUND_SILENT: &str = "the loop below the switch got no time in the flood";
+/// What the failure of the share says when the loop got time, but too little of it.
+const SHARE_KEPT: &str = "the loop below the switch kept ";
+
+/// Whether the failure of the share probe on the unbound image is the effect of the break (the
+/// loop starved or short of its share, or init calling the service silent). A probe that broke
+/// elsewhere (the boot, the quiet seconds) is no catch.
+pub fn unbound_caught(error: &str) -> bool {
+    error.starts_with(UNBOUND_SILENT)
+        || error.starts_with(SHARE_KEPT)
+        || error.starts_with("init: ") && error.contains("went silent")
+}
 
 /// `share`: the machine has one CPU, so the network service, the loop of `switch-probe spin` and
 /// the shell stand on CPU 0, and the -icount clock is that CPU's alone. The loop runs for
@@ -1484,9 +1499,6 @@ const FLOOD_FROM: u64 = 5;
 /// not looked into here); `saturate` checks the answers with a flood of the consumers' rings.
 /// The numbers print before the check, so that a build without the kernel budgets shows its
 /// share.
-/// The longest the unbound break is waited for in all.
-const UNBOUND_LIMIT: Duration = Duration::from_secs(400);
-
 fn share(
     run: &mut qemu::Run,
     udp_port: u16,
@@ -1494,7 +1506,9 @@ fn share(
     unbound: bool,
 ) -> Result<(), String> {
     // A loop that gets no time under the flood (the service unbound) says nothing for minutes:
-    // that is the failure, so the break is not waited for as long.
+    // that is the failure, so the break is not waited for as long: 150 s for a second, and
+    // `UNBOUND_TOTAL` for all the seconds together (a loop that gets one second now and then
+    // does not renew the wait without end).
     let per_second = Duration::from_secs(if unbound { 150 } else { 900 });
     booted(run)?;
     // The unbound break has none of these lines, and is left to fail on the share itself.
@@ -1508,23 +1522,38 @@ fn share(
     let mut flood: Option<Flood> = None;
     let began = Instant::now();
     loop {
-        let line = run.expect_line(
+        let wait = if unbound {
+            per_second.min(UNBOUND_TOTAL.saturating_sub(began.elapsed()))
+        } else {
+            per_second
+        };
+        let line = match run.expect_line(
             "a second of the loop below the switch",
             |l| l.contains("switch-probe: spin sec ") || l.contains("switch-probe: spin rate "),
-            per_second,
-        )?;
+            wait,
+        ) {
+            Ok(line) => line,
+            Err(e) => {
+                if let Some(f) = flood.take() {
+                    f.finish();
+                }
+                // The seconds up to the quiet ones came, the flood began, and the loop then
+                // got no time: that is the effect of the break. Anything else (the boot, the
+                // quiet seconds) is a broken probe.
+                return Err(if unbound && seconds.len() as u64 > QUIET_LAST {
+                    format!(
+                        "{UNBOUND_SILENT}: seconds {:?} came, then none in {} s of the flood ({e})",
+                        seconds.iter().map(|s| s.k).collect::<Vec<_>>(),
+                        began.elapsed().as_secs()
+                    )
+                } else {
+                    e
+                });
+            }
+        };
         let Some(second) = parse_second(&line) else {
             break;
         };
-        // A loop that gets a second now and then through the flood still fails the share, and
-        // the break is not waited for until the seconds run out.
-        if unbound && began.elapsed() > UNBOUND_LIMIT {
-            return Err(format!(
-                "the loop below the switch has had {} seconds in {} s of the flood",
-                seconds.len(),
-                began.elapsed().as_secs()
-            ));
-        }
         seconds.push(second);
         if second.k == QUIET_LAST && flood.is_none() {
             flood = Some(Flood::start(udp_port)?);
@@ -1559,7 +1588,7 @@ fn share(
     }
     if share < SHARE_MIN_PERCENT {
         return Err(format!(
-            "the loop below the switch kept {share} % of CPU 0 in its worst window of 10 ms in the flood, under {SHARE_MIN_PERCENT} %"
+            "{SHARE_KEPT}{share} % of CPU 0 in its worst window of 10 ms in the flood, under {SHARE_MIN_PERCENT} %"
         ));
     }
     notes.push(format!(
@@ -1571,6 +1600,25 @@ fn share(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_effects_of_the_unbound_break_count_as_caught() {
+        assert!(unbound_caught(&format!(
+            "{UNBOUND_SILENT}: seconds [0, 1, 2, 3] came"
+        )));
+        assert!(unbound_caught(
+            "the loop below the switch kept 3 % of CPU 0 in its worst window"
+        ));
+        assert!(unbound_caught("init: net: service went silent"));
+        // A probe that broke before the flood, or elsewhere, is no catch.
+        assert!(!unbound_caught(
+            "timed out waiting for \"# \"; last lines: []"
+        ));
+        assert!(!unbound_caught("seconds of the loop: []"));
+        assert!(!unbound_caught(
+            "the output ended before a second of the loop"
+        ));
+    }
 
     #[test]
     fn the_seconds_of_the_loop_below_the_switch_are_read_from_their_lines() {

@@ -416,6 +416,26 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask budget-break-unbound`: the share probe of the network service fails on the
+/// image whose switch and stack bind no budget. The loop below the switch must lose the CPU in
+/// the flood: its seconds up to the quiet ones came, and then none (a bounded wait counts that
+/// silence as the catch), or it kept too little of its share. A probe that broke elsewhere
+/// (the boot, the quiet seconds) fails the command.
+pub fn unbound_break() -> Result<(), String> {
+    match crate::fast_switch::probe(crate::fast_switch::Scenario::ShareUnbound) {
+        Err(e) if crate::fast_switch::unbound_caught(&e) => {
+            println!("budget-breaks: a network service that binds no budget is caught ({e})")
+        }
+        Err(e) => {
+            return Err(format!(
+                "the break (budget-unbound): the share probe broke: {e}"
+            ));
+        }
+        Ok(()) => return Err("the break (budget-unbound) passed the share probe".into()),
+    }
+    Ok(())
+}
+
 /// `cargo xtask budget-breaks`: the probe fails on each kernel with a
 /// break, the kernel tests fail the test of the level of a process on the
 /// kernel that ignores it, and the host tests of kcore fail on each break
@@ -602,11 +622,7 @@ pub fn breaks() -> Result<(), String> {
         }
         println!("budget-breaks: {feature} fails the host tests");
     }
-    // The network service with its threads unbound: the loop below the switch must lose the CPU.
-    match crate::fast_switch::probe(crate::fast_switch::Scenario::ShareUnbound) {
-        Err(e) => println!("budget-breaks: a network service that binds no budget is caught ({e})"),
-        Ok(()) => return Err("the break (budget-unbound) passed the share probe".into()),
-    }
+    unbound_break()?;
     // init's table check: budgets that take all of a CPU must be refused.
     let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(crate::root())
