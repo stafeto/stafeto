@@ -1681,10 +1681,15 @@ enum Variant {
     NoticePayerNoneTest,
     BudgetUnbindNoChargeTest,
     BudgetUnbindKeepsEventTest,
+    /// A holder that is not lifted again by the request that waits after a
+    /// receive that took a notification (`break-relift-notice`), or after the
+    /// reply between the halves of `reply_receive` (`break-relift-reply`).
+    LiftAgainNoticeTest,
+    LiftAgainReplyTest,
 }
 
 impl Variant {
-    const ALL: [Variant; 68] = [
+    const ALL: [Variant; 70] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1753,6 +1758,8 @@ impl Variant {
         Variant::NoticePayerNoneTest,
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
+        Variant::LiftAgainNoticeTest,
+        Variant::LiftAgainReplyTest,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1829,6 +1836,8 @@ impl Variant {
             Variant::NoticePayerNoneTest => Some("ktest,break-notice-payer-none"),
             Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
+            Variant::LiftAgainNoticeTest => Some("ktest,break-relift-notice"),
+            Variant::LiftAgainReplyTest => Some("ktest,break-relift-reply"),
         }
     }
 
@@ -1921,6 +1930,8 @@ impl Variant {
             Variant::NoticePayerNoneTest => "stafeto-ktest-notice-payer-none",
             Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
+            Variant::LiftAgainNoticeTest => "stafeto-ktest-relift-notice",
+            Variant::LiftAgainReplyTest => "stafeto-ktest-relift-reply",
         }
     }
 }

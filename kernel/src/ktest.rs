@@ -810,6 +810,22 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::a_notification_holder_is_not_lifted_after_its_next_receive_or_send,
     ),
     (
+        "a_receive_that_takes_a_notification_above_a_request_keeps_the_lift",
+        calls::a_receive_that_takes_a_notification_above_a_request_keeps_the_lift,
+    ),
+    (
+        "a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave",
+        calls::a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave,
+    ),
+    (
+        "a_failed_reply_leaves_the_holder_at_its_level",
+        calls::a_failed_reply_leaves_the_holder_at_its_level,
+    ),
+    (
+        "a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave",
+        calls::a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave,
+    ),
+    (
         "a_request_that_queues_lifts_a_notification_holder_of_another_cpu",
         calls::a_request_that_queues_lifts_a_notification_holder_of_another_cpu,
     ),
