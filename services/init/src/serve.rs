@@ -48,8 +48,9 @@ use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
-    Adoption, Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
-    START_NAMES, State, Stats, VERSION, Work,
+    Adoption, BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES, BudgetAsk, BudgetRelease, BudgetSharesAsk,
+    BudgetSharesHead, Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method,
+    Record as Listed, RegisterReply, START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
 #[cfg(feature = "dma-watch")]
@@ -511,6 +512,68 @@ impl Init {
             self.gates(place, true);
         }
         Answer::Status(Status::Ok)
+    }
+
+    /// BUDGET from the process service (proto_init): in 0.5.0 init has no
+    /// share of any CPU to give POSIX threads and holds no budget, so ASK is
+    /// refused (LIMIT_REACHED), RELEASE names a number init does not hold
+    /// (INVALID_ARGS) and SHARES says none (all zeros). BAD_STATE for any
+    /// other caller than the process service; a body off the rules is
+    /// INVALID_ARGS or BAD_SIZE.
+    fn budget(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if table::table()[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
+        }
+        let mut body = r.body();
+        let Ok(op) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        match op {
+            BUDGET_ASK => {
+                if let Err(status) = BudgetAsk::read(&mut body) {
+                    return Answer::Status(status);
+                }
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                refuse(FULL_SHARE)
+            }
+            BUDGET_RELEASE => {
+                if let Err(status) = BudgetRelease::read(&mut body) {
+                    return Answer::Status(status);
+                }
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                refuse(Error::InvalidArgs)
+            }
+            BUDGET_SHARES => {
+                if let Err(status) = BudgetSharesAsk::read(&mut body) {
+                    return Answer::Status(status);
+                }
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                // No CPU has a share in 0.5.0: no entry follows the head.
+                let reply = r.reply();
+                let head = BudgetSharesHead {
+                    flags: 0,
+                    reserved: 0,
+                    cpus: 0,
+                    count: 0,
+                };
+                if reply
+                    .u32(0)
+                    .and_then(|()| reply.u32(0))
+                    .and_then(|()| head.write(reply))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            _ => Answer::Status(Status::UnknownMethod),
+        }
     }
 
     /// The quota of an instance of the record at `place` in bytes: the
@@ -1732,6 +1795,7 @@ impl Service<1> for Init {
         Method::Adopted.number(),
         Method::Replaced.number(),
         Method::Ready.number(),
+        Method::Budget.number(),
     ];
     type Data = ();
 
@@ -1750,6 +1814,7 @@ impl Service<1> for Init {
             Some(Method::Adopted) => self.adopted(place, r),
             Some(Method::Replaced) => self.replaced(place, r),
             Some(Method::Ready) => self.ready(place, r),
+            Some(Method::Budget) => self.budget(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),

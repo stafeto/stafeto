@@ -1,0 +1,25 @@
+# Tests of the Open POSIX Test Suite that do not pass, for a reason that is no
+# defect, and what is expected of them (name, outcome, reason). The outcome is
+# the suite's own. SCHED_SPORADIC is defined for compilation in 0.5.0 and the
+# option macros are -1 (sysconf says -1 too), so every test that guards the
+# policy with `_POSIX_SPORADIC_SERVER` is UNSUPPORTED, as it was before the
+# policy was defined. When a release announces the option and lets a thread
+# take the policy, these tests run: the ones that set the policy and expect
+# success need the members sched_ss_* filled in (sched_setscheduler/1-1 fills
+# only sched_priority, and sched_setparam/23-2 and 25-2 pass priority 0, which
+# SCHED_OTHER has and SCHED_SPORADIC has not) and may stay UNRESOLVED then.
+conformance/interfaces/sched_get_priority_max/1-3 UNSUPPORTED guarded by _POSIX_SPORADIC_SERVER, which is -1.
+conformance/interfaces/sched_get_priority_min/1-3 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/23-2 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/23-3 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/23-4 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/23-5 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/25-2 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/25-3 UNSUPPORTED as above.
+conformance/interfaces/sched_setparam/25-4 UNSUPPORTED as above.
+conformance/interfaces/sched_setscheduler/17-2 UNSUPPORTED as above.
+conformance/interfaces/sched_setscheduler/17-3 UNSUPPORTED as above.
+conformance/interfaces/sched_setscheduler/17-4 UNSUPPORTED as above.
+conformance/interfaces/sched_setscheduler/19-2 UNSUPPORTED as above (the test does not include <unistd.h> either).
+conformance/interfaces/sched_setscheduler/19-3 UNSUPPORTED as above.
+conformance/interfaces/sched_setscheduler/19-4 UNSUPPORTED as above.

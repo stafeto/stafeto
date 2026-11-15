@@ -8,6 +8,11 @@ use crate::loaders::{Loaders, Place, Refused};
 pub const ARM: u16 = 0xfff8;
 pub const TRACE: u16 = 0xfff9;
 pub const CHILD_HANDOFF: u16 = 0xfffa;
+const _: () = assert!(
+    ARM >= proto_process::PROBE_BASE
+        && TRACE >= proto_process::PROBE_BASE
+        && CHILD_HANDOFF >= proto_process::PROBE_BASE
+);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Counts {

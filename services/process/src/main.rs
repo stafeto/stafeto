@@ -168,8 +168,8 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     #[cfg(feature = "tty-probe")]
     {
-        methods[i] = 42;
-        methods[i + 1] = 44;
+        methods[i] = proto_process::PROBE_NEWBORN;
+        methods[i + 1] = proto_process::PROBE_GROUPS;
     }
     #[cfg(feature = "image-probe")]
     {
@@ -1266,7 +1266,7 @@ impl Processes {
     fn notary(&mut self, r: &mut Request<'_>) -> Answer {
         let method = r.method();
         #[cfg(feature = "tty-probe")]
-        if method == 44 {
+        if method == proto_process::PROBE_GROUPS {
             if !proto_process::is_terminal(r.label()) {
                 return refuse(proto_process::PERMISSION);
             }
@@ -1282,7 +1282,7 @@ impl Processes {
             return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "tty-probe")]
-        if method == 42 {
+        if method == proto_process::PROBE_NEWBORN {
             return if proto_process::is_terminal(r.label()) {
                 self.probe_newborn(r)
             } else {
@@ -4728,6 +4728,34 @@ impl Processes {
         }
     }
 }
+impl Processes {
+    /// Method::Budget: in 0.5.0 every operation is refused, so that no
+    /// program binds, unbinds or reports on a budget of its own
+    /// (`posix_process_service::budget`).
+    fn budget(&mut self, r: &mut Request<'_>) -> Answer {
+        use posix_process_service::budget::{Reply, answer};
+        let mut body = r.body();
+        let Ok(op) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        // A copy of the handles that came is never kept: they close with the request.
+        match answer(r.label() != 0, op, body, r.handles.len()) {
+            Reply::Status(status) => Answer::Status(status),
+            Reply::Shares(shares) => {
+                let reply = r.reply();
+                if reply
+                    .u32(0)
+                    .and_then(|()| reply.u32(0))
+                    .and_then(|()| shares.write(reply))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+        }
+    }
+}
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = {
@@ -4761,6 +4789,11 @@ impl Service<0> for Processes {
     }
     fn request(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
+        // A notary session has no budgets (the probe methods are above
+        // `proto_process::PROBE_BASE` and do not collide with Budget).
+        if method == Method::Budget as u16 && !proto_process::is_notary(r.label()) {
+            return self.budget(r);
+        }
         let own = [
             Method::Create,
             Method::Loaded,

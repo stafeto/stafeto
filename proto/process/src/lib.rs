@@ -215,14 +215,16 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 pub mod retry;
+pub mod sporadic;
 
-/// Version 14: EntropyRejoin (number 4) gives a process that has no channel
+/// Version 15: Budget (number 42), the time budgets of POSIX threads under
+/// SCHED_SPORADIC (`sporadic`). Version 14: EntropyRejoin (number 4) gives a process that has no channel
 /// to init a new session with the entropy service after the service's
 /// instance ended. Version 13: LoaderRoot (number 43, which LoaderTerminal
 /// had) names the slot whose root it asks for in a body, and the notary marks
 /// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
 /// its root with Register.
-pub const VERSION: u16 = 14;
+pub const VERSION: u16 = 15;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -585,6 +587,11 @@ pub enum Method {
     /// a body of the operation u32 (`account_op`) and its arguments; the
     /// reply is the status u32 and the operation's values.
     Account = 63,
+    /// The time budgets of POSIX threads (SCHED_SPORADIC): a body of the
+    /// operation u32 (`sporadic::SET` ...) and its fields, each with a `flags`
+    /// word and a reserved word that are zero. The number is one of the gaps
+    /// below 64. In 0.5.0 the service refuses every operation (`sporadic`).
+    Budget = 42,
 }
 
 /// The operations of `Method::Account`, the first u32 of its body.
@@ -745,10 +752,28 @@ impl Method {
         }
     }
 }
+/// Method numbers of the probe images only (features `tty-probe`,
+/// `image-probe`, `lifetime-probe` of the service and the probes that ask
+/// them) start here; no production method may reach it (`METHODS` is checked
+/// below), so a new production method cannot collide with a probe's.
+pub const PROBE_BASE: u16 = 0xfff0;
+/// The terminal probe's methods through a notary session: a newborn target and
+/// the groups of a session.
+pub const PROBE_NEWBORN: u16 = 0xfff1;
+pub const PROBE_GROUPS: u16 = 0xfff2;
+const _: () = assert!(PROBE_NEWBORN >= PROBE_BASE && PROBE_GROUPS >= PROBE_BASE);
+const _: () = {
+    let mut i = 0;
+    while i < METHODS.len() {
+        assert!(METHODS[i] < PROBE_BASE);
+        i += 1;
+    }
+};
+
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
-    55, 56, 57, 58, 59, 60, 61, 62, 63,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -2014,6 +2039,7 @@ mod tests {
             Method::DropCtty,
             Method::TtyEvents,
             Method::AckCtty,
+            Method::Budget,
             Method::LoaderRoot,
             Method::LoaderClock,
             Method::Image,
@@ -2058,7 +2084,7 @@ mod tests {
         assert!(METHODS.iter().all(|&m| m < 64));
         // The request is a header and no body.
         let header = Method::EntropyRejoin.header();
-        assert_eq!(header.version, 14);
+        assert_eq!(header.version, 15);
         assert_eq!(header.bytes().len(), 8);
         assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
@@ -2358,7 +2384,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 14);
+        assert_eq!(VERSION, 15);
     }
 
     #[test]
