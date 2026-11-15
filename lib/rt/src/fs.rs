@@ -803,6 +803,14 @@ impl Files {
     }
     /// AUTHENTICATING guarantees no file effect. Complete the retained
     /// refresh before retrying the exact original handle-free request.
+    ///
+    /// A request of the file service never blocks in the POSIX sense: a call that waits
+    /// answers WAIT and goes through the long protocol. When a signal ends the send, the
+    /// request stood in the queue and the service changed nothing (the kernel takes back only
+    /// a request no service has taken), so the request goes again after the handler has run,
+    /// whatever SA_RESTART says, `proto_wire::again::MAX` times at most (a flood of signals
+    /// faster than the queue time then gives EINTR as before). Under `defer_entries` no
+    /// handler runs and the kernel would end the wait at once, so there the EINTR goes out.
     pub fn send_on(channel: &Handle<Channel>, request: &[u8]) -> Result<crate::sys::Reply, Status> {
         Self::send_on_with(channel, request, false)
     }
@@ -821,8 +829,16 @@ impl Files {
         request: &[u8],
         restart: bool,
     ) -> Result<crate::sys::Reply, Status> {
+        let mut tries = 0;
         loop {
             let reply = match sys::send(channel, request) {
+                Err(Error::Interrupted)
+                    if !restart
+                        && !crate::upcall::entries_deferred()
+                        && proto_wire::again::ask_again(&mut tries) =>
+                {
+                    continue;
+                }
                 Err(Error::Interrupted) if restart => {
                     debug_assert!(
                         !crate::upcall::entries_deferred(),

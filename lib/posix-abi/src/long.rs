@@ -65,6 +65,11 @@ struct Mode<'a> {
     every_handler: bool,
     /// The handles the start sends and the reply brings.
     carried: Option<&'a RefCell<Carried>>,
+    /// A start the kernel took back from the queue goes again even after a handler without
+    /// SA_RESTART ended the operation (a write that may not block): the service has changed
+    /// nothing. If the start then answers WAIT, the ended operation takes its way out with
+    /// EINTR as before, so only a start that the service can answer at once gains.
+    start_again: bool,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
@@ -77,6 +82,7 @@ impl Mode<'_> {
             check: None,
             every_handler: false,
             carried: None,
+            start_again: false,
         }
     }
 }
@@ -318,6 +324,28 @@ pub fn run_with(
     )
 }
 
+/// `run_with` for a call that may not block in the POSIX sense, a write: a start that a signal
+/// took back from the queue goes again whatever SA_RESTART says (`Mode::start_again`).
+pub fn run_nonblocking_start(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            start_again: true,
+            ..Mode::plain(true, false)
+        },
+    )
+}
+
 /// `run_with` that ends with ETIMEDOUT at the monotonic time `deadline` (ns)
 /// if the service has not answered: the thread's timer wakes its wait, and
 /// "cancel k" ends the operation in the service.
@@ -537,6 +565,7 @@ pub(crate) fn run_drain(
             check: None,
             every_handler: false,
             carried: None,
+            start_again: false,
         },
     )
     .map(drop)
@@ -596,6 +625,7 @@ fn run_in(
         check,
         every_handler,
         carried,
+        start_again,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -614,6 +644,7 @@ fn run_in(
             refusal(status)
         }
     };
+    let mut tries = 0;
     let key = loop {
         if admission && stop() {
             return Err(EINTR);
@@ -659,6 +690,9 @@ fn run_in(
             // every wait and no handler would run, and the start would go
             // on for ever.
             Err(EINTR) if !stop() => {}
+            // The handler ran on the way back from the send that ended. At most
+            // `proto_wire::again::MAX` times in a row, so a flood of signals gives EINTR.
+            Err(EINTR) if start_again && proto_wire::again::ask_again(&mut tries) => {}
             Err(error) => return Err(error),
             Ok(_) => return Err(EIO),
         }
