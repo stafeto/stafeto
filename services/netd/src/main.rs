@@ -2572,6 +2572,13 @@ impl Driver<'_> {
 impl Service<0> for Driver<'_> {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = METHODS;
+    // The builds that print the totals in `between_requests` send each answer
+    // first, so that the lines of the console do not hold the client up.
+    const OWES_REPLY: bool = !cfg!(any(
+        feature = "profile",
+        feature = "probe",
+        feature = "trace"
+    ));
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
@@ -2632,7 +2639,9 @@ impl Service<0> for Driver<'_> {
         self.bell_release();
         self.bell_checked = false;
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
-        // answer went, so that the lines of the console do not count in the step.
+        // answer went, so that the lines of the console do not count in the step. These builds
+        // send the answer at once (`OWES_REPLY`); the others send it with the next receive, after
+        // the bell below.
         #[cfg(any(feature = "profile", feature = "probe", feature = "trace"))]
         if core::mem::take(&mut self.inst.net.profile_due) {
             #[cfg(feature = "probe")]

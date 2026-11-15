@@ -718,6 +718,46 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::thread_bind_budget_checks_and_binds,
     ),
     (
+        "a_request_that_queues_lifts_a_demoted_server_of_its_cpu",
+        calls::a_request_that_queues_lifts_a_demoted_server_of_its_cpu,
+    ),
+    (
+        "a_request_that_queues_lifts_a_demoted_server_of_another_cpu",
+        calls::a_request_that_queues_lifts_a_demoted_server_of_another_cpu,
+    ),
+    (
+        "a_request_that_queues_leaves_a_server_with_a_budget",
+        calls::a_request_that_queues_leaves_a_server_with_a_budget,
+    ),
+    (
+        "a_request_that_queues_lifts_a_server_between_the_halves_of_reply_receive",
+        calls::a_request_that_queues_lifts_a_server_between_the_halves_of_reply_receive,
+    ),
+    (
+        "a_request_that_queues_leaves_a_thread_that_went_to_another_channel",
+        calls::a_request_that_queues_leaves_a_thread_that_went_to_another_channel,
+    ),
+    (
+        "a_request_that_queues_lifts_a_holder_whose_client_ended",
+        calls::a_request_that_queues_lifts_a_holder_whose_client_ended,
+    ),
+    (
+        "two_boost_asks_leave_the_larger",
+        calls::two_boost_asks_leave_the_larger,
+    ),
+    (
+        "reply_receive_takes_the_queued_request_at_its_level",
+        calls::reply_receive_takes_the_queued_request_at_its_level,
+    ),
+    (
+        "reply_receive_goes_on_when_the_client_ended",
+        calls::reply_receive_goes_on_when_the_client_ended,
+    ),
+    (
+        "reply_receive_refuses_before_it_replies",
+        calls::reply_receive_refuses_before_it_replies,
+    ),
+    (
         "a_thread_with_no_budget_works_at_the_free_level",
         calls::a_thread_with_no_budget_works_at_the_free_level,
     ),
@@ -778,7 +818,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// of the long calls of memory objects, the timers of programs, device
 /// windows, the calls of upcalls and process_kill with a level, whose
 /// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 9 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 10 } else { 0 };
 
 /// The tests of a build come in two images, which keep each under the size
 /// a test image may have: the first runs TESTS and, with `icount`, the
@@ -826,6 +866,10 @@ pub fn run(boot: &Boot) -> ! {
         report(
             "budget_firing_is_measured",
             calls::budget_firing_is_measured(boot),
+        );
+        report(
+            "reply_receive_is_measured",
+            calls::reply_receive_is_measured(boot),
         );
         report(
             "device_windows_are_measured",

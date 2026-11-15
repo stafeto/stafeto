@@ -61,6 +61,9 @@ pub use source::{Owner, Source, notify};
 /// it is the portion's last. One section under OBJ.
 const CLOSE_PORTION: usize = 8;
 
+/// `Channel::server` of a channel that gave no request yet.
+const NO_SERVER: u32 = u32::MAX;
+
 pub struct Channel {
     /// Its slots lend their priority to the receiver (spec 6.6); false in
     /// a wait channel (spec 6.5). Fixed at its creation.
@@ -85,6 +88,14 @@ pub struct Channel {
     /// The level of the cause of its close: its stage Close runs at the
     /// higher of it and the top level of its queue (spec 7.7).
     cause: u8,
+    /// The number of the thread that `accept` last gave a request of this
+    /// channel to, or NO_SERVER, and the token of that request: the thread a
+    /// sender that has to wait lifts (`message::lift_holder`). Either may be
+    /// stale, so the lift takes this thread only while its boost token equals
+    /// this token, or while it sits between the halves of `reply_receive` on
+    /// this channel (`message::holder`).
+    server: u32,
+    token: u64,
     /// The process whose pool of channels holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
@@ -131,6 +142,8 @@ pub fn create_with(
         sources: 1,
         closed: false,
         cause: 0,
+        server: NO_SERVER,
+        token: 0,
         payer,
         cleanup: Item::new(),
     };

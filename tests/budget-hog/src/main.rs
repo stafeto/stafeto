@@ -4,7 +4,7 @@
 //! The probe of the time budgets of threads (spec 8), for QEMU under
 //! -icount, where the numbers of one build repeat to the tick. It runs as
 //! init and prints lines that `cargo xtask budget-hog` checks against their
-//! bounds. Four phases, on one CPU unless a phase says another:
+//! bounds. Five phases, on one CPU unless a phase says another:
 //!
 //! 1. A hog at 50 with the budget of 300 us for each 1 ms, low 1, spins
 //!    against a victim at 10 with no budget. The victim notes the time it
@@ -17,7 +17,13 @@
 //! 3. The loan: a client at 40 with a budget calls a service whose budget is
 //!    gone, on its CPU and on another; the service's work is the client's
 //!    time, so the requests the client makes stay within its budget.
-//! 4. A worker at 5 with the budget of 200 us is notified through a channel
+//! 4. The queue: a client at 5 has a request in a service whose budget is
+//!    gone, which a spinner at 10 on the service's CPU keeps from running;
+//!    a client at 40 sends a request that queues behind it: the service is
+//!    lifted to 40, ends the first request and takes the second, so the
+//!    second client waits for one request at most, and the service never
+//!    waits at its low level between a reply and its next receive.
+//! 5. A worker at 5 with the budget of 200 us is notified through a channel
 //!    of 55 and spins 800 us for each notification: the boost of the slot
 //!    goes with the budget, and the victim at 10 keeps its share.
 
@@ -132,24 +138,26 @@ extern "C" fn hog(_: u64) -> ! {
     sys::thread_exit()
 }
 
-/// A service: takes requests, works WORK ticks for each, answers.
+/// A service: takes requests, works WORK ticks for each, answers; the
+/// answer goes with the next receive (`Token::reply_receive`), as the loop of
+/// `rt::service` does it.
 extern "C" fn service(_: u64) -> ! {
     let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
-    while let sys::Received::Message { token, words, .. } =
-        sys::receive(&channel).expect("receive a request")
-    {
+    let mut next = sys::receive(&channel).expect("receive a request");
+    while let sys::Received::Message { token, words, .. } = next {
         // "stop" ends the service; any other request is work.
         let stop = words[0].to_le_bytes()[0] == b's';
-        if !stop {
-            let until = time::now() + WORK.load(Relaxed);
-            while time::now() < until {
-                black_box(0);
-            }
-        }
-        token.reply(b"ok").expect("reply");
         if stop {
+            token.reply(b"ok").expect("reply");
             break;
         }
+        let until = time::now() + WORK.load(Relaxed);
+        while time::now() < until {
+            black_box(0);
+        }
+        next = token
+            .reply_receive(&channel, b"ok")
+            .expect("reply and receive");
     }
     sys::thread_exit()
 }
@@ -366,6 +374,118 @@ fn phase_loan(
     true
 }
 
+/// The longest wait of a request of the queue phase's client at 40 for the
+/// service to take it, ticks.
+static QUEUE_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// The service of the queue phase: as `service`, and a request of 8 bytes,
+/// the counter at which the client at 40 sent it, gives the wait until this
+/// receive (QUEUE_MAX). The time is the service's own, so the wake of a
+/// client's CPU that sleeps (QEMU's turn under -icount) is not in it.
+extern "C" fn queue_service(_: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    let mut next = sys::receive(&channel).expect("receive a request");
+    while let sys::Received::Message {
+        token, words, len, ..
+    } = next
+    {
+        if len == 8 {
+            QUEUE_MAX.fetch_max(time::now().saturating_sub(words[0]), Relaxed);
+        } else if words[0].to_le_bytes()[0] == b's' {
+            token.reply(b"ok").expect("reply");
+            break;
+        }
+        let until = time::now() + WORK.load(Relaxed);
+        while time::now() < until {
+            black_box(0);
+        }
+        next = token
+            .reply_receive(&channel, b"ok")
+            .expect("reply and receive");
+    }
+    sys::thread_exit()
+}
+
+/// The client at 5 of the queue phase: requests until the end, each of the
+/// service's 500 us; one of them is in hand when the other client's request
+/// queues. The phase ends it by closing the channel.
+extern "C" fn queue_low(_: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    while time::now() < END.load(Relaxed) {
+        if sys::send(&channel, b"work").is_err() {
+            break;
+        }
+    }
+    sys::thread_exit()
+}
+
+/// The client at 40 of the queue phase: a request every 4 ms from 5 ms on,
+/// which carries the counter of its send. It stops the service at the end.
+extern "C" fn queue_high(_: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    let wait = sys::channel_create_wait(40).expect("client channel");
+    let timer = sys::timer_create(&wait, 40).expect("client timer");
+    QUEUE_MAX.store(0, Relaxed);
+    ROUND_N.store(0, Relaxed);
+    let mut next = now_ns() + 5 * MS;
+    while time::now() < END.load(Relaxed) {
+        sleep_until(&wait, &timer, next);
+        sys::send(&channel, &time::now().to_le_bytes()).expect("request");
+        ROUND_N.fetch_add(1, Relaxed);
+        next += 4 * MS;
+    }
+    sys::send(&channel, b"stop").expect("stop the service");
+    sys::thread_exit()
+}
+
+/// The queue: a service at 20 on CPU `server_cpu` whose budget of 100 us
+/// for 1 s is gone with its first request works 500 us for each request.
+/// The client at 5 has a request in it, which a spinner at 10 on the
+/// service's CPU would keep from running; the client at 40, on CPU 0, sends
+/// one every 4 ms. The first of these queues behind the request in hand,
+/// which lifts the service to 40: it waits for the rest of that request,
+/// 500 us at most, and the kernel's longest stretch. The line says the
+/// longest wait of a request of the client at 40 for the service to take
+/// it. False when there is no such CPU.
+fn phase_queue(
+    process: &Handle<Process>,
+    resource: &Handle<Resource>,
+    server_cpu: u8,
+    tag: &str,
+) -> bool {
+    let Ok(service_budget) =
+        sys::budget_create(resource, server_cpu.into(), 100_000, 1_000_000_000, 1)
+    else {
+        return false;
+    };
+    begin(PHASE_MS / 2);
+    let channel = sys::channel_create(20).expect("service channel");
+    CHANNEL.store(channel.raw().0, Relaxed);
+    WORK.store(time::ns_to_ticks(500_000), Relaxed);
+    let server = spawn_on(process, 1, queue_service, 20, server_cpu);
+    sys::thread_bind_budget(&server, &service_budget).expect("bind the service's budget");
+    sys::thread_start(&server).expect("start the service");
+    let low = spawn(process, 2, queue_low, 5);
+    sys::thread_start(&low).expect("start the client at 5");
+    // The service takes the first request before the spinner starts.
+    let wait = sys::channel_create_wait(62).expect("channel");
+    let timer = sys::timer_create(&wait, 62).expect("timer");
+    sleep_until(&wait, &timer, now_ns() + MS);
+    let spinner = spawn_on(process, 0, victim, 10, server_cpu);
+    sys::thread_start(&spinner).expect("start the spinner");
+    let high = spawn(process, 3, queue_high, 40);
+    sys::thread_start(&high).expect("start the client at 40");
+    sleep_until(&wait, &timer, now_ns() + (PHASE_MS / 2 + 10) * MS);
+    println!(
+        "budget queue {} requests={} wait_us={}",
+        tag,
+        ROUND_N.load(Relaxed),
+        time::ticks_to_ns(QUEUE_MAX.load(Relaxed)) / 1000
+    );
+    drop(channel);
+    true
+}
+
 fn phase_slot(process: &Handle<Process>, resource: &Handle<Resource>) {
     begin(PHASE_MS);
     let channel = sys::channel_create(55).expect("worker channel");
@@ -421,6 +541,10 @@ fn main(_: u64) -> u64 {
     phase_loan(&process, &resource, 0, "same");
     if phase_loan(&process, &resource, 1, "other") {
         println!("budget loan ran");
+    }
+    phase_queue(&process, &resource, 0, "same");
+    if phase_queue(&process, &resource, 1, "other") {
+        println!("budget queue ran");
     }
     phase_slot(&process, &resource);
     println!("budget DONE");
