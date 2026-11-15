@@ -461,8 +461,13 @@ fn store_of(run: &mut qemu::Run, marker: &str) -> Result<(Vec<String>, Vec<Strin
     // free space do not.
     let mut check = expect_code(run, "pkg check", &format!("{marker}c"), 0, DIALOG_STEP)?;
     check.retain(|l| !l.starts_with("store generation") && !is_notice(l));
+    check.dedup();
     let mut list = expect_code(run, "pkg list", &format!("{marker}l"), 0, DIALOG_STEP)?;
     list.retain(|l| !is_notice(l));
+    // A notice that comes while the console writes a line makes it appear again after the notice
+    // (`busybox ...`, notice, `busybox ...`); with the notice gone the two are one line. Neither
+    // output has a line twice in a row.
+    list.dedup();
     Ok((check, list))
 }
 
