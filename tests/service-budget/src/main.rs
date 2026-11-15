@@ -374,7 +374,7 @@ fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
             reply_server,
             STACKS[1].top(),
             channel.raw().0,
-            45,
+            35,
             Policy::Fifo,
             abi::INIT_MSGBUF as usize + 2 * PAGE,
             None,
@@ -390,7 +390,7 @@ fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
             && r.bytes(&mut buffer).iter().all(|b| *b == 7)
             && r.handles.len() == 1
     });
-    let second = spawn_on(process, 0, second_client, channel.raw().0, 45, 0);
+    let second = spawn_on(process, 0, second_client, channel.raw().0, 35, 0);
     sys::thread_start(&second).expect("start the second client");
     sleep_until(wait, timer, now_ns() + 5 * MS);
     // The request the server refused to answer ends with the channel.
