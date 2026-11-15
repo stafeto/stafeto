@@ -449,6 +449,16 @@ pub fn breaks() -> Result<(), String> {
             "a lift of a notification's holder that names no payer",
         ),
         (
+            Variant::LiftAgainNoticeTest,
+            "a_receive_that_takes_a_notification_above_a_request_keeps_the_lift",
+            "a holder that a receive of a notification leaves below a queued request",
+        ),
+        (
+            Variant::LiftAgainReplyTest,
+            "a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave",
+            "a holder that the reply between the halves leaves below a queued request",
+        ),
+        (
             Variant::BudgetUnbindNoChargeTest,
             "unbinding_gives_a_thread_min_of_its_base_and_free",
             "an unbind that does not charge the stint that runs",
