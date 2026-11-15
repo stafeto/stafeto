@@ -926,19 +926,19 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 7] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-/// The image of the sporadic server probe (tests/sporadic): that of relibc's
-/// threads with the probe as its program, which the same table of
-/// init starts under the same name.
-const SPORADIC_PROGRAMS: [ImageProgram; 7] = {
-    let mut programs = RELIBC_THREADS_PROGRAMS;
-    programs[4] = ("relibc-threads", "sporadic-probe", POSIX_STACK_SIZE, &[]);
+/// The image of the sporadic server probe (tests/sporadic): that of the probe
+/// of POSIX processes (the loader, for `fork`) with the probe as its program,
+/// which the same table of init starts under the same name.
+const SPORADIC_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "sporadic-probe", POSIX_STACK_SIZE, &[]);
     programs
 };
 /// The same with the break `break-ss-no-unbind` in the layer of the probe.
-const SPORADIC_BROKEN_PROGRAMS: [ImageProgram; 7] = {
-    let mut programs = SPORADIC_PROGRAMS;
-    programs[4] = (
-        "relibc-threads",
+const SPORADIC_BROKEN_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = (
+        "posix-procs",
         "sporadic-probe",
         POSIX_STACK_SIZE,
         &["break-ss-no-unbind"],
@@ -8232,13 +8232,13 @@ fn sporadic_probe(broken: bool) -> Result<(), String> {
         run_until(
             cmd,
             Duration::from_secs(120),
-            Some("init: relibc-threads ended"),
+            Some("init: posix-procs ended"),
             &kernel.elf,
         )
     })?;
     qemu::expect_marker(
         &output,
-        "init: relibc-threads ended: exit code 0, not restarted",
+        "init: posix-procs ended: exit code 0, not restarted",
     )?;
     for marker in SPORADIC_MARKERS {
         qemu::expect_marker(&output, marker)?;
@@ -8288,7 +8288,7 @@ const SPORADIC_MARKERS: [&str; 13] = [
     "sporadic: CPU 2: the end of a process gave its share back ok",
     "sporadic: spin wall=",
     "sporadic: ok",
-    "init: relibc-threads ended",
+    "init: posix-procs ended",
 ];
 
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
