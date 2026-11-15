@@ -229,9 +229,19 @@ fn run_image(
     name: &'static str,
     programs: &'static [crate::ImageProgram],
 ) -> Result<Vec<String>, String> {
+    run_image_on(name, programs, 2, Variant::Normal)
+}
+
+/// `run_image` on `cpus` CPUs with the kernel of `variant`.
+fn run_image_on(
+    name: &'static str,
+    programs: &'static [crate::ImageProgram],
+    cpus: usize,
+    variant: Variant,
+) -> Result<Vec<String>, String> {
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
-    let kernel = build(Variant::Normal)?;
-    let outcome = qemu::on_cpus(2, || {
+    let kernel = build(variant)?;
+    let outcome = qemu::on_cpus(cpus, || {
         let mut cmd = qemu::command(&qemu::VIRT_V3, &kernel.image, Some(&image));
         cmd.args(qemu::HEADLESS);
         cmd.args(qemu::ICOUNT);
@@ -250,8 +260,13 @@ fn run_image(
                     .collect::<Vec<_>>()
                     .join(" ")
             });
+        let tail = outcome
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("svcbudget"))
+            .last();
         return Err(format!(
-            "the probe did not finish: {:?}{}",
+            "the probe did not finish: {:?}{} (last line of the probe: {tail:?})",
             outcome.lines.last(),
             why.map_or(String::new(), |w| format!(" ({w})"))
         ));
@@ -259,23 +274,172 @@ fn run_image(
     for line in outcome
         .lines
         .iter()
-        .filter(|l| l.starts_with("svcbudget ") || l.contains(": serve "))
+        .filter(|l| l.starts_with("svcbudget") || l.contains(": serve "))
     {
         println!("  {line}");
     }
     Ok(outcome.lines)
 }
 
+/// What the one-CPU probe measured for one service.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct One {
+    pub queue_ms: u64,
+    pub worst10: u64,
+    pub median10: u64,
+    pub bound10: u64,
+    pub c_us: u64,
+    pub requests_per_ping: u64,
+    pub worst_request_us: u64,
+    pub worst_wait_us: u64,
+    pub s_max_us: u64,
+    pub s0_us: u64,
+    pub bound_us: u64,
+}
+
+/// The lines of the one-CPU probe for each service.
+pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
+    if !lines.iter().any(|l| l == "svcbudget DONE") {
+        return Err(format!("the probe did not finish: {:?}", lines.last()));
+    }
+    if !lines
+        .iter()
+        .any(|l| l == "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1")
+    {
+        return Err("the replies phase failed".into());
+    }
+    let mut all = Vec::new();
+    for name in SERVICES {
+        let prefix = format!("svcbudget1 {name} ");
+        let mut one = One::default();
+        let (mut starved, mut leveled) = (false, false);
+        for line in lines.iter().filter_map(|l| l.strip_prefix(&prefix)) {
+            if line.starts_with("FAILED") {
+                return Err(format!("{name}: {line}"));
+            }
+            if line.starts_with("starve ") {
+                starved = true;
+                one.queue_ms = number(line, "queue_ms=")?;
+                one.worst10 = number(line, "worst10=")?;
+                one.median10 = number(line, "median10=")?;
+                one.bound10 = number(line, "bound10=")?;
+                one.c_us = number(line, "c_us=")?;
+            } else if line.starts_with("level40 ") {
+                leveled = true;
+                one.requests_per_ping = number(line, "requests_per_ping=")?;
+                one.worst_request_us = number(line, "worst_request_us=")?;
+                one.worst_wait_us = number(line, "worst_wait_us=")?;
+                one.s_max_us = number(line, "s_max_us=")?;
+                one.s0_us = number(line, "s0_us=")?;
+                one.bound_us = number(line, "bound_us=")?;
+            }
+        }
+        if !starved || !leveled {
+            return Err(format!("{name}: the lines of the phases are missing"));
+        }
+        all.push(one);
+    }
+    Ok(all)
+}
+
+/// The starvation gate of the one-CPU probe: the queue lasted at least 10 ms and the worst
+/// window of 10 ms in it left the victim its bound.
+pub fn verdict_starve(all: &[One]) -> Result<(), String> {
+    for (name, o) in SERVICES.iter().zip(all) {
+        if o.queue_ms < 10 {
+            return Err(format!(
+                "{name}: the queue lasted {} ms, under 10: the load is too short for a window",
+                o.queue_ms
+            ));
+        }
+        if o.worst10 < o.bound10 {
+            return Err(format!(
+                "{name}: the victim kept {} per mille in its worst window of 10 ms while the queue lasted, under {}",
+                o.worst10, o.bound10
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The level-40 gate: a request of the thread at 40 waits for 1.1 times the longest request of
+/// the service in hand, its own work and one stretch of the kernel at most.
+pub fn verdict_level40(all: &[One]) -> Result<(), String> {
+    for (name, o) in SERVICES.iter().zip(all) {
+        if o.worst_request_us > o.bound_us {
+            return Err(format!(
+                "{name}: a request of the thread at 40 waited {} us, over {} us ({} requests a ping)",
+                o.worst_request_us, o.bound_us, o.requests_per_ping
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn one_table(all: &[One]) {
+    for (name, o) in SERVICES.iter().zip(all) {
+        println!(
+            "service-budget: {name}: queue {} ms, worst window of 10 ms {} per mille (median {}, bound {}, C {} us, e {} us); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us (s_max {} us, s0 {} us)",
+            o.queue_ms,
+            o.worst10,
+            o.median10,
+            o.bound10,
+            o.c_us,
+            45,
+            o.requests_per_ping,
+            o.worst_request_us,
+            o.worst_wait_us,
+            o.bound_us,
+            o.s_max_us,
+            o.s0_us
+        );
+    }
+}
+
+/// `cargo xtask service-budget`: the one-CPU probe, gated. `two-cpu` runs the two-CPU probe, whose
+/// numbers are told and not gated (QEMU under -icount runs the vCPUs in turn with one instruction
+/// counter, so a busy CPU 1 advances the clock of CPU 0 while it executes nothing).
 pub fn run(args: &[String]) -> Result<(), String> {
     match args {
         [] => {}
+        [word] if word == "two-cpu" => return run_two_cpu(),
         [word] if word == "breaks" => return breaks(None),
         [word, only] if word == "breaks" => return breaks(Some(only)),
-        _ => return Err("usage: cargo xtask service-budget [breaks [ramfs|pipe|tty|free]]".into()),
+        _ => {
+            return Err(
+                "usage: cargo xtask service-budget [two-cpu | breaks [ramfs|pipe|tty|free|relift]]"
+                    .into(),
+            );
+        }
     }
+    let lines = run_image_on(
+        "boot-service-budget-1.img",
+        &crate::SERVICE_BUDGET_PROGRAMS,
+        1,
+        Variant::Normal,
+    )?;
+    require_service_budget_lines(&lines)?;
+    let all = parse_one(&lines)?;
+    one_table(&all);
+    verdict_starve(&all)?;
+    verdict_level40(&all)?;
+    for service in SERVICES {
+        let wanted = format!("init: {service} budget serve: at least");
+        if let Some(line) = lines.iter().find(|l| l.contains(&wanted)) {
+            println!("service-budget: journal: {line}");
+        }
+    }
+    println!("service-budget: the three services keep their budgets (one CPU)");
+    Ok(())
+}
+
+fn run_two_cpu() -> Result<(), String> {
     let lines = run_image("boot-service-budget.img", &crate::SERVICE_BUDGET_PROGRAMS)?;
     require_service_budget_lines(&lines)?;
-    judge(&lines)?;
+    // Told, not gated (the two-CPU probe is no oracle).
+    if let Err(e) = judge(&lines) {
+        println!("service-budget: two-CPU numbers off the old bounds (not gated): {e}");
+    }
     for line in ping_bounds(&parse(&lines)?) {
         println!("{line}");
     }
@@ -303,9 +467,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask budget-breaks`, the part of the services: the check of the lines of the budgets
-/// fails on the image in which one service binds no budget, and the host tests of init fail on
-/// init that passes no `free`.
+/// `cargo xtask budget-breaks`, the part of the services, on one CPU: the starvation gate fails
+/// by its numbers on the image in which one service binds no budget (the victim gets nothing
+/// while the queue lasts) and so does the check of the lines; the level-40 gate fails on the
+/// kernel with the holder not lifted again (`break-relift-notice`, `break-relift-reply`); and
+/// the host tests of init fail on init that passes no `free`.
 pub fn breaks(only: Option<&str>) -> Result<(), String> {
     for (service, name, programs) in [
         (
@@ -327,40 +493,61 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
         if only.is_some_and(|only| only != service) {
             continue;
         }
-        let lines = match run_image(name, programs) {
-            Ok(lines) => lines,
-            Err(e) => {
-                // The starved victim and the clients of an unbound service can take the probe
-                // down itself: that is the break caught.
-                println!("budget-breaks: the probe on the unbound {service} fails ({e})");
-                continue;
-            }
-        };
-        // The numbers: the victim of the unbound service keeps at least 300 per mille less than
-        // the control (told here; the line of the budget is the check that holds).
-        if let (Ok(all), Ok(control)) = (parse(&lines), parse_phase(&lines, "control")) {
-            let idx = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
-            let median = all[idx]
-                .windows
-                .iter()
-                .find(|w| w.0 == 10)
-                .map_or(0, |w| w.2);
-            let base = control.iter().find(|w| w.0 == 10).map_or(0, |w| w.2);
-            println!(
-                "budget-breaks: the victim of the unbound {service}: median {median} per mille in 10 ms, control {base} ({})",
-                if judge(&lines).is_err() {
-                    "caught by the numbers: the verdict fails"
-                } else {
-                    "not caught by the numbers"
-                }
-            );
-        }
+        let lines = run_image_on(name, programs, 1, Variant::Normal)
+            .map_err(|e| format!("the one-CPU probe on the unbound {service}: {e}"))?;
         match require_service_budget_lines(&lines) {
             Err(e) => println!("budget-breaks: {service} that binds no budget is caught ({e})"),
             Ok(()) => {
                 return Err(format!(
                     "the break (budget-unbound of {service}) left its line of the budget"
                 ));
+            }
+        }
+        match parse_one(&lines).and_then(|all| {
+            let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
+            println!(
+                "budget-breaks: unbound {service}: the victim's worst window {} per mille, bound {}",
+                all[at].worst10, all[at].bound10
+            );
+            verdict_starve(&all)
+        }) {
+            Err(e) => println!("budget-breaks: the unbound {service} is caught by the numbers ({e})"),
+            Ok(()) => {
+                return Err(format!(
+                    "the victim kept its share with the {service} unbound: the starvation gate does not catch it"
+                ));
+            }
+        }
+    }
+    for (what, variant, key) in [
+        (
+            "a holder not lifted again after a notification",
+            Variant::LiftAgainNotice,
+            "relift",
+        ),
+        (
+            "a holder not lifted again after the reply of reply_receive",
+            Variant::LiftAgainReply,
+            "relift",
+        ),
+    ] {
+        if only.is_some_and(|only| only != key) {
+            continue;
+        }
+        let lines = run_image_on(
+            "boot-service-budget-1.img",
+            &crate::SERVICE_BUDGET_PROGRAMS,
+            1,
+            variant,
+        )
+        .map_err(|e| format!("the one-CPU probe on the kernel with {what}: {e}"))?;
+        match parse_one(&lines).and_then(|all| {
+            one_table(&all);
+            verdict_level40(&all)
+        }) {
+            Err(e) => println!("budget-breaks: the level-40 gate catches {what} ({e})"),
+            Ok(()) => {
+                return Err(format!("the kernel with {what} passed the level-40 gate"));
             }
         }
     }

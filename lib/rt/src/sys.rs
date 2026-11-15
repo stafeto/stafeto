@@ -1517,6 +1517,22 @@ pub mod send_stats {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     static LONGEST: AtomicU64 = AtomicU64::new(0);
     static WATCHED: AtomicU64 = AtomicU64::new(0);
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    static TARGET: AtomicU64 = AtomicU64::new(0);
+    static DONE_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts the sends of every thread from now on, and notes the counter of the time when the
+    /// `target`-th has been answered (`done_at`): the end of a queue of `target` requests.
+    pub fn count_all(target: u64) {
+        ALL.store(0, Relaxed);
+        DONE_AT.store(0, Relaxed);
+        TARGET.store(target, Relaxed);
+    }
+
+    /// The counter of the time when the target of `count_all` was reached, 0 before.
+    pub fn done_at() -> u64 {
+        DONE_AT.load(Relaxed)
+    }
 
     /// Counts only the sends through the channel handle `raw` (the other threads of the
     /// program send too).
@@ -1525,6 +1541,10 @@ pub mod send_stats {
     }
 
     pub(super) fn note(raw: u64, ticks: u64) {
+        let all = ALL.fetch_add(1, Relaxed) + 1;
+        if all == TARGET.load(Relaxed) {
+            DONE_AT.store(crate::time::now(), Relaxed);
+        }
         if raw == WATCHED.load(Relaxed) {
             COUNT.fetch_add(1, Relaxed);
             LONGEST.fetch_max(ticks, Relaxed);

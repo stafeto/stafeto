@@ -307,6 +307,34 @@ fn windows(l: usize) -> (u64, u64) {
     )
 }
 
+/// The least and the median of the time of the victim over the windows of `l` buckets that lie
+/// whole in the buckets `from` to `to`, in ns; None when none does.
+fn windows_in(l: usize, from: usize, to: usize) -> Option<(u64, u64)> {
+    let mut sums = [0u64; BUCKETS];
+    let mut count = 0;
+    let mut first = from;
+    while first + l <= to.min(BUCKETS) {
+        let sum: u64 = SPENT[first..first + l]
+            .iter()
+            .map(|b| b.load(Relaxed))
+            .sum();
+        let mut at = count;
+        while at > 0 && sums[at - 1] > sum {
+            sums[at] = sums[at - 1];
+            at -= 1;
+        }
+        sums[at] = sum;
+        count += 1;
+        first += 1;
+    }
+    (count > 0).then(|| {
+        (
+            time::ticks_to_ns(sums[0]),
+            time::ticks_to_ns(sums[count / 2]),
+        )
+    })
+}
+
 /// The line of the shares of a phase: for each window the least and the median share, per mille.
 fn print_windows(name: &str) {
     for l in [1u64, 5, 10] {
@@ -425,9 +453,9 @@ extern "C" fn local_server(channel: u64) -> ! {
 /// The queued greedy clients, stopped, on CPU 1 at 20. A spinner on CPU 1 that keeps it from
 /// halting makes QEMU under -icount stall CPU 0 (the victim of the control phase then keeps
 /// 649 per mille in 10 ms), so there is none; 24 clients keep a request queued instead.
-fn spawn_greedies(process: &Handle<Process>) -> [Option<Handle<Thread>>; GREEDIES] {
+fn spawn_greedies(process: &Handle<Process>, cpu: u8) -> [Option<Handle<Thread>>; GREEDIES] {
     let n = CLIENTS.load(Relaxed);
-    core::array::from_fn(|i| (i < n).then(|| spawn_on(process, 2 + i, greedy, i as u64, 20, 1)))
+    core::array::from_fn(|i| (i < n).then(|| spawn_on(process, 2 + i, greedy, i as u64, 20, cpu)))
 }
 
 fn start_all(threads: &[Option<Handle<Thread>>]) {
@@ -476,7 +504,7 @@ fn control(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
     }
     .expect("create the control server");
     let victim = spawn_on(process, 0, victim, 0, 25, 0);
-    let greedies = spawn_greedies(process);
+    let greedies = spawn_greedies(process, 1);
     sys::thread_start(&server).expect("start the control server");
     sys::thread_start(&victim).expect("start the victim");
     start_all(&greedies);
@@ -541,7 +569,7 @@ fn phase(
         .as_ref()
         .expect("the session of the client at 40");
     let spinner = spawn_on(process, 0, victim, 0, if ping { 10 } else { 25 }, 0);
-    let greedies = spawn_greedies(process);
+    let greedies = spawn_greedies(process, 1);
     sys::thread_start(&spinner).expect("start the victim");
     start_all(&greedies);
     let (mut n, mut max, mut failed) = (0u64, 0u64, 0u64);
@@ -630,6 +658,11 @@ fn main(_: u64) -> u64 {
         }
     }
     sleep_until(&ping_wait, &ping_timer, now_ns() + 100 * MS);
+    if sys::cpu_info(0).map_or(1, |c| c.cpus) < 2 {
+        one_cpu(&start, &ping_wait, &ping_timer);
+        println!("svcbudget DONE");
+        return 0;
+    }
     replies(&start.process, &ping_wait, &ping_timer);
     idle(&start.process, &ping_wait, &ping_timer);
     control(&start.process, &ping_wait, &ping_timer);
@@ -661,4 +694,220 @@ fn main(_: u64) -> u64 {
     );
     println!("svcbudget DONE");
     0
+}
+
+// ---- The one-CPU probe (QEMU under -icount with one CPU): the oracle the verdicts hold to.
+//
+// With two CPUs QEMU runs the vCPUs in turn in one thread with one instruction counter, so a busy
+// CPU 1 advances the guest clock while CPU 0 executes nothing: the victim's share and a client's
+// wait on a two-CPU machine are partly the emulator's, and the phases above are told, not gated.
+// On one CPU everything below runs on CPU 0 and the numbers are the kernel's.
+
+/// C of each service's budget in microseconds, the longest stretch B of the kernel (`budget-hog`)
+/// and the cost of one timer event of a budget with the switches it makes: the victim of the
+/// pipe phase loses about 900 us in 10 ms (the buckets of its first 40 ms are printed), of which
+/// 2 C + 2 B = 170 us are the budget and the other 730 us the four events of the two periods:
+/// 180 us an event under -icount (about 11 000 instructions).
+const C_US: [u64; 3] = [250, 75, 75];
+const B_K_US: u64 = 150;
+const E_US: u64 = 180;
+
+/// A client of the starvation phase: one request of the service's dearest kind, then it ends.
+/// It stands below the victim, so once the victim runs it cannot send again.
+extern "C" fn one_shot(index: u64) -> ! {
+    let which = WHICH.load(Relaxed);
+    let session =
+        Handle::<Channel>::borrowed(abi::Handle(GREEDY_SESSIONS[index as usize].load(Relaxed)));
+    if which == 0 {
+        ask(0, &session, DEPTH);
+    } else {
+        heavy(which, &session, index as usize, false);
+    }
+    ENDED.fetch_add(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The starvation phase against `SERVICES[which]`: 24 clients at 20 each queue one dear request
+/// before the victim, at 25, starts; the clients below it cannot send again, so the load is the
+/// 24 requests and the service reaches them through its budget alone. The line gives the worst
+/// and the median share of the victim over the windows of 10 ms that lie in the time the queue
+/// lasted (the 24th request answered), where the median would hide a gap.
+fn starve(
+    process: &Handle<Process>,
+    parent: &Handle<Channel>,
+    which: usize,
+    wait: &Handle<Channel>,
+    timer: &Handle<Timer>,
+) {
+    let name = SERVICES[which];
+    let n = GREEDIES;
+    let sessions: [Option<Handle<Channel>>; GREEDIES] =
+        core::array::from_fn(|_| rt::service::connect(parent, name).ok());
+    if sessions.iter().any(Option::is_none) {
+        println!("svcbudget1 {name} FAILED no session");
+        return;
+    }
+    WHICH.store(kind_of(name), Relaxed);
+    for (slot, session) in GREEDY_SESSIONS.iter().zip(&sessions) {
+        slot.store(session.as_ref().map_or(0, |s| s.raw().0), Relaxed);
+    }
+    if which == 1 {
+        // The pipes are made before the queue: a write is the request.
+        for (i, s) in sessions.iter().flatten().enumerate() {
+            PIPE_ENDS[i].store(0, Relaxed);
+            heavy(1, s, i, false);
+        }
+    }
+    reset();
+    CLIENTS.store(n, Relaxed);
+    let clients: [Handle<Thread>; GREEDIES] =
+        core::array::from_fn(|i| spawn_on(process, 2 + i, one_shot, i as u64, 20, 0));
+    let victim_thread = spawn_on(process, 0, victim, 0, 25, 0);
+    sys::send_stats::count_all(n as u64);
+    for c in &clients {
+        sys::thread_start(c).expect("start a client");
+    }
+    // The clients send (the service takes its first budget on the way); the victim comes after.
+    sleep_until(wait, timer, now_ns() + 500_000);
+    let now = time::now();
+    START.store(now, Relaxed);
+    END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
+    sys::thread_start(&victim_thread).expect("start the victim");
+    sleep_until(wait, timer, now_ns() + 155 * MS);
+    STOP.store(true, Relaxed);
+    wait_ended(wait, timer, n as u64);
+    let done = sys::send_stats::done_at();
+    let queue_ms = if done == 0 {
+        150
+    } else {
+        time::ticks_to_ns(done.saturating_sub(now)) / MS
+    };
+    // The first 40 buckets of 1 ms, in microseconds of the victim.
+    let mut first = [0u64; 40];
+    for (i, b) in first.iter_mut().enumerate() {
+        *b = time::ticks_to_ns(SPENT[i].load(Relaxed)) / 1000;
+    }
+    println!("svcbudget1 {name} buckets_us {first:?}");
+    let l = 10;
+    let (worst, median) = windows_in(l, 0, (queue_ms as usize).min(150))
+        .map_or((0, 0), |(least, med)| {
+            (least * 1000 / (l as u64 * MS), med * 1000 / (l as u64 * MS))
+        });
+    let bound = 1000 - (2 * C_US[which] + 2 * 10 + 4 * E_US) * 1000 / (l as u64 * 1000);
+    println!(
+        "svcbudget1 {name} starve clients={n} queue_ms={queue_ms} worst10={worst} median10={median} bound10={bound} c_us={} e_us={E_US}",
+        C_US[which]
+    );
+}
+
+/// The level-40 phase against `SERVICES[which]`: 8 clients at 20 queue the dear request of the
+/// service without a pause (nothing above them but the thread at 40, asleep), the thread at 40
+/// asks every 1037 us from absolute times, so that its release sweeps the budget period of 5 ms
+/// by 37 us a step, 200 times. `s_max` is the longest single request of the dear kind alone and
+/// `s0` that of the thread's own, both of the same build; a request of the thread must wait
+/// 1.1 * s_max + s0 + B at most (one request in hand, the kernel's longest stretch). A ping of the
+/// RAM service is `requests` requests, each held to that.
+fn level40(
+    process: &Handle<Process>,
+    parent: &Handle<Channel>,
+    which: usize,
+    wait: &Handle<Channel>,
+    timer: &Handle<Timer>,
+) {
+    let name = SERVICES[which];
+    let kind = kind_of(name);
+    let n = 8;
+    let sessions: [Option<Handle<Channel>>; GREEDIES + 1] = core::array::from_fn(|i| {
+        (i < n || i >= GREEDIES - 1)
+            .then(|| rt::service::connect(parent, name).ok())
+            .flatten()
+    });
+    // Slots 0 to 7 are the clients', 22 the calibration's, 23 the thread at 40's.
+    let (Some(cal), Some(ping)) = (&sessions[GREEDIES - 1], &sessions[GREEDIES]) else {
+        println!("svcbudget1 {name} FAILED no session");
+        return;
+    };
+    WHICH.store(kind, Relaxed);
+    for i in 0..n {
+        GREEDY_SESSIONS[i].store(sessions[i].as_ref().map_or(0, |s| s.raw().0), Relaxed);
+        PIPE_ENDS[i].store(0, Relaxed);
+        if kind == 1 {
+            if let Some(s) = &sessions[i] {
+                heavy(1, s, i, false);
+            }
+        }
+    }
+    // Alone: the longest single request of the dear kind and of the thread's own.
+    PIPE_ENDS[GREEDIES - 1].store(0, Relaxed);
+    if kind == 1 {
+        heavy(1, cal, GREEDIES - 1, false);
+    }
+    sys::send_stats::watch(cal.raw().0);
+    let mut s_max = 0;
+    for i in 0..30 {
+        sys::send_stats::reset_longest();
+        if kind == 0 {
+            ask(0, cal, DEPTH);
+        } else {
+            heavy(kind, cal, GREEDIES - 1, i % 2 == 1);
+        }
+        s_max = s_max.max(sys::send_stats::read().1);
+    }
+    sys::send_stats::watch(ping.raw().0);
+    let (mut s0, mut requests) = (0, 0);
+    for _ in 0..50 {
+        let before = sys::send_stats::read().0;
+        sys::send_stats::reset_longest();
+        ask(kind, ping, 1);
+        let (after, longest) = sys::send_stats::read();
+        s0 = s0.max(longest);
+        requests = requests.max(after - before);
+    }
+    reset();
+    CLIENTS.store(n, Relaxed);
+    let clients = spawn_greedies(process, 0);
+    start_all(&clients);
+    sleep_until(wait, timer, now_ns() + MS);
+    let t0 = now_ns() + 2 * MS;
+    let (mut worst_request, mut worst_wait) = (0, 0);
+    for k in 0..200u64 {
+        let release = t0 + k * 1_037_000;
+        sleep_until(wait, timer, release);
+        sys::send_stats::reset_longest();
+        ask(kind, ping, 1);
+        let (_, longest) = sys::send_stats::read();
+        worst_request = worst_request.max(longest);
+        worst_wait = worst_wait.max(now_ns().saturating_sub(release));
+    }
+    STOP.store(true, Relaxed);
+    wait_ended_clients(wait, timer, n as u64);
+    let us = |t: u64| time::ticks_to_ns(t) / 1000;
+    let bound = us(s_max) * 11 / 10 + us(s0) + B_K_US;
+    println!(
+        "svcbudget1 {name} level40 releases=200 requests_per_ping={requests} worst_request_us={} worst_wait_us={} s_max_us={} s0_us={} bound_us={bound}",
+        us(worst_request),
+        worst_wait / 1000,
+        us(s_max),
+        us(s0)
+    );
+}
+
+/// `wait_ended` without the victim (the level-40 phase has none).
+fn wait_ended_clients(wait: &Handle<Channel>, timer: &Handle<Timer>, clients: u64) {
+    for _ in 0..1000 {
+        sleep_until(wait, timer, now_ns() + 5 * MS);
+        if ENDED.load(Relaxed) == clients {
+            return;
+        }
+    }
+    println!("svcbudget1 a client did not end");
+}
+
+/// The one-CPU probe: the replies, then for each service the starvation and the level-40 phase.
+fn one_cpu(start: &rt::startup::Startup, wait: &Handle<Channel>, timer: &Handle<Timer>) {
+    replies(&start.process, wait, timer);
+    for which in 0..SERVICES.len() {
+        starve(&start.process, &start.parent, which, wait, timer);
+        level40(&start.process, &start.parent, which, wait, timer);
+    }
 }

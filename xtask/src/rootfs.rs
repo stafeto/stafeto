@@ -1753,6 +1753,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
     let mut files = match name {
         "boot-ramfs.img" => ramfs(),
         "boot-service-budget.img"
+        | "boot-service-budget-1.img"
         | "boot-service-budget-ramfs-unbound.img"
         | "boot-service-budget-pipe-unbound.img"
         | "boot-service-budget-tty-unbound.img" => service_budget(),
