@@ -10966,17 +10966,18 @@ pub fn an_overrun_posts_one_notification_for_each_period(_: &Boot) -> Result<(),
 
 /// A thread whose budget ran out with an overrun its place was not told of
 /// ends (thread_exit, a kill) before the event that would tell it fires: the
-/// end tells the place, once, takes the event out of the heap and gives the
-/// budget back free (spec 8), as an unbind does. The thread ends running at
-/// `low`.
-pub fn a_thread_that_ends_with_an_overrun_untold_tells_the_place(
+/// end takes the event out of the heap and gives the budget back free (spec
+/// 8), as an unbind does, and the overrun stays untold, so that the next thread
+/// of the budget asks for the event at once and the place hears of it once.
+/// The thread ends running at `low`.
+pub fn a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread(
     _: &Boot,
 ) -> Result<(), &'static str> {
     const LEVEL: u8 = 10;
     const LABEL: u64 = 0x52;
     let c = Caller::new()?;
     let counts = (channel::in_use(), crate::budget::in_use());
-    let mut made: [Option<NonNull<Thread>>; 2] = [None; 2];
+    let mut made: [Option<NonNull<Thread>>; 3] = [None; 3];
     let mut budget = None;
     let mut channel_made = None;
     let result = (|| {
@@ -11023,7 +11024,28 @@ pub fn a_thread_that_ends_with_an_overrun_untold_tells_the_place(
         // SAFETY: the thread is the running one and alive; the test's own
         // reference stays until the end of the test.
         unsafe { sched::exit(t, CAUSE) };
-        // The place was told once, as the event would have told it.
+        check(
+            crate::budget::entry_deadline(b).is_none(),
+            "the event of the budget of an ended thread stayed in the heap",
+        )?;
+        let info = crate::budget::info(b);
+        check(
+            info.state == abi::BUDGET_FREE && info.overruns == 1,
+            "the budget of an ended thread is not free with its overrun counted",
+        )?;
+        // The next thread of the budget starts: the event stands at once, and
+        // the place hears of the overrun, once.
+        let t2 = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[2] = Some(t2);
+        crate::budget::bind(t2, b).map_err(|_| "the budget did not bind again")?;
+        thread::start(t2).map_err(|_| "a thread did not start")?;
+        pick(t2)?;
+        check(
+            crate::budget::entry_deadline(b).is_some(),
+            "the overrun that was left untold asked for no event",
+        )?;
+        timers::fire_at(LEVEL, timer::now());
         // SAFETY: the test holds the thread.
         let heard = Notification::from_words(
             unsafe { rcv.as_ref() }.regs.x[1..12]
@@ -11038,16 +11060,7 @@ pub fn a_thread_that_ends_with_an_overrun_untold_tells_the_place(
                     bits: 1,
                     count: 1,
                 },
-            "the end of the thread did not tell its place of the overrun",
-        )?;
-        check(
-            crate::budget::entry_deadline(b).is_none(),
-            "the event of the budget of an ended thread stayed in the heap",
-        )?;
-        let info = crate::budget::info(b);
-        check(
-            info.state == abi::BUDGET_FREE && info.overruns == 1,
-            "the budget of an ended thread is not free with its overrun counted",
+            "the place did not hear of the overrun of the thread that ended",
         )
     })();
     for t in made.into_iter().flatten() {

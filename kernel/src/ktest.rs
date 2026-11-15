@@ -794,8 +794,8 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::the_timer_of_an_unbound_budget_leaves_the_former_thread_alone,
     ),
     (
-        "a_thread_that_ends_with_an_overrun_untold_tells_the_place",
-        calls::a_thread_that_ends_with_an_overrun_untold_tells_the_place,
+        "a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread",
+        calls::a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread,
     ),
     (
         "the_event_of_a_budget_follows_the_base_of_its_thread",

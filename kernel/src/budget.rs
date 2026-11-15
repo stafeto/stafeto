@@ -314,11 +314,14 @@ fn server_of(b: NonNull<Budget>) -> NonNull<Server> {
 }
 
 /// The thread of `server` ended: the binding goes, and its reference with
-/// it, at `cause`. An overrun the place was not told of is told here, as
-/// `unbind` tells it, since the event that would have told it left the heap
-/// with the thread. Under OBJ, after the scheduler let the thread go (it
-/// closed and charged the stint that ran, took the loan and took the event
-/// out of the heap).
+/// it, at `cause`. The scheduler closed and charged the stint that ran, took
+/// the loan and took the event out of the heap. An overrun the place was not
+/// told of stays untold in the server: the next thread of the budget asks for
+/// the event at once (`Server::unblock`), and the place hears of it then. The
+/// post waits for that thread because the exit path of a thread, which a
+/// portion of cleanup runs for every thread of a dying process, takes no part
+/// in the delivery of a notification. Under OBJ, after the scheduler let the
+/// thread go.
 ///
 /// # Safety
 /// `server` is the server of the budget the ended thread had.
@@ -329,13 +332,6 @@ pub unsafe fn unbound(server: NonNull<Server>, cause: u8) {
     unsafe {
         let b = of_server(server);
         (*b.as_ptr()).thread = None;
-        // The break: the overrun is not told when the thread ends.
-        if !cfg!(feature = "break-budget-exit-silent")
-            && (*b.as_ptr()).server.take_notice()
-            && let Some(source) = (*b.as_ptr()).notice.as_mut()
-        {
-            let _ = Source::post(NonNull::from(source), NOTICE_BITS, cause);
-        }
         release(b, cause);
     }
 }
