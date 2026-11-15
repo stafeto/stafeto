@@ -1304,6 +1304,8 @@ struct Driver<'a> {
     /// The steps in a row, and the steps put off for a request that waits in the queue. The
     /// bits put off stay in `told`, so that neither the stack nor the switch tells them again.
     yielding: netd::gates::Yielding,
+    /// What of its counters the profile has.
+    yield_seen: [u32; 3],
     /// The doorbell held for the work queued behind a step.
     bell: netd::ring::Hold,
     /// The queue was looked at in the event that is on.
@@ -1402,6 +1404,7 @@ impl<'a> Driver<'a> {
             own_said: false,
             told: 0,
             yielding: netd::gates::Yielding::new(),
+            yield_seen: [0; 3],
             bell: netd::ring::Hold::new(),
             bell_checked: false,
             cleanup_due: false,
@@ -2464,11 +2467,13 @@ impl Driver<'_> {
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
-        let readiness = matches!(
-            Method::from_number(method),
-            Some(Method::EpollWait | Method::EpollWaitTake | Method::Watch | Method::WatchTake)
-        );
-        if readiness {
+        const READINESS: [u16; 4] = [
+            Method::EpollWait.number(),
+            Method::EpollWaitTake.number(),
+            Method::Watch.number(),
+            Method::WatchTake.number(),
+        ];
+        if READINESS.contains(&method) {
             self.settle();
         }
         // VERIFY_SESSION goes through the root alone, and the root has no
@@ -2546,12 +2551,13 @@ impl Driver<'_> {
         ]
     }
 
-    /// The profile counts what `Yielding` counted since `before`.
-    fn count_yielding(&self, before: [u32; 3]) {
+    /// The profile counts what `Yielding` counted since the last time (outside the steps).
+    fn count_yielding(&mut self) {
         let now = self.yielding_counts();
-        profile::add(Counter::YieldDeferred, u64::from(now[0] - before[0]));
-        profile::add(Counter::YieldIdle, u64::from(now[1] - before[1]));
-        profile::add(Counter::YieldServed, u64::from(now[2] - before[2]));
+        let seen = core::mem::replace(&mut self.yield_seen, now);
+        profile::add(Counter::YieldDeferred, u64::from(now[0] - seen[0]));
+        profile::add(Counter::YieldIdle, u64::from(now[1] - seen[1]));
+        profile::add(Counter::YieldServed, u64::from(now[2] - seen[2]));
     }
 
     /// One step of the stack, by its bit.
@@ -2623,9 +2629,7 @@ impl Driver<'_> {
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // A request that waits in the queue goes ahead of the steps that follow one
                 // another (`netd::gates::Yielding`).
-                let before = self.yielding_counts();
                 let steps = self.yielding.arrive(n.bits & STEP_BITS, RX | TX | WAKE);
-                self.count_yielding(before);
                 if steps == 0 {
                     return;
                 }
@@ -2748,18 +2752,16 @@ impl Service<0> for Driver<'_> {
         // one of the notifications in the queue and no request. The steps put off stay in
         // `told` and have no slot.
         let own = u64::from(self.told & !self.yielding.owed() & STEP_BITS != 0);
-        let before = self.yielding_counts();
         let owed = self.yielding.after(now_ns(), || queued(notify, own));
-        self.count_yielding(before);
+        self.count_yielding();
         self.tell_owed(owed);
     }
 
     fn between_requests(&mut self) {
         self.bell_release();
         self.bell_checked = false;
-        let before = self.yielding_counts();
         let owed = self.yielding.served(now_ns());
-        self.count_yielding(before);
+        self.count_yielding();
         self.tell_owed(owed);
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
         // answer went, so that the lines of the console do not count in the step. These builds
