@@ -345,7 +345,7 @@ fn main(_: u64) -> u64 {
         image_layers(ram, image, now);
     }
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
-    let Ok(channel) = sys::channel_create(1) else {
+    let Ok(channel) = sys::channel_create(level) else {
         return 2;
     };
     let mapper = mapper::Mapper::start(&start.process, &channel, level).ok();
