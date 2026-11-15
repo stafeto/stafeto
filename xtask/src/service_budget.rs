@@ -473,6 +473,7 @@ fn run_two_cpu() -> Result<(), String> {
 /// kernel with the holder not lifted again (`break-relift-notice`, `break-relift-reply`); and
 /// the host tests of init fail on init that passes no `free`.
 pub fn breaks(only: Option<&str>) -> Result<(), String> {
+    let mut uncaught: Vec<String> = Vec::new();
     for (service, name, programs) in [
         (
             "ramfs",
@@ -513,12 +514,13 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
             all[at].worst10, all[at].bound10
         );
         if all[at].worst10 >= 500 {
-            return Err(format!(
+            uncaught.push(format!(
                 "the victim of the unbound {service} kept {} per mille, not under 500: the starvation phase does not catch it",
                 all[at].worst10
             ));
+        } else {
+            println!("budget-breaks: the unbound {service} is caught by the numbers");
         }
-        println!("budget-breaks: the unbound {service} is caught by the numbers");
     }
     for (what, variant, key) in [
         (
@@ -551,6 +553,9 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
                 return Err(format!("the kernel with {what} passed the level-40 gate"));
             }
         }
+    }
+    if !uncaught.is_empty() {
+        return Err(uncaught.join("; "));
     }
     if only.is_some_and(|only| only != "free") {
         return Ok(());
