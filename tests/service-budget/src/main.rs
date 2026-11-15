@@ -63,7 +63,11 @@ const DEPTH: usize = 8;
 static STACKS: [Stack<8192>; 2 + GREEDIES] = [const { Stack::new() }; 2 + GREEDIES];
 /// The greedy clients of a phase, on CPU 1: more than one, so that the service has a request
 /// waiting when it ends one, whatever the wake of a client on the other CPU takes.
-const GREEDIES: usize = 8;
+const GREEDIES: usize = 24;
+/// The clients a phase starts: 8, and 24 in the stress phase (`CLIENTS`).
+const CLIENTS_DEFAULT: usize = 8;
+static CLIENTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(CLIENTS_DEFAULT);
 static START: AtomicU64 = AtomicU64::new(0);
 static END: AtomicU64 = AtomicU64::new(0);
 static SPENT: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -421,12 +425,13 @@ extern "C" fn local_server(channel: u64) -> ! {
 /// The queued greedy clients, stopped, on CPU 1 at 20. A spinner on CPU 1 that keeps it from
 /// halting makes QEMU under -icount stall CPU 0 (the victim of the control phase then keeps
 /// 649 per mille in 10 ms), so there is none; 24 clients keep a request queued instead.
-fn spawn_greedies(process: &Handle<Process>) -> [Handle<Thread>; GREEDIES] {
-    core::array::from_fn(|i| spawn_on(process, 2 + i, greedy, i as u64, 20, 1))
+fn spawn_greedies(process: &Handle<Process>) -> [Option<Handle<Thread>>; GREEDIES] {
+    let n = CLIENTS.load(Relaxed);
+    core::array::from_fn(|i| (i < n).then(|| spawn_on(process, 2 + i, greedy, i as u64, 20, 1)))
 }
 
-fn start_all(threads: &[Handle<Thread>]) {
-    for t in threads {
+fn start_all(threads: &[Option<Handle<Thread>>]) {
+    for t in threads.iter().flatten() {
         sys::thread_start(t).expect("start a greedy client");
     }
 }
@@ -477,7 +482,7 @@ fn control(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
     start_all(&greedies);
     sleep_until(wait, timer, now_ns() + PHASE_MS * MS);
     STOP.store(true, Relaxed);
-    wait_ended(wait, timer, GREEDIES as u64);
+    wait_ended(wait, timer, CLIENTS.load(Relaxed) as u64);
     print_windows("control");
     println!("svcbudget control share greedy={}", GREEDY_N.load(Relaxed));
     drop(channel);
@@ -510,11 +515,20 @@ fn phase(
     ping: bool,
     wait: &Handle<Channel>,
     timer: &Handle<Timer>,
+    label: &str,
 ) {
     let name = SERVICES[which];
-    let sessions: [Option<Handle<Channel>>; GREEDIES + 1] =
-        core::array::from_fn(|_| rt::service::connect(parent, name).ok());
-    if sessions.iter().any(Option::is_none) {
+    let sessions: [Option<Handle<Channel>>; GREEDIES + 1] = core::array::from_fn(|i| {
+        (i < CLIENTS.load(Relaxed) || i == GREEDIES)
+            .then(|| rt::service::connect(parent, name).ok())
+            .flatten()
+    });
+    let wanted = CLIENTS.load(Relaxed);
+    if sessions
+        .iter()
+        .enumerate()
+        .any(|(i, s)| (i < wanted || i == GREEDIES) && s.is_none())
+    {
         println!("svcbudget {name} FAILED no session");
         return;
     }
@@ -570,10 +584,10 @@ fn phase(
     }
     STOP.store(true, Relaxed);
     // The greedy clients end after the request in hand; the victim ended at END.
-    wait_ended(wait, timer, GREEDIES as u64);
+    wait_ended(wait, timer, CLIENTS.load(Relaxed) as u64);
     if ping {
         println!(
-            "svcbudget {name} ping n={n} failed={failed} max_us={} over_750us={over} requests={requests} worst_request_us={} mean_us={} worst_at_ms={worst_at} greedy={} greedy_failed={} status={}",
+            "svcbudget {label} ping n={n} failed={failed} max_us={} over_750us={over} requests={requests} worst_request_us={} mean_us={} worst_at_ms={worst_at} greedy={} greedy_failed={} status={}",
             time::ticks_to_ns(max) / 1000,
             time::ticks_to_ns(worst_request) / 1000,
             time::ticks_to_ns(sum) / 1000 / n.max(1),
@@ -582,9 +596,9 @@ fn phase(
             LAST_STATUS.load(Relaxed)
         );
     } else {
-        print_windows(name);
+        print_windows(label);
         println!(
-            "svcbudget {name} share greedy={} greedy_failed={} gap_us={} status={}",
+            "svcbudget {label} share greedy={} greedy_failed={} gap_us={} status={}",
             GREEDY_N.load(Relaxed),
             GREEDY_FAILED.load(Relaxed),
             time::ticks_to_ns(GAP.load(Relaxed)) / 1000,
@@ -619,6 +633,7 @@ fn main(_: u64) -> u64 {
     replies(&start.process, &ping_wait, &ping_timer);
     idle(&start.process, &ping_wait, &ping_timer);
     control(&start.process, &ping_wait, &ping_timer);
+    let name_of = |which: usize| SERVICES[which];
     for which in 0..SERVICES.len() {
         for ping in [false, true] {
             phase(
@@ -628,9 +643,22 @@ fn main(_: u64) -> u64 {
                 ping,
                 &ping_wait,
                 &ping_timer,
+                name_of(which),
             );
         }
     }
+    // The stress phase: 24 queued clients of the pipe service, the victim's share told (no gate;
+    // with the bound pipe on the kernel of #364 the victim kept 0 per mille: issue #750).
+    CLIENTS.store(GREEDIES, Relaxed);
+    phase(
+        &start.process,
+        &start.parent,
+        1,
+        false,
+        &ping_wait,
+        &ping_timer,
+        "pipe24",
+    );
     println!("svcbudget DONE");
     0
 }

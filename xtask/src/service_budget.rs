@@ -279,6 +279,26 @@ pub fn run(args: &[String]) -> Result<(), String> {
     for line in ping_bounds(&parse(&lines)?) {
         println!("{line}");
     }
+    // The stress phase, told and not gated: 24 queued clients of the pipe service (issue #750).
+    if let Ok(w) = parse_phase(&lines, "pipe24") {
+        let median = w.iter().find(|w| w.0 == 10).map_or(0, |w| w.2);
+        println!(
+            "service-budget: pipe with 24 queued clients: the victim keeps a median of {median} per mille in 10 ms (not gated)"
+        );
+    }
+    // Init's journal of the overruns (the budgets of these services have a NOTIFY place since the
+    // journal): a service that ran out of its budget under the load has a line.
+    for service in SERVICES {
+        let wanted = format!("init: {service} budget serve: at least");
+        match lines.iter().find(|l| l.contains(&wanted)) {
+            Some(line) => println!("service-budget: journal: {line}"),
+            None => {
+                return Err(format!(
+                    "no line {wanted:?} in init's journal of the overruns"
+                ));
+            }
+        }
+    }
     println!("service-budget: the three services keep their budgets");
     Ok(())
 }
