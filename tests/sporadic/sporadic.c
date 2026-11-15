@@ -136,7 +136,9 @@ static void run(void *(*body)(void *), void *arg) {
     int err;
     pthread_t t = make(body, arg, NULL, &err);
     CHECK(err == 0);
+    printf("sporadic: DEBUG joins\n");
     CHECK(pthread_join(t, NULL) == 0);
+    printf("sporadic: DEBUG joined\n");
 }
 
 static int row_ns(int cpu, long period) { /* the share of the CPU for POSIX threads, in ns of `period` */
@@ -160,6 +162,7 @@ static void *basic_thread(void *arg) {
     CHECK(sched_getparam(0, &got) == 0 && got.sched_priority == 21 && got.sched_ss_max_repl == 3);
     errno = 0;
     CHECK(pthread_setschedprio(pthread_self(), 5) == EINVAL); /* the base may not reach `low` */
+    printf("sporadic: DEBUG basic thread done, %lld us of CPU\n", thread_cpu_ns() / 1000);
 #if SS_REBIND
     /* A change of the parameters moves the thread to a new budget at once. */
     struct sched_param q = ss_param(22, 6, 2 * MS, 20 * MS, 2);
