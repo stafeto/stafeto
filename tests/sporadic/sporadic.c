@@ -59,7 +59,8 @@ static void options(void) {
     CHECK(sched_get_priority_min(SCHED_SPORADIC) == 1 && sched_get_priority_max(SCHED_SPORADIC) == 32);
     CHECK(sizeof(struct sched_param) == 48);
     unsigned mask = 99;
-    CHECK(sporadic_query(&mask) == 0 && mask == 0);
+    unsigned status = sporadic_query(&mask);
+    if (status != 0 || mask != 0) FAIL("QUERY gave %u, mask %u", status, mask);
     printf("sporadic: the options, SS_REPL_MAX and the range of SCHED_SPORADIC ok\n");
 }
 
@@ -106,9 +107,12 @@ static void refusals(const char *who) {
     CHECK(posix_spawnattr_destroy(&spawn) == 0);
     /* The service: every operation is refused, a handle of the thread goes
      * with the request and no handle comes back. */
-    CHECK(sporadic_set(0) == 502);
-    CHECK(sporadic_set(1) == 500);
-    CHECK(sporadic_work() == 501);
+    unsigned status = sporadic_set(0);
+    if (status != 502) FAIL("SET gave %u, not FULL", status);
+    status = sporadic_set(1);
+    if (status != 500) FAIL("SET with a flag gave %u, not INVALID", status);
+    status = sporadic_work();
+    if (status != 501) FAIL("WORK through a session gave %u, not PERMISSION", status);
     CHECK(sched_getscheduler(0) == policy);
     printf("sporadic: %s: every call that would give the policy is refused ok\n", who);
 }
@@ -137,7 +141,7 @@ static void round_trip(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "checked") == 0) return 0;
     if (argc > 1 && strcmp(argv[1], "user") == 0) {
-        /* A user, not root: the refusal is the same (EINVAL), not a refusal of privilege. */
+        /* A user: the refusal is the same (EINVAL), whatever the privilege. */
         if (setuid(1000) != 0 || geteuid() != 1000) return 51;
         refusals("user");
         return 0;
