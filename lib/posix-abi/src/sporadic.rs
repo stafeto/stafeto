@@ -211,13 +211,20 @@ pub fn ask(id: u64, cpu: usize, ss: &Ss, low: u8) -> Result<Given, i32> {
     .write(&mut w)
     .map_err(|_| EIO)?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let mut reply = crate::process::send_again(&w).map_err(|_| EIO)?;
+    let mut reply = crate::process::send_again(&w).map_err(|e| {
+        rt::println!("DEBUG ss: send {e:?}");
+        EIO
+    })?;
     let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
     let status = bytes.u32().map_err(|_| EIO)?;
     if status != 0 {
+        rt::println!("DEBUG ss: ask status {status}");
         return Err(errno_of(status));
     }
-    let new = reply.handles.take::<Budget>(0).map_err(|_| EIO)?;
+    let new = reply.handles.take::<Budget>(0).map_err(|e| {
+        rt::println!("DEBUG ss: no handle {e:?}");
+        EIO
+    })?;
     let old = reply.handles.take::<Budget>(1).ok();
     Ok(Given { new, old })
 }
@@ -281,6 +288,7 @@ pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32>
             }
         }
         Err(e) => {
+            rt::println!("DEBUG ss: bind {e:?}");
             done(id, false);
             Err(bind_errno(e))
         }
