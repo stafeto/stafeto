@@ -230,8 +230,9 @@ pub fn thread_set(id: u64, policy: i32, param: &SchedParam, tail: bool) -> Resul
     // The sporadic server: the parameters, and whether the budget changes.
     let ss = if policy != SCHED_SPORADIC {
         None
-    } else if keep {
-        // Only the priority changes: the thread's own parameters stay.
+    } else if keep && !tail {
+        // pthread_setschedprio: only the priority changes, the thread's own
+        // parameters stay.
         let own_ss = crate::sporadic::get(id).ok_or(EINVAL)?;
         validate(&to_param(priority, &own_ss))?;
         Some(own_ss)
