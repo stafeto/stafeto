@@ -870,6 +870,11 @@ static BUDGET_WENT_STALE: AtomicBool = AtomicBool::new(false);
 /// budget has no capacity) while the flag of the budget still says the thread
 /// is not in the background. True when the budget is in that state.
 fn make_stale(s: &mut Server) -> bool {
+    // The stint the server ran before it began to wait for its first request
+    // moved its whole chunk a period ahead: the state is there already.
+    if !s.background() && s.capacity(timer::now()) == 0 {
+        return true;
+    }
     let mut at = timer::now();
     // The head of the queue ends up 50 ms ahead at least, so that its
     // replenishment does not come while the test runs, whatever the speed
