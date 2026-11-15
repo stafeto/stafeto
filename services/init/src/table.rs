@@ -377,9 +377,11 @@ pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 /// What the budgets of CPU 0 leave free of `BUDGET_SHARE_MAX_PPM` for the budgets the table
 /// does not have yet: the process service and the package service (3 %). The sum of the
 /// table's budgets on CPU 0 and this is at most the limit, so a budget added later for either
-/// finds its room. It was 5 % in the plan of the budgets of the services; with it at 5 % the
-/// levels below the budgets keep 16.8 % of CPU 0 in a window of 10 ms where 20 % is wanted (a
-/// share the demoted services at level 32 do not leave to the levels of the POSIX processes).
+/// finds its room. The reserve keeps the table's budgets on CPU 0 at 71 % of the 75 % the
+/// limit allows, so the work no budget covers (the kernel, the interrupts, the drivers, init,
+/// the levels above the budgets) keeps its 25 % and more. It promises the levels of the POSIX
+/// processes nothing: the three services work at level 32 once their budget is spent, above
+/// them (the guarantee of the budgets is for the levels at 33 and above).
 pub const CPU0_RESERVE_PPM: u64 = 30_000;
 
 /// A time budget of one thread of a record (spec 8, `budget_create`):

@@ -2,17 +2,26 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The probe of the time budgets of the RAM file, pipe and terminal services
-//! (`tests/service-budget`, `cargo xtask service-budget`, spec 8), under QEMU's -icount with
-//! two CPUs. The services run as init starts them, with the budgets of its table on CPU 0; a
-//! greedy client at 20 on CPU 1 asks one service without a pause while a victim at 34 on CPU 0
-//! spins and a client at 40 on CPU 0 asks every 2 ms. The guarantee the probe judges: a service
-//! whose budget is spent works at level 32 and takes at most C of each T from the levels 33 and
-//! above, which is why the victim sits at 34 (below the network service at 35); for the levels
-//! at or below 32 the three services are services without a budget and the probe promises
-//! nothing. The lines the probe prints are checked
-//! against their bounds here. `breaks` runs the same probe on images in which one service
-//! binds no budget (`break-budget-unbound` of its crate), each of which must fail the check of
-//! the lines, and on init with no `free` level (`break-record-free`).
+//! (`tests/service-budget`, `cargo xtask service-budget`, spec 8), under QEMU's -icount. The
+//! services run as init starts them, with the budgets of its table on CPU 0. The gated probe
+//! runs on one CPU: 24 clients at 20 ask one service without a pause while a victim at 34
+//! spins 0.8 ms and sleeps 0.2 ms (the starvation phase), and a thread at 40 asks every 1037 us
+//! while 8 clients at 20 queue the dear request (the level-40 phase). The two-CPU probe
+//! (`two-cpu`) prints its numbers for information: its emulator advances the clock of CPU 0
+//! while CPU 1 runs. The guarantee the probe checks: a service whose budget is spent works at
+//! level 32 and takes at most C of each T from the levels 33 and above, which is why the victim
+//! sits at 34 (below the network service at 35); for the levels at or below 32 the three
+//! services are services without a budget and the probe promises nothing.
+//!
+//! Two limits of the gates. The starvation gate is a regression check on the cost of a budget:
+//! it cannot see a missing budget, because the work 24 clients refill in a cycle is small (the
+//! unbound RAM service keeps the victim at 968 per mille against a bound of 827), so a service
+//! that binds no budget is caught by the missing line `<service>: serve runs under its budget`.
+//! The level-40 gate takes `s_max` from requests asked with the budget fresh (see `level40` in
+//! the probe), so that no replenishment wait lies inside it. `breaks` runs the same probe on
+//! images in which one service binds no budget (`break-budget-unbound` of its crate), each of
+//! which must fail the check of the lines, and on init with no `free` level
+//! (`break-record-free`).
 
 use std::time::Duration;
 
@@ -135,7 +144,7 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
 /// for the kernel part), which
 /// is the two timer events of each period of the budget (its exhaustion and its replenishment),
 /// the overruns, the entries of the kernel and what the greedy client's two CPUs add under
-/// -icount. The worst window is told in the lines and not held to a bound: the two CPUs of
+/// -icount. The worst window is printed in the lines and held to no bound: the two CPUs of
 /// QEMU stall one of them for some milliseconds now and then, which shows as a window with no
 /// victim in it.
 fn allowed_loss(service: &str) -> u64 {
@@ -150,11 +159,11 @@ const CHECKED_WINDOWS: [u64; 2] = [5, 10];
 /// service and the kernel's longest stretch (`budget-hog`).
 const REQUEST_BOUND_US: u64 = 750;
 
-/// The two bounds of the client at 40, told for each service and not gated: a request has
+/// The two bounds of the client at 40, printed for each service for information: a request has
 /// `REQUEST_BOUND_US`, and a ping of several requests (the RAM service's lookup is five) has
 /// that for each of them. The tail the pings show (up to 52 ms) is the lost lift of the holder
 /// (stafeto-design#745); both checks are expected to fail until it is fixed, so they are
-/// numbers and no gate.
+/// numbers for information.
 pub fn ping_bounds(all: &[Numbers]) -> Vec<String> {
     SERVICES
         .iter()
@@ -208,8 +217,8 @@ pub fn verdict(all: &[Numbers], control: &[(u64, u64, u64)]) -> Result<(), Strin
                 ));
             }
         }
-        // The client at 40 gets its answer (at least one ping answered). The waits are told and
-        // not bounded: with the dear requests queued, the pings of the pipe and terminal
+        // The client at 40 gets its answer (at least one ping answered). The waits are printed for
+        // information: with the dear requests queued, the pings of the pipe and terminal
         // services wait up to 180 ms behind a request in hand and the RAM service's lookups
         // (jobs of several steps) take 2 ms on the average with the lift of the holder of a
         // notification, over the 750 us of one step: open findings for the kernel part.
@@ -366,8 +375,10 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
     Ok(())
 }
 
-/// The level-40 gate: a request of the thread at 40 waits for 1.1 times the longest request of
-/// the service in hand, its own work and one stretch of the kernel at most.
+/// The level-40 gate of the one-CPU probe: a request of the thread at 40 waits for the request
+/// in hand (1.1 times the longest request of the dear kind alone, measured with the budget
+/// fresh), its own work, one stretch of the kernel, one round trip, the budgets of the three
+/// services above 40 and the work of init at most (the formula above `level40` in the probe).
 pub fn verdict_level40(all: &[One]) -> Result<(), String> {
     for (name, o) in SERVICES.iter().zip(all) {
         if o.worst_request_us > o.bound_us {
@@ -402,7 +413,7 @@ fn one_table(all: &[One]) {
 }
 
 /// `cargo xtask service-budget`: the one-CPU probe, gated. `two-cpu` runs the two-CPU probe, whose
-/// numbers are told and not gated (QEMU under -icount runs the vCPUs in turn with one instruction
+/// numbers are printed for information (QEMU under -icount runs the vCPUs in turn with one instruction
 /// counter, so a busy CPU 1 advances the clock of CPU 0 while it executes nothing).
 pub fn run(args: &[String]) -> Result<(), String> {
     match args {
@@ -441,18 +452,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
 fn run_two_cpu() -> Result<(), String> {
     let lines = run_image("boot-service-budget.img", &crate::SERVICE_BUDGET_PROGRAMS)?;
     require_service_budget_lines(&lines)?;
-    // Told, not gated (the two-CPU probe is no oracle).
+    // Printed for information (the two-CPU probe is no oracle).
     if let Err(e) = judge(&lines) {
-        println!("service-budget: two-CPU numbers off the old bounds (not gated): {e}");
+        println!(
+            "service-budget: two-CPU numbers off the old bounds (printed for information): {e}"
+        );
     }
     for line in ping_bounds(&parse(&lines)?) {
         println!("{line}");
     }
-    // The stress phase, told and not gated: 24 queued clients of the pipe service (issue #750).
+    // The stress phase, printed for information: 24 queued clients of the pipe service (issue #750).
     if let Ok(w) = parse_phase(&lines, "pipe24") {
         let median = w.iter().find(|w| w.0 == 10).map_or(0, |w| w.2);
         println!(
-            "service-budget: pipe with 24 queued clients: the victim keeps a median of {median} per mille in 10 ms (not gated)"
+            "service-budget: pipe with 24 queued clients: the victim keeps a median of {median} per mille in 10 ms (printed for information)"
         );
     }
     // Init's journal of the overruns (the budgets of these services have a NOTIFY place since the
@@ -474,10 +487,10 @@ fn run_two_cpu() -> Result<(), String> {
 
 /// `cargo xtask budget-breaks`, the part of the services, on one CPU: the image in which one
 /// service binds no budget is caught by the missing line `<service>: serve runs under its budget`
-/// (the victim's numbers there are told, not judged: see the comment in the function); the
+/// (the victim's numbers there are printed for information: see the comment in the function); the
 /// level-40 numbers of the kernel with the holder not lifted again (`break-relift-notice`,
-/// `break-relift-reply`) are told and not judged (the kernel tests of `budget-hog`'s breaks judge
-/// both); and the host tests of init fail on init that passes no `free`.
+/// `break-relift-reply`) are printed for information and the kernel tests of `budget-hog`'s breaks
+/// judge both; and the host tests of init fail on init that passes no `free`.
 pub fn breaks(only: Option<&str>) -> Result<(), String> {
     for (service, name, programs) in [
         (
@@ -509,7 +522,7 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
                 ));
             }
         }
-        // The numbers of the unbound service are told and do not judge. They cannot catch it: the
+        // The numbers of the unbound service are printed for information and do not judge. They cannot catch it: the
         // work the clients refill in a cycle of 1 ms (24 clients, the dearest request each service
         // offers) is 14, 61 and 39 us of service CPU for ramfs, pipe and tty (a write of 1000 bytes
         // costs pipe and tty a few microseconds; the 180 us and 6 ms of `s_max` are round trips), so
@@ -520,7 +533,7 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
         if let Ok(all) = parse_one(&lines) {
             let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
             println!(
-                "budget-breaks: unbound {service}: the victim keeps {} per mille of its active time (a bound one keeps at least {}); told, not judged",
+                "budget-breaks: unbound {service}: the victim keeps {} per mille of its active time (a bound one keeps at least {}); printed for information",
                 all[at].worst10, all[at].bound10
             );
         }
@@ -547,7 +560,7 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
             variant,
         )
         .map_err(|e| format!("the one-CPU probe on the kernel with {what}: {e}"))?;
-        // Told, not judged: the worst request of the level-40 phase of the pipe moves by more
+        // Printed for information: the worst request of the level-40 phase of the pipe moves by more
         // than 130 us with the image alone (359 to 535 us on the unbroken kernel, 462 us on the
         // kernel with `break-relift-reply`), so this gate cannot tell the broken build from the
         // unbroken one. The kernel tests `a_receive_that_takes_a_notification_above_a_request_keeps_the_lift`
@@ -563,7 +576,7 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "budget-breaks: with {what} the level-40 phase measured {worst}; told, not judged"
+            "budget-breaks: with {what} the level-40 phase measured {worst}; printed for information, the kernel tests judge it"
         );
     }
     if only.is_some_and(|only| only != "free") {

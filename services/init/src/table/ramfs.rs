@@ -1080,9 +1080,10 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 ];
 
 /// The probe of the time budgets of the RAM, pipe and terminal services (tests/service-budget,
-/// xtask service-budget, under -icount with two CPUs): the three services as the shell image
-/// has them, with their budgets; the console's driver as the quiet stub of the steps of the
-/// terminal; and the probe at 40, whose threads stand at 20 (on CPU 1), 25 and 40.
+/// xtask service-budget, under -icount on one CPU, and with two CPUs for the numbers printed
+/// for information): the three services as the shell image has them, with their budgets; the
+/// console's driver as the quiet stub of the steps of the terminal; and the probe, whose threads
+/// stand at 20, 34 (the victim, above the demoted level 32) and 40.
 pub const SERVICE_BUDGET_TABLE: &[Record] = &[
     TTY_STEPS_TABLE[0],
     RAM_LEGACY,

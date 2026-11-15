@@ -1725,7 +1725,8 @@ enum Variant {
     LiftAgainNoticeTest,
     LiftAgainReplyTest,
     /// The same two breaks in the kernel the probes of the budgets boot (`cargo xtask
-    /// budget-breaks`): the one-CPU level-40 check must fail on each.
+    /// budget-breaks`): the kernel tests of `budget-hog` judge both, and the one-CPU level-40
+    /// numbers of `service-budget breaks` are printed for information.
     LiftAgainNotice,
     LiftAgainReply,
 }

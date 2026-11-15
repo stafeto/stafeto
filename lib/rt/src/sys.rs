@@ -1280,13 +1280,14 @@ impl Token {
     /// replies, and nothing changes when a check fails; the handles then stay
     /// in the caller's table and close here, with the error as the call's
     /// result (INVALID_ARGS, BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). The
+    /// error of a reply that went as far as it could (LIMIT_REACHED and
+    /// NO_MEMORY, the client's table had no room) is the call's too, and the
+    /// handles are gone; with PEER_CLOSED the receive follows.
+    ///
     /// On an error x1 of the call says which half failed (`reply_receive_took_handles`): when
     /// the reply went (the error is the receive half's) its handles are the client's and are
     /// never closed here; when nothing happened they close here unless the error is one that
     /// took them (`Error::keeps_handles`).
-    /// error of a reply that went as far as it could (LIMIT_REACHED and
-    /// NO_MEMORY, the client's table had no room) is the call's too, and the
-    /// handles are gone; with PEER_CLOSED the receive follows.
     pub fn reply_receive_handles(
         self,
         channel: &Handle<Channel>,
