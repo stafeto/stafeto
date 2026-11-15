@@ -129,9 +129,11 @@ idle-probe = ["idle-poll"]
 # with no drain of the queues, and the poll does not read ISR_EL1.
 # Deliberate breakage: the kernel leaves the boot seed in the device tree.
 break-seed-wipe = []
-# Deliberate breakage only: the port the kernel holds shows the headers of the
-# pieces of long lines (xtask console-strip-break).
-break-console-strip = ["console-line/break-line-strip"]
+# The port the kernel holds shows the headers of the pieces of long lines.
+# The probe kernels of images with no console service use it, and xtask
+# assembles the lines (xtask::untag); xtask console-strip-break pins that the
+# normal kernel strips them.
+keep-pieces = ["console-line/break-line-strip"]
 # Deliberate breakage of the time budgets (xtask budget-breaks): a bind that
 # binds nothing, a boost by a notification slot that survives the exhaustion,
 # a replenishment that never applies, and a thread with no budget that ignores
