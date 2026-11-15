@@ -371,6 +371,15 @@ pub struct Gate {
 /// the layout takes at 5 %.
 pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 
+/// The shares of each CPU the time budgets of POSIX threads (SCHED_SPORADIC)
+/// may take together, in parts per million (plan 4b, decision V4): none on
+/// CPU 0, where the services and the network service have their budgets;
+/// 20 % on CPU 1 beside the 20 % of `stack1`; half of each of the CPUs 2
+/// and 3 (`RT_CPUS`), which with the audio budgets of the layout reach the
+/// 75 % of `BUDGET_SHARE_MAX_PPM`. `check_budgets` adds the row to the sum of
+/// the table's budgets, so the table cannot take what POSIX threads may ask.
+pub const POSIX_BUDGETS: [u64; 8] = [0, 200_000, 500_000, 500_000, 0, 0, 0, 0];
+
 /// A time budget of one thread of a record (spec 8, `budget_create`):
 /// init makes it on `cpu` with the system resource's right `BUDGET`, and
 /// gives it to each instance of the record in its start data under `name`;
@@ -1006,7 +1015,7 @@ fn check_layers(table: &[Record]) -> Result<(), TableError<'static>> {
 /// of the budgets on a CPU at most BUDGET_SHARE_MAX_PPM of it together, so
 /// that the levels below the budgets keep the rest.
 fn check_budgets(table: &[Record]) -> Result<(), TableError<'static>> {
-    let mut ppm = [0u64; 8];
+    let mut ppm = POSIX_BUDGETS;
     for r in table {
         for (i, b) in r.budgets.iter().enumerate() {
             let own = Name::new(b.name.as_bytes()).is_ok()
@@ -4016,7 +4025,7 @@ mod tests {
         static HALF: [Budget; 1] = [budget("half", 0, 500_000, 1_000_000)];
         static QUARTER: [Budget; 1] = [budget("quarter", 0, 1_250_000, 5_000_000)];
         static MORE: [Budget; 1] = [budget("more", 0, 10_000, 1_000_000)];
-        static ON_ONE: [Budget; 1] = [budget("one", 1, 700_000, 1_000_000)];
+        static ON_ONE: [Budget; 1] = [budget("one", 4, 700_000, 1_000_000)];
         let table = |a: Record, b: Record| -> Vec<Record> { vec![a, b] };
         // 50 % and 25 % on CPU 0 are the 75 % the table allows.
         let both = table(budgeted("a", &HALF), budgeted("b", &QUARTER));
@@ -4103,6 +4112,27 @@ mod tests {
             "100 % on CPU 1"
         );
         assert!(check_one(budgeted("svc", &EDGES[..1])).is_ok());
+    }
+
+    #[test]
+    fn the_row_of_posix_budgets_counts_in_the_sum_of_each_cpu() {
+        // CPU 0 has no share of POSIX threads, CPUs 1 to 3 have the row.
+        assert_eq!(POSIX_BUDGETS[0], 0);
+        assert!(POSIX_BUDGETS.iter().all(|&p| p <= BUDGET_SHARE_MAX_PPM));
+        assert_eq!(POSIX_BUDGETS[1], 200_000);
+        assert_eq!(POSIX_BUDGETS[2], 500_000);
+        assert_eq!(POSIX_BUDGETS[3], 500_000);
+        // A record whose budget takes more of CPU 2 than the row leaves is refused.
+        static OVER: [Budget; 1] = [budget("over", 2, 260_000, 1_000_000)];
+        static FITS: [Budget; 1] = [budget("fits", 2, 250_000, 1_000_000)];
+        assert_eq!(
+            check_one(budgeted("svc", &OVER)),
+            Err(TableError::BudgetShare {
+                cpu: 2,
+                ppm: 760_000
+            })
+        );
+        assert!(check_one(budgeted("svc", &FITS)).is_ok());
     }
 
     #[test]

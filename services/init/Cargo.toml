@@ -30,6 +30,8 @@ steps-grid = ["steps", "rt/beat-grid"]
 break-bar-size = []
 # A table whose budgets take all of a CPU passes the check (`cargo xtask budget-breaks`).
 break-budget-share = []
+# Init counts no share for the budgets of POSIX threads (`cargo xtask sporadic-breaks`).
+break-ss-no-admission = []
 break-bar-offset = []
 break-measure-twice = []
 break-no-enable = []

@@ -24,6 +24,7 @@ use core::cell::UnsafeCell;
 #[cfg(feature = "image-probe")]
 mod image_probe_main;
 use core::sync::atomic::Ordering;
+use posix_process_service::budgets::Budgets;
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::images::{self, Images};
@@ -57,6 +58,7 @@ use rt::{
     sys,
 };
 mod adopt;
+mod budgeter;
 mod ends;
 mod generations;
 mod jobs;
@@ -66,6 +68,7 @@ mod make;
 mod pages;
 mod rejoiner;
 mod replace;
+mod sched;
 use core::mem::{ManuallyDrop, MaybeUninit};
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
@@ -331,6 +334,10 @@ struct Processes {
     replacing: [Option<Replacing>; RECORDS],
     replace_queue: Queue,
     replacer: Option<Pending>,
+    /// The time budgets of POSIX threads (sched.rs) and the budget thread's
+    /// WORK that waits for a job.
+    budgets: Budgets<Handle<rt::handle::Budget>, Pending>,
+    budgeter: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
     /// The occurrences of signals queued behind the one on a page.
@@ -439,6 +446,8 @@ impl Processes {
             Records::initialize_at(addr_of_mut!((*at).records));
             rt::bss::fill_none(addr_of_mut!((*at).replacing));
             addr_of_mut!((*at).replacer).write(None);
+            addr_of_mut!((*at).budgets).write(Budgets::new());
+            addr_of_mut!((*at).budgeter).write(None);
             Queued::initialize_at(addr_of_mut!((*at).queued));
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             Waits::initialize_at(addr_of_mut!((*at).waits));
@@ -524,6 +533,7 @@ fn main(_: u64) -> u64 {
     }
     if adopt::start(&start.process, level).is_err()
         || replace::start(&start.process, level).is_err()
+        || budgeter::start(&start.process, level).is_err()
         || ends::start(&start.process, &identities, level).is_err()
     {
         return 6;
@@ -4761,6 +4771,9 @@ impl Service<0> for Processes {
     }
     fn request(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
+        if method == Method::Budget as u16 {
+            return self.budget(r);
+        }
         let own = [
             Method::Create,
             Method::Loaded,
@@ -5126,6 +5139,8 @@ impl Service<0> for Processes {
         // An exec that waited for init goes on: its new image is dead.
         self.replace_queue.remove(index);
         self.finish_replace(index);
+        // The shares of its threads' time budgets go back to init.
+        self.budgets_of_record_ended(index);
         self.tickets[index] = 0;
         self.rejoin.ended(index);
         // Init reads the end once the witness closed.

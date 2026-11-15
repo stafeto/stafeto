@@ -13,6 +13,7 @@
 
 pub mod device;
 pub mod labels;
+pub mod posix_budget;
 pub mod quota;
 pub mod resolve;
 pub mod restart;

@@ -32,6 +32,7 @@
 //! main thread loads, maps and kills nothing itself, and lets go of no last
 //! handle of an instance (worker.rs).
 
+use crate::budget_call;
 use crate::worker::{Kept, Loaded, Worker};
 use abi::{Error, ObjectKind, ProcessState, Rights, Source};
 use bootimg::Program;
@@ -40,6 +41,7 @@ use core::mem;
 use core::mem::ManuallyDrop;
 use init::PAGE;
 use init::labels::Labels;
+use init::posix_budget::{self, Refused, Shares};
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::table::{self, MAX_RECORDS, Record, Restart};
@@ -47,8 +49,8 @@ use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
-    Adoption, Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
-    START_NAMES, State, Stats, VERSION, Work,
+    Adoption, BUDGET_ASK, BUDGET_RELEASE, BudgetAsk, Connect, FULL_SHARE, LIST_PAGE, ListReply,
+    ListRequest, Method, Record as Listed, RegisterReply, START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
 #[cfg(feature = "dma-watch")]
@@ -327,6 +329,8 @@ pub struct Init {
     adoption: Option<Pending>,
     /// The records whose first start is done or waits for quota.
     started: usize,
+    /// The time budgets init made for POSIX threads (BUDGET).
+    posix: Shares,
 }
 
 impl Init {
@@ -352,6 +356,7 @@ impl Init {
             jobs: Jobs::new(),
             adoption: None,
             started: 0,
+            posix: Shares::new(posix_budget::limits()),
         }
     }
 
@@ -485,6 +490,79 @@ impl Init {
             self.gates(place, true);
         }
         Answer::Status(Status::Ok)
+    }
+
+    /// BUDGET from the process service (proto_init): ASK makes a time budget
+    /// for a POSIX thread if the share of its CPU is there, RELEASE gives a
+    /// share back. BAD_STATE for any other caller.
+    fn budget(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if table::table()[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
+        }
+        let mut body = r.body();
+        let Ok(op) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        match op {
+            BUDGET_ASK => {
+                let Ok(ask) = BudgetAsk::read(&mut body) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let level = u8::try_from(ask.low).ok().filter(|l| (1..=63).contains(l));
+                let Some(level) = level.filter(|_| (1..=4).contains(&ask.max_repl)) else {
+                    return refuse(Error::InvalidArgs);
+                };
+                let id = match self.posix.admit(ask.cpu, ask.c_ns, ask.t_ns, ask.replace) {
+                    Ok(id) => id,
+                    Err(Refused::Invalid) => return refuse(Error::InvalidArgs),
+                    Err(Refused::Share | Refused::Room) => return refuse(FULL_SHARE),
+                };
+                let made = budget_call::create(
+                    &self.resource,
+                    ask.cpu,
+                    ask.c_ns,
+                    ask.t_ns,
+                    level,
+                    ask.max_repl,
+                );
+                match made {
+                    Ok(budget) => {
+                        let reply = r.reply();
+                        if reply
+                            .u32(0)
+                            .and_then(|()| reply.u32(0))
+                            .and_then(|()| reply.u64(id))
+                            .is_err()
+                        {
+                            self.posix.release(id);
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply([budget.erase()].into())
+                    }
+                    Err(e) => {
+                        self.posix.release(id);
+                        refuse(e)
+                    }
+                }
+            }
+            BUDGET_RELEASE => {
+                let Ok(id) = body.u64() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if self.posix.release(id) {
+                    Answer::Status(Status::Ok)
+                } else {
+                    refuse(Error::InvalidArgs)
+                }
+            }
+            _ => Answer::Status(Status::UnknownMethod),
+        }
     }
 
     /// The quota of an instance of the record at `place` in bytes: the
@@ -976,6 +1054,10 @@ impl Init {
         let Some(instance) = self.entries[place].held.take_running() else {
             return;
         };
+        // The threads of the process service's processes went with it.
+        if table::table()[place].name == table::PROCESS_SERVICE {
+            self.posix.clear();
+        }
         let lived = now().saturating_sub(instance.started);
         let end = End(
             sys::process_state(instance.process()),
@@ -1662,6 +1744,7 @@ impl Service<1> for Init {
         Method::Adopted.number(),
         Method::Replaced.number(),
         Method::Ready.number(),
+        Method::Budget.number(),
     ];
     type Data = ();
 
@@ -1680,6 +1763,7 @@ impl Service<1> for Init {
             Some(Method::Adopted) => self.adopted(place, r),
             Some(Method::Replaced) => self.replaced(place, r),
             Some(Method::Ready) => self.ready(place, r),
+            Some(Method::Budget) => self.budget(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),

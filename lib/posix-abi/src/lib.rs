@@ -11,6 +11,7 @@
 
 pub mod allocation;
 pub mod altstack;
+mod budget_call;
 pub mod change;
 pub mod clock;
 mod close_driver;
@@ -66,6 +67,7 @@ pub mod shared;
 pub mod shares;
 pub mod signals;
 pub mod sockets;
+pub mod sporadic;
 pub mod synchronization;
 pub mod terminal;
 pub mod threads;

@@ -36,6 +36,7 @@ use crate::constants::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 use posix_sync::{LayerLock, Woken};
 use posix_thread::{Block, effective_level, flag};
+use posix_types::sporadic::{SchedParam, Ss, to_param, validate};
 use rt::abi::Policy;
 use rt::handle::{Handle, Thread};
 use rt::sys;
@@ -43,6 +44,9 @@ use rt::sys;
 pub const SCHED_OTHER: i32 = 0;
 pub const SCHED_FIFO: i32 = 1;
 pub const SCHED_RR: i32 = 2;
+/// The sporadic server (XSH 2.8.4): the kernel's FIFO policy with a time
+/// budget of its own (`sporadic`).
+pub const SCHED_SPORADIC: i32 = posix_types::sporadic::SCHED_SPORADIC;
 /// The least and the greatest priority of SCHED_FIFO and SCHED_RR.
 pub const MIN_PRIORITY: i32 = 1;
 pub const MAX_PRIORITY: i32 = 32;
@@ -80,14 +84,14 @@ pub(crate) fn unpack(word: u64) -> (i32, i32) {
 pub fn priority_range(policy: i32, max: bool) -> Result<i32, i32> {
     match policy {
         SCHED_OTHER => Ok(0),
-        SCHED_FIFO | SCHED_RR => Ok(if max { MAX_PRIORITY } else { MIN_PRIORITY }),
+        SCHED_FIFO | SCHED_RR | SCHED_SPORADIC => Ok(if max { MAX_PRIORITY } else { MIN_PRIORITY }),
         _ => Err(EINVAL),
     }
 }
 
 /// The kernel policy of a POSIX policy.
 fn kernel_policy(policy: i32) -> Policy {
-    if policy == SCHED_FIFO {
+    if policy == SCHED_FIFO || policy == SCHED_SPORADIC {
         Policy::Fifo
     } else {
         Policy::RoundRobin
@@ -111,7 +115,9 @@ pub(crate) fn level_of(policy: i32, priority: i32) -> Result<(u8, Policy), i32> 
     let top = top()?;
     match policy {
         SCHED_OTHER if priority == 0 => Ok((other_level(top), Policy::RoundRobin)),
-        SCHED_FIFO | SCHED_RR if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) => {
+        SCHED_FIFO | SCHED_RR | SCHED_SPORADIC
+            if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) =>
+        {
             // At least one above SCHED_OTHER, at most the top.
             let level = (i32::from(top) - MAX_PRIORITY + priority).max(1) as u8;
             Ok((level, kernel_policy(policy)))
@@ -122,13 +128,15 @@ pub(crate) fn level_of(policy: i32, priority: i32) -> Result<(u8, Policy), i32> 
 
 /// The scheduling the next thread of the calling thread starts with (an
 /// attribute object with PTHREAD_EXPLICIT_SCHED): checked here, so that
-/// pthread_create can say EINVAL; a negative policy forgets it.
-pub fn next_sched(policy: i32, priority: i32) -> Result<(), i32> {
+/// pthread_create can say EINVAL; a negative policy forgets it. The members
+/// of the sporadic server come with `param` for SCHED_SPORADIC.
+pub fn next_sched(policy: i32, param: &SchedParam) -> Result<(), i32> {
     let block = crate::threads::own_block();
     if policy < 0 {
         block.next_sched.store(0, Ordering::Relaxed);
-        return Ok(());
+        return crate::sporadic::set_next(None);
     }
+    let priority = param.sched_priority;
     level_of(policy, priority)?;
     if !permitted(
         unpack(block.sched.load(Ordering::Relaxed)),
@@ -136,6 +144,14 @@ pub fn next_sched(policy: i32, priority: i32) -> Result<(), i32> {
     ) {
         return Err(EPERM);
     }
+    let ss = if policy == SCHED_SPORADIC {
+        let ss = validate(param)?;
+        level_of(SCHED_FIFO, ss.low)?;
+        Some(ss)
+    } else {
+        None
+    };
+    crate::sporadic::set_next(ss)?;
     block
         .next_sched
         .store(1 << 63 | pack(policy, priority), Ordering::Relaxed);
@@ -143,19 +159,34 @@ pub fn next_sched(policy: i32, priority: i32) -> Result<(), i32> {
 }
 
 /// The scheduling the thread being made takes: the creator's `sched`, or
-/// what `next_sched` set once. Returns the word, the base level and the
-/// kernel policy.
-pub(crate) fn for_new_thread(creator: &Block) -> Result<(u64, u8, Policy), i32> {
+/// what `next_sched` set once. Returns the word, the base level, the kernel
+/// policy and, for SCHED_SPORADIC, the parameters of the thread's budget:
+/// the attribute object's, or the creator's. EINVAL for a policy or priority
+/// out of range.
+pub(crate) fn for_new_thread(creator: &Block) -> Result<(u64, u8, Policy, Option<Ss>), i32> {
     let next = creator.next_sched.swap(0, Ordering::Relaxed);
     if next >> 63 != 0 {
         let (policy, priority) = unpack(next);
         let (level, kernel) = level_of(policy, priority)?;
-        return Ok((pack(policy, priority), level, kernel));
+        let ss = if policy == SCHED_SPORADIC {
+            Some(crate::sporadic::take_next().ok_or(EINVAL)?)
+        } else {
+            None
+        };
+        return Ok((pack(policy, priority), level, kernel, ss));
     }
     let base = creator.base_level.load(Ordering::Relaxed) as u8;
     let kernel =
         Policy::from_raw(creator.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
-    Ok((creator.sched.load(Ordering::Relaxed), base, kernel))
+    let word = creator.sched.load(Ordering::Relaxed);
+    // A thread made by a sporadic server runs under one of its own: the
+    // creator's parameters (XSH pthread_create: the attributes are inherited).
+    let ss = if unpack(word).0 == SCHED_SPORADIC {
+        Some(crate::sporadic::get(crate::threads::thread_number()).ok_or(EAGAIN)?)
+    } else {
+        None
+    };
+    Ok((word, base, kernel, ss))
 }
 
 /// Sets the level of the thread of `block` to the level it ought to run at
@@ -176,21 +207,54 @@ fn apply(block: &Block, native: &Handle<Thread>, tail: bool) {
 }
 
 /// pthread_setschedparam and sched_setscheduler (`tail`), pthread_setschedprio
-/// and sched_setparam: the policy (negative: the thread's) and priority of
-/// the thread `id`. The thread goes to the tail of its level (`tail`) or by
-/// the rules of pthread_setschedprio. Returns the old policy.
-pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32, i32> {
+/// and sched_setparam: the policy (negative: the thread's) and the parameters
+/// `param` of the thread `id`. The thread goes to the tail of its level
+/// (`tail`) or by the rules of pthread_setschedprio. Returns the old policy.
+///
+/// A thread that takes SCHED_SPORADIC, or other parameters of it, gets a new
+/// budget through the service (`sporadic::set`), which replaces its old one
+/// with no moment between; one that leaves the policy gives its budget back
+/// (`sporadic::leave`). The budget comes first: a refusal (EPERM for a share
+/// that is gone) leaves the thread as it was.
+pub fn thread_set(id: u64, policy: i32, param: &SchedParam, tail: bool) -> Result<i32, i32> {
     let own = crate::threads::thread_number() == id;
-    crate::relibc::with_target(id, |block, native| {
-        let (old_policy, _) = unpack(block.sched.load(Ordering::Relaxed));
-        let policy = if policy < 0 { old_policy } else { policy };
-        let (level, kernel) = level_of(policy, priority)?;
-        if !permitted(
-            unpack(block.sched.load(Ordering::Relaxed)),
-            (policy, priority),
-        ) {
-            return Err(EPERM);
+    let priority = param.sched_priority;
+    let keep = policy < 0;
+    let old =
+        crate::relibc::with_target(id, |block, _| unpack(block.sched.load(Ordering::Relaxed)))?;
+    let policy = if keep { old.0 } else { policy };
+    level_of(policy, priority)?;
+    if !permitted(old, (policy, priority)) {
+        return Err(EPERM);
+    }
+    // The sporadic server: the parameters, and whether the budget changes.
+    let ss = if policy != SCHED_SPORADIC {
+        None
+    } else if keep {
+        // Only the priority changes: the thread's own parameters stay.
+        let own_ss = crate::sporadic::get(id).ok_or(EINVAL)?;
+        validate(&to_param(priority, &own_ss))?;
+        Some(own_ss)
+    } else {
+        Some(validate(param)?)
+    };
+    let held = crate::sporadic::get(id);
+    let low = match ss {
+        Some(ss) => level_of(SCHED_FIFO, ss.low)?.0,
+        None => 0,
+    };
+    let rebudget = ss.is_some() && held != ss;
+    let leaves = ss.is_none() && held.is_some();
+    if rebudget || leaves {
+        let thread =
+            crate::relibc::with_target(id, |_, native| crate::sporadic::manage_copy(native))??;
+        match ss {
+            Some(ss) => crate::sporadic::set(id, &thread, ss, low)?,
+            None => crate::sporadic::leave(id, &thread)?,
         }
+    }
+    crate::relibc::with_target(id, |block, native| {
+        let (level, kernel) = level_of(policy, priority)?;
         block.sched.store(pack(policy, priority), Ordering::Relaxed);
         block.policy.store(kernel as u64, Ordering::Relaxed);
         if own {
@@ -199,7 +263,7 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
             block.base_level.store(u32::from(level), Ordering::Relaxed);
             apply(block, native, tail);
         }
-        Ok(old_policy)
+        Ok(old.0)
     })?
 }
 
@@ -211,6 +275,14 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
 pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
     let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
+    // The budget of a sporadic server is a thread's own: a child's main
+    // thread gets one when `fork` and `posix_spawn` reserve it with the
+    // process service; until then it starts as SCHED_FIFO at the same base.
+    let policy = if policy == SCHED_SPORADIC {
+        SCHED_FIFO
+    } else {
+        policy
+    };
     level_of(policy, priority)?;
     if spec.is_some() && !permitted(own, (policy, priority)) {
         return Err(EPERM);
@@ -248,9 +320,15 @@ pub(crate) fn start_apply(word: u64) {
     }
 }
 
-/// pthread_getschedparam: the policy and priority of the thread `id`.
-pub fn thread_get(id: u64) -> Result<(i32, i32), i32> {
-    crate::relibc::with_target(id, |block, _| unpack(block.sched.load(Ordering::Relaxed)))
+/// pthread_getschedparam: the policy and parameters of the thread `id`.
+pub fn thread_get(id: u64) -> Result<(i32, SchedParam), i32> {
+    let (policy, priority) =
+        crate::relibc::with_target(id, |block, _| unpack(block.sched.load(Ordering::Relaxed)))?;
+    let param = match crate::sporadic::get(id).filter(|_| policy == SCHED_SPORADIC) {
+        Some(ss) => to_param(priority, &ss),
+        None => SchedParam::with_priority(priority),
+    };
+    Ok((policy, param))
 }
 
 /// Which thread a process ID names for the scheduling calls of POSIX: the
@@ -295,14 +373,14 @@ pub fn getscheduler(pid: i32) -> Result<i32, i32> {
 }
 
 /// sched_getparam.
-pub fn getparam(pid: i32) -> Result<i32, i32> {
-    thread_get(thread_of(pid)?).map(|(_, priority)| priority)
+pub fn getparam(pid: i32) -> Result<SchedParam, i32> {
+    thread_get(thread_of(pid)?).map(|(_, param)| param)
 }
 
 /// sched_setscheduler (a policy) and sched_setparam (a negative policy):
 /// the old policy.
-pub fn set(pid: i32, policy: i32, priority: i32) -> Result<i32, i32> {
-    thread_set(thread_of(pid)?, policy, priority, true)
+pub fn set(pid: i32, policy: i32, param: &SchedParam) -> Result<i32, i32> {
+    thread_set(thread_of(pid)?, policy, param, true)
 }
 
 // ---- PTHREAD_PRIO_PROTECT ----

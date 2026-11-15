@@ -143,14 +143,31 @@
 //! the end it reports is the new process's; the reply is its status.
 //! INVALID_ARGS for a ticket no running instance has. The service lets the
 //! new image run only after the answer.
+//!
+//! BUDGET, from the process service alone (SCHED_SPORADIC of POSIX threads,
+//! spec 8): the header, an operation u32 and its fields. ASK (`BudgetAsk`):
+//! init checks the share of the CPU that POSIX threads may take together
+//! (`POSIX_BUDGETS` of its table), makes a time budget with the system
+//! resource's right BUDGET and replies status u32, zero u32, the budget's
+//! number u64 and one handle, the budget (BUDGET_RIGHTS); `FULL_SHARE` for a
+//! share that is gone (the sum on the CPU, or no room in init's list of
+//! POSIX budgets), INVALID_ARGS for numbers the kernel refuses, another
+//! kernel status for a call that failed (NO_MEMORY of init's quota). A budget
+//! that replaces another (`replace` not 0) is checked against the sum less
+//! the share of the old one on the same CPU, and the old one stays counted
+//! until its RELEASE: a rebind that fails leaves it as it was. RELEASE: the
+//! number u64; its share goes back, the reply is its status; INVALID_ARGS
+//! for a number init does not hold. Init forgets all numbers when the
+//! process service's instance ends.
 
 #![cfg_attr(not(test), no_std)]
 
 use abi::{KernelStats, MESSAGE_HANDLES, MESSAGE_MAX};
 use proto_wire::{HEADER_LEN, Header, NAME_LEN, Name, Reader, Status, Writer};
 
-/// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 1;
+/// The version of the protocol, in the header of each request. Version 2:
+/// BUDGET (number 13).
+pub const VERSION: u16 = 2;
 
 /// The methods of init with their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,10 +183,11 @@ pub enum Method {
     Adopted = 9,
     Replaced = 11,
     Ready = 12,
+    Budget = 13,
 }
 
 impl Method {
-    pub const ALL: [Method; 11] = [
+    pub const ALL: [Method; 12] = [
         Method::Start,
         Method::Register,
         Method::Connect,
@@ -181,6 +199,7 @@ impl Method {
         Method::Adopted,
         Method::Replaced,
         Method::Ready,
+        Method::Budget,
     ];
 
     pub const fn number(self) -> u16 {
@@ -285,6 +304,50 @@ pub const START_FIXED: usize = HEADER_LEN + START_NAMES * NAME_LEN;
 pub const START_PIECE_MAX: usize = MESSAGE_MAX - START_FIXED;
 /// The flag of the last reply to START.
 pub const LAST: u16 = 1;
+
+/// The operations of BUDGET, the first u32 of its body.
+pub const BUDGET_ASK: u32 = 1;
+pub const BUDGET_RELEASE: u32 = 2;
+
+/// The kernel status of a BUDGET whose share is not there.
+pub const FULL_SHARE: abi::Error = abi::Error::LimitReached;
+
+/// The body of BUDGET ASK after the operation: 36 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetAsk {
+    pub cpu: u32,
+    /// The level the thread falls to when its budget is gone.
+    pub low: u32,
+    /// Pending replenishments, 1 to 4.
+    pub max_repl: u32,
+    pub c_ns: u64,
+    pub t_ns: u64,
+    /// The number of the budget this one replaces, 0 for none.
+    pub replace: u64,
+}
+
+impl BudgetAsk {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.cpu)?;
+        w.u32(self.low)?;
+        w.u32(self.max_repl)?;
+        w.u64(self.c_ns)?;
+        w.u64(self.t_ns)?;
+        w.u64(self.replace)
+    }
+
+    /// BAD_SIZE for a body that is short.
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetAsk, Status> {
+        Ok(BudgetAsk {
+            cpu: r.u32()?,
+            low: r.u32()?,
+            max_repl: r.u32()?,
+            c_ns: r.u64()?,
+            t_ns: r.u64()?,
+            replace: r.u64()?,
+        })
+    }
+}
 
 /// A reply to START that is no refusal (the table above).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1456,9 +1519,31 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_request_keeps_its_fields() {
+        let ask = BudgetAsk {
+            cpu: 2,
+            low: 7,
+            max_repl: 3,
+            c_ns: 1_000_000,
+            t_ns: 10_000_000,
+            replace: 9,
+        };
+        let mut w = Writer::new();
+        ask.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 36);
+        let mut r = Reader::new(w.as_bytes());
+        assert_eq!(BudgetAsk::read(&mut r), Ok(ask));
+        assert_eq!(r.finish(), Ok(()));
+        assert_eq!(
+            BudgetAsk::read(&mut Reader::new(&w.as_bytes()[..35])),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
@@ -1466,10 +1551,11 @@ mod tests {
         assert_eq!(Method::from_number(0), None);
         assert_eq!(Method::from_number(10), None);
         assert_eq!(Method::from_number(12), Some(Method::Ready));
-        assert_eq!(Method::from_number(13), None);
-        assert_eq!(Method::Ready.header().bytes(), [12, 0, 1, 0, 0, 0, 0, 0]);
-        assert_eq!(VERSION, 1);
-        assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::from_number(13), Some(Method::Budget));
+        assert_eq!(Method::from_number(14), None);
+        assert_eq!(Method::Ready.header().bytes(), [12, 0, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(VERSION, 2);
+        assert_eq!(Method::Start.header().bytes(), [1, 0, 2, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);
     }
 }

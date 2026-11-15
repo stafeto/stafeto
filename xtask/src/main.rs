@@ -926,6 +926,14 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 7] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// The image of the sporadic server probe (tests/sporadic): that of relibc's
+/// threads with the probe as its program, which the same table of
+/// init starts under the same name.
+const SPORADIC_PROGRAMS: [ImageProgram; 7] = {
+    let mut programs = RELIBC_THREADS_PROGRAMS;
+    programs[4] = ("relibc-threads", "sporadic-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const BUSYBOX_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -1933,6 +1941,7 @@ commands:
             (tools/build-relibc.py) into target/relibc/sysroot
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
+  sporadic-probe SCHED_SPORADIC through relibc, the layer, the process service and init, on four CPUs
             over the Rust POSIX layer
   posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
             Cortex-A53 with the kernel entered at EL2 (as ci does)
@@ -2437,6 +2446,7 @@ fn main() {
             _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
+        Some("sporadic-probe") => sporadic_probe(),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
             Err(why) => {
@@ -8145,6 +8155,46 @@ fn widest_gap(lines: &[String]) -> Option<(String, usize, u64, u64)> {
         })
         .max_by_key(|row| row.2)
 }
+
+/// `cargo xtask sporadic-probe`: SCHED_SPORADIC on four CPUs (tests/sporadic).
+fn sporadic_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-sporadic.img", &SPORADIC_PROGRAMS, BOOT_PROFILE)?;
+    let output = qemu::on_cpus(4, || {
+        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        run_until(
+            cmd,
+            Duration::from_secs(120),
+            Some("init: relibc-threads ended"),
+            &kernel.elf,
+        )
+    })?;
+    qemu::expect_marker(
+        &output,
+        "init: relibc-threads ended: exit code 0, not restarted",
+    )?;
+    for marker in SPORADIC_MARKERS {
+        qemu::expect_marker(&output, marker)?;
+    }
+    println!("sporadic-probe: ok");
+    Ok(())
+}
+
+/// What the probe prints when each of its stages held.
+const SPORADIC_MARKERS: [&str; 10] = [
+    "sporadic: the options, SS_REPL_MAX and the priority range of SCHED_SPORADIC ok",
+    "sporadic: 10 parameters off the rules give EINVAL and leave the policy ok",
+    "sporadic: CPU 0: set, read back, refused over its share, given back at the end of a thread ok",
+    "sporadic: CPU 1: set, read back, refused over its share, given back at the end of a thread ok",
+    "sporadic: CPU 2: set, read back, refused over its share, given back at the end of a thread ok",
+    "sporadic: CPU 3: set, read back, refused over its share, given back at the end of a thread ok",
+    "sporadic: CPU 2: the end of a process gave its share back ok",
+    "sporadic: spin wall=",
+    "sporadic: ok",
+    "init: relibc-threads ended",
+];
 
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;

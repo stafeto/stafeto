@@ -879,7 +879,7 @@ pub unsafe fn create(
     };
     // The thread's scheduling: its creator's, or what the attribute object
     // of pthread_create gave (EINVAL for a policy or priority out of range).
-    let (sched_word, base, policy) = match crate::sched::for_new_thread(me) {
+    let (sched_word, base, policy, sporadic) = match crate::sched::for_new_thread(me) {
         Ok(taken) => taken,
         Err(errno) => {
             unmap(tcb, tcb_len);
@@ -919,6 +919,13 @@ pub unsafe fn create(
         }
     };
     let policy_raw = policy as u64;
+    // The CPU the thread runs on, for its time budget (a sporadic server's
+    // budget lives on the CPU of its thread).
+    let cpu_arg = crate::cpus::new_thread_cpu();
+    let cpu = match cpu_arg {
+        0 => crate::cpus::current(),
+        n => usize::from(n) - 1,
+    };
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
     let Ok(channel) = sys::channel_create_wait(base) else {
@@ -941,7 +948,7 @@ pub unsafe fn create(
             BUFFERS + index * PAGE,
             Some((&borrowed::<Channel>(exits), ceiling)),
             // The creator's CPU, or one the process's mask allows.
-            crate::cpus::new_thread_cpu(),
+            cpu_arg,
         )
     };
     let Ok(native) = made else {
@@ -957,6 +964,24 @@ pub unsafe fn create(
         );
         return Err(EAGAIN);
     };
+    // A thread under a sporadic server gets its budget before it starts, from
+    // the process service (init's admission): a refused share is EAGAIN
+    // and no thread (XSH pthread_create).
+    crate::sporadic::note_cpu(id, cpu);
+    if let Some(ss) = sporadic {
+        let low = crate::sched::level_of(crate::sched::SCHED_FIFO, ss.low)
+            .map(|(level, _)| level)
+            .unwrap_or(1);
+        if crate::sporadic::set(id, &native, ss, low).is_err() {
+            undo(
+                native.into_raw().0,
+                channel.into_raw().0,
+                timer.into_raw().0,
+                own.into_raw().0,
+            );
+            return Err(EAGAIN);
+        }
+    }
     // SAFETY: the caller's promise; the thread does not run yet.
     unsafe {
         let block = &mut *block;
@@ -1017,6 +1042,9 @@ pub unsafe fn create(
             .threads
             .fetch_and(!(1 << index), Ordering::AcqRel);
         wait_unpinned(index);
+        if sporadic.is_some() {
+            crate::sporadic::forget(id);
+        }
         undo(
             native.into_raw().0,
             block.channel.swap(0, Ordering::Relaxed),
@@ -1167,6 +1195,8 @@ pub fn leaving() {
         detach_open_owner(owner);
     }
     crate::signals::leaving();
+    // The budget of a thread under a sporadic server goes back to init.
+    crate::sporadic::release_own();
     if !leave_table(own) {
         // No other thread lives: the process ends as exit(0) ends it
         // (POSIX: the last thread's pthread_exit), atexit handlers and

@@ -973,6 +973,7 @@ fn child() -> Result<(), &'static str> {
         crate::mmap::forget_limits();
         crate::threads::after_fork(thread).map_err(|_| "its thread")?;
         posix_sync::after_fork();
+        crate::sporadic::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {
             crate::shared::after_fork(

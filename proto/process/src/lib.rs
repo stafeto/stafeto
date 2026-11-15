@@ -215,14 +215,16 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 pub mod retry;
+pub mod sporadic;
 
-/// Version 14: EntropyRejoin (number 4) gives a process that has no channel
+/// Version 15: Budget (number 42) gives POSIX threads time budgets through
+/// the service (`sporadic`). Version 14: EntropyRejoin (number 4) gives a process that has no channel
 /// to init a new session with the entropy service after the service's
 /// instance ended. Version 13: LoaderRoot (number 43, which LoaderTerminal
 /// had) names the slot whose root it asks for in a body, and the notary marks
 /// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
 /// its root with Register.
-pub const VERSION: u16 = 14;
+pub const VERSION: u16 = 15;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -585,6 +587,10 @@ pub enum Method {
     /// a body of the operation u32 (`account_op`) and its arguments; the
     /// reply is the status u32 and the operation's values.
     Account = 63,
+    /// The time budgets of POSIX threads (SCHED_SPORADIC): a body of the
+    /// operation u32 (`sporadic::ASK` ...) and its fields. The number is one
+    /// of the gaps below 64.
+    Budget = 42,
 }
 
 /// The operations of `Method::Account`, the first u32 of its body.
@@ -747,8 +753,8 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
-    55, 56, 57, 58, 59, 60, 61, 62, 63,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -2014,6 +2020,7 @@ mod tests {
             Method::DropCtty,
             Method::TtyEvents,
             Method::AckCtty,
+            Method::Budget,
             Method::LoaderRoot,
             Method::LoaderClock,
             Method::Image,
@@ -2058,7 +2065,7 @@ mod tests {
         assert!(METHODS.iter().all(|&m| m < 64));
         // The request is a header and no body.
         let header = Method::EntropyRejoin.header();
-        assert_eq!(header.version, 14);
+        assert_eq!(header.version, 15);
         assert_eq!(header.bytes().len(), 8);
         assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
@@ -2358,7 +2365,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 14);
+        assert_eq!(VERSION, 15);
     }
 
     #[test]
