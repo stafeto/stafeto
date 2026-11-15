@@ -1425,6 +1425,8 @@ pub mod entropy;
 pub mod fstack;
 pub mod gpu;
 pub mod input;
+#[cfg(feature = "table-budget-journal")]
+pub mod journal;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
 pub mod net;
@@ -1438,6 +1440,7 @@ pub mod vz;
 const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-cycle") as usize
     + cfg!(feature = "table-ceiling") as usize
+    + cfg!(feature = "table-budget-journal") as usize
     + cfg!(feature = "vz") as usize
     + cfg!(feature = "table-ramfs") as usize
     + cfg!(feature = "table-layer-probe") as usize
@@ -1527,6 +1530,7 @@ const _: () = assert!(
     feature = "table-test",
     feature = "table-cycle",
     feature = "table-ceiling",
+    feature = "table-budget-journal",
     feature = "vz",
     feature = "table-ramfs",
     feature = "table-layer-probe",
@@ -1679,6 +1683,8 @@ pub const TABLE: &[Record] = test::TABLE;
 pub const TABLE: &[Record] = cycle::TABLE;
 #[cfg(feature = "table-ceiling")]
 pub const TABLE: &[Record] = ceiling::TABLE;
+#[cfg(feature = "table-budget-journal")]
+pub const TABLE: &[Record] = journal::TABLE;
 #[cfg(feature = "table-tty")]
 pub const TABLE: &[Record] = ramfs::TTY_TABLE;
 #[cfg(feature = "table-tty-vz")]

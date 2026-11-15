@@ -9764,6 +9764,16 @@ fn with_holder_of(
     server_c: u64,
     body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_holder_at(budgets, server_c, FIRE_LEVEL, body)
+}
+
+/// `with_holder_of` with a channel whose notifications stand at `fire`.
+fn with_holder_at(
+    budgets: bool,
+    server_c: u64,
+    fire: u8,
+    body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let counts = (
         process::in_use(),
         thread::in_use(),
@@ -9775,7 +9785,7 @@ fn with_holder_of(
     let mut others = [None; 3];
     let result = match made {
         [Ok(service), Ok(client)] => (|| {
-            let channel = channel::create(service, FIRE_LEVEL).map_err(|_| "no channel")?;
+            let channel = channel::create(service, fire).map_err(|_| "no channel")?;
             let handle = process::insert_handle(service, Object::Channel(channel), Rights::RECEIVE);
             // SAFETY: the reference `create` handed out goes; the handle, if
             // it went in, holds the channel.
@@ -11082,6 +11092,163 @@ pub fn a_notification_holder_is_not_lifted_after_its_next_receive_or_send(
         check(
             level_of(h.r) == 1,
             "a request lifted a thread that waited in a send",
+        )
+    })
+}
+
+/// A ready thread at 10 stands where the scheduler picks among the ready:
+/// the holder `h.r`, whose queue holds a request at 40, must come before it.
+fn holder_precedes_a_lower_thread(
+    h: &Holder,
+    others: &mut [Option<NonNull<Thread>>; 3],
+) -> Result<(), &'static str> {
+    let low =
+        thread::create(h.client, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    let low = *others[2].insert(low);
+    thread::start(low).map_err(|_| "a thread did not start")?;
+    // SAFETY: the scheduler's threads are alive.
+    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+    check(
+        matches!(picked, kcore::sched::Decision::Run(r) if r == h.r),
+        "a request at 40 waits behind a ready thread at 10: its holder is not at its level",
+    )
+}
+
+/// A demoted server that holds a request is lifted to 40 by a request that
+/// queues. A notification above that request (the channel's slots stand at
+/// 48) comes first at its next receive, which ends the lift and takes the
+/// slot as a boost that a demoted thread does not keep: the request at 40 is
+/// still queued, and its holder must work at 40 for the step the
+/// notification asks for (`channel::receive`, the holder lifts again).
+pub fn a_receive_that_takes_a_notification_above_a_request_keeps_the_lift(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder_at(true, SERVER_C, 48, |h, others| {
+        h.demote()?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        channel::notify(h.channel, 1, CAUSE).map_err(|_| "no notification")?;
+        h.reply()?;
+        channel::receive(h.r, h.channel, false).map_err(|_| "the server did not take it")?;
+        // SAFETY: the test holds the thread.
+        let regs = unsafe { h.r.as_ref() }.regs.x;
+        check(
+            Notification::from_words(regs[1..12].try_into().expect("x1-x11")).source
+                == Source::Unlabeled,
+            "the server took the request before the notification",
+        )?;
+        holder_precedes_a_lower_thread(h, others)?;
+        check(
+            level_of(h.r) == 40,
+            "the receive that took a notification left the holder below the request at 40",
+        )
+    })
+}
+
+/// The reply of the first half of `reply_receive` ends the boost of the
+/// request it answers, and a poll that finds an interrupt starts the call
+/// over: the server waits at its `low` for its receive while a request at 40
+/// stands in the queue (it queued while the server worked, and lifted it).
+/// The server must work at 40 between the halves.
+pub fn a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        syscall::force_poll();
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        check(
+            thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+            "the poll with an interrupt pending did not start the call over",
+        )?;
+        holder_precedes_a_lower_thread(h, others)?;
+        check(
+            level_of(h.r) == 40,
+            "the reply left the holder below the request at 40 between the halves",
+        )
+    })
+}
+
+/// A `reply_receive` whose reply fails (BAD_STATE: the client waits for no
+/// reply from the process) goes back to EL0 with no receive: the holder it
+/// ended the boost of is not lifted for a step it does not take.
+pub fn a_failed_reply_leaves_the_holder_at_its_level(_: &Boot) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        // SAFETY: the test holds the client, which waits and does not run.
+        let waits = unsafe { (*h.t.as_ptr()).waits.take() };
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let code = unsafe { h.r.as_ref() }.regs.x[0];
+        // SAFETY: as above; the wait goes back as it was.
+        unsafe { (*h.t.as_ptr()).waits = waits };
+        check(
+            Error::from_code(code) == Some(Error::BadState),
+            "a reply to a client that waits for no reply did not fail",
+        )?;
+        check(
+            level_of(h.r) == 1,
+            "a failed reply left the holder lifted for a receive it does not make",
+        )
+    })
+}
+
+/// The send of a holder of a notification ends the hold (its token) and
+/// leaves the lift a queued request gave it: the thread waits in its send at
+/// 40. A send is no drop of the holder's level.
+pub fn a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        takes_a_notification(h)?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the notification holder",
+        )?;
+        let other = channel::create(h.service, FIRE_LEVEL).map_err(|_| "no channel")?;
+        let sent = channel::send(
+            h.r,
+            Via::Channel(other),
+            Desc::from_send(abi::NO_WAIT).expect("a send"),
+            &[],
+        );
+        // SAFETY: the reference `create` handed out goes.
+        unsafe { channel::release(other, Rights::NONE, CAUSE) };
+        check(
+            sent == Err(Error::WouldBlock),
+            "a send with no receiver did not refuse",
+        )?;
+        check(
+            level_of(h.r) == 40,
+            "a send that ended the hold of a notification lowered the holder below the request at 40",
         )
     })
 }

@@ -122,9 +122,9 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
         let values = message_handles(thread, desc, None)?;
         let values = &values[..desc.handles];
         let handle = channel_arg(thread);
-        lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
+        let c = lookup(thread, handle, Rights::RECEIVE, Object::channel)?;
         check_handles(thread, values)?;
-        match channel::reply(thread, a[0], desc, values) {
+        match channel::reply_on(thread, a[0], desc, values, Some(c)) {
             Ok(()) | Err(Error::PeerClosed) => {
                 // Set in this section, which the receive half's closes: a
                 // thread of another CPU reads it under OBJ (`channel::holder`).

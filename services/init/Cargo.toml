@@ -32,6 +32,10 @@ break-bar-size = []
 break-budget-share = []
 # Init passes no `free` level to process_create (`cargo xtask budget-breaks`).
 break-record-free = []
+# Overruns of the time budgets (`cargo xtask budget-breaks`): init takes no notice of them, or
+# writes a line for each notification.
+break-overrun-ignore = []
+break-overrun-log-each = []
 break-bar-offset = []
 break-measure-twice = []
 break-no-enable = []
@@ -41,6 +45,8 @@ break-master-left = []
 table-test = []
 table-cycle = []
 table-ceiling = []
+# The probe of the overruns in the journal (xtask budget-journal).
+table-budget-journal = []
 vz = []
 table-posix-abi-vz = []
 table-busybox-dialog-vz = []
