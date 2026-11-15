@@ -379,7 +379,7 @@ pub fn verdict_level40(all: &[One]) -> Result<(), String> {
 fn one_table(all: &[One]) {
     for (name, o) in SERVICES.iter().zip(all) {
         println!(
-            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
+            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
             o.worst10,
             o.median10,
             o.bound10,

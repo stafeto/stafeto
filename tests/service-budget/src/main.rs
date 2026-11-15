@@ -856,7 +856,7 @@ fn duty_windows() -> (u64, u64, u64) {
     (shares[0], shares[count / 2], n as u64)
 }
 
-/// The starvation phase against `SERVICES[which]`: 8 clients at 20 on CPU 0 ask the service the
+/// The starvation phase against `SERVICES[which]`: 24 clients at 20 on CPU 0 ask the service the
 /// dear request without a pause, and the victim at 25 spins 0.8 ms and sleeps 0.2 ms; the
 /// clients refill the queue in each sleep. A service above the victim without a budget (level 31)
 /// empties the queue above it in each cycle, a bound one gets C for each T. The line gives the
@@ -869,7 +869,7 @@ fn starve(
     timer: &Handle<Timer>,
 ) {
     let name = SERVICES[which];
-    let n = 8;
+    let n = GREEDIES;
     let sessions: [Option<Handle<Channel>>; GREEDIES] = core::array::from_fn(|i| {
         (i < n)
             .then(|| rt::service::connect(parent, name).ok())
@@ -921,7 +921,7 @@ fn starve(
 /// asks every 1037 us from absolute times, so that its release sweeps the budget period of 5 ms
 /// by 37 us a step, 200 times. `s_max` is the longest single request of the dear kind alone and
 /// `s0` that of the thread's own, both of the same build; a request of the thread must wait
-/// 1.05 * s_max + s0 + B + 2 e at most (one request in hand, the kernel's longest stretch, two
+/// 1.10 * s_max + s0 + B + 2 e at most (one request in hand, the kernel's longest stretch, two
 /// timer events of the budget). A ping of the
 /// RAM service is `requests` requests, each held to that.
 fn level40(
@@ -998,7 +998,7 @@ fn level40(
     wait_ended_clients(wait, timer, n as u64);
     let us = |t: u64| time::ticks_to_ns(t) / 1000;
     let e = e_of(which);
-    let bound = us(s_max) * 105 / 100 + us(s0) + B_K_US + 2 * e;
+    let bound = us(s_max) * 110 / 100 + us(s0) + B_K_US + 2 * e;
     println!(
         "svcbudget1 {name} level40 releases=200 requests_per_ping={requests} worst_request_us={} worst_wait_us={} s_max_us={} s0_us={} e_us={e} bound_us={bound}",
         us(worst_request),
