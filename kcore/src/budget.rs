@@ -282,6 +282,13 @@ impl Server {
         self.event = 0;
     }
 
+    /// The kernel holds the event in the heap of a level that is not the
+    /// thread's base any more: it takes the event out and puts it in again
+    /// (`event_change` answers with it), when one stands.
+    pub fn event_again(&mut self) {
+        self.armed = 0;
+    }
+
     fn pop(&mut self) -> Replenishment {
         let head = self.q[0];
         // The whole array moves up by one, whatever `len` is: three fixed

@@ -10857,6 +10857,233 @@ pub fn an_overrun_posts_one_notification_for_each_period(_: &Boot) -> Result<(),
     )
 }
 
+/// A thread whose budget ran out with an overrun its place was not told of
+/// ends (thread_exit, a kill) before the event that would tell it fires: the
+/// end tells the place, once, takes the event out of the heap and gives the
+/// budget back free (spec 8), as an unbind does. The thread ends running at
+/// `low`.
+pub fn a_thread_that_ends_with_an_overrun_untold_tells_the_place(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    const LABEL: u64 = 0x52;
+    let c = Caller::new()?;
+    let counts = (channel::in_use(), crate::budget::in_use());
+    let mut made: [Option<NonNull<Thread>>; 2] = [None; 2];
+    let mut budget = None;
+    let mut channel_made = None;
+    let result = (|| {
+        let ch = channel::create(c.process, LEVEL).map_err(|_| "no channel")?;
+        channel_made = Some(ch);
+        let rcv = thread::create(c.process, USER_VA, USER_VA, 0, 30, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[0] = Some(rcv);
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[1] = Some(t);
+        let b = crate::budget::create(
+            c.process,
+            0,
+            SERVER_C,
+            10 * SERVER_C,
+            1,
+            4,
+            Some((ch, LABEL)),
+        )
+        .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(rcv).map_err(|_| "a thread did not start")?;
+        pick(rcv)?;
+        channel::receive(rcv, ch, true).map_err(|_| "the receiver did not wait")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        // SAFETY: the test holds the thread, which does not run at EL0.
+        unsafe { (&mut (*rcv.as_ptr()).regs.x)[1..12].fill(0) };
+        // The thread runs past its budget at a time of the test's own: it is
+        // in the background, the overrun asked for its event at once, and the
+        // thread runs on at `low`.
+        let at = timer::now() + 4 * SERVER_C;
+        // SAFETY: the scheduler's threads are alive.
+        sched::locked(|k| unsafe { k.s.tick(at) });
+        pick(t)?;
+        // SAFETY: the test holds the thread.
+        let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+        check(
+            demoted && crate::budget::entry_deadline(b).is_some(),
+            "the budget did not run out with its event armed",
+        )?;
+        // SAFETY: the thread is the running one and alive; the test's own
+        // reference stays until the end of the test.
+        unsafe { sched::exit(t, CAUSE) };
+        // The place was told once, as the event would have told it.
+        // SAFETY: the test holds the thread.
+        let heard = Notification::from_words(
+            unsafe { rcv.as_ref() }.regs.x[1..12]
+                .try_into()
+                .expect("x1-x11"),
+        );
+        check(
+            heard
+                == Notification {
+                    source: Source::Budget,
+                    label: LABEL,
+                    bits: 1,
+                    count: 1,
+                },
+            "the end of the thread did not tell its place of the overrun",
+        )?;
+        check(
+            crate::budget::entry_deadline(b).is_none(),
+            "the event of the budget of an ended thread stayed in the heap",
+        )?;
+        let info = crate::budget::info(b);
+        check(
+            info.state == abi::BUDGET_FREE && info.overruns == 1,
+            "the budget of an ended thread is not free with its overrun counted",
+        )
+    })();
+    for t in made.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    if let Some(ch) = channel_made {
+        // SAFETY: the test's reference goes.
+        unsafe { channel::release(ch, abi::Rights::NONE, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        (channel::in_use(), crate::budget::in_use()) == counts,
+        "a channel or a budget of the test stayed",
+    )
+}
+
+/// The replenishment event of a budget stands in the heap of the level of the
+/// thread's base priority, and follows the base: a thread whose budget is
+/// gone raises its base, and a thread that spins above the old level must not
+/// starve its replenishment (a firing runs at its level). The event keeps its
+/// time and moves up; a lower base moves it down.
+pub fn the_event_of_a_budget_follows_the_base_of_its_thread(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    let c = Caller::new()?;
+    let counts = crate::budget::in_use();
+    let mut made = None;
+    let mut budget = None;
+    let result = (|| {
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made = Some(t);
+        let b = crate::budget::create(c.process, 0, SERVER_C, 10 * SERVER_C, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        let at = timer::now() + 4 * SERVER_C;
+        // SAFETY: the scheduler's threads are alive.
+        sched::locked(|k| unsafe { k.s.tick(at) });
+        // SAFETY: the test holds the thread.
+        let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+        check(demoted, "the budget did not run out")?;
+        let Some(deadline) = crate::budget::entry_deadline(b) else {
+            return Err("no event stood for the replenishment");
+        };
+        check(
+            level_of_entry(b) == LEVEL,
+            "the event does not stand at the base of its thread",
+        )?;
+        for base in [LEVEL + 20, LEVEL + 5] {
+            sched::set_priority(t, base, Policy::Fifo, false)
+                .map_err(|_| "the priority did not change")?;
+            check(
+                level_of_entry(b) == base && crate::budget::entry_deadline(b) == Some(deadline),
+                "the event did not follow the base of its thread with its time",
+            )?;
+        }
+        Ok(())
+    })();
+    if let Some(t) = made {
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        crate::budget::in_use() == counts,
+        "a budget of the test stayed",
+    )
+}
+
+/// The stint that runs when a thread ends is the budget's: the ticks it ran
+/// since its last stop are in the budget's `ran` once it ended, whatever the
+/// way it ended.
+pub fn the_stint_of_a_thread_that_ends_is_charged_to_its_budget(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    const STINT: u64 = 2_000;
+    let c = Caller::new()?;
+    let counts = crate::budget::in_use();
+    let mut made = None;
+    let mut budget = None;
+    let result = (|| {
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made = Some(t);
+        let b = crate::budget::create(c.process, 0, 100 * STINT, 1000 * STINT, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        let until = timer::now() + STINT;
+        while timer::now() < until {
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        unsafe { sched::exit(t, CAUSE) };
+        let info = crate::budget::info(b);
+        check(
+            info.ran >= STINT && info.state == abi::BUDGET_FREE,
+            "the stint of a thread that ended was not charged to its budget",
+        )
+    })();
+    if let Some(t) = made {
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        crate::budget::in_use() == counts,
+        "a budget of the test stayed",
+    )
+}
+
 /// The server takes a notification from the channel, as a receive of its own
 /// does: a slot posted while it works goes to its next `receive`, which
 /// returns it. Its budget is gone and its request answered, so it stands

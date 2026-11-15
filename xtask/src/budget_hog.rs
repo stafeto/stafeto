@@ -458,6 +458,26 @@ pub fn breaks() -> Result<(), String> {
             "the_timer_of_an_unbound_budget_leaves_the_former_thread_alone",
             "an unbind that leaves the event of the budget in the heap",
         ),
+        (
+            Variant::BudgetExitNoChargeTest,
+            "the_stint_of_a_thread_that_ends_is_charged_to_its_budget",
+            "an end of a thread that does not charge the stint that runs",
+        ),
+        (
+            Variant::BudgetExitSilentTest,
+            "a_thread_that_ends_with_an_overrun_untold_tells_the_place",
+            "an end of a thread that does not tell its place of an overrun",
+        ),
+        (
+            Variant::BudgetEventKeepsLevelTest,
+            "the_event_of_a_budget_follows_the_base_of_its_thread",
+            "an event of a budget that stays at the level its thread's base had",
+        ),
+        (
+            Variant::BudgetEventKeepsLevelEl0,
+            "a_raised_base_takes_the_replenishment_of_a_spent_budget_with_it",
+            "a replenishment that stays at the old base of a thread that raised it",
+        ),
     ] {
         let a = build(variant)?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
@@ -501,6 +521,7 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-unbind-keeps",
         "break-budget-unbind-no-charge",
         "break-budget-unbind-keeps-event",
+        "break-budget-exit-no-charge",
         "break-budget-early-replenish",
         "break-budget-full-queue-delay",
     ] {

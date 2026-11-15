@@ -66,6 +66,8 @@ unsafe extern "C" {
     static el0_count_until: u8;
     static el0_count_then_exit: u8;
     static el0_receive_then_poll: u8;
+    static el0_raise_then_notify: u8;
+    static el0_receive_then_watch: u8;
     static el0_count_to: u8;
     static el0_spin_then_yield: u8;
     static el0_set_priority: u8;
@@ -82,7 +84,7 @@ unsafe extern "C" {
     static el0_receive: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
-    static el0_raise_then_notify: u8;
+    static el0_set_priority_then_notify: u8;
     static el0_pattern_receive: u8;
     static el0_alarm_then: u8;
     static el0_send: u8;
@@ -460,6 +462,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_spent_thread_of_another_cpu_that_ends_is_heard",
         start: start_exit_remote,
         done: done_exit_remote,
+    },
+    El0Test {
+        name: "a_raised_base_takes_the_replenishment_of_a_spent_budget_with_it",
+        start: start_raised_base,
+        done: done_raised_base,
     },
     El0Test {
         name: "a_kill_takes_a_thread_whose_budget_is_spent",
@@ -1021,7 +1028,11 @@ fn teardown() {
         // scheduler first, and a thread that runs stops being the running
         // one.
         unsafe {
-            sched::exit(t, CAUSE);
+            // A thread that ended on another CPU stands as that CPU left it,
+            // and a second end would ask that CPU for its number again.
+            if t.as_ref().sched.state() != State::Dead {
+                sched::exit(t, CAUSE);
+            }
             thread::release(t, CAUSE);
         }
     }
@@ -4880,6 +4891,56 @@ fn done_exit_remote(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
+/// A thread at PRIORITY + 8 with a budget of 1 ms in each 4 ms counts until
+/// the word 3 is set. Its budget runs out and it falls to SPENT_LOW; the
+/// thread at PRIORITY then raises the spent thread's base to 31 (its event of
+/// replenishment stood at PRIORITY + 8) and wakes the third thread, which
+/// works at 31 and yields until the count of the spent one moves: it moves
+/// once the replenishment comes, which a firing at the level of the event
+/// takes up before the thread at 31 (a firing runs at its level, and an
+/// event that stayed at PRIORITY + 8 would wait for the thread at 31 to
+/// give the CPU up, which it does not). The third thread gives up when
+/// the counter reaches its limit, 0.5 s on, a bound for a kernel that
+/// starves the replenishment, and fails the test.
+fn start_raised_base(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let spent = sched_thread(f, 0, &raw const el0_count_until, PRIORITY + 8, FIFO)?;
+    let raiser = sched_thread(
+        f,
+        1,
+        &raw const el0_set_priority_then_notify,
+        PRIORITY,
+        FIFO,
+    )?;
+    let watcher = sched_thread(f, 2, &raw const el0_receive_then_watch, 31, FIFO)?;
+    let channel = own_channel(p, Rights::RECEIVE | Rights::NOTIFY)?;
+    let handle = give_thread(f, spent)?;
+    set_args(spent, &[word(0), word(3)]);
+    set_args(raiser, &[handle, 31, 1, channel]);
+    set_args(watcher, &[channel, 0]);
+    // SAFETY: the thread does not run yet.
+    unsafe {
+        let x = &mut (*watcher.as_ptr()).regs.x;
+        x[20] = word(0);
+        x[21] = word(2);
+        x[22] = timer::now() + timer::frequency() / 2;
+        x[23] = word(3);
+    }
+    let c = timer::frequency() / 1000;
+    bind_budget(p, spent, c, 4 * c, 1, here(), None)
+}
+
+fn done_raised_base(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        shared(f, 2) == 1,
+        "the replenishment of a spent budget whose thread raised its base was starved",
+    )
+}
+
 /// A process kills another whose thread is spent: the thread at
 /// PRIORITY + 2, with a budget of 1 ms, falls to SPENT_LOW; the killer at
 /// PRIORITY then kills its process and ends; the judge at BELOW_LOW runs
@@ -4922,7 +4983,10 @@ fn done_exit_heard(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     if f.slot(t) != 2 {
         return Ok(());
     }
-    check(t.regs.x[0] == 0, "the end of the spent thread was not heard")
+    check(
+        t.regs.x[0] == 0,
+        "the end of the spent thread was not heard",
+    )
 }
 
 fn done_kill_spent(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
