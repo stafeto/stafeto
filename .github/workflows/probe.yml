@@ -1,0 +1,138 @@
+name: probe
+
+# Runs one `cargo xtask` command on a branch, one or more times, on GitHub's
+# arm64 runners: `gh workflow run probe.yml --ref my-branch -f command=budget-breaks`
+# (docs/debugging.md, "Probes on GitHub runners"). Start only by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "The words after `cargo xtask`, for example `budget-breaks` or `kernel-test 512M`"
+        required: true
+        type: string
+      env:
+        description: "Optional NAME=value words for the command, for example `NET_PROBE_RUNS=r`"
+        required: false
+        default: ""
+        type: string
+      repeat:
+        description: "How many times to run the command (1 to 10)"
+        required: false
+        default: "1"
+        type: string
+      timeout:
+        description: "Minutes the runs may take together (1 to 60)"
+        required: false
+        default: "30"
+        type: string
+
+# The same probe on the same branch replaces its earlier run.
+concurrency:
+  group: probe-${{ github.ref }}-${{ inputs.command }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CI_JOBS: "2"
+  LLVM_VERSION: "23"
+  QEMU_VERSION: "11.1.2"
+
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-24.04-arm
+    # The setup (a cold QEMU build takes the longest) comes on top of `timeout`.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The text of the inputs reaches the shell only through the environment
+      # of the step, and this check runs before anything uses it.
+      - name: Check the inputs
+        env:
+          PROBE_COMMAND: ${{ inputs.command }}
+          PROBE_ENV: ${{ inputs.env }}
+          PROBE_REPEAT: ${{ inputs.repeat }}
+          PROBE_TIMEOUT: ${{ inputs.timeout }}
+        run: bash tools/probe-validate.sh
+
+      - uses: ./.github/actions/setup
+        with:
+          build-qemu: "true"
+
+      # The caches of ci: the newest build of the same toolchain and lock
+      # file, else the newest of the architecture. A miss costs a longer
+      # build below and fails nothing.
+      - name: Restore caches
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            target
+          key: probe-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
+          restore-keys: |
+            ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-
+            ci3-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      # What every ci group needs: the C library, the base programs, the
+      # kernels and the images. Cargo and the build scripts of the tools
+      # rebuild only what the branch changed against the restored cache.
+      - name: cargo xtask ci --group build
+        run: cargo xtask ci --group build --jobs "$CI_JOBS"
+
+      - name: Run the command
+        timeout-minutes: ${{ fromJSON(inputs.timeout) > 60 && 60 || fromJSON(inputs.timeout) }}
+        env:
+          PROBE_COMMAND: ${{ inputs.command }}
+          PROBE_ENV: ${{ inputs.env }}
+          PROBE_REPEAT: ${{ inputs.repeat }}
+        run: |
+          # Words from the checked character set, split on spaces and never
+          # parsed by the shell again.
+          read -r -a command_words <<<"$PROBE_COMMAND"
+          read -r -a env_words <<<"$PROBE_ENV"
+          failed=0
+          summary=()
+          for n in $(seq 1 "$PROBE_REPEAT"); do
+            echo "::group::run $n: cargo xtask $PROBE_COMMAND"
+            if env ${env_words[@]+"${env_words[@]}"} cargo xtask "${command_words[@]}"; then
+              result="run $n: ok"
+            else
+              result="run $n: FAILED"
+              failed=1
+            fi
+            echo "::endgroup::"
+            echo "$result"
+            summary+=("$result")
+          done
+          echo "== summary of cargo xtask $PROBE_COMMAND =="
+          printf '%s\n' "${summary[@]}"
+          exit "$failed"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          find target -type f \( -name '*.log' -o -name '*.out' -o -name '*.serial' -o -name 'config.log' \) -size -50M -print0 \
+            | xargs -0 -r -I{} cp --parents {} ci-logs/ || true
+          df -h > ci-logs/df.txt; free -m > ci-logs/free.txt; nproc > ci-logs/nproc.txt
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: probe-logs
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14

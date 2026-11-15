@@ -254,7 +254,7 @@ pub fn steps_verdict(lines: &[String]) -> Result<[Rows; 2], String> {
 /// `cargo xtask entropy` and its boot in `test`: the probe on `machine`,
 /// under -icount on QEMU's own emulation, where the steps are measured.
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let image = build_boot_image("boot-entropy.img", &PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -561,7 +561,7 @@ pub fn random_net_two(steps: bool) -> Result<(), String> {
 
 fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
     crate::relibc()?;
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let programs: &[ImageProgram] = match (two, steps) {
         (false, false) => &RANDOM_NET_PROGRAMS,
         (false, true) => &RANDOM_NET_PROGRAMS_STEPS,
@@ -789,7 +789,7 @@ fn restart_boot(
     name: &'static str,
     timeout: Duration,
 ) -> Result<qemu::Outcome, String> {
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -888,7 +888,7 @@ pub fn random_restart() -> Result<(), String> {
 /// printed, and both stay under 0.9 of term B.
 pub fn random_rejoin_steps() -> Result<(), String> {
     crate::relibc()?;
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let image = build_boot_image(
         "boot-posix-random-rejoin-steps.img",
         &REJOIN_STEPS_PROGRAMS,
@@ -1016,7 +1016,7 @@ pub fn random_restart_breaks() -> Result<(), String> {
 /// no line `posix-random: ok` comes.
 pub fn random_breaks() -> Result<(), String> {
     crate::relibc()?;
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let image = build_boot_image(
         "boot-posix-random-break.img",
         &RANDOM_BREAK_PROGRAMS,
@@ -1041,7 +1041,7 @@ pub fn random_breaks() -> Result<(), String> {
 
 fn random_run(machine: &qemu::Machine, steps: bool) -> Result<Vec<String>, String> {
     crate::relibc()?;
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(Variant::KeepPieces)?;
     let programs: &[ImageProgram] = if steps {
         &RANDOM_PROGRAMS_STEPS
     } else {
