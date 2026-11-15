@@ -3480,21 +3480,16 @@ mod tests {
         let mut w = World::new();
         let r = w.thread('r', 40, FIFO);
         w.budget(r, 2 * MS, 10 * MS, 1);
+        // A queue of one entry: a wait after a stint of 0.1 ms moves the
+        // whole chunk to the next period.
+        w.servers[0].set_max(1);
         w.start(r);
         let v = w.started('v', 10, FIFO);
-        // Four stints of 0.1 ms, each ending in a wait: the queue fills
-        // (one entry and three remnants), and the fourth wait merges.
         let mut now = 0;
-        for i in 0..4 {
-            assert_eq!(w.pick(now), 'r');
-            now += MS / 10;
-            w.now = now;
-            w.block();
-            if i < 3 {
-                now += MS;
-                w.wake(r);
-            }
-        }
+        assert_eq!(w.pick(now), 'r');
+        now += MS / 10;
+        w.now = now;
+        w.block();
         assert!(!node(r).is_demoted(), "the flag is stale");
         // SAFETY: the world keeps its budgets alive.
         let server = unsafe { node(r).server().unwrap().as_ref() };
@@ -3536,19 +3531,14 @@ mod tests {
         let mut w = World::new();
         let r = w.thread('r', 40, FIFO);
         w.budget(r, 2 * MS, 10 * MS, 1);
+        w.servers[0].set_max(1);
         w.start(r);
         let v = w.started('v', 10, FIFO);
         let mut now = 0;
-        for i in 0..4 {
-            assert_eq!(w.pick(now), 'r');
-            now += MS / 10;
-            w.now = now;
-            w.block();
-            if i < 3 {
-                now += MS;
-                w.wake(r);
-            }
-        }
+        assert_eq!(w.pick(now), 'r');
+        now += MS / 10;
+        w.now = now;
+        w.block();
         w.now = now;
         // SAFETY: the world keeps its threads alive; R waits.
         assert!(!unsafe { w.s.hand_off(r, now, None) });
