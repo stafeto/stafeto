@@ -188,7 +188,7 @@ pub fn wfi(out: bool) {
 
 /// The holder `t` of a channel works at `level` while the top of the
 /// channel's queue is `top`, above it, after a transition of `kind`
-/// (abi::HOLDER_*).
+/// (abi::STAMP_HOLDER_*).
 #[inline(always)]
 pub fn holder(t: NonNull<Thread>, kind: u8, level: u8, top: u8) {
     #[cfg(feature = "stamps")]

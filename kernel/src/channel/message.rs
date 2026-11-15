@@ -184,7 +184,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                     sched::boost_in_place(k, t, priority, ceiling, false);
                 }
                 hold_notice(t, c);
-                relift(k, t, c, abi::HOLDER_NOTICE);
+                relift(k, t, c, abi::STAMP_HOLDER_NOTICE);
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {
@@ -667,9 +667,9 @@ pub unsafe fn pay_loan(k: &mut Locked<'_>, t: NonNull<Thread>, lent: u64, now: u
 }
 
 /// The holder `t` of `c` works below the top of the queue of `c`, a request,
-/// after a transition of `kind` (abi::HOLDER_*) that took its lift away: a
-/// receive that took a notification (`HOLDER_NOTICE`), or the reply of the
-/// first half of `reply_receive` (`HOLDER_REPLY`). A holder whose budget is
+/// after a transition of `kind` (abi::STAMP_HOLDER_*) that took its lift away: a
+/// receive that took a notification (`STAMP_HOLDER_NOTICE`), or the reply of the
+/// first half of `reply_receive` (`STAMP_HOLDER_REPLY`). A holder whose budget is
 /// gone is lifted as a client of the request to its level, as `lift_holder`
 /// lifts it when the request queues; a holder with its budget keeps its own
 /// level, as there. The head sender of the top level pays the lift (the
@@ -698,11 +698,11 @@ unsafe fn relift(k: &mut Locked<'_>, t: NonNull<Thread>, c: NonNull<Channel>, ki
         }
         crate::stamps::holder(t, kind, level, top);
         #[cfg(feature = "break-relift-notice")]
-        if kind == abi::HOLDER_NOTICE {
+        if kind == abi::STAMP_HOLDER_NOTICE {
             return;
         }
         #[cfg(feature = "break-relift-reply")]
-        if kind == abi::HOLDER_REPLY {
+        if kind == abi::STAMP_HOLDER_REPLY {
             return;
         }
         if !t.as_ref().sched.is_demoted() {
@@ -804,19 +804,30 @@ pub fn reply_on(
         // waits is not `t`; the channel, which the receive handle names, is
         // alive.
         unsafe {
-            if token != 0 && (*t.as_ptr()).boost_token == token {
+            let ended = token != 0 && (*t.as_ptr()).boost_token == token;
+            if ended {
                 settle_loan(k, t);
                 k.s.unboost(t);
                 (*t.as_ptr()).boost_token = 0;
-                if let Some(c) = c {
-                    relift(k, t, c, abi::HOLDER_REPLY);
+            }
+            let checked = match k.tokens.check(token) {
+                Ok(client)
+                    if (*client.as_ptr()).waits != Some(Wait::Reply(t.as_ref().process())) =>
+                {
+                    Err(Error::BadState)
                 }
+                checked => checked,
+            };
+            // The call goes on to its receive after a reply that went, or
+            // met PEER_CLOSED; after any other error it returns to EL0, and
+            // the holder is not lifted for a step it does not take.
+            if ended
+                && matches!(checked, Ok(_) | Err(Error::PeerClosed))
+                && let Some(c) = c
+            {
+                relift(k, t, c, abi::STAMP_HOLDER_REPLY);
             }
-            let client = k.tokens.check(token)?;
-            if (*client.as_ptr()).waits != Some(Wait::Reply(t.as_ref().process())) {
-                return Err(Error::BadState);
-            }
-            Ok(client)
+            checked
         }
     });
     let client = match client {

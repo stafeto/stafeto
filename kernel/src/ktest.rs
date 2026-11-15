@@ -810,6 +810,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave,
     ),
     (
+        "a_failed_reply_leaves_the_holder_at_its_level",
+        calls::a_failed_reply_leaves_the_holder_at_its_level,
+    ),
+    (
         "a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave",
         calls::a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave,
     ),

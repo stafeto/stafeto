@@ -11087,9 +11087,42 @@ pub fn a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave(
     })
 }
 
-/// The send of a holder of a notification ends the hold (its token), and
-/// not the lift a queued request gave it: the thread waits in its send at 40.
-/// A send is not a drop of the holder's level.
+/// A `reply_receive` whose reply fails (BAD_STATE: the client waits for no
+/// reply from the process) goes back to EL0 with no receive: the holder it
+/// ended the boost of is not lifted for a step it does not take.
+pub fn a_failed_reply_leaves_the_holder_at_its_level(_: &Boot) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        // SAFETY: the test holds the client, which waits and does not run.
+        unsafe { (*h.t.as_ptr()).waits = None };
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let code = unsafe { h.r.as_ref() }.regs.x[0];
+        check(
+            Error::from_code(code) == Some(Error::BadState),
+            "a reply to a client that waits for no reply did not fail",
+        )?;
+        check(
+            level_of(h.r) == 1,
+            "a failed reply left the holder lifted for a receive it does not make",
+        )
+    })
+}
+
+/// The send of a holder of a notification ends the hold (its token) and
+/// leaves the lift a queued request gave it: the thread waits in its send at
+/// 40. A send is no drop of the holder's level.
 pub fn a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave(
     _: &Boot,
 ) -> Result<(), &'static str> {
