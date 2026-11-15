@@ -1365,9 +1365,7 @@ impl<T: Schedulable> Scheduler<T> {
     #[inline(always)]
     unsafe fn unbind(t: NonNull<T>, now: u64, running: bool) -> Option<(NonNull<Server>, u64)> {
         // SAFETY: the caller's promise.
-        if unsafe { node(t) }.server.is_none() {
-            return None;
-        }
+        unsafe { node(t) }.server?;
         // SAFETY: as above; `t` has a budget.
         unsafe { Self::settle_budget(t, now, running) }
     }
