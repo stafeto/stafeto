@@ -2273,6 +2273,7 @@ commands:
             level with a budget leaves a lower level its share; the boost of a request stays and a
             notification's goes with the budget)
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
+  budget-break-unbound the share probe of the network service fails on the image with no budget bound
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
@@ -2342,6 +2343,7 @@ fn main() {
         Some("smp-asid-vz") => vz::smp_asid(),
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
