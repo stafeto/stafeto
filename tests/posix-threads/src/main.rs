@@ -126,6 +126,10 @@ fn lower_to(level: u8) -> bool {
     let priority = i32::from(level) + 32 - i32::from(TOP_LEVEL);
     let param = ffi::SchedParam {
         sched_priority: priority,
+        sched_ss_low_priority: 0,
+        sched_ss_repl_period: [0; 2],
+        sched_ss_init_budget: [0; 2],
+        sched_ss_max_repl: 0,
     };
     let me = ffi::pthread_self();
     if unsafe { ffi::pthread_setschedparam(me, 2, &param) } != 0 {

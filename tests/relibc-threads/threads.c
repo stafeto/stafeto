@@ -659,7 +659,7 @@ static void burn_until(long long deadline) {
 }
 static pthread_t spawn_at(int priority, void *(*body)(void *), void *arg) {
     pthread_attr_t attr;
-    struct sched_param param = {priority};
+    struct sched_param param = {.sched_priority = priority};
     int policy = -1;
     CHECK(pthread_attr_init(&attr) == 0);
     CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
@@ -685,7 +685,7 @@ static void sched_calls(void) {
     struct timespec quantum;
     CHECK(sched_rr_get_interval(0, &quantum) == 0 && quantum.tv_sec == 0 && quantum.tv_nsec == 4000000);
     CHECK(sched_getscheduler(0) == SCHED_OTHER);
-    struct sched_param param = {32};
+    struct sched_param param = {.sched_priority = 32};
     CHECK(sched_setscheduler(0, SCHED_FIFO, &param) == SCHED_OTHER);
     CHECK(sched_getscheduler(0) == SCHED_FIFO);
     param.sched_priority = 0;
@@ -725,7 +725,7 @@ static void *equal_thread(void *arg) {
     return NULL;
 }
 static void tail_of_the_list(void) {
-    struct sched_param param = {32};
+    struct sched_param param = {.sched_priority = 32};
     CHECK(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0);
     equal_ran = equal_go = 0;
     pthread_t t = spawn_at(32, equal_thread, NULL);
@@ -1284,7 +1284,7 @@ static void timed_waits_across_a_second(void) {
 #define LOWERING_TURNS_MS 100
 static volatile int lowering_stop, lowering_mid_ran, lowering_failed;
 static void lower_self(int priority) {
-    struct sched_param param = {priority};
+    struct sched_param param = {.sched_priority = priority};
     if (pthread_setschedparam(pthread_self(), SCHED_RR, &param) != 0) lowering_failed = 1;
 }
 static void *lowering_low(void *arg) {
@@ -1360,7 +1360,7 @@ static void *other_mid(void *arg) {
 }
 static void lowered_by_another_thread(void) {
     pthread_t waiter, mid;
-    struct sched_param param = {12};
+    struct sched_param param = {.sched_priority = 12};
     other_waiting = other_go = other_stop = other_mid_ran = other_failed = 0;
     other_base = other_priority = -1;
     waiter = spawn_at(25, other_waiter, NULL);
@@ -1406,7 +1406,7 @@ static void *follow_spinner(void *arg) {
     return NULL;
 }
 static void timer_follows_the_level(void) {
-    struct sched_param param = {28};
+    struct sched_param param = {.sched_priority = 28};
     follow_waiting = follow_go = follow_stop = follow_done = 0;
     pthread_t sleeper = spawn_at(12, follow_sleeper, NULL);
     while (!follow_waiting) sleep_ms(1);
@@ -1450,7 +1450,7 @@ static void *deadline_waiter(void *arg) {
 }
 static void handler_keeps_the_deadline(void) {
     struct sigaction action;
-    struct sched_param param = {14};
+    struct sched_param param = {.sched_priority = 14};
     memset(&action, 0, sizeof action);
     action.sa_handler = deadline_handler;
     CHECK(sigaction(SIGUSR1, &action, NULL) == 0);

@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
         for (;;) pause();
     }
     if (strcmp(self, "quick") == 0) return 7;
-    struct sched_param top = {32};
+    struct sched_param top = {.sched_priority = 32};
     if (sched_setscheduler(0, SCHED_FIFO, &top) != 0)
         printf("os-test-run: SCHED_FIFO 32 for the runner failed: %s\n", strerror(errno));
     FILE *list = fopen("/os-test/list", "r");
