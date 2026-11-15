@@ -231,6 +231,12 @@ Actions.
 - SMP runs on up to 8 CPUs (QEMU, HVF and VZ are tested with 4); the
   bounds of a real-time analysis on several CPUs still wait for a board
   (docs/smp.md).
+- Time budgets of the RAM file, pipe and terminal services: each takes at most C of each
+  T (5 ms) from the levels 33 and above (the network service and real-time work) and, once
+  its budget is spent, works at level 32, above every POSIX process. For the levels at or
+  below 32 these three are services without a budget, and the share of 20 % of CPU 0 for the
+  levels below the budgets is not promised in 0.5.0. A service that works at level 1 once its
+  budget is spent, with its own work in a thread of its own, is planned for 0.5.1.
 - No PinePhone port yet.
 - `fork` copies everything the layer maps, with no copy on write (about
   70 us a MiB on HVF); mappings made past the

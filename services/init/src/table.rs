@@ -368,14 +368,18 @@ pub struct Gate {
 /// the sum of C/T of the budgets of the table on a CPU is at most this
 /// (spec 8). The rest is for the levels below the budgets and for the trusted
 /// work that has none (the kernel, the interrupts, the drivers, init), which
-/// the layout takes at 5 %.
+/// the layout takes at 5 %. The three general services work at level 32 once
+/// their budget is spent (`ramfs::SERVICE_LOW`), so the levels of the POSIX
+/// processes do not get this rest from them (it is the share of the levels at 33 and
+/// above that the budgets protect).
 pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 
 /// What the budgets of CPU 0 leave free of `BUDGET_SHARE_MAX_PPM` for the budgets the table
 /// does not have yet: the process service and the package service (3 %). The sum of the
 /// table's budgets on CPU 0 and this is at most the limit, so a budget added later for either
 /// finds its room. It was 5 % in the plan of the budgets of the services; with it at 5 % the
-/// levels below the budgets keep 16.8 % of CPU 0 in a window of 10 ms where 20 % is wanted.
+/// levels below the budgets keep 16.8 % of CPU 0 in a window of 10 ms where 20 % is wanted (a
+/// share the demoted services at level 32 do not leave to the levels of the POSIX processes).
 pub const CPU0_RESERVE_PPM: u64 = 30_000;
 
 /// A time budget of one thread of a record (spec 8, `budget_create`):
@@ -4171,7 +4175,7 @@ mod tests {
             let b = record.budgets[0];
             assert_eq!(
                 (b.name, b.cpu, b.c_ns, b.t_ns, b.low),
-                ("serve", 0, c_ns, 5_000_000, 32)
+                ("serve", 0, c_ns, 5_000_000, ramfs::SERVICE_LOW)
             );
             assert_eq!(record.free, ramfs::SERVICE_FREE);
             assert!(record.free < record.priority && record.free <= record.ceiling);
@@ -4189,7 +4193,7 @@ mod tests {
                     .budgets
                     .iter()
                     .all(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low)
-                        == ("serve", 0, 250_000, 5_000_000, 32))
+                        == ("serve", 0, 250_000, 5_000_000, ramfs::SERVICE_LOW))
             );
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works

@@ -39,21 +39,31 @@ const SERVICE_PERIOD_NS: u64 = 5 * MS;
 /// without it. The pipe and terminal services keep theirs.
 pub const RAM_BUDGET_ON: bool = true;
 
+/// The level the request thread of the RAM, pipe and terminal services works at once its budget is
+/// spent (`low` of the three budgets): 32, above every POSIX process (their ceiling is 31) and
+/// below the network service (35). The guarantee of the budgets is that each of the three takes at
+/// most C of each T from the levels 33 and above; for the levels at or below 32 it is a service
+/// without a budget, and the share of 20 % of CPU 0 for the levels below the budgets is not
+/// promised (the thread would run at 1 and keep it, which the own work of a service does not
+/// bear yet).
+pub const SERVICE_LOW: u8 = 32;
+
 /// The `free` level of the RAM records: `SERVICE_FREE` with the budget, 0 without it (a record
 /// without budgets has no `free`, `check_free`).
 pub const RAM_FREE: u8 = if RAM_BUDGET_ON { SERVICE_FREE } else { 0 };
 
 /// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
 /// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
-/// longest and the most frequent of the three. The thread works at `low` 32 after that (experiment: it was 1), where a
-/// request of a client costs at the client's own level (spec 8, the loan).
+/// longest and the most frequent of the three. The thread works at `low` 32 after that (`SERVICE_LOW`), where a
+/// request of a client below 32 costs at 32 and one of a client above it at the client's own
+/// level (spec 8, the loan).
 pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
     &[Budget {
         name: "serve",
         cpu: 0,
         c_ns: 250_000,
         t_ns: SERVICE_PERIOD_NS,
-        low: 32,
+        low: SERVICE_LOW,
     }]
 } else {
     &[]
@@ -65,7 +75,7 @@ pub const PIPE_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 75_000,
     t_ns: SERVICE_PERIOD_NS,
-    low: 32,
+    low: SERVICE_LOW,
 }];
 
 /// The budget of the terminal service's request thread: 75 us of each 5 ms (1.5 %), the output
@@ -75,7 +85,7 @@ pub const TTY_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 75_000,
     t_ns: SERVICE_PERIOD_NS,
-    low: 32,
+    low: SERVICE_LOW,
 }];
 
 const RAM_BASE: Record = Record {
