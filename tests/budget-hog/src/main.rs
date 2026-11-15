@@ -4,7 +4,7 @@
 //! The probe of the time budgets of threads (spec 8), for QEMU under
 //! -icount, where the numbers of one build repeat to the tick. It runs as
 //! init and prints lines that `cargo xtask budget-hog` checks against their
-//! bounds. Five phases, on one CPU unless a phase says another:
+//! bounds. Seven phases, on one CPU unless a phase says another:
 //!
 //! 1. A hog at 50 with the budget of 300 us for each 1 ms, low 1, spins
 //!    against a victim at 10 with no budget. The victim notes the time it
@@ -34,6 +34,16 @@
 //!    phase the hog's budget leaves it (`thread_unbind_budget`), and the hog
 //!    is a thread with no budget at its level `free`: it does not overrun
 //!    any more and its place posts nothing.
+//! 7. The carry: an interferer at 55 with a budget of 800 us for each 2 ms
+//!    spins 700 us at every even millisecond; a hog at 50 with the budget of
+//!    300 us for each 1 ms is released at the same moments and works 550 us
+//!    of its own time; a victim at 10 spins. The interferer holds the CPU
+//!    over the hog's activation, so the hog runs its chunk and the next one
+//!    back to back: 550 us in one window of 1 ms, more than C (what "no more
+//!    than C in a window of T" denies when a level stands above), while the
+//!    victim keeps what the busy period leaves. The lines give, for windows
+//!    of 1, 2, 5 and 10 ms, the most time of the hog and the least of the
+//!    victim, in microseconds.
 
 #![no_std]
 #![no_main]
@@ -628,6 +638,155 @@ fn phase_overrun(process: &Handle<Process>, resource: &Handle<Resource>) {
     sleep_until(&wait, &timer, now_ns() + 2 * MS);
 }
 
+/// The first release of the carry phase (ns on the clock), and the period of
+/// the interferer and the hog.
+static CARRY_T0: AtomicU64 = AtomicU64::new(0);
+const CARRY_PERIOD_NS: u64 = 2 * MS;
+const CARRY_SPIN_NS: u64 = 700_000;
+/// The hog's work for each release: less than 2C, because the probe notes
+/// a little less than the hog runs, and a hog that does not finish in the
+/// period stays ready and is no longer activated at the release.
+const CARRY_HOG_NS: u64 = 550_000;
+/// The buckets of the carry phase: 100 us each, 24 ms in all.
+const CARRY_BUCKET_NS: u64 = 100_000;
+const CARRY_MS: u64 = 24;
+
+/// Waits for each release `t0 + k * 2 ms` on a timer of its own and runs
+/// `work` until the end of the phase.
+///
+/// The timer fires at level 60, above the interferer: a timer's firing is a
+/// portion of the cleanup queue at the timer's level (kernel timer.rs), so a
+/// timer at the hog's own level 50 would fire only when the interferer at 55
+/// lets that level run, and the hog would be activated only then, after
+/// the release.
+fn carry_loop(priority: u8, work: fn()) -> ! {
+    let wait = sys::channel_create_wait(priority).expect("channel");
+    let timer = sys::timer_create(&wait, 60).expect("timer");
+    let mut next = CARRY_T0.load(Relaxed);
+    while time::now() < END.load(Relaxed) {
+        sleep_until(&wait, &timer, next);
+        work();
+        next += CARRY_PERIOD_NS;
+    }
+    sys::thread_exit()
+}
+
+/// The interferer: spins 700 us of the clock, and counts no time.
+fn carry_spin() {
+    let until = time::now() + time::ns_to_ticks(CARRY_SPIN_NS);
+    while time::now() < until {
+        black_box(0);
+    }
+}
+
+/// The hog: runs until it has noted 550 us of its own time in the buckets.
+fn carry_work() {
+    let bucket = BUCKET.load(Relaxed);
+    let start = START.load(Relaxed);
+    let gap_ticks = time::ns_to_ticks(GAP_NS);
+    let want = time::ns_to_ticks(CARRY_HOG_NS);
+    let (mut last, mut own, mut i) = (time::now(), 0u64, 0u64);
+    while own < want {
+        for _ in 0..16 {
+            i = black_box(i.wrapping_add(1));
+        }
+        let now = time::now();
+        let gap = now - last;
+        last = now;
+        if gap > gap_ticks {
+            GAP[HOG].fetch_max(gap, Relaxed);
+        } else {
+            let b = (now.saturating_sub(start) / bucket) as usize;
+            if b < BUCKETS {
+                SPENT[HOG][b].fetch_add(gap, Relaxed);
+            }
+            own += gap;
+        }
+        if now >= END.load(Relaxed) {
+            return;
+        }
+    }
+}
+
+extern "C" fn carry_interferer(_: u64) -> ! {
+    carry_loop(55, carry_spin)
+}
+
+extern "C" fn carry_hog(_: u64) -> ! {
+    carry_loop(50, carry_work)
+}
+
+/// The most and the least of `who` in the windows of `l` buckets from the
+/// bucket `from` to the bucket `to`, in ns.
+fn carry_windows(who: usize, l: usize, from: usize, to: usize) -> (u64, u64) {
+    let (mut least, mut most) = (u64::MAX, 0);
+    for first in from..to.saturating_sub(l) {
+        let sum: u64 = SPENT[who][first..first + l]
+            .iter()
+            .map(|b| b.load(Relaxed))
+            .sum();
+        let ns = time::ticks_to_ns(sum);
+        least = least.min(ns);
+        most = most.max(ns);
+    }
+    (least, most)
+}
+
+fn phase_carry(process: &Handle<Process>, resource: &Handle<Resource>) {
+    begin(CARRY_MS);
+    // The releases and the buckets start together, a few ms ahead.
+    let t0 = now_ns() + 3 * MS;
+    CARRY_T0.store(t0, Relaxed);
+    BUCKET.store(time::ns_to_ticks(CARRY_BUCKET_NS), Relaxed);
+    START.store(time::ns_to_ticks(t0), Relaxed);
+    END.store(time::ns_to_ticks(t0 + CARRY_MS * MS), Relaxed);
+    let hog_budget = sys::budget_create(resource, 0, 300_000, 1_000_000, 1).expect("hog budget");
+    // A budget over the interferer's work, so that the kernel lets it run
+    // at 55.
+    let spin_budget =
+        sys::budget_create(resource, 0, 800_000, 2_000_000, 1).expect("interferer budget");
+    let victim = spawn(process, 0, victim, 10);
+    let hog = spawn(process, 1, carry_hog, 50);
+    let interferer = spawn(process, 2, carry_interferer, 55);
+    sys::thread_bind_budget(&hog, &hog_budget).expect("bind the hog's budget");
+    sys::thread_bind_budget(&interferer, &spin_budget).expect("bind the interferer's budget");
+    sys::thread_start(&victim).expect("start the victim");
+    sys::thread_start(&hog).expect("start the hog");
+    sys::thread_start(&interferer).expect("start the interferer");
+    let wait = sys::channel_create_wait(62).expect("channel");
+    let timer = sys::timer_create(&wait, 62).expect("timer");
+    sleep_until(&wait, &timer, t0 + (CARRY_MS + 4) * MS);
+    let per_ms = (MS / CARRY_BUCKET_NS) as usize;
+    let buckets = (CARRY_MS * MS / CARRY_BUCKET_NS) as usize;
+    // The first 2 periods are the start of the threads, the last one is the
+    // end.
+    let (from, to) = (4 * per_ms, buckets - 2 * per_ms);
+    // Two periods of the buckets, in us of each 100 us: where the hog and the
+    // victim ran.
+    for (who, first) in [(HOG, 0), (VICTIM, 0), (HOG, 6 * per_ms)] {
+        let mut row = [0u64; 40];
+        for (k, cell) in row.iter_mut().enumerate() {
+            *cell = time::ticks_to_ns(SPENT[who][first + k].load(Relaxed)) / 1000;
+        }
+        println!(
+            "budget carry trace {} from={} us={:?}",
+            if who == HOG { "hog" } else { "victim" },
+            first,
+            row
+        );
+    }
+    for l in [1usize, 2, 5, 10] {
+        let (_, hog_most) = carry_windows(HOG, l * per_ms, from, to);
+        let (victim_least, _) = carry_windows(VICTIM, l * per_ms, from, to);
+        println!(
+            "budget carry window={} hog_max_us={} victim_min_us={}",
+            l,
+            hog_most / 1000,
+            victim_least / 1000
+        );
+    }
+}
+
 fn main(_: u64) -> u64 {
     let init = rt::init_handles().expect("init's handles");
     // The console takes the handle it prints through; the budgets need a
@@ -655,6 +814,7 @@ fn main(_: u64) -> u64 {
     }
     phase_slot(&process, &resource);
     phase_overrun(&process, &resource);
+    phase_carry(&process, &resource);
     println!("budget DONE");
     loop {
         sys::yield_now().expect("wait for the host");
