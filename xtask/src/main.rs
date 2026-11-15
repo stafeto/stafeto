@@ -8275,7 +8275,7 @@ fn sporadic_breaks() -> Result<(), String> {
 }
 
 /// What the probe prints when each of its stages held.
-const SPORADIC_MARKERS: [&str; 13] = [
+const SPORADIC_MARKERS: [&str; 15] = [
     "sporadic: CPU 1: leaving the policy gave the share back ok",
     "sporadic: the options, SS_REPL_MAX and the priority range of SCHED_SPORADIC ok",
     "sporadic: 10 parameters off the rules give EINVAL and leave the policy ok",
@@ -8285,7 +8285,9 @@ const SPORADIC_MARKERS: [&str; 13] = [
     "sporadic: CPU 3: set, read back, refused over its share, given back at the end of a thread ok",
     "sporadic: CPU 1: fork under a server gives the child its budget ok",
     "sporadic: CPU 3: fork under a server gives the child its budget ok",
-    "sporadic: CPU 2: the end of a process gave its share back ok",
+    "sporadic: posix_spawn under a server gives the child its budget ok",
+    "sporadic: exec under a server gives the new image a budget ok",
+    "sporadic: the end of a process gave the share of CPU",
     "sporadic: spin wall=",
     "sporadic: ok",
     "init: posix-procs ended",

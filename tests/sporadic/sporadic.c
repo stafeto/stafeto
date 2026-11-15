@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -386,13 +387,6 @@ static void *forker_thread(void *arg) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return NULL;
 }
-static void forks(int cpu) {
-    fork_cpu = cpu;
-    run(forker_thread, (void *)1L);
-    run(forker_thread, (void *)0L);
-    printf("sporadic: CPU %d: fork under a server gives the child its budget ok\n", cpu);
-}
-
 /* Everything on one CPU: threads made by a thread go where it runs. */
 static void *scenario(void *arg) {
     int cpu = (int)(long)arg;
@@ -437,7 +431,6 @@ static void *scenario(void *arg) {
         hold_go = 1;
         CHECK(pthread_join(holder, NULL) == 0);
         leaving_time();
-        forks(cpu);
 #if SS_REBIND
         leaving(cpu);
 #endif
@@ -462,22 +455,32 @@ static void on_cpu(int cpu) {
     CHECK(pthread_join(t, NULL) == 0);
 }
 
-/* The end of a process gives back its threads' shares. */
-static void process_end(int cpu) {
+/* The end of a process gives back its threads' shares: a child takes the whole
+ * row of the CPU it was placed on (the service places it, off CPU 0 when the
+ * parent has a budget; CPU 0 has no row, so a child there is asked again) and
+ * ends; the row is free for a thread of the parent. */
+static void process_end(void) {
+    pid_t child = -1;
+    int cpu = 0, status = 0;
+    for (int tries = 0; tries < 8; tries++) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            int here = sched_getcpu();
+            if (here <= 0) _exit(100);
+            struct sched_param p = ss_param(20, 5, row_ns(here, 10 * MS), 10 * MS, 4);
+            _exit(sched_setscheduler(0, SCHED_SPORADIC, &p) == -1 ? 40 + errno : 100 + here);
+        }
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WEXITSTATUS(status) != 100) break;
+    }
+    if (WEXITSTATUS(status) < 101) FAIL("the child could not take the row of its CPU: %d", WEXITSTATUS(status));
+    cpu = WEXITSTATUS(status) - 100;
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     CHECK(sched_setaffinity(0, sizeof set, &set) == 0);
-    pid_t child = fork();
-    CHECK(child >= 0);
-    if (child == 0) {
-        struct sched_param p = ss_param(20, 5, row_ns(cpu, 10 * MS), 10 * MS, 4);
-        _exit(sched_setscheduler(0, SCHED_SPORADIC, &p) == -1 ? 40 + errno : 0);
-    }
-    int status = 0;
-    CHECK(waitpid(child, &status, 0) == child);
-    CHECK(WIFEXITED(status));
-    if (WEXITSTATUS(status) != 0) FAIL("the child could not take the row of CPU %d: %d", cpu, WEXITSTATUS(status));
     int err = EPERM;
     for (int i = 0; i < 20 && err != 0; i++) {
         hold_ready = hold_go = 0;
@@ -491,10 +494,82 @@ static void process_end(int cpu) {
         if (err != 0) sleep_ms(50);
     }
     CHECK(err == 0);
-    printf("sporadic: CPU %d: the end of a process gave its share back ok\n", cpu);
+    printf("sporadic: the end of a process gave the share of CPU %d back ok\n", cpu);
 }
 
-int main(void) {
+/* A program the probe runs as a child (posix_spawn, exec) checks it runs under the server. */
+extern char **environ;
+static int checked_main(void) {
+    struct sched_param want = ss_param(20, 5, 1 * MS, 10 * MS, 4), got;
+    if (sched_getscheduler(0) != SCHED_SPORADIC) return 21;
+    if (sched_getparam(0, &got) != 0 || !same(&got, &want)) return 22;
+    if (sched_getcpu() <= 0) return 23;
+    return 0;
+}
+static void wait_ok(pid_t pid, const char *what) {
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) FAIL("%s: the child ended with status %#x", what, status);
+}
+/* posix_spawn of a child under a server, from a thread under one. */
+static void *spawner_thread(void *arg) {
+    (void)arg;
+    struct sched_param p = ss_param(20, 5, 1 * MS, 10 * MS, 4);
+    CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
+    posix_spawnattr_t attr;
+    CHECK(posix_spawnattr_init(&attr) == 0);
+    CHECK(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER) == 0);
+    CHECK(posix_spawnattr_setschedpolicy(&attr, SCHED_SPORADIC) == 0);
+    CHECK(posix_spawnattr_setschedparam(&attr, &p) == 0);
+    char *argv[] = {"procs-child", "checked", NULL};
+    pid_t pid;
+    int e = posix_spawn(&pid, "/bin/procs-child", NULL, &attr, argv, environ);
+    if (e != 0) FAIL("posix_spawn under a server gave %d", e);
+    CHECK(posix_spawnattr_destroy(&attr) == 0);
+    wait_ok(pid, "posix_spawn");
+    return NULL;
+}
+/* exec by a thread under a server: the new image keeps the policy and runs under a budget of its own. */
+static void *execer_thread(void *arg) {
+    (void)arg;
+    struct sched_param p = ss_param(20, 5, 1 * MS, 10 * MS, 4);
+    CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        char *argv[] = {"procs-child", "checked", NULL};
+        execv("/bin/procs-child", argv);
+        _exit(30 + errno);
+    }
+    wait_ok(child, "exec");
+    return NULL;
+}
+
+/* The process the probe spawns of itself: what needs fork, posix_spawn and exec. */
+static int fork_main(void) {
+    cpus_up = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus_up < 2) return 0;
+    for (int cpu = 1; cpu < cpus_up && cpu <= 3; cpu++) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        CHECK(sched_setaffinity(0, sizeof set, &set) == 0);
+        fork_cpu = cpu;
+        run(forker_thread, (void *)1L);
+        run(forker_thread, (void *)0L);
+        printf("sporadic: CPU %d: fork under a server gives the child its budget ok\n", cpu);
+    }
+    run(spawner_thread, NULL);
+    printf("sporadic: posix_spawn under a server gives the child its budget ok\n");
+    run(execer_thread, NULL);
+    printf("sporadic: exec under a server gives the new image a budget ok\n");
+    process_end();
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "checked") == 0) return checked_main();
+    if (argc > 1 && strcmp(argv[1], "fork") == 0) return fork_main();
     cpus_up = (int)sysconf(_SC_NPROCESSORS_ONLN);
     options();
     bad_parameters();
@@ -509,7 +584,12 @@ int main(void) {
     }
     on_cpu(0);
     for (int cpu = 1; cpu < cpus_up && cpu <= 3; cpu++) on_cpu(cpu);
-    process_end(cpus_up > 2 ? 2 : 1);
+    /* A process spawned of the probe does what needs fork (init's own programs have no map to copy). */
+    char *child_argv[] = {"procs-child", "fork", NULL};
+    pid_t pid;
+    int e = posix_spawn(&pid, "/bin/procs-child", NULL, NULL, child_argv, environ);
+    if (e != 0) FAIL("the spawn of the probe's child gave %d", e);
+    wait_ok(pid, "the child of the probe");
     printf("sporadic: ok\n");
     return 0;
 }
