@@ -181,6 +181,18 @@ el0_count_until:
     cbz     x3, 1b
     svc     #SVC_DONE
 
+// Adds 1 to the word at x0 over and over until the word at x1 is set, then
+// ends the thread with thread_exit.
+.global el0_count_then_exit
+el0_count_then_exit:
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    ldr     x3, [x1]
+    cbz     x3, 1b
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
 // Adds 1 to the word at x0 x1 times, the count in x2, then ends.
 .global el0_count_to
 el0_count_to:
@@ -357,6 +369,48 @@ el0_close_then_exit:
 .global el0_receive
 el0_receive:
     svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, x2 policy), then notify(x3
+// channel, bits 1), then ends.
+.global el0_set_priority_then_notify
+el0_set_priority_then_notify:
+    mov     x22, x3
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x0, x22
+    mov     x1, #1
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// receive(x0 channel, x1 flags), then yields until the word at x20, a peer's
+// count, moves: sets the words at x21 and x23 to 1 then. Sets the word at x21
+// to 2 and ends when the counter reaches x22 first.
+.global el0_receive_then_watch
+el0_receive_then_watch:
+    svc     #CALL_RECEIVE
+    ldr     x2, [x20]
+1:  svc     #CALL_YIELD
+    ldr     x3, [x20]
+    cmp     x3, x2
+    b.hi    2f
+    isb
+    mrs     x4, cntvct_el0
+    cmp     x4, x22
+    b.lo    1b
+    mov     x5, #2
+    str     x5, [x21]
+    svc     #SVC_DONE
+2:  mov     x5, #1
+    str     x5, [x21]
+    str     x5, [x23]
+    svc     #SVC_DONE
+
+// receive(x0 channel, x1 flags), then waits until the word at x20 is set.
+.global el0_receive_then_poll
+el0_receive_then_poll:
+    svc     #CALL_RECEIVE
+1:  ldr     x3, [x20]
+    cbz     x3, 1b
     svc     #SVC_DONE
 
 // receive(x0 channel, x1 flags), then thread_exit: the result stays in
