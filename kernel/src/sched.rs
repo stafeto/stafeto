@@ -535,9 +535,8 @@ pub fn serve_exit(t: NonNull<Thread>) {
     crate::obj::assert_held();
     // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
     let ask = crate::cmd::take_exit(t);
-    // SAFETY: the owner of the thread's end holds it; only the field is read.
-    let budget = unsafe { t.as_ref() }.sched.server();
-    locked(|k| {
+    let cause = (ask & 0xff) as u8;
+    let budget = locked(|k| {
         // SAFETY: the thread is alive and of this CPU, so its link is read
         // safely; a thread parked after the asker sent EXIT stands in the
         // ring of its process still, and leaves it before it ends.
@@ -545,22 +544,28 @@ pub fn serve_exit(t: NonNull<Thread>) {
             // SAFETY: a parked thread belongs to its process list.
             unsafe { crate::process::unlist_parked(t, k) };
         }
+        let now = timer::now();
         // SAFETY: as above.
-        unsafe { k.s.exit(t, timer::now()) };
-        if let Some(server) = budget {
-            // SAFETY: the thread had the budget, and the scheduler let it go.
-            unsafe { crate::budget::unbound(server, (ask & 0xff) as u8) };
+        let ended = unsafe { k.s.exit(t, now) };
+        if let Some((_, lent)) = ended {
+            // SAFETY: the thread is alive, with no stint open.
+            unsafe { channel::pay_loan(k, t, lent, now) };
         }
         if thread::current() == Some(t) {
             arch::user::clear_current();
         }
         // SAFETY: the thread is alive; its number goes back with its end.
-        unsafe { thread::give_number(t, k.tokens) }
+        unsafe { thread::give_number(t, k.tokens) };
+        ended.map(|(server, _)| server)
     });
+    if let Some(server) = budget {
+        // SAFETY: the thread had the budget, and the scheduler let it go.
+        unsafe { crate::budget::unbound(server, cause) };
+    }
     if ask & 0x100 != 0 {
         // SAFETY: the reference is the one `start` took, which the ask
         // handed to this CPU.
-        unsafe { thread::release(t, (ask & 0xff) as u8) };
+        unsafe { thread::release(t, cause) };
     }
 }
 
@@ -604,9 +609,7 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     // the number to the command EXIT, which follows them (`serve_exit`).
     let started = thread::is_started(t);
     let remote = started && !is_local(t);
-    // SAFETY: `t` is alive; its CPU alone changes the budget of a started thread.
-    let budget = unsafe { t.as_ref() }.sched.server().filter(|_| !remote);
-    let (held, waited) = locked(|k| {
+    let (held, waited, budget) = locked(|k| {
         let deferred = remote || (started && crate::cmd::pending(t));
         // SAFETY: `t` is alive. Its link belongs to its own CPU (a ready
         // queue changes it with no OBJ), so only a thread of this CPU is
@@ -619,12 +622,15 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
         // SAFETY: `t` and the scheduler's threads are alive; the queue
         // gives up the thread before the scheduler ends it.
         let waited = unsafe { channel::cancel(t, k) };
+        let mut budget = None;
         if !remote {
+            let now = timer::now();
             // SAFETY: as above.
-            unsafe { k.s.exit(t, timer::now()) };
-            if let Some(server) = budget {
-                // SAFETY: the thread had the budget, and the scheduler let it go.
-                unsafe { crate::budget::unbound(server, cause) };
+            let ended = unsafe { k.s.exit(t, now) };
+            if let Some((server, lent)) = ended {
+                // SAFETY: the thread is alive, with no stint open.
+                unsafe { channel::pay_loan(k, t, lent, now) };
+                budget = Some(server);
             }
         }
         if deferred {
@@ -632,12 +638,16 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
             // (`serve_exit`): the arguments of its commands lie under it.
             crate::cmd::ask_exit(t, thread::mark_ended(t), cause);
             crate::cmd::post(t, crate::cmd::EXIT);
-            return (false, waited);
+            return (false, waited, budget);
         }
         // SAFETY: as above.
         unsafe { thread::give_number(t, k.tokens) };
-        (thread::mark_ended(t), waited)
+        (thread::mark_ended(t), waited, budget)
     });
+    if let Some(server) = budget {
+        // SAFETY: the thread had the budget, and the scheduler let it go.
+        unsafe { crate::budget::unbound(server, cause) };
+    }
     if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
         unsafe { via.let_go(cause) };

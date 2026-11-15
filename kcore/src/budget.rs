@@ -204,6 +204,16 @@ impl Server {
         pending && !cfg!(feature = "break-budget-overrun-silent")
     }
 
+    /// The thread of the budget ended: what the place was not told of stays
+    /// untold for the next thread (`break-budget-exit-forgets`: it is told
+    /// of nothing, as if the place had heard it).
+    pub fn ended(&mut self) {
+        #[cfg(feature = "break-budget-exit-forgets")]
+        {
+            self.told = self.overruns;
+        }
+    }
+
     /// The sum of the ticks charged so far.
     pub fn ran(&self) -> u64 {
         self.ran
@@ -295,6 +305,13 @@ impl Server {
     /// No event is wanted any more: the thread goes.
     pub fn event_off(&mut self) {
         self.event = 0;
+    }
+
+    /// The kernel holds the event in the heap of a level that is not the
+    /// thread's base any more: it takes the event out and puts it in again
+    /// (`event_change` answers with it), when one stands.
+    pub fn event_again(&mut self) {
+        self.armed = 0;
     }
 
     fn pop(&mut self) -> Replenishment {
