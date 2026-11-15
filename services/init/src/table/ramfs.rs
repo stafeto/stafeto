@@ -45,7 +45,7 @@ pub const RAM_FREE: u8 = if RAM_BUDGET_ON { SERVICE_FREE } else { 0 };
 
 /// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
 /// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
-/// longest and the most frequent of the three. The thread works at `low` 1 after that, where a
+/// longest and the most frequent of the three. The thread works at `low` 32 after that (experiment: it was 1), where a
 /// request of a client costs at the client's own level (spec 8, the loan).
 pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
     &[Budget {
@@ -53,7 +53,7 @@ pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
         cpu: 0,
         c_ns: 250_000,
         t_ns: SERVICE_PERIOD_NS,
-        low: 1,
+        low: 32,
     }]
 } else {
     &[]
@@ -65,7 +65,7 @@ pub const PIPE_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 75_000,
     t_ns: SERVICE_PERIOD_NS,
-    low: 1,
+    low: 32,
 }];
 
 /// The budget of the terminal service's request thread: 75 us of each 5 ms (1.5 %), the output
@@ -75,7 +75,7 @@ pub const TTY_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 75_000,
     t_ns: SERVICE_PERIOD_NS,
-    low: 1,
+    low: 32,
 }];
 
 const RAM_BASE: Record = Record {

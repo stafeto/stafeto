@@ -4171,7 +4171,7 @@ mod tests {
             let b = record.budgets[0];
             assert_eq!(
                 (b.name, b.cpu, b.c_ns, b.t_ns, b.low),
-                ("serve", 0, c_ns, 5_000_000, 1)
+                ("serve", 0, c_ns, 5_000_000, 32)
             );
             assert_eq!(record.free, ramfs::SERVICE_FREE);
             assert!(record.free < record.priority && record.free <= record.ceiling);
@@ -4189,7 +4189,7 @@ mod tests {
                     .budgets
                     .iter()
                     .all(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low)
-                        == ("serve", 0, 250_000, 5_000_000, 1))
+                        == ("serve", 0, 250_000, 5_000_000, 32))
             );
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works
