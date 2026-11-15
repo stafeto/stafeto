@@ -1234,6 +1234,12 @@ impl Token {
     /// replies, and nothing changes when a check fails; the handles then stay
     /// in the caller's table and close here, with the error as the call's
     /// result (INVALID_ARGS, BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). The
+    /// Ownership hazard: when the reply half delivered the handles and the receive half then
+    /// fails, the handles are the client's. This function counts them as gone for every error
+    /// of `Error::keeps_handles() == false` and closes them only for an error that keeps them;
+    /// an error of the receive half that keeps handles (none today: the kernel checks the
+    /// channel before it replies) would close values that now name nothing of the caller's.
+    /// The kernel side of this is decided with the kernel part of the budgets.
     /// error of a reply that went as far as it could (LIMIT_REACHED and
     /// NO_MEMORY, the client's table had no room) is the call's too, and the
     /// handles are gone; with PEER_CLOSED the receive follows.

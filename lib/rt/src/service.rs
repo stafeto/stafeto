@@ -1064,8 +1064,10 @@ fn request<S: Service<K>, const K: usize>(
 #[cfg_attr(feature = "step-stats", allow(unused_variables))]
 fn owe(token: Token, bytes: &[u8], handles: Outgoing, owed: &mut Owed) {
     #[cfg(not(feature = "step-stats"))]
-    if owed.keep {
-        let len = bytes.len().min(MESSAGE_MAX);
+    // A reply over MESSAGE_MAX is no reply the kernel takes: it goes at once through the plain
+    // path, which refuses it and gives the client the error as its status.
+    if owed.keep && bytes.len() <= MESSAGE_MAX {
+        let len = bytes.len();
         owed.bytes[..len].copy_from_slice(&bytes[..len]);
         owed.len = len;
         owed.handles = handles;

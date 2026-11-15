@@ -1073,8 +1073,8 @@ pub const SERVICE_BUDGET_TABLE: &[Record] = &[
         program: "service-budget",
         priority: 40,
         ceiling: 40,
-        quota: 128 * PAGE,
-        handle_limit: 64,
+        quota: 256 * PAGE,
+        handle_limit: 128,
         connects: &["ramfs", "pipe", "tty"],
         ..TABLE[1]
     },
