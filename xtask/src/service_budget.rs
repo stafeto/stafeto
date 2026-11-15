@@ -280,11 +280,13 @@ fn run_image_on(
 /// What the one-CPU probe measured for one service.
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct One {
-    pub queue_ms: u64,
+    pub cycles: u64,
     pub worst10: u64,
     pub median10: u64,
     pub bound10: u64,
     pub c_us: u64,
+    pub e_us: u64,
+    pub remainder_us: u64,
     pub requests_per_ping: u64,
     pub worst_request_us: u64,
     pub worst_wait_us: u64,
@@ -315,7 +317,9 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
             }
             if line.starts_with("starve ") {
                 starved = true;
-                one.queue_ms = number(line, "queue_ms=")?;
+                one.cycles = number(line, "cycles=")?;
+                one.e_us = number(line, "e_us=")?;
+                one.remainder_us = number(line, "remainder_us=")?;
                 one.worst10 = number(line, "worst10=")?;
                 one.median10 = number(line, "median10=")?;
                 one.bound10 = number(line, "bound10=")?;
@@ -338,19 +342,19 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
     Ok(all)
 }
 
-/// The starvation gate of the one-CPU probe: the queue lasted at least 10 ms and the worst
-/// window of 10 ms in it left the victim its bound.
+/// The starvation gate of the one-CPU probe: the victim kept, in its worst 10 cycles, its bound
+/// of its own active time.
 pub fn verdict_starve(all: &[One]) -> Result<(), String> {
     for (name, o) in SERVICES.iter().zip(all) {
-        if o.queue_ms < 10 {
+        if o.cycles < 100 {
             return Err(format!(
-                "{name}: the queue lasted {} ms, under 10: the load is too short for a window",
-                o.queue_ms
+                "{name}: the victim made {} cycles, under 100",
+                o.cycles
             ));
         }
         if o.worst10 < o.bound10 {
             return Err(format!(
-                "{name}: the victim kept {} per mille in its worst window of 10 ms while the queue lasted, under {}",
+                "{name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}",
                 o.worst10, o.bound10
             ));
         }
@@ -375,13 +379,13 @@ pub fn verdict_level40(all: &[One]) -> Result<(), String> {
 fn one_table(all: &[One]) {
     for (name, o) in SERVICES.iter().zip(all) {
         println!(
-            "service-budget: {name}: queue {} ms, worst window of 10 ms {} per mille (median {}, bound {}, C {} us, e {} us); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us (s_max {} us, s0 {} us)",
-            o.queue_ms,
+            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
             o.worst10,
             o.median10,
             o.bound10,
             o.c_us,
-            45,
+            o.e_us,
+            o.remainder_us,
             o.requests_per_ping,
             o.worst_request_us,
             o.worst_wait_us,
@@ -499,23 +503,22 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
                 ));
             }
         }
-        // The numbers of the unbound service itself: told. The queue of 24 requests is cleared by an
-        // unbound service (level 31, above the clients) in the time of 0.5 to 1.5 ms, about the
-        // pause before the victim starts, so the victim of the unbound service loses little; the
-        // catch of the break is the missing line, and the gate is held to the bound services.
-        if let Ok(all) = parse_one(&lines) {
-            let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
-            println!(
-                "budget-breaks: unbound {service}: the victim's worst window {} per mille (bound {}): {}",
-                all[at].worst10,
-                all[at].bound10,
-                if all[at].worst10 < all[at].bound10 {
-                    "caught by the numbers"
-                } else {
-                    "not caught by the numbers (the queue is too short to outlast the start of the victim)"
-                }
-            );
+        // The numbers of the unbound service itself: the victim (it spins 0.8 ms and sleeps 0.2 ms,
+        // the clients refill the queue in each sleep) must keep under 500 per mille of its active
+        // time, because the unbound service at level 31 empties the queue above it each cycle.
+        let all = parse_one(&lines)?;
+        let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
+        println!(
+            "budget-breaks: unbound {service}: the victim keeps {} per mille of its active time (a bound one keeps at least {})",
+            all[at].worst10, all[at].bound10
+        );
+        if all[at].worst10 >= 500 {
+            return Err(format!(
+                "the victim of the unbound {service} kept {} per mille, not under 500: the starvation phase does not catch it",
+                all[at].worst10
+            ));
         }
+        println!("budget-breaks: the unbound {service} is caught by the numbers");
     }
     for (what, variant, key) in [
         (

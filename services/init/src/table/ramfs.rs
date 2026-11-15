@@ -1084,6 +1084,24 @@ pub const SERVICE_BUDGET_TABLE: &[Record] = &[
         quota: 256 * PAGE,
         handle_limit: 128,
         connects: &["ramfs", "pipe", "tty"],
+        // The budgets of the control phases (the spinners that measure the cost of a timer
+        // event): the same C and T as the RAM service's and the pipe service's.
+        budgets: &[
+            Budget {
+                name: "ctl-ramfs",
+                cpu: 0,
+                c_ns: 250_000,
+                t_ns: SERVICE_PERIOD_NS,
+                low: 1,
+            },
+            Budget {
+                name: "ctl-pipe",
+                cpu: 0,
+                c_ns: 75_000,
+                t_ns: SERVICE_PERIOD_NS,
+                low: 1,
+            },
+        ],
         ..TABLE[1]
     },
 ];
