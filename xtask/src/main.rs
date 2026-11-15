@@ -1612,9 +1612,12 @@ enum Variant {
     /// seed-breaks`): the test of the wipe must fail, and only it.
     SeedNoWipe,
     /// The normal kernel whose port shows the headers of the pieces of long
-    /// lines (kernel feature `break-console-strip`, `cargo xtask
-    /// console-strip-break`): the init tests must fail on the wire.
-    ConsoleNoStrip,
+    /// lines (kernel feature `keep-pieces`). The probe images that have no
+    /// console service run on it, so that `Untag` assembles the lines whole
+    /// and no record of another writer cuts one; `cargo xtask
+    /// console-strip-break`: the init tests on it must fail the check that
+    /// the normal kernel strips the headers.
+    KeepPieces,
     /// The normal kernel with one deliberate break of the time budgets each
     /// (kernel features `break-budget-*`, `cargo xtask budget-breaks`): a bind
     /// that binds nothing, a boost of a notification slot that survives the
@@ -1695,7 +1698,7 @@ impl Variant {
         Variant::ItsPresetBreak,
         Variant::ItsIntAlign4k,
         Variant::SeedNoWipe,
-        Variant::ConsoleNoStrip,
+        Variant::KeepPieces,
         Variant::BudgetOff,
         Variant::BudgetSlotKeeps,
         Variant::BudgetRefill,
@@ -1763,7 +1766,7 @@ impl Variant {
             Variant::ItsPresetBreak => Some("break-its-keep-firmware-lpis"),
             Variant::ItsIntAlign4k => Some("its-int,break-its-align-4k"),
             Variant::SeedNoWipe => Some("ktest,break-seed-wipe"),
-            Variant::ConsoleNoStrip => Some("break-console-strip"),
+            Variant::KeepPieces => Some("keep-pieces"),
             Variant::BudgetOff => Some("break-budget-off"),
             Variant::BudgetSlotKeeps => Some("break-budget-slot-keeps"),
             Variant::BudgetRefill => Some("break-budget-refill"),
@@ -1847,7 +1850,7 @@ impl Variant {
             Variant::ItsPresetBreak => "stafeto-its-preset-break",
             Variant::ItsIntAlign4k => "stafeto-its-int-align4k",
             Variant::SeedNoWipe => "stafeto-ktest-seed-no-wipe",
-            Variant::ConsoleNoStrip => "stafeto-console-no-strip",
+            Variant::KeepPieces => "stafeto-keep-pieces",
             Variant::BudgetOff => "stafeto-budget-off",
             Variant::BudgetSlotKeeps => "stafeto-budget-slot-keeps",
             Variant::BudgetRefill => "stafeto-budget-refill",
@@ -2829,9 +2832,9 @@ fn its_slow() -> Result<(), String> {
 
 /// `cargo xtask console-strip-break`: the init tests on a kernel that writes
 /// the headers of the pieces of long lines to its port
-/// (`break-console-strip`) fail on the check of the wire (`log_markers`).
+/// (`keep-pieces`) fail on the check of the wire (`log_markers`).
 fn console_strip_break() -> Result<(), String> {
-    match init_tests_in(Variant::ConsoleNoStrip, &qemu::VIRT, false, 1) {
+    match init_tests_in(Variant::KeepPieces, &qemu::VIRT, false, 1) {
         Err(e) if e.contains("tagged pieces") => {
             println!("console-strip-break: the headers on the port are caught ({e})");
             Ok(())
@@ -12699,7 +12702,10 @@ fn log_markers(o: &qemu::Outcome) -> Result<(), String> {
     }
     qemu::expect_line(o, LOG_IN_FRONT)?;
     // A line longer than a record, written in tagged pieces while the kernel
-    // holds the port: the kernel shows it as text, with no header on the wire.
+    // holds the port: the normal kernel shows it as text, with no header on
+    // the wire. The init tests run on the normal kernel only: on the one that
+    // keeps the pieces (`keep-pieces`, the kernel of the probe images, where
+    // `Untag` puts the lines back whole) this check fails, which pins the strip.
     if o.tagged > 0 {
         return Err(format!(
             "{} tagged pieces of long lines came on the port: the kernel did not strip their headers",
