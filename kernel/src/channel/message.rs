@@ -638,13 +638,17 @@ pub unsafe fn pay_loan(k: &mut Locked<'_>, t: NonNull<Thread>, lent: u64, now: u
             return;
         }
         let client = if is_notice(token) {
-            // The sender that queued and lifted `t` waits in `send`; a number
-            // that names another thread by now is one that waits there too, or
-            // nobody pays.
+            // The sender that queued and lifted `t` waits in `send` into the
+            // channel the token names. A number that names another thread by
+            // now waits somewhere else, or not at all: nobody pays then, and no
+            // budget of an unrelated process is charged.
             let Some(sender) = thread::payer(t).and_then(|n| k.tokens.thread(n)) else {
                 return;
             };
-            if sender == t || !matches!((*sender.as_ptr()).waits, Some(Wait::Send(_))) {
+            let Some(Wait::Send(via)) = (*sender.as_ptr()).waits else {
+                return;
+            };
+            if sender == t || notice_token(via.channel()) != token {
                 return;
             }
             sender
@@ -666,6 +670,12 @@ pub unsafe fn pay_loan(k: &mut Locked<'_>, t: NonNull<Thread>, lent: u64, now: u
 /// reaches 2^47 of one thread's requests; the rest names the channel.
 const NOTICE: u64 = 1 << 63;
 
+/// The `boost_token` of a holder of a notification of `c`: the tag and the
+/// channel's address, which nothing dereferences.
+fn notice_token(c: NonNull<Channel>) -> u64 {
+    c.as_ptr() as u64 | NOTICE
+}
+
 /// Whether `token`, a thread's `boost_token`, is a notification's.
 fn is_notice(token: u64) -> bool {
     token & NOTICE != 0
@@ -685,7 +695,7 @@ fn is_notice(token: u64) -> bool {
 pub unsafe fn hold_notice(t: NonNull<Thread>, c: NonNull<Channel>) {
     // SAFETY: the caller's promise.
     unsafe {
-        let token = c.as_ptr() as u64 | NOTICE;
+        let token = notice_token(c);
         (*t.as_ptr()).boost_token = token;
         thread::clear_payer(t);
         (*c.as_ptr()).server = u32::from(thread::index(t));
@@ -996,8 +1006,17 @@ unsafe fn lift_holder(c: NonNull<Channel>, k: &mut Locked<'_>, t: NonNull<Thread
         }
         // The holder of a notification works for no request: the sender that
         // lifts it pays the lift (`pay_loan`).
+        // The higher sender stays the payer: a lower one, whose ask the
+        // command BOOST of another CPU's holder drops for the larger (the
+        // remote path does not look at levels), does not take the payer over.
+        #[cfg(not(feature = "break-notice-payer-none"))]
         if is_notice((*server.as_ptr()).boost_token) {
-            thread::set_payer(server, t);
+            let kept = thread::payer(server)
+                .and_then(|n| k.tokens.thread(n))
+                .is_some_and(|p| p != t && p.as_ref().priority() >= level);
+            if !kept {
+                thread::set_payer(server, t);
+            }
         }
         if !sched::boost(k, server, level, ceiling(server)) {
             return None;

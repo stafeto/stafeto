@@ -89,6 +89,7 @@ pub fn create(
     c: u64,
     t: u64,
     low: u8,
+    max_repl: u8,
     notice: Option<(NonNull<Channel>, u64)>,
 ) -> Result<NonNull<Budget>, Error> {
     if !crate::timer::take_place() {
@@ -98,6 +99,7 @@ pub fn create(
         channel::reserve_source(channel).inspect_err(|_| crate::timer::give_place())?;
     }
     let mut server = Server::new(c, t, low, clock::now());
+    server.set_max(max_repl);
     if notice.is_some() {
         server.watch();
     }
@@ -241,21 +243,44 @@ pub fn bind(t: NonNull<Thread>, b: NonNull<Budget>) -> Result<(), Error> {
     Ok(())
 }
 
-/// thread_bind_budget with no budget (spec 8): the budget of `t`, which the
-/// caller holds, leaves it; `cause` is the level a release of the budget may
-/// queue its cleanup at. The rules are `bind`'s: BAD_STATE for a thread that
-/// has no budget or ended, and for a thread of another CPU that started (its
-/// scheduler is that CPU's alone). The stint that runs is charged first; a
-/// thread that fell to `low` comes back to min(its base, `free` of its
-/// process); what the budget lent for a request is the client's debt, paid
-/// now (`channel::pay_loan`), and no debt comes after it; the servers the
-/// thread lifted follow its new level (`channel::requeue`); the event of the
-/// budget leaves the heap, so that its timer touches no thread (`fire`), and
-/// an overrun it had not told its place of is told here. The binding's
-/// reference goes. Under OBJ.
-pub fn unbind(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+/// thread_bind_budget with x2 (spec 8): the budget `old` of `t`, which the
+/// caller holds, leaves it, and with `new` the budget `new` takes its place in
+/// the same section; `cause` is the level a release of a budget may queue its
+/// cleanup at. The checks, in this order: `new` is of the CPU of the thread
+/// (INVALID_ARGS) and has no thread (BAD_STATE); `old` is the budget `t` has
+/// now, which also fails a thread with no budget (BAD_STATE); then the rules
+/// of `bind` for a thread of another CPU that started (BAD_STATE, its
+/// scheduler is that CPU's alone) or ended. One section of the scheduler's
+/// lock (`sched::unbind_budget`) closes and charges the stint that runs, pays
+/// the loan to the client (`channel::pay_loan`), takes the old event out of
+/// the heap, binds `new`, if any, and sets the level once: min(base, `free`)
+/// when there is none, so no rebind leaves the thread at `free` in between;
+/// the servers the thread lifted follow it (`channel::requeue`). An overrun
+/// the old place was not told of is told here, and the binding's reference to
+/// `old` goes; `new` is retained. Under OBJ.
+pub fn unbind(
+    t: NonNull<Thread>,
+    old: NonNull<Budget>,
+    new: Option<NonNull<Budget>>,
+    cause: u8,
+) -> Result<(), Error> {
     crate::obj::assert_held();
-    let server = crate::sched::unbind_budget(t)?;
+    // SAFETY: the caller holds references to the thread and the budgets; the
+    // fields are read under OBJ.
+    unsafe {
+        if let Some(n) = new {
+            if thread::cpu_of(t) != usize::from((*n.as_ptr()).cpu) {
+                return Err(Error::InvalidArgs);
+            }
+            if (*n.as_ptr()).thread.is_some() {
+                return Err(Error::BadState);
+            }
+        }
+        if t.as_ref().sched.server() != Some(server_of(old)) {
+            return Err(Error::BadState);
+        }
+    }
+    let server = crate::sched::unbind_budget(t, new.map(server_of))?;
     // SAFETY: the server was the thread's, which the budget's binding kept
     // alive until here; the binding's reference is the one that goes.
     unsafe {
@@ -269,6 +294,10 @@ pub fn unbind(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
             let _ = Source::post(NonNull::from(source), NOTICE_BITS, cause);
         }
         release(b, cause);
+        if let Some(n) = new {
+            (*n.as_ptr()).thread = Some(t);
+            retain(n);
+        }
     }
     Ok(())
 }

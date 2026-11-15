@@ -1129,7 +1129,7 @@ why = "the second header of the loop over the CPUs that has something to take (t
 
 [[loop]]
 function = "<kcore::budget::Server>::unblock"
-at = "0xf4"
+at = "0x120"
 bound = 4
 why = "the replenishments of a budget that arrive while its thread runs merge into the first one: at most three, and the look that ends the loop (Server::unblock, MAX_REPLENISHMENTS = 4)"
 
@@ -1147,12 +1147,12 @@ why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENT
 
 [[loop]]
 function = "<kcore::budget::Server>::split"
-at = "0x94"
+at = "0x68"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
 
 [[loop]]
 function = "<kcore::budget::Server>::split"
-at = "0x110"
+at = "0x134"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"

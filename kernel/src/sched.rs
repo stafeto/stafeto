@@ -398,7 +398,10 @@ pub fn bind_budget(
 /// base and `free` of its process) and pays what it lent to the client of
 /// its request; the servers it lifted follow its level once the lock is
 /// gone. Returns the server that was the thread's. Under OBJ.
-pub fn unbind_budget(t: NonNull<Thread>) -> Result<NonNull<kcore::budget::Server>, Error> {
+pub fn unbind_budget(
+    t: NonNull<Thread>,
+    new: Option<NonNull<kcore::budget::Server>>,
+) -> Result<NonNull<kcore::budget::Server>, Error> {
     crate::obj::assert_held();
     if thread::is_started(t) && !is_local(t) {
         return Err(Error::BadState);
@@ -413,6 +416,11 @@ pub fn unbind_budget(t: NonNull<Thread>) -> Result<NonNull<kcore::budget::Server
         unsafe {
             let (server, lent) = k.s.unbind_budget(t, free, now)?;
             channel::pay_loan(k, t, lent, now);
+            // A rebind is one section: the level is set once more at once.
+            if let Some(new) = new {
+                k.s.bind(t, new, now)
+                    .unwrap_or_else(|_| kcore::fail_here!("a thread with no budget binds"));
+            }
             Ok::<_, Error>((server, channel::requeue(t, k)))
         }
     })?;

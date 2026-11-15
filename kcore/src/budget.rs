@@ -44,6 +44,7 @@
 
 /// The most pending replenishments: `_POSIX_SS_REPL_MAX`.
 pub const MAX_REPLENISHMENTS: usize = 4;
+const _: () = ::core::assert!(MAX_REPLENISHMENTS as u64 == abi::SS_REPL_MAX);
 
 /// A chunk of budget that comes back at `time` ticks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -81,6 +82,9 @@ pub struct Server {
     /// (`take_notice`).
     told: u32,
     low: u8,
+    /// The most replenishments pending at once, 1 to `MAX_REPLENISHMENTS`
+    /// (`_POSIX_SS_REPL_MAX` of the thread that has it).
+    max: u8,
     background: bool,
     /// The budget has a notification place: an overrun wants an event at
     /// once, for the kernel to post it under OBJ (`check`).
@@ -116,6 +120,7 @@ impl Server {
             overruns: 0,
             told: 0,
             low,
+            max: MAX_REPLENISHMENTS as u8,
             background: false,
             watched: false,
             len: 1,
@@ -151,6 +156,19 @@ impl Server {
         self.usage
     }
 
+    /// The queue holds `max` replenishments at most, 1 to
+    /// `MAX_REPLENISHMENTS` (the caller checked): a remnant that would make
+    /// one more merges into the next entry, later, never earlier (`split`).
+    pub fn set_max(&mut self, max: u8) {
+        assert!(max >= 1 && usize::from(max) <= MAX_REPLENISHMENTS);
+        self.max = max;
+    }
+
+    /// The most replenishments the queue holds.
+    pub fn max(&self) -> u8 {
+        self.max
+    }
+
     /// The budget has a notification place from now on: each overrun asks
     /// for an event at once, which `take_notice` answers.
     pub fn watch(&mut self) {
@@ -158,9 +176,11 @@ impl Server {
     }
 
     /// The event of a watched budget fired: whether an overrun is not told
-    /// yet. Overruns that came together are one notification; the place
-    /// counts one post for each call that says true, so that a thread that
-    /// overruns once for each period gives one notification for each period.
+    /// yet. The rule is one notification for each firing that finds an
+    /// overrun not told: overruns that come between two firings merge into
+    /// one (a period holds at most `MAX_REPLENISHMENTS` of them), and a thread
+    /// that overruns once for each period, with its event served in time,
+    /// gives one notification for each period.
     pub fn take_notice(&mut self) -> bool {
         let pending = self.overruns != self.told;
         self.told = self.overruns;
@@ -375,7 +395,7 @@ impl Server {
             time: self.q[0].time,
             amount: self.usage,
         };
-        if usize::from(self.len) == MAX_REPLENISHMENTS {
+        if self.len >= self.max {
             // The remnant goes to the next entry: later, never earlier.
             self.pop();
             if self.len > 0 {
@@ -461,6 +481,7 @@ impl Server {
         // The event came for the place, before the replenishment: the head
         // is not due, and the usage that `check` took in is not taken in
         // twice. The event of the replenishment goes back.
+        #[cfg(not(feature = "break-budget-early-replenish"))]
         if self.background && self.q[0].time > now {
             self.event = self.q[0].time;
             return;
@@ -501,14 +522,19 @@ mod tests {
         assert!(s.background());
         assert_eq!(s.overruns(), 1);
         assert_eq!(s.event_change(), Some(Some(12)));
-        // The event fires early: the notice is told, the head is not due.
+        // The event fires early: the notice is told, the head is not due. The
+        // head stays where it was (12 ticks ran of 10: the overrun of 2 moved
+        // it to 100 + 2) and the usage is not taken in twice.
+        assert_eq!(s.queue()[0].time, 102);
         assert!(s.take_notice());
         s.replenish(12);
         assert!(s.background());
-        assert_eq!(s.event_change(), Some(Some(s.queue()[0].time)));
+        assert_eq!((s.queue()[0].time, s.usage()), (102, 2));
+        assert_eq!(s.event_change(), Some(Some(102)));
         assert!(!s.take_notice());
         // The head's time comes: the thread is back, and no notice is owed.
         let at = s.queue()[0].time;
+        assert_eq!(at, 102);
         s.replenish(at);
         assert!(!s.background());
         assert!(!s.take_notice());
@@ -519,6 +545,26 @@ mod tests {
         assert_eq!(s.overruns(), 2);
         assert!(s.take_notice());
         assert!(!s.take_notice());
+    }
+
+    /// A queue limit below 4 merges the remnant into the next entry, so the
+    /// queue never holds more than the limit and the sum stays the budget.
+    #[test]
+    fn a_queue_limit_holds_the_queue_to_it() {
+        for max in 1..=4u8 {
+            let mut s = Server::new(40, 1000, 1, 0);
+            s.set_max(max);
+            let mut now = 0;
+            for _ in 0..30 {
+                s.unblock(now);
+                s.run(now);
+                now += 3;
+                s.stop(now, true, false);
+                assert!(s.queue().len() <= usize::from(max));
+                assert_eq!(s.sum(), 40);
+                now += 5;
+            }
+        }
     }
 
     /// A budget with no place keeps the events it had: an overrun asks for the

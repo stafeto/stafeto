@@ -1423,11 +1423,13 @@ impl<T: Schedulable> Scheduler<T> {
             if n.state == State::Dead {
                 return Err(Error::BadState);
             }
+            #[cfg(not(feature = "break-budget-unbind-no-charge"))]
             if n.state == State::Running {
                 Self::with_server(t, Op::Stop(false), now);
             }
             // The stint is closed: what the budget lent stands in `lent`.
             let lent = server.as_mut().take_loan(now, false);
+            #[cfg(not(feature = "break-budget-unbind-keeps-event"))]
             Self::with_server(t, Op::Off, 0);
             let n = node(t);
             n.server = None;

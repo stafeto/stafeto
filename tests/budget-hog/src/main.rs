@@ -597,8 +597,8 @@ fn phase_overrun(process: &Handle<Process>, resource: &Handle<Resource>) {
     let wait = sys::channel_create_wait(62).expect("channel");
     let timer = sys::timer_create(&wait, 62).expect("timer");
     sleep_until(&wait, &timer, now_ns() + PHASE_MS / 2 * MS);
-    let first = sys::thread_unbind_budget(&hog);
-    let second = sys::thread_unbind_budget(&hog);
+    let first = sys::thread_unbind_budget(&hog, &hog_budget);
+    let second = sys::thread_unbind_budget(&hog, &hog_budget);
     // The receiver, at 55, takes what the unbind told its place.
     sleep_until(&wait, &timer, now_ns() + 3 * MS);
     let info = sys::budget_info(&hog_budget).expect("budget info");

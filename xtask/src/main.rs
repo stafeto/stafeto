@@ -1206,12 +1206,13 @@ const OVERFLOW_PROBE_FN: &str = "karch::probe::recurse";
 /// image of the kernel tests (`Variant::el0_half`) must have run.
 const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
 const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
-const ICOUNT_TESTS: [&str; 20] = [
+const ICOUNT_TESTS: [&str; 21] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
     "timer_firing_is_measured",
     "budget_firing_is_measured",
+    "budget_notice_firing_is_measured",
     "reply_receive_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
@@ -1656,10 +1657,18 @@ enum Variant {
     /// it for the lift of the queue (`break-notice-holder-keeps`): the kernel
     /// tests of the lift must catch it.
     NoticeHolderKeepsTest,
+    /// Breaks the kernel tests of the rebind and the payer pin: a holder's lift
+    /// that names no payer (`break-notice-payer-none`), an unbind that does not
+    /// charge the stint that runs (`break-budget-unbind-no-charge`), and one
+    /// that leaves the event of the budget in the heap
+    /// (`break-budget-unbind-keeps-event`).
+    NoticePayerNoneTest,
+    BudgetUnbindNoChargeTest,
+    BudgetUnbindKeepsEventTest,
 }
 
 impl Variant {
-    const ALL: [Variant; 64] = [
+    const ALL: [Variant; 67] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1724,6 +1733,9 @@ impl Variant {
         Variant::BudgetOverrunSilentTest,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
+        Variant::NoticePayerNoneTest,
+        Variant::BudgetUnbindNoChargeTest,
+        Variant::BudgetUnbindKeepsEventTest,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1796,6 +1808,9 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
+            Variant::NoticePayerNoneTest => Some("ktest,break-notice-payer-none"),
+            Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
+            Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
         }
     }
 
@@ -1884,6 +1899,9 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
+            Variant::NoticePayerNoneTest => "stafeto-ktest-notice-payer-none",
+            Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
+            Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
         }
     }
 }

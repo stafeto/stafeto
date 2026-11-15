@@ -24,8 +24,11 @@ use core::ptr::NonNull;
 /// Bits of a token for the number; the count takes the rest (spec 6.1).
 pub const INDEX_BITS: u32 = 16;
 /// The last count of an entry: the thread on it gets BAD_STATE from send,
-/// and the entry retires when the thread goes.
-pub const MAX_COUNT: u64 = (1 << (u64::BITS - INDEX_BITS)) - 1;
+/// and the entry retires when the thread goes. 47 bits: bit 63 of a request's
+/// token is never set, which the tag of a notification's hold relies on
+/// (kernel::channel::message::NOTICE).
+pub const MAX_COUNT: u64 = (1 << 47) - 1;
+const _: () = ::core::assert!(MAX_COUNT << INDEX_BITS < 1 << 63);
 
 /// The bit of an entry's word that says it names a thread.
 const TAKEN: u64 = 1 << 63;
@@ -320,7 +323,7 @@ mod tests {
     #[test]
     fn entries_are_16_bytes() {
         assert_eq!(core::mem::size_of::<Entry<u8>>(), 16);
-        assert_eq!(MAX_COUNT, (1 << 48) - 1);
+        assert_eq!(MAX_COUNT, (1 << 47) - 1);
         // A new table is all zeros.
         let t: Table<u8, 4> = Table::new();
         // SAFETY: the table is words and a union, every byte of them set.

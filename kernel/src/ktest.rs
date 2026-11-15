@@ -758,12 +758,16 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::reply_receive_refuses_before_it_replies,
     ),
     (
+        "reply_receive_says_x1_1_when_its_receive_half_fails",
+        calls::reply_receive_says_x1_1_when_its_receive_half_fails,
+    ),
+    (
         "reply_receive_reads_its_channel_from_x10",
         calls::reply_receive_reads_its_channel_from_x10,
     ),
     (
-        "thread_bind_budget_with_no_budget_unbinds",
-        calls::thread_bind_budget_with_no_budget_unbinds,
+        "thread_bind_budget_with_x2_unbinds_and_rebinds",
+        calls::thread_bind_budget_with_x2_unbinds_and_rebinds,
     ),
     (
         "unbinding_gives_a_thread_min_of_its_base_and_free",
@@ -800,6 +804,10 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "a_request_that_queues_lifts_a_notification_holder_of_another_cpu",
         calls::a_request_that_queues_lifts_a_notification_holder_of_another_cpu,
+    ),
+    (
+        "a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel",
+        calls::a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel,
     ),
     (
         "a_thread_with_no_budget_works_at_the_free_level",
@@ -862,7 +870,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// of the long calls of memory objects, the timers of programs, device
 /// windows, the calls of upcalls and process_kill with a level, whose
 /// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 10 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 11 } else { 0 };
 
 /// The tests of a build come in two images, which keep each under the size
 /// a test image may have: the first runs TESTS and, with `icount`, the
@@ -910,6 +918,10 @@ pub fn run(boot: &Boot) -> ! {
         report(
             "budget_firing_is_measured",
             calls::budget_firing_is_measured(boot),
+        );
+        report(
+            "budget_notice_firing_is_measured",
+            calls::budget_notice_firing_is_measured(boot),
         );
         report(
             "reply_receive_is_measured",

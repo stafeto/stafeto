@@ -443,13 +443,31 @@ pub fn breaks() -> Result<(), String> {
             "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
             "a thread that goes on holding a notification after its receive",
         ),
+        (
+            Variant::NoticePayerNoneTest,
+            "a_request_that_queues_lifts_a_server_that_took_a_notification",
+            "a lift of a notification's holder that names no payer",
+        ),
+        (
+            Variant::BudgetUnbindNoChargeTest,
+            "unbinding_gives_a_thread_min_of_its_base_and_free",
+            "an unbind that does not charge the stint that runs",
+        ),
+        (
+            Variant::BudgetUnbindKeepsEventTest,
+            "the_timer_of_an_unbound_budget_leaves_the_former_thread_alone",
+            "an unbind that leaves the event of the budget in the heap",
+        ),
     ] {
         let a = build(variant)?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
         cmd.args(qemu::HEADLESS);
         let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
         let report = qemu::parse_report(&o.lines);
-        if !report.failed.iter().any(|(name, _)| name == test) {
+        // A break that corrupts the kernel's own structures may stop the run
+        // with a panic before the test reports: that is caught as well.
+        let panicked = o.lines.iter().any(|l| l.contains("KERNEL PANIC"));
+        if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }
         println!("budget-breaks: {what} is caught");
@@ -469,6 +487,9 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-forgive-loan",
         "break-budget-overrun-silent",
         "break-budget-unbind-keeps",
+        "break-budget-unbind-no-charge",
+        "break-budget-unbind-keeps-event",
+        "break-budget-early-replenish",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))

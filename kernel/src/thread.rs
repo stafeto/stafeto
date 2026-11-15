@@ -512,6 +512,13 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
 ///
 /// # Safety
 /// Both are alive; `sender` holds its number; OBJ is held.
+#[cfg_attr(
+    any(
+        feature = "break-notice-payer-none",
+        feature = "break-budget-no-queue-lift"
+    ),
+    allow(dead_code)
+)]
 pub unsafe fn set_payer(holder: NonNull<Thread>, sender: NonNull<Thread>) {
     // SAFETY: the caller's promise; only the field is written.
     unsafe { (*holder.as_ptr()).numbers.served_by = index(sender) };

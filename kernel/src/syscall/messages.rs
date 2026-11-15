@@ -111,8 +111,9 @@ fn receive_from(thread: NonNull<Thread>, handle: u64, wait: bool) -> Result<(), 
 /// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED), the handles of the reply. Then
 /// the reply, by the rules of `reply`: PEER_CLOSED of it goes on to the
 /// receive, since the reply went as far as it could; any other error is
-/// the call's, in x0 alone, and the receive does not run. The receive
-/// writes the result itself (x0-x11), an error of it in x0 alone.
+/// the call's, in x0 with x1 = 0, and the receive does not run. The receive
+/// writes the result itself (x0-x11); an error of it is in x0 with x1 = 1,
+/// which says the reply went and its handles are gone.
 #[inline(never)]
 pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
     let entry = crate::arch::timer::now();
@@ -135,7 +136,13 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
     });
     let handle = match replied {
         Ok(handle) => handle,
-        Err(e) => return set_result(thread, Err(e)),
+        Err(e) => {
+            // Nothing happened, or the reply was refused: x1 = 0 says the
+            // handles of the reply stay with the caller (keeps_handles).
+            set_result(thread, Err(e));
+            set_half(thread, 0);
+            return;
+        }
     };
     // The reply is a stretch of its own, as a portion of a long call is: the
     // poll for an interrupt follows it. With one pending the call starts over
@@ -158,6 +165,13 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
 fn channel_arg(thread: NonNull<Thread>) -> u64 {
     // SAFETY: the thread that made the call is alive and holds its registers.
     unsafe { thread.as_ref() }.regs.x[10]
+}
+
+/// x1 of a failed `reply_receive`: 0 when no effect came of it, 1 when its reply
+/// went (abi::Call::ReplyReceive).
+fn set_half(mut thread: NonNull<Thread>, half: u64) {
+    // SAFETY: the thread is alive, and nothing else refers to its registers now.
+    unsafe { thread.as_mut() }.regs.x[1] = half;
 }
 
 /// The kernel tests make the next poll between the halves of `reply_receive`
@@ -185,6 +199,11 @@ fn forced_poll() -> bool {
 /// `start`.
 #[inline(never)]
 pub(super) fn receive_second(thread: NonNull<Thread>, handle: u64, start: u64) {
+    // From here the reply is delivered, or met PEER_CLOSED, and its handles
+    // are gone: an error of the receive half, which `receive_on` or a later
+    // end of the wait writes in x0 alone, comes with x1 = 1. A notification or
+    // a request overwrites x1.
+    set_half(thread, 1);
     objects(|| {
         thread::end_long(thread);
         receive_on(thread, handle)

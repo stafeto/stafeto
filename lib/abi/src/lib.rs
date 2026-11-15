@@ -148,6 +148,10 @@ pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
 pub const BUDGET_RIGHTS: Rights =
     Rights(Rights::BUDGET.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
 
+/// The most replenishments a time budget keeps pending at once
+/// (`budget_create` x6), as `_POSIX_SS_REPL_MAX`.
+pub const SS_REPL_MAX: u64 = 4;
+
 /// The least budget and the least period `budget_create` accepts, in
 /// nanoseconds (spec 8).
 pub const MIN_BUDGET_NS: u64 = 10_000;
@@ -350,22 +354,38 @@ pub enum Call {
     MsiCreate = 37,
     /// x0 system resource with BUDGET, x1 CPU, x2 budget in ns, x3 period
     /// in ns, x4 the level `low` the thread falls to when its budget is
-    /// gone, x5 a handle with NOTIFY to a channel, or 0: makes a time
-    /// budget (spec 8); x1 returns a handle to it with `BUDGET_RIGHTS`. With
-    /// x5 the budget posts one notification (source `Budget`, the label of
-    /// the handle, bit 0) to the channel for each overrun, at the level
-    /// `low`. INVALID_ARGS for a CPU that is not up, a budget
-    /// below `MIN_BUDGET_NS` or above the period, a period below
-    /// `MIN_PERIOD_NS`, or a level outside 1-63.
+    /// gone, x5 a handle with NOTIFY to a channel or 0, x6 the most
+    /// replenishments pending at once (0 means `SS_REPL_MAX`, 1 to
+    /// `SS_REPL_MAX` are allowed): makes a time budget (spec 8); x1 returns
+    /// a handle to it with `BUDGET_RIGHTS`. With x5 the budget has a place
+    /// for the notifications of its overruns: one notification, source
+    /// `Budget`, bit 0 (bits 1-63 are zero and reserved), with the label of
+    /// the handle x5, at the level `low`, for each overrun; overruns that
+    /// come between two firings of the budget's event merge (the count of
+    /// the notification says how many posts merged; up to `SS_REPL_MAX` a
+    /// period). A handle with no label makes every budget report label 0, so
+    /// the creator gives each budget a labelled handle. INVALID_ARGS for a
+    /// CPU that is not up, a budget below `MIN_BUDGET_NS` or above the
+    /// period, a period below `MIN_PERIOD_NS`, a level outside 1-63, or x6
+    /// above `SS_REPL_MAX`.
     BudgetCreate = 38,
-    /// x0 thread with MANAGE, x1 budget with BUDGET: the thread works under
-    /// the budget from now on (spec 8). INVALID_ARGS for a thread of
-    /// another CPU than the budget's, BAD_STATE for a thread that has a
-    /// budget or ended, a budget that a thread has, or a thread of another
-    /// CPU that has started. With x1 = 0 the thread's budget leaves it:
-    /// the stint that runs is charged, and the thread works at min(its
-    /// base, `free` of its process) from now on; BAD_STATE for a thread
-    /// that has no budget or ended, or that started on another CPU.
+    /// x0 thread with MANAGE, x1 a new budget with BUDGET or 0, x2 the
+    /// thread's current budget with BUDGET or 0 (spec 8). x1 and x2 both 0 is
+    /// INVALID_ARGS. x1 != 0 and x2 = 0 binds: the thread works under the
+    /// budget from now on; INVALID_ARGS for a thread of another CPU than the
+    /// budget's, BAD_STATE for a thread that has a budget or ended, a budget
+    /// that a thread has, or a thread of another CPU that has started. x1 = 0
+    /// and x2 != 0 unbinds: x2 names the budget the thread has now (the
+    /// proof of what it gives up; the right MANAGE alone does not unbind),
+    /// the stint that runs is charged, the loan is paid, and the thread
+    /// works at min(its base, `free` of its process) from now on; BAD_STATE
+    /// when x2 is not the thread's budget (a thread with no budget among
+    /// them), for a thread that ended, or that started on another CPU. Both
+    /// set rebinds in one section: the old stint is charged, its loan paid,
+    /// an overrun its place was not told of is posted, the old event goes,
+    /// and the new budget is bound and the level set once; the thread is
+    /// never at `free` in between. The errors of unbind and of bind both
+    /// apply.
     ThreadBindBudget = 39,
     /// x0 token, x1 description, x2-x9 bytes 0-63 of the reply, as `Reply`;
     /// x10 a handle with RECEIVE to the channel to receive on, as x0 of
@@ -379,7 +399,11 @@ pub enum Call {
     /// `Reply` come first, then those of the handle, with no effect before
     /// they pass. PEER_CLOSED of the reply half goes on to the receive; any
     /// other error of the reply half returns in x0 and the receive does not
-    /// run. Once the reply half is done, the call ends as `Receive` does
+    /// run. On an error x0 holds it and x1 says which half failed: 0, nothing
+    /// happened (the checks failed or the reply was refused), and the handles of
+    /// the reply stay with the caller as `Error::keeps_handles` says; 1, the
+    /// reply was delivered or met PEER_CLOSED, its handles are gone, and the
+    /// error is the receive half's (no other register is written). Once the reply half is done, the call ends as `Receive` does
     /// (x0-x11), always waiting.
     ReplyReceive = 40,
 }

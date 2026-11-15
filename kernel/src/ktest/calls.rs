@@ -9326,13 +9326,12 @@ pub fn budget_create_checks_in_order(_: &Boot) -> Result<(), &'static str> {
             Object::Resource,
             Rights::DEVICE | Rights::KSTATS | Rights::DEBUG,
         )?;
-        let ok = [r.0, 0, 200_000, 1_000_000, 1, 0];
+        let ok = [r.0, 0, 200_000, 1_000_000, 1, 0, 0];
         let with = |i: usize, v: u64| {
             let mut a = ok;
             a[i] = v;
             a
         };
-        let budgets = crate::budget::in_use();
         // The values come first: a bad handle does not hide them.
         for (i, v) in [
             (1, arch::cpu::MAX_CPUS as u64),
@@ -9345,6 +9344,8 @@ pub fn budget_create_checks_in_order(_: &Boot) -> Result<(), &'static str> {
             (4, 0),
             (4, 64),
             (4, 1 << 8 | 1),
+            (6, abi::SS_REPL_MAX + 1),
+            (6, 1 << 32),
         ] {
             let mut a = with(i, v);
             a[0] = 0x7777;
@@ -9358,6 +9359,15 @@ pub fn budget_create_checks_in_order(_: &Boot) -> Result<(), &'static str> {
         if let Some(down) = (0..arch::cpu::MAX_CPUS).find(|&i| !arch::cpu::is_up(i)) {
             c.fails(n, &with(1, down as u64), Error::InvalidArgs)?;
         }
+        // x6: 0 is the most, 1 to 4 are allowed.
+        for max in [1, 2, abi::SS_REPL_MAX] {
+            let mut a = ok;
+            a[6] = max;
+            let h = c.created(n, &a)?;
+            c.close(h)?;
+        }
+        cleanup::drain();
+        let budgets = crate::budget::in_use();
         let b = c.created(n, &ok)?;
         let clock = arch::timer::clock();
         let whole = clock.ns_to_ticks(200_000);
@@ -9408,26 +9418,26 @@ pub fn thread_bind_budget_checks_and_binds(_: &Boot) -> Result<(), &'static str>
         args[6] = BUFFER + PAGE as u64;
         let other = c.created(Call::ThreadCreate.number(), &args)?;
         let make = Call::BudgetCreate.number();
-        let b = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0])?;
-        let spare = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0])?;
+        let b = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0, 0])?;
+        let spare = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0, 0])?;
         let budgets = crate::budget::in_use();
-        c.fails(n, &[0x7777, b.0], Error::BadHandle)?;
-        c.fails(n, &[b.0, b.0], Error::WrongType)?;
-        c.fails(n, &[t.0, 0x7777], Error::BadHandle)?;
-        c.fails(n, &[t.0, t.0], Error::WrongType)?;
+        c.fails(n, &[0x7777, b.0, 0], Error::BadHandle)?;
+        c.fails(n, &[b.0, b.0, 0], Error::WrongType)?;
+        c.fails(n, &[t.0, 0x7777, 0], Error::BadHandle)?;
+        c.fails(n, &[t.0, t.0, 0], Error::WrongType)?;
         // A handle to the budget without the right to bind it, and one to the
         // thread without MANAGE.
         let weak_budget = c.created(
             Call::HandleDuplicate.number(),
             &[b.0, Rights::DUPLICATE.0.into(), 0, 0],
         )?;
-        c.fails(n, &[t.0, weak_budget.0], Error::AccessDenied)?;
+        c.fails(n, &[t.0, weak_budget.0, 0], Error::AccessDenied)?;
         let weak_thread = c.created(
             Call::HandleDuplicate.number(),
             &[t.0, Rights::DUPLICATE.0.into(), 0, 0],
         )?;
-        c.fails(n, &[weak_thread.0, b.0], Error::AccessDenied)?;
-        c.succeeds(n, &[t.0, b.0], &[])?;
+        c.fails(n, &[weak_thread.0, b.0, 0], Error::AccessDenied)?;
+        c.succeeds(n, &[t.0, b.0, 0], &[])?;
         check(
             budget_info_of(c, b)?.state == abi::BUDGET_FULL,
             "the budget of a thread is not whole",
@@ -9439,10 +9449,10 @@ pub fn thread_bind_budget_checks_and_binds(_: &Boot) -> Result<(), &'static str>
         // SAFETY: the handle holds the thread, which never runs.
         let bound = unsafe { thread.as_ref() }.sched.has_budget();
         check(bound, "the thread has no budget after the bind")?;
-        c.fails(n, &[t.0, b.0], Error::BadState)?;
-        c.fails(n, &[other.0, b.0], Error::BadState)?;
-        c.fails(n, &[t.0, spare.0], Error::BadState)?;
-        c.succeeds(n, &[other.0, spare.0], &[])?;
+        c.fails(n, &[t.0, b.0, 0], Error::BadState)?;
+        c.fails(n, &[other.0, b.0, 0], Error::BadState)?;
+        c.fails(n, &[t.0, spare.0, 0], Error::BadState)?;
+        c.succeeds(n, &[other.0, spare.0, 0], &[])?;
         // The binding holds the budget when its handles go.
         for h in [b, spare, weak_budget] {
             c.close(h)?;
@@ -9545,9 +9555,9 @@ fn free_level_cases(c: &Caller, low: NonNull<Process>) -> Result<(), &'static st
     let r = c.insert(Object::Resource, abi::INIT_RESOURCE_RIGHTS)?;
     let b = c.created(
         Call::BudgetCreate.number(),
-        &[r.0, 0, 200_000, 1_000_000, 1, 0],
+        &[r.0, 0, 200_000, 1_000_000, 1, 0, 0],
     )?;
-    c.succeeds(Call::ThreadBindBudget.number(), &[t.0, b.0], &[])?;
+    c.succeeds(Call::ThreadBindBudget.number(), &[t.0, b.0, 0], &[])?;
     // SAFETY: as above.
     let level = unsafe { &thread.as_ref().sched }.priority();
     check(
@@ -9581,7 +9591,7 @@ pub fn budget_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
             Err(_) => made = Err("no thread"),
         }
         match // 100 us for each 1 ms at 62.5 MHz, in ticks.
-        crate::budget::create(c.process, 0, 6_250, 62_500, 1, None) {
+        crate::budget::create(c.process, 0, 6_250, 62_500, 1, 4, None) {
             Ok(n) => *b = Some(n),
             Err(_) => made = Err("no budget"),
         }
@@ -9788,11 +9798,11 @@ fn with_holder_of(
             });
             thread::give_buffer(r, BUFFER as usize).map_err(|_| "no buffer")?;
             if budgets {
-                let s = crate::budget::create(service, 0, server_c, 10 * server_c, 1, None)
+                let s = crate::budget::create(service, 0, server_c, 10 * server_c, 1, 4, None)
                     .map_err(|_| "no budget")?;
                 h.server_budget = Some(s);
                 crate::budget::bind(r, s).map_err(|_| "the server's budget did not bind")?;
-                let c = crate::budget::create(client, 0, CLIENT_C, 10 * CLIENT_C, 1, None)
+                let c = crate::budget::create(client, 0, CLIENT_C, 10 * CLIENT_C, 1, 4, None)
                     .map_err(|_| "no budget")?;
                 h.client_budget = Some(c);
                 crate::budget::bind(t, c).map_err(|_| "the client's budget did not bind")?;
@@ -10165,8 +10175,45 @@ pub fn reply_receive_refuses_before_it_replies(_: &Boot) -> Result<(), &'static 
             call(h.token ^ 1 << 40, 0) == Error::BadState && waits(h),
             "a token that names no request was not BAD_STATE",
         )?;
+        // x1 = 0 says nothing happened: the handles of the reply stay.
+        // SAFETY: the test holds the thread.
+        let half = unsafe { h.r.as_ref() }.regs.x[1];
+        check(half == 0, "a refused reply_receive did not say x1 = 0")?;
         let queued = channel::info(h.channel).queued;
         check(queued == 1, "the receive ran after a reply that failed")
+    })
+}
+
+/// reply_receive says which half failed in x1 (abi::Call::ReplyReceive): the
+/// reply is delivered and the channel handle goes between the halves (the poll
+/// there sent the call through EL0), so the receive half fails with BAD_HANDLE,
+/// and x1 = 1 says the reply went and its handles, if it had any, are gone: the
+/// client has its reply, and a second close would find nothing.
+pub fn reply_receive_says_x1_1_when_its_receive_half_fails(_: &Boot) -> Result<(), &'static str> {
+    with_holder(false, |h, _| {
+        give_channel(h);
+        syscall::force_poll();
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        check(
+            thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+            "the poll did not send the call through EL0",
+        )?;
+        process::close_handle(h.service, h.handle, CAUSE).map_err(|_| "no close")?;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let (r, t) = unsafe { (h.r.as_ref(), h.t.as_ref()) };
+        check(
+            Error::from_code(r.regs.x[0]) == Some(Error::BadHandle) && r.regs.x[1] == 1,
+            "a failed receive half did not say x1 = 1",
+        )?;
+        check(
+            t.sched.state() == State::Ready && t.regs.x[0] == 0,
+            "the reply of a call whose receive half failed did not reach its client",
+        )
     })
 }
 
@@ -10346,13 +10393,15 @@ pub fn reply_receive_reads_its_channel_from_x10(_: &Boot) -> Result<(), &'static
     })
 }
 
-/// thread_bind_budget with x1 = 0 unbinds (spec 8): BAD_HANDLE and
-/// ACCESS_DENIED come from the thread's handle, BAD_STATE for a thread that
-/// has no budget; a good call leaves the thread with none and the budget free,
-/// with its queue of replenishments and its usage as they were, and no thread
-/// for the budget to touch; the budget binds to another thread afterwards, and
-/// the old thread gets another.
-pub fn thread_bind_budget_with_no_budget_unbinds(_: &Boot) -> Result<(), &'static str> {
+/// thread_bind_budget with x2 (spec 8): x1 = x2 = 0 is INVALID_ARGS; x2 is the
+/// proof of what the thread gives up, so MANAGE alone unbinds nothing (x2 of a
+/// thread with no budget, or another budget, is BAD_STATE); a good unbind leaves
+/// the thread with none and the budget free, with its queue of replenishments
+/// as it was; the budget binds to another thread afterwards. Both x1 and x2
+/// rebind in one section: the old budget is free, the new one is the thread's,
+/// and a new budget that a thread has or of another CPU fails as for a bind,
+/// with the old binding left as it was.
+pub fn thread_bind_budget_with_x2_unbinds_and_rebinds(_: &Boot) -> Result<(), &'static str> {
     let n = Call::ThreadBindBudget.number();
     with_caller(|c| {
         let r = c.insert(Object::Resource, abi::INIT_RESOURCE_RIGHTS)?;
@@ -10362,23 +10411,29 @@ pub fn thread_bind_budget_with_no_budget_unbinds(_: &Boot) -> Result<(), &'stati
         let mut args = args;
         args[6] = BUFFER + PAGE as u64;
         let other = c.created(Call::ThreadCreate.number(), &args)?;
-        let b = c.created(
-            Call::BudgetCreate.number(),
-            &[r.0, 0, 200_000, 1_000_000, 1, 0],
-        )?;
+        let make = Call::BudgetCreate.number();
+        let b = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0, 0])?;
+        let b2 = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0, 0])?;
+        let b3 = c.created(make, &[r.0, 0, 200_000, 1_000_000, 1, 0, 0])?;
         let weak = c.created(
             Call::HandleDuplicate.number(),
             &[t.0, Rights::DUPLICATE.0.into(), 0, 0],
         )?;
-        c.fails(n, &[0x7777, 0], Error::BadHandle)?;
-        c.fails(n, &[b.0, 0], Error::WrongType)?;
-        c.fails(n, &[weak.0, 0], Error::AccessDenied)?;
-        // A thread with no budget has nothing to give back.
-        c.fails(n, &[t.0, 0], Error::BadState)?;
-        c.succeeds(n, &[t.0, b.0], &[])?;
+        c.fails(n, &[t.0, 0, 0], Error::InvalidArgs)?;
+        c.fails(n, &[0x7777, 0, b.0], Error::BadHandle)?;
+        c.fails(n, &[t.0, 0, 0x7777], Error::BadHandle)?;
+        c.fails(n, &[t.0, 0, t.0], Error::WrongType)?;
+        c.fails(n, &[weak.0, 0, b.0], Error::AccessDenied)?;
+        // A thread with no budget has nothing to give up, and MANAGE alone
+        // does not take one.
+        c.fails(n, &[t.0, 0, b.0], Error::BadState)?;
+        c.succeeds(n, &[t.0, b.0, 0], &[])?;
         let before = budget_info_of(c, b)?;
         check(before.state == abi::BUDGET_FULL, "the bind did not take")?;
-        c.succeeds(n, &[t.0, 0], &[])?;
+        // The proof is the budget the thread has: another one is no proof.
+        c.fails(n, &[t.0, 0, b2.0], Error::BadState)?;
+        c.fails(n, &[t.0, b2.0, b2.0], Error::BadState)?;
+        c.succeeds(n, &[t.0, 0, b.0], &[])?;
         let after = budget_info_of(c, b)?;
         check(
             after.state == abi::BUDGET_FREE
@@ -10391,25 +10446,39 @@ pub fn thread_bind_budget_with_no_budget_unbinds(_: &Boot) -> Result<(), &'stati
             .lookup(t, Rights::NONE, Object::thread)
             .map_err(|_| "the handle does not name the thread")?;
         check(!has_budget(thread), "the thread kept its budget")?;
-        let budget = {
+        let budget = |h: Handle| {
             // SAFETY: as above.
             unsafe { c.process.as_ref() }
-                .lookup(b, Rights::NONE, Object::budget)
-                .map_err(|_| "the handle does not name the budget")?
+                .lookup(h, Rights::NONE, Object::budget)
+                .map_err(|_| "the handle does not name the budget")
         };
         check(
-            crate::budget::bound_thread(budget).is_none(),
+            crate::budget::bound_thread(budget(b)?).is_none(),
             "the budget kept its thread",
         )?;
-        c.fails(n, &[t.0, 0], Error::BadState)?;
-        // The budget binds on, to another thread, and the first takes another.
-        c.succeeds(n, &[other.0, b.0], &[])?;
-        let spare = c.created(
-            Call::BudgetCreate.number(),
-            &[r.0, 0, 200_000, 1_000_000, 1, 0],
+        c.fails(n, &[t.0, 0, b.0], Error::BadState)?;
+        // The budget binds on, to another thread; the first takes another.
+        c.succeeds(n, &[other.0, b.0, 0], &[])?;
+        c.succeeds(n, &[t.0, b2.0, 0], &[])?;
+        // A rebind: b3 takes the place of b2 in one section.
+        c.fails(n, &[t.0, b.0, b2.0], Error::BadState)?;
+        check(
+            crate::budget::bound_thread(budget(b2)?) == Some(thread),
+            "a refused rebind changed the old binding",
         )?;
-        c.succeeds(n, &[t.0, spare.0], &[])?;
-        for h in [b, spare, weak, t, other, own, r] {
+        c.succeeds(n, &[t.0, b3.0, b2.0], &[])?;
+        check(
+            crate::budget::bound_thread(budget(b3)?) == Some(thread)
+                && crate::budget::bound_thread(budget(b2)?).is_none()
+                && budget_info_of(c, b2)?.state == abi::BUDGET_FREE
+                && budget_info_of(c, b3)?.state == abi::BUDGET_FULL,
+            "the rebind did not move the binding",
+        )?;
+        check(
+            level_of(thread) == 20,
+            "a thread rebound to a budget is not at its own level",
+        )?;
+        for h in [b, b2, b3, weak, t, other, own, r] {
             c.close(h)?;
         }
         cleanup::drain();
@@ -10433,7 +10502,8 @@ pub fn unbinding_gives_a_thread_min_of_its_base_and_free(_: &Boot) -> Result<(),
             "a server whose budget is gone did not fall to low",
         )?;
         process::set_free(h.service, 3);
-        crate::budget::unbind(h.r, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.r, h.server_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         check(
             level_of(h.r) == 3,
             "a thread that came off the budget is not at min(base, free)",
@@ -10443,7 +10513,8 @@ pub fn unbinding_gives_a_thread_min_of_its_base_and_free(_: &Boot) -> Result<(),
         h.demote()?;
         h.reply()?;
         process::set_free(h.service, 63);
-        crate::budget::unbind(h.r, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.r, h.server_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         check(
             level_of(h.r) == 5,
             "a thread that came off the budget is not at its base",
@@ -10457,7 +10528,8 @@ pub fn unbinding_gives_a_thread_min_of_its_base_and_free(_: &Boot) -> Result<(),
         let b = h.server_budget.ok_or("no budget")?;
         let ran = crate::budget::info(b).ran;
         spin(SPIN);
-        crate::budget::unbind(h.r, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.r, h.server_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         check(
             level_of(h.r) == 2,
             "a thread above free kept its level when its budget went",
@@ -10489,7 +10561,8 @@ pub fn unbinding_a_server_on_loan_charges_the_open_stint_to_the_client(
         )?;
         pick(h.r)?;
         spin(SPIN);
-        crate::budget::unbind(h.r, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.r, h.server_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         let paid = left_of(c);
         check(
             before >= paid + SPIN,
@@ -10523,7 +10596,8 @@ pub fn unbinding_a_client_lifts_the_server_that_works_for_it(_: &Boot) -> Result
             level_of(h.t) == 1 && level_of(h.r) == 5,
             "a demoted client moved with its base",
         )?;
-        crate::budget::unbind(h.t, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.t, h.client_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         let _ = c;
         check(
             level_of(h.t) == 30,
@@ -10552,7 +10626,8 @@ pub fn the_timer_of_an_unbound_budget_leaves_the_former_thread_alone(
             "a budget whose thread is in the background has no event",
         )?;
         process::set_free(h.service, 3);
-        crate::budget::unbind(h.r, CAUSE).map_err(|_| "the unbind failed")?;
+        crate::budget::unbind(h.r, h.server_budget.ok_or("no budget")?, None, CAUSE)
+            .map_err(|_| "the unbind failed")?;
         check(
             crate::budget::entry_deadline(b).is_none(),
             "the event of an unbound budget stayed in the heap",
@@ -10606,7 +10681,7 @@ pub fn budget_create_checks_its_place_for_overruns(_: &Boot) -> Result<(), &'sta
             Call::HandleDuplicate.number(),
             &[ch.0, Rights::RECEIVE.0.into(), 0, 0],
         )?;
-        let ok = [r.0, 0, 200_000, 1_000_000, 1, ch.0];
+        let ok = [r.0, 0, 200_000, 1_000_000, 1, ch.0, 0];
         let with = |v: u64| {
             let mut a = ok;
             a[5] = v;
@@ -10664,8 +10739,16 @@ pub fn an_overrun_posts_one_notification_for_each_period(_: &Boot) -> Result<(),
         let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
             .map_err(|_| "no thread")?;
         made[1] = Some(t);
-        let b = crate::budget::create(c.process, 0, SERVER_C, 10 * SERVER_C, 1, Some((ch, LABEL)))
-            .map_err(|_| "no budget")?;
+        let b = crate::budget::create(
+            c.process,
+            0,
+            SERVER_C,
+            10 * SERVER_C,
+            1,
+            4,
+            Some((ch, LABEL)),
+        )
+        .map_err(|_| "no budget")?;
         budget = Some(b);
         crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
         thread::start(rcv).map_err(|_| "a thread did not start")?;
@@ -10813,7 +10896,7 @@ pub fn a_request_that_queues_lifts_a_server_that_took_a_notification(
     with_holder(true, |h, others| {
         takes_a_notification(h)?;
         let t2 = *others[0].insert(running_at(h.client, 40)?);
-        let b2 = crate::budget::create(h.client, 0, CLIENT_C, 10 * CLIENT_C, 1, None)
+        let b2 = crate::budget::create(h.client, 0, CLIENT_C, 10 * CLIENT_C, 1, 4, None)
             .map_err(|_| "no budget")?;
         crate::budget::bind(t2, b2).map_err(|_| "the sender's budget did not bind")?;
         let before = left_of(b2);
@@ -10938,4 +11021,136 @@ pub fn a_request_that_queues_lifts_a_notification_holder_of_another_cpu(
             "a request at 40 did not lift the notification holder of another CPU",
         )
     })
+}
+
+/// A lift of a holder of a notification is charged to the sender that raised
+/// it, and to no other: a sender that waits in a send into another channel (a
+/// reused thread number would name one) is nobody the holder worked for, and
+/// its budget stays whole, while the sender that queued in this channel pays.
+pub fn a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        takes_a_notification(h)?;
+        let other = channel::create(h.service, FIRE_LEVEL).map_err(|_| "no channel")?;
+        let t3 = *others[0].insert(running_at(h.client, 30)?);
+        let b3 = crate::budget::create(h.client, 0, CLIENT_C, 10 * CLIENT_C, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        crate::budget::bind(t3, b3).map_err(|_| "the budget did not bind")?;
+        let sent = channel::send(
+            t3,
+            Via::Channel(other),
+            Desc::from_send(0).expect("a send"),
+            &[],
+        );
+        // SAFETY: the reference `create` handed out goes; the wait of `t3` holds
+        // the channel.
+        unsafe { channel::release(other, Rights::NONE, CAUSE) };
+        check(sent == Ok(None), "a send into another channel did not wait")?;
+        let t2 = *others[1].insert(running_at(h.client, 40)?);
+        let b2 = crate::budget::create(h.client, 0, CLIENT_C, 10 * CLIENT_C, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        crate::budget::bind(t2, b2).map_err(|_| "the budget did not bind")?;
+        // The holder names `t3` as its payer, as a stale number would.
+        // SAFETY: the test holds both threads; OBJ is the test's section.
+        sched::locked(|_| unsafe { thread::set_payer(h.r, t3) });
+        let (before3, now) = (left_of(b3), timer::now());
+        // SAFETY: the holder and the senders are alive; `k` is locked.
+        sched::locked(|k| unsafe { channel::pay_loan(k, h.r, 3 * SPIN, now) });
+        let kept = left_of(b3) == before3;
+        // The sender that queues in this channel takes the payer over (it is
+        // above `t3`) and pays.
+        let queued = h.queue(t2);
+        let before2 = left_of(b2);
+        // SAFETY: as above.
+        sched::locked(|k| unsafe { channel::pay_loan(k, h.r, 3 * SPIN, now) });
+        let paid = before2 >= left_of(b2) + 3 * SPIN;
+        for b in [b3, b2] {
+            // SAFETY: the test's reference goes.
+            unsafe { crate::budget::release(b, CAUSE) };
+        }
+        check(kept, "a sender of another channel was charged for a lift")?;
+        queued?;
+        check(paid, "the sender that queued was not charged for the lift")
+    })
+}
+
+/// The firing of eight budgets that overran, each with a place for its
+/// notification and a receiver of its own waiting, in one portion (spec 10,
+/// 15.3), under -icount: the posts of the places come with the replenishments.
+/// The line `budget notice firing ticks: eight=N` is the portion's ticks; the
+/// hold of OBJ is the kind 51 of the run's report.
+#[cfg(feature = "icount")]
+pub fn budget_notice_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    let c = Caller::new()?;
+    let counts = (channel::in_use(), crate::budget::in_use());
+    let mut threads: [Option<NonNull<Thread>>; WOKEN] = [None; WOKEN];
+    let mut receivers: [Option<NonNull<Thread>>; WOKEN] = [None; WOKEN];
+    let mut budgets = [None; WOKEN];
+    let mut channels = [None; WOKEN];
+    let result = (|| {
+        for i in 0..WOKEN {
+            let ch = channel::create(c.process, LEVEL).map_err(|_| "no channel")?;
+            channels[i] = Some(ch);
+            let r = thread::create(c.process, USER_VA, USER_VA, 0, 30, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            receivers[i] = Some(r);
+            let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            threads[i] = Some(t);
+            let b = crate::budget::create(c.process, 0, 6_250, 62_500, 1, 4, Some((ch, i as u64)))
+                .map_err(|_| "no budget")?;
+            budgets[i] = Some(b);
+            crate::budget::bind(t, b).map_err(|_| "a budget did not bind")?;
+            thread::start(r).map_err(|_| "a thread did not start")?;
+            pick(r)?;
+            channel::receive(r, ch, true).map_err(|_| "a receiver did not wait")?;
+        }
+        for t in threads.iter().flatten() {
+            thread::start(*t).map_err(|_| "a thread did not start")?;
+        }
+        for t in threads.iter().flatten() {
+            pick(*t)?;
+            // 125 us on: past the budget of 100 us: the overrun asks for its event.
+            let at = timer::now() + timer::frequency() / 8_000;
+            // SAFETY: the scheduler's threads are alive.
+            sched::locked(|k| unsafe { k.s.tick(at) });
+            check(is_demoted(*t), "the budget did not run out")?;
+        }
+        let far = timer::now() + timer::frequency() / 8_000;
+        let began = timer::now();
+        timers::fire_at(LEVEL, far);
+        let took = timer::now() - began;
+        kprintln!("budget notice firing ticks: eight={took}");
+        for ch in channels.iter().flatten() {
+            check(
+                channel::info(*ch).receivers == 0,
+                "a notification did not reach its receiver",
+            )?;
+        }
+        Ok(())
+    })();
+    for t in threads.into_iter().chain(receivers).flatten() {
+        // SAFETY: the test's reference goes, and the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for b in budgets.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    for ch in channels.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { channel::release(ch, Rights::NONE, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        (channel::in_use(), crate::budget::in_use()) == counts,
+        "a channel or a budget of the test stayed",
+    )
 }

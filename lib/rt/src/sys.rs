@@ -878,12 +878,24 @@ pub fn budget_create_with_notice(
     Ok(returned(&x))
 }
 
-/// thread_bind_budget with no budget: the budget of `thread` (MANAGE) leaves
-/// it, and the thread works at min(its base, `free` of its process) from now
-/// on. BAD_STATE for a thread that has no budget, ended, or started on
+/// thread_bind_budget with x2: `budget`, which `thread` (MANAGE) has now, is
+/// the proof of what it gives up, and the thread works at min(its base, `free`
+/// of its process) from now on. BAD_STATE when `budget` is not the thread's
+/// (a thread with no budget among them), the thread ended, or it started on
 /// another CPU than the caller's.
-pub fn thread_unbind_budget(thread: &Handle<Thread>) -> Result<(), Error> {
-    let args = [thread.raw().0, 0];
+pub fn thread_unbind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
+    let args = [thread.raw().0, 0, budget.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
+}
+
+/// thread_bind_budget with both x1 and x2: `new` takes the place of `old`, the
+/// thread's budget, in one section; the thread is never at `free` between them.
+pub fn thread_rebind_budget(
+    thread: &Handle<Thread>,
+    new: &Handle<Budget>,
+    old: &Handle<Budget>,
+) -> Result<(), Error> {
+    let args = [thread.raw().0, new.raw().0, old.raw().0];
     call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
 }
 
@@ -1249,8 +1261,12 @@ impl Token {
         // SAFETY: reply_receive uses no memory of the program but its own
         // message buffer; it reads x0-x10 and writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
+        // x1 of an error says which half failed (abi::Call::ReplyReceive): 0,
+        // nothing happened, so BAD_STATE there is the reply's (the token named
+        // no request that waited) and the call receives as `receive` does;
+        // 1, the reply went, and any error is the receive half's.
         match received(x) {
-            Err(Error::BadState) => receive(channel),
+            Err(Error::BadState) if x[1] == 0 => receive(channel),
             r => r,
         }
     }
