@@ -728,13 +728,20 @@ mod tests {
 
     /// Senders pin a place and read its resource; the collector frees the
     /// resource only for a place it took, and then makes a new generation.
-    /// No sender reads a freed resource.
+    /// No sender reads a freed resource. The rounds start after every
+    /// sender has read once, and each round ends only after a read in it, so
+    /// the outcome does not depend on when the host schedules the senders;
+    /// a wait that passes `WAIT` ends with a failure message.
     #[test]
     fn senders_never_read_a_resource_the_collector_freed() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         const FREED: u64 = u64::MAX;
-        const ROUNDS: u64 = 100_000;
+        const ROUNDS: u64 = 20_000;
+        const SENDERS: u64 = 4;
+        // Far above any scheduling delay of a loaded host; reached only when
+        // a sender cannot make progress at all.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
         struct Shared {
             row: Lifetime,
             pins: AtomicU32,
@@ -742,6 +749,7 @@ mod tests {
             done: AtomicBool,
             bad: AtomicU64,
             reads: AtomicU64,
+            started: AtomicU64,
         }
         let shared = Arc::new(Shared {
             row: Lifetime::new(),
@@ -750,6 +758,7 @@ mod tests {
             done: AtomicBool::new(false),
             bad: AtomicU64::new(0),
             reads: AtomicU64::new(0),
+            started: AtomicU64::new(0),
         });
         assert!(shared.row.reserve());
         shared.row.set_flags(LIVE);
@@ -757,19 +766,34 @@ mod tests {
             .map(|_| {
                 let shared = shared.clone();
                 std::thread::spawn(move || {
+                    let mut announced = false;
                     while !shared.done.load(Ordering::Relaxed) {
                         if let Some(_pin) = shared.row.try_pin(&shared.pins, 0, |_| {}) {
                             if shared.resource.load(Ordering::Acquire) == FREED {
                                 shared.bad.fetch_add(1, Ordering::SeqCst);
                             }
-                            shared.reads.fetch_add(1, Ordering::Relaxed);
+                            shared.reads.fetch_add(1, Ordering::SeqCst);
+                            if !announced {
+                                announced = true;
+                                shared.started.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                         std::thread::yield_now();
                     }
                 })
             })
             .collect();
+        let begun = std::time::Instant::now();
+        while shared.started.load(Ordering::SeqCst) < SENDERS {
+            assert!(
+                begun.elapsed() < WAIT,
+                "only {} of {SENDERS} senders read once within {WAIT:?}",
+                shared.started.load(Ordering::SeqCst)
+            );
+            std::thread::yield_now();
+        }
         for round in 0..ROUNDS {
+            let reads_before = shared.reads.load(Ordering::SeqCst);
             // The thread ended and was released.
             shared.row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
             while shared
@@ -784,6 +808,15 @@ mod tests {
             assert!(shared.row.reserve());
             shared.resource.store(round + 2, Ordering::Release);
             shared.row.set_flags(LIVE);
+            // A sender reads the new generation before the next round.
+            let waiting = std::time::Instant::now();
+            while shared.reads.load(Ordering::SeqCst) == reads_before {
+                assert!(
+                    waiting.elapsed() < WAIT,
+                    "no sender read in round {round} within {WAIT:?}"
+                );
+                std::thread::yield_now();
+            }
         }
         shared.done.store(true, Ordering::Relaxed);
         for sender in senders {
