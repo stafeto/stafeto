@@ -1361,6 +1361,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sporadic-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

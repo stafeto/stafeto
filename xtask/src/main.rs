@@ -927,6 +927,14 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 7] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// The image of the sporadic server probe (tests/sporadic): that of the probe
+/// of POSIX processes (the loader, for `fork`) with the probe as its program,
+/// which the same table of init starts under the same name.
+const SPORADIC_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "sporadic-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const BUSYBOX_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -1996,6 +2004,7 @@ commands:
             (tools/build-relibc.py) into target/relibc/sysroot
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
+  sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
             over the Rust POSIX layer
   posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
             Cortex-A53 with the kernel entered at EL2 (as ci does)
@@ -2504,6 +2513,7 @@ fn main() {
             _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
+        Some("sporadic-probe") => sporadic_probe(),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
             Err(why) => {
@@ -8212,6 +8222,43 @@ fn widest_gap(lines: &[String]) -> Option<(String, usize, u64, u64)> {
         })
         .max_by_key(|row| row.2)
 }
+
+/// `cargo xtask sporadic-probe`: SCHED_SPORADIC in 0.5.0 (tests/sporadic): the
+/// options say 0 and -1, every call that would give a thread the policy is
+/// refused for root and for a user, and no budget can be bound.
+fn sporadic_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-sporadic.img", &SPORADIC_PROGRAMS, BOOT_PROFILE)?;
+    let output = qemu::on_cpus(4, || {
+        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        run_until(
+            cmd,
+            Duration::from_secs(120),
+            Some("init: posix-procs ended"),
+            &kernel.elf,
+        )
+    })?;
+    qemu::expect_marker(
+        &output,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in SPORADIC_MARKERS {
+        qemu::expect_marker(&output, marker)?;
+    }
+    println!("sporadic-probe: ok");
+    Ok(())
+}
+
+/// What the probe prints when each of its stages held.
+const SPORADIC_MARKERS: [&str; 5] = [
+    "sporadic: the options, SS_REPL_MAX and the range of SCHED_SPORADIC ok",
+    "sporadic: root: every call that would give the policy is refused ok",
+    "sporadic: user: every call that would give the policy is refused ok",
+    "sporadic: no thread has a budget: the other policies and their parameters round trip ok",
+    "sporadic: ok",
+];
 
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
