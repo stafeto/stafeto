@@ -39,6 +39,10 @@ const SERVICE_PERIOD_NS: u64 = 5 * MS;
 /// without it. The pipe and terminal services keep theirs.
 pub const RAM_BUDGET_ON: bool = true;
 
+/// The `free` level of the RAM records: `SERVICE_FREE` with the budget, 0 without it (a record
+/// without budgets has no `free`, `check_free`).
+pub const RAM_FREE: u8 = if RAM_BUDGET_ON { SERVICE_FREE } else { 0 };
+
 /// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
 /// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
 /// longest and the most frequent of the three. The thread works at `low` 1 after that, where a
@@ -126,7 +130,7 @@ const RAM_BASE: Record = Record {
 pub const RAM_LEGACY: Record = Record {
     args: proto_fs::RAM_TIME_LEGACY,
     budgets: RAM_BUDGETS,
-    free: SERVICE_FREE,
+    free: RAM_FREE,
     ..RAM_BASE
 };
 
@@ -135,7 +139,7 @@ pub const RAM_CLOCKED: Record = Record {
     args: proto_fs::RAM_TIME_CLOCKED,
     connects: &["clock"],
     budgets: RAM_BUDGETS,
-    free: SERVICE_FREE,
+    free: RAM_FREE,
     ..RAM_BASE
 };
 
