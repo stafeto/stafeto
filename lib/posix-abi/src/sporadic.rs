@@ -387,10 +387,20 @@ pub fn take_own(id: u64) -> Result<(), i32> {
     }
 }
 
-/// The calling thread's end: its budget goes back, if it has one.
+/// The calling thread's end: its budget goes back, if it has one. The budget
+/// leaves the thread first (the way out of the policy), and the thread ends
+/// with none: a thread that ends bound to a budget it has spent hangs the CPU
+/// it ran on (found by `cargo xtask sporadic-probe`, variant 1 of the
+/// endings; reported with the part), so the layer does not leave that to the
+/// kernel.
 pub fn release_own() {
     let id = crate::threads::thread_number();
-    if get(id).is_some() {
+    if get(id).is_none() {
+        return;
+    }
+    let block = crate::threads::own_block();
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
+    if leave(id, &thread).is_err() {
         forget(id);
     }
 }
