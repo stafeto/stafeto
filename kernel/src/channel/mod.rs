@@ -53,7 +53,9 @@ use kcore::sched::Scheduler;
 mod message;
 mod source;
 
-pub use message::{Via, Wait, cancel, pay_loan, raise, receive, reply, requeue, send, withdraw};
+pub use message::{
+    Via, Wait, cancel, hold_notice, pay_loan, raise, receive, reply, requeue, send, withdraw,
+};
 pub use source::{Owner, Source, notify};
 
 /// The work a portion of the stage Close does, at most (spec 7.7): each

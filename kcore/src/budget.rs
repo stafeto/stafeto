@@ -164,7 +164,8 @@ impl Server {
     pub fn take_notice(&mut self) -> bool {
         let pending = self.overruns != self.told;
         self.told = self.overruns;
-        pending
+        // The break: the overrun is counted as told and nothing is posted.
+        pending && !cfg!(feature = "break-budget-overrun-silent")
     }
 
     /// The sum of the ticks charged so far.
@@ -355,15 +356,12 @@ impl Server {
     /// this budget, asked for at once, or as it stands when that is earlier
     /// already (a later check does not push it back).
     fn want_notice(&mut self, now: u64) {
-        #[cfg(not(feature = "break-budget-overrun-silent"))]
         if self.watched && self.overruns != self.told {
             self.event = match self.armed {
                 0 => now,
                 armed => armed.min(now),
             };
         }
-        #[cfg(feature = "break-budget-overrun-silent")]
-        let _ = now;
     }
 
     /// Split_Check (figure 6.4): the thread blocked at `now`.

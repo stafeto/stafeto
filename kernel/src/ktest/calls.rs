@@ -10915,10 +10915,15 @@ pub fn a_request_that_queues_lifts_a_notification_holder_of_another_cpu(
         return Ok(());
     }
     with_holder(true, |h, others| {
-        takes_a_notification(h)?;
+        h.demote()?;
         pick(h.r)?;
         // SAFETY: the scheduler's threads are alive; `r` runs.
         sched::locked(|k| unsafe { k.s.block(timer::now()) });
+        // The server took a notification of the channel (the call `receive`
+        // of its own does this on its CPU: `takes_a_notification`).
+        // SAFETY: the test holds the thread and the channel; the section is
+        // the test's.
+        sched::locked(|_| unsafe { channel::hold_notice(h.r, h.channel) });
         let t2 = *others[0].insert(running_at(h.client, 40)?);
         thread::pretend_cpu(h.r, 1);
         h.queue(t2)?;
