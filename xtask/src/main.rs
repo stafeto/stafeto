@@ -46,6 +46,7 @@ mod base_image;
 mod bash_dialog;
 mod blk_probe;
 mod budget_hog;
+mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
@@ -2279,6 +2280,7 @@ commands:
   budget-hog [--cpus N] the probe of the time budgets under -icount on one CPU and on four (a hog at a high
             level with a budget leaves a lower level its share; the boost of a request stays and a
             notification's goes with the budget)
+  budget-journal the probe of the overruns in init's journal under -icount: one line in each 10 s for a budget that overruns in every period, none for one that does not
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
@@ -2349,6 +2351,7 @@ fn main() {
         Some("smp-asid-vz") => vz::smp_asid(),
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
