@@ -17,4 +17,4 @@ abi = { path = "../../lib/abi" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
 proto-wire = { path = "../../proto/wire" }
-rt = { path = "../../lib/rt" }
+rt = { path = "../../lib/rt", features = ["send-stats"] }

@@ -32,6 +32,9 @@ pub struct Numbers {
     pub ping_failed: u64,
     pub ping_max_us: u64,
     pub ping_over: u64,
+    pub ping_requests: u64,
+    pub ping_worst_request_us: u64,
+    pub ping_mean_us: u64,
     pub ping_greedy: u64,
 }
 
@@ -106,6 +109,9 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
                 n.ping_failed = number(line, "failed=")?;
                 n.ping_max_us = number(line, "max_us=")?;
                 n.ping_over = number(line, "over_750us=")?;
+                n.ping_requests = number(line, "requests=")?;
+                n.ping_worst_request_us = number(line, "worst_request_us=")?;
+                n.ping_mean_us = number(line, "mean_us=")?;
                 n.ping_greedy = number(line, "greedy=")?;
             }
         }
@@ -131,6 +137,34 @@ fn allowed_loss(service: &str) -> u64 {
 
 /// The windows the verdict holds the victim to: the median share in a window of 5 and of 10 ms.
 const CHECKED_WINDOWS: [u64; 2] = [5, 10];
+
+/// The bound of one request of a client above the budgets, in microseconds: one step of the
+/// service and the kernel's longest stretch (`budget-hog`).
+const REQUEST_BOUND_US: u64 = 750;
+
+/// The two bounds of the client at 40, told for each service and not gated: a request has
+/// `REQUEST_BOUND_US`, and a ping of several requests (the RAM service's lookup is five) has
+/// that for each of them. The tail the pings show (up to 52 ms) is the lost lift of the holder
+/// (stafeto-design#745); both checks are expected to fail until it is fixed, so they are
+/// numbers and no gate.
+pub fn ping_bounds(all: &[Numbers]) -> Vec<String> {
+    SERVICES
+        .iter()
+        .zip(all)
+        .map(|(name, n)| {
+            let per_ping = n.ping_requests / n.pings.max(1);
+            let request = if n.ping_worst_request_us <= REQUEST_BOUND_US { "held" } else { "not held" };
+            let ping = if n.ping_max_us <= per_ping.max(1) * REQUEST_BOUND_US { "held" } else { "not held" };
+            format!(
+                "service-budget: {name}: {per_ping} requests per ping, worst request {} us (bound {REQUEST_BOUND_US}: {request}), worst ping {} us, mean {} us (bound {} us: {ping}); expected not held until #745",
+                n.ping_worst_request_us,
+                n.ping_max_us,
+                n.ping_mean_us,
+                per_ping.max(1) * REQUEST_BOUND_US
+            )
+        })
+        .collect()
+}
 
 /// The numbers of the lines judged: `parse` and the control phase.
 pub fn judge(lines: &[String]) -> Result<(), String> {
@@ -238,6 +272,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let lines = run_image("boot-service-budget.img", &crate::SERVICE_BUDGET_PROGRAMS)?;
     require_service_budget_lines(&lines)?;
     judge(&lines)?;
+    for line in ping_bounds(&parse(&lines)?) {
+        println!("{line}");
+    }
     println!("service-budget: the three services keep their budgets");
     Ok(())
 }
@@ -349,7 +386,7 @@ mod tests {
                 "svcbudget {name} share greedy=400 greedy_failed=0 gap_us=40 status=0"
             ));
             out.push(format!(
-                "svcbudget {name} ping n=90 failed=0 max_us=100 over_750us=0 mean_us=50 worst_at_ms=3 greedy=500 greedy_failed=0 status=0"
+                "svcbudget {name} ping n=90 failed=0 max_us=100 over_750us=0 requests=90 worst_request_us=60 mean_us=50 worst_at_ms=3 greedy=500 greedy_failed=0 status=0"
             ));
         }
         out.push("svcbudget DONE".to_owned());

@@ -533,15 +533,23 @@ fn phase(
     let (mut n, mut max, mut failed) = (0u64, 0u64, 0u64);
     let (mut over, mut worst_at) = (0u64, 0u64);
     let mut sum = 0u64;
+    // The requests of the pings (a lookup of the RAM service is five) and the longest one.
+    let (mut requests, mut worst_request) = (0u64, 0u64);
+    sys::send_stats::watch(ping_session.raw().0);
     if ping {
         // The client at 40 asks every 2 ms, from 20 ms on: the greedy client starts on CPU 1
         // meanwhile, and its start is not the service's.
         let mut next = now_ns() + 20 * MS;
         while time::now() < END.load(Relaxed) {
             sleep_until(wait, timer, next);
+            let (sends_before, _) = sys::send_stats::read();
+            sys::send_stats::reset_longest();
             let began = time::now();
             let ok = ask(kind_of(name), ping_session, 1);
             let took = time::now() - began;
+            let (sends_after, longest) = sys::send_stats::read();
+            requests += sends_after - sends_before;
+            worst_request = worst_request.max(longest);
             if ok {
                 n += 1;
                 sum += took;
@@ -565,8 +573,9 @@ fn phase(
     wait_ended(wait, timer, GREEDIES as u64);
     if ping {
         println!(
-            "svcbudget {name} ping n={n} failed={failed} max_us={} over_750us={over} mean_us={} worst_at_ms={worst_at} greedy={} greedy_failed={} status={}",
+            "svcbudget {name} ping n={n} failed={failed} max_us={} over_750us={over} requests={requests} worst_request_us={} mean_us={} worst_at_ms={worst_at} greedy={} greedy_failed={} status={}",
             time::ticks_to_ns(max) / 1000,
+            time::ticks_to_ns(worst_request) / 1000,
             time::ticks_to_ns(sum) / 1000 / n.max(1),
             GREEDY_N.load(Relaxed),
             GREEDY_FAILED.load(Relaxed),

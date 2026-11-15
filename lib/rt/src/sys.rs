@@ -1498,10 +1498,48 @@ fn send_with(
     // limits.
     #[cfg(feature = "step-stats")]
     let began = crate::time::now();
+    #[cfg(feature = "send-stats")]
+    let sent_at = crate::time::now();
     let sent = call::<{ Call::Send.number() }>(&args);
+    #[cfg(feature = "send-stats")]
+    send_stats::note(channel.raw().0, crate::time::now().saturating_sub(sent_at));
     #[cfg(feature = "step-stats")]
     crate::service::waited(crate::time::now().saturating_sub(began));
     reply_of(sent?)
+}
+
+/// The sends of the program counted and the longest one timed (feature `send-stats`, for the
+/// probes of the budgets: a transaction of several requests is told by its requests).
+#[cfg(feature = "send-stats")]
+pub mod send_stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static LONGEST: AtomicU64 = AtomicU64::new(0);
+    static WATCHED: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts only the sends through the channel handle `raw` (the other threads of the
+    /// program send too).
+    pub fn watch(raw: u64) {
+        WATCHED.store(raw, Relaxed);
+    }
+
+    pub(super) fn note(raw: u64, ticks: u64) {
+        if raw == WATCHED.load(Relaxed) {
+            COUNT.fetch_add(1, Relaxed);
+            LONGEST.fetch_max(ticks, Relaxed);
+        }
+    }
+
+    /// The sends made so far, and the longest in ticks since the last `reset`.
+    pub fn read() -> (u64, u64) {
+        (COUNT.load(Relaxed), LONGEST.load(Relaxed))
+    }
+
+    /// Zeroes the longest (the count goes on).
+    pub fn reset_longest() {
+        LONGEST.store(0, Relaxed);
+    }
 }
 
 fn reply_of(x: Regs) -> Result<Reply, Error> {
