@@ -212,17 +212,14 @@ pub fn ask(id: u64, cpu: usize, ss: &Ss, low: u8) -> Result<Given, i32> {
     .map_err(|_| EIO)?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let mut reply = crate::process::send_again(&w).map_err(|e| {
-        rt::println!("DEBUG ss: send {e:?}");
         EIO
     })?;
     let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
     let status = bytes.u32().map_err(|_| EIO)?;
     if status != 0 {
-        rt::println!("DEBUG ss: ask status {status}");
         return Err(errno_of(status));
     }
     let new = reply.handles.take::<Budget>(0).map_err(|e| {
-        rt::println!("DEBUG ss: no handle {e:?}");
         EIO
     })?;
     let old = reply.handles.take::<Budget>(1).ok();
@@ -267,9 +264,7 @@ fn bind_errno(e: rt::abi::Error) -> i32 {
 /// service, the bind (or the rebind, when it has one) and the report. The
 /// table keeps the parameters on success.
 pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32> {
-    rt::println!("DEBUG ss: set {id} asks");
     let given = ask(id, cpu_of(id), &ss, low)?;
-    rt::println!("DEBUG ss: set {id} got the budget");
     let bound = match given.old.as_ref() {
         Some(old) => budget_call::rebind(thread, &given.new, old),
         None => budget_call::bind(thread, &given.new),
@@ -277,11 +272,9 @@ pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32>
     // The copy goes once the kernel holds the budget: the thread keeps it
     // for its life, and the service keeps the handle that can take it off.
     drop(given);
-    rt::println!("DEBUG ss: set {id} bound {bound:?}");
     match bound {
         Ok(()) => {
             done(id, true);
-            rt::println!("DEBUG ss: set {id} done");
             if put(id as u32, ss) {
                 Ok(())
             } else {
@@ -292,7 +285,6 @@ pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32>
             }
         }
         Err(e) => {
-            rt::println!("DEBUG ss: bind {e:?}");
             done(id, false);
             Err(bind_errno(e))
         }
@@ -330,8 +322,6 @@ pub fn leave(id: u64, thread: &Handle<Thread>) -> Result<(), i32> {
 pub fn release_own() {
     let id = crate::threads::thread_number();
     if get(id).is_some() {
-        rt::println!("DEBUG ss: {id} forgets");
         forget(id);
-        rt::println!("DEBUG ss: {id} forgot");
     }
 }
