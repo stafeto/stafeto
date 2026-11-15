@@ -20,7 +20,7 @@
 use crate::budget_call;
 use crate::constants::*;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use posix_sync::LayerLock;
 use posix_types::sporadic::Ss;
 use proto_process::Method;
@@ -45,6 +45,10 @@ struct Table(UnsafeCell<[Slot; SLOTS]>);
 unsafe impl Sync for Table {}
 
 static LOCK: LayerLock = LayerLock::new();
+/// How many slots of the table are in use: a process that never used a
+/// sporadic server (nearly all) never takes the lock, also at the end of a
+/// thread, which may be a native one with a small stack.
+static USED: AtomicU32 = AtomicU32::new(0);
 static TABLE: Table = Table(UnsafeCell::new(
     [const {
         Slot {
@@ -67,6 +71,9 @@ fn with<R>(f: impl FnOnce(&mut [Slot; SLOTS]) -> R) -> R {
 
 /// The parameters of thread `id`, if it runs under a sporadic server.
 pub fn get(id: u64) -> Option<Ss> {
+    if USED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     let key = id as u32;
     with(|t| t.iter().find(|s| s.key == key).map(|s| s.ss))
 }
@@ -81,6 +88,7 @@ fn put(key: u32, ss: Ss) -> bool {
         match t.iter_mut().find(|s| s.key == 0) {
             Some(slot) => {
                 *slot = Slot { key, ss };
+                USED.fetch_add(1, Ordering::Relaxed);
                 true
             }
             None => false,
@@ -89,9 +97,13 @@ fn put(key: u32, ss: Ss) -> bool {
 }
 
 fn take(key: u32) -> Option<Ss> {
+    if USED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     with(|t| {
         let slot = t.iter_mut().find(|s| s.key == key)?;
         slot.key = 0;
+        USED.fetch_sub(1, Ordering::Relaxed);
         Some(slot.ss)
     })
 }
@@ -118,11 +130,15 @@ pub fn take_next() -> Option<Ss> {
 /// Forgets everything of the parent: a child of a fork has no budget and
 /// none of its threads' parameters.
 pub fn after_fork() {
+    if USED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     with(|t| {
         for slot in t.iter_mut() {
             slot.key = 0;
         }
     });
+    USED.store(0, Ordering::Relaxed);
 }
 
 /// The CPU each thread was made on, plus one (0: not known), by thread
@@ -402,6 +418,9 @@ pub fn take_own(id: u64) -> Result<(), i32> {
 /// endings; reported with the part), so the layer does not leave that to the
 /// kernel.
 pub fn release_own() {
+    if USED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let id = crate::threads::thread_number();
     if get(id).is_none() {
         return;
