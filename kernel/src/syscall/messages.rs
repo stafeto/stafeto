@@ -144,6 +144,13 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
             return;
         }
     };
+    // The reply's bytes between the buffers go before the receive begins: the
+    // receive may deliver a request of its own, and one copy waits at a time
+    // (`thread::copy_later`). The request's copy overwrites the buffer the
+    // reply's reads. A copy made here is outside both sections, with the
+    // interrupts masked as at the end of any call.
+    #[cfg(not(feature = "break-reply-receive-copy"))]
+    thread::flush_copy();
     // The reply is a stretch of its own, as a portion of a long call is: the
     // poll for an interrupt follows it. With one pending the call starts over
     // at its `svc` (the interrupt is taken on the way out, and the thread goes
