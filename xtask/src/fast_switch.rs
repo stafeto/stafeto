@@ -1503,6 +1503,9 @@ const FLOOD_FROM: u64 = 5;
 /// not looked into here); `saturate` checks the answers with a flood of the consumers' rings.
 /// The numbers print before the check, so that a build without the kernel budgets shows its
 /// share.
+/// The longest the unbound break is waited for in all.
+const UNBOUND_LIMIT: Duration = Duration::from_secs(400);
+
 fn share(
     run: &mut qemu::Run,
     udp_port: u16,
@@ -1532,6 +1535,15 @@ fn share(
         let Some(second) = parse_second(&line) else {
             break;
         };
+        // A loop that gets a second now and then through the flood still fails the share, and
+        // the break is not waited for until the seconds run out.
+        if unbound && began.elapsed() > UNBOUND_LIMIT {
+            return Err(format!(
+                "the loop below the switch has had {} seconds in {} s of the flood",
+                seconds.len(),
+                began.elapsed().as_secs()
+            ));
+        }
         seconds.push(second);
         if second.k == QUIET_LAST && flood.is_none() {
             flood = Some(Flood::start(udp_port)?);
