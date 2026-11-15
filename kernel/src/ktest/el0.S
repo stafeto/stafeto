@@ -16,6 +16,8 @@
 .equ SVC_PENDING, 0xFF05                // ktest::el0::SVC_PENDING
 .equ SVC_SUSPEND_SEND, 0xFF07
 .equ SVC_CONTINUE_CROWD, 0xFF08
+.equ SVC_TAKE, 0xFF09                   // ktest::el0::SVC_TAKE
+.equ SVC_TAKES_ALONE, 0xFF0A            // ktest::el0::SVC_TAKES_ALONE
 .equ SVC_PEND, 0xFF06                   // ktest::el0::SVC_PEND
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
 .equ CALL_SEND, 4                       // abi::Call::Send
@@ -191,6 +193,28 @@ el0_count_then_exit:
     ldr     x3, [x1]
     cbz     x3, 1b
     svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// Adds 1 to the word at x0 and takes OBJ (svc #SVC_TAKE) over and over until
+// the word at x1 is set, then ends the thread with thread_exit.
+.global el0_take_loop
+el0_take_loop:
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    svc     #SVC_TAKE
+    ldr     x3, [x1]
+    cbz     x3, 1b
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// Counts the takes of OBJ of this CPU (svc #SVC_TAKES_ALONE), sets the word
+// at x1 and ends.
+.global el0_takes_alone
+el0_takes_alone:
+    svc     #SVC_TAKES_ALONE
+    mov     x2, #1
+    str     x2, [x1]
     svc     #SVC_DONE
 
 // Adds 1 to the word at x0 x1 times, the count in x2, then ends.

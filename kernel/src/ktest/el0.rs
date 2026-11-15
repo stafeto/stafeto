@@ -20,6 +20,7 @@ use crate::channel::{self, Channel};
 use crate::cleanup;
 use crate::memory;
 use crate::mm::{pages, phys};
+use crate::obj;
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
 use crate::syscall::{self, Values};
@@ -31,7 +32,7 @@ use abi::{
     Notification, OWNER_RIGHTS, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering::Relaxed};
 use kcore::PAGE_SIZE;
 use kcore::budget::Server;
 use kcore::esr;
@@ -65,6 +66,8 @@ unsafe extern "C" {
     static el0_fault_nested_entry: u8;
     static el0_count_until: u8;
     static el0_count_then_exit: u8;
+    static el0_take_loop: u8;
+    static el0_takes_alone: u8;
     static el0_receive_then_poll: u8;
     static el0_raise_then_notify: u8;
     static el0_receive_then_watch: u8;
@@ -134,6 +137,8 @@ const SVC_PENDING: u16 = 0xFF05;
 const SVC_PEND: u16 = 0xFF06;
 const SVC_SUSPEND_SEND: u16 = 0xFF07;
 const SVC_CONTINUE_CROWD: u16 = 0xFF08;
+const SVC_TAKE: u16 = 0xFF09;
+const SVC_TAKES_ALONE: u16 = 0xFF0A;
 
 const _: () =
     ::core::assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
@@ -462,6 +467,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_spent_thread_of_another_cpu_that_ends_is_heard",
         start: start_exit_remote,
         done: done_exit_remote,
+    },
+    El0Test {
+        name: "obj_takes_count_this_cpu_alone",
+        start: start_takes_alone,
+        done: done_takes_alone,
     },
     El0Test {
         name: "a_raised_base_takes_the_replenishment_of_a_spent_budget_with_it",
@@ -1078,6 +1088,8 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
                 end(result);
             }
         }
+        SVC_TAKE => drop(obj::lock()),
+        SVC_TAKES_ALONE => takes_alone(),
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
             // send looks.
@@ -4875,6 +4887,69 @@ fn start_exit_remote(f: &mut Fixture) -> Result<(), &'static str> {
     bind_budget(p, spinner, c, 10 * c, 4, other, None)?;
     f.ends[0] = true;
     Ok(())
+}
+
+/// The count of the takes of `OBJ` (`obj::takes`) is this CPU's, whatever
+/// the other CPUs take meanwhile. A thread on another CPU takes `OBJ` over and
+/// over (`svc #SVC_TAKE`); the thread of the test on this CPU reads the count,
+/// takes one section, spins about 1 ms outside it and reads the count again
+/// (`takes_alone`): the difference is 1. Ends at once on a machine with one CPU.
+fn start_takes_alone(f: &mut Fixture) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 2 {
+        return Ok(());
+    }
+    TAKES_ALONE.store(0, Relaxed);
+    sched_process(f)?;
+    let looper = sched_thread(f, 0, &raw const el0_take_loop, PRIORITY, FIFO)?;
+    let judge = sched_thread(f, 1, &raw const el0_takes_alone, PRIORITY, FIFO)?;
+    set_args(looper, &[word(0), word(1)]);
+    set_args(judge, &[word(0), word(1)]);
+    let other = if here() == 0 { 1 } else { 0 };
+    thread::set_cpu(looper, usize::from(other));
+    f.ends[0] = true;
+    Ok(())
+}
+
+/// What `takes_alone` found: 0 not run, 1 the difference was 1, 2 it was not.
+static TAKES_ALONE: AtomicU8 = AtomicU8::new(0);
+
+/// `svc #SVC_TAKES_ALONE`: waits until the thread on the other CPU has begun
+/// to take `OBJ`, then counts this CPU's takes around one section and a spin
+/// of about 1 ms, in which the other CPU takes it many times.
+fn takes_alone() {
+    let begun = timer::now();
+    let limit = 100 * (timer::frequency() / 1000);
+    while shared(&FIXTURE.lock(), 0) == 0 {
+        if timer::now().wrapping_sub(begun) > limit {
+            TAKES_ALONE.store(2, Relaxed);
+            return;
+        }
+    }
+    let before = obj::takes();
+    drop(obj::lock());
+    let from = timer::now();
+    while timer::now().wrapping_sub(from) < timer::frequency() / 1000 {}
+    let one = obj::takes().wrapping_sub(before) == 1;
+    TAKES_ALONE.store(if one { 1 } else { 2 }, Relaxed);
+}
+
+fn done_takes_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.threads[0].is_none() || f.slot(t) != 1 {
+        return Ok(());
+    }
+    // The thread on the other CPU ends before the teardown.
+    let begun = timer::now();
+    let limit = 100 * (timer::frequency() / 1000);
+    while slot_thread(f, 0).sched.state() != State::Dead {
+        check(
+            timer::now().wrapping_sub(begun) <= limit,
+            "the thread of the other CPU did not end",
+        )?;
+    }
+    check(
+        TAKES_ALONE.load(Relaxed) == 1,
+        "the count of takes was not this CPU's alone",
+    )
 }
 
 fn done_exit_remote(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
