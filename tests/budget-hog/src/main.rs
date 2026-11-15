@@ -36,10 +36,10 @@
 //!    any more and its place posts nothing.
 //! 7. The carry: an interferer at 55 with a budget of 800 us for each 2 ms
 //!    spins 700 us at every even millisecond; a hog at 50 with the budget of
-//!    300 us for each 1 ms is released at the same moments and works 600 us
+//!    300 us for each 1 ms is released at the same moments and works 500 us
 //!    of its own time; a victim at 10 spins. The interferer holds the CPU
 //!    over the hog's activation, so the hog runs its chunk and the next one
-//!    back to back: about 600 us in one window of 1 ms (2C, what "no more
+//!    back to back: 500 us in one window of 1 ms, more than C (what "no more
 //!    than C in a window of T" denies when a level stands above), while the
 //!    victim keeps what the busy period leaves. The lines give, for windows
 //!    of 1, 2, 5 and 10 ms, the most time of the hog and the least of the
@@ -643,7 +643,10 @@ fn phase_overrun(process: &Handle<Process>, resource: &Handle<Resource>) {
 static CARRY_T0: AtomicU64 = AtomicU64::new(0);
 const CARRY_PERIOD_NS: u64 = 2 * MS;
 const CARRY_SPIN_NS: u64 = 700_000;
-const CARRY_HOG_NS: u64 = 600_000;
+/// The hog's work for each release: less than 2C, because the probe notes
+/// a little less than the hog runs, and a hog that does not finish in the
+/// period stays ready and is no longer activated at the release.
+const CARRY_HOG_NS: u64 = 500_000;
 /// The buckets of the carry phase: 100 us each, 24 ms in all.
 const CARRY_BUCKET_NS: u64 = 100_000;
 const CARRY_MS: u64 = 24;
@@ -670,7 +673,7 @@ fn carry_spin() {
     }
 }
 
-/// The hog: runs until it has noted 600 us of its own time in the buckets.
+/// The hog: runs until it has noted 500 us of its own time in the buckets.
 fn carry_work() {
     let bucket = BUCKET.load(Relaxed);
     let start = START.load(Relaxed);
