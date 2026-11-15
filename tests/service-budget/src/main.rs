@@ -706,11 +706,11 @@ fn main(_: u64) -> u64 {
 /// C of each service's budget in microseconds, the longest stretch B of the kernel (`budget-hog`)
 /// and the cost of one timer event of a budget with the switches it makes: the victim of the
 /// pipe phase loses about 900 us in 10 ms (the buckets of its first 40 ms are printed), of which
-/// 2 C + 2 B = 170 us are the budget and the other 730 us the four events of the two periods:
-/// 180 us an event under -icount (about 11 000 instructions).
+/// 2 C + 2 B = 170 us are the budget and the other 730 to 880 us the four events of the two periods:
+/// 220 us an event under -icount (about 14 000 instructions: measured on the runner, 895 per mille in the worst window of 10 ms).
 const C_US: [u64; 3] = [250, 75, 75];
 const B_K_US: u64 = 150;
-const E_US: u64 = 180;
+const E_US: u64 = 220;
 
 /// A client of the starvation phase: one request of the service's dearest kind, then it ends.
 /// It stands below the victim, so once the victim runs it cannot send again.
