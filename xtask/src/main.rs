@@ -7784,7 +7784,15 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// came from, and the rest of the split line, the next line, joins its
 /// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
-    const INTRUDERS: [&str; 2] = ["service ", "ramfs: "];
+    // The exact starts of the intruders: a text such as "in the service ok" is no intruder.
+    const INTRUDERS: [&str; 6] = [
+        "service step: ",
+        "service wait: ",
+        "service wait cut: ",
+        "service gap: ",
+        "service preempt: ",
+        "ramfs: audit round ",
+    ];
     // The lines of the probes that are long enough to be split: those of posix-procs and the
     // lines of its close and lifetime tests.
     const SPLIT_STARTS: [&str; 5] = [
@@ -15547,7 +15555,7 @@ mod tests {
         let lines: Vec<String> = [
             "RAM close event: exact replay, stale body, physical I/O andramfs: audit round 39",
             " 32-reference birth cleanup ok, ticks=12",
-            "a line of a test that says ramfs: audit round 1 in its text",
+            "posix-procs: pending WAIT of a dead process leaves nothing in the service ok",
         ]
         .iter()
         .map(|l| (*l).to_owned())
@@ -15557,7 +15565,7 @@ mod tests {
             [
                 "ramfs: audit round 39",
                 "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks=12",
-                "a line of a test that says ramfs: audit round 1 in its text",
+                "posix-procs: pending WAIT of a dead process leaves nothing in the service ok",
             ]
         );
     }
