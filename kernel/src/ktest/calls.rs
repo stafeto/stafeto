@@ -10127,6 +10127,9 @@ fn long_reply_and_long_request(restart: bool) -> Result<(), &'static str> {
         thread::give_buffer(t2, BUFFER as usize + 2 * PAGE_SIZE as usize)
             .map_err(|_| "no buffer")?;
         thread::write_words(t2, 64, &long_words(REQUEST));
+        // A queued request's description is read from its sender's x1.
+        // SAFETY: the test holds the thread, which does not run.
+        unsafe { (*t2.as_ptr()).regs.x[1] = LONG as u64 };
         let sent = channel::send(
             t2,
             Via::Channel(h.channel),
