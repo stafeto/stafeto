@@ -750,6 +750,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::reply_receive_takes_the_queued_request_at_its_level,
     ),
     (
+        "reply_receive_copies_a_long_reply_before_it_takes_a_long_request",
+        calls::reply_receive_copies_a_long_reply_before_it_takes_a_long_request,
+    ),
+    (
+        "reply_receive_copies_a_long_reply_before_its_receive_on_the_next_entry",
+        calls::reply_receive_copies_a_long_reply_before_its_receive_on_the_next_entry,
+    ),
+    (
         "reply_receive_goes_on_when_the_client_ended",
         calls::reply_receive_goes_on_when_the_client_ended,
     ),
@@ -812,6 +820,22 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
         calls::a_notification_holder_is_not_lifted_after_its_next_receive_or_send,
+    ),
+    (
+        "a_receive_that_takes_a_notification_above_a_request_keeps_the_lift",
+        calls::a_receive_that_takes_a_notification_above_a_request_keeps_the_lift,
+    ),
+    (
+        "a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave",
+        calls::a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave,
+    ),
+    (
+        "a_failed_reply_leaves_the_holder_at_its_level",
+        calls::a_failed_reply_leaves_the_holder_at_its_level,
+    ),
+    (
+        "a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave",
+        calls::a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave,
     ),
     (
         "a_request_that_queues_lifts_a_notification_holder_of_another_cpu",

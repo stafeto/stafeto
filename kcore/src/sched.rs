@@ -3659,8 +3659,10 @@ mod tests {
 
     /// A client at level 40 with a budget of `c` for each 10 ms calls a
     /// server that has none left; a thread at level 10 wants the CPU all the
-    /// time. In any window of a period the levels above 10 hold at most the
-    /// budget and one step of the server.
+    /// time. Nothing stands above the client, so in any window of a period the
+    /// levels above 10 hold at most the budget and one step of the server (with
+    /// a level above the client the window holds up to the lag of the chunk
+    /// as well).
     fn loan_window(c: u64, own: u64, step: u64) -> (u64, u64) {
         const STEP: u64 = MS / 10;
         let mut w = World::new();
