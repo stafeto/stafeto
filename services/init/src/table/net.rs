@@ -101,8 +101,7 @@ pub const DMA_TAILS: &[Dma] = &[
 /// bound holds while no busy client without a budget stands above the victim (the POSIX levels
 /// up to 31, stafeto-design#712); the derivation is the section "Window guarantee correction" of
 /// stafeto-design `plans/2026-11-14-budgets-4-5.md`. The records with two devices have no
-/// budgets and no pause, so the
-/// levels below them are not protected.
+/// budgets and no pause, so the levels below them are not protected.
 /// A thread whose budget is gone works at level 1 until the
 /// next replenishment, so it still runs when nothing else wants the CPU. The
 /// names are those the service takes in its start data

@@ -29,7 +29,7 @@
 //!   used a replenishment of its own at its activation time plus `t`; with
 //!   `MAX_REPLENISHMENTS` entries already, what was used merges into the last
 //!   entry at the later time and the remnant stays available now: a
-//!   replenishment is only ever delayed, so the bound below still holds).
+//!   replenishment moves later, so the bound below still holds).
 //!   With one entry only, the whole chunk goes `t` later.
 //! - `replenish` (the event): the thread returns to its own level.
 //!
@@ -43,7 +43,7 @@
 //! thread's own blocking is not in `j`). The statement "at most `c` in any
 //! window of `t`" holds only where `j` is small, that is, when nothing runs
 //! above the thread: a higher level that holds the CPU over the activation
-//! lets the thread run its chunk and the next one back to back. The levels
+//! lets the thread run its chunk and the next one back to back, and a thread that stays ready through the return of a chunk lags as well (`replenish` keeps the head's time in the past). The levels
 //! below all the budgets of a CPU need no `j`: in any window of `l` ticks they
 //! get at least `l` less the sum over the servers of `ceil(l / t) * c` (and
 //! the work above that has no budget), by the argument of the busy period.
@@ -436,8 +436,8 @@ impl Server {
         }
         r.time += self.t;
         if spare {
-            // The queue is full: a replenishment is only delayed, never
-            // brought forward, so the bound on the window stands.
+            // The queue is full: the replenishment moves later, so the
+            // bound on the window stands.
             // The last of two to four entries, with no index to check.
             let at = match self.len {
                 2 => 1,
