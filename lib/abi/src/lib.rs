@@ -363,7 +363,9 @@ pub enum Call {
     /// the handle x5, at the level `low`, for each overrun; overruns that
     /// come between two firings of the budget's event merge (the count of
     /// the notification says how many posts merged; up to `SS_REPL_MAX` a
-    /// period). A handle with no label makes every budget report label 0, so
+    /// period). An overrun left untold when the budget's thread ends is told
+    /// when the budget's next thread becomes ready, and `BudgetInfo.overruns`
+    /// always counts it. A handle with no label makes every budget report label 0, so
     /// the creator gives each budget a labelled handle. INVALID_ARGS for a
     /// CPU that is not up, a budget below `MIN_BUDGET_NS` or above the
     /// period, a period below `MIN_PERIOD_NS`, a level outside 1-63, or x6

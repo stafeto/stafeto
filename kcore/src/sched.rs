@@ -1081,20 +1081,23 @@ impl<T: Schedulable> Scheduler<T> {
             _ => {}
         }
         // SAFETY: the caller's promise; the borrow ends before the move.
-        let (level, to_tail) = unsafe {
+        let (level, to_tail, moved) = unsafe {
             let n = node(t);
+            let moved = n.base != priority;
             n.policy = policy;
             n.base = priority;
-            (n.effective(), tail && n.boost <= n.base)
+            (n.effective(), tail && n.boost <= n.base, moved)
         };
         // The event of a budget stands in the heap of the thread's base, so
         // that a thread above that level cannot starve the replenishment of
         // a thread whose base was raised: it moves with the base.
         #[cfg(not(feature = "break-budget-event-keeps-level"))]
-        // SAFETY: the caller's promise.
-        unsafe {
-            Self::with_server(t, Op::Again, now)
-        };
+        if moved {
+            // SAFETY: the caller's promise.
+            unsafe { Self::with_server(t, Op::Again, now) };
+        }
+        #[cfg(feature = "break-budget-event-keeps-level")]
+        let _ = moved;
         // SAFETY: the caller's promise.
         unsafe {
             match (to_tail, node(t).state) {
@@ -1320,9 +1323,9 @@ impl<T: Schedulable> Scheduler<T> {
     /// the stint that runs is closed and charged to it, what it lent is
     /// taken, its replenishment event goes, and the thread has no budget.
     /// Returns the server that was the thread's and the ticks it lent that
-    /// the client of its request has not paid yet; the kernel pays them,
-    /// tells the place of the server of an overrun it was not told of and
-    /// drops the binding's reference to the budget.
+    /// the client of its request has not paid yet; the kernel pays them and
+    /// drops the binding's reference to the budget. An overrun the place was
+    /// not told of stays untold in the server.
     ///
     /// # Safety
     /// `t` is alive; after this the scheduler no longer refers to it.

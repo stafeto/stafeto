@@ -332,6 +332,7 @@ pub unsafe fn unbound(server: NonNull<Server>, cause: u8) {
     unsafe {
         let b = of_server(server);
         (*b.as_ptr()).thread = None;
+        (*b.as_ptr()).server.ended();
         release(b, cause);
     }
 }

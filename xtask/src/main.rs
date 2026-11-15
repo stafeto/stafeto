@@ -1677,6 +1677,9 @@ enum Variant {
     /// (`break-budget-exit-no-charge`): the kernel tests of the end must catch
     /// it.
     BudgetExitNoChargeTest,
+    /// An end of a thread that counts its untold overrun as told
+    /// (`break-budget-exit-forgets`): the kernel test of the end must catch it.
+    BudgetExitForgetsTest,
     /// A replenishment event that stays in the heap of the level its thread's
     /// base had when it was armed (`break-budget-event-keeps-level`): the
     /// kernel test of the event must catch it.
@@ -1692,7 +1695,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 73] = [
+    const ALL: [Variant; 74] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1762,6 +1765,7 @@ impl Variant {
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
         Variant::BudgetExitNoChargeTest,
+        Variant::BudgetExitForgetsTest,
         Variant::BudgetEventKeepsLevelTest,
         Variant::BudgetEventKeepsLevelEl0,
         Variant::LiftAgainNoticeTest,
@@ -1843,6 +1847,7 @@ impl Variant {
             Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
             Variant::BudgetExitNoChargeTest => Some("ktest,break-budget-exit-no-charge"),
+            Variant::BudgetExitForgetsTest => Some("ktest,break-budget-exit-forgets"),
             Variant::BudgetEventKeepsLevelTest => Some("ktest,break-budget-event-keeps-level"),
             Variant::BudgetEventKeepsLevelEl0 => {
                 Some("ktest,el0-half,break-budget-event-keeps-level")
@@ -1942,6 +1947,7 @@ impl Variant {
             Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
             Variant::BudgetExitNoChargeTest => "stafeto-ktest-exit-no-charge",
+            Variant::BudgetExitForgetsTest => "stafeto-ktest-exit-forgets",
             Variant::BudgetEventKeepsLevelTest => "stafeto-ktest-event-keeps-level",
             Variant::BudgetEventKeepsLevelEl0 => "stafeto-ktest-el0-event-keeps-level",
             Variant::LiftAgainNoticeTest => "stafeto-ktest-relift-notice",

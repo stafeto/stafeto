@@ -204,6 +204,16 @@ impl Server {
         pending && !cfg!(feature = "break-budget-overrun-silent")
     }
 
+    /// The thread of the budget ended: what the place was not told of stays
+    /// untold for the next thread (`break-budget-exit-forgets`: it is told
+    /// of nothing, as if the place had heard it).
+    pub fn ended(&mut self) {
+        #[cfg(feature = "break-budget-exit-forgets")]
+        {
+            self.told = self.overruns;
+        }
+    }
+
     /// The sum of the ticks charged so far.
     pub fn ran(&self) -> u64 {
         self.ran

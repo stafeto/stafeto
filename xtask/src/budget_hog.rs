@@ -556,6 +556,11 @@ pub fn breaks() -> Result<(), String> {
             "an end of a thread that does not charge the stint that runs",
         ),
         (
+            Variant::BudgetExitForgetsTest,
+            "a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread",
+            "an end of a thread that counts its untold overrun as told",
+        ),
+        (
             Variant::BudgetEventKeepsLevelTest,
             "the_event_of_a_budget_follows_the_base_of_its_thread",
             "an event of a budget that stays at the level its thread's base had",
