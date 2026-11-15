@@ -450,15 +450,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
         }
     };
     PROBE_LOADING_PID.store(pid, Ordering::Release);
-    // A child of a thread under a sporadic server has its budget reserved
-    // before the copy: a refused share is EAGAIN and no child.
-    let made = match crate::sporadic::reserve_child(pid) {
-        Ok(()) => make(&c, regions, sessions, window),
-        Err(errno) => {
-            sessions.close();
-            Err(errno)
-        }
-    };
+    let made = make(&c, regions, sessions, window, pid);
     step(9);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
@@ -475,7 +467,14 @@ fn make(
     regions: Regions,
     sessions: Sessions,
     window: Option<fn()>,
+    pid: u32,
 ) -> Result<(), i32> {
+    // A child of a thread under a sporadic server has its budget reserved
+    // before the copy: a refused share is EAGAIN and no child.
+    if let Err(errno) = crate::sporadic::reserve_child(pid) {
+        sessions.close();
+        return Err(errno);
+    }
     // SAFETY: only CONTEXT's address and its stack pointer, which `point`
     // wrote before this ran.
     let sp = unsafe { (*CONTEXT.0.get()).sp };
