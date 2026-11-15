@@ -11,12 +11,15 @@
 //! keeps the object and the event.
 //!
 //! The replenishment event of a budget stands in the heap of the timers of
-//! its CPU, at the level of the thread's base priority when it was armed
-//! (spec 10): the portion of that level fires it as it fires a timer, and
-//! the replenishment may come later than its time and never earlier. Arming
-//! and taking out cost up to 13 steps of the heap, which the system's count
-//! of timers bounds: a budget takes a place of it (timer::take_place), and
-//! the rest of its work has no loop longer than abi's four replenishments.
+//! its CPU, at the level of the thread's base priority (spec 10), and moves
+//! with the base when `thread_set_priority` changes it: the portion of that
+//! level fires it as it fires a timer. A thread whose budget is gone and
+//! whose base rose therefore finds its replenishment at the new level, where
+//! a thread that works there cannot hold it back. The replenishment may come
+//! later than its time and never earlier. Arming, moving and taking out cost
+//! up to 13 steps of the heap, which the system's count of timers bounds: a
+//! budget takes a place of it (timer::take_place), and the rest of its work
+//! has no loop longer than abi's four replenishments.
 //!
 //! A budget lives while references to it are left: its handles and the
 //! binding to its thread, which ends with the thread (`unbound`). It is paid
