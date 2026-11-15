@@ -4789,7 +4789,9 @@ impl Service<0> for Processes {
     }
     fn request(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
-        if method == Method::Budget as u16 {
+        // The terminal probe (feature tty-probe) asks 42 through its notary
+        // session, where `notary` answers it; a notary session has no budgets.
+        if method == Method::Budget as u16 && !proto_process::is_notary(r.label()) {
             return self.budget(r);
         }
         let own = [
