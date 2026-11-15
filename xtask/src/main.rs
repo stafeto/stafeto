@@ -6063,7 +6063,9 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
         |line| line.starts_with("init: posix-procs ended:"),
         Duration::from_secs(30),
     );
-    let outcome = run.stop();
+    let mut outcome = run.stop();
+    // A line of the audit of ramfs or of the services' timing may land inside a long line.
+    outcome.lines = rejoin_split_lines(&outcome.lines);
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
@@ -7783,6 +7785,15 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
     const INTRUDERS: [&str; 2] = ["service ", "ramfs: "];
+    // The lines of the probes that are long enough to be split: those of posix-procs and the
+    // lines of its close and lifetime tests.
+    const SPLIT_STARTS: [&str; 5] = [
+        "posix-procs: ",
+        "RAM close ",
+        "POSIX close ",
+        "RAM native ",
+        "RAM lifetime ",
+    ];
     let mut out = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
@@ -7791,7 +7802,7 @@ fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
             .iter()
             .filter_map(|tag| line.find(tag))
             .min()
-            .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
+            .filter(|&at| at > 0 && SPLIT_STARTS.iter().any(|start| line.starts_with(start)));
         match (cut, lines.get(i + 1)) {
             (Some(at), Some(rest)) => {
                 out.push(line[at..].to_owned());
@@ -15526,6 +15537,27 @@ mod tests {
             [
                 "ramfs: audit round 67",
                 "posix-procs: names quota: process 8, quota 576 pages, used 294 pages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
+            ]
+        );
+    }
+
+    /// The same for the long lines of the close tests of the lifetime probe.
+    #[test]
+    fn an_audit_line_of_ramfs_inside_a_line_of_the_close_tests_goes_back_out() {
+        let lines: Vec<String> = [
+            "RAM close event: exact replay, stale body, physical I/O andramfs: audit round 39",
+            " 32-reference birth cleanup ok, ticks=12",
+            "a line of a test that says ramfs: audit round 1 in its text",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "ramfs: audit round 39",
+                "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks=12",
+                "a line of a test that says ramfs: audit round 1 in its text",
             ]
         );
     }
