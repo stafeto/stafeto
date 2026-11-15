@@ -4606,7 +4606,7 @@ fn start_budget_demotes(f: &mut Fixture) -> Result<(), &'static str> {
     // level 1.
     let freq = timer::frequency();
     for (t, c) in [(server, freq), (client, freq / 100)] {
-        let b = crate::budget::create(p, 0, c, 10 * c, 1).map_err(|_| "no budget")?;
+        let b = crate::budget::create(p, 0, c, 10 * c, 1, 4, None).map_err(|_| "no budget")?;
         let bound = crate::budget::bind(t, b);
         // SAFETY: the reference `create` handed out goes; the binding, if
         // it went through, holds the budget.

@@ -48,7 +48,8 @@ pub fn calls() -> u64 {
 }
 
 /// `svc #N`, the one place of a returning call: x0-x9 in and out, and
-/// x10, x11 out (`receive`, OUT11) or only changed (every other call).
+/// x10 in and out and x11 out (`receive` and `reply_receive`, OUT11) or
+/// only changed (every other call).
 ///
 /// # Safety
 /// As for `raw`.
@@ -72,7 +73,7 @@ unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
                 inout("x7") x[7],
                 inout("x8") x[8],
                 inout("x9") x[9],
-                lateout("x10") x[10],
+                inout("x10") x[10],
                 lateout("x11") x[11],
                 options(nostack),
             )
@@ -853,6 +854,51 @@ pub fn budget_create(
     Ok(returned(&x))
 }
 
+/// `budget_create` with a place for the notifications of overruns: `notice`,
+/// a handle with NOTIFY to a channel (a labelled one gives its label), gets
+/// one notification, source `Budget`, for each overrun of the budget, at the
+/// level `low`. The handle carries abi::BUDGET_RIGHTS.
+pub fn budget_create_with_notice(
+    resource: &Handle<Resource>,
+    cpu: u32,
+    budget_ns: u64,
+    period_ns: u64,
+    low: u8,
+    notice: &Handle<Channel>,
+) -> Result<Handle<Budget>, Error> {
+    let args = [
+        resource.raw().0,
+        cpu.into(),
+        budget_ns,
+        period_ns,
+        low.into(),
+        notice.raw().0,
+    ];
+    let x = call::<{ Call::BudgetCreate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// thread_bind_budget with x2: `budget`, which `thread` (MANAGE) has now, is
+/// the proof of what it gives up, and the thread works at min(its base, `free`
+/// of its process) from now on. BAD_STATE when `budget` is not the thread's
+/// (a thread with no budget among them), the thread ended, or it started on
+/// another CPU than the caller's.
+pub fn thread_unbind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
+    let args = [thread.raw().0, 0, budget.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
+}
+
+/// thread_bind_budget with both x1 and x2: `new` takes the place of `old`, the
+/// thread's budget, in one section; the thread is never at `free` between them.
+pub fn thread_rebind_budget(
+    thread: &Handle<Thread>,
+    new: &Handle<Budget>,
+    old: &Handle<Budget>,
+) -> Result<(), Error> {
+    let args = [thread.raw().0, new.raw().0, old.raw().0];
+    call::<{ Call::ThreadBindBudget.number() }>(&args).map(drop)
+}
+
 /// thread_bind_budget: `thread` (MANAGE) works under `budget` from now on.
 pub fn thread_bind_budget(thread: &Handle<Thread>, budget: &Handle<Budget>) -> Result<(), Error> {
     let args = [thread.raw().0, budget.raw().0];
@@ -1209,14 +1255,18 @@ impl Token {
         let Ok(regs) = message_regs(self.0, bytes, &[], 0) else {
             return Err(Error::InvalidArgs);
         };
-        msgbuf::set_channel(channel.raw().0);
         let mut x = [0; 12];
         x[..10].copy_from_slice(&regs);
+        x[10] = channel.raw().0;
         // SAFETY: reply_receive uses no memory of the program but its own
-        // message buffer; it writes x0-x11 only.
+        // message buffer; it reads x0-x10 and writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
+        // x1 of an error says which half failed (abi::Call::ReplyReceive): 0,
+        // nothing happened, so BAD_STATE there is the reply's (the token named
+        // no request that waited) and the call receives as `receive` does;
+        // 1, the reply went, and any error is the receive half's.
         match received(x) {
-            Err(Error::BadState) => receive(channel),
+            Err(Error::BadState) if x[1] == 0 => receive(channel),
             r => r,
         }
     }
