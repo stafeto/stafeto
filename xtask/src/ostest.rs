@@ -124,7 +124,7 @@ pub enum Ended {
 pub fn service_line(line: &str) -> bool {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    const EXACT: [&str; 8] = [
+    const EXACT: [&str; 11] = [
         "init: services started",
         "ramfs: ready",
         "posix-process: ready (records with their processes, root by init's table)",
@@ -133,6 +133,10 @@ pub fn service_line(line: &str) -> bool {
         "pipe: ready",
         "tty: ready",
         "entropy: seeded from the device",
+        // A service that has a budget says so when it binds it, as late as its first request.
+        "ramfs: serve runs under its budget",
+        "pipe: serve runs under its budget",
+        "tty: serve runs under its budget",
     ];
     if EXACT.contains(&line) {
         return true;
@@ -1818,6 +1822,7 @@ mod tests {
             "service wait: 15 kind 64 3480 ticks of 23806",
             "service gap: 9 kind 1 120 ticks of 900",
             "init: tty budget serve: at least 1 overruns, at least 1 in all, kernel counts 1",
+            "tty: serve runs under its budget",
             "@@os-test end basic/service-lines exit 0",
             "@@os-test begin basic/service-lines-fail",
             "entropy: seeded from the boot page (32 bytes)",
