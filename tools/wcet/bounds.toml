@@ -433,7 +433,7 @@ bound = 8
 why = "moves a slot behind at most LIFT_DEPTH = 8 servers (spec 6.6): called from requeue, and from send when a request queues behind a server whose budget is gone (lift_holder)"
 
 [[loop]]
-function = "kernel::channel::message::reply"
+function = "kernel::channel::message::reply_on"
 at = "*"
 bound = 4
 why = "a message carries up to four handles: the loops go over them (and over the slots that hold them), or retry the release of one"
