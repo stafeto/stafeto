@@ -340,6 +340,31 @@ static void endings(int cpu) {
     }
 }
 
+/* A thread that leaves the policy gives its share back: another takes the whole row. */
+static void *leaver_thread(void *arg) {
+    int cpu = (int)(long)arg;
+    struct sched_param p = ss_param(20, 5, row_ns(cpu, 10 * MS), 10 * MS, 4);
+    CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
+    struct sched_param f = {.sched_priority = 20};
+    CHECK(sched_setscheduler(0, SCHED_FIFO, &f) == SCHED_SPORADIC);
+    CHECK(sched_getscheduler(0) == SCHED_FIFO);
+    /* Still running, off the policy: the row is free. */
+    hold_ready = hold_go = 0;
+    rc = 0;
+    int err;
+    pthread_t holder = make(holder_thread, (void *)(long)cpu, NULL, &err);
+    CHECK(err == 0);
+    while (hold_ready == 0) sleep_ms(2);
+    CHECK(hold_ready == 1 && rc == 0);
+    hold_go = 1;
+    CHECK(pthread_join(holder, NULL) == 0);
+    return NULL;
+}
+static void leaving(int cpu) {
+    run(leaver_thread, (void *)(long)cpu);
+    printf("sporadic: CPU %d: leaving the policy gave the share back ok\n", cpu);
+}
+
 /* fork by a thread under a server: the child gets a budget of its own from the
  * service before the call returns, a refused share is EAGAIN and no child. */
 static int fork_cpu;
@@ -413,6 +438,9 @@ static void *scenario(void *arg) {
         CHECK(pthread_join(holder, NULL) == 0);
         leaving_time();
         forks(cpu);
+#if SS_REBIND
+        leaving(cpu);
+#endif
     } else {
         /* CPU 0 has no share: no thread there runs under a server. */
         struct sched_param p = ss_param(20, 5, 1 * MS, 10 * MS, 4);

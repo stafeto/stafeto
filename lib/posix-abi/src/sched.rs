@@ -246,6 +246,8 @@ pub fn thread_set(id: u64, policy: i32, param: &SchedParam, tail: bool) -> Resul
     };
     let rebudget = ss.is_some() && held != ss;
     let leaves = ss.is_none() && held.is_some();
+    // The break: a thread that leaves the policy keeps its budget.
+    let leaves = leaves && cfg!(not(feature = "break-ss-no-unbind"));
     if rebudget || leaves {
         let thread =
             crate::relibc::with_target(id, |_, native| crate::sporadic::manage_copy(native))??;

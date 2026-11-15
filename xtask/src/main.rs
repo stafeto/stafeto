@@ -934,6 +934,17 @@ const SPORADIC_PROGRAMS: [ImageProgram; 7] = {
     programs[4] = ("relibc-threads", "sporadic-probe", POSIX_STACK_SIZE, &[]);
     programs
 };
+/// The same with the break `break-ss-no-unbind` in the layer of the probe.
+const SPORADIC_BROKEN_PROGRAMS: [ImageProgram; 7] = {
+    let mut programs = SPORADIC_PROGRAMS;
+    programs[4] = (
+        "relibc-threads",
+        "sporadic-probe",
+        POSIX_STACK_SIZE,
+        &["break-ss-no-unbind"],
+    );
+    programs
+};
 const BUSYBOX_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -1986,6 +1997,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
   sporadic-probe SCHED_SPORADIC through relibc, the layer, the process service and init, on four CPUs
+  sporadic-breaks the deliberate breaks of SCHED_SPORADIC fail the host tests and the probe
             over the Rust POSIX layer
   posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
             Cortex-A53 with the kernel entered at EL2 (as ci does)
@@ -2490,7 +2502,8 @@ fn main() {
             _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
-        Some("sporadic-probe") => sporadic_probe(),
+        Some("sporadic-probe") => sporadic_probe(false),
+        Some("sporadic-breaks") => sporadic_breaks(),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
             Err(why) => {
@@ -8201,10 +8214,18 @@ fn widest_gap(lines: &[String]) -> Option<(String, usize, u64, u64)> {
 }
 
 /// `cargo xtask sporadic-probe`: SCHED_SPORADIC on four CPUs (tests/sporadic).
-fn sporadic_probe() -> Result<(), String> {
+fn sporadic_probe(broken: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-sporadic.img", &SPORADIC_PROGRAMS, BOOT_PROFILE)?;
+    let image = if broken {
+        build_boot_image(
+            "boot-sporadic-broken.img",
+            &SPORADIC_BROKEN_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else {
+        build_boot_image("boot-sporadic.img", &SPORADIC_PROGRAMS, BOOT_PROFILE)?
+    };
     let output = qemu::on_cpus(4, || {
         let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
         cmd.args(qemu::HEADLESS);
@@ -8226,8 +8247,36 @@ fn sporadic_probe() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask sporadic-breaks`: each deliberate break of SCHED_SPORADIC
+/// fails the check that owns it. `break-ss-no-admission` (init counts no
+/// share) and `break-ss-ignore-low` (the layer does not check
+/// `sched_ss_low_priority`) fail the host tests; `break-ss-no-unbind` (a
+/// thread that leaves the policy keeps its budget) fails the probe.
+fn sporadic_breaks() -> Result<(), String> {
+    for (package, feature) in [
+        ("init", "break-ss-no-admission"),
+        ("posix-types", "break-ss-ignore-low"),
+    ] {
+        let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .current_dir(root())
+            .args(["test", "-p", package, "--lib", "--features", feature])
+            .output()
+            .map_err(|e| format!("cargo test: {e}"))?;
+        if out.status.success() {
+            return Err(format!("the host tests of {package} passed with {feature}"));
+        }
+        println!("sporadic-breaks: {feature} fails the host tests of {package}");
+    }
+    match sporadic_probe(true) {
+        Err(e) => println!("sporadic-breaks: break-ss-no-unbind is caught by the probe ({e})"),
+        Ok(()) => return Err("the probe passed with break-ss-no-unbind".into()),
+    }
+    Ok(())
+}
+
 /// What the probe prints when each of its stages held.
-const SPORADIC_MARKERS: [&str; 12] = [
+const SPORADIC_MARKERS: [&str; 13] = [
+    "sporadic: CPU 1: leaving the policy gave the share back ok",
     "sporadic: the options, SS_REPL_MAX and the priority range of SCHED_SPORADIC ok",
     "sporadic: 10 parameters off the rules give EINVAL and leave the policy ok",
     "sporadic: CPU 0: set, read back, refused over its share, given back at the end of a thread ok",

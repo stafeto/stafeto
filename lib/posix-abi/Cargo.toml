@@ -41,6 +41,9 @@ wait-probe = []
 trace = ["trace/on"]
 # Deliberate breakage (cargo xtask random-restart): a session of the entropy
 # service that died with its instance is never replaced through init.
+# Deliberate breakage (`cargo xtask sporadic-breaks`): a thread that leaves
+# SCHED_SPORADIC keeps its budget and its share.
+break-ss-no-unbind = []
 break-no-reconnect = []
 # Deliberate breakage (cargo xtask random-restart-breaks): a process with no
 # channel to init never asks the process service for a new session
