@@ -13,7 +13,7 @@
 //! service that never registers (`mute`), `c` the client that runs the
 //! tests of init as a service manager (checker.rs), `t` a POSIX process
 //! that gives the clock peer its session with the process service and
-//! ends (`sender`), `b` a client with two budgets, one that runs out in
+//! ends (`sender`), `b` a service with two budgets, one that runs out in
 //! every period and one that never does (burner.rs, init's journal of
 //! overruns). A service registers
 //! its channel with init (rt::service::register) and serves it with its

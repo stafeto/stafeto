@@ -2,26 +2,31 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The table of the probe of the overruns in the journal (feature
-//! `table-budget-journal`, xtask `budget-journal`): one client, `burner`
+//! `table-budget-journal`, xtask `budget-journal`): one service, `burner`
 //! (tests/svc, role `b`), with two budgets on CPU 0 of 1 ms for each 10 ms.
 //! Its thread under `hog` works without a pause, so the budget runs out in
 //! every period; its thread under `quiet` works 100 us of each 10 ms and
-//! never runs out.
+//! never runs out. A service, since the tail of the overruns is written at the
+//! heartbeat of a record.
 
 use super::{Budget, GENERAL_CPUS, Kind, Record, Restart, Shares};
 use crate::PAGE;
+use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
 
 pub const TABLE: &[Record] = &[Record {
     name: "burner",
     program: "svc",
-    kind: Kind::Client,
+    kind: Kind::Service(Watch {
+        period_ns: 20 * MS,
+        deadline_ns: 100 * MS,
+    }),
     priority: 30,
     ceiling: 30,
     quota: 64 * PAGE,
     handle_limit: 64,
-    restart: Restart::Never,
+    restart: Restart::Always,
     console: true,
     log: false,
     trace: false,

@@ -1218,19 +1218,44 @@ impl Init {
 
     /// The notification of an overrun of a budget of the table (init::overrun):
     /// counts it, and writes the journal's line when one is due, with the
-    /// record, the budget, the overruns since the last line and the total.
+    /// record, the budget, the notifications' overruns since the last line and the total.
     /// The work is a lookup and two additions, whatever the count is.
     fn overran(&mut self, n: Notice) {
-        let Some(line) = self.overruns.note(n.label, n.count, now()) else {
-            return;
-        };
+        if let Some(line) = self.overruns.note(n.label, n.count, now()) {
+            Self::write_line(line);
+        }
+    }
+
+    /// The tail of the overruns of the budgets of the record at `place`
+    /// that no line told, once the window of the last line has passed
+    /// (`Overruns::flush`), at its heartbeat: one look at each of its budgets.
+    fn flush_overruns(&mut self, place: usize) {
+        let now = now();
+        for index in 0..table::table()[place].budgets.len() {
+            if let Some(line) = self.overruns.flush(place, index, now) {
+                Self::write_line(line);
+            }
+        }
+    }
+
+    /// The line of the journal for `line`. The notifications give a lower
+    /// bound of the overruns ("at least"); the kernel's own count of the
+    /// latest budget of the record follows when init can read it.
+    fn write_line(line: init::overrun::Line) {
         let record = table::table().get(line.place);
         let budget = record.and_then(|r| r.budgets.get(line.index));
-        if let (Some(record), Some(budget)) = (record, budget) {
-            println!(
-                "init: {} budget {}: {} overruns, {} in all",
+        let (Some(record), Some(budget)) = (record, budget) else {
+            return;
+        };
+        match crate::worker::kernel_overruns(line.place, line.index) {
+            Some(kernel) => println!(
+                "init: {} budget {}: at least {} overruns, at least {} in all, kernel counts {}",
+                record.name, budget.name, line.since, line.total, kernel
+            ),
+            None => println!(
+                "init: {} budget {}: at least {} overruns, at least {} in all",
                 record.name, budget.name, line.since, line.total
-            );
+            ),
         }
     }
 
@@ -1544,6 +1569,7 @@ impl Init {
         if let Some(at) = entry.watch.as_mut().map(|w| w.beat(now())) {
             self.set_deadline(place, at);
         }
+        self.flush_overruns(place);
         let reply = proto_init::heartbeat_reply(time::now());
         if r.reply().bytes(&reply[..]).is_err() {
             return Answer::Status(Status::BadSize);

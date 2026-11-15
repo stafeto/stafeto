@@ -6,21 +6,25 @@
 //! Init makes each budget of its table with a place for the notifications of
 //! its overruns (`budget_create` x5): a copy of init's channel with NOTIFY
 //! whose label names the record and the budget (`label`). The kernel posts
-//! one notification for each overrun and merges the overruns that come
-//! between two firings of the budget's event (at most `abi::SS_REPL_MAX` of
-//! them a period), so the count of a notification says how many overruns it
-//! stands for. `Overruns` adds the counts up for each budget and says when a
-//! line of the journal is due: the first at once, then at most one line a
-//! budget in each `WINDOW_NS`, with the overruns since the last line and the
-//! total.
+//! one notification for each firing of the budget's event that finds overruns
+//! it has not told, and merges the posts that come between two receives (at
+//! most `abi::SS_REPL_MAX` of them a period); the count of a notification is
+//! the number of posts merged. A thread that blocks can regain capacity
+//! before the firing and overrun twice in the one post, so the sum of the
+//! counts is a lower bound of the kernel's own counter of overruns, and the
+//! journal says "at least". `Overruns` adds the counts up for each budget and
+//! says when a line is due: the first at once, then at most one line per
+//! budget in each `WINDOW_NS`, with the notifications since the last line and
+//! the total; `flush` gives the line of a budget that overran and then
+//! stopped, once its window has passed. The totals run across the instances
+//! of a record: a restart makes new budgets under the same labels.
 //!
 //! The work for a flood of overruns is bounded: a notification costs one
 //! lookup in a table of `SLOTS` places and two additions, whatever its count
 //! is (init never loops over the overruns), the kernel posts at most
 //! `abi::SS_REPL_MAX` notifications for each budget in each of its periods,
-//! and a budget writes one line in `WINDOW_NS`. Overruns that come between
-//! two lines are in the count of the next line; a budget that overruns
-//! and then never again is counted but writes no line after its last.
+//! and a budget writes one line in `WINDOW_NS`. A heartbeat of a record looks
+//! at its budgets (`START_DATA_MAX` at most) once.
 
 use crate::table::{MAX_RECORDS, START_DATA_MAX};
 
@@ -112,6 +116,28 @@ impl Overruns {
             .is_none_or(|last| now.saturating_sub(last) >= WINDOW_NS);
         // The break: a line for every notification.
         if !due && cfg!(not(feature = "break-overrun-log-each")) {
+            return None;
+        }
+        slot.last = Some(now);
+        let since = core::mem::take(&mut slot.unwritten);
+        Some(Line {
+            place,
+            index,
+            since,
+            total: slot.total,
+        })
+    }
+
+    /// The line of the budget `index` of the record at `place` for the
+    /// overruns that no line has told, once the window of its last line has
+    /// passed: the tail of a budget that stopped overrunning. None when all
+    /// are told, or the window is still open.
+    pub fn flush(&mut self, place: usize, index: usize, now: u64) -> Option<Line> {
+        let slot = self.slots.get_mut(place * START_DATA_MAX + index)?;
+        let open = slot
+            .last
+            .is_some_and(|last| now.saturating_sub(last) < WINDOW_NS);
+        if slot.unwritten == 0 || open {
             return None;
         }
         slot.last = Some(now);
@@ -223,6 +249,38 @@ mod tests {
             l.since,
             u64::from(u32::MAX) + 1,
             "a count of 0 stands for one"
+        );
+    }
+
+    #[test]
+    fn the_tail_of_a_budget_that_stopped_is_flushed_once_its_window_has_passed() {
+        let mut o = Overruns::new();
+        let id = label(2, 0);
+        assert!(o.note(id, 1, 0).is_some());
+        assert!(o.note(id, 3, 4 * S).is_none());
+        assert_eq!(o.flush(2, 0, 9 * S), None, "the window is open");
+        let l = o.flush(2, 0, 10 * S).unwrap();
+        assert_eq!((l.since, l.total), (3, 4));
+        assert_eq!(o.flush(2, 0, 30 * S), None, "told once");
+        assert_eq!(o.flush(2, 1, 30 * S), None, "a budget with no overruns");
+        assert_eq!(o.flush(MAX_RECORDS, 0, 30 * S), None);
+    }
+
+    #[test]
+    fn totals_run_across_the_instances_of_a_record() {
+        // A restart makes new budgets under the same labels.
+        let mut o = Overruns::new();
+        let id = label(1, 1);
+        assert_eq!(o.note(id, 5, 0).unwrap().total, 5);
+        let l = o.note(id, 2, 10 * S).unwrap();
+        assert_eq!((l.since, l.total), (2, 7));
+        let l = o.flush(1, 1, 30 * S);
+        assert_eq!(l, None);
+        o.note(id, 1, 31 * S);
+        assert_eq!(
+            o.flush(1, 1, 45 * S).map(|l| l.total),
+            None,
+            "written at 31 s"
         );
     }
 

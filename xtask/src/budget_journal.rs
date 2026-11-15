@@ -5,16 +5,20 @@
 //! spec 8, stage 5) under QEMU's -icount on one CPU. Init's table
 //! (`table-budget-journal`) has one client, `burner` (tests/svc, role `b`),
 //! with two budgets of 1 ms for each 10 ms: its thread under `hog` works
-//! without a pause and overruns in every period, its thread under `quiet`
-//! stays within its budget. The client prints a line each second of the clock
-//! with the overruns the kernel counts for each budget. The verdict:
+//! without a pause and overruns in every period until second 13, its thread
+//! under `quiet` stays within its budget. The service prints a line each
+//! second of the clock with the overruns the kernel counts for each budget.
+//! The verdict:
 //!
 //! 1. `hog` has exactly one line of init's journal in each window of 10 s: one
-//!    by the first second, a second between the 10th and the 20th and a third
-//!    after the 20th.
+//!    by the first second, a second between the 10th and the 20th, and a third
+//!    after the 20th, which is the tail of the overruns of the 10th to the
+//!    13th second, written at the heartbeat after the window passed; no line
+//!    after it.
 //! 2. The total of each line stands between what the kernel counted at the
-//!    seconds on either side of the line, and the overruns since the last line
-//!    add up to the totals.
+//!    seconds on either side of the line, is not above the kernel's own count
+//!    the line prints, and the overruns since the last line add up to the
+//!    totals.
 //! 3. `quiet` has no line, and the kernel counts no overrun for it.
 //!
 //! `breaks` runs the probe on init built with each deliberate break; each must
@@ -30,7 +34,7 @@ use crate::{
 const TIMEOUT: Duration = Duration::from_secs(900);
 const DONE: &str = "burner: done";
 /// The seconds of the client's lines: 0 to this.
-const SECONDS: usize = 25;
+const SECONDS: usize = 30;
 /// The kernel's count may run ahead of the line's total by this much at most
 /// at the second before the line (a notification in flight).
 const SLACK: u64 = 2;
@@ -63,6 +67,8 @@ const EACH: [ImageProgram; 2] = [
 pub struct Entry {
     pub since: u64,
     pub total: u64,
+    /// What the kernel counts for the budget, when the line says.
+    pub kernel: Option<u64>,
 }
 
 /// What the lines of the run say, in the order they came: the lines of init
@@ -80,17 +86,19 @@ fn number(text: &str) -> Result<u64, String> {
     text.trim().parse().map_err(|e| format!("{text:?}: {e}"))
 }
 
-/// `init: burner budget hog: 1000 overruns, 3000 in all`.
+/// `init: burner budget hog: at least 1000 overruns, at least 3000 in all, kernel counts 3004`.
 fn entry(rest: &str) -> Result<Entry, String> {
-    let (since, rest) = rest
-        .split_once(" overruns, ")
-        .ok_or_else(|| format!("the line of a budget: {rest:?}"))?;
-    let total = rest
-        .strip_suffix(" in all")
-        .ok_or_else(|| format!("the line of a budget: {rest:?}"))?;
+    let bad = || format!("the line of a budget: {rest:?}");
+    let rest = rest.strip_prefix("at least ").ok_or_else(bad)?;
+    let (since, rest) = rest.split_once(" overruns, at least ").ok_or_else(bad)?;
+    let (total, kernel) = match rest.split_once(" in all, kernel counts ") {
+        Some((total, kernel)) => (total, Some(number(kernel)?)),
+        None => (rest.strip_suffix(" in all").ok_or_else(bad)?, None),
+    };
     Ok(Entry {
         since: number(since)?,
         total: number(total)?,
+        kernel,
     })
 }
 
@@ -113,15 +121,17 @@ pub fn parse(lines: &[String]) -> Result<Journal, String> {
     Ok(j)
 }
 
-/// The lines due at second `k` of the client's: those before its line of
+/// The lines due at second `k` of the ticker's: those before its line of
 /// second `k` count for it. Seconds 0, 10 and 20 are left out of the count:
 /// the second line comes 10 s after the first, which the budget wrote a few
-/// milliseconds before the client's clock began.
+/// milliseconds before the ticker's clock began. The hog stops at second 13;
+/// the third line is the tail of its overruns, written at the heartbeat that
+/// follows the end of the second window.
 fn expected_at(k: usize) -> Option<usize> {
     match k {
         1..=9 => Some(1),
         11..=19 => Some(2),
-        21..=25 => Some(3),
+        21..=30 => Some(3),
         _ => None,
     }
 }
@@ -173,13 +183,34 @@ pub fn verdict(j: &Journal) -> Result<(), String> {
                 e.total
             ));
         }
-        // 100 overruns a second, 1000 in a window.
-        if n > 0 && !(900..=1100).contains(&e.since) {
+        // 100 overruns a second: 1000 in the window of 10 s, and about 300
+        // in the tail (the hog stops at second 13).
+        let (least, most) = match n {
+            0 => (1, 1),
+            1 => (900, 1100),
+            _ => (200, 400),
+        };
+        if !(least..=most).contains(&e.since) {
             return Err(format!(
-                "line {n}: {} overruns in a window of 10 s, about 1000 expected",
+                "line {n}: {} overruns, {least} to {most} expected",
                 e.since
             ));
         }
+        // The notifications count a lower bound of the kernel's overruns.
+        if e.kernel.is_some_and(|k| e.total > k || k > ahead) {
+            return Err(format!(
+                "line {n}: a total of {} where the kernel counts {:?} (at most {ahead} at the next second)",
+                e.total, e.kernel
+            ));
+        }
+    }
+    // The tail is the whole: nothing is left untold at the end.
+    let last = j.kernel.last().map_or(0, |k| k.0);
+    if j.hog
+        .last()
+        .is_none_or(|(_, e)| e.total > last || e.total + SLACK < last)
+    {
+        return Err(format!("the last total is not the kernel's {last}"));
     }
     Ok(())
 }
@@ -257,16 +288,23 @@ pub fn breaks() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The lines of a good run: the hog's budget overruns 100 times a second.
+    /// The lines of a good run: the hog's budget overruns 100 times a second
+    /// until second 13, and init writes the lines at 0, 10 and 20 s.
     fn good() -> Vec<String> {
-        let mut lines = vec!["init: burner budget hog: 1 overruns, 1 in all".to_string()];
+        let mut lines = vec![
+            "init: burner budget hog: at least 1 overruns, at least 1 in all, kernel counts 1"
+                .to_string(),
+        ];
+        let count = |k: usize| 100 * k.min(13) as u64 + 1;
         for k in 0..=SECONDS {
-            lines.push(format!("burner: t={k} hog={} quiet=0", 100 * k + 1));
+            lines.push(format!("burner: t={k} hog={} quiet=0", count(k)));
             if k == 10 {
-                lines.push("init: burner budget hog: 1000 overruns, 1001 in all".into());
+                lines.push("init: burner budget hog: at least 1000 overruns, at least 1001 in all, kernel counts 1001".into());
             }
             if k == 20 {
-                lines.push("init: burner budget hog: 1000 overruns, 2001 in all".into());
+                lines.push(
+                    "init: burner budget hog: at least 300 overruns, at least 1301 in all".into(),
+                );
             }
         }
         lines.push(DONE.into());
@@ -283,7 +321,7 @@ mod tests {
         let mut lines = good();
         lines.insert(
             1,
-            "init: burner budget hog: 1 overruns, 2 in all".to_string(),
+            "init: burner budget hog: at least 1 overruns, at least 2 in all".to_string(),
         );
         assert!(verdict(&parse(&lines).unwrap()).is_err());
     }
@@ -302,7 +340,7 @@ mod tests {
         let mut lines = good();
         lines.insert(
             1,
-            "init: burner budget quiet: 1 overruns, 1 in all".to_string(),
+            "init: burner budget quiet: at least 1 overruns, at least 1 in all".to_string(),
         );
         assert!(verdict(&parse(&lines).unwrap()).is_err());
     }
@@ -311,23 +349,19 @@ mod tests {
     fn a_count_that_the_kernel_does_not_back_fails() {
         let mut lines = good();
         for l in &mut lines {
-            if l.ends_with("2001 in all") {
-                *l = "init: burner budget hog: 1000 overruns, 1500 in all".into();
-            }
-            if l.ends_with("1001 in all") {
-                *l = "init: burner budget hog: 1000 overruns, 1001 in all".into();
+            if l.ends_with("1301 in all") {
+                *l = "init: burner budget hog: at least 300 overruns, at least 1301 in all, kernel counts 900".into();
             }
         }
         assert!(verdict(&parse(&lines).unwrap()).is_err());
-        let mut short = good();
-        for l in &mut short {
-            if l.ends_with("1001 in all") {
-                *l = "init: burner budget hog: 900 overruns, 901 in all".into();
-            }
-        }
-        assert!(
-            verdict(&parse(&short).unwrap()).is_err(),
-            "a total far below the kernel's count"
-        );
+    }
+
+    #[test]
+    fn a_tail_that_never_comes_fails() {
+        let lines: Vec<String> = good()
+            .into_iter()
+            .filter(|l| !l.ends_with("1301 in all"))
+            .collect();
+        assert!(verdict(&parse(&lines).unwrap()).is_err());
     }
 }
