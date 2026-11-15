@@ -144,6 +144,19 @@ pub(super) fn reply_receive(thread: NonNull<Thread>, a: &Args) {
             return;
         }
     };
+    // The reply's bytes between the buffers go before the receive begins: the
+    // receive may deliver a request of its own, and one copy waits at a time
+    // (`thread::copy_later`). The request's copy overwrites the buffer the
+    // reply's reads. A copy made here is outside both sections, with the
+    // interrupts masked as at the end of any call.
+    #[cfg(not(feature = "break-reply-receive-copy"))]
+    {
+        #[cfg(feature = "ktest")]
+        if thread::copy_waits() {
+            BETWEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        thread::flush_copy();
+    }
     // The reply is a stretch of its own, as a portion of a long call is: the
     // poll for an interrupt follows it. With one pending the call starts over
     // at its `svc` (the interrupt is taken on the way out, and the thread goes
@@ -172,6 +185,16 @@ fn channel_arg(thread: NonNull<Thread>) -> u64 {
 fn set_half(mut thread: NonNull<Thread>, half: u64) {
     // SAFETY: the thread is alive, and nothing else refers to its registers now.
     unsafe { thread.as_mut() }.regs.x[1] = half;
+}
+
+/// The copies `reply_receive` made between its halves (the kernel tests: the
+/// end of `dispatch` flushes too, and only this counts the call's own).
+#[cfg(feature = "ktest")]
+static BETWEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "ktest")]
+pub fn copies_between_halves() -> u32 {
+    BETWEEN.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// The kernel tests make the next poll between the halves of `reply_receive`
