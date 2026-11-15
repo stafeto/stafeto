@@ -732,24 +732,34 @@ mod tests {
     fn a_burst_of_connects_to_a_forward_is_answered_whole() {
         use std::os::fd::AsRawFd;
         const BURST: usize = 24;
+        // The limit of every step of a connection (connect, write, read, and
+        // the forwarder's read). A reset on a full queue (macOS) fails at once
+        // whatever the limit. On Linux a dropped SYN, or a dropped final ACK
+        // of the handshake, is sent again after 1 s, then after 2 s, 4 s and
+        // 8 s; 30 s covers all four resends and a scheduling stall of a
+        // loaded runner on top, and a passing run never waits for it.
+        const STEP_LIMIT: Duration = Duration::from_secs(30);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // SAFETY: `listen` on the descriptor of a listening socket only
         // changes the length of its queue.
         assert_eq!(unsafe { listen(listener.as_raw_fd(), 1) }, 0);
         let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
         let acceptor = std::thread::spawn(move || {
             while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                // A blocking accept takes a connection the moment it queues; the
+                // test wakes it with a last connect after the burst.
                 let Ok((mut stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(1));
                     continue;
                 };
+                if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 std::thread::spawn(move || {
                     let mut request = [0u8; 1];
-                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(STEP_LIMIT)).unwrap();
                     if stream.read_exact(&mut request).is_ok() {
                         let _ = stream.write_all(b"x");
                     }
@@ -757,21 +767,20 @@ mod tests {
             }
         });
         let clients: Vec<_> = (0..BURST)
-            .map(|_| {
+            .map(|index| {
                 std::thread::spawn(move || -> Result<(), String> {
-                    // A reset on a full queue (macOS) fails at once whatever the limit;
-                    // a dropped SYN (Linux) is sent again after a second, so the limit
-                    // leaves room for that resend on a loaded machine.
-                    let mut stream = connect_forwarded(&address, Duration::from_secs(3))
-                        .map_err(|e| format!("connect: {e}"))?;
+                    let step = |what: &str, e: std::io::Error| {
+                        format!("connection {index} of {BURST}: {what}: {e}")
+                    };
+                    let mut stream =
+                        connect_forwarded(&address, STEP_LIMIT).map_err(|e| step("connect", e))?;
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .map_err(|e| format!("socket options: {e}"))?;
-                    stream.write_all(b"?").map_err(|e| format!("write: {e}"))?;
+                        .set_read_timeout(Some(STEP_LIMIT))
+                        .and_then(|()| stream.set_write_timeout(Some(STEP_LIMIT)))
+                        .map_err(|e| step("socket options", e))?;
+                    stream.write_all(b"?").map_err(|e| step("write", e))?;
                     let mut answer = [0u8; 1];
-                    stream
-                        .read_exact(&mut answer)
-                        .map_err(|e| format!("read: {e}"))
+                    stream.read_exact(&mut answer).map_err(|e| step("read", e))
                 })
             })
             .collect();
@@ -780,6 +789,7 @@ mod tests {
             .filter_map(|c| c.join().unwrap().err())
             .collect();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(TcpStream::connect_timeout(&address, STEP_LIMIT));
         acceptor.join().unwrap();
         assert!(
             failed.is_empty(),
