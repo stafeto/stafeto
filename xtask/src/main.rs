@@ -1682,6 +1682,10 @@ enum Variant {
     /// it for the lift of the queue (`break-notice-holder-keeps`): the kernel
     /// tests of the lift must catch it.
     NoticeHolderKeepsTest,
+    /// A `reply_receive` that leaves the copy of its reply waiting while its
+    /// receive delivers a request (`break-reply-receive-copy`): the kernel
+    /// tests of the call must catch it.
+    ReplyReceiveCopyTest,
     /// Breaks the kernel tests of the rebind and the payer pin: a holder's lift
     /// that names no payer (`break-notice-payer-none`), an unbind that does not
     /// charge the stint that runs (`break-budget-unbind-no-charge`), and one
@@ -1693,7 +1697,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 67] = [
+    const ALL: [Variant; 68] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1758,6 +1762,7 @@ impl Variant {
         Variant::BudgetOverrunSilentTest,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
+        Variant::ReplyReceiveCopyTest,
         Variant::NoticePayerNoneTest,
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
@@ -1833,6 +1838,7 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
+            Variant::ReplyReceiveCopyTest => Some("ktest,break-reply-receive-copy"),
             Variant::NoticePayerNoneTest => Some("ktest,break-notice-payer-none"),
             Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
@@ -1924,6 +1930,7 @@ impl Variant {
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
+            Variant::ReplyReceiveCopyTest => "stafeto-ktest-reply-receive-copy",
             Variant::NoticePayerNoneTest => "stafeto-ktest-notice-payer-none",
             Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
