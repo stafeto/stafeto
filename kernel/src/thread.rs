@@ -765,6 +765,13 @@ pub fn flush_copy() {
     }
 }
 
+/// Whether a copy waits on this CPU (the kernel tests tell a copy made by
+/// the call itself from one made at the end of `dispatch`).
+#[cfg(feature = "ktest")]
+pub fn copy_waits() -> bool {
+    crate::local::local().deferred.load(Ordering::Relaxed) & crate::local::COPY != 0
+}
+
 /// The copy that waits, then the commands that the call posted: a thread
 /// of another CPU reads the message once it is woken, so the commands go
 /// out after the copy (cmd.rs).
@@ -799,6 +806,18 @@ fn flush_copy_now() {
             .copying
             .fetch_sub(1, Ordering::Release);
     }
+}
+
+/// The word at byte `offset` of the message buffer of `t` (the kernel tests
+/// look at what a copy left there).
+#[cfg(feature = "ktest")]
+pub fn buffer_word(t: NonNull<Thread>, offset: usize) -> u64 {
+    // SAFETY: the caller holds the thread, which does not run; only the
+    // field is borrowed.
+    let Some(buffer) = (unsafe { &(*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    buffer.frame.word(offset)
 }
 
 /// Writes `words` into the message buffer of `t` from byte `offset` on
