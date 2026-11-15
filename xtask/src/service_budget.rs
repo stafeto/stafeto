@@ -390,6 +390,7 @@ fn one_table(all: &[One]) {
             o.worst_request_us,
             o.worst_wait_us,
             o.bound_us,
+            o.bound_us as i64 - o.worst_request_us as i64,
             o.s_max_us,
             o.s0_us
         );
