@@ -801,6 +801,18 @@ fn flush_copy_now() {
     }
 }
 
+/// The word at byte `offset` of the message buffer of `t` (the kernel tests
+/// look at what a copy left there).
+#[cfg(feature = "ktest")]
+pub fn buffer_word(t: NonNull<Thread>, offset: usize) -> u64 {
+    // SAFETY: the caller holds the thread, which does not run; only the
+    // field is borrowed.
+    let Some(buffer) = (unsafe { &(*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    buffer.frame.word(offset)
+}
+
 /// Writes `words` into the message buffer of `t` from byte `offset` on
 /// (spec 6.2, 11): the records object_info LOG takes, through the linear
 /// map; the kernel reads no table of a program. A thread that makes calls
