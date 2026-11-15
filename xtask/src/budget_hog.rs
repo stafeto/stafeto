@@ -445,7 +445,7 @@ pub fn breaks() -> Result<(), String> {
         ),
         (
             Variant::NoticePayerNoneTest,
-            "a_request_that_queues_lifts_a_server_that_took_a_notification",
+            "a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel",
             "a lift of a notification's holder that names no payer",
         ),
         (

@@ -10899,8 +10899,9 @@ pub fn a_request_that_queues_lifts_a_server_that_took_a_notification(
         let b2 = crate::budget::create(h.client, 0, CLIENT_C, 10 * CLIENT_C, 1, 4, None)
             .map_err(|_| "no budget")?;
         crate::budget::bind(t2, b2).map_err(|_| "the sender's budget did not bind")?;
-        let before = left_of(b2);
         h.queue(t2)?;
+        // After the queue: the stint `t2` ran before it blocked is its own.
+        let before = left_of(b2);
         check(
             level_of(h.r) == 40,
             "a request at 40 did not lift the server that took a notification",
