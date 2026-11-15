@@ -136,6 +136,8 @@ fn acquire(me: usize) {
     #[cfg(feature = "smp-measure")]
     let began = crate::arch::timer::now_unordered();
     OBJ.lock();
+    #[cfg(feature = "ktest")]
+    crate::local::local().takes.fetch_add(1, Relaxed);
     #[cfg(feature = "smp-measure")]
     crate::smpm::waited(crate::arch::timer::now_unordered().wrapping_sub(began));
     OWNER.store(me, Relaxed);
@@ -373,14 +375,14 @@ pub fn holds_by_kind() -> [u64; KINDS] {
     core::array::from_fn(|i| BY_KIND[i].load(Relaxed))
 }
 
-/// How many times `OBJ` was taken since the start, modulo 2^16, in every
+/// How many times this CPU took `OBJ` since the start, modulo 2^16, in every
 /// test build: the tests count the sections of a portion with it. The count
-/// of tickets is the lock's, common to all CPUs, so it is right only in the
-/// images that run on one CPU; in the image `smp 4 checks` xtask reads the
-/// kind of a stretch from the build that measures.
+/// is the CPU's own, so it is right on any number of CPUs: the takes of the
+/// other CPUs do not enter it, and an interrupt on this CPU that takes `OBJ`
+/// does.
 #[cfg(feature = "ktest")]
 pub fn takes() -> u16 {
-    OBJ.tickets()
+    crate::local::local().takes.load(Relaxed)
 }
 
 /// The kinds of cleanup (`CLEAN_*`) whose portions ran in this image, one

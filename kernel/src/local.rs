@@ -57,6 +57,10 @@ pub struct Local {
     /// timers, level 1 first (timer). Zeros until `init`: an `Item` is not
     /// all zeros, and a `Local` of zeros lives in .bss, outside the image file.
     pub firings: [UnsafeCell<MaybeUninit<Item>>; LEVELS],
+    /// How many times this CPU took `OBJ`, modulo 2^16, in every test build
+    /// (`obj::takes`): the tests count the sections of a portion with it.
+    #[cfg(feature = "ktest")]
+    pub takes: core::sync::atomic::AtomicU16,
     /// The ring of time stamps (stamps.rs); the last field, so that a kernel
     /// without the feature has the layout it had.
     #[cfg(feature = "stamps")]
@@ -79,6 +83,8 @@ impl Local {
             copy: Own::new(crate::thread::PendingCopy::new()),
             outbox: Own::new(crate::cmd::Outbox::new()),
             deferred: core::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "ktest")]
+            takes: core::sync::atomic::AtomicU16::new(0),
             entry: UnsafeCell::new((0, 0)),
             time: CpuTime::new(),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],

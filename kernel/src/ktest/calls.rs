@@ -4029,7 +4029,7 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
 /// process and each entry of mem_create takes `OBJ` once, in every build
 /// (spec 8.1): the frames go back or come in one section, the zeroing, the
 /// links of the list and the scrub of the pages outside it. The count of the
-/// takes is the lock's tickets (`obj::takes`), which every test build keeps.
+/// takes is this CPU's own (`obj::takes`), which every test build keeps.
 pub fn memory_shell_and_create_portions_take_obj_once(_: &Boot) -> Result<(), &'static str> {
     const ONCE: &str = "a portion took OBJ other than once";
     let objects = memory::in_use();
