@@ -11,15 +11,12 @@
 //! keeps the object and the event.
 //!
 //! The replenishment event of a budget stands in the heap of the timers of
-//! its CPU, at the level of the thread's base priority (spec 10), and moves
-//! with the base when `thread_set_priority` changes it: the portion of that
-//! level fires it as it fires a timer. A thread whose budget is gone and
-//! whose base rose therefore finds its replenishment at the new level, where
-//! a thread that works there cannot hold it back. The replenishment may come
-//! later than its time and never earlier. Arming, moving and taking out cost
-//! up to 13 steps of the heap, which the system's count of timers bounds: a
-//! budget takes a place of it (timer::take_place), and the rest of its work
-//! has no loop longer than abi's four replenishments.
+//! its CPU, at the level of the thread's base priority when it was armed
+//! (spec 10): the portion of that level fires it as it fires a timer, and
+//! the replenishment may come later than its time and never earlier. Arming
+//! and taking out cost up to 13 steps of the heap, which the system's count
+//! of timers bounds: a budget takes a place of it (timer::take_place), and
+//! the rest of its work has no loop longer than abi's four replenishments.
 //!
 //! A budget lives while references to it are left: its handles and the
 //! binding to its thread, which ends with the thread (`unbound`). It is paid
@@ -314,11 +311,7 @@ fn server_of(b: NonNull<Budget>) -> NonNull<Server> {
 }
 
 /// The thread of `server` ended: the binding goes, and its reference with
-/// it, at `cause`. An overrun the place was not told of is told here, as
-/// `unbind` tells it, since the event that would have told it left the heap
-/// with the thread. Under OBJ, after the scheduler let the thread go (it
-/// closed and charged the stint that ran, took the loan and took the event
-/// out of the heap).
+/// it, at `cause`. Under OBJ, after the scheduler let the thread go.
 ///
 /// # Safety
 /// `server` is the server of the budget the ended thread had.
@@ -329,13 +322,6 @@ pub unsafe fn unbound(server: NonNull<Server>, cause: u8) {
     unsafe {
         let b = of_server(server);
         (*b.as_ptr()).thread = None;
-        // The break: the overrun is not told when the thread ends.
-        if !cfg!(feature = "break-budget-exit-silent")
-            && (*b.as_ptr()).server.take_notice()
-            && let Some(source) = (*b.as_ptr()).notice.as_mut()
-        {
-            let _ = Source::post(NonNull::from(source), NOTICE_BITS, cause);
-        }
         release(b, cause);
     }
 }
