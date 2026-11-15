@@ -7053,6 +7053,30 @@ const RAM_STEP_KINDS: [(usize, &str); 26] = [
 /// 16,503 (ramfs, the wait of its step for the process service).
 const CALL_WAIT_MAX: u64 = 48_000;
 
+/// The length of a tick of the timer of the QEMU virt machine (62.5 MHz), in nanoseconds.
+const TICK_NS: u64 = 16;
+
+/// The most a wait of kind `kind` of the service with the tag `tag` may last, in ticks. The waits
+/// of kinds 64 to 66 (a notification, maintenance, a session that is gone) are the time a step
+/// spends in `send` to another service. A service that has a budget works at `low` once the
+/// budget is spent, and its request waits in the queue of the callee at that level until the
+/// replenishment gives it its own level back: up to T - C. The bound of such a kind is then
+/// CALL_WAIT_MAX + ticks(T - C), with T and C of the budget of the service in init's table
+/// (the tag 2 is the RAM service, 4 the pipe service, 5 the terminal service). Every other
+/// kind, and every service without a budget, keeps CALL_WAIT_MAX.
+fn call_wait_max(tag: &str, kind: usize) -> u64 {
+    let budgets = match tag {
+        "2" => init::table::ramfs::RAM_BUDGETS,
+        "4" => init::table::ramfs::PIPE_BUDGETS,
+        "5" => init::table::ramfs::TTY_BUDGETS,
+        _ => &[],
+    };
+    match budgets.first() {
+        Some(b) if (64..=66).contains(&kind) => CALL_WAIT_MAX + (b.t_ns - b.c_ns) / TICK_NS,
+        _ => CALL_WAIT_MAX,
+    }
+}
+
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
 const PIPE_STEP_KINDS: [(usize, &str); 15] = [
@@ -7484,7 +7508,8 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
 }
 
 /// Fails when a wait in the lines of the services `tags` passes
-/// CALL_WAIT_MAX (the heartbeat, kind 64, included), or when `rt` cut an
+/// `call_wait_max` (CALL_WAIT_MAX, more for the kinds 64 to 66 of a service with a budget; the
+/// heartbeat, kind 64, included), or when `rt` cut an
 /// accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
@@ -7492,9 +7517,10 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
-            if wait > CALL_WAIT_MAX {
+            let max = call_wait_max(tag, kind);
+            if wait > max {
                 return Err(format!(
-                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {CALL_WAIT_MAX}"
+                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {max}"
                 ));
             }
         }
@@ -14238,11 +14264,11 @@ mod tests {
         let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
         assert!(check_waits(&cut, &["5"], "t").is_err());
         let ok = vec![format!(
-            "service wait: 4 kind 64 {CALL_WAIT_MAX} ticks of 600000"
+            "service wait: 4 kind 25 {CALL_WAIT_MAX} ticks of 600000"
         )];
         assert!(check_waits(&ok, &["4"], "t").is_ok());
         let bad = vec![format!(
-            "service wait: 4 kind 64 {} ticks of 600000",
+            "service wait: 4 kind 25 {} ticks of 600000",
             CALL_WAIT_MAX + 1
         )];
         assert!(check_waits(&bad, &["4"], "t").is_err());
@@ -14250,6 +14276,31 @@ mod tests {
         // The preemption after init's answer has no limit.
         let preempted = vec!["service preempt: 4 kind 64 900000 ticks of 950000".to_owned()];
         assert!(check_waits(&preempted, &["4"], "t").is_ok());
+    }
+
+    #[test]
+    fn a_service_with_a_budget_may_wait_t_minus_c_more_in_its_own_calls() {
+        let on = |tag: &str| match tag {
+            "2" => init::table::ramfs::RAM_BUDGET_ON,
+            _ => true,
+        };
+        // The terminal and pipe services: (5 ms - 75 us) / 16 ns = 307 812 ticks more.
+        for tag in ["4", "5"] {
+            assert_eq!(call_wait_max(tag, 65), 355_812);
+            assert_eq!(call_wait_max(tag, 64), 355_812);
+            assert_eq!(call_wait_max(tag, 66), 355_812);
+            assert_eq!(call_wait_max(tag, 63), CALL_WAIT_MAX);
+            assert_eq!(call_wait_max(tag, 10), CALL_WAIT_MAX);
+        }
+        // The RAM service: (5 ms - 250 us) / 16 ns = 296 875 ticks more.
+        let ram = if on("2") { 344_875 } else { CALL_WAIT_MAX };
+        assert_eq!(call_wait_max("2", 65), ram);
+        assert_eq!(call_wait_max("2", 67), CALL_WAIT_MAX);
+        // A service without a budget keeps the bound.
+        assert_eq!(call_wait_max("10", 65), CALL_WAIT_MAX);
+        let line = |w: u64| vec![format!("service wait: 5 kind 65 {w} ticks of 400000")];
+        assert!(check_waits(&line(355_812), &["5"], "t").is_ok());
+        assert!(check_waits(&line(355_813), &["5"], "t").is_err());
     }
 
     /// The lines of a run for `getlimit_bound`: five services above the
