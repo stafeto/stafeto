@@ -591,7 +591,7 @@ static void epoll_basic(void)
 			REQUIRE(ev[i].events & EPOLLIN);
 			found = 1;
 		}
-	REQUIRE(found && "the event of the server after a send");
+	REQUIRE(found);
 	/* MOD changes the data word, DEL ends the reports. */
 	ep_do(ep, EPOLL_CTL_MOD, s, EPOLLIN, 43);
 	found = 0;
@@ -599,7 +599,7 @@ static void epoll_basic(void)
 	for (int i = 0; i < n; i++)
 		if (ev[i].data.u64 == 43)
 			found = 1;
-	REQUIRE(found && "the event of the server after MOD");
+	REQUIRE(found);
 	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, s, NULL) == 0);
 	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, c, NULL) == 0);
 	REQUIRE(ep_wait(ep, ev, 100) == 0);
