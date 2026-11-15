@@ -356,7 +356,7 @@ fn print_windows(name: &str) {
 
 /// The phase with no client: the victim alone, so that the time it loses to what the machine
 /// does besides (the interrupts of the timer, the heartbeats of the services, the entries of
-/// the probe's own thread) is told apart.
+/// the probe's own thread) is set apart.
 fn idle(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Timer>) {
     reset();
     let victim = spawn_on(process, 0, victim, 0, VICTIM_LEVEL, 0);
@@ -694,7 +694,7 @@ fn main(_: u64) -> u64 {
             );
         }
     }
-    // The stress phase: 24 queued clients of the pipe service, the victim's share told (no gate;
+    // The stress phase: 24 queued clients of the pipe service, the victim's share printed (no gate;
     // with the bound pipe on the kernel of #364 the victim kept 0 per mille: issue #750).
     CLIENTS.store(GREEDIES, Relaxed);
     phase(
@@ -714,7 +714,8 @@ fn main(_: u64) -> u64 {
 //
 // With two CPUs QEMU runs the vCPUs in turn in one thread with one instruction counter, so a busy
 // CPU 1 advances the guest clock while CPU 0 executes nothing: the victim's share and a client's
-// wait on a two-CPU machine are partly the emulator's, and the phases above are told, not gated.
+// wait on a two-CPU machine are partly the emulator's, and the phases above are printed for
+// information.
 // On one CPU everything below runs on CPU 0 and the numbers are the kernel's.
 
 /// C of each service's budget in microseconds and the longest stretch B of the kernel
@@ -731,8 +732,13 @@ const C_IPC_US: u64 = 32;
 /// window with a heartbeat of the RAM service, init ran 2 688 ticks) and up to two notifications
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
-/// What the explanation of the loss leaves unexplained, per service, as the gate allows it
-/// (measured on main; the remainder of the pipe and terminal services is an open issue).
+/// What the explanation of the loss leaves unexplained, per service, as the starvation gate
+/// allows it. A measured allowance: the one-CPU probe on the runner showed a remainder of 352
+/// (ramfs), 134 and 166 us (pipe and tty) of the loss of 10 ms with the demoted level 32, and
+/// 392, 542 and 438 us on the earlier head with the demoted level 1; the allowance is the
+/// measured value with room (stafeto-design#751 follows the part no term explains). It makes the
+/// starvation gate a regression check on the cost of a budget. It cannot see a missing budget: an
+/// unbound RAM service keeps the victim at 968 per mille against the bound of 827.
 const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
 
 /// The cost of one timer event of a budget in microseconds, by C: [250, 75] (`control`), measured.
@@ -795,7 +801,7 @@ fn control_budget(
     });
     // The loss of a typical window in microseconds: (1000 - median) per mille of 10 ms. (The worst
     // window can take the end of one period, a whole one and the start of the third, and tells
-    // a larger e: told too.)
+    // a larger e; that is printed too.)
     let loss_us = (1000 - median) * 10;
     let e = loss_us.saturating_sub(2 * c_us) / 4;
     let e_worst = ((1000 - worst) * 10).saturating_sub(2 * c_us) / 4;
@@ -1001,8 +1007,14 @@ fn level40(
         heavy(1, cal, GREEDIES - 1, false);
     }
     sys::send_stats::watch(cal.raw().0);
+    // Each request goes with the budget fresh: a pause of more than one period T before it lets
+    // the replenishment come, so no exhaustion (a wait of up to T - C for the next replenishment)
+    // lies inside the measure. Asked one after the other, the requests drain C of the service and
+    // the longest of them would be that wait (4.9 ms for the RAM and terminal services), which is
+    // no request in hand.
     let mut s_max = 0;
     for i in 0..30 {
+        sleep_until(wait, timer, now_ns() + (T_US + 500) * 1000);
         sys::send_stats::reset_longest();
         if kind == 0 {
             ask(0, cal, DEPTH);
