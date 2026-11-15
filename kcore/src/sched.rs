@@ -1362,7 +1362,28 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// `t` is alive, and no borrow of its node is alive.
+    #[inline(always)]
     unsafe fn unbind(t: NonNull<T>, now: u64, running: bool) -> Option<(NonNull<Server>, u64)> {
+        // SAFETY: the caller's promise.
+        if unsafe { node(t) }.server.is_none() {
+            return None;
+        }
+        // SAFETY: as above; `t` has a budget.
+        unsafe { Self::settle_budget(t, now, running) }
+    }
+
+    /// `unbind` for a thread that has a budget, out of line: a thread with
+    /// none passes `unbind` with one look.
+    ///
+    /// # Safety
+    /// As for `unbind`; `t` has a budget.
+    #[inline(never)]
+    #[cold]
+    unsafe fn settle_budget(
+        t: NonNull<T>,
+        now: u64,
+        running: bool,
+    ) -> Option<(NonNull<Server>, u64)> {
         // SAFETY: the caller's promise; the budget lives while `t` has it.
         unsafe {
             let mut server = node(t).server?;
