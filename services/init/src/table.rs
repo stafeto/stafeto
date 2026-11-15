@@ -533,7 +533,7 @@ pub struct Record {
     /// the record before it binds its budget, and the threads that have none, never run
     /// above it, so a service whose request thread does not bind (or whose helper threads
     /// have no budget) leaves the levels above `free` alone. A record with budgets has
-    /// it below its level (`check_free`).
+    /// it below its level and a record without budgets has 0 (`check_free`).
     pub free: u8,
 }
 
@@ -779,9 +779,9 @@ pub enum TableError<'a> {
         cpu: u8,
         ppm: u64,
     },
-    /// A `free` above the record's ceiling, or, for a record with budgets, a
-    /// `free` that is set and not below the record's priority (it would hold no
-    /// thread down).
+    /// A `free` above the record's ceiling, a `free` that is set on a record without
+    /// budgets, or, for a record with budgets, a `free` that is set and not below the
+    /// record's priority (it would hold no thread down).
     Free {
         record: &'static str,
     },
@@ -1084,12 +1084,13 @@ pub fn free_of(record: &Record) -> u8 {
     }
 }
 
-/// The `free` level of each record of `table` (spec 8): at most its ceiling, and for a
-/// record with budgets, when set, below its priority.
+/// The `free` level of each record of `table` (spec 8): at most its ceiling, and when set, only
+/// for a record with budgets, below its priority. A record without budgets never binds, so the
+/// level would hold its threads down for good.
 fn check_free(table: &[Record]) -> Result<(), TableError<'static>> {
     for r in table {
         let fine =
-            r.free <= r.ceiling && (r.free == 0 || r.budgets.is_empty() || r.free < r.priority);
+            r.free <= r.ceiling && (r.free == 0 || (!r.budgets.is_empty() && r.free < r.priority));
         if !fine {
             return Err(TableError::Free { record: r.name });
         }
@@ -4142,10 +4143,17 @@ mod tests {
             ..service("svc", 40, 40)
         };
         assert!(check_one(with(0, &[])).is_ok());
-        assert!(check_one(with(40, &[])).is_ok());
         assert!(check_one(with(31, &ONE)).is_ok());
         assert!(check_one(with(0, &ONE)).is_ok());
-        for bad in [with(41, &[]), with(41, &ONE), with(40, &ONE)] {
+        // A record without budgets never binds: a `free` on it holds its threads down for good.
+        for bad in [
+            with(40, &[]),
+            with(31, &[]),
+            with(1, &[]),
+            with(41, &[]),
+            with(41, &ONE),
+            with(40, &ONE),
+        ] {
             assert_eq!(
                 check_one(bad),
                 Err(TableError::Free { record: "svc" }),
@@ -4174,7 +4182,7 @@ mod tests {
             ramfs::RAM_CLOCKED,
             ramfs::RAM_FIFO_CLOCKED,
         ] {
-            assert_eq!(record.free, ramfs::SERVICE_FREE);
+            assert_eq!(record.free, ramfs::RAM_FREE);
             assert_eq!(record.budgets.len(), usize::from(ramfs::RAM_BUDGET_ON));
             assert!(
                 record
