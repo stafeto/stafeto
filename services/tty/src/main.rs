@@ -224,7 +224,7 @@ fn main(_: u64) -> u64 {
     };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
-    let Ok(channel) = sys::channel_create(1) else {
+    let Ok(channel) = sys::channel_create(level) else {
         return NO_CHANNEL;
     };
     if rt::service::register(&start.parent, &channel).is_err() {
