@@ -113,25 +113,29 @@ impl Default for Run {
     }
 }
 
-/// The steps in a row after which the loop looks at its queue for a request before the next
-/// step runs (`Yielding`).
-pub const RUN_STEPS: u32 = 2;
+/// How long the loop may go without serving a request before it looks at its queue for one: a
+/// period of the stack's budget.
+pub const YIELD_NS: u64 = 1_000_000;
 
 /// The loop of the stack takes the head of its queue, and the queue gives the head to the
 /// notification with the higher level: a request of a client at a level below the stack's
 /// waits for as long as the stack tells itself the next step and the switch the next frames,
-/// which is as long as the wire has more (stafeto-design#713). So after `RUN_STEPS` steps in a
-/// row the loop looks at the queue before the next one: with anything queued the step is put
-/// off (`owed`; the caller leaves its bits in its own `told`, so that no one tells them again)
-/// and the loop takes what stands in the queue. A notification that stands ahead of a request
-/// was told before the step was put off: the stack's own and the switch's share one slot, and
-/// the timer's and each session's have one each, so the request is taken after the receives of
-/// those and of the notifications the switch tells meanwhile (it tells the step of sending for
-/// each lend of buffers, and each costs one cheap receive). When the queue is empty, or a
-/// request is served, the steps owed are told and the run starts again.
+/// which is as long as the wire has more (stafeto-design#713). So when no request has been
+/// served for `YIELD_NS` the loop looks at the queue at the end of a notification (`after`, one
+/// `object_info` a millisecond at most, none while requests are served, and outside the step):
+/// with anything queued the next step that comes is put off (`arrive`: `owed`; the caller leaves
+/// its bits in its own `told`, so that no one tells them again) and the loop takes what stands in
+/// the queue. A notification that stands ahead of a request was told before the step was put off:
+/// the stack's own and the switch's share one slot, and the timer's and each session's have one
+/// each, so the request is taken after the receives of those and of the notifications the switch
+/// tells meanwhile (it tells the step of sending for each lend of buffers, and each costs one
+/// cheap receive). When the queue is empty, or a request is served, the steps owed are told and
+/// the time starts again. Under a load of requests one is served in every millisecond, so no step
+/// is ever put off.
 pub struct Yielding {
-    run: u32,
+    served_at: u64,
     owed: u64,
+    defer: bool,
     /// The steps put off.
     pub deferred: u32,
     /// The times the steps owed were told with no request served (the queue held only
@@ -150,50 +154,53 @@ impl Default for Yielding {
 impl Yielding {
     pub const fn new() -> Yielding {
         Yielding {
-            run: 0,
+            served_at: 0,
             owed: 0,
+            defer: false,
             deferred: 0,
             idle: 0,
             served: 0,
         }
     }
 
-    /// A notification of steps `bits` came. The steps to run now: `bits` (with those owed, when
-    /// the queue is seen empty), or 0 when they are put off. `queued` says whether anything
-    /// stands in the queue; it is asked only after `RUN_STEPS` steps in a row.
-    pub fn arrive(&mut self, bits: u64, queued: impl FnOnce() -> bool) -> u64 {
-        self.run = self.run.saturating_add(1);
-        if self.run <= RUN_STEPS {
-            return bits;
-        }
-        if queued() {
+    /// A notification of steps `bits` came. The steps to run now: `bits` with those owed, or 0
+    /// when they are put off.
+    pub fn arrive(&mut self, bits: u64) -> u64 {
+        if self.defer {
             self.owed |= bits;
             self.deferred += 1;
             return 0;
         }
-        self.run = 0;
-        if self.owed != 0 {
-            self.idle += 1;
-        }
         bits | core::mem::take(&mut self.owed)
     }
 
-    /// A request was served: the steps owed are to be told now (`always`), and the run starts
-    /// again. Without `always` (the end of a notification that no step took) the queue must be
-    /// empty for it, the steps owed are told then, so that none waits for a step that does not
-    /// follow.
-    pub fn resume(&mut self, always: bool, queued: impl FnOnce() -> bool) -> u64 {
-        if always {
-            self.run = 0;
-        }
-        if self.owed == 0 || (!always && queued()) {
+    /// The end of a notification at `now` (ns). `queued` says whether anything stands in the
+    /// queue; it is asked only when no request was served for `YIELD_NS`. With something
+    /// queued the next step is put off; with the queue empty the steps owed are to be told, and
+    /// the time starts again. Returns the steps to tell.
+    pub fn after(&mut self, now: u64, queued: impl FnOnce() -> bool) -> u64 {
+        if now.wrapping_sub(self.served_at) < YIELD_NS {
             return 0;
         }
-        self.run = 0;
-        if always {
-            self.served += 1;
-        } else {
+        if queued() {
+            self.defer = true;
+            return 0;
+        }
+        self.defer = false;
+        self.served_at = now;
+        if self.owed != 0 {
             self.idle += 1;
+        }
+        core::mem::take(&mut self.owed)
+    }
+
+    /// A request was served at `now`: the steps owed are to be told now, and the time starts
+    /// again. Returns the steps to tell.
+    pub fn served(&mut self, now: u64) -> u64 {
+        self.served_at = now;
+        self.defer = false;
+        if self.owed != 0 {
+            self.served += 1;
         }
         core::mem::take(&mut self.owed)
     }
@@ -201,6 +208,12 @@ impl Yielding {
     /// The steps put off and not told yet.
     pub fn owed(&self) -> u64 {
         self.owed
+    }
+
+    /// The steps of `mask` that were put off are run by the caller at once: they are no longer
+    /// owed.
+    pub fn settle(&mut self, mask: u64) {
+        self.owed &= !mask;
     }
 }
 
@@ -315,59 +328,57 @@ mod tests {
             }
         }
     }
+    const MS: u64 = 1_000_000;
+
     #[test]
-    fn a_run_of_steps_puts_the_next_off_while_a_request_waits() {
+    fn nothing_is_asked_while_requests_are_served_within_a_period() {
         let mut y = Yielding::new();
-        for _ in 0..RUN_STEPS {
-            assert_eq!(
-                y.arrive(0b1, || unreachable!("not asked in the first steps")),
-                0b1
-            );
+        y.served(5 * MS);
+        for k in 1..8 {
+            let now = 5 * MS + k * 100_000;
+            assert_eq!(y.after(now, || unreachable!("served lately")), 0);
+            assert_eq!(y.arrive(0b1), 0b1);
         }
-        // The next step, with a request queued, is put off and owed.
-        assert_eq!(y.arrive(0b1, || true), 0);
+        assert_eq!(y.deferred, 0);
+    }
+
+    #[test]
+    fn a_period_without_a_request_puts_the_next_step_off_while_a_request_waits() {
+        let mut y = Yielding::new();
+        y.served(5 * MS);
+        assert_eq!(y.after(6 * MS + 1, || true), 0);
+        assert_eq!(y.arrive(0b1), 0);
         // The notifications of other steps that stand ahead of the request are put off too.
-        assert_eq!(y.arrive(0b10, || true), 0);
-        // The request is served: the steps owed come back together, and a run starts.
-        assert_eq!(y.resume(true, || unreachable!("always")), 0b11);
-        assert_eq!(y.arrive(0b1, || unreachable!("a new run")), 0b1);
-        // Nothing owed, nothing told.
-        assert_eq!(y.resume(true, || true), 0);
+        assert_eq!(y.after(6 * MS + 2, || true), 0);
+        assert_eq!(y.arrive(0b10), 0);
+        // The request is served: the steps owed come back together, and a period starts.
+        assert_eq!(y.served(6 * MS + 3), 0b11);
+        assert_eq!(y.after(6 * MS + 4, || unreachable!("a new period")), 0);
+        assert_eq!(y.arrive(0b1), 0b1);
+        assert_eq!((y.deferred, y.idle, y.served), (2, 0, 1));
     }
 
     #[test]
-    fn an_empty_queue_takes_the_steps_owed_with_the_next_step() {
+    fn an_empty_queue_tells_the_steps_owed() {
         let mut y = Yielding::new();
-        for _ in 0..RUN_STEPS {
-            y.arrive(0b1, || false);
-        }
-        assert_eq!(y.arrive(0b1, || true), 0);
-        // What stood in the queue was no request; the next notification finds it empty.
-        assert_eq!(y.arrive(0b100, || false), 0b101);
-        assert_eq!(y.arrive(0b1, || unreachable!("a new run")), 0b1);
-    }
-
-    #[test]
-    fn steps_owed_are_told_when_no_step_follows_and_the_queue_is_empty() {
-        let mut y = Yielding::new();
-        for _ in 0..RUN_STEPS {
-            y.arrive(0b1, || false);
-        }
-        assert_eq!(y.arrive(0b1, || true), 0);
-        // The end of a notification that is no step: the queue still holds something.
-        assert_eq!(y.resume(false, || true), 0);
-        // It is empty now: the steps owed are told.
-        assert_eq!(y.resume(false, || false), 0b1);
-        assert_eq!(y.resume(false, || false), 0);
+        assert_eq!(y.after(2 * MS, || true), 0);
+        assert_eq!(y.arrive(0b1), 0);
+        // What stood in the queue was no request; the end of the next notification finds it
+        // empty.
+        assert_eq!(y.after(2 * MS + 1, || false), 0b1);
+        assert_eq!(y.arrive(0b100), 0b100);
+        assert_eq!(y.after(2 * MS + 2, || unreachable!("a new period")), 0);
+        assert_eq!((y.deferred, y.idle), (1, 1));
     }
 
     /// The queue of the loop in a model: one slot of label 0 (the stack's own bits and the
     /// switch's, ORed, ahead of the request as a level above it) and the requests behind it.
     /// The switch tells the stack every time it can, as under a full wire (the step of receiving
     /// once until the stack looks, the step of sending at each turn); it can in three turns of
-    /// four, the fourth being the one its budget is spent in (the stack's turn in the period). A
-    /// request that comes in the middle is served within a few receives, the steps put off come
-    /// back after it, and when the wire stops no step is left owed.
+    /// four, the fourth being the one its budget is spent in (the stack's turn in the period).
+    /// A receive takes 250 us. A request that comes in the middle is served within a period and
+    /// a few receives, the steps put off come back after it, and when the wire stops no step is
+    /// left owed.
     #[test]
     fn a_request_is_served_within_the_bound_under_a_full_wire_and_no_step_is_lost() {
         const RX: u64 = 1;
@@ -379,6 +390,7 @@ mod tests {
         let (mut asked_at, mut served_at, mut rx_at_served) = (None, None, 0);
         let mut progress_after = None;
         for receive in 0..4_000u32 {
+            let now = 10 * MS + u64::from(receive) * 250_000;
             let flood = receive < 300;
             if flood && receive % 4 != 3 {
                 // The switch, at a level above the stack, tells before each receive.
@@ -397,10 +409,9 @@ mod tests {
             }
             if slot != 0 {
                 let bits = core::mem::take(&mut slot);
-                let queued_now = requests > 0;
-                let run = y.arrive(bits, || queued_now);
+                let run = y.arrive(bits);
                 if run != 0 {
-                    let first = run & run.wrapping_neg();
+                    let first = 1u64 << run.trailing_zeros();
                     told &= !first;
                     if run & !first != 0 {
                         slot |= run & !first;
@@ -426,19 +437,20 @@ mod tests {
                     }
                 }
                 let queued_end = slot != 0 || requests > 0;
-                slot |= y.resume(false, || queued_end);
+                slot |= y.after(now, || queued_end);
             } else if requests > 0 {
                 requests -= 1;
                 served_at = Some(receive);
                 rx_at_served = rx_left;
-                slot |= y.resume(true, || false);
+                slot |= y.served(now);
             } else if !flood {
                 break;
             }
         }
         let (asked, served) = (asked_at.unwrap(), served_at.expect("the request is served"));
+        // A period (4 receives) and a few receives of the notifications ahead of it.
         assert!(
-            served - asked <= 8,
+            served - asked <= 12,
             "served after {} receives",
             served - asked
         );

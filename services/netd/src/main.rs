@@ -2409,9 +2409,70 @@ const METHODS: &[u16] = &[
 ];
 
 impl Driver<'_> {
+    /// A request that reads what the stack knows of the sockets (the wait of a set) does not
+    /// overtake the steps told before it: on the levels of the loop a step told by a request
+    /// ran before the next request of the same client, but a budget that is spent, another CPU
+    /// or a client above the stack's level can put the request first, and the data the client
+    /// just sent are not yet in the report. The steps of sending, receiving and waking that are
+    /// told (or put off) run here, once each, and in at most three rounds, for the sending
+    /// makes frames for the receiving and the receiving the events for the waking.
+    fn settle(&mut self) {
+        const SETTLED: u64 = TX | RX | WAKE;
+        #[cfg(feature = "probe")]
+        let held = core::mem::take(&mut self.hold);
+        // The steps the probe's hold has kept back are the steps told before the request.
+        #[cfg(feature = "probe")]
+        let kept = (if core::mem::take(&mut self.held_tx) {
+            TX
+        } else {
+            0
+        }) | (if core::mem::take(&mut self.held_rx) {
+            RX
+        } else {
+            0
+        });
+        #[cfg(not(feature = "probe"))]
+        let kept = 0;
+        for round in 0..3 {
+            let pending =
+                (self.told | self.yielding.owed() | if round == 0 { kept } else { 0 }) & SETTLED;
+            if pending == 0 {
+                break;
+            }
+            self.yielding.settle(pending);
+            for bit in [TX, RX, WAKE] {
+                if pending & bit == 0 {
+                    continue;
+                }
+                self.told &= !bit;
+                match bit {
+                    TX => self.tx_step(false),
+                    RX => self.rx_step(),
+                    _ => {
+                        rt::service::step_own();
+                        profile::count(Counter::StepWake);
+                        if self.inst.net.wake(&mut self.inst.stack, now_ns()) {
+                            self.tell(WAKE);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "probe")]
+        {
+            self.hold = held;
+        }
+    }
+
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        if matches!(
+            Method::from_number(method),
+            Some(Method::EpollWait | Method::EpollWaitTake | Method::Watch | Method::WatchTake)
+        ) {
+            self.settle();
+        }
         // VERIFY_SESSION goes through the root alone, and the root has no
         // other request.
         // The first instance sends it to the home of a session (`HOME_LABEL`), as it sends
@@ -2510,9 +2571,8 @@ impl Driver<'_> {
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // A request that waits in the queue goes ahead of the steps that follow one
                 // another (`netd::gates::Yielding`).
-                let notify = &self.notify;
                 let before = self.yielding_counts();
-                let steps = self.yielding.arrive(n.bits & STEP_BITS, || queued(notify));
+                let steps = self.yielding.arrive(n.bits & STEP_BITS);
                 self.count_yielding(before);
                 if steps == 0 {
                     return;
@@ -2682,7 +2742,7 @@ impl Service<0> for Driver<'_> {
         self.bell_checked = false;
         let notify = &self.notify;
         let before = self.yielding_counts();
-        let owed = self.yielding.resume(false, || queued(notify));
+        let owed = self.yielding.after(now_ns(), || queued(notify));
         self.count_yielding(before);
         self.tell_owed(owed);
     }
@@ -2691,7 +2751,7 @@ impl Service<0> for Driver<'_> {
         self.bell_release();
         self.bell_checked = false;
         let before = self.yielding_counts();
-        let owed = self.yielding.resume(true, || false);
+        let owed = self.yielding.served(now_ns());
         self.count_yielding(before);
         self.tell_owed(owed);
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its

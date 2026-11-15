@@ -190,7 +190,7 @@ fn counter(line: &str, key: &str) -> Option<u64> {
 }
 
 /// The longest wait of a request of the service in the flood of `share`, in the guest's time.
-const ASK_FLOOD_BOUND_US: u64 = 20_000;
+const ASK_FLOOD_BOUND_US: u64 = 5_000;
 
 /// `switch-probe ask`: the requests it made and the longest wait of one, in microseconds of the
 /// guest's time.
@@ -1590,7 +1590,7 @@ fn share(
             flood_ask.1, flood_ask.0, quiet_ask.1, quiet_ask.0
         );
         // A request waits for a few steps of the stack and a few receives, a few periods of
-        // its budget (netd::gates::Yielding), not for the flood: 20 ms is above what it measured, 1.4 ms.
+        // its budget (netd::gates::Yielding), not for the flood: 5 ms is above what it measured, 2.3 ms.
         if flood_ask.1 > ASK_FLOOD_BOUND_US {
             return Err(format!(
                 "a request of the network service waited {} us in the guest's time in the flood, over {ASK_FLOOD_BOUND_US} us",
