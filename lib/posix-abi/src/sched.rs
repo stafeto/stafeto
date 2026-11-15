@@ -43,6 +43,9 @@ use rt::sys;
 pub const SCHED_OTHER: i32 = 0;
 pub const SCHED_FIFO: i32 = 1;
 pub const SCHED_RR: i32 = 2;
+/// The sporadic server (XSH 2.8.4): defined for compilation; no thread takes it
+/// in 0.5.0 (`refused`).
+pub const SCHED_SPORADIC: i32 = posix_types::sporadic::SCHED_SPORADIC;
 /// The least and the greatest priority of SCHED_FIFO and SCHED_RR.
 pub const MIN_PRIORITY: i32 = 1;
 pub const MAX_PRIORITY: i32 = 32;
@@ -80,8 +83,19 @@ pub(crate) fn unpack(word: u64) -> (i32, i32) {
 pub fn priority_range(policy: i32, max: bool) -> Result<i32, i32> {
     match policy {
         SCHED_OTHER => Ok(0),
-        SCHED_FIFO | SCHED_RR => Ok(if max { MAX_PRIORITY } else { MIN_PRIORITY }),
+        // The range of a defined policy, which no thread takes in 0.5.0.
+        SCHED_FIFO | SCHED_RR | SCHED_SPORADIC => Ok(if max { MAX_PRIORITY } else { MIN_PRIORITY }),
         _ => Err(EINVAL),
+    }
+}
+
+/// The error of a call that would give a thread SCHED_SPORADIC: the policy
+/// is not supported at this run (posix_types::sporadic::refusal), for root and
+/// for a user alike, before any check of privilege.
+fn refused(call: posix_types::sporadic::Call, policy: i32) -> Result<(), i32> {
+    match posix_types::sporadic::refusal(call, policy) {
+        Some(errno) => Err(errno),
+        None => Ok(()),
     }
 }
 
@@ -129,6 +143,7 @@ pub fn next_sched(policy: i32, priority: i32) -> Result<(), i32> {
         block.next_sched.store(0, Ordering::Relaxed);
         return Ok(());
     }
+    refused(posix_types::sporadic::Call::ThreadCreate, policy)?;
     level_of(policy, priority)?;
     if !permitted(
         unpack(block.sched.load(Ordering::Relaxed)),
@@ -184,6 +199,7 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
     crate::relibc::with_target(id, |block, native| {
         let (old_policy, _) = unpack(block.sched.load(Ordering::Relaxed));
         let policy = if policy < 0 { old_policy } else { policy };
+        refused(posix_types::sporadic::Call::ThreadSetParam, policy)?;
         let (level, kernel) = level_of(policy, priority)?;
         if !permitted(
             unpack(block.sched.load(Ordering::Relaxed)),
@@ -211,6 +227,7 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
 pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
     let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
+    refused(posix_types::sporadic::Call::Spawn, policy)?;
     level_of(policy, priority)?;
     if spec.is_some() && !permitted(own, (policy, priority)) {
         return Err(EPERM);
@@ -302,6 +319,9 @@ pub fn getparam(pid: i32) -> Result<i32, i32> {
 /// sched_setscheduler (a policy) and sched_setparam (a negative policy):
 /// the old policy.
 pub fn set(pid: i32, policy: i32, priority: i32) -> Result<i32, i32> {
+    // EINVAL for the policy (XSH sched_setscheduler, sched_setparam); the
+    // thread call below says ENOTSUP, which is pthread_setschedparam's.
+    refused(posix_types::sporadic::Call::SetScheduler, policy)?;
     thread_set(thread_of(pid)?, policy, priority, true)
 }
 

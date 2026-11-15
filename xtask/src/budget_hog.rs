@@ -92,8 +92,11 @@ const LOAN_MOST: u64 = 64;
 /// own CPU: the service goes from its reply to its next receive in one entry
 /// (`reply_receive`), so it never waits at its low level behind the spinner
 /// between two requests, and the client gets one request for each 2 ms
-/// period (52 measured; two with a service that returns to EL0 between its
-/// reply and its receive).
+/// period (52 measured). The split of `reply_receive` into two entries has
+/// its own kernel test (`reply_receive_takes_the_queued_request_at_its_level`):
+/// the count of this phase with that break depends on the user code of
+/// `Token::reply_receive` (9 requests with one body of it, 50 with another, on
+/// one CPU and on four alike), so this bound judges the loan only.
 const LOAN_LEAST_SAME: u64 = 26;
 /// The longest wait of the client at 40 of the queue phase, its own 500 us of
 /// work not counted: the rest of the request in hand (500 us at most), B for
@@ -463,10 +466,6 @@ pub fn breaks() -> Result<(), String> {
             "a request that queues behind a server without a budget and does not lift it",
         ),
         (
-            Variant::ReplyReceiveSplit,
-            "a reply_receive that returns to EL0 between its reply and its receive",
-        ),
-        (
             Variant::BudgetOverrunSilent,
             "an overrun that posts nothing to the budget's place",
         ),
@@ -475,10 +474,7 @@ pub fn breaks() -> Result<(), String> {
         // CPU runs on the break too.
         let cpus = if matches!(
             variant,
-            Variant::BudgetForgiveLoan
-                | Variant::BudgetNoQueueLift
-                | Variant::ReplyReceiveSplit
-                | Variant::BudgetOverrunSilent
+            Variant::BudgetForgiveLoan | Variant::BudgetNoQueueLift | Variant::BudgetOverrunSilent
         ) {
             4
         } else {
@@ -519,6 +515,11 @@ pub fn breaks() -> Result<(), String> {
             Variant::NoticeHolderKeepsTest,
             "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
             "a thread that goes on holding a notification after its receive",
+        ),
+        (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_takes_the_queued_request_at_its_level",
+            "a reply_receive that returns to EL0 between its reply and its receive",
         ),
         (
             Variant::ReplyReceiveCopyTest,

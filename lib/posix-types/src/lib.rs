@@ -6,6 +6,7 @@
 #![no_std]
 
 pub mod constants;
+pub mod sporadic;
 
 /// Ordinary signal numbers use bits 0..30; unused bits remain reserved.
 pub type SigSet = u64;

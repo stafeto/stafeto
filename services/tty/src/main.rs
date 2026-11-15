@@ -2542,10 +2542,12 @@ impl Tty {
             let _ = w.u32(28);
             let _ = w.u64(generation);
         } else if r.method() == 22 {
-            let _ = proto_wire::Header::new(42, proto_process::VERSION).write(&mut w);
+            let _ = proto_wire::Header::new(proto_process::PROBE_NEWBORN, proto_process::VERSION)
+                .write(&mut w);
             let _ = w.u32(target);
         } else {
-            let _ = proto_wire::Header::new(44, proto_process::VERSION).write(&mut w);
+            let _ = proto_wire::Header::new(proto_process::PROBE_GROUPS, proto_process::VERSION)
+                .write(&mut w);
             let _ = w.u32(target);
             let _ = w.u32(sid);
         }
