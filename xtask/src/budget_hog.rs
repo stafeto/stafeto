@@ -502,6 +502,7 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-unbind-no-charge",
         "break-budget-unbind-keeps-event",
         "break-budget-early-replenish",
+        "break-budget-full-queue-delay",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
