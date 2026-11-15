@@ -32,18 +32,33 @@
 //!   image of an exec (`child` 0, the budget of `thread` kept). With
 //!   `RESERVE_FROM_RECORD` the parameters are those of the caller's thread
 //!   in the service's record, and the `Set` fields are zero.
-//! - `QUERY` (no body after the operation): the reply is the status u32, the
-//!   mask u32 of the CPUs on which POSIX threads have a share, and `flags`
-//!   u32 (zero). The mask is what `sysconf(_SC_SPORADIC_SERVER)` reads.
+//! - `GET` (`Get`): the policy and the parameters of the thread, for
+//!   `sched_getparam` and `pthread_getschedparam` of a thread under a budget,
+//!   also in a new image after an exec that kept the budget. The reply is
+//!   the status u32, a zero u32 and `Params`.
+//! - `QUERY` (`Query`): the shares of the CPUs from `first`, at most `count`
+//!   (and `SHARES_MAX`) of them. The reply is the status u32, a zero u32,
+//!   `SharesHead` and `head.count` entries of `Share` (the total of POSIX
+//!   threads and what is used of it, in parts per million). The form has no
+//!   width: the kernel starts 8 CPUs at most (`kboot::bootinfo::MAX_CPUS`),
+//!   and a CPU past `head.cpus` has no entry. A CPU has a share when its
+//!   total is not 0; `sysconf(_SC_SPORADIC_SERVER)` reads that.
 //!
 //! Through the channel with no label, from the service's own threads:
 //! `WORK` (`Work`, `Job`): the thread that asks init reports the job it did
 //! and waits for the next; `BIND_WORK` (`BindWork`, `BindJob`): the binder
 //! thread of a CPU reports the bind it did and waits for the next.
 //!
-//! In 0.5.0 the service answers `QUERY` with mask 0 and every other
-//! operation with `FULL`; `INVALID` for a body off the rules, `PERMISSION`
-//! for an operation of the channel with no label through a session.
+//! In 0.5.0 the service answers `QUERY` with no CPU (`head.cpus` 0) and every
+//! other operation with `FULL`; `INVALID` for a body off the rules,
+//! `PERMISSION` for an operation of the channel with no label through a
+//! session, and `UnknownMethod` (proto_wire) for a number that is no operation,
+//! so that a later layer can probe for an operation.
+//!
+//! The fingerprint of the series hashes the version of this crate alone, so
+//! the tests of this file are the guard of the wire format: every message
+//! has its size and a round trip tested, and a change of a body with no
+//! change of its test fails them.
 
 use proto_wire::{Reader, Status, Writer};
 
@@ -54,6 +69,7 @@ pub const RESERVE: u32 = 4;
 pub const QUERY: u32 = 5;
 pub const WORK: u32 = 6;
 pub const BIND_WORK: u32 = 7;
+pub const GET: u32 = 8;
 
 /// The threads of one process that may run under a budget at once.
 pub const THREADS_MAX: u32 = 8;
@@ -126,26 +142,80 @@ impl Set {
     }
 }
 
-/// The body of `CLEAR` and `DROP` after the operation, 8 bytes.
+/// The body of `CLEAR`, `DROP` and `GET` after the operation, 12 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clear {
     pub thread: u32,
     pub flags: u32,
+    pub reserved: u32,
 }
 
+/// `GET` takes the same body.
+pub type Get = Clear;
+
 impl Clear {
+    pub const LEN: usize = 12;
+
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u32(self.thread)?;
-        w.u32(self.flags)
+        w.u32(self.flags)?;
+        w.u32(self.reserved)
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<Clear, Status> {
         let clear = Clear {
             thread: r.u32()?,
             flags: r.u32()?,
+            reserved: r.u32()?,
         };
-        checked(clear.flags, 0, 0)?;
+        checked(clear.flags, clear.reserved, 0)?;
         Ok(clear)
+    }
+}
+
+/// The reply of `GET` after the status and a zero u32, 40 bytes: the POSIX
+/// policy of the thread, `flags`, and the parameters as `Set` has them
+/// (the CPU, `low`, `max_repl`, C, T; the policy is 4 for a thread under a
+/// budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Params {
+    pub policy: u32,
+    pub flags: u32,
+    pub cpu: u32,
+    pub low: u32,
+    pub max_repl: u32,
+    pub reserved: u32,
+    pub c_ns: u64,
+    pub t_ns: u64,
+}
+
+impl Params {
+    pub const LEN: usize = 40;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.policy)?;
+        w.u32(self.flags)?;
+        w.u32(self.cpu)?;
+        w.u32(self.low)?;
+        w.u32(self.max_repl)?;
+        w.u32(self.reserved)?;
+        w.u64(self.c_ns)?;
+        w.u64(self.t_ns)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Params, Status> {
+        let params = Params {
+            policy: r.u32()?,
+            flags: r.u32()?,
+            cpu: r.u32()?,
+            low: r.u32()?,
+            max_repl: r.u32()?,
+            reserved: r.u32()?,
+            c_ns: r.u64()?,
+            t_ns: r.u64()?,
+        };
+        checked(params.flags, params.reserved, 0)?;
+        Ok(params)
     }
 }
 
@@ -185,27 +255,102 @@ impl Reserve {
     }
 }
 
-/// The reply of `QUERY` after the status, 8 bytes.
+/// The most entries one reply of `QUERY` carries.
+pub const SHARES_MAX: u32 = 64;
+
+/// The body of `QUERY` after the operation, 16 bytes: the first CPU asked
+/// about, `flags`, a reserved word and how many CPUs at most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Shares {
-    /// The CPUs on which POSIX threads have a share.
-    pub mask: u32,
+pub struct Query {
+    pub first: u32,
     pub flags: u32,
+    pub reserved: u32,
+    pub count: u32,
 }
 
-impl Shares {
+impl Query {
+    pub const LEN: usize = 16;
+
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        w.u32(self.mask)?;
-        w.u32(self.flags)
+        w.u32(self.first)?;
+        w.u32(self.flags)?;
+        w.u32(self.reserved)?;
+        w.u32(self.count)
     }
 
-    pub fn read(r: &mut Reader<'_>) -> Result<Shares, Status> {
-        let shares = Shares {
-            mask: r.u32()?,
+    pub fn read(r: &mut Reader<'_>) -> Result<Query, Status> {
+        let query = Query {
+            first: r.u32()?,
             flags: r.u32()?,
+            reserved: r.u32()?,
+            count: r.u32()?,
         };
-        checked(shares.flags, 0, 0)?;
-        Ok(shares)
+        checked(query.flags, query.reserved, 0)?;
+        Ok(query)
+    }
+}
+
+/// The head of the reply of `QUERY` after the status and a zero u32, 16
+/// bytes: `flags`, a reserved word, the CPUs the table covers (0 when no CPU
+/// has a share) and the number of `Share` entries that follow, which start at
+/// CPU `first` of the query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharesHead {
+    pub flags: u32,
+    pub reserved: u32,
+    pub cpus: u32,
+    pub count: u32,
+}
+
+impl SharesHead {
+    pub const LEN: usize = 16;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.flags)?;
+        w.u32(self.reserved)?;
+        w.u32(self.cpus)?;
+        w.u32(self.count)
+    }
+
+    /// INVALID for a flag or a reserved word that is not zero, or a count
+    /// above `SHARES_MAX`.
+    pub fn read(r: &mut Reader<'_>) -> Result<SharesHead, Status> {
+        let head = SharesHead {
+            flags: r.u32()?,
+            reserved: r.u32()?,
+            cpus: r.u32()?,
+            count: r.u32()?,
+        };
+        checked(head.flags, head.reserved, 0)?;
+        if head.count > SHARES_MAX {
+            return Err(invalid());
+        }
+        Ok(head)
+    }
+}
+
+/// One entry of the reply of `QUERY`, 8 bytes: the share of the CPU that POSIX
+/// threads may take together, and what they take of it now, in parts per
+/// million.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub total_ppm: u32,
+    pub used_ppm: u32,
+}
+
+impl Share {
+    pub const LEN: usize = 8;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.total_ppm)?;
+        w.u32(self.used_ppm)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Share, Status> {
+        Ok(Share {
+            total_ppm: r.u32()?,
+            used_ppm: r.u32()?,
+        })
     }
 }
 
@@ -347,17 +492,6 @@ impl BindJob {
     }
 }
 
-/// The refusal of 0.5.0 for an operation of a session: `QUERY` has a reply of
-/// its own (`Shares`), every other operation is `FULL`, and a number that is
-/// no operation is `INVALID`.
-pub const fn refusal(op: u32) -> Option<u32> {
-    match op {
-        SET | CLEAR | DROP | RESERVE => Some(crate::FULL),
-        QUERY | WORK | BIND_WORK => None,
-        _ => Some(crate::INVALID),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,18 +515,36 @@ mod tests {
         w.as_bytes().to_vec()
     }
 
+    fn round<T: PartialEq + core::fmt::Debug + Copy>(
+        value: T,
+        len: usize,
+        write: impl Fn(&T, &mut Writer) -> Result<(), Status>,
+        read: impl Fn(&mut Reader<'_>) -> Result<T, Status>,
+    ) {
+        let b = bytes(|w| write(&value, w));
+        assert_eq!(b.len(), len);
+        let mut r = Reader::new(&b);
+        assert_eq!(read(&mut r), Ok(value));
+        assert_eq!(r.finish(), Ok(()));
+        assert!(
+            read(&mut Reader::new(&b[..len - 1])).is_err(),
+            "a short body"
+        );
+    }
+
     #[test]
-    fn every_body_keeps_its_fields_and_its_size() {
-        let b = bytes(|w| set().write(w));
-        assert_eq!(b.len(), Set::LEN);
-        assert_eq!(Set::read(&mut Reader::new(&b)), Ok(set()));
-        let clear = Clear {
-            thread: 5,
-            flags: 0,
-        };
-        let b = bytes(|w| clear.write(w));
-        assert_eq!(b.len(), 8);
-        assert_eq!(Clear::read(&mut Reader::new(&b)), Ok(clear));
+    fn every_message_keeps_its_fields_and_its_size() {
+        round(set(), Set::LEN, Set::write, Set::read);
+        round(
+            Clear {
+                thread: 5,
+                flags: 0,
+                reserved: 0,
+            },
+            Clear::LEN,
+            Clear::write,
+            Clear::read,
+        );
         let reserve = Reserve {
             child: 70,
             thread: 2,
@@ -407,16 +559,49 @@ mod tests {
                 ..set()
             },
         };
-        let b = bytes(|w| reserve.write(w));
-        assert_eq!(b.len(), Reserve::LEN);
-        assert_eq!(Reserve::read(&mut Reader::new(&b)), Ok(reserve));
-        let shares = Shares {
-            mask: 0b1110,
+        round(reserve, Reserve::LEN, Reserve::write, Reserve::read);
+        let params = Params {
+            policy: 4,
             flags: 0,
+            cpu: 2,
+            low: 4,
+            max_repl: 4,
+            reserved: 0,
+            c_ns: 1,
+            t_ns: 2,
         };
-        let b = bytes(|w| shares.write(w));
-        assert_eq!(b.len(), 8);
-        assert_eq!(Shares::read(&mut Reader::new(&b)), Ok(shares));
+        round(params, Params::LEN, Params::write, Params::read);
+        round(
+            Query {
+                first: 0,
+                flags: 0,
+                reserved: 0,
+                count: 8,
+            },
+            Query::LEN,
+            Query::write,
+            Query::read,
+        );
+        round(
+            SharesHead {
+                flags: 0,
+                reserved: 0,
+                cpus: 4,
+                count: 4,
+            },
+            SharesHead::LEN,
+            SharesHead::write,
+            SharesHead::read,
+        );
+        round(
+            Share {
+                total_ppm: 500_000,
+                used_ppm: 100_000,
+            },
+            Share::LEN,
+            Share::write,
+            Share::read,
+        );
         let work = Work {
             seq: 9,
             status: 0,
@@ -424,9 +609,7 @@ mod tests {
             flags: 0,
             reserved: 0,
         };
-        let b = bytes(|w| work.write(w));
-        assert_eq!(b.len(), 20);
-        assert_eq!(Work::read(&mut Reader::new(&b)), Ok(work));
+        round(work, 20, Work::write, Work::read);
         let job = Job {
             kind: JOB_ASK,
             seq: 9,
@@ -434,27 +617,38 @@ mod tests {
             flags: 0,
             set: set(),
         };
-        let b = bytes(|w| job.write(w));
-        assert_eq!(b.len(), 16 + Set::LEN);
-        assert_eq!(Job::read(&mut Reader::new(&b)), Ok(job));
-        let bw = BindWork {
-            seq: 1,
-            status: 0,
-            flags: 0,
-            reserved: 0,
-        };
-        let b = bytes(|w| bw.write(w));
-        assert_eq!(b.len(), 16);
-        assert_eq!(BindWork::read(&mut Reader::new(&b)), Ok(bw));
-        let bj = BindJob {
-            kind: JOB_BIND,
-            seq: 1,
-            entry: 2,
-            flags: 0,
-        };
-        let b = bytes(|w| bj.write(w));
-        assert_eq!(b.len(), 16);
-        assert_eq!(BindJob::read(&mut Reader::new(&b)), Ok(bj));
+        round(job, 16 + Set::LEN, Job::write, Job::read);
+        round(
+            BindWork {
+                seq: 1,
+                status: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            16,
+            BindWork::write,
+            BindWork::read,
+        );
+        round(
+            BindJob {
+                kind: JOB_BIND,
+                seq: 1,
+                entry: 2,
+                flags: 0,
+            },
+            16,
+            BindJob::write,
+            BindJob::read,
+        );
+    }
+
+    #[test]
+    fn the_operation_numbers_are_fixed() {
+        assert_eq!(
+            [SET, CLEAR, DROP, RESERVE, QUERY, WORK, BIND_WORK, GET],
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!((THREADS_MAX, REPL_MAX, SHARES_MAX), (8, 4, 64));
     }
 
     #[test]
@@ -470,38 +664,69 @@ mod tests {
                 .write(w)
             });
             assert_eq!(Set::read(&mut Reader::new(&b)), Err(bad));
+            let b = bytes(|w| {
+                Clear {
+                    thread: 1,
+                    flags,
+                    reserved,
+                }
+                .write(w)
+            });
+            assert_eq!(Clear::read(&mut Reader::new(&b)), Err(bad));
+            let b = bytes(|w| {
+                Query {
+                    first: 0,
+                    flags,
+                    reserved,
+                    count: 1,
+                }
+                .write(w)
+            });
+            assert_eq!(Query::read(&mut Reader::new(&b)), Err(bad));
+            let b = bytes(|w| {
+                SharesHead {
+                    flags,
+                    reserved,
+                    cpus: 0,
+                    count: 0,
+                }
+                .write(w)
+            });
+            assert_eq!(SharesHead::read(&mut Reader::new(&b)), Err(bad));
+            let b = bytes(|w| {
+                Work {
+                    seq: 0,
+                    status: 0,
+                    id: 0,
+                    flags,
+                    reserved,
+                }
+                .write(w)
+            });
+            assert_eq!(Work::read(&mut Reader::new(&b)), Err(bad));
+            let b = bytes(|w| {
+                BindWork {
+                    seq: 0,
+                    status: 0,
+                    flags,
+                    reserved,
+                }
+                .write(w)
+            });
+            assert_eq!(BindWork::read(&mut Reader::new(&b)), Err(bad));
+            let p = Params {
+                policy: 0,
+                flags,
+                cpu: 0,
+                low: 0,
+                max_repl: 0,
+                reserved,
+                c_ns: 0,
+                t_ns: 0,
+            };
+            let b = bytes(|w| p.write(w));
+            assert_eq!(Params::read(&mut Reader::new(&b)), Err(bad));
         }
-        let b = bytes(|w| {
-            Clear {
-                thread: 1,
-                flags: 2,
-            }
-            .write(w)
-        });
-        assert_eq!(Clear::read(&mut Reader::new(&b)), Err(bad));
-        let b = bytes(|w| Shares { mask: 0, flags: 1 }.write(w));
-        assert_eq!(Shares::read(&mut Reader::new(&b)), Err(bad));
-        let b = bytes(|w| {
-            Work {
-                seq: 0,
-                status: 0,
-                id: 0,
-                flags: 0,
-                reserved: 7,
-            }
-            .write(w)
-        });
-        assert_eq!(Work::read(&mut Reader::new(&b)), Err(bad));
-        let b = bytes(|w| {
-            BindWork {
-                seq: 0,
-                status: 0,
-                flags: 4,
-                reserved: 0,
-            }
-            .write(w)
-        });
-        assert_eq!(BindWork::read(&mut Reader::new(&b)), Err(bad));
         let b = bytes(|w| {
             BindJob {
                 kind: 1,
@@ -524,7 +749,6 @@ mod tests {
             let b = bytes(|w| r.write(w));
             assert_eq!(Reserve::read(&mut Reader::new(&b)), Err(bad));
         }
-        // The Set inside a Reserve is checked too.
         let r = Reserve {
             child: 1,
             thread: 1,
@@ -534,21 +758,16 @@ mod tests {
         };
         let b = bytes(|w| r.write(w));
         assert_eq!(Reserve::read(&mut Reader::new(&b)), Err(bad));
-    }
-
-    #[test]
-    fn a_short_body_is_a_size_error() {
-        let b = bytes(|w| set().write(w));
-        assert!(Set::read(&mut Reader::new(&b[..Set::LEN - 1])).is_err());
-    }
-
-    #[test]
-    fn in_0_5_0_every_operation_of_a_session_is_refused_but_the_query() {
-        for op in [SET, CLEAR, DROP, RESERVE] {
-            assert_eq!(refusal(op), Some(crate::FULL));
-        }
-        assert_eq!(refusal(QUERY), None);
-        assert_eq!(refusal(0), Some(crate::INVALID));
-        assert_eq!(refusal(8), Some(crate::INVALID));
+        // A reply that claims more entries than a reply holds.
+        let b = bytes(|w| {
+            SharesHead {
+                flags: 0,
+                reserved: 0,
+                cpus: 8,
+                count: SHARES_MAX + 1,
+            }
+            .write(w)
+        });
+        assert_eq!(SharesHead::read(&mut Reader::new(&b)), Err(bad));
     }
 }

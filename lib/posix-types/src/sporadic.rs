@@ -82,16 +82,17 @@ pub enum Call {
 
 /// The error a call gives for `policy` when the policy is not supported at
 /// this run: None for another policy. EINVAL for the calls whose XSH ERRORS
-/// say the policy is invalid, ENOTSUP where the attribute object is asked
-/// (XSH `pthread_attr_setschedpolicy`: "[ENOTSUP] An attempt was made to set
-/// the attribute to an unsupported value"). The same for root and for a
+/// say the policy is invalid (`sched_setscheduler`, `sched_setparam`,
+/// `posix_spawn`), ENOTSUP where XSH has "unsupported value" in the list
+/// (`pthread_setschedparam`, `pthread_attr_setschedpolicy`: "[ENOTSUP] An
+/// attempt was made to set the attribute to an unsupported value"). The same for root and for a
 /// user: the refusal does not depend on privilege.
 pub const fn refusal(call: Call, policy: i32) -> Option<i32> {
     if policy != SCHED_SPORADIC {
         return None;
     }
     Some(match call {
-        Call::AttrSetPolicy => ENOTSUP,
+        Call::AttrSetPolicy | Call::ThreadSetParam => ENOTSUP,
         _ => EINVAL,
     })
 }
@@ -105,13 +106,14 @@ mod tests {
         for call in [
             Call::SetScheduler,
             Call::SetParam,
-            Call::ThreadSetParam,
             Call::ThreadCreate,
             Call::Spawn,
         ] {
             assert_eq!(refusal(call, SCHED_SPORADIC), Some(EINVAL), "{call:?}");
         }
-        assert_eq!(refusal(Call::AttrSetPolicy, SCHED_SPORADIC), Some(ENOTSUP));
+        for call in [Call::ThreadSetParam, Call::AttrSetPolicy] {
+            assert_eq!(refusal(call, SCHED_SPORADIC), Some(ENOTSUP), "{call:?}");
+        }
     }
 
     #[test]

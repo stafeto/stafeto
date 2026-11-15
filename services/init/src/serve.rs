@@ -48,9 +48,9 @@ use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
-    Adoption, BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES, BudgetAsk, BudgetRelease, BudgetShares,
-    Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed,
-    RegisterReply, START_NAMES, State, Stats, VERSION, Work,
+    Adoption, BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES, BudgetAsk, BudgetRelease, BudgetSharesAsk,
+    BudgetSharesHead, Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method,
+    Record as Listed, RegisterReply, START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
 #[cfg(feature = "dma-watch")]
@@ -548,14 +548,24 @@ impl Init {
                 refuse(Error::InvalidArgs)
             }
             BUDGET_SHARES => {
+                if let Err(status) = BudgetSharesAsk::read(&mut body) {
+                    return Answer::Status(status);
+                }
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
+                // No CPU has a share in 0.5.0: no entry follows the head.
                 let reply = r.reply();
+                let head = BudgetSharesHead {
+                    flags: 0,
+                    reserved: 0,
+                    cpus: 0,
+                    count: 0,
+                };
                 if reply
                     .u32(0)
                     .and_then(|()| reply.u32(0))
-                    .and_then(|()| BudgetShares([0; 8]).write(reply))
+                    .and_then(|()| head.write(reply))
                     .is_err()
                 {
                     return Answer::Status(Status::BadSize);

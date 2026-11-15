@@ -43,10 +43,10 @@ fn read(
     let mut r = Reader::new(reply.bytes(buffer));
     let Ok(status) = r.u32() else { return 9999 };
     if let (0, Some(mask)) = (status, mask) {
-        let Ok(shares) = ss::Shares::read(&mut r) else {
+        let Ok(head) = r.u32().and_then(|_| ss::SharesHead::read(&mut r)) else {
             return 9999;
         };
-        *mask = shares.mask;
+        *mask = head.cpus + head.count;
     }
     status
 }
@@ -58,8 +58,7 @@ extern "C" fn sporadic_set(flags: u32) -> u32 {
     let Ok(thread) = rt::sys::handle_duplicate(
         &*posix_abi::threads::main_handle(),
         Rights::MANAGE | Rights::TRANSFER,
-    )
-    else {
+    ) else {
         return 7777;
     };
     let mut w = Writer::new();
@@ -84,14 +83,24 @@ extern "C" fn sporadic_set(flags: u32) -> u32 {
     ask(&w, handles, None)
 }
 
-/// QUERY: 0 and the mask of the CPUs with a share, or the status.
+/// QUERY: 0 and the CPUs that have a share and entries (0 in 0.5.0), or the
+/// status.
 ///
 /// # Safety
 /// `mask` is writable.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sporadic_query(mask: *mut u32) -> u32 {
     let mut w = Writer::new();
-    if Method::Budget.header().write(&mut w).is_err() || w.u32(ss::QUERY).is_err() {
+    let query = ss::Query {
+        first: 0,
+        flags: 0,
+        reserved: 0,
+        count: 8,
+    };
+    if Method::Budget.header().write(&mut w).is_err()
+        || w.u32(ss::QUERY).is_err()
+        || query.write(&mut w).is_err()
+    {
         return 9999;
     }
     let mut got = 99;
@@ -116,6 +125,31 @@ extern "C" fn sporadic_work() -> u32 {
         || w.u32(ss::WORK).is_err()
         || work.write(&mut w).is_err()
     {
+        return 9999;
+    }
+    ask(&w, rt::handle::Outgoing::new(), None)
+}
+
+/// GET of the main thread's parameters, and an operation that is no
+/// operation: the statuses of the service (`which` 0 and 1).
+#[unsafe(no_mangle)]
+extern "C" fn sporadic_other(which: u32) -> u32 {
+    let mut w = Writer::new();
+    let sent = Method::Budget.header().write(&mut w).is_ok()
+        && match which {
+            0 => {
+                w.u32(ss::GET).is_ok()
+                    && ss::Clear {
+                        thread: 1,
+                        flags: 0,
+                        reserved: 0,
+                    }
+                    .write(&mut w)
+                    .is_ok()
+            }
+            _ => w.u32(99).is_ok(),
+        };
+    if !sent {
         return 9999;
     }
     ask(&w, rt::handle::Outgoing::new(), None)

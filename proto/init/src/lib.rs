@@ -153,15 +153,22 @@
 //! `replace` (0 for none) of the same CPU, whose share is counted out for the
 //! check and stays counted until its RELEASE; the reply is status u32, zero
 //! u32, the budget's number u32, zero u32 and one handle, the budget
-//! (BUDGET_RIGHTS). RELEASE (`BudgetRelease`): the number u32 and `flags` u32;
-//! the service sends it only after it took the budget off its thread; the
-//! reply is its status. SHARES (no fields after the operation): the reply is
-//! the status u32, zero u32 and the share of each of the eight CPUs that POSIX
-//! threads may take together, in parts per million, a u32 each. Only the
-//! process service may ask (BAD_STATE for any other caller); INVALID_ARGS for
-//! a body off the rules, LIMIT_REACHED (`FULL_SHARE`) for a share that is
-//! gone. In 0.5.0 init has no share to give and holds no list: ASK is
-//! LIMIT_REACHED, RELEASE INVALID_ARGS, SHARES all zeros.
+//! (BUDGET_RIGHTS). RELEASE (`BudgetRelease`): the number u32, `flags` u32
+//! and a reserved word; the service sends it only after it took the budget off
+//! its thread; the reply is its status. SHARES (`BudgetSharesAsk`): the shares
+//! of the CPUs from `first`, at most `count` (and `BUDGET_SHARES_MAX`) of them;
+//! the reply is the status u32, a zero u32, `BudgetSharesHead` and `head.count`
+//! entries of `BudgetShare` (the total POSIX threads may take of the CPU and
+//! what they take now, in parts per million). The form has no width: the kernel
+//! starts 8 CPUs at most. Only the process service may ask (BAD_STATE for any
+//! other caller); INVALID_ARGS for a body off the rules, LIMIT_REACHED
+//! (`FULL_SHARE`) for a share that is gone, UnknownMethod (proto_wire) for a
+//! number that is no operation, so that a later layer can probe for one. In
+//! 0.5.0 init has no share to give and holds no list: ASK is LIMIT_REACHED,
+//! RELEASE INVALID_ARGS, SHARES covers no CPU (`head.cpus` 0). The fingerprint
+//! of the series hashes the version of this crate alone, so the tests of the
+//! bodies below (size and round trip of every message) are the guard of the
+//! wire format.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -369,50 +376,127 @@ impl BudgetAsk {
     }
 }
 
-/// The body of BUDGET RELEASE after the operation, 8 bytes.
+/// The body of BUDGET RELEASE after the operation, 12 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetRelease {
     pub id: u32,
     pub flags: u32,
+    pub reserved: u32,
 }
 
 impl BudgetRelease {
+    pub const LEN: usize = 12;
+
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u32(self.id)?;
-        w.u32(self.flags)
+        w.u32(self.flags)?;
+        w.u32(self.reserved)
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<BudgetRelease, Status> {
         let release = BudgetRelease {
             id: r.u32()?,
             flags: r.u32()?,
+            reserved: r.u32()?,
         };
-        if release.flags != 0 {
+        if release.flags != 0 || release.reserved != 0 {
             return Err(Status::Kernel(abi::Error::InvalidArgs));
         }
         Ok(release)
     }
 }
 
-/// The reply of BUDGET SHARES after the status and a zero u32: the share of
-/// each CPU, 32 bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BudgetShares(pub [u32; 8]);
+/// The most entries one reply of SHARES carries.
+pub const BUDGET_SHARES_MAX: u32 = 64;
 
-impl BudgetShares {
+/// The body of BUDGET SHARES after the operation, 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetSharesAsk {
+    pub first: u32,
+    pub flags: u32,
+    pub reserved: u32,
+    pub count: u32,
+}
+
+impl BudgetSharesAsk {
+    pub const LEN: usize = 16;
+
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        for ppm in self.0 {
-            w.u32(ppm)?;
-        }
-        Ok(())
+        w.u32(self.first)?;
+        w.u32(self.flags)?;
+        w.u32(self.reserved)?;
+        w.u32(self.count)
     }
 
-    pub fn read(r: &mut Reader<'_>) -> Result<BudgetShares, Status> {
-        let mut ppm = [0; 8];
-        for share in &mut ppm {
-            *share = r.u32()?;
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetSharesAsk, Status> {
+        let ask = BudgetSharesAsk {
+            first: r.u32()?,
+            flags: r.u32()?,
+            reserved: r.u32()?,
+            count: r.u32()?,
+        };
+        if ask.flags != 0 || ask.reserved != 0 {
+            return Err(Status::Kernel(abi::Error::InvalidArgs));
         }
-        Ok(BudgetShares(ppm))
+        Ok(ask)
+    }
+}
+
+/// The head of the reply of SHARES after the status and a zero u32, 16
+/// bytes: `flags`, a reserved word, the CPUs the table covers (0 for none) and
+/// the number of `BudgetShare` entries that follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetSharesHead {
+    pub flags: u32,
+    pub reserved: u32,
+    pub cpus: u32,
+    pub count: u32,
+}
+
+impl BudgetSharesHead {
+    pub const LEN: usize = 16;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.flags)?;
+        w.u32(self.reserved)?;
+        w.u32(self.cpus)?;
+        w.u32(self.count)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetSharesHead, Status> {
+        let head = BudgetSharesHead {
+            flags: r.u32()?,
+            reserved: r.u32()?,
+            cpus: r.u32()?,
+            count: r.u32()?,
+        };
+        if head.flags != 0 || head.reserved != 0 || head.count > BUDGET_SHARES_MAX {
+            return Err(Status::Kernel(abi::Error::InvalidArgs));
+        }
+        Ok(head)
+    }
+}
+
+/// One entry of the reply of SHARES, 8 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetShare {
+    pub total_ppm: u32,
+    pub used_ppm: u32,
+}
+
+impl BudgetShare {
+    pub const LEN: usize = 8;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.total_ppm)?;
+        w.u32(self.used_ppm)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetShare, Status> {
+        Ok(BudgetShare {
+            total_ppm: r.u32()?,
+            used_ppm: r.u32()?,
+        })
     }
 }
 
@@ -1622,27 +1706,105 @@ mod tests {
                 Err(invalid)
             );
         }
-        let release = BudgetRelease { id: 4, flags: 0 };
+        let release = BudgetRelease {
+            id: 4,
+            flags: 0,
+            reserved: 0,
+        };
         let mut w = Writer::new();
         release.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), BudgetRelease::LEN);
         assert_eq!(
             BudgetRelease::read(&mut Reader::new(w.as_bytes())),
             Ok(release)
         );
+        assert!(BudgetRelease::read(&mut Reader::new(&w.as_bytes()[..11])).is_err());
+        for (flags, reserved) in [(1, 0), (0, 1)] {
+            let mut w = Writer::new();
+            BudgetRelease {
+                id: 4,
+                flags,
+                reserved,
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(
+                BudgetRelease::read(&mut Reader::new(w.as_bytes())),
+                Err(invalid)
+            );
+            let mut w = Writer::new();
+            BudgetSharesAsk {
+                first: 0,
+                flags,
+                reserved,
+                count: 8,
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(
+                BudgetSharesAsk::read(&mut Reader::new(w.as_bytes())),
+                Err(invalid)
+            );
+            let mut w = Writer::new();
+            BudgetSharesHead {
+                flags,
+                reserved,
+                cpus: 0,
+                count: 0,
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(
+                BudgetSharesHead::read(&mut Reader::new(w.as_bytes())),
+                Err(invalid)
+            );
+        }
+        let ask = BudgetSharesAsk {
+            first: 2,
+            flags: 0,
+            reserved: 0,
+            count: 6,
+        };
         let mut w = Writer::new();
-        BudgetRelease { id: 4, flags: 1 }.write(&mut w).unwrap();
+        ask.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), BudgetSharesAsk::LEN);
         assert_eq!(
-            BudgetRelease::read(&mut Reader::new(w.as_bytes())),
+            BudgetSharesAsk::read(&mut Reader::new(w.as_bytes())),
+            Ok(ask)
+        );
+        let head = BudgetSharesHead {
+            flags: 0,
+            reserved: 0,
+            cpus: 4,
+            count: 4,
+        };
+        let mut w = Writer::new();
+        head.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), BudgetSharesHead::LEN);
+        assert_eq!(
+            BudgetSharesHead::read(&mut Reader::new(w.as_bytes())),
+            Ok(head)
+        );
+        let mut w = Writer::new();
+        BudgetSharesHead {
+            count: BUDGET_SHARES_MAX + 1,
+            ..head
+        }
+        .write(&mut w)
+        .unwrap();
+        assert_eq!(
+            BudgetSharesHead::read(&mut Reader::new(w.as_bytes())),
             Err(invalid)
         );
-        let shares = BudgetShares([0, 200_000, 500_000, 500_000, 0, 0, 0, 0]);
+        let share = BudgetShare {
+            total_ppm: 500_000,
+            used_ppm: 1,
+        };
         let mut w = Writer::new();
-        shares.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 32);
-        assert_eq!(
-            BudgetShares::read(&mut Reader::new(w.as_bytes())),
-            Ok(shares)
-        );
+        share.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), BudgetShare::LEN);
+        assert_eq!(BudgetShare::read(&mut Reader::new(w.as_bytes())), Ok(share));
+        assert_eq!((BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES), (1, 2, 3));
     }
 
     #[test]

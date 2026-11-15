@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* SCHED_SPORADIC in 0.5.0: the policy and its options exist for compilation
- * and no thread can take it. The option macros are 0 and sysconf says -1;
+ * and no thread can take it. The option macros and sysconf say -1;
  * every call that would give a thread the policy is refused, for root and
  * for a user alike (EINVAL, ENOTSUP for the attribute object); the process
  * service refuses every operation of its budget method and gives a program
@@ -24,8 +24,9 @@
  * process service, asked by hand. The status of the reply is the service's
  * (500 INVALID, 501 PERMISSION, 502 FULL), 0 for a reply with a body. */
 unsigned sporadic_set(unsigned flags);
-unsigned sporadic_query(unsigned *mask);
+unsigned sporadic_query(unsigned *cpus);
 unsigned sporadic_work(void);
+unsigned sporadic_other(unsigned which);
 
 #define FAIL(...) do { printf("sporadic: " __VA_ARGS__); printf("\n"); exit(10 + __LINE__ % 80); } while (0)
 #define CHECK(cond) do { if (!(cond)) FAIL("check failed at line %d: %s", __LINE__, #cond); } while (0)
@@ -45,11 +46,11 @@ static struct sched_param ss_param(int priority) {
 
 /* The options and the constants. */
 static void options(void) {
-#if !defined(_POSIX_SPORADIC_SERVER) || _POSIX_SPORADIC_SERVER != 0
-    FAIL("_POSIX_SPORADIC_SERVER is not 0");
+#if !defined(_POSIX_SPORADIC_SERVER) || _POSIX_SPORADIC_SERVER != -1
+    FAIL("_POSIX_SPORADIC_SERVER is not -1");
 #endif
-#if !defined(_POSIX_THREAD_SPORADIC_SERVER) || _POSIX_THREAD_SPORADIC_SERVER != 0
-    FAIL("_POSIX_THREAD_SPORADIC_SERVER is not 0");
+#if !defined(_POSIX_THREAD_SPORADIC_SERVER) || _POSIX_THREAD_SPORADIC_SERVER != -1
+    FAIL("_POSIX_THREAD_SPORADIC_SERVER is not -1");
 #endif
     errno = 0;
     CHECK(sysconf(_SC_SPORADIC_SERVER) == -1 && errno == 0);
@@ -58,9 +59,9 @@ static void options(void) {
     CHECK(SCHED_SPORADIC == 4);
     CHECK(sched_get_priority_min(SCHED_SPORADIC) == 1 && sched_get_priority_max(SCHED_SPORADIC) == 32);
     CHECK(sizeof(struct sched_param) == 48);
-    unsigned mask = 99;
-    unsigned status = sporadic_query(&mask);
-    if (status != 0 || mask != 0) FAIL("QUERY gave %u, mask %u", status, mask);
+    unsigned cpus = 99;
+    unsigned status = sporadic_query(&cpus);
+    if (status != 0 || cpus != 0) FAIL("QUERY gave status %u, %u CPUs with a share", status, cpus);
     printf("sporadic: the options, SS_REPL_MAX and the range of SCHED_SPORADIC ok\n");
 }
 
@@ -82,7 +83,7 @@ static void refusals(const char *who) {
     CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) == -1 && errno == EINVAL);
     CHECK(sched_getscheduler(0) == policy);
     CHECK(sched_getscheduler(getpid()) == policy);
-    CHECK(pthread_setschedparam(pthread_self(), SCHED_SPORADIC, &p) == EINVAL);
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_SPORADIC, &p) == ENOTSUP);
     CHECK(pthread_getschedparam(pthread_self(), &seen, &got) == 0 && seen == policy);
     /* The members of the server have no effect on the other policies. */
     pthread_t t;
@@ -108,11 +109,15 @@ static void refusals(const char *who) {
     /* The service: every operation is refused, a handle of the thread goes
      * with the request and no handle comes back. */
     unsigned status = sporadic_set(0);
-    if (status != 502) FAIL("SET gave %u, not FULL", status);
+    if (status != 502) FAIL("SET gave status %u, FULL is 502", status);
     status = sporadic_set(1);
-    if (status != 500) FAIL("SET with a flag gave %u, not INVALID", status);
+    if (status != 500) FAIL("SET with a flag gave status %u, INVALID is 500", status);
+    status = sporadic_other(0);
+    if (status != 502) FAIL("GET gave status %u, FULL is 502", status);
+    status = sporadic_other(1);
+    if (status != 256) FAIL("an unknown operation gave status %u, UnknownMethod is 256", status);
     status = sporadic_work();
-    if (status != 501) FAIL("WORK through a session gave %u, not PERMISSION", status);
+    if (status != 501) FAIL("WORK through a session gave status %u, PERMISSION is 501", status);
     CHECK(sched_getscheduler(0) == policy);
     printf("sporadic: %s: every call that would give the policy is refused ok\n", who);
 }

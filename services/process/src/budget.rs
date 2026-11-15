@@ -10,9 +10,10 @@
 //! Pure: tested on the host.
 
 use proto_process::sporadic::{
-    BIND_WORK, BindWork, CLEAR, Clear, DROP, QUERY, RESERVE, Reserve, SET, Set, Shares, WORK, Work,
+    BIND_WORK, BindWork, CLEAR, Clear, DROP, GET, QUERY, Query, RESERVE, Reserve, SET, Set,
+    SharesHead, WORK, Work,
 };
-use proto_process::{FULL, INVALID, PERMISSION};
+use proto_process::{FULL, PERMISSION};
 use proto_wire::{Reader, Status};
 
 /// What the service answers.
@@ -20,8 +21,8 @@ use proto_wire::{Reader, Status};
 pub enum Reply {
     /// A refusal: the status alone.
     Status(Status),
-    /// The reply of QUERY: the status 0 and these shares.
-    Shares(Shares),
+    /// The reply of QUERY: the status 0, this head and no entry.
+    Shares(SharesHead),
 }
 
 /// The answer to the operation `op` with `body` (after the operation) and
@@ -32,7 +33,12 @@ pub fn answer(session: bool, op: u32, mut body: Reader<'_>, handles: usize) -> R
     // The operations of the service's own threads come through the channel
     // with no label, and the operations of a program through its session.
     let own = matches!(op, WORK | BIND_WORK);
-    if own == session && matches!(op, WORK | BIND_WORK | SET | CLEAR | DROP | RESERVE | QUERY) {
+    if own == session
+        && matches!(
+            op,
+            WORK | BIND_WORK | SET | CLEAR | DROP | RESERVE | QUERY | GET
+        )
+    {
         return refuse(PERMISSION);
     }
     let read = |ok: Result<(), Status>, wanted: usize| match ok {
@@ -42,12 +48,14 @@ pub fn answer(session: bool, op: u32, mut body: Reader<'_>, handles: usize) -> R
     };
     let checked = match op {
         SET => read(Set::read(&mut body).map(drop), 1),
-        CLEAR | DROP => read(Clear::read(&mut body).map(drop), 0),
+        CLEAR | DROP | GET => read(Clear::read(&mut body).map(drop), 0),
         RESERVE => read(Reserve::read(&mut body).map(drop), 0),
         WORK => read(Work::read(&mut body).map(drop), 0),
         BIND_WORK => read(BindWork::read(&mut body).map(drop), 1),
-        QUERY => read(Ok(()), 0),
-        _ => return refuse(INVALID),
+        QUERY => read(Query::read(&mut body).map(drop), 0),
+        // A number that is no operation: distinct from a body off the rules,
+        // so that a later layer can probe for an operation.
+        _ => return Reply::Status(Status::UnknownMethod),
     };
     if let Some(reply) = checked {
         return reply;
@@ -56,7 +64,13 @@ pub fn answer(session: bool, op: u32, mut body: Reader<'_>, handles: usize) -> R
         return Reply::Status(Status::BadSize);
     }
     match op {
-        QUERY => Reply::Shares(Shares { mask: 0, flags: 0 }),
+        // No CPU has a share in 0.5.0.
+        QUERY => Reply::Shares(SharesHead {
+            flags: 0,
+            reserved: 0,
+            cpus: 0,
+            count: 0,
+        }),
         _ => refuse(FULL),
     }
 }
@@ -64,6 +78,7 @@ pub fn answer(session: bool, op: u32, mut body: Reader<'_>, handles: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_process::INVALID;
     use proto_wire::Writer;
 
     fn set() -> Set {
@@ -97,6 +112,7 @@ mod tests {
             Clear {
                 thread: 2,
                 flags: 0,
+                reserved: 0,
             }
             .write(w)
             .unwrap()
@@ -117,11 +133,47 @@ mod tests {
         assert_eq!(answer(true, RESERVE, Reader::new(&reserve), 0), full());
     }
 
+    fn query() -> Vec<u8> {
+        body(|w| {
+            Query {
+                first: 0,
+                flags: 0,
+                reserved: 0,
+                count: 8,
+            }
+            .write(w)
+            .unwrap()
+        })
+    }
+
     #[test]
     fn the_query_says_no_cpu_has_a_share() {
         assert_eq!(
-            answer(true, QUERY, Reader::new(&[]), 0),
-            Reply::Shares(Shares { mask: 0, flags: 0 })
+            answer(true, QUERY, Reader::new(&query()), 0),
+            Reply::Shares(SharesHead {
+                flags: 0,
+                reserved: 0,
+                cpus: 0,
+                count: 0
+            })
+        );
+    }
+
+    #[test]
+    fn a_get_is_refused_like_the_rest() {
+        let get = body(|w| {
+            Clear {
+                thread: 2,
+                flags: 0,
+                reserved: 0,
+            }
+            .write(w)
+            .unwrap()
+        });
+        assert_eq!(answer(true, GET, Reader::new(&get), 0), full());
+        assert_eq!(
+            answer(false, GET, Reader::new(&get), 0),
+            Reply::Status(Status::from_code(PERMISSION))
         );
     }
 
@@ -163,8 +215,23 @@ mod tests {
             answer(true, QUERY, Reader::new(&[0]), 0),
             Reply::Status(Status::BadSize)
         );
-        assert_eq!(answer(true, 0, Reader::new(&[]), 0), invalid);
-        assert_eq!(answer(true, 99, Reader::new(&[]), 0), invalid);
+        let mut long = query();
+        long.push(0);
+        assert_eq!(
+            answer(true, QUERY, Reader::new(&long), 0),
+            Reply::Status(Status::BadSize)
+        );
+        let flag = body(|w| {
+            Query {
+                first: 0,
+                flags: 1,
+                reserved: 0,
+                count: 8,
+            }
+            .write(w)
+            .unwrap()
+        });
+        assert_eq!(answer(true, QUERY, Reader::new(&flag), 0), invalid);
     }
 
     #[test]
@@ -198,6 +265,23 @@ mod tests {
         // The channel with no label carries no operation of a program.
         let ok = body(|w| set().write(w).unwrap());
         assert_eq!(answer(false, SET, Reader::new(&ok), 1), perm);
-        assert_eq!(answer(false, QUERY, Reader::new(&[]), 0), perm);
+        assert_eq!(answer(false, QUERY, Reader::new(&query()), 0), perm);
+    }
+}
+
+#[cfg(test)]
+mod unknown {
+    use super::*;
+    use proto_process::INVALID;
+
+    #[test]
+    fn a_number_that_is_no_operation_has_a_status_of_its_own() {
+        for op in [0, 9, 99] {
+            assert_eq!(
+                answer(true, op, Reader::new(&[]), 0),
+                Reply::Status(Status::UnknownMethod)
+            );
+            assert_ne!(Status::UnknownMethod, Status::from_code(INVALID));
+        }
     }
 }

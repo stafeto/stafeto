@@ -4743,7 +4743,12 @@ impl Processes {
             Reply::Status(status) => Answer::Status(status),
             Reply::Shares(shares) => {
                 let reply = r.reply();
-                if reply.u32(0).and_then(|()| shares.write(reply)).is_err() {
+                if reply
+                    .u32(0)
+                    .and_then(|()| reply.u32(0))
+                    .and_then(|()| shares.write(reply))
+                    .is_err()
+                {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())

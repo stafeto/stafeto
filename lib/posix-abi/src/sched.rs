@@ -319,6 +319,9 @@ pub fn getparam(pid: i32) -> Result<i32, i32> {
 /// sched_setscheduler (a policy) and sched_setparam (a negative policy):
 /// the old policy.
 pub fn set(pid: i32, policy: i32, priority: i32) -> Result<i32, i32> {
+    // EINVAL for the policy (XSH sched_setscheduler, sched_setparam); the
+    // thread call below says ENOTSUP, which is pthread_setschedparam's.
+    refused(posix_types::sporadic::Call::SetScheduler, policy)?;
     thread_set(thread_of(pid)?, policy, priority, true)
 }
 
