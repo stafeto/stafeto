@@ -23,23 +23,24 @@ pub fn take(start: &mut Startup, name: &str) -> Option<Handle<Budget>> {
 }
 
 /// Binds `budget`, if there is one, to `thread`, which has not begun to serve: the kernel
-/// keeps the budget for the life of the thread, so the handle may go. The result is told in
-/// a line, `<service>: <what> runs under its budget`, which the probes require. Err when the
-/// kernel refuses the budget.
+/// keeps the budget for the life of the thread, so the handle may go, or stay with a service
+/// that reads its counters (`sys::budget_info`). The result is told in a line,
+/// `<service>: <what> runs under its budget`, which the probes require. Err when the kernel
+/// refuses the budget; Ok(None) when there is none to bind.
 pub fn bind(
     service: &str,
     what: &str,
     budget: Option<Handle<Budget>>,
     thread: &Handle<Thread>,
-) -> Result<(), abi::Error> {
+) -> Result<Option<Handle<Budget>>, abi::Error> {
     let Some(budget) = budget else {
         crate::println!("{service}: {what} has no budget");
-        return Ok(());
+        return Ok(None);
     };
     match sys::thread_bind_budget(thread, &budget) {
         Ok(()) => {
             crate::println!("{service}: {what} runs under its budget");
-            Ok(())
+            Ok(Some(budget))
         }
         Err(e) => {
             crate::println!("{service}: the budget of {what} is refused: {e:?}");

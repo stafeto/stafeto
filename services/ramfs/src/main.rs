@@ -409,8 +409,17 @@ fn main(_: u64) -> u64 {
     );
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
-    if rt::budget::bind("ramfs", "serve", serve, &start.thread).is_err() {
-        return 10;
+    match rt::budget::bind("ramfs", "serve", serve, &start.thread) {
+        // The handle stays, for the counters the profile prints (`calls`).
+        Ok(budget) => {
+            #[cfg(feature = "profile")]
+            if let Some(budget) = budget {
+                calls::keep_budget(budget);
+            }
+            #[cfg(not(feature = "profile"))]
+            drop(budget);
+        }
+        Err(_) => return 10,
     }
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
@@ -518,6 +527,14 @@ mod calls {
     static PRINTED: AtomicU64 = AtomicU64::new(0);
     static NEXT: AtomicU64 = AtomicU64::new(0);
     static ID: AtomicU64 = AtomicU64::new(0);
+    /// The budget of the request thread (the value of its handle, 0 for none), whose time and
+    /// exhaustions the record tells.
+    static BUDGET: AtomicU64 = AtomicU64::new(0);
+
+    /// Keeps the handle of the request thread's budget for the records.
+    pub fn keep_budget(budget: rt::Handle<rt::handle::Budget>) {
+        BUDGET.store(budget.into_raw().0, Ordering::Relaxed);
+    }
 
     pub fn count(method: u16) {
         CALLS.fetch_add(1, Ordering::Relaxed);
@@ -554,8 +571,19 @@ mod calls {
         NEXT.store(now + rt::time::frequency() / 10, Ordering::Relaxed);
         PRINTED.store(calls, Ordering::Relaxed);
         let id = ID.fetch_add(1, Ordering::Relaxed) + 1;
+        // The time the request thread ran under its budget and the times the budget ran out, since
+        // the start.
+        let (ran_us, overruns) = match BUDGET.load(Ordering::Relaxed) {
+            0 => (0, 0),
+            raw => {
+                let budget = rt::Handle::<rt::handle::Budget>::borrowed(rt::abi::Handle(raw));
+                rt::sys::budget_info(&budget).map_or((0, 0), |i| {
+                    (rt::time::ticks_to_ns(i.ran) / 1000, i.overruns)
+                })
+            }
+        };
         rt::println!(
-            "ramfs: prof {id} calls {calls} reads {} snaps {}",
+            "ramfs: prof {id} calls {calls} reads {} snaps {} budget_ran_us {ran_us} budget_overruns {overruns}",
             READS.load(Ordering::Relaxed),
             SNAPS.load(Ordering::Relaxed)
         );
