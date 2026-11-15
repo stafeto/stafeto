@@ -4152,13 +4152,7 @@ mod tests {
     fn the_services_of_the_files_pipes_and_terminal_have_budgets_under_their_levels() {
         // Each binds `serve`, on CPU 0, to its request thread; the threads it does not bind
         // work at `SERVICE_FREE`.
-        for (record, c_ns) in [
-            (ramfs::RAM_LEGACY, 250_000),
-            (ramfs::RAM_CLOCKED, 250_000),
-            (ramfs::RAM_FIFO_CLOCKED, 250_000),
-            (ramfs::PIPE, 75_000),
-            (ramfs::TTY, 75_000),
-        ] {
+        for (record, c_ns) in [(ramfs::PIPE, 75_000), (ramfs::TTY, 75_000)] {
             assert_eq!(record.budgets.len(), 1, "{}", record.name);
             let b = record.budgets[0];
             assert_eq!(
@@ -4168,6 +4162,21 @@ mod tests {
             assert_eq!(record.free, ramfs::SERVICE_FREE);
             assert!(record.free < record.priority && record.free <= record.ceiling);
             assert!(start_data_names(&record) <= START_DATA_MAX);
+        }
+        for record in [
+            ramfs::RAM_LEGACY,
+            ramfs::RAM_CLOCKED,
+            ramfs::RAM_FIFO_CLOCKED,
+        ] {
+            assert_eq!(record.free, ramfs::SERVICE_FREE);
+            assert_eq!(record.budgets.len(), usize::from(ramfs::RAM_BUDGET_ON));
+            assert!(
+                record
+                    .budgets
+                    .iter()
+                    .all(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low)
+                        == ("serve", 0, 250_000, 5_000_000, 1))
+            );
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works
         // above them.
@@ -4191,7 +4200,14 @@ mod tests {
         .filter(|b| b.cpu == 0)
         .map(Budget::share_ppm)
         .sum();
-        assert_eq!(on_zero, 680_000);
+        assert_eq!(
+            on_zero,
+            if ramfs::RAM_BUDGET_ON {
+                680_000
+            } else {
+                630_000
+            }
+        );
         assert_eq!(BUDGET_SHARE_MAX_PPM - on_zero - CPU0_RESERVE_PPM, 40_000);
     }
 

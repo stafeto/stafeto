@@ -35,17 +35,25 @@ pub const SERVICE_FREE: u8 = 31;
 /// frames meanwhile.
 const SERVICE_PERIOD_NS: u64 = 5 * MS;
 
+/// Whether the RAM service has its budget: the one line to change (to `false`) for an image
+/// without it. The pipe and terminal services keep theirs.
+pub const RAM_BUDGET_ON: bool = true;
+
 /// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
 /// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
 /// longest and the most frequent of the three. The thread works at `low` 1 after that, where a
 /// request of a client costs at the client's own level (spec 8, the loan).
-pub const RAM_BUDGETS: &[Budget] = &[Budget {
-    name: "serve",
-    cpu: 0,
-    c_ns: 250_000,
-    t_ns: SERVICE_PERIOD_NS,
-    low: 1,
-}];
+pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
+    &[Budget {
+        name: "serve",
+        cpu: 0,
+        c_ns: 250_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: 1,
+    }]
+} else {
+    &[]
+};
 
 /// The budget of the pipe service's request thread: 75 us of each 5 ms (1.5 %).
 pub const PIPE_BUDGETS: &[Budget] = &[Budget {
