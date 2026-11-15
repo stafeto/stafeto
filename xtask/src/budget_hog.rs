@@ -490,7 +490,7 @@ pub fn breaks() -> Result<(), String> {
             || (variant == Variant::ReplyReceiveCopyTest
                 && o.lines
                     .iter()
-                    .any(|l| l == "KERNEL PANIC: a message copy waits for another"));
+                    .any(|l| l.starts_with("KERNEL PANIC: a message copy waits for another")));
         if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }
