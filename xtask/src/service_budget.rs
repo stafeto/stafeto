@@ -124,7 +124,7 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
 }
 
 /// What a service's budget may take of the victim in a typical window, per mille: its share of
-/// the CPU (C/T: 50 for the RAM service, 15 for the others) and a margin of 100 per mille (24 queued clients make 60 more requests of the pipe service a period than 4 did, and its median share fell from 966 to 907), which
+/// the CPU (C/T: 50 for the RAM service, 15 for the others) and a margin of 50 per mille for the RAM service (its median does not move with the number of clients: 940 with 8 and with 24) and 100 for the others (24 queued clients make 60 more requests of the pipe service a period than 4 did, and its median share fell from 966 to 907), which
 /// is the two timer events of each period of the budget (its exhaustion and its replenishment),
 /// the overruns, the entries of the kernel and what the greedy client's two CPUs add under
 /// -icount. The worst window is told in the lines and not held to a bound: the two CPUs of
@@ -132,7 +132,7 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
 /// victim in it.
 fn allowed_loss(service: &str) -> u64 {
     let share: u64 = if service == "ramfs" { 50 } else { 15 };
-    share + 100
+    share + if service == "ramfs" { 50 } else { 100 }
 }
 
 /// The windows the verdict holds the victim to: the median share in a window of 5 and of 10 ms.
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn the_loss_a_budget_may_cause_is_its_share_with_the_margin() {
         // The RAM service in a window of 10 ms: 3 periods of 260 us, and 30 per mille of margin.
-        assert_eq!(allowed_loss("ramfs"), 50 + 100);
+        assert_eq!(allowed_loss("ramfs"), 50 + 50);
         assert_eq!(allowed_loss("pipe"), 15 + 100);
         assert_eq!(allowed_loss("tty"), 15 + 100);
     }
