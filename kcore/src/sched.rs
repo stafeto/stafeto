@@ -669,6 +669,7 @@ enum Op {
     UnblockRun,
     Run,
     Replenish,
+    #[cfg_attr(feature = "break-budget-unbind-keeps-event", allow(dead_code))]
     Off,
     /// The base priority changed: the event moves to the heap of the new one.
     #[cfg_attr(feature = "break-budget-event-keeps-level", allow(dead_code))]
