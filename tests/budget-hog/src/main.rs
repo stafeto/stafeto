@@ -653,9 +653,15 @@ const CARRY_MS: u64 = 24;
 
 /// Waits for each release `t0 + k * 2 ms` on a timer of its own and runs
 /// `work` until the end of the phase.
+///
+/// The timer fires at level 60, above the interferer: a timer's firing is a
+/// portion of the cleanup queue at the timer's level (kernel timer.rs), so a
+/// timer at the hog's own level 50 would fire only when the interferer at 55
+/// lets that level run, and the hog would be activated then, not at the
+/// release.
 fn carry_loop(priority: u8, work: fn()) -> ! {
     let wait = sys::channel_create_wait(priority).expect("channel");
-    let timer = sys::timer_create(&wait, priority).expect("timer");
+    let timer = sys::timer_create(&wait, 60).expect("timer");
     let mut next = CARRY_T0.load(Relaxed);
     while time::now() < END.load(Relaxed) {
         sleep_until(&wait, &timer, next);
