@@ -198,6 +198,7 @@ pub struct Given {
 /// `ss` and `low` (the level of `sched_ss_low_priority`). The reply waits
 /// for init's admission. EPERM for a refused share, EINVAL for numbers the
 /// kernel refuses, EAGAIN while the thread's request is on.
+#[inline(never)]
 pub fn ask(id: u64, cpu: usize, ss: &Ss, low: u8) -> Result<Given, i32> {
     let mut w = crate::process::request(Method::Budget, &[proto::ASK])?;
     proto::Ask {
@@ -224,6 +225,7 @@ pub fn ask(id: u64, cpu: usize, ss: &Ss, low: u8) -> Result<Given, i32> {
 
 /// Tells the service how the bind of the thread `id` went: `bound`, or
 /// not (the new share goes back and the old stays).
+#[inline(never)]
 pub fn done(id: u64, bound: bool) {
     if let Ok(w) = request(proto::DONE, id, Some(u32::from(bound))) {
         let _ = crate::process::ask(&w);
@@ -231,6 +233,7 @@ pub fn done(id: u64, bound: bool) {
 }
 
 /// The thread `id` ended or never started: its budget and its share go back.
+#[inline(never)]
 pub fn forget(id: u64) {
     take(id as u32);
     if let Ok(w) = request(proto::DROP, id, None) {
@@ -259,6 +262,7 @@ fn bind_errno(e: rt::abi::Error) -> i32 {
 /// `ss` with its levels `low`, replacing what it has: a budget from the
 /// service, the bind (or the rebind, when it has one) and the report. The
 /// table keeps the parameters on success.
+#[inline(never)]
 pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32> {
     let given = ask(id, cpu_of(id), &ss, low)?;
     let bound = match given.old.as_ref() {
@@ -290,6 +294,7 @@ pub fn set(id: u64, thread: &Handle<Thread>, ss: Ss, low: u8) -> Result<(), i32>
 /// The thread `id` (handle `thread`) leaves the sporadic server: the
 /// service gives the handle of its budget, the kernel takes the budget off
 /// the thread, and the share goes back.
+#[inline(never)]
 pub fn leave(id: u64, thread: &Handle<Thread>) -> Result<(), i32> {
     let w = request(proto::UNBIND, id, None)?;
     let mut reply = crate::process::send_again(&w).map_err(|_| EIO)?;
@@ -319,6 +324,7 @@ pub fn leave(id: u64, thread: &Handle<Thread>) -> Result<(), i32> {
 /// `from` the calling thread, whose budget the new one replaces), with the
 /// parameters `ss`. The service picks the CPU of the child. EPERM for a refused
 /// share; the caller turns it into EAGAIN.
+#[inline(never)]
 pub fn reserve(child: u32, from: u64, thread: u32, ss: &Ss, low: u8) -> Result<(), i32> {
     let mut w = crate::process::request(Method::Budget, &[proto::RESERVE, child, from as u32])?;
     proto::Ask {
@@ -337,6 +343,7 @@ pub fn reserve(child: u32, from: u64, thread: u32, ss: &Ss, low: u8) -> Result<(
 /// The reservation for a child of the calling thread, which runs under a
 /// server (`fork`): nothing for a thread that does not. EAGAIN when the
 /// share is gone.
+#[inline(never)]
 pub fn reserve_child(child: u32) -> Result<(), i32> {
     let id = crate::threads::thread_number();
     let Some(ss) = get(id) else {
@@ -350,6 +357,7 @@ pub fn reserve_child(child: u32) -> Result<(), i32> {
 /// reserved for it, binds it to itself and keeps the parameters. An error
 /// means the thread would run with no budget under a policy that has one:
 /// the caller ends the process.
+#[inline(never)]
 pub fn take_own(id: u64) -> Result<(), i32> {
     let w = request(proto::TAKE, id, None)?;
     let mut reply = crate::process::send_again(&w).map_err(|_| EIO)?;
@@ -398,6 +406,14 @@ pub fn release_own() {
     if get(id).is_none() {
         return;
     }
+    release_bound(id);
+}
+
+/// The slow part of `release_own`, apart so that the frame of the common
+/// case (a thread with no budget, which may have a stack of a few
+/// kilobytes) holds none of the message buffers.
+#[inline(never)]
+fn release_bound(id: u64) {
     let block = crate::threads::own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
     if leave(id, &thread).is_err() {
