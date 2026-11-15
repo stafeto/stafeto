@@ -324,8 +324,8 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
             let base = control.iter().find(|w| w.0 == 10).map_or(0, |w| w.2);
             println!(
                 "budget-breaks: the victim of the unbound {service}: median {median} per mille in 10 ms, control {base} ({})",
-                if median + 300 <= base {
-                    "caught by the numbers"
+                if judge(&lines).is_err() {
+                    "caught by the numbers: the verdict fails"
                 } else {
                     "not caught by the numbers"
                 }
