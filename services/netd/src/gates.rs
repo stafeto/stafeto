@@ -167,9 +167,11 @@ impl Yielding {
     /// when the next step is to be put off, the steps of `bits` outside `deferrable` (the others
     /// are put off).
     pub fn arrive(&mut self, bits: u64, deferrable: u64) -> u64 {
-        if self.defer && bits & deferrable != 0 {
-            self.owed |= bits & deferrable;
-            self.deferred += 1;
+        if self.defer {
+            if bits & deferrable != 0 {
+                self.owed |= bits & deferrable;
+                self.deferred += 1;
+            }
             return bits & !deferrable;
         }
         bits | core::mem::take(&mut self.owed)
