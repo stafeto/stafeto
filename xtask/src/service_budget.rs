@@ -124,7 +124,11 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
 }
 
 /// What a service's budget may take of the victim in a typical window, per mille: its share of
-/// the CPU (C/T: 50 for the RAM service, 15 for the others) and a margin of 50 per mille for the RAM service (its median does not move with the number of clients: 940 with 8 and with 24) and 100 for the others (24 queued clients make 60 more requests of the pipe service a period than 4 did, and its median share fell from 966 to 907), which
+/// the CPU (C/T: 50 for the RAM service, 15 for the others) and a margin of 50 per mille (the
+/// median of the RAM service does not move with the number of clients, 940 with 8 and with 24;
+/// pipe and tty keep 967 and 954 with 8 clients, while 24 queued clients cost them 105 and 74
+/// per mille and, on the merged kernel, starve the victim of the bound pipe altogether: a finding
+/// for the kernel part), which
 /// is the two timer events of each period of the budget (its exhaustion and its replenishment),
 /// the overruns, the entries of the kernel and what the greedy client's two CPUs add under
 /// -icount. The worst window is told in the lines and not held to a bound: the two CPUs of
