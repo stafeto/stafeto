@@ -1811,6 +1811,15 @@ impl Tty {
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        // The driver's input that is waiting goes through the discipline before the output
+        // does: a flow character (XOFF) that came first stops the write, and the discipline
+        // sees it in the order it came in. The step of DRIVER_IN does the same, but it is
+        // the service's own work: a demoted service runs it at `low`, after the requests of
+        // its clients, and a write could pass an XOFF that was already in the driver. Only the
+        // console (terminal 0) has the driver's input.
+        if self.active == 0 {
+            let _ = self.pull();
+        }
         let part = &write.bytes[..write.bytes.len().min(WRITE_STEP)];
         let n = self.devices[self.active].console.write(part);
         if n == 0 {
