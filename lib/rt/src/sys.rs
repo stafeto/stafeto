@@ -1256,7 +1256,7 @@ impl Token {
     /// with a token its call used: a reply that fails with BAD_STATE when the
     /// kernel used the token up, and reaches the request when the kernel
     /// refused the call before it did (`service::Owed`).
-    pub(crate) const fn again(&self) -> Token {
+    pub const fn again(&self) -> Token {
         Token(self.0)
     }
 

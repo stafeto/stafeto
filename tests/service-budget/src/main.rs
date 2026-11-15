@@ -345,20 +345,15 @@ extern "C" fn reply_server(channel: u64) -> ! {
     if let Ok(sys::Received::Message { token, .. }) = next {
         REPLY_RESULT.fetch_or(1, Relaxed);
         let over = [7u8; abi::MESSAGE_MAX + 1];
+        let again = token.again();
         if token.reply_receive_handles(&channel, &over, rt::handle::Outgoing::new())
             == Err(abi::Error::InvalidArgs)
         {
             REPLY_RESULT.fetch_or(2, Relaxed);
         }
+        // The refused call left the request waiting: the token answers it.
+        let _ = again.reply(b"ok");
     }
-    sys::thread_exit()
-}
-
-/// The second request of the `replies` phase, from a thread of its own: the server refuses its
-/// reply, so the request waits until the probe closes the channel.
-extern "C" fn second_client(channel: u64) -> ! {
-    let channel = Handle::<Channel>::borrowed(abi::Handle(channel));
-    let _ = sys::send(&channel, b"two");
     sys::thread_exit()
 }
 
@@ -390,12 +385,8 @@ fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
             && r.bytes(&mut buffer).iter().all(|b| *b == 7)
             && r.handles.len() == 1
     });
-    let second = spawn_on(process, 2, second_client, channel.raw().0, 35, 0);
-    sys::thread_start(&second).expect("start the second client");
-    sleep_until(wait, timer, now_ns() + 5 * MS);
-    // The request the server refused to answer ends with the channel.
-    drop(channel);
-    sleep_until(wait, timer, now_ns() + 5 * MS);
+    let _ = sys::send(&channel, b"two");
+    let _ = (wait, timer);
     // The handles of a failed reply_receive: x1 = 1 says the reply went, whatever the error.
     use abi::Error::{BadHandle, InvalidArgs, LimitReached, PeerClosed};
     let took = sys::reply_receive_took_handles(1, BadHandle)
