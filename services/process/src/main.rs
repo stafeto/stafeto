@@ -168,8 +168,8 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     #[cfg(feature = "tty-probe")]
     {
-        methods[i] = 42;
-        methods[i + 1] = 44;
+        methods[i] = proto_process::PROBE_NEWBORN;
+        methods[i + 1] = proto_process::PROBE_GROUPS;
     }
     #[cfg(feature = "image-probe")]
     {
@@ -1266,7 +1266,7 @@ impl Processes {
     fn notary(&mut self, r: &mut Request<'_>) -> Answer {
         let method = r.method();
         #[cfg(feature = "tty-probe")]
-        if method == 44 {
+        if method == proto_process::PROBE_GROUPS {
             if !proto_process::is_terminal(r.label()) {
                 return refuse(proto_process::PERMISSION);
             }
@@ -1282,7 +1282,7 @@ impl Processes {
             return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "tty-probe")]
-        if method == 42 {
+        if method == proto_process::PROBE_NEWBORN {
             return if proto_process::is_terminal(r.label()) {
                 self.probe_newborn(r)
             } else {
@@ -4789,8 +4789,8 @@ impl Service<0> for Processes {
     }
     fn request(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
-        // The terminal probe (feature tty-probe) asks 42 through its notary
-        // session, where `notary` answers it; a notary session has no budgets.
+        // A notary session has no budgets (the probe methods are above
+        // `proto_process::PROBE_BASE` and do not collide with Budget).
         if method == Method::Budget as u16 && !proto_process::is_notary(r.label()) {
             return self.budget(r);
         }

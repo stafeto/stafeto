@@ -752,6 +752,24 @@ impl Method {
         }
     }
 }
+/// Method numbers of the probe images only (features `tty-probe`,
+/// `image-probe`, `lifetime-probe` of the service and the probes that ask
+/// them) start here; no production method may reach it (`METHODS` is checked
+/// below), so a new production method cannot collide with a probe's.
+pub const PROBE_BASE: u16 = 0xfff0;
+/// The terminal probe's methods through a notary session: a newborn target and
+/// the groups of a session.
+pub const PROBE_NEWBORN: u16 = 0xfff1;
+pub const PROBE_GROUPS: u16 = 0xfff2;
+const _: () = assert!(PROBE_NEWBORN >= PROBE_BASE && PROBE_GROUPS >= PROBE_BASE);
+const _: () = {
+    let mut i = 0;
+    while i < METHODS.len() {
+        assert!(METHODS[i] < PROBE_BASE);
+        i += 1;
+    }
+};
+
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
     29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53,
