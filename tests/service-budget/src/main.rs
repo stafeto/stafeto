@@ -114,7 +114,7 @@ fn spawn_on(
             cpu + 1,
         )
     }
-    .expect("create a thread")
+    .unwrap_or_else(|e| panic!("create a thread in slot {slot}: {e:?}"))
 }
 
 /// One request of the greedy client or of the client at 40 to the phase's service through
@@ -390,7 +390,7 @@ fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Tim
             && r.bytes(&mut buffer).iter().all(|b| *b == 7)
             && r.handles.len() == 1
     });
-    let second = spawn_on(process, 0, second_client, channel.raw().0, 35, 0);
+    let second = spawn_on(process, 2, second_client, channel.raw().0, 35, 0);
     sys::thread_start(&second).expect("start the second client");
     sleep_until(wait, timer, now_ns() + 5 * MS);
     // The request the server refused to answer ends with the channel.
