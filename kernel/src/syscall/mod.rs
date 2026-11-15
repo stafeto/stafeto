@@ -44,7 +44,7 @@ mod info;
 mod mem;
 mod messages;
 #[cfg(feature = "ktest")]
-pub use messages::force_poll;
+pub use messages::{copies_between_halves, force_poll};
 mod proc;
 mod time;
 mod upcall;

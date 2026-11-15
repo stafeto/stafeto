@@ -10114,6 +10114,103 @@ pub fn reply_receive_takes_the_queued_request_at_its_level(_: &Boot) -> Result<(
     })
 }
 
+/// The length of the long messages in the tests of `reply_receive`.
+const LONG: usize = 1000;
+
+/// The words of a long message from byte 64 on: `seed` and the index.
+fn long_words(seed: u64) -> [u64; (LONG - 64) / 8] {
+    core::array::from_fn(|i| seed << 32 | i as u64)
+}
+
+/// `reply_receive` of the server of `h` with a reply of `LONG` bytes while
+/// a request of `LONG` bytes waits behind it: both go through message
+/// buffers outside the section of the call, the reply's first (it reads the
+/// server's buffer, which the request then fills). With `restart` the poll
+/// between the halves finds an interrupt, and the receive comes on the next
+/// entry.
+fn long_reply_and_long_request(restart: bool) -> Result<(), &'static str> {
+    const REPLY: u64 = 0x5e;
+    const REQUEST: u64 = 0xa7;
+    with_holder(false, |h, others| {
+        thread::give_buffer(h.t, BUFFER as usize + PAGE_SIZE as usize).map_err(|_| "no buffer")?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        thread::give_buffer(t2, BUFFER as usize + 2 * PAGE_SIZE as usize)
+            .map_err(|_| "no buffer")?;
+        thread::write_words(t2, 64, &long_words(REQUEST));
+        // A queued request's description is read from its sender's x1.
+        // SAFETY: the test holds the thread, which does not run.
+        unsafe { (*t2.as_ptr()).regs.x[1] = LONG as u64 };
+        let sent = channel::send(
+            t2,
+            Via::Channel(h.channel),
+            Desc::from_send(LONG as u64).expect("a send"),
+            &[],
+        );
+        check(
+            sent == Ok(None),
+            "a long request did not queue behind the server",
+        )?;
+        pick(h.r)?;
+        thread::write_words(h.r, 64, &long_words(REPLY));
+        give_channel(h);
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = LONG as u64;
+        if restart {
+            syscall::force_poll();
+        }
+        let between = syscall::copies_between_halves();
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        if restart {
+            // The call starts over at its `svc`.
+            // SAFETY: as above.
+            unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+            syscall::dispatch(h.r, Call::ReplyReceive.number());
+        }
+        // The end of `dispatch` flushes in a test build too: only the counter
+        // says the call made the reply's copy itself, between its halves.
+        check(
+            syscall::copies_between_halves() == between + 1,
+            "the call did not make the copy of its reply between its halves",
+        )?;
+        let (reply, request) = (long_words(REPLY), long_words(REQUEST));
+        let got = |t, words: &[u64]| {
+            words
+                .iter()
+                .enumerate()
+                .all(|(i, w)| thread::buffer_word(t, 64 + 8 * i) == *w)
+        };
+        check(
+            got(h.t, &reply),
+            "the client did not get the bytes of the reply",
+        )?;
+        check(
+            got(h.r, &request),
+            "the server did not get the bytes of the request",
+        )
+    })
+}
+
+/// A reply of more than the inline part and a request of more than that
+/// that queued behind the server: the call makes both copies, the reply's
+/// before the receive begins (a call that left the reply's copy waiting
+/// panicked: a message copy waits for another).
+pub fn reply_receive_copies_a_long_reply_before_it_takes_a_long_request(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    long_reply_and_long_request(false)
+}
+
+/// The same with an interrupt at the poll between the halves: the reply's
+/// copy is made before the thread leaves the kernel, and the receive on the
+/// next entry makes the request's.
+pub fn reply_receive_copies_a_long_reply_before_its_receive_on_the_next_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    long_reply_and_long_request(true)
+}
+
 /// A client that ended while its request was served does not stop the
 /// receive: the reply is PEER_CLOSED, and the call goes on and takes the
 /// request that waits (spec 6.1, 6.8).
