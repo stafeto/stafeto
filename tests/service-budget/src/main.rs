@@ -26,7 +26,7 @@
 use abi::Policy;
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use proto_wire::Header;
+use proto_wire::{Header, Reader, Writer};
 use rt::handle::{Channel, Process, Thread, Timer};
 use rt::{Handle, Stack, println, sys, time};
 
@@ -140,6 +140,69 @@ fn ask(which: u64, session: &Handle<Channel>, depth: usize) -> bool {
     }
 }
 
+/// The ends of the pipe each greedy client of the pipe phase made: (read end << 32 | write end) + 1,
+/// 0 before it made one.
+static PIPE_ENDS: [AtomicU64; GREEDIES] = [const { AtomicU64::new(0) }; GREEDIES];
+
+/// The dearest request of the pipe and terminal services, for the greedy client `index`: the pipe
+/// service takes a write of 1000 bytes into the pipe of the client and gives them back in a read
+/// of 1000 (two requests in turn, each moving 1000 bytes through the ring); the terminal service
+/// takes a write of 1000 bytes (MAX_WRITE) of the console, which its driver takes in parts. The
+/// RAM service's dearest is the lookup of the path of eight names.
+fn heavy(which: u64, session: &Handle<Channel>, index: usize, odd: bool) -> bool {
+    let bytes = [b'x'; 1000];
+    let mut w = Writer::new();
+    let mut buffer = [0; abi::MESSAGE_MAX];
+    match which {
+        1 => {
+            let ends = PIPE_ENDS[index].load(Relaxed);
+            if ends == 0 {
+                let ok = Header::new(proto_pipe::Method::Create as u16, proto_pipe::VERSION)
+                    .write(&mut w)
+                    .and_then(|()| w.u32(0))
+                    .is_ok();
+                let Ok(reply) = sys::send(session, w.as_bytes()) else {
+                    return false;
+                };
+                let mut r = Reader::new(reply.bytes(&mut buffer));
+                let (Ok(0), Ok(read), Ok(write), true) = (r.u32(), r.u32(), r.u32(), ok) else {
+                    LAST_STATUS.store(1, Relaxed);
+                    return false;
+                };
+                PIPE_ENDS[index].store((u64::from(read) << 32 | u64::from(write)) + 1, Relaxed);
+                return true;
+            }
+            let (read, write) = (((ends - 1) >> 32) as u32, (ends - 1) as u32);
+            let made = if odd {
+                proto_pipe::Read {
+                    key: None,
+                    end: read,
+                    count: 1000,
+                }
+                .write(&mut w)
+            } else {
+                proto_pipe::Write {
+                    key: None,
+                    end: write,
+                    bytes: &bytes,
+                }
+                .write(&mut w)
+            };
+            made.is_ok() && sys::send(session, w.as_bytes()).is_ok()
+        }
+        _ => {
+            let made = proto_tty::Write {
+                key: None,
+                terminal: proto_tty::CONSOLE,
+                blocked: 0,
+                bytes: &bytes,
+            }
+            .write(&mut w);
+            made.is_ok() && sys::send(session, w.as_bytes()).is_ok()
+        }
+    }
+}
+
 /// Spins until `END`, noting in the buckets the ticks it ran: the gaps between two looks that
 /// are no longer than GAP_NS; a longer one goes to the longest gap.
 extern "C" fn victim(_: u64) -> ! {
@@ -170,13 +233,20 @@ extern "C" fn victim(_: u64) -> ! {
     }
 }
 
-/// The greedy client number `index`: asks the phase's service through its session until STOP.
+/// The greedy client number `index`: asks (the dearest request of the service, `heavy`) the phase's service through its session until STOP.
 extern "C" fn greedy(index: u64) -> ! {
     let which = WHICH.load(Relaxed);
     let session =
         Handle::<Channel>::borrowed(abi::Handle(GREEDY_SESSIONS[index as usize].load(Relaxed)));
+    let mut odd = true;
     while !STOP.load(Relaxed) {
-        if ask(which, &session, DEPTH) {
+        let done = if which == 0 || which > 2 {
+            ask(which, &session, DEPTH)
+        } else {
+            heavy(which, &session, index as usize, odd)
+        };
+        odd = !odd;
+        if done {
             GREEDY_N.fetch_add(1, Relaxed);
         } else {
             GREEDY_FAILED.fetch_add(1, Relaxed);
@@ -250,6 +320,87 @@ fn idle(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Timer>
     sys::thread_start(&victim).expect("start the victim");
     sleep_until(wait, timer, now_ns() + (PHASE_MS + 5) * MS);
     print_windows("idle");
+}
+
+/// What the server of the `replies` phase found: bit 0 the reply of MESSAGE_MAX bytes with a
+/// handle went with the next receive, bit 1 a reply of MESSAGE_MAX + 1 bytes was refused with
+/// INVALID_ARGS.
+static REPLY_RESULT: AtomicU64 = AtomicU64::new(0);
+
+/// The server of the `replies` phase: a reply of the most bytes a message holds, with a handle,
+/// goes through `reply_receive_handles`; the next request is answered with one byte too many,
+/// which the call refuses before it enters the kernel.
+extern "C" fn reply_server(channel: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(channel));
+    let Ok(sys::Received::Message { token, .. }) = sys::receive(&channel) else {
+        sys::thread_exit()
+    };
+    let Ok(own) = sys::channel_create(5) else {
+        sys::thread_exit()
+    };
+    let big = [7u8; abi::MESSAGE_MAX];
+    let mut handles = rt::handle::Outgoing::new();
+    let _ = handles.push(own.erase());
+    let next = token.reply_receive_handles(&channel, &big, handles);
+    if let Ok(sys::Received::Message { token, .. }) = next {
+        REPLY_RESULT.fetch_or(1, Relaxed);
+        let over = [7u8; abi::MESSAGE_MAX + 1];
+        if token.reply_receive_handles(&channel, &over, rt::handle::Outgoing::new())
+            == Err(abi::Error::InvalidArgs)
+        {
+            REPLY_RESULT.fetch_or(2, Relaxed);
+        }
+    }
+    sys::thread_exit()
+}
+
+/// The second request of the `replies` phase, from a thread of its own: the server refuses its
+/// reply, so the request waits until the probe closes the channel.
+extern "C" fn second_client(channel: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(channel));
+    let _ = sys::send(&channel, b"two");
+    sys::thread_exit()
+}
+
+/// The `replies` phase: the reply of MESSAGE_MAX bytes with a handle reaches the client whole
+/// (its second request is the one the server answers wrong), and the over-long reply is refused.
+fn replies(process: &Handle<Process>, wait: &Handle<Channel>, timer: &Handle<Timer>) {
+    let channel = sys::channel_create(5).expect("channel of the reply server");
+    // SAFETY: the server gets its own stack and message buffer page (slot 1) and the channel,
+    // which stays open until the phase ends.
+    let server = unsafe {
+        sys::thread_create_on(
+            process,
+            reply_server,
+            STACKS[1].top(),
+            channel.raw().0,
+            45,
+            Policy::Fifo,
+            abi::INIT_MSGBUF as usize + 2 * PAGE,
+            None,
+            1,
+        )
+    }
+    .expect("create the reply server");
+    sys::thread_start(&server).expect("start the reply server");
+    let first = sys::send(&channel, b"one");
+    let whole = first.as_ref().is_ok_and(|r| {
+        let mut buffer = [0; abi::MESSAGE_MAX];
+        r.len == abi::MESSAGE_MAX
+            && r.bytes(&mut buffer).iter().all(|b| *b == 7)
+            && r.handles.len() == 1
+    });
+    let second = spawn_on(process, 0, second_client, channel.raw().0, 45, 0);
+    sys::thread_start(&second).expect("start the second client");
+    sleep_until(wait, timer, now_ns() + 5 * MS);
+    // The request the server refused to answer ends with the channel.
+    drop(channel);
+    sleep_until(wait, timer, now_ns() + 5 * MS);
+    println!(
+        "svcbudget replies whole_with_handle={} server_saw={}",
+        u8::from(whole),
+        REPLY_RESULT.load(Relaxed)
+    );
 }
 
 /// The local server of the control phase, at 5 on CPU 0: answers each request at once. It ends
@@ -451,6 +602,7 @@ fn main(_: u64) -> u64 {
         }
     }
     sleep_until(&ping_wait, &ping_timer, now_ns() + 100 * MS);
+    replies(&start.process, &ping_wait, &ping_timer);
     idle(&start.process, &ping_wait, &ping_timer);
     control(&start.process, &ping_wait, &ping_timer);
     for which in 0..SERVICES.len() {
