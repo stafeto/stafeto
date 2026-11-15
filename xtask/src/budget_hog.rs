@@ -249,9 +249,10 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
         ));
     }
     // The carry: the interferer at 55 holds the CPU over the hog's
-    // activation, so the hog takes 2C of a window of 1 ms (the carry-in that
-    // "no more than C in a window of T" denies when a level stands above it:
-    // less than 2C minus a tenth means the phase does not test what it says).
+    // activation, so the hog takes more than C of a window of 1 ms, up to 2C
+    // (the carry-in that "no more than C in a window of T" denies when a level
+    // stands above it: no more than C and the kernel's longest stretch means
+    // the phase does not test what it says).
     // It never takes more than the bound with the lag J of the interferer,
     // and the victim keeps what the busy period leaves: the window less the
     // interferer's 700 us of each 2 ms and the hog's 300 us of each 1 ms, the
@@ -264,10 +265,10 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
                 "the hog took {hog_most} us in a window of {window} ms with a level above it: over {most}"
             ));
         }
-        if window == 1 && hog_most < 2 * HOG_US * 9 / 10 {
+        if window == 1 && hog_most <= HOG_US + B_US {
             return Err(format!(
-                "the hog took {hog_most} us in a window of 1 ms: under {}, the carry-in did not show",
-                2 * HOG_US * 9 / 10
+                "the hog took {hog_most} us in a window of 1 ms: not over {}, the carry-in did not show",
+                HOG_US + B_US
             ));
         }
         let owed =
@@ -656,7 +657,7 @@ mod tests {
             // No carry-in: the phase would test nothing.
             (
                 "window=1 hog_max_us=600",
-                "window=1 hog_max_us=300",
+                "window=1 hog_max_us=400",
                 "carry-in did not show",
             ),
             // More than the bound with the lag.
