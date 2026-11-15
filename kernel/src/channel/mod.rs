@@ -55,7 +55,9 @@ mod source;
 
 #[cfg(feature = "ktest")]
 pub use message::hold_notice;
-pub use message::{Via, Wait, cancel, pay_loan, raise, receive, reply, requeue, send, withdraw};
+pub use message::{
+    Via, Wait, cancel, pay_loan, raise, receive, reply, reply_on, requeue, send, withdraw,
+};
 pub use source::{Owner, Source, notify};
 
 /// The work a portion of the stage Close does, at most (spec 7.7): each
