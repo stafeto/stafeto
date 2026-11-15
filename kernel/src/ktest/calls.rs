@@ -11101,7 +11101,7 @@ pub fn a_failed_reply_leaves_the_holder_at_its_level(_: &Boot) -> Result<(), &'s
             "a request at 40 did not lift the server",
         )?;
         // SAFETY: the test holds the client, which waits and does not run.
-        unsafe { (*h.t.as_ptr()).waits = None };
+        let waits = unsafe { (*h.t.as_ptr()).waits.take() };
         // SAFETY: the test holds the thread, which does not run.
         let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
         x[0] = h.token;
@@ -11109,6 +11109,8 @@ pub fn a_failed_reply_leaves_the_holder_at_its_level(_: &Boot) -> Result<(), &'s
         syscall::dispatch(h.r, Call::ReplyReceive.number());
         // SAFETY: as above.
         let code = unsafe { h.r.as_ref() }.regs.x[0];
+        // SAFETY: as above; the wait goes back as it was.
+        unsafe { (*h.t.as_ptr()).waits = waits };
         check(
             Error::from_code(code) == Some(Error::BadState),
             "a reply to a client that waits for no reply did not fail",
