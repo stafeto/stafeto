@@ -196,14 +196,17 @@ el0_count_then_exit:
     svc     #SVC_DONE
 
 // Adds 1 to the word at x0 and takes OBJ (svc #SVC_TAKE) over and over until
-// the word at x1 is set, then ends the thread with thread_exit.
+// the word at x1 is set, then ends the thread with thread_exit. A call
+// overwrites x0, so the addresses go to x4 and x5.
 .global el0_take_loop
 el0_take_loop:
-1:  ldr     x2, [x0]
+    mov     x4, x0
+    mov     x5, x1
+1:  ldr     x2, [x4]
     add     x2, x2, #1
-    str     x2, [x0]
+    str     x2, [x4]
     svc     #SVC_TAKE
-    ldr     x3, [x1]
+    ldr     x3, [x5]
     cbz     x3, 1b
     svc     #CALL_THREAD_EXIT
     svc     #SVC_DONE
@@ -212,9 +215,10 @@ el0_take_loop:
 // at x1 and ends.
 .global el0_takes_alone
 el0_takes_alone:
+    mov     x5, x1
     svc     #SVC_TAKES_ALONE
     mov     x2, #1
-    str     x2, [x1]
+    str     x2, [x5]
     svc     #SVC_DONE
 
 // Adds 1 to the word at x0 x1 times, the count in x2, then ends.
