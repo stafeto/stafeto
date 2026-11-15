@@ -396,26 +396,14 @@ impl Server {
             time: self.q[0].time,
             amount: self.usage,
         };
+        // A full queue keeps the remnant available now and lets what was used
+        // join the last entry, later; with one entry, or nothing left, the
+        // chunk goes `t` later whole.
         #[cfg(not(feature = "break-budget-full-queue-delay"))]
         let spare = self.len >= self.max && self.len > 1 && remnant > 0;
         #[cfg(feature = "break-budget-full-queue-delay")]
         let spare = false;
-        if spare {
-            // The queue is full: the remnant stays available, and what was
-            // used joins the last entry, which comes later (a replenishment
-            // delayed is never a window violated).
-            self.q[0].amount = remnant;
-            self.q[0].time += self.usage;
-            let head = self.pop();
-            self.add(head);
-            r.time += self.t;
-            let last = &mut self.q[usize::from(self.len) - 1];
-            last.amount += r.amount;
-            last.time = last.time.max(r.time);
-            self.usage = 0;
-            return;
-        }
-        if self.len >= self.max {
+        if self.len >= self.max && !spare {
             // The remnant goes to the next entry: later, never earlier.
             self.pop();
             if self.len > 0 {
@@ -432,7 +420,21 @@ impl Server {
             self.add(head);
         }
         r.time += self.t;
-        self.add(r);
+        if spare {
+            // The queue is full: a replenishment delayed is never a window
+            // violated.
+            // The last of two to four entries, with no index to check.
+            let at = match self.len {
+                2 => 1,
+                3 => 2,
+                _ => 3,
+            };
+            let last = &mut self.q[at];
+            last.amount += r.amount;
+            last.time = last.time.max(r.time);
+        } else {
+            self.add(r);
+        }
         self.usage = 0;
     }
 
