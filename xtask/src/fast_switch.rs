@@ -58,7 +58,13 @@ const REQUESTS: usize = 200;
 /// block of 512): the service then lets the SYN start a new stream and counts it
 /// (`orphan_reused`). The case comes by chance, so the probe asks for it after each batch.
 const PROXY_BATCH: usize = 100;
-/// The most proxied requests the probe makes while waiting for the case.
+/// The most proxied requests the probe makes while waiting for the case. Ten runs on the GitHub
+/// runners met it after 100, 100, 200, 200, 200, 200, 300, 300, 500 and 500 requests (the first
+/// batch after which the counter was above 0), so one request meets it with a chance of about
+/// 1 in 250 (a mean of 190 to 240 requests). Chance 1/250 leaves (1 - 1/250)^3000 = 6e-6 for a
+/// false failure, and a chance three times lower than measured still leaves under 1e-4, the
+/// bound the probe holds. A run that meets it early stops early (about 40 s); the worst run
+/// makes 3000 requests (about 6 minutes).
 const PROXY_MAX: usize = 3000;
 /// The requests to nginx-fast's own port 80 through the proxy of the same worker.
 const SELF_REQUESTS: usize = 20;
