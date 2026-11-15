@@ -93,10 +93,13 @@ const LOAN_MOST: u64 = 64;
 /// (`reply_receive`), so it never waits at its low level behind the spinner
 /// between two requests, and the client gets one request for each 2 ms
 /// period (52 measured). The split of `reply_receive` into two entries has
-/// its own kernel test (`reply_receive_takes_the_queued_request_at_its_level`):
-/// the count of this phase with that break depends on the user code of
-/// `Token::reply_receive` (9 requests with one body of it, 50 with another, on
-/// one CPU and on four alike), so this bound judges the loan only.
+/// its own kernel test (`reply_receive_takes_the_queued_request_at_its_level`)
+/// and this phase does not judge it: on one CPU under -icount the count of
+/// the broken kernel follows the alignment of the service's loop against the
+/// budget's timer (0 to 4 NOPs before the call: 50, 50, 52, 18, 18 requests;
+/// 9 with the library of main), and with the work of each request swept by
+/// a prime step the broken kernel made 25 to 50 and the unbroken one 37 to
+/// 50, so no bound separates them. The bound below judges the loan alone.
 const LOAN_LEAST_SAME: u64 = 26;
 /// The longest wait of the client at 40 of the queue phase, its own 500 us of
 /// work not counted: the rest of the request in hand (500 us at most), B for
