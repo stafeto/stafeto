@@ -1675,7 +1675,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 67] = [
+    const ALL: [Variant; 68] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
