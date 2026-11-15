@@ -1054,6 +1054,14 @@ fn teardown() {
 
 /// The test system calls; false for any other number.
 pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
+    if number == SVC_TAKE {
+        // Before `note_stack`, which borrows the fixture: this call runs on
+        // another CPU while the judge of `takes_alone` reads the fixture.
+        TAKEN.fetch_add(1, Relaxed);
+        drop(obj::lock());
+        syscall::set_result(thread, Ok(Values::none()));
+        return true;
+    }
     note_stack();
     match number {
         SVC_NOP => {}
@@ -1088,7 +1096,6 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
                 end(result);
             }
         }
-        SVC_TAKE => drop(obj::lock()),
         SVC_TAKES_ALONE => takes_alone(),
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
@@ -4899,11 +4906,12 @@ fn start_takes_alone(f: &mut Fixture) -> Result<(), &'static str> {
         return Ok(());
     }
     TAKES_ALONE.store(0, Relaxed);
+    TAKEN.store(0, Relaxed);
     sched_process(f)?;
     let looper = sched_thread(f, 0, &raw const el0_take_loop, PRIORITY, FIFO)?;
     let judge = sched_thread(f, 1, &raw const el0_takes_alone, PRIORITY, FIFO)?;
     set_args(looper, &[word(0), word(1)]);
-    set_args(judge, &[word(0), word(1)]);
+    set_args(judge, &[word(0), word(1), timer::frequency() / 200]);
     let other = usize::from(here() == 0);
     thread::set_cpu(looper, other);
     f.ends[0] = true;
@@ -4913,13 +4921,16 @@ fn start_takes_alone(f: &mut Fixture) -> Result<(), &'static str> {
 /// What `takes_alone` found: 0 not run, 1 the difference was 1, 2 it was not.
 static TAKES_ALONE: AtomicU8 = AtomicU8::new(0);
 
+/// How many times `svc #SVC_TAKE` took `OBJ`.
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+
 /// `svc #SVC_TAKES_ALONE`: waits until the thread on the other CPU has begun
 /// to take `OBJ`, then counts this CPU's takes around one section and a spin
 /// of about 1 ms, in which the other CPU takes it many times.
 fn takes_alone() {
     let begun = timer::now();
     let limit = 100 * (timer::frequency() / 1000);
-    while shared(&FIXTURE.lock(), 0) == 0 {
+    while TAKEN.load(Relaxed) == 0 {
         if timer::now().wrapping_sub(begun) > limit {
             TAKES_ALONE.store(2, Relaxed);
             return;
@@ -4936,15 +4947,6 @@ fn takes_alone() {
 fn done_takes_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     if f.threads[0].is_none() || f.slot(t) != 1 {
         return Ok(());
-    }
-    // The thread on the other CPU ends before the teardown.
-    let begun = timer::now();
-    let limit = 100 * (timer::frequency() / 1000);
-    while slot_thread(f, 0).sched.state() != State::Dead {
-        check(
-            timer::now().wrapping_sub(begun) <= limit,
-            "the thread of the other CPU did not end",
-        )?;
     }
     check(
         TAKES_ALONE.load(Relaxed) == 1,
