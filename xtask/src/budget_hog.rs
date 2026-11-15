@@ -4,8 +4,10 @@
 //! The probe of the time budgets of threads (`tests/budget-hog`, spec 8)
 //! under QEMU's -icount, on one CPU and on four: a hog at a high level with
 //! a budget of C for each period T must not take more than C of a window of
-//! T from a task of a lower level on the same CPU, and without the budget
-//! the hog starves it. The lines the probe prints are checked against
+//! T from a task of a lower level on the same CPU, with no level running
+//! above the hog (with one above it, the hog may take 2C of a window of T:
+//! phase `carry` measures that, within the bound of the lag), and without
+//! the budget the hog starves it. The lines the probe prints are checked against
 //! their bounds here; `breaks` runs the same probe on the kernels with a
 //! deliberate break, each of which must fail it.
 
@@ -58,6 +60,9 @@ pub struct Numbers {
     /// the end; the unbind's results; the overruns of the polite thread and
     /// what its place held.
     pub overrun: Overrun,
+    /// The carry phase: (window in ms, most hog time in us, least victim
+    /// time in us).
+    pub carry: Vec<(u64, u64, u64)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -101,6 +106,19 @@ const QUEUE_LEAST: u64 = 5;
 const OVERRUNS_LEAST: u64 = 80;
 const HOG_US: u64 = 300;
 const B_US: u64 = 150;
+/// The carry phase: the interferer's work in each 2 ms (also the lag J of the
+/// hog), its budget's period, and the hog's period, in microseconds.
+const CARRY_J_US: u64 = 700;
+const CARRY_SPIN_PERIOD_US: u64 = 2000;
+const HOG_PERIOD_US: u64 = 1000;
+
+/// The most a server of the budget `c` and the period `t` runs in a window of
+/// `l` (all in the same unit) when a chunk lags `j` behind its activation:
+/// `n * c + min(c, l + j - n * t)`, `n = (l + j) / t`.
+fn window_bound(l: u64, c: u64, t: u64, j: u64) -> u64 {
+    let n = (l + j) / t;
+    n * c + c.min(l + j - n * t)
+}
 
 pub fn parse(lines: &[String]) -> Result<Numbers, String> {
     if !lines.iter().any(|l| l.starts_with("budget START "))
@@ -164,6 +182,12 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
             n.overrun.overruns_end = number(line, "overruns=")?;
             n.overrun.polite_overruns = number(line, "polite_overruns=")?;
             n.overrun.quiet = number(line, "quiet=")?;
+        } else if line.starts_with("budget carry window=") {
+            n.carry.push((
+                number(line, "window=")?,
+                number(line, "hog_max_us=")?,
+                number(line, "victim_min_us=")?,
+            ));
         } else if line.starts_with("budget slot ") {
             n.slot_share = number(line, "min_share=")?;
             n.slot_gap_us = number(line, "max_gap_us=")?;
@@ -174,6 +198,7 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
         || n.loan_same.0 == 0
         || n.queue_same.0 == 0
         || !n.overrun.seen
+        || n.carry.len() != 4
         || n.slot_share == 0 && n.slot_gap_us == 0
     {
         return Err(format!("the probe's lines are incomplete: {n:?}"));
@@ -222,6 +247,37 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
             n.victim_gap_us,
             1000 - HOG_US + B_US
         ));
+    }
+    // The carry: the interferer at 55 holds the CPU over the hog's
+    // activation, so the hog takes 2C of a window of 1 ms (the carry-in that
+    // "no more than C in a window of T" denies when a level stands above it:
+    // less than 2C minus a tenth means the phase does not test what it says).
+    // It never takes more than the bound with the lag J of the interferer,
+    // and the victim keeps what the busy period leaves: the window less the
+    // interferer's 700 us of each 2 ms and the hog's 300 us of each 1 ms, the
+    // kernel's longest stretch and a twentieth for the probe's own threads.
+    for &(window, hog_most, victim_least) in &n.carry {
+        let l = window * 1000;
+        let most = window_bound(l, HOG_US, HOG_PERIOD_US, CARRY_J_US) + B_US;
+        if hog_most > most {
+            return Err(format!(
+                "the hog took {hog_most} us in a window of {window} ms with a level above it: over {most}"
+            ));
+        }
+        if window == 1 && hog_most < 2 * HOG_US * 9 / 10 {
+            return Err(format!(
+                "the hog took {hog_most} us in a window of 1 ms: under {}, the carry-in did not show",
+                2 * HOG_US * 9 / 10
+            ));
+        }
+        let owed =
+            l.div_ceil(CARRY_SPIN_PERIOD_US) * CARRY_J_US + l.div_ceil(HOG_PERIOD_US) * HOG_US;
+        let least = l.saturating_sub(owed + B_US + l / 20);
+        if victim_least < least {
+            return Err(format!(
+                "the victim got {victim_least} us in a window of {window} ms with a hog and a level above it: under {least}"
+            ));
+        }
     }
     // The service's request takes its 500 us of work and no more: the boost
     // of its client stays when the budget of 200 us is gone.
@@ -565,6 +621,10 @@ mod tests {
             format!("budget slot min_share={} max_gap_us={}", slot.0, slot.1),
             "budget overrun unbind notes=100 bad=0 overruns=100 first=1 second_is_bad_state=1 free=1".into(),
             "budget overrun end notes=100 bad=0 overruns=100 polite_overruns=0 quiet=0".into(),
+            "budget carry window=1 hog_max_us=600 victim_min_us=0".into(),
+            "budget carry window=2 hog_max_us=600 victim_min_us=700".into(),
+            "budget carry window=5 hog_max_us=1500 victim_min_us=1700".into(),
+            "budget carry window=10 hog_max_us=3000 victim_min_us=3500".into(),
             "budget DONE".into(),
         ]
     }
@@ -587,6 +647,41 @@ mod tests {
             let e = verdict(&parse(&case).unwrap(), 1).unwrap_err();
             assert!(e.contains(text), "{e}");
         }
+    }
+
+    #[test]
+    fn the_carry_phase_checks_the_carry_in_the_hog_bound_and_the_victim() {
+        let base = lines(700, 300, 600, (800, 250));
+        for (from, to, text) in [
+            // No carry-in: the phase would test nothing.
+            (
+                "window=1 hog_max_us=600",
+                "window=1 hog_max_us=300",
+                "carry-in did not show",
+            ),
+            // More than the bound with the lag.
+            (
+                "window=2 hog_max_us=600",
+                "window=2 hog_max_us=1200",
+                "with a level above it",
+            ),
+            // The victim starved.
+            (
+                "window=10 hog_max_us=3000 victim_min_us=3500",
+                "window=10 hog_max_us=3000 victim_min_us=1000",
+                "the victim got",
+            ),
+        ] {
+            let case: Vec<String> = base.iter().map(|l| l.replace(from, to)).collect();
+            let e = verdict(&parse(&case).unwrap(), 1).unwrap_err();
+            assert!(e.contains(text), "{e}");
+        }
+        let short: Vec<String> = base
+            .iter()
+            .filter(|l| !l.starts_with("budget carry "))
+            .cloned()
+            .collect();
+        assert!(parse(&short).is_err());
     }
 
     #[test]
