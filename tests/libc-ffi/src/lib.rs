@@ -39,12 +39,12 @@ pub const PTHREAD_DESTRUCTOR_ITERATIONS: u32 = 4;
 /// `pthread_join`'s value of a cancelled thread.
 pub const CANCELED: *mut c_void = usize::MAX as *mut c_void;
 
-/// `pthread_attr_t`: 80 bytes (the scheduling parameters are held whole).
+/// `pthread_attr_t`: 96 bytes (the scheduling parameters are held whole, 16 bytes are reserved).
 #[repr(C, align(8))]
-pub struct Attr([u8; 80]);
+pub struct Attr([u8; 96]);
 impl Attr {
     pub const fn new() -> Self {
-        Self([0; 80])
+        Self([0; 96])
     }
 }
 impl Default for Attr {
