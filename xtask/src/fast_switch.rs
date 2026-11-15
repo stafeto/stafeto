@@ -52,12 +52,19 @@ const CONF9: &str = "/etc/nginx/nginx-fast-9.conf";
 const CONF_B: &str = "/etc/nginx/nginx-fast-b.conf";
 const CONF1: &str = "/etc/nginx/nginx-fast.conf";
 const REQUESTS: usize = 200;
-/// The requests through the proxy to `httpd` on 127.0.0.1:8080. A stream of the service that
-/// has closed holds its four until the sweep frees it, and a worker's next connection may pick
-/// the same source port. Twenty requests met that once in ci; the service now lets such a SYN
-/// start a new stream and counts it (`orphan_reused`), and this many requests meet it in every
-/// run: 300 requests met it 3 to 8 times, and once not at all in 11 runs.
-const PROXY_REQUESTS: usize = 600;
+/// The requests through the proxy to `httpd` on 127.0.0.1:8080, made in batches of this size. A
+/// stream of the service that has closed holds its four until the sweep frees it, and a worker's
+/// next connection may pick the same source port (the workers choose theirs at random from a
+/// block of 512): the service then lets the SYN start a new stream and counts it
+/// (`orphan_reused`). The case comes by chance, so the probe asks for it after each batch.
+const PROXY_BATCH: usize = 100;
+/// The most proxied requests the probe makes while waiting for the case. Forty runs on the
+/// GitHub runners met it after 100 to 1000 requests, 307 on the mean (counted in whole batches,
+/// so the true mean is near 260): one request meets it with a chance of about 1 in 260. With
+/// 4000 requests a false failure has the chance (1 - 1/260)^4000 = 2e-7, and a chance 1.5 times
+/// lower than measured still leaves 4e-5, under the bound of 1e-4 the probe holds. A run that
+/// meets the case early stops early (about 40 s); the worst run makes 4000 requests.
+const PROXY_MAX: usize = 4000;
 /// The requests to nginx-fast's own port 80 through the proxy of the same worker.
 const SELF_REQUESTS: usize = 20;
 /// How long `saturate` floods the ring.
@@ -561,24 +568,36 @@ fn loopback(
             after_wget.line
         ));
     }
-    if let Err(why) = requests(
-        "nginx-fast as a proxy to httpd over 127.0.0.1",
-        nginx,
-        "/up/index.html",
-        crate::rootfs::www_index(),
-        PROXY_REQUESTS,
-    ) {
-        let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
-        let drops: Vec<String> = run
-            .lines()
-            .iter()
-            .filter(|l| l.contains("net: switch dropped") || l.contains("net: bypass"))
-            .rev()
-            .take(2)
-            .cloned()
-            .collect();
-        return Err(format!("{why}; the service says {seen} {drops:?}"));
+    // The case comes by chance (see `PROXY_BATCH`): the requests go in batches and stop at the
+    // first batch after which the service has counted it.
+    let mut proxied = 0;
+    while proxied < PROXY_MAX {
+        if let Err(why) = requests(
+            "nginx-fast as a proxy to httpd over 127.0.0.1",
+            nginx,
+            "/up/index.html",
+            crate::rootfs::www_index(),
+            PROXY_BATCH,
+        ) {
+            let seen = stat(run, "lo-dbg").map(|s| s.line).unwrap_or_default();
+            let drops: Vec<String> = run
+                .lines()
+                .iter()
+                .filter(|l| l.contains("net: switch dropped") || l.contains("net: bypass"))
+                .rev()
+                .take(2)
+                .cloned()
+                .collect();
+            return Err(format!("{why}; the service says {seen} {drops:?}"));
+        }
+        proxied += PROXY_BATCH;
+        if stat(run, "lo-case")?.orphan_reused > 0 {
+            break;
+        }
     }
+    notes.push(format!(
+        "{proxied} proxied requests until a SYN met a closed stream on its four"
+    ));
     // The last proxied connection is still closing: its final packets count in `looped` until
     // two readings agree.
     let mut after_proxy = stat(run, "lo2")?;
@@ -599,7 +618,7 @@ fn loopback(
     }
     if after_proxy.orphan_reused == 0 {
         return Err(format!(
-            "no SYN of {PROXY_REQUESTS} proxied requests met a closed stream on its four: the probe does not reach the case: {}",
+            "no SYN of {proxied} proxied requests met a closed stream on its four: the probe does not reach the case: {}",
             after_proxy.line
         ));
     }
