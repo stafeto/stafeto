@@ -3765,7 +3765,21 @@ impl Processes {
             .records
             .get(child)
             .map_or(0, |record| u64::from(record.cpus));
-        let allowed = placing::allowed_cpus(page, record);
+        let mut allowed = placing::allowed_cpus(page, record);
+        // A child of a thread under a sporadic server needs a share of its
+        // CPU for its own budget, and CPU 0 has none (init's POSIX_BUDGETS):
+        // it goes to the others when it may.
+        let parent_pid = self
+            .records
+            .get(parent)
+            .map_or(0, |r| u64::from(r.label.pid()));
+        if cpus > 1 && self.budgets.holds(parent, parent_pid) {
+            let all = if allowed == 0 { u64::MAX } else { allowed };
+            let others = all & !1 & ((1u64 << cpus) - 1);
+            if others != 0 {
+                allowed = others;
+            }
+        }
         let now = Self::timer_now();
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);

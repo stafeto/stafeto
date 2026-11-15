@@ -344,22 +344,16 @@ static void endings(int cpu) {
  * service before the call returns, a refused share is EAGAIN and no child. */
 static int fork_cpu;
 static void *forker_thread(void *arg) {
-    int whole = (int)(long)arg; /* 1: the thread takes the whole row, the child finds none */
-    long c = row_ns(fork_cpu, 10 * MS) / (whole ? 1 : 2);
+    int whole = (int)(long)arg; /* 1: the thread takes half the row, 0: a quarter */
+    long c = row_ns(fork_cpu, 10 * MS) / (whole ? 2 : 4);
     struct sched_param p = ss_param(20, 5, c, 10 * MS, 4), got;
     CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
     pid_t child = fork();
-    if (whole) {
-        CHECK(child == -1 && errno == EAGAIN);
-        CHECK(sched_getscheduler(0) == SCHED_SPORADIC);
-        return NULL;
-    }
     CHECK(child >= 0);
     if (child == 0) {
         /* The child's main thread runs under the same server. */
         if (sched_getscheduler(0) != SCHED_SPORADIC) _exit(41);
         if (sched_getparam(0, &got) != 0 || !same(&got, &p)) _exit(42);
-        /* Its share is its own: leaving the whole row to nobody else. */
         _exit(0);
     }
     int status = 0;
@@ -371,7 +365,7 @@ static void forks(int cpu) {
     fork_cpu = cpu;
     run(forker_thread, (void *)1L);
     run(forker_thread, (void *)0L);
-    printf("sporadic: CPU %d: fork under a server gives the child its budget, EAGAIN when none is left ok\n", cpu);
+    printf("sporadic: CPU %d: fork under a server gives the child its budget ok\n", cpu);
 }
 
 /* Everything on one CPU: threads made by a thread go where it runs. */

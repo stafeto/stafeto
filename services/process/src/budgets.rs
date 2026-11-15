@@ -434,6 +434,14 @@ impl<H, P> Budgets<H, P> {
         &self.owed[..self.owed_count]
     }
 
+    /// Whether a thread of the record has a budget.
+    pub fn holds(&self, record: usize, label: u64) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|e| usize::from(e.record) == record && e.label == label && e.cur.is_some())
+    }
+
     /// The entries in use.
     pub fn threads(&self) -> usize {
         self.entries.iter().flatten().count()
