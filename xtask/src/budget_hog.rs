@@ -522,6 +522,11 @@ pub fn breaks() -> Result<(), String> {
             "a reply_receive that returns to EL0 between its reply and its receive",
         ),
         (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_with_a_handle_takes_the_queued_request_in_one_entry",
+            "a reply_receive with a handle in its reply that returns to EL0 between its reply and its receive",
+        ),
+        (
             Variant::ReplyReceiveCopyTest,
             "reply_receive_copies_a_long_reply_before_it_takes_a_long_request",
             "a reply_receive that leaves the copy of its reply waiting while it takes a request",

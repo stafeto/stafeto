@@ -10114,6 +10114,84 @@ pub fn reply_receive_takes_the_queued_request_at_its_level(_: &Boot) -> Result<(
     })
 }
 
+/// `reply_receive` of the server of `h` whose reply carries a handle (a resource with TRANSFER
+/// of the server's table) while a request queued behind it at 40. The handle goes to the
+/// client's table, the number of it into the client's buffer. With `poll` an interrupt is
+/// pending at the poll between the halves: the call starts over at its `svc`, and the receive
+/// comes on the next entry, with no second look at the handle that has gone.
+fn reply_with_a_handle_and_a_queued_request(poll: bool) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        thread::give_buffer(h.t, BUFFER as usize + PAGE_SIZE as usize).map_err(|_| "no buffer")?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        let moved = process::insert_handle(h.service, Object::Resource, Rights::TRANSFER)
+            .map_err(|_| "no handle to move")?;
+        // SAFETY: the test holds the thread, which does not run.
+        unsafe { thread::write_handles(h.r, &[(moved.0, 0)]) };
+        give_channel(h);
+        // SAFETY: as above.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 1 << abi::HANDLES_SHIFT;
+        if poll {
+            syscall::force_poll();
+        }
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        if poll {
+            check(
+                thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+                "the poll with an interrupt pending did not start the call over",
+            )?;
+            // The call starts over at its `svc`.
+            // SAFETY: as above.
+            unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+            syscall::dispatch(h.r, Call::ReplyReceive.number());
+        }
+        // SAFETY: as above.
+        let (r, t) = unsafe { (h.r.as_ref(), h.t.as_ref()) };
+        check(r.regs.x[0] == 0, "reply_receive with a handle failed")?;
+        check(
+            r.regs.x[11] != h.token && r.regs.x[11] != 0 && r.boost_token == r.regs.x[11],
+            "reply_receive with a handle did not take the queued request",
+        )?;
+        check(
+            poll || r.sched.state() == State::Running,
+            "the server left the CPU between its reply with a handle and its receive",
+        )?;
+        check(
+            process::close_handle(h.service, moved, CAUSE) == Err(Error::BadHandle),
+            "the handle of the reply stayed in the server's table",
+        )?;
+        let arrived = thread::buffer_word(h.t, abi::msgbuf::HANDLES);
+        check(
+            t.sched.state() == State::Ready
+                && process::close_handle(h.client, Handle(arrived), CAUSE).is_ok(),
+            "the client did not get the handle of the reply",
+        )?;
+        check(
+            process::close_handle(h.client, Handle(arrived), CAUSE) == Err(Error::BadHandle),
+            "the client got the handle of the reply twice",
+        )
+    })
+}
+
+/// A reply with a handle and the receive that follows it are one entry: the request that queued
+/// is taken at once and the server stays on the CPU, as for a reply with none.
+pub fn reply_receive_with_a_handle_takes_the_queued_request_in_one_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    reply_with_a_handle_and_a_queued_request(false)
+}
+
+/// The same with an interrupt at the poll between the halves: the handle goes with the reply of
+/// the first entry, and the receive on the next takes the request without a second move.
+pub fn reply_receive_with_a_handle_goes_on_with_its_receive_on_the_next_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    reply_with_a_handle_and_a_queued_request(true)
+}
+
 /// The length of the long messages in the tests of `reply_receive`.
 const LONG: usize = 1000;
 

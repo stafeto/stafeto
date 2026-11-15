@@ -750,6 +750,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::reply_receive_takes_the_queued_request_at_its_level,
     ),
     (
+        "reply_receive_with_a_handle_takes_the_queued_request_in_one_entry",
+        calls::reply_receive_with_a_handle_takes_the_queued_request_in_one_entry,
+    ),
+    (
+        "reply_receive_with_a_handle_goes_on_with_its_receive_on_the_next_entry",
+        calls::reply_receive_with_a_handle_goes_on_with_its_receive_on_the_next_entry,
+    ),
+    (
         "reply_receive_copies_a_long_reply_before_it_takes_a_long_request",
         calls::reply_receive_copies_a_long_reply_before_it_takes_a_long_request,
     ),
