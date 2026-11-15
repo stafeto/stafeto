@@ -2421,6 +2421,7 @@ impl Driver<'_> {
     /// rounds: the sending makes frames for the receiving and the receiving the events for the
     /// waking. The steps put off are those of the wire (`RX`, `TX`, `WAKE`) alone: the answers
     /// of the switch and the rest keep their order.
+    #[inline(never)]
     fn settle(&mut self) {
         const CASCADE: u64 = TX | RX | WAKE;
         #[cfg(feature = "probe")]
@@ -2464,17 +2465,37 @@ impl Driver<'_> {
         }
     }
 
+    /// The wait of a set does not report before the steps of the wire told ahead of it. A wait
+    /// that can block is parked and the step of waking answers it after them (`steps_pending`);
+    /// a wait that cannot block runs them here (`settle`).
+    #[inline(never)]
+    fn before_wait(&mut self, method: u16, r: &Request<'_>) {
+        #[cfg(feature = "probe")]
+        let kept = u64::from(self.held_tx) * TX | u64::from(self.held_rx) * RX;
+        #[cfg(not(feature = "probe"))]
+        let kept = 0;
+        if (self.told | self.yielding.owed() | kept) & (TX | RX | WAKE) == 0 {
+            return;
+        }
+        let blocking =
+            match Method::from_number(method).and_then(|m| sockets::Request::parse(m, r.body())) {
+                Some(Ok(sockets::Request::EpollWait { flags, .. })) => {
+                    flags & sockets::EPOLL_DONTWAIT == 0
+                }
+                _ => true,
+            };
+        if blocking {
+            self.inst.net.steps_pending = true;
+        } else {
+            self.settle();
+        }
+    }
+
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
-        const READINESS: [u16; 4] = [
-            Method::EpollWait.number(),
-            Method::EpollWaitTake.number(),
-            Method::Watch.number(),
-            Method::WatchTake.number(),
-        ];
-        if READINESS.contains(&method) {
-            self.settle();
+        if method == Method::EpollWait.number() || method == Method::EpollWaitTake.number() {
+            self.before_wait(method, r);
         }
         // VERIFY_SESSION goes through the root alone, and the root has no
         // other request.
@@ -2561,6 +2582,7 @@ impl Driver<'_> {
     }
 
     /// One step of the stack, by its bit.
+    #[inline(never)]
     fn run_step(&mut self, bit: u64) {
         match bit {
             RX => self.rx_step(),
