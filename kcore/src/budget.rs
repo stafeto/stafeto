@@ -27,9 +27,10 @@
 //!   capacity left the thread is in the background, and the replenishment
 //!   event is the head's time. When the thread blocks, `split` makes what it
 //!   used a replenishment of its own at its activation time plus `t`; with
-//!   `MAX_REPLENISHMENTS` entries already, the remnant merges into the next
-//!   entry, which postpones it and never advances it (the sliding window
-//!   constraint holds).
+//!   `MAX_REPLENISHMENTS` entries already, what was used merges into the last
+//!   entry at the later time and the remnant stays available now (a
+//!   replenishment delayed never breaks the sliding window constraint). With
+//!   one entry only, the whole chunk goes `t` later.
 //! - `replenish` (the event): the thread returns to its own level.
 //!
 //! The time the thread runs in the background is not charged to it: it costs
@@ -157,8 +158,8 @@ impl Server {
     }
 
     /// The queue holds `max` replenishments at most, 1 to
-    /// `MAX_REPLENISHMENTS` (the caller checked): a remnant that would make
-    /// one more merges into the next entry, later, never earlier (`split`).
+    /// `MAX_REPLENISHMENTS` (the caller checked): a chunk that would make
+    /// one more merges into the last entry, later, never earlier (`split`).
     pub fn set_max(&mut self, max: u8) {
         assert!(max >= 1 && usize::from(max) <= MAX_REPLENISHMENTS);
         self.max = max;
@@ -395,6 +396,25 @@ impl Server {
             time: self.q[0].time,
             amount: self.usage,
         };
+        #[cfg(not(feature = "break-budget-full-queue-delay"))]
+        let spare = self.len >= self.max && self.len > 1 && remnant > 0;
+        #[cfg(feature = "break-budget-full-queue-delay")]
+        let spare = false;
+        if spare {
+            // The queue is full: the remnant stays available, and what was
+            // used joins the last entry, which comes later (a replenishment
+            // delayed is never a window violated).
+            self.q[0].amount = remnant;
+            self.q[0].time += self.usage;
+            let head = self.pop();
+            self.add(head);
+            r.time += self.t;
+            let last = &mut self.q[usize::from(self.len) - 1];
+            last.amount += r.amount;
+            last.time = last.time.max(r.time);
+            self.usage = 0;
+            return;
+        }
         if self.len >= self.max {
             // The remnant goes to the next entry: later, never earlier.
             self.pop();
@@ -617,8 +637,39 @@ mod tests {
         bursts: u64,
         interference: bool,
     ) -> (Vec<u8>, Server) {
+        let mode = Mode {
+            interference,
+            max: MAX_REPLENISHMENTS as u8,
+            short: false,
+        };
+        simulate_with(c, t, seed, steps, bursts, mode)
+    }
+
+    /// What differs between the runs of `simulate_with`.
+    struct Mode {
+        interference: bool,
+        max: u8,
+        short: bool,
+    }
+
+    /// `simulate` with a queue limit of `mode.max`, and with `mode.short` the
+    /// bursts are a few ticks long (a server that serves many small requests).
+    fn simulate_with(
+        c: u64,
+        t: u64,
+        seed: u64,
+        steps: u64,
+        bursts: u64,
+        mode: Mode,
+    ) -> (Vec<u8>, Server) {
+        let Mode {
+            interference,
+            max,
+            short,
+        } = mode;
         let mut rng = Rng(seed | 1);
         let mut s = Server::new(c, t, 1, 0);
+        s.set_max(max);
         let mut fg = vec![0u8; steps as usize];
         // Waiting, or ready (maybe running).
         let mut ready = false;
@@ -643,7 +694,11 @@ mod tests {
             }
             // The thread's own demand and the interference.
             if work == 0 && rng.below(bursts) == 0 {
-                work = 1 + rng.below(c + 3);
+                work = if short {
+                    1 + rng.below(3)
+                } else {
+                    1 + rng.below(c + 3)
+                };
             }
             if interference && away == 0 && rng.below(7 * bursts) == 0 {
                 away = 1 + rng.below(c + 2);
@@ -757,6 +812,79 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_window_holds_for_every_queue_limit_and_for_short_stints() {
+        for max in 1..=4u8 {
+            for seed in 1..200u64 {
+                let t = 20 + (seed * 7) % 180;
+                let c = 1 + (seed * 13) % t;
+                for bursts in [1, 2, 5, 20] {
+                    for short in [false, true] {
+                        {
+                            let (fg, _) = simulate_with(
+                                c,
+                                t,
+                                seed.wrapping_mul(0x9e37_79b9),
+                                6_000,
+                                bursts,
+                                Mode {
+                                    interference: false,
+                                    max,
+                                    short,
+                                },
+                            );
+                            for l in [t / 2, t, 2 * t, 5 * t, 10 * t] {
+                                let most = busiest(&fg, l);
+                                assert!(
+                                    most <= l.div_ceil(t) * c,
+                                    "max {max} C {c} T {t} seed {seed} bursts {bursts} short {short}: {most} ticks in {l}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A server that serves many small requests keeps its level while it
+    /// has capacity: each stint is far below C/max, and the queue is full
+    /// after `max` of them, yet the thread stays at its own level until it
+    /// has used C in the window (issue 744).
+    #[test]
+    fn short_stints_keep_the_level_until_the_budget_is_used() {
+        for max in 2..=4u8 {
+            let (c, t) = (40, 1000);
+            let mut s = Server::new(c, t, 1, 0);
+            s.set_max(max);
+            let mut now = 0;
+            for i in 0..30u64 {
+                s.unblock(now);
+                assert!(!s.background(), "max {max}: demoted at stint {i}");
+                assert_eq!(s.capacity(now), c - i, "max {max}: stint {i}");
+                s.run(now);
+                now += 1;
+                s.stop(now, true, false);
+                assert_eq!(s.sum(), c);
+                assert!(s.queue().len() <= usize::from(max));
+                now += 4;
+            }
+            assert_eq!(s.overruns(), 0);
+            // 30 of the 40 are used: the next 10 are all that is left, and
+            // only then the thread falls.
+            for i in 30..40u64 {
+                s.unblock(now);
+                assert!(!s.background(), "max {max}: demoted at stint {i}");
+                s.run(now);
+                now += 1;
+                s.stop(now, true, false);
+                now += 4;
+            }
+            s.unblock(now);
+            assert!(s.background(), "max {max}: the budget is used");
         }
     }
 

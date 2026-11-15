@@ -865,11 +865,10 @@ static OVERRUN_BUDGET: AtomicPtr<Server> = AtomicPtr::new(core::ptr::null_mut())
 /// Whether the hook found the budget in that state afterwards.
 static BUDGET_WENT_STALE: AtomicBool = AtomicBool::new(false);
 
-/// Stints of 50 ms, each ending in a wait: the
-/// queue of replenishments fills, and the fourth wait merges the remnant
-/// into a later entry, so that the head lies ahead of now (the budget has no
-/// capacity) while the flag of the budget still says the thread is not in
-/// the background. True when the budget is in that state.
+/// A stint of 50 ms that ends in a wait: the budget holds one replenishment,
+/// so the whole chunk goes a period ahead and the head lies ahead of now (the
+/// budget has no capacity) while the flag of the budget still says the thread
+/// is not in the background. True when the budget is in that state.
 fn make_stale(s: &mut Server) -> bool {
     let mut at = timer::now();
     // The head of the queue ends up 50 ms ahead at least, so that its
@@ -4601,12 +4600,13 @@ fn start_budget_demotes(f: &mut Fixture) -> Result<(), &'static str> {
     set_args(server, &[h, 1]);
     set_args(client, &[h, REQUEST_LEN, REQUEST_WORD]);
     set_args(ready, &[word(0)]);
-    // The service has 1 s of budget in each 10 s (the hook fills its queue
-    // with stints of 50 ms), the client 10 ms in each 100 ms; both fall to
-    // level 1.
+    // The service has 1 s of budget in each 10 s with one replenishment (the
+    // hook makes it wait after a stint of 50 ms, which moves the whole chunk
+    // a period ahead), the client 10 ms in each 100 ms with four; both fall
+    // to level 1.
     let freq = timer::frequency();
-    for (t, c) in [(server, freq), (client, freq / 100)] {
-        let b = crate::budget::create(p, 0, c, 10 * c, 1, 4, None).map_err(|_| "no budget")?;
+    for (t, c, max) in [(server, freq, 1), (client, freq / 100, 4)] {
+        let b = crate::budget::create(p, 0, c, 10 * c, 1, max, None).map_err(|_| "no budget")?;
         let bound = crate::budget::bind(t, b);
         // SAFETY: the reference `create` handed out goes; the binding, if
         // it went through, holds the budget.
