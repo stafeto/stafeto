@@ -1300,7 +1300,7 @@ static int sem_waiters(void) {
     pthread_t threads[SEM_WAITERS];
     for (int i = 0; i < SEM_WAITERS; i++) {
         pthread_attr_t attr;
-        struct sched_param param = {priorities[i]};
+        struct sched_param param = {.sched_priority = priorities[i]};
         CHECK(pthread_attr_init(&attr) == 0);
         CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
         CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
@@ -1557,7 +1557,7 @@ static struct shared *shared_page(int named) {
 }
 
 static void set_priority(int priority) {
-    struct sched_param param = {priority};
+    struct sched_param param = {.sched_priority = priority};
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
 }
 
@@ -1970,7 +1970,7 @@ static int sem_signal_pass(int shared) {
     static const int levels[2] = {20, 10};
     for (int i = 0; i < 2; i++) {
         pthread_attr_t attr;
-        struct sched_param param = {levels[i]};
+        struct sched_param param = {.sched_priority = levels[i]};
         CHECK(pthread_attr_init(&attr) == 0);
         CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
         CHECK(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0);

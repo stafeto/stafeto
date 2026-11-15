@@ -1631,6 +1631,10 @@ include/sched/sched_rr_get_interval.c
 include/sched/sched_setparam.c
 include/sched/sched_setscheduler.c
 include/sched/sched_yield.c
+include/sched/struct-sched_param-sched_ss_init_budget.c
+include/sched/struct-sched_param-sched_ss_low_priority.c
+include/sched/struct-sched_param-sched_ss_max_repl.c
+include/sched/struct-sched_param-sched_ss_repl_period.c
 include/sched/struct-sched_param-sched_priority.c
 include/sched/struct-sched_param.c
 include/sched/struct-timespec.c
