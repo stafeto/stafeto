@@ -44,6 +44,7 @@
 
 /// The most pending replenishments: `_POSIX_SS_REPL_MAX`.
 pub const MAX_REPLENISHMENTS: usize = 4;
+const _: () = ::core::assert!(MAX_REPLENISHMENTS as u64 == abi::SS_REPL_MAX);
 
 /// A chunk of budget that comes back at `time` ticks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,8 +78,17 @@ pub struct Server {
     /// above `low` and has not yet been given to that client (`take_loan`).
     lent: u64,
     overruns: u32,
+    /// The overruns that the notification place has been told of
+    /// (`take_notice`).
+    told: u32,
     low: u8,
+    /// The most replenishments pending at once, 1 to `MAX_REPLENISHMENTS`
+    /// (`_POSIX_SS_REPL_MAX` of the thread that has it).
+    max: u8,
     background: bool,
+    /// The budget has a notification place: an overrun wants an event at
+    /// once, for the kernel to post it under OBJ (`check`).
+    watched: bool,
     len: u8,
 }
 
@@ -108,8 +118,11 @@ impl Server {
             ran: 0,
             lent: 0,
             overruns: 0,
+            told: 0,
             low,
+            max: MAX_REPLENISHMENTS as u8,
             background: false,
+            watched: false,
             len: 1,
         }
     }
@@ -141,6 +154,38 @@ impl Server {
     /// The usage since the head's time.
     pub fn usage(&self) -> u64 {
         self.usage
+    }
+
+    /// The queue holds `max` replenishments at most, 1 to
+    /// `MAX_REPLENISHMENTS` (the caller checked): a remnant that would make
+    /// one more merges into the next entry, later, never earlier (`split`).
+    pub fn set_max(&mut self, max: u8) {
+        assert!(max >= 1 && usize::from(max) <= MAX_REPLENISHMENTS);
+        self.max = max;
+    }
+
+    /// The most replenishments the queue holds.
+    pub fn max(&self) -> u8 {
+        self.max
+    }
+
+    /// The budget has a notification place from now on: each overrun asks
+    /// for an event at once, which `take_notice` answers.
+    pub fn watch(&mut self) {
+        self.watched = true;
+    }
+
+    /// The event of a watched budget fired: whether an overrun is not told
+    /// yet. The rule is one notification for each firing that finds an
+    /// overrun not told: overruns that come between two firings merge into
+    /// one (a period holds at most `MAX_REPLENISHMENTS` of them), and a thread
+    /// that overruns once for each period, with its event served in time,
+    /// gives one notification for each period.
+    pub fn take_notice(&mut self) -> bool {
+        let pending = self.overruns != self.told;
+        self.told = self.overruns;
+        // The break: the overrun is counted as told and nothing is posted.
+        pending && !cfg!(feature = "break-budget-overrun-silent")
     }
 
     /// The sum of the ticks charged so far.
@@ -323,6 +368,20 @@ impl Server {
                 self.event = self.q[0].time;
             }
         }
+        self.want_notice(now);
+    }
+
+    /// An overrun that the place has not been told of: the kernel posts it
+    /// under OBJ, which a scheduler section cannot take, from the event of
+    /// this budget, asked for at once, or as it stands when that is earlier
+    /// already (a later check does not push it back).
+    fn want_notice(&mut self, now: u64) {
+        if self.watched && self.overruns != self.told {
+            self.event = match self.armed {
+                0 => now,
+                armed => armed.min(now),
+            };
+        }
     }
 
     /// Split_Check (figure 6.4): the thread blocked at `now`.
@@ -336,7 +395,7 @@ impl Server {
             time: self.q[0].time,
             amount: self.usage,
         };
-        if usize::from(self.len) == MAX_REPLENISHMENTS {
+        if self.len >= self.max {
             // The remnant goes to the next entry: later, never earlier.
             self.pop();
             if self.len > 0 {
@@ -392,6 +451,8 @@ impl Server {
         if self.capacity(now) > 0 {
             self.background = false;
             self.event = 0;
+            // An overrun the place was not told of keeps its event.
+            self.want_notice(now);
             self.q[0].time = now;
             // The replenishments that arrive while the chunk runs are part
             // of it.
@@ -407,6 +468,7 @@ impl Server {
         } else {
             self.background = true;
             self.event = self.q[0].time;
+            self.want_notice(now);
         }
     }
 
@@ -416,6 +478,14 @@ impl Server {
     pub fn replenish(&mut self, now: u64) {
         self.armed = 0;
         self.event = 0;
+        // The event came for the place, before the replenishment: the head
+        // is not due, and the usage that `check` took in is not taken in
+        // twice. The event of the replenishment goes back.
+        #[cfg(not(feature = "break-budget-early-replenish"))]
+        if self.background && self.q[0].time > now {
+            self.event = self.q[0].time;
+            return;
+        }
         #[cfg(feature = "break-budget-refill")]
         {
             let _ = now;
@@ -439,6 +509,89 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One overrun of a watched server is one notice: its event is asked for
+    /// at once, `take_notice` answers it once, and the replenishment event
+    /// comes back with the replenishment at the head.
+    #[test]
+    fn a_watched_overrun_asks_for_one_notice_at_once() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.watch();
+        s.run(0);
+        s.stop(12, false, false);
+        assert!(s.background());
+        assert_eq!(s.overruns(), 1);
+        assert_eq!(s.event_change(), Some(Some(12)));
+        // The event fires early: the notice is told, the head is not due. The
+        // head stays where it was (12 ticks ran of 10: the overrun of 2 moved
+        // it to 100 + 2) and the usage is not taken in twice.
+        assert_eq!(s.queue()[0].time, 102);
+        assert!(s.take_notice());
+        s.replenish(12);
+        assert!(s.background());
+        assert_eq!((s.queue()[0].time, s.usage()), (102, 2));
+        assert_eq!(s.event_change(), Some(Some(102)));
+        assert!(!s.take_notice());
+        // The head's time comes: the thread is back, and no notice is owed.
+        let at = s.queue()[0].time;
+        assert_eq!(at, 102);
+        s.replenish(at);
+        assert!(!s.background());
+        assert!(!s.take_notice());
+        // The next period's overrun is the next notice.
+        s.unblock(at);
+        s.run(at);
+        s.stop(at + 11, false, false);
+        assert_eq!(s.overruns(), 2);
+        assert!(s.take_notice());
+        assert!(!s.take_notice());
+    }
+
+    /// A queue limit below 4 merges the remnant into the next entry, so the
+    /// queue never holds more than the limit and the sum stays the budget.
+    #[test]
+    fn a_queue_limit_holds_the_queue_to_it() {
+        for max in 1..=4u8 {
+            let mut s = Server::new(40, 1000, 1, 0);
+            s.set_max(max);
+            let mut now = 0;
+            for _ in 0..30 {
+                s.unblock(now);
+                s.run(now);
+                now += 3;
+                s.stop(now, true, false);
+                assert!(s.queue().len() <= usize::from(max));
+                assert_eq!(s.sum(), 40);
+                now += 5;
+            }
+        }
+    }
+
+    /// A budget with no place keeps the events it had: an overrun asks for the
+    /// replenishment only.
+    #[test]
+    fn an_unwatched_overrun_asks_for_the_replenishment_only() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.run(0);
+        s.stop(12, false, false);
+        let head = s.queue()[0].time;
+        assert_eq!(s.event_change(), Some(Some(head)));
+        assert!(head > 12);
+    }
+
+    /// An overrun of a thread that blocks asks for its notice as well, and a
+    /// check that comes while the event stands does not push it later.
+    #[test]
+    fn a_blocked_overrun_is_told_and_a_later_check_leaves_the_event() {
+        let mut s = Server::new(10, 100, 1, 0);
+        s.watch();
+        s.run(0);
+        s.stop(12, true, false);
+        assert_eq!(s.event_change(), Some(Some(12)));
+        s.unblock(20);
+        assert_eq!(s.event_change(), None);
+        assert!(s.take_notice());
+    }
 
     /// Xorshift: the same numbers on every run.
     struct Rng(u64);

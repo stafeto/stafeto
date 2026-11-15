@@ -1392,6 +1392,60 @@ impl<T: Schedulable> Scheduler<T> {
         Ok(())
     }
 
+    /// The budget of `t` leaves it at `now` (thread_bind_budget with no
+    /// budget): the stint that runs is closed and charged first (a thread
+    /// that works for a client above `low` lends it), the replenishment
+    /// event goes, and the thread works under the cap `cap`, `free` of its
+    /// process, from now on, at the higher of what its base and its boost
+    /// make, cut to that cap: a thread that fell to `low` comes back to its
+    /// own level, and one above `free` goes down to it. `t` stays in the
+    /// list it was in, moved to the level it now has. Returns the server
+    /// and the ticks the thread lent that the client of its request has not
+    /// paid yet; BAD_STATE for a thread that has no budget or ended. The
+    /// server is bound to no thread then, and its queue of replenishments
+    /// stays as it is.
+    ///
+    /// # Safety
+    /// `t` is alive, and runs on this CPU or has not started; no borrow of
+    /// its node is alive.
+    pub unsafe fn unbind_budget(
+        &mut self,
+        t: NonNull<T>,
+        cap: u8,
+        now: u64,
+    ) -> Result<(NonNull<Server>, u64), Error> {
+        // SAFETY: the caller's promise; the budget lives while `t` has it.
+        let (server, lent, level) = unsafe {
+            let n = node(t);
+            let Some(mut server) = n.server else {
+                return Err(Error::BadState);
+            };
+            if n.state == State::Dead {
+                return Err(Error::BadState);
+            }
+            #[cfg(not(feature = "break-budget-unbind-no-charge"))]
+            if n.state == State::Running {
+                Self::with_server(t, Op::Stop(false), now);
+            }
+            // The stint is closed: what the budget lent stands in `lent`.
+            let lent = server.as_mut().take_loan(now, false);
+            #[cfg(not(feature = "break-budget-unbind-keeps-event"))]
+            Self::with_server(t, Op::Off, 0);
+            let n = node(t);
+            n.server = None;
+            #[cfg(not(feature = "break-budget-unbind-keeps"))]
+            {
+                n.cap = cap;
+            }
+            #[cfg(feature = "break-budget-unbind-keeps")]
+            let _ = cap;
+            (server, lent, n.effective())
+        };
+        // SAFETY: the caller's promise.
+        unsafe { self.relevel(t, level) };
+        Ok((server, lent))
+    }
+
     /// The replenishment event of the budget of `t` at `now`: the thread
     /// goes back to its own level when its budget has capacity, to the
     /// tail with a new quantum when it is ready, with the rest of its
@@ -3312,6 +3366,56 @@ mod tests {
         w.exit(d);
         // SAFETY: as above.
         assert_eq!(unsafe { w.s.bind(d, p, 0) }, Err(Error::BadState));
+    }
+
+    #[test]
+    fn a_budget_that_leaves_its_thread_gives_it_min_of_its_base_and_the_cap() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 2 * MS, 10 * MS, 1);
+        w.start(hog);
+        w.started('v', 10, FIFO);
+        assert_eq!(w.pick(0), 'h');
+        assert_eq!(w.tick(2 * MS), 'v');
+        assert_eq!(node(hog).priority(), 1);
+        // The thread has no budget from now on: it works at its base, cut to
+        // the cap, and the event of the budget is gone.
+        // SAFETY: the world keeps its threads alive.
+        let (server, lent) = unsafe { w.s.unbind_budget(hog, 30, 2 * MS) }.unwrap();
+        assert_eq!(lent, 0);
+        assert_eq!(node(hog).priority(), 30);
+        assert!(!node(hog).has_budget() && !node(hog).is_demoted());
+        // SAFETY: the world keeps its threads alive; only the event is read.
+        assert_eq!(unsafe { hog.as_ref() }.event, None);
+        // The server keeps its queue and goes to another thread, whole once
+        // its replenishment came.
+        // SAFETY: the server is the world's, bound to no thread.
+        assert_eq!(unsafe { server.as_ref() }.queue().len(), 1);
+        let d = w.started('d', 20, FIFO);
+        // SAFETY: as above.
+        assert_eq!(unsafe { w.s.bind(d, server, 3 * MS) }, Ok(()));
+        // A thread with no budget has nothing to give back.
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { w.s.unbind_budget(hog, 30, 3 * MS) }.err(),
+            Some(Error::BadState)
+        );
+    }
+
+    #[test]
+    fn a_running_stint_is_charged_before_the_budget_goes_and_a_loan_is_handed_back() {
+        let mut w = World::new();
+        let a = w.thread('a', 50, FIFO);
+        w.budget(a, 4 * MS, 10 * MS, 1);
+        w.start(a);
+        assert_eq!(w.pick(0), 'a');
+        // SAFETY: the world keeps its threads alive.
+        let (server, lent) = unsafe { w.s.unbind_budget(a, 63, MS) }.unwrap();
+        assert_eq!(lent, 0);
+        // SAFETY: the server is the world's.
+        let server = unsafe { server.as_ref() };
+        assert_eq!(server.ran(), MS);
+        assert_eq!(server.usage(), MS);
     }
 
     #[test]

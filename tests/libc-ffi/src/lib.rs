@@ -39,12 +39,12 @@ pub const PTHREAD_DESTRUCTOR_ITERATIONS: u32 = 4;
 /// `pthread_join`'s value of a cancelled thread.
 pub const CANCELED: *mut c_void = usize::MAX as *mut c_void;
 
-/// `pthread_attr_t`: 32 bytes.
+/// `pthread_attr_t`: 96 bytes (the scheduling parameters are held whole, 16 bytes are reserved).
 #[repr(C, align(8))]
-pub struct Attr([u8; 32]);
+pub struct Attr([u8; 96]);
 impl Attr {
     pub const fn new() -> Self {
-        Self([0; 32])
+        Self([0; 96])
     }
 }
 impl Default for Attr {
@@ -164,10 +164,15 @@ pub unsafe fn cleanup_pop(_node: *mut Cleanup, execute: c_int) {
     unsafe { __relibc_internal_pthread_cleanup_pop(execute) }
 }
 
-/// `struct sched_param`.
+/// `struct sched_param` (48 bytes), with the members of the sporadic server
+/// option; a `timespec` is two 64-bit words here.
 #[repr(C)]
 pub struct SchedParam {
     pub sched_priority: c_int,
+    pub sched_ss_low_priority: c_int,
+    pub sched_ss_repl_period: [i64; 2],
+    pub sched_ss_init_budget: [i64; 2],
+    pub sched_ss_max_repl: c_int,
 }
 
 unsafe extern "C" {
