@@ -460,9 +460,43 @@ fn store_of(run: &mut qemu::Run, marker: &str) -> Result<(Vec<String>, Vec<Strin
     // The generation moves with a list of revocations that is taken again; the packages and the
     // free space do not.
     let mut check = expect_code(run, "pkg check", &format!("{marker}c"), 0, DIALOG_STEP)?;
-    check.retain(|l| !l.starts_with("store generation"));
-    let list = expect_code(run, "pkg list", &format!("{marker}l"), 0, DIALOG_STEP)?;
+    check.retain(|l| !l.starts_with("store generation") && !is_notice(l));
+    let mut list = expect_code(run, "pkg list", &format!("{marker}l"), 0, DIALOG_STEP)?;
+    list.retain(|l| !is_notice(l));
     Ok((check, list))
+}
+
+/// A line init writes to the console on its own account: the notice of the overruns of a time
+/// budget (`init: ramfs budget serve: at least 1 overruns, ...`). It comes when a budget runs
+/// out, whatever command is on the console then, so it can fall between the begin and end marks
+/// of `pkg check` or `pkg list` without being part of their output.
+fn is_notice(line: &str) -> bool {
+    line.starts_with("init: ") && line.contains(" budget ") && line.contains(" overruns")
+}
+
+/// Fails with `what` and the lines that differ when the two readings of the store are not the
+/// same.
+fn same_store(
+    what: &str,
+    before: &(Vec<String>, Vec<String>),
+    after: &(Vec<String>, Vec<String>),
+) -> Result<(), String> {
+    if before == after {
+        return Ok(());
+    }
+    let mut differ = Vec::new();
+    for (name, a, b) in [
+        ("check", &before.0, &after.0),
+        ("list", &before.1, &after.1),
+    ] {
+        for line in a.iter().filter(|l| !b.contains(l)) {
+            differ.push(format!("{name}: only before: {line:?}"));
+        }
+        for line in b.iter().filter(|l| !a.contains(l)) {
+            differ.push(format!("{name}: only after: {line:?}"));
+        }
+    }
+    Err(format!("{what}; the lines that differ: {differ:?}"))
 }
 
 /// Steps 1 to 9 (`install`), and with `full` the rest of the scenario on three boots of the machine.
@@ -812,9 +846,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         .push("not UID 0: pkg: permission denied, the mirror was not asked".into());
 
     let before = store_of(run, "s10")?;
-    if before != untouched {
-        return Err("step 10: the store changed after a process that is not the superuser".into());
-    }
+    same_store(
+        "step 10: the store changed after a process that is not the superuser",
+        &untouched,
+        &before,
+    )?;
     // Step 11: a byte of the file changed, and a file longer than the index says.
     ctx.state(&ctx.states.tampered)?;
     let (lines, _) = with_log(run, ctx, "pkg install hello", "tampered", 1)?;
@@ -823,9 +859,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         "pkg: hello: the file is not the one the index names",
         "step 11",
     )?;
-    if store_of(run, "s11a")? != before {
-        return Err("step 11: the store changed after a tampered file".into());
-    }
+    same_store(
+        "step 11: the store changed after a tampered file",
+        &before,
+        &store_of(run, "s11a")?,
+    )?;
     ctx.state(&ctx.states.long)?;
     let (lines, _) = with_log(run, ctx, "pkg install hello", "long", 1)?;
     if !has(&lines, "larger than the index says") && !has(&lines, "the server sent more than") {
@@ -833,9 +871,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
             "step 11: no line about a file longer than the index says: {lines:?}"
         ));
     }
-    if store_of(run, "s11b")? != before {
-        return Err("step 11: the store changed after a long file".into());
-    }
+    same_store(
+        "step 11: the store changed after a long file",
+        &before,
+        &store_of(run, "s11b")?,
+    )?;
     ctx.report
         .push("a changed byte and a longer file: refused, the store as it was".into());
 
@@ -850,9 +890,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
     ctx.state(&ctx.states.expired)?;
     let lines = expect_code(run, "pkg update", "expired", 1, INSTALL_WITHIN)?;
     need(&lines, "pkg: stafeto: index expired at ", "step 12")?;
-    if store_of(run, "s12")? != before {
-        return Err("step 12: the store changed after a refused index".into());
-    }
+    same_store(
+        "step 12: the store changed after a refused index",
+        &before,
+        &store_of(run, "s12")?,
+    )?;
     ctx.report
         .push("serial 1 after 2 and an expired index: refused, each with its line".into());
 
@@ -864,9 +906,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         "pkg: alien: signed by a key the repository stafeto does not trust",
         "step 13",
     )?;
-    if store_of(run, "s13")? != before {
-        return Err("step 13: the store changed after a package of a foreign key".into());
-    }
+    same_store(
+        "step 13: the store changed after a package of a foreign key",
+        &before,
+        &store_of(run, "s13")?,
+    )?;
     let lines = expect_code(run, "pkg install hello", "hello1", 0, INSTALL_WITHIN)?;
     need(&lines, "installed hello 1.0-1", "step 13")?;
     expect_code(run, "/opt/hello/bin/hello", "run-hello", 42, DIALOG_STEP)?;
@@ -1016,9 +1060,11 @@ fn manage(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         "signed by games-1, a key this repository does not trust",
         "step 18",
     )?;
-    if store_of(run, "s18b")? != before {
-        return Err("step 18: the store changed".into());
-    }
+    same_store(
+        "step 18: the store changed",
+        &before,
+        &store_of(run, "s18b")?,
+    )?;
     ctx.state(&ctx.states.next)?;
     ctx.report.push("an index signed by the key of games: refused for stafeto; install and upgrade refuse as a whole".into());
     Ok(())
@@ -1172,6 +1218,25 @@ pub fn command(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_notice_of_init_is_no_part_of_the_store_and_a_real_change_is_told() {
+        use super::{is_notice, same_store};
+        let notice = "init: pipe budget serve: at least 187 overruns, at least 5159 in all, kernel counts 5159";
+        assert!(is_notice(notice));
+        assert!(!is_notice(
+            "packages 2 on the disk, 10 in the image, 0 revoked"
+        ));
+        assert!(!is_notice(
+            "init: posix-procs ended: exit code 0, not restarted"
+        ));
+        let store = |lines: &[&str]| (lines.iter().map(|l| l.to_string()).collect(), Vec::new());
+        let a = store(&["packages 2 on the disk"]);
+        assert!(same_store("t", &a, &a.clone()).is_ok());
+        let b = store(&["packages 3 on the disk"]);
+        let told = same_store("t", &a, &b).unwrap_err();
+        assert!(told.contains("only before") && told.contains("packages 3 on the disk"));
+    }
+
     use super::*;
 
     #[test]
