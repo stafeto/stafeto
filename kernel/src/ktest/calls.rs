@@ -10150,6 +10150,7 @@ fn long_reply_and_long_request(restart: bool) -> Result<(), &'static str> {
         if restart {
             syscall::force_poll();
         }
+        let between = syscall::copies_between_halves();
         syscall::dispatch(h.r, Call::ReplyReceive.number());
         if restart {
             // The call starts over at its `svc`.
@@ -10157,6 +10158,12 @@ fn long_reply_and_long_request(restart: bool) -> Result<(), &'static str> {
             unsafe { (*h.r.as_ptr()).regs.elr += 4 };
             syscall::dispatch(h.r, Call::ReplyReceive.number());
         }
+        // The end of `dispatch` flushes in a test build too: only the counter
+        // says the call made the reply's copy itself, between its halves.
+        check(
+            syscall::copies_between_halves() == between + 1,
+            "the call did not make the copy of its reply between its halves",
+        )?;
         let (reply, request) = (long_words(REPLY), long_words(REQUEST));
         let got = |t, words: &[u64]| {
             words

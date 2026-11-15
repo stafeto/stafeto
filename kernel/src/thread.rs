@@ -765,6 +765,13 @@ pub fn flush_copy() {
     }
 }
 
+/// Whether a copy waits on this CPU (the kernel tests tell a copy made by
+/// the call itself from one made at the end of `dispatch`).
+#[cfg(feature = "ktest")]
+pub fn copy_waits() -> bool {
+    crate::local::local().deferred.load(Ordering::Relaxed) & crate::local::COPY != 0
+}
+
 /// The copy that waits, then the commands that the call posted: a thread
 /// of another CPU reads the message once it is woken, so the commands go
 /// out after the copy (cmd.rs).
