@@ -223,6 +223,11 @@ Actions.
   clears RAM at a reset, so the log does not outlive it; the same image
   under HVF shows the panic. On VZ `rtbench` runs beside the console's
   driver.
+- While the kernel holds the port (an image with no console service), a
+  line over 64 bytes goes out in pieces without their headers, and a record of
+  another writer can land between them; whole lines come only through the
+  console service. Probe images run on a kernel that keeps the headers, and
+  the probe runner puts the lines back whole.
 - SMP runs on up to 8 CPUs (QEMU, HVF and VZ are tested with 4); the
   bounds of a real-time analysis on several CPUs still wait for a board
   (docs/smp.md).
