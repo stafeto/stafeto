@@ -184,6 +184,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                     sched::boost_in_place(k, t, priority, ceiling, false);
                 }
                 hold_notice(t, c);
+                holder_below_queue(k, t, c, abi::HOLDER_NOTICE);
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {
@@ -665,6 +666,31 @@ pub unsafe fn pay_loan(k: &mut Locked<'_>, t: NonNull<Thread>, lent: u64, now: u
     }
 }
 
+/// The holder `t` of `c` works below the top of the queue of `c` after a
+/// transition of `kind`: a stamp (the build feature `stamps`).
+///
+/// # Safety
+/// `t` and `c` are alive; `k` is the locked scheduler.
+#[inline(always)]
+unsafe fn holder_below_queue(
+    k: &mut Locked<'_>,
+    t: NonNull<Thread>,
+    c: NonNull<Channel>,
+    kind: u8,
+) {
+    #[cfg(feature = "stamps")]
+    // SAFETY: the caller's promise.
+    unsafe {
+        if let Some(top) = queue(c, k.s).top()
+            && top > t.as_ref().priority()
+        {
+            crate::stamps::holder(t, kind, t.as_ref().priority(), top);
+        }
+    }
+    #[cfg(not(feature = "stamps"))]
+    let _ = (k, t, c, kind);
+}
+
 /// The tag of the `boost_token` of a thread that holds a notification
 /// (`hold_notice`): bit 63, which a token of a request has once its count
 /// reaches 2^47 of one thread's requests; the rest names the channel.
@@ -734,15 +760,30 @@ unsafe fn end_notice(t: NonNull<Thread>) {
 /// handles go. Handles that go are released at `t`'s priority. Never
 /// waits. O(1).
 pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Result<(), Error> {
+    reply_on(t, token, desc, values, None)
+}
+
+/// `reply` of the first half of `reply_receive`, which receives next on `c`.
+pub fn reply_on(
+    t: NonNull<Thread>,
+    token: u64,
+    desc: Desc,
+    values: &[u64],
+    c: Option<NonNull<Channel>>,
+) -> Result<(), Error> {
     let client = sched::locked(|k| {
         // SAFETY: the running thread is alive; so is a thread whose number
         // is taken (it gives the number back as it ends); a client that
-        // waits is not `t`.
+        // waits is not `t`; the channel, which the receive handle names, is
+        // alive.
         unsafe {
             if token != 0 && (*t.as_ptr()).boost_token == token {
                 settle_loan(k, t);
                 k.s.unboost(t);
                 (*t.as_ptr()).boost_token = 0;
+                if let Some(c) = c {
+                    holder_below_queue(k, t, c, abi::HOLDER_REPLY);
+                }
             }
             let client = k.tokens.check(token)?;
             if (*client.as_ptr()).waits != Some(Wait::Reply(t.as_ref().process())) {

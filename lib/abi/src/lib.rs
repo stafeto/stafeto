@@ -972,6 +972,16 @@ pub const STAMP_SGI_SENT: u8 = 4;
 pub const STAMP_SGI_GOT: u8 = 5;
 /// The CPU went to `wfi` (key 0) and came out of it (key 1).
 pub const STAMP_WFI: u8 = 6;
+/// The effective level of the holder of a channel (a server that took its
+/// last request or notification) fell, or was found, below the top of the
+/// channel's queue (key: the thread number in bits 0-15, the kind in bits
+/// 16-17 (1 a receive that took a notification, 2 a reply between the
+/// halves of `reply_receive`, 3 a send that ended a hold), the holder's
+/// level in bits 18-23 and the top of the queue in bits 24-29).
+pub const STAMP_HOLDER: u8 = 7;
+pub const HOLDER_NOTICE: u8 = 1;
+pub const HOLDER_REPLY: u8 = 2;
+pub const HOLDER_SEND: u8 = 3;
 /// The causes of `STAMP_READY`: a notification, the reply of a call, a
 /// request that reached a waiting receiver, the close of a channel or the
 /// end of a call by an interrupt, a command from another CPU, a timer, a

@@ -186,6 +186,26 @@ pub fn wfi(out: bool) {
     let _ = out;
 }
 
+/// The holder `t` of a channel works at `level` while the top of the
+/// channel's queue is `top`, above it, after a transition of `kind`
+/// (abi::HOLDER_*).
+#[inline(always)]
+pub fn holder(t: NonNull<Thread>, kind: u8, level: u8, top: u8) {
+    #[cfg(feature = "stamps")]
+    {
+        let number = crate::thread::try_index(t).unwrap_or(u16::MAX);
+        put(
+            abi::STAMP_HOLDER,
+            u32::from(number)
+                | u32::from(kind & 3) << 16
+                | u32::from(level & 63) << 18
+                | u32::from(top & 63) << 24,
+        );
+    }
+    #[cfg(not(feature = "stamps"))]
+    let _ = (t, kind, level, top);
+}
+
 /// Every ring of the CPUs that are up stops taking records, for good
 /// (abi::STAMPS_FREEZE).
 #[cfg(feature = "stamps")]
