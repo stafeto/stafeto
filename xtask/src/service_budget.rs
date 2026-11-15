@@ -132,7 +132,7 @@ pub fn parse(lines: &[String]) -> Result<Vec<Numbers>, String> {
 /// victim in it.
 fn allowed_loss(service: &str) -> u64 {
     let share: u64 = if service == "ramfs" { 50 } else { 15 };
-    share + if service == "ramfs" { 50 } else { 100 }
+    share + 50
 }
 
 /// The windows the verdict holds the victim to: the median share in a window of 5 and of 10 ms.
@@ -420,8 +420,8 @@ mod tests {
     fn the_loss_a_budget_may_cause_is_its_share_with_the_margin() {
         // The RAM service in a window of 10 ms: 3 periods of 260 us, and 30 per mille of margin.
         assert_eq!(allowed_loss("ramfs"), 50 + 50);
-        assert_eq!(allowed_loss("pipe"), 15 + 100);
-        assert_eq!(allowed_loss("tty"), 15 + 100);
+        assert_eq!(allowed_loss("pipe"), 15 + 50);
+        assert_eq!(allowed_loss("tty"), 15 + 50);
     }
 
     #[test]

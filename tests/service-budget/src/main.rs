@@ -63,7 +63,7 @@ const DEPTH: usize = 8;
 static STACKS: [Stack<8192>; 2 + GREEDIES] = [const { Stack::new() }; 2 + GREEDIES];
 /// The greedy clients of a phase, on CPU 1: more than one, so that the service has a request
 /// waiting when it ends one, whatever the wake of a client on the other CPU takes.
-const GREEDIES: usize = 24;
+const GREEDIES: usize = 8;
 static START: AtomicU64 = AtomicU64::new(0);
 static END: AtomicU64 = AtomicU64::new(0);
 static SPENT: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
