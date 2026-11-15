@@ -704,6 +704,21 @@ unsafe fn spawn(
             None
         }
     });
+    // The parameters of a sporadic server the child starts under.
+    let ss = match attributes {
+        Some(a)
+            if (a.flags & SPAWN_SETSCHEDULER != 0
+                && a.policy == posix_types::sporadic::SCHED_SPORADIC)
+                || (a.flags & SPAWN_SETSCHEDPARAM != 0
+                    && posix_abi::sched::own_policy() == posix_types::sporadic::SCHED_SPORADIC) =>
+        {
+            match posix_types::sporadic::validate(&a.param) {
+                Ok(ss) => Some(ss),
+                Err(errno) => return -errno,
+            }
+        }
+        _ => None,
+    };
     let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
         return -posix_abi::constants::EINVAL;
     };
@@ -721,6 +736,7 @@ unsafe fn spawn(
         default,
         umask,
         sched,
+        ss,
     };
     // SAFETY: the caller's promise for argv, envp and the file actions.
     let (argv, envp, file_actions) =

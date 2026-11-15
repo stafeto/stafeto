@@ -272,22 +272,27 @@ pub fn thread_set(id: u64, policy: i32, param: &SchedParam, tail: bool) -> Resul
 /// (policy and priority), or the caller's own scheduling for None. EINVAL
 /// for a policy or priority out of range, EPERM for a rise the caller may
 /// not make.
-pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
+pub(crate) fn for_child(
+    spec: Option<(i32, i32)>,
+    spec_ss: Option<Ss>,
+) -> Result<(u8, u64, Option<Ss>), i32> {
     let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
-    // The budget of a sporadic server is a thread's own: a child's main
-    // thread gets one when `fork` and `posix_spawn` reserve it with the
-    // process service; until then it starts as SCHED_FIFO at the same base.
-    let policy = if policy == SCHED_SPORADIC {
-        SCHED_FIFO
-    } else {
-        policy
-    };
     level_of(policy, priority)?;
+    // The budget of a sporadic server is a thread's own: the caller reserves
+    // one for the child's main thread with the process service
+    // (`sporadic::reserve`), which takes it when it starts (`start_apply`).
+    let ss = if policy != SCHED_SPORADIC {
+        None
+    } else if spec.is_some() {
+        Some(spec_ss.ok_or(EINVAL)?)
+    } else {
+        Some(crate::sporadic::get(crate::threads::thread_number()).ok_or(EINVAL)?)
+    };
     if spec.is_some() && !permitted(own, (policy, priority)) {
         return Err(EPERM);
     }
-    Ok((top()?, START | pack(policy, priority)))
+    Ok((top()?, START | pack(policy, priority), ss))
 }
 
 /// The POSIX policy of the calling thread.
@@ -313,11 +318,24 @@ pub(crate) fn start_apply(word: u64) {
         return;
     };
     let block = crate::threads::own_block();
+    // A main thread that starts under a sporadic server takes the budget the
+    // service reserved for it before it runs on: without it the process
+    // would run with a policy it does not have.
+    if policy == SCHED_SPORADIC && crate::sporadic::take_own(1).is_err() {
+        rt::println!("posix: no budget for a main thread under SCHED_SPORADIC");
+        sys::process_exit(126);
+    }
     block.sched.store(pack(policy, priority), Ordering::Relaxed);
     block.policy.store(kernel as u64, Ordering::Relaxed);
     if level != block.base_level.load(Ordering::Relaxed) as u8 || kernel != Policy::RoundRobin {
         let _ = crate::threads::move_to(level, kernel, false);
     }
+}
+
+/// The priority of SCHED_FIFO whose level is `level`, in 1 to 32.
+pub(crate) fn priority_of_level(level: u8) -> i32 {
+    let top = top().map_or(MAX_PRIORITY, i32::from);
+    (i32::from(level) + MAX_PRIORITY - top).clamp(MIN_PRIORITY, MAX_PRIORITY)
 }
 
 /// pthread_getschedparam: the policy and parameters of the thread `id`.

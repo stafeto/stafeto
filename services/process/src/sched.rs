@@ -119,6 +119,75 @@ impl Processes {
                 let _ = r.reply().u32(0).and_then(|()| r.reply().u32(0));
                 Answer::Reply(out)
             }
+            sporadic::RESERVE => {
+                let (Ok(child), Ok(from), Ok(mut ask), Ok(())) =
+                    (body.u32(), body.u32(), Ask::read(&mut body), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                // The target: a child of the caller still loading, or the
+                // caller's own record (an exec).
+                let (target, owner) = if child == 0 {
+                    (index, owner)
+                } else {
+                    let target = child as usize % proto_process::RECORDS;
+                    let mine = self.records.get(target).is_some_and(|c| {
+                        c.label.pid() == child
+                            && c.parent == self.records.get(index).map_or(0, |p| p.label.pid())
+                            && matches!(c.state, posix_process_service::records::State::Loading)
+                    });
+                    if !mine {
+                        return refuse(proto_process::NO_PROCESS);
+                    }
+                    (target, u64::from(child))
+                };
+                ask.cpu = self.records.get(target).map_or(0, |r| u32::from(r.cpu));
+                if ask.thread == 0
+                    || !(1..=4).contains(&ask.max_repl)
+                    || !(1..=63).contains(&ask.low)
+                {
+                    return refuse(proto_process::INVALID);
+                }
+                let Some(pending) = r.defer() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if let Err((why, pending)) = self
+                    .budgets
+                    .ask_for(target, owner, ask, from, true, pending)
+                {
+                    let code = match why {
+                        Refusal::Again => proto_process::AGAIN,
+                        Refusal::Room => proto_process::FULL,
+                    };
+                    let reply = proto_wire::reply(Status::from_code(code));
+                    let _ = pending.answer(&reply, Outgoing::new());
+                    return Answer::Deferred;
+                }
+                self.dispatch_budget();
+                Answer::Deferred
+            }
+            sporadic::TAKE => {
+                let (Ok(thread), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some((budget, ask)) = self.budgets.taken(index, owner, thread) else {
+                    return refuse(proto_process::NO_PROCESS);
+                };
+                let Ok(give) = copy(budget) else {
+                    return Answer::Status(Status::Kernel(abi::Error::NoMemory));
+                };
+                let mut out = Outgoing::new();
+                let _ = out.push(give.erase());
+                let w = r.reply();
+                if w.u32(0)
+                    .and_then(|()| w.u32(0))
+                    .and_then(|()| ask.write(w))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(out)
+            }
             sporadic::DROP => {
                 let (Ok(thread), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
@@ -148,7 +217,12 @@ impl Processes {
         if done.seq != 0
             && let Some(completed) = self.budgets.done(done.seq, done.status, done.id, handle)
         {
-            self.complete_ask(completed.slot, completed.status, completed.pending);
+            self.complete_ask(
+                completed.slot,
+                completed.status,
+                completed.plain,
+                completed.pending,
+            );
         }
         self.budgeter = r.defer();
         self.dispatch_budget();
@@ -157,7 +231,19 @@ impl Processes {
 
     /// The reply of a finished ASK: the budget, and the current one when the
     /// thread has one, or the refusal.
-    fn complete_ask(&mut self, slot: usize, status: u32, pending: rt::service::Pending) {
+    fn complete_ask(
+        &mut self,
+        slot: usize,
+        status: u32,
+        plain: bool,
+        pending: rt::service::Pending,
+    ) {
+        if status == 0 && plain {
+            // A reservation: the budget stays with the entry until its
+            // thread takes it.
+            let _ = pending.answer(&proto_wire::reply(Status::Ok), Outgoing::new());
+            return;
+        }
         if status != 0 {
             let reply = proto_wire::reply(Status::from_code(status_of(status)));
             let _ = pending.answer(&reply, Outgoing::new());

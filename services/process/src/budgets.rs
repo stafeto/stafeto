@@ -42,6 +42,11 @@ struct Entry<H> {
     probation: Option<(u64, H)>,
     /// A request for this entry waits for init or for its DONE.
     busy: bool,
+    /// What the probation was asked for, for the child that takes it (TAKE).
+    ask: Option<Ask>,
+    /// The thread of the old image whose budget this one replaces (exec):
+    /// its entry goes when this one is bound.
+    from: u32,
 }
 
 struct AskJob<P> {
@@ -50,6 +55,9 @@ struct AskJob<P> {
     ask: Ask,
     replace: u64,
     pending: Option<P>,
+    /// The reply carries no handles: the budget is for a thread that is not
+    /// there yet (a child, a new image), which takes it with TAKE.
+    plain: bool,
     /// Given to the budget thread.
     running: bool,
 }
@@ -65,6 +73,7 @@ pub struct Next {
 
 /// The reply a finished ASK owes its client.
 pub struct Completed<P> {
+    pub plain: bool,
     pub pending: P,
     /// 0, or init's status for the refusal (`Err` of the kernel's code).
     pub status: u32,
@@ -123,6 +132,22 @@ impl<H, P> Budgets<H, P> {
         ask: Ask,
         pending: P,
     ) -> Result<(), (Refusal, P)> {
+        self.ask_for(record, label, ask, 0, false, pending)
+    }
+
+    /// `ask` for a thread of another record or image (`plain`): a child of
+    /// `fork` or `posix_spawn`, or the new image of an exec, whose main
+    /// thread (`ask.thread`) replaces the budget of the thread `from` of the
+    /// old image (0 for none) and takes the new one with `take`.
+    pub fn ask_for(
+        &mut self,
+        record: usize,
+        label: u64,
+        ask: Ask,
+        from: u32,
+        plain: bool,
+        pending: P,
+    ) -> Result<(), (Refusal, P)> {
         let Some(job) = self.asks.iter().position(Option::is_none) else {
             return Err((Refusal::Again, pending));
         };
@@ -139,6 +164,8 @@ impl<H, P> Budgets<H, P> {
                     cur: None,
                     probation: None,
                     busy: false,
+                    ask: None,
+                    from: 0,
                 });
                 slot
             }
@@ -148,7 +175,16 @@ impl<H, P> Budgets<H, P> {
             return Err((Refusal::Again, pending));
         }
         entry.busy = true;
-        let replace = entry.cur.as_ref().map_or(0, |(id, _)| *id);
+        entry.from = from;
+        let mut replace = entry.cur.as_ref().map_or(0, |(id, _)| *id);
+        if from != 0
+            && let Some(old) = self.find(record, label, from)
+        {
+            replace = self.entries[old]
+                .as_ref()
+                .and_then(|e| e.cur.as_ref())
+                .map_or(0, |(id, _)| *id);
+        }
         let seq = self.next_seq();
         self.asks[job] = Some(AskJob {
             seq,
@@ -156,6 +192,7 @@ impl<H, P> Budgets<H, P> {
             ask,
             replace,
             pending: Some(pending),
+            plain,
             running: false,
         });
         Ok(())
@@ -229,12 +266,16 @@ impl<H, P> Budgets<H, P> {
             return None;
         };
         match (status, handle) {
-            (0, Some(handle)) => entry.probation = Some((id, handle)),
+            (0, Some(handle)) => {
+                entry.probation = Some((id, handle));
+                entry.ask = Some(job.ask);
+            }
             (0, None) => {
                 // A share without its budget goes back at once.
                 entry.busy = false;
                 self.give_back(id);
                 return job.pending.take().map(|pending| Completed {
+                    plain: job.plain,
                     pending,
                     status: proto_process::FULL,
                     slot,
@@ -248,6 +289,7 @@ impl<H, P> Budgets<H, P> {
             }
         }
         job.pending.take().map(|pending| Completed {
+            plain: job.plain,
             pending,
             status,
             slot,
@@ -278,6 +320,14 @@ impl<H, P> Budgets<H, P> {
         }
     }
 
+    /// TAKE: the budget the entry of `thread` got for it while it was not
+    /// there, with what it was asked for.
+    pub fn taken(&self, record: usize, label: u64, thread: u32) -> Option<(&H, Ask)> {
+        let slot = self.find(record, label, thread)?;
+        let entry = self.entries[slot].as_ref()?;
+        Some((&entry.probation.as_ref()?.1, entry.ask?))
+    }
+
     /// The thread's current budget, for the thread that leaves the policy.
     pub fn current(&self, record: usize, label: u64, thread: u32) -> Option<&H> {
         let slot = self.find(record, label, thread)?;
@@ -299,6 +349,7 @@ impl<H, P> Budgets<H, P> {
         };
         let entry = self.entries[slot].as_mut().expect("the entry just found");
         entry.busy = false;
+        let from = core::mem::take(&mut entry.from);
         let mut back = [0u64; 2];
         match (entry.probation.take(), bound) {
             (Some((id, handle)), true) => {
@@ -319,6 +370,15 @@ impl<H, P> Budgets<H, P> {
         }
         for id in back.into_iter().filter(|&id| id != 0) {
             self.give_back(id);
+        }
+        // The new image is bound: the thread of the old one that its
+        // budget replaced is gone with the image.
+        if bound
+            && from != 0
+            && from != thread
+            && let Some(old) = self.find(record, label, from)
+        {
+            self.free(old);
         }
         true
     }
@@ -529,6 +589,45 @@ mod tests {
         assert_eq!((job.kind, job.id), (JOB_RELEASE, 41));
         assert!(b.done(job.seq, 0, 0, None).is_none());
         assert_eq!(b.take_job().unwrap().kind, JOB_ASK);
+    }
+
+    #[test]
+    fn the_new_image_of_an_exec_replaces_the_budget_of_the_old_one() {
+        let mut b = B::new();
+        // The old image's thread 7 has number 41.
+        b.ask(5, 77, ask(7), "a").ok().unwrap();
+        let job = b.take_job().unwrap();
+        b.done(job.seq, 0, 41, Some(1001));
+        b.commit(5, 77, 7, true);
+        // The exec asks for the new main thread (1), replacing thread 7's.
+        b.ask_for(5, 77, ask(1), 7, true, "exec").ok().unwrap();
+        let job = b.take_job().unwrap();
+        assert_eq!(job.id, 41, "admission counts the old share out");
+        let done = b.done(job.seq, 0, 42, Some(1002)).unwrap();
+        assert!(done.plain);
+        let (handle, got) = b.taken(5, 77, 1).unwrap();
+        assert_eq!((*handle, got.thread), (1002, 1));
+        assert!(b.commit(5, 77, 1, true));
+        assert_eq!(b.owed(), &[41]);
+        assert_eq!(b.threads(), 1);
+        assert_eq!(b.current(5, 77, 1), Some(&1002));
+        assert_eq!(b.current(5, 77, 7), None);
+    }
+
+    #[test]
+    fn an_exec_by_the_main_thread_keeps_its_own_entry() {
+        let mut b = B::new();
+        b.ask(5, 77, ask(1), "a").ok().unwrap();
+        let job = b.take_job().unwrap();
+        b.done(job.seq, 0, 41, Some(1001));
+        b.commit(5, 77, 1, true);
+        b.ask_for(5, 77, ask(1), 1, true, "exec").ok().unwrap();
+        let job = b.take_job().unwrap();
+        assert_eq!(job.id, 41);
+        b.done(job.seq, 0, 42, Some(1002));
+        assert!(b.commit(5, 77, 1, true));
+        assert_eq!(b.current(5, 77, 1), Some(&1002));
+        assert_eq!(b.owed(), &[41]);
     }
 
     #[test]

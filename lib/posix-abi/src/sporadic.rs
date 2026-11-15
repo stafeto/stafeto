@@ -211,13 +211,13 @@ pub fn ask(id: u64, cpu: usize, ss: &Ss, low: u8) -> Result<Given, i32> {
     .write(&mut w)
     .map_err(|_| EIO)?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let mut reply = crate::process::send_again(&w).map_err(|e| EIO)?;
+    let mut reply = crate::process::send_again(&w).map_err(|_| EIO)?;
     let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
     let status = bytes.u32().map_err(|_| EIO)?;
     if status != 0 {
         return Err(errno_of(status));
     }
-    let new = reply.handles.take::<Budget>(0).map_err(|e| EIO)?;
+    let new = reply.handles.take::<Budget>(0).map_err(|_| EIO)?;
     let old = reply.handles.take::<Budget>(1).ok();
     Ok(Given { new, old })
 }
@@ -306,6 +306,79 @@ pub fn leave(id: u64, thread: &Handle<Thread>) -> Result<(), i32> {
             done(id, true);
             take(id as u32);
             Ok(())
+        }
+        Err(e) => {
+            done(id, false);
+            Err(bind_errno(e))
+        }
+    }
+}
+
+/// Asks the service for a budget for the main thread of a child of `fork` or
+/// `posix_spawn` (PID `child`), or of the new image of an exec (`child` 0,
+/// `from` the calling thread, whose budget the new one replaces), with the
+/// parameters `ss`. The service picks the CPU of the child. EPERM for a refused
+/// share; the caller turns it into EAGAIN.
+pub fn reserve(child: u32, from: u64, thread: u32, ss: &Ss, low: u8) -> Result<(), i32> {
+    let mut w = crate::process::request(Method::Budget, &[proto::RESERVE, child, from as u32])?;
+    proto::Ask {
+        thread,
+        cpu: 0,
+        low: u32::from(low),
+        max_repl: ss.max_repl,
+        c_ns: ss.c_ns,
+        t_ns: ss.t_ns,
+    }
+    .write(&mut w)
+    .map_err(|_| EIO)?;
+    crate::process::ask(&w).map(|_| ())
+}
+
+/// The reservation for a child of the calling thread, which runs under a
+/// server (`fork`): nothing for a thread that does not. EAGAIN when the
+/// share is gone.
+pub fn reserve_child(child: u32) -> Result<(), i32> {
+    let id = crate::threads::thread_number();
+    let Some(ss) = get(id) else {
+        return Ok(());
+    };
+    let low = crate::sched::level_of(crate::sched::SCHED_FIFO, ss.low).map_or(1, |(l, _)| l);
+    reserve(child, 0, id as u32, &ss, low).map_err(|_| EAGAIN)
+}
+
+/// The main thread of a child or of a new image takes the budget that was
+/// reserved for it, binds it to itself and keeps the parameters. An error
+/// means the thread would run with no budget under a policy that has one:
+/// the caller ends the process.
+pub fn take_own(id: u64) -> Result<(), i32> {
+    let w = request(proto::TAKE, id, None)?;
+    let mut reply = crate::process::send_again(&w).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    let status = bytes.u32().map_err(|_| EIO)?;
+    if status != 0 {
+        return Err(errno_of(status));
+    }
+    bytes.u32().map_err(|_| EIO)?;
+    let ask = proto::Ask::read(&mut bytes).map_err(|_| EIO)?;
+    let budget = reply.handles.take::<Budget>(0).map_err(|_| EIO)?;
+    let block = crate::threads::own_block();
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
+    let low = crate::sched::priority_of_level(ask.low as u8);
+    match budget_call::bind(&thread, &budget) {
+        Ok(()) => {
+            done(id, true);
+            let ss = Ss {
+                low,
+                c_ns: ask.c_ns,
+                t_ns: ask.t_ns,
+                max_repl: ask.max_repl,
+            };
+            if put(id as u32, ss) {
+                Ok(())
+            } else {
+                Err(EAGAIN)
+            }
         }
         Err(e) => {
             done(id, false);

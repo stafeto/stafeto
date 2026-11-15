@@ -46,6 +46,20 @@ pub const UNBIND: u32 = 3;
 pub const DROP: u32 = 4;
 /// The budget thread's request (label 0 only).
 pub const WORK: u32 = 5;
+/// A budget for the main thread of a child of `fork` or `posix_spawn`
+/// (`child` the PID the service gave) or of the new image of an exec
+/// (`child` 0), asked before ForkCommit, SpawnCommit or ExecCommit, so that
+/// a refused share fails the call. Body after the operation: child u32, from
+/// u32 (the thread of the old image whose budget the new one replaces, for
+/// an exec; else 0) and an `Ask` (thread 1; the CPU is the service's choice
+/// for the child, whatever the request says). The reply is a status alone;
+/// the caller of the exec or the parent is told `FULL` for a refused share.
+pub const RESERVE: u32 = 6;
+/// The main thread of the child or of the new image takes the budget the
+/// service reserved for it: body thread u32 (1); the reply is the status,
+/// zero u32, the `Ask` as reserved (CPU, `low` level, `max_repl`, C, T) and one
+/// handle, the budget (BUDGET, TRANSFER). The thread binds it and sends DONE.
+pub const TAKE: u32 = 7;
 
 /// The threads of one process that may run under a budget at once.
 pub const THREADS_MAX: usize = 8;

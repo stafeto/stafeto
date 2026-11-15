@@ -21,7 +21,7 @@
 /* The kernel that has the unbind and the atomic rebind (stafeto#358) lets a
  * thread change its parameters and leave the policy. */
 #ifndef SS_REBIND
-#define SS_REBIND 0
+#define SS_REBIND 1
 #endif
 
 #define MS 1000000L
@@ -136,9 +136,7 @@ static void run(void *(*body)(void *), void *arg) {
     int err;
     pthread_t t = make(body, arg, NULL, &err);
     CHECK(err == 0);
-    printf("sporadic: DEBUG joins\n");
     CHECK(pthread_join(t, NULL) == 0);
-    printf("sporadic: DEBUG joined\n");
 }
 
 static int row_ns(int cpu, long period) { /* the share of the CPU for POSIX threads, in ns of `period` */
@@ -162,7 +160,6 @@ static void *basic_thread(void *arg) {
     CHECK(sched_getparam(0, &got) == 0 && got.sched_priority == 21 && got.sched_ss_max_repl == 3);
     errno = 0;
     CHECK(pthread_setschedprio(pthread_self(), 5) == EINVAL); /* the base may not reach `low` */
-    printf("sporadic: DEBUG basic thread done, %lld us of CPU\n", thread_cpu_ns() / 1000);
 #if SS_REBIND
     /* A change of the parameters moves the thread to a new budget at once. */
     struct sched_param q = ss_param(22, 6, 2 * MS, 20 * MS, 2);
@@ -283,6 +280,35 @@ static void leaving_time(void) {
     CHECK(victim_pm >= 700);
 }
 
+/* A thread that ends under its budget: with it untouched, with it spent, and
+ * after it left the policy. */
+static volatile int variant;
+static void *ending_thread(void *arg) {
+    int v = (int)(long)arg;
+    struct sched_param p = ss_param(20, 5, 1 * MS, 10 * MS, 4);
+    CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) >= 0);
+    if (v >= 1) {
+        long long until = thread_cpu_ns() + 3 * MS;
+        while (thread_cpu_ns() < until) {}
+    }
+#if SS_REBIND
+    if (v == 2) {
+        struct sched_param f = {.sched_priority = 20};
+        CHECK(sched_setscheduler(0, SCHED_FIFO, &f) == SCHED_SPORADIC);
+    }
+#endif
+    return NULL;
+}
+static void endings(int cpu) {
+    for (int v = 0; v < (SS_REBIND ? 3 : 2); v++) {
+        printf("sporadic: CPU %d: a thread ends, variant %d\n", cpu, v);
+        int err;
+        pthread_t t = make(ending_thread, (void *)(long)v, NULL, &err);
+        CHECK(err == 0);
+        CHECK(pthread_join(t, NULL) == 0);
+    }
+}
+
 /* Everything on one CPU: threads made by a thread go where it runs. */
 static void *scenario(void *arg) {
     int cpu = (int)(long)arg;
@@ -292,6 +318,7 @@ static void *scenario(void *arg) {
     CHECK(pthread_setschedparam(pthread_self(), SCHED_FIFO, &top) == 0);
     int err;
     if (cpu >= 1) {
+        endings(cpu);
         run(basic_thread, NULL);
         run(refused_thread, NULL);
         /* A thread holds the whole row: a small request and the creation of
