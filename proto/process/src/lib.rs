@@ -217,8 +217,8 @@ pub mod lifetimes;
 pub mod retry;
 pub mod sporadic;
 
-/// Version 15: Budget (number 42) gives POSIX threads time budgets through
-/// the service (`sporadic`). Version 14: EntropyRejoin (number 4) gives a process that has no channel
+/// Version 15: Budget (number 42), the time budgets of POSIX threads under
+/// SCHED_SPORADIC (`sporadic`). Version 14: EntropyRejoin (number 4) gives a process that has no channel
 /// to init a new session with the entropy service after the service's
 /// instance ended. Version 13: LoaderRoot (number 43, which LoaderTerminal
 /// had) names the slot whose root it asks for in a body, and the notary marks
@@ -588,8 +588,9 @@ pub enum Method {
     /// reply is the status u32 and the operation's values.
     Account = 63,
     /// The time budgets of POSIX threads (SCHED_SPORADIC): a body of the
-    /// operation u32 (`sporadic::ASK` ...) and its fields. The number is one
-    /// of the gaps below 64.
+    /// operation u32 (`sporadic::SET` ...) and its fields, each with a `flags`
+    /// word and a reserved word that are zero. The number is one of the gaps
+    /// below 64. In 0.5.0 the service refuses every operation (`sporadic`).
     Budget = 42,
 }
 

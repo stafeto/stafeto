@@ -12,7 +12,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
-pub mod budgets;
+pub mod budget;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
 pub mod images;

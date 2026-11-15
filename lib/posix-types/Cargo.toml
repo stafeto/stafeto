@@ -9,8 +9,3 @@ description = "C ABI types and metadata conversion for stafeto Rust POSIX"
 
 [dependencies]
 proto-fs = { path = "../../proto/fs" }
-
-[features]
-# Deliberate breakage (`cargo xtask sporadic-breaks`): the layer does not
-# check that `sched_ss_low_priority` is below `sched_priority`.
-break-ss-ignore-low = []

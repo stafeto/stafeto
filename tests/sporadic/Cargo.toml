@@ -8,15 +8,14 @@ license = "GPL-3.0-or-later"
 description = "SCHED_SPORADIC through relibc and the Rust POSIX layer"
 build = "build.rs"
 
-[features]
-break-ss-no-unbind = ["posix-abi/break-ss-no-unbind"]
-
 [[bin]]
 name = "sporadic-probe"
 test = false
 bench = false
 
 [dependencies]
-posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
+posix-abi = { path = "../../lib/posix-abi" }
 posix-crt = { path = "../../lib/posix-crt" }
+proto-process = { path = "../../proto/process" }
+proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }

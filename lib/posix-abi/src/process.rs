@@ -1300,9 +1300,6 @@ pub struct SpawnAttributes {
     pub default: u64,
     pub umask: u32,
     pub sched: Option<(i32, i32)>,
-    /// The parameters of the sporadic server of the child, when `sched` names
-    /// SCHED_SPORADIC.
-    pub ss: Option<posix_types::sporadic::Ss>,
 }
 
 /// The errno of a refusal of SpawnStart.
@@ -1545,7 +1542,7 @@ pub fn spawn_search<'s, 'a>(
     // The scheduling the child starts with is checked before anything is
     // made: EINVAL for a policy or priority out of range, EPERM for a
     // rise the caller may not make.
-    let sched = crate::sched::for_child(attributes.sched, attributes.ss)?;
+    let sched = crate::sched::for_child(attributes.sched)?;
     let mut shadow = Shadow::take()?;
     shadow.umask = attributes.umask;
     shadow.real_ids = attributes.flags & proto_process::SPAWN_RESETIDS != 0
@@ -1676,7 +1673,7 @@ fn spawn_shadowed<'s>(
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     attributes: SpawnAttributes,
-    (level, sched, ss): (u8, u64, Option<posix_types::sporadic::Ss>),
+    (level, sched): (u8, u64),
     shadow: &Shadow,
 ) -> Result<i32, i32> {
     use crate::constants::{EAGAIN, EIO};
@@ -1722,13 +1719,7 @@ fn spawn_shadowed<'s>(
     let pid = r.u32().map_err(|_| EIO)?;
     let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
     let pid = i32::try_from(pid).map_err(|_| EIO)?;
-    // A child under a sporadic server has its budget reserved before it is
-    // made live: a refused share is EAGAIN and no child.
-    let reserved = ss.map_or(Ok(()), |ss| {
-        let low = crate::sched::level_of(crate::sched::SCHED_FIFO, ss.low).map_or(1, |(l, _)| l);
-        crate::sporadic::reserve(pid as u32, 0, 1, &ss, low).map_err(|_| EAGAIN)
-    });
-    let finished = reserved.and_then(|()| commit(&c, pid, len, object, shadow));
+    let finished = commit(&c, pid, len, object, shadow);
     if finished.is_err() {
         let _ = ask(&request(Method::SpawnAbort, &[pid as u32])?);
     }
@@ -1857,7 +1848,7 @@ fn exec_stopped<'s>(
     let (len, object) = built?;
     // The new image keeps the policy and priority of the calling thread
     // (XSH exec); it starts at the top level and moves there.
-    let (level, sched, ss) = crate::sched::for_child(None, None)?;
+    let (level, sched) = crate::sched::for_child(None)?;
     let start = SpawnStart {
         flags: 0,
         pgroup: 0,
@@ -1891,16 +1882,6 @@ fn exec_stopped<'s>(
     if let Err(errno) = ready {
         let _ = request(Method::ExecAbort, &[]).and_then(|w| ask(&w));
         return Err(errno);
-    }
-    // The new image under a sporadic server has its budget reserved before
-    // the commit, replacing the calling thread's (XSH exec: the policy is kept).
-    if let Some(ss) = ss {
-        let low = crate::sched::level_of(crate::sched::SCHED_FIFO, ss.low).map_or(1, |(l, _)| l);
-        let own = crate::threads::thread_number();
-        if crate::sporadic::reserve(0, own, 1, &ss, low).is_err() {
-            let _ = request(Method::ExecAbort, &[]).and_then(|w| ask(&w));
-            return Err(EAGAIN);
-        }
     }
     // The probes of the window: the old image ends before ExecCommit.
     match probe {

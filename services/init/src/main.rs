@@ -16,7 +16,6 @@
 #![no_std]
 #![no_main]
 
-mod budget_call;
 mod serve;
 mod worker;
 
@@ -36,11 +35,10 @@ rt::entry!(main);
 // The arguments init gives a record fit the start data of rt (spec 13.3).
 const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
 // Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
-// xtask), twice while `Init::new` builds it: 46 KiB at most, 18 left. The
+// xtask), twice while `Init::new` builds it: 44 KiB at most, 20 left. The
 // handles of eight DMA objects of each record's instance (table::MAX_DMA,
-// for the network service with two devices) made it 22 000 bytes, and the
-// list of the time budgets of POSIX threads (posix_budget) 800 more.
-const _: () = assert!(core::mem::size_of::<serve::Init>() <= 23 * 1024);
+// for the network service with two devices) made it 22 000 bytes.
+const _: () = assert!(core::mem::size_of::<serve::Init>() <= 22 * 1024);
 
 /// Where init maps the boot image, read-only, for as long as it lives: the
 /// programs it loads are read from there.

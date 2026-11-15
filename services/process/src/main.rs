@@ -24,7 +24,6 @@ use core::cell::UnsafeCell;
 #[cfg(feature = "image-probe")]
 mod image_probe_main;
 use core::sync::atomic::Ordering;
-use posix_process_service::budgets::Budgets;
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::images::{self, Images};
@@ -58,7 +57,6 @@ use rt::{
     sys,
 };
 mod adopt;
-mod budgeter;
 mod ends;
 mod generations;
 mod jobs;
@@ -68,7 +66,6 @@ mod make;
 mod pages;
 mod rejoiner;
 mod replace;
-mod sched;
 use core::mem::{ManuallyDrop, MaybeUninit};
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
@@ -334,10 +331,6 @@ struct Processes {
     replacing: [Option<Replacing>; RECORDS],
     replace_queue: Queue,
     replacer: Option<Pending>,
-    /// The time budgets of POSIX threads (sched.rs) and the budget thread's
-    /// WORK that waits for a job.
-    budgets: Budgets<Handle<rt::handle::Budget>, Pending>,
-    budgeter: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
     /// The occurrences of signals queued behind the one on a page.
@@ -446,8 +439,6 @@ impl Processes {
             Records::initialize_at(addr_of_mut!((*at).records));
             rt::bss::fill_none(addr_of_mut!((*at).replacing));
             addr_of_mut!((*at).replacer).write(None);
-            addr_of_mut!((*at).budgets).write(Budgets::new());
-            addr_of_mut!((*at).budgeter).write(None);
             Queued::initialize_at(addr_of_mut!((*at).queued));
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             Waits::initialize_at(addr_of_mut!((*at).waits));
@@ -533,7 +524,6 @@ fn main(_: u64) -> u64 {
     }
     if adopt::start(&start.process, level).is_err()
         || replace::start(&start.process, level).is_err()
-        || budgeter::start(&start.process, level).is_err()
         || ends::start(&start.process, &identities, level).is_err()
     {
         return 6;
@@ -3765,21 +3755,7 @@ impl Processes {
             .records
             .get(child)
             .map_or(0, |record| u64::from(record.cpus));
-        let mut allowed = placing::allowed_cpus(page, record);
-        // A child of a thread under a sporadic server needs a share of its
-        // CPU for its own budget, and CPU 0 has none (init's POSIX_BUDGETS):
-        // it goes to the others when it may.
-        let parent_pid = self
-            .records
-            .get(parent)
-            .map_or(0, |r| u64::from(r.label.pid()));
-        if cpus > 1 && self.budgets.holds(parent, parent_pid) {
-            let all = if allowed == 0 { u64::MAX } else { allowed };
-            let others = all & !1 & ((1u64 << cpus) - 1);
-            if others != 0 {
-                allowed = others;
-            }
-        }
+        let allowed = placing::allowed_cpus(page, record);
         let now = Self::timer_now();
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);
@@ -4752,6 +4728,29 @@ impl Processes {
         }
     }
 }
+impl Processes {
+    /// Method::Budget: in 0.5.0 every operation is refused, so that no
+    /// program binds, unbinds or reports on a budget of its own
+    /// (`posix_process_service::budget`).
+    fn budget(&mut self, r: &mut Request<'_>) -> Answer {
+        use posix_process_service::budget::{Reply, answer};
+        let mut body = r.body();
+        let Ok(op) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        // A copy of the handles that came is never kept: they close with the request.
+        match answer(r.label() != 0, op, body, r.handles.len()) {
+            Reply::Status(status) => Answer::Status(status),
+            Reply::Shares(shares) => {
+                let reply = r.reply();
+                if reply.u32(0).and_then(|()| shares.write(reply)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+        }
+    }
+}
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = {
@@ -5153,8 +5152,6 @@ impl Service<0> for Processes {
         // An exec that waited for init goes on: its new image is dead.
         self.replace_queue.remove(index);
         self.finish_replace(index);
-        // The shares of its threads' time budgets go back to init.
-        self.budgets_of_record_ended(index);
         self.tickets[index] = 0;
         self.rejoin.ended(index);
         // Init reads the end once the witness closed.

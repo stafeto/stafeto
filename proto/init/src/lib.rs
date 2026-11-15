@@ -144,21 +144,24 @@
 //! INVALID_ARGS for a ticket no running instance has. The service lets the
 //! new image run only after the answer.
 //!
-//! BUDGET, from the process service alone (SCHED_SPORADIC of POSIX threads,
-//! spec 8): the header, an operation u32 and its fields. ASK (`BudgetAsk`):
-//! init checks the share of the CPU that POSIX threads may take together
-//! (`POSIX_BUDGETS` of its table), makes a time budget with the system
-//! resource's right BUDGET and replies status u32, zero u32, the budget's
-//! number u64 and one handle, the budget (BUDGET_RIGHTS); `FULL_SHARE` for a
-//! share that is gone (the sum on the CPU, or no room in init's list of
-//! POSIX budgets), INVALID_ARGS for numbers the kernel refuses, another
-//! kernel status for a call that failed (NO_MEMORY of init's quota). A budget
-//! that replaces another (`replace` not 0) is checked against the sum less
-//! the share of the old one on the same CPU, and the old one stays counted
-//! until its RELEASE: a rebind that fails leaves it as it was. RELEASE: the
-//! number u64; its share goes back, the reply is its status; INVALID_ARGS
-//! for a number init does not hold. Init forgets all numbers when the
-//! process service's instance ends.
+//! BUDGET, from the process service alone (the time budgets of POSIX threads
+//! under SCHED_SPORADIC, spec 8): the header, an operation u32 and its fields,
+//! each message with a `flags` word and a reserved word that are zero
+//! (INVALID_ARGS for any other). Init makes each budget and gives its one
+//! handle to the service, which keeps it; init counts the shares by CPU. ASK
+//! (`BudgetAsk`): a budget for a thread on `cpu`, replacing the budget
+//! `replace` (0 for none) of the same CPU, whose share is counted out for the
+//! check and stays counted until its RELEASE; the reply is status u32, zero
+//! u32, the budget's number u32, zero u32 and one handle, the budget
+//! (BUDGET_RIGHTS). RELEASE (`BudgetRelease`): the number u32 and `flags` u32;
+//! the service sends it only after it took the budget off its thread; the
+//! reply is its status. SHARES (no fields after the operation): the reply is
+//! the status u32, zero u32 and the share of each of the eight CPUs that POSIX
+//! threads may take together, in parts per million, a u32 each. Only the
+//! process service may ask (BAD_STATE for any other caller); INVALID_ARGS for
+//! a body off the rules, LIMIT_REACHED (`FULL_SHARE`) for a share that is
+//! gone. In 0.5.0 init has no share to give and holds no list: ASK is
+//! LIMIT_REACHED, RELEASE INVALID_ARGS, SHARES all zeros.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -308,44 +311,108 @@ pub const LAST: u16 = 1;
 /// The operations of BUDGET, the first u32 of its body.
 pub const BUDGET_ASK: u32 = 1;
 pub const BUDGET_RELEASE: u32 = 2;
+pub const BUDGET_SHARES: u32 = 3;
 
 /// The kernel status of a BUDGET whose share is not there.
 pub const FULL_SHARE: abi::Error = abi::Error::LimitReached;
 
-/// The body of BUDGET ASK after the operation: 36 bytes.
+/// The pending replenishments of a budget, 1 to this (the ring of the kernel).
+pub const BUDGET_REPL_MAX: u32 = 4;
+
+/// The body of BUDGET ASK after the operation, 40 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetAsk {
     pub cpu: u32,
     /// The level the thread falls to when its budget is gone.
     pub low: u32,
-    /// Pending replenishments, 1 to 4.
+    /// Pending replenishments, 1 to `BUDGET_REPL_MAX`.
     pub max_repl: u32,
+    pub flags: u32,
+    /// The number of the budget this one replaces, 0 for none.
+    pub replace: u32,
+    pub reserved: u32,
     pub c_ns: u64,
     pub t_ns: u64,
-    /// The number of the budget this one replaces, 0 for none.
-    pub replace: u64,
 }
 
 impl BudgetAsk {
+    pub const LEN: usize = 40;
+
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u32(self.cpu)?;
         w.u32(self.low)?;
         w.u32(self.max_repl)?;
+        w.u32(self.flags)?;
+        w.u32(self.replace)?;
+        w.u32(self.reserved)?;
         w.u64(self.c_ns)?;
-        w.u64(self.t_ns)?;
-        w.u64(self.replace)
+        w.u64(self.t_ns)
     }
 
-    /// BAD_SIZE for a body that is short.
+    /// BAD_SIZE for a body that is short; INVALID_ARGS for a flag or a
+    /// reserved word that is not zero.
     pub fn read(r: &mut Reader<'_>) -> Result<BudgetAsk, Status> {
-        Ok(BudgetAsk {
+        let ask = BudgetAsk {
             cpu: r.u32()?,
             low: r.u32()?,
             max_repl: r.u32()?,
+            flags: r.u32()?,
+            replace: r.u32()?,
+            reserved: r.u32()?,
             c_ns: r.u64()?,
             t_ns: r.u64()?,
-            replace: r.u64()?,
-        })
+        };
+        if ask.flags != 0 || ask.reserved != 0 {
+            return Err(Status::Kernel(abi::Error::InvalidArgs));
+        }
+        Ok(ask)
+    }
+}
+
+/// The body of BUDGET RELEASE after the operation, 8 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetRelease {
+    pub id: u32,
+    pub flags: u32,
+}
+
+impl BudgetRelease {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.id)?;
+        w.u32(self.flags)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetRelease, Status> {
+        let release = BudgetRelease {
+            id: r.u32()?,
+            flags: r.u32()?,
+        };
+        if release.flags != 0 {
+            return Err(Status::Kernel(abi::Error::InvalidArgs));
+        }
+        Ok(release)
+    }
+}
+
+/// The reply of BUDGET SHARES after the status and a zero u32: the share of
+/// each CPU, 32 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetShares(pub [u32; 8]);
+
+impl BudgetShares {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for ppm in self.0 {
+            w.u32(ppm)?;
+        }
+        Ok(())
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<BudgetShares, Status> {
+        let mut ppm = [0; 8];
+        for share in &mut ppm {
+            *share = r.u32()?;
+        }
+        Ok(BudgetShares(ppm))
     }
 }
 
@@ -1519,24 +1586,62 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_request_keeps_its_fields() {
+    fn the_budget_bodies_keep_their_fields_and_refuse_flags_and_reserved_words() {
         let ask = BudgetAsk {
             cpu: 2,
             low: 7,
             max_repl: 3,
+            flags: 0,
+            replace: 9,
+            reserved: 0,
             c_ns: 1_000_000,
             t_ns: 10_000_000,
-            replace: 9,
         };
         let mut w = Writer::new();
         ask.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 36);
+        assert_eq!(w.as_bytes().len(), BudgetAsk::LEN);
         let mut r = Reader::new(w.as_bytes());
         assert_eq!(BudgetAsk::read(&mut r), Ok(ask));
         assert_eq!(r.finish(), Ok(()));
         assert_eq!(
-            BudgetAsk::read(&mut Reader::new(&w.as_bytes()[..35])),
+            BudgetAsk::read(&mut Reader::new(&w.as_bytes()[..BudgetAsk::LEN - 1])),
             Err(Status::BadSize)
+        );
+        let invalid = Status::Kernel(abi::Error::InvalidArgs);
+        for (flags, reserved) in [(1, 0), (0, 1)] {
+            let mut w = Writer::new();
+            BudgetAsk {
+                flags,
+                reserved,
+                ..ask
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(
+                BudgetAsk::read(&mut Reader::new(w.as_bytes())),
+                Err(invalid)
+            );
+        }
+        let release = BudgetRelease { id: 4, flags: 0 };
+        let mut w = Writer::new();
+        release.write(&mut w).unwrap();
+        assert_eq!(
+            BudgetRelease::read(&mut Reader::new(w.as_bytes())),
+            Ok(release)
+        );
+        let mut w = Writer::new();
+        BudgetRelease { id: 4, flags: 1 }.write(&mut w).unwrap();
+        assert_eq!(
+            BudgetRelease::read(&mut Reader::new(w.as_bytes())),
+            Err(invalid)
+        );
+        let shares = BudgetShares([0, 200_000, 500_000, 500_000, 0, 0, 0, 0]);
+        let mut w = Writer::new();
+        shares.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 32);
+        assert_eq!(
+            BudgetShares::read(&mut Reader::new(w.as_bytes())),
+            Ok(shares)
         );
     }
 

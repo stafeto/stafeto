@@ -1667,7 +1667,6 @@ pub const IMAGES: &[&str] = &[
     "boot-full.img",
     "boot-pkg-probe.img",
     "boot-sporadic.img",
-    "boot-sporadic-broken.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -2048,7 +2047,6 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         "boot-posix-procs.img"
         | "boot-sporadic.img"
-        | "boot-sporadic-broken.img"
         | "boot-posix-jobs.img"
         | "boot-posix-lifetimes.img"
         | "boot-posix-lock-rules.img"
@@ -2857,7 +2855,6 @@ mod tests {
                 "boot-net-steps-two.img" => &crate::net_probe::TWO_STEPS_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-sporadic.img" => &crate::SPORADIC_PROGRAMS,
-                "boot-sporadic-broken.img" => &crate::SPORADIC_BROKEN_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,
                 "boot-posix-fifo.img" => &crate::POSIX_FIFO_PROGRAMS,

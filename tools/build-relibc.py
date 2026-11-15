@@ -175,13 +175,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # posix_spawnattr_t hold it whole and keep 16 reserved bytes (96 bytes each);
 # SCHED_SPORADIC and the option macros wait for the implementation; tagged
 # pin-178e2b98.
-# SCHED_SPORADIC (4, stafeto-design#735): the whole sched_param goes to the
-# layer in sched_setscheduler, sched_setparam, sched_getparam,
-# pthread_setschedparam, pthread_getschedparam, pthread_create and
-# posix_spawn, _POSIX_SPORADIC_SERVER and _POSIX_THREAD_SPORADIC_SERVER are
-# 202405L, SS_REPL_MAX is 4 (limits.h, sched.h, sysconf), platform interface
-# 24; tagged pin-a2a22ee0.
-COMMIT = "a2a22ee0bc8d5ee23c6978cc71b5aa90412dcc61"
+# SCHED_SPORADIC (4, stafeto-design#735) for compilation only in 0.5.0: the
+# whole sched_param goes to the layer, _POSIX_SPORADIC_SERVER and
+# _POSIX_THREAD_SPORADIC_SERVER are 0 and sysconf says -1, SS_REPL_MAX is 4 in
+# limits.h, pthread_attr_setschedpolicy answers ENOTSUP, platform interface 24;
+# tagged pin-8381e60f.
+COMMIT = "8381e60ffca9c378ac185f284bfe3c6f7cffb0e6"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

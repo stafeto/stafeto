@@ -450,7 +450,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
         }
     };
     PROBE_LOADING_PID.store(pid, Ordering::Release);
-    let made = make(&c, regions, sessions, window, pid);
+    let made = make(&c, regions, sessions, window);
     step(9);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
@@ -467,14 +467,7 @@ fn make(
     regions: Regions,
     sessions: Sessions,
     window: Option<fn()>,
-    pid: u32,
 ) -> Result<(), i32> {
-    // A child of a thread under a sporadic server has its budget reserved
-    // before the copy: a refused share is EAGAIN and no child.
-    if let Err(errno) = crate::sporadic::reserve_child(pid) {
-        sessions.close();
-        return Err(errno);
-    }
     // SAFETY: only CONTEXT's address and its stack pointer, which `point`
     // wrote before this ran.
     let sp = unsafe { (*CONTEXT.0.get()).sp };
@@ -980,15 +973,7 @@ fn child() -> Result<(), &'static str> {
         crate::mmap::forget_limits();
         crate::threads::after_fork(thread).map_err(|_| "its thread")?;
         posix_sync::after_fork();
-        crate::sporadic::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
-        // The child runs under the sporadic server its parent's thread did:
-        // the budget the parent's call reserved for it is taken now.
-        if crate::sched::own_policy() == crate::sched::SCHED_SPORADIC
-            && crate::sporadic::take_own(crate::threads::thread_number()).is_err()
-        {
-            return Err("its sporadic budget");
-        }
         if let Some(files) = handle(raw(Slot::Files)) {
             crate::shared::after_fork(
                 files,

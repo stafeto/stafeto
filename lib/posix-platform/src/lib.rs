@@ -704,21 +704,6 @@ unsafe fn spawn(
             None
         }
     });
-    // The parameters of a sporadic server the child starts under.
-    let ss = match attributes {
-        Some(a)
-            if (a.flags & SPAWN_SETSCHEDULER != 0
-                && a.policy == posix_types::sporadic::SCHED_SPORADIC)
-                || (a.flags & SPAWN_SETSCHEDPARAM != 0
-                    && posix_abi::sched::own_policy() == posix_types::sporadic::SCHED_SPORADIC) =>
-        {
-            match posix_types::sporadic::validate(&a.param) {
-                Ok(ss) => Some(ss),
-                Err(errno) => return -errno,
-            }
-        }
-        _ => None,
-    };
     let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
         return -posix_abi::constants::EINVAL;
     };
@@ -736,7 +721,6 @@ unsafe fn spawn(
         default,
         umask,
         sched,
-        ss,
     };
     // SAFETY: the caller's promise for argv, envp and the file actions.
     let (argv, envp, file_actions) =
@@ -1696,9 +1680,9 @@ pub extern "C" fn stafeto_sched_getscheduler(pid: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_sched_getparam(pid: c_int, param: *mut SchedParam) -> c_int {
     match call(|| posix_abi::sched::getparam(pid)) {
-        Ok(value) => {
+        Ok(priority) => {
             // SAFETY: the caller's promise.
-            unsafe { param.write(value) };
+            unsafe { param.write(SchedParam::with_priority(priority)) };
             0
         }
         Err(errno) => -errno,
@@ -1717,8 +1701,8 @@ pub unsafe extern "C" fn stafeto_sched_set(
     param: *const SchedParam,
 ) -> c_int {
     // SAFETY: the caller's promise.
-    let param = unsafe { param.read() };
-    call(|| posix_abi::sched::set(pid, policy, &param)).unwrap_or_else(|errno| -errno)
+    let priority = unsafe { param.read() }.sched_priority;
+    call(|| posix_abi::sched::set(pid, policy, priority)).unwrap_or_else(|errno| -errno)
 }
 
 /// The CPUs that are up (sysconf `_SC_NPROCESSORS_CONF` and
@@ -1777,11 +1761,11 @@ pub unsafe extern "C" fn stafeto_thread_sched_get(
     param: *mut SchedParam,
 ) -> c_int {
     match posix_abi::sched::thread_get(tid as u64) {
-        Ok((kind, value)) => {
+        Ok((kind, priority)) => {
             // SAFETY: the caller's promise.
             unsafe {
                 policy.write(kind);
-                param.write(value);
+                param.write(SchedParam::with_priority(priority));
             }
             0
         }
@@ -1802,8 +1786,8 @@ pub unsafe extern "C" fn stafeto_thread_sched_set(
     tail: c_int,
 ) -> c_int {
     // SAFETY: the caller's promise.
-    let param = unsafe { param.read() };
-    posix_abi::sched::thread_set(tid as u64, policy, &param, tail != 0)
+    let priority = unsafe { param.read() }.sched_priority;
+    posix_abi::sched::thread_set(tid as u64, policy, priority, tail != 0)
         .map_or_else(|errno| -errno, |_| 0)
 }
 
@@ -1818,8 +1802,8 @@ pub unsafe extern "C" fn stafeto_thread_next_sched(
     param: *const SchedParam,
 ) -> c_int {
     // SAFETY: the caller's promise.
-    let param = unsafe { param.read() };
-    posix_abi::sched::next_sched(policy, &param).map_or_else(|errno| -errno, |()| 0)
+    let priority = unsafe { param.read() }.sched_priority;
+    posix_abi::sched::next_sched(policy, priority).map_or_else(|errno| -errno, |()| 0)
 }
 
 /// futex_wait for a mutex of PTHREAD_PRIO_INHERIT that the thread `owner`
