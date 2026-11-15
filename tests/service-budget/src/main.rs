@@ -831,10 +831,8 @@ fn level40(
     for i in 0..n {
         GREEDY_SESSIONS[i].store(sessions[i].as_ref().map_or(0, |s| s.raw().0), Relaxed);
         PIPE_ENDS[i].store(0, Relaxed);
-        if kind == 1 {
-            if let Some(s) = &sessions[i] {
-                heavy(1, s, i, false);
-            }
+        if let (1, Some(s)) = (kind, &sessions[i]) {
+            heavy(1, s, i, false);
         }
     }
     // Alone: the longest single request of the dear kind and of the thread's own.

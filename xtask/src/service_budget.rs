@@ -260,11 +260,7 @@ fn run_image_on(
                     .collect::<Vec<_>>()
                     .join(" ")
             });
-        let tail = outcome
-            .lines
-            .iter()
-            .filter(|l| l.starts_with("svcbudget"))
-            .last();
+        let tail = outcome.lines.iter().rfind(|l| l.starts_with("svcbudget"));
         return Err(format!(
             "the probe did not finish: {:?}{} (last line of the probe: {tail:?})",
             outcome.lines.last(),
