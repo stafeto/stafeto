@@ -148,7 +148,8 @@ static void *basic_thread(void *arg) {
     (void)arg;
     struct sched_param p = ss_param(20, 5, 1 * MS, 10 * MS, 3), got, got2;
     int old = sched_getscheduler(0);
-    CHECK(sched_setscheduler(0, SCHED_SPORADIC, &p) == old);
+    int set = sched_setscheduler(0, SCHED_SPORADIC, &p);
+    if (set != old) FAIL("sched_setscheduler gave %d, errno %d (the old policy is %d, CPU %d)", set, errno, old, sched_getcpu());
     CHECK(sched_getscheduler(0) == SCHED_SPORADIC);
     CHECK(sched_getparam(0, &got) == 0 && same(&got, &p));
     int policy = -1;
