@@ -155,8 +155,9 @@ them for the licence notes of the image.
   password login at all, no port forwarding, host keys made when first needed (the build has no
   syslog, so the log goes to the standard error, and `-E` is not an option of it); the server is started again a second after it ends. `cargo xtask net-ssh` runs
   it on `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused
-  key, refused passwords of 257 and 1 024 bytes, the command line of the server from
-  `/proc/<pid>/cmdline` and the pseudo terminals.
+  key, refused passwords of 257 and 1 024 bytes, the options of the server shown at work (the
+  public key alone offered, both kinds of port forwarding refused; `/proc/<pid>/cmdline` holds the name
+  of a program alone, so the launcher prints the command line it starts) and the pseudo terminals.
 - nginx 1.30.6 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
   `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
   exception, linked into nginx, no file of its own) are network packages

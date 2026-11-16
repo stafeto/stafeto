@@ -11,8 +11,10 @@
 //! 1. The image: `/etc/dropbear` holds no file (the host keys are made on
 //!    the first start), `/etc/shadow` locks every account (the check of
 //!    rootfs.rs), and the package carries its licence notice.
-//! 2. The command line of the running server, read from
-//!    `/proc/<pid>/cmdline`, is exactly `dropbear -F -R -s -j -k`: the
+//! 2. The one process named dropbear is running (`/proc/<pid>/cmdline`
+//!    holds the name of a program alone, the process service keeps no
+//!    arguments), and the launcher printed the command line it started it
+//!    with, exactly `dropbear -F -R -s -j -k`: the
 //!    password login is off, no port is forwarded, the host keys are made
 //!    when first needed (the build has no syslog, so the log goes to the
 //!    standard error).
@@ -256,33 +258,116 @@ fn guest(run: &mut qemu::Run, command: &str, marker: &str) -> Result<Vec<String>
     net_tls::capture(run, command, marker, DIALOG_STEP)
 }
 
-/// Step 2: the one running server and its command line.
-fn command_line(run: &mut qemu::Run) -> Result<(), String> {
-    let lines = guest(
+/// Step 2: the one running server. `/proc/<pid>/cmdline` of the system holds
+/// the name of the program alone (the process service keeps no arguments), so
+/// the command line is the line the launcher printed before it started the
+/// server; the options are then shown at work (steps 4 and 5).
+fn command_line(run: &mut qemu::Run, lines: &[String]) -> Result<(), String> {
+    let wanted = format!("ash-launch: {}", SERVER_LINE.join(" "));
+    if !lines.iter().any(|l| l.trim().ends_with(&wanted)) {
+        return Err(format!("the launcher printed no {wanted:?}"));
+    }
+    let found = guest(
         run,
         "for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); case \"$c\" in dropbear*) echo \"cmd ${p#/proc/}: $c\";; esac; done",
         "cmdline",
     )?;
-    let found: Vec<&String> = lines.iter().filter(|l| l.starts_with("cmd ")).collect();
+    let found: Vec<&String> = found.iter().filter(|l| l.starts_with("cmd ")).collect();
     let [line] = found.as_slice() else {
         return Err(format!(
-            "the guest runs {} servers named dropbear, wanted one: {lines:?}",
+            "the guest runs {} processes named dropbear, wanted one: {found:?}",
             found.len()
         ));
     };
-    let words: Vec<&str> = line
-        .split_once(": ")
-        .map(|(_, c)| c.split_whitespace().collect())
-        .unwrap_or_default();
-    if words != SERVER_LINE {
-        return Err(format!(
-            "the server runs as {words:?} ({line}), wanted {SERVER_LINE:?}"
-        ));
-    }
     println!(
-        "net-ssh: the server's command line is {}",
+        "net-ssh: one process named dropbear ({line}), started as {}",
         SERVER_LINE.join(" ")
     );
+    Ok(())
+}
+
+/// `-s`: the methods the server offers are the public key alone.
+fn methods(client: &Client) -> Result<(), String> {
+    let mut ssh = client.command("root", None, true);
+    ssh.args(["-v", "-o", "PreferredAuthentications=none"])
+        .arg("true");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    let offered = said
+        .stderr
+        .lines()
+        .find_map(|l| l.split_once("Authentications that can continue: "))
+        .map(|(_, list)| list.trim().trim_end_matches('.').to_owned())
+        .ok_or_else(|| format!("the server named no methods: {:?}", said.stderr))?;
+    if offered != "publickey" {
+        return Err(format!(
+            "the server offers {offered:?}, wanted publickey alone"
+        ));
+    }
+    println!("net-ssh: the server offers the public key alone (-s)");
+    Ok(())
+}
+
+/// `-k` and `-j`: a remote forward is refused, and a local forward opens a
+/// listener on the host whose connections the server refuses to carry.
+fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.args([
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-N",
+        "-R",
+        "19999:127.0.0.1:1",
+    ]);
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code != Some(255) || !said.stderr.contains("forwarding failed") {
+        return Err(format!(
+            "a remote forward gave {:?}, wanted refusal: {:?}",
+            said.code, said.stderr
+        ));
+    }
+    println!("net-ssh: a remote port forward is refused (-k)");
+    let local = crate::net_curl::free_tcp_port()?;
+    let mut command = client.command("root", Some(key), true);
+    command
+        .args(["-N", "-L"])
+        .arg(format!("{local}:127.0.0.1:80"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("ssh: {e}"))?;
+    let mut err = child.stderr.take().ok_or("ssh: no stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = err.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], local).into();
+    let deadline = Instant::now() + LOGIN_WITHIN;
+    let mut stream = loop {
+        match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the local forward never listened: {e}"));
+            }
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.write_all(b"GET / HTTP/1.0\r\n\r\n");
+    let mut got = Vec::new();
+    let _ = stream.read_to_end(&mut got);
+    let _ = child.kill();
+    let _ = child.wait();
+    let said = reader.join().unwrap_or_default();
+    if !got.is_empty() || !said.contains("administratively prohibited") {
+        return Err(format!(
+            "a local forward carried {} bytes, wanted refusal; ssh said {said:?}",
+            got.len()
+        ));
+    }
+    println!("net-ssh: a local port forward is refused (-j)");
     Ok(())
 }
 
@@ -398,7 +483,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         if held.iter().map(|l| l.trim()).collect::<Vec<_>>() != ["0"] {
             return Err(format!("/etc/dropbear is not empty at the start: {held:?}"));
         }
-        command_line(&mut run)?;
+        let seen = run.lines().to_vec();
+        command_line(&mut run, &seen)?;
         // The key of the probe, and an account whose field is `*`.
         run.send(&format!(
             "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '{good_line}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && echo 'star:x:1001:100:star:/tmp:/bin/ash' >> /etc/passwd && echo 'star:*:20000:0:99999:7:::' >> /etc/shadow && echo placed-$?"
@@ -478,6 +564,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         println!(
             "net-ssh: a session with a terminal runs a shell, {LINES} lines come back in order and its exit status is 3"
         );
+        methods(&client)?;
+        forwarding(&client, &good)?;
         // 4.
         let mut ssh = client.command("root", Some(&bad), true);
         ssh.arg("echo must-not-run");
@@ -560,7 +648,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         }
         println!("net-ssh: after they ended a new session got its terminal at once");
         // 7: the server is still the one process and still answers.
-        command_line(&mut run)?;
+        let seen = run.lines().to_vec();
+        command_line(&mut run, &seen)?;
         let mut ssh = client.command("root", Some(&good), true);
         ssh.arg("echo last-$((6*7))");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;

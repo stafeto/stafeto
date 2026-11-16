@@ -49,6 +49,10 @@ unsafe extern "C" {
 /// so its log goes to the standard error and the option `-E` does not exist.
 #[cfg(feature = "dropbear")]
 const DROPBEAR: &[&core::ffi::CStr] = &[c"dropbear", c"-F", c"-R", c"-s", c"-j", c"-k"];
+/// The same words as one line, which the launcher prints (`/proc/<pid>/cmdline`
+/// holds the name of the program alone); xtask's `net-ssh` reads it.
+#[cfg(feature = "dropbear")]
+const DROPBEAR_LINE: &str = "dropbear -F -R -s -j -k";
 
 #[cfg(feature = "dropbear")]
 #[repr(C)]
@@ -148,6 +152,7 @@ fn launch_ash() -> c_int {
 /// launcher then never sees it end and does not try again).
 #[cfg(feature = "dropbear")]
 fn start_server() -> c_int {
+    rt::println!("ash-launch: {DROPBEAR_LINE}");
     match spawn(c"/bin/dropbear", DROPBEAR) {
         Ok(pid) => pid,
         Err(error) => {
