@@ -641,10 +641,11 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         let keys = guest(&mut run, "ls /etc/dropbear", "keys1")?;
         let keys: Vec<&str> = keys
             .iter()
-            .map(|l| l.trim())
-            .filter(|l| l.starts_with("dropbear_"))
+            .flat_map(|l| l.split_whitespace())
+            .filter(|w| w.starts_with("dropbear_"))
             .collect();
-        if keys != ["dropbear_ed25519_host_key"] {
+        // The key and its public half (`dropbearkey` writes both).
+        if keys != ["dropbear_ed25519_host_key", "dropbear_ed25519_host_key.pub"] {
             return Err(format!("the host keys in /etc/dropbear are {keys:?}"));
         }
         let known = Command::new("ssh-keygen")
