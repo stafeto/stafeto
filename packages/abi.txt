@@ -1,6 +1,6 @@
 format 1
 series 0.5
-state open
+state frozen
 libc 47f71bbb0a6318c9406f242115b474ac0ecb0f73e1f3936f22c7eb2750769321
 layouts d661fcf6b8e8df36ff0c702cc48147c76d42913f50e3486ea6ec613778cf1ab5
 loader b298b6cb67e84311d2c6e9fe373eebcd934b0356fe6fce6cf4b006d72d6ff50c
