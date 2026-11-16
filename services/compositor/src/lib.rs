@@ -42,8 +42,10 @@ pub const PER_CONTEXT: usize = 4;
 /// something over others, whose pixman operations cost more a point.
 pub const BAND_ROWS: u32 = 8;
 /// The points one band lays over others at most (a band of a frame that
-/// has a window with an alpha, or the pointer, in it): the lines are this
-/// many points over the width of the damage, one line at least.
+/// has a window with an alpha, or the pointer, in it; with several such
+/// layers each counts): the lines are this many points over the width of the
+/// damage and the layers, one line at least. pixman's portable OVER takes about
+/// 13 ticks a point and a call about 1 500.
 pub const OVER_POINTS: u32 = 640;
 
 /// Linux's key codes the scene knows: the Alt keys and Tab.
@@ -864,12 +866,15 @@ impl Scene {
                 && r.y < damage.y + damage.h
                 && damage.y < r.y + r.h
         };
+        // The layers laid over others in the damage: windows with an alpha
+        // and the pointer's picture.
         let argb = self
             .windows
             .iter()
             .flatten()
-            .any(|w| Scene::shown(w) && w.format == Format::Argb && touches(w.rect));
-        let cursor = self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p)));
+            .filter(|w| Scene::shown(w) && w.format == Format::Argb && touches(w.rect))
+            .count() as u32;
+        let cursor = u32::from(self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p))));
         let covered = self.windows.iter().flatten().any(|w| {
             Scene::shown(w)
                 && w.format == Format::Xrgb
@@ -878,8 +883,8 @@ impl Scene {
                 && w.rect.x + w.rect.w >= damage.x + damage.w
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
-        if argb || cursor {
-            (OVER_POINTS / damage.w.max(1)).clamp(1, BAND_ROWS / 2)
+        if argb + cursor > 0 {
+            (OVER_POINTS / (damage.w.max(1) * (argb + cursor))).clamp(1, BAND_ROWS / 2)
         } else if covered {
             BAND_ROWS
         } else {

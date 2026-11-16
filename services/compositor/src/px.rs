@@ -6,12 +6,12 @@
 //! buffer replacing or lying over those of the screen.
 
 use compositor::{Format, Raster};
-use pixman::{Format as Px, Source, Target, composite, fill};
+use pixman::{Format as Px, Images, Source, Target, composite, fill};
 use proto_comp::Rect;
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
-/// The operations over the screen's buffer.
-pub struct Pixman;
+/// The operations over the screen's buffer, and the pixman images they keep.
+pub struct Pixman(Images);
 
 const fn format(f: Format) -> Px {
     match f {
@@ -41,9 +41,20 @@ impl Pixman {
             width: 1,
             height: 1,
         };
-        composite(true, &mut target, from, (0, 0), (0, 0), (1, 1));
-        composite(false, &mut target, from, (0, 0), (0, 0), (1, 1));
-        Pixman
+        let mut images = Images::new();
+        composite(&mut images, true, &mut target, from, (0, 0), (0, 0), (1, 1));
+        composite(
+            &mut images,
+            false,
+            &mut target,
+            from,
+            (0, 0),
+            (0, 0),
+            (1, 1),
+        );
+        // The two images of the warm-up wrapped memory of this frame.
+        drop(images);
+        Pixman(Images::new())
     }
 }
 
@@ -85,6 +96,6 @@ impl Raster for Pixman {
             width: size.0,
             height: size.1,
         };
-        composite(over, &mut target, source, from, to, area);
+        composite(&mut self.0, over, &mut target, source, from, to, area);
     }
 }

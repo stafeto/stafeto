@@ -34,6 +34,10 @@ mod imp {
     // pixman_op_t: PIXMAN_OP_SRC and PIXMAN_OP_OVER.
     const OP_SRC: i32 = 1;
     const OP_OVER: i32 = 3;
+    /// The images kept: the screen's, the pointer's picture and the buffers
+    /// of the windows in use (three buffers of each of eight windows is more
+    /// than a frame touches at once).
+    const KEPT: usize = 16;
 
     unsafe extern "C" {
         fn pixman_image_create_bits(
@@ -77,32 +81,18 @@ mod imp {
         }
     }
 
-    /// A pixman image over `bytes`: `width` by `height` points of `stride`
-    /// bytes a line. None when pixman refuses (no memory in its arena).
-    struct Image(*mut c_void);
-
-    impl Image {
-        fn new(
-            format: Format,
-            width: u32,
-            height: u32,
-            stride: u32,
-            bytes: *mut u8,
-        ) -> Option<Image> {
-            // SAFETY: pixman reads the arguments; the bits are not owned by
-            // the image, which the caller drops before the bytes go.
-            let image = unsafe {
-                pixman_image_create_bits(
-                    code(format),
-                    width as i32,
-                    height as i32,
-                    bytes.cast::<u32>(),
-                    stride as i32,
-                )
-            };
-            (!image.is_null()).then_some(Image(image))
-        }
+    /// What identifies an image: the memory it wraps and how it reads it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Key {
+        bytes: usize,
+        format: Format,
+        stride: u32,
+        width: u32,
+        height: u32,
     }
+
+    /// A pixman image over memory. It does not own the pixels.
+    struct Image(*mut c_void);
 
     impl Drop for Image {
         fn drop(&mut self) {
@@ -112,10 +102,63 @@ mod imp {
         }
     }
 
+    /// The images of the surfaces the service composes with, kept from one
+    /// call to the next: making and dropping a pair of images costs more
+    /// ticks than the points of a band of a window. A surface is told by its
+    /// address and shape; the oldest image goes when the table is full. The
+    /// memory an image wraps is only read or written in a call, so a surface
+    /// whose memory is gone is harmless until the service names it again.
+    pub struct Images {
+        kept: [Option<(Key, Image)>; KEPT],
+        next: usize,
+    }
+
+    impl Images {
+        pub const fn new() -> Images {
+            Images {
+                kept: [const { None }; KEPT],
+                next: 0,
+            }
+        }
+
+        /// The image of `key`, made when it is not kept. None when pixman
+        /// refuses (no memory in its arena).
+        fn image(&mut self, key: Key) -> Option<*mut c_void> {
+            if let Some((_, image)) = self.kept.iter().flatten().find(|(k, _)| *k == key) {
+                return Some(image.0);
+            }
+            // SAFETY: pixman reads the arguments; the bits are not owned by
+            // the image, which is dropped (with the table) before the
+            // service ends and is never used on memory the service unmapped.
+            let image = unsafe {
+                pixman_image_create_bits(
+                    code(key.format),
+                    key.width as i32,
+                    key.height as i32,
+                    key.bytes as *mut u32,
+                    key.stride as i32,
+                )
+            };
+            if image.is_null() {
+                return None;
+            }
+            let at = self.next;
+            self.next = (self.next + 1) % KEPT;
+            self.kept[at] = Some((key, Image(image)));
+            Some(image)
+        }
+    }
+
+    impl Default for Images {
+        fn default() -> Images {
+            Images::new()
+        }
+    }
+
     /// `op` of the `w` by `h` points at (`sx`, `sy`) of `src` onto
     /// (`dx`, `dy`) of `dst`; false when pixman could not make its images.
-    #[allow(clippy::too_many_arguments)]
     pub fn composite(
+        images: &mut Images,
         over: bool,
         dst: (&mut [u8], Format, u32, u32, u32),
         src: (&[u8], Format, u32, u32, u32),
@@ -125,17 +168,22 @@ mod imp {
         let (dbytes, dformat, dstride, dwidth, dheight) = dst;
         let (sbytes, sformat, sstride, swidth, sheight) = src;
         let (sx, sy, dx, dy) = at;
-        let Some(d) = Image::new(dformat, dwidth, dheight, dstride, dbytes.as_mut_ptr()) else {
+        let Some(d) = images.image(Key {
+            bytes: dbytes.as_mut_ptr() as usize,
+            format: dformat,
+            stride: dstride,
+            width: dwidth,
+            height: dheight,
+        }) else {
             return false;
         };
-        // The source is only read: pixman takes a mutable pointer for both.
-        let Some(s) = Image::new(
-            sformat,
-            swidth,
-            sheight,
-            sstride,
-            sbytes.as_ptr().cast_mut(),
-        ) else {
+        let Some(s) = images.image(Key {
+            bytes: sbytes.as_ptr() as usize,
+            format: sformat,
+            stride: sstride,
+            width: swidth,
+            height: sheight,
+        }) else {
             return false;
         };
         // SAFETY: both images wrap memory that outlives the call, and the
@@ -143,9 +191,9 @@ mod imp {
         unsafe {
             pixman_image_composite32(
                 if over { OP_OVER } else { OP_SRC },
-                s.0,
+                s,
                 core::ptr::null_mut(),
-                d.0,
+                d,
                 sx as i32,
                 sy as i32,
                 0,
@@ -177,6 +225,9 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "none")]
+pub use imp::Images;
+
 /// A surface to draw on.
 #[cfg(target_os = "none")]
 pub struct Target<'a> {
@@ -204,6 +255,7 @@ pub struct Source<'a> {
 /// False when pixman could not make its images.
 #[cfg(target_os = "none")]
 pub fn composite(
+    images: &mut Images,
     over: bool,
     dst: &mut Target<'_>,
     src: Source<'_>,
@@ -212,6 +264,7 @@ pub fn composite(
     (w, h): (u32, u32),
 ) -> bool {
     imp::composite(
+        images,
         over,
         (dst.bytes, dst.format, dst.stride, dst.width, dst.height),
         (src.bytes, src.format, src.stride, src.width, src.height),
