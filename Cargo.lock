@@ -87,6 +87,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "comp-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "compositor"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-init",
+ "proto-input",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "console-line"
 version = "0.1.0"
 
@@ -1050,6 +1075,14 @@ dependencies = [
 name = "proto-clock"
 version = "0.1.0"
 dependencies = [
+ "proto-wire",
+]
+
+[[package]]
+name = "proto-comp"
+version = "0.1.0"
+dependencies = [
+ "proto-gpu",
  "proto-wire",
 ]
 
