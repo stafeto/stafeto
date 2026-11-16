@@ -474,6 +474,9 @@ pub struct Net {
     /// The service is asked for a step of departure or of waking.
     pub cleanup_wanted: bool,
     pub wake_wanted: bool,
+    /// Steps of the wire are told ahead of the request that is handled: a wait of a
+    /// set answers after them (`Driver::handle_request`).
+    pub steps_pending: bool,
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
     wake_cursor: usize,

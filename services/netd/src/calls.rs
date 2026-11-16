@@ -2038,14 +2038,20 @@ impl Net {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let mut ready = EpollReady::EMPTY;
-        self.interest.take(set, most, &mut ready);
+        let blocking = key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0;
+        // Steps of the wire stand ahead of this request (told): a wait that
+        // can block does not report before them, the step of waking answers it after them.
+        let park = core::mem::take(&mut self.steps_pending) && blocking;
+        if !park {
+            self.interest.take(set, most, &mut ready);
+        }
         rt::service::step_detail(ready.len as u64);
-        if ready.len == 0 && (key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0) {
+        if (park || ready.len == 0) && blocking {
             let answer = self.wait(s, r, key, Kind::Epoll, set, notify);
             // The look at the list was cut short (it is longer than the window
-            // and the records seen reported nothing): records are left, and
-            // nothing else would wake the wait for them.
-            if self.interest.has_ready(set) {
+            // and the records seen reported nothing), or the steps ahead have not run:
+            // records are left, and nothing else would wake the wait for them.
+            if park || self.interest.has_ready(set) {
                 self.interest.due |= 1 << set;
                 self.wake_wanted = true;
             }
