@@ -3869,8 +3869,9 @@ mod tests {
             .unwrap();
         // The pool of the network image less the two quotas of a command that
         // the package service takes from init.
+        // (and the pages the compositor's pixman took).
         assert_eq!(
-            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA,
+            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA + base::PIXMAN_PAGES,
             net::NET_TABLE[2].quota
         );
         // The service of the network is the one of the network image, and the

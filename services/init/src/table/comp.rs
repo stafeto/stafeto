@@ -52,7 +52,7 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 420 * PAGE,
+    quota: 400 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,
     console: true,

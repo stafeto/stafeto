@@ -64,12 +64,22 @@ pub const LAUNCHER: Record = Record {
 /// the 14 x 4 096 pages left.
 pub const COMMAND_QUOTAS: u64 = 14;
 
+/// The pages the pool of the process service gave up for the compositor's
+/// pixman (stage G2 of the graphics design): the code of pixman is in the
+/// boot image and again in the process that runs it, together with its arena
+/// and the larger stack of the compositor, and the base image kept only 56
+/// pages over the 16 384 that `cargo xtask pkg-identity` asks for. The pool
+/// is tens of thousands of pages and the heaviest command (a reload of nginx,
+/// nine processes) needs 30 440, so it gives them up.
+pub const PIXMAN_PAGES: u64 = 150 * crate::PAGE;
+
 /// The process service of the base and the full image: the pool of the
 /// network image with `COMMAND_QUOTAS` quotas of a command.
 pub const BASE_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
-        + COMMAND_QUOTAS * NET_COMMAND_QUOTA,
+        + COMMAND_QUOTAS * NET_COMMAND_QUOTA
+        - PIXMAN_PAGES,
     ..NET_PROCESS_SERVICE
 };
 
