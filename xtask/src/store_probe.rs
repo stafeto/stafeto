@@ -1194,7 +1194,15 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         };
     }
     let blocks_hello = world.blocks("hello");
-    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN)?;
+    let first = nvme_run(
+        &firmware,
+        &esp,
+        &file.0,
+        &kernel.elf,
+        shape,
+        steps,
+        if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
+    )?;
     expect(&first, &full_lines(&world, steps))?;
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
@@ -1247,7 +1255,15 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     // QEMU was killed with the probe's last line: the second run is on what the file holds.
-    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN)?;
+    let second = nvme_run(
+        &firmware,
+        &esp,
+        &file.0,
+        &kernel.elf,
+        shape,
+        steps,
+        if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
+    )?;
     let wanted = [
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
@@ -1317,7 +1333,9 @@ fn nvme_run(
         ]);
     }
     if icount {
-        cmd.args(qemu::ICOUNT);
+        // One CPU, as the steps of the other services are measured: with two, the virtual time of
+        // the idle one runs the services past the deadlines of their heartbeats.
+        cmd.args(qemu::ICOUNT).args(["-smp", "1"]);
     }
     let output = run_until(cmd, within, Some("init: store-probe ended: "), elf)?;
     if let Some(failed) = output
