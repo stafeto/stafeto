@@ -1244,7 +1244,31 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     if steps {
         // Every method of the service came, and no step of it, the heartbeat's and the
         // interrupt's included, is past 0.9 of term B.
-        let blk = longest_steps(&first, blk_probe::BLK_TAG);
+        let mut blk = longest_steps(&first, blk_probe::BLK_TAG);
+        // A line of a step is told only when it is a new longest of its kind, and with the lines
+        // of the services glued together under -icount one may be lost: a kind that did not come
+        // is looked for in a run on a fresh disk, two more at most, and the longest of each kind
+        // is kept.
+        let mut runs = 1;
+        while runs < 3
+            && BLK_STEP_KINDS
+                .iter()
+                .any(|(kind, _)| !blk.iter().any(|row| row.0 == *kind))
+        {
+            write_disk(&file, None)?;
+            let again = nvme_run(
+                &firmware,
+                &esp,
+                &file.0,
+                &kernel.elf,
+                shape,
+                true,
+                BOOT_TIMEOUT * 40,
+            )?;
+            expect(&again, &full_lines(&world, true))?;
+            blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
+            runs += 1;
+        }
         judge("the NVMe service", &blk, &BLK_STEP_KINDS)?;
         check_waits(
             &first,
