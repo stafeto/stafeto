@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The probe of the SSH server (`cargo xtask net-ssh`): the image of the
-//! shell with the network service whose launcher also starts Dropbear
-//! (`/bin/dropbear -F -R -s -j -k`, tests/ash-launcher with the feature
-//! `dropbear`) on QEMU's user network, a port of the host forwarded to the
+//! shell with the network service whose boot script (`/etc/rc`, tools/rc)
+//! starts Dropbear (`/bin/dropbear -F -R -s -j -k`, from `/etc/rc.d/dropbear`
+//! once the key is in `/root/.ssh/authorized_keys`) on QEMU's user network, a port of the host forwarded to the
 //! port 22 of the guest. xtask drives `ash` over the serial port, as
 //! `net-curl` does, and is the client with the host's own `ssh`:
 //!
@@ -13,13 +13,14 @@
 //!    rootfs.rs), and the package carries its licence notice.
 //! 2. The one process named dropbear is running (`/proc/<pid>/cmdline`
 //!    holds the name of a program alone, the process service keeps no
-//!    arguments), and the launcher printed the command line it started it
+//!    arguments), and the boot script printed the command line it started it
 //!    with, exactly `dropbear -F -R -s -j -k`: the
 //!    password login is off, no port is forwarded, the host keys are made
 //!    when first needed (the build has no syslog, so the log goes to the
 //!    standard error).
-//! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key a
-//!    later part takes from the metadata of the instance): a login with it
+//! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key
+//!    `ec2-key` takes from the metadata of an instance; the image of the probe has a
+//!    script of its own that writes the key of the run): a login with it
 //!    runs a command and gives its exit status, a bulk transfer of 64 KiB
 //!    through the pipes of a session is whole, a session with a terminal
 //!    (`ssh -tt`) runs a shell on a pseudo terminal and brings 2 000 lines
@@ -45,13 +46,13 @@ use std::time::{Duration, Instant};
 use crate::qemu::{Forward, Proto};
 use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, ImageProgram, SERVICES_STARTED, Variant, build,
-    build_boot_image, busybox_build, nano_build, net, net_tls, qemu, relibc, rootfs, symbolize,
+    build_boot_image, busybox_build, nano_build, net_tls, qemu, relibc, rootfs, symbolize,
 };
 
 /// The image of the run.
 pub const IMAGE: &str = "boot-ssh-probe.img";
 
-/// The command line of the server the launcher starts.
+/// The command line of the server that `/etc/rc.d/dropbear` starts.
 const SERVER_LINE: [&str; 6] = ["dropbear", "-F", "-R", "-s", "-j", "-k"];
 
 /// How long one login may take: the key exchange and the first command run
@@ -68,18 +69,28 @@ const PAIRS: usize = 8;
 /// The lines a session with a terminal brings back.
 const LINES: usize = 2_000;
 
-/// The programs of the image: those of the shell image with the network
-/// service, with the launcher that also starts the server.
+/// The programs of the image: those of the shell with the network service
+/// whose init runs the launcher with the boot script `/etc/rc`, which starts the server.
 pub fn programs() -> &'static [ImageProgram] {
-    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let mut programs = net::programs().to_vec();
-        for program in &mut programs {
-            if program.0 == "ash-launcher" {
-                program.3 = &["interactive", "dropbear"];
-            }
-        }
-        programs
+    crate::net_ec2_key::programs()
+}
+
+/// The public key line `ec2-key` of the image writes: the key of the run
+/// (`set_key`), or a fixed one of the right form where nothing runs.
+static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+const PLACEHOLDER_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
+
+/// The script that stands for `ec2-key` in the image of the probe: it writes the key of the
+/// run as the metadata of an instance would give it.
+pub fn key_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
+        let text = format!(
+            "umask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\necho '{key}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\necho 'ec2-key: the key of the probe is placed'\n"
+        );
+        Box::leak(text.into_bytes().into_boxed_slice())
     })
 }
 
@@ -260,13 +271,11 @@ fn guest(run: &mut qemu::Run, command: &str, marker: &str) -> Result<Vec<String>
 
 /// Step 2: the one running server. `/proc/<pid>/cmdline` of the system holds
 /// the name of the program alone (the process service keeps no arguments), so
-/// the command line is the line the launcher printed before it started the
+/// the command line is the line `/etc/rc.d/dropbear` printed before it started the
 /// server; the options are then shown at work (steps 4 and 5).
-fn command_line(run: &mut qemu::Run, lines: &[String]) -> Result<(), String> {
-    let wanted = format!("ash-launch: {}", SERVER_LINE.join(" "));
-    if !lines.iter().any(|l| l.trim().ends_with(&wanted)) {
-        return Err(format!("the launcher printed no {wanted:?}"));
-    }
+fn command_line(run: &mut qemu::Run) -> Result<(), String> {
+    let wanted = format!("dropbear: {}", SERVER_LINE.join(" "));
+    run.expect_seen(&wanted, LOGIN_WITHIN)?;
     let found = guest(
         run,
         "for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); case \"$c\" in dropbear*) echo \"cmd ${p#/proc/}: $c\";; esac; done",
@@ -446,14 +455,16 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     crate::net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
-    image_check()?;
-    crate::notices::image_has_package_notices(&image, IMAGE, "dropbear")?;
     let dir = crate::target_dir().join("net-ssh");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (good, good_line) = make_key(&dir, "good")?;
     let (bad, _) = make_key(&dir, "bad")?;
+    KEY.set(good_line)
+        .map_err(|_| "the key of the run is set twice".to_owned())?;
+    let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
+    image_check()?;
+    crate::notices::image_has_package_notices(&image, IMAGE, "dropbear")?;
     let port = crate::net_curl::free_tcp_port()?;
     let client = Client {
         port,
@@ -483,26 +494,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         if held.iter().map(|l| l.trim()).collect::<Vec<_>>() != ["0"] {
             return Err(format!("/etc/dropbear is not empty at the start: {held:?}"));
         }
-        let seen = run.lines().to_vec();
-        command_line(&mut run, &seen)?;
+        command_line(&mut run)?;
 
-        // (Lines of the shell stay short: the terminal takes 256 bytes a line.)
-        for (marker, step) in [
-            (
-                "dir",
-                "mkdir -p /root/.ssh && chmod 700 /root/.ssh".to_owned(),
-            ),
-            (
-                "key",
-                format!("echo '{good_line}' > /root/.ssh/authorized_keys"),
-            ),
-            ("mode", "chmod 600 /root/.ssh/authorized_keys".to_owned()),
-        ] {
-            let lines = guest(&mut run, &format!("{step} && echo done-$S"), marker)?;
-            if !lines.iter().any(|l| l.trim() == "done-ok") {
-                return Err(format!("{step:?} did not end well: {lines:?}"));
-            }
-        }
         // 3.
         let mut ssh = client.command("root", Some(&good), true);
         ssh.arg("echo ssh-ok-$((6*7)); id -u");
@@ -660,8 +653,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         }
         println!("net-ssh: after they ended a new session got its terminal at once");
         // 7: the server is still the one process and still answers.
-        let seen = run.lines().to_vec();
-        command_line(&mut run, &seen)?;
+        command_line(&mut run)?;
         let mut ssh = client.command("root", Some(&good), true);
         ssh.arg("echo last-$((6*7))");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;

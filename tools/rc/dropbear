@@ -1,0 +1,29 @@
+# /etc/rc.d/dropbear: the SSH server, started at each boot after `ec2-key`
+# has written /root/.ssh/authorized_keys. Without that file, or without the
+# program (an image that holds no package dropbear), nothing starts and one
+# line says so.
+#
+# The server runs in the foreground (-F) under a loop of its own that starts
+# it again a second after it ends (it ends at once while the network has no
+# address to listen on). The host keys are made when first needed (-R), no
+# password login is possible (-s), and no port is forwarded (-j, -k). The
+# build has no syslog, so its log goes to the standard error, the console.
+
+args="-F -R -s -j -k"
+
+if [ ! -x /bin/dropbear ]; then
+    echo "dropbear: no /bin/dropbear in this image, SSH stays off"
+    exit 0
+fi
+if [ ! -f /root/.ssh/authorized_keys ]; then
+    echo "dropbear: no /root/.ssh/authorized_keys, SSH stays off"
+    exit 0
+fi
+
+echo "dropbear: dropbear $args"
+(
+    while :; do
+        /bin/dropbear $args
+        sleep 1
+    done
+) &

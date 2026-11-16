@@ -337,7 +337,7 @@ fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
 
 /// Sends `command` between two marker lines and gives the lines between them
 /// (the output of the command), waiting up to `within` for the end.
-fn capture(
+pub(crate) fn capture(
     run: &mut qemu::Run,
     command: &str,
     marker: &str,

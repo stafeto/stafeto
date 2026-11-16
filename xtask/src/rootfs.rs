@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 65] = [
+const SYSTEM_PATHS: [&str; 69] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -315,6 +315,11 @@ const SYSTEM_PATHS: [&str; 65] = [
     "/etc/resolv.conf",
     // The image on VZ with a static address for its second device.
     "/etc/netd.conf",
+    // The boot script and the files it runs (`rc_files`).
+    "/etc/rc",
+    "/etc/rc.d",
+    "/etc/rc.d/ec2-key",
+    "/etc/rc.d/dropbear",
     // The image with the network service: the page `httpd` serves and the
     // probe of the sockets.
     "/www",
@@ -1278,6 +1283,33 @@ const NETD_CONF_STATIC1: &[u8] = b"address1 192.168.64.250/24\n";
 /// `/etc/netd.conf` of the VZ images with one device: the segmentation offload on.
 const NETD_CONF_TSO: &[u8] = b"tso 1\n";
 
+/// The boot script `/etc/rc` that the launcher runs at each boot (tests/ash-launcher), and
+/// the files of `/etc/rc.d` it runs: `ec2-key` writes the key of the instance's key pair
+/// and `dropbear` starts the SSH server that reads it (tools/rc).
+pub fn rc_files() -> Vec<RootFile> {
+    vec![
+        of(
+            "/etc/rc",
+            0o755,
+            ROOT,
+            Source::Bytes("rc", include_bytes!("../../tools/rc/rc")),
+        ),
+        dir("/etc/rc.d"),
+        of(
+            "/etc/rc.d/ec2-key",
+            0o755,
+            ROOT,
+            Source::Bytes("ec2-key", include_bytes!("../../tools/rc/ec2-key")),
+        ),
+        of(
+            "/etc/rc.d/dropbear",
+            0o755,
+            ROOT,
+            Source::Bytes("dropbear", include_bytes!("../../tools/rc/dropbear")),
+        ),
+    ]
+}
+
 /// The files of the shell images with the network service: the shell's, the
 /// page `httpd -h /www` serves, and the probes of the sockets and of the
 /// resolver. `/etc/resolv.conf` is the network service's to write.
@@ -1707,6 +1739,7 @@ pub const IMAGES: &[&str] = &[
     "boot-fast-vz-steps.img",
     "boot-net-probe.img",
     "boot-net-probe-static.img",
+    "boot-net-rc.img",
     "boot-net-probe-its.img",
     "boot-net-probe-its-static.img",
     "boot-net-its.img",
@@ -1839,8 +1872,25 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-ash-dialog.img" | "boot-aws.img" | "boot-doom.img" | "boot-doom-steps.img" => {
-            dialog(name)
+        "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        // The shell on EC2 runs the boot script, which fetches the key of the instance.
+        "boot-aws.img" => {
+            let mut files = dialog(name);
+            files.extend(rc_files());
+            files
+        }
+        // The probe of the boot script: the shell with the network, the script, and the
+        // static address of `net-ec2-key` (the service of the metadata is not on the link).
+        "boot-net-rc.img" => {
+            let mut files = net_files(name);
+            files.extend(rc_files());
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", crate::net_ec2_key::NETD_CONF),
+            ));
+            files
         }
         // The base image has no package that makes /usr and /usr/share,
         // which the time zones stand in.
@@ -1885,7 +1935,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-net-its.img"
         | "boot-net-curl-steps.img"
         | "boot-posix-net-steps.img" => net_files(name),
-        "boot-ssh-probe.img" => net_files(name),
+        // The probe of the SSH server: the shell with the network and the boot script, whose
+        // `ec2-key` places the key of the probe (it has no metadata service to ask).
+        "boot-ssh-probe.img" => {
+            let mut files = net_files(name);
+            files.extend(rc_files());
+            let script = crate::net_ssh::key_script();
+            for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/ec2-key") {
+                f.source = Some(Source::Bytes("ec2-key-probe", script));
+            }
+            files
+        }
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
             let mut files = dialog(name);
@@ -2855,6 +2915,7 @@ mod tests {
                 }
                 "boot-net.img" => crate::net::programs(),
                 "boot-ssh-probe.img" => crate::net_ssh::programs(),
+                "boot-net-rc.img" => crate::net_ec2_key::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),

@@ -637,6 +637,7 @@ pub fn check() -> Result<(), String> {
         "boot-doom.img",
         "boot-net.img",
         "boot-ssh-probe.img",
+        "boot-net-rc.img",
         "boot-net-curl-steps.img",
         "boot-net-vz.img",
         "boot-net-vz2.img",
@@ -810,6 +811,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
         "boot-aws.img" => of(&[Group::Base]),
         "boot-net.img"
+        | "boot-net-rc.img"
         | "boot-net-its.img"
         | "boot-ssh-probe.img"
         | "boot-net-curl-steps.img"
