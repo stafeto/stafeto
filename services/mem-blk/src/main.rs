@@ -82,7 +82,7 @@ fn main(_: u64) -> u64 {
     let args = ServiceArgs::read(s.args()).ok();
     let own = args.map_or(&[][..], |a| a.own);
     let bytes = word(own, 0);
-    if bytes == 0 || bytes % PAGE != 0 || bytes > abi::MAX_MEMORY {
+    if bytes == 0 || !bytes.is_multiple_of(PAGE) || bytes > abi::MAX_MEMORY {
         return NO_START_DATA;
     }
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
