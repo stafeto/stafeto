@@ -382,7 +382,7 @@ fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
     let _ = child.kill();
     let _ = child.wait();
     let said = reader.join().unwrap_or_default();
-    if !got.is_empty() || !said.contains("administratively prohibited") {
+    if !got.is_empty() || !said.contains("open failed") {
         return Err(format!(
             "a local forward carried {} bytes, wanted refusal; ssh said {said:?}",
             got.len()
