@@ -65,6 +65,7 @@ pub const COMPOSITOR: Record = Record {
 /// The first client (role `a`): a window of its own, opaque.
 const PROBE_A: Record = Record {
     name: "focus-a",
+    program: "focus-probe",
     args: b"a",
     ..comp::PROBE
 };
@@ -72,6 +73,7 @@ const PROBE_A: Record = Record {
 /// The second client (role `b`): a window with an alpha, over the first.
 const PROBE_B: Record = Record {
     name: "focus-b",
+    program: "focus-probe",
     args: b"b",
     ..comp::PROBE
 };
@@ -79,6 +81,7 @@ const PROBE_B: Record = Record {
 /// The manager (role `m`): the compositor's manager session.
 const PROBE_WM: Record = Record {
     name: "focus-wm",
+    program: "focus-probe",
     args: b"m",
     ..comp::PROBE
 };
@@ -87,6 +90,7 @@ const PROBE_WM: Record = Record {
 /// scenes and prints the lines whose CRC xtask compares with the screen.
 const PROBE_INPUT: Record = Record {
     name: "focus-inject",
+    program: "focus-probe",
     args: b"i",
     ..comp::PROBE
 };
