@@ -368,8 +368,21 @@ pub struct Gate {
 /// the sum of C/T of the budgets of the table on a CPU is at most this
 /// (spec 8). The rest is for the levels below the budgets and for the trusted
 /// work that has none (the kernel, the interrupts, the drivers, init), which
-/// the layout takes at 5 %.
+/// the layout takes at 5 %. The three general services work at level 32 once
+/// their budget is spent (`ramfs::SERVICE_LOW`), so the levels of the POSIX
+/// processes do not get this rest from them (it is the share of the levels at 33 and
+/// above that the budgets protect).
 pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
+
+/// What the budgets of CPU 0 leave free of `BUDGET_SHARE_MAX_PPM` for the budgets the table
+/// does not have yet: the process service and the package service (3 %). The sum of the
+/// table's budgets on CPU 0 and this is at most the limit, so a budget added later for either
+/// finds its room. The reserve keeps the table's budgets on CPU 0 at 71 % of the 75 % the
+/// limit allows, so the work no budget covers (the kernel, the interrupts, the drivers, init,
+/// the levels above the budgets) keeps its 25 % and more. It promises the levels of the POSIX
+/// processes nothing: the three services work at level 32 once their budget is spent, above
+/// them (the guarantee of the budgets is for the levels at 33 and above).
+pub const CPU0_RESERVE_PPM: u64 = 30_000;
 
 /// A time budget of one thread of a record (spec 8, `budget_create`):
 /// init makes it on `cpu` with the system resource's right `BUDGET`, and
@@ -521,6 +534,13 @@ pub struct Record {
     /// The time budgets of its threads (`Budget`): init makes them on the
     /// CPUs of the record that are up, for each instance.
     pub budgets: &'static [Budget],
+    /// The level the threads of the record without a budget work at, at most
+    /// (process_create x2, bits 8-15; kernel spec 8): 0 for the ceiling. A thread of
+    /// the record before it binds its budget, and the threads that have none, never run
+    /// above it, so a service whose request thread does not bind (or whose helper threads
+    /// have no budget) leaves the levels above `free` alone. A record with budgets has
+    /// it below its level and a record without budgets has 0 (`check_free`).
+    pub free: u8,
 }
 
 /// A service a record waits for: its name, and how long the record waits at
@@ -583,6 +603,7 @@ impl Record {
         cpus: 1,
         waits: &[],
         budgets: &[],
+        free: 0,
     };
 
     /// The watchdog of a service; None for a client.
@@ -764,6 +785,12 @@ pub enum TableError<'a> {
         cpu: u8,
         ppm: u64,
     },
+    /// A `free` above the record's ceiling, a `free` that is set on a record without
+    /// budgets, or, for a record with budgets, a `free` that is set and not below the
+    /// record's priority (it would hold no thread down).
+    Free {
+        record: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -887,7 +914,11 @@ impl fmt::Display for TableError<'_> {
             ),
             TableError::BudgetShare { cpu, ppm } => write!(
                 f,
-                "the budgets on CPU {cpu} take {ppm} parts per million of it, at most {BUDGET_SHARE_MAX_PPM}"
+                "the budgets on CPU {cpu} take {ppm} parts per million of it (CPU 0 with its reserve of {CPU0_RESERVE_PPM}), at most {BUDGET_SHARE_MAX_PPM}"
+            ),
+            TableError::Free { record } => write!(
+                f,
+                "{record} has a `free` above its ceiling, or one that is set with budgets and not below its priority"
             ),
         }
     }
@@ -965,6 +996,7 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     check_layers(table)?;
     check_waits(table)?;
     check_budgets(table)?;
+    check_free(table)?;
     Ok(order(table))
 }
 
@@ -1031,12 +1063,42 @@ fn check_budgets(table: &[Record]) -> Result<(), TableError<'static>> {
         }
     }
     for (cpu, &sum) in ppm.iter().enumerate() {
+        let sum = if cpu == 0 {
+            sum + CPU0_RESERVE_PPM
+        } else {
+            sum
+        };
         // The break: a table whose budgets take all of a CPU passes.
         if cfg!(not(feature = "break-budget-share")) && sum > BUDGET_SHARE_MAX_PPM {
             return Err(TableError::BudgetShare {
                 cpu: cpu as u8,
                 ppm: sum,
             });
+        }
+    }
+    Ok(())
+}
+
+/// The `free` init passes to `process_create` for an instance of `record` (x2, bits 8-15).
+pub fn free_of(record: &Record) -> u8 {
+    // The break: init passes none, so the threads of the services without a budget work at
+    // their own levels.
+    if cfg!(feature = "break-record-free") {
+        0
+    } else {
+        record.free
+    }
+}
+
+/// The `free` level of each record of `table` (spec 8): at most its ceiling, and when set, only
+/// for a record with budgets, below its priority. A record without budgets never binds, so the
+/// level would hold its threads down for good.
+fn check_free(table: &[Record]) -> Result<(), TableError<'static>> {
+    for r in table {
+        let fine =
+            r.free <= r.ceiling && (r.free == 0 || (!r.budgets.is_empty() && r.free < r.priority));
+        if !fine {
+            return Err(TableError::Free { record: r.name });
         }
     }
     Ok(())
@@ -1418,6 +1480,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-tty") as usize
     + cfg!(feature = "table-tty-vz") as usize
     + cfg!(feature = "table-tty-steps") as usize
+    + cfg!(feature = "table-service-budget") as usize
     + cfg!(feature = "table-posix-tty") as usize
     + cfg!(feature = "table-posix-tty-vz") as usize
     + cfg!(feature = "table-entropy") as usize
@@ -1507,6 +1570,7 @@ const _: () = assert!(
     feature = "table-tty",
     feature = "table-tty-vz",
     feature = "table-tty-steps",
+    feature = "table-service-budget",
     feature = "table-posix-tty",
     feature = "table-posix-tty-vz",
     feature = "table-entropy",
@@ -1634,6 +1698,8 @@ pub const TABLE: &[Record] = ramfs::TTY_TABLE;
 pub const TABLE: &[Record] = vz::TTY_TABLE;
 #[cfg(feature = "table-tty-steps")]
 pub const TABLE: &[Record] = ramfs::TTY_STEPS_TABLE;
+#[cfg(feature = "table-service-budget")]
+pub const TABLE: &[Record] = ramfs::SERVICE_BUDGET_TABLE;
 #[cfg(feature = "table-posix-tty")]
 pub const TABLE: &[Record] = ramfs::POSIX_TTY_TABLE;
 #[cfg(feature = "table-posix-tty-vz")]
@@ -1783,6 +1849,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::RTBENCH_POSIX_TABLE,
     ramfs::TTY_TABLE,
     ramfs::TTY_STEPS_TABLE,
+    ramfs::SERVICE_BUDGET_TABLE,
     ramfs::POSIX_RANDOM_TABLE,
     ramfs::POSIX_RANDOM_RESTART_TABLE,
     net::POSIX_RANDOM_NET_TABLE,
@@ -1841,6 +1908,7 @@ mod tests {
             cpus: GENERAL_CPUS,
             waits: &[],
             budgets: &[],
+            free: 0,
         }
     }
 
@@ -2855,6 +2923,7 @@ mod tests {
             check_one(Record {
                 dma: Box::leak(dma.into_boxed_slice()),
                 budgets: &BUDGETS[..budgets],
+                free: 0,
                 console: true,
                 log,
                 trusted: true,
@@ -4020,11 +4089,11 @@ mod tests {
     #[test]
     fn the_budgets_of_a_cpu_take_three_quarters_of_it_at_most() {
         static HALF: [Budget; 1] = [budget("half", 0, 500_000, 1_000_000)];
-        static QUARTER: [Budget; 1] = [budget("quarter", 0, 1_250_000, 5_000_000)];
+        static QUARTER: [Budget; 1] = [budget("quarter", 0, 1_100_000, 5_000_000)];
         static MORE: [Budget; 1] = [budget("more", 0, 10_000, 1_000_000)];
         static ON_ONE: [Budget; 1] = [budget("one", 1, 700_000, 1_000_000)];
         let table = |a: Record, b: Record| -> Vec<Record> { vec![a, b] };
-        // 50 % and 25 % on CPU 0 are the 75 % the table allows.
+        // 50 % and 22 % on CPU 0 and the reserve of 3 % are the 75 % the table allows.
         let both = table(budgeted("a", &HALF), budgeted("b", &QUARTER));
         assert!(check(&both).is_ok(), "{:?}", check(&both));
         // A little more is refused, and the error says which CPU and how much.
@@ -4046,7 +4115,7 @@ mod tests {
         assert!(check(&apart).is_ok());
         // Rounding goes up: a share a part per million over the limit is refused.
         static EDGE: [Budget; 2] = [
-            budget("edge", 0, 750_001, 1_000_000),
+            budget("edge", 0, 720_001, 1_000_000),
             budget("zero", 2, 10_000, 1_000_000),
         ];
         assert_eq!(
@@ -4056,6 +4125,110 @@ mod tests {
                 ppm: 750_001
             })
         );
+        // The reserve of CPU 0 is that CPU's alone: the same share fits CPU 1 up to the limit.
+        static FULL: [Budget; 1] = [budget("full", 1, 750_000, 1_000_000)];
+        assert!(check(&[budgeted("a", &FULL)]).is_ok());
+        assert_eq!(CPU0_RESERVE_PPM, 30_000);
+    }
+
+    #[test]
+    fn init_passes_the_free_level_of_the_record_to_process_create() {
+        assert_eq!(free_of(&ramfs::RAM_FIFO_CLOCKED), 31);
+        assert_eq!(free_of(&ramfs::PIPE), 31);
+        assert_eq!(free_of(&ramfs::TTY), 31);
+        assert_eq!(free_of(&net::NETD), 0);
+    }
+
+    #[test]
+    fn the_free_level_stays_under_the_ceiling_and_under_the_level_of_a_record_with_budgets() {
+        static ONE: [Budget; 1] = [budget("one", 0, 100_000, 1_000_000)];
+        // `service` stands at 40 with the ceiling 40.
+        let with = |free: u8, budgets: &'static [Budget]| Record {
+            free,
+            budgets,
+            ..service("svc", 40, 40)
+        };
+        assert!(check_one(with(0, &[])).is_ok());
+        assert!(check_one(with(31, &ONE)).is_ok());
+        assert!(check_one(with(0, &ONE)).is_ok());
+        // A record without budgets never binds: a `free` on it holds its threads down for good.
+        for bad in [
+            with(40, &[]),
+            with(31, &[]),
+            with(1, &[]),
+            with(41, &[]),
+            with(41, &ONE),
+            with(40, &ONE),
+        ] {
+            assert_eq!(
+                check_one(bad),
+                Err(TableError::Free { record: "svc" }),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_services_of_the_files_pipes_and_terminal_have_budgets_under_their_levels() {
+        // Each binds `serve`, on CPU 0, to its request thread; the threads it does not bind
+        // work at `SERVICE_FREE`.
+        for (record, c_ns) in [(ramfs::PIPE, 75_000), (ramfs::TTY, 75_000)] {
+            assert_eq!(record.budgets.len(), 1, "{}", record.name);
+            let b = record.budgets[0];
+            assert_eq!(
+                (b.name, b.cpu, b.c_ns, b.t_ns, b.low),
+                ("serve", 0, c_ns, 5_000_000, ramfs::SERVICE_LOW)
+            );
+            assert_eq!(record.free, ramfs::SERVICE_FREE);
+            assert!(record.free < record.priority && record.free <= record.ceiling);
+            assert!(start_data_names(&record) <= START_DATA_MAX);
+        }
+        for record in [
+            ramfs::RAM_LEGACY,
+            ramfs::RAM_CLOCKED,
+            ramfs::RAM_FIFO_CLOCKED,
+        ] {
+            assert_eq!(record.free, ramfs::RAM_FREE);
+            assert_eq!(record.budgets.len(), usize::from(ramfs::RAM_BUDGET_ON));
+            assert!(
+                record
+                    .budgets
+                    .iter()
+                    .all(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low)
+                        == ("serve", 0, 250_000, 5_000_000, ramfs::SERVICE_LOW))
+            );
+        }
+        // The POSIX processes end at 31: a thread of a service that has no budget never works
+        // above them.
+        assert_eq!(ramfs::SERVICE_FREE, 31);
+        assert!(ramfs::SERVICE_FREE >= ramfs::RAM_LEGACY.priority.min(31));
+    }
+
+    #[test]
+    fn the_budgets_of_cpu_zero_in_the_image_of_the_shell_leave_the_reserve() {
+        // The network service (switch 40 % and stack 20 %) and the three services (5, 1.5 and
+        // 1.5 %): 68 %, and the reserve of 3 % for the process service and the package
+        // service, within the 75 % of the table, so 4 % are free over it.
+        let on_zero: u64 = [
+            net::NETD.budgets,
+            ramfs::RAM_FIFO_CLOCKED.budgets,
+            ramfs::PIPE.budgets,
+            ramfs::TTY.budgets,
+        ]
+        .iter()
+        .flat_map(|b| b.iter())
+        .filter(|b| b.cpu == 0)
+        .map(Budget::share_ppm)
+        .sum();
+        assert_eq!(
+            on_zero,
+            if ramfs::RAM_BUDGET_ON {
+                680_000
+            } else {
+                630_000
+            }
+        );
+        assert_eq!(BUDGET_SHARE_MAX_PPM - on_zero - CPU0_RESERVE_PPM, 40_000);
     }
 
     #[test]

@@ -18,6 +18,8 @@ test = false
 bench = false
 
 [features]
+# Deliberate break (`cargo xtask budget-breaks`): the service takes no budget from its start data, so its request thread runs unbound.
+break-budget-unbound = []
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask tty, under -icount).
 steps = ["rt/step-stats"]

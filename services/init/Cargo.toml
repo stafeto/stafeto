@@ -30,6 +30,8 @@ steps-grid = ["steps", "rt/beat-grid"]
 break-bar-size = []
 # A table whose budgets take all of a CPU passes the check (`cargo xtask budget-breaks`).
 break-budget-share = []
+# Init passes no `free` level to process_create (`cargo xtask budget-breaks`).
+break-record-free = []
 # Overruns of the time budgets (`cargo xtask budget-breaks`): init takes no notice of them, or
 # writes a line for each notification.
 break-overrun-ignore = []
@@ -93,6 +95,8 @@ table-posix-dialog-vz = []
 table-tty = []
 table-tty-vz = []
 table-tty-steps = []
+# The probe of the time budgets of the RAM, pipe and terminal services (xtask service-budget).
+table-service-budget = []
 # The probe of the terminal in C (xtask posix-tty, posix-tty-vz).
 table-posix-tty = []
 table-posix-tty-vz = []

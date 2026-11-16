@@ -556,7 +556,40 @@ fn run_on(
         return Err(failed.clone());
     }
     qemu::expect_stopped_on(&output, ENDED)?;
-    Ok(output.lines)
+    Ok(apart(&output.lines))
+}
+
+/// The lines of the package service that the probes look for, as they begin.
+const WHOLE_STARTS: [&str; 4] = [
+    "pkgd: roots ",
+    "pkgd: broken: ",
+    "pkgd: revoked: ",
+    "pkgd: keyb: ",
+];
+
+/// `lines` with a line of the package service that another writer's text came in front of set
+/// apart. The console takes a line of another service in several writes (the audit and the
+/// timing lines print their parts one after the other), and a line of pkgd that lands between
+/// them begins in the middle of the line it fell in: `xxxpkgd: roots stafeto-dev-root`. The
+/// text in front and the line are two lines again; only the exact starts of `WHOLE_STARTS`
+/// count, so a text that merely names them stays.
+fn apart(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let cut = WHOLE_STARTS
+            .iter()
+            .filter_map(|start| line.find(start))
+            .min()
+            .filter(|&at| at > 0 && !line.starts_with("store-probe: "));
+        match cut {
+            Some(at) => {
+                out.push(line[..at].to_owned());
+                out.push(line[at..].to_owned());
+            }
+            None => out.push(line.clone()),
+        }
+    }
+    out
 }
 
 fn expect(lines: &[String], wanted: &[String]) -> Result<(), String> {
@@ -1439,4 +1472,32 @@ fn doom(machine: &qemu::Machine) -> Result<(), String> {
         machine.name
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apart;
+
+    #[test]
+    fn a_line_of_pkgd_that_another_writers_text_came_before_is_set_apart() {
+        let lines: Vec<String> = [
+            "ramfs: audit round 4pkgd: roots stafeto-dev-root",
+            "pkgd: ready, 0 packages",
+            "store-probe: says pkgd: roots stafeto-dev-root in a text",
+            "a text that names pkgd: store formatted stays",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            apart(&lines),
+            [
+                "ramfs: audit round 4",
+                "pkgd: roots stafeto-dev-root",
+                "pkgd: ready, 0 packages",
+                "store-probe: says pkgd: roots stafeto-dev-root in a text",
+                "a text that names pkgd: store formatted stays",
+            ]
+        );
+    }
 }

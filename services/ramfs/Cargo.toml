@@ -16,6 +16,8 @@ test = false
 bench = false
 
 [features]
+# Deliberate break (`cargo xtask budget-breaks`): the service takes no budget from its start data, so its request thread runs unbound.
+break-budget-unbound = []
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
 # A bounded receive pause for genuine queued-request signal cancellation.
