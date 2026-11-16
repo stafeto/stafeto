@@ -14,16 +14,20 @@
 //! the manager's switch on Alt and Tab, and the screen after the second
 //! client ended. The guest checks that each client saw the focus and the keys
 //! of its time and no others, and that the manager heard the Alt keys alone.
-//! Then xtask moves QEMU's tablet and presses its button through the monitor:
-//! the surviving window must see the click, in its own coordinates, from the
-//! device and not from INJECT.
+//! Then xtask moves QEMU's tablet and presses its button through QMP
+//! (`input-send-event`: the monitor's `mouse_move` is relative, and a tablet
+//! has no relative axes): the surviving window must see the click, in its own
+//! coordinates, from the device, which is another path than INJECT's.
 //!
 //! A second run, under -icount, measures the steps of the compositor, of the
 //! display driver and of the tablet's driver: every step stays under 0.9 of
 //! term B, and a band of a frame and a step of the drivers' own under
 //! PORTION_MAX.
 
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::gpu_probe::{self, Scratch};
 use crate::monitor::Monitor;
@@ -220,6 +224,79 @@ pub fn steps_verdict(lines: &[String]) -> Result<(comp_probe::Rows, comp_probe::
     ))
 }
 
+/// A connection to QEMU's QMP socket: the events of the input devices, which
+/// the monitor of HMP cannot make for a tablet.
+struct Qmp {
+    reader: BufReader<UnixStream>,
+}
+
+impl Qmp {
+    /// Connects to `path` (it appears when QEMU starts), reads the greeting
+    /// and negotiates the capabilities.
+    fn connect(path: &Path, timeout: Duration) -> Result<Qmp, String> {
+        let deadline = Instant::now() + timeout;
+        let stream = loop {
+            match UnixStream::connect(path) {
+                Ok(stream) => break stream,
+                Err(e) if Instant::now() >= deadline => {
+                    return Err(format!("QMP at {}: {e}", path.display()));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| e.to_string())?;
+        let mut qmp = Qmp {
+            reader: BufReader::new(stream),
+        };
+        qmp.line()?;
+        qmp.execute(r#"{"execute":"qmp_capabilities"}"#)?;
+        Ok(qmp)
+    }
+
+    fn line(&mut self) -> Result<String, String> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Err("QMP closed".to_owned()),
+            Ok(_) => Ok(line),
+            Err(e) => Err(format!("QMP: {e}")),
+        }
+    }
+
+    /// Sends `request` and reads until its reply (events are skipped): an
+    /// error is the reply's `error`.
+    fn execute(&mut self, request: &str) -> Result<(), String> {
+        self.reader
+            .get_mut()
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|e| format!("QMP: {e}"))?;
+        loop {
+            let line = self.line()?;
+            if line.contains("\"error\"") {
+                return Err(format!("QMP {request}: {}", line.trim()));
+            }
+            if line.contains("\"return\"") {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The tablet to (`x`, `y`) of a screen of `width` by `height` points.
+    fn move_to(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), String> {
+        let (ax, ay) = (x * 0x8000 / width, y * 0x8000 / height);
+        self.execute(&format!(
+            r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"abs","data":{{"axis":"x","value":{ax}}}}},{{"type":"abs","data":{{"axis":"y","value":{ay}}}}}]}}}}"#
+        ))
+    }
+
+    fn left_button(&mut self, down: bool) -> Result<(), String> {
+        self.execute(&format!(
+            r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"btn","data":{{"down":{down},"button":"left"}}}}]}}}}"#
+        ))
+    }
+}
+
 /// Follows the run: the screenshots against the guest's CRC-lines, then the
 /// tablet's click, then the end of the four programs.
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
@@ -230,15 +307,17 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
         gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
     }
     // The keys are injected; then the device moves, to a place of the
-    // surviving window, and its button goes down and up there. The monitor's
-    // absolute coordinates are the console's: 640 by 400.
+    // surviving window, and its button goes down and up there.
     run.expect_line(INJECTED, |l| l == INJECTED, WITHIN)?;
-    let wait = Duration::from_secs(5);
-    monitor.command("mouse_move 200 120", wait)?;
+    let mut qmp = Qmp::connect(
+        &scratch.socket().with_file_name("qmp.sock"),
+        Duration::from_secs(20),
+    )?;
+    qmp.move_to(200, 120, 640, 400)?;
     std::thread::sleep(Duration::from_millis(300));
-    monitor.command("mouse_button 1", wait)?;
+    qmp.left_button(true)?;
     std::thread::sleep(Duration::from_millis(300));
-    monitor.command("mouse_button 0", wait)?;
+    qmp.left_button(false)?;
     for ended in ENDED {
         run.expect_line(ended, |l| l == ended, WITHIN)?;
     }
@@ -257,6 +336,11 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     cmd.arg(format!(
         "unix:{},server=on,wait=off",
         scratch.socket().display()
+    ));
+    cmd.args(["-qmp"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().with_file_name("qmp.sock").display()
     ));
     cmd.args(qemu::GPU);
     cmd.args(qemu::TABLET);
