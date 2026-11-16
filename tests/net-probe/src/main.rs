@@ -2626,27 +2626,10 @@ impl Probe<'_> {
             }
             set = self.epoll_set(&root, set, &records)?;
         }
-        // A wait that had steps to run in its request gives half of the most (`SETTLED_MOST`) and
-        // looks at as many records: the 64 stale records may take its looks, and the 64 places
-        // come in the waits that follow.
-        let mut seen = [false; 64];
-        let mut count = 0;
-        for _ in 0..3 {
-            let pairs = self.epoll_wait_now(&root, set, 64)?;
-            for &(label, _) in pairs.as_slice() {
-                let at = (label as usize).wrapping_sub(100);
-                if at < 64 && !seen[at] {
-                    seen[at] = true;
-                    count += 1;
-                }
-            }
-            if count == 64 {
-                break;
-            }
-        }
-        if count != 64 {
-            rt::println!("net-probe: {} places", count);
-            return Err("the waits did not give 64 pairs");
+        let pairs = self.epoll_wait_now(&root, set, 64)?;
+        if pairs.len != 64 {
+            rt::println!("net-probe: {} pairs", pairs.len);
+            return Err("the wait did not give 64 pairs");
         }
         rt::println!("net-probe: epoll wait ok 64 after 64 stale");
         // A request that changes a place with records brings what the service
@@ -2693,9 +2676,12 @@ impl Probe<'_> {
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
             self.close(&root, d).map_err(|_| "CLOSE failed")?;
         }
-        // A request that waits on a set does not overtake the steps told before it: a datagram
-        // sent while the steps of the stack are held is in the report of the wait that follows
-        // at once (the steps it needs run in the request, stafeto-design#713).
+        // A request that waits on a set does not overtake the steps told before it, and no step
+        // runs in a request. While the steps of the stack are held, the wait is parked behind them
+        // and the step of waking answers it, at the latest at its third step, with what is ready
+        // (nothing: the datagram is held). After the hold ends, the wait that follows at once is
+        // parked behind the steps the end tells and reports the datagram (stafeto-design#713,
+        // #741).
         {
             let d = self
                 .new_socket(&root, sockets::DGRAM)
@@ -2716,9 +2702,11 @@ impl Probe<'_> {
                 data: b"s",
             };
             let sent = self.plain(&root, request);
-            let pairs = self.epoll_wait_now(&root, set, 64);
+            let held = self.epoll_wait_now(&root, set, 64);
             self.hold(&root, proto_net::HOLD_OFF)?;
             sent.map_err(|_| "SEND failed")?;
+            held.map_err(|_| "a wait while the steps were held did not answer")?;
+            let pairs = self.epoll_wait_now(&root, set, 64);
             if pairs?.len != 1 {
                 return Err("a datagram sent while the steps were held was not reported");
             }

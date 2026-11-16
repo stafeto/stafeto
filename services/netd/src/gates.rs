@@ -212,12 +212,6 @@ impl Yielding {
     pub fn owed(&self) -> u64 {
         self.owed
     }
-
-    /// The steps of `mask` that were put off are run by the caller at once: they are no longer
-    /// owed.
-    pub fn settle(&mut self, mask: u64) {
-        self.owed &= !mask;
-    }
 }
 
 #[cfg(test)]
