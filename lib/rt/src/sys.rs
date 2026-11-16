@@ -472,6 +472,14 @@ pub fn thread_times(thread: &Handle<Thread>) -> Result<(u64, u64), Error> {
     Ok((x[5], x[6]))
 }
 
+/// object_info(THREAD_STATE) x7: the times a higher level took the thread
+/// off the CPU while it was ready (a preemption; the count wraps at 2^16).
+pub fn thread_preempts(thread: &Handle<Thread>) -> Result<u64, Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(x[7])
+}
+
 /// object_info(PROCESS_TIME) x1 and x2: the counter ticks the threads of
 /// the process have run, and those of them spent in the kernel.
 pub fn process_times(process: &Handle<Process>) -> Result<(u64, u64), Error> {

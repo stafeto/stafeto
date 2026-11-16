@@ -264,6 +264,12 @@ pub struct Node<T> {
     /// Ticks the thread has run, summed over its finished stints on the
     /// CPU (spec 8: the CPU time `object_info` reports).
     ran: u64,
+    /// Times a higher level (or the cleanup queue) took the thread off the
+    /// CPU while it was ready: `preempt` only. A block, a `yield`, the end
+    /// of a quantum and a budget's end do not count. It wraps at 2^16: the
+    /// field takes the two spare bytes of the node, so the thread keeps its
+    /// size, and a reader takes the difference of two readings modulo 2^16.
+    preempts: u16,
     /// While the thread runs, the counter value at which its stint began
     /// with `RUNNING` set; otherwise the ticks left of a round-robin quantum
     /// while it is ready. One word for both keeps the node, and so the
@@ -288,6 +294,7 @@ impl<T> Node<T> {
             cap: PRIORITY_LEVELS - 1,
             server: None,
             ran: 0,
+            preempts: 0,
             stamp: 0,
             link: Link::new(priority),
         }
@@ -382,6 +389,12 @@ impl<T> Node<T> {
     /// Ticks of the finished stints on the CPU, without the current one.
     pub fn ran(&self) -> u64 {
         self.ran
+    }
+
+    /// Times the thread was preempted by a higher level (the count wraps at
+    /// 2^16).
+    pub fn preempts(&self) -> u16 {
+        self.preempts
     }
 
     /// The counter value at which the current stint began, for the running
@@ -960,6 +973,7 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe {
             let demoted = Self::charge(r, now, Leave::Preempt);
             let n = node(r);
+            n.preempts = n.preempts.wrapping_add(1);
             let ended = demoted || n.policy == Policy::RoundRobin && rest == 0;
             n.state = State::Ready;
             n.stamp = if ended { self.quantum } else { rest };
@@ -3139,6 +3153,30 @@ mod tests {
         assert_eq!(node(high).ran(), 0);
         assert_eq!(node(high).ran_at(4 * MS), MS);
         assert_eq!(charged(&w), 3 * MS);
+    }
+
+    #[test]
+    fn only_a_higher_level_counts_as_a_preemption() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        w.started('b', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        // The end of a quantum, a yield: the same level, no count.
+        assert_eq!(w.tick(4 * MS), 'b');
+        assert_eq!(w.yield_at(5 * MS), 'a');
+        assert_eq!(node(a).preempts(), 0);
+        // A thread above takes the CPU: one count; picking again adds none.
+        let h = w.started('h', 20, FIFO);
+        assert_eq!(w.pick(6 * MS), 'h');
+        assert_eq!(w.pick(7 * MS), 'h');
+        assert_eq!(node(a).preempts(), 1);
+        assert_eq!(node(h).preempts(), 0);
+        w.exit(h);
+        // A park (a way of blocking): no count.
+        assert_eq!(w.pick(8 * MS), 'a');
+        // SAFETY: the world owns the thread, which runs.
+        unsafe { w.s.park(a, 9 * MS) };
+        assert_eq!(node(a).preempts(), 1);
     }
 
     #[test]

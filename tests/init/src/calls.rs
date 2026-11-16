@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 43] = [
+pub(crate) const TESTS: [Test; 44] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -138,6 +138,10 @@ pub(crate) const TESTS: [Test; 43] = [
         create_kill_cycles_leak_nothing,
     ),
     ("normal_build_costs", normal_build_costs),
+    (
+        "a_preemption_is_counted_and_costed",
+        a_preemption_is_counted_and_costed,
+    ),
 ];
 
 /// Init's first thread is FIFO at 63 under ceiling 63 (spec 13.3): a
@@ -2312,6 +2316,111 @@ fn normal_build_costs() -> Outcome {
             "normal build ticks: null={null} clock={clock} yield={yielded} notify={notify} round_trip={round_trip}"
         );
         println!("rt round trip ticks: round_trip={through_rt}");
+    }
+    Ok(())
+}
+
+/// Preemptions of the measured burn: the helper's timer fires this many
+/// times in it, by the length of a burn with no helper.
+const PREEMPTS: u64 = 8;
+/// The helper of `a_preemption_is_counted_and_costed` is to end.
+static HELPER_STOP: AtomicU64 = AtomicU64::new(0);
+/// The helper ended.
+static HELPER_DONE: AtomicU64 = AtomicU64::new(0);
+/// The period of the helper's timer, in nanoseconds.
+static HELPER_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+
+/// What one burn of `burn` charged the calling thread: the ticks of its
+/// time it added, the times it was preempted in between, and the counter
+/// ticks the burn took on the clock.
+fn timed_burn() -> Result<(u64, u64, u64), &'static str> {
+    let ran = sys::thread_ran(&me()).map_err(|_| "THREAD_STATE x5 failed")?;
+    let preempts = sys::thread_preempts(&me()).map_err(|_| "THREAD_STATE x7 failed")?;
+    let start = time::now();
+    burn();
+    let elapsed = time::now() - start;
+    let after = sys::thread_ran(&me()).map_err(|_| "THREAD_STATE x5 failed")?;
+    let preempts_after = sys::thread_preempts(&me()).map_err(|_| "THREAD_STATE x7 failed")?;
+    Ok((after - ran, preempts_after - preempts, elapsed))
+}
+
+/// A thread above init that arms the timer (`arg`: the timer in the high
+/// half, the channel in the low) one period ahead and waits for it, over
+/// and over, until HELPER_STOP. Each wake takes the CPU from init.
+extern "C" fn timer_helper(arg: u64) -> ! {
+    let (timer, channel) = (arg >> 32, arg & 0xffff_ffff);
+    while HELPER_STOP.load(Relaxed) == 0 {
+        let deadline = time::ticks_to_ns(time::now()) + HELPER_PERIOD_NS.load(Relaxed);
+        let mut x = [0; 10];
+        x[..2].copy_from_slice(&[timer, deadline]);
+        // SAFETY: timer_set uses no memory of the program.
+        if unsafe { sys::raw::<{ Call::TimerSet.number() }>(x) }[0] != 0 {
+            break;
+        }
+        if receive_x0_to_x11(abi::Handle(channel), 0, 0, 0)[0] != 0 {
+            break;
+        }
+    }
+    HELPER_DONE.store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The count of preemptions (object_info THREAD_STATE x7) and what one
+/// costs the preempted thread: a burn of init with no other thread, then
+/// the same burn with a thread above it woken by a timer PREEMPTS times.
+/// The time (x5) of the second burn is above the first by the exception
+/// entry, the handler, the wake, the decision and the way back to init,
+/// charged to init; the difference over the count is c_sw, the cost of
+/// one preemption, which a step measured by `thread_ran` holds once per
+/// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
+/// the numbers mean little and it prints nothing. On one CPU the count must
+/// be above 0 and the time of the second burn above the first; the helper
+/// blocks on every wait, which does not count.
+fn a_preemption_is_counted_and_costed() -> Outcome {
+    let (pure, none, elapsed) = timed_burn()?;
+    check(none == 0, "a burn with no other thread was preempted")?;
+    HELPER_STOP.store(0, Relaxed);
+    HELPER_DONE.store(0, Relaxed);
+    HELPER_PERIOD_NS.store(time::ticks_to_ns(elapsed) / (PREEMPTS + 1), Relaxed);
+    let c = channel(QUIET)?;
+    let timer = crate::timers::timer_at(&c, HIGH)?;
+    let arg = timer.raw().0 << 32 | c.raw().0;
+    // The helper runs at once, above init, and waits: that preemption is
+    // before the burn.
+    let helper = spawn(0, timer_helper, arg, HIGH, Policy::Fifo)?;
+    let (charged, count, _) = timed_burn()?;
+    HELPER_STOP.store(1, Relaxed);
+    while HELPER_DONE.load(Relaxed) == 0 {
+        // A deadline that passed fires in the call itself.
+        sys::timer_set(&timer, 0).map_err(|_| "timer_set failed")?;
+        sys::yield_now().map_err(|_| "yield failed")?;
+    }
+    let blocked = sys::thread_preempts(&helper).map_err(|_| "THREAD_STATE x7 failed")?;
+    close(helper)?;
+    close(timer)?;
+    close(c)?;
+    let one_cpu = sys::cpu_info(0).map_err(|_| "CPU info failed")?.cpus == 1;
+    if one_cpu {
+        check(
+            count > 0,
+            "a thread above init woken by a timer did not preempt it",
+        )?;
+        check(
+            count <= PREEMPTS + 2,
+            "init was preempted far more often than the timer fired",
+        )?;
+        check(
+            charged > pure,
+            "the preemptions added nothing to the time of init",
+        )?;
+    }
+    check(
+        blocked == 0,
+        "a block of the helper counted as a preemption",
+    )?;
+    if under_icount() && count > 0 {
+        let c_sw = charged.saturating_sub(pure) / count;
+        println!("preempt charge ticks: c_sw={c_sw} count={count} pure={pure} charged={charged}");
     }
     Ok(())
 }
