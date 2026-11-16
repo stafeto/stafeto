@@ -492,6 +492,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "mem-blk"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-blk",
+ "proto-init",
+ "proto-wire",
+ "rt",
+ "virtio-blk",
+]
+
+[[package]]
 name = "neighbour-learn"
 version = "0.1.0"
 dependencies = [

@@ -89,6 +89,7 @@ mod ncdu_dialog;
 mod net;
 mod net_bench;
 mod net_curl;
+mod net_ec2_key;
 mod net_probe;
 mod net_tls;
 mod net_trace;
@@ -1076,6 +1077,11 @@ fn aws_programs() -> &'static [ImageProgram] {
         // The entropy service seeds from the boot page (init's `entropy::SEED_TABLE`);
         // EC2 has no Virtio RNG, so `virtio-rng` stays out.
         programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "entropy"));
+        // The package service with its store in memory (init's records `blk` and `pkgd`):
+        // the memory disk, `pkgd` and the tool `/bin/pkg`, started from its file.
+        programs.push(("mem-blk", "mem-blk", blk_probe::BLK_STACK_SIZE, &[]));
+        programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
+        programs.push(("pkg", "pkg", 0, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -2219,11 +2225,13 @@ commands:
             READY, after the deadline of 3 s, and at once when the service ended
   pkg-slot  run the C probe of the package service's session in fork, spawn and exec,
             a set-ID program and the superuser's right, in QEMU
-  pkg-probe [install] [--hvf] run the package tool in the base image against mirrors of
+  pkg-probe [install|memory] [--hvf] run the package tool in the base image against mirrors of
             the repositories over https that the command starts and ends: pkg install doom
             and the demo, update, list, info, search, check and the log of the mirror
             (install stops there); the plain command goes on with every refusal, remove,
-            upgrade, the second repository and a restart on the same disk
+            upgrade, the second repository and a restart on the same disk; memory runs the
+            install steps on EC2's store, the memory disk of 256 MiB on a 2 GiB machine with
+            no disk, then removes Doom, installs it again and shows an empty store after a reboot
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -2322,6 +2330,10 @@ commands:
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
             `steps` the service counts its steps (TCG only)
+  net-ec2-key [MACHINE] boot the shell with the boot script of EC2 (`/etc/rc`, `/etc/rc.d/ec2-key`)
+            against a fake of the instance metadata service on the host: the
+            key file and its modes, the request without a token (401), no key,
+            and a refused token
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -2691,6 +2703,8 @@ fn main() {
         Some("linux-guest") => linux_guest::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
+        Some("net-ec2-key") => net_ec2_key::command(&args[1..]),
+        Some("net-ec2-key-imds") => net_ec2_key::imds_command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
@@ -10471,6 +10485,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-wget", || {
             net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
         }),
+        // The boot script of EC2: the key of the instance from a fake of the metadata
+        // service (IMDSv2) on the host, written for the SSH server. Also in the group `net`.
+        job("net-ec2-key", || net_ec2_key::probe(&qemu::VIRT)),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {

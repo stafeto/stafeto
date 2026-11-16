@@ -673,10 +673,23 @@ const _: () = assert!(str_eq(
     super::ramfs::POSIX_ABI_TABLE[1].program
 ));
 
+/// The arguments of a launcher that runs the boot script `/etc/rc` beside
+/// the shell (tests/ash-launcher): the script runs the files of `/etc/rc.d`
+/// in the order it names them, so a service that needs the network and what
+/// an earlier file made (the key of `ec2-key`, a server that reads it) is one
+/// more name in that list.
+pub const RC_LAUNCH_ARGS: &[u8] = b"ash-launch\0/etc/rc\0";
+
 /// The launcher of the shell with a session with the network service: the
 /// shell and its commands get the same (the launcher's connections are the
-/// shell's).
+/// shell's). With the feature `net-rc` it runs `/etc/rc` too, as the launcher
+/// of the shell on EC2 does.
 pub const NET_LAUNCHER: Record = Record {
+    args: if cfg!(feature = "net-rc") {
+        RC_LAUNCH_ARGS
+    } else {
+        super::ramfs::BUSYBOX_DIALOG_TABLE[5].args
+    },
     connects: &[
         "ramfs",
         "tty",
