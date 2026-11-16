@@ -2816,7 +2816,8 @@ mod tests {
         // pax).
         for p in packages.iter().filter(|p| p.files.is_empty()) {
             assert!(
-                packages.iter().any(|q| q.build_depends.contains(&p.name)),
+                crate::packages::SERVICE_LIBRARIES.contains(&p.name.as_str())
+                    || packages.iter().any(|q| q.build_depends.contains(&p.name)),
                 "{} installs nothing and no package links it in",
                 p.name
             );

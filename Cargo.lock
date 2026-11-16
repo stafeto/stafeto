@@ -594,6 +594,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixman"
+version = "0.1.0"
+
+[[package]]
 name = "pkg"
 version = "0.5.0"
 dependencies = [

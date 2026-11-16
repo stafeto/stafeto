@@ -43,6 +43,7 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
             read(target.join(format!("freedoom/freedoom-{}/COPYING.txt", version(name)?)))
         }
         "f-stack" => read(target.join("f-stack/LICENSE")),
+        "pixman" => read(target.join("pixman/COPYING")),
         "openssl" => read(target.join(format!("openssl/openssl-{}/LICENSE.txt", version(name)?))),
         "curl" => read(target.join(format!("curl/curl-{}/COPYING", version(name)?))),
         "pcre2" => read(target.join(format!("nginx/pcre2-{}/LICENCE.md", version(name)?))),

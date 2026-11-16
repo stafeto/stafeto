@@ -1,0 +1,12 @@
+[package]
+name = "pixman"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The pixel operations of pixman (tools/build-pixman.py) for the composition service, over a small interface of its own"
+build = "build.rs"
+
+[lib]
+bench = false
