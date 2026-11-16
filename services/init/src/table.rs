@@ -1426,6 +1426,7 @@ pub mod aws;
 pub mod base;
 pub mod bench;
 pub mod ceiling;
+pub mod comp;
 pub mod cycle;
 pub mod doom;
 pub mod entropy;
@@ -1487,6 +1488,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-entropy-vz") as usize
     + cfg!(feature = "table-entropy-seed") as usize
     + cfg!(feature = "table-gpu") as usize
+    + cfg!(feature = "table-comp") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
@@ -1577,6 +1579,7 @@ const _: () = assert!(
     feature = "table-entropy-vz",
     feature = "table-entropy-seed",
     feature = "table-gpu",
+    feature = "table-comp",
     feature = "table-net",
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
@@ -1714,6 +1717,8 @@ pub const TABLE: &[Record] = entropy::VZ_TABLE;
 pub const TABLE: &[Record] = entropy::SEED_TABLE;
 #[cfg(feature = "table-gpu")]
 pub const TABLE: &[Record] = gpu::TABLE;
+#[cfg(feature = "table-comp")]
+pub const TABLE: &[Record] = comp::TABLE;
 #[cfg(feature = "table-net")]
 pub const TABLE: &[Record] = net::NET_TABLE;
 #[cfg(feature = "table-net-probe")]
@@ -1802,6 +1807,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     doom::TABLE,
     base::BASE_TABLE,
     gpu::TABLE,
+    comp::TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -2649,6 +2655,7 @@ mod tests {
             doom::TABLE,
             base::BASE_TABLE,
             gpu::TABLE,
+            comp::TABLE,
             input::TABLE,
             entropy::TABLE,
             normal::TABLE,
@@ -3689,6 +3696,10 @@ mod tests {
         );
         assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
         assert_eq!(
+            order_of(comp::TABLE),
+            ["display", "gpu", "comp-probe", "comp-probe-b"]
+        );
+        assert_eq!(
             order_of(net::NET_PROBE_TABLE),
             ["ramfs", "rng", "entropy", "net", "net-probe"]
         );
@@ -3717,10 +3728,11 @@ mod tests {
         assert!(check(doom::TABLE).is_ok());
         let games = order_of(doom::TABLE);
         let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
-        assert!(at("input") < at("gpu"));
+        assert!(at("input") < at("display"));
+        assert!(at("display") < at("gpu"));
         assert!(at("gpu") < at("busybox-probe"));
         let mut names = games.clone();
-        names.retain(|&n| n != "input" && n != "gpu");
+        names.retain(|&n| n != "input" && n != "display" && n != "gpu");
         let mut dialog = order_of(ramfs::BUSYBOX_DIALOG_TABLE);
         names.sort_unstable();
         dialog.sort_unstable();
@@ -3755,7 +3767,8 @@ mod tests {
         assert!(check(base::BASE_TABLE).is_ok());
         let mut names = order_of(base::BASE_TABLE);
         let at = |names: &[&str], name: &str| names.iter().position(|&n| n == name).unwrap();
-        assert!(at(&names, "input") < at(&names, "gpu"));
+        assert!(at(&names, "input") < at(&names, "display"));
+        assert!(at(&names, "display") < at(&names, "gpu"));
         assert!(at(&names, NET_SERVICE) < names.len());
         assert!(at(&names, "blk") < at(&names, "pkgd"));
         assert!(at(&names, "ramfs") < at(&names, "pkgd"));
@@ -3792,10 +3805,10 @@ mod tests {
             net::NET_TABLE[2].quota
         );
         // The service of the network is the one of the network image, and the
-        // disk and package services close the table: 14 of 16 records.
-        assert_eq!(base::BASE_TABLE[11].name, net::NETD.name);
+        // disk and package services close the table: 15 of 16 records.
+        assert_eq!(base::BASE_TABLE[12].name, net::NETD.name);
         assert_eq!(base::BASE_TABLE.last().unwrap().name, "pkgd");
-        assert_eq!(base::BASE_TABLE.len(), 14);
+        assert_eq!(base::BASE_TABLE.len(), 15);
     }
 
     /// Every POSIX process leaves one level above main for its thread

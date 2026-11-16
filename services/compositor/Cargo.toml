@@ -1,0 +1,36 @@
+[package]
+name = "compositor"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The composition service of stafeto: windows of clients with buffers of their own, put together into the one screen of the display driver"
+
+# What the service decides, apart from the calls it makes: tested on the
+# host.
+[lib]
+bench = false
+
+[[bin]]
+name = "compositor"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount.
+[features]
+steps = ["rt/step-stats"]
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-comp = { path = "../../proto/comp" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-init = { path = "../../proto/init" }
+proto-input = { path = "../../proto/input" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }

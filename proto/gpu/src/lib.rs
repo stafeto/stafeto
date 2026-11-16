@@ -14,6 +14,8 @@
 //! | CLOSE (3) | the owner's | the header alone | the status alone | none |
 //! | CRASH (4) | `Display` | the header alone | none: the service ends with a fault | only a service built with the feature `crash` has it |
 //! | CLONE (8) | `Display` | the header alone | status 0 and one handle, a new `Display` session (SEND, DUPLICATE, TRANSFER) | LIMIT_REACHED |
+//! | SUBSCRIBE (5) | the owner's | the header alone and one handle: a channel of the owner with NOTIFY and TRANSFER | the status alone | INVALID, NOT_ALLOWED |
+//! | COMMIT (6) | the owner's | `x`, `y`, `w`, `h` (u32) | the status alone, as soon as the commands are in the device's queue | INVALID, REVOKED, BUSY, IO |
 //!
 //! The screen belongs to one owner at a time. OPEN of a free screen makes
 //! the owner's session, a new label of the service, and the reply's
@@ -41,6 +43,17 @@
 //! After the service ended and started again, every session of the old
 //! one leads to a closed channel (PEER_CLOSED): the new one knows none of
 //! them.
+//!
+//! Revision 2 (REVISION) adds the two methods a service of composition
+//! drives the screen with, and changes none of the first revision: the
+//! header's version stays VERSION, so that a program built for the series
+//! of ABI that froze with revision 1 and a service that takes both
+//! revisions keep talking. SUBSCRIBE gives the driver the owner's channel,
+//! once; COMMIT takes the rectangle like FLUSH but answers at once, and the
+//! driver says on that channel, in the bits FRAME_SHOWN or FRAME_FAILED,
+//! when the device finished the transfer and the flush of that rectangle.
+//! One COMMIT is with the device at a time: a second before the bit is
+//! BUSY. The owner never waits for the device inside a step.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -49,6 +62,16 @@ use proto_wire::{Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
 pub const VERSION: u16 = 1;
+
+/// The revision of the protocol: 2 adds SUBSCRIBE and COMMIT to the
+/// methods of revision 1 and changes none of them, so the version in the
+/// header stays VERSION (see above).
+pub const REVISION: u16 = 2;
+
+/// The bits of the driver's notification to the channel SUBSCRIBE gave:
+/// the last COMMIT is on the screen, or the device refused it.
+pub const FRAME_SHOWN: u64 = 1;
+pub const FRAME_FAILED: u64 = 2;
 
 /// The screen: points, bytes a line, bytes in all.
 pub const WIDTH: u32 = 640;
@@ -91,15 +114,19 @@ pub enum Method {
     Flush = 2,
     Close = 3,
     Crash = 4,
+    Subscribe = 5,
+    Commit = 6,
     Clone = 8,
 }
 
 impl Method {
-    pub const ALL: [Method; 5] = [
+    pub const ALL: [Method; 7] = [
         Method::Open,
         Method::Flush,
         Method::Close,
         Method::Crash,
+        Method::Subscribe,
+        Method::Commit,
         Method::Clone,
     ];
 
@@ -165,8 +192,13 @@ impl Rect {
 
     /// The header of FLUSH and the rectangle. INVALID outside the screen.
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        self.write_as(Method::Flush, w)
+    }
+
+    /// The header of `method` (FLUSH or COMMIT) and the rectangle.
+    pub fn write_as(&self, method: Method, w: &mut Writer) -> Result<(), Status> {
         self.check()?;
-        Method::Flush.header().write(w)?;
+        method.header().write(w)?;
         w.u32(self.x)?;
         w.u32(self.y)?;
         w.u32(self.w)?;
@@ -239,7 +271,7 @@ impl Screen {
     }
 
     /// Whether the buffer holds the screen: `height` lines of `stride`
-    /// bytes, in the object of BUFFER_BYTES.
+    /// bytes, in an object of at most BUFFER_BYTES (the compositor's is the screen's 250 pages).
     pub fn fits(&self) -> bool {
         u64::from(self.stride) >= u64::from(self.width) * 4
             && u64::from(self.stride) * u64::from(self.height) <= u64::from(BUFFER_BYTES)
@@ -263,12 +295,12 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        assert_eq!(numbers, [1, 2, 3, 4, 8]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 8]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(5), None);
+        assert_eq!(Method::from_number(7), None);
     }
 
     #[test]
@@ -373,6 +405,33 @@ mod tests {
         let header = Header::read(&mut Reader::new(bytes)).expect("header");
         assert_eq!(header, Method::Flush.header());
         assert_eq!(Rect::read(Reader::new(&bytes[8..])), Ok(r));
+    }
+
+    #[test]
+    fn commit_is_flush_under_its_own_number() {
+        let r = Rect {
+            x: 8,
+            y: 9,
+            w: 10,
+            h: 11,
+        };
+        let mut flush = Writer::new();
+        let mut commit = Writer::new();
+        r.write(&mut flush).expect("flush");
+        r.write_as(Method::Commit, &mut commit).expect("commit");
+        assert_eq!(flush.as_bytes()[8..], commit.as_bytes()[8..]);
+        let header = Header::read(&mut Reader::new(commit.as_bytes())).expect("header");
+        assert_eq!(header, Method::Commit.header());
+        assert_eq!(header.version, VERSION);
+        assert_eq!(Rect::read(Reader::new(&commit.as_bytes()[8..])), Ok(r));
+    }
+
+    #[test]
+    fn revision_2_changes_no_header_version() {
+        assert_eq!(VERSION, 1);
+        assert_eq!(REVISION, 2);
+        assert_eq!(Method::Subscribe.header().version, 1);
+        assert_eq!(FRAME_SHOWN & FRAME_FAILED, 0);
     }
 
     #[test]

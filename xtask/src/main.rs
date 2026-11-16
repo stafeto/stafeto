@@ -50,6 +50,7 @@ mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
+mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
@@ -2235,6 +2236,10 @@ commands:
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
             steps under -icount; with --hvf under HVF
+  comp-probe [--hvf] run the probe of the composition service in QEMU: windows of a client, a
+            rectangle posted alone, two windows, the screen after a process ended and a window
+            of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
+            of the compositor and the display driver under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2676,6 +2681,14 @@ fn main() {
         Some("init-wait") => init_wait::command(&args[1..]),
         Some("pkg-slot") => pkg_slot::probe(&qemu::VIRT),
         Some("pkg-probe") => pkg_probe::command(&args[1..]),
+        Some("comp-probe") => match args.get(1).map(String::as_str) {
+            None => comp_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                comp_probe::probe(&qemu::HVF_V3)?;
+                comp_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("comp-probe [--hvf]".to_owned()),
+        },
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -10501,6 +10514,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
+        // The composition service on that driver: windows against QEMU's
+        // screenshot, the end of a process, a program of the first
+        // revision, then the steps of the services under -icount.
+        job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10747,9 +10764,13 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-comp",
+        "--package",
         "virtio-mmio",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "proto-input",
         "--package",
@@ -13219,6 +13240,8 @@ fn hvf() -> Result<(), String> {
         // The display service: the buffer through the real processor's
         // caches, shown without a clean (spec 3, 3.4).
         gpu_probe::probe(m)?;
+        // The composition service over it, the same way.
+        comp_probe::probe(m)?;
         // The input service on the real processor, and its focus with the
         // display service.
         input_probe::probe(m)?;
@@ -13541,6 +13564,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-comp",
+        "--package",
         "proto-input",
         "--package",
         "proto-net",
@@ -13583,6 +13608,8 @@ fn ci_lints() -> Result<(), String> {
         "entropy",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "virtio-input",
         "--package",
@@ -13766,7 +13793,11 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "virtio-gpu",
         "--package",
+        "compositor",
+        "--package",
         "gpu-probe",
+        "--package",
+        "comp-probe",
         "--package",
         "virtio-input",
         "--package",
@@ -13792,7 +13823,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15912,6 +15943,11 @@ mod entropy_in_images_tests {
                 &crate::entropy::SEED_BREAK_PROGRAMS,
             ),
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
+            ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
+            (
+                "comp_probe::STEPS_PROGRAMS",
+                &crate::comp_probe::STEPS_PROGRAMS,
+            ),
             ("gpu_probe::PROGRAMS", &crate::gpu_probe::PROGRAMS),
             (
                 "gpu_probe::STEPS_PROGRAMS",
