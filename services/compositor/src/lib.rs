@@ -302,7 +302,8 @@ impl Scene {
     /// The window `i` goes: its place on the screen is to be shown again.
     pub fn destroy(&mut self, i: usize) -> Option<Window> {
         let w = self.windows.get_mut(i)?.take()?;
-        if w.current.is_some() || w.posted.is_some() {
+        // A window of the first revision always has its line to say.
+        if w.legacy || w.current.is_some() || w.posted.is_some() {
             self.add_damage(w.rect);
         }
         Some(w)
