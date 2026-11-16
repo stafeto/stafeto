@@ -3,13 +3,23 @@
 # program (an image that holds no package dropbear), nothing starts and one
 # line says so.
 #
+# The host key is an Ed25519 key made here, before the server starts and so
+# before anyone can connect (`dropbearkey` waits for the entropy service's
+# seed in `getrandom`). One line on the console gives its fingerprint, for the
+# owner to compare with what `ssh` shows at the first connection:
+#   ssh: host key SHA256:...
+# The key lives in /etc/dropbear, which is in memory: a new instance start
+# makes a new key.
+#
 # The server runs in the foreground (-F) under a loop of its own that starts
 # it again a second after it ends (it ends at once while the network has no
-# address to listen on). The host keys are made when first needed (-R), no
-# password login is possible (-s), and no port is forwarded (-j, -k). The
-# build has no syslog, so its log goes to the standard error, the console.
+# address to listen on; the line it printed is shown once and then only when it
+# changes). No password login is possible (-s) and no port is forwarded (-j,
+# -k); the build leaves both out as well. The build has no syslog, so the log
+# goes to the standard error, the console.
 
-args="-F -R -s -j -k"
+args="-F -s -j -k"
+key=/etc/dropbear/dropbear_ed25519_host_key
 
 if [ ! -x /bin/dropbear ]; then
     echo "dropbear: no /bin/dropbear in this image, SSH stays off"
@@ -20,10 +30,32 @@ if [ ! -f /root/.ssh/authorized_keys ]; then
     exit 0
 fi
 
-echo "dropbear: dropbear $args"
+mkdir -p /etc/dropbear
+if [ ! -f "$key" ]; then
+    if ! /bin/dropbearkey -t ed25519 -f "$key" >/dev/null 2>&1; then
+        rm -f "$key"
+        echo "dropbear: no host key could be made, SSH stays off"
+        exit 1
+    fi
+fi
+fingerprint=$(/bin/dropbearkey -y -f "$key" 2>/dev/null | sed -n 's/^Fingerprint: //p')
+echo "ssh: host key $fingerprint"
+
+echo "dropbear: dropbear $args -r $key"
 (
     while :; do
-        /bin/dropbear $args
+        /bin/dropbear $args -r "$key" 2>&1
         sleep 1
-    done
+    done | {
+        # One filter reads the lines of every run: a line is shown when its text (without
+        # the process number and the time the server puts in front) is not the one before.
+        last=
+        while IFS= read -r line; do
+            text=${line#*[0-9][0-9]:[0-9][0-9]:[0-9][0-9] }
+            if [ "$text" != "$last" ]; then
+                echo "$line"
+                last=$text
+            fi
+        done
+    }
 ) &

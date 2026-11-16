@@ -14,9 +14,11 @@ no syslog (the server then logs to stderr and has no option `-E`). No zlib, no P
 hardening flags of `configure` (the compiler options below carry the stack
 protector). `localoptions.h` (tools/dropbear/localoptions.h) turns off what
 the image does not hold: the re-execution of the server for each connection
-(it needs /proc/self/exe), the SFTP server, the agent and X11 forwarding.
-Port forwarding stays compiled in and is switched off when the server
-starts (`-j -k`). The result is one relocatable object,
+(it needs /proc/self/exe), the SFTP server, the agent and X11 forwarding, the
+password login and every kind of port forwarding; it also sets the limits of
+connections that have not authenticated. The server and `dropbearkey` are one
+program that runs as the name in argv[0] says. The boot script still starts
+the server with `-s -j -k`, which this build ignores: a second layer. The result is one relocatable object,
 target/dropbear/dropbear.o, that exports `main` alone; tools/build-libc-so.py
 programs links it against libc.so.
 
@@ -147,9 +149,11 @@ def main() -> None:
     # crt, and the C library of the program is libc.so. LibTomCrypt and
     # LibTomMath are archives of the build tree that the server's own link
     # takes in.
-    run(log, "make", "-j4", "PROGRAMS=dropbear", "dropbear", "LIBS=",
+    # One program for the server and `dropbearkey` (the key of the host is made by the boot
+    # script): `dropbearmulti` runs the one that argv[0] names.
+    run(log, "make", "-j4", "PROGRAMS=dropbear dropbearkey", "MULTI=1", "dropbearmulti", "LIBS=",
         f"LDFLAGS=-nostdlib -r --ld-path={lld}", cwd=build)
-    joined = build / "dropbear"
+    joined = build / "dropbearmulti"
     OUTPUT.unlink(missing_ok=True)
     run(log, objcopy, "--keep-global-symbol=main", joined, OUTPUT)
     listing = subprocess.run([str(nm), "-g", "--defined-only", str(OUTPUT)],

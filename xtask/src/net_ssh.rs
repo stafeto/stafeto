@@ -3,31 +3,36 @@
 
 //! The probe of the SSH server (`cargo xtask net-ssh`): the image of the
 //! shell with the network service whose boot script (`/etc/rc`, tools/rc)
-//! starts Dropbear (`/bin/dropbear -F -R -s -j -k`, from `/etc/rc.d/dropbear`
+//! starts Dropbear (`/bin/dropbear -F -s -j -k -r KEY`, from `/etc/rc.d/dropbear`
 //! once the key is in `/root/.ssh/authorized_keys`) on QEMU's user network, a port of the host forwarded to the
 //! port 22 of the guest. xtask drives `ash` over the serial port, as
 //! `net-curl` does, and is the client with the host's own `ssh`:
 //!
-//! 1. The image: `/etc/dropbear` holds no file (the host keys are made on
-//!    the first start), `/etc/shadow` locks every account (the check of
+//! 1. The image: `/etc/dropbear` holds no file (the boot script
+//!    makes the host key with `dropbearkey`), `/etc/shadow` locks every account (the check of
 //!    rootfs.rs), and the package carries its licence notice.
 //! 2. The one process named dropbear is running (`/proc/<pid>/cmdline`
 //!    holds the name of a program alone, the process service keeps no
 //!    arguments), and the boot script printed the command line it started it
-//!    with, exactly `dropbear -F -R -s -j -k`: the
-//!    password login is off, no port is forwarded, the host keys are made
-//!    when first needed (the build has no syslog, so the log goes to the
-//!    standard error).
+//!    with, exactly the line of `SERVER_LINE`: the
+//!    password login is off (and left out of the build), no port is forwarded
+//!    (likewise), and the log goes to the standard error (the build has no
+//!    syslog). The console shows `ssh: host key SHA256:...` before the probe
+//!    connects, and the client sees the same key.
 //! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key
 //!    `ec2-key` takes from the metadata of an instance; the image of the probe has a
 //!    script of its own that writes the key of the run): a login with it
 //!    runs a command and gives its exit status, a bulk transfer of 64 KiB
 //!    through the pipes of a session is whole, a session with a terminal
 //!    (`ssh -tt`) runs a shell on a pseudo terminal and brings 2 000 lines
-//!    back in order. The host key now exists in `/etc/dropbear`.
+//!    back in order. `/etc/dropbear` holds the one host key.
 //! 4. A key the server does not know is refused.
 //! 5. A password of 257 and one of 1 024 bytes is refused for the account
 //!    `root` (the field `!` of `/etc/shadow`) and for `star`, an account the probe's image adds with `*`.
+//! 5b. Connections that have not authenticated: the most one address may hold
+//!    are held open, the next is refused, an HTTP request to the guest is still
+//!    answered, and the server closes the held ones after `AUTH_TIMEOUT`,
+//!    after which a login works.
 //! 6. Pseudo terminals: sessions with a terminal are opened one after the
 //!    other until one gets none (the pairs are eight, the console takes
 //!    one), the count is printed, and after they all end a new session gets
@@ -52,8 +57,15 @@ use crate::{
 /// The image of the run.
 pub const IMAGE: &str = "boot-ssh-probe.img";
 
+/// The host key the boot script makes with `dropbearkey`.
+const HOST_KEY: &str = "/etc/dropbear/dropbear_ed25519_host_key";
+/// The limits of connections that have not authenticated (tools/dropbear/localoptions.h).
+const UNAUTH_PER_IP: usize = 2;
+/// The time a connection may stay unauthenticated (`AUTH_TIMEOUT`), in seconds.
+const AUTH_TIMEOUT: u64 = 30;
+
 /// The command line of the server that `/etc/rc.d/dropbear` starts.
-const SERVER_LINE: [&str; 6] = ["dropbear", "-F", "-R", "-s", "-j", "-k"];
+const SERVER_LINE: [&str; 7] = ["dropbear", "-F", "-s", "-j", "-k", "-r", HOST_KEY];
 
 /// How long one login may take: the key exchange and the first command run
 /// on an emulated CPU.
@@ -380,6 +392,92 @@ fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Connections that have not authenticated: the most one address may hold are held open, the next
+/// one is refused, a request to another service of the image is still answered and a login with
+/// the key is refused while they are held, and the server closes them after `AUTH_TIMEOUT`, after
+/// which the login works at once. (The probe reaches the server from one address, so the limit
+/// of all the addresses together is not reached.)
+fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Result<(), String> {
+    run.send("httpd -f -p 80 -h /www &")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], client.port).into();
+    let mut held = Vec::new();
+    for n in 1..=UNAUTH_PER_IP {
+        let mut stream = crate::net_curl::connect_forwarded(&address, LOGIN_WITHIN)
+            .map_err(|e| format!("held connection {n}: {e}"))?;
+        stream
+            .set_read_timeout(Some(LOGIN_WITHIN))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut banner = [0u8; 64];
+        let got = stream
+            .read(&mut banner)
+            .map_err(|e| format!("held connection {n}: {e}"))?;
+        if !banner[..got].starts_with(b"SSH-2.0-") {
+            return Err(format!("held connection {n} got {:?}", &banner[..got]));
+        }
+        held.push(stream);
+    }
+    let began = Instant::now();
+    let mut extra = crate::net_curl::connect_forwarded(&address, LOGIN_WITHIN)
+        .map_err(|e| format!("the connection past the limit: {e}"))?;
+    extra
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let mut bytes = [0u8; 64];
+    match extra.read(&mut bytes) {
+        Ok(0) | Err(_) if began.elapsed() < Duration::from_secs(20) => {}
+        other => {
+            return Err(format!(
+                "the connection past the limit was served: {other:?}"
+            ));
+        }
+    }
+    let (body, _) = crate::net_curl::get_within(([127, 0, 0, 1], http).into(), LOGIN_WITHIN)
+        .map_err(|e| format!("a request to the HTTP server with the connections held: {e}"))?;
+    crate::net_curl::check_body(&body)?;
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.args(["-o", "ConnectTimeout=20"]).arg("true");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code == Some(0) {
+        return Err("a login went through with the connections of the address held".to_owned());
+    }
+    println!(
+        "net-ssh: {UNAUTH_PER_IP} connections held, the next refused, the HTTP server answers, a login from the same address waits"
+    );
+    // The server closes the held connections after AUTH_TIMEOUT.
+    for stream in &mut held {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(AUTH_TIMEOUT + 30)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut rest = [0u8; 256];
+        loop {
+            match stream.read(&mut rest) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+    let waited = began.elapsed().as_secs();
+    if waited + 5 < AUTH_TIMEOUT || waited > AUTH_TIMEOUT + 30 {
+        return Err(format!(
+            "the held connections ended after {waited} s, the limit is {AUTH_TIMEOUT} s"
+        ));
+    }
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.arg("echo again-$((6*7))");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code != Some(0) || !said.text().contains("again-42") {
+        return Err(format!(
+            "no login after the held connections ended: {:?} {:?}",
+            said.code, said.stderr
+        ));
+    }
+    println!(
+        "net-ssh: the server closed the held connections after {waited} s and a login with the key works"
+    );
+    Ok(())
+}
+
 /// Step 6: sessions with a terminal until one gets none.
 fn terminals(client: &Client, key: &Path) -> Result<usize, String> {
     use std::io::{BufRead, BufReader};
@@ -476,6 +574,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     image_check()?;
     crate::notices::image_has_package_notices(&image, IMAGE, "dropbear")?;
     let port = crate::net_curl::free_tcp_port()?;
+    let http = crate::net_curl::free_tcp_port()?;
     let client = Client {
         port,
         dir: dir.clone(),
@@ -484,27 +583,41 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net_on(
         machine,
-        &[Forward {
-            proto: Proto::Tcp,
-            host: port,
-            guest: 22,
-        }],
+        &[
+            Forward {
+                proto: Proto::Tcp,
+                host: port,
+                guest: 22,
+            },
+            Forward {
+                proto: Proto::Tcp,
+                host: http,
+                guest: 80,
+            },
+        ],
     ));
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let started = Instant::now();
     let mut terminal_sessions = 0;
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        // The line of the host key is on the console before anyone can connect: the probe
+        // connects only after it.
+        let said = run.expect_line(
+            "the line of the host key",
+            |l| l.contains("ssh: host key SHA256:"),
+            LOGIN_WITHIN,
+        )?;
+        let fingerprint = said
+            .split_once("ssh: host key ")
+            .map(|(_, f)| f.trim().to_owned())
+            .ok_or("no fingerprint in the line of the host key")?;
+        println!("net-ssh: the console says ssh: host key {fingerprint}");
         run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("S=ok")?;
         run.expect("# ", DIALOG_STEP)?;
         // 1 (the guest's half) and 2.
-        let held = guest(&mut run, "ls -A /etc/dropbear | wc -l", "keys0")?;
-        // (Lines of the boot script may come in between.)
-        if !held.iter().any(|l| l.trim() == "0") {
-            return Err(format!("/etc/dropbear is not empty at the start: {held:?}"));
-        }
         command_line(&mut run)?;
 
         // 3.
@@ -521,10 +634,27 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         }
         println!("net-ssh: the login with the key runs a command");
         let keys = guest(&mut run, "ls /etc/dropbear", "keys1")?;
-        if keys.iter().all(|l| l.trim().is_empty()) {
-            return Err("the first login made no host key in /etc/dropbear".to_owned());
+        let keys: Vec<&str> = keys
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| l.starts_with("dropbear_"))
+            .collect();
+        if keys != ["dropbear_ed25519_host_key"] {
+            return Err(format!("the host keys in /etc/dropbear are {keys:?}"));
         }
-        println!("net-ssh: host keys after the first login: {keys:?}");
+        let known = Command::new("ssh-keygen")
+            .arg("-l")
+            .arg("-f")
+            .arg(dir.join("known_hosts"))
+            .output()
+            .map_err(|e| format!("ssh-keygen: {e}"))?;
+        let known = String::from_utf8_lossy(&known.stdout).into_owned();
+        if !known.contains(&fingerprint) {
+            return Err(format!(
+                "the client saw {known:?}, the console said {fingerprint}"
+            ));
+        }
+        println!("net-ssh: the key the client saw is the one the console named");
         let mut ssh = client.command("root", Some(&good), true);
         ssh.arg("exit 7");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
@@ -640,6 +770,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         println!(
             "net-ssh: a password of 257 and one of 1024 bytes is refused for the account with ! and the one with *"
         );
+        preauth(&mut run, &client, &good, http)?;
         // 6.
         terminal_sessions = terminals(&client, &good)?;
         println!(
