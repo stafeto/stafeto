@@ -49,8 +49,8 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::ManuallyDrop;
 use core::slice;
 use proto_gpu::{
-    BUSY, CLEARING, IO, Method, NO_DEVICE, NO_INPUT, NOT_ALLOWED, REVOKED, Rect, STRIDE, Screen,
-    VERSION, code,
+    BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, INVALID, IO, Method, NO_DEVICE, NO_INPUT,
+    NOT_ALLOWED, REVOKED, Rect, STRIDE, Screen, VERSION, code,
 };
 use proto_init::ServiceArgs;
 use proto_input::{self, Method as InputMethod};
@@ -218,6 +218,8 @@ fn main(_: u64) -> u64 {
         focus_on: false,
         showing: None,
         queued: None,
+        subscriber: None,
+        committing: false,
         fb,
         _maps: (dma, window),
     };
@@ -336,6 +338,10 @@ struct Driver {
     /// The FLUSH with the device, and the one that waits for it.
     showing: Option<Pending>,
     queued: Option<(Pending, Rect)>,
+    /// The channel SUBSCRIBE gave, which the end of a COMMIT is told on,
+    /// and whether the show with the device is a COMMIT's.
+    subscriber: Option<Handle<Channel>>,
+    committing: bool,
     /// The buffer's object that the owners' copies come from (init gave it
     /// DUPLICATE), and the DMA object and the window, mapped for the
     /// driver's life.
@@ -485,22 +491,21 @@ impl Driver {
         sent
     }
 
-    /// Starts a FLUSH: the transfer and the flush of the rectangle, two
-    /// chains. The device is idle. A refusal of the queue answers the
-    /// client at once.
-    fn show(&mut self, pending: Pending, rect: Rect) {
+    /// The transfer and the flush of `rect` into the queue, two chains, and
+    /// the job that holds them. The device is idle. The flush chain is None
+    /// when the queue refused it (the job is then bad: the transfer that is
+    /// in comes back and nothing waits on it); the first is None when the
+    /// queue refused both.
+    fn show_chains(&mut self, rect: &Rect) -> Option<Option<Chain>> {
         let transfer = self.submit(0, ANSWER_AT[0], HEADER, |b| {
-            commands::transfer_to_host_2d(b, &rect, commands::RESOURCE)
+            commands::transfer_to_host_2d(b, rect, commands::RESOURCE)
         });
         let flush = transfer.and_then(|_| {
             self.submit(1, ANSWER_AT[1], HEADER, |b| {
-                commands::resource_flush(b, &rect, commands::RESOURCE)
+                commands::resource_flush(b, rect, commands::RESOURCE)
             })
         });
-        let Some(first) = transfer else {
-            let _ = pending.answer(&proto_wire::reply(code(IO)), Outgoing::new());
-            return;
-        };
+        let first = transfer?;
         // A transfer in the queue with no flush after it is taken back by
         // the interrupt that brings it, and nothing waits on it.
         self.flight = Some(Flight {
@@ -510,10 +515,18 @@ impl Driver {
             bad: flush.is_none(),
         });
         self.ring();
-        if flush.is_some() {
-            self.showing = Some(pending);
-        } else {
-            let _ = pending.answer(&proto_wire::reply(code(IO)), Outgoing::new());
+        Some(flush)
+    }
+
+    /// Starts a FLUSH: the transfer and the flush of the rectangle, two
+    /// chains. The device is idle. A refusal of the queue answers the
+    /// client at once.
+    fn show(&mut self, pending: Pending, rect: Rect) {
+        match self.show_chains(&rect) {
+            Some(Some(_)) => self.showing = Some(pending),
+            _ => {
+                let _ = pending.answer(&proto_wire::reply(code(IO)), Outgoing::new());
+            }
         }
     }
 
@@ -641,6 +654,16 @@ impl Driver {
                 if let Some(pending) = self.showing.take() {
                     let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
                 }
+                if core::mem::take(&mut self.committing)
+                    && let Some(subscriber) = &self.subscriber
+                {
+                    let bit = if flight.bad {
+                        FRAME_FAILED
+                    } else {
+                        FRAME_SHOWN
+                    };
+                    let _ = sys::notify(subscriber, bit);
+                }
             }
         }
     }
@@ -681,6 +704,7 @@ impl Driver {
             return;
         }
         self.revoke_focus();
+        self.subscriber = None;
         if let Some((pending, _)) = self.queued.take() {
             let _ = pending.answer(&proto_wire::reply(code(REVOKED)), Outgoing::new());
         }
@@ -851,6 +875,54 @@ impl Driver {
         Answer::Deferred
     }
 
+    /// SUBSCRIBE of the owner's session: the channel COMMIT's end is told
+    /// on, once.
+    fn subscribe(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if !self.owner.owns(r.label()) {
+            return Answer::Status(code(REVOKED));
+        }
+        if self.subscriber.is_some() {
+            return Answer::Status(code(NOT_ALLOWED));
+        }
+        let Ok(channel) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(code(INVALID));
+        };
+        self.subscriber = Some(channel);
+        Answer::Status(Status::Ok)
+    }
+
+    /// COMMIT of the owner's session: the rectangle goes into the device's
+    /// queue and the reply goes at once; the end comes as a bit on the
+    /// subscribed channel. BUSY while the device holds a job.
+    fn commit(&mut self, r: &mut Request<'_>) -> Answer {
+        let rect = match Rect::read(r.body()) {
+            Ok(rect) => rect,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if !self.owner.owns(r.label()) || self.setup != Setup::Ready {
+            return Answer::Status(code(REVOKED));
+        }
+        if self.subscriber.is_none() {
+            return Answer::Status(code(NOT_ALLOWED));
+        }
+        if self.flight.is_some() || self.queued.is_some() {
+            return Answer::Status(code(BUSY));
+        }
+        match self.show_chains(&rect) {
+            Some(Some(_)) => {
+                self.committing = true;
+                Answer::Status(Status::Ok)
+            }
+            _ => Answer::Status(code(IO)),
+        }
+    }
+
     /// CLOSE of the owner's session.
     fn close(&mut self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
@@ -894,6 +966,8 @@ const METHODS: &[u16] = &[
     Method::Open.number(),
     Method::Flush.number(),
     Method::Close.number(),
+    Method::Subscribe.number(),
+    Method::Commit.number(),
     Method::Clone.number(),
     Method::Crash.number(),
 ];
@@ -902,6 +976,8 @@ const METHODS: &[u16] = &[
     Method::Open.number(),
     Method::Flush.number(),
     Method::Close.number(),
+    Method::Subscribe.number(),
+    Method::Commit.number(),
     Method::Clone.number(),
 ];
 
@@ -916,7 +992,9 @@ impl Service<1> for Driver {
         // and clone: the other method is not theirs.
         let owner_session = owner::is_owner_label(r.label());
         match method {
-            Some(Method::Flush | Method::Close) if !owner_session => {
+            Some(Method::Flush | Method::Close | Method::Subscribe | Method::Commit)
+                if !owner_session =>
+            {
                 return Answer::Status(code(NOT_ALLOWED));
             }
             Some(Method::Open | Method::Clone) if owner_session => {
@@ -928,6 +1006,8 @@ impl Service<1> for Driver {
             Some(Method::Open) => self.open(r),
             Some(Method::Flush) => self.flush(r),
             Some(Method::Close) => self.close(r),
+            Some(Method::Subscribe) => self.subscribe(r),
+            Some(Method::Commit) => self.commit(r),
             Some(Method::Clone) => self.clone_session(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),
