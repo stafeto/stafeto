@@ -379,10 +379,10 @@ mod tests {
         assert!(MEMBLK.windows.is_empty() && MEMBLK.bindings.is_empty() && MEMBLK.dma.is_empty());
         assert!(MEMBLK.quiesce.is_empty() && !MEMBLK.trusted);
         assert_eq!(MEMBLK.restart, Restart::Never);
-        assert!(MEMBLK.quota >= MEMORY_STORE_BYTES);
+        const { assert!(MEMBLK.quota >= MEMORY_STORE_BYTES) };
         // The level of the driver: above the package service, which calls it.
         assert_eq!((MEMBLK.priority, MEMBLK.ceiling), (39, 39));
-        assert!(PKGD.ceiling <= MEMBLK.priority);
+        const { assert!(PKGD.ceiling <= MEMBLK.priority) };
         // The store probe's table with the memory disk as its `blk` is a good table.
         let table: Vec<Record> = STORE_PROBE_TABLE
             .iter()
