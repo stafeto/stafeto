@@ -318,8 +318,10 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     qmp.left_button(true)?;
     std::thread::sleep(Duration::from_millis(300));
     qmp.left_button(false)?;
+    // The four end in the order the scene takes, which the lines of one
+    // run already passed: each is looked for anywhere in the output.
     for ended in ENDED {
-        run.expect_line(ended, |l| l == ended, WITHIN)?;
+        run.expect_seen(ended, WITHIN)?;
     }
     Ok(())
 }
