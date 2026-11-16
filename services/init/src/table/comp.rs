@@ -78,14 +78,16 @@ pub const COMPOSITOR_KEYS: Record = Record {
 };
 
 /// The probe (role `w`): a window of its own with two buffers, a pattern,
-/// then another buffer; it ends holding the window.
+/// then another buffer; it ends holding the window. The quota is the
+/// buffers it makes (four objects of 63 pages, a small one and a second
+/// window's 10) and its stack.
 const PROBE: Record = Record {
     name: "comp-probe",
     program: "comp-probe",
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 96 * PAGE,
+    quota: 640 * PAGE,
     handle_limit: 48,
     restart: Restart::Never,
     console: true,
