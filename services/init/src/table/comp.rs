@@ -14,9 +14,12 @@
 //!
 //! The compositor holds the one buffer of the screen the driver gave it,
 //! the buffers of its windows' clients (mapped for reading) and, for a
-//! program that knows no windows, the 256 pages of the buffer it makes
-//! (`mem_create`, in its own quota): the quota is those, the tables of its
-//! mappings and its stack.
+//! program that knows no windows, the 250 pages of the buffer it makes at
+//! its start (`mem_create`, in its own quota): the quota is those, its 13
+//! pages of program, the tables of its mappings and its stack. The base
+//! image keeps 16 384 free pages after its services started (`cargo xtask
+//! pkg-identity`), and init takes each record's quota from them: this one
+//! is what is left of the 429 pages the base image has over.
 //!
 //! Level 32 (design of graphics, 'Processes'): above the processes of POSIX
 //! (31 and below), whose clients call it, and below the driver (33) and the
@@ -47,8 +50,8 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 512 * PAGE,
-    handle_limit: 192,
+    quota: 336 * PAGE,
+    handle_limit: 128,
     restart: Restart::Always,
     console: true,
     log: false,

@@ -66,7 +66,9 @@ const CHUNK: usize = 32;
 /// The tries and the pause of the first OPEN of the driver.
 const OPEN_TRIES: u32 = 150;
 const OPEN_PAUSE_NS: u64 = 5_000_000;
-/// The bytes of the buffer of the first revision one step clears.
+/// The bytes of the buffer of the first revision: the screen's, 250 pages.
+const LEGACY_LEN: usize = SCREEN_BYTES as usize;
+/// The bytes of it one step clears.
 const CLEARED: usize = 16 * 1024;
 /// The sessions of the service's channel: the contexts, the windows, and
 /// the clones' places, with room.
@@ -225,21 +227,12 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     // The buffer of the window of the first revision, made here, outside
-    // any step (the kernel clears its 256 pages in the call).
-    let Ok(legacy) = sys::mem_create(u64::from(BUFFER_BYTES)) else {
+    // any step (the kernel clears its 250 pages in the call).
+    let Ok(legacy) = sys::mem_create(LEGACY_LEN as u64) else {
         return NOT_REGISTERED;
     };
     let rw = Access::ReadWrite;
-    if sys::mem_map(
-        &s.process,
-        &legacy,
-        0,
-        u64::from(BUFFER_BYTES),
-        LEGACY_AT,
-        rw,
-    )
-    .is_err()
-    {
+    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err() {
         return NOT_REGISTERED;
     }
     let mut service = Compositor {
@@ -604,12 +597,14 @@ impl Compositor {
     fn work(&mut self) {
         rt::service::step_own();
         if let Some(done) = self.cleared {
+            let len = CLEARED.min(LEGACY_LEN - done);
             // SAFETY: the service's own read and write mapping of the
-            // legacy buffer, BUFFER_BYTES long; no window uses it while it
-            // is being cleared (OPEN says CLEARING).
-            unsafe { core::ptr::write_bytes((LEGACY_AT + done) as *mut u8, 0, CLEARED) };
-            let done = done + CLEARED;
-            self.cleared = (done < BUFFER_BYTES as usize).then_some(done);
+            // legacy buffer, LEGACY_LEN long, of which `len` bytes from
+            // `done` are in it; no window uses it while it is being
+            // cleared (OPEN says CLEARING).
+            unsafe { core::ptr::write_bytes((LEGACY_AT + done) as *mut u8, 0, len) };
+            let done = done + len;
+            self.cleared = (done < LEGACY_LEN).then_some(done);
         } else if let Some(i) = self.extra.iter().position(|e| e.dying) {
             self.unmap_chunk(i);
         } else if self.attaching.is_some() {
