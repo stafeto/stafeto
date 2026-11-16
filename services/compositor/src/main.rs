@@ -38,7 +38,7 @@ use core::slice;
 use proto_comp::{Attach, BUFFER_MAX, Create, Description, Method as Comp, Post, Rect};
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, HEIGHT, IO, Method as Gpu, NO_DEVICE,
-    NO_INPUT, NOT_ALLOWED, SCREEN_BYTES, STRIDE, Screen, VERSION, WIDTH, code,
+    NO_INPUT, NOT_ALLOWED, SCREEN_BYTES, Screen, VERSION, WIDTH, code,
 };
 use proto_init::ServiceArgs;
 use proto_input::Method as InputMethod;
@@ -46,6 +46,7 @@ use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
 use rt::handle::{Any, Channel, Memory, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
+use rt::wait::Waiter;
 use rt::{Handle, sys};
 
 rt::entry!(main);
@@ -54,7 +55,19 @@ rt::entry!(main);
 /// windows (each place of a window has three spans of BUFFER_MAX).
 const FB_AT: usize = 0x10_0100_0000;
 const BUF_AT: usize = 0x11_0000_0000;
+/// Where the service maps the buffer it made for the window of the first
+/// revision, for reading and writing, for its whole life.
+const LEGACY_AT: usize = 0x12_0000_0000;
 const PAGE: usize = 4096;
+/// The pages one step of the service maps or unmaps at most: a page costs
+/// the kernel about 200 ticks of a mapping and 80 of an unmapping, and a
+/// step stays under 16 500 (xtask).
+const CHUNK: usize = 32;
+/// The tries and the pause of the first OPEN of the driver.
+const OPEN_TRIES: u32 = 150;
+const OPEN_PAUSE_NS: u64 = 5_000_000;
+/// The bytes of the buffer of the first revision one step clears.
+const CLEARED: usize = 16 * 1024;
 /// The sessions of the service's channel: the contexts, the windows, and
 /// the clones' places, with room.
 const SESSIONS: usize = 64;
@@ -66,8 +79,10 @@ const CLONES: usize = 32;
 const OWN: u64 = 1 << 63;
 const WINDOW: u64 = 1 << 62;
 const DRIVER: u64 = 1 << 61;
-/// The service's own bit: the next band of the frame is due.
+/// The service's own bits: the next band of the frame is due, and a chunk of
+/// mapping, unmapping or clearing is.
 const BAND: u64 = 1;
+const WORK: u64 = 2;
 /// The codes of a start that failed, and of the driver's end.
 const NO_START_DATA: u64 = 1;
 const NOT_REGISTERED: u64 = 2;
@@ -84,13 +99,18 @@ fn is_window(label: u64) -> bool {
 }
 
 /// What a window holds besides what the scene decides: the objects of its
-/// buffers (mapped for reading), the channel the client is told on, the
-/// FLUSH that waits for the frame in progress and the one that waits for
-/// the next.
+/// buffers with the pages of each that are mapped (for reading, from the
+/// start, in chunks), the channel the client is told on, the FLUSH that
+/// waits for the frame in progress and the one that waits for the next. A
+/// window that went keeps its place, `dying`, until its pages are unmapped,
+/// a chunk a step.
 struct Extra {
     notify: Option<Handle<Channel>>,
     memory: [Option<Handle<Memory>>; proto_comp::BUFFERS],
+    /// The pages each buffer has, and the pages of them mapped so far.
+    pages: [usize; proto_comp::BUFFERS],
     mapped: [usize; proto_comp::BUFFERS],
+    dying: bool,
     wait: Option<Pending>,
     queued: Option<Pending>,
 }
@@ -100,11 +120,23 @@ impl Extra {
         Extra {
             notify: None,
             memory: [const { None }; proto_comp::BUFFERS],
+            pages: [0; proto_comp::BUFFERS],
             mapped: [0; proto_comp::BUFFERS],
+            dying: false,
             wait: None,
             queued: None,
         }
     }
+}
+
+/// An ATTACH whose buffers are being mapped: window `slot` gets `count`
+/// buffers of `stride`, the reply waits for the last chunk.
+struct Attaching {
+    slot: usize,
+    count: u8,
+    stride: u32,
+    buffer: usize,
+    pending: Pending,
 }
 
 /// The pixels of the windows' buffers, as the mappings hold them.
@@ -116,11 +148,18 @@ impl PixelSource for Pixels<'_> {
             .0
             .window(window)
             .map_or(0, |w| w.stride as usize * w.rect.h as usize);
-        // SAFETY: a buffer is taken only once it is attached, and ATTACH
-        // maps its object read-only at this address for at least `stride`
-        // times `h` bytes; the mapping stays until the window goes, which
-        // is never in the middle of a band (one thread).
-        unsafe { slice::from_raw_parts(buf_at(window, buffer as usize) as *const u8, len) }
+        let at = if self.0.window(window).is_some_and(|w| w.legacy) {
+            LEGACY_AT
+        } else {
+            buf_at(window, buffer as usize)
+        };
+        // SAFETY: a buffer is taken only once it is attached, and the
+        // reply of ATTACH comes after its last chunk is mapped read-only at
+        // this address, for at least `stride` times `h` bytes; the legacy
+        // buffer is mapped from the start. The mapping stays until the
+        // window has gone and a later step unmaps it, never in the middle
+        // of a band (one thread).
+        unsafe { slice::from_raw_parts(at as *const u8, len) }
     }
 }
 
@@ -159,6 +198,12 @@ struct Compositor {
     released: u32,
     input: Link,
     focus_on: bool,
+    /// The buffer of the window of the first revision: the service's own
+    /// object, mapped at LEGACY_AT for good, cleared a step at a time when
+    /// its window goes (`cleared`: the bytes done, None when it is clean).
+    legacy: Handle<Memory>,
+    cleared: Option<usize>,
+    attaching: Option<Attaching>,
 }
 
 fn main(_: u64) -> u64 {
@@ -179,6 +224,24 @@ fn main(_: u64) -> u64 {
     let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
         return NOT_REGISTERED;
     };
+    // The buffer of the window of the first revision, made here, outside
+    // any step (the kernel clears its 256 pages in the call).
+    let Ok(legacy) = sys::mem_create(u64::from(BUFFER_BYTES)) else {
+        return NOT_REGISTERED;
+    };
+    let rw = Access::ReadWrite;
+    if sys::mem_map(
+        &s.process,
+        &legacy,
+        0,
+        u64::from(BUFFER_BYTES),
+        LEGACY_AT,
+        rw,
+    )
+    .is_err()
+    {
+        return NOT_REGISTERED;
+    }
     let mut service = Compositor {
         channel: Handle::borrowed(channel.raw()),
         notify,
@@ -195,11 +258,16 @@ fn main(_: u64) -> u64 {
         released: 0,
         input: Link::Absent,
         focus_on: false,
+        legacy,
+        cleared: None,
+        attaching: None,
     };
     service.input = service.connect_input();
-    // The first try, so that the first client finds the screen ready; a
-    // driver that is still setting up is asked again at a request.
-    let _ = service.open_screen();
+    // The screen is opened here, outside any step (its buffer is 256 pages
+    // to map): the driver says CLEARING while it sets the device up, and
+    // the service asks again on a timer of its own channel. A driver that
+    // does not answer is asked again at a request.
+    service.open_screen_waiting(level);
     #[cfg(feature = "steps")]
     rt::service::report_steps(17);
     let config = Config {
@@ -300,6 +368,26 @@ impl Compositor {
         Ok(())
     }
 
+    /// `open_screen`, again every few milliseconds while the driver says it
+    /// is not ready, for a second at most.
+    fn open_screen_waiting(&mut self, level: u8) {
+        let Ok(quiet) = sys::channel_create(level) else {
+            let _ = self.open_screen();
+            return;
+        };
+        let Ok(waiter) = Waiter::new(&quiet, 0, level) else {
+            let _ = self.open_screen();
+            return;
+        };
+        for _ in 0..OPEN_TRIES {
+            if self.open_screen() != Err(code(CLEARING)) {
+                return;
+            }
+            let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(OPEN_PAUSE_NS);
+            let _ = waiter.receive_until(&quiet, deadline);
+        }
+    }
+
     /// The driver is gone or broke: every window this instance gave leads
     /// nowhere, so the service ends and init starts it again.
     fn driver_gone(&self) -> ! {
@@ -384,24 +472,26 @@ impl Compositor {
         let _ = sys::notify(&self.notify, BAND);
     }
 
-    /// One band of the frame; the last one commits it.
+    /// One band of the frame; the step after the last band commits it
+    /// (the driver's answer is a wait of its own, which does not belong in
+    /// the step of a band).
     fn band(&mut self) {
         rt::service::step_own();
         let Some(job) = self.job.as_mut() else {
             return;
         };
+        if job.row >= job.damage.y + job.damage.h {
+            let damage = job.damage;
+            self.job = None;
+            self.commit(damage);
+            return;
+        }
         // SAFETY: the buffer is this service's mapping of the screen's
         // object, read and write, SCREEN_BYTES of its 256 pages; nothing
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         job.row = compose(&self.scene, job.damage, job.row, fb, &Pixels(&self.scene));
-        if job.row < job.damage.y + job.damage.h {
-            let _ = sys::notify(&self.notify, BAND);
-            return;
-        }
-        let damage = job.damage;
-        self.job = None;
-        self.commit(damage);
+        let _ = sys::notify(&self.notify, BAND);
     }
 
     /// COMMIT of the frame's rectangle: the driver answers at once and says
@@ -460,53 +550,151 @@ impl Compositor {
 
     // ------------------------------------------------------------ the windows
 
-    /// The window at place `i` goes: its buffers unmap, what it waited for
-    /// is refused (PEER_CLOSED), the focus of a window of the first
-    /// revision ends, and the place is shown again.
+    /// The window at place `i` goes: what it waited for is refused
+    /// (PEER_CLOSED), its buffers are unmapped a chunk a step (the place is
+    /// `dying` until then), the focus of a window of the first revision
+    /// ends and its buffer is cleared a step at a time, and the place on
+    /// the screen is shown again.
     fn destroy(&mut self, i: usize) {
         let Some(w) = self.scene.destroy(i) else {
             return;
         };
-        let extra = &mut self.extra[i];
-        for b in 0..proto_comp::BUFFERS {
-            if extra.mapped[b] != 0 {
-                // SAFETY: the buffer's own mapping, made by this service
-                // at this address; no band is in progress (one thread).
-                let _ =
-                    unsafe { sys::mem_unmap(&self.process, buf_at(i, b), extra.mapped[b] as u64) };
-            }
+        if self.attaching.as_ref().is_some_and(|a| a.slot == i) {
+            self.attaching = None;
         }
-        *extra = Extra::new();
+        let extra = &mut self.extra[i];
+        extra.notify = None;
+        extra.wait = None;
+        extra.queued = None;
+        if extra.mapped.iter().any(|&m| m != 0) {
+            extra.dying = true;
+        } else {
+            *extra = Extra::new();
+        }
         if w.legacy {
             self.revoke_focus();
             self.released += 1;
+            self.cleared = Some(0);
         }
+        let _ = sys::notify(&self.notify, WORK);
         self.kick();
     }
 
-    /// Maps `memory` for reading at the place of buffer `b` of window `i`:
-    /// the bytes it must hold are `need`.
-    fn map_buffer(
-        &mut self,
-        i: usize,
-        b: usize,
-        memory: Handle<Memory>,
-        need: u64,
-    ) -> Result<(), Status> {
-        let Ok(info) = sys::memory_info(&memory) else {
-            return Err(proto_comp::code(proto_comp::INVALID));
-        };
-        if info.size < need || info.size > BUFFER_MAX {
-            return Err(proto_comp::code(proto_comp::INVALID));
+    /// The places that cannot take a new window: those whose pages are
+    /// still being unmapped.
+    fn taken(&self) -> u8 {
+        let mut mask = 0;
+        for (i, e) in self.extra.iter().enumerate() {
+            if e.dying {
+                mask |= 1 << i;
+            }
         }
-        let len = need.div_ceil(PAGE as u64) * PAGE as u64;
-        sys::mem_map(&self.process, &memory, 0, len, buf_at(i, b), Access::Read).map_err(|e| {
-            rt::println!("compositor: a buffer could not be mapped: {e:?}");
-            proto_comp::code(proto_comp::INVALID)
-        })?;
-        self.extra[i].mapped[b] = len as usize;
-        self.extra[i].memory[b] = Some(memory);
-        Ok(())
+        mask
+    }
+
+    /// Whether a step of the work is due: clearing, unmapping, mapping.
+    fn has_work(&self) -> bool {
+        self.cleared.is_some() || self.attaching.is_some() || self.extra.iter().any(|e| e.dying)
+    }
+
+    /// One step of the work: a piece of the legacy buffer cleared, else a
+    /// chunk of a dying window's pages unmapped, else a chunk of the
+    /// buffers an ATTACH waits for mapped. The next is due by the service's
+    /// own bit.
+    fn work(&mut self) {
+        rt::service::step_own();
+        if let Some(done) = self.cleared {
+            // SAFETY: the service's own read and write mapping of the
+            // legacy buffer, BUFFER_BYTES long; no window uses it while it
+            // is being cleared (OPEN says CLEARING).
+            unsafe { core::ptr::write_bytes((LEGACY_AT + done) as *mut u8, 0, CLEARED) };
+            let done = done + CLEARED;
+            self.cleared = (done < BUFFER_BYTES as usize).then_some(done);
+        } else if let Some(i) = self.extra.iter().position(|e| e.dying) {
+            self.unmap_chunk(i);
+        } else if self.attaching.is_some() {
+            self.map_chunk();
+        }
+        if self.has_work() {
+            let _ = sys::notify(&self.notify, WORK);
+        }
+    }
+
+    /// The last chunk of the pages mapped of a dying window `i`.
+    fn unmap_chunk(&mut self, i: usize) {
+        let extra = &mut self.extra[i];
+        if let Some(b) = (0..proto_comp::BUFFERS).find(|&b| extra.mapped[b] != 0) {
+            let first = (extra.mapped[b] - 1) / CHUNK * CHUNK;
+            let pages = extra.mapped[b] - first;
+            // SAFETY: the chunk is one mapping this service made at this
+            // address, of these pages; no band reads a dying window.
+            let _ = unsafe {
+                sys::mem_unmap(
+                    &self.process,
+                    buf_at(i, b) + first * PAGE,
+                    (pages * PAGE) as u64,
+                )
+            };
+            extra.mapped[b] = first;
+        }
+        if extra.mapped.iter().all(|&m| m == 0) {
+            *extra = Extra::new();
+        }
+    }
+
+    /// A chunk of the buffer the ATTACH in progress is at; the last chunk
+    /// of the last buffer ends it.
+    fn map_chunk(&mut self) {
+        let Some(job) = &self.attaching else {
+            return;
+        };
+        let (i, b) = (job.slot, job.buffer);
+        let extra = &mut self.extra[i];
+        let done = extra.mapped[b];
+        let pages = CHUNK.min(extra.pages[b] - done);
+        let mapped = match &extra.memory[b] {
+            Some(memory) => sys::mem_map(
+                &self.process,
+                memory,
+                (done * PAGE) as u64,
+                (pages * PAGE) as u64,
+                buf_at(i, b) + done * PAGE,
+                Access::Read,
+            ),
+            None => Err(Error::BadState),
+        };
+        if let Err(error) = mapped {
+            rt::println!("compositor: a buffer could not be mapped: {error:?}");
+            if let Some(job) = self.attaching.take() {
+                let _ = job.pending.answer(
+                    &proto_wire::reply(proto_comp::code(proto_comp::INVALID)),
+                    Outgoing::new(),
+                );
+            }
+            self.destroy(i);
+            return;
+        }
+        extra.mapped[b] = done + pages;
+        if extra.mapped[b] < extra.pages[b] {
+            return;
+        }
+        let Some(job) = self.attaching.as_mut() else {
+            return;
+        };
+        job.buffer += 1;
+        if job.buffer < job.count as usize {
+            return;
+        }
+        let Some(job) = self.attaching.take() else {
+            return;
+        };
+        let status = match self.scene.attach(job.slot, job.count, job.stride) {
+            Ok(()) => Status::Ok,
+            Err(refusal) => Compositor::refusal(refusal),
+        };
+        let _ = job
+            .pending
+            .answer(&proto_wire::reply(status), Outgoing::new());
     }
 
     /// The window a request's session names, and the reason it has none.
@@ -559,29 +747,23 @@ impl Compositor {
         if self.scene.has_legacy() {
             return Answer::Status(code(BUSY));
         }
+        // The last window's buffer is being cleared: ask again.
+        if self.cleared.is_some() {
+            return Answer::Status(code(CLEARING));
+        }
         let Ok((label, session)) = self.window_session() else {
             return Answer::Status(Status::Kernel(Error::NoMemory));
         };
-        let i = match self.scene.create(label, r.label(), SCREEN, true) {
+        let taken = self.taken();
+        let i = match self.scene.create(label, r.label(), SCREEN, true, taken) {
             Ok(i) => i,
             Err(refusal) => return Answer::Status(Compositor::refusal(refusal)),
         };
-        let made = sys::mem_create(u64::from(BUFFER_BYTES)).and_then(|memory| {
-            let client = sys::handle_duplicate(
-                &memory,
-                Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
-            )?;
-            Ok((memory, client))
-        });
-        let Ok((memory, client)) = made else {
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let Ok(client) = sys::handle_duplicate(&self.legacy, rights) else {
             self.destroy(i);
             return Answer::Status(Status::Kernel(Error::NoMemory));
         };
-        let need = u64::from(STRIDE) * u64::from(HEIGHT);
-        if self.map_buffer(i, 0, memory, need).is_err() {
-            self.destroy(i);
-            return Answer::Status(code(IO));
-        }
         let mut handles: Outgoing = [client.erase(), session.erase()].into();
         let focus = self.grant_focus();
         let status = if focus.is_some() {
@@ -711,7 +893,8 @@ impl Compositor {
             w: create.w,
             h: create.h,
         };
-        let i = match self.scene.create(label, r.label(), rect, false) {
+        let taken = self.taken();
+        let i = match self.scene.create(label, r.label(), rect, false, taken) {
             Ok(i) => i,
             Err(refusal) => return Answer::Status(Compositor::refusal(refusal)),
         };
@@ -749,38 +932,40 @@ impl Compositor {
         {
             return Answer::Status(proto_comp::code(proto_comp::INVALID));
         }
+        if self.attaching.is_some() {
+            return Answer::Status(proto_comp::code(proto_comp::BUSY));
+        }
         let need = attach.bytes(w.rect.h);
+        // The objects are looked at here, in this step; they are mapped a
+        // chunk of pages a step, and the reply waits for the last.
+        let mut memory: [Option<Handle<Memory>>; proto_comp::BUFFERS] = [const { None }; 3];
+        let mut pages = [0; proto_comp::BUFFERS];
         for b in 0..attach.count as usize {
-            let Ok(memory) = r.handles.take::<Memory>(b) else {
-                self.unmap_all(i);
+            let Ok(object) = r.handles.take::<Memory>(b) else {
                 return Answer::Status(proto_comp::code(proto_comp::INVALID));
             };
-            if let Err(status) = self.map_buffer(i, b, memory, need) {
-                self.unmap_all(i);
-                return Answer::Status(status);
+            match sys::memory_info(&object) {
+                Ok(info) if info.size >= need && info.size <= BUFFER_MAX => {}
+                _ => return Answer::Status(proto_comp::code(proto_comp::INVALID)),
             }
+            pages[b] = (need as usize).div_ceil(PAGE);
+            memory[b] = Some(object);
         }
-        match self.scene.attach(i, attach.count as u8, attach.stride) {
-            Ok(()) => Answer::Status(Status::Ok),
-            Err(refusal) => {
-                self.unmap_all(i);
-                Answer::Status(Compositor::refusal(refusal))
-            }
-        }
-    }
-
-    /// Takes back the buffers a failed ATTACH mapped.
-    fn unmap_all(&mut self, i: usize) {
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
         let extra = &mut self.extra[i];
-        for b in 0..proto_comp::BUFFERS {
-            if extra.mapped[b] != 0 {
-                // SAFETY: the buffer's own mapping, made by this service.
-                let _ =
-                    unsafe { sys::mem_unmap(&self.process, buf_at(i, b), extra.mapped[b] as u64) };
-                extra.mapped[b] = 0;
-            }
-            extra.memory[b] = None;
-        }
+        extra.memory = memory;
+        extra.pages = pages;
+        self.attaching = Some(Attaching {
+            slot: i,
+            count: attach.count as u8,
+            stride: attach.stride,
+            buffer: 0,
+            pending,
+        });
+        let _ = sys::notify(&self.notify, WORK);
+        Answer::Deferred
     }
 
     /// POST: a buffer of window `i` is the window's next.
@@ -884,7 +1069,15 @@ impl Service<1> for Compositor {
 
     fn notification(&mut self, n: Notice) {
         match n.source {
-            Source::Unlabeled if n.bits & BAND != 0 => self.band(),
+            // One piece of work to a step: when both bits came, the work's
+            // goes again by the service's own bit.
+            Source::Unlabeled if n.bits & BAND != 0 => {
+                self.band();
+                if n.bits & WORK != 0 {
+                    let _ = sys::notify(&self.notify, WORK);
+                }
+            }
+            Source::Unlabeled if n.bits & WORK != 0 => self.work(),
             Source::Session if n.label == DRIVER => {
                 if n.bits & FRAME_SHOWN != 0 {
                     self.finish(true);

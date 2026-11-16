@@ -79,7 +79,7 @@ const B_ENDS: &str = "init: comp-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 16] = [
+const CHECKS: [(&str, usize); 17] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -95,6 +95,10 @@ const CHECKS: [(&str, usize); 16] = [
     ),
     ("comp-probe: the buffer the frame replaced came free", 1),
     ("comp-probe: a session calls its own methods only", 1),
+    (
+        "comp-probe: a window that went gives its place to a window with buffers",
+        1,
+    ),
     ("comp-probe: a context has four windows at most", 1),
     ("comp-probe: the client ends with its windows", 1),
     (

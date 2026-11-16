@@ -627,6 +627,33 @@ impl Probe<'_> {
             expected_crc(&[Layer::First { marked: true }, Layer::Second])
         );
         self.sleep(SNAPSHOT_NS);
+        // The second window goes: its place is reused for a window with
+        // buffers once the pages are unmapped.
+        drop(second);
+        drop(objects2);
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while self.settled(&display)?.open != 1 {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the second window never went");
+            }
+            self.sleep(RETRY_NS);
+        }
+        let (reuse, _) = self
+            .create(
+                &display,
+                Rect {
+                    x: 0,
+                    y: 100,
+                    w: 8,
+                    h: 8,
+                },
+                FORMAT_XRGB8888,
+            )
+            .map_err(say("the window after one went"))?;
+        let (objects3, _) = self.buffers(1, 8 * 8 * 4)?;
+        self.attach(&reuse, 32, &objects3[..1])
+            .map_err(say("ATTACH after a window went"))?;
+        rt::println!("comp-probe: a window that went gives its place to a window with buffers");
         // The context's share of windows: four, the fifth is refused.
         let _third = self
             .create(
@@ -666,7 +693,7 @@ impl Probe<'_> {
             return Err("the fifth window of a context was not refused");
         }
         let d = self.describe(&display).map_err(say("DESCRIBE"))?;
-        if d.open != 4 || d.created != 4 {
+        if d.open != 4 || d.created != 5 {
             return Err("DESCRIBE does not count four windows");
         }
         rt::println!("comp-probe: a context has four windows at most");

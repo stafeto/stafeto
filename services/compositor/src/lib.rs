@@ -22,6 +22,8 @@ use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
 /// The windows at once, and the windows of one context.
 pub const MAX_WINDOWS: usize = 8;
+// The places a mask of `u8` names (`Scene::create`).
+const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
 /// The lines of one band of a frame: one step of the service. The step
 /// stays under 0.8 of term B (xtask).
@@ -153,15 +155,17 @@ impl Scene {
         self.windows.iter().flatten().any(|w| w.legacy)
     }
 
-    /// A window of context `ctx` at `rect`: its place. Limit when the
-    /// table or the context's share is full, Invalid for a rectangle
-    /// outside the screen.
+    /// A window of context `ctx` at `rect`: its place, which is none of the
+    /// places the bits of `taken` name (a place whose mappings are still
+    /// going). Limit when the table or the context's share is full, Invalid
+    /// for a rectangle outside the screen.
     pub fn create(
         &mut self,
         label: u64,
         ctx: u64,
         rect: Rect,
         legacy: bool,
+        taken: u8,
     ) -> Result<usize, Refusal> {
         if !rect.within(WIDTH, HEIGHT) {
             return Err(Refusal::Invalid);
@@ -178,7 +182,8 @@ impl Scene {
         let place = self
             .windows
             .iter()
-            .position(Option::is_none)
+            .enumerate()
+            .position(|(i, w)| w.is_none() && taken & (1 << i) == 0)
             .ok_or(Refusal::Limit)?;
         self.seq = self.seq.wrapping_add(1);
         self.created += 1;
@@ -463,7 +468,7 @@ mod tests {
     }
 
     fn make(scene: &mut Scene, label: u64, ctx: u64, r: Rect, count: u8) -> usize {
-        let i = scene.create(label, ctx, r, false).unwrap();
+        let i = scene.create(label, ctx, r, false, 0).unwrap();
         scene.attach(i, count, r.w * 4).unwrap();
         i
     }
@@ -490,26 +495,26 @@ mod tests {
     fn a_window_needs_the_screen_and_its_context_a_share() {
         let mut s = Scene::new();
         assert_eq!(
-            s.create(1, 7, rect(600, 0, 41, 10), false),
+            s.create(1, 7, rect(600, 0, 41, 10), false, 0),
             Err(Refusal::Invalid)
         );
         assert_eq!(
-            s.create(1, 7, rect(0, 0, 0, 10), false),
+            s.create(1, 7, rect(0, 0, 0, 10), false, 0),
             Err(Refusal::Invalid)
         );
         for k in 0..PER_CONTEXT as u64 {
-            s.create(k, 7, rect(0, 0, 10, 10), false).unwrap();
+            s.create(k, 7, rect(0, 0, 10, 10), false, 0).unwrap();
         }
         assert_eq!(
-            s.create(9, 7, rect(0, 0, 10, 10), false),
+            s.create(9, 7, rect(0, 0, 10, 10), false, 0),
             Err(Refusal::Limit)
         );
         // Another context has its own share, until the table is full.
         for k in 0..(MAX_WINDOWS - PER_CONTEXT) as u64 {
-            s.create(100 + k, 8, rect(0, 0, 10, 10), false).unwrap();
+            s.create(100 + k, 8, rect(0, 0, 10, 10), false, 0).unwrap();
         }
         assert_eq!(
-            s.create(200, 9, rect(0, 0, 10, 10), false),
+            s.create(200, 9, rect(0, 0, 10, 10), false, 0),
             Err(Refusal::Limit)
         );
         assert_eq!(s.open(), MAX_WINDOWS as u32);
@@ -517,9 +522,27 @@ mod tests {
     }
 
     #[test]
+    fn a_taken_place_is_not_given() {
+        let mut s = Scene::new();
+        let a = s.create(1, 1, rect(0, 0, 8, 8), false, 0).unwrap();
+        assert_eq!(a, 0);
+        s.destroy(a);
+        // Place 0 is free in the scene but its pages are still going.
+        let b = s.create(2, 1, rect(0, 0, 8, 8), false, 0b1).unwrap();
+        assert_eq!(b, 1);
+        assert_eq!(s.create(3, 1, rect(0, 0, 8, 8), false, 0b11).unwrap(), 2);
+        let all = u8::MAX;
+        assert_eq!(
+            s.create(4, 2, rect(0, 0, 8, 8), false, all),
+            Err(Refusal::Limit)
+        );
+        assert_eq!(s.create(5, 2, rect(0, 0, 8, 8), false, 0).unwrap(), 0);
+    }
+
+    #[test]
     fn attach_is_once_and_checks_the_stride() {
         let mut s = Scene::new();
-        let i = s.create(1, 1, rect(0, 0, 100, 10), false).unwrap();
+        let i = s.create(1, 1, rect(0, 0, 100, 10), false, 0).unwrap();
         assert_eq!(s.attach(i, 0, 400), Err(Refusal::Invalid));
         assert_eq!(s.attach(i, 4, 400), Err(Refusal::Invalid));
         assert_eq!(s.attach(i, 2, 399), Err(Refusal::Invalid));
@@ -686,7 +709,7 @@ mod tests {
     #[test]
     fn the_legacy_window_flushes_its_one_buffer() {
         let mut s = Scene::new();
-        let i = s.create(1, 1, SCREEN, true).unwrap();
+        let i = s.create(1, 1, SCREEN, true, 0).unwrap();
         assert!(s.has_legacy());
         assert_eq!(s.window(i).unwrap().stride, STRIDE);
         assert_eq!(s.post(i, 0, &[]), Err(Refusal::NotAllowed));
@@ -721,7 +744,7 @@ mod tests {
     #[test]
     fn a_band_is_a_few_lines_and_the_frame_ends_at_the_damage() {
         let mut s = Scene::new();
-        let i = s.create(1, 1, SCREEN, true).unwrap();
+        let i = s.create(1, 1, SCREEN, true, 0).unwrap();
         let src = flat(&[(i, 0, 1, (STRIDE * HEIGHT) as usize)]);
         let mut fb = screen();
         s.flush(i, SCREEN).unwrap();

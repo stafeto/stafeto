@@ -59,8 +59,8 @@ pub const VERSION: u16 = 1;
 /// The most buffers of a window, and the most rectangles of a POST.
 pub const BUFFERS: usize = 3;
 pub const MAX_RECTS: usize = 4;
-/// The most bytes of one buffer's object: 1024 by 1024 points.
-pub const BUFFER_MAX: u64 = 4 << 20;
+/// The most bytes of one buffer's object: a megabyte, the screen's.
+pub const BUFFER_MAX: u64 = 1 << 20;
 
 /// The format of a point: proto_gpu's XRGB8888, the only one.
 pub const FORMAT_XRGB8888: u32 = proto_gpu::FORMAT_XRGB8888;
