@@ -206,11 +206,18 @@ pub type Rows = Vec<(usize, u64, u64)>;
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
-    for prefix in [WINDOW, PARTIAL, OVERLAP, BLACK, LEGACY, LEGACY_PARTIAL] {
+    let compare = |run: &mut Run, monitor: &mut Monitor, prefix: &str| -> Result<(), String> {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
-        gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
+        gpu_probe::compare(monitor, &scratch.picture(), &line, prefix)
+    };
+    for prefix in [WINDOW, PARTIAL, OVERLAP] {
+        compare(run, &mut monitor, prefix)?;
     }
+    // The first client ends, and the second finds the black screen it left.
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
+    for prefix in [BLACK, LEGACY, LEGACY_PARTIAL] {
+        compare(run, &mut monitor, prefix)?;
+    }
     run.expect_line(ENDED_B, |l| l == ENDED_B, WITHIN)?;
     // The compositor paints the legacy window's place black and says so
     // once that frame is shown, which can come after the launcher's line.
