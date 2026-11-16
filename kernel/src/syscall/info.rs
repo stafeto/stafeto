@@ -175,9 +175,9 @@ fn thread_current(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn thread_state(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
-    let (info, ran, kernel) = thread::info(t);
+    let (info, ran, kernel, preempts) = thread::info(t);
     let [a1, a2, a3, a4] = info.to_words();
-    Ok(Values::new(&[a1, a2, a3, a4, ran, kernel]))
+    Ok(Values::new(&[a1, a2, a3, a4, ran, kernel, preempts]))
 }
 
 /// CHANNEL: x2 reserved; a channel's counts.

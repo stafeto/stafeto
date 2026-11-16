@@ -873,7 +873,11 @@ pub const INFO_MEMORY: u64 = 5;
 /// has run, the stint it is in now included (idle time and cleanup are
 /// nobody's), and in x6 the part of them it spent in the kernel, from each
 /// entry from EL0 to the decision that sends a thread back (its system
-/// time; the rest is its user time).
+/// time; the rest is its user time), and in x7 the times a higher level
+/// (or the cleanup queue) took the thread off the CPU while it was ready:
+/// not a block, a yield or the end of a quantum (the count wraps at 2^16).
+/// Each preemption adds the exception entry, the handler and the way back
+/// to the ticks of x5.
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.

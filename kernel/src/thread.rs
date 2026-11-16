@@ -1150,8 +1150,9 @@ pub fn user_ticks(thread: &Thread, now: u64) -> u64 {
 /// and its policy, read under OBJ, since the scheduler and
 /// the channels change them there. O(1).
 /// The ticks the thread has run, the stint it is in now included, come
-/// with it (x5), and those of them it spent in the kernel (x6).
-pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
+/// with it (x5), those of them it spent in the kernel (x6), and the times a
+/// higher level took it off the CPU while it was ready (x7).
+pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64, u64) {
     let now = crate::arch::timer::now();
     sched::locked(|_| {
         // SAFETY: the caller holds a reference to the thread; only its
@@ -1184,7 +1185,12 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             policy: Some(t.sched.policy()),
         };
         let ran = t.sched.ran_at(now);
-        (info, ran, ran.saturating_sub(user_ticks(t, now)))
+        (
+            info,
+            ran,
+            ran.saturating_sub(user_ticks(t, now)),
+            u64::from(t.sched.preempts()),
+        )
     })
 }
 

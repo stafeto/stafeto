@@ -33,7 +33,7 @@ fn info_in_flight(t: NonNull<Thread>) {
     if unsafe { t.as_ref() }.priority() != INFO_LEVEL || INFO_ASKED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let (info, _, _) = thread::info(t);
+    let (info, ..) = thread::info(t);
     if info.state == abi::ThreadState::Ready {
         kprintln!("smp window  thread_info of a thread with its wake on the way gave Ready");
     }
