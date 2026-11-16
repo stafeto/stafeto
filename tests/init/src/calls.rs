@@ -2371,7 +2371,9 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// The time (x5) of the second burn is above the first by the exception
 /// entry, the handler, the wake, the decision and the way back to init,
 /// charged to init; the difference over the count is c_sw, the cost of
-/// one preemption, which a step measured by `thread_ran` holds once per
+/// one preemption in this setup (the preemptor is a thread of the same
+/// process on one CPU: no address-space switch, no SGI, likely no FP save),
+/// so a lower bound; a preemption by another process costs more. A step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
 /// be above 0, and under -icount near the timer's, with the time of the
@@ -2420,7 +2422,9 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
     }
     if under_icount() && count > 0 {
         let c_sw = charged.saturating_sub(pure) / count;
-        println!("preempt charge ticks: c_sw={c_sw} count={count} pure={pure} charged={charged}");
+        println!(
+            "preempt charge ticks: same-process one-cpu lower bound c_sw={c_sw} count={count} pure={pure} charged={charged}"
+        );
     }
     Ok(())
 }

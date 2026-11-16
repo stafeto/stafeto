@@ -392,9 +392,14 @@ impl<T> Node<T> {
         self.ran
     }
 
-    /// One more preemption. Kept out of line: the decision is inlined into
-    /// the scheduler's loop, and a few bytes more there moved a step of the
-    /// RAM service past its guard in the probes of lock requests.
+    /// One more preemption. Kept out of line, and this fixes no defect: with
+    /// the increment inline `exit_loop` comes out 128 bytes smaller (12392
+    /// to 12264) with other registers and stack slots across the whole
+    /// function, and the timer interrupts land elsewhere in the probes. In
+    /// posix-lock-core smp 4 one more preemption (about 1500 ticks) then
+    /// fell in the step of kind 50 (16986 against the guard of 16500). The
+    /// call keeps the measured steps where they were; the follow-up that
+    /// subtracts n_preempt times c_sw in the probes removes the dependence.
     #[inline(never)]
     fn count_preemption(&mut self) {
         self.preempts = self.preempts.wrapping_add(1);
