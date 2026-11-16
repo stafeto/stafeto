@@ -50,6 +50,7 @@ mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
+mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
@@ -2237,6 +2238,10 @@ commands:
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
             steps under -icount; with --hvf under HVF
+  comp-probe [--hvf] run the probe of the composition service in QEMU: windows of a client, a
+            rectangle posted alone, two windows, the screen after a process ended and a window
+            of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
+            of the compositor and the display driver under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2365,6 +2370,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2400,6 +2406,7 @@ fn main() {
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
+        Some("nvme-breaks") => nvme_breaks(),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
         Some("its-drop") => its_drop(),
@@ -2677,6 +2684,14 @@ fn main() {
         Some("init-wait") => init_wait::command(&args[1..]),
         Some("pkg-slot") => pkg_slot::probe(&qemu::VIRT),
         Some("pkg-probe") => pkg_probe::command(&args[1..]),
+        Some("comp-probe") => match args.get(1).map(String::as_str) {
+            None => comp_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                comp_probe::probe(&qemu::HVF_V3)?;
+                comp_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("comp-probe [--hvf]".to_owned()),
+        },
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2942,6 +2957,40 @@ fn ena_breaks() -> Result<(), String> {
                 println!("ena-breaks: {feature} is caught by the host tests of {package}");
             }
             Ok(_) => return Err(format!("{feature} passed the host tests of {package}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// The deliberate breaks of the NVMe driver (`cargo xtask nvme-breaks`): each
+/// is a feature of `lib/nvme` that does one wrong thing, and its host tests
+/// pass without it and fail with it.
+const NVME_BREAKS: [&str; 10] = [
+    "break-nvme-cq-phase",
+    "break-nvme-prp2",
+    "break-nvme-dstrd",
+    "break-nvme-flush-early",
+    "break-nvme-partition",
+    "break-nvme-cq-head",
+    "break-nvme-wmb",
+    "break-nvme-reset-wait",
+    "break-nvme-sq-head",
+    "break-nvme-abort-early",
+];
+
+fn nvme_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "nvme", "--lib"]);
+    run_cmd(&mut ok)?;
+    for feature in NVME_BREAKS {
+        let mut broken = cargo();
+        broken.args(["test", "--package", "nvme", "--lib", "--features", feature]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => {
+                println!("nvme-breaks: {feature} is caught by the host tests of nvme");
+            }
+            Ok(_) => return Err(format!("{feature} passed the host tests of nvme")),
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -10457,6 +10506,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
+        // The composition service on that driver: windows against QEMU's
+        // screenshot, the end of a process, a program of the first
+        // revision, then the steps of the services under -icount.
+        job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10696,6 +10749,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "ena",
         "--package",
+        "nvme",
+        "--package",
         "proto-entropy",
         "--package",
         "virtio-rng",
@@ -10706,9 +10761,13 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-comp",
+        "--package",
         "virtio-mmio",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "proto-input",
         "--package",
@@ -13178,6 +13237,8 @@ fn hvf() -> Result<(), String> {
         // The display service: the buffer through the real processor's
         // caches, shown without a clean (spec 3, 3.4).
         gpu_probe::probe(m)?;
+        // The composition service over it, the same way.
+        comp_probe::probe(m)?;
         // The input service on the real processor, and its focus with the
         // display service.
         input_probe::probe(m)?;
@@ -13492,11 +13553,15 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "ena",
         "--package",
+        "nvme",
+        "--package",
         "proto-entropy",
         "--package",
         "posix-random",
         "--package",
         "proto-gpu",
+        "--package",
+        "proto-comp",
         "--package",
         "proto-input",
         "--package",
@@ -13540,6 +13605,8 @@ fn ci_lints() -> Result<(), String> {
         "entropy",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "virtio-input",
         "--package",
@@ -13723,7 +13790,11 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "virtio-gpu",
         "--package",
+        "compositor",
+        "--package",
         "gpu-probe",
+        "--package",
+        "comp-probe",
         "--package",
         "virtio-input",
         "--package",
@@ -13747,7 +13818,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15867,6 +15938,11 @@ mod entropy_in_images_tests {
                 &crate::entropy::SEED_BREAK_PROGRAMS,
             ),
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
+            ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
+            (
+                "comp_probe::STEPS_PROGRAMS",
+                &crate::comp_probe::STEPS_PROGRAMS,
+            ),
             ("gpu_probe::PROGRAMS", &crate::gpu_probe::PROGRAMS),
             (
                 "gpu_probe::STEPS_PROGRAMS",
