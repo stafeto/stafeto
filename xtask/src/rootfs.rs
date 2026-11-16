@@ -530,6 +530,8 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
         "inputrc" => Ok(INPUTRC),
         "htoprc" => Ok(b"hide_userland_threads=1\n"),
+        // The shells a login may use (Dropbear refuses an account whose shell is not listed).
+        "shells" => Ok(b"/bin/ash\n/bin/sh\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),

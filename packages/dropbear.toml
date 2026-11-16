@@ -23,4 +23,6 @@ program = "dropbear"
 dirs = ["/etc/dropbear"]
 files = [
   "/bin/dropbear = elf:dropbear",
+  # The shells an account may have: the server refuses a login whose shell is not listed.
+  "/etc/shells = bytes:shells",
 ]
