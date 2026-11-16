@@ -589,6 +589,22 @@ CI are `blk-probe`, `blk-probe GICv3` and `blk-faults`.
 (512 MiB, sparse) to the image it boots, and `--fresh-store` makes it new;
 only an image whose table has the record `blk` uses it.
 
+### The store in memory
+
+The image for EC2 (`table-aws`) has no disk. Its record `blk` is the memory disk,
+`services/mem-blk`: the same protocol as the Virtio driver (`proto/blk`), with the sectors in a
+memory object of 256 MiB (`pkg::MEMORY_STORE_BYTES`) that the service makes before it registers.
+The object is zero at the start, so `pkgd` formats it, and it is gone with the service: the
+record never restarts it, since a new instance would show a running `pkgd` an empty disk. The
+packages installed with `pkg` are gone after a reboot, like every file of the image; the service
+says so on the console (`mem-blk: 524288 sectors in memory; installed packages are gone after a
+reboot`). The official repository is the one of the series, `/etc/pkg/official` as in the base
+image. A disk on NVMe for EBS with a permanent store comes after series 0.5.
+`cargo xtask pkg-probe memory` runs the install steps on this store (init's feature
+`memory-store` turns the base table's disk into the memory disk, on the 2 GiB machine with no
+disk), removes Doom, installs it again, and boots the machine anew: the store holds no package
+and no file of Doom is there.
+
 ## The package service
 
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches

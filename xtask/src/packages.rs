@@ -801,7 +801,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
             .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))
             .collect()),
         // The base image holds the base packages, the full image all of them.
-        "boot-base.img" | "boot-pkg-probe.img" => Ok(load()?
+        "boot-base.img" | "boot-pkg-probe.img" | "boot-pkg-probe-memory.img" => Ok(load()?
             .into_iter()
             .filter(|p| p.kind == Kind::Base)
             .collect()),

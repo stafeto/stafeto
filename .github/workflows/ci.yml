@@ -284,6 +284,9 @@ jobs:
       - name: cargo xtask pkg-probe
         run: cargo xtask pkg-probe
 
+      - name: cargo xtask pkg-probe memory
+        run: cargo xtask pkg-probe memory
+
       - name: Collect logs
         if: failure()
         run: |
