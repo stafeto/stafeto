@@ -1206,11 +1206,14 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     expect(&first, &full_lines(&world, steps))?;
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
+    // Under -icount the lines of the services come glued to the lines of a step: the text is read from its start.
     let nvme_line = first
         .iter()
-        .find(|l| l.starts_with("nvme: ") && l.contains(" blocks of "))
-        .ok_or("the NVMe service said nothing of its controller")?
-        .clone();
+        .find_map(|l| {
+            let at = l.find("nvme: ")?;
+            l.contains(" blocks of ").then(|| l[at..].to_string())
+        })
+        .ok_or("the NVMe service said nothing of its controller")?;
     if !nvme_line.contains(shape.said()) {
         return Err(format!(
             "the controller is not the one asked for ({}): {nvme_line}",
@@ -1222,13 +1225,13 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     }
     if !first
         .iter()
-        .any(|l| l == "nvme: first interrupt of vector 1")
+        .any(|l| l.contains("nvme: first interrupt of vector 1"))
     {
         return Err("no interrupt of vector 1 came: the completions were found by polling".into());
     }
     if first
         .iter()
-        .any(|l| l.starts_with("virtio-blk") || l.starts_with("nvme: reset"))
+        .any(|l| l.contains("virtio-blk: ") || l.contains("nvme: reset"))
     {
         return Err("the Virtio disk ran, or the controller was reset in place".into());
     }
