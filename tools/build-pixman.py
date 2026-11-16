@@ -7,7 +7,7 @@ pinned source archive, unchanged, as one static library.
 
 The service is a program with no C library, so the build is freestanding:
 the portable C paths of pixman (no SIMD, no threads, no timers) compiled
-with the headers of ports/pixman/include in place of a C library's, and
+with the headers of ports/pixman/include standing for a C library's, and
 ports/pixman/shim.c, which gives pixman the arena it allocates from and the
 few functions of <math.h> and <string.h> it calls. The result is
 target/pixman/libpixman.a, which lib/pixman's build script links, and
