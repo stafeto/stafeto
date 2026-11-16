@@ -72,9 +72,9 @@ const LEGACY_LEN: usize = SCREEN_BYTES as usize;
 const CLEARED: usize = 16 * 1024;
 /// The sessions of the service's channel: the contexts, the windows, and
 /// the clones' places, with room.
-const SESSIONS: usize = 64;
+const SESSIONS: usize = 96;
 /// The clones the service keeps alive at most, for all its clients.
-const CLONES: usize = 32;
+const CLONES: usize = 64;
 /// The marks of labels: a clone's (bit 63, as the driver has them), a
 /// window's (bit 62), and the label of the handle the driver notifies
 /// through (bit 61).
@@ -740,6 +740,11 @@ impl Compositor {
             return Answer::Status(status);
         }
         if self.scene.has_legacy() {
+            return Answer::Status(code(BUSY));
+        }
+        // A client that closed its window and kept its mapping still reaches
+        // the buffer: the service holds the only mapping it may have.
+        if sys::memory_info(&self.legacy).is_ok_and(|info| info.mappings > 1) {
             return Answer::Status(code(BUSY));
         }
         // The last window's buffer is being cleared: ask again.

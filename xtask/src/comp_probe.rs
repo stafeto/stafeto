@@ -79,7 +79,7 @@ const B_ENDS: &str = "init: comp-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 17] = [
+const CHECKS: [(&str, usize); 19] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -110,6 +110,11 @@ const CHECKS: [(&str, usize); 17] = [
         1,
     ),
     ("comp-probe: a second OPEN is BUSY", 1),
+    (
+        "comp-probe: OPEN is BUSY while a closed window's mapping is kept",
+        1,
+    ),
+    ("comp-probe: after the unmap OPEN gives a cleared buffer", 1),
     (
         "comp-probe: FLUSH of a rectangle outside the screen is INVALID",
         1,
@@ -147,7 +152,7 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
     if let Some(failed) = lines.iter().find(|l| l.starts_with("comp-probe: failed")) {
         return Err(failed.clone());
     }
-    for (marker, wanted) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 1)]) {
+    for (marker, wanted) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 2)]) {
         if count(marker) != *wanted {
             let found: Vec<_> = lines
                 .iter()
@@ -225,7 +230,7 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     run.expect_line(ENDED_B, |l| l == ENDED_B, WITHIN)?;
     // The compositor paints the legacy window's place black and says so
     // once that frame is shown, which can come after the launcher's line.
-    run.expect_times(RELEASED, 1, WITHIN)?;
+    run.expect_times(RELEASED, 2, WITHIN)?;
     Ok(())
 }
 
@@ -301,7 +306,7 @@ mod tests {
 
     fn good_run() -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
-        for (marker, n) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 1)]) {
+        for (marker, n) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 2)]) {
             for _ in 0..*n {
                 lines.push((*marker).to_owned());
             }

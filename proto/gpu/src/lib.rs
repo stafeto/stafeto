@@ -271,7 +271,7 @@ impl Screen {
     }
 
     /// Whether the buffer holds the screen: `height` lines of `stride`
-    /// bytes, in the object of BUFFER_BYTES.
+    /// bytes, in an object of at most BUFFER_BYTES (the compositor's is the screen's 250 pages).
     pub fn fits(&self) -> bool {
         u64::from(self.stride) >= u64::from(self.width) * 4
             && u64::from(self.stride) * u64::from(self.height) <= u64::from(BUFFER_BYTES)

@@ -1,0 +1,28 @@
+[package]
+name = "nvme"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "A driver of an NVMe controller as a library: registers, the admin queue and one I/O queue pair by polling, PRP lists, phase bits, flush semantics, timeouts and the reset"
+
+# No call of the kernel and no stack: tested on the host against a model of the controller.
+[lib]
+bench = false
+
+[features]
+# The deliberate breaks of the host tests (`cargo xtask nvme-breaks`): each
+# makes the driver do one wrong thing a test of the model catches.
+break-nvme-cq-phase = []
+break-nvme-prp2 = []
+break-nvme-dstrd = []
+break-nvme-flush-early = []
+break-nvme-partition = []
+break-nvme-cq-head = []
+break-nvme-wmb = []
+break-nvme-reset-wait = []
+break-nvme-sq-head = []
+break-nvme-abort-early = []
+# The model of the controller for the tests of a service (`nvme::model`).
+model = []

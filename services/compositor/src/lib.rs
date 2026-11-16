@@ -27,7 +27,7 @@ const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
 /// The lines of one band of a frame: one step of the service. The step
 /// stays under 0.8 of term B (xtask).
-pub const BAND_ROWS: u32 = 4;
+pub const BAND_ROWS: u32 = 8;
 
 /// The state of a buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(at(&fb, 5, 5), 0xA);
         assert_eq!(at(&fb, 15, 15), 0xB);
         assert_eq!(at(&fb, 25, 25), 0xB);
-        // Inside the damage and under no window: black, not the old 0xEE.
+        // Inside the damage and under no window: black: the old 0xEE is gone.
         assert_eq!(at(&fb, 25, 5), 0);
         // Outside the damage: untouched.
         assert_eq!(at(&fb, 40, 40), 0xEE);

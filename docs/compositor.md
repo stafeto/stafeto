@@ -31,10 +31,21 @@ and the header version 1 of both.
   once the frame that shows it is on the screen. Doom runs as it did on the
   driver, without a rebuild. One such window lives at a time; a second OPEN is
   BUSY, as it was. When the window goes the buffer is cleared in portions of
-  16 KiB, OPEN says CLEARING meanwhile, and the next window finds it zero. A
-  program that passed its copy of the buffer's handle on and kept a mapping
-  can write into the next window of the first revision, and into that window
-  alone: the screen is never mapped by a client.
+  16 KiB, OPEN says CLEARING meanwhile, and the next window finds it zero.
+  The buffer is shared with its client: CLOSE, or dropping the window's
+  session, leaves a client that kept its mapping able to read and write the
+  next window of the first revision's pixels, and the next window's alone, as
+  the screen is never mapped by a client. OPEN therefore says BUSY while the
+  object has more than one mapping (the compositor holds the only legitimate
+  one), which closes the common case. What stays open is a handle kept
+  unmapped and mapped after the next OPEN.
+
+## Limits accepted in stage G1
+
+One process can take all 8 window places through clones of its session. A
+client at level 1 that posts without pause drives composition at level 32
+with no budget; budgets come at stage 5, and until then the interference
+reaches the real-time POSIX tasks up to level 31.
 
 ## Steps
 
@@ -48,7 +59,7 @@ megabyte at most.
 ## The frame
 
 A frame takes the posted buffer of every window at its start, is made in
-bands of four lines, a step each (the compositor's own bit starts the next
+bands of eight lines, a step each (the compositor's own bit starts the next
 band, so requests of clients pass between bands), and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as

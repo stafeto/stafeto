@@ -823,6 +823,60 @@ impl Probe<'_> {
             return Err("a rectangle outside the screen was not INVALID");
         }
         rt::println!("comp-probe: FLUSH of a rectangle outside the screen is INVALID");
+        // CLOSE with the mapping kept: the next OPEN is BUSY while the
+        // buffer has a mapping besides the service's, and succeeds with a
+        // cleared buffer once the mapping is gone.
+        plain(&owner, &proto_gpu::Method::Close.header().bytes()).map_err(say("CLOSE"))?;
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        loop {
+            let (status, _) = call(&display, &open).map_err(say("OPEN after CLOSE"))?;
+            if status == proto_gpu::code(proto_gpu::BUSY) {
+                break;
+            }
+            if status != proto_gpu::code(proto_gpu::CLEARING)
+                || time::ticks_to_ns(time::now()) > end
+            {
+                return Err("OPEN with a mapping kept was not BUSY");
+            }
+            self.sleep(RETRY_NS);
+        }
+        rt::println!("comp-probe: OPEN is BUSY while a closed window's mapping is kept");
+        // SAFETY: the probe uses `points` no more.
+        unsafe { sys::mem_unmap(self.process, at, u64::from(proto_gpu::SCREEN_BYTES)) }
+            .map_err(say("unmap"))?;
+        drop(memory);
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        let (status, mut reply) = loop {
+            let (status, reply) = call(&display, &open).map_err(say("OPEN after the unmap"))?;
+            if status != proto_gpu::code(proto_gpu::CLEARING) {
+                break (status, reply);
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("OPEN says CLEARING for good");
+            }
+            self.sleep(RETRY_NS);
+        };
+        let again = reply.handles.take::<Memory>(0);
+        if status != proto_gpu::code(proto_gpu::NO_INPUT) || again.is_err() {
+            return Err("OPEN after the unmap failed");
+        }
+        let again = again.map_err(|_| "OPEN's buffer")?;
+        let at2 = MAP_AT + (self.maps.get() + 1) * MAP_STEP;
+        sys::mem_map(
+            self.process,
+            &again,
+            0,
+            u64::from(proto_gpu::SCREEN_BYTES),
+            at2,
+            Access::ReadWrite,
+        )
+        .map_err(say("map again"))?;
+        // SAFETY: mapped just above, for reading; the probe is the only user.
+        let zero = unsafe { core::slice::from_raw_parts(at2 as *const u32, 256_000) };
+        if zero.iter().any(|&p| p != 0) {
+            return Err("the buffer of the next window was not cleared");
+        }
+        rt::println!("comp-probe: after the unmap OPEN gives a cleared buffer");
         rt::println!("comp-probe: the program ends with its window");
         Ok(())
     }
