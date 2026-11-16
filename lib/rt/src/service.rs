@@ -825,11 +825,13 @@ mod steps {
         // the wait for another service nor a thread of a higher level that
         // ran in the middle belongs to it (spec 2, 2: the levels of the
         // services are above those of the processes they serve).
+        // The count is read before the time: a preemption between the two reads is in the time
+        // and not in the count, which judges the step by more, never by less.
+        let n_preempt =
+            own_preempts(slot).wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
         let ran = own_ran(slot).saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
         let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
-        let n_preempt =
-            own_preempts(slot).wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
         let judged = super::sample::judged(took, n_preempt);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
