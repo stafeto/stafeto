@@ -382,6 +382,7 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
             timers: record.shares.timers,
         },
         cpus,
+        free: init::table::free_of(record),
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;

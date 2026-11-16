@@ -92,8 +92,14 @@ const LOAN_MOST: u64 = 64;
 /// own CPU: the service goes from its reply to its next receive in one entry
 /// (`reply_receive`), so it never waits at its low level behind the spinner
 /// between two requests, and the client gets one request for each 2 ms
-/// period (52 measured; two with a service that returns to EL0 between its
-/// reply and its receive).
+/// period (52 measured). The split of `reply_receive` into two entries has
+/// its own kernel test (`reply_receive_takes_the_queued_request_at_its_level`)
+/// and this phase does not judge it: on one CPU under -icount the count of
+/// the broken kernel follows the alignment of the service's loop against the
+/// budget's timer (0 to 4 NOPs before the call: 50, 50, 52, 18, 18 requests;
+/// 9 with the library of main), and with the work of each request swept by
+/// a prime step the broken kernel made 25 to 50 and the unbroken one 37 to
+/// 50, so no bound separates them. The bound below judges the loan alone.
 const LOAN_LEAST_SAME: u64 = 26;
 /// The longest wait of the client at 40 of the queue phase, its own 500 us of
 /// work not counted: the rest of the request in hand (500 us at most), B for
@@ -463,10 +469,6 @@ pub fn breaks() -> Result<(), String> {
             "a request that queues behind a server without a budget and does not lift it",
         ),
         (
-            Variant::ReplyReceiveSplit,
-            "a reply_receive that returns to EL0 between its reply and its receive",
-        ),
-        (
             Variant::BudgetOverrunSilent,
             "an overrun that posts nothing to the budget's place",
         ),
@@ -475,10 +477,7 @@ pub fn breaks() -> Result<(), String> {
         // CPU runs on the break too.
         let cpus = if matches!(
             variant,
-            Variant::BudgetForgiveLoan
-                | Variant::BudgetNoQueueLift
-                | Variant::ReplyReceiveSplit
-                | Variant::BudgetOverrunSilent
+            Variant::BudgetForgiveLoan | Variant::BudgetNoQueueLift | Variant::BudgetOverrunSilent
         ) {
             4
         } else {
@@ -519,6 +518,16 @@ pub fn breaks() -> Result<(), String> {
             Variant::NoticeHolderKeepsTest,
             "a_notification_holder_is_not_lifted_after_its_next_receive_or_send",
             "a thread that goes on holding a notification after its receive",
+        ),
+        (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_takes_the_queued_request_at_its_level",
+            "a reply_receive that returns to EL0 between its reply and its receive",
+        ),
+        (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_with_a_handle_takes_the_queued_request_in_one_entry",
+            "a reply_receive with a handle in its reply that returns to EL0 between its reply and its receive",
         ),
         (
             Variant::ReplyReceiveCopyTest,
@@ -661,8 +670,10 @@ pub fn breaks() -> Result<(), String> {
         return Err("the host tests of init passed with break-budget-share".into());
     }
     println!("budget-breaks: break-budget-share fails the host tests of init");
-    // init's journal of the overruns.
-    crate::budget_journal::breaks()
+    // init's journal of the overruns, and the three services with their request threads
+    // unbound and init with no `free` level.
+    crate::budget_journal::breaks()?;
+    crate::service_budget::breaks(None)
 }
 
 #[cfg(test)]

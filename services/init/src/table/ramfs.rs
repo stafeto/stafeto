@@ -3,7 +3,7 @@
 
 //! RAM file service and its guest probe in a dedicated boot image.
 
-use super::{ALL_CPUS, GENERAL_CPUS, Kind, POSIX_SHARES, Record, Restart, Shares, Window};
+use super::{ALL_CPUS, Budget, GENERAL_CPUS, Kind, POSIX_SHARES, Record, Restart, Shares, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -20,6 +20,73 @@ const TABLES: u64 = 915 + 392 + 336 + 160 + 5;
 pub const SERVICE_LEVEL: u8 = 48;
 /// The level of the process service, the highest of the POSIX services.
 pub const PROCESS_LEVEL: u8 = 52;
+
+/// The level the threads of the RAM, pipe and terminal services work at while they have no
+/// budget (`Record::free`): the highest level of the POSIX processes (their ceiling is 31). The
+/// request thread binds its budget before it serves, so it works at its own level (48 or 50)
+/// for its C of each T and at `low` after; a thread of these services that has none (the one
+/// that maps layers, the one that registers the root of the pipes) and the request thread of
+/// a service that does not bind never work above the POSIX processes.
+pub const SERVICE_FREE: u8 = 31;
+
+/// The period of the budgets of the three services, 5 ms: the longest line of budgets of
+/// services one after the other above the network service is the sum of their C, 0.4 ms,
+/// under the period of its switch (1 ms for 0.4) and well inside the ring that takes the
+/// frames meanwhile.
+const SERVICE_PERIOD_NS: u64 = 5 * MS;
+
+/// Whether the RAM service has its budget: the one line to change (to `false`) for an image
+/// without it. The pipe and terminal services keep theirs.
+pub const RAM_BUDGET_ON: bool = true;
+
+/// The level the request thread of the RAM, pipe and terminal services works at once its budget is
+/// spent (`low` of the three budgets): 32, above every POSIX process (their ceiling is 31) and
+/// below the network service (35). The guarantee of the budgets is that each of the three takes at
+/// most C of each T from the levels 33 and above; for the levels at or below 32 it is a service
+/// without a budget, and the share of 20 % of CPU 0 for the levels below the budgets is not
+/// promised (the thread would run at 1 and keep it, which the own work of a service does not
+/// bear yet).
+pub const SERVICE_LOW: u8 = 32;
+
+/// The `free` level of the RAM records: `SERVICE_FREE` with the budget, 0 without it (a record
+/// without budgets has no `free`, `check_free`).
+pub const RAM_FREE: u8 = if RAM_BUDGET_ON { SERVICE_FREE } else { 0 };
+
+/// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
+/// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
+/// longest and the most frequent of the three. The thread works at `low` 32 after that (`SERVICE_LOW`), where a
+/// request of a client below 32 costs at 32 and one of a client above it at the client's own
+/// level (spec 8, the loan).
+pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
+    &[Budget {
+        name: "serve",
+        cpu: 0,
+        c_ns: 250_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: SERVICE_LOW,
+    }]
+} else {
+    &[]
+};
+
+/// The budget of the pipe service's request thread: 75 us of each 5 ms (1.5 %).
+pub const PIPE_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 75_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: SERVICE_LOW,
+}];
+
+/// The budget of the terminal service's request thread: 75 us of each 5 ms (1.5 %), the output
+/// being bound by the driver as well.
+pub const TTY_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 75_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: SERVICE_LOW,
+}];
 
 const RAM_BASE: Record = Record {
     name: "ramfs",
@@ -66,11 +133,14 @@ const RAM_BASE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// Standalone RAM probes use an explicit deterministic source.
 pub const RAM_LEGACY: Record = Record {
     args: proto_fs::RAM_TIME_LEGACY,
+    budgets: RAM_BUDGETS,
+    free: RAM_FREE,
     ..RAM_BASE
 };
 
@@ -78,6 +148,8 @@ pub const RAM_LEGACY: Record = Record {
 pub const RAM_CLOCKED: Record = Record {
     args: proto_fs::RAM_TIME_CLOCKED,
     connects: &["clock"],
+    budgets: RAM_BUDGETS,
+    free: RAM_FREE,
     ..RAM_BASE
 };
 
@@ -115,6 +187,7 @@ pub const TABLE: &[Record] = &[
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     },
 ];
 
@@ -578,6 +651,8 @@ pub const PIPE: Record = Record {
     quota: 160 * PAGE,
     handle_limit: 224,
     restart: Restart::Never,
+    budgets: PIPE_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -951,6 +1026,8 @@ pub const TTY: Record = Record {
     handle_limit: 192,
     restart: Restart::Never,
     connects: &["uart"],
+    budgets: TTY_BUDGETS,
+    free: SERVICE_FREE,
     ..RAM_BASE
 };
 
@@ -999,6 +1076,48 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
         handle_limit: 320,
         quota: 64 * PAGE,
         ..TTY_TABLE[2]
+    },
+];
+
+/// The probe of the time budgets of the RAM, pipe and terminal services (tests/service-budget,
+/// xtask service-budget, under -icount on one CPU, and with two CPUs for the numbers printed
+/// for information): the three services as the shell image has them, with their budgets; the
+/// console's driver as the quiet stub of the steps of the terminal; and the probe, whose threads
+/// stand at 20, 34 (the victim, above the demoted level 32) and 40.
+pub const SERVICE_BUDGET_TABLE: &[Record] = &[
+    TTY_STEPS_TABLE[0],
+    RAM_LEGACY,
+    PIPE,
+    TTY,
+    Record {
+        // The name of the diagnostic client of the RAM service, which init gives the boot profile
+        // (`BOOT_PROFILE_CLIENTS`): the probe's lookups of paths need it.
+        name: "ramfs-probe",
+        program: "service-budget",
+        priority: 40,
+        ceiling: 40,
+        quota: 256 * PAGE,
+        handle_limit: 128,
+        connects: &["ramfs", "pipe", "tty"],
+        // The budgets of the control phases (the spinners that measure the cost of a timer
+        // event): the same C and T as the RAM service's and the pipe service's.
+        budgets: &[
+            Budget {
+                name: "ctl-ramfs",
+                cpu: 0,
+                c_ns: 250_000,
+                t_ns: SERVICE_PERIOD_NS,
+                low: 1,
+            },
+            Budget {
+                name: "ctl-pipe",
+                cpu: 0,
+                c_ns: 75_000,
+                t_ns: SERVICE_PERIOD_NS,
+                low: 1,
+            },
+        ],
+        ..TABLE[1]
     },
 ];
 

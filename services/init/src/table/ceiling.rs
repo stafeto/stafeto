@@ -38,6 +38,7 @@ pub const TABLE: &[Record] = &[
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     },
     Record {
         name: "high",
@@ -65,5 +66,6 @@ pub const TABLE: &[Record] = &[
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     },
 ];

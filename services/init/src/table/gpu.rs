@@ -106,6 +106,7 @@ pub const GPU: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The first probe, the owner (role `o`): opens the screen, draws and
@@ -136,6 +137,7 @@ const PROBE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The second probe (role `s`): takes the screen once the first ended,

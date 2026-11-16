@@ -1002,6 +1002,7 @@ fn sources_give_their_slots_back() -> Outcome {
             None,
             sys::Shares::CREATOR,
             0,
+            0,
         );
         close(child.map_err(|_| "process_create with an exit channel failed")?)?;
         let ended = sys::try_receive(&c);
@@ -1051,6 +1052,7 @@ pub(crate) fn heard_child(
         Some((name, priority)),
         None,
         sys::Shares::CREATOR,
+        0,
         0,
     )
     .map_err(|_| "process_create with an exit channel failed")
@@ -1280,6 +1282,7 @@ fn start_channel_moves_into_the_child() -> Outcome {
         Some((&name, QUIET)),
         Some(c),
         sys::Shares::CREATOR,
+        0,
         0,
     );
     let Ok(child) = made else {

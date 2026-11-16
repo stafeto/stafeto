@@ -22,6 +22,7 @@
 #![no_std]
 
 pub mod bss;
+pub mod budget;
 pub mod console;
 pub mod dma;
 pub mod fs;

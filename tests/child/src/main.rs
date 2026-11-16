@@ -417,6 +417,7 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
         cpu: 0,
         shares: sys::Shares::CREATOR,
         cpus: 0,
+        free: 0,
     };
     // The next call is process_create: the parent's tests that hold or end
     // the child at that call look at this mark.

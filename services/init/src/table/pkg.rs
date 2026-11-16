@@ -152,6 +152,7 @@ pub const BLK: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The probe of the disk (tests/blk-probe): a client of the service, at 30.
@@ -185,6 +186,7 @@ pub const BLK_PROBE: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The image of the disk probe: the PL011's driver, the disk service and
@@ -228,6 +230,7 @@ pub const PKGD: Record = Record {
     cpus: GENERAL_CPUS,
     waits: &[],
     budgets: &[],
+    free: 0,
 };
 
 /// The probe of the package service (tests/store-probe): the first POSIX process, root,

@@ -233,8 +233,17 @@ pub fn process_create(
     handle_limit: u32,
     ceiling: u8,
 ) -> Result<Handle<Process>, Error> {
-    process_create_with(quota, handle_limit, ceiling, None, None, Shares::CREATOR, 0)
-        .map_err(|(e, _)| e)
+    process_create_with(
+        quota,
+        handle_limit,
+        ceiling,
+        None,
+        None,
+        Shares::CREATOR,
+        0,
+        0,
+    )
+    .map_err(|(e, _)| e)
 }
 
 /// process_create with channels (spec 7.9, 13.3). `exit`, a channel handle
@@ -245,7 +254,11 @@ pub fn process_create(
 /// (abi::START_CHANNEL) with its rights, label and all; when the call
 /// fails it stays the caller's and comes back with the error. `shares` are
 /// x6 and x7 (spec 7.5) and `cpus` is x8, the CPUs of the process's
-/// threads, a subset of the caller's: 0 for the caller's own.
+/// threads, a subset of the caller's: 0 for the caller's own. `free` is the
+/// level its threads without a budget work at, at most (x2, bits 8-15; spec
+/// 8): 0 for the ceiling, or a priority of 1 up to the ceiling that does not
+/// lie above the creator's own.
+#[allow(clippy::too_many_arguments)]
 pub fn process_create_with(
     quota: u64,
     handle_limit: u32,
@@ -254,13 +267,14 @@ pub fn process_create_with(
     start: Option<Handle<Channel>>,
     shares: Shares,
     cpus: u8,
+    free: u8,
 ) -> Result<Handle<Process>, (Error, Option<Handle<Channel>>)> {
     let (x3, x4) = exit.map_or((0, 0), |(c, priority)| (c.raw().0, priority.into()));
     let x5 = start.as_ref().map_or(0, |c| c.raw().0);
     let args = [
         quota,
         handle_limit.into(),
-        ceiling.into(),
+        u64::from(ceiling) | u64::from(free) << 8,
         x3,
         x4,
         x5,
@@ -1246,6 +1260,14 @@ impl Token {
 
 /// Token::reply_receive, below.
 impl Token {
+    /// A second value for the same token, for the one thing a caller does
+    /// with a token its call used: a reply that fails with BAD_STATE when the
+    /// kernel used the token up, and reaches the request when the kernel
+    /// refused the call before it did (`service::Owed`).
+    pub const fn again(&self) -> Token {
+        Token(self.0)
+    }
+
     /// reply with `bytes`, up to abi::MESSAGE_MAX and no handles, and then
     /// receive on `channel`, a handle with RECEIVE, in one entry into the
     /// kernel (`Call::ReplyReceive`): the thread does not come back to its
@@ -1257,10 +1279,33 @@ impl Token {
     /// as `receive` does. Any other error is the call's: the reply, or the
     /// receive after it, failed with it.
     pub fn reply_receive(self, channel: &Handle<Channel>, bytes: &[u8]) -> Result<Received, Error> {
+        self.reply_receive_handles(channel, bytes, Outgoing::new())
+    }
+
+    /// reply_receive with `handles` in the reply, an `Outgoing` of at most
+    /// abi::MESSAGE_HANDLES, each with TRANSFER: they move as `reply_handles`
+    /// moves them. The kernel checks the message and its handles before it
+    /// replies, and nothing changes when a check fails; the handles then stay
+    /// in the caller's table and close here, with the error as the call's
+    /// result (INVALID_ARGS, BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). The
+    /// error of a reply that went as far as it could (LIMIT_REACHED and
+    /// NO_MEMORY, the client's table had no room) is the call's too, and the
+    /// handles are gone; with PEER_CLOSED the receive follows.
+    ///
+    /// On an error x1 of the call says which half failed (`reply_receive_took_handles`): when
+    /// the reply went (the error is the receive half's) its handles are the client's and are
+    /// never closed here; when nothing happened they close here unless the error is one that
+    /// took them (`Error::keeps_handles`).
+    pub fn reply_receive_handles(
+        self,
+        channel: &Handle<Channel>,
+        bytes: &[u8],
+        handles: Outgoing,
+    ) -> Result<Received, Error> {
         if bytes.len() > MESSAGE_MAX {
             return Err(Error::InvalidArgs);
         }
-        let Ok(regs) = message_regs(self.0, bytes, &[], 0) else {
+        let Ok(regs) = message_regs(self.0, bytes, handles.values(), 0) else {
             return Err(Error::InvalidArgs);
         };
         let mut x = [0; 12];
@@ -1269,15 +1314,28 @@ impl Token {
         // SAFETY: reply_receive uses no memory of the program but its own
         // message buffer; it reads x0-x10 and writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
-        // x1 of an error says which half failed (abi::Call::ReplyReceive): 0,
-        // nothing happened, so BAD_STATE there is the reply's (the token named
-        // no request that waited) and the call receives as `receive` does;
-        // 1, the reply went, and any error is the receive half's.
-        match received(x) {
-            Err(Error::BadState) if x[1] == 0 => receive(channel),
+        let result = received(x);
+        // x1 of an error says which half failed (abi::Call::ReplyReceive): 0, nothing
+        // happened (BAD_STATE is the reply's: the token named no request that waited, and the
+        // call receives as `receive` does); 1, the reply went and its handles are gone.
+        let half = x[1];
+        match &result {
+            Err(e) if !reply_receive_took_handles(half, *e) => {}
+            _ => handles.sent(),
+        }
+        match result {
+            Err(Error::BadState) if half == 0 => receive(channel),
             r => r,
         }
     }
+}
+
+/// Whether the handles of the reply of a `reply_receive` that failed with `error` are gone: x1 of
+/// the error is 1 (the reply was delivered, the error is the receive half's) or the error is one
+/// that takes the handles (`Error::keeps_handles`, as for `reply`). With x1 = 0 and an error that
+/// keeps them, they stay with the caller.
+pub const fn reply_receive_took_handles(x1: u64, error: Error) -> bool {
+    x1 == 1 || !error.keeps_handles()
 }
 
 /// A send or a reply with handles that failed (spec 6.1): its error, and
@@ -1449,10 +1507,68 @@ fn send_with(
     // limits.
     #[cfg(feature = "step-stats")]
     let began = crate::time::now();
+    #[cfg(feature = "send-stats")]
+    let sent_at = crate::time::now();
     let sent = call::<{ Call::Send.number() }>(&args);
+    #[cfg(feature = "send-stats")]
+    send_stats::note(channel.raw().0, crate::time::now().saturating_sub(sent_at));
     #[cfg(feature = "step-stats")]
     crate::service::waited(crate::time::now().saturating_sub(began));
     reply_of(sent?)
+}
+
+/// The sends of the program counted and the longest one timed (feature `send-stats`, for the
+/// probes of the budgets: a transaction of several requests is told by its requests).
+#[cfg(feature = "send-stats")]
+pub mod send_stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static LONGEST: AtomicU64 = AtomicU64::new(0);
+    static WATCHED: AtomicU64 = AtomicU64::new(0);
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    static TARGET: AtomicU64 = AtomicU64::new(0);
+    static DONE_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts the sends of every thread from now on, and notes the counter of the time when the
+    /// `target`-th has been answered (`done_at`): the end of a queue of `target` requests.
+    pub fn count_all(target: u64) {
+        ALL.store(0, Relaxed);
+        DONE_AT.store(0, Relaxed);
+        TARGET.store(target, Relaxed);
+    }
+
+    /// The counter of the time when the target of `count_all` was reached, 0 before.
+    pub fn done_at() -> u64 {
+        DONE_AT.load(Relaxed)
+    }
+
+    /// Counts only the sends through the channel handle `raw` (the other threads of the
+    /// program send too).
+    pub fn watch(raw: u64) {
+        WATCHED.store(raw, Relaxed);
+    }
+
+    pub(super) fn note(raw: u64, ticks: u64) {
+        let all = ALL.fetch_add(1, Relaxed) + 1;
+        if all == TARGET.load(Relaxed) {
+            DONE_AT.store(crate::time::now(), Relaxed);
+        }
+        if raw == WATCHED.load(Relaxed) {
+            COUNT.fetch_add(1, Relaxed);
+            LONGEST.fetch_max(ticks, Relaxed);
+        }
+    }
+
+    /// The sends made so far, and the longest in ticks since the last `reset`.
+    pub fn read() -> (u64, u64) {
+        (COUNT.load(Relaxed), LONGEST.load(Relaxed))
+    }
+
+    /// Zeroes the longest (the count goes on).
+    pub fn reset_longest() {
+        LONGEST.store(0, Relaxed);
+    }
 }
 
 fn reply_of(x: Regs) -> Result<Reply, Error> {
