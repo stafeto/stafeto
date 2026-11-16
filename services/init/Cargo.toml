@@ -114,6 +114,9 @@ table-net = []
 # with an ITS, a virtio-net-pci with a vector of MSI-X a queue (table/net.rs,
 # NETD_ITS; xtask's machine ITS).
 net-its = []
+# With table-net: the launcher runs the boot script /etc/rc beside the shell
+# (xtask net-ec2-key; the shell on EC2 does it always).
+net-rc = []
 table-net-probe = []
 # The probe's image with both network devices on QEMU.
 table-net-probe-two = []

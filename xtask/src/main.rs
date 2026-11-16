@@ -88,6 +88,7 @@ mod ncdu_dialog;
 mod net;
 mod net_bench;
 mod net_curl;
+mod net_ec2_key;
 mod net_probe;
 mod net_tls;
 mod net_trace;
@@ -2317,6 +2318,10 @@ commands:
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
             `steps` the service counts its steps (TCG only)
+  net-ec2-key [MACHINE] boot the shell with the boot script of EC2 (`/etc/rc`, `/etc/rc.d/ec2-key`)
+            against a fake of the instance metadata service on the host: the
+            key file and its modes, the request without a token (401), no key,
+            and a refused token
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -2680,6 +2685,8 @@ fn main() {
         Some("linux-guest") => linux_guest::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
+        Some("net-ec2-key") => net_ec2_key::command(&args[1..]),
+        Some("net-ec2-key-imds") => net_ec2_key::imds_command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
@@ -10490,6 +10497,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-wget", || {
             net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
         }),
+        // The boot script of EC2: the key of the instance from a fake of the metadata
+        // service (IMDSv2) on the host, written for the SSH server. Also in the group `net`.
+        job("net-ec2-key", || net_ec2_key::probe(&qemu::VIRT)),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {
