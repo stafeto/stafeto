@@ -1142,24 +1142,21 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         }
     }
     let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
-    let name = if breaks {
-        "boot-nvme-persist-break.img"
-    } else if steps {
-        "boot-nvme-persist-steps.img"
-    } else {
-        "boot-nvme-persist.img"
+    // The jobs of the ci run side by side in one tree: each variant has the files of its own.
+    let tag = match (breaks, steps, shape) {
+        (true, ..) => "-break",
+        (_, true, _) => "-steps",
+        (_, _, Shape::Plain) => "",
+        (_, _, Shape::Lba4096) => "-4096",
+        (_, _, Shape::Mdts1) => "-mdts1",
     };
-    let esp_name = match shape {
-        Shape::Plain if steps => "efi-disk-nvme-persist-steps.raw",
-        Shape::Plain => "efi-disk-nvme-persist.raw",
-        Shape::Lba4096 => "efi-disk-nvme-persist-4096.raw",
-        Shape::Mdts1 => "efi-disk-nvme-persist-mdts1.raw",
-    };
+    let name: &str = &format!("boot-nvme-persist{tag}.img");
+    let esp_name = format!("efi-disk-nvme-persist{tag}.raw");
     let image = image_with(name, programs, world.files.clone(), None)?;
     let kernel = build(Variant::Normal)?;
     let firmware = efi::firmware()?;
     let loader = efi::build_loader(&[])?;
-    let esp = target_dir().join(esp_name);
+    let esp = target_dir().join(&esp_name);
     let artifacts = Artifacts {
         boot_image: image,
         ..kernel.clone()
@@ -1353,7 +1350,12 @@ fn nvme_run(
     icount: bool,
     within: Duration,
 ) -> Result<Vec<String>, String> {
-    let mut cmd = efi::command(&efi::EFI, firmware, esp, true, "nvme-persist")?;
+    // The variables of the firmware are copied to a file named after the disk of the run.
+    let vars = esp
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("nvme-persist");
+    let mut cmd = efi::command(&efi::EFI, firmware, esp, true, vars)?;
     cmd.arg("-drive").arg(format!(
         "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
         data.display()
