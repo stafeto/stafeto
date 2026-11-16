@@ -265,10 +265,11 @@ pub struct Node<T> {
     /// CPU (spec 8: the CPU time `object_info` reports).
     ran: u64,
     /// Times a higher level (or the cleanup queue) took the thread off the
-    /// CPU while it was ready: `preempt` only. A block, a `yield`, the end
-    /// of a quantum and a budget's end do not count. It wraps at 2^16: the
-    /// field takes the two spare bytes of the node, so the thread keeps its
-    /// size, and a reader takes the difference of two readings modulo 2^16.
+    /// CPU while it was ready: counted in `pick`, where it calls `preempt`,
+    /// and nowhere else. A block, a `yield`, the end of a quantum and a
+    /// budget's end do not count. It wraps at 2^16: the field takes the two
+    /// spare bytes of the node, so the thread keeps its size, and a reader
+    /// takes the difference of two readings modulo 2^16.
     preempts: u16,
     /// While the thread runs, the counter value at which its stint began
     /// with `RUNNING` set; otherwise the ticks left of a round-robin quantum
@@ -926,7 +927,13 @@ impl<T: Schedulable> Scheduler<T> {
                 return Decision::Run(r);
             }
             // SAFETY: as above.
-            unsafe { self.preempt(r, now) }
+            unsafe {
+                // The one place a higher level (or the cleanup) takes the
+                // CPU from a ready thread: a preemption.
+                let n = node(r);
+                n.preempts = n.preempts.wrapping_add(1);
+                self.preempt(r, now)
+            }
         }
         let top = self.ready.top();
         if let Some(c) = cleanup
@@ -973,7 +980,6 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe {
             let demoted = Self::charge(r, now, Leave::Preempt);
             let n = node(r);
-            n.preempts = n.preempts.wrapping_add(1);
             let ended = demoted || n.policy == Policy::RoundRobin && rest == 0;
             n.state = State::Ready;
             n.stamp = if ended { self.quantum } else { rest };
