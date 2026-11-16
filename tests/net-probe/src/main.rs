@@ -2626,10 +2626,27 @@ impl Probe<'_> {
             }
             set = self.epoll_set(&root, set, &records)?;
         }
-        let pairs = self.epoll_wait_now(&root, set, 64)?;
-        if pairs.len != 64 {
-            rt::println!("net-probe: {} pairs", pairs.len);
-            return Err("the wait did not give 64 pairs");
+        // A wait that had steps to run in its request gives half of the most (`SETTLED_MOST`) and
+        // looks at as many records: the 64 stale records may take its looks, and the 64 places
+        // come in the waits that follow.
+        let mut seen = [false; 64];
+        let mut count = 0;
+        for _ in 0..3 {
+            let pairs = self.epoll_wait_now(&root, set, 64)?;
+            for &(label, _) in pairs.as_slice() {
+                let at = (label as usize).wrapping_sub(100);
+                if at < 64 && !seen[at] {
+                    seen[at] = true;
+                    count += 1;
+                }
+            }
+            if count == 64 {
+                break;
+            }
+        }
+        if count != 64 {
+            rt::println!("net-probe: {} places", count);
+            return Err("the waits did not give 64 pairs");
         }
         rt::println!("net-probe: epoll wait ok 64 after 64 stale");
         // A request that changes a place with records brings what the service
