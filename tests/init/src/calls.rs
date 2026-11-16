@@ -2374,7 +2374,8 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// one preemption, which a step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
-/// be above 0 and the time of the second burn above the first.
+/// be above 0, and under -icount near the timer's, with the time of the
+/// second burn above the first.
 fn a_preemption_is_counted_and_costed() -> Outcome {
     let (pure, none, elapsed) = timed_burn()?;
     check(none == 0, "a burn with no other thread was preempted")?;
@@ -2403,6 +2404,11 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
             count > 0,
             "a thread above init woken by a timer did not preempt it",
         )?;
+    }
+    // Under -icount the burns are the same instructions: the count is near
+    // the timer's and the time of the second is above the first. Elsewhere
+    // the host's time moves both.
+    if under_icount() && one_cpu {
         check(
             count <= PREEMPTS + 2,
             "init was preempted far more often than the timer fired",
