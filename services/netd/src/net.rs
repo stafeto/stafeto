@@ -477,6 +477,10 @@ pub struct Net {
     /// Steps of the wire are told or put off ahead of the request that is handled: a wait of a
     /// set answers after them (`Driver::handle_request`).
     pub steps_pending: bool,
+    /// Steps of the wire ran in the request that is handled (`Driver::settle`): the wait of a set
+    /// gives at most `SETTLED_MOST` pairs, so that the steps and the wait together stay within the
+    /// bound of a step.
+    pub settled: bool,
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
     wake_cursor: usize,

@@ -2440,6 +2440,7 @@ impl Driver<'_> {
         #[cfg(not(feature = "probe"))]
         let kept = 0;
         let mut pending = (self.told | self.yielding.owed() | kept) & CASCADE;
+        self.inst.net.settled = pending != 0;
         for round in 0..3 {
             if pending == 0 {
                 break;
@@ -2494,6 +2495,7 @@ impl Driver<'_> {
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        self.inst.net.settled = false;
         if method == Method::EpollWait.number() || method == Method::EpollWaitTake.number() {
             self.before_wait(method, r);
         }

@@ -2038,6 +2038,13 @@ impl Net {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let mut ready = EpollReady::EMPTY;
+        // A wait that followed steps run in its request may give fewer pairs than it was asked
+        // (the caller waits again for the rest): the sum stays within the bound of a step.
+        let most = if core::mem::take(&mut self.settled) {
+            most.min(SETTLED_MOST)
+        } else {
+            most
+        };
         let blocking = key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0;
         // Steps of the wire stand ahead of this request (told, or put off for it): a wait that
         // can block does not report before them, the step of waking answers it after them.
@@ -2266,6 +2273,9 @@ fn is_loopback_or_own(net: &Net, ip: [u8; 4]) -> bool {
 }
 
 const _: () = assert!(SESSIONS >= ROOT_CLONES);
+
+/// The pairs a wait of a set gives when steps of the wire ran in its request.
+pub const SETTLED_MOST: usize = proto_net::sockets::EPOLL_MOST / 2;
 
 /// The label of the handle with which an instance of the service sends HOME_MAKE to another.
 pub const HOME_LABEL: u64 = 0x484F_4D45_0000_0001;
