@@ -594,6 +594,23 @@ fn apart(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// `expect` for a run under -icount on the machine of the firmware, where the lines of the services come
+/// glued to each other: each wanted line is in some line, not necessarily alone.
+fn expect_within(lines: &[String], wanted: &[String]) -> Result<(), String> {
+    for line in wanted {
+        if !lines.iter().any(|l| l.contains(line.as_str())) {
+            let said: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("pkgd") || l.contains("store-probe"))
+                .collect();
+            return Err(format!(
+                "no line {line:?}; pkgd and the probe said {said:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expect(lines: &[String], wanted: &[String]) -> Result<(), String> {
     for line in wanted {
         if !lines.iter().any(|l| l == line) {
@@ -1069,7 +1086,11 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     let file = Disk::new(mode);
     write_disk(&file, None)?;
     let first = run(&image, &file.0, steps)?;
-    expect(&first, &full_lines(&world, steps))?;
+    if steps {
+        expect_within(&first, &full_lines(&world, steps))?;
+    } else {
+        expect(&first, &full_lines(&world, steps))?;
+    }
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The second run: the same machine on the same disk file.
     let second = run(&image, &file.0, steps)?;
@@ -1201,8 +1222,11 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         steps,
         if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
     )?;
-    expect(&first, &full_lines(&world, steps))?;
-    let (generation, free, disk) = status_numbers(&first, "final status")?;
+    if steps {
+        expect_within(&first, &full_lines(&world, steps))?;
+    } else {
+        expect(&first, &full_lines(&world, steps))?;
+    }
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
     // Under -icount the lines of the services come glued to the lines of a step, and a long one may
     // be cut: the text is read from its start, and the line of the controller is required whole
@@ -1263,7 +1287,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 true,
                 BOOT_TIMEOUT * 40,
             )?;
-            expect(&again, &full_lines(&world, true))?;
+            expect_within(&again, &full_lines(&world, true))?;
             blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
             runs += 1;
         }
@@ -1285,6 +1309,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
+    let (generation, free, disk) = status_numbers(&first, "final status")?;
     // QEMU was killed with the probe's last line: the second run is on what the file holds.
     let second = nvme_run(
         &firmware,
