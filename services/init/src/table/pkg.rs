@@ -383,7 +383,7 @@ mod tests {
         // The level of the driver: above the package service, which calls it.
         assert_eq!((MEMBLK.priority, MEMBLK.ceiling), (39, 39));
         assert!(PKGD.ceiling <= MEMBLK.priority);
-        // The store probe's table with the memory disk in place of the Virtio one is a good table.
+        // The store probe's table with the memory disk as its `blk` is a good table.
         let table: Vec<Record> = STORE_PROBE_TABLE
             .iter()
             .map(|r| if r.name == "blk" { MEMBLK } else { *r })

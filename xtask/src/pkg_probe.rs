@@ -22,13 +22,13 @@
 //! 6. `pkg info doom` and `pkg search doom`.
 //! 7. `pkg update`: `serial 2, was 2`.
 //! 8. `pkg install doom` again: "is installed", and no package was downloaded (the log of the mirror).
+//! 9. The codes of exit: 2 for a command line that is none, 1 with a line of its own for a name no
+//!    repository has, and no package downloaded for it.
+//!
 //! `memory` runs steps 1 to 9 on the image of EC2's kind of store (init's feature `memory-store`:
 //! the disk service over a memory object of 256 MiB, no disk on the machine, 2 GiB as on a
 //! t4g.small), then `pkg remove doom`, the install again, and a second boot of the machine,
 //! where the store is empty: the packages were in memory.
-//!
-//! 9. The codes of exit: 2 for a command line that is none, 1 with a line of its own for a name no
-//!    repository has, and no package downloaded for it.
 
 use crate::net_tls::{capture, coded};
 use crate::pkg_states;
