@@ -118,8 +118,13 @@ megabyte at most.
 ## The frame
 
 A frame takes the posted buffer of every window at its start, is made in
-bands of eight lines, a step each (the compositor's own bit starts the next
-band, so requests of clients pass between bands), and then goes to the driver
+bands, a step each (the compositor's own bit starts the next band, so requests
+of clients pass between bands). A band that only copies is eight lines of the
+damage's width under a window that covers the damage, and four where it starts
+black (pixman's fill costs about twice its copy). A band that lays something
+over others (a window with an alpha, the pointer's picture) is 320 points of
+all those layers at most, down the damage and across it, since the portable
+OVER of pixman takes about 25 ticks a point, and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as
 soon as the commands are in the device's queue, and the driver says
