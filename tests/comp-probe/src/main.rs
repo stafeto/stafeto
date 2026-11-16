@@ -758,7 +758,7 @@ impl Probe<'_> {
             self.process,
             &memory,
             0,
-            u64::from(proto_gpu::BUFFER_BYTES),
+            u64::from(proto_gpu::SCREEN_BYTES),
             at,
             Access::ReadWrite,
         )
