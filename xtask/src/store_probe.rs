@@ -1087,7 +1087,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1096,12 +1096,19 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 /// installation of `hello`, every refusal, a group of packages, the settings, REMOVE), after which QEMU
 /// is killed, as a power failure would; the second run starts the machine on the same file and the probe
 /// finds `hello` installed and running, the settings and the serial in place. With `breaks` the service
-/// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass.
+/// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass; `lba4096`
+/// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB.
 pub fn nvme_persist(args: &[String]) -> Result<(), String> {
-    let breaks = match args.first().map(String::as_str) {
-        None => false,
-        Some("breaks") => true,
-        Some(other) => return Err(format!("usage: nvme-persist [breaks]: {other}")),
+    let (breaks, shape) = match args.first().map(String::as_str) {
+        None => (false, Shape::Plain),
+        Some("breaks") => (true, Shape::Plain),
+        Some("lba4096") => (false, Shape::Lba4096),
+        Some("mdts1") => (false, Shape::Mdts1),
+        Some(other) => {
+            return Err(format!(
+                "usage: nvme-persist [breaks|lba4096|mdts1]: {other}"
+            ));
+        }
     };
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
@@ -1128,11 +1135,16 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     } else {
         "boot-nvme-persist.img"
     };
+    let esp_name = match shape {
+        Shape::Plain => "efi-disk-nvme-persist.raw",
+        Shape::Lba4096 => "efi-disk-nvme-persist-4096.raw",
+        Shape::Mdts1 => "efi-disk-nvme-persist-mdts1.raw",
+    };
     let image = image_with(name, programs, world.files.clone(), None)?;
     let kernel = build(Variant::Normal)?;
     let firmware = efi::firmware()?;
     let loader = efi::build_loader(&[])?;
-    let esp = target_dir().join("efi-disk-nvme-persist.raw");
+    let esp = target_dir().join(esp_name);
     let artifacts = Artifacts {
         boot_image: image,
         ..kernel.clone()
@@ -1141,7 +1153,14 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     let file = Disk::new("nvme");
     write_disk(&file, None)?;
     if breaks {
-        return match nvme_run(&firmware, &esp, &file.0, &kernel.elf, BOOT_TIMEOUT * 6) {
+        return match nvme_run(
+            &firmware,
+            &esp,
+            &file.0,
+            &kernel.elf,
+            shape,
+            BOOT_TIMEOUT * 6,
+        ) {
             Err(why) => {
                 println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
                 Ok(())
@@ -1156,7 +1175,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         };
     }
     let blocks_hello = world.blocks("hello");
-    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, WITHIN)?;
+    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN)?;
     expect(&first, &full_lines(&world, false))?;
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
@@ -1165,6 +1184,12 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         .find(|l| l.starts_with("nvme: ") && l.contains(" blocks of "))
         .ok_or("the NVMe service said nothing of its controller")?
         .clone();
+    if !nvme_line.contains(shape.said()) {
+        return Err(format!(
+            "the controller is not the one asked for ({}): {nvme_line}",
+            shape.said()
+        ));
+    }
     if !nvme_line.contains("msi yes") {
         return Err(format!("the NVMe service ran without MSI-X: {nvme_line}"));
     }
@@ -1181,7 +1206,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         return Err("the Virtio disk ran, or the controller was reset in place".into());
     }
     // QEMU was killed with the probe's last line: the second run is on what the file holds.
-    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, WITHIN)?;
+    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN)?;
     let wanted = [
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
@@ -1196,6 +1221,36 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// How the data disk's controller is made: as QEMU makes it by default, with a namespace of 4 KiB
+/// blocks (`nvme-ns`), or with a transfer limit of two pages (`mdts=1`: the library cuts each cell of
+/// 16 KiB into two commands).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Plain,
+    Lba4096,
+    Mdts1,
+}
+
+impl Shape {
+    fn device(self) -> String {
+        let base = "nvme,serial=stafeto-data,bus=pcie.0,addr=0x4";
+        match self {
+            Shape::Plain => format!("{base},drive=data"),
+            Shape::Lba4096 => format!("{base},id=data-controller"),
+            Shape::Mdts1 => format!("{base},drive=data,mdts=1"),
+        }
+    }
+
+    /// What the line of the service says of the controller.
+    fn said(self) -> &'static str {
+        match self {
+            Shape::Plain => " blocks of 512 bytes ",
+            Shape::Lba4096 => " blocks of 4096 bytes ",
+            Shape::Mdts1 => "mdts 1 (8192 bytes)",
+        }
+    }
+}
+
 /// One run of the machine `EFI` on the boot disk `esp` with the data disk `data` as a second NVMe
 /// controller (the function at 00:04.0; the boot disk's is at 00:01.0), until the probe ends: the lines
 /// of its output. QEMU is killed when the line comes, or after `within`.
@@ -1204,6 +1259,7 @@ fn nvme_run(
     esp: &Path,
     data: &Path,
     elf: &Path,
+    shape: Shape,
     within: Duration,
 ) -> Result<Vec<String>, String> {
     let mut cmd = efi::command(&efi::EFI, firmware, esp, true, "nvme-persist")?;
@@ -1211,10 +1267,13 @@ fn nvme_run(
         "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
         data.display()
     ));
-    cmd.args([
-        "-device",
-        "nvme,drive=data,serial=stafeto-data,bus=pcie.0,addr=0x4",
-    ]);
+    cmd.args(["-device", &shape.device()]);
+    if shape == Shape::Lba4096 {
+        cmd.args([
+            "-device",
+            "nvme-ns,drive=data,bus=data-controller,logical_block_size=4096,physical_block_size=4096",
+        ]);
+    }
     let output = run_until(
         cmd,
         BOOT_TIMEOUT * 16,
