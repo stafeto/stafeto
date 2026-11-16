@@ -43,10 +43,10 @@ pub const PER_CONTEXT: usize = 4;
 pub const BAND_ROWS: u32 = 8;
 /// The points one band lays over others at most (a band of a frame that
 /// has a window with an alpha, or the pointer, in it; with several such
-/// layers each counts): the lines are this many points over the width of the
-/// damage and the layers, one line at least. pixman's portable OVER takes about
-/// 13 ticks a point and a call about 1 500.
-pub const OVER_POINTS: u32 = 640;
+/// layers each counts): a band is this many points of all the layers, on
+/// the damage's lines and columns, at least one point. pixman's portable OVER
+/// takes about 25 ticks a point.
+pub const OVER_POINTS: u32 = 320;
 
 /// Linux's key codes the scene knows: the Alt keys and Tab.
 pub const KEY_TAB: u16 = 15;
@@ -855,11 +855,13 @@ impl Scene {
         (at, m)
     }
 
-    /// The lines of the next band of a frame over `damage`: a band that
-    /// lays something over what is below it (a window with an alpha, the
-    /// pointer's picture) is as many lines as OVER_POINTS points of the
-    /// damage's width, a band that only copies BAND_ROWS.
-    fn band_rows(&self, damage: Rect) -> u32 {
+    /// The size of the next band of a frame over `damage`, as columns and
+    /// lines. A band that lays something over what is below it (windows with
+    /// an alpha, the pointer's picture) holds OVER_POINTS points of all those
+    /// layers at most, at least one point; a band that only copies is the
+    /// damage's width and BAND_ROWS lines under a window that covers the
+    /// damage, and half as many where it starts black.
+    fn tile(&self, damage: Rect) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
                 && damage.x < r.x + r.w
@@ -883,13 +885,16 @@ impl Scene {
                 && w.rect.x + w.rect.w >= damage.x + damage.w
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
-        if argb + cursor > 0 {
-            (OVER_POINTS / (damage.w.max(1) * (argb + cursor))).clamp(1, BAND_ROWS / 2)
+        let layers = argb + cursor;
+        if layers > 0 {
+            let budget = (OVER_POINTS / layers).max(1);
+            let w = damage.w.min(budget).max(1);
+            (w, (budget / w).clamp(1, BAND_ROWS / 2))
         } else if covered {
-            BAND_ROWS
+            (damage.w, BAND_ROWS)
         } else {
             // Black under the bands (pixman's fill costs about twice a copy).
-            BAND_ROWS / 2
+            (damage.w, BAND_ROWS / 2)
         }
     }
 }
@@ -926,25 +931,40 @@ pub trait Raster {
     );
 }
 
-/// One band of the frame, from line `row` of `damage`: the lines
-/// `row..row + rows` (to the damage's end) of the damage's columns are made
-/// in `fb`, the screen's bytes. The topmost opaque window that covers the
-/// band whole is its base, and the windows above it lie over it; a band no
+/// A place in the frame: the line, and the column from the damage's left edge,
+/// where the next band starts. The frame is done when the line is past the
+/// damage's last.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Band {
+    pub row: u32,
+    pub col: u32,
+}
+
+/// One band of the frame, from `at` in `damage`: the lines
+/// `at.row..at.row + rows` (to the damage's end) of the columns from `at.col`
+/// (to the damage's end, `width` of them) are made in `fb`, the screen's
+/// bytes. The topmost opaque window that covers the band whole is its base, and the windows above it lie over it; a band no
 /// opaque window covers whole starts black. The pointer's picture goes last.
-/// The next line to make, which is the damage's end when the frame is done.
+/// The place of the next band, whose line is the damage's end when the frame
+/// is done.
 pub fn compose(
     scene: &Scene,
     damage: Rect,
-    row: u32,
+    at: Band,
     fb: &mut [u8],
     src: &impl Source,
     raster: &mut impl Raster,
-) -> u32 {
-    let y0 = row.max(damage.y);
-    let y1 = (y0 + scene.band_rows(damage)).min(damage.y + damage.h);
-    let (x0, x1) = (damage.x, damage.x + damage.w);
-    if y0 >= y1 {
-        return damage.y + damage.h;
+) -> Band {
+    let (width, rows) = scene.tile(damage);
+    let y0 = at.row.max(damage.y);
+    let y1 = (y0 + rows).min(damage.y + damage.h);
+    let x0 = damage.x + at.col;
+    let x1 = (x0 + width).min(damage.x + damage.w);
+    if y0 >= y1 || x0 >= x1 {
+        return Band {
+            row: damage.y + damage.h,
+            col: 0,
+        };
     }
     let (order, n) = scene.order();
     let window = |k: u8| scene.window(k as usize).copied();
@@ -993,8 +1013,8 @@ pub fn compose(
             w.format == Format::Argb,
         );
     }
-    if let Some(at) = scene.pointer {
-        let c = Scene::cursor_rect(at);
+    if let Some(p) = scene.pointer {
+        let c = Scene::cursor_rect(p);
         let (cx0, cx1) = (x0.max(c.x), x1.min(c.x + c.w));
         let (cy0, cy1) = (y0.max(c.y), y1.min(c.y + c.h));
         if cx0 < cx1 && cy0 < cy1 {
@@ -1011,7 +1031,14 @@ pub fn compose(
             );
         }
     }
-    y1
+    if x1 < damage.x + damage.w {
+        Band {
+            row: y0,
+            col: x1 - damage.x,
+        }
+    } else {
+        Band { row: y1, col: 0 }
+    }
 }
 
 #[cfg(test)]
@@ -1087,13 +1114,21 @@ mod tests {
         i
     }
 
+    /// Makes the bands of a frame over `d` into `fb`, one after another.
+    fn draw(scene: &Scene, d: Rect, fb: &mut [u8], src: &impl Source) -> usize {
+        let mut at = Band { row: d.y, col: 0 };
+        let mut bands = 0;
+        while at.row < d.y + d.h {
+            at = compose(scene, d, at, fb, src, &mut Plain);
+            bands += 1;
+        }
+        bands
+    }
+
     /// Runs one whole frame into `fb`.
     fn frame(scene: &mut Scene, fb: &mut [u8], src: &impl Source) -> [Ended; MAX_WINDOWS] {
         let d = scene.begin().expect("a frame");
-        let mut row = d.y;
-        while row < d.y + d.h {
-            row = compose(scene, d, row, fb, src, &mut Plain);
-        }
+        draw(scene, d, fb, src);
         scene.end(true)
     }
 
@@ -1226,10 +1261,7 @@ mod tests {
         s.post(i, 1, &[]).unwrap();
         let d = s.begin().unwrap();
         assert_eq!(s.window(i).unwrap().bufs[0], Buf::Taken);
-        let mut row = d.y;
-        while row < d.y + d.h {
-            row = compose(&s, d, row, &mut fb, &src, &mut Plain);
-        }
+        draw(&s, d, &mut fb, &src);
         let ended = s.end(true);
         assert_eq!(
             ended[i],
@@ -1334,10 +1366,7 @@ mod tests {
         s.flush(i, rect(120, 100, 50, 10)).unwrap();
         let d = s.begin().unwrap();
         assert_eq!(d, rect(100, 100, 70, 10));
-        let mut row = d.y;
-        while row < d.y + d.h {
-            row = compose(&s, d, row, &mut fb, &src, &mut Plain);
-        }
+        draw(&s, d, &mut fb, &src);
         let ended = s.end(true);
         assert_eq!(
             ended[i],
@@ -1364,17 +1393,22 @@ mod tests {
         s.flush(i, SCREEN).unwrap();
         let d = s.begin().unwrap();
         let mut bands = 0;
-        let mut row = d.y;
-        while row < d.y + d.h {
-            let next = compose(&s, d, row, &mut fb, &src, &mut Plain);
-            assert_eq!(next, (row + BAND_ROWS).min(HEIGHT));
-            row = next;
+        let mut at = Band { row: d.y, col: 0 };
+        while at.row < d.y + d.h {
+            let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
+            assert_eq!(next.col, 0);
+            assert_eq!(next.row, (at.row + BAND_ROWS).min(HEIGHT));
+            at = next;
             bands += 1;
         }
         assert_eq!(bands, HEIGHT.div_ceil(BAND_ROWS));
-        assert_eq!(row, HEIGHT);
+        assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
-        assert_eq!(compose(&s, d, HEIGHT, &mut fb, &src, &mut Plain), HEIGHT);
+        let done = Band {
+            row: HEIGHT,
+            col: 0,
+        };
+        assert_eq!(compose(&s, d, done, &mut fb, &src, &mut Plain), done);
         s.end(true);
     }
 
@@ -1393,10 +1427,7 @@ mod tests {
         // older one, under `b`, and `b` covers the band whole.
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 16, 16));
-        let mut row = d.y;
-        while row < d.y + d.h {
-            row = compose(&s, d, row, &mut fb, &src, &mut Plain);
-        }
+        draw(&s, d, &mut fb, &src);
         assert_eq!(at(&fb, 2, 2), 9);
         s.end(true);
     }
@@ -1693,15 +1724,19 @@ mod tests {
         s.post(a, 0, &[]).unwrap();
         s.post(b, 0, &[]).unwrap();
         // A frame with an alpha window in it is made in bands of
-        // OVER_POINTS / width lines.
+        // OVER_POINTS points of the layers: 30 wide, one layer, so 4 lines
+        // at most.
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 30, 30));
-        let next = compose(&s, d, 0, &mut fb, &src, &mut Plain);
-        assert_eq!(next, BAND_ROWS / 2);
-        let mut row = next;
-        while row < d.y + d.h {
-            row = compose(&s, d, row, &mut fb, &src, &mut Plain);
-        }
+        let first = compose(&s, d, Band::default(), &mut fb, &src, &mut Plain);
+        assert_eq!(
+            first,
+            Band {
+                row: BAND_ROWS / 2,
+                col: 0
+            }
+        );
+        draw(&s, d, &mut fb, &src);
         s.end(true);
         // Only a: 0x80. Over a: 0x40 + 0x80 * 0x7F / 255 = 0x80.
         assert_eq!(at(&fb, 5, 5), 0x80);
@@ -1712,35 +1747,83 @@ mod tests {
         // The pointer's picture on top: its '#' is opaque black.
         s.pointer_to(2, 2);
         let d = s.begin().unwrap();
-        let mut row = d.y;
-        while row < d.y + d.h {
-            row = compose(&s, d, row, &mut fb, &src, &mut Plain);
-        }
+        draw(&s, d, &mut fb, &src);
         s.end(true);
         assert_eq!(at(&fb, 2, 2), 0);
         assert_eq!(at(&fb, 3, 4), 0xFF);
     }
 
     #[test]
-    fn a_band_over_a_wide_damage_is_one_line() {
+    fn the_bands_over_others_hold_the_points_of_all_the_layers_at_most() {
         let mut s = Scene::new();
         let a = s.create(1, 1, SCREEN, true, 0).unwrap();
         s.pointer_to(5, 5);
         s.flush(a, SCREEN).unwrap();
         let d = s.begin().unwrap();
         assert_eq!(d, SCREEN);
-        // 640 points over 640 wide is 1 line; with the pointer in the
-        // damage a narrow one is at most 4.
-        assert_eq!(s.band_rows(d), 1);
-        assert_eq!(s.band_rows(rect(0, 0, 100, 50)), BAND_ROWS / 2);
+        // The pointer is the one layer: one line of OVER_POINTS columns of
+        // the whole width, or more lines of a narrow damage.
+        assert_eq!(s.tile(d), (OVER_POINTS, 1));
+        assert_eq!(s.tile(rect(0, 0, 100, 50)), (100, OVER_POINTS / 100));
         // Away from the pointer: a copy under a window that covers the
-        // damage is 8 lines, and one that starts black 4.
-        assert_eq!(s.band_rows(rect(300, 300, 100, 50)), BAND_ROWS);
+        // damage is 8 lines of its width, and one that starts black 4.
+        assert_eq!(s.tile(rect(300, 300, 100, 50)), (100, BAND_ROWS));
         let mut t = Scene::new();
         let a = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
         t.flush(a, rect(0, 0, 50, 50)).unwrap();
         t.begin().unwrap();
-        assert_eq!(t.band_rows(rect(10, 10, 50, 50)), BAND_ROWS);
-        assert_eq!(t.band_rows(rect(0, 0, 100, 100)), BAND_ROWS / 2);
+        assert_eq!(t.tile(rect(10, 10, 50, 50)), (50, BAND_ROWS));
+        assert_eq!(t.tile(rect(0, 0, 100, 100)), (100, BAND_ROWS / 2));
+    }
+
+    #[test]
+    fn a_wide_layer_is_made_in_bands_across_the_damage() {
+        let mut s = Scene::new();
+        let a = s.create(1, 1, SCREEN, true, 0).unwrap();
+        let b = s.create(2, 2, rect(0, 0, 600, 100), false, 0).unwrap();
+        s.set_format(b, Format::Argb);
+        s.attach(b, 1, 2400).unwrap();
+        s.flush(a, SCREEN).unwrap();
+        s.post(b, 0, &[]).unwrap();
+        let d = s.begin().unwrap();
+        s.end(true);
+        let damage = rect(0, 0, 600, 100);
+        assert!(d.w >= 600);
+        // One layer with an alpha: a line of OVER_POINTS columns.
+        assert_eq!(s.tile(damage), (OVER_POINTS, 1));
+        // Two such layers, the pointer too: 213 points of each.
+        s.pointer_to(1, 1);
+        let c = s.create(3, 3, rect(0, 0, 600, 100), false, 0).unwrap();
+        s.set_format(c, Format::Argb);
+        s.attach(c, 1, 2400).unwrap();
+        s.post(c, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.tile(damage), (OVER_POINTS / 3, 1));
+        // A frame over a damage wider than a band goes across it.
+        let src = flat(&[
+            (a, 0, 7, (STRIDE * HEIGHT) as usize),
+            (b, 0, 0x10, 2400 * 100),
+            (c, 0, 0x10, 2400 * 100),
+        ]);
+        let mut fb = screen();
+        let mut at = Band { row: 0, col: 0 };
+        let mut seen = Vec::new();
+        while at.row < 2 {
+            seen.push(at);
+            at = compose(&s, damage, at, &mut fb, &src, &mut Plain);
+        }
+        assert_eq!(seen[0], Band { row: 0, col: 0 });
+        assert_eq!(
+            seen[1],
+            Band {
+                row: 0,
+                col: OVER_POINTS / 3
+            }
+        );
+        assert_eq!(
+            seen.len(),
+            2 * 600usize.div_ceil((OVER_POINTS / 3) as usize)
+        );
     }
 }

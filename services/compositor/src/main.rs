@@ -39,7 +39,9 @@
 #![no_main]
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
-use compositor::{Format, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose};
+use compositor::{
+    Band, Format, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
+};
 use core::mem::ManuallyDrop;
 use core::slice;
 use proto_comp::{
@@ -235,7 +237,7 @@ struct Axes {
 /// The frame being made: the rectangle and the next line.
 struct Job {
     damage: Rect,
-    row: u32,
+    at: Band,
 }
 
 struct Compositor {
@@ -702,7 +704,10 @@ impl Compositor {
         }
         self.job = Some(Job {
             damage,
-            row: damage.y,
+            at: Band {
+                row: damage.y,
+                col: 0,
+            },
         });
         let _ = sys::notify(&self.notify, BAND);
     }
@@ -715,7 +720,7 @@ impl Compositor {
         let Some(job) = self.job.as_mut() else {
             return;
         };
-        if job.row >= job.damage.y + job.damage.h {
+        if job.at.row >= job.damage.y + job.damage.h {
             let damage = job.damage;
             self.job = None;
             self.commit(damage);
@@ -725,10 +730,10 @@ impl Compositor {
         // object, read and write, SCREEN_BYTES of its 256 pages; nothing
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
-        job.row = compose(
+        job.at = compose(
             &self.scene,
             job.damage,
-            job.row,
+            job.at,
             fb,
             &Pixels(&self.scene),
             &mut self.raster,
