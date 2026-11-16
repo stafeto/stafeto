@@ -35,20 +35,6 @@ impl StepSample {
         self
     }
 }
-/// The ticks one preemption adds to the time of the thread it preempted, at the least: the
-/// entry, the handler and the decision of the kernel, and on the way back the other thread's exit
-/// and the thread's own restore. 487 is the lower bound the kernel test measures for a switch
-/// inside one process (the `preempt charge ticks` row). A step is judged by its time less one
-/// such charge for each preemption in it. The lower bound is the safe side: a larger charge
-/// would hide step work, a smaller leaves some preemption in the time. `xtask` has the same
-/// number (`PREEMPT_CHARGE` of `step_line.rs`).
-pub const PREEMPT_CHARGE: u64 = 487;
-
-/// The time of a step less the charge of the `preempts` preemptions that came in it.
-pub fn judged(took: u64, preempts: u64) -> u64 {
-    took.saturating_sub(preempts.saturating_mul(PREEMPT_CHARGE))
-}
-
 /// The reply/maintenance tail completes before the existing end clock is read.
 #[inline(always)]
 pub fn finish_after<T>(dispatch: impl FnOnce(), finish: impl FnOnce() -> T) -> T {
@@ -58,12 +44,6 @@ pub fn finish_after<T>(dispatch: impl FnOnce(), finish: impl FnOnce() -> T) -> T
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn the_charge_of_preemptions_is_taken_off_and_never_below_nothing() {
-        assert_eq!(judged(10_000, 0), 10_000);
-        assert_eq!(judged(10_000, 3), 10_000 - 3 * PREEMPT_CHARGE);
-        assert_eq!(judged(900, 5), 0);
-    }
     #[test]
     fn only_actual_leader_wait_is_removed_from_complete_dispatch() {
         let s = StepSample::measured(58, 16, 20410, 300);

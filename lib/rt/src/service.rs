@@ -668,8 +668,6 @@ mod steps {
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    /// The longest step of a kind less the charge of its preemptions (`sample::judged`).
-    static JUDGED: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -821,7 +819,6 @@ mod steps {
             preempts_now.wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
         let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
-        let judged = super::sample::judged(took, n_preempt);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
         } else if detail == 16 {
@@ -834,14 +831,14 @@ mod steps {
             // the step: the accounting is lost, and `xtask` fails the run.
             crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
         }
-        // A line prints when the raw time or the time judged (less the charge of the
-        // preemptions) of the kind grows: a reader takes the longest by the judged time.
-        let raw_grew = took > LONGEST[kind].fetch_max(took, Ordering::Relaxed);
-        let judged_grew = judged > JUDGED[kind].fetch_max(judged, Ordering::Relaxed);
-        if raw_grew || judged_grew {
-            if raw_grew {
-                DETAILS[kind].store(detail, Ordering::Relaxed);
-            }
+        // A line prints when the raw time of the kind grows, as it always did, and carries the
+        // preemptions of that step. The console is slow and a probe that reads it is
+        // sensitive to its volume, so a step whose raw time is not a new longest prints
+        // nothing, though its time less the charge may be longer than that of the line before:
+        // a reader that judges by the lines takes at most the charge of the preemptions of the
+        // longest raw step too little, and the warning of a raw time above the bound names it.
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+            DETAILS[kind].store(detail, Ordering::Relaxed);
             if printing {
                 // The count is left out when it is 0 (most steps): a reader takes a missing
                 // count as 0, and the console, which is slow, has less to write.

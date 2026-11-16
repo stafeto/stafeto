@@ -4,7 +4,10 @@
 //! The line `service step: T kind K N ticks detail D preempts P` of `rt::service` (`preempts P`
 //! is left out when P is 0) and the judgement of a step against the bound B.
 //!
-//! The line carries the raw time N of the step, the CPU ticks of the thread in it. A step that a
+//! The line carries the raw time N of the step, the CPU ticks of the thread in it, and is
+//! printed when the raw time of a kind grows (a step with a shorter raw time and more work does
+//! not print: the reader may take at most the charge of the preemptions of the longest raw step
+//! too little, and the warning names a raw time above the bound). A step that a
 //! higher level preempted P times holds P charges of the switch that are no work of the step, so
 //! the probes judge `N - P * PREEMPT_CHARGE` (`judged`) and keep printing the raw N. A warning
 //! names the raw time when it is above the bound.
@@ -13,8 +16,7 @@
 /// bound the kernel test measures for a switch inside one process (the `preempt charge ticks`
 /// row). A lower bound cannot hide step work: a step that took N with P preemptions did at least
 /// `N - P * c` ticks of its own for any true charge c at or above the bound, so judging by that
-/// value never passes a step that a true charge would fail. The same number as
-/// `rt::service::sample::PREEMPT_CHARGE`.
+/// value never passes a step that a true charge would fail.
 pub const PREEMPT_CHARGE: u64 = 487;
 
 /// A line of a step, read.
@@ -207,12 +209,5 @@ mod tests {
             "service step: 4 kind 7 99999 ticks detail 0 preempts 0",
         ]);
         assert_eq!(longest(&rows, "14"), vec![(7, 17_000, 1), (8, 500, 0)]);
-    }
-
-    #[test]
-    fn the_charge_is_the_one_of_the_service_library() {
-        let source = include_str!("../../lib/rt/src/service/sample.rs");
-        assert!(source.contains("pub const PREEMPT_CHARGE: u64 = 487;"));
-        assert_eq!(PREEMPT_CHARGE, 487);
     }
 }
