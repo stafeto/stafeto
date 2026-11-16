@@ -1,0 +1,15 @@
+[package]
+name = "proto-comp"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the composition service of stafeto (services/compositor): its method numbers, its codes and the bodies of its requests"
+
+[lib]
+bench = false
+
+[dependencies]
+proto-gpu = { path = "../gpu" }
+proto-wire = { path = "../wire" }
