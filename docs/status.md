@@ -4,27 +4,31 @@ The README gives the short picture; this page keeps the details of each part of 
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
-on three kinds of machine:
+on four kinds of machine:
 
 - QEMU `virt` under emulation (TCG), with GICv2 or GICv3;
 - QEMU with HVF on a Mac with Apple silicon, on Apple's GICv3 and on
   QEMU's GICv2;
 - Apple Virtualization.framework without QEMU: the same kernel image,
   with the Virtio PCI console driven by a user-space service
-  (`cargo xtask vz`).
+  (`cargo xtask vz`);
+- AWS EC2 Graviton (t4g.small in `eu-central-1`), booted through an EFI loader,
+  with the ENA network device.
 
-**Kernel.** 37 system calls, the same on every machine, over 64-bit handles
+**Kernel.** 38 system calls, the same on every machine, over 64-bit handles
 with rights: processes, threads, channels, sessions, timers, memory
 objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
 four handles; a service runs at its client's priority under its own
 ceiling, and a fast path hands the CPU straight to a waiting service. The
 scheduler has 64 priority levels (round robin and FIFO) with tickless
-preemption. Every process pays for its kernel memory from a quota, memory
+preemption, and a thread can be bound to a sporadic-server budget of C per period T
+(`budget_create`, `thread_bind_budget`, `reply_receive`); `object_info(THREAD_STATE)` also
+returns the thread's preemption count. Every process pays for its kernel memory from a quota, memory
 is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 204,805 bytes on QEMU and on Apple VZ, as measured; it has no size
+image is 212,997 bytes, as measured by `cargo xtask kernel-size`; it has no size
 limit. `cargo xtask build` prints the size and its difference from the record
 in `kernel/size.txt`, and flags a growth of more than 4 KiB.
 The longest stretch the kernel runs without taking an interrupt (term B of the
@@ -203,7 +207,12 @@ and `posix_spawn` takes `POSIX_SPAWN_SETSCHEDULER` and `SETSCHEDPARAM`.
 `PTHREAD_PRIO_INHERIT` mutexes pass priority along chains up to depth 8 and
 report a cycle with `EDEADLK`; `PTHREAD_PRIO_PROTECT` uses ceilings. POSIX
 timers, `alarm` and `sigqueue` live in the process service, and faults reach
-programs as signals on an alternate stack when asked.
+programs as signals on an alternate stack when asked. `SCHED_SPORADIC` is defined for
+compilation and refused: `EINVAL` from `sched_setscheduler`, `sched_setparam` and
+`posix_spawn`, `ENOTSUP` from `pthread_setschedparam` and `pthread_attr_setschedpolicy`,
+and `_POSIX_SPORADIC_SERVER` and `_POSIX_THREAD_SPORADIC_SERVER` are -1
+(docs/posix-coverage.md). The C layouts of `struct sched_param` (48 bytes), `pthread_attr_t`
+and `posix_spawnattr_t` (96 bytes) are final, and the release freezes the ABI series 0.5.
 
 **Sockets and message passing.** AF_UNIX stream and datagram sockets
 (`socketpair`, names in the file system, `SCM_RIGHTS`) and the IPv4 loopback
