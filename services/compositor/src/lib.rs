@@ -36,8 +36,10 @@ pub const MAX_WINDOWS: usize = 8;
 // The places a mask of `u8` names (`Scene::create`).
 const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
-/// The lines of one band of a frame that only copies: one step of the
-/// service. The step stays under 0.8 of term B (xtask).
+/// The lines of one band of a frame that only copies a window that covers
+/// the damage: one step of the service (pixman's copy of 8 lines of 640 points
+/// takes about 14 000 ticks). Half of it where the band starts black or lays
+/// something over others, whose pixman operations cost more a point.
 pub const BAND_ROWS: u32 = 8;
 /// The points one band lays over others at most (a band of a frame that
 /// has a window with an alpha, or the pointer, in it): the lines are this
@@ -868,10 +870,21 @@ impl Scene {
             .flatten()
             .any(|w| Scene::shown(w) && w.format == Format::Argb && touches(w.rect));
         let cursor = self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p)));
+        let covered = self.windows.iter().flatten().any(|w| {
+            Scene::shown(w)
+                && w.format == Format::Xrgb
+                && w.rect.x <= damage.x
+                && w.rect.y <= damage.y
+                && w.rect.x + w.rect.w >= damage.x + damage.w
+                && w.rect.y + w.rect.h >= damage.y + damage.h
+        });
         if argb || cursor {
-            (OVER_POINTS / damage.w.max(1)).clamp(1, BAND_ROWS)
-        } else {
+            (OVER_POINTS / damage.w.max(1)).clamp(1, BAND_ROWS / 2)
+        } else if covered {
             BAND_ROWS
+        } else {
+            // Black under the bands (pixman's fill costs about twice a copy).
+            BAND_ROWS / 2
         }
     }
 }
@@ -1679,7 +1692,7 @@ mod tests {
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 30, 30));
         let next = compose(&s, d, 0, &mut fb, &src, &mut Plain);
-        assert_eq!(next, BAND_ROWS);
+        assert_eq!(next, BAND_ROWS / 2);
         let mut row = next;
         while row < d.y + d.h {
             row = compose(&s, d, row, &mut fb, &src, &mut Plain);
@@ -1711,12 +1724,18 @@ mod tests {
         s.flush(a, SCREEN).unwrap();
         let d = s.begin().unwrap();
         assert_eq!(d, SCREEN);
-        // 640 points over 640 wide is 1 line; the copy alone is 8.
+        // 640 points over 640 wide is 1 line; with the pointer in the
+        // damage a narrow one is at most 4.
         assert_eq!(s.band_rows(d), 1);
+        assert_eq!(s.band_rows(rect(0, 0, 100, 50)), BAND_ROWS / 2);
+        // Away from the pointer: a copy under a window that covers the
+        // damage is 8 lines, and one that starts black 4.
         assert_eq!(s.band_rows(rect(300, 300, 100, 50)), BAND_ROWS);
-        assert_eq!(
-            s.band_rows(rect(0, 0, 100, 50)),
-            BAND_ROWS.min(OVER_POINTS / 100)
-        );
+        let mut t = Scene::new();
+        let a = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
+        t.flush(a, rect(0, 0, 50, 50)).unwrap();
+        t.begin().unwrap();
+        assert_eq!(t.band_rows(rect(10, 10, 50, 50)), BAND_ROWS);
+        assert_eq!(t.band_rows(rect(0, 0, 100, 100)), BAND_ROWS / 2);
     }
 }
