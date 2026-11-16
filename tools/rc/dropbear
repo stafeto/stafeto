@@ -12,9 +12,8 @@
 # makes a new key.
 #
 # The server runs in the foreground (-F) under a loop of its own that starts
-# it again a second after it ends (it ends at once while the network has no
-# address to listen on; the line it printed is shown once and then only when it
-# changes). No password login is possible (-s) and no port is forwarded (-j,
+# it again a second after it ends (it starts when the network has its address, so
+# that no line repeats every second while it has none). No password login is possible (-s) and no port is forwarded (-j,
 # -k); the build leaves both out as well. The build has no syslog, so the log
 # goes to the standard error, the console.
 
@@ -43,19 +42,17 @@ echo "ssh: host key $fingerprint"
 
 echo "dropbear: dropbear $args -r $key"
 (
-    while :; do
-        /bin/dropbear $args -r "$key" 2>&1
+    # The server ends at once while the network has no address to listen on, and each try
+    # would print a line: it starts when the network service has written /etc/resolv.conf
+    # (its lease), or after a minute. (A loop with a filter for its lines would take two more
+    # processes of a pool that counts.)
+    tries=0
+    while [ ! -s /etc/resolv.conf ] && [ "$tries" -lt 60 ]; do
         sleep 1
-    done | {
-        # One filter reads the lines of every run: a line is shown when its text (without
-        # the process number and the time the server puts in front) is not the one before.
-        last=
-        while IFS= read -r line; do
-            text=${line#*[0-9][0-9]:[0-9][0-9]:[0-9][0-9] }
-            if [ "$text" != "$last" ]; then
-                echo "$line"
-                last=$text
-            fi
-        done
-    }
+        tries=$((tries + 1))
+    done
+    while :; do
+        /bin/dropbear $args -r "$key"
+        sleep 1
+    done
 ) &
