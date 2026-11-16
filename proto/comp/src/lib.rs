@@ -13,7 +13,7 @@
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
-//! | DESCRIBE (17) | `Display` | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy` (u32 each) | NO_DEVICE |
+//! | DESCRIBE (17) | `Display`, manager, input | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy` (u32 each) | NO_DEVICE |
 //! | WINDOW_CREATE (18) | `Display` | `x`, `y`, `w`, `h`, `format`, `flags` (u32); one handle: a channel with NOTIFY and TRANSFER | status, `id` (u32); one handle: the window's session (SEND, TRANSFER) | INVALID, UNSUPPORTED, NO_DEVICE, LIMIT_REACHED |
 //! | ATTACH (19) | window | `count`, `stride`, `format` (u32); `count` memory objects with MAP_READ and TRANSFER | the status alone | BUSY, INVALID, UNSUPPORTED, REVOKED |
 //! | POST (20) | window | `buffer`, `count` (u32), then `count` rectangles of 4 u32 | the status alone, at once | BUSY, INVALID, NOT_ALLOWED, REVOKED |

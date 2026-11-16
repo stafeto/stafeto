@@ -1281,6 +1281,7 @@ impl Compositor {
                 }
             }
             Some(Comp::Manage) => self.manage(r),
+            Some(Comp::Describe) => self.describe(r),
             _ => Compositor::not_allowed(Comp::from_number(method).is_some()),
         }
     }
@@ -1395,6 +1396,7 @@ impl Service<1> for Compositor {
         if is_input(label) {
             return match comp {
                 Some(Comp::Inject) => self.inject(r),
+                Some(Comp::Describe) => self.describe(r),
                 _ => Compositor::not_allowed(comp.is_some()),
             };
         }
