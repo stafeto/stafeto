@@ -1162,7 +1162,8 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         ..kernel.clone()
     };
     efi::make_disk(&loader, &artifacts, &esp)?;
-    let file = Disk::new("nvme");
+    // The ci runs the variants as threads of one process: the data disk is named after the variant.
+    let file = Disk::new(&format!("nvme{tag}"));
     write_disk(&file, None)?;
     if breaks {
         // The first run keeps what it wrote in memory, so it may pass; the machine that starts again
