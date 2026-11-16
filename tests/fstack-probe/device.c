@@ -169,6 +169,31 @@ stats_text(char *out, size_t cap)
 }
 
 /* The datagrams of port 7: the echo, and the two commands. */
+/* The stack asks for the hardware address of the user network's name server
+ * (the address ending in 3 of the net of the claim): the user network answers
+ * that ARP request, and the answer is the ARP reply for the stack's address
+ * that the layer copies to the network service through the bypass ring. The
+ * request has to come from the stack itself. The stack's gratuitous ARP at
+ * the start teaches the user network the stack's address, so that its first
+ * datagram needs no ARP request of the user network's own, and the stack's
+ * request for the host's address follows. When the first datagram comes
+ * before the gratuitous ARP is taken, the user network asks first, the stack
+ * learns the host's address from that request, and no ARP reply for the
+ * stack ever comes. */
+static void
+ask_arp_once(const struct stafeto_fast_claim *claim)
+{
+    struct sockaddr_in to;
+
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(9);
+    to.sin_addr.s_addr = htonl((uint32_t)claim->config.address[0] << 24 |
+        (uint32_t)claim->config.address[1] << 16 |
+        (uint32_t)claim->config.address[2] << 8 | 3);
+    (void)ff_sendto(udp_fd, "arp", 3, 0, (struct linux_sockaddr *)&to, sizeof(to));
+}
+
 static int
 serve_udp(void)
 {
@@ -406,6 +431,7 @@ fstack_device_main(int argc, char **argv)
         (unsigned long long)claim.objects[3].pa, (unsigned long long)claim.objects[4].pa);
     udp_fd = open_udp(UDP_PORT);
     tcp_fd = open_tcp(TCP_PORT);
+    ask_arp_once(&claim);
     if (mode == MODE_FLOOD)
         flood(&claim);
     printf("fstack-probe: device serving\n");
