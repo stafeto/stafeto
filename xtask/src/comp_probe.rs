@@ -33,9 +33,10 @@ use crate::{
     build_boot_image, longest_steps, qemu, run_until,
 };
 
-/// The stack of the compositor: its loop's table of 64 sessions and the
-/// clones it gave.
-pub const COMP_STACK_SIZE: u32 = 32 * 1024;
+/// The stack of the compositor: its loop's table of 96 sessions, the clones
+/// it gave, the rings of events of its windows, and the frames of pixman's
+/// general path, which keeps scanline buffers of 24 KiB on the stack.
+pub const COMP_STACK_SIZE: u32 = 64 * 1024;
 
 /// The probe's image: the driver, the compositor, the two clients.
 pub const PROGRAMS: [ImageProgram; 4] = [

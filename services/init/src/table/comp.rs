@@ -15,8 +15,10 @@
 //! The compositor holds the one buffer of the screen the driver gave it,
 //! the buffers of its windows' clients (mapped for reading) and, for a
 //! program that knows no windows, the 250 pages of the buffer it makes at
-//! its start (`mem_create`, in its own quota): the quota is those, its 13
-//! pages of program, the tables of its mappings and its stack. The base
+//! its start (`mem_create`, in its own quota): the quota is those, its
+//! program (about 57 pages with pixman, which the windows are put together
+//! by), the arena of pixman's allocations (8 pages), the rings of events
+//! (3 pages), the tables of its mappings and its 64 KiB stack. The base
 //! image keeps 16 384 free pages after its services started (`cargo xtask
 //! pkg-identity`), and init takes each record's quota from them: this one
 //! is what is left of the 429 pages the base image has over.
@@ -50,7 +52,7 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 336 * PAGE,
+    quota: 420 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,
     console: true,
@@ -84,7 +86,7 @@ pub const COMPOSITOR_KEYS: Record = Record {
 /// then another buffer; it ends holding the window. The quota is the
 /// buffers it makes (four objects of 63 pages, a small one and a second
 /// window's 10) and its stack.
-const PROBE: Record = Record {
+pub const PROBE: Record = Record {
     name: "comp-probe",
     program: "comp-probe",
     kind: Kind::Client,

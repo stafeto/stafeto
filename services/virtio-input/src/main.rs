@@ -33,7 +33,8 @@ use core::mem::ManuallyDrop;
 use core::slice;
 use proto_init::ServiceArgs;
 use proto_input::{
-    EVENT_LEN, Event, MAX_READ, Method, NOT_ALLOWED, REVOKED, VERSION, code, read_max, write_events,
+    EVENT_LEN, Event, INVALID, MAX_READ, Method, NOT_ALLOWED, REVOKED, VERSION, code, read_max,
+    write_events,
 };
 use proto_wire::Status;
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource};
@@ -64,6 +65,8 @@ const PER_STEP: u64 = 16;
 /// The bit of the driver's notification to its own channel: more events
 /// wait in the queue.
 const MORE: u64 = 1;
+/// The bit the holder of the focus is told that events wait for it.
+const WAKE: u64 = 1;
 
 /// The codes of a start that failed: the start data or `dma`; REGISTER, the
 /// window or the binding; a map; the loop; no input device at the
@@ -200,6 +203,7 @@ fn main(_: u64) -> u64 {
         level,
         notify,
         focus: Focus::new(),
+        waker: None,
         slot_of: [0; QUEUE_SIZE],
         _maps: (dma, window),
     };
@@ -244,6 +248,9 @@ struct Driver {
     notify: Handle<Channel>,
     level: u8,
     focus: Focus,
+    /// The holder's channel with NOTIFY, when it gave one at GRANT: the
+    /// bit 1 goes to it when a step put events into the ring.
+    waker: Option<Handle<Channel>>,
     /// The buffer each token of the queue stands for.
     slot_of: [u8; QUEUE_SIZE],
     /// The object and the window, mapped for the driver's life.
@@ -329,6 +336,7 @@ impl Driver {
     /// back or given back ends the driver (DEVICE_FAILED).
     fn reap(&mut self, most: u64) -> u64 {
         let mut taken = 0u64;
+        let mut pushed = false;
         while taken < most
             && let Some(token) = self.queue.peek_used()
         {
@@ -350,7 +358,7 @@ impl Driver {
             if len as usize >= EVENT_LEN {
                 // SAFETY: as above; read before the buffer goes back.
                 let bytes = unsafe { *(buffer(slot) as *const [u8; EVENT_LEN]) };
-                self.focus.event(Event::from_bytes(bytes));
+                pushed |= self.focus.event(Event::from_bytes(bytes));
             }
             if !self.offer(slot) {
                 rt::println!("virtio-input: buffer {slot} could not go back to the queue");
@@ -361,14 +369,27 @@ impl Driver {
         if taken > 0 && self.queue.should_notify() {
             virtio_mmio::ring(&mut self.transport, EVENTQ);
         }
+        // One bit for the step: the holder reads them all in its own.
+        if pushed && let Some(waker) = &self.waker {
+            let _ = sys::notify(waker, WAKE);
+        }
         taken
     }
 
-    /// GRANT: a new session of focus, which revokes the one before.
+    /// GRANT: a new session of focus, which revokes the one before. A
+    /// channel in the request is where the holder is told of events.
     fn grant(&mut self, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() || !r.handles.is_empty() {
+        if r.body().finish().is_err() || r.handles.len() > 1 {
             return Answer::Status(Status::BadSize);
         }
+        let waker = if r.handles.is_empty() {
+            None
+        } else {
+            match r.handles.take::<Channel>(0) {
+                Ok(channel) => Some(channel),
+                Err(_) => return Answer::Status(code(INVALID)),
+            }
+        };
         let label = self.focus.grant();
         // A handle in a reply must carry TRANSFER (spec 6.1), and the
         // display service passes this one on to the owner of the screen.
@@ -379,6 +400,7 @@ impl Driver {
                     self.focus.revoke();
                     return Answer::Status(Status::BadSize);
                 }
+                self.waker = waker;
                 Answer::Reply([session.erase()].into())
             }
             Err(error) => {
@@ -394,6 +416,7 @@ impl Driver {
             return Answer::Status(Status::BadSize);
         }
         self.focus.revoke();
+        self.waker = None;
         Answer::Status(Status::Ok)
     }
 
@@ -458,6 +481,9 @@ impl Service<1> for Driver {
     /// it).
     fn closed(&mut self, label: u64) {
         self.focus.closed(label);
+        if self.focus.holder().is_none() {
+            self.waker = None;
+        }
     }
 
     fn notification(&mut self, n: Notice) {

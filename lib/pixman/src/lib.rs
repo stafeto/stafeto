@@ -82,7 +82,13 @@ mod imp {
     struct Image(*mut c_void);
 
     impl Image {
-        fn new(format: Format, width: u32, height: u32, stride: u32, bytes: *mut u8) -> Option<Image> {
+        fn new(
+            format: Format,
+            width: u32,
+            height: u32,
+            stride: u32,
+            bytes: *mut u8,
+        ) -> Option<Image> {
             // SAFETY: pixman reads the arguments; the bits are not owned by
             // the image, which the caller drops before the bytes go.
             let image = unsafe {

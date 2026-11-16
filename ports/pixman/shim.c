@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ARENA_BYTES (48 * 1024)
+#define ARENA_BYTES (32 * 1024)
 #define ALIGN 16
 
 struct block {
@@ -167,3 +167,18 @@ double ceil(double x) { return __builtin_ceil(x); }
 double exp(double x) { (void)x; __builtin_trap(); }
 double sin(double x) { (void)x; __builtin_trap(); }
 double atan2(double y, double x) { (void)y; (void)x; __builtin_trap(); }
+
+// The two files of pixman the build leaves out (tools/build-pixman.py): the
+// combiners of the wide formats, which stay unset (an image of a wide format
+// is never made), and the accessors, which no image has.
+struct pixman_implementation;
+void _pixman_setup_combiner_functions_float(struct pixman_implementation *imp)
+{
+    (void)imp;
+}
+
+void _pixman_bits_image_setup_accessors_accessors(void *image)
+{
+    (void)image;
+    __builtin_trap();
+}

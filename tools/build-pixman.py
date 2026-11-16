@@ -16,7 +16,11 @@ target/pixman/COPYING, the licence the notices of the package carry.
 pixman is under the MIT licence: the archive is fetched at build time with
 its SHA-256 checked, as the other C ports are, and the notice of the package
 names it. The list of the files pixman compiles is the one of its
-meson.build (pixman/meson.build, `pixman_files`)."""
+meson.build (pixman/meson.build, `pixman_files`) without two files that the
+service never reaches, each replaced by its one function in shim.c:
+pixman-combine-float.c (the combiners of the wide formats, 45 KB of code) and
+pixman-access-accessors.c (the access of images with accessor functions,
+33 KB): the windows are 8 bits to the channel, and no image has accessors."""
 
 from hashlib import sha256
 from pathlib import Path
@@ -39,8 +43,8 @@ PORT = ROOT / "ports" / "pixman"
 OUTPUT = WORK / "libpixman.a"
 # The files of `pixman_files` in pixman/meson.build.
 SOURCES = [
-    "pixman", "pixman-access", "pixman-access-accessors", "pixman-arm",
-    "pixman-bits-image", "pixman-combine32", "pixman-combine-float",
+    "pixman", "pixman-access", "pixman-arm",
+    "pixman-bits-image", "pixman-combine32",
     "pixman-conical-gradient", "pixman-edge", "pixman-edge-accessors",
     "pixman-fast-path", "pixman-filter", "pixman-glyph", "pixman-general",
     "pixman-gradient-walker", "pixman-image", "pixman-implementation",

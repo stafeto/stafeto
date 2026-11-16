@@ -72,7 +72,8 @@
 //! injects an event as if the device had made it: a KEY, a MOVE with the
 //! screen's coordinates (the pointer goes there) or a BUTTON.
 //!
-//! DESCRIBE's `open` is the windows alive now, `created` the windows ever
+//! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
+//! subscribed. Its `open` is the windows alive now, `created` the windows ever
 //! made, `frames` the frames shown, `busy` 1 while a frame is being made
 //! or waits to be: a probe that waits for `busy` to be 0 finds the screen
 //! settled.
@@ -103,6 +104,9 @@ pub const FORMAT_ARGB8888: u32 = 3;
 /// (a clone's is bit 63, a window's 62, the driver's 61).
 pub const MANAGER_MARK: u64 = 1 << 60;
 pub const INPUT_MARK: u64 = 1 << 59;
+
+/// DESCRIBE's `flags`: a manager has subscribed.
+pub const HAS_MANAGER: u32 = 1;
 
 /// The bit the service sends a window's channel when its ring has events;
 /// bits 0 to 2 tell the buffer that is free.
@@ -558,7 +562,9 @@ pub const FOCUSED: u32 = 2;
 
 impl WindowRecord {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        for n in [self.id, self.x, self.y, self.w, self.h, self.flags, self.depth] {
+        for n in [
+            self.id, self.x, self.y, self.w, self.h, self.flags, self.depth,
+        ] {
             w.u32(n)?;
         }
         Ok(())
@@ -595,6 +601,61 @@ pub fn read_list(reply: &[u8], mut each: impl FnMut(WindowRecord)) -> Result<(),
         });
     }
     r.finish()
+}
+
+/// The picture of the pointer, which the service lays over the screen and
+/// a probe computes the screen's CRC with.
+pub mod cursor {
+    /// The pointer's picture: 12 by 19 points, '#' black, 'o' white.
+    pub const CURSOR_W: u32 = 12;
+    pub const CURSOR_H: u32 = 19;
+    const CURSOR_ART: [&[u8; CURSOR_W as usize]; CURSOR_H as usize] = [
+        b"#           ",
+        b"##          ",
+        b"#o#         ",
+        b"#oo#        ",
+        b"#ooo#       ",
+        b"#oooo#      ",
+        b"#ooooo#     ",
+        b"#oooooo#    ",
+        b"#ooooooo#   ",
+        b"#oooooooo#  ",
+        b"#ooooo######",
+        b"#oo#oo#     ",
+        b"#o# #oo#    ",
+        b"##  #oo#    ",
+        b"#    #oo#   ",
+        b"     #oo#   ",
+        b"      #oo#  ",
+        b"      #oo#  ",
+        b"       ##   ",
+    ];
+
+    /// The bytes of the pointer's picture as ARGB8888, premultiplied (the
+    /// points are opaque or empty), CURSOR_W * 4 bytes a line.
+    pub const CURSOR: [u8; (CURSOR_W * CURSOR_H * 4) as usize] = {
+        let mut out = [0u8; (CURSOR_W * CURSOR_H * 4) as usize];
+        let mut y = 0;
+        while y < CURSOR_H as usize {
+            let mut x = 0;
+            while x < CURSOR_W as usize {
+                let point: u32 = match CURSOR_ART[y][x] {
+                    b'#' => 0xFF00_0000,
+                    b'o' => 0xFFFF_FFFF,
+                    _ => 0,
+                };
+                let b = point.to_le_bytes();
+                let at = (y * CURSOR_W as usize + x) * 4;
+                out[at] = b[0];
+                out[at + 1] = b[1];
+                out[at + 2] = b[2];
+                out[at + 3] = b[3];
+                x += 1;
+            }
+            y += 1;
+        }
+        out
+    };
 }
 
 /// The union of rectangles: the least rectangle that holds both; an empty

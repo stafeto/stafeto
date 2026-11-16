@@ -223,56 +223,7 @@ pub const SCREEN: Rect = Rect {
     h: HEIGHT,
 };
 
-/// The pointer's picture: 12 by 19 points, '#' black, 'o' white.
-pub const CURSOR_W: u32 = 12;
-pub const CURSOR_H: u32 = 19;
-const CURSOR_ART: [&[u8; CURSOR_W as usize]; CURSOR_H as usize] = [
-    b"#           ",
-    b"##          ",
-    b"#o#         ",
-    b"#oo#        ",
-    b"#ooo#       ",
-    b"#oooo#      ",
-    b"#ooooo#     ",
-    b"#oooooo#    ",
-    b"#ooooooo#   ",
-    b"#oooooooo#  ",
-    b"#ooooo######",
-    b"#oo#oo#     ",
-    b"#o# #oo#    ",
-    b"##  #oo#    ",
-    b"#    #oo#   ",
-    b"     #oo#   ",
-    b"      #oo#  ",
-    b"      #oo#  ",
-    b"       ##   ",
-];
-
-/// The bytes of the pointer's picture as ARGB8888, premultiplied (the
-/// points are opaque or empty), CURSOR_W * 4 bytes a line.
-pub const CURSOR: [u8; (CURSOR_W * CURSOR_H * 4) as usize] = {
-    let mut out = [0u8; (CURSOR_W * CURSOR_H * 4) as usize];
-    let mut y = 0;
-    while y < CURSOR_H as usize {
-        let mut x = 0;
-        while x < CURSOR_W as usize {
-            let point: u32 = match CURSOR_ART[y][x] {
-                b'#' => 0xFF00_0000,
-                b'o' => 0xFFFF_FFFF,
-                _ => 0,
-            };
-            let b = point.to_le_bytes();
-            let at = (y * CURSOR_W as usize + x) * 4;
-            out[at] = b[0];
-            out[at + 1] = b[1];
-            out[at + 2] = b[2];
-            out[at + 3] = b[3];
-            x += 1;
-        }
-        y += 1;
-    }
-    out
-};
+pub use proto_comp::cursor::{CURSOR, CURSOR_H, CURSOR_W};
 
 impl Scene {
     pub const fn new() -> Scene {
@@ -668,13 +619,7 @@ impl Scene {
         if let Some(i) = self.held.or_else(|| self.hit(at.0, at.1))
             && let Some(w) = self.window(i)
         {
-            let e = Event::at(
-                MOVE,
-                0,
-                0,
-                at.0 - w.rect.x as i32,
-                at.1 - w.rect.y as i32,
-            );
+            let e = Event::at(MOVE, 0, 0, at.0 - w.rect.x as i32, at.1 - w.rect.y as i32);
             self.tell(i, e);
         }
     }
@@ -1501,7 +1446,13 @@ mod tests {
             [Event::new(KEY, 30, 1), Event::new(KEY, 30, 0)]
         );
         assert!(events(&mut s, a).is_empty());
-        assert_eq!(s.delivered(), Delivered { windows: 1 << b, manager: false });
+        assert_eq!(
+            s.delivered(),
+            Delivered {
+                windows: 1 << b,
+                manager: false
+            }
+        );
         // No window with the focus: the key is dropped.
         s.destroy(b);
         s.destroy(a);
@@ -1522,7 +1473,10 @@ mod tests {
         assert_eq!(s.focus(), Some(a));
         assert_eq!(
             events(&mut s, a),
-            [Event::new(FOCUS_IN, 0, 0), Event::at(BUTTON, 0x110, 1, 10, 10)]
+            [
+                Event::new(FOCUS_IN, 0, 0),
+                Event::at(BUTTON, 0x110, 1, 10, 10)
+            ]
         );
         assert_eq!(events(&mut s, b), [Event::new(FOCUS_OUT, 0, 0)]);
         // a is on top now: at (60, 60), where both lie, a is hit.
@@ -1634,7 +1588,10 @@ mod tests {
         // Without a manager the Alt keys are the window's.
         s.set_manager(false);
         s.key(KEY_LEFTALT, true);
-        assert_eq!(events(&mut s, a).last(), Some(&Event::new(KEY, KEY_LEFTALT, 1)));
+        assert_eq!(
+            events(&mut s, a).last(),
+            Some(&Event::new(KEY, KEY_LEFTALT, 1))
+        );
     }
 
     #[test]
@@ -1757,6 +1714,9 @@ mod tests {
         // 640 points over 640 wide is 1 line; the copy alone is 8.
         assert_eq!(s.band_rows(d), 1);
         assert_eq!(s.band_rows(rect(300, 300, 100, 50)), BAND_ROWS);
-        assert_eq!(s.band_rows(rect(0, 0, 100, 50)), BAND_ROWS.min(OVER_POINTS / 100));
+        assert_eq!(
+            s.band_rows(rect(0, 0, 100, 50)),
+            BAND_ROWS.min(OVER_POINTS / 100)
+        );
     }
 }

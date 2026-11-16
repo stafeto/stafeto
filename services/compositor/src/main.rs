@@ -23,31 +23,43 @@
 //! are painted over in the next frame.
 //!
 //! The service is the driver's client by init's table (`connects` has
-//! `display`) and the input service's (`input`), whose focus it passes on
-//! to the program that holds the window of the first revision. It ends
-//! with a code of its own when the driver goes (every session it gave is
-//! dead then); init starts it again.
+//! `display`) and the input services': the keyboard's (`input`) and the
+//! pointer's (`pointer`, a virtio-tablet), whose focus it holds for itself
+//! (GRANT with a channel of its own, so that a bit tells it when events
+//! wait) and routes to the windows (stage G2: the window with the focus
+//! gets the keys, the one under the pointer the pointer, a click moves the
+//! focus). The keyboard's focus passes to the program that holds the window
+//! of the first revision while that window lives. A manager (a program the
+//! table gives a session marked MANAGER_MARK) moves, raises and hides the
+//! windows and gives one the focus; a session marked INPUT_MARK injects
+//! events as a device would. It ends with a code of its own when the driver
+//! goes (every session it gave is dead then); init starts it again.
 
 #![no_std]
 #![no_main]
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
-use compositor::{MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose};
+use compositor::{Format, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose};
 use core::mem::ManuallyDrop;
 use core::slice;
-use proto_comp::{Attach, BUFFER_MAX, Create, Description, Method as Comp, Post, Rect};
+use proto_comp::{
+    Attach, BUFFER_MAX, Create, Description, EVENTS_BIT, Event, FOCUSED, INPUT_MARK, MANAGER_MARK,
+    MAX_EVENTS, Method as Comp, Post, Rect, SHOWN, WindowRecord, manage,
+};
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, HEIGHT, IO, Method as Gpu, NO_DEVICE,
     NO_INPUT, NOT_ALLOWED, SCREEN_BYTES, Screen, VERSION, WIDTH, code,
 };
 use proto_init::ServiceArgs;
-use proto_input::Method as InputMethod;
+use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
 use rt::handle::{Any, Channel, Memory, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::wait::Waiter;
 use rt::{Handle, sys};
+
+mod px;
 
 rt::entry!(main);
 
@@ -81,10 +93,19 @@ const CLONES: usize = 64;
 const OWN: u64 = 1 << 63;
 const WINDOW: u64 = 1 << 62;
 const DRIVER: u64 = 1 << 61;
-/// The service's own bits: the next band of the frame is due, and a chunk of
-/// mapping, unmapping or clearing is.
+/// Init's marks (proto_comp: MANAGER_MARK is bit 60, INPUT_MARK bit 59) and
+/// the labels of the handles the input services notify through (bits 58
+/// and 57). Init's labels are counts, far under these bits.
+const KEYS: u64 = 1 << 58;
+const POINTER: u64 = 1 << 57;
+/// The service's own bits: the next band of the frame is due, a chunk of
+/// mapping, unmapping or clearing is, and more events wait at an input
+/// service.
 const BAND: u64 = 1;
 const WORK: u64 = 2;
+const INPUT: u64 = 4;
+/// The events one READ of an input service asks for.
+const READ_MAX: u32 = 32;
 /// The codes of a start that failed, and of the driver's end.
 const NO_START_DATA: u64 = 1;
 const NOT_REGISTERED: u64 = 2;
@@ -98,6 +119,16 @@ const fn buf_at(i: usize, b: usize) -> usize {
 
 fn is_window(label: u64) -> bool {
     label & WINDOW != 0 && label & OWN == 0
+}
+
+/// A session of the manager or of the input: a label init marked. The
+/// service's own labels never have these marks.
+fn is_manager(label: u64) -> bool {
+    label & MANAGER_MARK != 0 && label & (OWN | WINDOW | DRIVER) == 0
+}
+
+fn is_input(label: u64) -> bool {
+    label & INPUT_MARK != 0 && label & (OWN | WINDOW | DRIVER | MANAGER_MARK) == 0
 }
 
 /// What a window holds besides what the scene decides: the objects of its
@@ -165,11 +196,40 @@ impl PixelSource for Pixels<'_> {
     }
 }
 
-/// The link to the input service, as the display driver has one.
+/// The link to an input service, as the display driver has one.
 enum Link {
     Absent,
     Linked(Handle<Channel>),
     Lost,
+}
+
+/// An input service and the focus the compositor holds at it.
+struct Device {
+    name: &'static str,
+    /// The bit's label of the handle the service notifies through.
+    mark: u64,
+    link: Link,
+    /// The session of focus the service made for the compositor.
+    own: Option<Handle<Channel>>,
+}
+
+impl Device {
+    const fn new(name: &'static str, mark: u64) -> Device {
+        Device {
+            name,
+            mark,
+            link: Link::Absent,
+            own: None,
+        }
+    }
+}
+
+/// The place the absolute pointer last said, a number of the device's axes
+/// (0 to ABS_MAX) each.
+#[derive(Default)]
+struct Axes {
+    x: Option<i32>,
+    y: Option<i32>,
 }
 
 /// The frame being made: the rectangle and the next line.
@@ -198,7 +258,13 @@ struct Compositor {
     /// The windows of the first revision that went since the last frame
     /// shown: each is a line "gpu: screen released" once its place is.
     released: u32,
-    input: Link,
+    raster: px::Pixman,
+    keys: Device,
+    pointer: Device,
+    axes: Axes,
+    /// The channel the manager is told of events through, once it said.
+    manager: Option<Handle<Channel>>,
+    /// The first revision's window holds the keyboard's focus.
     focus_on: bool,
     /// The buffer of the window of the first revision: the service's own
     /// object, mapped at LEGACY_AT for good, cleared a step at a time when
@@ -249,18 +315,26 @@ fn main(_: u64) -> u64 {
         job: None,
         committed: false,
         released: 0,
-        input: Link::Absent,
+        raster: px::Pixman::warm(),
+        keys: Device::new("input", KEYS),
+        pointer: Device::new("pointer", POINTER),
+        axes: Axes::default(),
+        manager: None,
         focus_on: false,
         legacy,
         cleared: None,
         attaching: None,
     };
-    service.input = service.connect_input();
+    service.keys.link = connect_device(&service.parent, service.keys.name);
+    service.pointer.link = connect_device(&service.parent, service.pointer.name);
     // The screen is opened here, outside any step (its buffer is 256 pages
     // to map): the driver says CLEARING while it sets the device up, and
     // the service asks again on a timer of its own channel. A driver that
     // does not answer is asked again at a request.
     service.open_screen_waiting(level);
+    // The devices' focus is the compositor's, once the screen is.
+    service.take_own(Which::Keys);
+    service.take_own(Which::Pointer);
     #[cfg(feature = "steps")]
     rt::service::report_steps(17);
     let config = Config {
@@ -273,6 +347,32 @@ fn main(_: u64) -> u64 {
     };
     let _ = rt::service::run::<Compositor, SESSIONS, 1>(&channel, &mut service, config);
     STOPPED
+}
+
+/// The format a number of the protocol names.
+fn format_of(number: u32) -> Option<Format> {
+    match number {
+        proto_comp::FORMAT_XRGB8888 => Some(Format::Xrgb),
+        proto_comp::FORMAT_ARGB8888 => Some(Format::Argb),
+        _ => None,
+    }
+}
+
+/// The two input services of the compositor.
+#[derive(Clone, Copy)]
+enum Which {
+    Keys,
+    Pointer,
+}
+
+/// The session init gives the compositor with the input service `name`
+/// (`connects` of its record): Absent when the table gives none.
+fn connect_device(parent: &Handle<Channel>, name: &str) -> Link {
+    match rt::service::connect(parent, name) {
+        Ok(session) => Link::Linked(session),
+        Err(Status::Kernel(Error::AccessDenied)) => Link::Absent,
+        Err(_) => Link::Lost,
+    }
 }
 
 /// The status at the head of a reply.
@@ -390,22 +490,63 @@ impl Compositor {
 
     // ------------------------------------------------------------ the input
 
-    fn connect_input(&self) -> Link {
-        match rt::service::connect(&self.parent, "input") {
-            Ok(session) => Link::Linked(session),
-            Err(Status::Kernel(Error::AccessDenied)) => Link::Absent,
-            Err(_) => Link::Lost,
+    fn device(&mut self, which: Which) -> &mut Device {
+        match which {
+            Which::Keys => &mut self.keys,
+            Which::Pointer => &mut self.pointer,
+        }
+    }
+
+    /// GRANT with a channel of the compositor's own: the focus of the
+    /// device is its, and the device says by a bit when events wait.
+    fn take_own(&mut self, which: Which) {
+        let level = self.level;
+        let channel = &self.channel;
+        let device = match which {
+            Which::Keys => &mut self.keys,
+            Which::Pointer => &mut self.pointer,
+        };
+        for _ in 0..2 {
+            if matches!(device.link, Link::Lost) {
+                device.link = connect_device(&self.parent, device.name);
+            }
+            let Link::Linked(session) = &device.link else {
+                return;
+            };
+            let rights = Rights::NOTIFY | Rights::TRANSFER;
+            let Ok(wake) = sys::handle_label(channel, rights, device.mark, level) else {
+                return;
+            };
+            match sys::send_handles(
+                session,
+                &InputMethod::Grant.header().bytes(),
+                [wake.erase()],
+            ) {
+                Ok(mut reply) => {
+                    let mut buffer = [0; MESSAGE_MAX];
+                    let status = status_of(reply.bytes(&mut buffer));
+                    if status == Some(Status::Ok) && reply.handles.len() == 1 {
+                        device.own = reply.handles.take::<Channel>(0).ok();
+                    } else {
+                        rt::println!("compositor: GRANT of {} refused: {status:?}", device.name);
+                    }
+                    return;
+                }
+                Err(refused) if refused.error == Error::PeerClosed => device.link = Link::Lost,
+                Err(_) => return,
+            }
         }
     }
 
     /// GRANT: the session of focus for the window of the first revision,
-    /// or None (OPEN's status is NO_INPUT).
+    /// or None (OPEN's status is NO_INPUT). The keyboard's focus is the
+    /// client's while its window lives: the service revokes ours.
     fn grant_focus(&mut self) -> Option<Handle<Any>> {
         for _ in 0..2 {
-            if matches!(self.input, Link::Lost) {
-                self.input = self.connect_input();
+            if matches!(self.keys.link, Link::Lost) {
+                self.keys.link = connect_device(&self.parent, self.keys.name);
             }
-            let Link::Linked(session) = &self.input else {
+            let Link::Linked(session) = &self.keys.link else {
                 return None;
             };
             match sys::send(session, &InputMethod::Grant.header().bytes()) {
@@ -417,27 +558,123 @@ impl Compositor {
                         return None;
                     }
                     let focus = reply.handles.take::<Any>(0).ok()?;
+                    self.keys.own = None;
                     self.focus_on = true;
                     return Some(focus);
                 }
-                Err(Error::PeerClosed) => self.input = Link::Lost,
+                Err(Error::PeerClosed) => self.keys.link = Link::Lost,
                 Err(_) => return None,
             }
         }
         None
     }
 
+    /// The window of the first revision went: its focus ends and the
+    /// keyboard's is the compositor's again.
     fn revoke_focus(&mut self) {
         if !core::mem::take(&mut self.focus_on) {
             return;
         }
-        let Link::Linked(session) = &self.input else {
+        let Link::Linked(session) = &self.keys.link else {
             return;
         };
         match sys::send(session, &InputMethod::Revoke.header().bytes()) {
             Ok(_) => {}
-            Err(Error::PeerClosed) => self.input = Link::Lost,
+            Err(Error::PeerClosed) => self.keys.link = Link::Lost,
             Err(error) => rt::println!("compositor: REVOKE failed: {error:?}"),
+        }
+        self.take_own(Which::Keys);
+    }
+
+    /// READ of a device's events (up to READ_MAX, without waiting) into the
+    /// scene; when it filled the request the next ones wait for the
+    /// service's own bit.
+    fn read_device(&mut self, which: Which) {
+        rt::service::step_own();
+        let mut request = Writer::new();
+        if proto_input::write_read(READ_MAX, &mut request).is_err() {
+            return;
+        }
+        let device = self.device(which);
+        let Some(own) = &device.own else {
+            return;
+        };
+        let reply = match sys::send(own, request.as_bytes()) {
+            Ok(reply) => reply,
+            Err(Error::PeerClosed) => {
+                device.own = None;
+                device.link = Link::Lost;
+                return;
+            }
+            Err(_) => return,
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut batch = [proto_input::Event::default(); READ_MAX as usize];
+        let mut n = 0;
+        let read = proto_input::read_events(reply.bytes(&mut buffer), |e| {
+            if n < batch.len() {
+                batch[n] = e;
+                n += 1;
+            }
+        });
+        if read.is_err() {
+            return;
+        }
+        for e in &batch[..n] {
+            self.route(which, *e);
+        }
+        self.pointer_to_axes();
+        if n == READ_MAX as usize {
+            let _ = sys::notify(&self.notify, INPUT);
+        }
+        self.kick();
+    }
+
+    /// An event of a device into the scene.
+    fn route(&mut self, which: Which, e: proto_input::Event) {
+        match (which, e.kind) {
+            (Which::Keys, EV_KEY) => self.scene.key(e.code, e.value == proto_input::PRESS),
+            (Which::Pointer, EV_KEY) => {
+                // The place first, then the button that was pressed there.
+                self.pointer_to_axes();
+                self.scene.button(e.code, e.value == proto_input::PRESS);
+            }
+            (Which::Pointer, EV_ABS) if e.code == ABS_X => self.axes.x = Some(e.value),
+            (Which::Pointer, EV_ABS) if e.code == ABS_Y => self.axes.y = Some(e.value),
+            _ => {}
+        }
+    }
+
+    /// The pointer goes where the axes say, once something moved them.
+    fn pointer_to_axes(&mut self) {
+        let (x, y) = (self.axes.x.take(), self.axes.y.take());
+        if x.is_none() && y.is_none() {
+            return;
+        }
+        let (px, py) = self.scene.pointer().unwrap_or((0, 0));
+        let scale = |v: i32, size: u32| {
+            (i64::from(v.clamp(0, ABS_MAX)) * i64::from(size) / (i64::from(ABS_MAX) + 1)) as i32
+        };
+        let x = x.map_or(px, |v| scale(v, proto_gpu::WIDTH));
+        let y = y.map_or(py, |v| scale(v, proto_gpu::HEIGHT));
+        self.scene.pointer_to(x, y);
+    }
+
+    /// Tells the windows and the manager whose rings got events since the
+    /// last time.
+    fn deliver(&mut self) {
+        let d = self.scene.delivered();
+        for i in 0..MAX_WINDOWS {
+            if d.windows & (1 << i) != 0
+                && let Some(notify) = &self.extra[i].notify
+            {
+                let _ = sys::notify(notify, EVENTS_BIT);
+            }
+        }
+        if d.manager
+            && let Some(manager) = &self.manager
+        {
+            let _ = sys::notify(manager, EVENTS_BIT);
         }
     }
 
@@ -447,6 +684,11 @@ impl Compositor {
     /// damage waits: the windows' posted buffers are taken, the FLUSHes
     /// that wait move to this frame, and the first band is due.
     fn kick(&mut self) {
+        self.start_frame();
+        self.deliver();
+    }
+
+    fn start_frame(&mut self) {
         if self.screen.is_none() || self.job.is_some() || self.committed {
             return;
         }
@@ -483,7 +725,14 @@ impl Compositor {
         // object, read and write, SCREEN_BYTES of its 256 pages; nothing
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
-        job.row = compose(&self.scene, job.damage, job.row, fb, &Pixels(&self.scene));
+        job.row = compose(
+            &self.scene,
+            job.damage,
+            job.row,
+            fb,
+            &Pixels(&self.scene),
+            &mut self.raster,
+        );
         let _ = sys::notify(&self.notify, BAND);
     }
 
@@ -850,7 +1099,7 @@ impl Compositor {
             width: WIDTH,
             height: HEIGHT,
             format: proto_comp::FORMAT_XRGB8888,
-            flags: 0,
+            flags: u32::from(self.scene.has_manager()),
             open: self.scene.open(),
             created: self.scene.created(),
             frames: self.scene.frames(),
@@ -872,7 +1121,10 @@ impl Compositor {
         if r.handles.len() != 1 {
             return Answer::Status(Status::BadSize);
         }
-        if create.format != proto_comp::FORMAT_XRGB8888 || create.flags != 0 {
+        let Some(format) = format_of(create.format) else {
+            return Answer::Status(proto_comp::code(proto_comp::UNSUPPORTED));
+        };
+        if create.flags != 0 {
             return Answer::Status(proto_comp::code(proto_comp::UNSUPPORTED));
         }
         if !create.fits(WIDTH, HEIGHT) {
@@ -898,7 +1150,10 @@ impl Compositor {
             Ok(i) => i,
             Err(refusal) => return Answer::Status(Compositor::refusal(refusal)),
         };
+        self.scene.set_format(i, format);
         self.extra[i].notify = Some(notify);
+        // The manager hears of the new window.
+        self.deliver();
         let wrote = r
             .reply()
             .u32(Status::Ok.code())
@@ -919,12 +1174,13 @@ impl Compositor {
         if r.handles.len() != attach.count as usize {
             return Answer::Status(Status::BadSize);
         }
-        if attach.format != proto_comp::FORMAT_XRGB8888 {
-            return Answer::Status(proto_comp::code(proto_comp::UNSUPPORTED));
-        }
         let Some(w) = self.scene.window(i).copied() else {
             return Answer::Status(proto_comp::code(proto_comp::REVOKED));
         };
+        // The buffers are of the window's format.
+        if format_of(attach.format) != Some(w.format) {
+            return Answer::Status(proto_comp::code(proto_comp::UNSUPPORTED));
+        }
         if w.attached != 0 {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
@@ -996,6 +1252,115 @@ impl Compositor {
             Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
         }
     }
+
+    /// EVENTS of window `i`.
+    fn events_of_window(&mut self, i: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut out = [Event::default(); MAX_EVENTS];
+        let (n, lost) = self.scene.take_events(i, &mut out);
+        match proto_comp::write_events(&out[..n], lost, r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// The requests of the manager's session: EVENTS of its ring and MANAGE.
+    fn manager_request(&mut self, method: u16, r: &mut Request<'_>) -> Answer {
+        match Comp::from_number(method) {
+            Some(Comp::Events) => {
+                if r.body().finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let mut out = [Event::default(); MAX_EVENTS];
+                let (n, lost) = self.scene.take_manager_events(&mut out);
+                match proto_comp::write_events(&out[..n], lost, r.reply()) {
+                    Ok(()) => Answer::Reply(Outgoing::new()),
+                    Err(status) => Answer::Status(status),
+                }
+            }
+            Some(Comp::Manage) => self.manage(r),
+            _ => Compositor::not_allowed(Comp::from_number(method).is_some()),
+        }
+    }
+
+    /// MANAGE: the manager's operations on the windows.
+    fn manage(&mut self, r: &mut Request<'_>) -> Answer {
+        let [op, a, b, c] = match proto_comp::read_manage(r.body()) {
+            Ok(n) => n,
+            Err(status) => return Answer::Status(status),
+        };
+        if (op == manage::SUBSCRIBE) != (r.handles.len() == 1) || r.handles.len() > 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let id = a as usize;
+        let result = match op {
+            manage::SUBSCRIBE => {
+                let Ok(notify) = r.handles.take::<Channel>(0) else {
+                    return Answer::Status(proto_comp::code(proto_comp::INVALID));
+                };
+                self.manager = Some(notify);
+                self.scene.set_manager(true);
+                Ok(())
+            }
+            manage::LIST => return self.list(r),
+            manage::MOVE => self.scene.move_to(id, b, c),
+            manage::RAISE => self.scene.raise(id),
+            manage::FOCUS => self.scene.focus_on(id),
+            _ => self.scene.set_visible(id, b != 0),
+        };
+        self.kick();
+        match result {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
+        }
+    }
+
+    /// LIST: the windows, each with its place, its flags and its depth.
+    fn list(&mut self, r: &mut Request<'_>) -> Answer {
+        let (order, n) = self.scene.by_depth();
+        let mut records = [WindowRecord::default(); MAX_WINDOWS];
+        for (depth, &k) in order[..n].iter().enumerate() {
+            let Some(w) = self.scene.window(k as usize) else {
+                continue;
+            };
+            let mut flags = 0;
+            if w.visible && w.current.is_some() {
+                flags |= SHOWN;
+            }
+            if self.scene.focus() == Some(k as usize) {
+                flags |= FOCUSED;
+            }
+            records[depth] = WindowRecord {
+                id: u32::from(k),
+                x: w.rect.x,
+                y: w.rect.y,
+                w: w.rect.w,
+                h: w.rect.h,
+                flags,
+                depth: depth as u32,
+            };
+        }
+        match proto_comp::write_list(&records[..n], r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// INJECT: an event as a device would have made it.
+    fn inject(&mut self, r: &mut Request<'_>) -> Answer {
+        let event = match Event::read_inject(r.body()) {
+            Ok(event) => event,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        self.scene.inject(event);
+        self.kick();
+        Answer::Status(Status::Ok)
+    }
 }
 
 /// The methods of the service: proto_gpu's first revision (OPEN, FLUSH,
@@ -1009,6 +1374,9 @@ const METHODS: &[u16] = &[
     Comp::WindowCreate.number(),
     Comp::Attach.number(),
     Comp::Post.number(),
+    Comp::Events.number(),
+    Comp::Manage.number(),
+    Comp::Inject.number(),
 ];
 
 impl Service<1> for Compositor {
@@ -1021,6 +1389,15 @@ impl Service<1> for Compositor {
         let method = r.method();
         let gpu = Gpu::from_number(method);
         let comp = Comp::from_number(method);
+        if is_manager(label) {
+            return self.manager_request(method, r);
+        }
+        if is_input(label) {
+            return match comp {
+                Some(Comp::Inject) => self.inject(r),
+                _ => Compositor::not_allowed(comp.is_some()),
+            };
+        }
         if is_window(label) {
             // A window's session: ATTACH and POST of a window with buffers
             // of its own, FLUSH and CLOSE of the window of the first
@@ -1034,6 +1411,7 @@ impl Service<1> for Compositor {
                 (Some(Gpu::Close), _) => self.close(i, r),
                 (_, Some(Comp::Attach)) => self.attach(i, r),
                 (_, Some(Comp::Post)) => self.post(i, r),
+                (_, Some(Comp::Events)) => self.events_of_window(i, r),
                 _ => Compositor::not_allowed(comp.is_some()),
             };
         }
@@ -1050,7 +1428,15 @@ impl Service<1> for Compositor {
     /// context's (the process ended, or `exec` closed it) takes all its
     /// windows, and a clone's frees its place.
     fn closed(&mut self, label: u64) {
-        if label == DRIVER {
+        if label == DRIVER || label == KEYS || label == POINTER {
+            return;
+        }
+        if is_manager(label) {
+            self.manager = None;
+            self.scene.set_manager(false);
+            return;
+        }
+        if is_input(label) {
             return;
         }
         if is_window(label) {
@@ -1068,7 +1454,13 @@ impl Service<1> for Compositor {
     }
 
     fn notification(&mut self, n: Notice) {
+        if matches!(n.source, Source::Unlabeled) && n.bits & INPUT != 0 {
+            self.read_device(Which::Keys);
+            self.read_device(Which::Pointer);
+        }
         match n.source {
+            Source::Session if n.label == KEYS => self.read_device(Which::Keys),
+            Source::Session if n.label == POINTER => self.read_device(Which::Pointer),
             // One piece of work to a step: when both bits came, the work's
             // goes again by the service's own bit.
             Source::Unlabeled if n.bits & BAND != 0 => {
