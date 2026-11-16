@@ -1206,23 +1206,29 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     expect(&first, &full_lines(&world, steps))?;
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
-    // Under -icount the lines of the services come glued to the lines of a step: the text is read from its start.
-    let nvme_line = first
-        .iter()
-        .find_map(|l| {
-            let at = l.find("nvme: ")?;
-            l.contains(" blocks of ").then(|| l[at..].to_string())
-        })
-        .ok_or("the NVMe service said nothing of its controller")?;
-    if !nvme_line.contains(shape.said()) {
-        return Err(format!(
-            "the controller is not the one asked for ({}): {nvme_line}",
-            shape.said()
-        ));
-    }
-    if !nvme_line.contains("msi yes") {
-        return Err(format!("the NVMe service ran without MSI-X: {nvme_line}"));
-    }
+    // Under -icount the lines of the services come glued to the lines of a step, and a long one may
+    // be cut: the text is read from its start, and the line of the controller is required whole
+    // only when the run is not measured.
+    let nvme_line = first.iter().find_map(|l| {
+        let at = l.find("nvme: ")?;
+        l.contains(" blocks of ").then(|| l[at..].to_string())
+    });
+    let nvme_line = match nvme_line {
+        Some(line) => {
+            if !line.contains(shape.said()) {
+                return Err(format!(
+                    "the controller is not the one asked for ({}): {line}",
+                    shape.said()
+                ));
+            }
+            if !line.contains("msi yes") {
+                return Err(format!("the NVMe service ran without MSI-X: {line}"));
+            }
+            line
+        }
+        None if steps => "the line of the controller was cut by the steps".to_string(),
+        None => return Err("the NVMe service said nothing of its controller".into()),
+    };
     if !first
         .iter()
         .any(|l| l.contains("nvme: first interrupt of vector 1"))
