@@ -10,6 +10,12 @@
 //! `TERM` and execs `/bin/ash -i`; the launcher, in another session, waits
 //! for it. INTR at the console so reaches the shell and its commands and
 //! never the launcher.
+//!
+//! With a second argument (`/etc/rc`, in the record of a machine that runs
+//! boot scripts) the launcher first starts `/bin/ash` on that file, in the
+//! background and as a child of its own, so the shell's prompt does not wait
+//! for it. The script sets up its own console. The launcher reaps it with the
+//! getty.
 
 #![no_std]
 #![no_main]
@@ -40,12 +46,14 @@ unsafe extern "C" {
 
 /// Starts the getty, which becomes the shell, and waits for it: its exit
 /// status, 128 plus the signal that ended it, or 125 when it did not
-/// start.
-fn launch_ash() -> c_int {
+/// start. `script` is the boot script to run beside it, if the record names
+/// one.
+fn launch_ash(script: Option<&core::ffi::CStr>) -> c_int {
     const EINTR: c_int = 4;
     // The console of a machine like EC2 shows complete lines only, and the
     // prompt has none: this line says that the shell is on its way.
     rt::println!("ash-launch: ash on tty");
+    let rc = script.map(start_script);
     let argv = [GETTY.as_ptr(), core::ptr::null()];
     let mut pid: c_int = 0;
     // SAFETY: the path and the arguments are NUL-terminated and live on;
@@ -65,11 +73,20 @@ fn launch_ash() -> c_int {
         return 125;
     }
     let mut status: c_int = 0;
-    // SAFETY: `status` is writable and `pid` is the child of this process.
-    while unsafe { waitpid(pid, &mut status, 0) } < 0 {
-        // SAFETY: relibc's errno of this thread.
-        if unsafe { *__errno_location() } != EINTR {
-            return 125;
+    // With a script the launcher has two children and takes whichever ends
+    // first until the getty has: the script's status is not the shell's.
+    let wanted = if rc.is_some() { -1 } else { pid };
+    loop {
+        // SAFETY: `status` is writable and `wanted` is a child of this process or -1.
+        let ended = unsafe { waitpid(wanted, &mut status, 0) };
+        if ended == pid {
+            break;
+        }
+        if ended < 0 {
+            // SAFETY: relibc's errno of this thread.
+            if unsafe { *__errno_location() } != EINTR {
+                return 125;
+            }
         }
     }
     if status & 0x7f == 0 {
@@ -79,7 +96,31 @@ fn launch_ash() -> c_int {
     }
 }
 
+/// Starts `/bin/ash` on `script` and does not wait for it: the line it prints
+/// says whether it started.
+fn start_script(script: &core::ffi::CStr) -> c_int {
+    let argv = [c"ash".as_ptr(), script.as_ptr(), core::ptr::null()];
+    let mut pid: c_int = 0;
+    // SAFETY: as in `launch_ash`.
+    let started = unsafe {
+        posix_spawn(
+            &mut pid,
+            c"/bin/busybox".as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            argv.as_ptr(),
+            environ,
+        )
+    };
+    if started != 0 {
+        rt::println!("ash-launch: cannot start the boot script: error {started}");
+    }
+    started
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn main(_argc: isize, _argv: *mut *mut c_char, _envp: *mut *mut c_char) -> c_int {
-    launch_ash()
+extern "C" fn main(argc: isize, argv: *mut *mut c_char, _envp: *mut *mut c_char) -> c_int {
+    // SAFETY: relibc gives `argc` NUL-terminated strings at `argv`.
+    let script = (argc > 1).then(|| unsafe { core::ffi::CStr::from_ptr(*argv.add(1)) });
+    launch_ash(script)
 }

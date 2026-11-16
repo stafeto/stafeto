@@ -286,8 +286,10 @@ pub const ENTROPY: Record = Record {
 /// The launcher of the shell with a session with the network service: the shell and its
 /// commands get the same (the launcher's connections are the shell's), and the quota of a
 /// command that links OpenSSL; and the entropy service, for getrandom and the keys of the
-/// shell's programs.
+/// shell's programs. It runs the boot script `/etc/rc` beside the shell: the script waits
+/// for the network itself, so the record needs no order beyond its session with the service.
 const LAUNCHER: Record = Record {
+    args: super::net::RC_LAUNCH_ARGS,
     connects: &[
         "ramfs",
         "tty",
@@ -361,6 +363,8 @@ mod tests {
         assert!(clock.windows.is_empty());
         let launcher = TABLE.iter().find(|r| r.name == "busybox-probe").unwrap();
         assert_eq!(launcher.program, "ash-launcher");
+        // The launcher runs the boot script of the image next to the shell.
+        assert_eq!(launcher.args, b"ash-launch\0/etc/rc\0");
     }
 
     #[test]
