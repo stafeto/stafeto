@@ -151,9 +151,9 @@ them for the licence notes of the image.
   `tools/dropbear/localoptions.h` (no re-execution of the server for a connection, no SFTP
   server, no agent or X11 forwarding). The description makes the empty directory
   `/etc/dropbear`: the host keys are made on the first start. The launcher of the image
-  (`tests/ash-launcher` with the feature `dropbear`) runs `dropbear -F -E -R -s -j -k`: no
-  password login at all, no port forwarding, the log on the standard error, host keys made when
-  first needed; the server is started again a second after it ends. `cargo xtask net-ssh` runs
+  (`tests/ash-launcher` with the feature `dropbear`) runs `dropbear -F -R -s -j -k`: no
+  password login at all, no port forwarding, host keys made when first needed (the build has no
+  syslog, so the log goes to the standard error, and `-E` is not an option of it); the server is started again a second after it ends. `cargo xtask net-ssh` runs
   it on `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused
   key, refused passwords of 257 and 1 024 bytes, the command line of the server from
   `/proc/<pid>/cmdline` and the pseudo terminals.

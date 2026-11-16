@@ -10,7 +10,7 @@ Dropbear's own `configure` runs with the cross compiler of the project
 (clang and lld) and the Linux platform (the host triple names it), with its
 bundled LibTomCrypt and LibTomMath. Only the server is built. The login
 records are left out: no utmp, utmpx, wtmp, wtmpx, lastlog or login(), and
-no syslog (the server logs to stderr with `-E`). No zlib, no PAM, no
+no syslog (the server then logs to stderr and has no option `-E`). No zlib, no PAM, no
 hardening flags of `configure` (the compiler options below carry the stack
 protector). `localoptions.h` (tools/dropbear/localoptions.h) turns off what
 the image does not hold: the re-execution of the server for each connection

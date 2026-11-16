@@ -3,7 +3,7 @@
 
 //! The probe of the SSH server (`cargo xtask net-ssh`): the image of the
 //! shell with the network service whose launcher also starts Dropbear
-//! (`/bin/dropbear -F -E -R -s -j -k`, tests/ash-launcher with the feature
+//! (`/bin/dropbear -F -R -s -j -k`, tests/ash-launcher with the feature
 //! `dropbear`) on QEMU's user network, a port of the host forwarded to the
 //! port 22 of the guest. xtask drives `ash` over the serial port, as
 //! `net-curl` does, and is the client with the host's own `ssh`:
@@ -12,9 +12,10 @@
 //!    the first start), `/etc/shadow` locks every account (the check of
 //!    rootfs.rs), and the package carries its licence notice.
 //! 2. The command line of the running server, read from
-//!    `/proc/<pid>/cmdline`, is exactly `dropbear -F -E -R -s -j -k`: the
-//!    password login is off, no port is forwarded, the log goes to the
-//!    standard error, the host keys are made when first needed.
+//!    `/proc/<pid>/cmdline`, is exactly `dropbear -F -R -s -j -k`: the
+//!    password login is off, no port is forwarded, the host keys are made
+//!    when first needed (the build has no syslog, so the log goes to the
+//!    standard error).
 //! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key a
 //!    later part takes from the metadata of the instance): a login with it
 //!    runs a command and gives its exit status, a bulk transfer of 64 KiB
@@ -49,7 +50,7 @@ use crate::{
 pub const IMAGE: &str = "boot-ssh-probe.img";
 
 /// The command line of the server the launcher starts.
-const SERVER_LINE: [&str; 7] = ["dropbear", "-F", "-E", "-R", "-s", "-j", "-k"];
+const SERVER_LINE: [&str; 6] = ["dropbear", "-F", "-R", "-s", "-j", "-k"];
 
 /// How long one login may take: the key exchange and the first command run
 /// on an emulated CPU.

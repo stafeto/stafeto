@@ -12,7 +12,7 @@
 //! never the launcher.
 //!
 //! With the feature `dropbear` it also starts the SSH server of the package
-//! `dropbear` (`/bin/dropbear -F -E -R -s -j -k`) and starts it again a second
+//! `dropbear` (`/bin/dropbear -F -R -s -j -k`) and starts it again a second
 //! after it ends: it ends at once while the network service has no address
 //! to listen on.
 
@@ -43,12 +43,12 @@ unsafe extern "C" {
     static environ: *const *const c_char;
 }
 
-/// The SSH server: in the foreground (`-F`, the launcher is its parent), its
-/// log on the standard error (`-E`), host keys made when first needed (`-R`),
-/// no password login at all (`-s`), no local or remote port forwarding (`-j`,
-/// `-k`).
+/// The SSH server: in the foreground (`-F`, the launcher is its parent), host
+/// keys made when first needed (`-R`), no password login at all (`-s`), no
+/// local or remote port forwarding (`-j`, `-k`). It is built without syslog,
+/// so its log goes to the standard error and the option `-E` does not exist.
 #[cfg(feature = "dropbear")]
-const DROPBEAR: &[&core::ffi::CStr] = &[c"dropbear", c"-F", c"-E", c"-R", c"-s", c"-j", c"-k"];
+const DROPBEAR: &[&core::ffi::CStr] = &[c"dropbear", c"-F", c"-R", c"-s", c"-j", c"-k"];
 
 #[cfg(feature = "dropbear")]
 #[repr(C)]
