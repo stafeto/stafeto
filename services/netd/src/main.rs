@@ -2517,61 +2517,6 @@ impl Driver<'_> {
         profile::add(Counter::YieldServed, u64::from(now[2] - seen[2]));
     }
 
-    /// One step of the stack, by its bit.
-    #[inline(never)]
-    fn run_step(&mut self, bit: u64) {
-        match bit {
-            RX => self.rx_step(),
-            RX1 => {
-                self.rx1_step(false);
-            }
-            RETURN => self.return_step(),
-            BACK => self.back_step(),
-            MAP => {
-                rt::service::step_own();
-                if self.inst.net.map_waiting() {
-                    self.tell(MAP);
-                }
-            }
-            TX => self.tx_step(false),
-            WAKE => {
-                rt::service::step_own();
-                profile::count(Counter::StepWake);
-                #[cfg(feature = "probe")]
-                let began = self.ran();
-                let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
-                #[cfg(feature = "probe")]
-                self.measured(0, began);
-                if left {
-                    self.tell(WAKE);
-                }
-            }
-            CLEANUP => {
-                rt::service::step_own();
-                profile::count(Counter::StepCleanup);
-                #[cfg(feature = "probe")]
-                let began = self.ran();
-                let more = self.inst.net.depart_step(&mut self.inst.stack);
-                #[cfg(feature = "probe")]
-                self.measured(1, began);
-                if more {
-                    self.cleanup();
-                }
-            }
-            RESOLV => {
-                profile::count(Counter::StepResolv);
-                self.resolv_step()
-            }
-            _ => {
-                rt::service::step_own();
-                profile::count(Counter::StepSweep);
-                if self.inst.net.sweep(&mut self.inst.stack, now_ns()) {
-                    self.tell(SWEEP);
-                }
-            }
-        }
-    }
-
     fn handle_notification(&mut self, mut n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
