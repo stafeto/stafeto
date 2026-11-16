@@ -398,7 +398,7 @@ fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
 /// which the login works at once. (The probe reaches the server from one address, so the limit
 /// of all the addresses together is not reached.)
 fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Result<(), String> {
-    run.send("httpd -f -p 80 -h /www &")?;
+    run.send("httpd -f -p 80 -h /www & H=$!")?;
     run.expect("# ", DIALOG_STEP)?;
     let address: std::net::SocketAddr = ([127, 0, 0, 1], client.port).into();
     let mut held = Vec::new();
@@ -485,6 +485,9 @@ fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Resul
             said.code, said.stderr
         ));
     }
+    // The server and its children of the request take places the terminals below count.
+    run.send("kill $H; wait $H")?;
+    run.expect("# ", DIALOG_STEP)?;
     println!(
         "net-ssh: the server closed the held connections after {waited} s and a login with the key works"
     );
