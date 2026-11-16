@@ -188,7 +188,9 @@ const RETURN_MAX_AFTER_LOAD: u64 = 4_800_000;
 fn is_return_step(line: &str, after_kill: bool) -> bool {
     line.contains(&format!("kind {RETURN_KIND} "))
         && line.rsplit_once("detail ").is_some_and(|(_, d)| {
-            d.trim()
+            d.split_whitespace()
+                .next()
+                .unwrap_or("")
                 .parse::<u64>()
                 .is_ok_and(|d| d == 1 || d == 2 || (d == 0 && after_kill))
         })
@@ -751,12 +753,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
         };
         let mut returns: std::collections::BTreeMap<u64, u64> = Default::default();
         for line in &back {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            if let Some(i) = words.iter().position(|w| *w == "ticks")
-                && let (Some(ticks), Some(detail)) = (
-                    words.get(i - 1).and_then(|w| w.parse::<u64>().ok()),
-                    words.last().and_then(|w| w.parse::<u64>().ok()),
-                )
+            if let Some(step) = crate::step_line::parse(line)
+                && let (ticks, detail) = (step.ticks, step.detail)
             {
                 let longest = returns.entry(detail).or_default();
                 *longest = (*longest).max(ticks);

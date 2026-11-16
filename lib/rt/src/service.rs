@@ -616,6 +616,8 @@ mod steps {
         /// had run when the step in progress began.
         own: AtomicU64,
         ran_begin: AtomicU64,
+        /// The count of preemptions of the loop's thread when the step in progress began.
+        preempt_begin: AtomicU64,
         /// A number the handler of the step gives (`super::step_detail`), for the line a new
         /// longest prints.
         detail: AtomicU64,
@@ -630,6 +632,7 @@ mod steps {
             preempted: AtomicU64::new(0),
             own: AtomicU64::new(0),
             ran_begin: AtomicU64::new(0),
+            preempt_begin: AtomicU64::new(0),
             detail: AtomicU64::new(0),
         }
     }; LOOPS];
@@ -665,6 +668,8 @@ mod steps {
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The longest step of a kind less the charge of its preemptions (`sample::judged`).
+    static JUDGED: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -686,6 +691,24 @@ mod steps {
     /// that runs in the middle of a step does not lengthen, as the clock
     /// does. 0 when the thread has no handle to itself.
     fn own_ran(slot: &Slot) -> u64 {
+        match own_thread(slot) {
+            Some(own) => crate::sys::thread_ran(&own).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// The times a thread of a higher level took the loop's thread off the CPU (object_info
+    /// THREAD_STATE x7; the count wraps at 2^16, so differences are taken modulo 2^16).
+    fn own_preempts(slot: &Slot) -> u64 {
+        match own_thread(slot) {
+            Some(own) => crate::sys::thread_preempts(&own).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    fn own_thread(
+        slot: &Slot,
+    ) -> Option<core::mem::ManuallyDrop<crate::handle::Handle<crate::handle::Thread>>> {
         let mut handle = slot.own.load(Ordering::Relaxed);
         if handle == 0 {
             match crate::sys::self_thread() {
@@ -693,12 +716,12 @@ mod steps {
                     handle = own.into_raw().0;
                     slot.own.store(handle, Ordering::Relaxed);
                 }
-                Err(_) => return 0,
+                Err(_) => return None,
             }
         }
-        let own =
-            crate::handle::Handle::<crate::handle::Thread>::borrowed(crate::abi::Handle(handle));
-        crate::sys::thread_ran(&own).unwrap_or(0)
+        Some(crate::handle::Handle::<crate::handle::Thread>::borrowed(
+            crate::abi::Handle(handle),
+        ))
     }
 
     pub fn quiet() {
@@ -743,6 +766,8 @@ mod steps {
     pub fn restart() {
         let Some(slot) = claim() else { return };
         slot.ran_begin.store(own_ran(slot), Ordering::Relaxed);
+        slot.preempt_begin
+            .store(own_preempts(slot), Ordering::Relaxed);
         slot.waited.store(0, Ordering::Relaxed);
         slot.preempted.store(0, Ordering::Relaxed);
         slot.departed.store(false, Ordering::Relaxed);
@@ -801,6 +826,9 @@ mod steps {
         let ran = own_ran(slot).saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
         let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
+        let n_preempt =
+            own_preempts(slot).wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
+        let judged = super::sample::judged(took, n_preempt);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
         } else if detail == 16 {
@@ -813,10 +841,18 @@ mod steps {
             // the step: the accounting is lost, and `xtask` fails the run.
             crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
         }
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
-            DETAILS[kind].store(detail, Ordering::Relaxed);
+        // A line prints when the raw time or the time judged (less the charge of the
+        // preemptions) of the kind grows: a reader takes the longest by the judged time.
+        let raw_grew = took > LONGEST[kind].fetch_max(took, Ordering::Relaxed);
+        let judged_grew = judged > JUDGED[kind].fetch_max(judged, Ordering::Relaxed);
+        if raw_grew || judged_grew {
+            if raw_grew {
+                DETAILS[kind].store(detail, Ordering::Relaxed);
+            }
             if printing {
-                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+                crate::println!(
+                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
+                );
             }
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
