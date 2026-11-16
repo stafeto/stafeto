@@ -25,10 +25,25 @@ and the header version 1 of both.
   windows, and their places are painted again in the next frame.
 - `proto_gpu` first revision (`proto/gpu`): OPEN, FLUSH, CLOSE and CLONE, as
   `libc.so` speaks them (`stafeto_display_open` and `stafeto_display_flush`).
-  OPEN makes a window of the whole screen with a buffer the compositor made;
-  FLUSH posts a rectangle of it and its reply comes once the frame that shows
-  it is on the screen. Doom runs as it did on the driver, without a rebuild.
-  One such window lives at a time; a second OPEN is BUSY, as it was.
+  OPEN makes a window of the whole screen over the one buffer the compositor
+  made at its start (it cannot make one in a step: the kernel clears the
+  megabyte inside the call); FLUSH posts a rectangle of it and its reply comes
+  once the frame that shows it is on the screen. Doom runs as it did on the
+  driver, without a rebuild. One such window lives at a time; a second OPEN is
+  BUSY, as it was. When the window goes the buffer is cleared in portions of
+  16 KiB, OPEN says CLEARING meanwhile, and the next window finds it zero. A
+  program that passed its copy of the buffer's handle on and kept a mapping
+  can write into the next window of the first revision, and into that window
+  alone: the screen is never mapped by a client.
+
+## Steps
+
+Every step of the compositor stays under 16 500 ticks. A page costs the kernel
+about 200 ticks to map and 80 to unmap, so ATTACH looks at its objects in the
+step of the request and maps them a chunk of 32 pages a step, and its reply
+comes after the last chunk; a window that went keeps its place, with its
+pages, until its chunks are unmapped one step at a time. A buffer is a
+megabyte at most.
 
 ## The frame
 
