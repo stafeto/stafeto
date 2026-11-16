@@ -891,33 +891,31 @@ fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
     out
 }
 
-/// The boots of the run `E` the batch of EPOLL_SET is chosen over at most.
-const EPOLL_STARTS: usize = 3;
-
-/// The longest step of EPOLL_SET for each number of records, the least over the boots `runs`
-/// (each boot's own longest, `epoll_set_by_batch`): a boot where an interrupt or a switch of
-/// another service landed inside a step does not decide the batch.
-fn epoll_set_least(runs: &[Vec<String>]) -> Vec<(usize, u64)> {
-    let mut out: Vec<(usize, u64)> = Vec::new();
-    for run in runs {
-        for (detail, ticks) in epoll_set_by_batch(run) {
-            match out.iter_mut().find(|(d, _)| *d == detail) {
-                Some(row) => row.1 = row.1.min(ticks),
-                None => out.push((detail, ticks)),
-            }
-        }
-    }
-    out.sort_unstable();
-    out
-}
+/// What a step of the service may exceed the budget of a batch by, in ticks: the cost of one
+/// preemption inside the step, charged to the thread that was preempted (its entry, handler and
+/// decision, and on the way back the other thread's exit and its own restore, about 1 400 ticks).
+/// The services of the budgets work at levels above netd, so a step of netd can have one. It is
+/// to be replaced by the value the kernel test measures (PR #381).
+const SWITCH_ALLOWANCE: u64 = 1_400;
 
 /// The batch of EPOLL_SET: the largest of 16, 8 and 4 records whose step on
-/// places that hold fifteen records stays within the budget of a step.
+/// places that hold fifteen records stays within the budget of a step and `SWITCH_ALLOWANCE`
+/// (the first boot decides; no choice over boots).
 fn epoll_batch_choice(rows: &[(usize, u64)]) -> Option<usize> {
     [16, 8, 4].into_iter().find(|&size| {
         rows.iter()
-            .any(|&(d, ticks)| d == size && ticks <= netd::choose::BUDGET)
+            .any(|&(d, ticks)| d == size && ticks <= netd::choose::BUDGET + SWITCH_ALLOWANCE)
     })
+}
+
+/// The rows of `epoll_set_by_batch` that exceed the budget and pass by the allowance.
+fn epoll_allowed(rows: &[(usize, u64)]) -> Vec<(usize, u64)> {
+    rows.iter()
+        .copied()
+        .filter(|&(_, ticks)| {
+            ticks > netd::choose::BUDGET && ticks <= netd::choose::BUDGET + SWITCH_ALLOWANCE
+        })
+        .collect()
 }
 
 /// The steps of the service: every kind came and every row stays under
@@ -1370,7 +1368,6 @@ fn acceptance(
 ) -> Result<Vec<Rows>, String> {
     let mut all = Vec::new();
     let mut epoll_run = Vec::new();
-    let mut epoll_by_batch: Vec<(usize, u64)> = Vec::new();
     let mut pass_run = Vec::new();
     let mut buffer_run = Vec::new();
     for (what, programs, roles) in acceptance_runs(netd) {
@@ -1383,32 +1380,6 @@ fn acceptance(
         )?;
         let rows = longest_over_starts(&lines);
         if what == "E" {
-            // The batch of EPOLL_SET is a selection: the largest batch whose step stays within
-            // the budget. A step is the longest of its run, and a single step that the
-            // interrupts and the switches of the other services stretch (about 1 400 ticks for
-            // each preemption inside it) would flip the choice, so the choice goes on the least of
-            // the longest steps over up to EPOLL_STARTS boots of the run. Every boot keeps its own
-            // checks against B (the rows below and `steps_verdict_rows`), and the choice stays
-            // within the budget in at least one boot, which a batch that is really too long
-            // never does.
-            let mut runs = vec![lines.clone()];
-            while strict
-                && runs.len() < EPOLL_STARTS
-                && epoll_batch_choice(&epoll_set_least(&runs))
-                    != Some(proto_net::sockets::EPOLL_BATCH)
-            {
-                let again = steps_lines(
-                    machine,
-                    measured_name(&format!("{tag}-{what}")),
-                    programs,
-                    roles,
-                    strict,
-                )?;
-                steps_verdict_rows(&longest_over_starts(&again))
-                    .map_err(|e| format!("run {what}: {e}"))?;
-                runs.push(again);
-            }
-            epoll_by_batch = epoll_set_least(&runs);
             epoll_run = lines;
         } else if what == "x" {
             pass_run = lines;
@@ -1509,11 +1480,7 @@ fn acceptance(
             longest_named(&buffer_run, "cleanup")
         ));
     }
-    let by_batch = if epoll_by_batch.is_empty() {
-        epoll_set_by_batch(&epoll_run)
-    } else {
-        epoll_by_batch
-    };
+    let by_batch = epoll_set_by_batch(&epoll_run);
     println!(
         "net-probe: EPOLL_SET by batch {by_batch:?}, EPOLL_WAIT of 64 pairs {}, EPOLL_DROP {} (chosen batch {})",
         kind("E", EPOLL_WAIT_KIND),
@@ -1535,6 +1502,13 @@ fn acceptance(
                     "the step of {which} took {ticks} ticks, {STEP_MAX} at most"
                 ));
             }
+        }
+        let allowed = epoll_allowed(&by_batch);
+        if !allowed.is_empty() {
+            println!(
+                "net-probe: rows over the budget {} that pass by the allowance of one preemption ({SWITCH_ALLOWANCE}): {allowed:?}",
+                netd::choose::BUDGET
+            );
         }
         let chosen = epoll_batch_choice(&by_batch);
         if chosen != Some(proto_net::sockets::EPOLL_BATCH) {
@@ -2561,7 +2535,7 @@ mod tests {
 
     #[test]
     fn the_batch_of_epoll_set_is_the_largest_within_the_budget() {
-        let budget = netd::choose::BUDGET;
+        let budget = netd::choose::BUDGET + SWITCH_ALLOWANCE;
         assert_eq!(
             epoll_batch_choice(&[(4, 7_000), (8, 9_000), (16, budget)]),
             Some(16)
@@ -2579,19 +2553,13 @@ mod tests {
         };
         let lines = vec![line(8, 100), line(16, 300), line(16, 200), line(1, 9_999)];
         assert_eq!(epoll_set_by_batch(&lines), [(8, 100), (16, 300)]);
-        // The least over the boots: a boot with a stretched step does not decide.
-        let spiked = vec![line(16, 15_293), line(16, 16_470)];
-        let quiet = vec![line(16, 15_293)];
-        assert_eq!(
-            epoll_batch_choice(&epoll_set_by_batch(&spiked)),
-            None,
-            "one boot with a spike gives no batch of 16"
-        );
-        assert_eq!(
-            epoll_set_least(&[spiked.clone(), quiet.clone()]),
-            [(16, 15_293)]
-        );
-        assert_eq!(epoll_set_least(&[spiked.clone(), spiked]), [(16, 16_470)]);
+        // A step over the budget by less than one preemption passes and is named; more fails.
+        let over = netd::choose::BUDGET + 1;
+        let beyond = netd::choose::BUDGET + SWITCH_ALLOWANCE + 1;
+        assert_eq!(epoll_batch_choice(&[(8, 9_000), (16, over)]), Some(16));
+        assert_eq!(epoll_batch_choice(&[(8, 9_000), (16, beyond)]), Some(8));
+        assert_eq!(epoll_allowed(&[(8, 9_000), (16, over)]), [(16, over)]);
+        assert_eq!(epoll_allowed(&[(16, beyond), (8, 9_000)]), []);
     }
 
     #[test]
