@@ -14,6 +14,7 @@
 //! - `doom`, which opens the window of QEMU for a person to play in.
 
 use super::*;
+use crate::comp_probe;
 use crate::gpu_probe::{self, Scratch};
 use crate::monitor::{Monitor, Ppm};
 use std::time::Instant;
@@ -75,6 +76,12 @@ fn image_programs(features: &'static [&'static str]) -> Vec<ImageProgram> {
         "virtio-gpu",
         "virtio-gpu",
         gpu_probe::GPU_STACK_SIZE,
+        features,
+    ));
+    programs.push((
+        "compositor",
+        "compositor",
+        comp_probe::COMP_STACK_SIZE,
         features,
     ));
     programs
@@ -685,7 +692,11 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
     let output = run.stop();
     driven.map_err(|e| format!("doom steps under -icount: {e}"))?;
     let mut text = Vec::new();
-    for (name, tag) in [("display", GPU_TAG), ("input", INPUT_TAG)] {
+    for (name, tag) in [
+        ("display", GPU_TAG),
+        ("input", INPUT_TAG),
+        ("compositor", comp_probe::COMP_TAG),
+    ] {
         let rows = longest_steps(&output.lines, tag);
         if rows.is_empty() {
             return Err(format!("doom steps: no step of the {name} service"));
@@ -694,6 +705,11 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
             return Err(format!(
                 "doom steps: a step of the {name} service past 0.9 of term B ({}): {row:?}",
                 gpu_probe::STEP_MAX
+            ));
+        }
+        if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
+            return Err(format!(
+                "doom steps: a portion or an interrupt of the {name} service past {PORTION_MAX}: {row:?}"
             ));
         }
         let rows: Vec<_> = rows

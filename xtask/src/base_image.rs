@@ -58,6 +58,7 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
         &[],
     ));
     programs.push(("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]));
+    programs.push(("compositor", "compositor", comp_probe::COMP_STACK_SIZE, &[]));
     let list: &'static [ImageProgram] = Box::leak(programs.into_boxed_slice());
     lists.push((image.to_string(), list));
     list

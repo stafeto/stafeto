@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The composition service (services/compositor) and the image of its probe
+//! (tests/comp-probe): the display driver (`DISPLAY`, the record of
+//! `gpu::GPU` under the name `display`) has the compositor as its one
+//! client, and the compositor takes the name `gpu`, so that a program that
+//! connects to `gpu` (the launcher of the games image, the probes, the
+//! place `Display` of every process) meets the compositor and sees no
+//! other change. The compositor is the driver's client by `connects`
+//! (and the input service's where the image has one: `COMPOSITOR_KEYS`),
+//! and the driver names no input service, so the focus is the compositor's
+//! to hand out.
+//!
+//! The compositor holds the one buffer of the screen the driver gave it,
+//! the buffers of its windows' clients (mapped for reading) and, for a
+//! program that knows no windows, the 256 pages of the buffer it makes
+//! (`mem_create`, in its own quota): the quota is those, the tables of its
+//! mappings and its stack.
+//!
+//! Level 32 (design of graphics, 'Processes'): above the processes of POSIX
+//! (31 and below), whose clients call it, and below the driver (33) and the
+//! input service (34), which it calls; the services at 40 and above never
+//! call it.
+
+use super::gpu;
+use super::{GENERAL_CPUS, Kind, Record, Restart, Shares};
+use crate::PAGE;
+use crate::watch::Watch;
+
+const MS: u64 = 1_000_000;
+
+/// The display driver as the images with a compositor have it: the record
+/// of the driver without a connection to the input service.
+pub const DISPLAY: Record = Record {
+    name: "display",
+    ..gpu::GPU
+};
+
+/// The compositor, under the name its clients connect to.
+pub const COMPOSITOR: Record = Record {
+    name: "gpu",
+    program: "compositor",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 32,
+    ceiling: 32,
+    quota: 512 * PAGE,
+    handle_limit: 192,
+    restart: Restart::Always,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["display"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    start: &[],
+    release: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+    waits: &[],
+    budgets: &[],
+    free: 0,
+};
+
+/// The compositor of the images that take keys: it asks the input service
+/// for the focus of the window of the first revision.
+pub const COMPOSITOR_KEYS: Record = Record {
+    connects: &["display", "input"],
+    ..COMPOSITOR
+};
+
+/// The probe (role `w`): a window of its own with two buffers, a pattern,
+/// then another buffer; it ends holding the window.
+const PROBE: Record = Record {
+    name: "comp-probe",
+    program: "comp-probe",
+    kind: Kind::Client,
+    priority: 30,
+    ceiling: 30,
+    quota: 96 * PAGE,
+    handle_limit: 48,
+    restart: Restart::Never,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["gpu"],
+    args: b"w",
+    dma: &[],
+    quiesce: &[],
+    start: &[],
+    release: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+    waits: &[],
+    budgets: &[],
+    free: 0,
+};
+
+/// The second probe (role `l`): waits for the first one's window to go,
+/// then asks for the screen as a program of the first revision does.
+const PROBE_B: Record = Record {
+    name: "comp-probe-b",
+    args: b"l",
+    ..PROBE
+};
+
+/// The probe's image on QEMU.
+pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B];

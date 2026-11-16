@@ -17,7 +17,7 @@ use super::pkg::{BLK, PKGD};
 use super::{NET_SERVICE, Record, Wait};
 
 // BASE_TABLE copies the records of the games table by number.
-const _: () = assert!(doom::TABLE.len() == 11);
+const _: () = assert!(doom::TABLE.len() == 12);
 
 const fn at_least(a: u64, b: u64) -> u64 {
     if a > b { a } else { b }
@@ -94,6 +94,7 @@ pub const BASE_TABLE: &[Record] = &[
     doom::TABLE[8],
     doom::TABLE[9],
     doom::TABLE[10],
+    doom::TABLE[11],
     NETD,
     BLK,
     PKGD,
