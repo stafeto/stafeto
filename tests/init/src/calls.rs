@@ -2413,6 +2413,12 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
             charged > pure,
             "the preemptions added nothing to the time of init",
         )?;
+        // The helper blocks on every wait and runs to its end: no thread
+        // above it takes its CPU, so a block does not count.
+        check(
+            blocked == 0,
+            "a block of the helper counted as a preemption",
+        )?;
     }
     check(
         blocked == 0,
