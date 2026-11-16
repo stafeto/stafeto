@@ -491,7 +491,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         // 1 (the guest's half) and 2.
         let held = guest(&mut run, "ls -A /etc/dropbear | wc -l", "keys0")?;
-        if held.iter().map(|l| l.trim()).collect::<Vec<_>>() != ["0"] {
+        // (Lines of the boot script may come in between.)
+        if !held.iter().any(|l| l.trim() == "0") {
             return Err(format!("/etc/dropbear is not empty at the start: {held:?}"));
         }
         command_line(&mut run)?;
