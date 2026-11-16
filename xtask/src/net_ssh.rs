@@ -601,22 +601,27 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     let mut terminal_sessions = 0;
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
-        // The line of the host key is on the console before anyone can connect: the probe
-        // connects only after it.
-        let said = run.expect_line(
-            "the line of the host key",
-            |l| l.contains("ssh: host key SHA256:"),
-            LOGIN_WITHIN,
-        )?;
-        let fingerprint = said
-            .split_once("ssh: host key ")
-            .map(|(_, f)| f.trim().to_owned())
-            .ok_or("no fingerprint in the line of the host key")?;
-        println!("net-ssh: the console says ssh: host key {fingerprint}");
         run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("S=ok")?;
         run.expect("# ", DIALOG_STEP)?;
+        // The line of the host key is on the console before anyone has connected: the probe
+        // connects only after it (the line may come before or after the prompt).
+        let began = Instant::now();
+        let fingerprint = loop {
+            let found = run.lines().iter().find_map(|l| {
+                l.split_once("ssh: host key SHA256:")
+                    .map(|(_, f)| format!("SHA256:{}", f.trim()))
+            });
+            if let Some(found) = found {
+                break found;
+            }
+            if began.elapsed() > LOGIN_WITHIN {
+                return Err("the console shows no line \"ssh: host key SHA256:...\"".to_owned());
+            }
+            guest(&mut run, "sleep 1", "wait")?;
+        };
+        println!("net-ssh: the console says ssh: host key {fingerprint}");
         // 1 (the guest's half) and 2.
         command_line(&mut run)?;
 
