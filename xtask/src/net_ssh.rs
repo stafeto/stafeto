@@ -29,15 +29,15 @@
 //! 4. A key the server does not know is refused.
 //! 5. A password of 257 and one of 1 024 bytes is refused for the account
 //!    `root` (the field `!` of `/etc/shadow`) and for `star`, an account the probe's image adds with `*`.
-//! 5b. Connections that have not authenticated: the most one address may hold
+//! 6. Connections that have not authenticated: the most one address may hold
 //!    are held open, the next is refused, an HTTP request to the guest is still
 //!    answered, and the server closes the held ones after `AUTH_TIMEOUT`,
 //!    after which a login works.
-//! 6. Pseudo terminals: sessions with a terminal are opened one after the
+//! 7. Pseudo terminals: sessions with a terminal are opened one after the
 //!    other until one gets none (the pairs are eight, the console takes
 //!    one), the count is printed, and after they all end a new session gets
 //!    its terminal again.
-//! 7. The server's log on the console says what happened (a public key
+//! 8. The server's log on the console says what happened (a public key
 //!    accepted, no password accepted) and the guest did not fault.
 //!
 //! The host needs `ssh` and `ssh-keygen` of OpenSSH. The ports of the host
