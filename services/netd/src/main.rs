@@ -2418,7 +2418,7 @@ impl Driver<'_> {
     #[inline(never)]
     fn before_wait(&mut self) {
         #[cfg(feature = "probe")]
-        let kept = u64::from(self.held_tx) * TX | u64::from(self.held_rx) * RX;
+        let kept = (u64::from(self.held_tx) * TX) | (u64::from(self.held_rx) * RX);
         #[cfg(not(feature = "probe"))]
         let kept = 0;
         if (self.told | self.yielding.owed() | kept) & (TX | RX | WAKE) != 0 {
