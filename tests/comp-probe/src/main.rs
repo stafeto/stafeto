@@ -96,6 +96,14 @@ fn main(_: u64) -> u64 {
     }
 }
 
+/// The reason of a failed step, in the log with what the call said.
+fn say<E: core::fmt::Debug>(what: &'static str) -> impl Fn(E) -> &'static str {
+    move |e| {
+        rt::println!("comp-probe: {what}: {e:?}");
+        what
+    }
+}
+
 /// What a request to the service came to.
 #[derive(Debug, PartialEq, Eq)]
 enum Fail {
@@ -330,7 +338,7 @@ impl Probe<'_> {
     }
 
     fn display(&self) -> Result<Handle<Channel>, &'static str> {
-        rt::service::connect(self.parent, "gpu").map_err(|_| "connect to gpu")
+        rt::service::connect(self.parent, "gpu").map_err(say("connect to gpu"))
     }
 
     fn describe(&self, display: &Handle<Channel>) -> Result<Description, Fail> {
@@ -361,7 +369,7 @@ impl Probe<'_> {
     fn settled(&self, display: &Handle<Channel>) -> Result<Description, &'static str> {
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         loop {
-            let d = self.describe(display).map_err(|_| "DESCRIBE")?;
+            let d = self.describe(display).map_err(say("DESCRIBE"))?;
             if d.busy == 0 {
                 return Ok(d);
             }
@@ -416,12 +424,12 @@ impl Probe<'_> {
         let mut at = [0; 3];
         let len = bytes.div_ceil(4096) * 4096;
         for b in 0..count {
-            let memory = sys::mem_create(len).map_err(|_| "mem_create")?;
+            let memory = sys::mem_create(len).map_err(say("mem_create"))?;
             let n = self.maps.get();
             self.maps.set(n + 1);
             at[b] = MAP_AT + n * MAP_STEP;
             sys::mem_map(self.process, &memory, 0, len, at[b], Access::ReadWrite)
-                .map_err(|_| "map a buffer")?;
+                .map_err(say("map a buffer"))?;
             objects[b] = Some(memory);
         }
         Ok((objects, at))
@@ -481,18 +489,18 @@ impl Probe<'_> {
         rt::println!("comp-probe: windows outside the screen or of another format are refused");
         let (window, id) = self
             .create(&display, FIRST, FORMAT_XRGB8888)
-            .map_err(|_| "WINDOW_CREATE")?;
+            .map_err(say("WINDOW_CREATE"))?;
         let stride = FIRST.w * 4;
         let bytes = u64::from(stride) * u64::from(FIRST.h);
         // POST before ATTACH, ATTACH with too small an object.
         if !refused(self.post(&window, 0, &[]), code(NOT_ALLOWED)) {
             return Err("POST before ATTACH was not refused");
         }
-        let small = sys::mem_create(4096).map_err(|_| "mem_create")?;
+        let small = sys::mem_create(4096).map_err(say("mem_create"))?;
         if !refused(self.attach(&window, stride, &[Some(small)]), code(INVALID)) {
             return Err("ATTACH of too small an object was not refused");
         }
-        let fresh = sys::mem_create(bytes.div_ceil(4096) * 4096).map_err(|_| "mem_create")?;
+        let fresh = sys::mem_create(bytes.div_ceil(4096) * 4096).map_err(say("mem_create"))?;
         if !refused(
             self.attach(&window, stride - 4, &[Some(fresh)]),
             code(INVALID),
@@ -501,7 +509,7 @@ impl Probe<'_> {
         }
         let (objects, at) = self.buffers(2, bytes)?;
         self.attach(&window, stride, &objects)
-            .map_err(|_| "ATTACH")?;
+            .map_err(say("ATTACH"))?;
         if !refused(self.attach(&window, stride, &objects), code(BUSY)) {
             return Err("a second ATTACH was not BUSY");
         }
@@ -518,11 +526,11 @@ impl Probe<'_> {
                 points(0)[(y * FIRST.w + x) as usize] = window_pattern(x, y);
             }
         }
-        let before = self.describe(&display).map_err(|_| "DESCRIBE")?;
+        let before = self.describe(&display).map_err(say("DESCRIBE"))?;
         if before.open != 1 || before.created != 1 {
             return Err("DESCRIBE does not count the window");
         }
-        self.post(&window, 0, &[]).map_err(|_| "POST")?;
+        self.post(&window, 0, &[]).map_err(say("POST"))?;
         let after = self.settled(&display)?;
         if after.frames != before.frames + 1 {
             return Err("the first POST was not one frame");
@@ -556,7 +564,7 @@ impl Probe<'_> {
         }
         rt::println!("comp-probe: a POST with a wrong buffer or rectangle is INVALID");
         self.post(&window, 1, &[CHANGED])
-            .map_err(|_| "POST of a rectangle")?;
+            .map_err(say("POST of a rectangle"))?;
         self.settled(&display)?;
         rt::println!(
             "comp-probe: partial crc {:08x}",
@@ -572,7 +580,7 @@ impl Probe<'_> {
         let mut flush = Writer::new();
         proto_gpu::Rect::SCREEN
             .write(&mut flush)
-            .map_err(|_| "FLUSH's bytes")?;
+            .map_err(say("FLUSH's bytes"))?;
         let mut create = Writer::new();
         Create {
             x: 0,
@@ -583,7 +591,7 @@ impl Probe<'_> {
             flags: 0,
         }
         .write(&mut create)
-        .map_err(|_| "CREATE's bytes")?;
+        .map_err(say("CREATE's bytes"))?;
         if !refused(
             plain(&window, &Method::Describe.header().bytes()),
             code(NOT_ALLOWED),
@@ -597,9 +605,10 @@ impl Probe<'_> {
         // A second window over the first: the newest is on top.
         let (second, _) = self
             .create(&display, SECOND, FORMAT_XRGB8888)
-            .map_err(|_| "the second WINDOW_CREATE")?;
+            .map_err(say("the second WINDOW_CREATE"))?;
         let (objects2, at2) = self.buffers(1, 100 * 100 * 4)?;
-        self.attach(&second, 400, &objects2).map_err(|_| "ATTACH")?;
+        self.attach(&second, 400, &objects2)
+            .map_err(say("ATTACH"))?;
         for y in 0..100u32 {
             for x in 0..100u32 {
                 // SAFETY: as above, for the second window's buffer.
@@ -611,7 +620,7 @@ impl Probe<'_> {
             }
         }
         self.post(&second, 0, &[])
-            .map_err(|_| "POST of the second")?;
+            .map_err(say("POST of the second"))?;
         self.settled(&display)?;
         rt::println!(
             "comp-probe: overlap crc {:08x}",
@@ -630,7 +639,7 @@ impl Probe<'_> {
                 },
                 FORMAT_XRGB8888,
             )
-            .map_err(|_| "the third window")?;
+            .map_err(say("the third window"))?;
         let _fourth = self
             .create(
                 &display,
@@ -642,7 +651,7 @@ impl Probe<'_> {
                 },
                 FORMAT_XRGB8888,
             )
-            .map_err(|_| "the fourth window")?;
+            .map_err(say("the fourth window"))?;
         let fifth = self.create(
             &display,
             Rect {
@@ -656,7 +665,7 @@ impl Probe<'_> {
         if fifth.err() != Some(Fail::Status(proto_gpu::LIMIT)) {
             return Err("the fifth window of a context was not refused");
         }
-        let d = self.describe(&display).map_err(|_| "DESCRIBE")?;
+        let d = self.describe(&display).map_err(say("DESCRIBE"))?;
         if d.open != 4 || d.created != 4 {
             return Err("DESCRIBE does not count four windows");
         }
@@ -692,7 +701,7 @@ impl Probe<'_> {
         let open = proto_gpu::Method::Open.header().bytes();
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         let (status, mut reply) = loop {
-            let (status, reply) = call(&display, &open).map_err(|_| "OPEN")?;
+            let (status, reply) = call(&display, &open).map_err(say("OPEN"))?;
             if status != proto_gpu::code(proto_gpu::CLEARING) {
                 break (status, reply);
             }
@@ -706,7 +715,7 @@ impl Probe<'_> {
         }
         let mut buffer = [0; MESSAGE_MAX];
         let (_, screen) =
-            proto_gpu::Screen::read(reply.bytes(&mut buffer)).map_err(|_| "OPEN's reply")?;
+            proto_gpu::Screen::read(reply.bytes(&mut buffer)).map_err(say("OPEN's reply"))?;
         let (Ok(memory), Ok(owner)) = (
             reply.handles.take::<Memory>(0),
             reply.handles.take::<Channel>(1),
@@ -726,7 +735,7 @@ impl Probe<'_> {
             at,
             Access::ReadWrite,
         )
-        .map_err(|_| "map the buffer")?;
+        .map_err(say("map the buffer"))?;
         // SAFETY: mapped for reading and writing just above; the probe is
         // the only user, in one thread.
         let points = unsafe {
@@ -750,7 +759,7 @@ impl Probe<'_> {
             rect.write(&mut w).map_err(Fail::Status)?;
             plain(&owner, w.as_bytes())
         };
-        flush(proto_gpu::Rect::SCREEN).map_err(|_| "FLUSH of the screen")?;
+        flush(proto_gpu::Rect::SCREEN).map_err(say("FLUSH of the screen"))?;
         let mut crc = Crc(0xFFFF_FFFF);
         for &p in &points[..(WIDTH * HEIGHT) as usize] {
             crc.point(p);
@@ -768,7 +777,7 @@ impl Probe<'_> {
                 points[(y * WIDTH + x) as usize] = 0x00FF_8000;
             }
         }
-        flush(inside).map_err(|_| "FLUSH of a rectangle")?;
+        flush(inside).map_err(say("FLUSH of a rectangle"))?;
         let mut crc = Crc(0xFFFF_FFFF);
         for &p in &points[..(WIDTH * HEIGHT) as usize] {
             crc.point(p);

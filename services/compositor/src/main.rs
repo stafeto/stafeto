@@ -500,8 +500,10 @@ impl Compositor {
             return Err(proto_comp::code(proto_comp::INVALID));
         }
         let len = need.div_ceil(PAGE as u64) * PAGE as u64;
-        sys::mem_map(&self.process, &memory, 0, len, buf_at(i, b), Access::Read)
-            .map_err(|_| proto_comp::code(proto_comp::INVALID))?;
+        sys::mem_map(&self.process, &memory, 0, len, buf_at(i, b), Access::Read).map_err(|e| {
+            rt::println!("compositor: a buffer could not be mapped: {e:?}");
+            proto_comp::code(proto_comp::INVALID)
+        })?;
         self.extra[i].mapped[b] = len as usize;
         self.extra[i].memory[b] = Some(memory);
         Ok(())
