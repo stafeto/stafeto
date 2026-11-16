@@ -173,6 +173,16 @@ el0_mark:
     str     x1, [x0]
     svc     #SVC_DONE
 
+// Adds 1 to the word at x0 and ends the thread with thread_exit: a mark that
+// makes no test call, for a thread that runs on a CPU other than 0.
+.global el0_mark_then_exit
+el0_mark_then_exit:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
 // Adds 1 to the word at x0 over and over until the word at x1 is set.
 .global el0_count_until
 el0_count_until:
