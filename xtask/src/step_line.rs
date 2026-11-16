@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The line `service step: T kind K N ticks detail D preempts P` of `rt::service` (an older
-//! image prints it without `preempts P`) and the judgement of a step against the bound B.
+//! The line `service step: T kind K N ticks detail D preempts P` of `rt::service` (`preempts P`
+//! is left out when P is 0) and the judgement of a step against the bound B.
 //!
 //! The line carries the raw time N of the step, the CPU ticks of the thread in it. A step that a
 //! higher level preempted P times holds P charges of the switch that are no work of the step, so

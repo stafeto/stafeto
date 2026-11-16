@@ -843,9 +843,15 @@ mod steps {
                 DETAILS[kind].store(detail, Ordering::Relaxed);
             }
             if printing {
-                crate::println!(
-                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
-                );
+                // The count is left out when it is 0 (most steps): a reader takes a missing
+                // count as 0, and the console, which is slow, has less to write.
+                if n_preempt == 0 {
+                    crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+                } else {
+                    crate::println!(
+                        "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
+                    );
+                }
             }
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
