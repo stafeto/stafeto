@@ -1153,6 +1153,15 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     let file = Disk::new("nvme");
     write_disk(&file, None)?;
     if breaks {
+        // The first run keeps what it wrote in memory, so it may pass; the machine that starts again
+        // on the file reads what the service wrote, and must not find the store whole.
+        let caught = |why: String| {
+            println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
+            Ok(())
+        };
+        if let Err(why) = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN) {
+            return caught(format!("the first run failed: {why}"));
+        }
         return match nvme_run(
             &firmware,
             &esp,
@@ -1161,15 +1170,9 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             shape,
             BOOT_TIMEOUT * 6,
         ) {
-            Err(why) => {
-                println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
-                Ok(())
-            }
+            Err(why) => caught(format!("the run after the kill failed: {why}")),
             Ok(lines) if !lines.iter().any(|l| l == "store-probe: ok") => {
-                println!(
-                    "nvme-persist breaks: break-nvme-write-offset is caught: the probe did not say ok"
-                );
-                Ok(())
+                caught("the probe did not say ok after the kill".into())
             }
             Ok(_) => Err("break-nvme-write-offset passed the probe".into()),
         };

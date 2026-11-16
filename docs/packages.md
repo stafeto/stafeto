@@ -605,6 +605,30 @@ image. A disk on NVMe for EBS with a permanent store comes later (stafeto-design
 disk), removes Doom, installs it again, and boots the machine anew: the store holds no package
 and no file of Doom is there.
 
+### The store on an NVMe disk
+
+`services/nvme` (the program `nvme-blk`) is the `blk` of an image whose store is an NVMe disk: the
+same protocol as the Virtio driver (`proto/blk` version 1), over the library `lib/nvme`. Init finds
+the controller by its PCI id and its index in the walk of the bus (`At::Bar`, `At::Config`), and
+gives the service BAR 0, the function's page of configuration, the two MSI-X vectors (vector 0 for
+the admin queue, vector 1 for the I/O pair) and two DMA objects: the queues of 32 KiB, uncached,
+and the four cells of 16 KiB, cached (the DMA is coherent on EC2 and under QEMU). A completion is
+found by the interrupt of vector 1, or by the timer, which looks at the queue every 500 us while a
+command is out and no completion has come (and is the only way without MSI-X). A disk with blocks
+of 4 KiB reports `block` 4096, and a request that does not begin and end on a block is `INVALID`.
+`FLUSH` goes to the controller when it has a volatile write cache (VWC) and is done when the
+writes before it are, otherwise. The service is at level 39 with the budget `serve`, 100 us of each
+10 ms on CPU 0 (1 %, so the sum of CPU 0 in the shell image is 72 % of the 75 % the table allows).
+Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.SHST`) and `CC` 0
+before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
+it is given: the table names the data disk, and a disk with a system on it is never named.
+`cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
+a second NVMe controller over a file, kills QEMU, and starts the machine again on the same file: the
+probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
+and with a transfer limit of 8 KiB; `breaks` runs a service that writes one sector off, which the
+probe must catch). The record for EC2's volume comes with the switch of the image for EC2
+(stafeto-design#757).
+
 ## The package service
 
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches
