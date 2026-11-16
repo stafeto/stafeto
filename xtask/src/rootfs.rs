@@ -1886,6 +1886,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-net-rc.img" => {
             let mut files = net_files(name);
             files.extend(rc_files());
+            // The SSH server is the probe of `net-ssh`'s; here it stays off, as its lines would
+            // come between those the probe reads.
+            for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/dropbear") {
+                f.source = Some(Source::Bytes("dropbear-off", b"# off in this image\n"));
+            }
             files.push(of(
                 "/etc/netd.conf",
                 0o644,
