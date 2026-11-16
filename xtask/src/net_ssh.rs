@@ -26,7 +26,7 @@
 //!    back in order. The host key now exists in `/etc/dropbear`.
 //! 4. A key the server does not know is refused.
 //! 5. A password of 257 and one of 1 024 bytes is refused for the account
-//!    `root` (the field `!` of `/etc/shadow`) and for an account with `*`.
+//!    `root` (the field `!` of `/etc/shadow`) and for `star`, an account the probe's image adds with `*`.
 //! 6. Pseudo terminals: sessions with a terminal are opened one after the
 //!    other until one gets none (the pairs are eight, the console takes
 //!    one), the count is printed, and after they all end a new session gets
@@ -485,7 +485,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         }
         let seen = run.lines().to_vec();
         command_line(&mut run, &seen)?;
-        // The key of the probe, and an account whose field is `*`.
+
         // (Lines of the shell stay short: the terminal takes 256 bytes a line.)
         for (marker, step) in [
             (
@@ -497,14 +497,6 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 format!("echo '{good_line}' > /root/.ssh/authorized_keys"),
             ),
             ("mode", "chmod 600 /root/.ssh/authorized_keys".to_owned()),
-            (
-                "passwd",
-                "echo 'star:x:1001:100:star:/tmp:/bin/ash' >> /etc/passwd".to_owned(),
-            ),
-            (
-                "shadow",
-                "echo 'star:*:20000:0:99999:7:::' >> /etc/shadow".to_owned(),
-            ),
         ] {
             let lines = guest(&mut run, &format!("{step} && echo done-$S"), marker)?;
             if !lines.iter().any(|l| l.trim() == "done-ok") {

@@ -1295,6 +1295,38 @@ fn net_files(image: &str) -> Vec<RootFile> {
     files.push(file("/bin/posix-net", 0o755, ROOT, "posix-net"));
     files
 }
+/// The account of the SSH probe whose password field is `*`, in the two files of the accounts of
+/// the image (no image that ships has one: stafeto-design#631).
+pub const SSH_PROBE_STAR: &str = "star";
+
+/// The accounts of the image of `net-ssh`: those of the shell and one more, `star`, whose field of
+/// /etc/shadow is `*`: the probe shows that a password is refused for it as for the locked accounts
+/// (/etc/passwd is read-only, so the image has to carry it).
+fn add_star(image: &str, files: &mut [RootFile]) {
+    for (path, name, line) in [
+        (
+            "/etc/passwd",
+            "passwd-star",
+            format!("{SSH_PROBE_STAR}:x:1001:100:{SSH_PROBE_STAR}:/tmp:/bin/ash\n"),
+        ),
+        (
+            "/etc/shadow",
+            "shadow-star",
+            format!("{SSH_PROBE_STAR}:*:20000:0:99999:7:::\n"),
+        ),
+    ] {
+        let file = files
+            .iter_mut()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{image}: no {path}"));
+        let Some(Source::Bytes(_, bytes)) = file.source else {
+            panic!("{image}: {path} is not bytes");
+        };
+        let mut text = bytes.to_vec();
+        text.extend_from_slice(line.as_bytes());
+        file.source = Some(Source::Bytes(name, Box::leak(text.into_boxed_slice())));
+    }
+}
 /// The files of the images of `nginx-probe`: those of the shell with the
 /// network (nginx among them), with the probe's variant of nginx's settings
 /// as the package's, the variant with one listening socket, the
@@ -1851,9 +1883,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         "boot-net.img"
         | "boot-net-its.img"
-        | "boot-ssh-probe.img"
         | "boot-net-curl-steps.img"
         | "boot-posix-net-steps.img" => net_files(name),
+        "boot-ssh-probe.img" => net_files(name),
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
             let mut files = dialog(name);
@@ -2233,6 +2265,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         _ => Vec::new(),
     };
     files.extend(accounts());
+    if name == "boot-ssh-probe.img" {
+        add_star(name, &mut files);
+    }
     files
 }
 
@@ -2417,6 +2452,13 @@ mod tests {
                 assert_eq!(value, "x", "{image}: /etc/passwd field of {name}");
             }
             for (name, value) in &shadow {
+                // The probe of the SSH server carries one account whose field is `*`, to show
+                // that a password is refused for it too.
+                let probe_star = image == &"boot-ssh-probe.img" && name == SSH_PROBE_STAR;
+                if probe_star {
+                    assert_eq!(value, "*");
+                    continue;
+                }
                 assert!(
                     value.starts_with('!') && value != "*",
                     "{image}: /etc/shadow field of {name} is not locked"
