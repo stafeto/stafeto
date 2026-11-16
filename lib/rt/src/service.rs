@@ -1036,7 +1036,11 @@ fn request<S: Service<K>, const K: usize>(
     };
     // The handles the request brought and the handler left close before the
     // reply goes, so that the thread has no work between the reply and its
-    // next receive.
+    // next receive. This work belongs to the step: the reply waits for the next receive (the
+    // reply of a step-stats build goes at once but keeps this order, so that the step measures
+    // what the service does), and in the step of EPOLL_WAIT of netd it costs about 1 000 ticks
+    // (the median of the step with 64 pairs is 17 020 with the close before the reply and 16 059
+    // with it after, on the runner under -icount).
     drop(core::mem::replace(&mut r.handles, Incoming::none()));
     // A reply the client could not take is no error of the service; one
     // the kernel refused for the service's own handles, the client gets
