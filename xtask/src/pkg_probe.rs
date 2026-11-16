@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! `cargo xtask pkg-probe [install] [--hvf]`: the package tool in the guest (sub-project 5, part 4a;
+//! `cargo xtask pkg-probe [install|memory] [--hvf]`: the package tool in the guest (sub-project 5, part 4a;
 //! pk4-design R16, R17). The image (`boot-pkg-probe.img`) is the base image with the certificate
 //! file of the probe CA and the mirror of the probe as its official repository,
 //! `https://10.0.2.2:8443/<series>/aarch64`, trusting the roots of the development keys. xtask
@@ -22,6 +22,11 @@
 //! 6. `pkg info doom` and `pkg search doom`.
 //! 7. `pkg update`: `serial 2, was 2`.
 //! 8. `pkg install doom` again: "is installed", and no package was downloaded (the log of the mirror).
+//! `memory` runs steps 1 to 9 on the image of EC2's kind of store (init's feature `memory-store`:
+//! the disk service over a memory object of 256 MiB, no disk on the machine, 2 GiB as on a
+//! t4g.small), then `pkg remove doom`, the install again, and a second boot of the machine,
+//! where the store is empty: the packages were in memory.
+//!
 //! 9. The codes of exit: 2 for a command line that is none, 1 with a line of its own for a name no
 //!    repository has, and no package downloaded for it.
 
@@ -41,6 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const IMAGE: &str = "boot-pkg-probe.img";
+/// The image of `pkg-probe memory`: the same files, the store in memory.
+pub const MEMORY_IMAGE: &str = "boot-pkg-probe-memory.img";
 /// The port of the mirror, in `/etc/pkg/official` of the image.
 const PORT: u16 = 8443;
 /// The port of the mirror whose certificate no one trusts (`host-b` of the probe CA, self-signed).
@@ -355,6 +362,8 @@ struct Ctx<'a> {
     states: &'a pkg_states::States,
     report: Vec<String>,
     image_count: usize,
+    /// The store is a memory object (`pkg-probe memory`): no disk on the machine.
+    memory: bool,
 }
 
 impl Ctx<'_> {
@@ -383,7 +392,11 @@ fn guest(
 ) -> Result<(), String> {
     let mut cmd = qemu::command(ctx.machine, &ctx.kernel.image, Some(&ctx.image));
     cmd.args(qemu::HEADLESS);
-    cmd.args(base_image::machine_args(&ctx.store));
+    if ctx.memory {
+        cmd.args(base_image::memory_machine_args());
+    } else {
+        cmd.args(base_image::machine_args(&ctx.store));
+    }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = boot(&mut run, ctx).and_then(|()| body(&mut run, ctx));
     let output = run.stop();
@@ -531,7 +544,7 @@ fn same_store(
 }
 
 /// Steps 1 to 9 (`install`), and with `full` the rest of the scenario on three boots of the machine.
-fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
+fn scenario(machine: &'static qemu::Machine, full: bool, memory: bool) -> Result<(), String> {
     let started = Instant::now();
     base_image::prepare()?;
     let ca = probe_ca::ensure(false)?;
@@ -558,9 +571,14 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
     )?;
     let roots = roots_path();
     let roots_text = roots.display().to_string();
+    let (image_name, programs) = if memory {
+        (MEMORY_IMAGE, base_image::memory_programs())
+    } else {
+        (IMAGE, base_image::programs(base_image::BASE_IMAGE))
+    };
     let image = crate::write_boot_image_files(
-        IMAGE,
-        base_image::programs(base_image::BASE_IMAGE),
+        image_name,
+        programs,
         BOOT_PROFILE,
         &[("STAFETO_PKG_ROOTS", &roots_text)],
         test_files()?,
@@ -582,7 +600,9 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
     )?;
     // The disk of the guest: new for the run, the same for its boots.
     let store = image.with_file_name("store-pkg-probe.img");
-    qemu::store_file(&store, STORE_BYTES, true)?;
+    if !memory {
+        qemu::store_file(&store, STORE_BYTES, true)?;
+    }
     let mut ctx = Ctx {
         machine,
         kernel: &kernel,
@@ -593,6 +613,7 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
         states: &states,
         report: Vec::new(),
         image_count: base_packages()?,
+        memory,
     };
     let began = Instant::now();
     guest(&mut ctx, |run, ctx| first_boot(run, ctx, full))?;
@@ -600,6 +621,9 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
         ctx.state(&states.next)?;
         guest(&mut ctx, second_boot)?;
         guest(&mut ctx, third_boot)?;
+    }
+    if memory {
+        guest(&mut ctx, memory_second_boot)?;
     }
     let report = ctx.report.clone();
     drop(ctx);
@@ -611,7 +635,13 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
     }
     println!(
         "pkg-probe{} on {}: passed in {:.0} s (the build and the repositories {:.0} s, the guest {:.0} s)",
-        if full { "" } else { " install" },
+        if memory {
+            " memory"
+        } else if full {
+            ""
+        } else {
+            " install"
+        },
         machine.name,
         total.as_secs_f64(),
         prepared.as_secs_f64(),
@@ -782,6 +812,9 @@ fn first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>, full: bool) -> Result<(), 
             .into(),
     );
     if !full {
+        if ctx.memory {
+            memory_first_boot(run, ctx)?;
+        }
         report_free(run, &mut ctx.report);
         return Ok(());
     }
@@ -1226,29 +1259,161 @@ fn absolute(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
 /// `cargo xtask pkg-probe [install] [--hvf]`: `install` is steps 1 to 9, the plain command the
 /// whole scenario.
 pub fn command(args: &[String]) -> Result<(), String> {
-    let (mut hvf, mut full) = (false, true);
+    let (mut hvf, mut full, mut memory) = (false, true, false);
     for a in args {
         match a.as_str() {
             "install" => full = false,
+            "memory" => {
+                full = false;
+                memory = true;
+            }
             "--hvf" => hvf = true,
             other => {
                 return Err(format!(
-                    "usage: cargo xtask pkg-probe [install] [--hvf]: {other}"
+                    "usage: cargo xtask pkg-probe [install|memory] [--hvf]: {other}"
                 ));
             }
         }
     }
+    if memory && hvf {
+        return Err("pkg-probe memory runs on the 2 GiB machine of QEMU: no --hvf".into());
+    }
     let machine = if hvf {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
         &qemu::HVF_V3
+    } else if memory {
+        &qemu::VIRT_2G
     } else {
         base_image::machine(base_image::BASE_IMAGE)
     };
-    scenario(machine, full)
+    scenario(machine, full, memory)
+}
+
+/// The megabytes `pkg check` names as the free space of the store: the number in the brackets of
+/// `store generation 3, 61 blocks, 59 free (254.8 MB)`.
+fn free_megabytes(lines: &[String]) -> Option<f64> {
+    let line = lines.iter().find(|l| l.starts_with("store generation"))?;
+    let inside = line.rsplit_once('(')?.1;
+    inside.strip_suffix(" MB)")?.parse().ok()
+}
+
+/// What the first boot of `pkg-probe memory` does after steps 1 to 9: the store is the 256 MiB
+/// of the memory disk, a removal gives its files up, and the install puts Doom in again, so the
+/// second boot has something to lose.
+fn memory_first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
+    let lines = expect_code(run, "pkg check", "m1-check", 0, DIALOG_STEP)?;
+    let free =
+        free_megabytes(&lines).ok_or_else(|| format!("memory: no free space in {lines:?}"))?;
+    // 256 MiB is 268.4 MB; the format and Doom (29 MB) take some.
+    if !(150.0..=268.5).contains(&free) {
+        return Err(format!(
+            "memory: the store should have about 238 MB free with Doom in it, it has {free} MB: {lines:?}"
+        ));
+    }
+    if !run
+        .lines()
+        .iter()
+        .any(|l| l.contains("mem-blk: 524288 sectors in memory"))
+    {
+        return Err("memory: mem-blk did not say \"524288 sectors in memory\"".into());
+    }
+    if run.lines().iter().any(|l| l.contains("virtio-blk")) {
+        return Err("memory: the Virtio disk driver ran".into());
+    }
+    ctx.report.push(format!(
+        "the store is the memory disk of 524288 sectors (256 MiB), {free} MB free with Doom installed"
+    ));
+    let lines = expect_code(run, "pkg remove doom", "m1-rm", 0, INSTALL_WITHIN)?;
+    need(
+        &lines,
+        "removed doomgeneric e257a095-1, freedoom 0.13.0-1 (no longer needed)",
+        "memory",
+    )?;
+    let (code, lines) = run_command(
+        run,
+        "ls /bin/doom /games/freedoom1.wad",
+        "m1-ls",
+        DIALOG_STEP,
+    )?;
+    if code == 0 || lines.iter().filter(|l| l.contains("No such file")).count() != 2 {
+        return Err(format!(
+            "memory: Doom should be gone after the removal: exit {code}, {lines:?}"
+        ));
+    }
+    let lines = expect_code(run, "pkg check", "m1-check2", 0, DIALOG_STEP)?;
+    if count_in(&lines, "packages ", " on the disk") != Some(0) {
+        return Err(format!(
+            "memory: the store should be empty after the removal: {lines:?}"
+        ));
+    }
+    ctx.report
+        .push("pkg remove doom: the files go, 0 packages in the store".into());
+    expect_code(run, "pkg install doom", "m1-install", 0, INSTALL_WITHIN)?;
+    expect_code(
+        run,
+        "ls /bin/doom /games/freedoom1.wad",
+        "m1-ls2",
+        0,
+        DIALOG_STEP,
+    )?;
+    let lines = expect_code(run, "pkg check", "m1-check3", 0, DIALOG_STEP)?;
+    if count_in(&lines, "packages ", " on the disk") != Some(2) {
+        return Err(format!(
+            "memory: Doom should be in the store again: {lines:?}"
+        ));
+    }
+    ctx.report
+        .push("pkg install doom again: 2 packages in the store before the reboot".into());
+    Ok(())
+}
+
+/// The second boot of `pkg-probe memory`: a new machine with no disk, and the store is empty:
+/// what was installed is gone, the image's packages are there.
+fn memory_second_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
+    let image_count = ctx.image_count;
+    let lines = expect_code(run, "pkg check", "m2-check", 0, DIALOG_STEP)?;
+    if count_in(&lines, "packages ", " on the disk") != Some(0)
+        || count_in(&lines, "disk, ", " in the image") != Some(image_count)
+    {
+        return Err(format!(
+            "memory: after the reboot the store should hold 0 packages and the image {image_count}: {lines:?}"
+        ));
+    }
+    let lines = expect_code(run, "pkg list", "m2-list", 0, DIALOG_STEP)?;
+    if lines.len() != image_count || !lines.iter().all(|l| l.ends_with("[image]")) {
+        return Err(format!(
+            "memory: after the reboot pkg list should list the image alone: {lines:?}"
+        ));
+    }
+    let (code, lines) = run_command(
+        run,
+        "ls /bin/doom /games/freedoom1.wad",
+        "m2-ls",
+        DIALOG_STEP,
+    )?;
+    if code == 0 || lines.iter().filter(|l| l.contains("No such file")).count() != 2 {
+        return Err(format!(
+            "memory: Doom should be gone after the reboot: exit {code}, {lines:?}"
+        ));
+    }
+    ctx.report.push(format!(
+        "after the reboot: 0 packages in the store, {image_count} in the image, no file of Doom (the packages were in memory)"
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_free_space_is_the_number_in_the_brackets_of_the_first_line_of_check() {
+        let lines = vec![
+            "store generation 3, 61 blocks, 59 free (238.8 MB)".to_owned(),
+            "packages 2 on the disk, 10 in the image, 0 revoked".to_owned(),
+        ];
+        assert_eq!(super::free_megabytes(&lines), Some(238.8));
+        assert_eq!(super::free_megabytes(&lines[1..]), None);
+    }
+
     #[test]
     fn a_notice_of_init_is_no_part_of_the_store_and_a_real_change_is_told() {
         use super::{is_notice, same_store};
