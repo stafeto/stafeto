@@ -2054,20 +2054,22 @@ impl Net {
         // parked with its steps of waking counted (`netd::zero`) and answered by the step of
         // waking, empty if nothing is ready then.
         let steps = core::mem::take(&mut self.steps_pending);
-        if steps && !blocking && netd::zero::room(&self.zero) {
-            if let Some(pending) = r.defer() {
-                let item = ZeroWait {
-                    pending,
-                    label: s.label(),
-                    wire,
-                    most,
-                };
-                if netd::zero::park(&mut self.zero, item).is_ok() {
-                    self.wake_wanted = true;
-                    self.interest.due |= 1 << set;
-                }
-                return Answer::Deferred;
+        if steps
+            && !blocking
+            && netd::zero::room(&self.zero)
+            && let Some(pending) = r.defer()
+        {
+            let item = ZeroWait {
+                pending,
+                label: s.label(),
+                wire,
+                most,
+            };
+            if netd::zero::park(&mut self.zero, item).is_ok() {
+                self.wake_wanted = true;
+                self.interest.due |= 1 << set;
             }
+            return Answer::Deferred;
         }
         if !steps {
             self.interest.take(set, most, &mut ready);
