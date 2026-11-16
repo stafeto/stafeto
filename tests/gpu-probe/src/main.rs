@@ -441,18 +441,43 @@ impl Probe<'_> {
         // runs again, and its OPEN finds the screen free; an OPEN that came
         // earlier would be told CLEARING (the machine's tests on the host
         // have it). The buffer is all zero in either case.
-        let first = opened.owner;
+        // The former owner keeps its handle and its mapping of the buffer:
+        // the driver clears it all the same, and says BUSY to an OPEN until
+        // the last reference of the former owner is gone.
+        let (first, former) = (opened.owner, opened.buffer);
         plain(&first, Method::Close).map_err(|_| "CLOSE")?;
         if flush(&first, Rect::SCREEN) != Err(Fail::Status(code(REVOKED))) {
             return Err("FLUSH after CLOSE was not REVOKED");
         }
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        // The service writes the zeros: read them from the mapping each time.
+        // SAFETY: each index is inside the mapped buffer.
+        while (0..points.len())
+            .any(|i| unsafe { core::ptr::read_volatile(&raw const points[i]) } != 0)
+        {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("CLOSE did not clear the buffer");
+            }
+            self.sleep(RETRY_NS);
+        }
+        rt::println!("gpu-probe: CLOSE returned the screen, a cleared buffer, FLUSH REVOKED");
+        if open(&display).err() != Some(Fail::Status(code(BUSY))) {
+            return Err("OPEN with the former owner's buffer kept was not BUSY");
+        }
+        // SAFETY: the probe uses `points` no more.
+        unsafe {
+            sys::mem_unmap(
+                self.process,
+                FB_AT + (self.maps - 1) * FB_STEP,
+                u64::from(BUFFER_BYTES),
+            )
+        }
+        .map_err(|_| "unmap the former buffer")?;
+        drop(former);
         let again = self
             .open_when_clear(&display)
             .map_err(|_| "OPEN after CLOSE")?;
-        if points.iter().any(|&p| p != 0) {
-            return Err("CLOSE did not clear the buffer");
-        }
-        rt::println!("gpu-probe: CLOSE returned the screen, a cleared buffer, FLUSH REVOKED");
+        rt::println!("gpu-probe: OPEN is BUSY while a former owner keeps its buffer");
         flush(&again.owner, Rect::SCREEN).map_err(|_| "FLUSH of the new owner")?;
         // Kill the service: it never replies, and the channel's end is the
         // answer. The owner's session leads nowhere now.

@@ -33,12 +33,18 @@ and the header version 1 of both.
   BUSY, as it was. When the window goes the buffer is cleared in portions of
   16 KiB, OPEN says CLEARING meanwhile, and the next window finds it zero.
   The buffer is shared with its client: CLOSE, or dropping the window's
-  session, leaves a client that kept its mapping able to read and write the
-  next window of the first revision's pixels, and the next window's alone, as
-  the screen is never mapped by a client. OPEN therefore says BUSY while the
-  object has more than one mapping (the compositor holds the only legitimate
-  one), which closes the common case. What stays open is a handle kept
-  unmapped and mapped after the next OPEN.
+  session, leaves a client that kept the handle, mapped or not, or sent a copy
+  of it to another process, able to read and write the next window of the
+  first revision's pixels, and the next window's alone, as the screen is never
+  mapped by a client. OPEN therefore says BUSY while the object has more
+  references than the compositor's own two, its handle and its mapping
+  (`object_info` of a memory object returns the count in x4: handles in any
+  process, mappings, handles in transit and long calls). This closes the
+  case of a kept handle, mapped or not, and of a copy handed on. The price
+  is availability of the old path alone: a former client that keeps its
+  handle blocks the first revision's OPEN until it exits or closes the
+  handle, and the second revision (ATTACH) is unaffected. The driver
+  (`virtio-gpu`) makes the same check for its `fb` in OPEN.
 
 ## Limits accepted in stage G1
 

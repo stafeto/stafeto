@@ -3638,6 +3638,7 @@ pub fn object_pays_its_budget_back_to_the_payer(_: &Boot) -> Result<(), &'static
                         size: 600 * PAGE_SIZE,
                         pages: 600,
                         mappings: 0,
+                        refs: info.refs,
                     },
             "the caller does not pay for the object, or it is not whole",
         )?;
@@ -3755,6 +3756,7 @@ pub fn contiguous_object_is_one_aligned_block(_: &Boot) -> Result<(), &'static s
                     size,
                     pages,
                     mappings: 0,
+                    refs: info.refs,
                 },
                 "a contiguous object is not whole",
             )?;
@@ -5640,6 +5642,7 @@ pub fn boot_image_frames_never_go(boot: &Boot) -> Result<(), &'static str> {
                 size: image.size,
                 pages: 0,
                 mappings: 0,
+                refs: info.refs,
             },
             "the object over the boot image does not report the image",
         )?;

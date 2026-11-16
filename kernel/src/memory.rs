@@ -497,11 +497,19 @@ pub fn frames(m: NonNull<Memory>, first: usize, out: &mut [u64]) {
 
 /// object_info MEMORY of `m`, which the caller holds (spec 11): its size in
 /// bytes, the pages whose frames it owns, every page once it is whole and
-/// none over the boot image or of a device window, and its mappings.
+/// none over the boot image or of a device window, its mappings, and every
+/// reference that keeps it: handles, mappings, handles in transit and long
+/// calls.
 pub fn info(m: NonNull<Memory>) -> MemoryInfo {
     // SAFETY: the caller holds a reference to the object; only the fields
     // are read.
-    let (backing, mappings) = unsafe { (&(*m.as_ptr()).backing, (*m.as_ptr()).mappings) };
+    let (backing, mappings, refs) = unsafe {
+        (
+            &(*m.as_ptr()).backing,
+            (*m.as_ptr()).mappings,
+            (*m.as_ptr()).refs.get(),
+        )
+    };
     let owned = match backing {
         Backing::Owned(list) => list.filled(),
         Backing::Contiguous { filled, .. } => *filled,
@@ -511,6 +519,7 @@ pub fn info(m: NonNull<Memory>) -> MemoryInfo {
         size: pages(m) as u64 * PAGE_SIZE,
         pages: owned as u64,
         mappings: mappings.into(),
+        refs: refs.into(),
     }
 }
 

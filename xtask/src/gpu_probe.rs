@@ -69,7 +69,7 @@ const B_ENDS: &str = "init: gpu-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 11] = [
+const CHECKS: [(&str, usize); 12] = [
     ("gpu-probe: the owner's handles cannot be duplicated", 1),
     (
         "gpu-probe: screen 640x400, stride 2560, a cleared buffer",
@@ -84,6 +84,10 @@ const CHECKS: [(&str, usize); 11] = [
     ),
     (
         "gpu-probe: CLOSE returned the screen, a cleared buffer, FLUSH REVOKED",
+        1,
+    ),
+    (
+        "gpu-probe: OPEN is BUSY while a former owner keeps its buffer",
         1,
     ),
     ("gpu-probe: FLUSH after the service ended is PEER_CLOSED", 1),
