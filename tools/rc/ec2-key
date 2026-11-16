@@ -13,6 +13,9 @@
 #
 # IMDS_HOST, IMDS_PORT and SSH_DIR are for the checks of the image.
 
+# No file name expansion anywhere: the words of a reply never become patterns.
+set -f
+
 host=${IMDS_HOST:-169.254.169.254}
 port=${IMDS_PORT:-80}
 dir=${SSH_DIR:-/root/.ssh}
@@ -23,7 +26,7 @@ say() {
     echo "ec2-key: $*"
 }
 
-# imds METHOD PATH [HEADER]: sets `status` (empty when nothing answered) and
+# imds METHOD PATH [HEADER]: sets `status` (empty when nothing answered, 000 when the status line is not three digits) and
 # `body` from one request.
 imds() {
     status= body=
@@ -33,12 +36,16 @@ imds() {
             printf '%s\r\n' "$3"
         fi
         printf '\r\n'
-    } | nc -w 5 "$host" "$port" | tr -d '\r')
+    } | nc -w 5 "$host" "$port" | head -c 16384 | tr -d '\r')
     line=${reply%%"$nl"*}
     case $line in
         HTTP/*)
             set -- $line
             status=$2
+            case $status in
+                [0-9][0-9][0-9]) ;;
+                *) status=000 ;;
+            esac
             case $reply in
                 *"$nl$nl"*) body=${reply#*"$nl$nl"} ;;
             esac
@@ -66,6 +73,12 @@ if [ "$status" != 200 ] || [ -z "$body" ]; then
     say "the metadata service gave no token (HTTP $status), SSH stays off"
     exit 1
 fi
+case $body in
+    '' | *[!A-Za-z0-9+/=_-]*)
+        say "the metadata service gave a token that is not one word, SSH stays off"
+        exit 1
+        ;;
+esac
 token=$body
 
 imds GET /latest/meta-data/public-keys/0/openssh-key "X-aws-ec2-metadata-token: $token"
@@ -84,22 +97,31 @@ esac
 
 key=$body
 case $key in
-    *"$nl"*) key= ;;
+    *[![:print:]]*) key= ;;
     ssh-* | ecdsa-sha2-* | sk-ssh-* | sk-ecdsa-*) ;;
     *) key= ;;
 esac
+# An OpenSSH key line is a few hundred bytes; the reply was cut at 16 KiB.
+if [ "${#key}" -gt 8192 ]; then
+    key=
+fi
 if [ -z "$key" ]; then
     say "the key is not one line of an OpenSSH public key, SSH stays off"
     exit 1
 fi
 
 umask 077
+if [ -L "$dir" ]; then
+    say "$dir is a symbolic link, SSH stays off"
+    exit 1
+fi
 mkdir -p "$dir" || exit 1
 chmod 700 "$dir"
-printf '%s\n' "$key" >"$dir/authorized_keys" || exit 1
-chmod 600 "$dir/authorized_keys"
+tmp=$dir/.authorized_keys.$$
+printf '%s\n' "$key" >"$tmp" || exit 1
+chmod 600 "$tmp"
+mv -f "$tmp" "$dir/authorized_keys" || exit 1
 
-set -f
 set -- $key
 ktype=$1
 if [ $# -ge 2 ]; then

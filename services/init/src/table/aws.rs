@@ -8,10 +8,12 @@
 //! window. The entropy service has no driver here (the t4g has no device of
 //! random bytes): the boot loader puts the seed it took from the firmware
 //! in the device tree, the kernel gives it to init, and init to the
-//! service (`ENTROPY`).
+//! service (`ENTROPY`). The package service (`pkgd`) keeps its store in memory, on the
+//! disk service over a memory object (`MEMBLK`, 256 MiB): the packages installed with
+//! `pkg` are gone after a reboot, like every file of the image.
 
 use super::{
-    At, Binding, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Window, Write,
+    At, Binding, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Wait, Window, Write,
 };
 use crate::PAGE;
 use crate::resolve::Platform;
@@ -298,8 +300,15 @@ const LAUNCHER: Record = Record {
         "posix",
         "entropy",
         super::NET_SERVICE,
+        "pkgd",
     ],
     quota: super::net::NET_COMMAND_QUOTA,
+    // The shell starts once `pkgd` says READY (the store is formatted at the start); past
+    // this it starts without waiting, as on the base image.
+    waits: &[Wait {
+        service: "pkgd",
+        deadline_ms: super::base::PKGD_READY_MS,
+    }],
     ..named(DIALOG, "busybox-probe")
 };
 
@@ -316,6 +325,8 @@ pub const TABLE: &[Record] = &[
     LAUNCHER,
     named(DIALOG, "tty"),
     NET,
+    super::pkg::MEMBLK,
+    super::pkg::PKGD,
 ];
 
 #[cfg(test)]
@@ -352,7 +363,9 @@ mod tests {
                 "entropy",
                 "busybox-probe",
                 "tty",
-                "net"
+                "net",
+                "blk",
+                "pkgd"
             ]
         );
         // The posix record is the shell dialog's, with its larger quota; the
