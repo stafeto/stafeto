@@ -2348,6 +2348,7 @@ commands:
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
+  nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2383,6 +2384,7 @@ fn main() {
         Some("efi") => efi::run(&args[1..]),
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
+        Some("nvme-breaks") => nvme_breaks(),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
         Some("its-drop") => its_drop(),
@@ -2922,6 +2924,39 @@ fn ena_breaks() -> Result<(), String> {
                 println!("ena-breaks: {feature} is caught by the host tests of {package}");
             }
             Ok(_) => return Err(format!("{feature} passed the host tests of {package}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// The deliberate breaks of the NVMe driver (`cargo xtask nvme-breaks`): each
+/// is a feature of `lib/nvme` that does one wrong thing, and its host tests
+/// pass without it and fail with it.
+const NVME_BREAKS: [&str; 9] = [
+    "break-nvme-cq-phase",
+    "break-nvme-prp2",
+    "break-nvme-dstrd",
+    "break-nvme-flush-early",
+    "break-nvme-partition",
+    "break-nvme-cq-head",
+    "break-nvme-wmb",
+    "break-nvme-reset-wait",
+    "break-nvme-sq-head",
+];
+
+fn nvme_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "nvme", "--lib"]);
+    run_cmd(&mut ok)?;
+    for feature in NVME_BREAKS {
+        let mut broken = cargo();
+        broken.args(["test", "--package", "nvme", "--lib", "--features", feature]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => {
+                println!("nvme-breaks: {feature} is caught by the host tests of nvme");
+            }
+            Ok(_) => return Err(format!("{feature} passed the host tests of nvme")),
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -10667,6 +10702,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "ena",
         "--package",
+        "nvme",
+        "--package",
         "proto-entropy",
         "--package",
         "virtio-rng",
@@ -13462,6 +13499,8 @@ fn ci_lints() -> Result<(), String> {
         "pci",
         "--package",
         "ena",
+        "--package",
+        "nvme",
         "--package",
         "proto-entropy",
         "--package",
