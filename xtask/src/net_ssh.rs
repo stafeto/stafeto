@@ -432,8 +432,21 @@ fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Resul
             ));
         }
     }
-    let (body, _) = crate::net_curl::get_within(([127, 0, 0, 1], http).into(), LOGIN_WITHIN)
-        .map_err(|e| format!("a request to the HTTP server with the connections held: {e}"))?;
+    // The first request waits for `httpd` to listen (a connection that comes before is reset).
+    let listening = Instant::now();
+    let body = loop {
+        match crate::net_curl::get_within(([127, 0, 0, 1], http).into(), Duration::from_secs(5)) {
+            Ok((body, _)) => break body,
+            Err(_) if listening.elapsed() < Duration::from_secs(40) => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "a request to the HTTP server with the connections held: {e}"
+                ));
+            }
+        }
+    };
     crate::net_curl::check_body(&body)?;
     let mut ssh = client.command("root", Some(key), true);
     ssh.args(["-o", "ConnectTimeout=20"]).arg("true");
