@@ -686,23 +686,15 @@ mod steps {
         REPORT.store(tag, Ordering::Relaxed);
     }
 
-    /// The CPU ticks the loop's thread has run (object_info THREAD_STATE
-    /// x5): the time of its own stints, which a thread of a higher level
-    /// that runs in the middle of a step does not lengthen, as the clock
-    /// does. 0 when the thread has no handle to itself.
-    fn own_ran(slot: &Slot) -> u64 {
+    /// The CPU ticks the loop's thread has run (object_info THREAD_STATE x5), the time of its own
+    /// stints, which a thread of a higher level that runs in the middle of a step does not
+    /// lengthen, as the clock does, and the count of preemptions (x7), from one call (the count
+    /// wraps at 2^16, so differences are taken modulo 2^16). 0 and 0 when the thread has no
+    /// handle to itself.
+    fn own_state(slot: &Slot) -> (u64, u64) {
         match own_thread(slot) {
-            Some(own) => crate::sys::thread_ran(&own).unwrap_or(0),
-            None => 0,
-        }
-    }
-
-    /// The times a thread of a higher level took the loop's thread off the CPU (object_info
-    /// THREAD_STATE x7; the count wraps at 2^16, so differences are taken modulo 2^16).
-    fn own_preempts(slot: &Slot) -> u64 {
-        match own_thread(slot) {
-            Some(own) => crate::sys::thread_preempts(&own).unwrap_or(0),
-            None => 0,
+            Some(own) => crate::sys::thread_ran_preempts(&own).unwrap_or((0, 0)),
+            None => (0, 0),
         }
     }
 
@@ -765,11 +757,9 @@ mod steps {
     /// (between steps) waited does not belong to it.
     pub fn restart() {
         let Some(slot) = claim() else { return };
-        // The count first: the call that reads it runs before the thread's time is read, so
-        // that its ticks are not in the step.
-        slot.preempt_begin
-            .store(own_preempts(slot), Ordering::Relaxed);
-        slot.ran_begin.store(own_ran(slot), Ordering::Relaxed);
+        let (ran, preempts) = own_state(slot);
+        slot.ran_begin.store(ran, Ordering::Relaxed);
+        slot.preempt_begin.store(preempts, Ordering::Relaxed);
         slot.waited.store(0, Ordering::Relaxed);
         slot.preempted.store(0, Ordering::Relaxed);
         slot.departed.store(false, Ordering::Relaxed);
@@ -825,11 +815,10 @@ mod steps {
         // the wait for another service nor a thread of a higher level that
         // ran in the middle belongs to it (spec 2, 2: the levels of the
         // services are above those of the processes they serve).
-        // The count is read before the time: a preemption between the two reads is in the time
-        // and not in the count, which judges the step by more, never by less.
+        let (ran_now, preempts_now) = own_state(slot);
+        let ran = ran_now.saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
         let n_preempt =
-            own_preempts(slot).wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
-        let ran = own_ran(slot).saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
+            preempts_now.wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
         let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
         let judged = super::sample::judged(took, n_preempt);
