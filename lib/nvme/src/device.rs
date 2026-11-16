@@ -29,10 +29,10 @@ pub trait Platform {
     fn now_ns(&self) -> u64;
     /// `dmb oshst`: the stores to the queues come before the doorbell write
     /// that follows.
-    fn wmb(&self) {}
+    fn wmb(&self);
     /// `dmb oshld`: the loads of a completion after this see what the
     /// controller stored before the phase bit that was read.
-    fn rmb(&self) {}
+    fn rmb(&self);
     fn log(&self, line: fmt::Arguments<'_>);
 }
 
@@ -93,7 +93,7 @@ pub const SLOW_IO_NS: u64 = 30_000_000_000;
 const WATCH_NS: u64 = 100_000_000;
 /// How long the controller has to finish a normal shutdown.
 const SHUTDOWN_NS: u64 = 5_000_000_000;
-/// Three resets inside this window end the recovery in place.
+/// Three resets inside this window (or three times CAP.TO, if longer) end the recovery in place.
 const RESETS: usize = 3;
 const RESET_WINDOW_NS: u64 = 60_000_000_000;
 
@@ -194,6 +194,7 @@ pub enum Outcome {
     Error {
         sct: u8,
         sc: u8,
+        dnr: bool,
     },
     /// A reset took the command; it may or may not have run.
     Aborted,
@@ -251,7 +252,7 @@ enum Cmd {
 enum Next {
     Restart,
     Fail(Failure),
-    Shutdown,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +279,13 @@ enum Stage {
         next: Next,
         announced: bool,
     },
+    /// CC.EN = 0 written; wait for CSTS.RDY = 0, after which the controller
+    /// does no more DMA and the requests in work can be handed back.
+    QuiesceWrite(Next),
+    QuiesceWait(Next),
+    Drain(Next),
+    /// CC.EN = 1 and RDY = 0 at the start: firmware is enabling the controller.
+    WaitEnabled,
     ShutWrite,
     ShutWait,
     ShutOff,
@@ -354,7 +362,7 @@ struct Busy {
     parts: u8,
     done: u8,
     /// The first error of the parts.
-    error: Option<(u8, u8)>,
+    error: Option<(u8, u8, bool)>,
     since_ns: u64,
     warned: bool,
 }
@@ -375,6 +383,7 @@ pub struct Nvme<P: Platform> {
     slots: [Slot; TAGS],
     /// The window of the namespace the owner gets: first block and blocks.
     window: (u64, u64),
+    window_set: bool,
     cid: u16,
     resets: [u64; RESETS],
     reset_count: u64,
@@ -391,6 +400,13 @@ impl<P: Platform> Nvme<P> {
     /// nothing else uses, for as long as the value lives. The queues are
     /// `mem`, which is `MEM_BYTES` or more; the cells are `CELLS_BYTES` or
     /// more; both start on a page.
+    ///
+    /// The driver assumes DMA is coherent and does no cache maintenance: the
+    /// controller and the CPU see the same bytes once the barriers have run.
+    /// That holds on t4g (no SMMU node in IORT, and the Nitro PCIe is
+    /// I/O-coherent) and under QEMU TCG. It is unverified under HVF or KVM,
+    /// where a non-cacheable guest mapping against a cacheable host access can
+    /// lose coherence.
     pub unsafe fn open(p: P, mem: Region, cells: Region, cfg: Config) -> Result<Nvme<P>, Failure> {
         let aligned =
             |r: &Region| r.va.is_multiple_of(cmd::PAGE) && r.pa.is_multiple_of(cmd::PAGE as u64);
@@ -417,6 +433,7 @@ impl<P: Platform> Nvme<P> {
             io: Ring::new(IO_DEPTH),
             slots: [Slot::Idle; TAGS],
             window: (0, 0),
+            window_set: false,
             cid: 0,
             resets: [0; RESETS],
             reset_count: 0,
@@ -474,6 +491,7 @@ impl<P: Platform> Nvme<P> {
             return false;
         }
         self.window = (first, len);
+        self.window_set = true;
         true
     }
 
@@ -585,11 +603,28 @@ impl<P: Platform> Nvme<P> {
                     return self.fail(Failure::Gone);
                 }
                 self.stage = if cc & regs::CC_EN != 0 {
-                    Stage::WriteCcOff
+                    // Enabled: let a controller that is still becoming ready
+                    // get there before CC.EN is cleared (NVMe 1.3, section
+                    // 3.1.5, "likely" by the review that named it; the clause
+                    // is not checked against the text).
+                    self.deadline = self.p.now_ns() + self.cap.timeout_ns();
+                    Stage::WaitEnabled
                 } else {
                     self.wait_clear()
                 };
                 Event::Working
+            }
+            Stage::WaitEnabled => {
+                let sts = self.p.read32(regs::CSTS);
+                if sts == regs::GONE {
+                    return self.fail(Failure::Gone);
+                }
+                if sts & regs::CSTS_RDY != 0 || self.p.now_ns() > self.deadline {
+                    self.stage = Stage::WriteCcOff;
+                    Event::Working
+                } else {
+                    Event::Idle
+                }
             }
             Stage::WriteCcOff => {
                 self.p.write32(regs::CC, 0);
@@ -642,6 +677,27 @@ impl<P: Platform> Nvme<P> {
                 next,
                 announced,
             } => self.step_abort(cause, next, announced),
+            Stage::QuiesceWrite(next) => {
+                self.p.write32(regs::CC, 0);
+                self.deadline = self.p.now_ns() + self.cap.timeout_ns();
+                self.stage = Stage::QuiesceWait(next);
+                Event::Working
+            }
+            Stage::QuiesceWait(next) => {
+                let sts = self.p.read32(regs::CSTS);
+                let early = cfg!(feature = "break-nvme-abort-early");
+                if early || sts == regs::GONE || sts & regs::CSTS_RDY == 0 {
+                    self.stage = Stage::Drain(next);
+                    Event::Working
+                } else if self.p.now_ns() > self.deadline {
+                    self.p.log(format_args!("nvme: RDY did not fall"));
+                    self.stage = Stage::Drain(next);
+                    Event::Working
+                } else {
+                    Event::Idle
+                }
+            }
+            Stage::Drain(next) => self.step_drain(next),
             Stage::ShutWrite => {
                 self.p
                     .write32(regs::CC, regs::cc_enable() | regs::CC_SHN_NORMAL);
@@ -670,8 +726,8 @@ impl<P: Platform> Nvme<P> {
             Stage::ShutWaitOff => {
                 let sts = self.p.read32(regs::CSTS);
                 if sts & regs::CSTS_RDY == 0 {
-                    self.stage = Stage::Stopped;
-                    Event::Stopped
+                    self.stage = Stage::Drain(Next::Stop);
+                    Event::Working
                 } else if self.p.now_ns() > self.deadline {
                     self.fail(Failure::Shutdown)
                 } else {
@@ -685,14 +741,46 @@ impl<P: Platform> Nvme<P> {
     /// Begins a normal shutdown (CC.SHN = 1, wait for CSTS.SHST = 2, then
     /// CC = 0): the requests in work end as `Aborted`, then `Stopped` comes.
     pub fn shutdown(&mut self) {
-        if matches!(self.stage, Stage::Stopped | Stage::Failed) {
-            return;
+        match self.stage {
+            Stage::Stopped | Stage::Failed => {}
+            // Up: the notification needs the admin queues; the requests in
+            // work are handed back after RDY = 0.
+            Stage::Up => self.stage = Stage::ShutWrite,
+            Stage::ShutWrite | Stage::ShutWait | Stage::ShutOff | Stage::ShutWaitOff => {}
+            // A reset or a failure is under way: it ends in `Stopped` unless it
+            // is a failure.
+            Stage::Abort {
+                cause,
+                next,
+                announced,
+            } => {
+                self.stage = Stage::Abort {
+                    cause,
+                    next: Self::stop(next),
+                    announced,
+                };
+            }
+            Stage::QuiesceWrite(n) => self.stage = Stage::QuiesceWrite(Self::stop(n)),
+            Stage::QuiesceWait(n) => self.stage = Stage::QuiesceWait(Self::stop(n)),
+            Stage::Drain(n) => self.stage = Stage::Drain(Self::stop(n)),
+            // Not up yet: there are no admin queues for a notification, so
+            // CC = 0 and the wait for RDY = 0 (the controller is never enabled
+            // to be shut down).
+            _ => {
+                self.stage = Stage::Abort {
+                    cause: Cause::Fatal,
+                    next: Next::Stop,
+                    announced: true,
+                }
+            }
         }
-        self.stage = Stage::Abort {
-            cause: Cause::Fatal,
-            next: Next::Shutdown,
-            announced: true,
-        };
+    }
+
+    fn stop(next: Next) -> Next {
+        match next {
+            Next::Fail(f) => Next::Fail(f),
+            _ => Next::Stop,
+        }
     }
 
     fn fail(&mut self, f: Failure) -> Event {
@@ -949,7 +1037,11 @@ impl<P: Platform> Nvme<P> {
         };
         info.blocks = nsze;
         info.block_shift = lbads;
-        self.window = (0, nsze);
+        // The owner's window survives a reset in place if it still fits.
+        if !(self.window_set && self.window.0 + self.window.1 <= nsze) {
+            self.window = (0, nsze);
+            self.window_set = false;
+        }
         true
     }
 
@@ -984,6 +1076,13 @@ impl<P: Platform> Nvme<P> {
             };
             return Event::Reset(cause);
         }
+        // The controller is stopped before any request is handed back: a
+        // command in work may still move data into its cell until RDY = 0.
+        self.stage = Stage::QuiesceWrite(next);
+        Event::Working
+    }
+
+    fn step_drain(&mut self, next: Next) -> Event {
         // Up to the requests in work, one a step.
         for tag in 0..TAGS {
             if self.slots[tag] != Slot::Idle {
@@ -1002,7 +1101,7 @@ impl<P: Platform> Nvme<P> {
                 self.resets[RESETS - 1] = now;
                 // The oldest of the last three, when there are three.
                 let oldest = self.resets[0];
-                if oldest != 0 && now - oldest < RESET_WINDOW_NS {
+                if oldest != 0 && now - oldest < RESET_WINDOW_NS.max(3 * self.cap.timeout_ns()) {
                     self.p.log(format_args!("nvme: too many resets"));
                     self.stage = Stage::Failed;
                     return Event::Failed(Failure::TooManyResets);
@@ -1015,9 +1114,9 @@ impl<P: Platform> Nvme<P> {
                 self.stage = Stage::Failed;
                 Event::Failed(f)
             }
-            Next::Shutdown => {
-                self.stage = Stage::ShutWrite;
-                Event::Working
+            Next::Stop => {
+                self.stage = Stage::Stopped;
+                Event::Stopped
             }
         }
     }
@@ -1184,7 +1283,7 @@ impl<P: Platform> Nvme<P> {
         }
         b.done |= 1 << part;
         if !cqe.ok() && b.error.is_none() {
-            b.error = Some((cqe.sct, cqe.sc));
+            b.error = Some((cqe.sct, cqe.sc, cqe.dnr));
         }
         if b.done.count_ones() < b.parts as u32 {
             self.slots[tag] = Slot::Busy(b);
@@ -1198,7 +1297,7 @@ impl<P: Platform> Nvme<P> {
         }
         let outcome = match b.error {
             None => Outcome::Ok,
-            Some((sct, sc)) => Outcome::Error { sct, sc },
+            Some((sct, sc, dnr)) => Outcome::Error { sct, sc, dnr },
         };
         Event::Done(Completion {
             tag: tag as u8,

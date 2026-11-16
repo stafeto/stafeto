@@ -54,6 +54,11 @@ pub struct Scenario {
     pub no_namespace: bool,
     /// CC.EN is 1 and CSTS.RDY is 1 when the driver comes.
     pub initially_enabled: bool,
+    /// With `initially_enabled`: RDY rises this long after the driver comes
+    /// (firmware is still enabling the controller); 0 for RDY already set.
+    pub initial_rdy_after_ns: u64,
+    /// Failed commands carry Do Not Retry.
+    pub dnr: bool,
     /// RDY rises this long after CC.EN = 1, and falls this long after
     /// CC.EN = 0.
     pub rdy_delay_ns: u64,
@@ -90,6 +95,8 @@ impl Default for Scenario {
             odd_shift: None,
             no_namespace: false,
             initially_enabled: false,
+            initial_rdy_after_ns: 0,
+            dnr: false,
             rdy_delay_ns: 0,
             clear_delay_ns: 0,
             never_ready: false,
@@ -172,6 +179,9 @@ pub struct Inner {
     pub reg_accesses: u64,
     /// The times CC.EN fell.
     pub controller_resets: u32,
+    /// The transfers the controller made to or from the host's memory for
+    /// Read and Write commands.
+    pub dma_count: u32,
     pub flush_commands: u32,
     /// The queues the driver created: (queue id, depth, interrupt on, vector).
     pub created: Vec<(u16, u16, bool, u16)>,
@@ -193,8 +203,9 @@ impl Model {
             regions: std::vec![mem, cells],
             now: 1_000 * MS,
             cc: if enabled { regs::CC_EN } else { 0 },
-            rdy: enabled,
-            rdy_at: None,
+            rdy: enabled && scenario.initial_rdy_after_ns == 0,
+            rdy_at: (enabled && scenario.initial_rdy_after_ns > 0)
+                .then_some(1_000 * MS + scenario.initial_rdy_after_ns),
             clear_at: None,
             shst: 0,
             shst_at: None,
@@ -215,6 +226,7 @@ impl Model {
             reg_log: Vec::new(),
             reg_accesses: 0,
             controller_resets: 0,
+            dma_count: 0,
             flush_commands: 0,
             created: Vec::new(),
             interrupts: Vec::new(),
@@ -286,6 +298,15 @@ impl Model {
 
     pub fn controller_resets(&self) -> u32 {
         self.0.borrow().controller_resets
+    }
+
+    pub fn dma_count(&self) -> u32 {
+        self.0.borrow().dma_count
+    }
+
+    /// The commands the controller holds that have not completed.
+    pub fn in_work(&self) -> usize {
+        self.0.borrow().pending.len()
     }
 
     pub fn flush_commands(&self) -> u32 {
@@ -418,7 +439,7 @@ impl Inner {
         }
         if self.clear_at.is_some_and(|t| self.now >= t) {
             self.clear_at = None;
-            self.rdy = false;
+            self.finish_reset();
         }
         if self.shst_at.is_some_and(|t| self.now >= t) {
             self.shst_at = None;
@@ -438,6 +459,15 @@ impl Inner {
                 break;
             }
         }
+    }
+
+    /// RDY falls: until now the controller held its queues and its commands in
+    /// work, and could still move data to and from the host.
+    fn finish_reset(&mut self) {
+        self.q = [Queue::default(); 2];
+        self.pending.clear();
+        self.cfs = false;
+        self.rdy = false;
     }
 
     /// Runs the effect of the pending command `i` and posts its completion.
@@ -463,6 +493,7 @@ impl Inner {
                     }
                 }
                 Effect::Write { lba, segs } => {
+                    self.dma_count += 1;
                     let mut data = Vec::new();
                     for (pa, len) in segs {
                         match self.mem_get(*pa, *len) {
@@ -475,6 +506,7 @@ impl Inner {
                     }
                 }
                 Effect::Read { lba, segs } => {
+                    self.dma_count += 1;
                     let total: usize = segs.iter().map(|s| s.1).sum();
                     let blocks = total / self.bs();
                     let data: Vec<u8> = (*lba..*lba + blocks as u64)
@@ -496,7 +528,8 @@ impl Inner {
         let dw3 = p.cid as u32
             | (q.phase as u32) << 16
             | (status.1 as u32) << 17
-            | (status.0 as u32) << 25;
+            | (status.0 as u32) << 25
+            | ((status != (0, 0) && self.scenario.dnr) as u32) << 31;
         let (ien, iv) = (q.ien, q.iv);
         q.cq_tail += 1;
         if q.cq_tail == q.cq_depth {
@@ -606,15 +639,15 @@ impl Inner {
                 }
             }
         } else if !new_en && old_en {
+            if self.rdy_at.is_some() {
+                self.violation("CC.EN cleared while the controller was still becoming ready");
+            }
             self.controller_resets += 1;
-            self.q = [Queue::default(); 2];
-            self.pending.clear();
-            self.cfs = false;
             self.shst = 0;
             self.rdy_at = None;
             if !self.scenario.never_clear {
                 if self.scenario.clear_delay_ns == 0 {
-                    self.rdy = false;
+                    self.finish_reset();
                 } else {
                     self.clear_at = Some(self.now + self.scenario.clear_delay_ns);
                 }
@@ -952,6 +985,8 @@ impl Platform for Model {
     fn wmb(&self) {
         self.0.borrow_mut().barrier = true;
     }
+
+    fn rmb(&self) {}
 
     fn log(&self, line: fmt::Arguments<'_>) {
         self.0.borrow_mut().log.push(line.to_string());

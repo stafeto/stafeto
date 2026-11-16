@@ -83,6 +83,8 @@ pub struct Cqe {
     pub phase: bool,
     pub sc: u8,
     pub sct: u8,
+    /// Do Not Retry.
+    pub dnr: bool,
 }
 
 impl Cqe {
@@ -95,6 +97,7 @@ impl Cqe {
             phase: w[3] >> 16 & 1 != 0,
             sc: (w[3] >> 17) as u8,
             sct: (w[3] >> 25 & 7) as u8,
+            dnr: w[3] >> 31 != 0,
         }
     }
 

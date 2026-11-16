@@ -387,7 +387,7 @@ fn a_namespace_the_driver_cannot_run_ends_the_bring_up() {
 }
 
 #[test]
-fn what_cap_lacks_ends_the_bring_up_before_the_controller_is_touched() {
+fn what_cap_lacks_ends_the_bring_up_before_a_queue_is_set_up() {
     let cases: [(Tweak, Unsupported); 3] = [
         (Box::new(|s| s.css = 0), Unsupported::CommandSet),
         (Box::new(|s| s.mpsmin = 1), Unsupported::PageSize),
@@ -399,7 +399,8 @@ fn what_cap_lacks_ends_the_bring_up_before_the_controller_is_touched() {
         let mut r = rig(s);
         let e = r.until(S, |e| matches!(e, Event::Failed(_)));
         assert_eq!(e, [Event::Failed(Failure::Unsupported(what))]);
-        assert!(r.model.reg_log().is_empty());
+        // Only the disable of the quiesce: no queue was set up.
+        assert!(r.model.reg_log().iter().all(|w| *w == (regs::CC, 0)));
     }
 }
 
@@ -700,7 +701,11 @@ fn an_error_status_is_reported_and_the_cell_can_be_used_again() {
         r.done(1),
         [Completion {
             tag: 0,
-            outcome: Outcome::Error { sct: 2, sc: 0x81 }
+            outcome: Outcome::Error {
+                sct: 2,
+                sc: 0x81,
+                dnr: false
+            }
         }]
     );
     r.model.set(|s| s.io_error = None);
@@ -1003,4 +1008,134 @@ fn the_steps_of_a_long_run_make_one_register_access_at_most() {
     r.model.inject_fatal();
     r.until(30 * S, |e| *e == Event::Up);
     r.clean();
+}
+
+// ----- the review's fixes -----
+
+#[test]
+fn the_window_survives_a_reset_in_place() {
+    let mut r = up(s());
+    assert!(r.dev.set_window(100, 50));
+    r.model.inject_fatal();
+    r.until(30 * S, |e| *e == Event::Up);
+    assert_eq!(r.dev.blocks(), 50);
+    let data = r.put(0, 49, 1, 7);
+    assert_eq!(r.model.media(149, 1), data);
+    assert_eq!(r.write(0, 50, 1), Err(Reject::Range));
+    r.clean();
+}
+
+#[test]
+fn a_shutdown_before_the_controller_is_up_only_disables_it() {
+    for polls in [0, 3, 8, 12] {
+        let mut r = rig(s());
+        for _ in 0..polls {
+            r.step();
+        }
+        r.dev.shutdown();
+        let e = r.until(10 * S, |e| *e == Event::Stopped);
+        assert_eq!(e, [Event::Stopped]);
+        // CC is never written with EN and SHN: no queues exist to shut down.
+        assert!(
+            r.model
+                .reg_log()
+                .iter()
+                .all(|(o, v)| *o != regs::CC || *v & regs::CC_SHN_MASK == 0),
+            "{polls}: {:?}",
+            r.model.reg_log()
+        );
+        assert_eq!(r.model.reg_log().last().unwrap(), &(regs::CC, 0));
+        r.clean();
+    }
+}
+
+#[test]
+fn a_shutdown_during_a_reset_ends_in_stopped() {
+    let mut r = up(s());
+    r.model.inject_fatal();
+    r.step();
+    r.dev.shutdown();
+    r.until(10 * S, |e| *e == Event::Stopped);
+}
+
+#[test]
+fn requests_are_handed_back_only_after_the_controller_stopped() {
+    // Catches break-nvme-abort-early: the controller keeps its commands, and
+    // may still move data into a cell, until CSTS.RDY falls.
+    let mut sc = s();
+    sc.clear_delay_ns = 300 * MS;
+    let mut r = up(sc);
+    r.model.set(|s| s.io_delay_ns = 200 * MS);
+    r.cell(0).fill(0);
+    r.read(0, 0, 8).unwrap();
+    r.model.inject_fatal();
+    r.until(30 * S, |e| matches!(e, Event::Done(_)));
+    assert_eq!(r.model.in_work(), 0);
+    let dma = r.model.dma_count();
+    r.pump(S);
+    assert_eq!(r.model.dma_count(), dma);
+    r.clean();
+}
+
+#[test]
+fn a_controller_that_is_still_becoming_ready_is_waited_for_before_it_is_disabled() {
+    let mut sc = s();
+    sc.initially_enabled = true;
+    sc.initial_rdy_after_ns = 300 * MS;
+    let mut r = rig(sc);
+    let t0 = r.model.now();
+    r.up();
+    assert_eq!(r.model.reg_log()[0], (regs::CC, 0));
+    // The model notes an EN cleared before RDY rose.
+    r.clean();
+    assert!(r.model.now() - t0 >= 300 * MS);
+}
+
+#[test]
+fn a_controller_that_never_becomes_ready_is_disabled_after_cap_to() {
+    let mut sc = s();
+    sc.initially_enabled = true;
+    sc.initial_rdy_after_ns = 10 * S;
+    let mut r = rig(sc);
+    let t0 = r.model.now();
+    while r.model.reg_log().is_empty() {
+        r.step();
+        r.model.advance(MS);
+        assert!(r.model.now() - t0 < 5 * S);
+    }
+    assert!(r.model.now() - t0 >= S);
+}
+
+#[test]
+fn the_do_not_retry_bit_is_reported() {
+    let mut sc = s();
+    sc.dnr = true;
+    let mut r = up(sc);
+    r.model.set(|s| s.io_error = Some((READ, 2, 0x81)));
+    r.read(0, 0, 8).unwrap();
+    assert_eq!(
+        r.done(1)[0].outcome,
+        Outcome::Error {
+            sct: 2,
+            sc: 0x81,
+            dnr: true
+        }
+    );
+    assert!(cmd::Cqe::decode([0, 0, 0, 1 << 31]).dnr);
+}
+
+#[test]
+fn the_reset_window_grows_with_cap_to() {
+    // CAP.TO of 200 is 100 s: three resets 70 s apart are inside 3 x 100 s.
+    let mut sc = s();
+    sc.to = 200;
+    let mut r = up(sc);
+    let mut last = None;
+    for _ in 0..3 {
+        r.pump(70 * S);
+        r.model.inject_fatal();
+        let e = r.until(30 * S, |e| matches!(e, Event::Up | Event::Failed(_)));
+        last = e.last().copied();
+    }
+    assert_eq!(last, Some(Event::Failed(Failure::TooManyResets)));
 }

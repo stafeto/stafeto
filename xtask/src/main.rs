@@ -2933,7 +2933,7 @@ fn ena_breaks() -> Result<(), String> {
 /// The deliberate breaks of the NVMe driver (`cargo xtask nvme-breaks`): each
 /// is a feature of `lib/nvme` that does one wrong thing, and its host tests
 /// pass without it and fail with it.
-const NVME_BREAKS: [&str; 9] = [
+const NVME_BREAKS: [&str; 10] = [
     "break-nvme-cq-phase",
     "break-nvme-prp2",
     "break-nvme-dstrd",
@@ -2943,6 +2943,7 @@ const NVME_BREAKS: [&str; 9] = [
     "break-nvme-wmb",
     "break-nvme-reset-wait",
     "break-nvme-sq-head",
+    "break-nvme-abort-early",
 ];
 
 fn nvme_breaks() -> Result<(), String> {
