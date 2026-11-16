@@ -508,9 +508,9 @@ impl Probe<'_> {
             return Err("ATTACH of a stride under the width was not refused");
         }
         let (objects, at) = self.buffers(2, bytes)?;
-        self.attach(&window, stride, &objects)
+        self.attach(&window, stride, &objects[..2])
             .map_err(say("ATTACH"))?;
-        if !refused(self.attach(&window, stride, &objects), code(BUSY)) {
+        if !refused(self.attach(&window, stride, &objects[..2]), code(BUSY)) {
             return Err("a second ATTACH was not BUSY");
         }
         rt::println!("comp-probe: ATTACH takes the buffers once and checks them");
@@ -607,7 +607,7 @@ impl Probe<'_> {
             .create(&display, SECOND, FORMAT_XRGB8888)
             .map_err(say("the second WINDOW_CREATE"))?;
         let (objects2, at2) = self.buffers(1, 100 * 100 * 4)?;
-        self.attach(&second, 400, &objects2)
+        self.attach(&second, 400, &objects2[..1])
             .map_err(say("ATTACH"))?;
         for y in 0..100u32 {
             for x in 0..100u32 {
