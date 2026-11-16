@@ -168,32 +168,33 @@ stats_text(char *out, size_t cap)
         s.free_low, s.free_now, accepted, served, echoed, held_count);
 }
 
-/* The datagrams of port 7: the echo, and the two commands. */
-/* The stack asks for the hardware address of the user network's name server
- * (the address ending in 3 of the net of the claim): the user network answers
- * that ARP request, and the answer is the ARP reply for the stack's address
- * that the layer copies to the network service through the bypass ring. The
- * request has to come from the stack itself. The stack's gratuitous ARP at
- * the start teaches the user network the stack's address, so that its first
- * datagram needs no ARP request of the user network's own, and the stack's
- * request for the host's address follows. When the first datagram comes
- * before the gratuitous ARP is taken, the user network asks first, the stack
- * learns the host's address from that request, and no ARP reply for the
- * stack ever comes. */
+/* `?arp`: the stack asks for the hardware address of the user network's
+ * name server (the address ending in 3 of the net of the claim). The user
+ * network answers that ARP request, and the answer is an ARP reply for the
+ * stack's address that the layer copies to the network service through the
+ * bypass ring. The request has to come from the stack itself: the stack's
+ * gratuitous ARP at the start teaches the user network the stack's address
+ * only when it is taken before the host's first datagram, and then the stack
+ * asks for the host's address itself; in the other order the user network asks
+ * first, the stack learns the host's address from that request, and no ARP
+ * reply for the stack ever comes. */
+static uint8_t address[4];
+
 static void
-ask_arp_once(const struct stafeto_fast_claim *claim)
+ask_arp_once(void)
 {
     struct sockaddr_in to;
 
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
     to.sin_port = htons(9);
-    to.sin_addr.s_addr = htonl((uint32_t)claim->config.address[0] << 24 |
-        (uint32_t)claim->config.address[1] << 16 |
-        (uint32_t)claim->config.address[2] << 8 | 3);
+    to.sin_addr.s_addr = htonl((uint32_t)address[0] << 24 |
+        (uint32_t)address[1] << 16 |
+        (uint32_t)address[2] << 8 | 3);
     (void)ff_sendto(udp_fd, "arp", 3, 0, (struct linux_sockaddr *)&to, sizeof(to));
 }
 
+/* The datagrams of port 7: the echo, and the commands. */
 static int
 serve_udp(void)
 {
@@ -220,6 +221,10 @@ serve_udp(void)
             if (len > (int)sizeof(text) - 1)
                 len = (int)sizeof(text) - 1;
             ff_sendto(udp_fd, text, (size_t)len, 0, (struct linux_sockaddr *)&from, flen);
+            continue;
+        }
+        if (got == 4 && memcmp(buf, "?arp", 4) == 0) {
+            ask_arp_once();
             continue;
         }
         if (got == 8 && memcmp(buf, "?release", 8) == 0) {
@@ -431,7 +436,7 @@ fstack_device_main(int argc, char **argv)
         (unsigned long long)claim.objects[3].pa, (unsigned long long)claim.objects[4].pa);
     udp_fd = open_udp(UDP_PORT);
     tcp_fd = open_tcp(TCP_PORT);
-    ask_arp_once(&claim);
+    memcpy(address, claim.config.address, 4);
     if (mode == MODE_FLOOD)
         flood(&claim);
     printf("fstack-probe: device serving\n");

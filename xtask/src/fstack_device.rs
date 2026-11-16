@@ -11,15 +11,14 @@
 //! drives the shell:
 //!
 //! 1. `fstack-probe device &`: the stack starts on the device; 300
-//!    datagrams of the echo come back byte for byte (the program first has the
-//!    stack ask ARP for the user network's name server, so that an ARP reply
-//!    for the stack's address always comes; slirp or the stack may ask the
+//!    datagrams of the echo come back byte for byte (slirp or the stack asks
 //!    ARP for the host first, depending on which frame is taken first); the page of 1 MiB comes three
 //!    times in turn and four at once, byte for byte; the latency of a
 //!    datagram after a pause (the interrupts on, the queue looked at again);
 //!    the rate of the echo with 32 datagrams in flight; the layer's counters
-//!    (`?stats`): the frames came in without a copy, an ARP reply went to the
-//!    network service through the bypass ring; `?stop` ends the program and
+//!    (`?stats`, after `?arp`, which has the stack ask ARP for the user
+//!    network's name server): the frames came in without a copy, an ARP reply
+//!    went to the network service through the bypass ring; `?stop` ends the program and
 //!    the device comes back;
 //! 2. `fstack-probe device hold &`: 500 connections of TCP 80 each send
 //!    twenty segments that nobody reads, so the stack keeps more than the pool
@@ -441,6 +440,11 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
             let rate = echo_rate(&udp, 3000, 32)?;
             notes.push(format!("echo rate with 32 in flight {rate:.0} datagrams/s"));
         }
+        // The stack asks ARP itself for the name server of the user network: the
+        // reply is the frame the ring has to carry, whichever frame was taken first
+        // at the start.
+        udp.send(b"?arp").map_err(|e| format!("?arp: {e}"))?;
+        std::thread::sleep(Duration::from_millis(500));
         let stats = stats_of(&udp)?;
         let get = |k: &str| stat(&stats, k);
         if get("bypass") < 1 {
@@ -645,20 +649,20 @@ mod tests {
     }
 
     /// The ARP reply that the check of the bypass ring counts has to come
-    /// from a request of the stack itself, made before the program says it
-    /// serves. Without that request the reply exists only when the stack's
-    /// gratuitous ARP reaches the user network before the first datagram of
-    /// the host (a race: 2 of 10 runs of the probe had no reply).
+    /// from a request of the stack itself, which `?arp` makes. Without it the
+    /// reply exists only when the stack's gratuitous ARP reaches the user
+    /// network before the first datagram of the host (a race: 2 of 10 runs of
+    /// the probe had no reply).
     #[test]
-    fn the_program_asks_arp_before_it_serves() {
+    fn the_probe_has_the_stack_ask_arp_before_the_counters() {
         let source =
             std::fs::read_to_string(crate::root().join("tests/fstack-probe/device.c")).unwrap();
-        let asks = source.find("    ask_arp_once(&claim);").expect("the ask");
-        let serves = source
-            .find("printf(\"fstack-probe: device serving\\n\");")
-            .expect("the line");
-        assert!(asks < serves);
-        assert!(source.contains("(uint32_t)claim->config.address[2] << 8 | 3);"));
+        assert!(source.contains("memcmp(buf, \"?arp\", 4) == 0"));
+        assert!(source.contains("address[2] << 8 | 3);"));
+        let text = include_str!("fstack_device.rs");
+        let ask = text.find("udp.send(b\"?arp\")").expect("the ask");
+        let stats = text[ask..].find("stats_of(&udp)").expect("the stats");
+        assert!(stats > 0);
     }
 
     #[test]
