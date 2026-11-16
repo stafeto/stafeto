@@ -63,6 +63,23 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     list
 }
 
+/// The programs of the image of `cargo xtask pkg-probe memory`: those of the base image with
+/// the store of the package service in memory: init's feature `memory-store`, and the memory
+/// disk (services/mem-blk) where the Virtio driver was.
+pub fn memory_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        programs(BASE_IMAGE)
+            .iter()
+            .map(|&(name, package, stack, features)| match name {
+                "init" => (name, package, stack, &["table-base", "memory-store"][..]),
+                "virtio-blk" => ("mem-blk", "mem-blk", blk_probe::BLK_STACK_SIZE, &[][..]),
+                _ => (name, package, stack, features),
+            })
+            .collect()
+    })
+}
+
 /// The devices of the machine of both images: the screen, the keyboard, the
 /// network device on user-mode networking, and the disk of the package
 /// service, the file `store` (`qemu::store_file` makes it).
@@ -71,6 +88,14 @@ pub fn machine_args(store: &Path) -> Vec<String> {
     args.extend(qemu::KEYBOARD.iter().map(|s| (*s).to_owned()));
     args.extend(qemu::net(&[]));
     args.extend(qemu::store(store, None));
+    args
+}
+
+/// The devices of the machine of the memory image: `machine_args` without the disk.
+pub fn memory_machine_args() -> Vec<String> {
+    let mut args: Vec<String> = qemu::GPU.iter().map(|s| (*s).to_owned()).collect();
+    args.extend(qemu::KEYBOARD.iter().map(|s| (*s).to_owned()));
+    args.extend(qemu::net(&[]));
     args
 }
 

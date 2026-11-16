@@ -155,6 +155,38 @@ pub const BLK: Record = Record {
     free: 0,
 };
 
+/// The bytes of the store of an image with no disk: 256 MiB, the object of the memory disk.
+pub const MEMORY_STORE_BYTES: u64 = 256 << 20;
+
+/// The own arguments of the memory disk: the size of its object in bytes.
+const MEMBLK_ARGS: [u8; 8] = MEMORY_STORE_BYTES.to_le_bytes();
+
+/// The disk service over a memory object (services/mem-blk), under the name and at the level of
+/// the Virtio driver, so `pkgd` finds it the same way. It needs no window, no binding and no
+/// DMA. Its quota is the pages of the object and 2 048 for their list, the mappings and the
+/// client's buffer. It never restarts: a new instance would show a running `pkgd` an empty
+/// disk.
+pub const MEMBLK: Record = Record {
+    program: "mem-blk",
+    quota: (MEMORY_STORE_BYTES / PAGE + 2_048) * PAGE,
+    restart: Restart::Never,
+    windows: &[],
+    bindings: &[],
+    args: &MEMBLK_ARGS,
+    dma: &[],
+    quiesce: &[],
+    trusted: false,
+    ..BLK
+};
+
+/// The disk service of the images with a package service: the Virtio disk, or with the feature
+/// `memory-store` the memory disk (`cargo xtask pkg-probe memory`).
+pub const STORE_BLK: Record = if cfg!(feature = "memory-store") {
+    MEMBLK
+} else {
+    BLK
+};
+
 /// The probe of the disk (tests/blk-probe): a client of the service, at 30.
 /// It picks its mode from sector 0 of the disk: a pattern and a flush, the
 /// check of the pattern with a restart of the service, or the faults the
@@ -337,6 +369,26 @@ mod tests {
         assert_eq!(BLK.args[8..], 1u64.to_le_bytes());
         assert_eq!(BLK.dma[0].size, 32 * PAGE);
         assert!(BLK.dma[0].uncached && BLK.trusted);
+    }
+
+    #[test]
+    fn the_memory_disk_is_the_disk_service_with_no_device_and_an_object_of_256_mib() {
+        assert_eq!(MEMBLK.name, "blk");
+        assert_eq!(MEMBLK.program, "mem-blk");
+        assert_eq!(MEMBLK.args, &(256u64 << 20).to_le_bytes());
+        assert!(MEMBLK.windows.is_empty() && MEMBLK.bindings.is_empty() && MEMBLK.dma.is_empty());
+        assert!(MEMBLK.quiesce.is_empty() && !MEMBLK.trusted);
+        assert_eq!(MEMBLK.restart, Restart::Never);
+        const { assert!(MEMBLK.quota >= MEMORY_STORE_BYTES) };
+        // The level of the driver: above the package service, which calls it.
+        assert_eq!((MEMBLK.priority, MEMBLK.ceiling), (39, 39));
+        const { assert!(PKGD.ceiling <= MEMBLK.priority) };
+        // The store probe's table with the memory disk as its `blk` is a good table.
+        let table: Vec<Record> = STORE_PROBE_TABLE
+            .iter()
+            .map(|r| if r.name == "blk" { MEMBLK } else { *r })
+            .collect();
+        assert!(crate::table::check(&table).is_ok());
     }
 
     #[test]

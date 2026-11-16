@@ -1,0 +1,18 @@
+# /etc/rc: the boot script. The launcher of the shell (ash-launcher, with this
+# file as its argument in init's table) runs it with `ash` at each boot,
+# beside the shell: the prompt does not wait for it.
+#
+# The files of /etc/rc.d run in the order of the list below, each one to its
+# end, and each one waits for what it needs (the network) by itself. A service
+# of the image joins by shipping a file in /etc/rc.d and putting its name in
+# the list after the names whose work it needs: a server that reads
+# /root/.ssh/authorized_keys goes after `ec2-key`.
+
+# The console, for the lines the scripts print.
+exec </dev/null >/dev/console 2>&1
+
+for name in ec2-key; do
+    if [ -f "/etc/rc.d/$name" ]; then
+        ash "/etc/rc.d/$name"
+    fi
+done

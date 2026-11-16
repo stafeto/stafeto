@@ -1,0 +1,21 @@
+[package]
+name = "mem-blk"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The disk service over a memory object: the store of the package service on an image with no disk"
+
+[[bin]]
+name = "mem-blk"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-blk = { path = "../../proto/blk" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
+virtio-blk = { path = "../virtio-blk" }

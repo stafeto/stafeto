@@ -797,6 +797,7 @@ mod tests {
                 "net-probe",
                 "net-curl",
                 "net-wget",
+                "net-ec2-key",
                 "net-tls",
                 "posix-net",
                 "fstack-probe",

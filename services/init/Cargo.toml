@@ -89,6 +89,9 @@ table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
 table-doom = []
 table-base = []
+# The store of the package service in memory: the base table's disk service is the memory disk
+# (xtask pkg-probe memory).
+memory-store = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
 # The probe of the terminal service (xtask tty, tty-vz).
@@ -114,6 +117,9 @@ table-net = []
 # with an ITS, a virtio-net-pci with a vector of MSI-X a queue (table/net.rs,
 # NETD_ITS; xtask's machine ITS).
 net-its = []
+# With table-net: the launcher runs the boot script /etc/rc beside the shell
+# (xtask net-ec2-key; the shell on EC2 does it always).
+net-rc = []
 table-net-probe = []
 # The probe's image with both network devices on QEMU.
 table-net-probe-two = []
