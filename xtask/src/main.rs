@@ -89,6 +89,7 @@ mod net;
 mod net_bench;
 mod net_curl;
 mod net_probe;
+mod net_ssh;
 mod net_tls;
 mod net_trace;
 mod net_vz;
@@ -1024,7 +1025,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 10] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1038,6 +1039,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 10] = [
     ("doom", "doom", 0, &["dynamic"]),
     ("openssl", "openssl", 0, &["dynamic"]),
     ("curl", "curl", 0, &["dynamic"]),
+    ("dropbear", "dropbear", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
 ];
@@ -2252,6 +2254,9 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  net-ssh [MACHINE] run the SSH server (Dropbear) of boot-ssh-probe.img: logins
+            with a key from the host's `ssh`, a key and long passwords refused,
+            the server's command line from /proc, the pseudo terminals
   fstack-probe [write-blocking] [MACHINE] run `fstack-probe` in the guest:
             the TCP/IP stack of FreeBSD 15 (F-Stack) in a process on its own
             loopback: 16 MiB through a pair of sockets, kqueue, a partial
@@ -2671,6 +2676,7 @@ fn main() {
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
+        Some("net-ssh") => net_ssh::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
         Some("net-bench") => net_bench::command(&args[1..]),
@@ -4949,6 +4955,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("fast-layer", _) => "fast-layer",
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
+        ("dropbear", _) => "dropbear",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
         _ => panic!("no dynamic build of the program {package}"),
@@ -10448,6 +10455,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // guest, UDP both ways and the checks of `net-sock`, through the
         // ports QEMU forwards. Also in the group `net`.
         job("net-curl", || net_curl::probe(&qemu::VIRT, false)),
+        // The SSH server (Dropbear) of the image with the network service:
+        // logins with a key from the host's `ssh`, the refusals of another
+        // key and of long passwords, the command line of the server and the
+        // pseudo terminals. Also in the group `net`.
+        job("net-ssh", || net_ssh::probe(&qemu::VIRT)),
         // The way out: BusyBox `wget` over HTTP and HTTPS to servers on the
         // host, the lookups of the resolver against name servers in the
         // guest, and the file `/etc/resolv.conf` the service writes.

@@ -1644,6 +1644,7 @@ pub const WWW_INDEX_LEN: usize = 64 * 1024;
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
+    "boot-ssh-probe.img",
     "boot-net-curl-steps.img",
     "boot-net-tls.img",
     "boot-net-tls-steps.img",
@@ -1850,6 +1851,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         "boot-net.img"
         | "boot-net-its.img"
+        | "boot-ssh-probe.img"
         | "boot-net-curl-steps.img"
         | "boot-posix-net-steps.img" => net_files(name),
         // The shell's image with the probe of F-Stack.
@@ -2810,6 +2812,7 @@ mod tests {
                     crate::base_image::programs(image)
                 }
                 "boot-net.img" => crate::net::programs(),
+                "boot-ssh-probe.img" => crate::net_ssh::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),

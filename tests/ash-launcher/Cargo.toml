@@ -12,6 +12,8 @@ build = "build.rs"
 # the dialog (posix-crt/uart-input).
 [features]
 interactive = ["posix-crt/uart-input"]
+# Also starts the SSH server of the package dropbear and keeps it running.
+dropbear = []
 
 [[bin]]
 name = "ash-launcher"

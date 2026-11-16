@@ -144,6 +144,19 @@ them for the licence notes of the image.
   `CURL-SOURCE`, `CA-BUNDLE-LICENSE`, `CA-BUNDLE-SOURCE`). The images of the
   probe of TLS (`cargo xtask net-tls`) replace the bytes of the CA file with
   the same roots plus the probe CA of `cargo xtask probe-ca`.
+- Dropbear 2026.94 (`/bin/dropbear`, MIT with parts under BSD-2-Clause and others: its whole
+  `LICENSE` file is the package's licence) is the SSH server, an optional network package built
+  by `tools/build-dropbear.py`: the server alone with its bundled LibTomCrypt and LibTomMath,
+  no zlib, no PAM, no utmp, wtmp, lastlog or syslog, and the options of
+  `tools/dropbear/localoptions.h` (no re-execution of the server for a connection, no SFTP
+  server, no agent or X11 forwarding). The description makes the empty directory
+  `/etc/dropbear`: the host keys are made on the first start. The launcher of the image
+  (`tests/ash-launcher` with the feature `dropbear`) runs `dropbear -F -E -R -s -j -k`: no
+  password login at all, no port forwarding, the log on the standard error, host keys made when
+  first needed; the server is started again a second after it ends. `cargo xtask net-ssh` runs
+  it on `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused
+  key, refused passwords of 257 and 1 024 bytes, the command line of the server from
+  `/proc/<pid>/cmdline` and the pseudo terminals.
 - nginx 1.30.6 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
   `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
   exception, linked into nginx, no file of its own) are network packages

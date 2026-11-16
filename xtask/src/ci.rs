@@ -796,6 +796,7 @@ mod tests {
             [
                 "net-probe",
                 "net-curl",
+                "net-ssh",
                 "net-wget",
                 "net-tls",
                 "posix-net",
