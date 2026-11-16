@@ -1881,7 +1881,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, memory, 4),
         (own, table, 4),
         (own, abi::INFO_PROCESS_TIME, 3),
-        (thread, thread_state, 7),
+        (thread, thread_state, 8),
         (seen, channel_kind, 5),
     ]
     .map(|(h, kind, past)| {
