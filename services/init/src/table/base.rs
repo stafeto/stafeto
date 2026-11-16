@@ -76,8 +76,8 @@ pub const BASE_PROCESS_SERVICE: Record = Record {
 /// The table of the base and the full image.
 ///
 /// What init has free after the services started (the line `init: free pages`,
-/// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 26 843 pages of
-/// 127 972 on 512 MiB; `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
+/// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 16 440 pages of
+/// 127 388 on 512 MiB (16 813 before the compositor took its quota of 336 pages); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
 /// of 54 MB leaves the memory of init about 11 000 pages smaller than the base image's, and the
 /// pool of the process service (16 quotas of 4 096 pages) stays; so the full image runs on 1 GiB
 /// (xtask `base_image::machine`), where the number is the one in docs/packages.md. The disk

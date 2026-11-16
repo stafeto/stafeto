@@ -76,7 +76,7 @@ pub fn machine_args(store: &Path) -> Vec<String> {
 }
 
 /// The machine of an image: the full image runs on 1 GiB, because on 512 MiB
-/// its container of 54 MB leaves init 15 837 free pages (the base image, 26 843
+/// its container of 54 MB leaves init 15 837 free pages (the base image, 16 440
 /// on 512 MiB, stays there); the archive of the full image names it in its
 /// `run.sh` (spec 5, release).
 pub fn machine(image: &str) -> &'static qemu::Machine {
