@@ -486,11 +486,31 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         let seen = run.lines().to_vec();
         command_line(&mut run, &seen)?;
         // The key of the probe, and an account whose field is `*`.
-        run.send(&format!(
-            "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '{good_line}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && echo 'star:x:1001:100:star:/tmp:/bin/ash' >> /etc/passwd && echo 'star:*:20000:0:99999:7:::' >> /etc/shadow && echo placed-$?"
-        ))?;
-        run.expect_line("the key placed", |l| l.trim() == "placed-0", DIALOG_STEP)?;
-        run.expect("# ", DIALOG_STEP)?;
+        // (Lines of the shell stay short: the terminal takes 256 bytes a line.)
+        for (marker, step) in [
+            (
+                "dir",
+                "mkdir -p /root/.ssh && chmod 700 /root/.ssh".to_owned(),
+            ),
+            (
+                "key",
+                format!("echo '{good_line}' > /root/.ssh/authorized_keys"),
+            ),
+            ("mode", "chmod 600 /root/.ssh/authorized_keys".to_owned()),
+            (
+                "passwd",
+                "echo 'star:x:1001:100:star:/tmp:/bin/ash' >> /etc/passwd".to_owned(),
+            ),
+            (
+                "shadow",
+                "echo 'star:*:20000:0:99999:7:::' >> /etc/shadow".to_owned(),
+            ),
+        ] {
+            let lines = guest(&mut run, &format!("{step} && echo done-$S"), marker)?;
+            if !lines.iter().any(|l| l.trim() == "done-ok") {
+                return Err(format!("{step:?} did not end well: {lines:?}"));
+            }
+        }
         // 3.
         let mut ssh = client.command("root", Some(&good), true);
         ssh.arg("echo ssh-ok-$((6*7)); id -u");
