@@ -183,7 +183,16 @@ static uint8_t address[4];
 static void
 ask_arp_once(void)
 {
+    static int fd = -1;
     struct sockaddr_in to;
+
+    /* A socket of its own: a datagram from port 7 to the name server would
+     * take the place of the user network's forwarding of port 7. */
+    if (fd < 0) {
+        fd = ff_socket(AF_INET, SOCK_DGRAM, 0);
+        REQUIRE(fd >= 0);
+        nonblocking(fd);
+    }
 
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
@@ -191,7 +200,7 @@ ask_arp_once(void)
     to.sin_addr.s_addr = htonl((uint32_t)address[0] << 24 |
         (uint32_t)address[1] << 16 |
         (uint32_t)address[2] << 8 | 3);
-    (void)ff_sendto(udp_fd, "arp", 3, 0, (struct linux_sockaddr *)&to, sizeof(to));
+    (void)ff_sendto(fd, "arp", 3, 0, (struct linux_sockaddr *)&to, sizeof(to));
 }
 
 /* The datagrams of port 7: the echo, and the commands. */
