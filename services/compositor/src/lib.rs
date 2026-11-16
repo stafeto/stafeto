@@ -886,8 +886,8 @@ impl Scene {
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
         let layers = argb + cursor;
-        if layers > 0 {
-            let budget = (OVER_POINTS / layers).max(1);
+        if let Some(share) = OVER_POINTS.checked_div(layers) {
+            let budget = share.max(1);
             let w = damage.w.min(budget).max(1);
             (w, (budget / w).clamp(1, BAND_ROWS / 2))
         } else if covered {
