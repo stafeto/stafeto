@@ -1076,6 +1076,11 @@ fn aws_programs() -> &'static [ImageProgram] {
         // The entropy service seeds from the boot page (init's `entropy::SEED_TABLE`);
         // EC2 has no Virtio RNG, so `virtio-rng` stays out.
         programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "entropy"));
+        // The package service with its store in memory (init's records `blk` and `pkgd`):
+        // the memory disk, `pkgd` and the tool `/bin/pkg`, started from its file.
+        programs.push(("mem-blk", "mem-blk", blk_probe::BLK_STACK_SIZE, &[]));
+        programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
+        programs.push(("pkg", "pkg", 0, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -2219,11 +2224,13 @@ commands:
             READY, after the deadline of 3 s, and at once when the service ended
   pkg-slot  run the C probe of the package service's session in fork, spawn and exec,
             a set-ID program and the superuser's right, in QEMU
-  pkg-probe [install] [--hvf] run the package tool in the base image against mirrors of
+  pkg-probe [install|memory] [--hvf] run the package tool in the base image against mirrors of
             the repositories over https that the command starts and ends: pkg install doom
             and the demo, update, list, info, search, check and the log of the mirror
             (install stops there); the plain command goes on with every refusal, remove,
-            upgrade, the second repository and a restart on the same disk
+            upgrade, the second repository and a restart on the same disk; memory runs the
+            install steps on EC2's store, the memory disk of 256 MiB on a 2 GiB machine with
+            no disk, then removes Doom, installs it again and shows an empty store after a reboot
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its

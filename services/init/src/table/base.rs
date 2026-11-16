@@ -13,7 +13,7 @@
 
 use super::doom;
 use super::net::{NET_COMMAND_QUOTA, NET_PROCESS_SERVICE, NETD};
-use super::pkg::{BLK, PKGD};
+use super::pkg::{PKGD, STORE_BLK};
 use super::{NET_SERVICE, Record, Wait};
 
 // BASE_TABLE copies the records of the games table by number.
@@ -95,6 +95,6 @@ pub const BASE_TABLE: &[Record] = &[
     doom::TABLE[9],
     doom::TABLE[10],
     NETD,
-    BLK,
+    STORE_BLK,
     PKGD,
 ];

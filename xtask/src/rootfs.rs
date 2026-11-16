@@ -1712,6 +1712,7 @@ pub const IMAGES: &[&str] = &[
     "boot-base.img",
     "boot-full.img",
     "boot-pkg-probe.img",
+    "boot-pkg-probe-memory.img",
     "boot-sporadic.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
@@ -1833,12 +1834,6 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
-        // The shell on EC2 runs the boot script, which fetches the key of the instance.
-        "boot-aws.img" => {
-            let mut files = dialog(name);
-            files.extend(rc_files());
-            files
-        }
         // The probe of the boot script: the shell with the network, the script, and the
         // static address of `net-ec2-key` (the service of the metadata is not on the link).
         "boot-net-rc.img" => {
@@ -1860,7 +1855,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The full image without a package (`image full --without`) is the full image.
         name if matches!(
             name,
-            "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img"
+            "boot-base.img"
+                | "boot-full.img"
+                | "boot-pkg-probe.img"
+                | "boot-pkg-probe-memory.img"
+                | "boot-aws.img"
         ) || crate::packages::without_name(name).is_some() =>
         {
             let mut files = dialog(name);
@@ -1869,7 +1868,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     files.push(dir(d));
                 }
             }
-            if name == "boot-pkg-probe.img" {
+            if name == "boot-pkg-probe.img" || name == "boot-pkg-probe-memory.img" {
                 for f in files
                     .iter_mut()
                     .filter(|f| f.path == crate::net_tls::CA_BUNDLE)
@@ -1888,6 +1887,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     &crate::pkg::official_address(),
                     &official_roots(),
                 ));
+            }
+            // The shell on EC2 runs the boot script, which fetches the key of the instance.
+            if name == "boot-aws.img" {
+                files.extend(rc_files());
             }
             files
         }
@@ -2725,7 +2728,13 @@ mod tests {
                 _ => None,
             }
         };
-        for image in ["boot-base.img", "boot-full.img", "boot-pkg-probe.img"] {
+        for image in [
+            "boot-base.img",
+            "boot-full.img",
+            "boot-pkg-probe.img",
+            "boot-pkg-probe-memory.img",
+            "boot-aws.img",
+        ] {
             let files = files_of(image);
             let tool = files.iter().find(|f| f.path == "/bin/pkg").unwrap();
             assert_eq!((tool.mode, tool.uid, tool.gid), (0o755, 0, 0), "{image}");
@@ -2741,7 +2750,7 @@ mod tests {
             }
             assert!(is_system("/bin/pkg"));
         }
-        for image in ["boot-base.img", "boot-full.img"] {
+        for image in ["boot-base.img", "boot-full.img", "boot-aws.img"] {
             assert_eq!(
                 bytes(image, "/etc/pkg/official").unwrap(),
                 format!(
@@ -2852,6 +2861,7 @@ mod tests {
                 "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img" => {
                     crate::base_image::programs(image)
                 }
+                "boot-pkg-probe-memory.img" => crate::base_image::memory_programs(),
                 "boot-net.img" => crate::net::programs(),
                 "boot-net-rc.img" => crate::net_ec2_key::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
