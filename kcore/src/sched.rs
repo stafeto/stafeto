@@ -392,6 +392,14 @@ impl<T> Node<T> {
         self.ran
     }
 
+    /// One more preemption. Kept out of line: the decision is inlined into
+    /// the scheduler's loop, and a few bytes more there moved a step of the
+    /// RAM service past its guard in the probes of lock requests.
+    #[inline(never)]
+    fn count_preemption(&mut self) {
+        self.preempts = self.preempts.wrapping_add(1);
+    }
+
     /// Times the thread was preempted by a higher level (the count wraps at
     /// 2^16).
     pub fn preempts(&self) -> u16 {
@@ -931,7 +939,7 @@ impl<T: Schedulable> Scheduler<T> {
                 // The one place a higher level (or the cleanup) takes the
                 // CPU from a ready thread: a preemption.
                 let n = node(r);
-                n.preempts = n.preempts.wrapping_add(1);
+                n.count_preemption();
                 self.preempt(r, now)
             }
         }
