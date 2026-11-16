@@ -594,6 +594,16 @@ fn apart(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// The lines of the full scenario a measured run must show: those of the probe. The first lines of the
+/// package service come while every service starts and print at once, and the console drops some of
+/// them under -icount.
+fn steady_lines(world: &World) -> Vec<String> {
+    full_lines(world, true)
+        .into_iter()
+        .filter(|l| !l.starts_with("pkgd: "))
+        .collect()
+}
+
 /// `expect` for a run under -icount on the machine of the firmware, where the lines of the services come
 /// glued to each other: each wanted line is in some line, not necessarily alone.
 fn expect_within(lines: &[String], wanted: &[String]) -> Result<(), String> {
@@ -1087,7 +1097,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     write_disk(&file, None)?;
     let first = run(&image, &file.0, steps)?;
     if steps {
-        expect_within(&first, &full_lines(&world, steps))?;
+        expect_within(&first, &steady_lines(&world))?;
     } else {
         expect(&first, &full_lines(&world, steps))?;
     }
@@ -1223,7 +1233,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
     )?;
     if steps {
-        expect_within(&first, &full_lines(&world, steps))?;
+        expect_within(&first, &steady_lines(&world))?;
     } else {
         expect(&first, &full_lines(&world, steps))?;
     }
@@ -1287,7 +1297,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 true,
                 BOOT_TIMEOUT * 40,
             )?;
-            expect_within(&again, &full_lines(&world, true))?;
+            expect_within(&again, &steady_lines(&world))?;
             blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
             runs += 1;
         }
