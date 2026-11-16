@@ -52,7 +52,7 @@ pub const NETD_CONF: &[u8] =
 /// The address and port the guest asks for the metadata.
 const IMDS: &str = "169.254.169.254";
 
-/// The key the fake gives: not a real key, in the form of one.
+/// The key the fake gives: a made-up key in the form of a real one.
 const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEKEYFAKEKEYFAKEKEYFAKEKEYFAKEKEYFAKEKEYAB fake-key@xtask";
 /// The token the fake gives.
 const TOKEN: &str = "AQAEAFAKETOKENxtask0123456789abcdefghijklmnopqrstuvwxyz==";
@@ -693,6 +693,116 @@ mod tests {
             } else if mode == Mode::Refuse {
                 assert_eq!(lines.len(), 1, "no request without a token: {lines:?}");
             }
+        }
+    }
+
+    /// What the script does with replies a hostile service could send: it writes nothing,
+    /// says one line, and asks at most for the token and the key.
+    #[test]
+    fn the_script_refuses_hostile_replies_on_a_host() {
+        let have = |tool: &str| {
+            Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have("nc") || !have("tr") || !have("head") {
+            return;
+        }
+        let script = crate::root().join("tools/rc/ec2-key");
+        let work = crate::target_dir().join("net-ec2-key-hostile");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let ok = |body: &[u8]| -> Vec<u8> {
+            let mut r =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            r.extend_from_slice(body);
+            r
+        };
+        let token = ok(TOKEN.as_bytes());
+        let not_key = "the key is not one line of an OpenSSH public key, SSH stays off";
+        let not_word = "the metadata service gave a token that is not one word, SSH stays off";
+        let mut huge = b"ssh-ed25519 ".to_vec();
+        huge.resize(1 << 20, b'a');
+        let cases: Vec<(&str, Vec<Vec<u8>>, &str, usize)> = vec![
+            (
+                "control",
+                vec![token.clone(), ok(b"ssh-ed25519 AAAA c\x1b[31mred\x07")],
+                not_key,
+                2,
+            ),
+            ("newline-token", vec![ok(b"tok\nX-Evil: 1")], not_word, 1),
+            (
+                "status",
+                vec![b"HTTP/1.1 2*0 OK\r\n\r\nx".to_vec()],
+                "the metadata service gave no token (HTTP 000), SSH stays off",
+                1,
+            ),
+            ("huge", vec![token.clone(), ok(&huge)], not_key, 2),
+            (
+                "two-keys",
+                vec![token.clone(), ok(format!("{KEY}\n{KEY}").as_bytes())],
+                not_key,
+                2,
+            ),
+            (
+                "symlink",
+                vec![token.clone(), ok(KEY.as_bytes())],
+                "is a symbolic link, SSH stays off",
+                2,
+            ),
+        ];
+        for (name, replies, said, asked) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let mut heads = Vec::new();
+                for (n, stream) in listener.incoming().enumerate() {
+                    let mut stream: TcpStream = stream.unwrap();
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(k) => head.extend_from_slice(&chunk[..k]),
+                        }
+                    }
+                    if head.is_empty() {
+                        break;
+                    }
+                    heads.push(String::from_utf8_lossy(&head).into_owned());
+                    if let Some(reply) = replies.get(n) {
+                        let _ = stream.write_all(reply);
+                    }
+                }
+                heads
+            });
+            let ssh = work.join(format!("ssh-{name}"));
+            if name == "symlink" {
+                let target = work.join("target");
+                std::fs::create_dir_all(&target).unwrap();
+                std::os::unix::fs::symlink(&target, &ssh).unwrap();
+            }
+            let out = Command::new("sh")
+                .arg(&script)
+                .env("IMDS_HOST", "127.0.0.1")
+                .env("IMDS_PORT", port.to_string())
+                .env("SSH_DIR", &ssh)
+                .output()
+                .unwrap();
+            // Unblocks the server's accept.
+            drop(TcpStream::connect(("127.0.0.1", port)));
+            let heads = server.join().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(text.lines().count(), 1, "{name}: {out:?}");
+            assert!(text.contains(said), "{name}: {out:?}");
+            assert!(!text.contains('\x1b') && !text.contains("X-Evil"), "{name}");
+            assert_eq!(heads.len(), asked, "{name}: {heads:?}");
+            assert!(heads.iter().all(|h| !h.contains("X-Evil")), "{name}");
+            let found: Vec<_> = std::fs::read_dir(&ssh)
+                .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+                .unwrap_or_default();
+            assert!(found.is_empty(), "{name}: wrote {found:?}");
         }
     }
 }
