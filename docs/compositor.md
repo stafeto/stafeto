@@ -44,7 +44,8 @@ and the header version 1 of both.
   is availability of the old path alone: a former client that keeps its
   handle blocks the first revision's OPEN until it exits or closes the
   handle, and the second revision (ATTACH) is unaffected. The driver
-  (`virtio-gpu`) makes the same check for its `fb` in OPEN.
+  (`virtio-gpu`) makes the same check for its `fb` in OPEN, with three
+  references of its own: its handle, its mapping and init's handle.
 
 ## Limits accepted in stage G1
 

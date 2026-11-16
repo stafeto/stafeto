@@ -76,9 +76,11 @@ rt::entry!(main);
 const DMA_AT: usize = 0x10_0000_0000;
 const FB_AT: usize = 0x10_0100_0000;
 const MMIO_AT: usize = 0x10_1000_0000;
-/// The references the driver itself holds to `fb`: its handle and its
-/// mapping. More mean that an owner of the screen kept a copy.
-const FB_REFS: u64 = 2;
+/// The references of the instance itself to `fb`: its handle, its mapping
+/// and init's own handle to the object, which init keeps while the instance
+/// lives (services/init worker). More mean that an owner of the screen kept
+/// a copy.
+const FB_REFS: u64 = 3;
 /// The sessions of the driver's channel: every POSIX process may hold one
 /// `Display` session, init's or a clone, and the owner's session is one
 /// more; room beside them.
@@ -808,8 +810,8 @@ impl Driver {
             _ => return Answer::Status(code(CLEARING)),
         }
         // A former owner that kept a copy of `fb`, mapped or not, or sent
-        // one on, still reaches the buffer: the driver holds the only two
-        // references it may have, its handle and its mapping.
+        // one on, still reaches the buffer: the driver and init hold the
+        // only references it may have (FB_REFS).
         if sys::memory_info(&self.fb).is_ok_and(|info| info.refs > FB_REFS) {
             return Answer::Status(code(BUSY));
         }
