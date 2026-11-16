@@ -56,6 +56,7 @@ unsafe extern "C" {
     static el0_wait_loop: u8;
     static el0_pattern_yield: u8;
     static el0_mark: u8;
+    static el0_mark_then_exit: u8;
     static el0_fault_load: u8;
     static el0_fault_pc: u8;
     static el0_fault_entry: u8;
@@ -1062,6 +1063,12 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
         syscall::set_result(thread, Ok(Values::none()));
         return true;
     }
+    // The fixture is a flag that does not wait: a test call that takes it
+    // comes from CPU 0 only, as the hooks of `testpoint` do.
+    assert!(
+        here() == 0,
+        "a test call that takes the fixture came from another CPU"
+    );
     note_stack();
     match number {
         SVC_NOP => {}
@@ -4877,8 +4884,8 @@ fn start_exit_remote(f: &mut Fixture) -> Result<(), &'static str> {
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
     let spinner = spinner?;
     f.threads[0] = Some(spinner);
-    let setter = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
-    let after = sched_thread(f, 2, &raw const el0_mark, BELOW_LOW, FIFO)?;
+    let setter = sched_thread(f, 1, &raw const el0_mark_then_exit, PRIORITY, FIFO)?;
+    let after = sched_thread(f, 2, &raw const el0_mark_then_exit, BELOW_LOW, FIFO)?;
     let receiver = sched_thread(f, 3, &raw const el0_receive_then_poll, PRIORITY + 8, FIFO)?;
     set_args(spinner, &[word(0), word(1)]);
     set_args(setter, &[word(1)]);
@@ -4892,7 +4899,10 @@ fn start_exit_remote(f: &mut Fixture) -> Result<(), &'static str> {
     }
     let c = timer::frequency() / 1000;
     bind_budget(p, spinner, c, 10 * c, 4, other, None)?;
+    // The threads on the other CPU make no test call: they end with thread_exit.
     f.ends[0] = true;
+    f.ends[1] = true;
+    f.ends[2] = true;
     Ok(())
 }
 
