@@ -39,6 +39,8 @@ const DISK_BYTES: u64 = 512 << 20;
 /// The tags of the services' lines of steps: the file service 2, the disk 15, the package service 16.
 const RAM_TAG: &str = "2";
 const PKGD_TAG: &str = "16";
+/// The longest a run of the machine with the NVMe disk may take on TCG, edk2 and the loader included.
+const WITHIN: Duration = Duration::from_secs(480);
 /// The kinds of the package service's steps that must come: all of its methods, the heartbeat,
 /// a notification and the departure of a session.
 const PKGD_STEP_KINDS: [(usize, &str); 20] = [
@@ -1083,6 +1085,151 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
         "store-probe: full: hello installed (signed by the development key, {blocks_hello} blocks), every refusal, NOT_ALLOWED without UID 0, a group of big and wide, the settings, the serial and the list of revocations, REMOVE; after the restart the packages, the settings and the serial are in place (generation {generation}, {free} blocks free): ok"
     );
     Ok(first)
+}
+
+/// `cargo xtask nvme-persist [breaks]`: the package service on an NVMe disk that outlives the machine.
+/// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
+/// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
+/// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
+/// `nvme-blk` (MSI-X on the ITS, the polling of the queue behind it) is the `blk` of the package
+/// service. The first run is the whole scenario of `store-probe full` (the format of the store, the
+/// installation of `hello`, every refusal, a group of packages, the settings, REMOVE), after which QEMU
+/// is killed, as a power failure would; the second run starts the machine on the same file and the probe
+/// finds `hello` installed and running, the settings and the serial in place. With `breaks` the service
+/// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass.
+pub fn nvme_persist(args: &[String]) -> Result<(), String> {
+    let breaks = match args.first().map(String::as_str) {
+        None => false,
+        Some("breaks") => true,
+        Some(other) => return Err(format!("usage: nvme-persist [breaks]: {other}")),
+    };
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let world = make_world(&hello_elf()?, false, "full")?;
+    let broken: &'static [&'static str] = if breaks {
+        &["break-nvme-write-offset"]
+    } else {
+        &[]
+    };
+    let mut list = PROGRAMS.to_vec();
+    for program in &mut list {
+        match program.0 {
+            "init" => program.3 = &["table-store-probe", "nvme-store"],
+            "virtio-blk" => {
+                *program = ("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, broken);
+            }
+            _ => {}
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
+    let name = if breaks {
+        "boot-nvme-persist-break.img"
+    } else {
+        "boot-nvme-persist.img"
+    };
+    let image = image_with(name, programs, world.files.clone(), None)?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join("efi-disk-nvme-persist.raw");
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let file = Disk::new("nvme");
+    write_disk(&file, None)?;
+    if breaks {
+        return match nvme_run(&firmware, &esp, &file.0, &kernel.elf, BOOT_TIMEOUT * 6) {
+            Err(why) => {
+                println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
+                Ok(())
+            }
+            Ok(lines) if !lines.iter().any(|l| l == "store-probe: ok") => {
+                println!(
+                    "nvme-persist breaks: break-nvme-write-offset is caught: the probe did not say ok"
+                );
+                Ok(())
+            }
+            Ok(_) => Err("break-nvme-write-offset passed the probe".into()),
+        };
+    }
+    let blocks_hello = world.blocks("hello");
+    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, WITHIN)?;
+    expect(&first, &full_lines(&world, false))?;
+    let (generation, free, disk) = status_numbers(&first, "final status")?;
+    // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
+    let nvme_line = first
+        .iter()
+        .find(|l| l.starts_with("nvme: ") && l.contains(" blocks of "))
+        .ok_or("the NVMe service said nothing of its controller")?
+        .clone();
+    if !nvme_line.contains("msi yes") {
+        return Err(format!("the NVMe service ran without MSI-X: {nvme_line}"));
+    }
+    if !first
+        .iter()
+        .any(|l| l == "nvme: first interrupt of vector 1")
+    {
+        return Err("no interrupt of vector 1 came: the completions were found by polling".into());
+    }
+    if first
+        .iter()
+        .any(|l| l.starts_with("virtio-blk") || l.starts_with("nvme: reset"))
+    {
+        return Err("the Virtio disk ran, or the controller was reset in place".into());
+    }
+    // QEMU was killed with the probe's last line: the second run is on what the file holds.
+    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, WITHIN)?;
+    let wanted = [
+        "pkgd: roots stafeto-dev-root".to_string(),
+        "pkgd: keyb: key revoked, skipped".to_string(),
+        "store-probe: restart: hello runs, big, the settings and the serial are in place, wide and keyb are not".to_string(),
+        "store-probe: ok".to_string(),
+        format!("store-probe: status generation={generation} free={free} disk={}", disk - 1),
+    ];
+    expect(&second, &wanted)?;
+    println!(
+        "nvme-persist: on QEMU's NVMe disk the full scenario of the store probe passed (hello, {blocks_hello} blocks, every refusal, a group of big and wide, the settings, the serial, REMOVE), QEMU was killed, and the machine started again on the same file found hello installed and running, the settings and the serial in place (generation {generation}, {free} blocks free): ok; {nvme_line}"
+    );
+    Ok(())
+}
+
+/// One run of the machine `EFI` on the boot disk `esp` with the data disk `data` as a second NVMe
+/// controller (the function at 00:04.0; the boot disk's is at 00:01.0), until the probe ends: the lines
+/// of its output. QEMU is killed when the line comes, or after `within`.
+fn nvme_run(
+    firmware: &efi::Firmware,
+    esp: &Path,
+    data: &Path,
+    elf: &Path,
+    within: Duration,
+) -> Result<Vec<String>, String> {
+    let mut cmd = efi::command(&efi::EFI, firmware, esp, true, "nvme-persist")?;
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+        data.display()
+    ));
+    cmd.args([
+        "-device",
+        "nvme,drive=data,serial=stafeto-data,bus=pcie.0,addr=0x4",
+    ]);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT * 16,
+        Some("init: store-probe ended: "),
+        elf,
+    )?;
+    if let Some(failed) = output
+        .lines
+        .iter()
+        .find(|l| l.starts_with("store-probe: failed"))
+    {
+        return Err(failed.clone());
+    }
+    qemu::expect_stopped_on(&output, ENDED)?;
+    Ok(apart(&output.lines))
 }
 
 /// The disk service built to stop answering at the first write of a package's data

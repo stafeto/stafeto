@@ -1676,7 +1676,9 @@ pub use crate::resolve::table;
 /// The platform a table with places by function (`At`) resolves them on.
 #[cfg(feature = "table-aws")]
 pub const PLATFORM: Option<crate::resolve::Platform> = Some(aws::PLATFORM);
-#[cfg(not(feature = "table-aws"))]
+#[cfg(all(feature = "nvme-store", not(feature = "table-aws")))]
+pub const PLATFORM: Option<crate::resolve::Platform> = Some(pkg::QEMU_PLATFORM);
+#[cfg(not(any(feature = "table-aws", feature = "nvme-store")))]
 pub const PLATFORM: Option<crate::resolve::Platform> = None;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;

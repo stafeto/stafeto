@@ -599,7 +599,7 @@ record never restarts it, since a new instance would show a running `pkgd` an em
 packages installed with `pkg` are gone after a reboot, like every file of the image; the service
 says so on the console (`mem-blk: 524288 sectors in memory; installed packages are gone after a
 reboot`). The official repository is the one of the series, `/etc/pkg/official` as in the base
-image. A disk on NVMe for EBS with a permanent store comes after series 0.5.
+image. A disk on NVMe for EBS with a permanent store comes later (stafeto-design#757).
 `cargo xtask pkg-probe memory` runs the install steps on this store (init's feature
 `memory-store` turns the base table's disk into the memory disk, on the 2 GiB machine with no
 disk), removes Doom, installs it again, and boots the machine anew: the store holds no package
