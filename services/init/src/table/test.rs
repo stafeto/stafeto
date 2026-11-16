@@ -50,6 +50,7 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     }
 }
 

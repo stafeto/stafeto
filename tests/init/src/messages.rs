@@ -841,6 +841,7 @@ fn close_round(sender: bool) -> Outcome {
         Some(moved),
         sys::Shares::CREATOR,
         0,
+        0,
     )
     .map_err(|_| "process_create with a start channel failed")?;
     let send = copy(&c, Rights::SEND)?;

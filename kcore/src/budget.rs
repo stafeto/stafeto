@@ -27,10 +27,26 @@
 //!   capacity left the thread is in the background, and the replenishment
 //!   event is the head's time. When the thread blocks, `split` makes what it
 //!   used a replenishment of its own at its activation time plus `t`; with
-//!   `MAX_REPLENISHMENTS` entries already, the remnant merges into the next
-//!   entry, which postpones it and never advances it (the sliding window
-//!   constraint holds).
+//!   `MAX_REPLENISHMENTS` entries already, what was used merges into the last
+//!   entry at the later time and the remnant stays available now: a
+//!   replenishment moves later, so the bound below still holds).
+//!   With one entry only, the whole chunk goes `t` later.
 //! - `replenish` (the event): the thread returns to its own level.
+//!
+//! What the rules guarantee is the equivalence with a periodic task of the
+//! budget `c` and the period `t`, released at the activation times. In a
+//! window of `l` ticks the thread runs at its own level at most
+//! `n * c + min(c, l + j - n * t)` ticks, with `n = (l + j) / t` rounded
+//! down, plus one overrun at the edge of the window. `j` is how long a chunk
+//! lags behind its activation while the thread is ready with capacity and a
+//! level above it runs (at most `r - c` by the response analysis; the
+//! thread's own blocking is not in `j`). The statement "at most `c` in any
+//! window of `t`" holds only where `j` is small, that is, when nothing runs
+//! above the thread: a higher level that holds the CPU over the activation
+//! lets the thread run its chunk and the next one back to back, and a thread that stays ready through the return of a chunk lags as well (`replenish` keeps the head's time in the past). The levels
+//! below all the budgets of a CPU need no `j`: in any window of `l` ticks they
+//! get at least `l` less the sum over the servers of `ceil(l / t) * c` (and
+//! the work above that has no budget), by the argument of the busy period.
 //!
 //! The time the thread runs in the background is not charged to it: it costs
 //! the levels at `low` and below, which the budget does not promise anything.
@@ -157,8 +173,8 @@ impl Server {
     }
 
     /// The queue holds `max` replenishments at most, 1 to
-    /// `MAX_REPLENISHMENTS` (the caller checked): a remnant that would make
-    /// one more merges into the next entry, later, never earlier (`split`).
+    /// `MAX_REPLENISHMENTS` (the caller checked): a chunk that would make
+    /// one more merges into the last entry, later, never earlier (`split`).
     pub fn set_max(&mut self, max: u8) {
         assert!(max >= 1 && usize::from(max) <= MAX_REPLENISHMENTS);
         self.max = max;
@@ -186,6 +202,16 @@ impl Server {
         self.told = self.overruns;
         // The break: the overrun is counted as told and nothing is posted.
         pending && !cfg!(feature = "break-budget-overrun-silent")
+    }
+
+    /// The thread of the budget ended: what the place was not told of stays
+    /// untold for the next thread (`break-budget-exit-forgets`: it is told
+    /// of nothing, as if the place had heard it).
+    pub fn ended(&mut self) {
+        #[cfg(feature = "break-budget-exit-forgets")]
+        {
+            self.told = self.overruns;
+        }
     }
 
     /// The sum of the ticks charged so far.
@@ -279,6 +305,13 @@ impl Server {
     /// No event is wanted any more: the thread goes.
     pub fn event_off(&mut self) {
         self.event = 0;
+    }
+
+    /// The kernel holds the event in the heap of a level that is not the
+    /// thread's base any more: it takes the event out and puts it in again
+    /// (`event_change` answers with it), when one stands.
+    pub fn event_again(&mut self) {
+        self.armed = 0;
     }
 
     fn pop(&mut self) -> Replenishment {
@@ -395,7 +428,14 @@ impl Server {
             time: self.q[0].time,
             amount: self.usage,
         };
-        if self.len >= self.max {
+        // A full queue keeps the remnant available now and lets what was used
+        // join the last entry, later; with one entry, or nothing left, the
+        // chunk goes `t` later whole.
+        #[cfg(not(feature = "break-budget-full-queue-delay"))]
+        let spare = self.len >= self.max && self.len > 1 && remnant > 0;
+        #[cfg(feature = "break-budget-full-queue-delay")]
+        let spare = false;
+        if self.len >= self.max && !spare {
             // The remnant goes to the next entry: later, never earlier.
             self.pop();
             if self.len > 0 {
@@ -412,7 +452,21 @@ impl Server {
             self.add(head);
         }
         r.time += self.t;
-        self.add(r);
+        if spare {
+            // The queue is full: the replenishment moves later, so the
+            // bound on the window stands.
+            // The last of two to four entries, with no index to check.
+            let at = match self.len {
+                2 => 1,
+                3 => 2,
+                _ => 3,
+            };
+            let last = &mut self.q[at];
+            last.amount += r.amount;
+            last.time = last.time.max(r.time);
+        } else {
+            self.add(r);
+        }
         self.usage = 0;
     }
 
@@ -608,7 +662,10 @@ mod tests {
     /// One thread of a fixed priority CPU, in steps of one tick: it wants
     /// the CPU in random bursts, a higher level takes the CPU from it at
     /// random, and the server charges what it ran at its own level.
-    /// Returns the ticks it ran at its own level, a 1 for each.
+    /// Returns the ticks it ran at its own level, a 1 for each, the server,
+    /// and the lag `j`: the most that a chunk was behind its activation
+    /// (`now + 1 - head.time - usage`) in the ticks where the thread was ready
+    /// with capacity and did not run, because a higher level did.
     fn simulate(
         c: u64,
         t: u64,
@@ -616,9 +673,40 @@ mod tests {
         steps: u64,
         bursts: u64,
         interference: bool,
-    ) -> (Vec<u8>, Server) {
+    ) -> (Vec<u8>, Server, u64) {
+        let mode = Mode {
+            interference,
+            max: MAX_REPLENISHMENTS as u8,
+            short: false,
+        };
+        simulate_with(c, t, seed, steps, bursts, mode)
+    }
+
+    /// What differs between the runs of `simulate_with`.
+    struct Mode {
+        interference: bool,
+        max: u8,
+        short: bool,
+    }
+
+    /// `simulate` with a queue limit of `mode.max`, and with `mode.short` the
+    /// bursts are a few ticks long (a server that serves many small requests).
+    fn simulate_with(
+        c: u64,
+        t: u64,
+        seed: u64,
+        steps: u64,
+        bursts: u64,
+        mode: Mode,
+    ) -> (Vec<u8>, Server, u64) {
+        let Mode {
+            interference,
+            max,
+            short,
+        } = mode;
         let mut rng = Rng(seed | 1);
         let mut s = Server::new(c, t, 1, 0);
+        s.set_max(max);
         let mut fg = vec![0u8; steps as usize];
         // Waiting, or ready (maybe running).
         let mut ready = false;
@@ -626,6 +714,7 @@ mod tests {
         let mut work = 0u64;
         let mut away = 0u64;
         let mut heap: Option<u64> = None;
+        let mut lag = 0u64;
         for now in 0..steps {
             // The event of the heap.
             if let Some(change) = s.event_change() {
@@ -643,7 +732,11 @@ mod tests {
             }
             // The thread's own demand and the interference.
             if work == 0 && rng.below(bursts) == 0 {
-                work = 1 + rng.below(c + 3);
+                work = if short {
+                    1 + rng.below(3)
+                } else {
+                    1 + rng.below(c + 3)
+                };
             }
             if interference && away == 0 && rng.below(7 * bursts) == 0 {
                 away = 1 + rng.below(c + 2);
@@ -689,6 +782,9 @@ mod tests {
                     work -= 1;
                 }
             }
+            if ready && !running && s.capacity(now) > 0 {
+                lag = lag.max((now + 1).saturating_sub(s.queue()[0].time + s.usage()));
+            }
             away = away.saturating_sub(1);
             assert_eq!(s.sum(), c, "the amounts add up to the budget at {now}");
             assert!(s.queue().len() <= MAX_REPLENISHMENTS);
@@ -701,7 +797,7 @@ mod tests {
                 // Ends its burst: blocks at the next step.
             }
         }
-        (fg, s)
+        (fg, s, lag)
     }
 
     /// The most ticks run in any window of `t` ticks.
@@ -717,21 +813,30 @@ mod tests {
         most
     }
 
+    /// The most a server of the budget `c` and the period `t` runs in a
+    /// window of `l` ticks when a chunk lags `j` ticks behind its activation
+    /// (the corrected guarantee, see the module documentation).
+    fn window_bound(l: u64, c: u64, t: u64, j: u64) -> u64 {
+        let n = (l + j) / t;
+        n * c + c.min(l + j - n * t)
+    }
+
     #[test]
-    fn a_thread_that_always_wants_the_cpu_never_gets_more_than_the_budget_in_a_period() {
-        // Alone on its CPU, wanting it all the time: the server is a
-        // periodic task of the budget and the period, and a window of `l`
-        // ticks holds at most the budget for each period it touches.
+    fn a_thread_alone_on_its_cpu_that_always_wants_it_gets_the_budget_in_a_period() {
+        // Alone on its CPU (nothing runs above it, so `j` is 0), wanting the
+        // CPU all the time: the server is a periodic task of the budget and
+        // the period, and a window of `l` ticks holds at most the budget for
+        // each period it touches.
         let mut ran = 0;
         for seed in 1..300u64 {
             let t = 20 + (seed * 7) % 180;
             let c = 1 + (seed * 13) % t;
-            let (fg, s) = simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 6_000, 1, false);
-            for l in [t / 2, t, 2 * t, 5 * t] {
+            let (fg, s, j) = simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 6_000, 1, false);
+            for l in [t / 2 + 1, t, t + 1, 2 * t, 5 * t] {
                 let most = busiest(&fg, l);
                 assert!(
-                    most <= l.div_ceil(t) * c,
-                    "C {c} T {t} seed {seed}: {most} ticks in {l}"
+                    most <= window_bound(l, c, t, j),
+                    "C {c} T {t} seed {seed} lag {j}: {most} ticks in {l}"
                 );
             }
             ran += s.ran();
@@ -740,20 +845,21 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_that_blocks_and_wakes_never_gets_more_than_the_budget_in_a_period() {
-        // Alone on its CPU, with bursts of work and sleeps between them: a
-        // window of `l` ticks holds at most the budget for each period it
-        // touches.
+    fn a_thread_alone_on_its_cpu_that_blocks_and_wakes_gets_the_budget_in_a_period() {
+        // Alone on its CPU (nothing above it, `j` is 0), with bursts of work
+        // and sleeps between them: a window of `l` ticks holds at most the
+        // budget for each period it touches.
         for seed in 1..400u64 {
             let t = 20 + (seed * 7) % 180;
             let c = 1 + (seed * 13) % t;
             for bursts in [2, 5, 20] {
-                let (fg, _) = simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 8_000, bursts, false);
-                for l in [t / 2, t, 2 * t, 5 * t, 10 * t] {
+                let (fg, _, j) =
+                    simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 8_000, bursts, false);
+                for l in [t / 2 + 1, t, t + 1, 2 * t, 5 * t, 10 * t] {
                     let most = busiest(&fg, l);
                     assert!(
-                        most <= l.div_ceil(t) * c,
-                        "C {c} T {t} seed {seed} bursts {bursts}: {most} ticks in {l}"
+                        most <= window_bound(l, c, t, j),
+                        "C {c} T {t} seed {seed} bursts {bursts} lag {j}: {most} ticks in {l}"
                     );
                 }
             }
@@ -761,20 +867,343 @@ mod tests {
     }
 
     #[test]
+    fn the_window_holds_with_and_without_a_level_above_for_every_queue_limit_and_short_stints() {
+        // Without a level above (`interference: false`) the lag is 0 and the
+        // window is the budget for each period it touches; with one, the
+        // bound has the lag the run measured.
+        for interference in [false, true] {
+            for max in 1..=4u8 {
+                for seed in 1..200u64 {
+                    let t = 20 + (seed * 7) % 180;
+                    let c = 1 + (seed * 13) % t;
+                    for bursts in [1, 2, 5, 20] {
+                        for short in [false, true] {
+                            let (fg, _, j) = simulate_with(
+                                c,
+                                t,
+                                seed.wrapping_mul(0x9e37_79b9),
+                                6_000,
+                                bursts,
+                                Mode {
+                                    interference,
+                                    max,
+                                    short,
+                                },
+                            );
+                            for l in [t / 2 + 1, t, t + 1, 2 * t, 5 * t, 10 * t] {
+                                let most = busiest(&fg, l);
+                                assert!(
+                                    most <= window_bound(l, c, t, j),
+                                    "above {interference} max {max} C {c} T {t} seed {seed} bursts {bursts} short {short} lag {j}: {most} ticks in {l}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A server that serves many small requests keeps its level while it
+    /// has capacity: each stint is far below C/max, and the queue is full
+    /// after `max` of them, yet the thread stays at its own level until it
+    /// has used C in the window (issue 744).
+    #[test]
+    fn short_stints_keep_the_level_until_the_budget_is_used() {
+        for max in 2..=4u8 {
+            let (c, t) = (40, 1000);
+            let mut s = Server::new(c, t, 1, 0);
+            s.set_max(max);
+            let mut now = 0;
+            for i in 0..30u64 {
+                s.unblock(now);
+                assert!(!s.background(), "max {max}: demoted at stint {i}");
+                assert_eq!(s.capacity(now), c - i, "max {max}: stint {i}");
+                s.run(now);
+                now += 1;
+                s.stop(now, true, false);
+                assert_eq!(s.sum(), c);
+                assert!(s.queue().len() <= usize::from(max));
+                now += 4;
+            }
+            assert_eq!(s.overruns(), 0);
+            // 30 of the 40 are used: the next 10 are all that is left, and
+            // only then the thread falls.
+            for i in 30..40u64 {
+                s.unblock(now);
+                assert!(!s.background(), "max {max}: demoted at stint {i}");
+                s.run(now);
+                now += 1;
+                s.stop(now, true, false);
+                now += 4;
+            }
+            s.unblock(now);
+            assert!(s.background(), "max {max}: the budget is used");
+        }
+    }
+
+    #[test]
     fn a_server_kept_off_the_cpu_by_a_higher_level_keeps_its_queue_in_order() {
         // The level above holds the thread ready and away for stretches: the
         // chunks come back late, and the queue stays what it must be (the
-        // checks inside `simulate`) while the thread still runs.
+        // checks inside `simulate`) while the thread still runs, and the
+        // window holds with the lag `j` the run measured.
         let mut ran = 0;
+        let mut lagged = 0;
         for seed in 1..300u64 {
             let t = 20 + (seed * 7) % 180;
             let c = 1 + (seed * 13) % t;
             for bursts in [2, 5, 20] {
-                let (_, s) = simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 8_000, bursts, true);
+                let (fg, s, j) =
+                    simulate(c, t, seed.wrapping_mul(0x9e37_79b9), 8_000, bursts, true);
                 ran += s.ran();
+                lagged += u64::from(j > 0);
+                for l in [t / 2 + 1, t, t + 1, 2 * t, 5 * t] {
+                    let most = busiest(&fg, l);
+                    assert!(
+                        most <= window_bound(l, c, t, j),
+                        "C {c} T {t} seed {seed} bursts {bursts} lag {j}: {most} ticks in {l}"
+                    );
+                }
             }
         }
         assert!(ran > 100_000, "the runs did something: {ran}");
+        assert!(lagged > 100, "the interference lagged the chunks: {lagged}");
+    }
+
+    #[test]
+    fn a_level_above_that_holds_the_cpu_lets_the_server_run_two_chunks_back_to_back() {
+        // C = 14, T = 27, activated at 0 with a higher level on the CPU over
+        // 0..13: the thread runs 13..41, which is 27 ticks in a window of 27
+        // and 28 in a window of 28. The lag is 13, and the bound of the
+        // guarantee is met exactly (a window of `t` is not limited to `c`).
+        let (c, t) = (14, 27);
+        let mut s = Server::new(c, t, 1, 0);
+        s.unblock(0);
+        let mut fg = vec![0u8; 120];
+        let (mut heap, mut running, mut lag) = (None, false, 0);
+        for now in 0..120u64 {
+            if let Some(change) = s.event_change() {
+                heap = change;
+            }
+            if heap.is_some_and(|at| at <= now) {
+                heap = None;
+                s.replenish(now);
+                if let Some(change) = s.event_change() {
+                    heap = change;
+                }
+            }
+            if !running && now >= 13 && !s.background() {
+                running = true;
+                s.run(now);
+            }
+            if running {
+                if now >= s.exhaust_at() {
+                    s.stop(now, false, false);
+                    if let Some(change) = s.event_change() {
+                        heap = change;
+                    }
+                    if s.background() {
+                        running = false;
+                    } else {
+                        s.run(now);
+                    }
+                }
+                if running {
+                    fg[now as usize] = 1;
+                }
+            }
+            if !running && s.capacity(now) > 0 {
+                lag = lag.max((now + 1).saturating_sub(s.queue()[0].time + s.usage()));
+            }
+        }
+        assert_eq!(lag, 13);
+        assert!(fg[13..41].iter().all(|&x| x == 1) && fg[41] == 0 && fg[12] == 0);
+        assert_eq!(busiest(&fg, 27), 27);
+        assert_eq!(busiest(&fg, 28), 28);
+        assert_eq!(window_bound(27, c, t, lag), 27);
+        assert_eq!(window_bound(28, c, t, lag), 28);
+        // The lag is what allows it: with none, a window of `t` holds `c`.
+        assert_eq!(window_bound(27, c, t, 0), 14);
+    }
+
+    /// What `simulate_share` returns.
+    type Share = (Vec<u8>, Vec<(u64, u64)>, (u64, u64));
+
+    /// One server of the share model.
+    struct Member {
+        server: Server,
+        level: u64,
+        bursts: u64,
+        ready: bool,
+        running: bool,
+        work: u64,
+        heap: Option<u64>,
+    }
+
+    /// The share model: 1 to 4 servers (budget `c`, period `t`, equal levels
+    /// allowed, greedy or in bursts), a sporadic task with no budget above
+    /// all of them (`hc` ticks, released at least `ht` apart), and a victim
+    /// below that is always ready. The timer is exact. Returns the ticks the
+    /// victim ran, the (c, t) of the servers and the (hc, ht) of the task
+    /// above.
+    fn simulate_share(seed: u64, steps: u64) -> Share {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        for _ in 0..8 {
+            rng.below(2);
+        }
+        let n = 1 + rng.below(4) as usize;
+        let mut members = Vec::new();
+        for _ in 0..n {
+            let t = 8 + rng.below(60);
+            let c = 1 + rng.below(t / (n as u64 + 1));
+            members.push(Member {
+                server: Server::new(c, t, 1, 0),
+                level: rng.below(3),
+                bursts: [1, 1, 3, 12][rng.below(4) as usize],
+                ready: false,
+                running: false,
+                work: 0,
+                heap: None,
+            });
+        }
+        let ht = 10 + rng.below(60);
+        let hc = 1 + rng.below(ht / 3);
+        let hbursts = [1, 1, 4][rng.below(3) as usize];
+        let (mut hi_work, mut hi_next) = (0u64, 0u64);
+        let mut victim = vec![0u8; steps as usize];
+        for now in 0..steps {
+            for m in &mut members {
+                if let Some(change) = m.server.event_change() {
+                    m.heap = change;
+                }
+                if m.heap.is_some_and(|at| at <= now) {
+                    m.heap = None;
+                    m.server.replenish(now);
+                    if let Some(change) = m.server.event_change() {
+                        m.heap = change;
+                    }
+                }
+                if m.work == 0 && rng.below(m.bursts) == 0 {
+                    m.work = 1 + rng.below(m.server.budget() + 3);
+                }
+            }
+            if hi_work == 0 && now >= hi_next && rng.below(hbursts) == 0 {
+                hi_work = hc;
+                hi_next = now + ht;
+            }
+            for m in &mut members {
+                if m.running && m.work == 0 {
+                    m.running = false;
+                    m.ready = false;
+                    m.server.stop(now, true, false);
+                    if let Some(change) = m.server.event_change() {
+                        m.heap = change;
+                    }
+                }
+                if m.work > 0 && !m.ready {
+                    m.ready = true;
+                    m.server.unblock(now);
+                    if let Some(change) = m.server.event_change() {
+                        m.heap = change;
+                    }
+                }
+            }
+            // The one that runs: the task above, else the highest level
+            // (the lowest index of equals) that is ready with capacity.
+            let top = loop {
+                let top = if hi_work > 0 {
+                    Some(n)
+                } else {
+                    (0..n)
+                        .filter(|&i| members[i].ready && !members[i].server.background())
+                        .max_by_key(|&i| (members[i].level, n - i))
+                };
+                for (i, m) in members.iter_mut().enumerate() {
+                    if m.running && top != Some(i) {
+                        m.running = false;
+                        m.server.stop(now, false, false);
+                        if let Some(change) = m.server.event_change() {
+                            m.heap = change;
+                        }
+                    }
+                }
+                let Some(i) = top.filter(|&i| i < n) else {
+                    break top;
+                };
+                let m = &mut members[i];
+                if !m.running {
+                    m.running = true;
+                    m.server.run(now);
+                }
+                if now >= m.server.exhaust_at() {
+                    m.server.stop(now, false, false);
+                    if let Some(change) = m.server.event_change() {
+                        m.heap = change;
+                    }
+                    if m.server.background() {
+                        m.running = false;
+                        continue;
+                    }
+                    m.server.run(now);
+                }
+                break top;
+            };
+            match top {
+                Some(i) if i == n => hi_work -= 1,
+                Some(i) => members[i].work -= 1,
+                None => victim[now as usize] = 1,
+            }
+            for m in &members {
+                assert_eq!(m.server.sum(), m.server.budget());
+                assert!(m.server.queue().windows(2).all(|w| w[0].time <= w[1].time));
+            }
+        }
+        let servers = members
+            .iter()
+            .map(|m| (m.server.budget(), m.server.period()))
+            .collect();
+        (victim, servers, (hc, ht))
+    }
+
+    #[test]
+    fn the_levels_below_all_the_budgets_get_the_share_the_busy_period_leaves() {
+        // In any sliding window of `l` ticks the victim gets at least `l`
+        // less the sum of ceil(l / t) * c over the servers and the work of
+        // the level above: no lag term (the argument of the busy period).
+        // `tight` counts the windows that meet the bound, so that the model
+        // is not an empty one: a kernel whose servers get less than their
+        // budget, or none at all, leaves the victim more than the bound.
+        let (mut windows, mut tight, mut tight_long) = (0u64, 0u64, 0u64);
+        for seed in 1..1500u64 {
+            let (victim, servers, (hc, ht)) = simulate_share(seed, 2_000);
+            for l in [5u64, 10, 17, 27, 50, 100, 200, 500] {
+                let owed: u64 = servers.iter().map(|&(c, t)| l.div_ceil(t) * c).sum::<u64>()
+                    + l.div_ceil(ht) * hc;
+                let bound = l as i64 - owed as i64;
+                let l = l as usize;
+                let mut sum: u64 = victim[..l].iter().map(|&x| u64::from(x)).sum();
+                let mut least = sum;
+                for i in l..victim.len() {
+                    sum += u64::from(victim[i]);
+                    sum -= u64::from(victim[i - l]);
+                    least = least.min(sum);
+                }
+                assert!(
+                    least as i64 >= bound,
+                    "seed {seed} servers {servers:?} above {:?}: the victim got {least} in {l}, the bound is {bound}",
+                    (hc, ht)
+                );
+                if bound > 0 {
+                    windows += 1;
+                    tight += u64::from(least as i64 == bound);
+                    tight_long += u64::from(least as i64 == bound && l >= 100);
+                }
+            }
+        }
+        assert!(windows > 3_000, "the windows with a bound: {windows}");
+        assert!(tight > 300, "windows on the bound: {tight} of {windows}");
+        assert!(tight_long > 100, "long windows on the bound: {tight_long}");
     }
 
     #[test]
@@ -980,7 +1409,7 @@ mod tests {
         // The same run as the first one: a replenishment that is never
         // applied leaves the thread in the background for good.
         let (c, t) = (30, 100);
-        let (fg, _) = simulate(c, t, 5, 5_000, 1, false);
+        let (fg, _, _) = simulate(c, t, 5, 5_000, 1, false);
         let total: u64 = fg.iter().map(|&x| u64::from(x)).sum();
         assert!(
             total > 2 * c,

@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.5.0-pre.0"
+version = "0.5.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "pkg"
-version = "0.5.0-pre.0"
+version = "0.5.0"
 dependencies = [
  "libc-ffi",
  "pkgd",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "pkgd"
-version = "0.5.0-pre.0"
+version = "0.5.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "posix-platform"
-version = "0.5.0-pre.0"
+version = "0.5.0"
 dependencies = [
  "dynlink",
  "posix-abi",
@@ -1327,6 +1327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-budget"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-pipe",
+ "proto-tty",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1358,6 +1369,17 @@ dependencies = [
  "defmt",
  "heapless",
  "managed",
+]
+
+[[package]]
+name = "sporadic-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-process",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]
@@ -1676,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.0-pre.0"
+version = "0.5.0"
 dependencies = [
  "abi",
  "bootimg",

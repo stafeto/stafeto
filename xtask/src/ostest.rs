@@ -124,7 +124,7 @@ pub enum Ended {
 pub fn service_line(line: &str) -> bool {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    const EXACT: [&str; 8] = [
+    const EXACT: [&str; 11] = [
         "init: services started",
         "ramfs: ready",
         "posix-process: ready (records with their processes, root by init's table)",
@@ -133,6 +133,10 @@ pub fn service_line(line: &str) -> bool {
         "pipe: ready",
         "tty: ready",
         "entropy: seeded from the device",
+        // A service that has a budget says so when it binds it, as late as its first request.
+        "ramfs: serve runs under its budget",
+        "pipe: serve runs under its budget",
+        "tty: serve runs under its budget",
     ];
     if EXACT.contains(&line) {
         return true;
@@ -159,6 +163,23 @@ pub fn service_line(line: &str) -> bool {
         && let Some((name, why)) = r.split_once(" ended: ")
     {
         return !name.is_empty() && !name.contains(' ') && !why.is_empty();
+    }
+    // `init: NAME budget THREAD: at least N overruns, at least M in all, kernel counts K`: init's
+    // notice of the overruns of a time budget (spec 8), which it writes when a budget runs out,
+    // whatever test is on the console then.
+    if let Some(r) = line.strip_prefix("init: ")
+        && let Some((name, r)) = r.split_once(" budget ")
+        && let Some((thread, r)) = r.split_once(": at least ")
+        && let Some((overruns, r)) = r.split_once(" overruns, at least ")
+        && let Some((all, kernel)) = r.split_once(" in all, kernel counts ")
+    {
+        return !name.is_empty()
+            && !name.contains(' ')
+            && !thread.is_empty()
+            && !thread.contains(' ')
+            && number(overruns)
+            && number(all)
+            && number(kernel);
     }
     // `ramfs: storage pages=N tables=N bytes`, `ramfs: layers bytes=N`
     if let Some(r) = line.strip_prefix("ramfs: storage pages=")
@@ -1800,6 +1821,8 @@ mod tests {
             "service step: 12 kind 64 3480 ticks detail 3",
             "service wait: 15 kind 64 3480 ticks of 23806",
             "service gap: 9 kind 1 120 ticks of 900",
+            "init: tty budget serve: at least 1 overruns, at least 1 in all, kernel counts 1",
+            "tty: serve runs under its budget",
             "@@os-test end basic/service-lines exit 0",
             "@@os-test begin basic/service-lines-fail",
             "entropy: seeded from the boot page (32 bytes)",
@@ -1815,6 +1838,7 @@ mod tests {
             "clock: ready twice",
             "init: oops",
             "service step: x kind 1 2 ticks",
+            "init: tty budget serve: at least x overruns, at least 1 in all, kernel counts 1",
             "@@os-test end basic/own-lines exit 1",
         ]);
         assert_eq!(
@@ -1824,7 +1848,7 @@ mod tests {
         assert_eq!(
             outcome(&log, "basic/own-lines"),
             Ended::Exited(
-                "net: something failed\nclock: ready twice\ninit: oops\nservice step: x kind 1 2 ticks\n"
+                "net: something failed\nclock: ready twice\ninit: oops\nservice step: x kind 1 2 ticks\ninit: tty budget serve: at least x overruns, at least 1 in all, kernel counts 1\n"
                     .to_owned(),
                 1
             )

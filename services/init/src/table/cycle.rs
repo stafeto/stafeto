@@ -38,6 +38,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         cpus: GENERAL_CPUS,
         waits: &[],
         budgets: &[],
+        free: 0,
     }
 }
 

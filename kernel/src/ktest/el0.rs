@@ -20,6 +20,7 @@ use crate::channel::{self, Channel};
 use crate::cleanup;
 use crate::memory;
 use crate::mm::{pages, phys};
+use crate::obj;
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
 use crate::syscall::{self, Values};
@@ -31,7 +32,7 @@ use abi::{
     Notification, OWNER_RIGHTS, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering::Relaxed};
 use kcore::PAGE_SIZE;
 use kcore::budget::Server;
 use kcore::esr;
@@ -55,6 +56,7 @@ unsafe extern "C" {
     static el0_wait_loop: u8;
     static el0_pattern_yield: u8;
     static el0_mark: u8;
+    static el0_mark_then_exit: u8;
     static el0_fault_load: u8;
     static el0_fault_pc: u8;
     static el0_fault_entry: u8;
@@ -64,6 +66,12 @@ unsafe extern "C" {
     static el0_fault_nested: u8;
     static el0_fault_nested_entry: u8;
     static el0_count_until: u8;
+    static el0_count_then_exit: u8;
+    static el0_take_loop: u8;
+    static el0_takes_alone: u8;
+    static el0_receive_then_poll: u8;
+    static el0_raise_then_notify: u8;
+    static el0_receive_then_watch: u8;
     static el0_count_to: u8;
     static el0_spin_then_yield: u8;
     static el0_set_priority: u8;
@@ -80,7 +88,7 @@ unsafe extern "C" {
     static el0_receive: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
-    static el0_raise_then_notify: u8;
+    static el0_set_priority_then_notify: u8;
     static el0_pattern_receive: u8;
     static el0_alarm_then: u8;
     static el0_send: u8;
@@ -130,6 +138,8 @@ const SVC_PENDING: u16 = 0xFF05;
 const SVC_PEND: u16 = 0xFF06;
 const SVC_SUSPEND_SEND: u16 = 0xFF07;
 const SVC_CONTINUE_CROWD: u16 = 0xFF08;
+const SVC_TAKE: u16 = 0xFF09;
+const SVC_TAKES_ALONE: u16 = 0xFF0A;
 
 const _: () =
     ::core::assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
@@ -165,7 +175,7 @@ const PRIORITY: u8 = 10;
 const HANDLE_LIMIT: u32 = 16;
 const CEILING: u8 = 63;
 /// Threads a test may have.
-const SLOTS: usize = 3;
+const SLOTS: usize = 4;
 /// Threads of the child whose kill the cleanup tests queue: a portion each.
 const CHILD_THREADS: usize = 8;
 /// The portion of cleanup after which the cleanup tests' interrupt comes.
@@ -440,6 +450,41 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_budget_demotes,
     },
     El0Test {
+        name: "a_thread_exits_with_its_budget_spent",
+        start: start_exit_spent,
+        done: done_exit_spent,
+    },
+    El0Test {
+        name: "a_thread_exits_with_replenishments_pending",
+        start: start_exit_pending,
+        done: done_exit_spent,
+    },
+    El0Test {
+        name: "a_spent_thread_that_ends_is_heard",
+        start: start_exit_heard,
+        done: done_exit_heard,
+    },
+    El0Test {
+        name: "a_spent_thread_of_another_cpu_that_ends_is_heard",
+        start: start_exit_remote,
+        done: done_exit_remote,
+    },
+    El0Test {
+        name: "obj_takes_count_this_cpu_alone",
+        start: start_takes_alone,
+        done: done_takes_alone,
+    },
+    El0Test {
+        name: "a_raised_base_takes_the_replenishment_of_a_spent_budget_with_it",
+        start: start_raised_base,
+        done: done_raised_base,
+    },
+    El0Test {
+        name: "a_kill_takes_a_thread_whose_budget_is_spent",
+        start: start_kill_spent,
+        done: done_kill_spent,
+    },
+    El0Test {
         name: "fast_path_skips_a_pending_interrupt",
         start: start_pending_interrupt,
         done: done_pending_interrupt,
@@ -686,11 +731,11 @@ struct Fixture {
     /// Whether the test expects a fault at EL0, which then ends the
     /// faulting process as in a build without tests.
     faults: bool,
-    /// SP in the first test system call, and whether a later one had
+    /// SP in the first test system call of each CPU, and whether a later one had
     /// another, or one far from the top of the kernel stack. The fixture
     /// starts all zero, so FIXTURE lies in .bss and adds nothing to the
     /// kernel image (spec 3.4).
-    stack: Option<usize>,
+    stack: [Option<usize>; crate::arch::cpu::MAX_CPUS],
     stack_moved: bool,
     /// Timer interrupts taken at EL0, and whether one of them moved the
     /// thread past its wait loop.
@@ -791,7 +836,7 @@ impl Fixture {
             queued_at_wake: None,
             counter: 0,
             faults: false,
-            stack: None,
+            stack: [None; crate::arch::cpu::MAX_CPUS],
             stack_moved: false,
             interrupts: 0,
             interrupt_log: [(0, 0); INTERRUPT_LOG],
@@ -865,12 +910,16 @@ static OVERRUN_BUDGET: AtomicPtr<Server> = AtomicPtr::new(core::ptr::null_mut())
 /// Whether the hook found the budget in that state afterwards.
 static BUDGET_WENT_STALE: AtomicBool = AtomicBool::new(false);
 
-/// Stints of 50 ms, each ending in a wait: the
-/// queue of replenishments fills, and the fourth wait merges the remnant
-/// into a later entry, so that the head lies ahead of now (the budget has no
-/// capacity) while the flag of the budget still says the thread is not in
-/// the background. True when the budget is in that state.
+/// A stint of 50 ms that ends in a wait: the budget holds one replenishment,
+/// so the whole chunk goes a period ahead and the head lies ahead of now (the
+/// budget has no capacity) while the flag of the budget still says the thread
+/// is not in the background. True when the budget is in that state.
 fn make_stale(s: &mut Server) -> bool {
+    // The stint the server ran before it began to wait for its first request
+    // moved its whole chunk a period ahead: the state is there already.
+    if !s.background() && s.capacity(timer::now()) == 0 {
+        return true;
+    }
     let mut at = timer::now();
     // The head of the queue ends up 50 ms ahead at least, so that its
     // replenishment does not come while the test runs, whatever the speed
@@ -920,6 +969,11 @@ fn start(first: usize) -> ! {
             (test.start)(&mut f).map(|()| f.threads)
         };
         match started {
+            // A test that has nothing to run on this machine passes.
+            Ok(threads) if threads.iter().all(Option::is_none) => {
+                report(test.name, Ok(()));
+                teardown();
+            }
             Ok(threads) => {
                 for t in threads.into_iter().flatten() {
                     thread::start(t).expect("a new thread starts");
@@ -985,7 +1039,11 @@ fn teardown() {
         // scheduler first, and a thread that runs stops being the running
         // one.
         unsafe {
-            sched::exit(t, CAUSE);
+            // A thread that ended on another CPU stands as that CPU left it,
+            // and a second end would ask that CPU for its number again.
+            if t.as_ref().sched.state() != State::Dead {
+                sched::exit(t, CAUSE);
+            }
             thread::release(t, CAUSE);
         }
     }
@@ -997,6 +1055,20 @@ fn teardown() {
 
 /// The test system calls; false for any other number.
 pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
+    if number == SVC_TAKE {
+        // Before `note_stack`, which borrows the fixture: this call runs on
+        // another CPU while the judge of `takes_alone` reads the fixture.
+        TAKEN.fetch_add(1, Relaxed);
+        drop(obj::lock());
+        syscall::set_result(thread, Ok(Values::none()));
+        return true;
+    }
+    // The fixture is a flag that does not wait: a test call that takes it
+    // comes from CPU 0 only, as the hooks of `testpoint` do.
+    assert!(
+        here() == 0,
+        "a test call that takes the fixture came from another CPU"
+    );
     note_stack();
     match number {
         SVC_NOP => {}
@@ -1031,6 +1103,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
                 end(result);
             }
         }
+        SVC_TAKES_ALONE => takes_alone(),
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
             // send looks.
@@ -1166,10 +1239,14 @@ fn note_stack() {
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
     };
-    let top = symbols::boot_stack().end;
+    let cpu = arch::cpu::this().index();
     let mut f = FIXTURE.lock();
-    let first = *f.stack.get_or_insert(sp);
-    f.stack_moved |= sp != first || top - sp >= PAGE;
+    let first = *f.stack[cpu].get_or_insert(sp);
+    f.stack_moved |= sp != first;
+    // Only the boot CPU's stack is known; every CPU enters at one place.
+    if cpu == 0 {
+        f.stack_moved |= symbols::boot_stack().end - sp >= PAGE;
+    }
 }
 
 /// The idle wait starts near the top of the kernel stack (the way out of
@@ -2658,7 +2735,7 @@ fn cleanup_done() -> Result<(), &'static str> {
         "the cleanup queue is not empty, or no portion was measured",
     )?;
     check(
-        thread::in_use() == SLOTS && process::in_use() == 2,
+        thread::in_use() == 3 && process::in_use() == 2,
         "the killed child's threads stayed in their pool",
     )
 }
@@ -4601,12 +4678,13 @@ fn start_budget_demotes(f: &mut Fixture) -> Result<(), &'static str> {
     set_args(server, &[h, 1]);
     set_args(client, &[h, REQUEST_LEN, REQUEST_WORD]);
     set_args(ready, &[word(0)]);
-    // The service has 1 s of budget in each 10 s (the hook fills its queue
-    // with stints of 50 ms), the client 10 ms in each 100 ms; both fall to
-    // level 1.
+    // The service has 1 s of budget in each 10 s with one replenishment (the
+    // hook makes it wait after a stint of 50 ms, which moves the whole chunk
+    // a period ahead), the client 10 ms in each 100 ms with four; both fall
+    // to level 1.
     let freq = timer::frequency();
-    for (t, c) in [(server, freq), (client, freq / 100)] {
-        let b = crate::budget::create(p, 0, c, 10 * c, 1, 4, None).map_err(|_| "no budget")?;
+    for (t, c, max) in [(server, freq, 1), (client, freq / 100, 4)] {
+        let b = crate::budget::create(p, 0, c, 10 * c, 1, max, None).map_err(|_| "no budget")?;
         let bound = crate::budget::bind(t, b);
         // SAFETY: the reference `create` handed out goes; the binding, if
         // it went through, holds the budget.
@@ -4659,6 +4737,353 @@ fn done_budget_demotes(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         ),
         _ => Ok(()),
     }
+}
+
+/// The level a budget of the exit tests drops its thread to, and the level
+/// of the thread that waits for the CPU below it.
+const SPENT_LOW: u8 = 2;
+const BELOW_LOW: u8 = 1;
+
+/// The CPU the chain of tests runs on: where the threads of a test start.
+fn here() -> u8 {
+    arch::cpu::this().index() as u8
+}
+
+/// Binds a new budget of `c` ticks in each `t`, which falls to SPENT_LOW and
+/// keeps `max` replenishments, to the thread `thread` of the process `p`.
+fn bind_budget(
+    p: NonNull<Process>,
+    thread: NonNull<Thread>,
+    c: u64,
+    t: u64,
+    max: u8,
+    cpu: u8,
+    notice: Option<(NonNull<Channel>, u64)>,
+) -> Result<(), &'static str> {
+    let b = crate::budget::create(p, cpu, c, t, SPENT_LOW, max, notice).map_err(|_| "no budget")?;
+    let bound = crate::budget::bind(thread, b);
+    // SAFETY: the reference `create` handed out goes; the binding, if it
+    // went through, holds the budget.
+    unsafe { crate::budget::release(b, CAUSE) };
+    bound.map_err(|_| "a budget did not bind")
+}
+
+/// A thread at PRIORITY + 2 with a budget of 1 ms in each `period` ms
+/// spins until the word 1 is set. The budget runs out, and the thread falls
+/// to SPENT_LOW, below the thread at PRIORITY, which sets the word 1 and
+/// ends; the spinner, back at the CPU at SPENT_LOW, ends with thread_exit
+/// (it ends demoted, or replenished when the period is short). The thread at
+/// BELOW_LOW waits for the CPU all that time, and runs once the spinner is
+/// gone. A kernel whose exit leaves the CPU stuck never gets there, and the
+/// run ends by its time limit with this test as the last one named.
+fn exit_spent(f: &mut Fixture, period: u64, max: u8) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spinner = sched_thread(f, 0, &raw const el0_count_then_exit, PRIORITY + 2, FIFO)?;
+    let setter = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    let after = sched_thread(f, 2, &raw const el0_mark, BELOW_LOW, FIFO)?;
+    set_args(spinner, &[word(0), word(1)]);
+    set_args(setter, &[word(1)]);
+    set_args(after, &[word(2)]);
+    let p = f.processes[0].expect("the test's process");
+    let c = timer::frequency() / 1000;
+    bind_budget(p, spinner, c, period * c, max, here(), None)?;
+    f.ends[0] = true;
+    Ok(())
+}
+
+/// The budget is spent and its replenishment is far away.
+fn start_exit_spent(f: &mut Fixture) -> Result<(), &'static str> {
+    exit_spent(f, 1000, 1)
+}
+
+/// The queue of replenishments holds more than one, and they come every
+/// 3 ms while the thread works.
+fn start_exit_pending(f: &mut Fixture) -> Result<(), &'static str> {
+    exit_spent(f, 3, 4)
+}
+
+fn done_exit_spent(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        slot_thread(f, 0).sched.state() == State::Dead,
+        "the spinner did not end",
+    )?;
+    check(
+        shared(f, 0) > 0 && shared(f, 1) == 1 && shared(f, 2) == 1,
+        "the thread below the spinner did not run after its exit",
+    )
+}
+
+/// The spent thread has an exit channel, which the thread at BELOW_LOW
+/// receives from, and its budget a place for overruns.
+fn start_exit_heard(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    let n = channel::create(p, PRIORITY).map_err(|_| "no channel");
+    // A handle that the teardown closes, which ends the cycle of the channel
+    // and the place of the budget in it.
+    let hn = n
+        .as_ref()
+        .map_err(|e| *e)
+        .and_then(|n| give(p, Object::Channel(*n), Rights::RECEIVE));
+    let slot = f
+        .handles
+        .iter()
+        .position(Option::is_none)
+        .expect("room for a handle");
+    if let Ok(hn) = hn {
+        f.handles[slot] = Some((p, Handle(hn)));
+    }
+    let entry = user_address(&raw const el0_count_then_exit);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let spinner = thread::create_with_exit(p, entry, DATA_VA + PAGE, 0, PRIORITY + 2, FIFO, exit)
+        .map_err(|_| "no thread with an exit channel");
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let spinner = spinner?;
+    f.threads[0] = Some(spinner);
+    let setter = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    let after = sched_thread(f, 2, &raw const el0_receive, BELOW_LOW, FIFO)?;
+    set_args(spinner, &[word(0), word(1)]);
+    set_args(setter, &[word(1)]);
+    set_args(after, &[h?, 0]);
+    let c = timer::frequency() / 1000;
+    let n = n?;
+    let bound = bind_budget(p, spinner, c, 4 * c, 4, here(), Some((n, 0)));
+    // SAFETY: as above, for the channel of the place.
+    unsafe { channel::release(n, Rights::NONE, CAUSE) };
+    bound?;
+    f.ends[0] = true;
+    Ok(())
+}
+
+/// The same on another CPU, where the spinner, the setter and the thread below
+/// the spinner run, with the receiver of the exit channel on CPU 0, which
+/// holds the end of the test until the thread below has run: a thread that
+/// ends spent on another CPU leaves that CPU free (probe `sporadic-probe`).
+/// Ends at once on a machine with one CPU.
+fn start_exit_remote(f: &mut Fixture) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 2 {
+        return Ok(());
+    }
+    sched_process(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    let entry = user_address(&raw const el0_count_then_exit);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let spinner = thread::create_with_exit(p, entry, DATA_VA + PAGE, 0, PRIORITY + 2, FIFO, exit)
+        .map_err(|_| "no thread with an exit channel");
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let spinner = spinner?;
+    f.threads[0] = Some(spinner);
+    let setter = sched_thread(f, 1, &raw const el0_mark_then_exit, PRIORITY, FIFO)?;
+    let after = sched_thread(f, 2, &raw const el0_mark_then_exit, BELOW_LOW, FIFO)?;
+    let receiver = sched_thread(f, 3, &raw const el0_receive_then_poll, PRIORITY + 8, FIFO)?;
+    set_args(spinner, &[word(0), word(1)]);
+    set_args(setter, &[word(1)]);
+    set_args(after, &[word(2)]);
+    set_args(receiver, &[h?, 0]);
+    // SAFETY: the thread does not run yet.
+    unsafe { (*receiver.as_ptr()).regs.x[20] = word(2) };
+    let other = if here() == 0 { 1 } else { 0 };
+    for t in [spinner, setter, after] {
+        thread::set_cpu(t, usize::from(other));
+    }
+    let c = timer::frequency() / 1000;
+    bind_budget(p, spinner, c, 10 * c, 4, other, None)?;
+    // The threads on the other CPU make no test call: they end with thread_exit.
+    f.ends[0] = true;
+    f.ends[1] = true;
+    f.ends[2] = true;
+    Ok(())
+}
+
+/// The count of the takes of `OBJ` (`obj::takes`) is this CPU's, whatever
+/// the other CPUs take meanwhile. A thread on another CPU takes `OBJ` over and
+/// over (`svc #SVC_TAKE`); the thread of the test on this CPU reads the count,
+/// takes one section, spins about 1 ms outside it and reads the count again
+/// (`takes_alone`): the difference is 1. Ends at once on a machine with one CPU.
+fn start_takes_alone(f: &mut Fixture) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 2 {
+        return Ok(());
+    }
+    TAKES_ALONE.store(0, Relaxed);
+    TAKEN.store(0, Relaxed);
+    sched_process(f)?;
+    let looper = sched_thread(f, 0, &raw const el0_take_loop, PRIORITY, FIFO)?;
+    let judge = sched_thread(f, 1, &raw const el0_takes_alone, PRIORITY, FIFO)?;
+    set_args(looper, &[word(0), word(1)]);
+    set_args(judge, &[word(0), word(1), timer::frequency() / 200]);
+    let other = usize::from(here() == 0);
+    thread::set_cpu(looper, other);
+    f.ends[0] = true;
+    Ok(())
+}
+
+/// What `takes_alone` found: 0 not run, 1 the difference was 1, 2 it was not.
+static TAKES_ALONE: AtomicU8 = AtomicU8::new(0);
+
+/// How many times `svc #SVC_TAKE` took `OBJ`.
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// `svc #SVC_TAKES_ALONE`: waits until the thread on the other CPU has begun
+/// to take `OBJ`, then counts this CPU's takes around one section and a spin
+/// of about 1 ms, in which the other CPU takes it many times.
+fn takes_alone() {
+    let begun = timer::now();
+    let limit = 100 * (timer::frequency() / 1000);
+    while TAKEN.load(Relaxed) == 0 {
+        if timer::now().wrapping_sub(begun) > limit {
+            TAKES_ALONE.store(2, Relaxed);
+            return;
+        }
+    }
+    let before = obj::takes();
+    drop(obj::lock());
+    let from = timer::now();
+    while timer::now().wrapping_sub(from) < timer::frequency() / 1000 {}
+    let one = obj::takes().wrapping_sub(before) == 1;
+    TAKES_ALONE.store(if one { 1 } else { 2 }, Relaxed);
+}
+
+fn done_takes_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.threads[0].is_none() || f.slot(t) != 1 {
+        return Ok(());
+    }
+    check(
+        TAKES_ALONE.load(Relaxed) == 1,
+        "the count of takes was not this CPU's alone",
+    )
+}
+
+fn done_exit_remote(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.threads[0].is_none() || f.slot(t) != 3 {
+        return Ok(());
+    }
+    check(
+        slot_thread(f, 0).sched.state() == State::Dead && shared(f, 2) == 1,
+        "the thread below the spinner did not run after its exit",
+    )?;
+    check(
+        t.regs.x[0] == 0,
+        "the end of the spent thread was not heard",
+    )
+}
+
+/// A thread at PRIORITY + 8 with a budget of 1 ms in each 4 ms counts until
+/// the word 3 is set. Its budget runs out and it falls to SPENT_LOW; the
+/// thread at PRIORITY then raises the spent thread's base to 31 (its event of
+/// replenishment stood at PRIORITY + 8) and wakes the third thread, which
+/// works at 31 and yields until the count of the spent one moves: it moves
+/// once the replenishment comes, which a firing at the level of the event
+/// takes up before the thread at 31 (a firing runs at its level, and an
+/// event that stayed at PRIORITY + 8 would wait for the thread at 31 to
+/// give the CPU up, which it does not). The third thread gives up when
+/// the counter reaches its limit, 0.5 s on, a bound for a kernel that
+/// starves the replenishment, and fails the test.
+fn start_raised_base(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let spent = sched_thread(f, 0, &raw const el0_count_until, PRIORITY + 8, FIFO)?;
+    let raiser = sched_thread(
+        f,
+        1,
+        &raw const el0_set_priority_then_notify,
+        PRIORITY,
+        FIFO,
+    )?;
+    let watcher = sched_thread(f, 2, &raw const el0_receive_then_watch, 31, FIFO)?;
+    let channel = own_channel(p, Rights::RECEIVE | Rights::NOTIFY)?;
+    let handle = give_thread(f, spent)?;
+    set_args(spent, &[word(0), word(3)]);
+    set_args(raiser, &[handle, 31, 1, channel]);
+    set_args(watcher, &[channel, 0]);
+    // SAFETY: the thread does not run yet.
+    unsafe {
+        let x = &mut (*watcher.as_ptr()).regs.x;
+        x[20] = word(0);
+        x[21] = word(2);
+        x[22] = timer::now() + timer::frequency() / 2;
+        x[23] = word(3);
+    }
+    let c = timer::frequency() / 1000;
+    bind_budget(p, spent, c, 4 * c, 1, here(), None)
+}
+
+fn done_raised_base(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        shared(f, 2) == 1,
+        "the replenishment of a spent budget whose thread raised its base was starved",
+    )
+}
+
+/// A process kills another whose thread is spent: the thread at
+/// PRIORITY + 2, with a budget of 1 ms, falls to SPENT_LOW; the killer at
+/// PRIORITY then kills its process and ends; the judge at BELOW_LOW runs
+/// when the CPU is free.
+fn start_kill_spent(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spinner = sched_thread(f, 0, &raw const el0_count_then_exit, PRIORITY + 2, FIFO)?;
+    set_args(spinner, &[word(0), word(1)]);
+    let p = f.processes[0].expect("the test's process");
+    let c = timer::frequency() / 1000;
+    bind_budget(p, spinner, c, 1000 * c, 1, here(), None)?;
+    let q = new_process(f, 1)?;
+    let target = give(q, Object::Process(p), Rights::MANAGE)?;
+    let killer = thread::create(
+        q,
+        user_address(&raw const el0_kill),
+        DATA_VA + PAGE,
+        0,
+        PRIORITY,
+        FIFO,
+    )
+    .map_err(|_| "no killer")?;
+    f.threads[1] = Some(killer);
+    set_args(killer, &[target]);
+    let after = thread::create(
+        q,
+        user_address(&raw const el0_done_at_once),
+        DATA_VA + PAGE,
+        0,
+        BELOW_LOW,
+        FIFO,
+    )
+    .map_err(|_| "no judge")?;
+    f.threads[2] = Some(after);
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_exit_heard(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        t.regs.x[0] == 0,
+        "the end of the spent thread was not heard",
+    )
+}
+
+fn done_kill_spent(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        slot_thread(f, 0).sched.state() == State::Dead,
+        "the spinner did not end",
+    )
 }
 
 /// The fast path gives way to a pending interrupt (spec 6.4, 8.1): a
@@ -4724,7 +5149,7 @@ fn start_round_trips(f: &mut Fixture) -> Result<(), &'static str> {
     set_args(client, &[send, partner, ROUNDS, TIMES_VA as u64, handles]);
     set_args(server, &[requests]);
     f.data = process::translate(p, DATA_VA).ok_or("no data page")?.0;
-    f.ends = [false, true, true];
+    f.ends = [false, true, true, false];
     Ok(())
 }
 

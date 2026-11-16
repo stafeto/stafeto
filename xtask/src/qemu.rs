@@ -573,11 +573,24 @@ impl Transcript {
     /// The first whole line that `wanted` takes, a CR before its LF cut,
     /// among those that start after the last text found; the next search
     /// starts after its LF.
+    #[cfg(test)]
     pub fn find_line(&mut self, wanted: impl Fn(&str) -> bool) -> Option<String> {
+        self.find_line_resuming(wanted, &mut 0)
+    }
+
+    /// `find_line` for a wait that asks again and again with the one `wanted`: `seen` is where
+    /// the lines it took a look at already end (0 to begin with), so that each ask reads only
+    /// the lines that came since.
+    fn find_line_resuming(
+        &mut self,
+        wanted: impl Fn(&str) -> bool,
+        seen: &mut usize,
+    ) -> Option<String> {
         let mut start = self.from;
         if start > 0 && self.bytes[start - 1] != b'\n' {
             start += self.bytes[start..].iter().position(|&b| b == b'\n')? + 1;
         }
+        start = start.max(*seen);
         while let Some(len) = self.bytes[start..].iter().position(|&b| b == b'\n') {
             let bytes = &self.bytes[start..start + len];
             let line = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
@@ -587,6 +600,7 @@ impl Transcript {
                 return Some(line.into_owned());
             }
         }
+        *seen = start;
         None
     }
 
@@ -748,7 +762,13 @@ impl Run {
 
     /// Waits for the next piece of output until `deadline`.
     fn wait(&mut self, deadline: Instant) -> Wait {
+        // A reader that is slower than the output (a host busy with a flood) finds a piece
+        // queued at every wait, and `recv_timeout` gives a queued piece whatever the time left:
+        // without this check the deadline would never be seen.
         let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Wait::Deadline;
+        }
         match self.pieces.recv_timeout(left) {
             Ok(piece) => {
                 self.take(&piece);
@@ -780,8 +800,9 @@ impl Run {
         timeout: Duration,
     ) -> Result<String, String> {
         let deadline = Instant::now() + timeout;
+        let mut seen = 0;
         loop {
-            if let Some(line) = self.transcript.find_line(&wanted) {
+            if let Some(line) = self.transcript.find_line_resuming(&wanted, &mut seen) {
                 return Ok(line);
             }
             self.wait_on(deadline, what)?;
@@ -2375,5 +2396,35 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             "store-probe: refused TOO_LONG, the receipt is gone, nothing chanservice wait: 15 kind 64",
         ]);
         assert!(expect_line(&cut, line).is_err());
+    }
+
+    /// A guest that prints a burst of lines (200000, about 7 MB) and never the awaited line, and
+    /// then keeps silent (a service starved under a flood, with its neighbours' lines still
+    /// coming): the wait ends at its deadline however
+    /// much output is queued, and does not rescan the lines it has seen (a rescan per piece made
+    /// the reader slower than the output, so that the queue was never empty and no deadline
+    /// came).
+    #[test]
+    fn a_wait_for_a_line_ends_at_its_deadline_in_a_stream_of_other_lines() {
+        let mut run = Run::start_with(
+            sh("yes 'net: bells tx 251 frames 501' | head -n 200000; exec sleep 30"),
+            Input::Null,
+            Box::new(|_| {}),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let r = run.expect_line(
+            "a second of the loop",
+            |l| l.contains("spin sec "),
+            Duration::from_secs(2),
+        );
+        let took = start.elapsed();
+        let _ = run.stop();
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("timed out waiting for a second of the loop"),
+            "{e}"
+        );
+        assert!(took < Duration::from_secs(4), "{took:?}");
     }
 }

@@ -2676,6 +2676,44 @@ impl Probe<'_> {
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
             self.close(&root, d).map_err(|_| "CLOSE failed")?;
         }
+        // A request that waits on a set does not overtake the steps told before it: a datagram
+        // sent while the steps of the stack are held is in the report of the wait that follows
+        // at once (the steps it needs run in the request, stafeto-design#713).
+        {
+            let d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, d, [127, 0, 0, 1], 9701)
+                .map_err(|_| "BIND failed")?;
+            let set = self.epoll_set(
+                &root,
+                0,
+                &[rec(sockets::EPOLL_ADD, d, proto_net::sockets::epoll::IN, 1)],
+            )?;
+            self.hold(&root, proto_net::HOLD_ON)?;
+            let request = Request::Send {
+                key: None,
+                description: sender,
+                flags: 0,
+                address: Address::v4([127, 0, 0, 1], 9701),
+                data: b"s",
+            };
+            let sent = self.plain(&root, request);
+            let pairs = self.epoll_wait_now(&root, set, 64);
+            self.hold(&root, proto_net::HOLD_OFF)?;
+            sent.map_err(|_| "SEND failed")?;
+            if pairs?.len != 1 {
+                return Err("a datagram sent while the steps were held was not reported");
+            }
+            rt::println!("net-probe: epoll wait after a send while the steps are held ok");
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
         // A session that lets go of a description takes its records off the
         // place, which another session still holds: 17 rounds of 64 places
         // through one set (it takes 1 024 records) never fill it.

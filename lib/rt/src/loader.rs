@@ -46,6 +46,9 @@ pub struct Params<'a> {
     /// caller's own).
     pub shares: sys::Shares,
     pub cpus: u8,
+    /// The level of the threads without a budget (process_create x2, bits
+    /// 8-15): 0 for the ceiling.
+    pub free: u8,
 }
 
 /// A process that `load` made and its first thread.
@@ -99,6 +102,7 @@ pub unsafe fn load(
         params.start,
         params.shares,
         params.cpus,
+        params.free,
     )?;
     // SAFETY: the caller's promise for `window`.
     let filled = unsafe {
@@ -148,6 +152,8 @@ pub struct SpawnParams<'a> {
     /// The shares and the CPU mask of the process (`Params::shares`).
     pub shares: sys::Shares,
     pub cpus: u8,
+    /// The level of its threads without a budget (`Params::free`).
+    pub free: u8,
 }
 
 /// A program `spawn` loaded, whose first thread does not run yet: its
@@ -205,6 +211,7 @@ pub unsafe fn spawn(
         cpu: params.cpu,
         shares: params.shares,
         cpus: params.cpus,
+        free: params.free,
     };
     // SAFETY: the caller's promise for `window`.
     let child = unsafe { load(own, program, window, load_params) }.map_err(|(e, _)| e)?;

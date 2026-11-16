@@ -4,8 +4,10 @@
 //! The probe of the time budgets of threads (`tests/budget-hog`, spec 8)
 //! under QEMU's -icount, on one CPU and on four: a hog at a high level with
 //! a budget of C for each period T must not take more than C of a window of
-//! T from a task of a lower level on the same CPU, and without the budget
-//! the hog starves it. The lines the probe prints are checked against
+//! T from a task of a lower level on the same CPU, with no level running
+//! above the hog (with one above it, the hog may take 2C of a window of T:
+//! phase `carry` measures that, within the bound of the lag), and without
+//! the budget the hog starves it. The lines the probe prints are checked against
 //! their bounds here; `breaks` runs the same probe on the kernels with a
 //! deliberate break, each of which must fail it.
 
@@ -58,6 +60,9 @@ pub struct Numbers {
     /// the end; the unbind's results; the overruns of the polite thread and
     /// what its place held.
     pub overrun: Overrun,
+    /// The carry phase: (window in ms, most hog time in us, least victim
+    /// time in us).
+    pub carry: Vec<(u64, u64, u64)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -87,8 +92,14 @@ const LOAN_MOST: u64 = 64;
 /// own CPU: the service goes from its reply to its next receive in one entry
 /// (`reply_receive`), so it never waits at its low level behind the spinner
 /// between two requests, and the client gets one request for each 2 ms
-/// period (52 measured; two with a service that returns to EL0 between its
-/// reply and its receive).
+/// period (52 measured). The split of `reply_receive` into two entries has
+/// its own kernel test (`reply_receive_takes_the_queued_request_at_its_level`)
+/// and this phase does not judge it: on one CPU under -icount the count of
+/// the broken kernel follows the alignment of the service's loop against the
+/// budget's timer (0 to 4 NOPs before the call: 50, 50, 52, 18, 18 requests;
+/// 9 with the library of main), and with the work of each request swept by
+/// a prime step the broken kernel made 25 to 50 and the unbroken one 37 to
+/// 50, so no bound separates them. The bound below judges the loan alone.
 const LOAN_LEAST_SAME: u64 = 26;
 /// The longest wait of the client at 40 of the queue phase, its own 500 us of
 /// work not counted: the rest of the request in hand (500 us at most), B for
@@ -101,6 +112,19 @@ const QUEUE_LEAST: u64 = 5;
 const OVERRUNS_LEAST: u64 = 80;
 const HOG_US: u64 = 300;
 const B_US: u64 = 150;
+/// The carry phase: the interferer's work in each 2 ms (also the lag J of the
+/// hog), its budget's period, and the hog's period, in microseconds.
+const CARRY_J_US: u64 = 700;
+const CARRY_SPIN_PERIOD_US: u64 = 2000;
+const HOG_PERIOD_US: u64 = 1000;
+
+/// The most a server of the budget `c` and the period `t` runs in a window of
+/// `l` (all in the same unit) when a chunk lags `j` behind its activation:
+/// `n * c + min(c, l + j - n * t)`, `n = (l + j) / t`.
+fn window_bound(l: u64, c: u64, t: u64, j: u64) -> u64 {
+    let n = (l + j) / t;
+    n * c + c.min(l + j - n * t)
+}
 
 pub fn parse(lines: &[String]) -> Result<Numbers, String> {
     if !lines.iter().any(|l| l.starts_with("budget START "))
@@ -164,6 +188,12 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
             n.overrun.overruns_end = number(line, "overruns=")?;
             n.overrun.polite_overruns = number(line, "polite_overruns=")?;
             n.overrun.quiet = number(line, "quiet=")?;
+        } else if line.starts_with("budget carry window=") {
+            n.carry.push((
+                number(line, "window=")?,
+                number(line, "hog_max_us=")?,
+                number(line, "victim_min_us=")?,
+            ));
         } else if line.starts_with("budget slot ") {
             n.slot_share = number(line, "min_share=")?;
             n.slot_gap_us = number(line, "max_gap_us=")?;
@@ -174,6 +204,7 @@ pub fn parse(lines: &[String]) -> Result<Numbers, String> {
         || n.loan_same.0 == 0
         || n.queue_same.0 == 0
         || !n.overrun.seen
+        || n.carry.len() != 4
         || n.slot_share == 0 && n.slot_gap_us == 0
     {
         return Err(format!("the probe's lines are incomplete: {n:?}"));
@@ -222,6 +253,38 @@ pub fn verdict(n: &Numbers, cpus: usize) -> Result<(), String> {
             n.victim_gap_us,
             1000 - HOG_US + B_US
         ));
+    }
+    // The carry: the interferer at 55 holds the CPU over the hog's
+    // activation, so the hog takes more than C of a window of 1 ms, up to 2C
+    // (the carry-in that "no more than C in a window of T" denies when a level
+    // stands above it: no more than C and the kernel's longest stretch means
+    // the phase does not test what it says).
+    // It never takes more than the bound with the lag J of the interferer,
+    // and the victim keeps what the busy period leaves: the window less the
+    // interferer's 700 us of each 2 ms and the hog's 300 us of each 1 ms, the
+    // kernel's longest stretch and a twentieth for the probe's own threads.
+    for &(window, hog_most, victim_least) in &n.carry {
+        let l = window * 1000;
+        let most = window_bound(l, HOG_US, HOG_PERIOD_US, CARRY_J_US) + B_US;
+        if hog_most > most {
+            return Err(format!(
+                "the hog took {hog_most} us in a window of {window} ms with a level above it: over {most}"
+            ));
+        }
+        if window == 1 && hog_most <= HOG_US + B_US {
+            return Err(format!(
+                "the hog took {hog_most} us in a window of 1 ms: not over {}, the carry-in did not show",
+                HOG_US + B_US
+            ));
+        }
+        let owed =
+            l.div_ceil(CARRY_SPIN_PERIOD_US) * CARRY_J_US + l.div_ceil(HOG_PERIOD_US) * HOG_US;
+        let least = l.saturating_sub(owed + B_US + l / 20);
+        if victim_least < least {
+            return Err(format!(
+                "the victim got {victim_least} us in a window of {window} ms with a hog and a level above it: under {least}"
+            ));
+        }
     }
     // The service's request takes its 500 us of work and no more: the boost
     // of its client stays when the budget of 200 us is gone.
@@ -359,6 +422,26 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask budget-break-unbound`: the share probe of the network service fails on the
+/// image whose switch and stack bind no budget. The loop below the switch must lose the CPU in
+/// the flood: its seconds up to the quiet ones came, and then none (a bounded wait counts that
+/// silence as the catch), or it kept too little of its share. A probe that broke elsewhere
+/// (the boot, the quiet seconds) fails the command.
+pub fn unbound_break() -> Result<(), String> {
+    match crate::fast_switch::probe(crate::fast_switch::Scenario::ShareUnbound) {
+        Err(e) if crate::fast_switch::unbound_caught(&e) => {
+            println!("budget-breaks: a network service that binds no budget is caught ({e})")
+        }
+        Err(e) => {
+            return Err(format!(
+                "the break (budget-unbound): the share probe broke: {e}"
+            ));
+        }
+        Ok(()) => return Err("the break (budget-unbound) passed the share probe".into()),
+    }
+    Ok(())
+}
+
 /// `cargo xtask budget-breaks`: the probe fails on each kernel with a
 /// break, the kernel tests fail the test of the level of a process on the
 /// kernel that ignores it, and the host tests of kcore fail on each break
@@ -386,10 +469,6 @@ pub fn breaks() -> Result<(), String> {
             "a request that queues behind a server without a budget and does not lift it",
         ),
         (
-            Variant::ReplyReceiveSplit,
-            "a reply_receive that returns to EL0 between its reply and its receive",
-        ),
-        (
             Variant::BudgetOverrunSilent,
             "an overrun that posts nothing to the budget's place",
         ),
@@ -398,10 +477,7 @@ pub fn breaks() -> Result<(), String> {
         // CPU runs on the break too.
         let cpus = if matches!(
             variant,
-            Variant::BudgetForgiveLoan
-                | Variant::BudgetNoQueueLift
-                | Variant::ReplyReceiveSplit
-                | Variant::BudgetOverrunSilent
+            Variant::BudgetForgiveLoan | Variant::BudgetNoQueueLift | Variant::BudgetOverrunSilent
         ) {
             4
         } else {
@@ -444,9 +520,34 @@ pub fn breaks() -> Result<(), String> {
             "a thread that goes on holding a notification after its receive",
         ),
         (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_takes_the_queued_request_at_its_level",
+            "a reply_receive that returns to EL0 between its reply and its receive",
+        ),
+        (
+            Variant::ReplyReceiveSplitTest,
+            "reply_receive_with_a_handle_takes_the_queued_request_in_one_entry",
+            "a reply_receive with a handle in its reply that returns to EL0 between its reply and its receive",
+        ),
+        (
+            Variant::ReplyReceiveCopyTest,
+            "reply_receive_copies_a_long_reply_before_it_takes_a_long_request",
+            "a reply_receive that leaves the copy of its reply waiting while it takes a request",
+        ),
+        (
             Variant::NoticePayerNoneTest,
             "a_lift_is_not_charged_to_a_sender_that_waits_on_another_channel",
             "a lift of a notification's holder that names no payer",
+        ),
+        (
+            Variant::LiftAgainNoticeTest,
+            "a_receive_that_takes_a_notification_above_a_request_keeps_the_lift",
+            "a holder that a receive of a notification leaves below a queued request",
+        ),
+        (
+            Variant::LiftAgainReplyTest,
+            "a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave",
+            "a holder that the reply between the halves leaves below a queued request",
         ),
         (
             Variant::BudgetUnbindNoChargeTest,
@@ -457,6 +558,26 @@ pub fn breaks() -> Result<(), String> {
             Variant::BudgetUnbindKeepsEventTest,
             "the_timer_of_an_unbound_budget_leaves_the_former_thread_alone",
             "an unbind that leaves the event of the budget in the heap",
+        ),
+        (
+            Variant::BudgetExitNoChargeTest,
+            "the_stint_of_a_thread_that_ends_is_charged_to_its_budget",
+            "an end of a thread that does not charge the stint that runs",
+        ),
+        (
+            Variant::BudgetExitForgetsTest,
+            "a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread",
+            "an end of a thread that counts its untold overrun as told",
+        ),
+        (
+            Variant::BudgetEventKeepsLevelTest,
+            "the_event_of_a_budget_follows_the_base_of_its_thread",
+            "an event of a budget that stays at the level its thread's base had",
+        ),
+        (
+            Variant::BudgetEventKeepsLevelEl0,
+            "a_raised_base_takes_the_replenishment_of_a_spent_budget_with_it",
+            "a replenishment that stays at the old base of a thread that raised it",
         ),
     ] {
         let a = build(variant)?;
@@ -479,6 +600,21 @@ pub fn breaks() -> Result<(), String> {
                 .lines
                 .iter()
                 .any(|l| l.starts_with(&format!("TEST {test} ")));
+        // The break that leaves the copy of the reply waiting stops the run in
+        // the named test with the panic of `copy_later`.
+        // The test before it passed, and the named one did not report.
+        let panicked = panicked
+            || (variant == Variant::ReplyReceiveCopyTest
+                && o.lines
+                    .iter()
+                    .any(|l| l.starts_with("KERNEL PANIC: a message copy waits for another"))
+                && o.lines
+                    .iter()
+                    .any(|l| l == "TEST reply_receive_takes_the_queued_request_at_its_level ok")
+                && !o
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("TEST {test} "))));
         if !panicked && !report.failed.iter().any(|(name, _)| name == test) {
             return Err(format!("the kernel with {what} passed its test"));
         }
@@ -501,7 +637,9 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-unbind-keeps",
         "break-budget-unbind-no-charge",
         "break-budget-unbind-keeps-event",
+        "break-budget-exit-no-charge",
         "break-budget-early-replenish",
+        "break-budget-full-queue-delay",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -514,11 +652,7 @@ pub fn breaks() -> Result<(), String> {
         }
         println!("budget-breaks: {feature} fails the host tests");
     }
-    // The network service with its threads unbound: the loop below the switch must lose the CPU.
-    match crate::fast_switch::probe(crate::fast_switch::Scenario::ShareUnbound) {
-        Err(e) => println!("budget-breaks: a network service that binds no budget is caught ({e})"),
-        Ok(()) => return Err("the break (budget-unbound) passed the share probe".into()),
-    }
+    unbound_break()?;
     // init's table check: budgets that take all of a CPU must be refused.
     let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(crate::root())
@@ -536,7 +670,10 @@ pub fn breaks() -> Result<(), String> {
         return Err("the host tests of init passed with break-budget-share".into());
     }
     println!("budget-breaks: break-budget-share fails the host tests of init");
-    Ok(())
+    // init's journal of the overruns, and the three services with their request threads
+    // unbound and init with no `free` level.
+    crate::budget_journal::breaks()?;
+    crate::service_budget::breaks(None)
 }
 
 #[cfg(test)]
@@ -564,6 +701,10 @@ mod tests {
             format!("budget slot min_share={} max_gap_us={}", slot.0, slot.1),
             "budget overrun unbind notes=100 bad=0 overruns=100 first=1 second_is_bad_state=1 free=1".into(),
             "budget overrun end notes=100 bad=0 overruns=100 polite_overruns=0 quiet=0".into(),
+            "budget carry window=1 hog_max_us=600 victim_min_us=0".into(),
+            "budget carry window=2 hog_max_us=600 victim_min_us=700".into(),
+            "budget carry window=5 hog_max_us=1500 victim_min_us=1700".into(),
+            "budget carry window=10 hog_max_us=3000 victim_min_us=3500".into(),
             "budget DONE".into(),
         ]
     }
@@ -586,6 +727,41 @@ mod tests {
             let e = verdict(&parse(&case).unwrap(), 1).unwrap_err();
             assert!(e.contains(text), "{e}");
         }
+    }
+
+    #[test]
+    fn the_carry_phase_checks_the_carry_in_the_hog_bound_and_the_victim() {
+        let base = lines(700, 300, 600, (800, 250));
+        for (from, to, text) in [
+            // No carry-in: the phase would test nothing.
+            (
+                "window=1 hog_max_us=600",
+                "window=1 hog_max_us=400",
+                "carry-in did not show",
+            ),
+            // More than the bound with the lag.
+            (
+                "window=2 hog_max_us=600",
+                "window=2 hog_max_us=1200",
+                "with a level above it",
+            ),
+            // The victim starved.
+            (
+                "window=10 hog_max_us=3000 victim_min_us=3500",
+                "window=10 hog_max_us=3000 victim_min_us=1000",
+                "the victim got",
+            ),
+        ] {
+            let case: Vec<String> = base.iter().map(|l| l.replace(from, to)).collect();
+            let e = verdict(&parse(&case).unwrap(), 1).unwrap_err();
+            assert!(e.contains(text), "{e}");
+        }
+        let short: Vec<String> = base
+            .iter()
+            .filter(|l| !l.starts_with("budget carry "))
+            .cloned()
+            .collect();
+        assert!(parse(&short).is_err());
     }
 
     #[test]

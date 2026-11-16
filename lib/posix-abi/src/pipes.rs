@@ -81,7 +81,7 @@ fn write_once(
     let mut start = Writer::new();
     write_request(end, None, bytes, &mut start).map_err(|_| EIO)?;
     let mut result = [0; 4];
-    let n = crate::long::run_with(
+    let n = crate::long::run_nonblocking_start(
         pipes,
         start.as_bytes(),
         |cancel, key, w| {

@@ -27,6 +27,7 @@ use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use init::overrun;
 use init::table::{
     self, BOOT_IMAGE, CLOCK_SERVICE, Confirm, ENTROPY_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE,
     PROCESS_SERVICE, RAM_SERVICE, Record, SEED, Write,
@@ -34,7 +35,7 @@ use init::table::{
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
-use rt::handle::{Channel, Memory, Process, Resource, Thread};
+use rt::handle::{Budget, Channel, Memory, Process, Resource, Thread};
 use rt::loader::{self, SpawnParams, Spawned};
 use rt::startup::Giver;
 use rt::{Handle, Stack, mmio, sys};
@@ -381,6 +382,7 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
             timers: record.shares.timers,
         },
         cpus,
+        free: init::table::free_of(record),
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;
@@ -454,8 +456,17 @@ fn budgets(
     giver: &mut Giver,
     resource: &Handle<Resource>,
 ) -> Result<(), Error> {
-    for b in record.budgets.iter().filter(|b| cpus >> b.cpu & 1 != 0) {
-        let budget = sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?;
+    let place = table::table().iter().position(|r| r.name == record.name);
+    for (index, b) in record
+        .budgets
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| cpus >> b.cpu & 1 != 0)
+    {
+        let budget = match place.filter(|_| overrun::reports(record.name)) {
+            Some(place) => noticed(resource, overrun::label(place, index), b)?,
+            None => sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?,
+        };
         // The checks of the table keep the names apart from the others of the
         // start data, and START_DATA_MAX keeps all of them within the giver's.
         // A budget the service cannot take is an error: the record would start unbudgeted.
@@ -464,6 +475,54 @@ fn budgets(
             .map_err(|_| Error::InvalidArgs)?;
     }
     Ok(())
+}
+
+/// Init's own copies of the budgets it made with a place for overruns, by
+/// the place of the count (init::overrun): a copy with no rights, enough for
+/// `object_info`, which the main thread reads once for each line it writes
+/// (`kernel_overruns`). The worker replaces the copy when an instance of the
+/// record restarts, and closes the old one.
+static KEPT: [AtomicU64; init::overrun::SLOTS] =
+    [const { AtomicU64::new(0) }; init::overrun::SLOTS];
+
+/// The overruns the kernel counts for the latest budget of the record at
+/// `place` under its budget `index`, when init has it. A copy that the worker
+/// closes at that moment gives an error and None.
+pub fn kernel_overruns(place: usize, index: usize) -> Option<u64> {
+    let raw = KEPT.get(place * table::START_DATA_MAX + index)?;
+    let raw = raw.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    let budget = Handle::<Budget>::borrowed(abi::Handle(raw));
+    sys::budget_info(&budget).ok().map(|info| info.overruns)
+}
+
+/// The budget `b` made with a place for the notifications of its overruns on
+/// init's channel, under `label` (init::overrun): the main thread counts
+/// them and writes the journal's lines. The copy of the channel that gives
+/// the label goes right after the call; the budget holds the place itself.
+fn noticed(
+    resource: &Handle<Resource>,
+    label: u64,
+    b: &table::Budget,
+) -> Result<Handle<Budget>, Error> {
+    let channel = view::<Channel>(CHANNEL);
+    let notice = sys::handle_label(&channel, Rights::NOTIFY, label, b.low)?;
+    let budget =
+        sys::budget_create_with_notice(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low, &notice)?;
+    // A copy that cannot be made leaves the line without the kernel's count.
+    if let (Some((place, index)), Ok(copy)) = (
+        overrun::decode(label),
+        sys::handle_duplicate(&budget, Rights::NONE),
+    ) && let Some(kept) = KEPT.get(place * table::START_DATA_MAX + index)
+    {
+        let old = kept.swap(copy.into_raw().0, Ordering::AcqRel);
+        if old != 0 {
+            drop(Handle::<Budget>::from_raw(abi::Handle(old)));
+        }
+    }
+    Ok(budget)
 }
 
 /// Copies of `resource`, the system resource, in `giver` for `record`:

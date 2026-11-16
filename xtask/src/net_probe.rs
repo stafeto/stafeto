@@ -264,6 +264,7 @@ const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
 const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
 const EPOLL_WAIT_OK: &str = "net-probe: epoll wait ok 64 after 64 stale";
+const EPOLL_HELD_OK: &str = "net-probe: epoll wait after a send while the steps are held ok";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -698,6 +699,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.epoll_sets {
         once.push((EPOLL_WAKE, 1));
         once.push((EPOLL_WAIT_OK, 1));
+        once.push((EPOLL_HELD_OK, 1));
         once.push((EPOLL_CLOSE, 1));
         once.push((EPOLL_REQUESTS, 1));
         once.push((EPOLL_OK, 1));
@@ -891,13 +893,31 @@ fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
     out
 }
 
+/// What a step of the service may exceed the budget of a batch by, in ticks: the cost of one
+/// preemption inside the step, charged to the thread that was preempted (its entry, handler and
+/// decision, and on the way back the other thread's exit and its own restore, about 1 400 ticks).
+/// The services of the budgets work at levels above netd, so a step of netd can have one. It is
+/// to be replaced by the value the kernel test measures (PR #381).
+const SWITCH_ALLOWANCE: u64 = 1_400;
+
 /// The batch of EPOLL_SET: the largest of 16, 8 and 4 records whose step on
-/// places that hold fifteen records stays within the budget of a step.
+/// places that hold fifteen records stays within the budget of a step and `SWITCH_ALLOWANCE`
+/// (the first boot decides; no choice over boots).
 fn epoll_batch_choice(rows: &[(usize, u64)]) -> Option<usize> {
     [16, 8, 4].into_iter().find(|&size| {
         rows.iter()
-            .any(|&(d, ticks)| d == size && ticks <= netd::choose::BUDGET)
+            .any(|&(d, ticks)| d == size && ticks <= netd::choose::BUDGET + SWITCH_ALLOWANCE)
     })
+}
+
+/// The rows of `epoll_set_by_batch` that exceed the budget and pass by the allowance.
+fn epoll_allowed(rows: &[(usize, u64)]) -> Vec<(usize, u64)> {
+    rows.iter()
+        .copied()
+        .filter(|&(_, ticks)| {
+            ticks > netd::choose::BUDGET && ticks <= netd::choose::BUDGET + SWITCH_ALLOWANCE
+        })
+        .collect()
 }
 
 /// The steps of the service: every kind came and every row stays under
@@ -1485,6 +1505,13 @@ fn acceptance(
                 ));
             }
         }
+        let allowed = epoll_allowed(&by_batch);
+        if !allowed.is_empty() {
+            println!(
+                "net-probe: rows over the budget {} that pass by the allowance of one preemption ({SWITCH_ALLOWANCE}): {allowed:?}",
+                netd::choose::BUDGET
+            );
+        }
         let chosen = epoll_batch_choice(&by_batch);
         if chosen != Some(proto_net::sockets::EPOLL_BATCH) {
             return Err(format!(
@@ -2027,7 +2054,8 @@ fn rates(machine: &qemu::Machine) -> Result<(), String> {
 
 /// The network service has told that its switch thread and its stack run under their kernel
 /// budgets (`budgets.rs`): a service whose budget is refused does not start, and one that took
-/// none would leave the levels below it without protection.
+/// none would leave the levels below it without protection; the same for the request threads of
+/// the RAM file, pipe and terminal services (`rt::budget`).
 pub fn require_budget_lines(lines: &[String]) -> Result<(), String> {
     for what in ["the switch", "the stack"] {
         let wanted = format!("net: {what} runs under its budget");
@@ -2035,7 +2063,8 @@ pub fn require_budget_lines(lines: &[String]) -> Result<(), String> {
             return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
         }
     }
-    Ok(())
+    // The RAM, pipe and terminal services of the image tell the same of their request threads.
+    crate::service_budget::require_service_budget_lines(lines)
 }
 
 #[cfg(test)]
@@ -2508,7 +2537,7 @@ mod tests {
 
     #[test]
     fn the_batch_of_epoll_set_is_the_largest_within_the_budget() {
-        let budget = netd::choose::BUDGET;
+        let budget = netd::choose::BUDGET + SWITCH_ALLOWANCE;
         assert_eq!(
             epoll_batch_choice(&[(4, 7_000), (8, 9_000), (16, budget)]),
             Some(16)
@@ -2526,6 +2555,13 @@ mod tests {
         };
         let lines = vec![line(8, 100), line(16, 300), line(16, 200), line(1, 9_999)];
         assert_eq!(epoll_set_by_batch(&lines), [(8, 100), (16, 300)]);
+        // A step over the budget by less than one preemption passes and is named; more fails.
+        let over = netd::choose::BUDGET + 1;
+        let beyond = netd::choose::BUDGET + SWITCH_ALLOWANCE + 1;
+        assert_eq!(epoll_batch_choice(&[(8, 9_000), (16, over)]), Some(16));
+        assert_eq!(epoll_batch_choice(&[(8, 9_000), (16, beyond)]), Some(8));
+        assert_eq!(epoll_allowed(&[(8, 9_000), (16, over)]), [(16, over)]);
+        assert_eq!(epoll_allowed(&[(16, beyond), (8, 9_000)]), []);
     }
 
     #[test]

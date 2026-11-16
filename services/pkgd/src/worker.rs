@@ -14,6 +14,7 @@
 
 use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
+use core::fmt::Write as _;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use pkgd::commit::{self, Device, Failed, Point, Start};
 use pkgd::packages::Entry;
@@ -590,6 +591,35 @@ pub struct Worker {
     pub first_write: bool,
 }
 
+/// A line of text built on the stack, for a line that must go out in one write.
+struct Line {
+    bytes: [u8; 192],
+    len: usize,
+}
+
+impl Line {
+    const fn new() -> Self {
+        Line {
+            bytes: [0; 192],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.len + text.len();
+        let room = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        room.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// The state the worker starts with: the disk service connected, the store read, its
 /// packages attached; the lines it prints are the service's account of what it found
 /// (pk3-design R12).
@@ -597,11 +627,14 @@ fn boot() -> Result<Worker, Fail> {
     let process = view::<Process>(PROCESS);
     let disk = connect_disk(&process)?;
     let roots = roots();
-    rt::print!("pkgd: roots");
+    // The line goes out in one write: a line of another writer (init's notice of an overrun, say)
+    // cannot fall between its pieces.
+    let mut line = Line::new();
+    let _ = line.write_str("pkgd: roots");
     for key in &roots.0[..roots.1] {
-        rt::print!(" {}", key.name.as_str());
+        let _ = write!(line, " {}", key.name.as_str());
     }
-    rt::println!();
+    rt::println!("{}", line.as_str());
     let mut worker = Worker {
         disk,
         process,

@@ -765,6 +765,13 @@ pub fn flush_copy() {
     }
 }
 
+/// Whether a copy waits on this CPU (the kernel tests tell a copy made by
+/// the call itself from one made at the end of `dispatch`).
+#[cfg(feature = "ktest")]
+pub fn copy_waits() -> bool {
+    crate::local::local().deferred.load(Ordering::Relaxed) & crate::local::COPY != 0
+}
+
 /// The copy that waits, then the commands that the call posted: a thread
 /// of another CPU reads the message once it is woken, so the commands go
 /// out after the copy (cmd.rs).
@@ -799,6 +806,18 @@ fn flush_copy_now() {
             .copying
             .fetch_sub(1, Ordering::Release);
     }
+}
+
+/// The word at byte `offset` of the message buffer of `t` (the kernel tests
+/// look at what a copy left there).
+#[cfg(feature = "ktest")]
+pub fn buffer_word(t: NonNull<Thread>, offset: usize) -> u64 {
+    // SAFETY: the caller holds the thread, which does not run; only the
+    // field is borrowed.
+    let Some(buffer) = (unsafe { &(*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    buffer.frame.word(offset)
 }
 
 /// Writes `words` into the message buffer of `t` from byte `offset` on
@@ -1131,8 +1150,9 @@ pub fn user_ticks(thread: &Thread, now: u64) -> u64 {
 /// and its policy, read under OBJ, since the scheduler and
 /// the channels change them there. O(1).
 /// The ticks the thread has run, the stint it is in now included, come
-/// with it (x5), and those of them it spent in the kernel (x6).
-pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
+/// with it (x5), those of them it spent in the kernel (x6), and the times a
+/// higher level took it off the CPU while it was ready (x7).
+pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64, u64) {
     let now = crate::arch::timer::now();
     sched::locked(|_| {
         // SAFETY: the caller holds a reference to the thread; only its
@@ -1165,7 +1185,12 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             policy: Some(t.sched.policy()),
         };
         let ran = t.sched.ran_at(now);
-        (info, ran, ran.saturating_sub(user_ticks(t, now)))
+        (
+            info,
+            ran,
+            ran.saturating_sub(user_ticks(t, now)),
+            u64::from(t.sched.preempts()),
+        )
     })
 }
 

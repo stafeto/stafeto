@@ -197,6 +197,26 @@ fn ramfs() -> Vec<RootFile> {
     ]
 }
 
+/// The probe of the time budgets of the services (tests/service-budget): the directories of a
+/// path of eight names of 60 bytes (488 bytes: the probe builds the same path) and a file at
+/// its end, which the greedy client asks the RAM service to look up.
+fn service_budget() -> Vec<RootFile> {
+    let name = "n".repeat(60);
+    let mut files = Vec::new();
+    let mut path = String::new();
+    for depth in 1..=8 {
+        path.push('/');
+        path.push_str(&name);
+        let leaked: &'static str = Box::leak(path.clone().into_boxed_str());
+        files.push(if depth < 8 {
+            dir(leaked)
+        } else {
+            file(leaked, 0o755, ROOT, "service-budget")
+        });
+    }
+    files
+}
+
 /// `/dev/null`: the RAM service serves the entry of this path as the null
 /// device (writes dropped, reads at the end), so the bytes are none.
 fn null_device() -> RootFile {
@@ -1666,6 +1686,7 @@ pub const IMAGES: &[&str] = &[
     "boot-base.img",
     "boot-full.img",
     "boot-pkg-probe.img",
+    "boot-sporadic.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1732,6 +1753,11 @@ fn pkg_files(address: &str, roots: &[u8]) -> Vec<RootFile> {
 pub fn files_of(name: &str) -> Vec<RootFile> {
     let mut files = match name {
         "boot-ramfs.img" => ramfs(),
+        "boot-service-budget.img"
+        | "boot-service-budget-1.img"
+        | "boot-service-budget-ramfs-unbound.img"
+        | "boot-service-budget-pipe-unbound.img"
+        | "boot-service-budget-tty-unbound.img" => service_budget(),
         "boot-ramfs-cleanup.img"
         | "boot-loader-abort.img"
         | "boot-loader-abort-steps.img"
@@ -2045,6 +2071,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-posix-procs.img"
+        | "boot-sporadic.img"
         | "boot-posix-jobs.img"
         | "boot-posix-lifetimes.img"
         | "boot-posix-lock-rules.img"
@@ -2852,6 +2879,7 @@ mod tests {
                 "boot-net-probe-two.img" => &crate::net_probe::TWO_PROGRAMS,
                 "boot-net-steps-two.img" => &crate::net_probe::TWO_STEPS_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-sporadic.img" => &crate::SPORADIC_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,
                 "boot-posix-fifo.img" => &crate::POSIX_FIFO_PROGRAMS,

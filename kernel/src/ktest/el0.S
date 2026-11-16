@@ -16,6 +16,8 @@
 .equ SVC_PENDING, 0xFF05                // ktest::el0::SVC_PENDING
 .equ SVC_SUSPEND_SEND, 0xFF07
 .equ SVC_CONTINUE_CROWD, 0xFF08
+.equ SVC_TAKE, 0xFF09                   // ktest::el0::SVC_TAKE
+.equ SVC_TAKES_ALONE, 0xFF0A            // ktest::el0::SVC_TAKES_ALONE
 .equ SVC_PEND, 0xFF06                   // ktest::el0::SVC_PEND
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
 .equ CALL_SEND, 4                       // abi::Call::Send
@@ -171,6 +173,16 @@ el0_mark:
     str     x1, [x0]
     svc     #SVC_DONE
 
+// Adds 1 to the word at x0 and ends the thread with thread_exit: a mark that
+// makes no test call, for a thread that runs on a CPU other than 0.
+.global el0_mark_then_exit
+el0_mark_then_exit:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
 // Adds 1 to the word at x0 over and over until the word at x1 is set.
 .global el0_count_until
 el0_count_until:
@@ -179,6 +191,55 @@ el0_count_until:
     str     x2, [x0]
     ldr     x3, [x1]
     cbz     x3, 1b
+    svc     #SVC_DONE
+
+// Adds 1 to the word at x0 over and over until the word at x1 is set, then
+// ends the thread with thread_exit.
+.global el0_count_then_exit
+el0_count_then_exit:
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    ldr     x3, [x1]
+    cbz     x3, 1b
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// Takes OBJ (svc #SVC_TAKE) over and over until the word at x1 is set, then
+// sets the word at x0 and ends the thread with thread_exit. A call
+// overwrites x0, so the addresses go to x4 and x5.
+.global el0_take_loop
+el0_take_loop:
+    mov     x4, x0
+    mov     x5, x1
+1:  svc     #SVC_TAKE
+    ldr     x3, [x5]
+    cbz     x3, 1b
+    mov     x2, #1
+    str     x2, [x4]
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// Counts the takes of OBJ of this CPU (svc #SVC_TAKES_ALONE), sets the word
+// at x1, waits for the word at x0, which the thread of el0_take_loop sets,
+// then spins x2 counter ticks, which the end of that thread takes, and ends.
+.global el0_takes_alone
+el0_takes_alone:
+    mov     x4, x0
+    mov     x5, x1
+    mov     x6, x2
+    svc     #SVC_TAKES_ALONE
+    mov     x2, #1
+    str     x2, [x5]
+1:  ldr     x2, [x4]
+    cbz     x2, 1b
+    isb
+    mrs     x7, cntvct_el0
+    add     x7, x7, x6
+2:  isb
+    mrs     x8, cntvct_el0
+    cmp     x8, x7
+    b.lo    2b
     svc     #SVC_DONE
 
 // Adds 1 to the word at x0 x1 times, the count in x2, then ends.
@@ -357,6 +418,48 @@ el0_close_then_exit:
 .global el0_receive
 el0_receive:
     svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, x2 policy), then notify(x3
+// channel, bits 1), then ends.
+.global el0_set_priority_then_notify
+el0_set_priority_then_notify:
+    mov     x22, x3
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x0, x22
+    mov     x1, #1
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// receive(x0 channel, x1 flags), then yields until the word at x20, a peer's
+// count, moves: sets the words at x21 and x23 to 1 then. Sets the word at x21
+// to 2 and ends when the counter reaches x22 first.
+.global el0_receive_then_watch
+el0_receive_then_watch:
+    svc     #CALL_RECEIVE
+    ldr     x2, [x20]
+1:  svc     #CALL_YIELD
+    ldr     x3, [x20]
+    cmp     x3, x2
+    b.hi    2f
+    isb
+    mrs     x4, cntvct_el0
+    cmp     x4, x22
+    b.lo    1b
+    mov     x5, #2
+    str     x5, [x21]
+    svc     #SVC_DONE
+2:  mov     x5, #1
+    str     x5, [x21]
+    str     x5, [x23]
+    svc     #SVC_DONE
+
+// receive(x0 channel, x1 flags), then waits until the word at x20 is set.
+.global el0_receive_then_poll
+el0_receive_then_poll:
+    svc     #CALL_RECEIVE
+1:  ldr     x3, [x20]
+    cbz     x3, 1b
     svc     #SVC_DONE
 
 // receive(x0 channel, x1 flags), then thread_exit: the result stays in

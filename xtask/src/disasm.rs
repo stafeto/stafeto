@@ -433,7 +433,7 @@ pub fn counter_read_sites(root: &Path) -> Result<Vec<(String, usize)>, String> {
 pub const COUNTER_READ_SITES: [(&str, usize); 11] = [
     ("karch/src/timer.rs", 1),
     ("kernel/src/ktest.rs", 2),
-    ("kernel/src/ktest/el0.S", 8),
+    ("kernel/src/ktest/el0.S", 11),
     ("lib/posix-abi/src/signals.rs", 1),
     ("lib/rt/src/sys.rs", 1),
     ("lib/rt/src/time.rs", 1),

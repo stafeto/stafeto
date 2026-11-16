@@ -363,7 +363,9 @@ pub enum Call {
     /// the handle x5, at the level `low`, for each overrun; overruns that
     /// come between two firings of the budget's event merge (the count of
     /// the notification says how many posts merged; up to `SS_REPL_MAX` a
-    /// period). A handle with no label makes every budget report label 0, so
+    /// period). An overrun left untold when the budget's thread ends is told
+    /// when the budget's next thread becomes ready, and `BudgetInfo.overruns`
+    /// always counts it. A handle with no label makes every budget report label 0, so
     /// the creator gives each budget a labelled handle. INVALID_ARGS for a
     /// CPU that is not up, a budget below `MIN_BUDGET_NS` or above the
     /// period, a period below `MIN_PERIOD_NS`, a level outside 1-63, or x6
@@ -871,7 +873,11 @@ pub const INFO_MEMORY: u64 = 5;
 /// has run, the stint it is in now included (idle time and cleanup are
 /// nobody's), and in x6 the part of them it spent in the kernel, from each
 /// entry from EL0 to the decision that sends a thread back (its system
-/// time; the rest is its user time).
+/// time; the rest is its user time), and in x7 the times a higher level
+/// (or the cleanup queue) took the thread off the CPU while it was ready:
+/// not a block, a yield or the end of a quantum (the count wraps at 2^16).
+/// Each preemption adds the exception entry, the handler and the way back
+/// to the ticks of x5.
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.
@@ -972,6 +978,15 @@ pub const STAMP_SGI_SENT: u8 = 4;
 pub const STAMP_SGI_GOT: u8 = 5;
 /// The CPU went to `wfi` (key 0) and came out of it (key 1).
 pub const STAMP_WFI: u8 = 6;
+/// The effective level of the holder of a channel (a server that took its
+/// last request or notification) fell, or was found, below the top of the
+/// channel's queue (key: the thread number in bits 0-15, the kind in bits
+/// 16-17 (1 a receive that took a notification, 2 a reply between the
+/// halves of `reply_receive`), the holder's
+/// level in bits 18-23 and the top of the queue in bits 24-29).
+pub const STAMP_HOLDER: u8 = 7;
+pub const STAMP_HOLDER_NOTICE: u8 = 1;
+pub const STAMP_HOLDER_REPLY: u8 = 2;
 /// The causes of `STAMP_READY`: a notification, the reply of a call, a
 /// request that reached a waiting receiver, the close of a channel or the
 /// end of a call by an interrupt, a command from another CPU, a timer, a

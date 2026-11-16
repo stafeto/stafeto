@@ -4029,7 +4029,7 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
 /// process and each entry of mem_create takes `OBJ` once, in every build
 /// (spec 8.1): the frames go back or come in one section, the zeroing, the
 /// links of the list and the scrub of the pages outside it. The count of the
-/// takes is the lock's tickets (`obj::takes`), which every test build keeps.
+/// takes is this CPU's own (`obj::takes`), which every test build keeps.
 pub fn memory_shell_and_create_portions_take_obj_once(_: &Boot) -> Result<(), &'static str> {
     const ONCE: &str = "a portion took OBJ other than once";
     let objects = memory::in_use();
@@ -9764,6 +9764,16 @@ fn with_holder_of(
     server_c: u64,
     body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_holder_at(budgets, server_c, FIRE_LEVEL, body)
+}
+
+/// `with_holder_of` with a channel whose notifications stand at `fire`.
+fn with_holder_at(
+    budgets: bool,
+    server_c: u64,
+    fire: u8,
+    body: impl FnOnce(&Holder, &mut [Option<NonNull<Thread>>; 3]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let counts = (
         process::in_use(),
         thread::in_use(),
@@ -9775,7 +9785,7 @@ fn with_holder_of(
     let mut others = [None; 3];
     let result = match made {
         [Ok(service), Ok(client)] => (|| {
-            let channel = channel::create(service, FIRE_LEVEL).map_err(|_| "no channel")?;
+            let channel = channel::create(service, fire).map_err(|_| "no channel")?;
             let handle = process::insert_handle(service, Object::Channel(channel), Rights::RECEIVE);
             // SAFETY: the reference `create` handed out goes; the handle, if
             // it went in, holds the channel.
@@ -10102,6 +10112,181 @@ pub fn reply_receive_takes_the_queued_request_at_its_level(_: &Boot) -> Result<(
             "the server left the CPU between its reply and its receive",
         )
     })
+}
+
+/// `reply_receive` of the server of `h` whose reply carries a handle (a resource with TRANSFER
+/// of the server's table) while a request queued behind it at 40. The handle goes to the
+/// client's table, the number of it into the client's buffer. With `poll` an interrupt is
+/// pending at the poll between the halves: the call starts over at its `svc`, and the receive
+/// comes on the next entry, with no second look at the handle that has gone.
+fn reply_with_a_handle_and_a_queued_request(poll: bool) -> Result<(), &'static str> {
+    with_holder(false, |h, others| {
+        thread::give_buffer(h.t, BUFFER as usize + PAGE_SIZE as usize).map_err(|_| "no buffer")?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        pick(h.r)?;
+        let moved = process::insert_handle(h.service, Object::Resource, Rights::TRANSFER)
+            .map_err(|_| "no handle to move")?;
+        // SAFETY: the test holds the thread, which does not run.
+        unsafe { thread::write_handles(h.r, &[(moved.0, 0)]) };
+        give_channel(h);
+        // SAFETY: as above.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 1 << abi::HANDLES_SHIFT;
+        if poll {
+            syscall::force_poll();
+        }
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        if poll {
+            check(
+                thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+                "the poll with an interrupt pending did not start the call over",
+            )?;
+            // The call starts over at its `svc`.
+            // SAFETY: as above.
+            unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+            syscall::dispatch(h.r, Call::ReplyReceive.number());
+        }
+        // SAFETY: as above.
+        let (r, t) = unsafe { (h.r.as_ref(), h.t.as_ref()) };
+        check(r.regs.x[0] == 0, "reply_receive with a handle failed")?;
+        check(
+            r.regs.x[11] != h.token && r.regs.x[11] != 0 && r.boost_token == r.regs.x[11],
+            "reply_receive with a handle did not take the queued request",
+        )?;
+        check(
+            poll || r.sched.state() == State::Running,
+            "the server left the CPU between its reply with a handle and its receive",
+        )?;
+        check(
+            process::close_handle(h.service, moved, CAUSE) == Err(Error::BadHandle),
+            "the handle of the reply stayed in the server's table",
+        )?;
+        let arrived = thread::buffer_word(h.t, abi::msgbuf::HANDLES);
+        check(
+            t.sched.state() == State::Ready
+                && process::close_handle(h.client, Handle(arrived), CAUSE).is_ok(),
+            "the client did not get the handle of the reply",
+        )?;
+        check(
+            process::close_handle(h.client, Handle(arrived), CAUSE) == Err(Error::BadHandle),
+            "the client got the handle of the reply twice",
+        )
+    })
+}
+
+/// A reply with a handle and the receive that follows it are one entry: the request that queued
+/// is taken at once and the server stays on the CPU, as for a reply with none.
+pub fn reply_receive_with_a_handle_takes_the_queued_request_in_one_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    reply_with_a_handle_and_a_queued_request(false)
+}
+
+/// The same with an interrupt at the poll between the halves: the handle goes with the reply of
+/// the first entry, and the receive on the next takes the request without a second move.
+pub fn reply_receive_with_a_handle_goes_on_with_its_receive_on_the_next_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    reply_with_a_handle_and_a_queued_request(true)
+}
+
+/// The length of the long messages in the tests of `reply_receive`.
+const LONG: usize = 1000;
+
+/// The words of a long message from byte 64 on: `seed` and the index.
+fn long_words(seed: u64) -> [u64; (LONG - 64) / 8] {
+    core::array::from_fn(|i| seed << 32 | i as u64)
+}
+
+/// `reply_receive` of the server of `h` with a reply of `LONG` bytes while
+/// a request of `LONG` bytes waits behind it: both go through message
+/// buffers outside the section of the call, the reply's first (it reads the
+/// server's buffer, which the request then fills). With `restart` the poll
+/// between the halves finds an interrupt, and the receive comes on the next
+/// entry.
+fn long_reply_and_long_request(restart: bool) -> Result<(), &'static str> {
+    const REPLY: u64 = 0x5e;
+    const REQUEST: u64 = 0xa7;
+    with_holder(false, |h, others| {
+        thread::give_buffer(h.t, BUFFER as usize + PAGE_SIZE as usize).map_err(|_| "no buffer")?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        thread::give_buffer(t2, BUFFER as usize + 2 * PAGE_SIZE as usize)
+            .map_err(|_| "no buffer")?;
+        thread::write_words(t2, 64, &long_words(REQUEST));
+        // A queued request's description is read from its sender's x1.
+        // SAFETY: the test holds the thread, which does not run.
+        unsafe { (*t2.as_ptr()).regs.x[1] = LONG as u64 };
+        let sent = channel::send(
+            t2,
+            Via::Channel(h.channel),
+            Desc::from_send(LONG as u64).expect("a send"),
+            &[],
+        );
+        check(
+            sent == Ok(None),
+            "a long request did not queue behind the server",
+        )?;
+        pick(h.r)?;
+        thread::write_words(h.r, 64, &long_words(REPLY));
+        give_channel(h);
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = LONG as u64;
+        if restart {
+            syscall::force_poll();
+        }
+        let between = syscall::copies_between_halves();
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        if restart {
+            // The call starts over at its `svc`.
+            // SAFETY: as above.
+            unsafe { (*h.r.as_ptr()).regs.elr += 4 };
+            syscall::dispatch(h.r, Call::ReplyReceive.number());
+        }
+        // The end of `dispatch` flushes in a test build too: only the counter
+        // says the call made the reply's copy itself, between its halves.
+        check(
+            syscall::copies_between_halves() == between + 1,
+            "the call did not make the copy of its reply between its halves",
+        )?;
+        let (reply, request) = (long_words(REPLY), long_words(REQUEST));
+        let got = |t, words: &[u64]| {
+            words
+                .iter()
+                .enumerate()
+                .all(|(i, w)| thread::buffer_word(t, 64 + 8 * i) == *w)
+        };
+        check(
+            got(h.t, &reply),
+            "the client did not get the bytes of the reply",
+        )?;
+        check(
+            got(h.r, &request),
+            "the server did not get the bytes of the request",
+        )
+    })
+}
+
+/// A reply of more than the inline part and a request of more than that
+/// that queued behind the server: the call makes both copies, the reply's
+/// before the receive begins (a call that left the reply's copy waiting
+/// panicked: a message copy waits for another).
+pub fn reply_receive_copies_a_long_reply_before_it_takes_a_long_request(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    long_reply_and_long_request(false)
+}
+
+/// The same with an interrupt at the poll between the halves: the reply's
+/// copy is made before the thread leaves the kernel, and the receive on the
+/// next entry makes the request's.
+pub fn reply_receive_copies_a_long_reply_before_its_receive_on_the_next_entry(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    long_reply_and_long_request(true)
 }
 
 /// A client that ended while its request was served does not stop the
@@ -10857,6 +11042,246 @@ pub fn an_overrun_posts_one_notification_for_each_period(_: &Boot) -> Result<(),
     )
 }
 
+/// A thread whose budget ran out with an overrun its place was not told of
+/// ends (thread_exit, a kill) before the event that would tell it fires: the
+/// end takes the event out of the heap and gives the budget back free (spec
+/// 8), as an unbind does, and the overrun stays untold, so that the next thread
+/// of the budget asks for the event at once and the place hears of it once.
+/// The thread ends running at `low`.
+pub fn a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    const LABEL: u64 = 0x52;
+    let c = Caller::new()?;
+    let counts = (channel::in_use(), crate::budget::in_use());
+    let mut made: [Option<NonNull<Thread>>; 3] = [None; 3];
+    let mut budget = None;
+    let mut channel_made = None;
+    let result = (|| {
+        let ch = channel::create(c.process, LEVEL).map_err(|_| "no channel")?;
+        channel_made = Some(ch);
+        let rcv = thread::create(c.process, USER_VA, USER_VA, 0, 30, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[0] = Some(rcv);
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[1] = Some(t);
+        let b = crate::budget::create(
+            c.process,
+            0,
+            SERVER_C,
+            10 * SERVER_C,
+            1,
+            4,
+            Some((ch, LABEL)),
+        )
+        .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(rcv).map_err(|_| "a thread did not start")?;
+        pick(rcv)?;
+        channel::receive(rcv, ch, true).map_err(|_| "the receiver did not wait")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        // SAFETY: the test holds the thread, which does not run at EL0.
+        unsafe { (&mut (*rcv.as_ptr()).regs.x)[1..12].fill(0) };
+        // The thread runs past its budget at a time of the test's own: it is
+        // in the background, the overrun asked for its event at once, and the
+        // thread runs on at `low`.
+        let at = timer::now() + 4 * SERVER_C;
+        // SAFETY: the scheduler's threads are alive.
+        sched::locked(|k| unsafe { k.s.tick(at) });
+        pick(t)?;
+        // SAFETY: the test holds the thread.
+        let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+        check(
+            demoted && crate::budget::entry_deadline(b).is_some(),
+            "the budget did not run out with its event armed",
+        )?;
+        // SAFETY: the thread is the running one and alive; the test's own
+        // reference stays until the end of the test.
+        unsafe { sched::exit(t, CAUSE) };
+        check(
+            crate::budget::entry_deadline(b).is_none(),
+            "the event of the budget of an ended thread stayed in the heap",
+        )?;
+        let info = crate::budget::info(b);
+        check(
+            info.state == abi::BUDGET_FREE && info.overruns == 1,
+            "the budget of an ended thread is not free with its overrun counted",
+        )?;
+        // The next thread of the budget starts: the event stands at once, and
+        // the place hears of the overrun, once.
+        let t2 = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made[2] = Some(t2);
+        crate::budget::bind(t2, b).map_err(|_| "the budget did not bind again")?;
+        thread::start(t2).map_err(|_| "a thread did not start")?;
+        pick(t2)?;
+        check(
+            crate::budget::entry_deadline(b).is_some(),
+            "the overrun that was left untold asked for no event",
+        )?;
+        timers::fire_at(LEVEL, timer::now());
+        // SAFETY: the test holds the thread.
+        let heard = Notification::from_words(
+            unsafe { rcv.as_ref() }.regs.x[1..12]
+                .try_into()
+                .expect("x1-x11"),
+        );
+        check(
+            heard
+                == Notification {
+                    source: Source::Budget,
+                    label: LABEL,
+                    bits: 1,
+                    count: 1,
+                },
+            "the place did not hear of the overrun of the thread that ended",
+        )
+    })();
+    for t in made.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    if let Some(ch) = channel_made {
+        // SAFETY: the test's reference goes.
+        unsafe { channel::release(ch, abi::Rights::NONE, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        (channel::in_use(), crate::budget::in_use()) == counts,
+        "a channel or a budget of the test stayed",
+    )
+}
+
+/// The replenishment event of a budget stands in the heap of the level of the
+/// thread's base priority, and follows the base: a thread whose budget is
+/// gone raises its base, and a thread that spins above the old level must not
+/// starve its replenishment (a firing runs at its level). The event keeps its
+/// time and moves up; a lower base moves it down.
+pub fn the_event_of_a_budget_follows_the_base_of_its_thread(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 10;
+    let c = Caller::new()?;
+    let counts = crate::budget::in_use();
+    let mut made = None;
+    let mut budget = None;
+    let result = (|| {
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, LEVEL, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made = Some(t);
+        let b = crate::budget::create(c.process, 0, SERVER_C, 10 * SERVER_C, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        let at = timer::now() + 4 * SERVER_C;
+        // SAFETY: the scheduler's threads are alive.
+        sched::locked(|k| unsafe { k.s.tick(at) });
+        // SAFETY: the test holds the thread.
+        let demoted = unsafe { t.as_ref() }.sched.is_demoted();
+        check(demoted, "the budget did not run out")?;
+        let Some(deadline) = crate::budget::entry_deadline(b) else {
+            return Err("no event stood for the replenishment");
+        };
+        check(
+            level_of_entry(b) == LEVEL,
+            "the event does not stand at the base of its thread",
+        )?;
+        for base in [LEVEL + 20, LEVEL + 5] {
+            sched::set_priority(t, base, Policy::Fifo, false)
+                .map_err(|_| "the priority did not change")?;
+            check(
+                level_of_entry(b) == base && crate::budget::entry_deadline(b) == Some(deadline),
+                "the event did not follow the base of its thread with its time",
+            )?;
+        }
+        Ok(())
+    })();
+    if let Some(t) = made {
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        crate::budget::in_use() == counts,
+        "a budget of the test stayed",
+    )
+}
+
+/// The stint that runs when a thread ends is the budget's: the ticks it ran
+/// since its last stop are in the budget's `ran` once it ended, whatever the
+/// way it ended.
+pub fn the_stint_of_a_thread_that_ends_is_charged_to_its_budget(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    const STINT: u64 = 2_000;
+    let c = Caller::new()?;
+    let counts = crate::budget::in_use();
+    let mut made = None;
+    let mut budget = None;
+    let result = (|| {
+        let t = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        made = Some(t);
+        let b = crate::budget::create(c.process, 0, 100 * STINT, 1000 * STINT, 1, 4, None)
+            .map_err(|_| "no budget")?;
+        budget = Some(b);
+        crate::budget::bind(t, b).map_err(|_| "the budget did not bind")?;
+        thread::start(t).map_err(|_| "a thread did not start")?;
+        pick(t)?;
+        let until = timer::now() + STINT;
+        while timer::now() < until {
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        unsafe { sched::exit(t, CAUSE) };
+        let info = crate::budget::info(b);
+        check(
+            info.ran >= STINT && info.state == abi::BUDGET_FREE,
+            "the stint of a thread that ended was not charged to its budget",
+        )
+    })();
+    if let Some(t) = made {
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    if let Some(b) = budget {
+        // SAFETY: the test's reference goes.
+        unsafe { crate::budget::release(b, CAUSE) };
+    }
+    c.release();
+    timer::disarm();
+    result?;
+    check(
+        crate::budget::in_use() == counts,
+        "a budget of the test stayed",
+    )
+}
+
 /// The server takes a notification from the channel, as a receive of its own
 /// does: a slot posted while it works goes to its next `receive`, which
 /// returns it. Its budget is gone and its request answered, so it stands
@@ -10985,6 +11410,163 @@ pub fn a_notification_holder_is_not_lifted_after_its_next_receive_or_send(
         check(
             level_of(h.r) == 1,
             "a request lifted a thread that waited in a send",
+        )
+    })
+}
+
+/// A ready thread at 10 stands where the scheduler picks among the ready:
+/// the holder `h.r`, whose queue holds a request at 40, must come before it.
+fn holder_precedes_a_lower_thread(
+    h: &Holder,
+    others: &mut [Option<NonNull<Thread>>; 3],
+) -> Result<(), &'static str> {
+    let low =
+        thread::create(h.client, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    let low = *others[2].insert(low);
+    thread::start(low).map_err(|_| "a thread did not start")?;
+    // SAFETY: the scheduler's threads are alive.
+    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+    check(
+        matches!(picked, kcore::sched::Decision::Run(r) if r == h.r),
+        "a request at 40 waits behind a ready thread at 10: its holder is not at its level",
+    )
+}
+
+/// A demoted server that holds a request is lifted to 40 by a request that
+/// queues. A notification above that request (the channel's slots stand at
+/// 48) comes first at its next receive, which ends the lift and takes the
+/// slot as a boost that a demoted thread does not keep: the request at 40 is
+/// still queued, and its holder must work at 40 for the step the
+/// notification asks for (`channel::receive`, the holder lifts again).
+pub fn a_receive_that_takes_a_notification_above_a_request_keeps_the_lift(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder_at(true, SERVER_C, 48, |h, others| {
+        h.demote()?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        channel::notify(h.channel, 1, CAUSE).map_err(|_| "no notification")?;
+        h.reply()?;
+        channel::receive(h.r, h.channel, false).map_err(|_| "the server did not take it")?;
+        // SAFETY: the test holds the thread.
+        let regs = unsafe { h.r.as_ref() }.regs.x;
+        check(
+            Notification::from_words(regs[1..12].try_into().expect("x1-x11")).source
+                == Source::Unlabeled,
+            "the server took the request before the notification",
+        )?;
+        holder_precedes_a_lower_thread(h, others)?;
+        check(
+            level_of(h.r) == 40,
+            "the receive that took a notification left the holder below the request at 40",
+        )
+    })
+}
+
+/// The reply of the first half of `reply_receive` ends the boost of the
+/// request it answers, and a poll that finds an interrupt starts the call
+/// over: the server waits at its `low` for its receive while a request at 40
+/// stands in the queue (it queued while the server worked, and lifted it).
+/// The server must work at 40 between the halves.
+pub fn a_reply_between_the_halves_keeps_the_lift_a_queued_request_gave(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        syscall::force_poll();
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        check(
+            thread::long(h.r) == Some(thread::Long::Receive(h.handle.0)),
+            "the poll with an interrupt pending did not start the call over",
+        )?;
+        holder_precedes_a_lower_thread(h, others)?;
+        check(
+            level_of(h.r) == 40,
+            "the reply left the holder below the request at 40 between the halves",
+        )
+    })
+}
+
+/// A `reply_receive` whose reply fails (BAD_STATE: the client waits for no
+/// reply from the process) goes back to EL0 with no receive: the holder it
+/// ended the boost of is not lifted for a step it does not take.
+pub fn a_failed_reply_leaves_the_holder_at_its_level(_: &Boot) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        h.demote()?;
+        give_channel(h);
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the server",
+        )?;
+        // SAFETY: the test holds the client, which waits and does not run.
+        let waits = unsafe { (*h.t.as_ptr()).waits.take() };
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*h.r.as_ptr()).regs.x };
+        x[0] = h.token;
+        x[1] = 0;
+        syscall::dispatch(h.r, Call::ReplyReceive.number());
+        // SAFETY: as above.
+        let code = unsafe { h.r.as_ref() }.regs.x[0];
+        // SAFETY: as above; the wait goes back as it was.
+        unsafe { (*h.t.as_ptr()).waits = waits };
+        check(
+            Error::from_code(code) == Some(Error::BadState),
+            "a reply to a client that waits for no reply did not fail",
+        )?;
+        check(
+            level_of(h.r) == 1,
+            "a failed reply left the holder lifted for a receive it does not make",
+        )
+    })
+}
+
+/// The send of a holder of a notification ends the hold (its token) and
+/// leaves the lift a queued request gave it: the thread waits in its send at
+/// 40. A send is no drop of the holder's level.
+pub fn a_send_that_ends_a_notification_hold_keeps_the_lift_a_queued_request_gave(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_holder(true, |h, others| {
+        takes_a_notification(h)?;
+        let t2 = *others[0].insert(running_at(h.client, 40)?);
+        h.queue(t2)?;
+        check(
+            level_of(h.r) == 40,
+            "a request at 40 did not lift the notification holder",
+        )?;
+        let other = channel::create(h.service, FIRE_LEVEL).map_err(|_| "no channel")?;
+        let sent = channel::send(
+            h.r,
+            Via::Channel(other),
+            Desc::from_send(abi::NO_WAIT).expect("a send"),
+            &[],
+        );
+        // SAFETY: the reference `create` handed out goes.
+        unsafe { channel::release(other, Rights::NONE, CAUSE) };
+        check(
+            sent == Err(Error::WouldBlock),
+            "a send with no receiver did not refuse",
+        )?;
+        check(
+            level_of(h.r) == 40,
+            "a send that ended the hold of a notification lowered the holder below the request at 40",
         )
     })
 }

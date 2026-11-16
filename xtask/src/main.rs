@@ -46,6 +46,7 @@ mod base_image;
 mod bash_dialog;
 mod blk_probe;
 mod budget_hog;
+mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
@@ -119,6 +120,7 @@ mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod rtbench_check;
+mod service_budget;
 mod smpmeasure;
 mod store_probe;
 mod stubs;
@@ -195,6 +197,27 @@ const VZ_PROGRAMS: [ImageProgram; 3] = [
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
 /// The probe of the time budgets (budget_hog.rs), as init.
 const BUDGET_HOG_PROGRAMS: [ImageProgram; 1] = [("init", "budget-hog", INIT_STACK_SIZE, &[])];
+/// The probe of the time budgets of the RAM, pipe and terminal services (service_budget.rs):
+/// the three services, the quiet driver of the console (the program of the probe of the
+/// terminal, role `S`) and the probe.
+const SERVICE_BUDGET_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-service-budget"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+    ("service-budget", "service-budget", SVC_STACK_SIZE, &[]),
+];
+/// The same with the service at index `at` of the list binding no budget
+/// (`break-budget-unbound`, `cargo xtask budget-breaks`).
+const fn service_budget_unbound(at: usize) -> [ImageProgram; 6] {
+    let mut programs = SERVICE_BUDGET_PROGRAMS;
+    programs[at].3 = &["break-budget-unbound"];
+    programs
+}
+const SERVICE_BUDGET_RAMFS_UNBOUND: [ImageProgram; 6] = service_budget_unbound(1);
+const SERVICE_BUDGET_PIPE_UNBOUND: [ImageProgram; 6] = service_budget_unbound(2);
+const SERVICE_BUDGET_TTY_UNBOUND: [ImageProgram; 6] = service_budget_unbound(3);
 /// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
@@ -926,6 +949,14 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 7] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// The image of the sporadic server probe (tests/sporadic): that of the probe
+/// of POSIX processes (the loader, for `fork`) with the probe as its program,
+/// which the same table of init starts under the same name.
+const SPORADIC_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "sporadic-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const BUSYBOX_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -1428,7 +1459,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 271;
+const INIT_TESTS: u32 = 272;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1643,9 +1674,11 @@ enum Variant {
     BudgetNoQueueLift,
     BudgetNoQueueLiftTest,
     /// `reply_receive` that returns to EL0 between its reply and its receive
-    /// (`break-reply-receive-split`): the loan and queue phases of the probe
-    /// `budget-hog` must catch it.
-    ReplyReceiveSplit,
+    /// (`break-reply-receive-split`): the kernel test
+    /// `reply_receive_takes_the_queued_request_at_its_level` must catch it. The
+    /// loan phase of the probe `budget-hog` shows the break only with some
+    /// code of `Token::reply_receive` in the user library, so the probe does not judge it.
+    ReplyReceiveSplitTest,
     /// An overrun that posts nothing to the budget's place
     /// (`break-budget-overrun-silent`): the overrun phase of the probe
     /// `budget-hog` must catch it, and, with the kernel tests
@@ -1660,6 +1693,10 @@ enum Variant {
     /// it for the lift of the queue (`break-notice-holder-keeps`): the kernel
     /// tests of the lift must catch it.
     NoticeHolderKeepsTest,
+    /// A `reply_receive` that leaves the copy of its reply waiting while its
+    /// receive delivers a request (`break-reply-receive-copy`): the kernel
+    /// tests of the call must catch it.
+    ReplyReceiveCopyTest,
     /// Breaks the kernel tests of the rebind and the payer pin: a holder's lift
     /// that names no payer (`break-notice-payer-none`), an unbind that does not
     /// charge the stint that runs (`break-budget-unbind-no-charge`), and one
@@ -1668,10 +1705,34 @@ enum Variant {
     NoticePayerNoneTest,
     BudgetUnbindNoChargeTest,
     BudgetUnbindKeepsEventTest,
+    /// A thread that ends without its budget charged for the stint that runs
+    /// (`break-budget-exit-no-charge`): the kernel tests of the end must catch
+    /// it.
+    BudgetExitNoChargeTest,
+    /// An end of a thread that counts its untold overrun as told
+    /// (`break-budget-exit-forgets`): the kernel test of the end must catch it.
+    BudgetExitForgetsTest,
+    /// A replenishment event that stays in the heap of the level its thread's
+    /// base had when it was armed (`break-budget-event-keeps-level`): the
+    /// kernel test of the event must catch it.
+    BudgetEventKeepsLevelTest,
+    /// The same break in the image of the EL0 tests, where the test of a
+    /// thread that raises its base and a thread above it that spins runs.
+    BudgetEventKeepsLevelEl0,
+    /// A holder that is not lifted again by the request that waits after a
+    /// receive that took a notification (`break-relift-notice`), or after the
+    /// reply between the halves of `reply_receive` (`break-relift-reply`).
+    LiftAgainNoticeTest,
+    LiftAgainReplyTest,
+    /// The same two breaks in the kernel the probes of the budgets boot (`cargo xtask
+    /// budget-breaks`): the kernel tests of `budget-hog` judge both, and the one-CPU level-40
+    /// numbers of `service-budget breaks` are printed for information.
+    LiftAgainNotice,
+    LiftAgainReply,
 }
 
 impl Variant {
-    const ALL: [Variant; 67] = [
+    const ALL: [Variant; 76] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1731,14 +1792,23 @@ impl Variant {
         Variant::BudgetForgiveLoan,
         Variant::BudgetNoQueueLift,
         Variant::BudgetNoQueueLiftTest,
-        Variant::ReplyReceiveSplit,
+        Variant::ReplyReceiveSplitTest,
         Variant::BudgetOverrunSilent,
         Variant::BudgetOverrunSilentTest,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
+        Variant::ReplyReceiveCopyTest,
         Variant::NoticePayerNoneTest,
         Variant::BudgetUnbindNoChargeTest,
         Variant::BudgetUnbindKeepsEventTest,
+        Variant::BudgetExitNoChargeTest,
+        Variant::BudgetExitForgetsTest,
+        Variant::BudgetEventKeepsLevelTest,
+        Variant::BudgetEventKeepsLevelEl0,
+        Variant::LiftAgainNoticeTest,
+        Variant::LiftAgainNotice,
+        Variant::LiftAgainReply,
+        Variant::LiftAgainReplyTest,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1806,14 +1876,25 @@ impl Variant {
             Variant::BudgetForgiveLoan => Some("break-budget-forgive-loan"),
             Variant::BudgetNoQueueLift => Some("break-budget-no-queue-lift"),
             Variant::BudgetNoQueueLiftTest => Some("ktest,break-budget-no-queue-lift"),
-            Variant::ReplyReceiveSplit => Some("break-reply-receive-split"),
+            Variant::ReplyReceiveSplitTest => Some("ktest,break-reply-receive-split"),
             Variant::BudgetOverrunSilent => Some("break-budget-overrun-silent"),
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
+            Variant::ReplyReceiveCopyTest => Some("ktest,break-reply-receive-copy"),
             Variant::NoticePayerNoneTest => Some("ktest,break-notice-payer-none"),
             Variant::BudgetUnbindNoChargeTest => Some("ktest,break-budget-unbind-no-charge"),
             Variant::BudgetUnbindKeepsEventTest => Some("ktest,break-budget-unbind-keeps-event"),
+            Variant::BudgetExitNoChargeTest => Some("ktest,break-budget-exit-no-charge"),
+            Variant::BudgetExitForgetsTest => Some("ktest,break-budget-exit-forgets"),
+            Variant::BudgetEventKeepsLevelTest => Some("ktest,break-budget-event-keeps-level"),
+            Variant::BudgetEventKeepsLevelEl0 => {
+                Some("ktest,el0-half,break-budget-event-keeps-level")
+            }
+            Variant::LiftAgainNoticeTest => Some("ktest,break-relift-notice"),
+            Variant::LiftAgainReplyTest => Some("ktest,break-relift-reply"),
+            Variant::LiftAgainNotice => Some("break-relift-notice"),
+            Variant::LiftAgainReply => Some("break-relift-reply"),
         }
     }
 
@@ -1897,14 +1978,23 @@ impl Variant {
             Variant::BudgetForgiveLoan => "stafeto-budget-forgive-loan",
             Variant::BudgetNoQueueLift => "stafeto-budget-no-queue-lift",
             Variant::BudgetNoQueueLiftTest => "stafeto-ktest-budget-no-queue-lift",
-            Variant::ReplyReceiveSplit => "stafeto-reply-receive-split",
+            Variant::ReplyReceiveSplitTest => "stafeto-ktest-reply-receive-split",
             Variant::BudgetOverrunSilent => "stafeto-budget-overrun-silent",
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
+            Variant::ReplyReceiveCopyTest => "stafeto-ktest-reply-receive-copy",
             Variant::NoticePayerNoneTest => "stafeto-ktest-notice-payer-none",
             Variant::BudgetUnbindNoChargeTest => "stafeto-ktest-unbind-no-charge",
             Variant::BudgetUnbindKeepsEventTest => "stafeto-ktest-unbind-keeps-event",
+            Variant::BudgetExitNoChargeTest => "stafeto-ktest-exit-no-charge",
+            Variant::BudgetExitForgetsTest => "stafeto-ktest-exit-forgets",
+            Variant::BudgetEventKeepsLevelTest => "stafeto-ktest-event-keeps-level",
+            Variant::BudgetEventKeepsLevelEl0 => "stafeto-ktest-el0-event-keeps-level",
+            Variant::LiftAgainNoticeTest => "stafeto-ktest-relift-notice",
+            Variant::LiftAgainReplyTest => "stafeto-ktest-relift-reply",
+            Variant::LiftAgainNotice => "stafeto-relift-notice",
+            Variant::LiftAgainReply => "stafeto-relift-reply",
         }
     }
 }
@@ -1977,6 +2067,7 @@ commands:
             (tools/build-relibc.py) into target/relibc/sysroot
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
+  sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
             over the Rust POSIX layer
   posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
             Cortex-A53 with the kernel entered at EL2 (as ci does)
@@ -2272,7 +2363,9 @@ commands:
   budget-hog [--cpus N] the probe of the time budgets under -icount on one CPU and on four (a hog at a high
             level with a budget leaves a lower level its share; the boost of a request stays and a
             notification's goes with the budget)
+  budget-journal the probe of the overruns in init's journal under -icount: one line in each 10 s for a budget that overruns in every period, none for one that does not
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
+  budget-break-unbound the share probe of the network service fails on the image with no budget bound
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
   uart-breaks the deliberate break of the driver (break-uart-poll) fails the host test of the polled 16550
   aws       the disk of the EFI loader on EC2 with guards: check, image, boot, dump, neighbour, clean, sweep
@@ -2341,7 +2434,10 @@ fn main() {
         Some("smp-vz") => vz::smp_boot(),
         Some("smp-asid-vz") => vz::smp_asid(),
         Some("budget-hog") => budget_hog::run(&args[1..]),
+        Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("budget-break-unbound") => budget_hog::unbound_break(),
+        Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
@@ -2481,6 +2577,7 @@ fn main() {
             _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
+        Some("sporadic-probe") => sporadic_probe(),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
             Err(why) => {
@@ -5966,7 +6063,9 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
         |line| line.starts_with("init: posix-procs ended:"),
         Duration::from_secs(30),
     );
-    let outcome = run.stop();
+    let mut outcome = run.stop();
+    // A line of the audit of ramfs or of the services' timing may land inside a long line.
+    outcome.lines = rejoin_split_lines(&outcome.lines);
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
@@ -6985,6 +7084,56 @@ const RAM_STEP_KINDS: [(usize, &str); 26] = [
 /// 16,503 (ramfs, the wait of its step for the process service).
 const CALL_WAIT_MAX: u64 = 48_000;
 
+/// The length of a tick of the timer of the QEMU virt machine (62.5 MHz), in nanoseconds.
+const TICK_NS: u64 = 16;
+
+/// The most a wait of kind `kind` of the service with the tag `tag` may last, in ticks. The
+/// tags are 2 for the RAM service, 4 for the pipe service and 5 for the terminal service; T and C
+/// come from the budgets in init's table. A service that has a budget makes its calls at the
+/// level `low` (32) once the budget is spent, and the levels above it work inside the wait:
+///
+/// - the waits of kinds 64 to 66 (a notification, maintenance, a session that is gone) may last
+///   until the replenishment gives the caller its own level back, T - C, so their bound is
+///   CALL_WAIT_MAX + ticks(T - C);
+/// - every request of the terminal service (tag 5) has the same CALL_WAIT_MAX + ticks(T - C): a
+///   request may call the process service (a TtySignal, a vouch), which queues the walk of a
+///   TtySignal and works at its own level less TTY_STEP_BELOW (52 - 3 = 49, below the
+///   terminal's 50) while it is queued. A terminal that spent its budget calls from 32, below
+///   that walk, and its call returns once the steps of the walk (a crowd of 64 members: eight
+///   steps of 7,000 ticks and more) have run or the replenishment gives it level 50 back, T - C
+///   at the most. Seen 86,546 ticks of kind 21 (the probe's TtySignal to a crowd of 64) and
+///   42,306 of kind 28 (Detach);
+/// - every other kind has CALL_WAIT_MAX + ticks(C1 + C2 + C3), the C of the three budgets, as
+///   each of the other two services and the service itself may take its C above 32 once inside
+///   the wait (a wait is shorter than T);
+/// - a service without a budget keeps CALL_WAIT_MAX.
+fn call_wait_max(tag: &str, kind: usize) -> u64 {
+    let budgets = match tag {
+        "2" => init::table::ramfs::RAM_BUDGETS,
+        "4" => init::table::ramfs::PIPE_BUDGETS,
+        "5" => init::table::ramfs::TTY_BUDGETS,
+        _ => &[],
+    };
+    match budgets.first() {
+        Some(b) if (64..=66).contains(&kind) || tag == "5" => {
+            CALL_WAIT_MAX + (b.t_ns - b.c_ns) / TICK_NS
+        }
+        Some(_) => {
+            let c_ns: u64 = [
+                init::table::ramfs::RAM_BUDGETS,
+                init::table::ramfs::PIPE_BUDGETS,
+                init::table::ramfs::TTY_BUDGETS,
+            ]
+            .iter()
+            .filter_map(|b| b.first())
+            .map(|b| b.c_ns)
+            .sum();
+            CALL_WAIT_MAX + c_ns / TICK_NS
+        }
+        None => CALL_WAIT_MAX,
+    }
+}
+
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
 const PIPE_STEP_KINDS: [(usize, &str); 15] = [
@@ -7416,7 +7565,8 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
 }
 
 /// Fails when a wait in the lines of the services `tags` passes
-/// CALL_WAIT_MAX (the heartbeat, kind 64, included), or when `rt` cut an
+/// `call_wait_max` (CALL_WAIT_MAX, more for the kinds 64 to 66 of a service with a budget and for
+/// every request of the terminal service; the heartbeat, kind 64, included), or when `rt` cut an
 /// accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
@@ -7424,9 +7574,10 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
-            if wait > CALL_WAIT_MAX {
+            let max = call_wait_max(tag, kind);
+            if wait > max {
                 return Err(format!(
-                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {CALL_WAIT_MAX}"
+                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {max}"
                 ));
             }
         }
@@ -7643,7 +7794,24 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// came from, and the rest of the split line, the next line, joins its
 /// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
-    const INTRUDERS: [&str; 2] = ["service ", "ramfs: "];
+    // The exact starts of the intruders: a text such as "in the service ok" is no intruder.
+    const INTRUDERS: [&str; 6] = [
+        "service step: ",
+        "service wait: ",
+        "service wait cut: ",
+        "service gap: ",
+        "service preempt: ",
+        "ramfs: audit round ",
+    ];
+    // The lines of the probes that are long enough to be split: those of posix-procs and the
+    // lines of its close and lifetime tests.
+    const SPLIT_STARTS: [&str; 5] = [
+        "posix-procs: ",
+        "RAM close ",
+        "POSIX close ",
+        "RAM native ",
+        "RAM lifetime ",
+    ];
     let mut out = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
@@ -7652,7 +7820,7 @@ fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
             .iter()
             .filter_map(|tag| line.find(tag))
             .min()
-            .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
+            .filter(|&at| at > 0 && SPLIT_STARTS.iter().any(|start| line.starts_with(start)));
         match (cut, lines.get(i + 1)) {
             (Some(at), Some(rest)) => {
                 out.push(line[at..].to_owned());
@@ -8189,6 +8357,43 @@ fn widest_gap(lines: &[String]) -> Option<(String, usize, u64, u64)> {
         })
         .max_by_key(|row| row.2)
 }
+
+/// `cargo xtask sporadic-probe`: SCHED_SPORADIC in 0.5.0 (tests/sporadic): the
+/// options say 0 and -1, every call that would give a thread the policy is
+/// refused for root and for a user, and no budget can be bound.
+fn sporadic_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-sporadic.img", &SPORADIC_PROGRAMS, BOOT_PROFILE)?;
+    let output = qemu::on_cpus(4, || {
+        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        run_until(
+            cmd,
+            Duration::from_secs(120),
+            Some("init: posix-procs ended"),
+            &kernel.elf,
+        )
+    })?;
+    qemu::expect_marker(
+        &output,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in SPORADIC_MARKERS {
+        qemu::expect_marker(&output, marker)?;
+    }
+    println!("sporadic-probe: ok");
+    Ok(())
+}
+
+/// What the probe prints when each of its stages held.
+const SPORADIC_MARKERS: [&str; 5] = [
+    "sporadic: the options, SS_REPL_MAX and the range of SCHED_SPORADIC ok",
+    "sporadic: root: every call that would give the policy is refused ok",
+    "sporadic: user: every call that would give the policy is refused ok",
+    "sporadic: no thread has a budget: the other policies and their parameters round trip ok",
+    "sporadic: ok",
+];
 
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
@@ -13467,6 +13672,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "ramfs-probe",
         "--package",
+        "service-budget",
+        "--package",
         "test-svc",
         "--package",
         "rtbench",
@@ -14125,24 +14332,67 @@ mod tests {
     #[test]
     fn a_wait_past_the_limit_fails() {
         // A call and the heartbeat have CALL_WAIT_MAX, and a cut line fails.
-        let call = |w: u64| vec![format!("service wait: 2 kind 25 {w} ticks of {w}")];
-        assert!(check_waits(&call(CALL_WAIT_MAX), &["2"], "t").is_ok());
-        assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["2"], "t").is_err());
+        // (the tag 10 is a service without a budget)
+        let call = |w: u64| vec![format!("service wait: 10 kind 25 {w} ticks of {w}")];
+        assert!(check_waits(&call(CALL_WAIT_MAX), &["10"], "t").is_ok());
+        assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["10"], "t").is_err());
         let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
         assert!(check_waits(&cut, &["5"], "t").is_err());
         let ok = vec![format!(
-            "service wait: 4 kind 64 {CALL_WAIT_MAX} ticks of 600000"
+            "service wait: 10 kind 25 {CALL_WAIT_MAX} ticks of 600000"
         )];
-        assert!(check_waits(&ok, &["4"], "t").is_ok());
+        assert!(check_waits(&ok, &["10"], "t").is_ok());
         let bad = vec![format!(
-            "service wait: 4 kind 64 {} ticks of 600000",
+            "service wait: 10 kind 25 {} ticks of 600000",
             CALL_WAIT_MAX + 1
         )];
-        assert!(check_waits(&bad, &["4"], "t").is_err());
+        assert!(check_waits(&bad, &["10"], "t").is_err());
         assert!(check_waits(&bad, &["5"], "t").is_ok());
         // The preemption after init's answer has no limit.
         let preempted = vec!["service preempt: 4 kind 64 900000 ticks of 950000".to_owned()];
         assert!(check_waits(&preempted, &["4"], "t").is_ok());
+    }
+
+    #[test]
+    fn a_service_with_a_budget_may_wait_t_minus_c_more_in_its_own_calls() {
+        let on = |tag: &str| match tag {
+            "2" => init::table::ramfs::RAM_BUDGET_ON,
+            _ => true,
+        };
+        // The terminal and pipe services: (5 ms - 75 us) / 16 ns = 307 812 ticks more.
+        // Every request of the terminal service may wait behind the walk of a TtySignal.
+        assert_eq!(call_wait_max("5", 21), 355_812);
+        assert_eq!(call_wait_max("5", 28), 355_812);
+        assert_eq!(call_wait_max("5", 10), 355_812);
+        let seen = vec!["service wait: 5 kind 21 86546 ticks of 92072".to_owned()];
+        assert!(check_waits(&seen, &["5"], "t").is_ok());
+        for tag in ["4", "5"] {
+            assert_eq!(call_wait_max(tag, 65), 355_812);
+            assert_eq!(call_wait_max(tag, 64), 355_812);
+            assert_eq!(call_wait_max(tag, 66), 355_812);
+            // The other kinds: the C of the three budgets, 400 us = 25 000 ticks.
+            let all = if init::table::ramfs::RAM_BUDGET_ON {
+                25_000
+            } else {
+                9_375
+            };
+            if tag == "4" {
+                assert_eq!(call_wait_max(tag, 63), CALL_WAIT_MAX + all);
+                assert_eq!(call_wait_max(tag, 10), CALL_WAIT_MAX + all);
+            }
+        }
+        // The RAM service: (5 ms - 250 us) / 16 ns = 296 875 ticks more.
+        let ram = if on("2") { 344_875 } else { CALL_WAIT_MAX };
+        assert_eq!(call_wait_max("2", 65), ram);
+        assert_eq!(
+            call_wait_max("2", 25),
+            CALL_WAIT_MAX + if on("2") { 25_000 } else { 9_375 }
+        );
+        // A service without a budget keeps the bound.
+        assert_eq!(call_wait_max("10", 65), CALL_WAIT_MAX);
+        let line = |w: u64| vec![format!("service wait: 5 kind 65 {w} ticks of 400000")];
+        assert!(check_waits(&line(355_812), &["5"], "t").is_ok());
+        assert!(check_waits(&line(355_813), &["5"], "t").is_err());
     }
 
     /// The lines of a run for `getlimit_bound`: five services above the
@@ -15317,6 +15567,27 @@ mod tests {
         );
     }
 
+    /// The same for the long lines of the close tests of the lifetime probe.
+    #[test]
+    fn an_audit_line_of_ramfs_inside_a_line_of_the_close_tests_goes_back_out() {
+        let lines: Vec<String> = [
+            "RAM close event: exact replay, stale body, physical I/O andramfs: audit round 39",
+            " 32-reference birth cleanup ok, ticks=12",
+            "posix-procs: pending WAIT of a dead process leaves nothing in the service ok",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "ramfs: audit round 39",
+                "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks=12",
+                "posix-procs: pending WAIT of a dead process leaves nothing in the service ok",
+            ]
+        );
+    }
+
     #[test]
     fn locks_of_the_kernel_are_the_ones_the_order_names() {
         // DEVICES and LPI_MAP: the MSI devices by DeviceID and the free LPIs
@@ -15587,6 +15858,19 @@ mod entropy_in_images_tests {
             ),
             ("main::EXT4RO_PROGRAMS", &EXT4RO_PROGRAMS),
             ("main::RAMFS_PROGRAMS", &RAMFS_PROGRAMS),
+            ("main::SERVICE_BUDGET_PROGRAMS", &SERVICE_BUDGET_PROGRAMS),
+            (
+                "main::SERVICE_BUDGET_RAMFS_UNBOUND",
+                &SERVICE_BUDGET_RAMFS_UNBOUND,
+            ),
+            (
+                "main::SERVICE_BUDGET_PIPE_UNBOUND",
+                &SERVICE_BUDGET_PIPE_UNBOUND,
+            ),
+            (
+                "main::SERVICE_BUDGET_TTY_UNBOUND",
+                &SERVICE_BUDGET_TTY_UNBOUND,
+            ),
             ("main::POSIX_FILES_PROGRAMS", &POSIX_FILES_PROGRAMS),
             ("main::LOADER_ABORT_PROGRAMS", &LOADER_ABORT_PROGRAMS),
             ("main::IMAGE_GATES_PROGRAMS", &IMAGE_GATES_PROGRAMS),

@@ -433,7 +433,7 @@ bound = 8
 why = "moves a slot behind at most LIFT_DEPTH = 8 servers (spec 6.6): called from requeue, and from send when a request queues behind a server whose budget is gone (lift_holder)"
 
 [[loop]]
-function = "kernel::channel::message::reply"
+function = "kernel::channel::message::reply_on"
 at = "*"
 bound = 4
 why = "a message carries up to four handles: the loops go over them (and over the slots that hold them), or retry the release of one"
@@ -1147,12 +1147,12 @@ why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENT
 
 [[loop]]
 function = "<kcore::budget::Server>::split"
-at = "0x68"
+at = "0xac"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
 
 [[loop]]
 function = "<kcore::budget::Server>::split"
-at = "0x134"
+at = "0x174"
 bound = 5
 why = "the insertion of a replenishment in time order: at most MAX_REPLENISHMENTS = 4 places and the look that ends the loop (Server::add)"
