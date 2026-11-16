@@ -23,6 +23,32 @@ and the header version 1 of both.
   making, the newest on top. A window goes when the last copy of its session
   closes or when the context's session does: the end of a process frees its
   windows, and their places are painted again in the next frame.
+  A window is XRGB8888 (opaque) or ARGB8888 (the colour already multiplied
+  by the alpha, laid over what is below); the format of WINDOW_CREATE and of
+  ATTACH must agree. The compositor puts the windows together with pixman
+  (below), and draws a pointer's picture over them once a pointer was seen.
+- Events (stage G2). Each window has a ring of 64 events of 16 bytes; EVENTS,
+  called on a window's session, takes up to 32 of them without waiting, and
+  says LOST when older ones were dropped. The bit 3 of the channel
+  WINDOW_CREATE gave says a ring has something. A window that has its first
+  buffer taken into a frame gets the focus and the top place; the window with
+  the focus gets the keys; a window gets the pointer's moves and buttons in its
+  own coordinates (the window under the pointer, or the one a pressed button
+  holds until it is released); a click on a window gives it the focus and the
+  top place; FOCUS_IN and FOCUS_OUT tell a window it won or lost the focus,
+  and when the window with the focus goes it passes to the one on top. The
+  design keeps the rings per context; this stage keeps them per window, which
+  is the same for a context with one window and costs a client with several
+  windows one EVENTS call each.
+- The manager (`MANAGE`, a session whose label init marked MANAGER_MARK: the
+  table's `COMP_MANAGERS`) lists the windows, moves them, raises them, shows and
+  hides them and gives one the focus, and reads CREATE and CLOSE of every window
+  in a ring of its own. While it has subscribed (DESCRIBE's `flags` bit 0), the
+  Alt keys and the keys pressed with Alt held are its alone, so Alt and Tab can
+  switch the windows without the window with the focus seeing them.
+- The input session (`INJECT`, INPUT_MARK, `COMP_INJECTORS`: the probes only)
+  injects a key, the pointer's place on the screen or a button, which takes the
+  path of the device's own event.
 - `proto_gpu` first revision (`proto/gpu`): OPEN, FLUSH, CLOSE and CLONE, as
   `libc.so` speaks them (`stafeto_display_open` and `stafeto_display_flush`).
   OPEN makes a window of the whole screen over the one buffer the compositor
@@ -39,6 +65,39 @@ and the header version 1 of both.
   object has more than one mapping (the compositor holds the only legitimate
   one), which closes the common case. What stays open is a handle kept
   unmapped and mapped after the next OPEN.
+
+## Input
+
+The compositor is the client of two input services of init's table: the
+keyboard's (`input`) and the pointer's (`pointer`, a second instance of
+`virtio-input` on a virtio-tablet). It asks each for the focus with a channel
+of its own in GRANT, and the driver sends that channel the bit 1 whenever a
+step put events into the ring; the compositor reads them (READ, up to 32 at a
+time, without waiting) in its own step. The keyboard's focus is the first
+revision's window's while that window lives (Doom reads its keys from the
+service itself, as before) and the compositor's again when it goes. The tablet
+reports `EV_ABS` `ABS_X` and `ABS_Y` from 0 to 32 767 across the screen and
+`BTN_LEFT` as a key; the compositor scales them to the screen's 640 by 400. The
+image of the probe (`table::focus`) has the tablet on the transport 13; the
+base image has no tablet record yet, so its pointer is stage G2's probe image
+only.
+
+## pixman
+
+The windows are put together by pixman 0.46.4 (MIT), built from its pinned
+source by `tools/build-pixman.py` (`packages/pixman.toml`: version, URL and
+SHA-256 of the archive) as a static library that `lib/pixman` links into the
+compositor: its portable C paths, with no SIMD, no threads and no timers, over
+the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
+allocates from, and the few functions of a C library it calls). Two files of
+pixman are left out and replaced by one function each in the shim: the
+combiners of the wide formats and the accessors of images, which windows of 8
+bits to the channel never reach. The package installs no file: its licence
+notice is the one the distribution carries for it
+(`/usr/share/licenses/pixman/`), and `xtask packages` accepts it as a library
+of a service (`SERVICE_LIBRARIES`). The copy of a band and the lay of a band over
+the screen are pixman's SRC and OVER; the glue is `lib/pixman` and
+`services/compositor/src/px.rs`.
 
 ## Limits accepted in stage G1
 
@@ -83,10 +142,23 @@ the driver: every step stays under 0.9 of term B, and a band of a frame, like
 a portion of the driver's clearing, under 16 328 ticks. `cargo xtask
 doom-probe` runs Doom through the compositor.
 
+`cargo xtask focus-probe` (stage G2) runs the compositor with a tablet, two
+clients whose windows overlap (the second with an alpha), a manager and a
+program that injects events, and compares QEMU's screenshot with the CRC-32
+the guest computed after each step: the overlap with its transparency, a click
+that gives the first window the focus and the top place, the manager's switch
+on Alt and Tab, and the screen after the second client ended and the first
+went on untouched. Each client's events must be exactly the list it expects:
+the keys only while it had the focus, the focus changes, the click in its own
+coordinates. QEMU's tablet then moves and presses through the monitor, and the
+surviving window must see the click. Under `-icount` it measures the steps of
+the compositor and of the tablet's driver (each under 0.9 of term B, a band
+under 16 328 ticks).
+
 ## Not yet
 
-The pointer and the keyboard focus of several windows, events in the client's
-ring, the period of a frame and its counters, pixman, transparency, a window's
-move and resize, the layers of the display controller and the bypass of the
-composition for one window, and the C functions for windows in `libc.so`
-(a change of the ABI series).
+The period of a frame and its counters, a window's resize, NEON paths of
+pixman, a window manager as a program of its own (the probe's manager is a role
+of `focus-probe`), the pointer in the base image, the layers of the display
+controller and the bypass of the composition for one window, and the C
+functions for windows in `libc.so` (a change of the ABI series).
