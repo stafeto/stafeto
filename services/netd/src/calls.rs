@@ -54,6 +54,15 @@ fn ok() -> Answer {
     Answer::Status(Status::Ok)
 }
 
+/// A wait of a set that cannot block, parked behind the steps of the wire: the reply the step of
+/// waking owes, and what it needs to take the records.
+pub struct ZeroWait {
+    pub pending: rt::service::Pending,
+    pub label: u64,
+    pub wire: u32,
+    pub most: usize,
+}
+
 fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
     match reply.write(r.reply()) {
         Ok(()) => Answer::Reply(Outgoing::new()),
@@ -2038,31 +2047,46 @@ impl Net {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let mut ready = EpollReady::EMPTY;
-        // A wait that followed steps run in its request may give fewer pairs than it was asked
-        // (the caller waits again for the rest): the sum stays within the bound of a step.
-        let most = if core::mem::take(&mut self.settled) {
-            most.min(SETTLED_MOST)
-        } else {
-            most
-        };
         let blocking = key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0;
-        // Steps of the wire stand ahead of this request (told): a wait that
-        // can block does not report before them, the step of waking answers it after them.
-        let park = core::mem::take(&mut self.steps_pending) && blocking;
-        if !park {
+        // Steps of the wire stand ahead of this request (told, or owed): no step runs in a
+        // request, so the wait does not report before them. A wait that can block is parked and
+        // the step of waking answers it when the records are ready; one that cannot block is
+        // parked with its steps of waking counted (`netd::zero`) and answered by the step of
+        // waking, empty if nothing is ready then.
+        let steps = core::mem::take(&mut self.steps_pending);
+        if steps && !blocking && netd::zero::room(&self.zero) {
+            if let Some(pending) = r.defer() {
+                let item = ZeroWait {
+                    pending,
+                    label: s.label(),
+                    wire,
+                    most,
+                };
+                if netd::zero::park(&mut self.zero, item).is_ok() {
+                    self.wake_wanted = true;
+                    self.interest.due |= 1 << set;
+                }
+                return Answer::Deferred;
+            }
+        }
+        if !steps {
             self.interest.take(set, most, &mut ready);
         }
         rt::service::step_detail(ready.len as u64);
-        if (park || ready.len == 0) && blocking {
+        if (steps || ready.len == 0) && blocking {
             let answer = self.wait(s, r, key, Kind::Epoll, set, notify);
             // The look at the list was cut short (it is longer than the window
             // and the records seen reported nothing), or the steps ahead have not run:
             // records are left, and nothing else would wake the wait for them.
-            if park || self.interest.has_ready(set) {
+            if steps || self.interest.has_ready(set) {
                 self.interest.due |= 1 << set;
                 self.wake_wanted = true;
             }
             return answer;
+        }
+        if steps {
+            // No room to park a wait that cannot block (or no token): it reports what is known.
+            self.interest.take(set, most, &mut ready);
         }
         let mut w = Writer::new();
         let answer = match ready.write(&mut w) {
@@ -2070,6 +2094,40 @@ impl Net {
             Err(status) => Answer::Status(status),
         };
         self.done(s, key, answer)
+    }
+
+    /// A step of waking ran (`quiet`: neither sending nor receiving is told): the waits that
+    /// cannot block and are parked answer, with the records as they stand.
+    pub fn answer_zero(&mut self, quiet: bool) {
+        let interest = &mut self.interest;
+        netd::zero::after_wake(&mut self.zero, quiet, |w| {
+            let mut ready = EpollReady::EMPTY;
+            let found = interest.find_set(w.label, w.wire);
+            if let Some(set) = found {
+                interest.take(set, w.most, &mut ready);
+            }
+            let mut body = Writer::new();
+            let mut out = Writer::new();
+            let sent = match found {
+                None => w
+                    .pending
+                    .answer(&proto_wire::reply(code(proto_net::BAD_FD)), Outgoing::new()),
+                Some(_) if ready.write(&mut body).is_err() => w.pending.answer(
+                    &proto_wire::reply(code(proto_net::INVALID)),
+                    Outgoing::new(),
+                ),
+                Some(_) => match long::Reply::Ready(body.as_bytes()).write(&mut out) {
+                    Ok(()) => w.pending.answer(out.as_bytes(), Outgoing::new()),
+                    Err(status) => w
+                        .pending
+                        .answer(&proto_wire::reply(status), Outgoing::new()),
+                },
+            };
+            if sent.is_err() {
+                rt::println!("net: a reply of a parked wait could not be written");
+            }
+        });
+        self.step_due = true;
     }
 
     // ----- CLONE -----
@@ -2273,9 +2331,6 @@ fn is_loopback_or_own(net: &Net, ip: [u8; 4]) -> bool {
 }
 
 const _: () = assert!(SESSIONS >= ROOT_CLONES);
-
-/// The pairs a wait of a set gives when steps of the wire ran in its request.
-pub const SETTLED_MOST: usize = proto_net::sockets::EPOLL_MOST / 2;
 
 /// The label of the handle with which an instance of the service sends HOME_MAKE to another.
 pub const HOME_LABEL: u64 = 0x484F_4D45_0000_0001;
