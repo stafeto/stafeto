@@ -765,9 +765,11 @@ mod steps {
     /// (between steps) waited does not belong to it.
     pub fn restart() {
         let Some(slot) = claim() else { return };
-        slot.ran_begin.store(own_ran(slot), Ordering::Relaxed);
+        // The count first: the call that reads it runs before the thread's time is read, so
+        // that its ticks are not in the step.
         slot.preempt_begin
             .store(own_preempts(slot), Ordering::Relaxed);
+        slot.ran_begin.store(own_ran(slot), Ordering::Relaxed);
         slot.waited.store(0, Ordering::Relaxed);
         slot.preempted.store(0, Ordering::Relaxed);
         slot.departed.store(false, Ordering::Relaxed);
