@@ -1087,7 +1087,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks|lba4096|mdts1]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1097,29 +1097,41 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 /// is killed, as a power failure would; the second run starts the machine on the same file and the probe
 /// finds `hello` installed and running, the settings and the serial in place. With `breaks` the service
 /// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass; `lba4096`
-/// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB.
+/// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB; `steps` runs the first scenario
+/// under -icount with the steps of the services counted and holds the NVMe service's to 0.9 of term B.
 pub fn nvme_persist(args: &[String]) -> Result<(), String> {
-    let (breaks, shape) = match args.first().map(String::as_str) {
-        None => (false, Shape::Plain),
-        Some("breaks") => (true, Shape::Plain),
-        Some("lba4096") => (false, Shape::Lba4096),
-        Some("mdts1") => (false, Shape::Mdts1),
+    let (breaks, shape, steps) = match args.first().map(String::as_str) {
+        None => (false, Shape::Plain, false),
+        Some("breaks") => (true, Shape::Plain, false),
+        Some("lba4096") => (false, Shape::Lba4096, false),
+        Some("mdts1") => (false, Shape::Mdts1, false),
+        Some("steps") => (false, Shape::Plain, true),
         Some(other) => {
             return Err(format!(
-                "usage: nvme-persist [breaks|lba4096|mdts1]: {other}"
+                "usage: nvme-persist [breaks|lba4096|mdts1|steps]: {other}"
             ));
         }
     };
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
-    let world = make_world(&hello_elf()?, false, "full")?;
+    let world = make_world(
+        &hello_elf()?,
+        steps,
+        if steps { "full-steps" } else { "full" },
+    )?;
     let broken: &'static [&'static str] = if breaks {
         &["break-nvme-write-offset"]
+    } else if steps {
+        &["steps"]
     } else {
         &[]
     };
-    let mut list = PROGRAMS.to_vec();
+    let mut list = if steps {
+        PROGRAMS_STEPS.to_vec()
+    } else {
+        PROGRAMS.to_vec()
+    };
     for program in &mut list {
         match program.0 {
             "init" => program.3 = &["table-store-probe", "nvme-store"],
@@ -1132,10 +1144,13 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
     let name = if breaks {
         "boot-nvme-persist-break.img"
+    } else if steps {
+        "boot-nvme-persist-steps.img"
     } else {
         "boot-nvme-persist.img"
     };
     let esp_name = match shape {
+        Shape::Plain if steps => "efi-disk-nvme-persist-steps.raw",
         Shape::Plain => "efi-disk-nvme-persist.raw",
         Shape::Lba4096 => "efi-disk-nvme-persist-4096.raw",
         Shape::Mdts1 => "efi-disk-nvme-persist-mdts1.raw",
@@ -1159,7 +1174,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
             Ok(())
         };
-        if let Err(why) = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN) {
+        if let Err(why) = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN) {
             return caught(format!("the first run failed: {why}"));
         }
         return match nvme_run(
@@ -1168,6 +1183,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             &file.0,
             &kernel.elf,
             shape,
+            false,
             BOOT_TIMEOUT * 6,
         ) {
             Err(why) => caught(format!("the run after the kill failed: {why}")),
@@ -1178,8 +1194,8 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         };
     }
     let blocks_hello = world.blocks("hello");
-    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN)?;
-    expect(&first, &full_lines(&world, false))?;
+    let first = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN)?;
+    expect(&first, &full_lines(&world, steps))?;
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
     let nvme_line = first
@@ -1208,8 +1224,30 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     {
         return Err("the Virtio disk ran, or the controller was reset in place".into());
     }
+    if steps {
+        // Every method of the service came, and no step of it, the heartbeat's and the
+        // interrupt's included, is past 0.9 of term B.
+        let blk = longest_steps(&first, blk_probe::BLK_TAG);
+        judge("the NVMe service", &blk, &BLK_STEP_KINDS)?;
+        check_waits(
+            &first,
+            &[PKGD_TAG, blk_probe::BLK_TAG, RAM_TAG],
+            "nvme-persist",
+        )?;
+        let text = blk
+            .iter()
+            .map(|(k, t, _)| format!("kind {k} {t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("nvme-persist steps: the NVMe service {text}");
+        println!(
+            "nvme-persist steps: every step of the NVMe service under 0.9 of term B ({}): ok; {nvme_line}",
+            blk_probe::STEP_MAX
+        );
+        return Ok(());
+    }
     // QEMU was killed with the probe's last line: the second run is on what the file holds.
-    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, WITHIN)?;
+    let second = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN)?;
     let wanted = [
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
@@ -1263,6 +1301,7 @@ fn nvme_run(
     data: &Path,
     elf: &Path,
     shape: Shape,
+    icount: bool,
     within: Duration,
 ) -> Result<Vec<String>, String> {
     let mut cmd = efi::command(&efi::EFI, firmware, esp, true, "nvme-persist")?;
@@ -1277,12 +1316,10 @@ fn nvme_run(
             "nvme-ns,drive=data,bus=data-controller,logical_block_size=4096,physical_block_size=4096",
         ]);
     }
-    let output = run_until(
-        cmd,
-        BOOT_TIMEOUT * 16,
-        Some("init: store-probe ended: "),
-        elf,
-    )?;
+    if icount {
+        cmd.args(qemu::ICOUNT);
+    }
+    let output = run_until(cmd, within, Some("init: store-probe ended: "), elf)?;
     if let Some(failed) = output
         .lines
         .iter()
