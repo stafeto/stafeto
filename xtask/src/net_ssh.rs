@@ -404,12 +404,22 @@ fn terminals(client: &Client, key: &Path) -> Result<usize, String> {
                 }
             }
         });
-        let said = rx.recv_timeout(LOGIN_WITHIN);
+        // Past the seventh the system has no room (the server's fork finds no process or memory
+        // left, or no terminal is free): the connection gets no answer, and the count stops there.
+        let said = rx.recv_timeout(if n < PAIRS {
+            LOGIN_WITHIN
+        } else {
+            Duration::from_secs(20)
+        });
         held.push(child);
         match said {
             Ok(line) if line.starts_with("tty-/dev/") => got = n,
             Ok(line) => {
                 println!("net-ssh: session {n} got no terminal ({line})");
+                break;
+            }
+            Err(_) if n >= PAIRS => {
+                println!("net-ssh: session {n} got no answer: the system is full");
                 break;
             }
             Err(_) => {
