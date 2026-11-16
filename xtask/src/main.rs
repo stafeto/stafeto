@@ -7095,6 +7095,14 @@ const TICK_NS: u64 = 16;
 /// - the waits of kinds 64 to 66 (a notification, maintenance, a session that is gone) may last
 ///   until the replenishment gives the caller its own level back, T - C, so their bound is
 ///   CALL_WAIT_MAX + ticks(T - C);
+/// - every request of the terminal service (tag 5) has the same CALL_WAIT_MAX + ticks(T - C): a
+///   request may call the process service (a TtySignal, a vouch), which queues the walk of a
+///   TtySignal and works at its own level less TTY_STEP_BELOW (52 - 3 = 49, below the
+///   terminal's 50) while it is queued. A terminal that spent its budget calls from 32, below
+///   that walk, and its call returns once the steps of the walk (a crowd of 64 members: eight
+///   steps of 7,000 ticks and more) have run or the replenishment gives it level 50 back, T - C
+///   at the most. Seen 86,546 ticks of kind 21 (the probe's TtySignal to a crowd of 64) and
+///   42,306 of kind 28 (Detach);
 /// - every other kind has CALL_WAIT_MAX + ticks(C1 + C2 + C3), the C of the three budgets, as
 ///   each of the other two services and the service itself may take its C above 32 once inside
 ///   the wait (a wait is shorter than T);
@@ -7107,7 +7115,9 @@ fn call_wait_max(tag: &str, kind: usize) -> u64 {
         _ => &[],
     };
     match budgets.first() {
-        Some(b) if (64..=66).contains(&kind) => CALL_WAIT_MAX + (b.t_ns - b.c_ns) / TICK_NS,
+        Some(b) if (64..=66).contains(&kind) || tag == "5" => {
+            CALL_WAIT_MAX + (b.t_ns - b.c_ns) / TICK_NS
+        }
         Some(_) => {
             let c_ns: u64 = [
                 init::table::ramfs::RAM_BUDGETS,
@@ -7555,8 +7565,8 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
 }
 
 /// Fails when a wait in the lines of the services `tags` passes
-/// `call_wait_max` (CALL_WAIT_MAX, more for the kinds 64 to 66 of a service with a budget; the
-/// heartbeat, kind 64, included), or when `rt` cut an
+/// `call_wait_max` (CALL_WAIT_MAX, more for the kinds 64 to 66 of a service with a budget and for
+/// every request of the terminal service; the heartbeat, kind 64, included), or when `rt` cut an
 /// accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
@@ -14350,6 +14360,12 @@ mod tests {
             _ => true,
         };
         // The terminal and pipe services: (5 ms - 75 us) / 16 ns = 307 812 ticks more.
+        // Every request of the terminal service may wait behind the walk of a TtySignal.
+        assert_eq!(call_wait_max("5", 21), 355_812);
+        assert_eq!(call_wait_max("5", 28), 355_812);
+        assert_eq!(call_wait_max("5", 10), 355_812);
+        let seen = vec!["service wait: 5 kind 21 86546 ticks of 92072".to_owned()];
+        assert!(check_waits(&seen, &["5"], "t").is_ok());
         for tag in ["4", "5"] {
             assert_eq!(call_wait_max(tag, 65), 355_812);
             assert_eq!(call_wait_max(tag, 64), 355_812);
@@ -14360,8 +14376,10 @@ mod tests {
             } else {
                 9_375
             };
-            assert_eq!(call_wait_max(tag, 63), CALL_WAIT_MAX + all);
-            assert_eq!(call_wait_max(tag, 10), CALL_WAIT_MAX + all);
+            if tag == "4" {
+                assert_eq!(call_wait_max(tag, 63), CALL_WAIT_MAX + all);
+                assert_eq!(call_wait_max(tag, 10), CALL_WAIT_MAX + all);
+            }
         }
         // The RAM service: (5 ms - 250 us) / 16 ns = 296 875 ticks more.
         let ram = if on("2") { 344_875 } else { CALL_WAIT_MAX };
