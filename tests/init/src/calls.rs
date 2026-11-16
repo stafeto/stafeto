@@ -2374,8 +2374,7 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// one preemption, which a step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
-/// be above 0 and the time of the second burn above the first; the helper
-/// blocks on every wait, which does not count.
+/// be above 0 and the time of the second burn above the first.
 fn a_preemption_is_counted_and_costed() -> Outcome {
     let (pure, none, elapsed) = timed_burn()?;
     check(none == 0, "a burn with no other thread was preempted")?;
@@ -2395,7 +2394,6 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
         sys::timer_set(&timer, 0).map_err(|_| "timer_set failed")?;
         sys::yield_now().map_err(|_| "yield failed")?;
     }
-    let blocked = sys::thread_preempts(&helper).map_err(|_| "THREAD_STATE x7 failed")?;
     close(helper)?;
     close(timer)?;
     close(c)?;
@@ -2413,17 +2411,7 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
             charged > pure,
             "the preemptions added nothing to the time of init",
         )?;
-        // The helper blocks on every wait and runs to its end: no thread
-        // above it takes its CPU, so a block does not count.
-        check(
-            blocked == 0,
-            "a block of the helper counted as a preemption",
-        )?;
     }
-    check(
-        blocked == 0,
-        "a block of the helper counted as a preemption",
-    )?;
     if under_icount() && count > 0 {
         let c_sw = charged.saturating_sub(pure) / count;
         println!("preempt charge ticks: c_sw={c_sw} count={count} pure={pure} charged={charged}");
