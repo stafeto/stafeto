@@ -747,7 +747,7 @@ const INIT_PER_SERVICE_US: u64 = 70;
 /// What the explanation of the loss leaves unexplained, per service, as the starvation gate
 /// allows it: 750, 800 and 800 us of the loss of a window of 10 cycles. The window is the one
 /// with the least share of the victim's own time, and its span (about 11 ms) holds the starts
-/// of three periods, not two. The time stamps of the kernel in that window (one CPU, -icount) show
+/// of three periods. The time stamps of the kernel in that window (one CPU, -icount) show
 /// the main thread of a service running above the victim for about 580 us (terminal), 660 us
 /// (pipe) and 1 200 us (RAM) where its budgets give 75, 75 and 250 us a period: the rest is the
 /// steps of the turns thread's relay, each up to 160 us where the `turns` budget is 25 or 50 us.

@@ -649,8 +649,9 @@ fn depart_label<S: Service<K>, const K: usize>(
 /// turns thread (`turns`), which init carves out of `serve`, so that the work of the service
 /// for itself has a budget of its own and the requests of its clients do not wait for it.
 ///
-/// The service makes its timers and its wake handles on `channel`, not on the channel of the
-/// loop, and starts the thread (`start`) before the loop serves.
+/// The service makes its timers and its wake handles on `channel` (the loop keeps its own
+/// channel for requests and the notices of the kernel), and starts the thread (`start`) before
+/// the loop serves.
 pub struct Turns {
     channel: Handle<Channel>,
     level: u8,
