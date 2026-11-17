@@ -3031,7 +3031,10 @@ impl Service<0> for Fs {
                     return value(r, u32::from(self.ram.storage.usage(s.data.root).pages));
                 }
                 2 if self.steps_reclaim_owner == Some(r.label()) => {
+                    // The probe lets go of the maintenance and takes the step itself: a turn
+                    // told to the turns thread could come after the probe's next request.
                     self.steps_reclaim_owner = None;
+                    self.ram.storage.reclaim_step();
                     let _ = sys::notify(&self.turns, 1);
                 }
                 _ => return status(proto_fs::INVALID_ARGUMENT),
