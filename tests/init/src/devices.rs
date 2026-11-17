@@ -489,6 +489,7 @@ fn window_info_counts_its_mappings() -> Outcome {
             size: page,
             pages: 0,
             mappings,
+            refs: 1 + mappings,
         })
     };
     let before = sys::memory_info(&w);

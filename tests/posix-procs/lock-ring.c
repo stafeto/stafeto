@@ -71,7 +71,7 @@ static int ring_setup(unsigned index) {
     close(fd); return ok ? 0 : -1;
 }
 static int ring_wait(void) {
-    if (!ring_gate(ring_index == 15 ? "/tmp/lock-ring-last" : "/tmp/lock-ring-start")) return -1;
+    if (!ring_gate(ring_index == 15 ? "/tmp/lock-ring-last" : "/tmp/lock-ring-start")) { printf("posix-procs: ring gate index=%u\n", ring_index); return -1; }
     ring_probe_arm(); errno = 0;
     ring_rc = ring_set(ring_b, F_SETLKW, F_WRLCK); ring_errno = errno;
     ring_probe_disarm();
@@ -81,6 +81,7 @@ static int ring_wait(void) {
     if (ring_phase(ring_index, phase)) phase = 'X';
     close(ring_a); close(ring_b); ring_a = ring_b = -1;
     __atomic_store_n(&ring_done, 1, __ATOMIC_RELEASE);
+    if (phase == 'X') printf("posix-procs: ring phase X index=%u rc=%d errno=%d\n", ring_index, ring_rc, ring_errno);
     return phase == 'X' ? -1 : 0;
 }
 static void *ring_worker(void *unused) { (void)unused; ring_wait(); return NULL; }
@@ -172,10 +173,12 @@ static int ring_run(unsigned family) {
     }
     if (ring_setup(4 * family)) return 1;
     int bad = family ? ring_wait() : ring_coordinator();
+    if (bad) printf("posix-procs: ring own part failed family=%u bad=%d\n", family, bad);
     for (unsigned i = 0; i < 3; ++i) {
         int status = 0;
-        if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status) || WEXITSTATUS(status)) bad = 1;
-        if (process_lifetime(children[i]) != 0) bad = 1;
+        if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status) || WEXITSTATUS(status)) { bad = 1; printf("posix-procs: ring child %u status=%d\n", i, status); }
+        int life = process_lifetime(children[i]);
+        if (life != 0) { bad = 1; printf("posix-procs: ring lifetime %u = %d\n", i, life); }
     }
     if (!bad) printf("posix-procs: genuine ring16 family %u ok\n", family);
     return bad ? 1 : 0;

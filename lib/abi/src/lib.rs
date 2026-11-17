@@ -866,7 +866,8 @@ pub const INFO_PROCESS_HANDLES: u64 = 3;
 /// `KernelStats::to_words` in x1-x8.
 pub const INFO_KERNEL_STATS: u64 = 4;
 /// MEMORY takes a memory object's handle, a device window's too, with no
-/// right needed, and returns `MemoryInfo::to_words` in x1-x3.
+/// right needed, and returns `MemoryInfo::to_words` in x1-x4 (x4 is the object's reference
+/// count).
 pub const INFO_MEMORY: u64 = 5;
 /// THREAD_STATE takes a thread handle, with no right needed, and returns
 /// `ThreadInfo::to_words` in x1-x4 and in x5 the counter ticks the thread
@@ -1158,26 +1159,30 @@ impl ProcessShares {
 
 /// A memory object (spec 7.3, 11): its size in bytes, the pages whose
 /// frames it owns, every page of an object `mem_create` made and none of a
-/// device window, and the mappings of it now.
+/// device window, the mappings of it now, and every reference that keeps it
+/// (its handles in any process, its mappings, its handles in transit inside
+/// messages and the long call that makes it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryInfo {
     pub size: u64,
     pub pages: u64,
     pub mappings: u64,
+    pub refs: u64,
 }
 
 impl MemoryInfo {
-    /// The words `object_info` returns in x1-x3.
-    pub const fn to_words(self) -> [u64; 3] {
-        [self.size, self.pages, self.mappings]
+    /// The words `object_info` returns in x1-x4.
+    pub const fn to_words(self) -> [u64; 4] {
+        [self.size, self.pages, self.mappings, self.refs]
     }
 
-    /// The object from x1-x3 of `object_info`.
-    pub const fn from_words(words: [u64; 3]) -> MemoryInfo {
+    /// The object from x1-x4 of `object_info`.
+    pub const fn from_words(words: [u64; 4]) -> MemoryInfo {
         MemoryInfo {
             size: words[0],
             pages: words[1],
             mappings: words[2],
+            refs: words[3],
         }
     }
 }
@@ -2230,14 +2235,15 @@ mod tests {
     }
 
     #[test]
-    fn memory_info_travels_in_three_words() {
+    fn memory_info_travels_in_four_words() {
         assert_eq!((INFO_MEMORY, MAX_MEMORY), (5, 1 << 30));
         let info = MemoryInfo {
             size: 3 << 12,
             pages: 3,
             mappings: 1,
+            refs: 4,
         };
-        assert_eq!(info.to_words(), [3 << 12, 3, 1]);
+        assert_eq!(info.to_words(), [3 << 12, 3, 1, 4]);
         assert_eq!(MemoryInfo::from_words(info.to_words()), info);
     }
 
