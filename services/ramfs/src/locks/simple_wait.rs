@@ -132,6 +132,8 @@ impl Check {
 
 pub struct Waits<H> {
     registrations: [Option<Registration<H>>; CAPACITY],
+    /// Where `wake_all` goes on.
+    wake_cursor: usize,
     receipt: [u16; PLACES],
     heads: [u16; storage::NODES],
     free: [u64; CAPACITY / 64],
@@ -166,6 +168,7 @@ impl<H> Waits<H> {
             core::ptr::addr_of_mut!((*destination).pid_waiters).write([0; CAPACITY]);
             core::ptr::addr_of_mut!((*destination).pid_owner).write([0; CAPACITY]);
             core::ptr::addr_of_mut!((*destination).free).write([u64::MAX; CAPACITY / 64]);
+            core::ptr::addr_of_mut!((*destination).wake_cursor).write(0);
             core::ptr::addr_of_mut!((*destination).number).write(0);
             core::ptr::addr_of_mut!((*destination).count).write(0);
             core::ptr::addr_of_mut!((*destination).cursor).write(0);
@@ -354,6 +357,64 @@ impl<H> Waits<H> {
             }
             at = r.next;
         }
+    }
+    /// Tells the waiters on `inode` that its locks changed, now: each registration that
+    /// `changed` marked and whose handle is armed gets its notice, in the request that
+    /// released the lock, so that the waiter does not wait for the sweep of the service's
+    /// own work. A notice is a hint (the waiter's next Query decides), so a waiter that
+    /// still conflicts asks and sleeps again. Visits the waiters of the inode only, and tells
+    /// `limit` of them at most (each is a call of the kernel, and the step of a request is
+    /// bounded): the rest stay marked for the sweep.
+    pub fn wake_inode(&mut self, inode: Token, limit: usize, mut notify: impl FnMut(&H)) -> usize {
+        let mut woken = 0;
+        let mut at = self.heads[inode.slot as usize];
+        while at != NONE && woken < limit {
+            let r = self.registrations[at as usize].as_mut().unwrap();
+            if r.captured.request.inode == inode
+                && r.linked
+                && r.dirty
+                && let Some(handle) = r.handle.as_ref()
+            {
+                notify(handle);
+                r.dirty = false;
+                woken += 1;
+            }
+            at = r.next;
+        }
+        woken
+    }
+    /// Tells `limit` armed waiters at most now, for the departure of a client whose locks may
+    /// have stood in their way (the lock of a process that ended is gone for the waiter's Query
+    /// as soon as the page of lifetimes says so), from where the last call stopped; the rest are
+    /// marked for the sweep. Visits the registrations once.
+    pub fn wake_all(&mut self, limit: usize, mut notify: impl FnMut(&H)) -> usize {
+        let mut woken = 0;
+        // Nothing registered: no place is touched.
+        if self.free.iter().all(|w| *w == u64::MAX) {
+            return 0;
+        }
+        for step in 0..CAPACITY {
+            let i = (self.wake_cursor + step) % CAPACITY;
+            if self.free[i / 64] >> (i % 64) & 1 != 0 {
+                continue;
+            }
+            let Some(r) = self.registrations[i].as_mut() else {
+                continue;
+            };
+            if !r.linked || r.handle.is_none() {
+                continue;
+            }
+            if woken < limit {
+                if let Some(handle) = r.handle.as_ref() {
+                    notify(handle);
+                }
+                woken += 1;
+                self.wake_cursor = (i + 1) % CAPACITY;
+            } else {
+                r.dirty = true;
+            }
+        }
+        woken
     }
     /// The owner's lock count went from zero to one: its waits no longer
     /// yield to the writer FIFO and must be evaluated again.
