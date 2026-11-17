@@ -7,7 +7,7 @@
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
-//! | GRANT (1) | the display service's | the header alone | status 0 and one handle, the new session of focus (SEND, TRANSFER) | NOT_ALLOWED |
+//! | GRANT (1) | the display service's | the header alone, or with one handle: a channel with NOTIFY and TRANSFER | status 0 and one handle, the new session of focus (SEND, TRANSFER) | NOT_ALLOWED |
 //! | REVOKE (2) | the display service's | the header alone | the status alone | NOT_ALLOWED |
 //! | READ (3) | the focus | `max` (u32, 1 to MAX_READ) | status, `count` and `flags` (u32 each: bit 0 is LOST), then `count` events of 8 bytes | INVALID, REVOKED, NOT_ALLOWED |
 //!
@@ -22,6 +22,11 @@
 //! and the next READ carries LOST, which it clears. READ never waits: it
 //! returns the events there are, none included.
 //!
+//! With a channel in GRANT the service sends it the bit 1 whenever its step
+//! put events into the focus's ring, so that the holder reads when there is
+//! something and needs no timer. The channel goes with the focus: REVOKE,
+//! the next GRANT and the end of the holder drop it.
+//!
 //! A session of focus that was revoked gets REVOKED from READ. The channel
 //! stays open: the kernel has no call that closes the service's side of
 //! one label, so the service refuses with a code of its own.
@@ -29,8 +34,11 @@
 //! The event is the `struct virtio_input_event` of Virtio 1.2, 5.8.6, and
 //! Linux's `struct input_event` without the time: `type`, `code`, `value`.
 //! The service passes `EV_KEY` events whose value is 0 (release) or 1
-//! (press) and drops the rest, repeats (value 2) among them. The codes of
-//! keys are those of Linux's `input-event-codes.h`.
+//! (press), which are the keys of a keyboard and the buttons of a pointer
+//! (BTN_LEFT, 0x110, and the others), and the two axes of an absolute
+//! pointer (`EV_ABS`, `ABS_X` 0 and `ABS_Y` 1, a place from 0 to 32 767
+//! across the screen: a tablet), and drops the rest, repeats (value 2)
+//! among them. The codes are those of Linux's `input-event-codes.h`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -84,6 +92,12 @@ impl Method {
 
 /// The type of a key's event (Linux's EV_KEY).
 pub const EV_KEY: u16 = 1;
+/// The type of an absolute axis's event (Linux's EV_ABS), its two axes, and
+/// the largest value the device reports on them.
+pub const EV_ABS: u16 = 3;
+pub const ABS_X: u16 = 0;
+pub const ABS_Y: u16 = 1;
+pub const ABS_MAX: i32 = 32_767;
 /// The values of a key's event: released, pressed. Linux's 2 is a repeat.
 pub const RELEASE: i32 = 0;
 pub const PRESS: i32 = 1;
@@ -124,10 +138,12 @@ impl Event {
         [k[0], k[1], c[0], c[1], v[0], v[1], v[2], v[3]]
     }
 
-    /// Whether the service passes the event on: a key pressed or
-    /// released. Repeats, synchronisation, LEDs and the rest go.
+    /// Whether the service passes the event on: a key or a button pressed
+    /// or released, or a place on an absolute axis. Repeats,
+    /// synchronisation, LEDs and the rest go.
     pub const fn passes(self) -> bool {
-        self.kind == EV_KEY && (self.value == RELEASE || self.value == PRESS)
+        (self.kind == EV_KEY && (self.value == RELEASE || self.value == PRESS))
+            || (self.kind == EV_ABS && (self.code == ABS_X || self.code == ABS_Y))
     }
 }
 
@@ -241,6 +257,29 @@ mod tests {
             };
             assert!(!e.passes(), "{e:?}");
         }
+    }
+
+    #[test]
+    fn the_two_axes_of_a_tablet_pass_and_no_other_axis() {
+        for code in [ABS_X, ABS_Y] {
+            let e = Event {
+                kind: EV_ABS,
+                code,
+                value: 12_000,
+            };
+            assert!(e.passes());
+        }
+        // The wheel and the pressure of a tablet.
+        for code in [2, 8, 24] {
+            let e = Event {
+                kind: EV_ABS,
+                code,
+                value: 1,
+            };
+            assert!(!e.passes());
+        }
+        // A button of the pointer is a key's event.
+        assert!(Event::key(0x110, true).passes());
     }
 
     #[test]

@@ -66,6 +66,7 @@ mod fast_nginx;
 mod fast_probe;
 mod fast_scale;
 mod fast_switch;
+mod focus_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -96,6 +97,7 @@ mod net_probe;
 mod net_ssh;
 mod net_tls;
 mod net_trace;
+mod net_try;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
@@ -1064,6 +1066,19 @@ fn shell_program_list() -> Vec<ImageProgram> {
     programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
     programs
+}
+
+/// The programs of the image of the try-out on QEMU (init's table `table-aws-qemu`): those of the
+/// shell on EC2 and the driver of the Virtio RNG, which the entropy service of QEMU's machine
+/// reads where EC2's has the boot seed.
+pub(crate) fn aws_qemu_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = aws_programs().to_vec();
+        programs[0].3 = &["table-aws-qemu"];
+        programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "virtio-rng"));
+        programs
+    })
 }
 
 /// The programs of the shell on EC2 (init's table `table-aws`): the shell
@@ -2246,6 +2261,11 @@ commands:
             rectangle posted alone, two windows, the screen after a process ended and a window
             of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
             of the compositor and the display driver under -icount; with --hvf under HVF
+  focus-probe [--hvf] run the probe of focus and composition of two clients in QEMU: a window
+            with an alpha over another, the screen after a click that raises one, after the
+            manager's Alt-Tab and after the second client ended, each compared with QEMU's
+            screenshot by CRC-32, the keys of the window with the focus alone, a click of
+            QEMU's tablet, and the steps of the services under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2343,6 +2363,11 @@ commands:
             against a fake of the instance metadata service on the host: the
             key file and its modes, the request without a token (401), no key,
             and a refused token
+  net-try [MACHINE] boot the closest image on QEMU to the try-out on EC2 (boot-aws-qemu.img: the
+            services of the AWS table over virtio-net): the page on 80, 443 and 8080, a login
+            with a probe key, `pkg update` and `pkg search`, and the image check (no host key
+            or private key in the image, every account locked, only the ports 22, 80, 443 and
+            8080 answer)
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -2702,6 +2727,14 @@ fn main() {
             }),
             Some(_) => Err("comp-probe [--hvf]".to_owned()),
         },
+        Some("focus-probe") => match args.get(1).map(String::as_str) {
+            None => focus_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                focus_probe::probe(&qemu::HVF_V3)?;
+                focus_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("focus-probe [--hvf]".to_owned()),
+        },
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2722,6 +2755,7 @@ fn main() {
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-ec2-key") => net_ec2_key::command(&args[1..]),
+        Some("net-try") => net_try::command(&args[1..]),
         Some("net-ec2-key-imds") => net_ec2_key::imds_command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
@@ -10544,6 +10578,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // screenshot, the end of a process, a program of the first
         // revision, then the steps of the services under -icount.
         job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
+        // Focus and composition of two clients: a window with an alpha over
+        // another, a click and Alt-Tab that switch them, the keys of the
+        // window with the focus alone, a tablet's click, and the steps of
+        // the compositor and of the tablet's driver under -icount.
+        job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10570,6 +10609,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The boot script of EC2: the key of the instance from a fake of the metadata
         // service (IMDSv2) on the host, written for the SSH server. Also in the group `net`.
         job("net-ec2-key", || net_ec2_key::probe(&qemu::VIRT)),
+        // The try-out image of EC2 on QEMU: its page on 80, 443 and 8080, a login, `pkg search`
+        // and the image check. Also in the group `net`.
+        job("net-try", || net_try::probe(&qemu::VIRT_2G)),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {
@@ -13834,6 +13876,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "comp-probe",
         "--package",
+        "focus-probe",
+        "--package",
         "virtio-input",
         "--package",
         "input-probe",
@@ -13862,7 +13906,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15984,6 +16028,11 @@ mod entropy_in_images_tests {
             ),
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
             ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
+            ("focus_probe::PROGRAMS", &crate::focus_probe::PROGRAMS),
+            (
+                "focus_probe::STEPS_PROGRAMS",
+                &crate::focus_probe::STEPS_PROGRAMS,
+            ),
             (
                 "comp_probe::STEPS_PROGRAMS",
                 &crate::comp_probe::STEPS_PROGRAMS,

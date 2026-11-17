@@ -806,6 +806,7 @@ mod tests {
                 "net-ssh",
                 "net-wget",
                 "net-ec2-key",
+                "net-try",
                 "net-tls",
                 "posix-net",
                 "fstack-probe",

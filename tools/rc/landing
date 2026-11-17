@@ -1,0 +1,122 @@
+# /etc/rc.d/landing: writes the first page of the instance, /www/index.html, at each boot.
+#
+# The page says what stafeto is, that the system is experimental, how to log in, what to
+# try, what is lost at a reboot, and the warning about secrets and the security group. The
+# address and the type of the instance come from the metadata service (IMDSv2, one attempt
+# with a short wait: the script runs after `ec2-key`, which has waited for the network); when
+# the service does not answer, the page says ADDRESS and the type is left out. The version is
+# the one the image was built from (xtask writes it into the page where the image is made).
+#
+# One line on the console says it is done:
+#   landing: page written for ADDRESS (TYPE)
+# IMDS_HOST and IMDS_PORT are for the checks of the image.
+
+# No file name expansion anywhere: the words of a reply never become patterns.
+set -f
+
+host=${IMDS_HOST:-169.254.169.254}
+port=${IMDS_PORT:-80}
+nl='
+'
+
+# imds METHOD PATH [HEADER]: sets `status` and `body` from one request, as /etc/rc.d/ec2-key does.
+imds() {
+    status= body=
+    reply=$({
+        printf '%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Length: 0\r\n' "$1" "$2" "$host"
+        if [ -n "$3" ]; then
+            printf '%s\r\n' "$3"
+        fi
+        printf '\r\n'
+    } | nc -w 3 "$host" "$port" | head -c 16384 | tr -d '\r')
+    case $reply in
+        "HTTP/1."*" 200"*)
+            status=200
+            case $reply in
+                *"$nl$nl"*) body=${reply#*"$nl$nl"} ;;
+            esac
+            ;;
+    esac
+}
+
+address=ADDRESS
+type=
+imds PUT /latest/api/token 'X-aws-ec2-metadata-token-ttl-seconds: 60'
+token=$body
+case $token in
+    '' | *[!A-Za-z0-9+/=_-]*) token= ;;
+esac
+if [ -n "$token" ]; then
+    imds GET /latest/meta-data/public-ipv4 "X-aws-ec2-metadata-token: $token"
+    case $body in
+        '' | *[!0-9.]*) ;;
+        *) address=$body ;;
+    esac
+    imds GET /latest/meta-data/instance-type "X-aws-ec2-metadata-token: $token"
+    case $body in
+        '' | *[!a-z0-9.]*) ;;
+        *) type=$body ;;
+    esac
+fi
+token=
+
+mkdir -p /www
+page=/www/index.html
+{
+    sed -e "s|@ADDRESS@|$address|g" -e "s|@TYPE@|${type:-this instance}|g" <<'PAGE'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stafeto</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1b1b1b; background: #fff; }
+code, pre { font-family: ui-monospace, monospace; background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }
+pre { padding: 0.6rem; overflow-x: auto; }
+.warn { border: 2px solid #b00020; padding: 0.6rem 1rem; border-radius: 4px; }
+td { padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
+@media (prefers-color-scheme: dark) { body { color: #e6e6e6; background: #151515; } code, pre { background: #2a2a2a; } .warn { border-color: #ff6b81; } }
+</style>
+</head>
+<body>
+<h1>stafeto</h1>
+<p>stafeto @VERSION@ is an experimental operating system: a microkernel written in Rust for AArch64, with real-time scheduling. Its TCP/IP stack runs as a user-space service. You are looking at a page served by it on @TYPE@.</p>
+<p class="warn"><strong>This is an experimental system.</strong> Keep no secrets on it. Open the security group of this instance only to your own address.</p>
+
+<h2>What runs here</h2>
+<table>
+<tr><td>22</td><td>Dropbear SSH server, public key login only</td></tr>
+<tr><td>80</td><td>nginx on the sockets of the network service (HTTP)</td></tr>
+<tr><td>443</td><td>nginx with TLS 1.3 and HTTP/2; the certificate is self-signed and was made on this instance when it booted, so a browser warns about it</td></tr>
+<tr><td>8080</td><td>nginx-fast: nginx on the F-Stack TCP/IP stack in its own process, reached through the switch of the network service</td></tr>
+</table>
+
+<h2>Log in</h2>
+<pre>ssh root@@ADDRESS@</pre>
+<p>Use the private key of the key pair you chose when you launched the instance. There is no password login and no other user: you are root.</p>
+
+<h2>What to try</h2>
+<ul>
+<li>Open this page on the three ports: <code>http://@ADDRESS@/</code>, <code>https://@ADDRESS@/</code> and <code>http://@ADDRESS@:8080/</code>.</li>
+<li>From your machine: <code>curl -k https://@ADDRESS@/</code></li>
+<li>In the shell: <code>pkg update</code>, then <code>pkg search nginx</code>, <code>pkg install htop</code> and <code>htop</code>.</li>
+<li>Look around: <code>ps</code>, <code>top</code>, <code>cat /proc/meminfo</code>.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+<li>Every file lives in memory, the packages you install with <code>pkg install</code> among them. A reboot or a stop of the instance removes them all. A permanent disk comes in a later release.</li>
+<li>The SSH host key is made at every boot, so it changes each time the instance starts and <code>ssh</code> warns about it. The fingerprint is on the console of the instance, on the line <code>ssh: host key</code>. Remove the old entry with <code>ssh-keygen -R @ADDRESS@</code>.</li>
+<li>The network is IPv4 only.</li>
+</ul>
+
+<h2>Security</h2>
+<p>The network path of this system is young and has had little exposure to the open internet. Keep no secrets on this instance, and open its security group only to your own address.</p>
+
+<p><a href="https://github.com/stafeto/stafeto">github.com/stafeto/stafeto</a></p>
+</body>
+</html>
+PAGE
+} > "$page.new" && mv "$page.new" "$page" && chmod 644 "$page"
+echo "landing: page written for $address (${type:-unknown type})"

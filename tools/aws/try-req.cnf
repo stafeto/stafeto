@@ -1,0 +1,13 @@
+# The request of the self-signed certificate that /etc/rc.d/web makes on the instance at each
+# boot (`openssl req -x509 -config`): a subject and no prompts.
+[req]
+distinguished_name = dn
+prompt = no
+x509_extensions = ext
+
+[dn]
+CN = stafeto
+
+[ext]
+basicConstraints = critical,CA:FALSE
+subjectAltName = DNS:stafeto

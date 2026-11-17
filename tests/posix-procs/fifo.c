@@ -435,6 +435,96 @@ static void storm(void) {
     printf("posix-fifo: %d opens under signals ok\n", 2 * STORM_ROUNDS);
 }
 
+static int leak_reader_fd;
+static void *blocking_leak_reader(void *unused) {
+    (void)unused;
+    leak_reader_fd = open("/tmp/fifo-e", O_RDONLY);
+    return NULL;
+}
+
+/* Signals that interrupt blocking opens at every point leave no ticket of the
+ * pipe service behind: more interrupted opens than the service has slots for
+ * operations must leave new opens able to succeed. */
+#define LEAK_OPENS 300
+static volatile sig_atomic_t leak_signals;
+static int leak_done;
+static int leak_interrupted;
+static int leak_failed;
+static void leak_handler(int signal) {
+    (void)signal;
+    ++leak_signals;
+}
+
+static void *leak_opener(void *unused) {
+    (void)unused;
+    while (leak_interrupted < LEAK_OPENS) {
+        int fd = open("/tmp/fifo-e", O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            __atomic_store_n(&leak_failed, -1, __ATOMIC_RELEASE);
+            break;
+        }
+        if (errno != EINTR) {
+            __atomic_store_n(&leak_failed, errno ? errno : -2, __ATOMIC_RELEASE);
+            break;
+        }
+        leak_interrupted++;
+    }
+    __atomic_store_n(&leak_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void leak_storm(void) {
+    struct sigaction action = {0};
+    action.sa_handler = leak_handler;
+    sigemptyset(&action.sa_mask);
+    CHECK(sigaction(SIGUSR2, &action, NULL) == 0);
+    CHECK(mkfifo("/tmp/fifo-e", 0600) == 0);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, leak_opener, NULL) == 0);
+    struct timespec start, now;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    while (!__atomic_load_n(&leak_done, __ATOMIC_ACQUIRE)) {
+        pthread_kill(thread, SIGUSR2);
+        struct timespec delay = {0, 100000};
+        nanosleep(&delay, NULL);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        if (now.tv_sec - start.tv_sec >= 40) {
+            printf("posix-fifo: FAIL interrupted opens do not end (%d of %d)\n",
+                   leak_interrupted, LEAK_OPENS);
+            fflush(stdout);
+            _exit(1);
+        }
+    }
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(leak_failed == 0);
+    /* Quiet the storm, then ask for new opens of the same end and of others. */
+    action.sa_handler = SIG_IGN;
+    CHECK(sigaction(SIGUSR2, &action, NULL) == 0);
+    for (int i = 0; i < 4; i++) {
+        int rd = open("/tmp/fifo-e", O_RDONLY | O_NONBLOCK);
+        CHECK(rd >= 0);
+        int wr = open("/tmp/fifo-e", O_WRONLY | O_NONBLOCK);
+        CHECK(wr >= 0);
+        CHECK(write(wr, "L", 1) == 1);
+        char c;
+        CHECK(read(rd, &c, 1) == 1 && c == 'L');
+        CHECK(close(wr) == 0);
+        CHECK(close(rd) == 0);
+    }
+    pthread_t reader_thread;
+    CHECK(pthread_create(&reader_thread, NULL, blocking_leak_reader, NULL) == 0);
+    int w = open("/tmp/fifo-e", O_WRONLY);
+    CHECK(w >= 0);
+    CHECK(pthread_join(reader_thread, NULL) == 0);
+    CHECK(leak_reader_fd >= 0);
+    CHECK(close(w) == 0);
+    CHECK(close(leak_reader_fd) == 0);
+    CHECK(unlink("/tmp/fifo-e") == 0);
+    printf("posix-fifo: %d interrupted opens leave no ticket (%d signals) ok\n",
+           leak_interrupted, (int)leak_signals);
+}
+
 static void custody(void) {
     int r = reader("/tmp/fifo-a");
     int w = writer("/tmp/fifo-a");
@@ -489,6 +579,7 @@ int main(int argc, char **argv) {
     rendezvous();
     crowd();
     storm();
+    leak_storm();
     custody();
     memory("complete");
     printf("posix-fifo: done failures %d\n", failures);

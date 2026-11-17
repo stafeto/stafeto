@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# pixman: the library of pixel operations the composition service
+# (services/compositor) puts its windows together with. The service links
+# its portable C paths statically (tools/build-pixman.py, with the shim of
+# ports/pixman for a program with no C library); the package installs no
+# file of its own, and its licence notice is the one the distribution
+# carries for it. The SHA-256 is that of the archive; the release
+# publishes the same value in pixman-0.46.4.tar.gz.sha512 (SHA-512
+# 10ddb88b51f5456c440d77a7b4230600b099e818378a9b55f715bbe5ec3d9f1e9da2124d28a2bd3377f1ab20af87e0ec4fa9dadaa20a2f1f880dd2dc7f27ca6c).
+# Format: docs/packages.md.
+
+name = "pixman"
+version = "0.46.4"
+kind = "base"
+image = "shell"
+release = "1"
+summary = "pixman pixel operations, linked into the composition service"
+url = "https://www.cairographics.org/releases/pixman-0.46.4.tar.gz"
+sha256 = "d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c"
+license = "MIT"
+license_file = "COPYING"
+build = "tools/build-pixman.py"
+files = []

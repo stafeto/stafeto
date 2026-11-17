@@ -189,6 +189,9 @@ pub const NET: Record = Record {
     // the driver tries three resets a minute before it gives up.
     restart: Restart::Always,
     waits: &[],
+    // The consumers of the switch (`switch N` in `netd.conf`): the table of flows and the
+    // translation tables of the rings of the consumers.
+    quota: super::net::NETD.quota + super::net::SWITCH_QUOTA_PAGES * PAGE,
     ..super::net::NETD
 };
 
@@ -285,12 +288,37 @@ pub const ENTROPY: Record = Record {
     ..super::entropy::ENTROPY
 };
 
+/// The quota of a command: the launcher's, which the shell and every command it starts get
+/// too, is the one of the images of `nginx-fast` (`FAST_COMMAND_QUOTA`): the master of
+/// `nginx-fast` (6 MB of code and read-only data) and its workers run beside the shell, and
+/// OpenSSL makes the certificate of the instance at its first boot.
+pub const COMMAND_QUOTA: u64 = super::fstack::FAST_COMMAND_QUOTA;
+
+/// The quotas of a command in the pool of the process service. The image of the try-out runs
+/// at once the boot script and its waiting subshells (about six), the shell of the console,
+/// nginx (a master and two workers), nginx-fast (a master and two workers), the SSH server and
+/// its sessions (two processes each: the server's child and the shell it starts), and the
+/// commands of the visitor (`pkg`, `openssl`, `curl`). Twenty-four hold that with room for
+/// four sessions; a fork that finds the pool empty fails with an out-of-memory error and the
+/// system goes on (a login then gets no answer until another session ends).
+pub const COMMANDS: u64 = 24;
+
+/// The process service of the shell on EC2: the pool of the shell's image and `COMMANDS`
+/// quotas of a command.
+pub const PROCESS_SERVICE: Record = Record {
+    quota: super::ramfs::POSIX_ABI_TABLE[1].quota
+        + super::ramfs::BUSYBOX_DIALOG_POOL
+        + COMMANDS * COMMAND_QUOTA,
+    ..super::net::NET_PROCESS_SERVICE
+};
+
 /// The launcher of the shell with a session with the network service: the shell and its
 /// commands get the same (the launcher's connections are the shell's), and the quota of a
-/// command that links OpenSSL; and the entropy service, for getrandom and the keys of the
-/// shell's programs. It runs the boot script `/etc/rc` beside the shell: the script waits
-/// for the network itself, so the record needs no order beyond its session with the service.
-const LAUNCHER: Record = Record {
+/// command that runs `nginx-fast` or links OpenSSL; and the entropy service, for getrandom
+/// and the keys of the shell's programs. It runs the boot script `/etc/rc` beside the shell:
+/// the script waits for the network itself, so the record needs no order beyond its session
+/// with the service.
+pub const LAUNCHER: Record = Record {
     args: super::net::RC_LAUNCH_ARGS,
     connects: &[
         "ramfs",
@@ -302,7 +330,7 @@ const LAUNCHER: Record = Record {
         super::NET_SERVICE,
         "pkgd",
     ],
-    quota: super::net::NET_COMMAND_QUOTA,
+    quota: COMMAND_QUOTA,
     // The shell starts once `pkgd` says READY (the store is formatted at the start); past
     // this it starts without waiting, as on the base image.
     waits: &[Wait {
@@ -315,9 +343,9 @@ const LAUNCHER: Record = Record {
 pub const TABLE: &[Record] = &[
     CONSOLE,
     named(DIALOG, "ramfs"),
-    // The process service with the pool of the shell's image with the network: `httpd` forks
-    // a child for each connection.
-    super::net::NET_PROCESS_SERVICE,
+    // The process service with the pool of the shell's image and the quotas of a command of
+    // the try-out (nginx, nginx-fast, the SSH server and its sessions).
+    PROCESS_SERVICE,
     // No PL031 on EC2: the clock starts at the time the image was built.
     named(super::ramfs::POSIX_ABI_TABLE, "clock"),
     named(DIALOG, "pipe"),
@@ -328,6 +356,29 @@ pub const TABLE: &[Record] = &[
     super::pkg::MEMBLK,
     super::pkg::PKGD,
 ];
+
+/// The closest image on QEMU to the table above (`cargo xtask net-try`): the services of the
+/// table of EC2 with the PL011 for the console, the Virtio RNG for the entropy service, and the
+/// network service on Virtio over QEMU's user network with the switch (`netd.conf` has
+/// `switch 8`), in the order of the shell's image with the network.
+pub const QEMU_TABLE: &[Record] = &[
+    super::net::NET_TABLE[0],
+    super::net::NET_TABLE[1],
+    PROCESS_SERVICE,
+    super::net::NET_TABLE[3],
+    super::net::NET_TABLE[4],
+    LAUNCHER,
+    super::net::NET_TABLE[6],
+    super::net::NET_TABLE[7],
+    super::net::NET_TABLE[8],
+    super::net::NETD_SWITCH,
+    super::pkg::MEMBLK,
+    super::pkg::PKGD,
+];
+
+/// The pages of RAM of a t4g.small: 2 GiB.
+#[cfg(test)]
+const T4G_SMALL_PAGES: u64 = (2u64 << 30) / PAGE;
 
 #[cfg(test)]
 mod tests {
@@ -515,6 +566,90 @@ mod tests {
             }
         ));
         assert!(crate::table::check(found.table).is_ok());
+    }
+
+    /// The pages the table holds for its records: each record's quota and its DMA objects
+    /// (init pays for them apart from the quota).
+    fn pages_held(table: &[Record]) -> u64 {
+        table
+            .iter()
+            .map(|r| r.quota / PAGE + r.dma.iter().map(|d| d.size / PAGE).sum::<u64>())
+            .sum()
+    }
+
+    /// The memory budget of the try-out on a t4g.small (2 GiB): the quotas and DMA objects of
+    /// the table, the boot image (about 96 MiB with nginx, nginx-fast, OpenSSL, curl and
+    /// Dropbear: its files are in the memory of init), the kernel and its tables (64 MiB), and
+    /// the 16 384 pages init keeps free after the services started (`cargo xtask
+    /// pkg-identity` holds the base image to the same) all fit in the 524 288 pages.
+    #[test]
+    fn the_quotas_of_the_table_with_nginx_and_nginx_fast_fit_a_t4g_small() {
+        const IMAGE_PAGES: u64 = (96 << 20) / PAGE;
+        const KERNEL_PAGES: u64 = (64 << 20) / PAGE;
+        const INIT_FREE: u64 = 16_384;
+        let held = pages_held(TABLE);
+        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE;
+        assert!(
+            need <= T4G_SMALL_PAGES,
+            "the table holds {held} pages and with the image, the kernel and init's free pages {need} of the {T4G_SMALL_PAGES} of a t4g.small"
+        );
+        // The pool holds the quotas of a command the plan counts for.
+        let pool = TABLE.iter().find(|r| r.name == "posix").unwrap();
+        assert!(pool.quota >= COMMANDS * COMMAND_QUOTA);
+        let launcher = TABLE.iter().find(|r| r.name == "busybox-probe").unwrap();
+        // nginx-fast's master and worker run under the launcher's quota.
+        assert_eq!(launcher.quota, super::super::fstack::FAST_COMMAND_QUOTA);
+        // The memory disk of 256 MiB and the package service are in the sum above.
+        assert!(
+            TABLE
+                .iter()
+                .any(|r| r.name == "blk" && r.quota >= 256 << 20)
+        );
+        assert!(TABLE.iter().any(|r| r.name == "pkgd"));
+        // The switch of the network service has the pages of its flows and rings.
+        let net = TABLE.iter().find(|r| r.name == "net").unwrap();
+        assert_eq!(
+            net.quota,
+            super::super::net::NETD.quota + super::super::net::SWITCH_QUOTA_PAGES * PAGE
+        );
+    }
+
+    /// The table of the closest image on QEMU is a good table, has the records of EC2's in the
+    /// order of the shell's image with the network, and holds the same memory but for the
+    /// network service's.
+    #[test]
+    fn the_qemu_table_is_ec2s_with_the_pl011_the_virtio_rng_and_the_virtio_net() {
+        assert!(crate::table::check(QEMU_TABLE).is_ok());
+        let names: Vec<&str> = QEMU_TABLE.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "uart",
+                "ramfs",
+                "posix",
+                "clock",
+                "pipe",
+                "busybox-probe",
+                "tty",
+                "rng",
+                "entropy",
+                "net",
+                "blk",
+                "pkgd"
+            ]
+        );
+        let of =
+            |table: &'static [Record], name: &str| *table.iter().find(|r| r.name == name).unwrap();
+        for name in ["posix", "busybox-probe", "blk", "pkgd"] {
+            assert_eq!(of(QEMU_TABLE, name).quota, of(TABLE, name).quota, "{name}");
+        }
+        // The network service has the same quota with the switch on either device.
+        assert_eq!(of(QEMU_TABLE, "net").quota, of(TABLE, "net").quota);
+        assert_eq!(
+            of(QEMU_TABLE, "busybox-probe").args,
+            b"ash-launch\0/etc/rc\0"
+        );
+        assert!(pages_held(QEMU_TABLE) <= pages_held(TABLE) + 1_000);
     }
 
     #[test]
