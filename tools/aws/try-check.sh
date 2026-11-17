@@ -43,8 +43,11 @@
 #        ec2-key: ...                          (the type and comment of the key pair)
 #        nvme: Amazon Elastic Block Store fw ... sn ..., N blocks of 512 bytes ...
 #                                              (the disk service of the data volume found the second NVMe
-#                                              function, and EBS names it sdf; the line of the root volume
-#                                              never appears, no service gets that function)
+#                                              function, and EBS names it sdf; the record names the second
+#                                              function of the measured walk order, and a root volume found
+#                                              there is refused by the name check: `nvme: datadisk is not
+#                                              the data volume, left alone`; the line ends with the
+#                                              controller's mqes, to and dstrd)
 #        datafs: partition table written, data volume formatted, ...
 #                                              (the first boot of a volume) or
 #        datafs: data volume mounted, ...      (a later boot: mounted, never formatted again)
@@ -105,7 +108,7 @@
 #        reboot (in the session on the instance, or `aws ec2 reboot-instances`)
 #                                              the console line `datakey: host key restored from /data` and
 #                                              the same `ssh: host key SHA256:...`; no `datafs: ... formatted`
-#                                              line (`data volume mounted` instead); `ssh` raises no host key warning
+#                                              line (the line says `data volume mounted`); `ssh` raises no host key warning
 #        stop and start the instance           the same again: the volume stays attached to a stopped
 #                                              instance, the fingerprint is the same
 #      A volume attached after the boot is not used until the next boot (`datafs` connects once).

@@ -423,7 +423,7 @@ fn main(_: u64) -> u64 {
     let block = 1u32 << found.block_shift;
     let sectors = found.blocks << (found.block_shift - 9);
     rt::println!(
-        "nvme: {} fw {} sn {}, {} blocks of {} bytes ({} sectors), mdts {} ({} bytes), vwc {}, nn {}, msi {}",
+        "nvme: {} fw {} sn {}, {} blocks of {} bytes ({} sectors), mdts {} ({} bytes), vwc {}, nn {}, msi {}, mqes {}, to {}, dstrd {}",
         Field(&found.model),
         Field(&found.firmware),
         Field(&found.serial),
@@ -434,7 +434,10 @@ fn main(_: u64) -> u64 {
         found.max_transfer,
         u8::from(found.vwc),
         found.nn,
-        if plan.is_some() { "yes" } else { "no" }
+        if plan.is_some() { "yes" } else { "no" },
+        found.cap.mqes,
+        found.cap.to,
+        found.cap.dstrd
     );
     // The identity of the volume, before any request: a controller that is not the one the record
     // names (the ESP of a machine, the root volume of an instance) is registered and refuses every

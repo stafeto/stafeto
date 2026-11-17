@@ -806,6 +806,22 @@ mod tests {
     }
 
     #[test]
+    fn only_datakey_connects_to_datafs_on_both_tables() {
+        for table in [TABLE, QEMU_TABLE] {
+            let clients: Vec<&str> = table
+                .iter()
+                .filter(|r| r.connects.contains(&"datafs"))
+                .map(|r| r.name)
+                .collect();
+            assert!(clients.is_empty() || clients == ["datakey"], "{clients:?}");
+            // The launcher is the POSIX launcher: it only waits for the key service.
+            let launcher = table.iter().find(|r| r.name == "busybox-probe").unwrap();
+            assert!(!launcher.connects.contains(&"datafs"));
+            assert!(!launcher.connects.contains(&"datakey"));
+        }
+    }
+
+    #[test]
     fn the_launcher_waits_for_pkgd_and_for_the_host_key_service() {
         for table in [TABLE, QEMU_TABLE] {
             let launcher = table.iter().find(|r| r.name == "busybox-probe").unwrap();

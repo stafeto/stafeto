@@ -687,10 +687,10 @@ points, on the Virtio disk). The service writes the whole disk it serves, so the
 identity stands before every use of it. The partitions of one disk (windows of `nvme-blk` by partition) wait for the
 move of `pkgd` to the disk.
 
-**The data volume on EC2.** The image registered for EC2 carries a second block device mapping,
+**The data volume on EC2.** Each instance gets this volume, 2 GiB of gp3 billed to the launching account (about 0.19 USD a month in eu-central-1, approximate), deleted with the instance; `--no-data-volume` or a NoDevice mapping (below) launches without it. The image registered for EC2 carries a second block device mapping,
 `/dev/sdf`: an empty gp3 volume of 2 GiB with `DeleteOnTermination`, made at each launch and removed
 with the instance. Nitro shows it as the second NVMe function (`1d0f:8061`, walk index 1; the root
-volume is index 0 and no service ever gets it), and EBS writes `sdf` into Identify Controller bytes
+volume is index 0; the record names index 1 of the measured walk order, and a root volume found there is refused by the name check), and EBS writes `sdf` into Identify Controller bytes
 3072..3104 (`sdf` and 29 spaces; the root volume reads `xvda` and spaces). The record `datadisk` of
 `table/aws.rs` asks for the EBS name `sdf` (kind 2), `datafs` and `datakey` follow it, and the boot
 script of Dropbear starts once `datakey` is ready (the launcher waits for it for 30 s). The first boot
