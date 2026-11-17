@@ -605,7 +605,7 @@ fn steady_lines(world: &World) -> Vec<String> {
 }
 
 /// `expect` for a run under -icount on the machine of the firmware, where the lines of the services come
-/// glued to each other: each wanted line is in some line, not necessarily alone.
+/// glued to each other: each wanted line is part of some line.
 fn expect_within(lines: &[String], wanted: &[String]) -> Result<(), String> {
     for line in wanted {
         if !lines.iter().any(|l| l.contains(line.as_str())) {
@@ -1125,7 +1125,9 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 /// `nvme-blk` (MSI-X on the ITS, the polling of the queue behind it) is the `blk` of the package
 /// service. The first run is the whole scenario of `store-probe full` (the format of the store, the
 /// installation of `hello`, every refusal, a group of packages, the settings, REMOVE), after which QEMU
-/// is killed, as a power failure would; the second run starts the machine on the same file and the probe
+/// is killed once the probe has ended and nothing is in flight (the data are the ones the service
+/// and the controller took; the survival of the store format over a cut at each point of a write is
+/// the evidence of `store-crash`, 13 crash points, on Virtio); the second run starts the machine on the same file and the probe
 /// finds `hello` installed and running, the settings and the serial in place. With `breaks` the service
 /// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass; `lba4096`
 /// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB; `steps` runs the first scenario

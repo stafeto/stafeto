@@ -645,10 +645,14 @@ Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.S
 before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
 it is given: the table names the data disk, and a disk with a system on it is never named.
 `cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
-a second NVMe controller over a file, kills QEMU, and starts the machine again on the same file: the
-probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
+a second NVMe controller over a file, stops QEMU once the probe has ended and nothing is in flight, and
+starts the machine again on the same file: the probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
 and with a transfer limit of 8 KiB; `breaks` runs a service that writes one sector off, which the
-probe must catch). The record for EC2's volume comes with the switch of the image for EC2
+probe must catch). The probe shows that what the service wrote is read back after a restart of the
+machine; it does not cut a write short, and a service that never sends FLUSH would pass it. The survival
+of the store format over a cut at each point of a write is shown by `cargo xtask store-crash` (13 crash
+points, on the Virtio disk). The service writes the whole disk, so choosing a volume and a partition
+table come before the record for EC2's volume. The record for EC2's volume comes with the switch of the image for EC2
 (stafeto-design#757).
 
 ## The package service

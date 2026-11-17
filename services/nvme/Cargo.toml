@@ -7,6 +7,9 @@ repository.workspace = true
 license = "GPL-3.0-or-later"
 description = "The disk service over an NVMe controller (a PCI function of class 0x010802): the store of the package service on a disk of EBS or QEMU"
 
+[lib]
+bench = false
+
 [[bin]]
 name = "nvme-blk"
 test = false
@@ -21,6 +24,9 @@ steps = ["rt/step-stats"]
 break-nvme-write-offset = []
 
 [dependencies]
+
+# The program alone runs on stafeto: the host tests of the library build without rt.
+[target.'cfg(target_os = "none")'.dependencies]
 abi = { path = "../../lib/abi" }
 nvme = { path = "../../lib/nvme" }
 pci = { path = "../../lib/pci" }

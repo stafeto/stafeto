@@ -764,7 +764,7 @@ mod tests {
             .collect();
         let found = resolved(&table);
         let blk = found.iter().find(|r| r.name == "blk").unwrap();
-        // The function at 00:04.0 (RID 0x20), not the ESP's at 00:01.0 (RID 0x08).
+        // The function at 00:04.0 (RID 0x20); the ESP's controller at 00:01.0 (RID 0x08) is index 0.
         let bar = blk.windows.iter().find(|w| w.name == "bar").unwrap();
         assert_eq!((bar.base, bar.len), (0x80_0001_0000, 4 * PAGE));
         let ecam = blk.windows.iter().find(|w| w.name == "ecam").unwrap();

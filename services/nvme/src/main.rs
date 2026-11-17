@@ -18,10 +18,10 @@
 //! The service has one thread. The library does the controller's work in steps of one
 //! register access (`Nvme::poll`); a request goes to the queue in the call that takes it, and
 //! the completion is found by the step that an interrupt of vector 1 (or of vector 0), the
-//! timer or the heartbeat starts. While a command is with the controller and no completion has
-//! come, the timer looks at the queue every 500 us (the way the ENA service polls a silent
-//! vector); with no command the service sleeps until a request, an interrupt or the heartbeat
-//! comes. Without MSI-X (no capability, no LPI for a binding, a table not in BAR 0) the
+//! timer or the heartbeat starts. While any command is with the controller, the timer looks at
+//! the queue every 500 us (the way the ENA service polls a silent vector), and after a reset in
+//! place it runs the bring-up the same way until the queues are up; with no command out and the
+//! controller up the service sleeps until a request, an interrupt or the heartbeat comes. Without MSI-X (no capability, no LPI for a binding, a table not in BAR 0) the
 //! controller runs without vectors and the timer is the only way a completion is found.
 //!
 //! The data of a write are copied from the client's cell of the shared buffer into the cell of
@@ -450,6 +450,7 @@ fn main(_: u64) -> u64 {
         },
         shift: found.block_shift,
         inflight: 0,
+        up: true,
         said: [false; VECTORS],
         timer,
         deadline: 0,
@@ -490,6 +491,8 @@ struct Disk {
     shift: u8,
     /// The commands with the controller whose completion has not come.
     inflight: u32,
+    /// False from a reset in place until the queues are up again.
+    up: bool,
     /// The vectors that have raised an interrupt, for the line that says so once.
     said: [bool; VECTORS],
     timer: Handle<Timer>,
@@ -549,6 +552,7 @@ impl Disk {
                         Cause::AdminTimeout => "an admin command timed out",
                         Cause::NotReady | Cause::NotCleared => "CSTS.RDY did not change",
                     };
+                    self.up = false;
                     rt::println!("nvme: reset in place: {why}");
                 }
                 Event::Failed(why) => {
@@ -556,7 +560,10 @@ impl Disk {
                     sys::process_exit(FAILED)
                 }
                 Event::Stopped => sys::process_exit(FAILED),
-                Event::Up => rt::println!("nvme: the queues are up again"),
+                Event::Up => {
+                    self.up = true;
+                    rt::println!("nvme: the queues are up again");
+                }
                 Event::Working => {}
             }
         }
@@ -578,10 +585,11 @@ impl Disk {
         }
     }
 
-    /// Looks at the queue again `after` ns from now while a command is out. The timer is
+    /// Looks at the queue again `after` ns from now while a command is out or the controller is
+    /// coming up after a reset. The timer is
     /// armed once: a later deadline never replaces an earlier one.
     fn arm(&mut self, after: u64) {
-        if self.inflight == 0 {
+        if !nvme_blk::timer_wanted(self.inflight, self.up) {
             return;
         }
         let at = now_ns() + after;
