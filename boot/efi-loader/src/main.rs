@@ -601,6 +601,7 @@ fn main() -> Status {
     let image_buf =
         unsafe { core::slice::from_raw_parts_mut(image_ptr.as_ptr(), image_len as usize) };
     read_all(&mut image_file, image_buf, BOOT_IMAGE_PATH);
+    stamp_time(image_buf);
 
     let loaded = Loaded {
         kernel: Region {
@@ -718,6 +719,49 @@ fn main() -> Status {
 /// second failure, which hides the cause. Returns the final map and the
 /// attempts. After the first call only memory services are allowed, so a
 /// failure is said through the port of the SPCR.
+/// Writes the firmware's time (UEFI GetTime, read while the boot services
+/// run) into the file `boot-time` of the boot image in memory, where the
+/// clock service starts CLOCK_REALTIME on machines without a PL031 (EC2).
+/// Any failure leaves the image as it was and the boot goes on.
+fn stamp_time(image: &mut [u8]) {
+    let time = match uefi::runtime::get_time() {
+        Ok(time) => time,
+        Err(e) => {
+            say(&format!(
+                "efi-loader: no time from GetTime ({:?})\n",
+                e.status()
+            ));
+            return;
+        }
+    };
+    let seconds = rtc::from_efi(
+        time.year(),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+        time.time_zone().unwrap_or(0x7FF),
+    );
+    let Some(seconds) = seconds else {
+        say(&format!(
+            "efi-loader: no time from GetTime (the firmware says {}-{:02}-{:02} {:02}:{:02}:{:02}, before 2026 or out of range)\n",
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second()
+        ));
+        return;
+    };
+    if rtc::stamp(image, seconds) {
+        say(&format!("efi-loader: time {seconds} from GetTime\n"));
+    } else {
+        say("efi-loader: boot.img has no boot-time file\n");
+    }
+}
+
 fn exit_boot_services(buf: &mut [u8]) -> (Vec<Desc>, u32) {
     let handle = boot::image_handle();
     let max_tries = if cfg!(feature = "break-ebs-retry") {

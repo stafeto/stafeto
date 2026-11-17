@@ -22,6 +22,8 @@
 #      Lines that must appear (the order of the last four may vary: each runs in a subshell):
 #        net: ena mac 02:..., link up
 #        entropy: seeded from the boot page (32 bytes)
+#        efi-loader: time N from GetTime       (the firmware's time, written into boot-time)
+#        clock: ready (started at N from the boot image)   (N within seconds of the host's date +%s)
 #        ec2-key: ...                          (the type and comment of the key pair)
 #        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
@@ -54,6 +56,7 @@
 #        posix-net stat                        `consumers` equal to the workers of nginx-fast (2),
 #                                              `rx_consumer` and `tx_consumer` above 0 after the
 #                                              curl of 8080, `tx_refused 0`, `rx_full 0`
+#        date -u                               within a few seconds of the host's `date -u` (before pkg update)
 #        pkg update; pkg search nginx          the index of the series 0.5 from stafeto.github.io
 #        pkg install htop; htop                a package from the store in memory
 #        ps; cat /proc/meminfo                 nginx, nginx-fast and dropbear are running; the
