@@ -5,6 +5,7 @@
 
 #[macro_use]
 mod out;
+mod step_line;
 
 #[cfg(test)]
 mod change_release_reply_tests;
@@ -7545,40 +7546,10 @@ fn check_loader_stack(lines: &[String]) -> Result<(), String> {
 /// objects holds 128, so the fork with the map full runs.
 const LOADER_REGIONS_MIN: u64 = 100;
 
-/// The longest step of each kind in `lines`: (kind, ticks, detail), the
-/// last line of a kind being its longest, since each prints only when it
-/// grows.
+/// The longest step of each kind in `lines`: (kind, ticks, detail), by the time less the charge
+/// of the preemptions in the step (`step_line`).
 fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
-    let mut out: Vec<(usize, u64, u64)> = Vec::new();
-    for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [
-            "service",
-            "step:",
-            line_tag,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] = words.as_slice()
-        else {
-            continue;
-        };
-        if *line_tag != tag {
-            continue;
-        }
-        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
-        else {
-            continue;
-        };
-        match out.iter_mut().find(|(k, ..)| *k == kind) {
-            Some(row) => *row = (kind, ticks, detail),
-            None => out.push((kind, ticks, detail)),
-        }
-    }
-    out
+    step_line::longest_warned(lines, tag, TERM_B)
 }
 
 /// The longest wait of each kind in `lines`: (kind, wait, whole step), from

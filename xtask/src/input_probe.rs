@@ -175,23 +175,9 @@ const PER_STEP: u64 = 16;
 /// longest, so the first is the shortest.
 fn interrupt_steps(lines: &[String]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        if let [
-            "service",
-            "step:",
-            tag,
-            "kind",
-            "65",
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] = words.as_slice()
-            && *tag == INPUT_TAG
-            && let (Ok(ticks), Ok(detail)) = (ticks.parse(), detail.parse())
-        {
-            out.push((ticks, detail));
+    for step in lines.iter().filter_map(|l| crate::step_line::parse(l)) {
+        if step.tag == INPUT_TAG && step.kind == 65 {
+            out.push((step.ticks, step.detail));
         }
     }
     out
