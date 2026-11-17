@@ -1134,7 +1134,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign [diag]]|blk-probe]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1152,20 +1152,22 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("key") => {
             let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-            let (case, breaks) = match rest.as_slice() {
-                [] => (KeyCase::Normal, false),
-                ["nodisk"] => (KeyCase::NoDisk, false),
-                ["wrongdisk"] => (KeyCase::WrongDisk, false),
-                ["wrongdisk", "breaks"] => (KeyCase::WrongDisk, true),
-                ["wrongdisk", "blank"] => (KeyCase::WrongBlank, false),
-                ["wrongdisk", "blank", "breaks"] => (KeyCase::WrongBlank, true),
+            let (case, breaks, diag) = match rest.as_slice() {
+                [] => (KeyCase::Normal, false, false),
+                ["nodisk"] => (KeyCase::NoDisk, false, false),
+                ["wrongdisk"] => (KeyCase::WrongDisk, false, false),
+                ["wrongdisk", "breaks"] => (KeyCase::WrongDisk, true, false),
+                ["wrongdisk", "blank"] => (KeyCase::WrongBlank, false, false),
+                ["wrongdisk", "blank", "breaks"] => (KeyCase::WrongBlank, true, false),
+                ["foreign"] => (KeyCase::Foreign, false, false),
+                ["foreign", "diag"] => (KeyCase::Foreign, false, true),
                 other => {
                     return Err(format!(
-                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]]: {other:?}"
+                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]|foreign [diag]]: {other:?}"
                     ));
                 }
             };
-            return nvme_persist_key(case, breaks);
+            return nvme_persist_key(case, breaks, diag);
         }
         Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
         _ => {}
@@ -1444,6 +1446,9 @@ enum KeyCase {
     /// The same, with the first MiB of the file zeroed: `datafs` would take it for a blank disk and
     /// partition it, so only the check of the identity protects it.
     WrongBlank,
+    /// The serial the record wants over a file of non-zero bytes with no table: the identity
+    /// matches, and `datafs` itself says the disk holds something else.
+    Foreign,
 }
 
 /// The size of the file that stands for an ESP in the case `WrongDisk`.
@@ -1496,7 +1501,7 @@ fn no_restart_loop(lines: &[String], what: &str) -> Result<(), String> {
 /// the same after the boot, the data file service says not mounted, and the key is new. With
 /// `breaks` the check of the identity always passes (`break-nvme-identity`), and the case must
 /// then fail.
-fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
+fn nvme_persist_key(case: KeyCase, breaks: bool, diag: bool) -> Result<(), String> {
     let tag = match (case, breaks) {
         (KeyCase::Normal, _) => "",
         (KeyCase::NoDisk, _) => "-nodisk",
@@ -1504,12 +1509,22 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         (KeyCase::WrongDisk, true) => "-wrongdisk-break",
         (KeyCase::WrongBlank, false) => "-wrongblank",
         (KeyCase::WrongBlank, true) => "-wrongblank-break",
+        (KeyCase::Foreign, false) => "-foreign",
+        (KeyCase::Foreign, true) => "-foreign-break",
     };
+    let tag = if diag { "-foreign-diag" } else { tag };
     let mut list = PROGRAMS_KEY.to_vec();
     if breaks {
         for program in &mut list {
             if program.0 == "nvme-blk" {
                 program.3 = &["break-nvme-identity"];
+            }
+        }
+    }
+    if diag {
+        for program in &mut list {
+            if program.0 == "nvme-blk" || program.0 == "datafsd" {
+                program.3 = &["diag"];
             }
         }
     }
@@ -1534,11 +1549,13 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     efi::make_disk(&loader, &artifacts, &esp)?;
     let file = Disk::new(&format!("nvme-key{tag}"));
     let shape = match case {
-        KeyCase::Normal => Shape::Plain,
+        KeyCase::Normal | KeyCase::Foreign => Shape::Plain,
         KeyCase::NoDisk => Shape::Absent,
         KeyCase::WrongDisk | KeyCase::WrongBlank => Shape::Wrong,
     };
-    if case != KeyCase::Normal && case != KeyCase::NoDisk {
+    if case == KeyCase::Foreign {
+        write_stand_in(&file.0, false)?;
+    } else if case != KeyCase::Normal && case != KeyCase::NoDisk {
         write_stand_in(&file.0, case == KeyCase::WrongBlank)?;
     } else {
         write_disk(&file, None)?;
@@ -1555,6 +1572,9 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
             "datakey-probe",
         )
     };
+    if case == KeyCase::Foreign {
+        return nvme_key_foreign(&file.0, diag, &run);
+    }
     if case != KeyCase::Normal {
         return nvme_key_without_volume(case, breaks, &file.0, &run);
     }
@@ -1571,7 +1591,9 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         ));
     }
     let before = key_fingerprint(&first)?;
+    no_foreign_report(&first, "nvme-persist key, first boot")?;
     let second = run()?;
+    no_foreign_report(&second, "nvme-persist key, second boot")?;
     if !said(&second, "datakey: host key restored from /data")
         || said(&second, "datakey: no host key")
     {
@@ -1591,6 +1613,124 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     }
     println!(
         "nvme-persist key: the host key made on the first boot of a blank NVMe data volume was kept by datakey, and the second boot of the same volume restored it (fingerprint FNV:{before} on both): ok"
+    );
+    Ok(())
+}
+
+/// A blank volume and a valid one never print the lines of a foreign disk.
+fn no_foreign_report(lines: &[String], what: &str) -> Result<(), String> {
+    match lines
+        .iter()
+        .find(|l| l.contains("datafs: foreign at") || l.contains("datafs: lba1 "))
+    {
+        Some(line) => Err(format!("{what}: a line of a foreign disk: {line}")),
+        None => Ok(()),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `nvme-persist key foreign [diag]`: the record's serial over a file of non-zero bytes with no
+/// table. The service of the disk takes it, and `datafs` classifies it as foreign and says where
+/// the first byte that is not zero is (sector 0, offset 0) with the bytes there, and the first
+/// bytes of sector 1 and of the last sector. The file is not changed. With `diag` the diagnostic
+/// builds of the disk and data services print the entries, the pattern check and three rereads.
+fn nvme_key_foreign(
+    file: &Path,
+    diag: bool,
+    run: &dyn Fn() -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let name = if diag {
+        "nvme-persist key foreign diag"
+    } else {
+        "nvme-persist key foreign"
+    };
+    let before = file_sha256(file)?;
+    let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let lines = run()?;
+    no_restart_loop(&lines, name)?;
+    let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
+    let once = |text: &str| -> Result<(), String> {
+        match count(text) {
+            1 => Ok(()),
+            n => Err(format!(
+                "{name}: {n} lines with {text:?}, one expected: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datafs") || l.contains("nvme"))
+                    .collect::<Vec<_>>()
+            )),
+        }
+    };
+    let last = &bytes[bytes.len() - 512..];
+    once(&format!(
+        "datafs: foreign at sector 0 offset 0: {}",
+        hex(&bytes[..32])
+    ))?;
+    once(&format!(
+        "datafs: lba1 {} lba-last {}",
+        hex(&bytes[512..520]),
+        hex(&last[..8])
+    ))?;
+    once("datafs: the disk holds something else, left alone")?;
+    if count("nvme: dma queues 0x") != 1 {
+        return Err(format!("{name}: the line of the DMA addresses is missing"));
+    }
+    if said(&lines, "datafs: no disk: ") || said(&lines, "datafs: data volume") {
+        return Err(format!("{name}: the volume was not left alone"));
+    }
+    let extra = [
+        "nvme: sqe",
+        "nvme: cqe",
+        "nvme: staging",
+        "nvme: pattern",
+        "datafs: reread",
+        "datafs: second verdict",
+    ];
+    if diag {
+        let head = hex(&bytes[..16]);
+        for n in 1..=3 {
+            once(&format!("datafs: reread {n} {head}"))?;
+        }
+        once(&format!(
+            "datafs: second verdict foreign at sector 0 offset 0: {}",
+            hex(&bytes[..32])
+        ))?;
+        if count("nvme: pattern overwritten") == 0 {
+            return Err(format!("{name}: no line \"nvme: pattern overwritten\""));
+        }
+        if said(&lines, "nvme: pattern survived") {
+            return Err(format!("{name}: the pattern survived"));
+        }
+        for text in [
+            "nvme: sqe op 0x2 ",
+            "nvme: cqe cid ",
+            "nvme: staging nonzero at 0",
+        ] {
+            if count(text) == 0 {
+                return Err(format!("{name}: no line with {text:?}"));
+            }
+        }
+    } else if let Some(line) = lines.iter().find(|l| extra.iter().any(|t| l.contains(t))) {
+        return Err(format!(
+            "{name}: a line of the diagnostic build in a normal one: {line}"
+        ));
+    }
+    let after = file_sha256(file)?;
+    if before != after {
+        return Err(format!(
+            "{name}: the file changed: SHA-256 {before} before the boot, {after} after"
+        ));
+    }
+    println!(
+        "{name}: datafs said where the first byte that is not zero is (sector 0 offset 0), the first bytes of sector 1 and of the last sector, and left the disk alone, the file has the same SHA-256 ({after}){}: ok",
+        if diag {
+            ", the pattern was overwritten, and three rereads and the second verdict agree"
+        } else {
+            ""
+        }
     );
     Ok(())
 }

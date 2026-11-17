@@ -371,6 +371,10 @@ struct Busy {
 }
 
 /// The driver.
+/// The I/O commands whose entries the diagnostic build prints.
+#[cfg(feature = "diag")]
+const DIAG_SHOWN: u8 = 4;
+
 pub struct Nvme<P: Platform> {
     p: P,
     mem: Region,
@@ -391,6 +395,9 @@ pub struct Nvme<P: Platform> {
     resets: [u64; RESETS],
     reset_count: u64,
     stray: u64,
+    /// The submission and completion entries still to print (the feature `diag`).
+    #[cfg(feature = "diag")]
+    shown: (u8, u8),
 }
 
 impl<P: Platform> Nvme<P> {
@@ -441,6 +448,8 @@ impl<P: Platform> Nvme<P> {
             resets: [0; RESETS],
             reset_count: 0,
             stray: 0,
+            #[cfg(feature = "diag")]
+            shown: (DIAG_SHOWN, DIAG_SHOWN),
         };
         // The PRP lists never change: the list of a cell holds its pages 1 to
         // 3, so that a part of four pages is PRP1 and a pointer to the list.
@@ -1205,6 +1214,19 @@ impl<P: Platform> Nvme<P> {
             let (p1, p2) = cmd::prps(first_pa, len, list);
             cmd::set_prp(&mut e, p1, p2);
             cmd::set_rw(&mut e, first + (i as u64) * per_part as u64, nblocks);
+            #[cfg(feature = "diag")]
+            if self.shown.0 > 0 {
+                self.shown.0 -= 1;
+                self.p.log(format_args!(
+                    "nvme: sqe op {:#x} nsid {} slba {} nlb {} prp1 {:#x} prp2 {:#x}",
+                    e[0] & 0xff,
+                    e[1],
+                    u64::from(e[10]) | u64::from(e[11]) << 32,
+                    (e[12] & 0xffff) + 1,
+                    u64::from(e[6]) | u64::from(e[7]) << 32,
+                    u64::from(e[8]) | u64::from(e[9]) << 32,
+                ));
+            }
             let slot = self.io.push();
             self.put_sqe(IOSQ_AT, slot, &e);
         }
@@ -1270,6 +1292,20 @@ impl<P: Platform> Nvme<P> {
     /// Takes one completion: the head moves, the doorbell is written, and the
     /// request ends when its last part did.
     fn complete(&mut self, cqe: Cqe) -> Event {
+        #[cfg(feature = "diag")]
+        if self.shown.1 > 0 {
+            self.shown.1 -= 1;
+            self.p.log(format_args!(
+                "nvme: cqe cid {} sqid {} sqhd {} status sct {:#x} sc {:#x} dnr {} phase {}",
+                cqe.cid,
+                cqe.sq_id,
+                cqe.sq_head,
+                cqe.sct,
+                cqe.sc,
+                u8::from(cqe.dnr),
+                u8::from(cqe.phase)
+            ));
+        }
         self.io.pop();
         if !cfg!(feature = "break-nvme-sq-head") {
             self.io.sq_head = cqe.sq_head % IO_DEPTH;

@@ -130,7 +130,20 @@ pub enum Class {
     /// The first MiB is zero and no table is there: free to partition.
     Blank,
     /// Something else is there (a boot disk, a foreign file system): not ours to write.
-    Foreign,
+    Foreign(Found),
+}
+
+/// Where `classify` found the first byte that is not zero, for the console line of a refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Found {
+    /// The sector and the offset in it of the first non-zero byte.
+    pub sector: u64,
+    pub offset: usize,
+    /// The 32 bytes of the sector from `offset & !15`.
+    pub bytes: [u8; 32],
+    /// The first eight bytes of sector 1 and of the last sector.
+    pub lba1: [u8; 8],
+    pub last: [u8; 8],
 }
 
 /// A partition to create: the type, the sectors and the name.
@@ -277,27 +290,46 @@ pub fn read<D: Device>(dev: &mut D) -> Result<Table, Error> {
     read_copy(dev, last, last)?.ok_or(Error::NoTable)
 }
 
-fn zero<D: Device>(dev: &mut D, first: u64, count: u64) -> Result<bool, Error> {
+/// The first byte that is not zero in `count` sectors from `first` (the sector, the offset and the
+/// bytes around it; the other fields are filled by the caller), or None when all are zero.
+fn nonzero<D: Device>(dev: &mut D, first: u64, count: u64) -> Result<Option<Found>, Error> {
     let mut sector = [0u8; SECTOR];
     for i in 0..count.min(dev.sectors().saturating_sub(first)) {
         dev.read(first + i, &mut sector)?;
-        if sector.iter().any(|&b| b != 0) {
-            return Ok(false);
+        if let Some(offset) = sector.iter().position(|&b| b != 0) {
+            let from = offset & !15;
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&sector[from..from + 32]);
+            return Ok(Some(Found {
+                sector: first + i,
+                offset,
+                bytes,
+                lba1: [0; 8],
+                last: [0; 8],
+            }));
         }
     }
-    Ok(true)
+    Ok(None)
+}
+
+/// The first eight bytes of a sector.
+fn head<D: Device>(dev: &mut D, lba: u64) -> Result<[u8; 8], Error> {
+    let mut sector = [0u8; SECTOR];
+    dev.read(lba, &mut sector)?;
+    Ok(sector[..8].try_into().expect("eight bytes"))
 }
 
 pub fn classify<D: Device>(dev: &mut D) -> Result<Class, Error> {
     match read(dev) {
         Ok(table) => Ok(Class::Gpt(table)),
-        Err(Error::NoTable) => {
-            if zero(dev, 0, BLANK_SECTORS)? {
-                Ok(Class::Blank)
-            } else {
-                Ok(Class::Foreign)
+        Err(Error::NoTable) => match nonzero(dev, 0, BLANK_SECTORS)? {
+            None => Ok(Class::Blank),
+            Some(mut found) => {
+                found.lba1 = head(dev, 1)?;
+                found.last = head(dev, dev.sectors() - 1)?;
+                Ok(Class::Foreign(found))
             }
-        }
+        },
         Err(other) => Err(other),
     }
 }

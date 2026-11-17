@@ -1104,8 +1104,11 @@ fn aws_programs() -> &'static [ImageProgram] {
         // The data volume (init's records `datadisk`, `datafs` and `datakey`): the NVMe disk
         // service built with no feature (the test `no_shipped_image_builds_nvme_blk_with_a_crash_or_a_break_feature` keeps it so), the
         // data file service and the host key service.
-        programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
-        programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
+        // `aws image --diag` (the variable `STAFETO_AWS_DIAG`) builds the disk and data services with
+        // the feature `diag`; it is the only way to a shipped list with a feature.
+        let diag = diag_features(std::env::var("STAFETO_AWS_DIAG").ok().as_deref());
+        programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, diag));
+        programs.push(("datafsd", "datafsd", 32 * 1024, diag));
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
@@ -1122,6 +1125,15 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
         programs
     })
+}
+
+/// The features of the disk and data services of the image of EC2: `diag` when `aws image --diag`
+/// set the variable to "1", none otherwise.
+fn diag_features(value: Option<&str>) -> &'static [&'static str] {
+    match value {
+        Some("1") => &["diag"],
+        _ => &[],
+    }
 }
 
 /// The boot image of the shell on EC2.
@@ -2409,7 +2421,7 @@ commands:
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   datafs-breaks the deliberate breaks of lib/datafs fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
+  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign [diag]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign [diag]: the serial the record wants over a file of non-zero bytes with no table, datafs says where the first non-zero byte is and leaves the disk alone (diag: the diagnostic build of the disk and data services, for the launch of stafeto-design#765); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -10582,6 +10594,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
                 "breaks".to_string(),
             ])
         }),
+        job("nvme-persist key foreign", || {
+            store_probe::nvme_persist(&["key".to_string(), "foreign".to_string()])
+        }),
         job("nvme-persist blk-probe", || {
             store_probe::nvme_persist(&["blk-probe".to_string()])
         }),
@@ -13952,7 +13967,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,nvme-blk/diag,datafsd/diag",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -16351,6 +16366,20 @@ mod entropy_in_images_tests {
         assert_eq!(nvme_blk_features(&crashing), Some(&["crash"][..]));
         let broken = [("nvme-blk", "nvme-blk", 0, &["break-nvme-identity"][..])];
         assert!(nvme_blk_features(&broken).is_some());
+        // Only the explicit option of `aws image --diag` builds the diagnostics in.
+        assert_eq!(diag_features(None), &[] as &[&str]);
+        assert_eq!(diag_features(Some("")), &[] as &[&str]);
+        assert_eq!(diag_features(Some("0")), &[] as &[&str]);
+        assert_eq!(diag_features(Some("1")), &["diag"]);
+        let diag = [("nvme-blk", "nvme-blk", 0, diag_features(Some("1")))];
+        assert!(nvme_blk_features(&diag).is_some());
+        for program in aws_programs().iter().filter(|p| p.1 == "datafsd") {
+            assert!(
+                program.3.is_empty(),
+                "datafsd of aws_programs: {:?}",
+                program.3
+            );
+        }
     }
 
     /// A failing `cargo tree` gives an error.

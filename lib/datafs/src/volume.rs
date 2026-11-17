@@ -13,14 +13,14 @@
 //!   volume is for its owner to look at).
 
 use crate::fs::{Fs, Storage};
-use crate::gpt::{self, Class, FORMATTED, Partition, TYPE_DATA};
+use crate::gpt::{self, Class, FORMATTED, Found, Partition, TYPE_DATA};
 use crate::{BLOCK_SECTORS, BLOCKS_MIN, Device, Window};
 
 /// Why no volume was opened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     /// Something else is on the disk.
-    Foreign,
+    Foreign(Found),
     /// A table with no data partition.
     NoPartition,
     /// The partition is too small for the file system.
@@ -34,7 +34,7 @@ pub enum Refusal {
 impl Refusal {
     pub const fn text(self) -> &'static str {
         match self {
-            Self::Foreign => "the disk holds something else, left alone",
+            Self::Foreign(_) => "the disk holds something else, left alone",
             Self::NoPartition => "no data partition in the table",
             Self::TooSmall => "the data partition is too small",
             Self::Damaged => "the data volume does not mount, left alone",
@@ -62,7 +62,7 @@ pub fn open<D: Device>(
     let mut did = Did::Mounted;
     let table = match gpt::classify(&mut device).map_err(|_| Refusal::Device)? {
         Class::Gpt(table) => table,
-        Class::Foreign => return Err(Refusal::Foreign),
+        Class::Foreign(found) => return Err(Refusal::Foreign(found)),
         Class::Blank => {
             let layout = gpt::default_layout(device.sectors()).ok_or(Refusal::Device)?;
             did = Did::Partitioned;

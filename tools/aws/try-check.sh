@@ -21,6 +21,8 @@
 #        tools/build-nginx.py
 #        tools/build-fstack.py
 #      (one run each; about four minutes in all).
+#      On macOS the C parts of littlefs are archived with the `llvm-ar` of the Rust toolchain (lib/datafs/build.rs,
+#      component `llvm-tools`), so no `AR` is set; Apple's `ar` leaves ELF archives with no symbol index.
 #   1. Build and register the image (nginx, nginx-fast, Dropbear, pkg and the page are in it):
 #        cargo xtask aws image --session S
 #      The image check of the plan's security floor has run before on the lists of the image
@@ -117,6 +119,20 @@
 #      (`--no-data-volume` maps /dev/sdf to NoDevice.) The console shows `init: left out: datadisk`, `datafs: no
 #      disk`, and `ssh: host key SHA256:...` made at this boot; after a reboot the fingerprint differs. The
 #      page and the other servers work as before.
+#   4c. A diagnostic launch (issue stafeto-design#765: `datafs: the disk holds something else, left alone`
+#      on a fresh volume). Build the image with the diagnostics in the disk and data services:
+#        cargo xtask aws image --diag --session S
+#      (the services `nvme-blk` and `datafsd` get the feature `diag`; no other image has it). Launch it as in
+#      step 2 and grep the console for:
+#        foreign at     `datafs: foreign at sector S offset O: ...` and `datafs: lba1 ... lba-last ...` (these two
+#                       lines are in every build, and appear only when datafs finds something that is not zero)
+#        sqe, cqe       the entries of the first four I/O commands: opcode, slba, nlb, prp1, prp2; cid, status, phase
+#        staging        `nvme: staging zero` or `nvme: staging nonzero at OFFSET`, as the read is taken
+#        pattern        `nvme: pattern survived` (the controller wrote nothing at the address) or `overwritten`
+#        reread         `datafs: reread 1|2|3 ...`: the sector again, twice through cell 0 and once through cell 1
+#        second verdict `datafs: second verdict ...` 5 s later; nothing is formatted or mounted in this build
+#      Also in every build: `nvme: dma queues 0x... cells 0x...` once, and `nvme: io error cid C sct/sc ... slba L` on
+#      the first errors. The probe of the lines on QEMU is `cargo xtask nvme-persist key foreign diag`.
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #

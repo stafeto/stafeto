@@ -202,8 +202,57 @@ fn gpt_is_made_read_and_set() {
     // A volume with anything else on it is foreign.
     let mut other = MemDevice::new(131_072);
     other.write(5, &[1u8; SECTOR]).unwrap();
-    assert_eq!(gpt::classify(&mut other), Ok(Class::Foreign));
+    assert!(matches!(
+        gpt::classify(&mut other),
+        Ok(Class::Foreign(found)) if found.sector == 5 && found.offset == 0
+    ));
     assert!(gpt::default_layout(2048).is_none());
+}
+
+#[test]
+fn foreign_says_where_the_first_byte_that_is_not_zero_is() {
+    let mut dev = MemDevice::new(131_072);
+    let mut sector = [0u8; SECTOR];
+    for (i, b) in sector.iter_mut().enumerate().skip(300) {
+        *b = (i % 251) as u8 + 1;
+    }
+    dev.write(7, &sector).unwrap();
+    // A later sector with other bytes does not change the answer.
+    dev.write(9, &[0xEEu8; SECTOR]).unwrap();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut last = [0u8; SECTOR];
+    last[..8].copy_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+    dev.write(131_071, &last).unwrap();
+    let mut one = [0u8; SECTOR];
+    one[..8].copy_from_slice(&first);
+    // Sector 1 holds bytes that are no header: the first non-zero byte is still in sector 1.
+    dev.write(1, &one).unwrap();
+    let Ok(Class::Foreign(found)) = gpt::classify(&mut dev) else {
+        panic!("not foreign");
+    };
+    assert_eq!((found.sector, found.offset), (1, 0));
+    assert_eq!(found.lba1, first);
+    assert_eq!(found.last, [8, 7, 6, 5, 4, 3, 2, 1]);
+    assert_eq!(&found.bytes[..8], &first);
+    // Without sector 1 the byte in sector 7 is the first one, at offset 300.
+    dev.write(1, &[0u8; SECTOR]).unwrap();
+    // The backup header's sector is not zero either, so the sector 7 scan is the one that counts.
+    let Ok(Class::Foreign(found)) = gpt::classify(&mut dev) else {
+        panic!("not foreign");
+    };
+    assert_eq!((found.sector, found.offset), (7, 300));
+    assert_eq!(found.lba1, [0; 8]);
+    assert_eq!(found.bytes[..], sector[288..320]);
+}
+
+#[test]
+fn blank_and_a_valid_table_have_no_foreign_report() {
+    let mut dev = MemDevice::new(131_072);
+    assert_eq!(gpt::classify(&mut dev), Ok(Class::Blank));
+    let layout = gpt::default_layout(dev.sectors()).unwrap();
+    gpt::create(&mut dev, &layout, 7).unwrap();
+    assert!(matches!(gpt::classify(&mut dev), Ok(Class::Gpt(_))));
 }
 
 #[test]
@@ -255,7 +304,7 @@ fn a_cut_while_the_table_is_made_leaves_blank_or_a_table() {
                     assert_eq!(table.total, 2, "cut {cut}: a table is whole or not there");
                 }
                 Class::Blank => {}
-                Class::Foreign => panic!("cut {cut} {survive:?}: neither a table nor blank"),
+                Class::Foreign(_) => panic!("cut {cut} {survive:?}: neither a table nor blank"),
             }
         }
     }
@@ -757,10 +806,10 @@ mod volumes {
         disk.flush().unwrap();
         let before = disk.medium().to_vec();
         let mut state = storage();
-        assert_eq!(
+        assert!(matches!(
             volume::open(&mut disk, &mut state, 1).err(),
-            Some(Refusal::Foreign)
-        );
+            Some(Refusal::Foreign(found)) if found.sector == 0 && found.bytes[..4] == [0x55; 4]
+        ));
         assert_eq!(disk.medium(), &before[..]);
         // A table with no data partition.
         let mut disk = MemDevice::new(131_072);

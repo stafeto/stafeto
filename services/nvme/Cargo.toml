@@ -25,6 +25,9 @@ bench = false
 steps = ["rt/step-stats"]
 # `crash`: the method CRASH of proto_blk, for the restart probe over NVMe.
 crash = []
+# `diag`: the entries of the first four commands, a pattern in the staging cell before a read and what
+# the controller left there (the try-out image of `cargo xtask aws image --diag`).
+diag = ["nvme/diag"]
 break-nvme-write-offset = []
 break-nvme-identity = []
 

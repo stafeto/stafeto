@@ -375,6 +375,7 @@ fn main(_: u64) -> u64 {
     if queues_pa == 0 || cells_pa == 0 || mapped.is_err() {
         return NOT_MAPPED;
     }
+    rt::println!("nvme: dma queues {queues_pa:#x} cells {cells_pa:#x}");
     // SAFETY: the window `bar` maps BAR 0 at BAR_AT for BAR_PAGES pages (init's table).
     let hw = Hw {
         bar: unsafe { Bar::new(BAR_AT, (BAR_PAGES * PAGE) as usize) },
@@ -475,6 +476,10 @@ fn main(_: u64) -> u64 {
         process: Handle::borrowed(s.process.raw()),
         _objects: [queues, cell_object],
         _windows: [ecam, bar],
+        slba: [0; CELLS_N],
+        errors: ERRORS_SHOWN,
+        #[cfg(feature = "diag")]
+        diag: Diag::default(),
     };
     #[cfg(feature = "steps")]
     rt::service::report_steps(15);
@@ -523,6 +528,47 @@ struct Disk {
     /// The DMA objects and the windows, mapped for the service's life.
     _objects: [Handle<Memory>; 2],
     _windows: [Handle<Memory>; 2],
+    /// The first block of the command in each place, for the line of an I/O error.
+    slba: [u64; CELLS_N],
+    /// The I/O errors that may still print a line.
+    errors: u8,
+    #[cfg(feature = "diag")]
+    diag: Diag,
+}
+
+/// The places of the staging cells.
+const CELLS_N: usize = proto_blk::CELLS as usize;
+/// The I/O errors that print a line.
+const ERRORS_SHOWN: u8 = 4;
+
+/// The state of the diagnostic build: the reads that are still watched, and for each place the
+/// sectors of the pattern its read started with (0 for none).
+#[cfg(feature = "diag")]
+#[derive(Default)]
+struct Diag {
+    reads: u8,
+    takes: u8,
+    pattern: [u32; CELLS_N],
+}
+
+/// The byte the staging cell is filled with before a read in the diagnostic build.
+#[cfg(feature = "diag")]
+const PATTERN: u8 = 0x5A;
+/// The reads the diagnostic build watches.
+#[cfg(feature = "diag")]
+const WATCHED: u8 = 4;
+
+/// The first `count` sectors of the staging cell of `place` as bytes.
+#[cfg(feature = "diag")]
+fn staging(nvme: &Nvme<Hw>, place: usize, count: u32) -> &[u8] {
+    // SAFETY: the cell lies in the mapped DMA object for its 16 KiB, `count` sectors within it
+    // (the request was admitted); the command that wrote it has completed.
+    unsafe {
+        core::slice::from_raw_parts(
+            nvme.cell_va(place as u8) as *const u8,
+            count as usize * SECTOR,
+        )
+    }
 }
 
 /// `count` sectors between cell `place` of the DMA object and the client's cell of the same
@@ -593,6 +639,32 @@ impl Disk {
     fn finish(&mut self, done: Completion) {
         let place = usize::from(done.tag);
         self.inflight = self.inflight.saturating_sub(1);
+        if let NvmeOutcome::Error { sct, sc, dnr } = done.outcome
+            && self.errors > 0
+        {
+            self.errors -= 1;
+            rt::println!(
+                "nvme: io error cid {} sct/sc {:#x}/{:#x} dnr {} slba {}",
+                u16::from(done.tag) << 2,
+                sct,
+                sc,
+                u8::from(dnr),
+                self.slba.get(place).copied().unwrap_or(0)
+            );
+        }
+        #[cfg(feature = "diag")]
+        if let (NvmeOutcome::Ok, Some(sectors)) = (done.outcome, self.diag.pattern.get_mut(place))
+            && *sectors > 0
+        {
+            let kept = staging(&self.nvme, place, *sectors)
+                .iter()
+                .all(|&b| b == PATTERN);
+            *sectors = 0;
+            rt::println!(
+                "nvme: pattern {}",
+                if kept { "survived" } else { "overwritten" }
+            );
+        }
         let outcome = match done.outcome {
             NvmeOutcome::Ok => Outcome::Ok,
             NvmeOutcome::Error { .. } | NvmeOutcome::Aborted => Outcome::Io,
@@ -649,6 +721,23 @@ impl Disk {
         };
         if kind == Kind::Write {
             copy_cell(&self.nvme, place, io.count, false);
+        }
+        if let Some(at) = self.slba.get_mut(place) {
+            *at = lba;
+        }
+        #[cfg(feature = "diag")]
+        if kind == Kind::Read && self.diag.reads < WATCHED {
+            self.diag.reads += 1;
+            // SAFETY: the staging cell of the place, in the mapped DMA object, 16 KiB, with no
+            // command on it (the place was admitted).
+            unsafe {
+                core::ptr::write_bytes(
+                    self.nvme.cell_va(place as u8) as *mut u8,
+                    PATTERN,
+                    io.count as usize * SECTOR,
+                )
+            };
+            self.diag.pattern[place] = io.count;
         }
         let sent = match kind {
             Kind::Read => self.nvme.read(place as u8, lba, blocks),
@@ -760,6 +849,17 @@ impl Disk {
                 self.ops.finish(&mut s.data, label, key);
                 if let Some(refusal) = done.outcome.refusal() {
                     return Answer::Status(refusal);
+                }
+                #[cfg(feature = "diag")]
+                if done.kind == Kind::Read && self.diag.takes < WATCHED {
+                    self.diag.takes += 1;
+                    match staging(&self.nvme, done.place, done.count)
+                        .iter()
+                        .position(|&b| b != 0)
+                    {
+                        Some(at) => rt::println!("nvme: staging nonzero at {at}"),
+                        None => rt::println!("nvme: staging zero"),
+                    }
                 }
                 if done.kind == Kind::Read {
                     copy_cell(&self.nvme, done.place, done.count, true);

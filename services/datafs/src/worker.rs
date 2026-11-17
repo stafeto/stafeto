@@ -11,8 +11,11 @@ use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering::{Acquire, Release};
+use datafs::gpt::Found;
+#[cfg(feature = "diag")]
+use datafs::gpt::{self, Class};
 use datafs::server::Server;
-use datafs::volume::{self, Did};
+use datafs::volume::{self, Did, Refusal};
 use datafs::{Device, DeviceError, SECTOR};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk};
 use proto_wire::{Status, Writer, long};
@@ -136,10 +139,10 @@ impl Disk {
         }
     }
 
-    fn io(&self, method: Blk, count: u32, sector: u64) -> Result<u64, Status> {
+    fn io(&self, method: Blk, cell: u32, count: u32, sector: u64) -> Result<u64, Status> {
         let mut w = Writer::new();
         method.header().write(&mut w)?;
-        w.u32(0)?;
+        w.u32(cell)?;
         w.u32(count)?;
         w.u64(sector)?;
         match self.call(w.as_bytes(), None)? {
@@ -193,6 +196,25 @@ impl Disk {
         done
     }
 
+    /// Waits `ns` on the worker's timer (the diagnostic build only).
+    #[cfg(feature = "diag")]
+    fn sleep(&self, ns: u64) {
+        let until = rt::time::ticks_to_ns(rt::time::now()) + ns;
+        if sys::timer_set(&self.timer, until).is_err() {
+            return;
+        }
+        loop {
+            match sys::receive(&self.own) {
+                Ok(Received::Notification {
+                    source: Source::Timer,
+                    ..
+                }) if rt::time::reached(until) => return,
+                Err(_) => return,
+                _ => {}
+            }
+        }
+    }
+
     fn cell() -> *mut u8 {
         BUFFER_AT as *mut u8
     }
@@ -207,7 +229,7 @@ impl Device for Disk {
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             let key = self
-                .io(Blk::Read, (chunk.len() / SECTOR) as u32, at)
+                .io(Blk::Read, 0, (chunk.len() / SECTOR) as u32, at)
                 .map_err(|_| DeviceError)?;
             self.finish(key).map_err(|_| DeviceError)?;
             // SAFETY: cell 0 of the mapped buffer; READY: the disk service wrote it, and no
@@ -229,7 +251,7 @@ impl Device for Disk {
             // SAFETY: cell 0 of the mapped buffer; no request of it is in flight.
             unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), Self::cell(), chunk.len()) };
             if count > 0 {
-                let key = self.io(Blk::Write, count, at).map_err(|_| DeviceError)?;
+                let key = self.io(Blk::Write, 0, count, at).map_err(|_| DeviceError)?;
                 self.finish(key).map_err(|_| DeviceError)?;
             }
             #[cfg(feature = "crash")]
@@ -359,6 +381,12 @@ fn open_volume(disk: Disk) -> Option<Volume> {
         rt::println!("datafs: the disk has no flush, no data volume");
         return None;
     }
+    #[cfg(feature = "diag")]
+    let mut disk = disk;
+    #[cfg(feature = "diag")]
+    if diagnose(&mut disk) {
+        return None;
+    }
     // The GUIDs of a new table come from the clock: unique enough for a table that is written once.
     let seed = rt::time::now() ^ disk.sectors;
     // SAFETY: the storage is the worker's alone, and lives for the life of the process.
@@ -379,10 +407,86 @@ fn open_volume(disk: Disk) -> Option<Volume> {
             Some(fs)
         }
         Err(refusal) => {
+            if let Refusal::Foreign(found) = refusal {
+                say_foreign(&found);
+            }
             rt::println!("datafs: {}", refusal.text());
             None
         }
     }
+}
+
+/// The bytes as hex digits, for a console line.
+struct Hex<'a>(&'a [u8]);
+
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// The two lines of a refusal of a disk that holds something else: where the first byte that is
+/// not zero is, and the first bytes of the two sectors that a table would be in.
+fn say_foreign(found: &Found) {
+    rt::println!(
+        "datafs: foreign at sector {} offset {}: {}",
+        found.sector,
+        found.offset,
+        Hex(&found.bytes)
+    );
+    rt::println!(
+        "datafs: lba1 {} lba-last {}",
+        Hex(&found.lba1),
+        Hex(&found.last)
+    );
+}
+
+/// The diagnostic build (`diag`): when the disk reads as foreign, the sector is read three more
+/// times (twice into cell 0, once into cell 1 after the client's cell was filled with 0xA5), and
+/// the disk is classified again 5 s later. Nothing is written or mounted. True when the disk was
+/// foreign and the worker has nothing more to do with it.
+#[cfg(feature = "diag")]
+fn diagnose(disk: &mut Disk) -> bool {
+    let Ok(Class::Foreign(found)) = gpt::classify(&mut *disk) else {
+        return false;
+    };
+    say_foreign(&found);
+    let mut sector = [0u8; SECTOR];
+    for n in 1..=2 {
+        match disk.read(found.sector, &mut sector) {
+            Ok(()) => rt::println!("datafs: reread {n} {}", Hex(&sector[..16])),
+            Err(_) => rt::println!("datafs: reread {n} failed"),
+        }
+    }
+    let other = BUFFER_AT + CELL_BYTES as usize;
+    // SAFETY: cell 1 of the mapped buffer; no request of it is in flight.
+    unsafe { core::ptr::write_bytes(other as *mut u8, 0xA5, CELL_BYTES as usize) };
+    let third = disk
+        .io(Blk::Read, 1, 1, found.sector)
+        .and_then(|key| disk.finish(key));
+    match third {
+        Ok(()) => {
+            let mut head = [0u8; 16];
+            // SAFETY: cell 1 of the mapped buffer; READY, so no request of it is in flight.
+            unsafe { core::ptr::copy_nonoverlapping(other as *const u8, head.as_mut_ptr(), 16) };
+            rt::println!("datafs: reread 3 {}", Hex(&head));
+        }
+        Err(_) => rt::println!("datafs: reread 3 failed"),
+    }
+    disk.sleep(5_000_000_000);
+    match gpt::classify(&mut *disk) {
+        Ok(Class::Blank) => rt::println!("datafs: second verdict blank"),
+        Ok(Class::Gpt(_)) => rt::println!("datafs: second verdict table"),
+        Ok(Class::Foreign(again)) => rt::println!(
+            "datafs: second verdict foreign at sector {} offset {}: {}",
+            again.sector,
+            again.offset,
+            Hex(&again.bytes)
+        ),
+        Err(_) => rt::println!("datafs: second verdict device error"),
+    }
+    rt::println!("datafs: {}", Refusal::Foreign(found).text());
+    true
 }
 
 /// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
