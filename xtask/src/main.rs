@@ -2403,7 +2403,7 @@ commands:
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   datafs-breaks the deliberate breaks of lib/datafs fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key wrongdisk: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
+  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -10558,6 +10558,21 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             store_probe::nvme_persist(&[
                 "key".to_string(),
                 "wrongdisk".to_string(),
+                "breaks".to_string(),
+            ])
+        }),
+        job("nvme-persist key wrongdisk blank", || {
+            store_probe::nvme_persist(&[
+                "key".to_string(),
+                "wrongdisk".to_string(),
+                "blank".to_string(),
+            ])
+        }),
+        job("nvme-persist key wrongdisk blank breaks", || {
+            store_probe::nvme_persist(&[
+                "key".to_string(),
+                "wrongdisk".to_string(),
+                "blank".to_string(),
                 "breaks".to_string(),
             ])
         }),

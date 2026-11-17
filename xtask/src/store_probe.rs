@@ -1157,9 +1157,11 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 ["nodisk"] => (KeyCase::NoDisk, false),
                 ["wrongdisk"] => (KeyCase::WrongDisk, false),
                 ["wrongdisk", "breaks"] => (KeyCase::WrongDisk, true),
+                ["wrongdisk", "blank"] => (KeyCase::WrongBlank, false),
+                ["wrongdisk", "blank", "breaks"] => (KeyCase::WrongBlank, true),
                 other => {
                     return Err(format!(
-                        "usage: nvme-persist key [nodisk|wrongdisk [breaks]]: {other:?}"
+                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]]: {other:?}"
                     ));
                 }
             };
@@ -1439,6 +1441,9 @@ enum KeyCase {
     /// A controller whose serial number is another one, over a file that stands for an ESP: the
     /// service of the disk leaves it alone.
     WrongDisk,
+    /// The same, with the first MiB of the file zeroed: `datafs` would take it for a blank disk and
+    /// partition it, so only the check of the identity protects it.
+    WrongBlank,
 }
 
 /// The size of the file that stands for an ESP in the case `WrongDisk`.
@@ -1457,10 +1462,14 @@ fn file_sha256(path: &Path) -> Result<String, String> {
 
 /// A file of non-zero bytes that stands for an ESP: a service that wrote to it or formatted it
 /// would change its digest.
-fn write_stand_in(path: &Path) -> Result<(), String> {
+fn write_stand_in(path: &Path, blank_start: bool) -> Result<(), String> {
     let mut bytes = vec![0u8; STAND_IN_BYTES];
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 1;
+    }
+    if blank_start {
+        // The first MiB is zero: the test of `datafs` for a blank disk.
+        bytes[..1 << 20].fill(0);
     }
     std::fs::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -1493,6 +1502,8 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         (KeyCase::NoDisk, _) => "-nodisk",
         (KeyCase::WrongDisk, false) => "-wrongdisk",
         (KeyCase::WrongDisk, true) => "-wrongdisk-break",
+        (KeyCase::WrongBlank, false) => "-wrongblank",
+        (KeyCase::WrongBlank, true) => "-wrongblank-break",
     };
     let mut list = PROGRAMS_KEY.to_vec();
     if breaks {
@@ -1525,10 +1536,10 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     let shape = match case {
         KeyCase::Normal => Shape::Plain,
         KeyCase::NoDisk => Shape::Absent,
-        KeyCase::WrongDisk => Shape::Wrong,
+        KeyCase::WrongDisk | KeyCase::WrongBlank => Shape::Wrong,
     };
-    if case == KeyCase::WrongDisk {
-        write_stand_in(&file.0)?;
+    if case != KeyCase::Normal && case != KeyCase::NoDisk {
+        write_stand_in(&file.0, case == KeyCase::WrongBlank)?;
     } else {
         write_disk(&file, None)?;
     }
@@ -1591,13 +1602,18 @@ fn nvme_key_without_volume(
     file: &Path,
     run: &dyn Fn() -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
-    let name = if case == KeyCase::NoDisk {
-        "nvme-persist key nodisk"
-    } else {
-        "nvme-persist key wrongdisk"
+    let name = match case {
+        KeyCase::NoDisk => "nvme-persist key nodisk",
+        KeyCase::WrongBlank => "nvme-persist key wrongdisk blank",
+        _ => "nvme-persist key wrongdisk",
     };
+    let blank = case == KeyCase::WrongBlank;
     let judge = |lines: &[String], boot: &str| -> Result<String, String> {
         no_restart_loop(lines, &format!("{name}, {boot} boot"))?;
+        if blank && breaks {
+            // The break must be caught by the file's digest alone: the lines are not looked at.
+            return Ok(String::new());
+        }
         // The data file service says it has no volume, whatever the reason.
         if !said(lines, "datafs: no disk: ") {
             return Err(format!(
@@ -1619,13 +1635,13 @@ fn nvme_key_without_volume(
             KeyCase::NoDisk if !said(lines, "init: left out: ") => Err(format!(
                 "{name}, {boot} boot: init did not say it left the record out"
             )),
-            KeyCase::WrongDisk if left != 1 => Err(format!(
+            KeyCase::WrongDisk | KeyCase::WrongBlank if left != 1 => Err(format!(
                 "{name}, {boot} boot: {left} lines {LEFT_ALONE:?}, one expected"
             )),
             _ => key_fingerprint(lines),
         }
     };
-    let before = if case == KeyCase::WrongDisk {
+    let before = if case != KeyCase::NoDisk {
         Some(file_sha256(file)?)
     } else {
         None
@@ -1636,7 +1652,7 @@ fn nvme_key_without_volume(
         let outcome = run().and_then(|lines| judge(&lines, boot));
         match outcome {
             Ok(key) => keys.push(key),
-            Err(why) if breaks => {
+            Err(why) if breaks && !blank => {
                 println!("{name} breaks: break-nvme-identity is caught: {why}");
                 return Ok(());
             }
@@ -1650,10 +1666,18 @@ fn nvme_key_without_volume(
                 "the file of the wrong disk changed: SHA-256 {before} before the boot, {after} after"
             );
             if breaks {
-                println!("{name} breaks: break-nvme-identity is caught: {why}");
+                println!(
+                    "{name} breaks: break-nvme-identity is caught because the SHA-256 of the file changed: {why}"
+                );
                 return Ok(());
             }
             return Err(why);
+        }
+        if blank && breaks {
+            return Err(
+                "break-nvme-identity passed: the SHA-256 of the blank-start file is unchanged"
+                    .into(),
+            );
         }
     }
     if breaks {
