@@ -1261,9 +1261,11 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         None if steps => "the line of the controller was cut by the steps".to_string(),
         None => return Err("the NVMe service said nothing of its controller".into()),
     };
-    if !first
-        .iter()
-        .any(|l| l.contains("nvme: first interrupt of vector 1"))
+    // The measured run may lose a line of the console; the interrupt is required of the others.
+    if !steps
+        && !first
+            .iter()
+            .any(|l| l.contains("nvme: first interrupt of vector 1"))
     {
         return Err("no interrupt of vector 1 came: the completions were found by polling".into());
     }
