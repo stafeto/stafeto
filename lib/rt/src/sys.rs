@@ -1538,6 +1538,7 @@ fn send_with(
 /// steps of its places) is worked off well inside it.
 pub const TRY_AGAIN_MAX: u32 = 4096;
 
+#[inline(always)]
 fn send_once(
     channel: &Handle<Channel>,
     bytes: &[u8],

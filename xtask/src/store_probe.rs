@@ -34,7 +34,9 @@ use pkgfmt::meta::Meta;
 use pkgfmt::{Certificate, Key, Kind, Revocation, keyfile, sig};
 use std::path::{Path, PathBuf};
 
-pub const PKGD_STACK_SIZE: u32 = 32 * 1024;
+/// 4 KiB more than the first measure: a call that is sent again on TRY_AGAIN (`rt::sys::send`)
+/// and the frame of the loop of a service are a few hundred bytes deeper than before.
+pub const PKGD_STACK_SIZE: u32 = 36 * 1024;
 const DISK_BYTES: u64 = 512 << 20;
 /// The tags of the services' lines of steps: the file service 2, the disk 15, the package service 16.
 const RAM_TAG: &str = "2";

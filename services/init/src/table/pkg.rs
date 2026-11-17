@@ -421,7 +421,7 @@ pub const DATAFS_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 100_000,
     t_ns: 10 * MS,
-    low: super::ramfs::SERVICE_LOW,
+    low: NVME_LOW,
 }];
 
 /// The data file service (services/datafs): the files of `/data` on the data partition of the disk
