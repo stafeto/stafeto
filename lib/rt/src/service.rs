@@ -431,6 +431,22 @@ pub fn run_in<S: Service<K>, const K: usize>(
     config: Config<'_>,
     table: &mut [Option<Session<S::Data, K>>],
 ) -> Error {
+    run_with(channel, service, config, table, None)
+}
+
+/// `run_in` with the thread of the service's own work (`Turns`), when the service has one: the
+/// notifications the thread takes come to the loop as requests under its label (`TURN_LABEL`)
+/// and go to `Service::notification` and `Service::maintenance` as they would have, and the
+/// departure of a session (CLIENT_GONE) is only noted on the main thread, in O(1), and made by
+/// a turn. The loop answers each turn with its status alone.
+pub fn run_with<S: Service<K>, const K: usize>(
+    channel: &Handle<Channel>,
+    service: &mut S,
+    config: Config<'_>,
+    table: &mut [Option<Session<S::Data, K>>],
+    turns: Option<&Turns>,
+) -> Error {
+    let mut ring = Ring::new();
     let mut beat = match config.heartbeat.map(|h| Beat::start(channel, h)) {
         None => None,
         Some(Ok(beat)) => Some(beat),
@@ -451,6 +467,8 @@ pub fn run_in<S: Service<K>, const K: usize>(
         steps::restart();
         #[cfg(feature = "step-stats")]
         service.measured_begin();
+        // The token of a turn, answered once its notice has been dispatched.
+        let mut turn: Option<Token> = None;
         let notice = match incoming {
             Err(e) => return e,
             Ok(Received::Message {
@@ -467,46 +485,63 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 } else {
                     msgbuf::read(0, bytes);
                 }
-                let kind = steps::kind_of(bytes);
-                service.before_request();
-                #[cfg(not(feature = "step-stats"))]
-                let began = steps::begin();
-                #[cfg(feature = "step-stats")]
-                {
-                    let sample = sample::finish_after(
-                        || {
-                            // With the feature the step sends its reply.
-                            request(
-                                service,
-                                table,
-                                config.issued,
-                                label,
-                                bytes,
-                                handles,
-                                token,
-                                &mut owed,
-                            );
-                        },
-                        || steps::end(began, kind),
-                    );
-                    service.measured_step(sample, table);
+                if turns.is_some() && label == TURN_LABEL {
+                    // A notice the thread of the service's own work took. Only that thread
+                    // holds a handle with this label; a request of another size is refused.
+                    drop(handles);
+                    match turn_notice(bytes) {
+                        Some(notice) => {
+                            turn = Some(token);
+                            notice
+                        }
+                        None => {
+                            let status = proto_wire::reply(Status::BadSize);
+                            owe(token, &status, Outgoing::new(), &mut owed);
+                            continue;
+                        }
+                    }
+                } else {
+                    let kind = steps::kind_of(bytes);
+                    service.before_request();
+                    #[cfg(not(feature = "step-stats"))]
+                    let began = steps::begin();
+                    #[cfg(feature = "step-stats")]
+                    {
+                        let sample = sample::finish_after(
+                            || {
+                                // With the feature the step sends its reply.
+                                request(
+                                    service,
+                                    table,
+                                    config.issued,
+                                    label,
+                                    bytes,
+                                    handles,
+                                    token,
+                                    &mut owed,
+                                );
+                            },
+                            || steps::end(began, kind),
+                        );
+                        service.measured_step(sample, table);
+                    }
+                    #[cfg(not(feature = "step-stats"))]
+                    {
+                        request(
+                            service,
+                            table,
+                            config.issued,
+                            label,
+                            bytes,
+                            handles,
+                            token,
+                            &mut owed,
+                        );
+                        steps::end(began, kind);
+                    }
+                    service.between_requests();
+                    continue;
                 }
-                #[cfg(not(feature = "step-stats"))]
-                {
-                    request(
-                        service,
-                        table,
-                        config.issued,
-                        label,
-                        bytes,
-                        handles,
-                        token,
-                        &mut owed,
-                    );
-                    steps::end(began, kind);
-                }
-                service.between_requests();
-                continue;
             }
             Ok(Received::Notification {
                 source,
@@ -526,28 +561,54 @@ pub fn run_in<S: Service<K>, const K: usize>(
             match (notice.source, notice.label, &mut beat) {
                 (Source::Timer, 0, Some(beat)) => beat.expired(),
                 (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
-                    steps::gone();
-                    let bits = notice.bits & !CLIENT_GONE;
-                    if bits != 0 {
-                        service.notification(Notice { bits, ..notice });
-                    }
-                    let placed = service.place(label);
-                    let found = match placed {
-                        Some(i) => table
-                            .get_mut(i)
-                            .filter(|s| s.as_ref().is_none_or(|s| s.label == label)),
-                        None => table
-                            .iter_mut()
-                            .skip(S::PLACED)
-                            .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
-                    };
-                    if let Some(slot) = found {
-                        if placed.is_some() && slot.is_none() {
-                            *slot = Some(Session::new(label, S::Data::default(), config.issued));
+                    if turns.is_some() && turn.is_none() {
+                        // The main thread only notes the departure and wakes the thread of
+                        // the service's own work, which makes it as a turn; a full ring is
+                        // made here.
+                        let bits = notice.bits & !CLIENT_GONE;
+                        if bits != 0 {
+                            service.notification(Notice { bits, ..notice });
                         }
-                        depart_session(service, slot);
+                        if ring.push(label) {
+                            if let Some(turns) = turns {
+                                turns.wake_departures();
+                            }
+                            // Noted, nothing more on this thread: a turn makes the rest.
+                            return;
+                        } else {
+                            steps::gone();
+                            depart_label(service, table, label, config.issued);
+                        }
+                    } else {
+                        steps::gone();
+                        let bits = notice.bits & !CLIENT_GONE;
+                        if bits != 0 {
+                            service.notification(Notice { bits, ..notice });
+                        }
+                        depart_label(service, table, label, config.issued);
                     }
-                    service.closed(label);
+                }
+                (Source::Session, RING_LABEL, _) if turn.is_some() => {
+                    // Takes the next departure the main thread noted.
+                    if let Some(label) = ring.pop() {
+                        steps::gone();
+                        depart_label(service, table, label, config.issued);
+                        if let Some(turns) = turns
+                            && !ring.is_empty()
+                        {
+                            turns.wake_departures();
+                        }
+                        service.maintenance(
+                            table,
+                            Notice {
+                                source: Source::Session,
+                                label,
+                                bits: CLIENT_GONE,
+                                count: 1,
+                            },
+                        );
+                    }
+                    return;
                 }
                 _ => service.notification(notice),
             }
@@ -564,7 +625,217 @@ pub fn run_in<S: Service<K>, const K: usize>(
             dispatch();
             steps::end(began, steps::NOTICE);
         }
-        service.between_notifications(notice);
+        match turn.take() {
+            Some(token) => {
+                let status = proto_wire::reply(Status::Ok);
+                owe(token, &status, Outgoing::new(), &mut owed);
+            }
+            None => service.between_notifications(notice),
+        }
+    }
+}
+
+/// The label of the requests of the thread of a service's own work, the turns. It has a bit
+/// the labels of clients do not use (`proto_fs::OWN` and the like are bit 63).
+pub const TURN_LABEL: u64 = (1 << 62) | 0x5455_524e;
+/// The label of the wake of the thread of the own work for a departure the main thread noted.
+const RING_LABEL: u64 = (1 << 62) | 0x5249_4e47;
+/// The departures the main thread notes at most before a turn takes them; one more is made on
+/// the main thread at once.
+const RING: usize = 256;
+
+/// The labels of sessions that went, noted by the main thread and made by turns.
+struct Ring {
+    labels: [u64; RING],
+    head: usize,
+    len: usize,
+}
+
+impl Ring {
+    const fn new() -> Ring {
+        Ring {
+            labels: [0; RING],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, label: u64) -> bool {
+        if self.len == RING {
+            return false;
+        }
+        self.labels[(self.head + self.len) % RING] = label;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        let label = self.labels[self.head];
+        self.head = (self.head + 1) % RING;
+        self.len -= 1;
+        Some(label)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The notice a turn carries: source, label, bits and count as four words.
+fn turn_notice(bytes: &[u8]) -> Option<Notice> {
+    if bytes.len() != 32 {
+        return None;
+    }
+    let word = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    Some(Notice {
+        source: Source::from_code(word(0)),
+        label: word(1),
+        bits: word(2),
+        count: word(3) as u32,
+    })
+}
+
+/// The departure of the client `label`: its session ends (`gone`, the handles it held close)
+/// and the service hears that the last copy of the handle went (`closed`).
+fn depart_label<S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &mut [Option<Session<S::Data, K>>],
+    label: u64,
+    issued: u32,
+) {
+    let placed = service.place(label);
+    let found = match placed {
+        Some(i) => table
+            .get_mut(i)
+            .filter(|s| s.as_ref().is_none_or(|s| s.label == label)),
+        None => table
+            .iter_mut()
+            .skip(S::PLACED)
+            .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
+    };
+    if let Some(slot) = found {
+        if placed.is_some() && slot.is_none() {
+            *slot = Some(Session::new(label, S::Data::default(), issued));
+        }
+        depart_session(service, slot);
+    }
+    service.closed(label);
+}
+
+/// The thread of a service's own work (session departures, maintenance, timers, the wakes of
+/// other threads): it takes every notification that comes to its channel and sends each to the
+/// loop as a request, a turn, which the loop runs on the main thread under the turn's label,
+/// so that the service's state stays in one thread. The turn queues at the level of the thread
+/// that sent it, and the time the main thread spends on it is lent to it (spec 8): once the
+/// main thread has spent its own budget (`serve`), the turn is paid from the budget of the
+/// turns thread (`turns`), which init carves out of `serve`, so that the work of the service
+/// for itself has a budget of its own and the requests of its clients do not wait for it.
+///
+/// The service makes its timers and its wake handles on `channel`, not on the channel of the
+/// loop, and starts the thread (`start`) before the loop serves.
+pub struct Turns {
+    channel: Handle<Channel>,
+    level: u8,
+    wake: Handle<Channel>,
+}
+
+/// The handles the thread uses: its channel and the handle it sends turns through.
+static TURN_HANDLES: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Turns {
+    /// The channel of the thread, at `level` (the level of the service's loop).
+    pub fn new(level: u8) -> Result<Turns, Error> {
+        let channel = sys::channel_create(level)?;
+        let wake = sys::handle_label(&channel, Rights::NOTIFY, RING_LABEL, level)?;
+        Ok(Turns {
+            channel,
+            level,
+            wake,
+        })
+    }
+
+    /// The thread's channel: the handle the service makes its timers on and its wake handles of
+    /// (`sys::handle_label` with NOTIFY), and `sys::notify` through it wakes the thread with no
+    /// label.
+    pub fn channel(&self) -> &Handle<Channel> {
+        &self.channel
+    }
+
+    /// Makes the thread in `process`, stopped, binds `budget` to it and starts it: it sends its
+    /// turns to `main`, the loop's channel. `stack` is the top of a stack of its own and
+    /// `buffer` the page of its message buffer. Err when the thread or the budget is refused:
+    /// the service would run its own work without a limit, so it does not start.
+    ///
+    /// # Safety
+    /// `stack` is the top of memory nothing else uses while the thread lives (a `Stack`).
+    pub unsafe fn start(
+        &self,
+        service: &str,
+        process: &Handle<crate::handle::Process>,
+        main: &Handle<Channel>,
+        stack: usize,
+        buffer: usize,
+        budget: Option<Handle<crate::handle::Budget>>,
+    ) -> Result<Option<Handle<crate::handle::Budget>>, Error> {
+        use core::sync::atomic::Ordering;
+        let tell = sys::handle_label(main, Rights::SEND, TURN_LABEL, self.level)?;
+        TURN_HANDLES[0].store(self.channel.raw().0, Ordering::Release);
+        TURN_HANDLES[1].store(tell.into_raw().0, Ordering::Release);
+        // SAFETY: the caller's promise about `stack`.
+        let thread = unsafe {
+            sys::thread_create(
+                process,
+                turns_main,
+                stack,
+                0,
+                self.level,
+                abi::Policy::Fifo,
+                buffer,
+            )
+        }?;
+        let bound = crate::budget::bind(service, "turns", budget, &thread)?;
+        sys::thread_start(&thread)?;
+        core::mem::forget(thread);
+        Ok(bound)
+    }
+
+    /// Wakes the thread for a departure the loop noted.
+    fn wake_departures(&self) {
+        let _ = sys::notify(&self.wake, 1);
+    }
+}
+
+extern "C" fn turns_main(_: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let channel = Handle::<Channel>::borrowed(abi::Handle(TURN_HANDLES[0].load(Ordering::Acquire)));
+    let tell = Handle::<Channel>::borrowed(abi::Handle(TURN_HANDLES[1].load(Ordering::Acquire)));
+    loop {
+        let Ok(Received::Notification {
+            source,
+            label,
+            bits,
+            count,
+        }) = sys::receive(&channel)
+        else {
+            // The handles live as long as the service; a message on this channel is no turn.
+            let _ = sys::yield_now();
+            continue;
+        };
+        let mut bytes = [0; 32];
+        for (i, word) in [source.code(), label, bits, u64::from(count)]
+            .into_iter()
+            .enumerate()
+        {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let _ = sys::send(&tell, &bytes);
+        // The turn is a request in the loop's queue by the level of this thread; the yield
+        // keeps a chain of turns from holding a CPU against the threads at its level.
+        let _ = sys::yield_now();
     }
 }
 
