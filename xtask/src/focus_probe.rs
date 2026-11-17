@@ -308,7 +308,23 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
     for prefix in [OVERLAP, CLICK, SWITCH, SURVIVOR] {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
-        gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
+        let first = gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix);
+        // A runner under load has dropped the monitor's connection once with
+        // QEMU still up (the guest was waiting 2.5 s for this photograph). The
+        // monitor takes a new client when the old one is gone, so a reset or a
+        // closed connection is tried once more on a new one; a QEMU that is
+        // gone refuses the new connection and the first error is the failure,
+        // and a CRC that differs is never tried again.
+        if let Err(e) = &first
+            && (e.contains("Connection reset") || e.contains("monitor closed"))
+        {
+            println!("focus-probe: {e}; connecting to the monitor again");
+            monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(5))
+                .map_err(|again| format!("{e}; and the monitor does not answer again: {again}"))?;
+            gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
+        } else {
+            first?;
+        }
     }
     // The keys are injected; then the device moves, to a place of the
     // surviving window, and its button goes down and up there.
