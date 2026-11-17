@@ -646,9 +646,13 @@ static int t_c_itimer(void) {
         struct itimerval cpu = {.it_value = {0, 30000}, .it_interval = {0, 30000}}, back;
         if (t_block(signals[k])) return 20 + k;
         if (setitimer(which[k], &cpu, NULL)) return 22 + k;
-        if (getitimer(which[k], &back) || back.it_interval.tv_sec || back.it_interval.tv_usec != 30000
-                || back.it_value.tv_sec || back.it_value.tv_usec <= 0 || back.it_value.tv_usec > 30000)
-            return 24 + k;
+        /* One code a field (40 + 6 * k + n), so a failure says which one was wrong. */
+        if (getitimer(which[k], &back)) return 40 + 6 * k;
+        if (back.it_interval.tv_sec) return 41 + 6 * k;
+        if (back.it_interval.tv_usec != 30000) return 42 + 6 * k;
+        if (back.it_value.tv_sec) return 43 + 6 * k;
+        if (back.it_value.tv_usec <= 0) return 44 + 6 * k;
+        if (back.it_value.tv_usec > 30000) return 45 + 6 * k;
         struct timespec begin, end;
         clock_gettime(CLOCK_MONOTONIC, &begin);
         volatile unsigned long spin = 0;
