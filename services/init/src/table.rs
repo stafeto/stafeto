@@ -3428,8 +3428,7 @@ mod tests {
     #[test]
     fn a_client_of_the_entropy_service_has_it_and_only_two_images_go_without_a_driver() {
         let mut seed_only = 0;
-        let tables =
-            all_tables().into_iter().chain([entropy::SEED_TABLE]);
+        let tables = all_tables().into_iter().chain([entropy::SEED_TABLE]);
         for table in tables {
             let wants = table.iter().any(|r| r.connects.contains(&ENTROPY_SERVICE));
             let service = table.iter().find(|r| r.name == ENTROPY_SERVICE);

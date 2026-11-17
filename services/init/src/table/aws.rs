@@ -771,9 +771,8 @@ mod tests {
         let disk = found.table.iter().find(|r| r.name == "datadisk").unwrap();
         // `nvme-map.txt`: 00:04.0 is the root volume (walk index 0), 00:1f.0 the volume of
         // /dev/sdf (index 1); `pci.txt`: its BAR at 0x80000000, 16 KiB.
-        let nvme_map = include_str!(
-            "../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/nvme-map.txt"
-        );
+        let nvme_map =
+            include_str!("../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/nvme-map.txt");
         assert!(nvme_map.contains("pci=0000:00:1f.0 role=sdf"));
         let bar = disk.windows.iter().find(|w| w.name == "bar").unwrap();
         assert_eq!((bar.base, bar.len), (0x8000_0000, 0x4000));
