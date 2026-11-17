@@ -144,6 +144,28 @@ them for the licence notes of the image.
   `CURL-SOURCE`, `CA-BUNDLE-LICENSE`, `CA-BUNDLE-SOURCE`). The images of the
   probe of TLS (`cargo xtask net-tls`) replace the bytes of the CA file with
   the same roots plus the probe CA of `cargo xtask probe-ca`.
+- Dropbear 2026.94 (`/bin/dropbear`, MIT with parts under BSD-2-Clause and others: its whole
+  `LICENSE` file is the package's licence) is the SSH server, an optional network package built
+  by `tools/build-dropbear.py`: the server alone with its bundled LibTomCrypt and LibTomMath,
+  no zlib, no PAM, no utmp, wtmp, lastlog or syslog, and the options of
+  `tools/dropbear/localoptions.h`: no re-execution of the server for a connection, no SFTP server,
+  no agent or X11 forwarding, no password login and no port forwarding of any kind (compiled
+  out), and the limits of connections that have not authenticated (4 in all, 2 for an address, 30
+  seconds, 3 tries), because each is a forked child and `fork` copies the whole address space.
+  The server and `dropbearkey` are one program (`/bin/dropbearkey` is a link to `/bin/dropbear`).
+  The description makes the empty directory `/etc/dropbear`. The boot script of the image
+  (`/etc/rc` runs `/etc/rc.d/dropbear` after `ec2-key`, tools/rc), when
+  `/root/.ssh/authorized_keys` exists, makes an Ed25519 host key with `dropbearkey`, prints
+  `ssh: host key SHA256:...` on the console and starts `dropbear -F -s -j -k -r KEY` (`-s -j -k`
+  repeat what the build leaves out); the server is started again a second after it ends, and a line
+  it prints is shown once until it changes. The build has no syslog, so the log goes to the
+  standard error, and `-E` is not an option of it. `cargo xtask net-ssh` runs it on
+  `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused key, refused
+  passwords of 257 and 1 024 bytes, the options of the server shown at work (the public key alone
+  offered, both kinds of port forwarding refused; `/proc/<pid>/cmdline` holds the name of a program
+  alone, so the script prints the command line it starts), the fingerprint on the console,
+  connections held before authentication with an HTTP request and a login still answered after
+  them, and the pseudo terminals.
 - nginx 1.30.6 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
   `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
   exception, linked into nginx, no file of its own) are network packages

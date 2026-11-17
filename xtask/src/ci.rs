@@ -801,6 +801,7 @@ mod tests {
             [
                 "net-probe",
                 "net-curl",
+                "net-ssh",
                 "net-wget",
                 "net-ec2-key",
                 "net-tls",

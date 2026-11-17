@@ -1,0 +1,861 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The probe of the SSH server (`cargo xtask net-ssh`): the image of the
+//! shell with the network service whose boot script (`/etc/rc`, tools/rc)
+//! starts Dropbear (`/bin/dropbear -F -s -j -k -r KEY`, from `/etc/rc.d/dropbear`
+//! once the key is in `/root/.ssh/authorized_keys`) on QEMU's user network, a port of the host forwarded to the
+//! port 22 of the guest. xtask drives `ash` over the serial port, as
+//! `net-curl` does, and is the client with the host's own `ssh`:
+//!
+//! 1. The image: `/etc/dropbear` holds no file (the boot script
+//!    makes the host key with `dropbearkey`), `/etc/shadow` locks every account (the check of
+//!    rootfs.rs), and the package carries its licence notice.
+//! 2. The one process named dropbear is running (`/proc/<pid>/cmdline`
+//!    holds the name of a program alone, the process service keeps no
+//!    arguments), and the boot script printed the command line it started it
+//!    with, exactly the line of `SERVER_LINE`: the
+//!    password login is off (and left out of the build), no port is forwarded
+//!    (likewise), and the log goes to the standard error (the build has no
+//!    syslog). The console shows `ssh: host key SHA256:...` before the probe
+//!    connects, and the client sees the same key.
+//! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key
+//!    `ec2-key` takes from the metadata of an instance; the image of the probe has a
+//!    script of its own that writes the key of the run): a login with it
+//!    runs a command and gives its exit status, a bulk transfer of 64 KiB
+//!    through the pipes of a session is whole, a session with a terminal
+//!    (`ssh -tt`) runs a shell on a pseudo terminal and brings 2 000 lines
+//!    back in order. `/etc/dropbear` holds the one host key.
+//! 4. A key the server does not know is refused.
+//! 5. A password of 257 and one of 1 024 bytes is refused for the account
+//!    `root` (the field `!` of `/etc/shadow`) and for `star`, an account the probe's image adds with `*`.
+//! 6. Connections that have not authenticated: the most one address may hold
+//!    are held open, the next is refused, an HTTP request to the guest is still
+//!    answered, and the server closes the held ones after `AUTH_TIMEOUT`,
+//!    after which a login works.
+//! 7. Pseudo terminals: sessions with a terminal are opened one after the
+//!    other until one gets none (the pairs are eight, the console takes
+//!    one), the count is printed, and after they all end a new session gets
+//!    its terminal again.
+//! 8. The server's log on the console says what happened (a public key
+//!    accepted, no password accepted) and the guest did not fault.
+//!
+//! The host needs `ssh` and `ssh-keygen` of OpenSSH. The ports of the host
+//! are free ports xtask took and gave back just before QEMU starts.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::qemu::{Forward, Proto};
+use crate::{
+    BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, ImageProgram, SERVICES_STARTED, Variant, build,
+    build_boot_image, busybox_build, nano_build, net_tls, qemu, relibc, rootfs, symbolize,
+};
+
+/// The image of the run.
+pub const IMAGE: &str = "boot-ssh-probe.img";
+
+/// The host key the boot script makes with `dropbearkey`.
+const HOST_KEY: &str = "/etc/dropbear/dropbear_ed25519_host_key";
+/// The limits of connections that have not authenticated (tools/dropbear/localoptions.h).
+const UNAUTH_PER_IP: usize = 2;
+/// The time a connection may stay unauthenticated (`AUTH_TIMEOUT`), in seconds.
+const AUTH_TIMEOUT: u64 = 30;
+
+/// The command line of the server that `/etc/rc.d/dropbear` starts.
+const SERVER_LINE: [&str; 7] = ["dropbear", "-F", "-s", "-j", "-k", "-r", HOST_KEY];
+
+/// How long one login may take: the key exchange and the first command run
+/// on an emulated CPU.
+const LOGIN_WITHIN: Duration = Duration::from_secs(120);
+/// The whole run may take this long.
+const RUN_WITHIN: Duration = Duration::from_secs(600);
+/// The sessions with a terminal the run opens at most: more than the pairs
+/// the system has.
+const SESSIONS_AT_MOST: usize = 10;
+/// The pairs of pseudo terminals of the system (`docs/status.md`); the
+/// console is next to them, so seven sessions is the least that must get one.
+const PAIRS: usize = 8;
+/// The lines a session with a terminal brings back.
+const LINES: usize = 2_000;
+
+/// The programs of the image: those of the shell with the network service
+/// whose init runs the launcher with the boot script `/etc/rc`, which starts the server.
+pub fn programs() -> &'static [ImageProgram] {
+    crate::net_ec2_key::programs()
+}
+
+/// The public key line `ec2-key` of the image writes: the key of the run
+/// (`set_key`), or a fixed one of the right form where nothing runs.
+static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+const PLACEHOLDER_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
+
+/// The script that stands for `ec2-key` in the image of the probe: it writes the key of the
+/// run as the metadata of an instance would give it.
+pub fn key_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
+        let text = format!(
+            "umask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\necho '{key}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\necho 'ec2-key: the key of the probe is placed'\n"
+        );
+        Box::leak(text.into_bytes().into_boxed_slice())
+    })
+}
+
+/// What a run of `ssh` came to.
+struct Ended {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+impl Ended {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+}
+
+/// Runs `command` with `stdin` written to it, waiting up to `within`; the
+/// process is killed when the time is up.
+fn run_for(mut command: Command, stdin: &[u8], within: Duration) -> Result<Ended, String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh: {e}"))?;
+    // The input stays open until the session ends: an end of input that
+    // comes before the shell has read its lines would cut them off.
+    let mut input = child.stdin.take().ok_or("ssh: no stdin")?;
+    input
+        .write_all(stdin)
+        .and_then(|()| input.flush())
+        .map_err(|e| format!("ssh: {e}"))?;
+    let mut out = child.stdout.take().ok_or("ssh: no stdout")?;
+    let mut err = child.stderr.take().ok_or("ssh: no stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = out.read_to_end(&mut bytes);
+        bytes
+    });
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = err.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + within;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = reader.join().unwrap_or_default();
+                let stderr = errors.join().unwrap_or_default();
+                return Err(format!(
+                    "ssh did not end within {} s; it said {:?} and {:?}",
+                    within.as_secs(),
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ));
+            }
+            Err(e) => return Err(format!("ssh: {e}")),
+        }
+    };
+    drop(input);
+    Ok(Ended {
+        code,
+        stdout: reader.join().unwrap_or_default(),
+        stderr: String::from_utf8_lossy(&errors.join().unwrap_or_default()).into_owned(),
+    })
+}
+
+/// The host's `ssh` towards the forwarded port: no configuration file, no
+/// agent, the key exchange and the host key that the server's own list
+/// starts with (the curve25519 exchange is the quick one on an emulated CPU,
+/// and Ed25519 is the host key made first), and a file of known hosts of the
+/// run.
+struct Client {
+    port: u16,
+    dir: PathBuf,
+}
+
+impl Client {
+    fn command(&self, user: &str, key: Option<&Path>, batch: bool) -> Command {
+        let mut command = Command::new("ssh");
+        command
+            .args(["-F", "/dev/null", "-p", &self.port.to_string()])
+            .args(["-o", "StrictHostKeyChecking=no"])
+            .arg("-o")
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                self.dir.join("known_hosts").display()
+            ))
+            .args(["-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"])
+            .args(["-o", "HostKeyAlgorithms=ssh-ed25519"])
+            .args(["-o", "KexAlgorithms=curve25519-sha256"])
+            .args(["-o", "ConnectTimeout=60"])
+            .args([
+                "-o",
+                &format!("BatchMode={}", if batch { "yes" } else { "no" }),
+            ]);
+        if let Some(key) = key {
+            command.arg("-i").arg(key);
+        }
+        command.arg(format!("{user}@127.0.0.1"));
+        command
+    }
+}
+
+/// `ssh-keygen` makes the key `name` in `dir` without a passphrase: the
+/// private file and the public line.
+fn make_key(dir: &Path, name: &str) -> Result<(PathBuf, String), String> {
+    let path = dir.join(name);
+    let made = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("ssh-keygen: {e}"))?;
+    if !made.success() {
+        return Err(format!("ssh-keygen ended with {made}"));
+    }
+    let line = std::fs::read_to_string(path.with_extension("pub"))
+        .or_else(|_| std::fs::read_to_string(format!("{}.pub", path.display())))
+        .map_err(|e| format!("the public key: {e}"))?;
+    Ok((path, line.trim().to_owned()))
+}
+
+/// The version line of `ssh`, which the run needs on the host.
+fn host_ssh() -> Result<String, String> {
+    let said = Command::new("ssh")
+        .arg("-V")
+        .output()
+        .map_err(|e| format!("net-ssh needs the OpenSSH client `ssh` on the host: {e}"))?;
+    let text = String::from_utf8_lossy(&said.stderr).trim().to_owned();
+    Command::new("ssh-keygen")
+        .arg("-?")
+        .output()
+        .map_err(|e| format!("net-ssh needs `ssh-keygen` on the host: {e}"))?;
+    Ok(text)
+}
+
+/// The files the image holds under `/etc/dropbear`, and whether the image
+/// lists the directory: the host keys are made on the first start, so the
+/// directory is empty.
+fn image_check() -> Result<(), String> {
+    let files = rootfs::files_of(IMAGE);
+    let held: Vec<&str> = files
+        .iter()
+        .map(|f| f.path)
+        .filter(|p| p.starts_with("/etc/dropbear/"))
+        .collect();
+    if !held.is_empty() {
+        return Err(format!("the image holds files of /etc/dropbear: {held:?}"));
+    }
+    let package = crate::packages::load()?
+        .into_iter()
+        .find(|p| p.name == "dropbear")
+        .ok_or("no package dropbear")?;
+    if !package.dirs.iter().any(|d| d == "/etc/dropbear") {
+        return Err("the package dropbear lists no directory /etc/dropbear".to_owned());
+    }
+    if let Some(file) = package
+        .files
+        .iter()
+        .find(|f| f.0.starts_with("/etc/dropbear/"))
+    {
+        return Err(format!("the package dropbear holds {}", file.0));
+    }
+    Ok(())
+}
+
+/// The lines between the markers of `command` in the guest.
+fn guest(run: &mut qemu::Run, command: &str, marker: &str) -> Result<Vec<String>, String> {
+    net_tls::capture(run, command, marker, DIALOG_STEP)
+}
+
+/// Step 2: the one running server. `/proc/<pid>/cmdline` of the system holds
+/// the name of the program alone (the process service keeps no arguments), so
+/// the command line is the line `/etc/rc.d/dropbear` printed before it started the
+/// server; the options are then shown at work (steps 4 and 5).
+fn command_line(run: &mut qemu::Run) -> Result<(), String> {
+    let wanted = format!("dropbear: {}", SERVER_LINE.join(" "));
+    run.expect_seen(&wanted, LOGIN_WITHIN)?;
+    let found = guest(
+        run,
+        "for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); case \"$c\" in dropbear*) echo \"cmd ${p#/proc/}: $c\";; esac; done",
+        "cmdline",
+    )?;
+    let found: Vec<&String> = found.iter().filter(|l| l.starts_with("cmd ")).collect();
+    let [line] = found.as_slice() else {
+        return Err(format!(
+            "the guest runs {} processes named dropbear, wanted one: {found:?}",
+            found.len()
+        ));
+    };
+    println!(
+        "net-ssh: one process named dropbear ({line}), started as {}",
+        SERVER_LINE.join(" ")
+    );
+    Ok(())
+}
+
+/// `-s`: the methods the server offers are the public key alone.
+fn methods(client: &Client) -> Result<(), String> {
+    let mut ssh = client.command("root", None, true);
+    ssh.args(["-v", "-o", "PreferredAuthentications=none"])
+        .arg("true");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    let offered = said
+        .stderr
+        .lines()
+        .find_map(|l| l.split_once("Authentications that can continue: "))
+        .map(|(_, list)| list.trim().trim_end_matches('.').to_owned())
+        .ok_or_else(|| format!("the server named no methods: {:?}", said.stderr))?;
+    if offered != "publickey" {
+        return Err(format!(
+            "the server offers {offered:?}, wanted publickey alone"
+        ));
+    }
+    println!("net-ssh: the server offers the public key alone (-s)");
+    Ok(())
+}
+
+/// `-k` and `-j`: a remote forward is refused, and a local forward opens a
+/// listener on the host whose connections the server refuses to carry.
+fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.args([
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-N",
+        "-R",
+        "19999:127.0.0.1:1",
+    ]);
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code != Some(255) || !said.stderr.contains("forwarding failed") {
+        return Err(format!(
+            "a remote forward gave {:?}, wanted refusal: {:?}",
+            said.code, said.stderr
+        ));
+    }
+    println!("net-ssh: a remote port forward is refused (-k)");
+    let local = crate::net_curl::free_tcp_port()?;
+    let mut command = client.command("root", Some(key), true);
+    command
+        .args(["-N", "-L"])
+        .arg(format!("{local}:127.0.0.1:80"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("ssh: {e}"))?;
+    let mut err = child.stderr.take().ok_or("ssh: no stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = err.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], local).into();
+    let deadline = Instant::now() + LOGIN_WITHIN;
+    let mut stream = loop {
+        match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the local forward never listened: {e}"));
+            }
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.write_all(b"GET / HTTP/1.0\r\n\r\n");
+    let mut got = Vec::new();
+    let _ = stream.read_to_end(&mut got);
+    let _ = child.kill();
+    let _ = child.wait();
+    let said = reader.join().unwrap_or_default();
+    if !got.is_empty() || !said.contains("open failed") {
+        return Err(format!(
+            "a local forward carried {} bytes, wanted refusal; ssh said {said:?}",
+            got.len()
+        ));
+    }
+    println!("net-ssh: a local port forward is refused (-j)");
+    Ok(())
+}
+
+/// Connections that have not authenticated: the most one address may hold are held open, the next
+/// one is refused, a request to another service of the image is still answered and a login with
+/// the key is refused while they are held, and the server closes them after `AUTH_TIMEOUT`, after
+/// which the login works at once. (The probe reaches the server from one address, so the limit
+/// of all the addresses together is not reached.)
+fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Result<(), String> {
+    run.send("httpd -f -p 80 -h /www & H=$!")?;
+    run.expect("# ", DIALOG_STEP)?;
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], client.port).into();
+    let mut held = Vec::new();
+    for n in 1..=UNAUTH_PER_IP {
+        let mut stream = crate::net_curl::connect_forwarded(&address, LOGIN_WITHIN)
+            .map_err(|e| format!("held connection {n}: {e}"))?;
+        stream
+            .set_read_timeout(Some(LOGIN_WITHIN))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut banner = [0u8; 64];
+        let got = stream
+            .read(&mut banner)
+            .map_err(|e| format!("held connection {n}: {e}"))?;
+        if !banner[..got].starts_with(b"SSH-2.0-") {
+            return Err(format!("held connection {n} got {:?}", &banner[..got]));
+        }
+        held.push(stream);
+    }
+    let began = Instant::now();
+    let mut extra = crate::net_curl::connect_forwarded(&address, LOGIN_WITHIN)
+        .map_err(|e| format!("the connection past the limit: {e}"))?;
+    extra
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let mut bytes = [0u8; 64];
+    match extra.read(&mut bytes) {
+        Ok(0) | Err(_) if began.elapsed() < Duration::from_secs(20) => {}
+        other => {
+            return Err(format!(
+                "the connection past the limit was served: {other:?}"
+            ));
+        }
+    }
+    // The first request waits for `httpd` to listen (a connection that comes before is reset).
+    let listening = Instant::now();
+    let body = loop {
+        match crate::net_curl::get_within(([127, 0, 0, 1], http).into(), Duration::from_secs(5)) {
+            Ok((body, _)) => break body,
+            Err(_) if listening.elapsed() < Duration::from_secs(40) => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "a request to the HTTP server with the connections held: {e}"
+                ));
+            }
+        }
+    };
+    crate::net_curl::check_body(&body)?;
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.args(["-o", "ConnectTimeout=20"]).arg("true");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code == Some(0) {
+        return Err("a login went through with the connections of the address held".to_owned());
+    }
+    println!(
+        "net-ssh: {UNAUTH_PER_IP} connections held, the next refused, the HTTP server answers, a login from the same address waits"
+    );
+    // The server closes the held connections after AUTH_TIMEOUT.
+    for stream in &mut held {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(AUTH_TIMEOUT + 30)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut rest = [0u8; 256];
+        loop {
+            match stream.read(&mut rest) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+    let waited = began.elapsed().as_secs();
+    if waited + 5 < AUTH_TIMEOUT || waited > AUTH_TIMEOUT + 30 {
+        return Err(format!(
+            "the held connections ended after {waited} s, the limit is {AUTH_TIMEOUT} s"
+        ));
+    }
+    let mut ssh = client.command("root", Some(key), true);
+    ssh.arg("echo again-$((6*7))");
+    let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+    if said.code != Some(0) || !said.text().contains("again-42") {
+        return Err(format!(
+            "no login after the held connections ended: {:?} {:?}",
+            said.code, said.stderr
+        ));
+    }
+    // The server and its children of the request take places the terminals below count.
+    run.send("kill $H; wait $H")?;
+    run.expect("# ", DIALOG_STEP)?;
+    println!(
+        "net-ssh: the server closed the held connections after {waited} s and a login with the key works"
+    );
+    Ok(())
+}
+
+/// Step 6: sessions with a terminal until one gets none.
+fn terminals(client: &Client, key: &Path) -> Result<usize, String> {
+    use std::io::{BufRead, BufReader};
+    let mut held: Vec<std::process::Child> = Vec::new();
+    let mut got = 0;
+    for n in 1..=SESSIONS_AT_MOST {
+        let mut command = client.command("root", Some(key), true);
+        command
+            .arg("-tt")
+            .arg("echo tty-$(tty); sleep 600")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().map_err(|e| format!("ssh: {e}"))?;
+        let out = child.stdout.take().ok_or("ssh: no stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if line.trim().starts_with("tty-") {
+                    let _ = tx.send(line.trim().to_owned());
+                    break;
+                }
+            }
+        });
+        // Past the seventh the system has no room (the server's fork finds no process or memory
+        // left, or no terminal is free): the connection gets no answer, and the count stops there.
+        let said = rx.recv_timeout(if n < PAIRS {
+            LOGIN_WITHIN
+        } else {
+            Duration::from_secs(20)
+        });
+        held.push(child);
+        match said {
+            Ok(line) if line.starts_with("tty-/dev/") => got = n,
+            Ok(line) => {
+                println!("net-ssh: session {n} got no terminal ({line})");
+                break;
+            }
+            Err(_) if n >= PAIRS => {
+                println!("net-ssh: session {n} got no answer: the system is full");
+                break;
+            }
+            Err(_) => {
+                for mut child in held {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(format!(
+                    "session {n} said nothing within {} s",
+                    LOGIN_WITHIN.as_secs()
+                ));
+            }
+        }
+    }
+    for mut child in held {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(got)
+}
+
+/// `cargo xtask net-ssh [MACHINE]`.
+pub fn command(args: &[String]) -> Result<(), String> {
+    let machine = match args {
+        [] => &qemu::VIRT,
+        [name] => match name.as_str() {
+            "hvf" => &qemu::HVF_V3,
+            "tcg" => &qemu::VIRT,
+            other => qemu::machine(Some(&other.to_owned()))?,
+        },
+        _ => return Err("usage: cargo xtask net-ssh [tcg|hvf]".to_owned()),
+    };
+    probe(machine)
+}
+
+pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
+    if machine.is_hvf() {
+        crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
+    }
+    println!("net-ssh: host client {}", host_ssh()?);
+    busybox_build()?;
+    nano_build()?;
+    crate::net_build()?;
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let dir = crate::target_dir().join("net-ssh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (good, good_line) = make_key(&dir, "good")?;
+    let (bad, _) = make_key(&dir, "bad")?;
+    KEY.set(good_line)
+        .map_err(|_| "the key of the run is set twice".to_owned())?;
+    let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
+    image_check()?;
+    crate::notices::image_has_package_notices(&image, IMAGE, "dropbear")?;
+    let port = crate::net_curl::free_tcp_port()?;
+    let http = crate::net_curl::free_tcp_port()?;
+    let client = Client {
+        port,
+        dir: dir.clone(),
+    };
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::net_on(
+        machine,
+        &[
+            Forward {
+                proto: Proto::Tcp,
+                host: port,
+                guest: 22,
+            },
+            Forward {
+                proto: Proto::Tcp,
+                host: http,
+                guest: 80,
+            },
+        ],
+    ));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let started = Instant::now();
+    let mut terminal_sessions = 0;
+    let talked = (|| {
+        run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("S=ok")?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The line of the host key is on the console before anyone has connected: the probe
+        // connects only after it (the line may come before or after the prompt).
+        let began = Instant::now();
+        let fingerprint = loop {
+            let found = run.lines().iter().find_map(|l| {
+                l.split_once("ssh: host key SHA256:")
+                    .map(|(_, f)| format!("SHA256:{}", f.trim()))
+            });
+            if let Some(found) = found {
+                break found;
+            }
+            if began.elapsed() > LOGIN_WITHIN {
+                return Err("the console shows no line \"ssh: host key SHA256:...\"".to_owned());
+            }
+            guest(&mut run, "sleep 1", "wait")?;
+        };
+        println!("net-ssh: the console says ssh: host key {fingerprint}");
+        // 1 (the guest's half) and 2.
+        command_line(&mut run)?;
+
+        // 3.
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("echo ssh-ok-$((6*7)); id -u");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code != Some(0) || !said.text().contains("ssh-ok-42") {
+            return Err(format!(
+                "the login with the key gave {:?}: {:?} {:?}",
+                said.code,
+                said.text(),
+                said.stderr
+            ));
+        }
+        println!("net-ssh: the login with the key runs a command");
+        let keys = guest(&mut run, "ls /etc/dropbear", "keys1")?;
+        let keys: Vec<&str> = keys
+            .iter()
+            .flat_map(|l| l.split_whitespace())
+            .filter(|w| w.starts_with("dropbear_"))
+            .collect();
+        // The key and its public half (`dropbearkey` writes both).
+        if keys != ["dropbear_ed25519_host_key", "dropbear_ed25519_host_key.pub"] {
+            return Err(format!("the host keys in /etc/dropbear are {keys:?}"));
+        }
+        let known = Command::new("ssh-keygen")
+            .arg("-l")
+            .arg("-f")
+            .arg(dir.join("known_hosts"))
+            .output()
+            .map_err(|e| format!("ssh-keygen: {e}"))?;
+        let known = String::from_utf8_lossy(&known.stdout).into_owned();
+        if !known.contains(&fingerprint) {
+            return Err(format!(
+                "the client saw {known:?}, the console said {fingerprint}"
+            ));
+        }
+        println!("net-ssh: the key the client saw is the one the console named");
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("exit 7");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code != Some(7) {
+            return Err(format!(
+                "the exit status of the session is {:?}, wanted 7: {}",
+                said.code, said.stderr
+            ));
+        }
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("cat /www/index.html");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.stdout != rootfs::www_index() {
+            return Err(format!(
+                "the page through a session is {} bytes (code {:?}), wanted {}: {}",
+                said.stdout.len(),
+                said.code,
+                rootfs::WWW_INDEX_LEN,
+                said.stderr
+            ));
+        }
+        println!(
+            "net-ssh: exit status 7 and a page of {} bytes through the pipes are whole",
+            rootfs::WWW_INDEX_LEN
+        );
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("-tt");
+        let script = format!(
+            "tty\necho pty-$((6*7))\ni=0; while [ $i -lt {LINES} ]; do echo line-$i; i=$((i+1)); done\nexit 3\n"
+        );
+        let said = run_for(ssh, script.as_bytes(), LOGIN_WITHIN)?;
+        let text = said.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| l.starts_with("line-") && !l.contains("$"))
+            .collect();
+        let in_order = lines.len() == LINES
+            && lines
+                .iter()
+                .enumerate()
+                .all(|(n, l)| *l == format!("line-{n}"));
+        if said.code != Some(3) || !text.contains("pty-42") || !text.contains("/dev/") || !in_order
+        {
+            return Err(format!(
+                "the session with a terminal: code {:?}, {} of {LINES} lines (in order {in_order}), stderr {:?}, the head {:?}",
+                said.code,
+                lines.len(),
+                said.stderr,
+                text.chars().take(300).collect::<String>()
+            ));
+        }
+        println!(
+            "net-ssh: a session with a terminal runs a shell, {LINES} lines come back in order and its exit status is 3"
+        );
+        methods(&client)?;
+        forwarding(&client, &good)?;
+        // 4.
+        let mut ssh = client.command("root", Some(&bad), true);
+        ssh.arg("echo must-not-run");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code != Some(255)
+            || said.text().contains("must-not-run")
+            || !said.stderr.contains("Permission denied")
+        {
+            return Err(format!(
+                "a key the server does not know gave {:?}: {:?} {:?}",
+                said.code,
+                said.text(),
+                said.stderr
+            ));
+        }
+        println!("net-ssh: a key the server does not know is refused");
+        // 5.
+        for length in [257usize, 1024] {
+            let secret = dir.join("secret");
+            std::fs::write(&secret, "a".repeat(length)).map_err(|e| format!("secret: {e}"))?;
+            let askpass = dir.join("askpass.sh");
+            std::fs::write(&askpass, format!("#!/bin/sh\ncat '{}'\n", secret.display()))
+                .map_err(|e| format!("askpass: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| format!("askpass: {e}"))?;
+            }
+            for user in ["root", "star"] {
+                let mut ssh = client.command(user, None, false);
+                ssh.args([
+                    "-o",
+                    "PreferredAuthentications=password,keyboard-interactive",
+                ])
+                .args(["-o", "PubkeyAuthentication=no"])
+                .args(["-o", "NumberOfPasswordPrompts=1"])
+                .arg("echo must-not-run")
+                .env("SSH_ASKPASS", &askpass)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env_remove("DISPLAY");
+                let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+                if said.code != Some(255)
+                    || said.text().contains("must-not-run")
+                    || !said.stderr.contains("Permission denied")
+                {
+                    return Err(format!(
+                        "a password of {length} bytes for {user} gave {:?}: {:?} {:?}",
+                        said.code,
+                        said.text(),
+                        said.stderr
+                    ));
+                }
+            }
+        }
+        println!(
+            "net-ssh: a password of 257 and one of 1024 bytes is refused for the account with ! and the one with *"
+        );
+        preauth(&mut run, &client, &good, http)?;
+        // 6.
+        terminal_sessions = terminals(&client, &good)?;
+        println!(
+            "net-ssh: {terminal_sessions} sessions at once got a terminal of the {PAIRS} pairs"
+        );
+        if terminal_sessions < PAIRS - 1 {
+            return Err(format!(
+                "only {terminal_sessions} sessions got a terminal, wanted at least {}",
+                PAIRS - 1
+            ));
+        }
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.args(["-tt", "tty"]);
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code != Some(0) || !said.text().contains("/dev/") {
+            return Err(format!(
+                "after the sessions ended a new session got no terminal: {:?} {:?} {:?}",
+                said.code,
+                said.text(),
+                said.stderr
+            ));
+        }
+        println!("net-ssh: after they ended a new session got its terminal at once");
+        // 7: the server is still the one process and still answers.
+        command_line(&mut run)?;
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("echo last-$((6*7))");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code != Some(0) || !said.text().contains("last-42") {
+            return Err(format!("the last login: {:?} {:?}", said.code, said.stderr));
+        }
+        Ok::<(), String>(())
+    })();
+    let output = run.stop();
+    symbolize::backtrace(&output.lines, &kernel.elf);
+    talked?;
+    let has = |what: &str| output.lines.iter().any(|l| l.contains(what));
+    if output.lines.iter().any(|line| {
+        line.contains("process fault:")
+            || line.contains("KERNEL PANIC")
+            || line.contains("out of memory")
+            || line.contains("init: net ended: fault")
+    }) {
+        return Err("the image with the SSH server faulted".into());
+    }
+    if !has("Pubkey auth succeeded") {
+        return Err("the console shows no \"Pubkey auth succeeded\" of the server".to_owned());
+    }
+    if has("Password auth succeeded") {
+        return Err("the console shows a \"Password auth succeeded\"".to_owned());
+    }
+    let elapsed = started.elapsed();
+    if elapsed > RUN_WITHIN {
+        return Err(format!(
+            "the run took {:.0} s, past {} s",
+            elapsed.as_secs_f64(),
+            RUN_WITHIN.as_secs()
+        ));
+    }
+    println!(
+        "net-ssh passed in {:.0} s on {}: {terminal_sessions} terminals at once",
+        elapsed.as_secs_f64(),
+        machine.name
+    );
+    Ok(())
+}

@@ -67,6 +67,11 @@ const PROXY_BATCH: usize = 100;
 const PROXY_MAX: usize = 4000;
 /// The requests to nginx-fast's own port 80 through the proxy of the same worker.
 const SELF_REQUESTS: usize = 20;
+/// How long `posix-net stat` may take to answer in the flood of `share`, in the time of the
+/// host: a process that starts beside the flood and asks the service for its session, and then
+/// three requests, on QEMU under -icount (the time of the host runs several times past the
+/// time of the guest there).
+const STAT_FLOOD_BOUND: Duration = Duration::from_secs(5);
 /// How long `saturate` floods the ring.
 const SATURATE_SECS: u64 = 300;
 /// How many answers of `posix-net stat` the flood must get, and the bound of each: this many
@@ -191,6 +196,29 @@ fn counter(line: &str, key: &str) -> Option<u64> {
     rest.split([' ', ',']).next()?.parse().ok()
 }
 
+/// The longest wait of a request of the service in the flood of `share`, in the guest's time.
+const ASK_FLOOD_BOUND_US: u64 = 5_000;
+
+/// `switch-probe ask`: the requests it made and the longest wait of one, in microseconds of the
+/// guest's time.
+fn ask(run: &mut qemu::Run) -> Result<(u64, u64), String> {
+    run.send("switch-probe ask 2")?;
+    let line = run.expect_line(
+        "the waits of `switch-probe ask`",
+        |l| l.contains("switch-probe: ask calls "),
+        Duration::from_secs(120),
+    )?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let number = |name: &str| -> Result<u64, String> {
+        let at = words.iter().position(|w| *w == name).ok_or(line.clone())?;
+        words
+            .get(at + 1)
+            .and_then(|w| w.parse().ok())
+            .ok_or_else(|| format!("no {name} in {line:?}"))
+    };
+    Ok((number("calls")?, number("max_us")?))
+}
+
 /// What `posix-net stat` makes the service say: the last lines `net: switch`.
 struct Stat {
     consumers: u64,
@@ -212,6 +240,11 @@ struct Stat {
 }
 
 fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
+    stat_within(run, tag, Duration::from_secs(120))
+}
+
+/// `stat` with the time its answer may take.
+fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
     let from = run.lines().len();
     run.send("posix-net stat")?;
     // The service prints its counters when the request is over, so they may come after the
@@ -219,7 +252,7 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
     run.expect_line(
         "the counters of the switch",
         |l| l.contains("net: switch rx_by "),
-        Duration::from_secs(120),
+        within,
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
@@ -1535,6 +1568,7 @@ fn share(
         net_probe::require_budget_lines(run.lines())?;
     }
     let quiet_stat = stat(run, "quiet")?;
+    let quiet_ask = ask(run)?;
     run.send(&format!("switch-probe spin {SPIN_TOTAL} &"))?;
     run.expect("# ", DIALOG_STEP)?;
     let mut seconds: Vec<Second> = Vec::new();
@@ -1598,6 +1632,32 @@ fn share(
         began.elapsed().as_secs_f64()
     );
     println!("fast-switch: seconds {seconds:?}");
+    // The loop has ended and the flood goes on. The break with the service unbound fails on the
+    // share, as it did.
+    if flood.is_some() && !unbound {
+        // A new process asks the network service for its session, and `posix-net stat` is
+        // such a process: under the flood the service must answer within a bound
+        // (stafeto-design#713: it waited behind the steps of the stack for as long as the
+        // flood lasted).
+        let asked = Instant::now();
+        stat_within(run, "flood", STAT_FLOOD_BOUND).map_err(|e| {
+            format!("`posix-net stat` got no answer within {STAT_FLOOD_BOUND:?} of the flood: {e}")
+        })?;
+        let stat_took = asked.elapsed();
+        let flood_ask = ask(run)?;
+        println!(
+            "fast-switch: `posix-net stat` answered in {stat_took:?} of the host's time under the flood; the longest wait of a request in the guest's time: {} us in the flood ({} requests), {} us quiet ({} requests)",
+            flood_ask.1, flood_ask.0, quiet_ask.1, quiet_ask.0
+        );
+        // A request waits for a few steps of the stack and a few receives, a few periods of
+        // its budget (netd::gates::Yielding), not for the flood: 5 ms is above what it measured, 2.3 ms.
+        if flood_ask.1 > ASK_FLOOD_BOUND_US {
+            return Err(format!(
+                "a request of the network service waited {} us in the guest's time in the flood, over {ASK_FLOOD_BOUND_US} us",
+                flood_ask.1
+            ));
+        }
+    }
     if let Some(f) = flood {
         f.finish();
     }
