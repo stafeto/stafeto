@@ -21,6 +21,7 @@
 #        cargo xtask aws boot --ami AMI --end "fast: nginx-fast on 8080" --serial 180 --session S
 #      Lines that must appear (the order of the last four may vary: each runs in a subshell):
 #        net: ena mac 02:..., link up
+#        entropy: seeded from the boot page (32 bytes)
 #        ec2-key: ...                          (the type and comment of the key pair)
 #        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
@@ -41,7 +42,11 @@
 #        curl http://ADDRESS:8080/             the same page from nginx-fast
 #        ssh root@ADDRESS                      the key pair of the instance gets in; the fingerprint of
 #                                              the host key is the one of the console line
-#        nc -z -w 2 ADDRESS PORT               refused (or filtered) for every other port
+#        nmap -Pn -p 1-65535 ADDRESS           a full TCP scan: only 22, 80, 443 and 8080 are open
+#        nmap -Pn -sU --top-ports 200 ADDRESS  UDP: nothing answers but what the security group
+#                                              lets through (the group of the instance opens the four
+#                                              TCP ports to the operator's address alone)
+#      Run both from the operator's host, outside the VPC, on the public address.
 #      The page says what stafeto is, that it is experimental, how to log in, what to try, that
 #      files and packages are gone after a reboot, that the host key changes at every boot, and
 #      the warning about secrets and the security group.

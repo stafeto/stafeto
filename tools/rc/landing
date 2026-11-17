@@ -88,7 +88,7 @@ td { padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
 <table>
 <tr><td>22</td><td>Dropbear SSH server, public key login only</td></tr>
 <tr><td>80</td><td>nginx on the sockets of the network service (HTTP)</td></tr>
-<tr><td>443</td><td>nginx with TLS 1.3 and HTTP/2; the certificate is self-signed and was made on this instance at its first boot, so a browser warns about it</td></tr>
+<tr><td>443</td><td>nginx with TLS 1.3 and HTTP/2; the certificate is self-signed and was made on this instance when it booted, so a browser warns about it</td></tr>
 <tr><td>8080</td><td>nginx-fast: nginx on the F-Stack TCP/IP stack in its own process, reached through the switch of the network service</td></tr>
 </table>
 

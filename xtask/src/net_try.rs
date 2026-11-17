@@ -42,8 +42,8 @@ use crate::net_ssh::{Client, host_ssh, make_key, run_for};
 use crate::qemu::{Forward, Proto};
 use crate::rootfs::{RootFile, Source};
 use crate::{
-    BOOT_PROFILE, SERVICES_STARTED, Variant, build, busybox_build, keys, nano_build, pkg_probe,
-    probe_ca, qemu, relibc, rootfs, symbolize,
+    BOOT_PROFILE, SERVICES_STARTED, Variant, build, busybox_build, keys, nano_build, packages,
+    pkg_probe, probe_ca, qemu, relibc, rootfs, symbolize,
 };
 
 /// The image of the run.
@@ -310,6 +310,29 @@ fn check_built(path: &Path) -> Result<(), String> {
         bytes.len()
     );
     Ok(())
+}
+
+/// The notices of every package of the image `name` are in the built image at `path`.
+pub fn check_notices(path: &Path, name: &str) -> Result<(), String> {
+    let all = packages::of_image(name)?;
+    for package in &all {
+        crate::notices::image_has_package_notices(path, name, &package.name)?;
+    }
+    println!(
+        "net-try: the built {name} holds the notices of all {} of its packages",
+        all.len()
+    );
+    Ok(())
+}
+
+/// The gate of the image of EC2: the image check on its lists and on the built image, and the
+/// notices of its packages. `aws image` runs it before the disk is registered.
+pub fn gate_aws_image(path: &Path) -> Result<(), String> {
+    for line in check_image(AWS_IMAGE)? {
+        println!("aws: {AWS_IMAGE}: {line}");
+    }
+    check_built(path)?;
+    check_notices(path, AWS_IMAGE)
 }
 
 // ---- the clients -------------------------------------------------------------------------
@@ -625,9 +648,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         Vec::new(),
     )?;
     check_built(&image)?;
-    for package in ["dropbear", "nginx", "nginx-fast", "openssl"] {
-        crate::notices::image_has_package_notices(&image, IMAGE, package)?;
-    }
+    check_notices(&image, IMAGE)?;
     let mirror = pkg_probe::Mirror::start(
         &www,
         MIRROR_PORT,
@@ -681,6 +702,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 ("the certificate", "web: certificate "),
                 ("nginx", "web: nginx on 80 and 443"),
                 ("nginx-fast", "fast: nginx-fast on 8080"),
+                ("the seed of the entropy service", "entropy: seeded"),
             ],
             BOOT_WITHIN,
         )?;
@@ -748,7 +770,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         let listing = guest_ok(
             &client,
             &good,
-            "ls -l /etc/nginx/server.key /etc/nginx/server.crt; ls /etc/dropbear; openssl x509 -in /etc/nginx/server.crt -noout -subject -enddate",
+            "ls -l /etc/nginx/server.key /etc/nginx/server.crt /etc/dropbear/dropbear_ed25519_host_key; openssl x509 -in /etc/nginx/server.crt -noout -subject -enddate",
             SSH_WITHIN,
         )?;
         let key_line = listing
@@ -760,10 +782,17 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 "the key of nginx is not private to root: {key_line:?}"
             ));
         }
-        if !listing.contains("dropbear_ed25519_host_key") || !listing.contains("stafeto") {
+        let host_line = listing
+            .lines()
+            .find(|l| l.ends_with("/etc/dropbear/dropbear_ed25519_host_key"))
+            .ok_or_else(|| format!("no host key on the guest: {listing:?}"))?;
+        if !host_line.starts_with("-rw-------") {
             return Err(format!(
-                "the host key or the certificate is missing: {listing:?}"
+                "the host key of SSH is not private to root: {host_line:?}"
             ));
+        }
+        if !listing.contains("stafeto") {
+            return Err(format!("the certificate is missing: {listing:?}"));
         }
         println!(
             "net-try: the key and the certificate of nginx and the host key of SSH were made on the instance, the key is -rw-------"
@@ -938,6 +967,26 @@ mod tests {
                 assert!(packages.iter().any(|p| p.name == name), "{image}: {name}");
             }
         }
+    }
+
+    #[test]
+    fn the_probes_of_the_c_library_are_not_in_the_images_of_the_try_out() {
+        for image in [AWS_IMAGE, IMAGE] {
+            let files = rootfs::files_of(image);
+            for path in rootfs::AWS_WITHOUT {
+                assert!(files.iter().all(|f| f.path != path), "{image}: {path}");
+            }
+            let layers = rootfs::layered(image).unwrap();
+            let busybox = layers
+                .packages
+                .iter()
+                .find(|l| l.package.name == "busybox")
+                .unwrap();
+            assert_eq!(busybox.removed, rootfs::AWS_WITHOUT);
+        }
+        // The shell image keeps them.
+        let files = rootfs::files_of("boot-ash-dialog.img");
+        assert!(files.iter().any(|f| f.path == "/libexec/login-probe"));
     }
 
     #[test]
@@ -1129,9 +1178,11 @@ mod tests {
         let conf = rootfs::try_nginx_conf();
         assert!(conf.contains("worker_processes 2;"));
         assert!(conf.contains("include /etc/nginx/tls.conf;"));
+        assert!(conf.contains("server_tokens off;") && conf.contains("keepalive_timeout 15;"));
         assert!(listen_ports(conf).contains(&80));
         let fast = rootfs::try_fast_conf();
         assert!(fast.contains("worker_processes 2;"));
+        assert!(fast.contains("server_tokens off;") && fast.contains("keepalive_timeout 15;"));
         assert_eq!(listen_ports(fast), [8080]);
         assert_eq!(listen_ports(crate::nginx_probe::TLS_CONF), [443]);
     }

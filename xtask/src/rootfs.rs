@@ -656,6 +656,9 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
         ),
     ]);
     files.extend(package_files(&crate::packages::of_image(image)?)?);
+    if is_aws_image(image) {
+        files.retain(|f| !AWS_WITHOUT.contains(&f.path));
+    }
     files.extend(zoneinfo());
     files.extend(devices());
     Ok(files)
@@ -677,7 +680,19 @@ pub struct LayerPackage {
     /// The bytes that replace the package's own at paths of the package (a probe's settings, a certificate file with its own
     /// authority): the image holds a variant of the package file.
     pub replaced: Vec<(&'static str, &'static [u8])>,
+    /// The paths of the package that the image's package file leaves out (the probes of BusyBox
+    /// in the image of EC2): the image holds a variant of the package file.
+    pub removed: Vec<&'static str>,
 }
+
+/// The images of the try-out on EC2 and on QEMU.
+pub fn is_aws_image(name: &str) -> bool {
+    matches!(name, "boot-aws.img" | "boot-aws-qemu.img")
+}
+
+/// The probes of BusyBox's package (tests of the C library's account and journal calls) that
+/// the images of the try-out leave out: nothing of them is for a visitor.
+pub const AWS_WITHOUT: [&str; 2] = ["/libexec/login-probe", "/libexec/crypt-probe"];
 
 /// The paths `package` names, the files and its directories.
 fn owns(package: &crate::packages::Package, path: &str) -> bool {
@@ -699,6 +714,11 @@ pub fn layered(name: &str) -> Result<Layered, String> {
         .map(|p| LayerPackage {
             package: p.clone(),
             replaced: Vec::new(),
+            removed: if is_aws_image(name) && p.name == "busybox" {
+                AWS_WITHOUT.to_vec()
+            } else {
+                Vec::new()
+            },
         })
         .collect();
     let mut system = Vec::new();
@@ -882,6 +902,9 @@ pub fn check_owners(
     }
     for p in packages {
         for path in p.files.iter().map(|f| &f.0).chain(&p.dirs) {
+            if is_aws_image(name) && AWS_WITHOUT.contains(&path.as_str()) {
+                continue;
+            }
             if !files.iter().any(|f| f.path == path) {
                 wrong.push(format!("{path} of {} is not in the image", p.name));
             }
@@ -1341,6 +1364,7 @@ pub fn try_nginx_conf() -> &'static str {
             "worker_processes 4;",
             "worker_processes 2;",
         );
+        let text = try_http(&text);
         crate::nginx_probe::replaced(
             &text,
             "    server {\n",
@@ -1350,6 +1374,17 @@ pub fn try_nginx_conf() -> &'static str {
             ),
         )
     })
+}
+
+/// The settings of the try-out in the `http` block: no version in the `Server` header, and
+/// connections that idle for 15 s at most (a visitor on the open internet).
+fn try_http(text: &str) -> String {
+    let text = crate::nginx_probe::replaced(
+        text,
+        "    access_log off;\n",
+        "    access_log off;\n    server_tokens off;\n",
+    );
+    crate::nginx_probe::replaced(&text, "keepalive_timeout 65;", "keepalive_timeout 15;")
 }
 
 /// The settings of nginx-fast on EC2: the package's on port 8080 with two workers (the switch
@@ -1362,7 +1397,7 @@ pub fn try_fast_conf() -> &'static str {
             "worker_processes 1;",
             "worker_processes 2;",
         );
-        crate::nginx_probe::replaced(&text, "listen 80;", "listen 8080;")
+        crate::nginx_probe::replaced(&try_http(&text), "listen 80;", "listen 8080;")
     })
 }
 
@@ -2824,6 +2859,9 @@ mod tests {
                 merged.push((f.path, f.mode, f.uid, f.gid, f.source));
             }
             for f in &declared {
+                if split.packages.iter().any(|l| l.removed.contains(&f.path)) {
+                    continue;
+                }
                 let mut source = f.source;
                 for l in &split.packages {
                     if let Some((_, bytes)) = l.replaced.iter().find(|(p, _)| *p == f.path) {

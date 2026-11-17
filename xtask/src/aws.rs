@@ -1101,6 +1101,8 @@ fn image(args: &[String]) -> Result<(), String> {
     let disk = old_disk.clone().unwrap_or_else(|| s.dir.join("disk.raw"));
     let t = Instant::now();
     if old_disk.is_none() {
+        // The image check of the try-out gates the registration: a failure stops the build.
+        crate::net_try::gate_aws_image(&crate::aws_boot_image()?)?;
         make_disk(&features, variant, &disk)?;
         println!("disk built in {:.1} s", t.elapsed().as_secs_f64());
     }
