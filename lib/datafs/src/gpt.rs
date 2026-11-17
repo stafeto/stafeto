@@ -106,6 +106,11 @@ pub struct Table {
     pub total: usize,
     /// The primary header was damaged and the backup one was read.
     pub from_backup: bool,
+    /// The primary header is valid but names a backup header before the last sector: the disk is
+    /// larger than the one the table was made on. `relocate_backup` moves the backup to the end.
+    pub grown: bool,
+    /// The sector the primary header names as the backup header's.
+    alternate: u64,
     entries_crc: u32,
     entries_lba: u64,
 }
@@ -133,17 +138,16 @@ pub enum Class {
     Foreign(Found),
 }
 
-/// Where `classify` found the first byte that is not zero, for the console line of a refusal.
+/// Where `classify` found the first byte that is not zero, for the console line of a refusal. It
+/// holds no byte of the disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Found {
     /// The sector and the offset in it of the first non-zero byte.
     pub sector: u64,
     pub offset: usize,
-    /// The 32 bytes of the sector from `offset & !15`.
-    pub bytes: [u8; 32],
-    /// The first eight bytes of sector 1 and of the last sector.
-    pub lba1: [u8; 8],
-    pub last: [u8; 8],
+    /// Whether sector 1 and the last sector are all zero.
+    pub lba1_zero: bool,
+    pub last_zero: bool,
 }
 
 /// A partition to create: the type, the sectors and the name.
@@ -209,9 +213,10 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
         return Ok(None);
     }
     let alternate = if lba == 1 { last } else { 1 };
+    let named = le64(&sector, 32);
     let (entries_lba, count, size) = (le64(&sector, 72), le32(&sector, 80), le32(&sector, 84));
     if le64(&sector, 24) != lba
-        || le64(&sector, 32) != alternate
+        || (named != alternate && lba != 1)
         || count != ENTRIES
         || size as usize != ENTRY_BYTES
         || entries_lba == 0
@@ -226,6 +231,17 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
     if first_usable > last_usable
         || first_usable < entries_lba.min(2) + ENTRY_SECTORS
         || last_usable >= last - ENTRY_SECTORS
+    {
+        return Ok(None);
+    }
+    // A primary header whose backup lies before the end of the volume (the volume grew) is taken
+    // when that backup, and the 32 sectors of entries before it, end before the entries of a backup
+    // at the new end: the old and the new copy do not overlap.
+    let grown = lba == 1 && named != last;
+    if grown
+        && (named >= last
+            || named <= last_usable.saturating_add(ENTRY_SECTORS)
+            || named >= last - ENTRY_SECTORS)
     {
         return Ok(None);
     }
@@ -272,6 +288,8 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
         parts,
         total,
         from_backup: lba != 1,
+        grown,
+        alternate: named,
         entries_crc: crc,
         entries_lba,
     }))
@@ -290,33 +308,29 @@ pub fn read<D: Device>(dev: &mut D) -> Result<Table, Error> {
     read_copy(dev, last, last)?.ok_or(Error::NoTable)
 }
 
-/// The first byte that is not zero in `count` sectors from `first` (the sector, the offset and the
-/// bytes around it; the other fields are filled by the caller), or None when all are zero.
+/// The first byte that is not zero in `count` sectors from `first` (the sector and the offset; the
+/// other fields are filled by the caller), or None when all are zero.
 fn nonzero<D: Device>(dev: &mut D, first: u64, count: u64) -> Result<Option<Found>, Error> {
     let mut sector = [0u8; SECTOR];
     for i in 0..count.min(dev.sectors().saturating_sub(first)) {
         dev.read(first + i, &mut sector)?;
         if let Some(offset) = sector.iter().position(|&b| b != 0) {
-            let from = offset & !15;
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&sector[from..from + 32]);
             return Ok(Some(Found {
                 sector: first + i,
                 offset,
-                bytes,
-                lba1: [0; 8],
-                last: [0; 8],
+                lba1_zero: true,
+                last_zero: true,
             }));
         }
     }
     Ok(None)
 }
 
-/// The first eight bytes of a sector.
-fn head<D: Device>(dev: &mut D, lba: u64) -> Result<[u8; 8], Error> {
+/// Whether a sector is all zero.
+fn is_zero<D: Device>(dev: &mut D, lba: u64) -> Result<bool, Error> {
     let mut sector = [0u8; SECTOR];
     dev.read(lba, &mut sector)?;
-    Ok(sector[..8].try_into().expect("eight bytes"))
+    Ok(sector.iter().all(|&b| b == 0))
 }
 
 pub fn classify<D: Device>(dev: &mut D) -> Result<Class, Error> {
@@ -325,8 +339,8 @@ pub fn classify<D: Device>(dev: &mut D) -> Result<Class, Error> {
         Err(Error::NoTable) => match nonzero(dev, 0, BLANK_SECTORS)? {
             None => Ok(Class::Blank),
             Some(mut found) => {
-                found.lba1 = head(dev, 1)?;
-                found.last = head(dev, dev.sectors() - 1)?;
+                found.lba1_zero = is_zero(dev, 1)?;
+                found.last_zero = is_zero(dev, dev.sectors() - 1)?;
                 Ok(Class::Foreign(found))
             }
         },
@@ -535,6 +549,11 @@ pub fn create<D: Device>(dev: &mut D, spec: &[New], mut seed: u64) -> Result<Tab
 /// flush, header, flush: at every cut one copy is whole.
 pub fn set_attributes<D: Device>(dev: &mut D, index: u32, attributes: u64) -> Result<Table, Error> {
     let table = read(dev)?;
+    let table = if table.grown {
+        relocate_backup(dev)?
+    } else {
+        table
+    };
     table
         .parts
         .iter()
@@ -584,6 +603,50 @@ pub fn set_attributes<D: Device>(dev: &mut D, index: u32, attributes: u64) -> Re
     dev.write(read_entries + sector_of, &sector)?;
     dev.flush()?;
     write_header(dev, &header(read_header, read_entries, crc))?;
+    dev.flush()?;
+    read(dev)
+}
+
+/// Moves the backup copy of a table to the end of a volume that grew (what `sgdisk -e` does), and
+/// returns the table read again. A table that is not `grown` is returned as it is. The partitions
+/// and the usable sectors keep their size and place.
+///
+/// The order leaves a table that `read` takes at every cut: the entries at the new end, flush, the
+/// backup header there, flush (now both copies are whole, and the primary one still names the old
+/// place, so the next boot takes it as grown and does the same again), the primary header with the
+/// new place, flush, and last the old backup header cleared. The entries come from the primary copy,
+/// which `read` validated.
+pub fn relocate_backup<D: Device>(dev: &mut D) -> Result<Table, Error> {
+    let table = read(dev)?;
+    if !table.grown {
+        return Ok(table);
+    }
+    let last = table.last;
+    let end_entries = last - ENTRY_SECTORS;
+    let header = |lba: u64, entries_lba: u64| Header {
+        lba,
+        alternate: if lba == 1 { last } else { 1 },
+        first_usable: table.first_usable,
+        last_usable: table.last_usable,
+        disk: table.disk,
+        entries_lba,
+        entries_crc: table.entries_crc,
+    };
+    if cfg!(feature = "break-datafs-relocate-order") {
+        // The primary header first: a cut leaves a table that names a backup that is not there.
+        write_header(dev, &header(1, table.entries_lba))?;
+    }
+    let mut sector = [0u8; SECTOR];
+    for i in 0..ENTRY_SECTORS {
+        dev.read(table.entries_lba + i, &mut sector)?;
+        dev.write(end_entries + i, &sector)?;
+    }
+    dev.flush()?;
+    write_header(dev, &header(last, end_entries))?;
+    dev.flush()?;
+    write_header(dev, &header(1, table.entries_lba))?;
+    dev.flush()?;
+    dev.write(table.alternate, &[0u8; SECTOR])?;
     dev.flush()?;
     read(dev)
 }

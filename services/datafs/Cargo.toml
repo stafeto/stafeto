@@ -20,9 +20,6 @@ bench = false
 [features]
 steps = ["rt/step-stats"]
 crash = []
-# `diag`: when the disk reads as foreign, the sector is read again three ways and classified again
-# 5 s later, and the results go to the console (the try-out image of `cargo xtask aws image --diag`).
-diag = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

@@ -12,9 +12,6 @@ description = "A driver of an NVMe controller as a library: registers, the admin
 bench = false
 
 [features]
-# `diag`: the first four I/O commands and their completions go to the platform's log
-# (the try-out image of `cargo xtask aws image --diag`).
-diag = []
 # The deliberate breaks of the host tests (`cargo xtask nvme-breaks`): each
 # makes the driver do one wrong thing a test of the model catches.
 break-nvme-cq-phase = []

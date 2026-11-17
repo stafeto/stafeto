@@ -34,7 +34,9 @@ pub enum Refusal {
 impl Refusal {
     pub const fn text(self) -> &'static str {
         match self {
-            Self::Foreign(_) => "the disk holds something else, left alone",
+            Self::Foreign(_) => {
+                "the disk holds something else, left alone and unused in this release"
+            }
             Self::NoPartition => "no data partition in the table",
             Self::TooSmall => "the data partition is too small",
             Self::Damaged => "the data volume does not mount, left alone",
@@ -50,6 +52,9 @@ pub enum Did {
     Partitioned,
     /// The partition was formatted.
     Formatted,
+    /// The volume had grown: the backup copy of the table was moved to the new end, and the volume
+    /// mounted.
+    Relocated,
     Mounted,
 }
 
@@ -70,6 +75,12 @@ pub fn open<D: Device>(
         }
     };
     let part = table.find(&TYPE_DATA).ok_or(Refusal::NoPartition)?;
+    // A table of ours (it has our data partition) on a volume that grew gets its backup copy moved.
+    // A table with no such partition is not ours and is not written.
+    if table.grown {
+        gpt::relocate_backup(&mut device).map_err(|_| Refusal::Device)?;
+        did = Did::Relocated;
+    }
     if part.sectors() / BLOCK_SECTORS < BLOCKS_MIN {
         return Err(Refusal::TooSmall);
     }

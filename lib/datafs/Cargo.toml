@@ -19,10 +19,12 @@ model = []
 # test catches. `break-datafs-sync`: the flush of the volume does nothing, so a cut loses what was
 # synced. `break-datafs-consistent`: a mount leaves a half-done rename as it is. `break-datafs-busy`:
 # an open file may be removed. `break-datafs-gpt-order`: a new table is written start first.
+# `break-datafs-relocate-order`: the moved backup is announced by the primary header before it is there.
 break-datafs-sync = []
 break-datafs-consistent = []
 break-datafs-busy = []
 break-datafs-gpt-order = []
+break-datafs-relocate-order = []
 
 [dependencies]
 littlefs = { path = "../../third-party/littlefs" }

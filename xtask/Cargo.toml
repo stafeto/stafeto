@@ -17,6 +17,7 @@ break-stamps-split = []
 [dependencies]
 abi = { path = "../lib/abi" }
 console-line = { path = "../lib/console-line" }
+datafs = { path = "../lib/datafs" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 # The records of the network service, whose quota `netd-quota` checks.
 init = { path = "../services/init" }
