@@ -36,10 +36,14 @@ const BLOCK: usize = 512 * 1024;
 /// price list showed it when this was written (unverified: it only sizes the
 /// estimate the commands print).
 const PRICE_SMALL: f64 = 0.0184;
+/// The charge of one public IPv4 address in USD per hour (unverified, as the price above).
+const PRICE_IPV4: f64 = 0.005;
+/// How long a try-out instance is meant to live, in hours, when `--lifetime-hours` does not say.
+const TRY_LIFETIME_HOURS: u64 = 2;
 
 const USAGE: &str = "usage: xtask aws check
        xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
-       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try] [--session S]
+       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
        xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
@@ -477,7 +481,9 @@ fn clean(s: &Session) -> Result<(), String> {
         }
     }
     if failed.is_empty() {
-        let _ = std::fs::remove_file(s.dir.join("address"));
+        for f in ["address", "try-key", "try-key.pub"] {
+            let _ = std::fs::remove_file(s.dir.join(f));
+        }
         Ok(())
     } else {
         Err(format!("{} resources were not removed", failed.len()))
@@ -596,6 +602,7 @@ fn sweep(args: &[String]) -> Result<(), String> {
             .collect();
         println!("{}: {} {}", kind.name(), ids.len(), ids.join(" "));
     }
+    print_try_instances();
     if found.is_empty() {
         println!("sweep: nothing tagged project=stafeto is left");
         Ok(())
@@ -695,11 +702,20 @@ fn operator_cidr(text: &str) -> Result<String, String> {
 /// The public address of this host, as the AWS check service sees it.
 fn operator_address() -> Result<String, String> {
     let o = Command::new("curl")
-        .args(["-s", "--max-time", "15", "https://checkip.amazonaws.com"])
+        .args([
+            "-4",
+            "-fsS",
+            "--max-time",
+            "15",
+            "https://checkip.amazonaws.com",
+        ])
         .output()
         .map_err(|e| format!("curl: {e}"))?;
     if !o.status.success() {
-        return Err("the public address of this host could not be found (checkip failed)".into());
+        return Err(format!(
+            "the public address of this host could not be found (checkip failed: {})",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ));
     }
     operator_cidr(&String::from_utf8_lossy(&o.stdout))
 }
@@ -777,9 +793,119 @@ fn assert_try(group: &str, cidr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The first id a lookup by name and by the session's tags gives. The tags are part of the
+/// question: a resource of the same name that lacks either of them is never taken.
+fn adopt(
+    s: &Session,
+    kind: Kind,
+    what: &[&str],
+    name_filter: &str,
+    query: &str,
+) -> Result<Option<String>, String> {
+    let mut args = vec!["ec2"];
+    args.extend(what);
+    let session = format!("Name=tag:session,Values={}", s.id);
+    args.extend([
+        "--filters",
+        name_filter,
+        "Name=tag:project,Values=stafeto",
+        &session,
+    ]);
+    args.extend(["--query", query]);
+    let found = aws(&args)?;
+    match found.split_whitespace().next() {
+        Some(id) if id != "None" => {
+            if !s.live().iter().any(|(k, i)| *k == kind && i == id) {
+                s.note("created", kind, id)?;
+            }
+            Ok(Some(id.to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `adopt`, with the error of the failed call that made the lookup necessary kept.
+fn adopt_after(
+    s: &Session,
+    kind: Kind,
+    what: &[&str],
+    name_filter: &str,
+    query: &str,
+    e: String,
+) -> Result<String, String> {
+    match adopt(s, kind, what, name_filter, query) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Err(e),
+        Err(look) => Err(format!(
+            "{e}; and the lookup of a {} it may have made failed: {look}; run `xtask aws clean --session {}`",
+            kind.name(),
+            s.id
+        )),
+    }
+}
+
+/// The id of the session's try-out group in the journal: the live group whose name is
+/// `name`.
+fn named_group(s: &Session, name: &str) -> Result<Option<String>, String> {
+    for (_, g) in s.live().into_iter().filter(|(k, _)| *k == Kind::Group) {
+        let n = aws(&[
+            "ec2",
+            "describe-security-groups",
+            "--group-ids",
+            &g,
+            "--query",
+            "SecurityGroups[0].GroupName",
+        ])?;
+        if n == name {
+            return Ok(Some(g));
+        }
+    }
+    Ok(None)
+}
+
+/// An existing try-out group is the group of this operator's address. When its four rules
+/// are all for another block, the address has changed since it was made.
+fn assert_try_address(s: &Session, group: &str, cidr: &str) -> Result<(), String> {
+    let ingress = aws(&[
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group,
+        "--query",
+        &format!("SecurityGroups[0].IpPermissions[].{RULE_COLUMNS}"),
+    ])?;
+    let ports: Vec<(&str, u16)> = TRY_PORTS.iter().map(|p| ("tcp", *p)).collect();
+    let other = ingress
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(4))
+        .unwrap_or("");
+    if other != cidr && rules_are(&ingress, &ports, other) {
+        return Err(format!(
+            "the address of this host changed since the group of session {} was made: run `xtask aws clean --session {}` and start again",
+            s.id, s.id
+        ));
+    }
+    Ok(())
+}
+
 /// The session's group of the try-out: the four ports from `cidr`, HTTPS and DNS out.
 fn try_group(s: &Session, cidr: &str) -> Result<String, String> {
-    if let Some((_, g)) = s.live().into_iter().find(|(k, _)| *k == Kind::Group) {
+    let name = format!("stafeto-try-{}", s.id);
+    let by_name = format!("Name=group-name,Values={name}");
+    if let Some(g) = named_group(s, &name)? {
+        assert_try_address(s, &g, cidr)?;
+        return Ok(g);
+    }
+    // A call of an earlier run may have made the group and died before its line.
+    if let Some(g) = adopt(
+        s,
+        Kind::Group,
+        &["describe-security-groups"],
+        &by_name,
+        "SecurityGroups[].GroupId",
+    )? {
+        assert_try_address(s, &g, cidr)?;
         return Ok(g);
     }
     let (_, vpc) = default_subnet()?;
@@ -799,8 +925,22 @@ fn try_group(s: &Session, cidr: &str) -> Result<String, String> {
     );
     args.extend(s.tag_spec(&["security-group"]));
     args.extend(["--query", "GroupId"].map(String::from));
-    let g = aws_s(&args)?;
-    s.note("created", Kind::Group, &g)?;
+    let g = match aws_s(&args) {
+        Ok(g) => {
+            s.note("created", Kind::Group, &g)?;
+            g
+        }
+        Err(e) => {
+            return adopt_after(
+                s,
+                Kind::Group,
+                &["describe-security-groups"],
+                &by_name,
+                "SecurityGroups[].GroupId",
+                e,
+            );
+        }
+    };
     aws(&[
         "ec2",
         "revoke-security-group-egress",
@@ -840,6 +980,19 @@ fn try_key(s: &Session) -> Result<String, String> {
     if s.live().iter().any(|(k, _)| *k == Kind::Key) {
         return Ok(name);
     }
+    let by_name = format!("Name=key-name,Values={name}");
+    // A call of an earlier run may have made the key pair and died before its line.
+    if adopt(
+        s,
+        Kind::Key,
+        &["describe-key-pairs"],
+        &by_name,
+        "KeyPairs[].KeyPairId",
+    )?
+    .is_some()
+    {
+        return Ok(name);
+    }
     let key = s.dir.join("try-key");
     if !key.exists() {
         let st = Command::new("ssh-keygen")
@@ -864,8 +1017,19 @@ fn try_key(s: &Session) -> Result<String, String> {
     args.push(format!("fileb://{}.pub", key.display()));
     args.extend(s.tag_spec(&["key-pair"]));
     args.extend(["--query", "KeyPairId"].map(String::from));
-    let id = aws_s(&args)?;
-    s.note("created", Kind::Key, &id)?;
+    match aws_s(&args) {
+        Ok(id) => s.note("created", Kind::Key, &id)?,
+        Err(e) => {
+            adopt_after(
+                s,
+                Kind::Key,
+                &["describe-key-pairs"],
+                &by_name,
+                "KeyPairs[].KeyPairId",
+                e,
+            )?;
+        }
+    }
     Ok(name)
 }
 
@@ -938,6 +1102,8 @@ struct Launch<'a> {
     private_ip: Option<&'a str>,
     /// The key pair the instance gets (`--key-name`): the try-out session's.
     key_name: Option<&'a str>,
+    /// The instance gets the tag `expires` with this UTC time: the end of its meant life.
+    expires: Option<&'a str>,
 }
 
 /// Starts one instance with every guard; the journal has it and its volumes.
@@ -994,7 +1160,16 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
         .map(String::from),
     );
     args.push(nic);
-    args.extend(s.tag_spec(&["instance", "volume", "network-interface"]));
+    let mut spec = s.tag_spec(&["instance", "volume", "network-interface"]);
+    if let Some(at) = l.expires {
+        for v in spec
+            .iter_mut()
+            .filter(|v| v.starts_with("ResourceType=instance,"))
+        {
+            *v = format!("{},{{Key=expires,Value={at}}}]", v.trim_end_matches(']'));
+        }
+    }
+    args.extend(spec);
     if let Some(snap) = l.extra_snapshot {
         args.extend([
             "--block-device-mappings".to_string(),
@@ -1151,6 +1326,114 @@ fn print_console(text: &str) {
         println!("{}", redact(l));
     }
     println!("--- end of console output ---");
+}
+
+/// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+fn utc_stamp(epoch: u64) -> String {
+    let (days, rem) = ((epoch / 86400) as i64, epoch % 86400);
+    // The civil date of a day count (the algorithm of H. Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// The epoch seconds of the first 19 characters of a UTC stamp (`YYYY-MM-DDTHH:MM:SS`, what
+/// `utc_stamp` and the CLI's `LaunchTime` begin with).
+fn parse_stamp(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> { text.get(from..from + len)?.parse().ok() };
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, m, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hh, mm, ss) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// `1h05m` for a number of seconds.
+fn span(secs: u64) -> String {
+    format!("{}h{:02}m", secs / 3600, secs % 3600 / 60)
+}
+
+/// One line per row of the try-out instances (id, launch time, `expires` tag; tab separated,
+/// one instance per line): its age, and whether it is past its `expires`.
+fn try_report(rows: &str, now: u64) -> Vec<String> {
+    rows.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let [id, launched, expires] = f[..] else {
+                return None;
+            };
+            let age = parse_stamp(launched)
+                .map_or("unknown".to_string(), |t| span(now.saturating_sub(t)));
+            let end = match parse_stamp(expires) {
+                Some(e) if e < now => format!("PAST expires {expires} by {}", span(now - e)),
+                Some(e) => format!("expires {expires} (in {})", span(e - now)),
+                None => format!("expires {expires} (unreadable)"),
+            };
+            Some(format!("try-out instance {}: age {age}, {end}", redact(id)))
+        })
+        .collect()
+}
+
+/// Prints the try-out instances of the project with their age and their `expires`. The
+/// lifetime is not enforced by this command: an instance past it is for `clean`.
+fn print_try_instances() {
+    let rows = aws(&[
+        "ec2",
+        "describe-instances",
+        "--filters",
+        "Name=tag:project,Values=stafeto",
+        "Name=tag-key,Values=expires",
+        "Name=instance-state-name,Values=pending,running,stopping,stopped",
+        "--query",
+        "Reservations[].Instances[].[InstanceId,LaunchTime,Tags[?Key==`expires`]|[0].Value]",
+    ]);
+    match rows {
+        Ok(rows) => {
+            let lines = try_report(&rows, now_epoch());
+            if lines.is_empty() {
+                println!("try-out instances: none");
+            }
+            for l in lines {
+                println!("{l}");
+            }
+        }
+        Err(e) => println!("try-out instances: the list failed: {e}"),
+    }
 }
 
 fn cost(spent: Duration, per_hour: f64) -> f64 {
@@ -1453,6 +1736,7 @@ fn check() -> Result<(), String> {
     );
     let found = project_resources()?;
     println!("resources of the project that exist: {}", found.len());
+    print_try_instances();
     println!("types allowed: {ALLOWED_TYPES:?}, at most {MAX_LIVE} live, credits standard");
     Ok(())
 }
@@ -1471,6 +1755,15 @@ fn boot(args: &[String]) -> Result<(), String> {
     if try_out && stop {
         return Err("--try keeps the instance running: it does not go with --stop".into());
     }
+    let lifetime = match flag(args, "--lifetime-hours") {
+        None => TRY_LIFETIME_HOURS,
+        Some(h) => h
+            .parse::<u64>()
+            .ok()
+            .filter(|h| (1..=72).contains(h))
+            .ok_or("--lifetime-hours takes a whole number from 1 to 72")?,
+    };
+    let expires = try_out.then(|| utc_stamp(now_epoch() + lifetime * 3600));
     let s = Session::open(flag(args, "--session"))?;
     // The try-out session: the key pair, the group open to this host alone, a public address.
     let (group, key) = if try_out {
@@ -1500,6 +1793,7 @@ fn boot(args: &[String]) -> Result<(), String> {
             public_ip: try_out,
             private_ip: None,
             key_name: key.as_deref(),
+            expires: expires.as_deref(),
         },
     )?;
     let result = (|| {
@@ -1559,9 +1853,16 @@ fn boot(args: &[String]) -> Result<(), String> {
     };
     if try_out && result.is_ok() {
         println!(
-            "the try-out instance stays up: remove everything with `xtask aws clean --session {}`",
-            s.id
+            "the try-out instance stays up until `xtask aws clean --session {}` terminates it; meant to expire at {} (this is a tag: nothing enforces it yet)",
+            s.id,
+            expires.as_deref().unwrap_or("")
         );
+        let rate = PRICE_SMALL + PRICE_IPV4;
+        println!(
+            "it costs {rate:.4} USD per hour, {:.2} USD per day, while it runs (the instance {PRICE_SMALL} and the public IPv4 address {PRICE_IPV4})",
+            rate * 24.0
+        );
+        return result;
     }
     println!(
         "estimated cost of this instance: {:.3} USD",
@@ -1833,6 +2134,7 @@ fn neighbour(args: &[String]) -> Result<(), String> {
             public_ip: false,
             private_ip: None,
             key_name: None,
+            expires: None,
         },
     )?;
     let result = (|| {
@@ -1926,6 +2228,7 @@ fn dump_run(s: &Session) -> Result<(), String> {
             public_ip: false,
             private_ip: None,
             key_name: None,
+            expires: None,
         },
     )?;
     let snap = (|| {
@@ -2251,6 +2554,7 @@ fn pair(args: &[String]) -> Result<(), String> {
                     public_ip: internet,
                     private_ip: None,
                     key_name: None,
+                    expires: None,
                 },
             )?);
         }
@@ -2277,6 +2581,7 @@ fn pair(args: &[String]) -> Result<(), String> {
                 public_ip: false,
                 private_ip: Some(&nip),
                 key_name: None,
+                expires: None,
             },
         )?);
         let nid = neighbour
@@ -2633,6 +2938,7 @@ mod tests {
                     public_ip: true,
                     private_ip: None,
                     key_name: Some("stafeto-try-1"),
+                    expires: None,
                 },
             )
             .unwrap();
@@ -2666,8 +2972,20 @@ case "$*" in
    if [ -f "$d/gone" ]; then echo "An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation" >&2; exit 254; fi
    if [ -f "$d/terminated" ]; then echo terminated; else echo running; fi ;;
  *describe-tags*) echo stafeto ;;
+ *GroupName*) cat "$d/groupname" 2>/dev/null ;;
+ *Name=group-name*) if [ -f "$d/group_exists" ]; then echo sg-0123456789abcdef1; fi ;;
+ *IpPermissionsEgress*) cat "$d/egress_rows" 2>/dev/null ;;
+ *'IpPermissions[]'*) cat "$d/ingress_rows" 2>/dev/null ;;
+ *describe-key-pairs*) if [ -f "$d/key_exists" ]; then echo key-0123456789abcdef0; fi ;;
+ *import-key-pair*)
+   [ -f "$d/ledgerpath" ] && cp "$(cat "$d/ledgerpath")" "$d/ledger_at_import"
+   if [ -f "$d/import_fails" ]; then touch "$d/key_exists"; echo "An error occurred (InvalidKeyPair.Duplicate) when calling the ImportKeyPair operation" >&2; exit 254; fi
+   echo key-0123456789abcdef0 ;;
  *describe-subnets*) echo "subnet-1 vpc-1" ;;
- *create-security-group*) echo sg-0123456789abcdef0 ;;
+ *create-security-group*)
+   [ -f "$d/ledgerpath" ] && cp "$(cat "$d/ledgerpath")" "$d/ledger_at_create"
+   if [ -f "$d/create_fails" ]; then touch "$d/group_exists"; echo "An error occurred (InvalidGroup.Duplicate) when calling the CreateSecurityGroup operation" >&2; exit 254; fi
+   echo sg-0123456789abcdef0 ;;
  *length*) echo 0 ;;
 esac
 exit 0
@@ -2690,6 +3008,7 @@ exit 0
         *CLI.lock().unwrap() = Some(script);
         let s = Session::open(Some(format!("9999-{}", std::process::id()))).unwrap();
         let _ = std::fs::remove_file(s.ledger());
+        std::fs::write(dir.join("ledgerpath"), s.ledger().display().to_string()).unwrap();
         f(&s, &dir);
         *CLI.lock().unwrap() = None;
         let _ = std::fs::remove_dir_all(&s.dir);
@@ -2712,6 +3031,7 @@ exit 0
                 public_ip: false,
                 private_ip: None,
                 key_name: None,
+                expires: None,
             },
         )
     }
@@ -2800,6 +3120,199 @@ exit 0
             assert!(live.iter().any(|(k, _)| *k == Kind::Instance));
             assert!(live.iter().any(|(k, _)| *k == Kind::Volume));
         });
+    }
+
+    fn ledger_copy(dir: &Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+    }
+
+    const BOTH_TAGS: [&str; 2] = [
+        "Name=tag:project,Values=stafeto",
+        "Name=tag:session,Values=9999-",
+    ];
+
+    #[test]
+    fn the_try_group_is_journaled_before_it_is_made_and_made_with_the_tags() {
+        with_fake(&[], |s, dir| {
+            let g = try_group(s, "203.0.113.7/32").unwrap();
+            assert_eq!(g, "sg-0123456789abcdef0");
+            let at_create = ledger_copy(dir, "ledger_at_create");
+            assert!(at_create.contains("intent\tgroup"), "{at_create}");
+            assert!(!at_create.contains("created"), "{at_create}");
+            assert!(s.live().contains(&(Kind::Group, g)));
+            let c = calls(dir);
+            assert!(c.contains("Key=project,Value=stafeto"), "{c}");
+            assert!(c.contains("Key=session,Value=9999-"), "{c}");
+            assert_eq!(c.matches("authorize-security-group-ingress").count(), 4);
+        });
+    }
+
+    #[test]
+    fn a_group_that_exists_with_both_tags_is_adopted_and_journaled() {
+        with_fake(&["group_exists"], |s, dir| {
+            let g = try_group(s, "203.0.113.7/32").unwrap();
+            assert_eq!(g, "sg-0123456789abcdef1");
+            let c = calls(dir);
+            assert!(!c.contains("create-security-group"), "{c}");
+            for tag in BOTH_TAGS {
+                assert!(c.contains(tag), "{tag}: {c}");
+            }
+            assert!(
+                c.contains("Name=group-name,Values=stafeto-try-9999-"),
+                "{c}"
+            );
+            assert!(s.live().contains(&(Kind::Group, g)));
+        });
+    }
+
+    #[test]
+    fn a_create_that_fails_after_the_group_exists_adopts_it() {
+        with_fake(&["create_fails"], |s, dir| {
+            let g = try_group(s, "203.0.113.7/32").unwrap();
+            assert_eq!(g, "sg-0123456789abcdef1");
+            assert!(s.live().contains(&(Kind::Group, g)));
+            assert_eq!(
+                calls(dir).matches("Name=group-name").count(),
+                2,
+                "looked up twice"
+            );
+        });
+    }
+
+    #[test]
+    fn a_session_with_a_closed_group_gets_a_try_group_of_its_own() {
+        with_fake(&[], |s, dir| {
+            s.note("created", Kind::Group, "sg-0123456789abcdef9")
+                .unwrap();
+            std::fs::write(dir.join("groupname"), "stafeto-closed-9999\n").unwrap();
+            let g = try_group(s, "203.0.113.7/32").unwrap();
+            assert_eq!(g, "sg-0123456789abcdef0");
+            assert!(calls(dir).contains("create-security-group"));
+        });
+    }
+
+    #[test]
+    fn a_try_group_of_another_address_says_the_address_changed() {
+        with_fake(&[], |s, dir| {
+            s.note("created", Kind::Group, "sg-0123456789abcdef9")
+                .unwrap();
+            std::fs::write(dir.join("groupname"), format!("stafeto-try-{}\n", s.id)).unwrap();
+            let rows: String = TRY_PORTS
+                .iter()
+                .map(|p| format!("tcp {p} {p} 1 203.0.113.9/32 0 0 0\n"))
+                .collect();
+            std::fs::write(dir.join("ingress_rows"), &rows).unwrap();
+            let e = try_group(s, "203.0.113.7/32").unwrap_err();
+            assert!(e.contains("address of this host changed"), "{e}");
+            assert!(e.contains("clean --session"), "{e}");
+            // The same address gives the group back.
+            assert_eq!(
+                try_group(s, "203.0.113.9/32").unwrap(),
+                "sg-0123456789abcdef9"
+            );
+        });
+    }
+
+    #[test]
+    fn the_try_key_is_journaled_before_it_is_imported_and_imported_with_the_tags() {
+        with_fake(&[], |s, dir| {
+            let name = try_key(s).unwrap();
+            assert_eq!(name, format!("stafeto-try-{}", s.id));
+            let at_import = ledger_copy(dir, "ledger_at_import");
+            assert!(at_import.contains("intent\tkey"), "{at_import}");
+            assert!(!at_import.contains("created"), "{at_import}");
+            assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
+            let c = calls(dir);
+            assert!(c.contains("ResourceType=key-pair,Tags=[{Key=project,Value=stafeto},{Key=session,Value=9999-"), "{c}");
+            assert!(s.dir.join("try-key").exists());
+        });
+    }
+
+    #[test]
+    fn a_key_pair_that_exists_with_both_tags_is_adopted() {
+        with_fake(&["key_exists"], |s, dir| {
+            try_key(s).unwrap();
+            let c = calls(dir);
+            assert!(!c.contains("import-key-pair"), "{c}");
+            for tag in BOTH_TAGS {
+                assert!(c.contains(tag), "{tag}: {c}");
+            }
+            assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
+        });
+        with_fake(&["import_fails"], |s, _| {
+            try_key(s).unwrap();
+            assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
+        });
+    }
+
+    #[test]
+    fn clean_removes_the_local_key_files() {
+        with_fake(&[], |s, _| {
+            try_key(s).unwrap();
+            assert!(s.dir.join("try-key.pub").exists());
+            s.note("deleted", Kind::Key, "key-0123456789abcdef0")
+                .unwrap();
+            clean(s).unwrap();
+            assert!(!s.dir.join("try-key").exists());
+            assert!(!s.dir.join("try-key.pub").exists());
+        });
+    }
+
+    #[test]
+    fn the_instance_alone_gets_the_expires_tag() {
+        with_fake(&[], |s, dir| {
+            let l = Launch {
+                ami: "ami-0123456789abcdef0",
+                ty: "t4g.small",
+                user_data: None,
+                extra_snapshot: None,
+                group: Some("sg-0123456789abcdef0"),
+                public_ip: true,
+                private_ip: None,
+                key_name: None,
+                expires: Some("2026-11-17T12:00:00Z"),
+            };
+            launch(s, &l).unwrap();
+            let c = calls(dir);
+            assert!(c.contains("ResourceType=instance,Tags=[{Key=project,Value=stafeto},{Key=session,Value=9999-"), "{c}");
+            assert!(
+                c.contains("{Key=expires,Value=2026-11-17T12:00:00Z}]"),
+                "{c}"
+            );
+            assert_eq!(c.matches("Key=expires").count(), 1, "{c}");
+        });
+    }
+
+    #[test]
+    fn stamps_round_trip_and_the_report_says_past_or_not() {
+        assert_eq!(utc_stamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_stamp(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            parse_stamp("2023-11-14T22:13:20+00:00"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(parse_stamp(&utc_stamp(1_784_000_123)), Some(1_784_000_123));
+        assert_eq!(parse_stamp("None"), None);
+        let now = 1_700_000_000;
+        let rows = format!(
+            "i-0123456789abcdef0\t{}\t{}\ni-0123456789abcdef1\t{}\t{}\n",
+            utc_stamp(now - 3 * 3600),
+            utc_stamp(now - 3600),
+            utc_stamp(now - 600),
+            utc_stamp(now + 7200 - 600)
+        );
+        let r = try_report(&rows, now);
+        assert_eq!(r.len(), 2);
+        assert!(
+            r[0].contains("i-...") && r[0].contains("age 3h00m") && r[0].contains("PAST"),
+            "{}",
+            r[0]
+        );
+        assert!(
+            r[1].contains("age 0h10m") && r[1].contains("(in 1h50m)"),
+            "{}",
+            r[1]
+        );
     }
 
     #[test]

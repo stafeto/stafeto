@@ -56,7 +56,8 @@
 #        curl http://ADDRESS/                  the page, 200
 #        curl -k https://ADDRESS/              the same page over TLS 1.3 (the certificate is self-signed)
 #        curl http://ADDRESS:8080/             the same page from nginx-fast
-#        ssh -i target/aws/S/try-key root@ADDRESS                      the key pair of the instance gets in; the fingerprint of
+#        ssh -i target/aws/S/try-key root@ADDRESS
+#                                              the key pair of the instance gets in; the fingerprint of
 #                                              the host key is the one of the console line
 #        nmap -Pn -p 1-65535 ADDRESS           a full TCP scan: only 22, 80, 443 and 8080 are open
 #        nmap -Pn -sU --top-ports 200 ADDRESS  UDP: nothing answers but what the security group
@@ -75,7 +76,8 @@
 #        date -u -s "YYYY-MM-DD HH:MM:SS"      first: the clock starts at 2026-01-01 and `pkg` refuses the
 #                                              certificate of stafeto.github.io until it is set
 #        pkg update; pkg search nginx          the index of the series 0.5 from stafeto.github.io
-#        pkg install htop; TERM=vt100 htop     (the image has no terminfo for xterm)                a package from the store in memory
+#        pkg install htop; TERM=vt100 htop     a package from the store in memory (the image has no
+#                                              terminfo for xterm)
 #        ps; cat /proc/meminfo                 nginx, nginx-fast and dropbear are running; the
 #                                              memory fits the 2 GiB (the console line `frames N
 #                                              MiB free` before the services shows what there is;
@@ -83,5 +85,5 @@
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #
-# Stop the instance at the end: `cargo xtask aws clean --session S`.
+# End of the session: `cargo xtask aws clean --session S` terminates the instance and removes the group and the key pair.
 echo "see the comments of this file: the steps and the expected console lines"
