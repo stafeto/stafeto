@@ -40,22 +40,23 @@ pub enum Want {
 
 impl Want {
     /// The wanted identity from the own arguments of the service (the two addresses, then a kind
-    /// byte and the value, zero padded). Absent bytes or kind 0 are `Any`; a kind that is not
-    /// known is an empty serial, which nothing matches.
+    /// byte and the value, zero padded). Absent bytes or kind 0 are `Any`. A kind that is not known,
+    /// or a value longer than its field (it would be cut short and match a shorter name), is an
+    /// empty serial, which nothing matches.
     pub fn parse(own: &[u8]) -> Want {
         let value = own.get(ADDRESS_BYTES + 1..).unwrap_or(&[]);
+        // The padding of the value is zeros: the length is where the last byte that is none lies.
+        let value = &value[..value.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)];
         match own.get(ADDRESS_BYTES).copied() {
             None | Some(WANT_ANY) => Want::Any,
-            Some(WANT_SERIAL) => {
+            Some(WANT_SERIAL) if value.len() <= 20 => {
                 let mut w = [0; 20];
-                let n = value.len().min(20);
-                w[..n].copy_from_slice(&value[..n]);
+                w[..value.len()].copy_from_slice(value);
                 Want::Serial(w)
             }
-            Some(WANT_EBS_NAME) => {
+            Some(WANT_EBS_NAME) if value.len() <= 32 => {
                 let mut w = [0; 32];
-                let n = value.len().min(32);
-                w[..n].copy_from_slice(&value[..n]);
+                w[..value.len()].copy_from_slice(value);
                 Want::EbsName(w)
             }
             Some(_) => Want::Serial([0; 20]),
@@ -192,6 +193,22 @@ mod tests {
         assert_eq!(Want::parse(&[]), Want::Any);
         own[16] = 9;
         assert!(!identity(&[0; 4096], &Want::parse(&own)));
+    }
+
+    #[test]
+    fn a_value_longer_than_its_field_is_refused() {
+        let mut own = [b'a'; 16 + 1 + 40];
+        own[16] = WANT_SERIAL;
+        assert!(!identity(&[b'a'; 4096], &Want::parse(&own[..16 + 1 + 21])));
+        assert_eq!(Want::parse(&own[..16 + 1 + 21]), Want::Serial([0; 20]));
+        own[16] = WANT_EBS_NAME;
+        assert_eq!(Want::parse(&own[..16 + 1 + 32]), want_name(&[b'a'; 32]));
+        assert_eq!(Want::parse(&own[..16 + 1 + 33]), Want::Serial([0; 20]));
+        // Padding of zeros past the field is no value.
+        let mut own = [0u8; 16 + 1 + 40];
+        own[16] = WANT_SERIAL;
+        own[17..20].copy_from_slice(b"abc");
+        assert_eq!(Want::parse(&own), want_serial(b"abc"));
     }
 
     #[test]

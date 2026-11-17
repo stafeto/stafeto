@@ -265,3 +265,4 @@ netd = { path = "../netd" }
 proto-comp = { path = "../../proto/comp" }
 pci = { path = "../../lib/pci", features = ["fake"] }
 nvme = { path = "../../lib/nvme" }
+nvme-blk = { path = "../nvme" }

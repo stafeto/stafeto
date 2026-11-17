@@ -1935,6 +1935,46 @@ mod tests {
         tables
     }
 
+    /// A record of `nvme-blk` named `datadisk` always says which volume it may serve: a kind byte of
+    /// 1 (serial) or 2 (EBS name) and a value, so an EC2 record can never fall back to `Any` by
+    /// left-out arguments. Only the record `blk` may have no check.
+    #[test]
+    fn every_data_disk_record_names_the_identity_it_serves() {
+        let mut tables = all_tables();
+        tables.push(pkg::DATAKEY_PROBE_TABLE);
+        tables.push(pkg::DATA_PROBE_TABLE);
+        let mut seen = 0;
+        for r in tables
+            .into_iter()
+            .flatten()
+            .filter(|r| r.name == "datadisk")
+        {
+            if r.program != "nvme-blk" {
+                continue;
+            }
+            seen += 1;
+            let kind = r.args.first().copied();
+            assert!(
+                matches!(kind, Some(nvme_blk::WANT_SERIAL | nvme_blk::WANT_EBS_NAME)),
+                "datadisk has no identity kind: {:?}",
+                r.args
+            );
+            assert!(
+                r.args.len() > 1 && r.args[1] != 0,
+                "datadisk has an empty identity"
+            );
+        }
+        assert!(seen > 0);
+    }
+
+    /// The own arguments of `nvme-blk` start after the physical address of each of its DMA objects,
+    /// 8 bytes each: the offset its `Want::parse` reads at.
+    #[test]
+    fn the_identity_of_nvme_blk_follows_the_addresses_of_its_dma_objects() {
+        assert_eq!(8 * pkg::NVME_QEMU_BLK.dma.len(), nvme_blk::ADDRESS_BYTES);
+        assert_eq!(8 * pkg::NVME_QEMU_DATA.dma.len(), nvme_blk::ADDRESS_BYTES);
+    }
+
     use super::*;
 
     const MS: u64 = 1_000_000;
