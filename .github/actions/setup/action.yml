@@ -22,7 +22,8 @@ runs:
         # A connection that a runner cannot make (run 43993748769: curl exit 7 to apt.llvm.org
         # after 195 ms) is tried again: five tries, three seconds apart, of 20 seconds each.
         retry="--retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20"
-        curl -fsSL $retry https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+        curl -fsSL $retry -o "$RUNNER_TEMP/llvm.gpg.key" https://apt.llvm.org/llvm-snapshot.gpg.key
+        sudo install -m 0644 "$RUNNER_TEMP/llvm.gpg.key" /etc/apt/keyrings/apt.llvm.org.asc
         echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" | sudo tee /etc/apt/sources.list.d/llvm.list
         # On 2026-11-11 the resolver of the runners failed for the Ubuntu mirror
         # while public resolvers answered. When that happens, the address from
@@ -81,6 +82,10 @@ runs:
       shell: bash
       run: |
         if ! command -v rustup >/dev/null; then
-          curl -sSf --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          # The script is downloaded whole (with tries) and then run: a cut download is never
+          # run.
+          script="$RUNNER_TEMP/rustup-init.sh"
+          curl -sSf --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 20 -o "$script" https://sh.rustup.rs
+          sh "$script" -y --profile minimal --default-toolchain none
         fi
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

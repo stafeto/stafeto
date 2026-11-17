@@ -245,9 +245,10 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
 
 /// `stat` with the time its answer may take.
 fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
-    // The service writes a line longer than 64 bytes to the console in pieces, and `posix-net`
-    // prints its own line meanwhile, so a counter line can come cut in two with that line
-    // between the halves. The counters are cumulative: asking again gives a whole line.
+    // The counter lines are under the 128 bytes (`LINE_MAX` of the console's driver, which
+    // puts out a longer line in parts, and reassembles the 64-byte pieces of a line up to
+    // that length) and so come whole. A line that came without a counter is asked for again:
+    // the counters are cumulative. The retry is a safety net.
     let mut last = String::new();
     for _ in 0..STAT_ATTEMPTS {
         match stat_once(run, tag, within) {
@@ -277,14 +278,22 @@ fn stat_once(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, S
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
-    let line = lines
-        .iter()
-        .rev()
-        .find(|l| l.contains("net: switch consumers "))
-        .cloned()
-        .ok_or_else(|| {
-            format!("no line `net: switch consumers` after posix-net stat: {lines:?}")
-        })?;
+    // The counters come in three lines (`report_switch`), each under the 128 bytes of a part
+    // of the console; they are read as one.
+    let mut parts = Vec::new();
+    for head in [
+        "net: switch consumers ",
+        "net: switch tx_refused ",
+        "net: switch left ",
+    ] {
+        let part = lines
+            .iter()
+            .rev()
+            .find(|l| l.contains(head))
+            .ok_or_else(|| format!("no line `{head}` after posix-net stat: {lines:?}"))?;
+        parts.push(part.as_str());
+    }
+    let line = parts.join(" ");
     let by = lines
         .iter()
         .rev()
@@ -1847,6 +1856,8 @@ mod tests {
             std::fs::read_to_string(crate::root().join("services/netd/src/main.rs")).unwrap();
         for line in [
             "net: switch consumers ",
+            "net: switch tx_refused ",
+            "net: switch left ",
             "net: switch rx_by ",
             "refused_by {refused:?}",
         ] {
