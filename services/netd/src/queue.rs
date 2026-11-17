@@ -8,8 +8,8 @@
 //! on them; the tests here fix the rules.
 
 /// Sockets of a queue one SYN may rebuild (release one that closed, build a
-/// fresh one that listens). The step of the service is bound at 16 500 ticks;
-/// a rebuild is the costly part, so later SYNs reap the rest.
+/// fresh one that listens). The step of the service has a bound of 18 369 ticks
+/// (16 500 is the margin at which the probes warn); a rebuild is the costly part, so later SYNs reap the rest.
 pub const REBUILD_MAX: u8 = 4;
 
 /// How long a connection that has not finished its handshake (SYN-RECEIVED)
@@ -50,6 +50,24 @@ impl ReapBudget {
     pub const fn tried(&self) -> u8 {
         self.tried
     }
+}
+
+/// The least age of a half-open socket that may be recycled, in
+/// nanoseconds: about one retransmission timeout of the SYN-ACK, so that a
+/// burst of legitimate handshakes is dropped and retried as before and only
+/// stale entries are taken.
+pub const EMBRYO_MIN_AGE_NS: u64 = 1_000_000_000;
+
+/// Whether a half-open socket of this age may be recycled.
+pub const fn recyclable(age_ns: u64) -> bool {
+    age_ns >= EMBRYO_MIN_AGE_NS
+}
+
+/// Whether the place is still the orphan noted at `captured`: it is an
+/// orphan now and was let go of at that time. A place given to another
+/// stream since is not.
+pub const fn same_orphan(is_orphan: bool, captured: u64, current: u64) -> bool {
+    is_orphan && captured == current
 }
 
 /// The timeout of a queue socket that left LISTEN, in seconds.
@@ -141,6 +159,37 @@ mod tests {
         o.offer(7, 100);
         o.offer(3, 100);
         assert_eq!(o.place(), Some(7));
+    }
+
+    #[test]
+    fn a_place_given_to_another_stream_since_the_capture_is_not_released() {
+        assert!(same_orphan(true, 500, 500));
+        // Evicted and allocated again as a queue socket.
+        assert!(!same_orphan(false, 500, 0));
+        // Evicted and let go of again later.
+        assert!(!same_orphan(true, 500, 900));
+    }
+
+    #[test]
+    fn one_budget_for_a_syn_bounds_all_its_steps() {
+        // The closed four, the reap and the recycling share one budget: four
+        // failed rebuilds in any mix end the work of the SYN.
+        let mut b = ReapBudget::new();
+        for _ in 0..3 {
+            assert!(b.open());
+            b.charge(false);
+        }
+        assert!(b.open());
+        b.charge(false);
+        assert!(!b.open());
+        assert_eq!(b.tried(), REBUILD_MAX);
+    }
+
+    #[test]
+    fn only_stale_half_open_entries_are_recycled() {
+        assert!(!recyclable(0));
+        assert!(!recyclable(EMBRYO_MIN_AGE_NS - 1));
+        assert!(recyclable(EMBRYO_MIN_AGE_NS));
     }
 
     #[test]
