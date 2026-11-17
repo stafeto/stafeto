@@ -1725,9 +1725,16 @@ pub use crate::resolve::table;
 /// The platform a table with places by function (`At`) resolves them on.
 #[cfg(feature = "table-aws")]
 pub const PLATFORM: Option<crate::resolve::Platform> = Some(aws::PLATFORM);
-#[cfg(all(feature = "nvme-store", not(feature = "table-aws")))]
+#[cfg(all(
+    any(feature = "nvme-store", feature = "table-aws-qemu"),
+    not(feature = "table-aws")
+))]
 pub const PLATFORM: Option<crate::resolve::Platform> = Some(pkg::QEMU_PLATFORM);
-#[cfg(not(any(feature = "table-aws", feature = "nvme-store")))]
+#[cfg(not(any(
+    feature = "table-aws",
+    feature = "table-aws-qemu",
+    feature = "nvme-store"
+)))]
 pub const PLATFORM: Option<crate::resolve::Platform> = None;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
@@ -1877,6 +1884,8 @@ pub const ALL_TABLES: &[&[Record]] = &[
     fstack::FAST_SWITCH_SCALE_TABLE,
     fstack::FAST_SWITCH_SCALE_VZ_TABLE,
     ramfs::POSIX_MAP_BIG_TABLE,
+    aws::TABLE,
+    aws::QEMU_TABLE,
     net::NET_TABLE,
     net::NET_TWO_TABLE,
     net::NET_VZ_TABLE,
@@ -1965,6 +1974,10 @@ mod tests {
             );
         }
         assert!(seen > 0);
+        // The record of EC2 asks for the EBS name `sdf`, its mirror on QEMU for a serial number.
+        assert_eq!(&aws::DATADISK.args[..1], &[nvme_blk::WANT_EBS_NAME]);
+        assert!(aws::TABLE.iter().any(|r| r.name == "datadisk"));
+        assert!(aws::QEMU_TABLE.iter().any(|r| r.name == "datadisk"));
     }
 
     /// The own arguments of `nvme-blk` start after the physical address of each of its DMA objects,
@@ -3416,9 +3429,7 @@ mod tests {
     fn a_client_of_the_entropy_service_has_it_and_only_two_images_go_without_a_driver() {
         let mut seed_only = 0;
         let tables =
-            all_tables()
-                .into_iter()
-                .chain([aws::TABLE, aws::QEMU_TABLE, entropy::SEED_TABLE]);
+            all_tables().into_iter().chain([entropy::SEED_TABLE]);
         for table in tables {
             let wants = table.iter().any(|r| r.connects.contains(&ENTROPY_SERVICE));
             let service = table.iter().find(|r| r.name == ENTROPY_SERVICE);

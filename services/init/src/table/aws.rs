@@ -10,7 +10,11 @@
 //! in the device tree, the kernel gives it to init, and init to the
 //! service (`ENTROPY`). The package service (`pkgd`) keeps its store in memory, on the
 //! disk service over a memory object (`MEMBLK`, 256 MiB): the packages installed with
-//! `pkg` are gone after a reboot, like every file of the image.
+//! `pkg` are gone after a reboot, like every file of the image. The second EBS volume of
+//! the image (`/dev/sdf`, 2 GiB) is the data volume: the disk service `datadisk` serves it
+//! only when the name EBS gives it is `sdf`, `datafs` keeps the files of `/data` on it, and
+//! `datakey` keeps the SSH host key there. An instance launched without that volume leaves
+//! `datadisk` out and makes a new host key at each boot.
 
 use super::{
     At, Binding, Confirm, Dma, GENERAL_CPUS, Kind, Record, Restart, Shares, Wait, Window, Write,
@@ -40,7 +44,7 @@ pub const PLATFORM: Platform = Platform {
     ecam: ECAM,
     scan_last_bus: 0,
     io_shift: 0,
-    optional: &[super::NET_SERVICE],
+    optional: &[super::NET_SERVICE, "datadisk"],
 };
 /// The ENA function: Amazon's vendor id and device 0xec20 (`pci.txt` of the
 /// fixtures), the first and only one.
@@ -312,6 +316,9 @@ pub const PROCESS_SERVICE: Record = Record {
     ..super::net::NET_PROCESS_SERVICE
 };
 
+/// How long the launcher waits for the host key service.
+pub const DATAKEY_READY_MS: u32 = 30_000;
+
 /// The launcher of the shell with a session with the network service: the shell and its
 /// commands get the same (the launcher's connections are the shell's), and the quota of a
 /// command that runs `nginx-fast` or links OpenSSL; and the entropy service, for getrandom
@@ -333,11 +340,71 @@ pub const LAUNCHER: Record = Record {
     quota: COMMAND_QUOTA,
     // The shell starts once `pkgd` says READY (the store is formatted at the start); past
     // this it starts without waiting, as on the base image.
-    waits: &[Wait {
-        service: "pkgd",
-        deadline_ms: super::base::PKGD_READY_MS,
-    }],
+    //
+    // The boot script starts Dropbear with the key `datakey` has put into `/etc/dropbear`, so
+    // the launcher waits for that service too (30 s: the first start formats the volume).
+    waits: &[
+        Wait {
+            service: "pkgd",
+            deadline_ms: super::base::PKGD_READY_MS,
+        },
+        Wait {
+            service: "datakey",
+            deadline_ms: DATAKEY_READY_MS,
+        },
+    ],
     ..named(DIALOG, "busybox-probe")
+};
+
+/// The NVMe function of an EBS volume: Amazon's vendor id and device 0x8061 (`pci.txt` of the
+/// fixtures), one function per volume in the order of the walk.
+pub const EBS_NVME_ID: u32 = 0x1d0f_8061;
+/// The walk index of the data volume: the root volume is the function 0 (00:04.0) and the volume
+/// attached as `/dev/sdf` the function 1 (00:1f.0) in the measurement of the fixtures
+/// (`nvme-map.txt`). The index only places the record; the name EBS writes into Identify
+/// Controller decides which volume the service serves, so a volume in the wrong function is left
+/// alone.
+const DATA_INDEX: u8 = 1;
+/// The own arguments of `datadisk` after the addresses of its DMA objects: the kind 2 (the name of
+/// the block device in Identify Controller bytes 3072..3104) and the name `sdf`.
+const DATADISK_WANT: &[u8] = b"\x02sdf";
+const DATADISK_WINDOWS: &[Window] = &[
+    Window {
+        name: "bar",
+        base: 0,
+        len: 4 * PAGE,
+        duplicate: false,
+        at: At::Bar {
+            id: EBS_NVME_ID,
+            index: DATA_INDEX,
+            bar: 0,
+        },
+    },
+    Window {
+        name: "ecam",
+        base: 0,
+        len: PAGE,
+        duplicate: false,
+        at: At::Config {
+            id: EBS_NVME_ID,
+            index: DATA_INDEX,
+        },
+    },
+];
+const DATADISK_BINDINGS: &[Binding] = &[
+    Binding::msi_of("irq0", EBS_NVME_ID, DATA_INDEX, 0),
+    Binding::msi_of("irq1", EBS_NVME_ID, DATA_INDEX, 1),
+];
+
+/// The disk service of the data volume: the NVMe service of the QEMU machine's data disk with the
+/// function of the second EBS volume and the check of its name. It is optional on this platform
+/// (`PLATFORM.optional`): with no second volume init leaves it out and `datafs` says `no disk`.
+pub const DATADISK: Record = Record {
+    name: "datadisk",
+    windows: DATADISK_WINDOWS,
+    bindings: DATADISK_BINDINGS,
+    args: DATADISK_WANT,
+    ..super::pkg::NVME_QEMU_BLK
 };
 
 pub const TABLE: &[Record] = &[
@@ -356,6 +423,9 @@ pub const TABLE: &[Record] = &[
     NET,
     super::pkg::MEMBLK,
     super::pkg::PKGD,
+    DATADISK,
+    super::pkg::DATAFS,
+    super::pkg::DATAKEY,
 ];
 
 /// The closest image on QEMU to the table above (`cargo xtask net-try`): the services of the
@@ -375,6 +445,9 @@ pub const QEMU_TABLE: &[Record] = &[
     super::net::NETD_SWITCH,
     super::pkg::MEMBLK,
     super::pkg::PKGD,
+    super::pkg::NVME_QEMU_DATA,
+    super::pkg::DATAFS,
+    super::pkg::DATAKEY,
 ];
 
 /// The pages of RAM of a t4g.small: 2 GiB.
@@ -417,7 +490,10 @@ mod tests {
                 "tty",
                 "net",
                 "blk",
-                "pkgd"
+                "pkgd",
+                "datadisk",
+                "datafs",
+                "datakey"
             ]
         );
         // The posix record is the shell dialog's, with its larger quota; the
@@ -433,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_launcher_connects_to_net_the_launcher_and_net_to_entropy_and_only_net_has_pci_windows()
+    fn only_the_launcher_connects_to_net_the_launcher_and_net_to_entropy_and_only_net_and_datadisk_have_pci_windows()
      {
         for r in TABLE {
             // No driver of random bytes: the boot seed is the source.
@@ -450,7 +526,7 @@ mod tests {
                 "{}",
                 r.name
             );
-            if r.name == "net" {
+            if r.name == "net" || r.name == "datadisk" {
                 assert!(r.windows.iter().all(|w| w.at != At::Fixed));
             } else {
                 assert!(r.windows.iter().all(|w| w.base == SPCR_PORT));
@@ -556,7 +632,8 @@ mod tests {
             Box::leak(Box::new(crate::resolve::Store::EMPTY));
         let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
         assert!(found.table.iter().all(|r| r.name != "net"));
-        assert_eq!(found.table.len(), TABLE.len() - 1);
+        // The volume's record is left out as well: no function of its id is there.
+        assert_eq!(found.table.len(), TABLE.len() - 2);
         let left = found.skipped[0].unwrap();
         assert_eq!(left.record, "net");
         assert!(matches!(
@@ -636,7 +713,10 @@ mod tests {
                 "entropy",
                 "net",
                 "blk",
-                "pkgd"
+                "pkgd",
+                "datadisk",
+                "datafs",
+                "datakey"
             ]
         );
         let of =
@@ -651,6 +731,117 @@ mod tests {
             b"ash-launch\0/etc/rc\0"
         );
         assert!(pages_held(QEMU_TABLE) <= pages_held(TABLE) + 1_000);
+    }
+
+    /// The own arguments of `nvme-blk` as the service reads them: the addresses of its DMA
+    /// objects, then the record's bytes.
+    fn own_arguments(record: &Record) -> Vec<u8> {
+        let mut own = vec![0u8; nvme_blk::ADDRESS_BYTES];
+        own.extend_from_slice(record.args);
+        own
+    }
+
+    /// Identify Controller of an EBS volume with `name` in bytes 3072..3104, padded with spaces.
+    fn identify(name: &[u8]) -> [u8; 4096] {
+        let mut id = [0u8; 4096];
+        id[3072..3104].fill(b' ');
+        id[3072..3072 + name.len()].copy_from_slice(name);
+        id
+    }
+
+    #[test]
+    fn datadisk_serves_the_volume_named_sdf_and_no_other() {
+        let want = nvme_blk::Want::parse(&own_arguments(&DATADISK));
+        assert_eq!(DATADISK.args[0], nvme_blk::WANT_EBS_NAME);
+        assert!(nvme_blk::identity(&identify(b"sdf"), &want));
+        assert!(!nvme_blk::identity(&identify(b"xvda"), &want));
+        assert!(!nvme_blk::identity(&identify(b"sda1"), &want));
+        assert!(!nvme_blk::identity(&[0; 4096], &want));
+        // The QEMU record of the same name asks for a serial number: an EBS name cannot open it.
+        let qemu = nvme_blk::Want::parse(&own_arguments(&super::super::pkg::NVME_QEMU_DATA));
+        assert!(!nvme_blk::identity(&identify(b"sdf"), &qemu));
+    }
+
+    #[test]
+    fn datadisk_is_the_second_nvme_function_of_the_instance() {
+        let mut config = pci::fake::t4g();
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
+        let disk = found.table.iter().find(|r| r.name == "datadisk").unwrap();
+        // `nvme-map.txt`: 00:04.0 is the root volume (walk index 0), 00:1f.0 the volume of
+        // /dev/sdf (index 1); `pci.txt`: its BAR at 0x80000000, 16 KiB.
+        let nvme_map = include_str!(
+            "../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/nvme-map.txt"
+        );
+        assert!(nvme_map.contains("pci=0000:00:1f.0 role=sdf"));
+        let bar = disk.windows.iter().find(|w| w.name == "bar").unwrap();
+        assert_eq!((bar.base, bar.len), (0x8000_0000, 0x4000));
+        let ecam = disk.windows.iter().find(|w| w.name == "ecam").unwrap();
+        assert_eq!(ecam.base, ECAM.base + (0x1f << 15));
+        let events: Vec<_> = disk.bindings.iter().map(|b| b.event()).collect();
+        assert_eq!(events, [Some((0xf8, 0)), Some((0xf8, 1))]);
+        assert!(found.skipped.iter().all(Option::is_none));
+        assert!(crate::table::check(found.table).is_ok());
+        // The net record is on its own function and the two volumes never share one.
+        assert_eq!(EBS_NVME_ID, 0x1d0f_8061);
+    }
+
+    #[test]
+    fn an_instance_without_the_second_volume_leaves_datadisk_out_and_datafs_goes_on() {
+        let mut config = pci::fake::Fake::default();
+        config.function(pci::Address::new(0, 4, 0), 0x1d0f, 0x8061, 0x010802, false);
+        config.mem32(pci::Address::new(0, 4, 0), 0, 0x8000_8000, 0x4000);
+        config.function(pci::Address::new(0, 5, 0), 0x1d0f, 0xec20, 0x020000, false);
+        config.mem32(pci::Address::new(0, 5, 0), 0, 0x8000_4000, 0x4000);
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found = crate::resolve::resolve(TABLE, &PLATFORM, &mut config, store).unwrap();
+        assert!(found.table.iter().all(|r| r.name != "datadisk"));
+        let left = found.skipped.iter().flatten().next().unwrap();
+        assert_eq!(left.record, "datadisk");
+        let datafs = found.table.iter().find(|r| r.name == "datafs").unwrap();
+        assert!(datafs.connects.is_empty());
+        assert!(found.table.iter().any(|r| r.name == "datakey"));
+        assert!(crate::table::check(found.table).is_ok());
+    }
+
+    #[test]
+    fn the_launcher_waits_for_pkgd_and_for_the_host_key_service() {
+        for table in [TABLE, QEMU_TABLE] {
+            let launcher = table.iter().find(|r| r.name == "busybox-probe").unwrap();
+            let waited: Vec<_> = launcher.waits.iter().map(|w| w.service).collect();
+            assert_eq!(waited, ["pkgd", "datakey"]);
+            let datakey = table.iter().find(|r| r.name == "datakey").unwrap();
+            assert!(datakey.waits.is_empty());
+            assert!(!datakey.is_client());
+        }
+    }
+
+    /// The budgets on CPU 0 of the EC2 table: the network service 40 % and 20 %, the file
+    /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the NVMe service 1 %
+    /// and the data file service 1 %, and the reserve of 3 % for the process service and the
+    /// package service: 73 % under the 75 % the table allows.
+    #[test]
+    fn the_budgets_of_cpu_zero_on_ec2_are_73_percent_under_the_cap_of_75() {
+        for table in [TABLE, QEMU_TABLE] {
+            let on_zero: u64 = table
+                .iter()
+                .flat_map(|r| r.budgets.iter())
+                .filter(|b| b.cpu == 0)
+                .map(crate::table::Budget::share_ppm)
+                .sum();
+            assert_eq!(
+                on_zero + crate::table::CPU0_RESERVE_PPM,
+                730_000,
+                "40 + 20 + 5 + 1.5 + 1.5 + 1 + 1 + 3 per cent"
+            );
+            assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
+        }
+        for name in ["datadisk", "datafs"] {
+            let r = TABLE.iter().find(|r| r.name == name).unwrap();
+            assert_eq!(r.budgets.iter().map(|b| b.share_ppm()).sum::<u64>(), 10_000);
+        }
     }
 
     #[test]

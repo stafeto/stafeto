@@ -1101,6 +1101,12 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs.push(("mem-blk", "mem-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
         programs.push(("pkg", "pkg", 0, &[]));
+        // The data volume (init's records `datadisk`, `datafs` and `datakey`): the NVMe disk
+        // service built with no feature (the test `no_shipped_image_builds_nvme_blk_with_a_crash_or_a_break_feature` keeps it so), the
+        // data file service and the host key service.
+        programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
+        programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
+        programs.push(("datakey", "datakey", 128 * 1024, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -16305,6 +16311,46 @@ mod entropy_in_images_tests {
             }
         }
         assert!(lacking.is_empty(), "no entropy service: {lacking:#?}");
+    }
+
+    /// The features of the first `nvme-blk` of a list that has any: the disk service of the data
+    /// volume ships with none. `crash` gives a client the method that ends the service, and each
+    /// `break-*` feature is a fault built in on purpose for a probe (`break-nvme-identity` makes
+    /// the check of the volume's identity always pass).
+    fn nvme_blk_features(programs: &[ImageProgram]) -> Option<&'static [&'static str]> {
+        programs
+            .iter()
+            .find(|p| p.1 == "nvme-blk" && !p.3.is_empty())
+            .map(|p| p.3)
+    }
+
+    #[test]
+    fn no_shipped_image_builds_nvme_blk_with_a_crash_or_a_break_feature() {
+        let shipped: [(&str, &[ImageProgram]); 4] = [
+            ("aws_programs", aws_programs()),
+            ("aws_qemu_programs", aws_qemu_programs()),
+            ("shell_programs", shell_programs()),
+            ("doom::programs", crate::doom::programs()),
+        ];
+        for (name, programs) in shipped {
+            assert_eq!(nvme_blk_features(programs), None, "{name}");
+        }
+        for (name, programs) in [
+            ("aws_programs", aws_programs()),
+            ("aws_qemu_programs", aws_qemu_programs()),
+        ] {
+            for program in ["nvme-blk", "datafsd", "datakey"] {
+                assert!(
+                    programs.iter().any(|p| p.1 == program),
+                    "{name} has no {program}"
+                );
+            }
+        }
+        // The check sees a build with a fault.
+        let crashing = [("nvme-blk", "nvme-blk", 0, &["crash"][..])];
+        assert_eq!(nvme_blk_features(&crashing), Some(&["crash"][..]));
+        let broken = [("nvme-blk", "nvme-blk", 0, &["break-nvme-identity"][..])];
+        assert!(nvme_blk_features(&broken).is_some());
     }
 
     /// A failing `cargo tree` gives an error.

@@ -218,6 +218,28 @@ mod tests {
         assert!(!identity(&id, &want_name(b"sdf")));
     }
 
+    /// The bytes the measurement of a t4g.small gave (`nvme-map.txt` of the fixtures): the name of
+    /// the block device, without `/dev/`, padded with spaces to 32 bytes.
+    #[test]
+    fn the_measured_names_of_ebs_pass_or_fail_the_data_volume_check() {
+        let mut sdf = [0x20u8; 32];
+        sdf[..3].copy_from_slice(&[0x73, 0x64, 0x66]);
+        let mut xvda = [0x20u8; 32];
+        xvda[..4].copy_from_slice(&[0x78, 0x76, 0x64, 0x61]);
+        let mut id = [0u8; 4096];
+        let mut want = [0u8; 32];
+        want[..3].copy_from_slice(b"sdf");
+        let want = Want::EbsName(want);
+        id[EBS_NAME_AT..EBS_NAME_AT + 32].copy_from_slice(&sdf);
+        assert!(identity(&id, &want));
+        id[EBS_NAME_AT..EBS_NAME_AT + 32].copy_from_slice(&xvda);
+        assert!(!identity(&id, &want));
+        // The same through the arguments of the record: kind 2 and the name.
+        let mut own = [0u8; ADDRESS_BYTES + 4];
+        own[ADDRESS_BYTES..].copy_from_slice(b"\x02sdf");
+        assert_eq!(Want::parse(&own), want);
+    }
+
     use super::timer_wanted;
 
     #[test]
