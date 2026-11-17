@@ -1130,34 +1130,22 @@ fn request<S: Service<K>, const K: usize>(
         token: Some(token),
         reply: None,
     };
-    let mut at = seat.expect("seated");
-    // One call site of the handler (two inlined copies double the frame of the loop): a request
-    // refused for room goes round once more after the steps of cleanup.
-    let (mut again, mut settled) = (false, Settled::Nothing);
-    let answer = loop {
-        let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
-        if let Answer::Status(refusal) = &answer {
-            if again {
-                if settled == Settled::Pending
-                    && service.refused_for_room(r.header.method, *refusal) == Refusal::Retry
-                {
-                    answer = Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN));
-                }
-            } else if r.token.is_some()
-                && service.refused_for_room(r.header.method, *refusal) != Refusal::Other
-            {
-                settled = service.settle(table);
-                if bare
-                    && settled != Settled::Nothing
-                    && let Some(next) = session_index::<S, K>(service, table, label, place, issued)
-                {
-                    (at, again) = (next, true);
-                    continue;
-                }
-            }
-        }
-        break answer;
-    };
+    let at = seat.expect("seated");
+    let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
+    if let Answer::Status(refusal) = &answer
+        && r.token.is_some()
+        && service.refused_for_room(r.header.method, *refusal) != Refusal::Other
+    {
+        let refusal = *refusal;
+        answer = ask_again(
+            service,
+            table,
+            (label, place, issued),
+            bare,
+            &mut r,
+            refusal,
+        );
+    }
     let Some(token) = r.token.take() else {
         return;
     };
@@ -1183,6 +1171,38 @@ fn request<S: Service<K>, const K: usize>(
             owed,
         ),
     }
+}
+
+/// A request refused for room: the steps of cleanup it makes (`Service::settle`), and the handler
+/// asked again once they made progress; the answer is the refusal of the earlier try when they
+/// made none, and TRY_AGAIN when the room is still short with cleanup left and the service says
+/// the refusal may be tried again (`Refusal::Retry`). Out of line, so that the frame of the loop
+/// of a service that never refuses for room does not grow.
+#[inline(never)]
+#[cold]
+fn ask_again<S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &mut [Option<Session<S::Data, K>>],
+    (label, place, issued): (u64, Option<usize>, u32),
+    bare: bool,
+    r: &mut Request<'_>,
+    refusal: Status,
+) -> Answer {
+    let settled = service.settle(table);
+    if bare
+        && settled != Settled::Nothing
+        && let Some(at) = session_index::<S, K>(service, table, label, place, issued)
+    {
+        let answer = service.request(table[at].as_mut().expect("seated"), r);
+        if let Answer::Status(again) = &answer
+            && settled == Settled::Pending
+            && service.refused_for_room(r.header.method, *again) == Refusal::Retry
+        {
+            return Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN));
+        }
+        return answer;
+    }
+    Answer::Status(refusal)
 }
 
 /// The reply `bytes` with `handles` to the request `token` names. It waits

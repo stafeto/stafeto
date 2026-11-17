@@ -66,7 +66,7 @@ const CHUNK: u32 = 64;
 const WRITES: usize = 1;
 /// The pieces of output a Flow request sends to the driver at most, and a write: each is a call
 /// to the driver and the step of a request is bounded.
-const FLOW_PUSHES: usize = 32;
+const FLOW_PUSHES: usize = 4;
 const WRITE_PUSHES: usize = 1;
 /// The bytes of a client's write one step takes at most: a write of
 /// more gets the count of those (the layer writes the rest).

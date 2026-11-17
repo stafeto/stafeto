@@ -5148,7 +5148,11 @@ impl Service<0> for Processes {
             let mask = self.terminals.leader_ended(r.sid);
             if let Some(notice) = self.terminal_notice.as_ref() {
                 // A leader whose terminal link was already ended names no terminal: all are asked.
-                let bits = if mask == 0 { u64::MAX } else { mask };
+                let bits = if mask == 0 {
+                    (1u64 << proto_process::TERMINALS) - 1
+                } else {
+                    mask
+                };
                 let _ = sys::notify(notice, bits);
             }
         }

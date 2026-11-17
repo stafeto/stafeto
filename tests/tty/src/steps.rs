@@ -570,7 +570,15 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     .write(Method::Flow, &mut w)
     .map_err(fail)?;
     status_call(probe, w.as_bytes())?;
-    let after = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    // The request sends a few pieces (its step is bounded); the steps of the service send the
+    // rest, and the count the driver took is read until it settles.
+    let mut after = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    for _ in 0..5000 {
+        if after - before >= 4096 {
+            break;
+        }
+        after = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    }
     if after - before != 4096 {
         return Err("accepted flow characters or cancelled writes changed the output count");
     }

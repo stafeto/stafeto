@@ -7201,12 +7201,10 @@ const TICK_NS: u64 = 16;
 /// gives the calling thread its own level back, T - C, for each service in the chain that is
 /// demoted (a hop, counted once), and the levels above work inside the wait:
 ///
-/// - the waits of kinds 64 to 66 (a notification, maintenance, a session that is gone) and every
-///   request of the terminal service (tag 5: a request may call the process service, a
-///   TtySignal or a vouch, which queues the walk of a TtySignal) have one hop, the service's
-///   own: CALL_WAIT_MAX + ticks(T - C);
-/// - every other kind may call another of the three services, which may itself be demoted, so
-///   its bound is CALL_WAIT_MAX plus the hops of the three services, one each;
+/// - a call of a step may reach another of the three services, which may itself be demoted
+///   (the RAM service's job round with the pipe service, a TtySignal of the terminal service
+///   through the process service to the others), so every kind of a service with a budget has
+///   CALL_WAIT_MAX plus the hops of the three services, one each (a chain visits a service once);
 /// - a service without a budget keeps CALL_WAIT_MAX.
 ///
 /// Every term comes from the table's constants.
@@ -7225,11 +7223,8 @@ fn call_wait_max(tag: &str, kind: usize) -> u64 {
     if budgets(tag).is_empty() {
         return CALL_WAIT_MAX;
     }
-    if (64..=66).contains(&kind) || tag == "5" {
-        CALL_WAIT_MAX + hop(tag)
-    } else {
-        CALL_WAIT_MAX + hop("2") + hop("4") + hop("5")
-    }
+    let _ = kind;
+    CALL_WAIT_MAX + hop("2") + hop("4") + hop("5")
 }
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
@@ -14482,44 +14477,29 @@ mod tests {
             "2" => init::table::ramfs::RAM_BUDGET_ON,
             _ => true,
         };
-        // The terminal and pipe services: (5 ms - 75 us) / 16 ns = 307 812 ticks more.
-        // Every request of the terminal service may wait behind the walk of a TtySignal.
-        assert_eq!(call_wait_max("5", 21), 355_812);
-        assert_eq!(call_wait_max("5", 28), 355_812);
-        assert_eq!(call_wait_max("5", 10), 355_812);
-        let seen = vec!["service wait: 5 kind 21 86546 ticks of 92072".to_owned()];
-        assert!(check_waits(&seen, &["5"], "t").is_ok());
+        // The hops: (5 ms - 75 us) / 16 ns = 307 812 ticks for the pipe and terminal services and
+        // (5 ms - 250 us) / 16 ns = 296 875 for the RAM service, one each in every chain.
         let ram_hop = if on("2") { 296_875 } else { 0 };
-        for tag in ["4", "5"] {
-            assert_eq!(call_wait_max(tag, 65), 355_812);
-            assert_eq!(call_wait_max(tag, 64), 355_812);
-            assert_eq!(call_wait_max(tag, 66), 355_812);
+        let all = CALL_WAIT_MAX + ram_hop + 2 * 307_812;
+        for kind in [10, 21, 28, 63, 64, 65, 66] {
+            assert_eq!(call_wait_max("5", kind), all);
+            assert_eq!(call_wait_max("4", kind), all);
         }
-        // The other kinds of the pipe service: the hops of the three services, one each.
         assert_eq!(
-            call_wait_max("4", 63),
-            CALL_WAIT_MAX + ram_hop + 2 * 307_812
+            call_wait_max("2", 65),
+            if on("2") { all } else { CALL_WAIT_MAX }
         );
-        assert_eq!(
-            call_wait_max("4", 10),
-            CALL_WAIT_MAX + ram_hop + 2 * 307_812
-        );
-        // The RAM service: (5 ms - 250 us) / 16 ns = 296 875 ticks more.
-        let ram = if on("2") { 344_875 } else { CALL_WAIT_MAX };
-        assert_eq!(call_wait_max("2", 65), ram);
         assert_eq!(
             call_wait_max("2", 25),
-            if on("2") {
-                CALL_WAIT_MAX + 296_875 + 2 * 307_812
-            } else {
-                CALL_WAIT_MAX
-            }
+            if on("2") { all } else { CALL_WAIT_MAX }
         );
+        let seen = vec!["service wait: 5 kind 21 86546 ticks of 92072".to_owned()];
+        assert!(check_waits(&seen, &["5"], "t").is_ok());
         // A service without a budget keeps the bound.
         assert_eq!(call_wait_max("10", 65), CALL_WAIT_MAX);
-        let line = |w: u64| vec![format!("service wait: 5 kind 65 {w} ticks of 400000")];
-        assert!(check_waits(&line(355_812), &["5"], "t").is_ok());
-        assert!(check_waits(&line(355_813), &["5"], "t").is_err());
+        let line = |w: u64| vec![format!("service wait: 5 kind 65 {w} ticks of 1200000")];
+        assert!(check_waits(&line(all), &["5"], "t").is_ok());
+        assert!(check_waits(&line(all + 1), &["5"], "t").is_err());
     }
 
     /// The lines of a run for `getlimit_bound`: five services above the
