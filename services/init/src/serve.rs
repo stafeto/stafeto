@@ -722,7 +722,7 @@ impl Init {
             // pkg-identity keeps it from 16 384 pages). The other images
             // print nothing more: a line at this point moves the time of
             // the boot, and posix-lock-pages measures a sleep against it.
-            #[cfg(feature = "table-base")]
+            #[cfg(any(feature = "table-base", feature = "table-aws-qemu"))]
             if let Ok(memory) = sys::process_memory(&self.own) {
                 println!(
                     "init: free pages {} of {}",

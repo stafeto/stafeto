@@ -31,10 +31,15 @@
 //! 6. The scan: of the ports of the host's forwards (1 to 1 024, 8 000 to 8 199 and a few usual
 //!    ones) only 22, 80, 443 and 8080 keep a connection open.
 //! 7. The console shows no fault.
+//! 8. The data volume (`persist`, also `cargo xtask net-try persist` alone): the same image on
+//!    EFI's machine with a second NVMe controller that stands for the second EBS volume. The first
+//!    boot formats it and keeps the host key, the second boot of the same file mounts it and
+//!    serves the same key; with no controller the record is left out and the key is new; a
+//!    controller with another serial number over a blank-looking file is left alone.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -42,8 +47,8 @@ use crate::net_ssh::{Client, host_ssh, make_key, run_for};
 use crate::qemu::{Forward, Proto};
 use crate::rootfs::{RootFile, Source};
 use crate::{
-    BOOT_PROFILE, SERVICES_STARTED, Variant, build, busybox_build, keys, nano_build, packages,
-    pkg_probe, probe_ca, qemu, relibc, rootfs, symbolize,
+    Artifacts, BOOT_PROFILE, SERVICES_STARTED, Variant, build, busybox_build, efi, keys,
+    nano_build, packages, pkg_probe, probe_ca, qemu, relibc, rootfs, symbolize,
 };
 
 /// The image of the run.
@@ -409,7 +414,7 @@ fn https_get(port: u16) -> Result<(Vec<u8>, String), String> {
 }
 
 /// What the page must say (the plan's section 3, item 4, and section 1, item 6).
-const PAGE_SAYS: [&str; 15] = [
+const PAGE_SAYS: [&str; 17] = [
     "experimental operating system",
     "microkernel written in Rust",
     "This is an experimental system",
@@ -422,6 +427,8 @@ const PAGE_SAYS: [&str; 15] = [
     "pkg install htop",
     "A reboot or a stop of the instance removes them all",
     "changes each time the instance starts",
+    "stays the same after a reboot and after a stop and start",
+    "left out of the block device mappings",
     ":8080/",
     "<td>8080</td>",
     "nginx-fast",
@@ -596,18 +603,34 @@ fn guest_ok(
 
 /// `cargo xtask net-try [MACHINE]`.
 pub fn command(args: &[String]) -> Result<(), String> {
+    let (persist_only, args) = match args {
+        [first, rest @ ..] if first == "persist" => (true, rest),
+        _ => (false, args),
+    };
     let machine = match args {
         [] => &qemu::VIRT_2G,
         [name] => match name.as_str() {
             "tcg" => &qemu::VIRT_2G,
             other => qemu::machine(Some(&other.to_owned()))?,
         },
-        _ => return Err("usage: cargo xtask net-try [tcg]".to_owned()),
+        _ => return Err("usage: cargo xtask net-try [persist] [tcg]".to_owned()),
     };
+    if persist_only {
+        return persist_probe(machine);
+    }
     probe(machine)
 }
 
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
+    run_probe(machine, false)
+}
+
+/// `cargo xtask net-try persist`: only the cases of the data volume (`persist`), on EFI's machine.
+fn persist_probe(machine: &'static qemu::Machine) -> Result<(), String> {
+    run_probe(machine, true)
+}
+
+fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), String> {
     // The table holds 1.2 GiB of quotas (the memory the try-out is sized for is a t4g.small's 2 GiB).
     if machine.ram() < 2 << 30 {
         return Err(format!(
@@ -654,6 +677,9 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     )?;
     check_built(&image)?;
     check_notices(&image, IMAGE)?;
+    if persist_only {
+        return persist(&kernel, &image, &dir, &good);
+    }
     let mirror = pkg_probe::Mirror::start(
         &www,
         MIRROR_PORT,
@@ -893,6 +919,341 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         elapsed.as_secs_f64(),
         machine.name
     );
+    // The same image with a data volume: the host key outlives the boot.
+    persist(&kernel, &image, &dir, &good)
+}
+
+// ---- the data volume ---------------------------------------------------------------------
+
+/// The size of the file that stands for the data volume (sparse).
+const VOLUME_BYTES: u64 = 64 << 20;
+/// The serial number the record `datadisk` of the image on QEMU asks for.
+const DATA_SERIAL: &str = "stafeto-data";
+/// The serial number of the boot disk, which the record never names.
+const OTHER_SERIAL: &str = "stafeto-esp";
+/// The line of the disk service that leaves a volume alone.
+const LEFT_ALONE: &str = "nvme: datadisk is not the data volume, left alone";
+/// The line of the boot script that gives the fingerprint of the host key.
+const KEY_LINE: &str = "ssh: host key SHA256:";
+
+/// What the machine has as the second NVMe controller.
+enum Volume<'a> {
+    /// No second controller.
+    Absent,
+    /// A controller with this serial number over this file.
+    Serial(&'a str, &'a Path),
+}
+
+/// One boot of the image on EFI's machine: the lines of the console, the fingerprint the client
+/// saw at a login (the file `known_hosts` of `ssh_dir`), and the lines that were wanted.
+struct Booted {
+    lines: Vec<String>,
+    seen: String,
+}
+
+impl Booted {
+    fn said(&self, text: &str) -> bool {
+        self.lines.iter().any(|l| l.contains(text))
+    }
+
+    fn position(&self, text: &str) -> Option<usize> {
+        self.lines.iter().position(|l| l.contains(text))
+    }
+
+    /// The fingerprint of the boot script's line.
+    fn fingerprint(&self) -> Result<String, String> {
+        let found: Vec<&str> = self
+            .lines
+            .iter()
+            .filter_map(|l| l.split_once(KEY_LINE).map(|(_, f)| f.trim()))
+            .collect();
+        match found.as_slice() {
+            [one] if !one.is_empty() => Ok(format!("SHA256:{one}")),
+            other => Err(format!(
+                "one line {KEY_LINE:?} wanted, the console has {other:?}"
+            )),
+        }
+    }
+}
+
+/// The SHA-256 of a file as text.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = [0u8; 64];
+    Ok(pkgfmt::sha::hex(&pkgfmt::sha::sha256(&bytes), &mut buf).to_string())
+}
+
+/// What every boot of `persist` shares.
+struct Rig<'a> {
+    firmware: efi::Firmware,
+    esp: PathBuf,
+    elf: &'a Path,
+    good: &'a Path,
+    dir: &'a Path,
+}
+
+/// Boots the image from `esp` on EFI's machine with `volume` as the second controller, waits for
+/// the boot script's lines and `wanted`, logs in with `good` and reads the host key the client
+/// saw, then stops the machine.
+fn boot_with_volume(
+    rig: &Rig,
+    volume: &Volume,
+    case: &str,
+    wanted: &[(&str, &str)],
+) -> Result<Booted, String> {
+    let Rig {
+        firmware,
+        esp,
+        elf,
+        good,
+        dir,
+    } = rig;
+    let ssh_dir = dir.join(format!("persist-{case}"));
+    let _ = std::fs::remove_dir_all(&ssh_dir);
+    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("{}: {e}", ssh_dir.display()))?;
+    let port = free_ports(1)?[0];
+    let forwards = [Forward {
+        proto: Proto::Tcp,
+        host: port,
+        guest: 22,
+    }];
+    let vars = format!("net-try-{case}");
+    let mut cmd = efi::command(&efi::EFI_2G, firmware, esp, true, &vars)?;
+    if let Volume::Serial(serial, file) = volume {
+        cmd.arg("-drive").arg(format!(
+            "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+            file.display()
+        ));
+        cmd.args([
+            "-device",
+            &format!("nvme,serial={serial},bus=pcie.0,addr=0x4,drive=data"),
+        ]);
+    }
+    cmd.args(qemu::net(&forwards));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let client = Client {
+        port,
+        dir: ssh_dir.clone(),
+    };
+    let talked = (|| {
+        let mut every = vec![
+            ("the lease", "net: lease "),
+            (
+                "the key of the probe",
+                "ec2-key: the key of the probe is placed",
+            ),
+            ("the SSH host key", KEY_LINE),
+            ("the server", "dropbear: dropbear -F"),
+            ("the free pages of init", "init: free pages "),
+        ];
+        every.extend_from_slice(wanted);
+        console_lines(&mut run, &every, BOOT_WITHIN)?;
+        // The login: the server may not listen yet when its line is on the console.
+        let began = Instant::now();
+        loop {
+            let tried = guest(&client, good, "echo ssh-ok-$((6*7))", SSH_WITHIN);
+            match &tried {
+                Ok(said) if said.code == Some(0) && said.text().contains("ssh-ok-42") => break,
+                Ok(said) if began.elapsed() > SSH_WITHIN => {
+                    return Err(format!(
+                        "no login on the case {case}: {:?} {:?} {:?}",
+                        said.code,
+                        said.text(),
+                        said.stderr
+                    ));
+                }
+                Err(why) if began.elapsed() > SSH_WITHIN => {
+                    return Err(format!("no login on the case {case}: {why}"));
+                }
+                _ => std::thread::sleep(Duration::from_secs(3)),
+            }
+        }
+        let known = Command::new("ssh-keygen")
+            .arg("-l")
+            .arg("-f")
+            .arg(ssh_dir.join("known_hosts"))
+            .output()
+            .map_err(|e| format!("ssh-keygen: {e}"))?;
+        Ok(String::from_utf8_lossy(&known.stdout).into_owned())
+    })();
+    let output = run.stop();
+    symbolize::backtrace(&output.lines, elf);
+    let seen = talked?;
+    if let Some(line) = output.lines.iter().find(|l| {
+        l.contains("process fault:")
+            || l.contains("KERNEL PANIC")
+            || l.contains("out of memory")
+            || l.contains("; restarts in ")
+    }) {
+        return Err(format!(
+            "the case {case} faulted or restarted a service: {line}"
+        ));
+    }
+    Ok(Booted {
+        lines: output.lines,
+        seen,
+    })
+}
+
+/// The cases of the data volume on the image of the try-out (the table `table-aws-qemu`, whose
+/// records `datadisk`, `datafs` and `datakey` mirror EC2's): the second NVMe controller of EFI's
+/// machine stands for the second EBS volume. The first boot of a blank volume formats it and
+/// keeps the host key; the second boot of the same file mounts it, never formats it again, and
+/// serves the same key (the console and the client say so). With no second controller the record
+/// is left out and the key is new at each boot. A controller with another serial number over a
+/// file that looks blank is left alone: the file's SHA-256 is the same after the boot.
+fn persist(kernel: &Artifacts, image: &Path, dir: &Path, good: &Path) -> Result<(), String> {
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = crate::target_dir().join("efi-disk-net-try.raw");
+    let artifacts = Artifacts {
+        boot_image: image.to_path_buf(),
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let volume = dir.join("data-volume.raw");
+    qemu::store_file(&volume, VOLUME_BYTES, true)?;
+    let rig = Rig {
+        firmware,
+        esp,
+        elf: &kernel.elf,
+        good,
+        dir,
+    };
+    let boot = |volume: &Volume, case: &str, wanted: &[(&str, &str)]| {
+        boot_with_volume(&rig, volume, case, wanted)
+    };
+    let kept = |b: &Booted, key: &str| -> Result<(), String> {
+        if !b.seen.contains(key) {
+            return Err(format!(
+                "the client saw {:?}, the console said {key}",
+                b.seen
+            ));
+        }
+        Ok(())
+    };
+
+    // 1. A blank volume: formatted, the key kept.
+    let first = boot(
+        &Volume::Serial(DATA_SERIAL, &volume),
+        "first",
+        &[
+            ("the key kept", "datakey: host key saved to /data"),
+            ("the volume formatted", "data volume formatted"),
+        ],
+    )?;
+    if !first.said("datakey: no host key on /data") {
+        return Err("the first boot did not find a blank volume".into());
+    }
+    let before = first.fingerprint()?;
+    kept(&first, &before)?;
+    println!(
+        "net-try persist: the first boot formatted the blank volume and kept the host key ({before})"
+    );
+    let free_first = first
+        .lines
+        .iter()
+        .find(|l| l.contains("init: free pages "))
+        .cloned()
+        .unwrap_or_default();
+
+    // 2. The same file: mounted, never formatted again, the same key served.
+    let second = boot(
+        &Volume::Serial(DATA_SERIAL, &volume),
+        "second",
+        &[
+            ("the key restored", "datakey: host key restored from /data"),
+            ("the volume mounted", "datafs: data volume mounted"),
+        ],
+    )?;
+    if second.said("data volume formatted") || second.said("datakey: no host key") {
+        return Err("the second boot formatted the volume or found no key".into());
+    }
+    let after = second.fingerprint()?;
+    if before != after {
+        return Err(format!(
+            "the host key changed between two boots of one volume: {before} then {after}"
+        ));
+    }
+    kept(&second, &before)?;
+    let order = (
+        second.position("datakey: host key restored from /data"),
+        second.position(KEY_LINE),
+        second.position("dropbear: dropbear -F"),
+    );
+    match order {
+        (Some(restored), Some(key), Some(server)) if restored < key && key < server => {}
+        other => {
+            return Err(format!(
+                "the server did not start with the restored key, the lines stand at {other:?}"
+            ));
+        }
+    }
+    println!(
+        "net-try persist: the second boot of the same volume mounted it, formatted nothing, and Dropbear served the same key ({after}) on the console and to the client"
+    );
+
+    // 3. No second controller: the record is left out, the key is new.
+    let bare = boot(
+        &Volume::Absent,
+        "absent",
+        &[("the record left out", "init: left out: ")],
+    )?;
+    if !bare.said("init: left out: datadisk") || !bare.said("datafs: no disk: ") {
+        return Err("the boot with no volume did not leave datadisk out".into());
+    }
+    if bare.said("datakey: host key saved") || bare.said("datakey: host key restored") {
+        return Err("a key was kept or restored with no volume".into());
+    }
+    let key = bare.fingerprint()?;
+    kept(&bare, &key)?;
+    if key == before {
+        return Err("the key with no volume is the key of the volume".into());
+    }
+    println!(
+        "net-try persist: with no second controller init left datadisk out, datafs has no disk, and the key is a per-boot one ({key})"
+    );
+
+    // 4. Another serial number over a file that looks blank: left alone, the file unchanged.
+    let wrong = dir.join("wrong-volume.raw");
+    qemu::store_file(&wrong, VOLUME_BYTES, true)?;
+    let digest = file_sha256(&wrong)?;
+    let stranger = boot(
+        &Volume::Serial(OTHER_SERIAL, &wrong),
+        "wrong",
+        &[("the volume left alone", LEFT_ALONE)],
+    )?;
+    let left = stranger
+        .lines
+        .iter()
+        .filter(|l| l.contains(LEFT_ALONE))
+        .count();
+    if left != 1 {
+        return Err(format!("{left} lines {LEFT_ALONE:?}, one expected"));
+    }
+    if stranger.said("data volume formatted")
+        || stranger.said("datakey: host key saved")
+        || stranger.said("datakey: host key restored")
+        || !stranger.said("datafs: no disk: ")
+    {
+        return Err("the controller with another serial number was served".into());
+    }
+    let key = stranger.fingerprint()?;
+    kept(&stranger, &key)?;
+    if key == before {
+        return Err("the key of the other volume is the key of the data volume".into());
+    }
+    let digest_after = file_sha256(&wrong)?;
+    if digest != digest_after {
+        return Err(format!(
+            "the file of the other controller changed: SHA-256 {digest} before, {digest_after} after"
+        ));
+    }
+    println!(
+        "net-try persist: the controller with another serial number was left alone, the file that looks blank has the same SHA-256 after the boot ({digest_after}), and the key is a per-boot one"
+    );
+    println!("net-try persist: {free_first}");
+    println!("net-try persist passed");
     Ok(())
 }
 
