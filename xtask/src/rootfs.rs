@@ -863,7 +863,7 @@ pub fn check_owners(
 ) -> Result<(), String> {
     let mut wrong = Vec::new();
     for f in files {
-        let owners: Vec<&str> = packages
+        let mut owners: Vec<&str> = packages
             .iter()
             .filter(|p| {
                 p.files.iter().any(|(path, _)| path == f.path) || p.dirs.iter().any(|d| d == f.path)
@@ -871,6 +871,11 @@ pub fn check_owners(
             .map(|p| p.name.as_str())
             .chain(is_system(f.path).then_some("system"))
             .collect();
+        // The directories above the time zones belong to the system in an image that holds no
+        // package that makes them (ncurses does, in the images with the add-ons).
+        if owners.is_empty() && matches!(f.path, "/usr" | "/usr/share") {
+            owners.push("system");
+        }
         if owners.len() != 1 {
             wrong.push(format!("{} ({})", f.path, owners.join(", ")));
         }
