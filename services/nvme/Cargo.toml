@@ -1,0 +1,37 @@
+[package]
+name = "nvme-blk"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The disk service over an NVMe controller (a PCI function of class 0x010802): the store of the package service on a disk of EBS or QEMU"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "nvme-blk"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's feature step-stats), for
+# the measurement under -icount.
+# `break-nvme-write-offset`: a write lands one sector past where it was asked, so the store the
+# package service wrote is not the one it reads back (`cargo xtask nvme-persist breaks`).
+[features]
+steps = ["rt/step-stats"]
+break-nvme-write-offset = []
+
+[dependencies]
+
+# The program alone runs on stafeto: the host tests of the library build without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+abi = { path = "../../lib/abi" }
+nvme = { path = "../../lib/nvme" }
+pci = { path = "../../lib/pci" }
+proto-blk = { path = "../../proto/blk" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
+virtio-blk = { path = "../virtio-blk" }

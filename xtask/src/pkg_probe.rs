@@ -1362,8 +1362,13 @@ fn memory_first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), Strin
             "memory: Doom should be in the store again: {lines:?}"
         ));
     }
-    ctx.report
-        .push("pkg install doom again: 2 packages in the store before the reboot".into());
+    // The files the install put back are the ones of a program that runs.
+    let demo = format!("doom -iwad {WAD} -timedemo demo1 -nodraw");
+    let timed = demo_run(run, &demo, "m1-demo")?;
+    ctx.report.push(format!(
+        "pkg install doom again: 2 packages in the store before the reboot, the demo runs: timed {} gametics",
+        timed.0
+    ));
     Ok(())
 }
 
