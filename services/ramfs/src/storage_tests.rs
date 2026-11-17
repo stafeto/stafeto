@@ -834,7 +834,7 @@ fn a_truncated_chain_is_owed_by_nobody_and_its_pages_wait_for_the_maintenance() 
     ram.storage
         .truncate_zero(file, proto_fs::Timestamp::legacy_ns(1))
         .unwrap();
-    // The charge went at once; the pages are on the FIFO and not yet on the free list.
+    // The charge went at once; the pages wait on the FIFO, off the free list until the maintenance moves them.
     assert_eq!(ram.storage.usage(FIRST).pages, 0);
     assert_eq!(ram.storage.available().pages, free - 3);
     while ram.storage.reclaim_step() {}
