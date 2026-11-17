@@ -7,7 +7,7 @@
 # the package's settings (port 80 alone) and one line says so.
 #
 # Console lines of a good start:
-#   web: certificate SHA256 Fingerprint=...
+#   web: certificate sha256 Fingerprint=...
 #   web: nginx on 80 and 443
 # From nginx itself: `start worker process` for each of its two workers.
 

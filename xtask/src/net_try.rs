@@ -581,6 +581,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
 
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     println!("net-try: host client {}", host_ssh()?);
+    // The key of the run goes first: the script of the image that writes it is made once, from
+    // the key as it is when the lists of the image are first read.
+    let dir = crate::target_dir().join("net-try");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (good, good_line) = make_key(&dir, "good")?;
+    KEY.set(good_line)
+        .map_err(|_| "the key of the run is set twice".to_owned())?;
     // Step 0 on the lists, before anything is built.
     for image in [AWS_IMAGE, IMAGE] {
         for line in check_image(image)? {
@@ -592,13 +600,6 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     nano_build()?;
     crate::net_build()?;
     let kernel = build(Variant::Normal)?;
-    let dir = crate::target_dir().join("net-try");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let (good, good_line) = make_key(&dir, "good")?;
-    KEY.set(good_line)
-        .map_err(|_| "the key of the run is set twice".to_owned())?;
-
     // The mirror of the probe: one small base package, signed by the development keys.
     let ca = probe_ca::ensure(false)?;
     keys::dev_keys(&crate::root())?;

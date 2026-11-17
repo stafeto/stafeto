@@ -25,7 +25,7 @@
 #        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
 #        landing: page written for ADDRESS (t4g.small)
-#        web: certificate SHA256 Fingerprint=...
+#        web: certificate sha256 Fingerprint=...
 #        web: nginx on 80 and 443
 #        fast: nginx-fast on 8080
 #      Lines that must not appear:
