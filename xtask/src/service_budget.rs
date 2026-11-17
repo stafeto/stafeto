@@ -9,15 +9,20 @@
 //! while 8 clients at 20 queue the dear request (the level-40 phase). The two-CPU probe
 //! (`two-cpu`) prints its numbers for information: its emulator advances the clock of CPU 0
 //! while CPU 1 runs. The guarantee the probe checks: a service whose budget is spent works at
-//! level 32 and takes at most C of each T from the levels 33 and above, which is why the victim
-//! sits at 34 (below the network service at 35); for the levels at or below 32 the three
-//! services are services without a budget and the probe promises nothing.
+//! level 1 and takes at most C of each T from every level above it, which is why the victim sits
+//! at 31, the highest level of the POSIX processes.
 //!
-//! Two limits of the gates. The starvation gate is a regression check on the cost of a budget:
-//! it cannot see a missing budget, because the work 24 clients refill in a cycle is small (the
-//! unbound RAM service keeps the victim at 968 per mille against a bound of 827), so a service
-//! that binds no budget is caught by the missing line `<service>: serve runs under its budget`.
-//! The level-40 gate takes `s_max` from requests asked with the budget fresh (see `level40` in
+//! The starvation gate has two parts and every term of both comes from the constants of the code
+//! (C, T, the step limit of 18 369 ticks, the kernel's longest stretch) or from the control
+//! phase of the same run (the cost e of one timer event of a budget), never from the measured
+//! run of the service itself. The victim keeps its bound of its own active time in its worst 10
+//! cycles, and the ticks the service's `serve` budget charged over the phase (`BudgetInfo::ran`,
+//! read through a copy init gives the probe) are at most `ceil(P / T) * C` plus one overrun and
+//! at least one C. The first part is a regression check on the cost of a budget and cannot see a
+//! missing budget, because the work 24 clients refill in a cycle is small; the second sees it:
+//! the budget of a service that binds none charges nothing. `breaks` runs each
+//! `break-budget-unbound` image and requires the gate to fail on it, besides the missing line
+//! `<service>: serve runs under its budget`. The level-40 gate takes `s_max` from requests asked with the budget fresh (see `level40` in
 //! the probe), so that no replenishment wait lies inside it. `breaks` runs the same probe on
 //! images in which one service binds no budget (`break-budget-unbound` of its crate), each of
 //! which must fail the check of the lines, and on init with no `free` level
@@ -300,6 +305,11 @@ pub struct One {
     pub c_us: u64,
     pub e_us: u64,
     pub remainder_us: u64,
+    /// The ticks of the `serve` budget charged in the phase, its bound and its floor, in
+    /// microseconds.
+    pub ran_us: u64,
+    pub ran_bound_us: u64,
+    pub ran_floor_us: u64,
     pub requests_per_ping: u64,
     pub worst_request_us: u64,
     pub worst_wait_us: u64,
@@ -337,6 +347,9 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
                 one.median10 = number(line, "median10=")?;
                 one.bound10 = number(line, "bound10=")?;
                 one.c_us = number(line, "c_us=")?;
+                one.ran_us = number(line, "ran_us=")?;
+                one.ran_bound_us = number(line, "ran_bound_us=")?;
+                one.ran_floor_us = number(line, "ran_floor_us=")?;
             } else if line.starts_with("level40 ") {
                 leveled = true;
                 one.requests_per_ping = number(line, "requests_per_ping=")?;
@@ -355,9 +368,35 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
     Ok(all)
 }
 
+/// The account of one service's budget in the starvation phase: it charged at most
+/// `ceil(P / T) * C` and one overrun, and at least one C.
+pub fn verdict_ran_of(name: &str, o: &One) -> Result<(), String> {
+    if o.ran_us > o.ran_bound_us {
+        return Err(format!(
+            "{name}: the budget charged {} us in the phase, over {} us (ceil(P / T) * C and one overrun)",
+            o.ran_us, o.ran_bound_us
+        ));
+    }
+    if o.ran_us < o.ran_floor_us {
+        return Err(format!(
+            "{name}: the budget charged {} us in the phase, under {} us: the service is not under its budget or was not asked",
+            o.ran_us, o.ran_floor_us
+        ));
+    }
+    Ok(())
+}
+
+pub fn verdict_ran(all: &[One]) -> Result<(), String> {
+    for (name, o) in SERVICES.iter().zip(all) {
+        verdict_ran_of(name, o)?;
+    }
+    Ok(())
+}
+
 /// The starvation gate of the one-CPU probe: the victim kept, in its worst 10 cycles, its bound
-/// of its own active time.
+/// of its own active time, and each budget's account holds (`verdict_ran`).
 pub fn verdict_starve(all: &[One]) -> Result<(), String> {
+    verdict_ran(all)?;
     for (name, o) in SERVICES.iter().zip(all) {
         if o.cycles < 100 {
             return Err(format!(
@@ -394,13 +433,16 @@ pub fn verdict_level40(all: &[One]) -> Result<(), String> {
 fn one_table(all: &[One]) {
     for (name, o) in SERVICES.iter().zip(all) {
         println!(
-            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
+            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); budget charged {} us of at most {} (at least {}); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
             o.worst10,
             o.median10,
             o.bound10,
             o.c_us,
             o.e_us,
             o.remainder_us,
+            o.ran_us,
+            o.ran_bound_us,
+            o.ran_floor_us,
             o.requests_per_ping,
             o.worst_request_us,
             o.worst_wait_us,
@@ -522,20 +564,23 @@ pub fn breaks(only: Option<&str>) -> Result<(), String> {
                 ));
             }
         }
-        // The numbers of the unbound service are printed for information and do not judge. They cannot catch it: the
-        // work the clients refill in a cycle of 1 ms (24 clients, the dearest request each service
-        // offers) is 14, 61 and 39 us of service CPU for ramfs, pipe and tty (a write of 1000 bytes
-        // costs pipe and tty a few microseconds; the 180 us and 6 ms of `s_max` are round trips), so
-        // an unbound service at level 31 takes 2 to 8 per cent of the victim's 0.8 ms, never most
-        // of it. The enforcement of a budget is pinned in the kernel suite (`budget-hog`: a hog under
-        // a budget and its unbound break), and a service that fails to bind does not start. Do not
-        // add a check of the victim's share here.
-        if let Ok(all) = parse_one(&lines) {
-            let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
-            println!(
-                "budget-breaks: unbound {service}: the victim keeps {} per mille of its active time (a bound one keeps at least {}); printed for information",
-                all[at].worst10, all[at].bound10
-            );
+        // The victim's share cannot catch an unbound service: the work the clients refill in a
+        // cycle of 1 ms (24 clients, the dearest request each service offers) is 14, 61 and 39 us
+        // of service CPU for ramfs, pipe and tty, so an unbound service takes 2 to 8 per cent of
+        // the victim's 0.8 ms, never most of it. The account of the budget catches it: the
+        // budget of a service that binds none charges nothing, which is under its floor of one
+        // C, so the gate must fail on this image.
+        let all = parse_one(&lines)
+            .map_err(|e| format!("the one-CPU probe on the unbound {service}: {e}"))?;
+        let at = SERVICES.iter().position(|s| *s == service).unwrap_or(0);
+        match verdict_ran_of(service, &all[at]) {
+            Err(e) => println!("budget-breaks: the gate fails on the unbound {service} ({e})"),
+            Ok(()) => {
+                return Err(format!(
+                    "the gate passed on the unbound {service}: its budget charged {} us",
+                    all[at].ran_us
+                ));
+            }
         }
     }
     for (what, variant, key) in [
@@ -675,6 +720,29 @@ mod tests {
             require_service_budget_lines(&all)
                 .unwrap_err()
                 .contains("pipe")
+        );
+    }
+
+    #[test]
+    fn the_account_of_a_budget_is_held_between_one_c_and_its_periods_and_one_overrun() {
+        let one = |ran: u64| One {
+            ran_us: ran,
+            ran_bound_us: 31 * 250 + 444,
+            ran_floor_us: 250,
+            ..One::default()
+        };
+        assert!(verdict_ran_of("ramfs", &one(31 * 250)).is_ok());
+        // A budget that charged nothing is not bound: the unbound image fails here.
+        assert!(
+            verdict_ran_of("ramfs", &one(0))
+                .unwrap_err()
+                .contains("not under its budget")
+        );
+        // A budget that charged more than its periods and one overrun is not enforced.
+        assert!(
+            verdict_ran_of("ramfs", &one(31 * 250 + 445))
+                .unwrap_err()
+                .contains("over")
         );
     }
 }

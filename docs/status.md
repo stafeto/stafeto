@@ -240,12 +240,23 @@ Actions.
 - SMP runs on up to 8 CPUs (QEMU, HVF and VZ are tested with 4); the
   bounds of a real-time analysis on several CPUs still wait for a board
   (docs/smp.md).
-- Time budgets of the RAM file, pipe and terminal services: each takes at most C of each
-  T (5 ms) from the levels 33 and above (the network service and real-time work) and, once
-  its budget is spent, works at level 32, above every POSIX process. For the levels at or
-  below 32 these three are services without a budget, and the share of 20 % of CPU 0 for the
-  levels below the budgets is not promised in 0.5.0. A service that works at level 1 once its
-  budget is spent, with its own work in a thread of its own, is planned for 0.5.1.
+- Time budgets of the RAM file, pipe and terminal services: each has one budget `serve` of
+  T = 5 ms on CPU 0 for its request thread (RAM 250 us, pipe and terminal 75 us). Once it is
+  spent the thread works at level 1 until the next replenishment, so the service takes at most
+  C of each T from every level above 1 and the levels of the POSIX processes keep 23.3 % of
+  CPU 0 (the release promises 20 %). The work a blocked client waits on (end of file or a
+  broken pipe, the hang-up of a terminal, waking the waiters of a lock, handing a lock on) is
+  done in the notice or request that unblocks it. The work that frees a resource someone
+  needs (the descriptions and places of sessions that went, retired pages) is done by the
+  client that needs it, inside its refused request and on the time that request lends: up to
+  3 steps or 8 000 ticks, after which the request goes on, or the service answers an internal
+  "try again" that the library sends again without showing it to the program (every answer
+  made at least one step of progress, and the library gives up after 4 096). The rest of the
+  service's work (cleaning of caches) is optional and runs when no client needs the CPU. The
+  survivor of a departed session that asks no service sees the departure within
+  (T - C) + B, about 4.8 ms. Deferred: a thread of its own for the services' work under a
+  budget of its own, and stopping a loan when the budget of its lender runs out, which needs
+  kernel support (docs/service-budgets.md).
 - No PinePhone port yet.
 - `fork` copies everything the layer maps, with no copy on write (about
   70 us a MiB on HVF); mappings made past the

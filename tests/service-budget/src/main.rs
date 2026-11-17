@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The probe of the time budgets of the services (spec 8; `cargo xtask service-budget`), for
-//! QEMU under -icount with two CPUs, where the numbers of one build repeat to the tick. The
-//! RAM file, pipe and terminal services run as init starts them, with their budgets, on CPU 0.
-//! Each service has two phases of 200 ms, with a greedy client at 20 on CPU 1 that asks it
-//! without a pause (the RAM service a path of eight names, 488 bytes, to look up; the others a
-//! request their loop refuses for its header). The client sits on another CPU, so the service
-//! works for it at its own level on CPU 0, above whatever stands there:
+//! The probe of the time budgets of the services (spec 8; `cargo xtask service-budget`). The RAM
+//! file, pipe and terminal services run as init starts them, with their budgets, on CPU 0. A
+//! service whose budget is spent works at level 1 until the next replenishment, so the levels of
+//! the POSIX processes keep what the budgets leave. The gated probe runs on one CPU under
+//! -icount (`one_cpu`, below); the phases of two CPUs are printed for information, because the
+//! emulator advances the clock of CPU 0 while CPU 1 runs. Each service has two phases of 200 ms
+//! with a greedy client at 20 on CPU 1 that asks it without a pause (the RAM service a path of
+//! eight names, 488 bytes, to look up; the others a request their loop refuses for its header):
 //!
-//! - `share`: a victim at 34 on CPU 0 spins and notes the time it runs in buckets of 1 ms. The
-//!   service works at its own level for C of each T and, with its budget spent, at its demoted
-//!   level 32, below the victim, for the rest: the guarantee of the budgets is that it takes at
-//!   most C of each T from the levels 33 and above, and for the levels at or below 32 it is a
-//!   service without a budget (a victim at 25 would be starved by the demoted service, which is
-//!   no breach). The line gives, for windows of 1, 5 and 10 ms, the least share (per mille) the
-//!   victim got;
-//! - `ping`: a spinner at 10 on CPU 0 (below the demoted level 32, so it is only a load) and
-//!   the probe's own thread at 40 asks the service every 2 ms; the line gives the longest round
-//!   trip of its request.
+//! - `share`: a victim at 31, the highest level of the POSIX processes, on CPU 0 spins and notes
+//!   the time it runs in buckets of 1 ms. The line gives, for windows of 1, 5 and 10 ms, the
+//!   least share (per mille) the victim got;
+//! - `ping`: a spinner at 10 on CPU 0 is a load, and the probe's own thread at 40 asks the
+//!   service every 2 ms; the line gives the longest round trip of its request.
 //!
 //! An `idle` phase before them has the victim alone: the time it loses to the machine itself.
 
@@ -35,11 +31,10 @@ use rt::{Handle, Stack, println, sys, time};
 rt::entry!(main);
 
 const MS: u64 = 1_000_000;
-/// The level of the victims. The three services take at most C of each T from the levels 33 and
-/// above, and are services without a budget for the levels at or below 32 (the level they work
-/// at when their budget is spent, `low` in init's table: above every POSIX process, below the
-/// network service at 35), so the guarantee is judged for a victim above 32 and below 35.
-const VICTIM_LEVEL: u8 = 34;
+/// The level of the victims: 31, the highest level of the POSIX processes. The three services
+/// work at level 1 once their budget is spent (`low` in init's table), so they take at most C of
+/// each T from every level above 1.
+const VICTIM_LEVEL: u8 = 31;
 const PAGE: usize = 4096;
 /// The buckets of 1 ms the time of the victim is noted in.
 const BUCKETS: usize = 256;
@@ -483,7 +478,7 @@ fn wait_ended(wait: &Handle<Channel>, timer: &Handle<Timer>, greedies: u64) {
 }
 
 /// The control phase: the greedy client on CPU 1 asks a server of the probe at 5 on CPU 0, which
-/// has no budget and answers at the client's level (20), below the victim (34). What the victim
+/// has no budget and answers at the client's level (20), below the victim (31). What the victim
 /// loses here is what the greedy client costs it on its own (the interrupts, the rest of the
 /// machine's work across the two CPUs, which the 2-CPU machine under -icount makes), and the
 /// services' phases lose that and their budgets.
@@ -540,7 +535,7 @@ fn reset() {
 }
 
 /// A phase against `SERVICES[which]`: the greedy client asks it through a session of its own.
-/// With `ping` false a victim at 34 spins and the lines give its shares; with `ping` true a
+/// With `ping` false a victim at 31 spins and the lines give its shares; with `ping` true a
 /// spinner at 10 does, and the probe's thread at 40 asks the service every 2 ms through its own
 /// session and notes the longest round trip.
 fn phase(
@@ -732,14 +727,22 @@ const C_IPC_US: u64 = 32;
 /// window with a heartbeat of the RAM service, init ran 2 688 ticks) and up to two notifications
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
-/// What the explanation of the loss leaves unexplained, per service, as the starvation gate
-/// allows it. A measured allowance: the one-CPU probe on the runner showed a remainder of 352
-/// (ramfs), 134 and 166 us (pipe and tty) of the loss of 10 ms with the demoted level 32, and
-/// 392, 542 and 438 us on the earlier head with the demoted level 1; the allowance is the
-/// measured value with room (stafeto-design#751 follows the part no term explains). It makes the
-/// starvation gate a regression check on the cost of a budget. It cannot see a missing budget: an
-/// unbound RAM service keeps the victim at 968 per mille against the bound of 827.
-const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
+/// What the starvation gate allows beyond the terms it explains, per service: the events of one
+/// period of the budget (its exhaustion and its replenishment, 2 e, with e from the control phase
+/// of the same run) and the work of init for it (`INIT_PER_SERVICE_US`). No term comes from the
+/// measured run of the service itself.
+fn allowance_us(e: u64) -> u64 {
+    2 * e + INIT_PER_SERVICE_US
+}
+
+/// What one overrun of a budget is, microseconds: the kernel charges a loan at the end of the
+/// request, so a budget runs over by at most one step of its service before the next
+/// replenishment repays it (`B_K_US`, the kernel's longest stretch, and the longest step of a
+/// service, `STEP_LIMIT_US`, 18 369 ticks).
+const OVERRUN_US: u64 = B_K_US + STEP_LIMIT_US;
+/// The longest step of a service, microseconds: the bound of a notice or a request of the
+/// services (`xtask` holds each step under 18 369 ticks, 294 us at 62.5 MHz).
+const STEP_LIMIT_US: u64 = 294;
 
 /// The cost of one timer event of a budget in microseconds, by C: [250, 75] (`control`), measured.
 static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -747,6 +750,14 @@ static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static CYC_RUN: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYC_WALL: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// The ticks `serve` of the service `which` has charged (`BudgetInfo::ran`), or 0.
+fn ran_of(budget: &Option<Handle<rt::handle::Budget>>) -> u64 {
+    budget
+        .as_ref()
+        .and_then(|b| sys::budget_info(b).ok())
+        .map_or(0, |i| i.ran)
+}
 
 /// The e of the service `which` (index of SERVICES): the control phase of its C.
 fn e_of(which: usize) -> u64 {
@@ -764,7 +775,7 @@ extern "C" fn busy(_: u64) -> ! {
     sys::thread_exit()
 }
 
-/// The control phase for C = `c_us`: the victim at 34 against a spinner at 40 under `budget`
+/// The control phase for C = `c_us`: the victim at 31 against a spinner at 40 under `budget`
 /// (that C for each 5 ms, `low` 1): the victim's worst window of 10 ms loses 2 C and four events
 /// (the exhaustion and the replenishment of each of its two periods), so
 /// e = (loss - 2 C) / 4. Told per C.
@@ -887,18 +898,21 @@ fn duty_windows() -> (u64, u64, u64) {
 }
 
 /// The starvation phase against `SERVICES[which]`: 24 clients at 20 on CPU 0 ask the service the
-/// dear request without a pause, and the victim at 34 (`VICTIM_LEVEL`, above the demoted level
-/// 32) spins 0.8 ms and sleeps 0.2 ms; the clients refill the queue in each sleep. The service
-/// works above the victim for C of each T and at 32, below it, for the rest, so the victim loses
-/// what the budget and its events explain and no more: in 10 ms, two periods, 2 C, the two
-/// timer events of each period (4 e) and the 2 x 10 us of the kernel's entries. A victim at or
-/// below 32 would lose all of its time to the demoted service, which the guarantee does not
-/// cover. The line gives the worst and the median share of the victim's own active time over 10
-/// cycles.
+/// dear request without a pause, and the victim at 31 (`VICTIM_LEVEL`, the highest level of the
+/// POSIX processes) spins 0.8 ms and sleeps 0.2 ms; the clients refill the queue in each sleep.
+/// The service works above the victim for C of each T and at level 1, below it, for the rest, so
+/// the victim loses what the budget and its events explain and no more: in 10 ms, two periods,
+/// 2 C, the two timer events of each period (4 e, e from the control phase) and the 2 x 10 us of
+/// the kernel's entries, with the allowance `allowance_us`. The line gives the worst and the
+/// median share of the victim's own active time over 10 cycles, and the ticks the service's
+/// `serve` budget charged over the phase against its bound, `ceil(P / T) * C` and one overrun,
+/// with a floor of one C (a budget that charged less was not bound, or the clients did not
+/// ask).
 fn starve(
     process: &Handle<Process>,
     parent: &Handle<Channel>,
     which: usize,
+    budget: &Option<Handle<rt::handle::Budget>>,
     wait: &Handle<Channel>,
     timer: &Handle<Timer>,
 ) {
@@ -931,11 +945,13 @@ fn starve(
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
+    let (ran_before, began) = (ran_of(budget), time::now());
     start_all(&clients);
     sys::thread_start(&victim_thread).expect("start the victim");
     sleep_until(wait, timer, now_ns() + 155 * MS);
     STOP.store(true, Relaxed);
     wait_ended(wait, timer, n as u64);
+    let (ran_after, ended) = (ran_of(budget), time::now());
     let (worst, median, cycles) = duty_windows();
     let e = e_of(which);
     // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
@@ -943,10 +959,17 @@ fn starve(
     let loss_us = (1000 - worst) * 8;
     let explained = 2 * C_US[which] + 2 * 10 + 4 * e;
     let remainder = loss_us.saturating_sub(explained);
-    let bound = 1000 - (explained + ALLOWANCE_US[which]) / 8;
+    let bound = 1000 - (explained + allowance_us(e)) / 8;
+    // The budget's own account: the ticks charged in the phase against ceil(P / T) periods of C
+    // and one overrun, and against the floor of one C.
+    let phase_us = time::ticks_to_ns(ended - began) / 1000;
+    let ran_us = time::ticks_to_ns(ran_after.saturating_sub(ran_before)) / 1000;
+    let ran_bound = phase_us.div_ceil(T_US) * C_US[which] + OVERRUN_US;
     println!(
-        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={}",
-        C_US[which], ALLOWANCE_US[which]
+        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={} ran_us={ran_us} ran_bound_us={ran_bound} ran_floor_us={} phase_us={phase_us}",
+        C_US[which],
+        allowance_us(e),
+        C_US[which]
     );
 }
 
@@ -1099,8 +1122,15 @@ fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Han
     let pipe_budget = rt::budget::take(start, "ctl-pipe");
     control_budget(&start.process, ramfs_budget, 250, 0, wait, timer);
     control_budget(&start.process, pipe_budget, 75, 1, wait, timer);
-    for which in 0..SERVICES.len() {
-        starve(&start.process, &start.parent, which, wait, timer);
+    // The budgets of the services' request threads, read-only, from init (feature
+    // `table-service-budget`): the account of what each charged.
+    let observed = [
+        rt::budget::take(start, "ran-ramfs"),
+        rt::budget::take(start, "ran-pipe"),
+        rt::budget::take(start, "ran-tty"),
+    ];
+    for (which, budget) in observed.iter().enumerate() {
+        starve(&start.process, &start.parent, which, budget, wait, timer);
         level40(&start.process, &start.parent, which, wait, timer);
     }
 }
