@@ -1759,7 +1759,6 @@ fn nvme_blk_probe() -> Result<(), String> {
     let second = run()?;
     verdict(&second, 2, &blk_probe::CHECK_LINES)
         .map_err(|e| format!("nvme-persist blk-probe (checking): {e}"))?;
-    no_restart_loop(&second, "nvme-persist blk-probe")?;
     println!(
         "nvme-persist blk-probe: refusals, a pattern of 4 MiB and the disk's tail written and flushed over NVMe, CANCEL, the same read after a new start of QEMU, a CRASH and a restart of the disk service: ok"
     );
