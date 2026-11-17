@@ -245,6 +245,27 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
 
 /// `stat` with the time its answer may take.
 fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
+    // The service writes a line longer than 64 bytes to the console in pieces, and `posix-net`
+    // prints its own line meanwhile, so a counter line can come cut in two with that line
+    // between the halves. The counters are cumulative: asking again gives a whole line.
+    let mut last = String::new();
+    for _ in 0..STAT_ATTEMPTS {
+        match stat_once(run, tag, within) {
+            Ok(stat) => return Ok(stat),
+            Err(e) if e.starts_with(TORN) => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// How many times `stat` asks when the counter line comes cut.
+const STAT_ATTEMPTS: usize = 4;
+/// The start of the error for a counter line that came cut.
+const TORN: &str = "torn counter line";
+
+/// One `posix-net stat` and the parse of its lines.
+fn stat_once(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
     let from = run.lines().len();
     run.send("posix-net stat")?;
     // The service prints its counters when the request is over, so they may come after the
@@ -296,20 +317,25 @@ fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat,
         .rev()
         .find(|l| l.contains("net: frames rx "))
         .and_then(|l| counter(l, "orphan_reused"))
-        .ok_or("no orphan_reused in the line `net: frames rx`")?;
+        .ok_or_else(|| format!("{TORN}: no orphan_reused in the line `net: frames rx`"))?;
     Ok(Stat {
         orphan_reused,
         refused_by,
-        consumers: counter(&line, "consumers").ok_or("consumers")?,
-        hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
-        own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
-        tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
-        park_given: counter(&line, "park_given").ok_or("park_given")?,
-        looped: counter(&line, "looped").ok_or("looped")?,
-        left: counter(&line, "left").ok_or("left")?,
+        consumers: counter(&line, "consumers").ok_or_else(|| torn(&line))?,
+        hairpin: counter(&line, "hairpin").ok_or_else(|| torn(&line))?,
+        own_to_device: counter(&line, "own_to_device").ok_or_else(|| torn(&line))?,
+        tx_refused: counter(&line, "tx_refused").ok_or_else(|| torn(&line))?,
+        park_given: counter(&line, "park_given").ok_or_else(|| torn(&line))?,
+        looped: counter(&line, "looped").ok_or_else(|| torn(&line))?,
+        left: counter(&line, "left").ok_or_else(|| torn(&line))?,
         rx_by,
         line,
     })
+}
+
+/// The error for a counter line that lacks a counter, which is a line cut by another writer.
+fn torn(line: &str) -> String {
+    format!("{TORN}: {line:?}")
 }
 
 /// The shell prompt and the lease (one device).
