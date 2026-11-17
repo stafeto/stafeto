@@ -262,7 +262,7 @@ fn main(_: u64) -> u64 {
     let place = |label| sys::handle_label(turns.channel(), Rights::NOTIFY, label, level);
     let (Ok(step), Ok(view)) = (
         place(STEP),
-        sys::handle_label(turns.channel(), Rights::RECEIVE, TIMER, level),
+        sys::handle_label(&channel, Rights::RECEIVE, TIMER, level),
     ) else {
         return NO_PLACES;
     };
@@ -313,8 +313,6 @@ fn main(_: u64) -> u64 {
         preparation: if notary.is_some() { 1 } else { 3 },
         notary,
         generations: None,
-        departure_left: 0,
-        departure_cursor: 0,
     };
     let config = Config {
         issued: 0,
@@ -459,8 +457,6 @@ struct Tty {
     notary: Option<Handle<Channel>>,
     generations: Option<Handle<Memory>>,
     preparation: u8,
-    departure_left: usize,
-    departure_cursor: usize,
 }
 
 static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
@@ -911,9 +907,13 @@ impl Tty {
         }
     }
 
-    fn tell_place(&self, label: u64) {
-        if let Ok(place) = sys::handle_label(&self.turns, Rights::NOTIFY, label, self.level) {
-            let _ = sys::notify(&place, 1);
+    /// Tells the loop of the departures of the terminals in `mask` (bit `terminal`), on its own
+    /// channel, as the process service does: the client that asks next lifts the thread that
+    /// holds the notice.
+    fn tell_departures(&self, mask: u64) {
+        if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, DEPARTURES, self.level)
+        {
+            let _ = sys::notify(&place, mask);
         }
     }
 
@@ -1081,8 +1081,8 @@ impl Tty {
                 let _ = self.endpoints.set_link(self.active, i.generation, false);
             }
         }
-        self.departure_left = TERMINALS;
-        self.tell_place(DEPARTURES);
+        // One old connection per step: the terminal is asked again.
+        self.tell_departures(1 << self.active);
     }
 
     /// Tells the loop of a step, unless one is told already; a refused
@@ -3167,20 +3167,6 @@ impl Service<0> for Tty {
     };
     type Data = Client;
 
-    /// A request pays the work of a step while one is told (input from the driver, output, the
-    /// cleanup after sessions that went): the turns thread runs on its small budget once the
-    /// budgets are spent, and what a client can observe of that work is owed it in its call.
-    fn pay_backlog(&mut self, _: &mut [Option<Session<Client, 0>>]) -> bool {
-        if !(self.step_told || self.step_due) {
-            return false;
-        }
-        self.step_told = false;
-        self.step_due = false;
-        self.select(0);
-        self.work();
-        true
-    }
-
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.select(0);
         self.due();
@@ -3340,17 +3326,14 @@ impl Service<0> for Tty {
         match (n.source, n.label) {
             (Source::Session, DEPARTURES) => {
                 rt::service::step_own();
-                if self.departure_left == 0 {
-                    self.departure_left = TERMINALS;
+                // The bits are the terminals the process service names (one each).
+                for terminal in 0..TERMINALS {
+                    if n.bits & (1 << terminal) != 0 {
+                        self.select(terminal);
+                        self.departure();
+                    }
                 }
-                let terminal = self.departure_cursor;
-                self.departure_cursor = (terminal + 1) % TERMINALS;
-                self.departure_left -= 1;
-                self.select(terminal);
-                self.departure();
-                if self.departure_left != 0 {
-                    self.tell_place(DEPARTURES);
-                }
+                self.select(0);
             }
             (Source::Session, DRIVER_IN) => {
                 rt::service::step_own();

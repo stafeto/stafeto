@@ -2388,10 +2388,6 @@ impl<'a> Storage<'a> {
     pub fn reclaim_backlog(&self) -> usize {
         self.state.reclaim_len
     }
-    /// Whether pages or nodes wait for reclamation.
-    pub fn reclaim_pending(&self) -> bool {
-        self.state.reclaim_len != 0 || self.state.retired_len != 0
-    }
     pub fn reclaim_step(&mut self) -> bool {
         if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
             self.state.retired_turn = false;

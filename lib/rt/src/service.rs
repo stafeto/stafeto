@@ -120,18 +120,6 @@ pub trait Service<const K: usize> {
         let _ = notice;
     }
 
-    /// One unit of the service's own work that the request in hand pays for before it is
-    /// served, while the service has a backlog of such work (departed sessions whose objects
-    /// are not yet given back, pages to reclaim): true when there was a unit to do. A service
-    /// that runs its own work in a thread of its own (`Turns`) gets that work done only for the
-    /// budget of that thread once its budgets are spent, and what a client can observe of it
-    /// (a table that is full, a quota that is not yet given back) must not wait for that: the
-    /// loop calls this up to `PAY` times before each request. The default has no backlog.
-    fn pay_backlog(&mut self, sessions: &mut [Option<Session<Self::Data, K>>]) -> bool {
-        let _ = sessions;
-        false
-    }
-
     /// Before every request the loop took, once the receive has returned.
     fn before_request(&mut self) {}
 
@@ -449,8 +437,8 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// `run_in` with the thread of the service's own work (`Turns`), when the service has one: the
 /// notifications the thread takes come to the loop as requests under its label (`TURN_LABEL`)
 /// and go to `Service::notification` and `Service::maintenance` as they would have, and the
-/// departure of a session (CLIENT_GONE) is only noted on the main thread, in O(1), and made by
-/// a turn. The loop answers each turn with its status alone.
+/// departure of a session (CLIENT_GONE) is made on the main thread, in the notice of the kernel.
+/// The loop answers each turn with its status alone.
 pub fn run_with<S: Service<K>, const K: usize>(
     channel: &Handle<Channel>,
     service: &mut S,
@@ -458,7 +446,6 @@ pub fn run_with<S: Service<K>, const K: usize>(
     table: &mut [Option<Session<S::Data, K>>],
     turns: Option<&Turns>,
 ) -> Error {
-    let mut ring = Ring::new();
     let mut beat = match config.heartbeat.map(|h| Beat::start(channel, h)) {
         None => None,
         Some(Ok(beat)) => Some(beat),
@@ -513,9 +500,6 @@ pub fn run_with<S: Service<K>, const K: usize>(
                         }
                     }
                 } else {
-                    if turns.is_some() {
-                        pay(service, table, &mut ring, config.issued);
-                    }
                     let kind = steps::kind_of(bytes);
                     service.before_request();
                     #[cfg(not(feature = "step-stats"))]
@@ -576,54 +560,16 @@ pub fn run_with<S: Service<K>, const K: usize>(
             match (notice.source, notice.label, &mut beat) {
                 (Source::Timer, 0, Some(beat)) => beat.expired(),
                 (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
-                    if turns.is_some() && turn.is_none() {
-                        // The main thread only notes the departure and wakes the thread of
-                        // the service's own work, which makes it as a turn; a full ring is
-                        // made here.
-                        let bits = notice.bits & !CLIENT_GONE;
-                        if bits != 0 {
-                            service.notification(Notice { bits, ..notice });
-                        }
-                        if ring.push(label) {
-                            if let Some(turns) = turns {
-                                turns.wake_departures();
-                            }
-                            // Noted, nothing more on this thread: a turn makes the rest.
-                            return;
-                        } else {
-                            steps::gone();
-                            depart_label(service, table, label, config.issued);
-                        }
-                    } else {
-                        steps::gone();
-                        let bits = notice.bits & !CLIENT_GONE;
-                        if bits != 0 {
-                            service.notification(Notice { bits, ..notice });
-                        }
-                        depart_label(service, table, label, config.issued);
+                    // The departure of a client is made in the notice of the main thread, so
+                    // that a client that asks next lifts the thread that holds it (spec 6.6):
+                    // what the departure frees (a lock, an end of a pipe) is free for that
+                    // client. Only the steps that follow it are turns.
+                    steps::gone();
+                    let bits = notice.bits & !CLIENT_GONE;
+                    if bits != 0 {
+                        service.notification(Notice { bits, ..notice });
                     }
-                }
-                (Source::Session, RING_LABEL, _) if turn.is_some() => {
-                    // Takes the next departure the main thread noted.
-                    if let Some(label) = ring.pop() {
-                        steps::gone();
-                        depart_label(service, table, label, config.issued);
-                        if let Some(turns) = turns
-                            && !ring.is_empty()
-                        {
-                            turns.wake_departures();
-                        }
-                        service.maintenance(
-                            table,
-                            Notice {
-                                source: Source::Session,
-                                label,
-                                bits: CLIENT_GONE,
-                                count: 1,
-                            },
-                        );
-                    }
-                    return;
+                    depart_label(service, table, label, config.issued);
                 }
                 _ => service.notification(notice),
             }
@@ -650,86 +596,9 @@ pub fn run_with<S: Service<K>, const K: usize>(
     }
 }
 
-/// The units of the service's own work a request pays for at most (`Service::pay_backlog` and
-/// the departures noted in the ring).
-const PAY: usize = 4;
-
-/// The own work a request pays for before it is served: the departures the main thread noted
-/// and then the units the service reports (`Service::pay_backlog`), `PAY` of them at most.
-fn pay<S: Service<K>, const K: usize>(
-    service: &mut S,
-    table: &mut [Option<Session<S::Data, K>>],
-    ring: &mut Ring,
-    issued: u32,
-) {
-    for _ in 0..PAY {
-        // Each unit is a step of its own for the measure (a departure, or an own step), and the
-        // request that follows starts its count anew.
-        steps::restart();
-        let began = time::now();
-        if let Some(label) = ring.pop() {
-            steps::gone();
-            depart_label(service, table, label, issued);
-            let _ = steps::end(began, steps::NOTICE);
-        } else if service.pay_backlog(table) {
-            steps::own();
-            let _ = steps::end(began, steps::NOTICE);
-        } else {
-            break;
-        }
-    }
-    steps::restart();
-}
-
 /// The label of the requests of the thread of a service's own work, the turns. It has a bit
 /// the labels of clients do not use (`proto_fs::OWN` and the like are bit 63).
 pub const TURN_LABEL: u64 = (1 << 62) | 0x5455_524e;
-/// The label of the wake of the thread of the own work for a departure the main thread noted.
-const RING_LABEL: u64 = (1 << 62) | 0x5249_4e47;
-/// The departures the main thread notes at most before a turn takes them; one more is made on
-/// the main thread at once.
-const RING: usize = 256;
-
-/// The labels of sessions that went, noted by the main thread and made by turns.
-struct Ring {
-    labels: [u64; RING],
-    head: usize,
-    len: usize,
-}
-
-impl Ring {
-    const fn new() -> Ring {
-        Ring {
-            labels: [0; RING],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, label: u64) -> bool {
-        if self.len == RING {
-            return false;
-        }
-        self.labels[(self.head + self.len) % RING] = label;
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<u64> {
-        if self.len == 0 {
-            return None;
-        }
-        let label = self.labels[self.head];
-        self.head = (self.head + 1) % RING;
-        self.len -= 1;
-        Some(label)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
 /// The notice a turn carries: source, label, bits and count as four words.
 fn turn_notice(bytes: &[u8]) -> Option<Notice> {
     if bytes.len() != 32 {
@@ -785,7 +654,6 @@ fn depart_label<S: Service<K>, const K: usize>(
 pub struct Turns {
     channel: Handle<Channel>,
     level: u8,
-    wake: Handle<Channel>,
 }
 
 /// The handles the thread uses: its channel and the handle it sends turns through.
@@ -796,12 +664,7 @@ impl Turns {
     /// The channel of the thread, at `level` (the level of the service's loop).
     pub fn new(level: u8) -> Result<Turns, Error> {
         let channel = sys::channel_create(level)?;
-        let wake = sys::handle_label(&channel, Rights::NOTIFY, RING_LABEL, level)?;
-        Ok(Turns {
-            channel,
-            level,
-            wake,
-        })
+        Ok(Turns { channel, level })
     }
 
     /// The thread's channel: the handle the service makes its timers on and its wake handles of
@@ -847,11 +710,6 @@ impl Turns {
         sys::thread_start(&thread)?;
         core::mem::forget(thread);
         Ok(bound)
-    }
-
-    /// Wakes the thread for a departure the loop noted.
-    fn wake_departures(&self) {
-        let _ = sys::notify(&self.wake, 1);
     }
 }
 

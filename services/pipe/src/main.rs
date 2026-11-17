@@ -1818,25 +1818,6 @@ impl Service<0> for PipeService {
     };
     type Data = Client;
 
-    /// A request pays the step of the descriptions that sessions which went let go of, while one
-    /// is told: the turns thread runs on its small budget once the budgets are spent, and a
-    /// client that asks for a description or a ticket must not find the ones the exited
-    /// processes held still taken.
-    fn pay_backlog(&mut self, _: &mut [Option<Session<Client, 0>>]) -> bool {
-        if !(self.step_told || self.step_due) {
-            return false;
-        }
-        self.step_told = false;
-        self.step_due = false;
-        let mut wakes = Wakes::default();
-        let more = self.cleanup_step(&mut wakes);
-        self.tell(&wakes);
-        if more {
-            self.kick();
-        }
-        true
-    }
-
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
         // VerifySession goes through the root alone, and the root has no

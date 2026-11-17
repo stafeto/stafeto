@@ -247,7 +247,9 @@ Actions.
   thread of the service works at level 1, so the service takes at most its C of each T from
   every level above 1, and the levels below the budgets keep 23.3 % of CPU 0 (the release
   promises 20 %) with the network service at stage 4. What a client can observe the service
-  finishes in that client's own request. The threads that have no budget (the one that maps
+  finishes in that client's own request. The departure of a session and the hang-up of a
+  terminal are made in the notice of the service's main thread (a client that asks next lifts
+  it); a survivor that asks no service sees them within (T - C_serve) + B_dep, about 4.8 ms. The threads that have no budget (the one that maps
   layers, the one that registers the root of the pipes) work at level 31 at most.
 - No PinePhone port yet.
 - `fork` copies everything the layer maps, with no copy on write (about

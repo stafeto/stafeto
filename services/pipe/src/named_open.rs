@@ -22,6 +22,8 @@ fn absent(ticket: NamedTicket) -> NamedReply {
     }
 }
 
+const NAMED_CLEANUP_ON_DEMAND: usize = 16;
+
 impl PipeService {
     pub(super) fn named_room(&self) -> bool {
         self.ops.counts().0 + self.named.count() < OPERATIONS
@@ -104,18 +106,17 @@ impl PipeService {
             _ => return Answer::Status(Status::BadSize),
         };
         if let Some(ticket) = self.named.find(s.label(), open) {
-            // A witness asked for again, whose ticket has not been prepared and whose capability
-            // has gone out in a reply: the reply did not reach the client (a call a signal took
-            // back, repeated), and a capability cannot be given twice. A fresh ticket with its
-            // own capability replaces the old one, which no broker has seen.
-            let lost = self
-                .named
-                .get(ticket)
-                .is_some_and(|r| r.phase == NamedPhase::Witness && r.handle.is_none());
-            if !lost {
-                return self.named_answer(ticket, r, true);
+            return self.named_answer(ticket, r, true);
+        }
+        // A table of tickets that is full may hold tickets whose cleanup the turns have not yet
+        // done (a signal took the cleanup of an interrupted open back): the request that finds
+        // no room does that cleanup first.
+        if !self.named_room() {
+            for _ in 0..NAMED_CLEANUP_ON_DEMAND {
+                if !self.named_cleanup() || self.named_room() {
+                    break;
+                }
             }
-            self.named_free(ticket, true);
         }
         if !self.named_room() {
             return status(proto_pipe::AGAIN);

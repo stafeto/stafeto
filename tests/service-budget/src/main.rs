@@ -745,14 +745,14 @@ const C_IPC_US: u64 = 32;
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
 /// What the explanation of the loss leaves unexplained, per service, as the starvation gate
-/// allows it. A measured allowance: the one-CPU probe on the runner showed a remainder of 248 to
-/// 672 (ramfs), 630 to 710 (pipe) and 910 to 1030 us (tty) of the loss of 10 ms with the
-/// services at level 1 and two budgets each (the events of the turns budget and the round trips
-/// of its turns are in it; stafeto-design#751 follows the part no term explains); the allowance
-/// is the measured value with room. It makes the starvation gate a regression check on the cost
-/// of a budget. It cannot see a missing budget: an unbound RAM service keeps the victim at 968
-/// per mille against the bound of 827.
-const ALLOWANCE_US: [u64; 3] = [900, 950, 1250];
+/// allows it: 750, 800 and 800 us of the loss of 10 ms. The one-CPU probe on the runner showed
+/// remainders of 248 to 672 (ramfs), 630 to 710 (pipe) and 910 to 1030 us (tty) with the
+/// services at level 1 and two budgets each, so the gate for the victim at level 10 and for
+/// tty fails on some runs until the term that explains the rest is found (stafeto-design#751;
+/// suspects: the driver of the terminal's own time under `settle_output` and
+/// `take_driver_input`, and the events of the `turns` budget). An unbound RAM service keeps the
+/// victim at 968 per mille against the bound of 827.
+const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
 
 /// The cost of one timer event of a budget in microseconds, by C: [250, 75] (`control`), measured.
 static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];

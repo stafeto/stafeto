@@ -493,48 +493,6 @@ fn fifo_ticket(recovery: Recovery) -> proto_pipe::NamedTicket {
     }
 }
 
-/// The payer's witness of the open: its ticket and the capability the grant carries, saved in
-/// the record. Asked again after a grant a signal took back: the capability that went with that
-/// call is gone (`Error::keeps_handles`), and the pipe service, which keeps the capability of a
-/// ticket that is not yet prepared, gives a copy again. The phase of the ticket is returned: a
-/// ticket past `Witness` has been prepared, so the grant went through.
-fn fifo_witness(
-    token: OpenToken,
-    claim: ClaimToken,
-    recovery: &mut Recovery,
-    session: &rt::handle::Handle<rt::handle::Channel>,
-) -> Result<proto_pipe::NamedPhase, i32> {
-    let block = crate::threads::own_block();
-    loop {
-        // A signal waits for the open to end: the repeated call would be taken back at once.
-        if crate::long::ending(&block.flags, true) {
-            return Err(EINTR);
-        }
-        let _short = crate::long::ShortScope::enter(true)?;
-        let response = rt::pipe::request(
-            session,
-            proto_pipe::Method::PayerWitness,
-            proto_pipe::NamedTicket {
-                slot: token.slot() as u32,
-                generation: token.generation(),
-            },
-            None,
-        );
-        match response {
-            Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
-            Err(error) => return Err(protocol(error)),
-            Ok(response) => {
-                recovery.fifo_ticket_slot = response.state.ticket.slot;
-                recovery.fifo_ticket_generation = response.state.ticket.generation;
-                recovery.fifo_stage = 2;
-                let phase = response.state.phase;
-                save_fifo_capability(claim, recovery, response.capability)?;
-                return Ok(phase);
-            }
-        }
-    }
-}
-
 /// Each short response becomes resident before signal delivery reopens. The
 /// rendezvous receive itself owns neither FILES_LOCK nor signal deferral.
 fn fifo_open(
@@ -552,7 +510,29 @@ fn fifo_open(
     let _restart = crate::long::OuterRestart::enter(&block.flags);
     recovery.fifo_stage = 1;
     save(claim, *recovery)?;
-    fifo_witness(token, claim, recovery, &session)?;
+    loop {
+        let _short = crate::long::ShortScope::enter(true)?;
+        let response = rt::pipe::request(
+            &session,
+            Method::PayerWitness,
+            proto_pipe::NamedTicket {
+                slot: token.slot() as u32,
+                generation: token.generation(),
+            },
+            None,
+        );
+        match response {
+            Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
+            Err(error) => return Err(protocol(error)),
+            Ok(response) => {
+                recovery.fifo_ticket_slot = response.state.ticket.slot;
+                recovery.fifo_ticket_generation = response.state.ticket.generation;
+                recovery.fifo_stage = 2;
+                save_fifo_capability(claim, recovery, response.capability)?;
+                break;
+            }
+        }
+    }
     let held = metadata.prepared();
     let grant = proto_fs::FifoGrant {
         key: key(token),
@@ -564,8 +544,6 @@ fn fifo_open(
     };
     let mut brokered = false;
     let mut full = false;
-    // The witness is asked for again before the next grant (it takes a short custody of its own).
-    let mut rewitness = false;
     loop {
         if core::mem::take(&mut full) {
             // The end's queue of waiters is full: try again shortly. A caught signal ends the
@@ -574,12 +552,6 @@ fn fifo_open(
         }
         if crate::long::ending(&block.flags, true) {
             return Err(EINTR);
-        }
-        if core::mem::take(&mut rewitness)
-            && fifo_witness(token, claim, recovery, &session)? != NamedPhase::Witness
-        {
-            // The ticket was prepared: the call had reached the service.
-            brokered = true;
         }
         let _short = crate::long::ShortScope::enter(true)?;
         let response = if !brokered {
@@ -605,13 +577,10 @@ fn fifo_open(
                     }
                 }
                 Err(refused) => {
-                    // A witness that went with a call a signal took back is gone with it.
-                    let lost = raw != 0 && refused.capability.is_none();
                     save_fifo_capability(claim, recovery, refused.capability)?;
                     match refused.status {
                         Status::Kernel(rt::abi::Error::Interrupted)
                         | Status::Unknown(proto_fs::RESOLVING | proto_fs::AUTHENTICATING) => {
-                            rewitness = lost;
                             continue;
                         }
                         error => Err(error),
