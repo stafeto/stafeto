@@ -278,6 +278,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("nvme-persist mdts1", 80),
     ("nvme-persist steps", 500),
     ("store-crash", 25),
+    ("data-probe", 12),
+    ("data-crash", 60),
     ("init-wait", 12),
     ("pkg-slot", 12),
     ("gpu-probe", 8),

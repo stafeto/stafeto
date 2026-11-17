@@ -409,6 +409,92 @@ pub const BLK_PROBE: Record = Record {
 /// its client.
 pub const BLK_PROBE_TABLE: &[Record] = &[super::normal::TABLE[0], BLK, BLK_PROBE];
 
+/// The budget of the request thread of the data file service: 100 us of each 10 ms (1 % of CPU 0),
+/// at 32 once spent. A request is a copy of at most 1 KiB into a job and a reply; the work on the
+/// volume is the worker's, which has no budget and runs at 30, below the levels of the budgets.
+pub const DATAFS_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 100_000,
+    t_ns: 10 * MS,
+    low: super::ramfs::SERVICE_LOW,
+}];
+
+/// The data file service (services/datafs): the files of `/data` on the data partition of the disk
+/// service. Its request thread works at 36 under a budget, above the clients of POSIX (ceiling 31) and
+/// below the disk service (39) whose client its worker is, at 30. Its quota is the worker's stack, the
+/// disk buffer and the pages of the volume's memory with room over. It connects to the disk service and
+/// restarts: a new instance mounts the volume again, and a client opens its files again.
+pub const DATAFS: Record = Record {
+    name: "datafs",
+    program: "datafsd",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 36,
+    ceiling: 36,
+    quota: 512 * PAGE,
+    handle_limit: 128,
+    restart: Restart::Always,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["blk"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    start: &[],
+    release: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+    waits: &[],
+    budgets: DATAFS_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
+};
+
+/// The probe of the data file service (tests/data-probe): a client at 30 with a session of the
+/// service by name. It starts when the service said READY, the volume mounted or not.
+pub const DATA_PROBE: Record = Record {
+    name: "data-probe",
+    program: "data-probe",
+    kind: Kind::Client,
+    priority: 30,
+    ceiling: 30,
+    quota: 64 * PAGE,
+    handle_limit: 32,
+    restart: Restart::Never,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["datafs"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    start: &[],
+    release: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+    waits: &[Wait {
+        service: "datafs",
+        deadline_ms: 30_000,
+    }],
+    budgets: &[],
+    free: 0,
+};
+
+/// The image of the data probe: the PL011's driver, the disk service, the data file service and the
+/// probe.
+pub const DATA_PROBE_TABLE: &[Record] = &[super::normal::TABLE[0], BLK, DATAFS, DATA_PROBE];
+
 /// The package service (pk3-design R2, R5, R15): level 32 for its main thread, below the
 /// disk (39) and the file service (48) it calls and above no one it serves but the
 /// processes of POSIX (ceiling 31). Its quota is the 16,384 pages of the objects of the

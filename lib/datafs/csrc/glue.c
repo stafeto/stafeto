@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+// The flat interface of littlefs the Rust side calls: one volume in one block of memory the
+// caller owns, every buffer inside it (littlefs never allocates here), files and directories as
+// slot numbers. The device is behind five functions of the Rust side (datafs_rs_*).
+#include <stddef.h>
+#include <stdint.h>
+
+#include "lfs.h"
+
+#define BLOCK 4096u
+#define SECTOR 512u
+#define LOOKAHEAD 128u
+
+#ifndef DATAFS_FILES
+#define DATAFS_FILES 8
+#endif
+#ifndef DATAFS_DIRS
+#define DATAFS_DIRS 4
+#endif
+
+int datafs_rs_read(void *ctx, uint32_t block, uint32_t off, void *buffer, uint32_t size);
+int datafs_rs_prog(void *ctx, uint32_t block, uint32_t off, const void *buffer, uint32_t size);
+int datafs_rs_sync(void *ctx);
+
+struct datafs {
+    lfs_t lfs;
+    struct lfs_config cfg;
+    void *ctx;
+    uint8_t read_cache[BLOCK];
+    uint8_t prog_cache[BLOCK];
+    uint8_t lookahead[LOOKAHEAD];
+    lfs_file_t file[DATAFS_FILES];
+    struct lfs_file_config file_cfg[DATAFS_FILES];
+    uint8_t file_cache[DATAFS_FILES][BLOCK];
+    uint8_t file_used[DATAFS_FILES];
+    lfs_dir_t dir[DATAFS_DIRS];
+    uint8_t dir_used[DATAFS_DIRS];
+};
+
+size_t datafs_state_size(void) { return sizeof(struct datafs); }
+size_t datafs_state_align(void) { return _Alignof(struct datafs); }
+int datafs_files(void) { return DATAFS_FILES; }
+int datafs_dirs(void) { return DATAFS_DIRS; }
+
+static int dev_read(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *buffer,
+                    lfs_size_t size)
+{
+    struct datafs *d = c->context;
+    return datafs_rs_read(d->ctx, block, off, buffer, size);
+}
+
+static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off,
+                    const void *buffer, lfs_size_t size)
+{
+    struct datafs *d = c->context;
+    return datafs_rs_prog(d->ctx, block, off, buffer, size);
+}
+
+// The blocks need no erase: the device overwrites in place.
+static int dev_erase(const struct lfs_config *c, lfs_block_t block)
+{
+    (void)c;
+    (void)block;
+    return 0;
+}
+
+static int dev_sync(const struct lfs_config *c)
+{
+    struct datafs *d = c->context;
+    return datafs_rs_sync(d->ctx);
+}
+
+// Sets the volume up over a device of `blocks` blocks of 4 KiB. Nothing is read.
+void datafs_setup(struct datafs *d, uint32_t blocks)
+{
+    uint8_t *bytes = (uint8_t *)d;
+    for (size_t i = 0; i < sizeof(*d); i++) {
+        bytes[i] = 0;
+    }
+    d->cfg.context = d;
+    d->cfg.read = dev_read;
+    d->cfg.prog = dev_prog;
+    d->cfg.erase = dev_erase;
+    d->cfg.sync = dev_sync;
+    d->cfg.read_size = SECTOR;
+    d->cfg.prog_size = SECTOR;
+    d->cfg.block_size = BLOCK;
+    d->cfg.block_count = blocks;
+    // A virtual disk wears no block out: no relocation by erase count.
+    d->cfg.block_cycles = -1;
+    d->cfg.cache_size = BLOCK;
+    d->cfg.lookahead_size = LOOKAHEAD;
+    d->cfg.read_buffer = d->read_cache;
+    d->cfg.prog_buffer = d->prog_cache;
+    d->cfg.lookahead_buffer = d->lookahead;
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        d->file_cfg[i].buffer = d->file_cache[i];
+    }
+}
+
+int datafs_format(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    return lfs_format(&d->lfs, &d->cfg);
+}
+
+// Mounts and finishes what a cut of the power left half done (a rename between two directories
+// that was committed in the first and not yet in the second, a directory made and not linked):
+// until that is done a listing of a directory with a pending move skips an entry after the moved
+// one. The writes of the repair are the ones of the next operation, made now.
+int datafs_mount(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    int err = lfs_mount(&d->lfs, &d->cfg);
+    if (err < 0) {
+        return err;
+    }
+#ifdef DATAFS_BREAK_CONSISTENT
+    err = 0;
+#else
+    err = lfs_fs_mkconsistent(&d->lfs);
+#endif
+    if (err < 0) {
+        lfs_unmount(&d->lfs);
+    }
+    return err;
+}
+
+int datafs_unmount(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    return lfs_unmount(&d->lfs);
+}
+
+// The blocks in use, or a negative error.
+int64_t datafs_used(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    return lfs_fs_size(&d->lfs);
+}
+
+// A file: the slot, or a negative error (LFS_ERR_NOMEM when every slot is open).
+int datafs_open(struct datafs *d, void *ctx, const char *path, int flags)
+{
+    d->ctx = ctx;
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (!d->file_used[i]) {
+            int err = lfs_file_opencfg(&d->lfs, &d->file[i], path, flags, &d->file_cfg[i]);
+            if (err < 0) {
+                return err;
+            }
+            d->file_used[i] = 1;
+            return i;
+        }
+    }
+    return LFS_ERR_NOMEM;
+}
+
+static int file_ok(struct datafs *d, int slot)
+{
+    return slot >= 0 && slot < DATAFS_FILES && d->file_used[slot];
+}
+
+int datafs_close(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    d->file_used[slot] = 0;
+    return lfs_file_close(&d->lfs, &d->file[slot]);
+}
+
+int64_t datafs_read(struct datafs *d, void *ctx, int slot, void *buffer, uint32_t size)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_read(&d->lfs, &d->file[slot], buffer, size);
+}
+
+int64_t datafs_write(struct datafs *d, void *ctx, int slot, const void *buffer, uint32_t size)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_write(&d->lfs, &d->file[slot], buffer, size);
+}
+
+int datafs_sync(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_sync(&d->lfs, &d->file[slot]);
+}
+
+int64_t datafs_seek(struct datafs *d, void *ctx, int slot, int32_t offset, int whence)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_seek(&d->lfs, &d->file[slot], offset, whence);
+}
+
+int datafs_truncate(struct datafs *d, void *ctx, int slot, uint32_t size)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_truncate(&d->lfs, &d->file[slot], size);
+}
+
+int64_t datafs_size(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_size(&d->lfs, &d->file[slot]);
+}
+
+int datafs_mkdir(struct datafs *d, void *ctx, const char *path)
+{
+    d->ctx = ctx;
+    return lfs_mkdir(&d->lfs, path);
+}
+
+int datafs_remove(struct datafs *d, void *ctx, const char *path)
+{
+    d->ctx = ctx;
+    return lfs_remove(&d->lfs, path);
+}
+
+int datafs_rename(struct datafs *d, void *ctx, const char *from, const char *to)
+{
+    d->ctx = ctx;
+    return lfs_rename(&d->lfs, from, to);
+}
+
+// The type (1 file, 2 directory), the size and the name (256 bytes) of `path`.
+int datafs_stat(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
+                char *name)
+{
+    struct lfs_info info;
+    d->ctx = ctx;
+    int err = lfs_stat(&d->lfs, path, &info);
+    if (err < 0) {
+        return err;
+    }
+    *type = info.type;
+    *size = info.size;
+    for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+        name[i] = info.name[i];
+    }
+    return 0;
+}
+
+int datafs_opendir(struct datafs *d, void *ctx, const char *path)
+{
+    d->ctx = ctx;
+    for (int i = 0; i < DATAFS_DIRS; i++) {
+        if (!d->dir_used[i]) {
+            int err = lfs_dir_open(&d->lfs, &d->dir[i], path);
+            if (err < 0) {
+                return err;
+            }
+            d->dir_used[i] = 1;
+            return i;
+        }
+    }
+    return LFS_ERR_NOMEM;
+}
+
+static int dir_ok(struct datafs *d, int slot)
+{
+    return slot >= 0 && slot < DATAFS_DIRS && d->dir_used[slot];
+}
+
+int datafs_closedir(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    d->dir_used[slot] = 0;
+    return lfs_dir_close(&d->lfs, &d->dir[slot]);
+}
+
+// The next entry of a directory: 1 with the entry in the outputs, 0 at the end.
+int datafs_readdir(struct datafs *d, void *ctx, int slot, uint8_t *type, uint32_t *size,
+                   char *name)
+{
+    struct lfs_info info;
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    int res = lfs_dir_read(&d->lfs, &d->dir[slot], &info);
+    if (res > 0) {
+        *type = info.type;
+        *size = info.size;
+        for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+            name[i] = info.name[i];
+        }
+    }
+    return res;
+}
+
+int datafs_rewinddir(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_dir_rewind(&d->lfs, &d->dir[slot]);
+}
