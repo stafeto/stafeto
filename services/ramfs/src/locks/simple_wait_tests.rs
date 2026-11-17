@@ -791,7 +791,7 @@ fn a_change_of_an_inode_wakes_the_waiters_on_it_at_once_and_only_once() {
 }
 
 #[test]
-fn a_departure_tells_a_few_waiters_in_the_notice_and_marks_the_rest_for_the_sweep() {
+fn a_departure_tells_a_few_waiters_in_the_notice_and_leaves_the_rest_to_the_sweep() {
     let mut f = Fixture::new();
     let a = f.captured.request.inode;
     f.hold_on(a, 300, 0, Kind::Write);
@@ -803,7 +803,8 @@ fn a_departure_tells_a_few_waiters_in_the_notice_and_marks_the_rest_for_the_swee
         r.handle = Some(7);
         r.dirty = false;
     }
-    // One notice at most: the other waiter is marked, and the next call goes on from there.
+    // One notice at most: the other waiter stays quiet and unmarked (the sweep of `poll`
+    // finds it), and the next call goes on from there.
     let mut told = 0;
     assert_eq!(f.waits.wake_all(1, |_| told += 1), 1);
     assert_eq!(told, 1);
@@ -811,13 +812,8 @@ fn a_departure_tells_a_few_waiters_in_the_notice_and_marks_the_rest_for_the_swee
         let slot = f.waits.slot(id).unwrap();
         f.waits.registrations[slot].as_ref().unwrap().dirty
     };
-    assert_eq!(
-        [dirty(&f, first), dirty(&f, second)]
-            .iter()
-            .filter(|d| **d)
-            .count(),
-        1
-    );
+    assert!(!dirty(&f, first) && !dirty(&f, second));
     assert_eq!(f.waits.wake_all(1, |_| told += 1), 1);
     assert_eq!(told, 2);
+    assert_eq!(f.waits.wake_all(0, |_| panic!("no notice allowed")), 0);
 }

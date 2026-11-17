@@ -385,12 +385,13 @@ impl<H> Waits<H> {
     }
     /// Tells `limit` armed waiters at most now, for the departure of a client whose locks may
     /// have stood in their way (the lock of a process that ended is gone for the waiter's Query
-    /// as soon as the page of lifetimes says so), from where the last call stopped; the rest are
-    /// marked for the sweep. Visits the registrations once.
+    /// as soon as the page of lifetimes says so), from where the last call stopped. The rest are
+    /// left alone: the sweep that `poll` schedules finds the waiters a dead owner released
+    /// through its own grantability check, so a departure never wakes every waiter.
     pub fn wake_all(&mut self, limit: usize, mut notify: impl FnMut(&H)) -> usize {
         let mut woken = 0;
         // Nothing registered: no place is touched.
-        if self.free.iter().all(|w| *w == u64::MAX) {
+        if limit == 0 || self.free.iter().all(|w| *w == u64::MAX) {
             return 0;
         }
         for step in 0..CAPACITY {
@@ -404,14 +405,13 @@ impl<H> Waits<H> {
             if !r.linked || r.handle.is_none() {
                 continue;
             }
-            if woken < limit {
-                if let Some(handle) = r.handle.as_ref() {
-                    notify(handle);
-                }
-                woken += 1;
-                self.wake_cursor = (i + 1) % CAPACITY;
-            } else {
-                r.dirty = true;
+            if let Some(handle) = r.handle.as_ref() {
+                notify(handle);
+            }
+            woken += 1;
+            self.wake_cursor = (i + 1) % CAPACITY;
+            if woken >= limit {
+                break;
             }
         }
         woken
