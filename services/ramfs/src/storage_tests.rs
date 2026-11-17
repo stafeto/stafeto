@@ -635,11 +635,11 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
             .truncate_zero(token, proto_fs::Timestamp::legacy_ns(i as u64))
             .unwrap();
     }
-    assert_eq!(ram.storage.usage(FIRST).pages, PAGE_SHARE);
-    assert_eq!(
-        ram.storage.usage(SECOND).pages as usize,
-        PAGES - PAGE_SHARE as usize
-    );
+    // The charge of a retired chain went with its retirement: the pages wait on the FIFO, owed
+    // by no account, and none is free until the FIFO moves it.
+    assert_eq!(ram.storage.usage(FIRST).pages, 0);
+    assert_eq!(ram.storage.usage(SECOND).pages, 0);
+    assert_eq!(ram.storage.available().pages, 0);
     // Empty truncation is valid with all 4096 detached credits already occupied.
     ram.storage
         .truncate_zero(first, proto_fs::Timestamp::legacy_ns(5000))
@@ -658,7 +658,8 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
     assert_eq!(ram.storage.usage(FIRST).pages, before.pages);
     assert!(ram.storage.reclaim_step());
     assert_eq!(ram.storage.usage(FIRST).inodes, before.inodes - 1);
-    assert_eq!(ram.storage.usage(FIRST).pages, before.pages - 1);
+    assert_eq!(ram.storage.usage(FIRST).pages, before.pages);
+    assert_eq!(ram.storage.available().pages, 1);
     let mut steps = 2;
     while ram.storage.reclaim_step() {
         steps += 1;
@@ -820,4 +821,28 @@ fn what_changes_names_raises_the_generation_of_their_directory_and_what_changes_
     ram.storage.unlink(d2, b"x", FIRST).unwrap();
     assert!(generation_of(&ram, d2) > g, "a name gone");
     let _ = dir;
+}
+
+#[test]
+fn a_truncated_chain_is_owed_by_nobody_and_settle_moves_only_the_pages_asked_for() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let file = create(&mut ram, FIRST, b"settled");
+    let free = ram.storage.available().pages;
+    let data = [1u8; 3 * 4096];
+    assert_eq!(ram.storage.write(file, FIRST, 0, &data), Ok(data.len()));
+    assert_eq!(ram.storage.usage(FIRST).pages, 3);
+    ram.storage
+        .truncate_zero(file, proto_fs::Timestamp::legacy_ns(1))
+        .unwrap();
+    // The charge went at once; the pages are on the FIFO and not yet on the free list.
+    assert_eq!(ram.storage.usage(FIRST).pages, 0);
+    assert_eq!(ram.storage.available().pages, free - 3);
+    // A floor at or below the list as it is moves nothing; a higher one moves what it lacks.
+    ram.storage.settle_pages(usize::from(free - 3));
+    assert_eq!(ram.storage.available().pages, free - 3);
+    ram.storage.settle_pages(usize::from(free - 1));
+    assert_eq!(ram.storage.available().pages, free - 1);
+    ram.storage.settle_pages(usize::MAX);
+    assert_eq!(ram.storage.available().pages, free);
+    assert!(!ram.storage.reclaim_step());
 }

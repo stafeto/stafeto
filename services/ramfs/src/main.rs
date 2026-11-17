@@ -748,6 +748,10 @@ struct Fs {
     cancel_reported: u32,
 }
 
+/// The free pages a request finds ready: the retired pages that bring the free list up to this
+/// many are moved to it before the request runs (at most this many steps).
+const SETTLE_PAGES: usize = 64;
+
 /// The clones the service keeps alive at most: one for each record of the
 /// process service and room beside them.
 const CLONES: usize = 320;
@@ -2447,6 +2451,11 @@ impl Service<0> for Fs {
 
     fn before_request(&mut self) {
         self.request_began = rt::time::ticks_to_ns(rt::time::now());
+        // The pages of detached chains are free for a request that needs them: the free list
+        // is filled to a floor from the chains before the request runs, a page at a time, so
+        // that the work of the service's own turns does not stand between a client and the
+        // pages a file it truncated gave back.
+        self.ram.storage.settle_pages(SETTLE_PAGES);
     }
 
     fn between_requests(&mut self) {
