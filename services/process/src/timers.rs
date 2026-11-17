@@ -266,8 +266,20 @@ impl Timers {
 
     fn setting(slot: &Slot, now: u64) -> Setting {
         if slot.armed {
+            // An armed timer never reads 0 (0 means disarmed). A deadline that
+            // has passed and is not yet taken (the service is late) leaves a
+            // periodic timer the rest of its current interval, the time to
+            // its next expiry; a timer of one shot has its signal on the way
+            // and shows the least time, 1 ns.
+            let remaining = if now < slot.deadline {
+                slot.deadline - now
+            } else if slot.interval > 0 {
+                slot.interval - (now - slot.deadline) % slot.interval
+            } else {
+                1
+            };
             Setting {
-                remaining: slot.deadline.saturating_sub(now).max(1),
+                remaining,
                 interval: slot.interval,
             }
         } else {
@@ -691,6 +703,30 @@ mod tests {
                 Ok(if process == 1 { 5 } else { 0 })
             );
         }
+    }
+
+    #[test]
+    fn an_armed_timer_with_a_passed_deadline_never_reads_zero() {
+        let mut t = Timers::new();
+        let once = t.create(3, 10, 0, false).unwrap();
+        t.set(3, once, Some(100 * MS), 0, 0).unwrap();
+        assert_eq!(t.get(3, once, 100 * MS).unwrap().remaining, 1);
+        assert_eq!(t.get(3, once, 900 * MS).unwrap().remaining, 1);
+        let every = t.create(3, 10, 0, false).unwrap();
+        t.set(3, every, Some(100 * MS), 30 * MS, 0).unwrap();
+        // The rest of the current interval, never 0, whatever the lateness.
+        let at = |now| t.get(3, every, now).unwrap();
+        assert_eq!(at(99 * MS).remaining, MS);
+        assert_eq!(at(100 * MS).remaining, 30 * MS);
+        assert_eq!(at(105 * MS).remaining, 25 * MS);
+        assert_eq!(at(165 * MS).remaining, 25 * MS);
+        assert_eq!(at(165 * MS).interval, 30 * MS);
+        for now in (0..400).map(|n| n * MS / 7) {
+            assert!(at(now).remaining > 0);
+        }
+        // The alarm shares the rule.
+        t.alarm(4, Some(100 * MS), 30 * MS, 0).unwrap();
+        assert_eq!(t.alarm_setting(4, 105 * MS).remaining, 25 * MS);
     }
 
     #[test]
