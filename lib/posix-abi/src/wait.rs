@@ -362,11 +362,20 @@ fn net_refusal(status: Status) -> i32 {
         Status::Unknown(code) => match code {
             proto_net::BAD_FD => EBADF,
             proto_net::AGAIN => EAGAIN,
+            proto_net::BUSY => NET_BUSY,
             _ => EIO,
         },
         _ => EIO,
     }
 }
+
+/// The refusal of a wait that cannot block when netd has no place to park it behind the steps of
+/// the wire (`netd::zero`): no errno of the program, the wait asks again (`NetWait::more`).
+const NET_BUSY: i32 = -0x4e42;
+
+/// How many times a wait that cannot block asks again after BUSY. A place is held for three steps
+/// of waking at most, so a few rounds free one.
+const BUSY_ROUNDS: u32 = 64;
 
 impl NetWait {
     /// A wait on `set` for at most `most` pairs (1 to 64).
@@ -452,16 +461,27 @@ impl NetWait {
     /// taken into `ready` in place of the pairs it had (a poll over many
     /// descriptors asks again while each answer is full). How many came.
     pub fn more(&mut self) -> Result<usize, i32> {
-        match self.call(
-            &self.wait_request(None, proto_net::sockets::EPOLL_DONTWAIT),
-            None,
-        )? {
-            NetReply::Ready(ready) => {
-                self.ready = ready;
-                Ok(ready.len)
+        for _ in 0..BUSY_ROUNDS {
+            match self.call(
+                &self.wait_request(None, proto_net::sockets::EPOLL_DONTWAIT),
+                None,
+            ) {
+                Ok(NetReply::Ready(ready)) => {
+                    self.ready = ready;
+                    return Ok(ready.len);
+                }
+                Ok(_) => return Err(EIO),
+                // The service had no place to park the wait behind its steps: yield and ask
+                // again.
+                Err(NET_BUSY) => {
+                    let _ = sys::yield_now();
+                }
+                Err(errno) => return Err(errno),
             }
-            _ => Err(EIO),
         }
+        // Still no place after the rounds: nothing is reported, the caller asks again.
+        self.ready = proto_net::sockets::EpollReady::EMPTY;
+        Ok(0)
     }
 
     fn take(&mut self, channel: &Handle<Channel>, level: u8) -> Result<(), i32> {

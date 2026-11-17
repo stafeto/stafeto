@@ -2,11 +2,13 @@
 
 The games image (`boot-doom.img`) is the shell image with Doomgeneric
 (`/bin/doom`), the Freedoom data (`/games/freedoom1.wad`) and the services
-of the screen and the keys: `virtio-gpu` (a 640 by 400 screen, XRGB8888)
+of the screen and the keys: `virtio-gpu` (a 640 by 400 screen, XRGB8888),
+the composition service `compositor` in front of it (`docs/compositor.md`)
 and `virtio-input` (the keyboard). The game is a program on `libc.so` that
 calls `stafeto_display_open`, `stafeto_display_flush` and
-`stafeto_input_read` (`<stafeto/display.h>`); the screen and the keys belong
-to the process that owns the screen.
+`stafeto_input_read` (`<stafeto/display.h>`); the game draws in a buffer the
+compositor made for its window of the whole screen, and the keys belong to
+the process that has that window.
 
 ## Play by hand
 

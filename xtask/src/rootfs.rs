@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 68] = [
+const SYSTEM_PATHS: [&str; 69] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -319,6 +319,7 @@ const SYSTEM_PATHS: [&str; 68] = [
     "/etc/rc",
     "/etc/rc.d",
     "/etc/rc.d/ec2-key",
+    "/etc/rc.d/dropbear",
     // The image with the network service: the page `httpd` serves and the
     // probe of the sockets.
     "/www",
@@ -529,6 +530,8 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
         "inputrc" => Ok(INPUTRC),
         "htoprc" => Ok(b"hide_userland_threads=1\n"),
+        // The shells a login may use (Dropbear refuses an account whose shell is not listed).
+        "shells" => Ok(b"/bin/ash\n/bin/sh\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
@@ -1284,7 +1287,7 @@ const NETD_CONF_TSO: &[u8] = b"tso 1\n";
 
 /// The boot script `/etc/rc` that the launcher runs at each boot (tests/ash-launcher), and
 /// the files of `/etc/rc.d` it runs: `ec2-key` writes the key of the instance's key pair
-/// for the SSH server (tools/rc).
+/// and `dropbear` starts the SSH server that reads it (tools/rc).
 pub fn rc_files() -> Vec<RootFile> {
     vec![
         of(
@@ -1299,6 +1302,12 @@ pub fn rc_files() -> Vec<RootFile> {
             0o755,
             ROOT,
             Source::Bytes("ec2-key", include_bytes!("../../tools/rc/ec2-key")),
+        ),
+        of(
+            "/etc/rc.d/dropbear",
+            0o755,
+            ROOT,
+            Source::Bytes("dropbear", include_bytes!("../../tools/rc/dropbear")),
         ),
     ]
 }
@@ -1319,6 +1328,38 @@ fn net_files(image: &str) -> Vec<RootFile> {
     files.push(file("/bin/net-dns", 0o755, ROOT, "net-dns"));
     files.push(file("/bin/posix-net", 0o755, ROOT, "posix-net"));
     files
+}
+/// The account of the SSH probe whose password field is `*`, in the two files of the accounts of
+/// the image (no image that ships has one: stafeto-design#631).
+pub const SSH_PROBE_STAR: &str = "star";
+
+/// The accounts of the image of `net-ssh`: those of the shell and one more, `star`, whose field of
+/// /etc/shadow is `*`: the probe shows that a password is refused for it as for the locked accounts
+/// (/etc/passwd is read-only, so the image has to carry it).
+fn add_star(image: &str, files: &mut [RootFile]) {
+    for (path, name, line) in [
+        (
+            "/etc/passwd",
+            "passwd-star",
+            format!("{SSH_PROBE_STAR}:x:1001:100:{SSH_PROBE_STAR}:/tmp:/bin/ash\n"),
+        ),
+        (
+            "/etc/shadow",
+            "shadow-star",
+            format!("{SSH_PROBE_STAR}:*:20000:0:99999:7:::\n"),
+        ),
+    ] {
+        let file = files
+            .iter_mut()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{image}: no {path}"));
+        let Some(Source::Bytes(_, bytes)) = file.source else {
+            panic!("{image}: {path} is not bytes");
+        };
+        let mut text = bytes.to_vec();
+        text.extend_from_slice(line.as_bytes());
+        file.source = Some(Source::Bytes(name, Box::leak(text.into_boxed_slice())));
+    }
 }
 /// The files of the images of `nginx-probe`: those of the shell with the
 /// network (nginx among them), with the probe's variant of nginx's settings
@@ -1669,6 +1710,7 @@ pub const WWW_INDEX_LEN: usize = 64 * 1024;
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
+    "boot-ssh-probe.img",
     "boot-net-curl-steps.img",
     "boot-net-tls.img",
     "boot-net-tls-steps.img",
@@ -1839,6 +1881,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-net-rc.img" => {
             let mut files = net_files(name);
             files.extend(rc_files());
+            // The SSH server is the probe of `net-ssh`'s; here it stays off, as its lines would
+            // come between those the probe reads.
+            for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/dropbear") {
+                f.source = Some(Source::Bytes("dropbear-off", b"# off in this image\n"));
+            }
             files.push(of(
                 "/etc/netd.conf",
                 0o644,
@@ -1898,6 +1945,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-net-its.img"
         | "boot-net-curl-steps.img"
         | "boot-posix-net-steps.img" => net_files(name),
+        // The probe of the SSH server: the shell with the network and the boot script, whose
+        // `ec2-key` places the key of the probe (it has no metadata service to ask).
+        "boot-ssh-probe.img" => {
+            let mut files = net_files(name);
+            files.extend(rc_files());
+            let script = crate::net_ssh::key_script();
+            for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/ec2-key") {
+                f.source = Some(Source::Bytes("ec2-key-probe", script));
+            }
+            files
+        }
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
             let mut files = dialog(name);
@@ -2277,6 +2335,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         _ => Vec::new(),
     };
     files.extend(accounts());
+    if name == "boot-ssh-probe.img" {
+        add_star(name, &mut files);
+    }
     files
 }
 
@@ -2461,6 +2522,13 @@ mod tests {
                 assert_eq!(value, "x", "{image}: /etc/passwd field of {name}");
             }
             for (name, value) in &shadow {
+                // The probe of the SSH server carries one account whose field is `*`, to show
+                // that a password is refused for it too.
+                let probe_star = image == &"boot-ssh-probe.img" && name == SSH_PROBE_STAR;
+                if probe_star {
+                    assert_eq!(value, "*");
+                    continue;
+                }
                 assert!(
                     value.starts_with('!') && value != "*",
                     "{image}: /etc/shadow field of {name} is not locked"
@@ -2863,6 +2931,7 @@ mod tests {
                 }
                 "boot-pkg-probe-memory.img" => crate::base_image::memory_programs(),
                 "boot-net.img" => crate::net::programs(),
+                "boot-ssh-probe.img" => crate::net_ssh::programs(),
                 "boot-net-rc.img" => crate::net_ec2_key::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),

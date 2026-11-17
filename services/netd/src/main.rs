@@ -161,7 +161,9 @@ const RETURN: u64 = 128;
 pub(crate) const BACK: u64 = 256;
 /// The map of a shared buffer a BUFFER waits for (`Net::map_waiting`).
 const MAP: u64 = 512;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP;
+/// The step that answers one parked wait that cannot block (`netd::zero`).
+const ZERO: u64 = 1024;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP | ZERO;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The label of the sweep's timer on the switch thread's channel.
@@ -2421,7 +2423,7 @@ impl Driver<'_> {
         let kept = (u64::from(self.held_tx) * TX) | (u64::from(self.held_rx) * RX);
         #[cfg(not(feature = "probe"))]
         let kept = 0;
-        if (self.told | self.yielding.owed() | kept) & (TX | RX | WAKE) != 0 {
+        if (self.told | self.yielding.owed() | kept) & (TX | RX | RX1 | WAKE) != 0 {
             self.inst.net.steps_pending = true;
         }
     }
@@ -2532,7 +2534,9 @@ impl Driver<'_> {
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // A request that waits in the queue goes ahead of the steps that follow one
                 // another (`netd::gates::Yielding`).
-                let steps = self.yielding.arrive(n.bits & STEP_BITS, RX | TX | WAKE);
+                let steps = self
+                    .yielding
+                    .arrive(n.bits & STEP_BITS, RX | TX | WAKE | ZERO);
                 if steps == 0 {
                     return;
                 }
@@ -2540,7 +2544,9 @@ impl Driver<'_> {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP];
+                let order = [
+                    RX, RX1, TX, WAKE, ZERO, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP,
+                ];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -2575,13 +2581,23 @@ impl Driver<'_> {
                         let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
-                        // The waits that cannot block and are parked count this step: the wire
-                        // is quiet when neither sending nor receiving is told.
+                        // The waits that cannot block and are parked count this step: the
+                        // wire is quiet when no step of sending or receiving (of either device)
+                        // is told. Answers are the step ZERO's, one a step.
                         self.inst
                             .net
-                            .answer_zero((self.told | self.yielding.owed()) & (TX | RX) == 0);
-                        if left || netd::zero::parked(&self.inst.net.zero) {
+                            .count_zero((self.told | self.yielding.owed()) & (TX | RX | RX1) == 0);
+                        if self.inst.net.zero_due() {
+                            self.tell(ZERO);
+                        }
+                        if left || self.inst.net.zero_waiting() {
                             self.tell(WAKE);
+                        }
+                    }
+                    ZERO => {
+                        rt::service::step_own();
+                        if self.inst.net.answer_zero() {
+                            self.tell(ZERO);
                         }
                     }
                     CLEANUP => {

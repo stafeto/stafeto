@@ -5,6 +5,7 @@
 
 #[macro_use]
 mod out;
+mod step_line;
 
 #[cfg(test)]
 mod change_release_reply_tests;
@@ -50,6 +51,7 @@ mod budget_journal;
 mod carry;
 mod ci;
 mod clock_probe;
+mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
@@ -90,6 +92,7 @@ mod net_bench;
 mod net_curl;
 mod net_ec2_key;
 mod net_probe;
+mod net_ssh;
 mod net_tls;
 mod net_trace;
 mod net_vz;
@@ -1025,7 +1028,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 10] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1039,6 +1042,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 10] = [
     ("doom", "doom", 0, &["dynamic"]),
     ("openssl", "openssl", 0, &["dynamic"]),
     ("curl", "curl", 0, &["dynamic"]),
+    ("dropbear", "dropbear", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
 ];
@@ -2235,6 +2239,10 @@ commands:
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
             steps under -icount; with --hvf under HVF
+  comp-probe [--hvf] run the probe of the composition service in QEMU: windows of a client, a
+            rectangle posted alone, two windows, the screen after a process ended and a window
+            of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
+            of the compositor and the display driver under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2260,6 +2268,9 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  net-ssh [MACHINE] run the SSH server (Dropbear) of boot-ssh-probe.img: logins
+            with a key from the host's `ssh`, a key and long passwords refused,
+            the server's command line from /proc, the pseudo terminals
   fstack-probe [write-blocking] [MACHINE] run `fstack-probe` in the guest:
             the TCP/IP stack of FreeBSD 15 (F-Stack) in a process on its own
             loopback: 16 MiB through a pair of sockets, kqueue, a partial
@@ -2674,6 +2685,14 @@ fn main() {
         Some("init-wait") => init_wait::command(&args[1..]),
         Some("pkg-slot") => pkg_slot::probe(&qemu::VIRT),
         Some("pkg-probe") => pkg_probe::command(&args[1..]),
+        Some("comp-probe") => match args.get(1).map(String::as_str) {
+            None => comp_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                comp_probe::probe(&qemu::HVF_V3)?;
+                comp_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("comp-probe [--hvf]".to_owned()),
+        },
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2685,6 +2704,7 @@ fn main() {
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
+        Some("net-ssh") => net_ssh::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
         Some("net-bench") => net_bench::command(&args[1..]),
@@ -4999,6 +5019,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("fast-layer", _) => "fast-layer",
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
+        ("dropbear", _) => "dropbear",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
         _ => panic!("no dynamic build of the program {package}"),
@@ -7525,40 +7546,10 @@ fn check_loader_stack(lines: &[String]) -> Result<(), String> {
 /// objects holds 128, so the fork with the map full runs.
 const LOADER_REGIONS_MIN: u64 = 100;
 
-/// The longest step of each kind in `lines`: (kind, ticks, detail), the
-/// last line of a kind being its longest, since each prints only when it
-/// grows.
+/// The longest step of each kind in `lines`: (kind, ticks, detail), by the time less the charge
+/// of the preemptions in the step (`step_line`).
 fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
-    let mut out: Vec<(usize, u64, u64)> = Vec::new();
-    for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [
-            "service",
-            "step:",
-            line_tag,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] = words.as_slice()
-        else {
-            continue;
-        };
-        if *line_tag != tag {
-            continue;
-        }
-        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
-        else {
-            continue;
-        };
-        match out.iter_mut().find(|(k, ..)| *k == kind) {
-            Some(row) => *row = (kind, ticks, detail),
-            None => out.push((kind, ticks, detail)),
-        }
-    }
-    out
+    step_line::longest_warned(lines, tag, TERM_B)
 }
 
 /// The longest wait of each kind in `lines`: (kind, wait, whole step), from
@@ -10486,6 +10477,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
+        // The composition service on that driver: windows against QEMU's
+        // screenshot, the end of a process, a program of the first
+        // revision, then the steps of the services under -icount.
+        job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10498,6 +10493,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // guest, UDP both ways and the checks of `net-sock`, through the
         // ports QEMU forwards. Also in the group `net`.
         job("net-curl", || net_curl::probe(&qemu::VIRT, false)),
+        // The SSH server (Dropbear) of the image with the network service:
+        // logins with a key from the host's `ssh`, the refusals of another
+        // key and of long passwords, the command line of the server and the
+        // pseudo terminals. Also in the group `net`.
+        job("net-ssh", || net_ssh::probe(&qemu::VIRT)),
         // The way out: BusyBox `wget` over HTTP and HTTPS to servers on the
         // host, the lookups of the resolver against name servers in the
         // guest, and the file `/etc/resolv.conf` the service writes.
@@ -10732,9 +10732,13 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-comp",
+        "--package",
         "virtio-mmio",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "proto-input",
         "--package",
@@ -13204,6 +13208,8 @@ fn hvf() -> Result<(), String> {
         // The display service: the buffer through the real processor's
         // caches, shown without a clean (spec 3, 3.4).
         gpu_probe::probe(m)?;
+        // The composition service over it, the same way.
+        comp_probe::probe(m)?;
         // The input service on the real processor, and its focus with the
         // display service.
         input_probe::probe(m)?;
@@ -13526,6 +13532,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-comp",
+        "--package",
         "proto-input",
         "--package",
         "proto-net",
@@ -13568,6 +13576,8 @@ fn ci_lints() -> Result<(), String> {
         "entropy",
         "--package",
         "virtio-gpu",
+        "--package",
+        "compositor",
         "--package",
         "virtio-input",
         "--package",
@@ -13751,7 +13761,11 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "virtio-gpu",
         "--package",
+        "compositor",
+        "--package",
         "gpu-probe",
+        "--package",
+        "comp-probe",
         "--package",
         "virtio-input",
         "--package",
@@ -13775,7 +13789,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15895,6 +15909,11 @@ mod entropy_in_images_tests {
                 &crate::entropy::SEED_BREAK_PROGRAMS,
             ),
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
+            ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
+            (
+                "comp_probe::STEPS_PROGRAMS",
+                &crate::comp_probe::STEPS_PROGRAMS,
+            ),
             ("gpu_probe::PROGRAMS", &crate::gpu_probe::PROGRAMS),
             (
                 "gpu_probe::STEPS_PROGRAMS",

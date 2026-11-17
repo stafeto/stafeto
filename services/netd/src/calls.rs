@@ -2054,11 +2054,17 @@ impl Net {
         // parked with its steps of waking counted (`netd::zero`) and answered by the step of
         // waking, empty if nothing is ready then.
         let steps = core::mem::take(&mut self.steps_pending);
-        if steps
-            && !blocking
-            && netd::zero::room(&self.zero)
-            && let Some(pending) = r.defer()
-        {
+        if steps && !blocking {
+            // No step runs in a request and no wait is answered from the state the steps have
+            // not reached: with no place to park it (the table is full, or the token is gone)
+            // the caller is told BUSY and asks again; a slot is held for three steps of waking
+            // at most.
+            if !netd::zero::room(&self.zero) {
+                return refuse(proto_net::BUSY);
+            }
+            let Some(pending) = r.defer() else {
+                return refuse(proto_net::BUSY);
+            };
             let item = ZeroWait {
                 pending,
                 label: s.label(),
@@ -2086,10 +2092,6 @@ impl Net {
             }
             return answer;
         }
-        if steps {
-            // No room to park a wait that cannot block (or no token): it reports what is known.
-            self.interest.take(set, most, &mut ready);
-        }
         let mut w = Writer::new();
         let answer = match ready.write(&mut w) {
             Ok(()) => long_answer(r, long::Reply::Ready(w.as_bytes())),
@@ -2099,37 +2101,54 @@ impl Net {
     }
 
     /// A step of waking ran (`quiet`: neither sending nor receiving is told): the waits that
-    /// cannot block and are parked answer, with the records as they stand.
-    pub fn answer_zero(&mut self, quiet: bool) {
-        let interest = &mut self.interest;
-        netd::zero::after_wake(&mut self.zero, quiet, |w| {
-            let mut ready = EpollReady::EMPTY;
-            let found = interest.find_set(w.label, w.wire);
-            if let Some(set) = found {
-                interest.take(set, w.most, &mut ready);
-            }
-            let mut body = Writer::new();
-            let mut out = Writer::new();
-            let sent = match found {
-                None => w
+    /// cannot block and are parked count it, and those that are due wait for the step `ZERO`.
+    pub fn count_zero(&mut self, quiet: bool) {
+        netd::zero::after_wake(&mut self.zero, quiet);
+    }
+
+    /// Whether the step of waking has waits to count, and whether the step `ZERO` has waits to
+    /// answer.
+    pub fn zero_waiting(&self) -> bool {
+        netd::zero::waiting(&self.zero)
+    }
+
+    pub fn zero_due(&self) -> bool {
+        netd::zero::due(&self.zero)
+    }
+
+    /// The step `ZERO`: one parked wait that is due is answered with the records as they stand.
+    /// True when another is due.
+    pub fn answer_zero(&mut self) -> bool {
+        let Some(w) = netd::zero::take_due(&mut self.zero) else {
+            return false;
+        };
+        let mut ready = EpollReady::EMPTY;
+        let found = self.interest.find_set(w.label, w.wire);
+        if let Some(set) = found {
+            self.interest.take(set, w.most, &mut ready);
+        }
+        let mut body = Writer::new();
+        let mut out = Writer::new();
+        let sent = match found {
+            None => w
+                .pending
+                .answer(&proto_wire::reply(code(proto_net::BAD_FD)), Outgoing::new()),
+            Some(_) if ready.write(&mut body).is_err() => w.pending.answer(
+                &proto_wire::reply(code(proto_net::INVALID)),
+                Outgoing::new(),
+            ),
+            Some(_) => match long::Reply::Ready(body.as_bytes()).write(&mut out) {
+                Ok(()) => w.pending.answer(out.as_bytes(), Outgoing::new()),
+                Err(status) => w
                     .pending
-                    .answer(&proto_wire::reply(code(proto_net::BAD_FD)), Outgoing::new()),
-                Some(_) if ready.write(&mut body).is_err() => w.pending.answer(
-                    &proto_wire::reply(code(proto_net::INVALID)),
-                    Outgoing::new(),
-                ),
-                Some(_) => match long::Reply::Ready(body.as_bytes()).write(&mut out) {
-                    Ok(()) => w.pending.answer(out.as_bytes(), Outgoing::new()),
-                    Err(status) => w
-                        .pending
-                        .answer(&proto_wire::reply(status), Outgoing::new()),
-                },
-            };
-            if sent.is_err() {
-                rt::println!("net: a reply of a parked wait could not be written");
-            }
-        });
+                    .answer(&proto_wire::reply(status), Outgoing::new()),
+            },
+        };
+        if sent.is_err() {
+            rt::println!("net: a reply of a parked wait could not be written");
+        }
         self.step_due = true;
+        netd::zero::due(&self.zero)
     }
 
     // ----- CLONE -----
