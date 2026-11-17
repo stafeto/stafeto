@@ -2533,7 +2533,17 @@ impl Tty {
             return status(code);
         }
         match control.word {
-            FLOW_OUT_OFF => self.devices[self.active].console.set_stopped(true),
+            FLOW_OUT_OFF => {
+                // The output accepted before the stop goes out first, up to the room the driver
+                // gave: the steps that would have sent it run at the service's own level only
+                // while its budgets last, and the stop is owed the state the client left.
+                for _ in 0..FLOW_PUSHES {
+                    if !self.push() {
+                        break;
+                    }
+                }
+                self.devices[self.active].console.set_stopped(true);
+            }
             FLOW_OUT_ON => {
                 self.devices[self.active].console.set_stopped(false);
                 // The output the stop held goes on in this request, up to the room the driver

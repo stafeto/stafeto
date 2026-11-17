@@ -104,7 +104,18 @@ impl PipeService {
             _ => return Answer::Status(Status::BadSize),
         };
         if let Some(ticket) = self.named.find(s.label(), open) {
-            return self.named_answer(ticket, r, true);
+            // A witness asked for again, whose ticket has not been prepared and whose capability
+            // has gone out in a reply: the reply did not reach the client (a call a signal took
+            // back, repeated), and a capability cannot be given twice. A fresh ticket with its
+            // own capability replaces the old one, which no broker has seen.
+            let lost = self
+                .named
+                .get(ticket)
+                .is_some_and(|r| r.phase == NamedPhase::Witness && r.handle.is_none());
+            if !lost {
+                return self.named_answer(ticket, r, true);
+            }
+            self.named_free(ticket, true);
         }
         if !self.named_room() {
             return status(proto_pipe::AGAIN);
