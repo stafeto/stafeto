@@ -79,7 +79,7 @@ const B_ENDS: &str = "init: comp-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 19] = [
+const CHECKS: [(&str, usize); 20] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -112,6 +112,10 @@ const CHECKS: [(&str, usize); 19] = [
     ("comp-probe: a second OPEN is BUSY", 1),
     (
         "comp-probe: OPEN is BUSY while a closed window's mapping is kept",
+        1,
+    ),
+    (
+        "comp-probe: OPEN is BUSY while a closed window's handle is kept",
         1,
     ),
     ("comp-probe: after the unmap OPEN gives a cleared buffer", 1),

@@ -767,11 +767,12 @@ pub fn log_peek(
 }
 
 /// object_info(MEMORY): the object's size in bytes, the pages whose frames
-/// it owns and its mappings now.
+/// it owns, its mappings now and every reference that keeps it (handles of
+/// any process, mappings, handles in transit, long calls).
 pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
     let args = [memory.raw().0, abi::INFO_MEMORY, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
-    Ok(MemoryInfo::from_words([x[1], x[2], x[3]]))
+    Ok(MemoryInfo::from_words([x[1], x[2], x[3], x[4]]))
 }
 
 /// object_info(THREAD_STATE): what the thread does now, with what it waits
