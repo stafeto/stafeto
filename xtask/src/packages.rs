@@ -1235,7 +1235,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 24);
+        assert_eq!(packages.len(), 25);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
