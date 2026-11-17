@@ -1,0 +1,19 @@
+[package]
+name = "data-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the data file service: a series of synced writes, and the check of what a cut of the power left"
+
+[[bin]]
+name = "data-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-data = { path = "../../proto/data" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

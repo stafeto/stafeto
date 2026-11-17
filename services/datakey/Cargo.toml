@@ -1,0 +1,22 @@
+[package]
+name = "datakey"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The host key service of stafeto: keeps the SSH host key of Dropbear on the data volume and puts it into /etc/dropbear at the start"
+
+[[bin]]
+name = "datakey"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+posix-fs = { path = "../../lib/posix-fs" }
+proto-data = { path = "../../proto/data" }
+proto-fs = { path = "../../proto/fs" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

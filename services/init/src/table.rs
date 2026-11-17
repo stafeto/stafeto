@@ -71,7 +71,13 @@ pub const ENTROPY_SERVICE: &str = "entropy";
 /// The clients init gives the RAM file service's boot profile
 /// (proto_fs::BOOT_PROFILE): the diagnostic client of the RAM service and
 /// the network service, which reads `/etc/netd.conf` as the boot root.
-pub const BOOT_PROFILE_CLIENTS: &[&str] = &["ramfs-probe", NET_SERVICE, "layer-probe"];
+pub const BOOT_PROFILE_CLIENTS: &[&str] = &[
+    "ramfs-probe",
+    NET_SERVICE,
+    "layer-probe",
+    "datakey",
+    "datakey-probe",
+];
 
 /// The client init gives the RAM file service's layer session
 /// (`proto_fs::LAYERS`, attach and detach of package files): the diagnostic client of the
@@ -1523,6 +1529,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-pci-walk-qemu") as usize
     + cfg!(feature = "table-blk-probe") as usize
+    + cfg!(feature = "table-data-probe") as usize
+    + cfg!(feature = "table-datakey-probe") as usize
     + cfg!(feature = "table-store-probe") as usize
     + cfg!(feature = "table-init-wait") as usize
     + cfg!(feature = "table-pkg-slot") as usize
@@ -1616,6 +1624,8 @@ const _: () = assert!(
     feature = "table-pci-walk-vz",
     feature = "table-pci-walk-qemu",
     feature = "table-blk-probe",
+    feature = "table-data-probe",
+    feature = "table-datakey-probe",
     feature = "table-store-probe",
     feature = "table-init-wait",
     feature = "table-pkg-slot",
@@ -1785,6 +1795,10 @@ pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 pub const TABLE: &[Record] = pkg::PCI_WALK_QEMU_TABLE;
 #[cfg(feature = "table-blk-probe")]
 pub const TABLE: &[Record] = pkg::BLK_PROBE_TABLE;
+#[cfg(feature = "table-data-probe")]
+pub const TABLE: &[Record] = pkg::DATA_PROBE_TABLE;
+#[cfg(feature = "table-datakey-probe")]
+pub const TABLE: &[Record] = pkg::DATAKEY_PROBE_TABLE;
 #[cfg(feature = "table-store-probe")]
 pub const TABLE: &[Record] = pkg::STORE_PROBE_TABLE;
 #[cfg(feature = "table-init-wait")]

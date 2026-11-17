@@ -1,0 +1,18 @@
+[package]
+name = "datakey-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the host key service: stands in for the boot script of Dropbear and prints the line of the fingerprint"
+
+[[bin]]
+name = "datakey-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-fs = { path = "../../lib/posix-fs" }
+proto-fs = { path = "../../proto/fs" }
+rt = { path = "../../lib/rt" }
