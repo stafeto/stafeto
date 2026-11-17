@@ -457,6 +457,7 @@ dependencies = [
  "console-line",
  "netd",
  "nvme",
+ "nvme-blk",
  "pci",
  "proto-comp",
  "proto-fs",

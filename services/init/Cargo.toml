@@ -156,6 +156,8 @@ table-pci-walk-vz = []
 table-pci-walk-qemu = []
 # The disk service and its probe (xtask blk-probe).
 table-blk-probe = []
+# The same probe over the NVMe disk of QEMU's machine with edk2 (xtask nvme-persist blk-probe); with nvme-store.
+table-blk-probe-nvme = []
 # The data file service and its probe (xtask data-probe, data-crash).
 table-data-probe = []
 table-datakey-probe = []
@@ -263,3 +265,4 @@ netd = { path = "../netd" }
 proto-comp = { path = "../../proto/comp" }
 pci = { path = "../../lib/pci", features = ["fake"] }
 nvme = { path = "../../lib/nvme" }
+nvme-blk = { path = "../nvme" }

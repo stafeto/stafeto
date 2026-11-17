@@ -50,7 +50,7 @@ pub const PROGRAMS: [ImageProgram; 4] = [
 ];
 
 /// The bytes of the files of the runs: 131,072 sectors.
-const DISK_BYTES: u64 = 64 << 20;
+pub const DISK_BYTES: u64 = 64 << 20;
 /// The marks of sector 0 (tests/blk-probe).
 const FAULTS_MARK: &[u8; 8] = b"STAFFLT1";
 /// The rules of the host's `blkdebug` for run 3: the first flush and the
@@ -77,9 +77,9 @@ const ENDED: &str = "init: blk-probe ended: exit code 0, not restarted";
 const ENDS: &str = "init: blk-probe ended: ";
 
 /// The lines of the probe, once each, per mode.
-const NO_BUFFER: &str = "blk-probe: READ before BUFFER is NO_BUFFER";
-const INFO: &str = "blk-probe: 131072 sectors, block 512, flush";
-const WRITE_LINES: [&str; 7] = [
+pub const NO_BUFFER: &str = "blk-probe: READ before BUFFER is NO_BUFFER";
+pub const INFO: &str = "blk-probe: 131072 sectors, block 512, flush";
+pub const WRITE_LINES: [&str; 7] = [
     "blk-probe: bad requests are refused: counts, cell, range, keys",
     "blk-probe: a cell in flight is BUSY, a second BUFFER is EXISTS",
     "blk-probe: 8224 sectors of the pattern written, four cells in flight",
@@ -88,7 +88,7 @@ const WRITE_LINES: [&str; 7] = [
     "blk-probe: 8224 sectors read back and equal",
     "blk-probe: written 8224 sectors",
 ];
-const CHECK_LINES: [&str; 3] = [
+pub const CHECK_LINES: [&str; 3] = [
     "blk-probe: verified 8224 sectors",
     "blk-probe: crashing blk",
     "blk-probe: restarted",
