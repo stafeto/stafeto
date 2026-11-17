@@ -838,6 +838,7 @@ impl Inner {
         Self::put(&mut b, cmd::IDC_SN, &pad("MODEL-SERIAL-0001", 20));
         Self::put(&mut b, cmd::IDC_MN, &pad("stafeto model controller", 40));
         Self::put(&mut b, cmd::IDC_FR, &pad("1.0", 8));
+        Self::put(&mut b, cmd::IDC_VENDOR_NAME, b"/dev/sdf");
         b[cmd::IDC_MDTS] = self.scenario.mdts;
         Self::put(&mut b, cmd::IDC_VER, &0x0002_0000u32.to_le_bytes());
         Self::put(&mut b, cmd::IDC_NN, &1u32.to_le_bytes());

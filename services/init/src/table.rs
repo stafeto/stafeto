@@ -1529,6 +1529,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-pci-walk-qemu") as usize
     + cfg!(feature = "table-blk-probe") as usize
+    + cfg!(feature = "table-blk-probe-nvme") as usize
     + cfg!(feature = "table-data-probe") as usize
     + cfg!(feature = "table-datakey-probe") as usize
     + cfg!(feature = "table-store-probe") as usize
@@ -1624,6 +1625,7 @@ const _: () = assert!(
     feature = "table-pci-walk-vz",
     feature = "table-pci-walk-qemu",
     feature = "table-blk-probe",
+    feature = "table-blk-probe-nvme",
     feature = "table-data-probe",
     feature = "table-datakey-probe",
     feature = "table-store-probe",
@@ -1795,6 +1797,8 @@ pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 pub const TABLE: &[Record] = pkg::PCI_WALK_QEMU_TABLE;
 #[cfg(feature = "table-blk-probe")]
 pub const TABLE: &[Record] = pkg::BLK_PROBE_TABLE;
+#[cfg(feature = "table-blk-probe-nvme")]
+pub const TABLE: &[Record] = pkg::BLK_PROBE_NVME_TABLE;
 #[cfg(feature = "table-data-probe")]
 pub const TABLE: &[Record] = pkg::DATA_PROBE_TABLE;
 #[cfg(feature = "table-datakey-probe")]
@@ -1929,6 +1933,46 @@ mod tests {
         let mut tables = ALL_TABLES.to_vec();
         tables.push(lock_ring::TABLE);
         tables
+    }
+
+    /// A record of `nvme-blk` named `datadisk` always says which volume it may serve: a kind byte of
+    /// 1 (serial) or 2 (EBS name) and a value, so an EC2 record can never fall back to `Any` by
+    /// left-out arguments. Only the record `blk` may have no check.
+    #[test]
+    fn every_data_disk_record_names_the_identity_it_serves() {
+        let mut tables = all_tables();
+        tables.push(pkg::DATAKEY_PROBE_TABLE);
+        tables.push(pkg::DATA_PROBE_TABLE);
+        let mut seen = 0;
+        for r in tables
+            .into_iter()
+            .flatten()
+            .filter(|r| r.name == "datadisk")
+        {
+            if r.program != "nvme-blk" {
+                continue;
+            }
+            seen += 1;
+            let kind = r.args.first().copied();
+            assert!(
+                matches!(kind, Some(nvme_blk::WANT_SERIAL | nvme_blk::WANT_EBS_NAME)),
+                "datadisk has no identity kind: {:?}",
+                r.args
+            );
+            assert!(
+                r.args.len() > 1 && r.args[1] != 0,
+                "datadisk has an empty identity"
+            );
+        }
+        assert!(seen > 0);
+    }
+
+    /// The own arguments of `nvme-blk` start after the physical address of each of its DMA objects,
+    /// 8 bytes each: the offset its `Want::parse` reads at.
+    #[test]
+    fn the_identity_of_nvme_blk_follows_the_addresses_of_its_dma_objects() {
+        assert_eq!(8 * pkg::NVME_QEMU_BLK.dma.len(), nvme_blk::ADDRESS_BYTES);
+        assert_eq!(8 * pkg::NVME_QEMU_DATA.dma.len(), nvme_blk::ADDRESS_BYTES);
     }
 
     use super::*;

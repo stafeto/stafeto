@@ -15,13 +15,18 @@ name = "nvme-blk"
 test = false
 bench = false
 
+# `break-nvme-identity`: the check of the volume always passes, so a controller that is not the data
+# volume is served (`cargo xtask nvme-persist key wrongdisk` must then fail).
 # `steps`: each new longest step of the loop goes to the console (rt's feature step-stats), for
 # the measurement under -icount.
 # `break-nvme-write-offset`: a write lands one sector past where it was asked, so the store the
 # package service wrote is not the one it reads back (`cargo xtask nvme-persist breaks`).
 [features]
 steps = ["rt/step-stats"]
+# `crash`: the method CRASH of proto_blk, for the restart probe over NVMe.
+crash = []
 break-nvme-write-offset = []
+break-nvme-identity = []
 
 [dependencies]
 

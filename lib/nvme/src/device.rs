@@ -127,6 +127,9 @@ pub struct Info {
     pub serial: [u8; 20],
     pub model: [u8; 40],
     pub firmware: [u8; 8],
+    /// The vendor specific bytes 3072..3104 of Identify controller: the name of the block device
+    /// on EBS ("sdf" or "/dev/sdf"), zeros elsewhere.
+    pub vendor_name: [u8; 32],
     /// The namespaces the controller reports.
     pub nn: u32,
     /// Whether the controller has a volatile write cache (Identify
@@ -1005,6 +1008,7 @@ impl<P: Platform> Nvme<P> {
             serial: self.bytes(cmd::IDC_SN),
             model: self.bytes(cmd::IDC_MN),
             firmware: self.bytes(cmd::IDC_FR),
+            vendor_name: self.bytes(cmd::IDC_VENDOR_NAME),
             nn: self.get32(IDENT_AT + cmd::IDC_NN),
             vwc: self.get8(IDENT_AT + cmd::IDC_VWC) & 1 != 0,
             mdts,

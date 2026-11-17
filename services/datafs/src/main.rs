@@ -32,7 +32,6 @@ const SESSIONS: usize = 32;
 
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;
-const NOT_CONNECTED: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
 const BUDGET: u64 = 4;
 const STOPPED: u64 = 5;
@@ -47,9 +46,9 @@ fn main(_: u64) -> u64 {
     let serve = rt::budget::take(&mut s, rt::budget::SERVE);
     let args = ServiceArgs::read(s.args()).ok();
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
-    let Ok(blk) = rt::service::connect(&s.parent, "blk") else {
-        return NOT_CONNECTED;
-    };
+    // The record `datadisk` is optional: a machine without a data volume has none, and the service
+    // answers every request with "not mounted" (the worker finds no session of a disk).
+    let blk = rt::service::connect(&s.parent, "datadisk").ok();
     let Ok(channel) = sys::channel_create(1) else {
         return NOT_REGISTERED;
     };
@@ -82,7 +81,10 @@ fn main(_: u64) -> u64 {
     };
     for (i, raw) in [
         (worker::PROCESS, s.process.raw()),
-        (worker::BLK_SESSION, blk.into_raw()),
+        (
+            worker::BLK_SESSION,
+            blk.map_or(abi::Handle(0), |h| h.into_raw()),
+        ),
         (worker::WAKE, done.into_raw()),
     ] {
         worker::RAW[i].store(raw.0, Release);
