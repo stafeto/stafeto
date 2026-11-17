@@ -732,14 +732,22 @@ const C_IPC_US: u64 = 32;
 /// window with a heartbeat of the RAM service, init ran 2 688 ticks) and up to two notifications
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
-/// What the explanation of the loss leaves unexplained, per service, as the starvation gate
-/// allows it. A measured allowance: the one-CPU probe on the runner showed a remainder of 352
-/// (ramfs), 134 and 166 us (pipe and tty) of the loss of 10 ms with the demoted level 32, and
-/// 392, 542 and 438 us on the earlier head with the demoted level 1; the allowance is the
-/// measured value with room (stafeto-design#751 follows the part no term explains). It makes the
-/// starvation gate a regression check on the cost of a budget. It cannot see a missing budget: an
-/// unbound RAM service keeps the victim at 968 per mille against the bound of 827.
-const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
+/// What the starvation gate allows beyond the terms it explains, per service: the events of one
+/// period of the budget (its exhaustion and its replenishment, 2 e, with e from the control phase
+/// of the same run) and the work of init for it (`INIT_PER_SERVICE_US`). No term comes from the
+/// measured run of the service itself.
+fn allowance_us(e: u64) -> u64 {
+    2 * e + INIT_PER_SERVICE_US
+}
+
+/// What one overrun of a budget is, microseconds: the kernel charges a loan at the end of the
+/// request, so a budget runs over by at most one step of its service before the next
+/// replenishment repays it (`B_K_US`, the kernel's longest stretch, and the longest step of a
+/// service, `STEP_LIMIT_US`, 18 369 ticks).
+const OVERRUN_US: u64 = B_K_US + STEP_LIMIT_US;
+/// The longest step of a service, microseconds: the bound of a notice or a request of the
+/// services (`xtask` holds each step under 18 369 ticks, 294 us at 62.5 MHz).
+const STEP_LIMIT_US: u64 = 294;
 
 /// The cost of one timer event of a budget in microseconds, by C: [250, 75] (`control`), measured.
 static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -747,6 +755,15 @@ static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static CYC_RUN: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYC_WALL: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// The ticks `serve` of the service has charged (`BudgetInfo::ran`), or None when init gave the
+/// probe no copy of the budget (a probe that reads nothing fails the run).
+fn ran_of(budget: &Option<Handle<rt::handle::Budget>>) -> Option<u64> {
+    budget
+        .as_ref()
+        .and_then(|b| sys::budget_info(b).ok())
+        .map(|i| i.ran)
+}
 
 /// The e of the service `which` (index of SERVICES): the control phase of its C.
 fn e_of(which: usize) -> u64 {
@@ -891,14 +908,18 @@ fn duty_windows() -> (u64, u64, u64) {
 /// 32) spins 0.8 ms and sleeps 0.2 ms; the clients refill the queue in each sleep. The service
 /// works above the victim for C of each T and at 32, below it, for the rest, so the victim loses
 /// what the budget and its events explain and no more: in 10 ms, two periods, 2 C, the two
-/// timer events of each period (4 e) and the 2 x 10 us of the kernel's entries. A victim at or
-/// below 32 would lose all of its time to the demoted service, which the guarantee does not
-/// cover. The line gives the worst and the median share of the victim's own active time over 10
-/// cycles.
+/// timer events of each period (4 e, e from the control phase) and the 2 x 10 us of the kernel's
+/// entries, with the allowance `allowance_us`. A victim at or below 32 would lose all of its
+/// time to the demoted service, which the guarantee does not cover. The line gives the worst and
+/// the median share of the victim's own active time over 10 cycles, and the ticks the service's
+/// `serve` budget charged over the phase against its bound, `ceil(P / T) * C` and one overrun,
+/// with a floor of one C (a budget that charged less was not bound, or the clients did not
+/// ask).
 fn starve(
     process: &Handle<Process>,
     parent: &Handle<Channel>,
     which: usize,
+    budget: &Option<Handle<rt::handle::Budget>>,
     wait: &Handle<Channel>,
     timer: &Handle<Timer>,
 ) {
@@ -931,11 +952,21 @@ fn starve(
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
+    let Some(ran_before) = ran_of(budget) else {
+        println!("svcbudget1 {name} FAILED no ran-{name}");
+        return;
+    };
+    let began = time::now();
     start_all(&clients);
     sys::thread_start(&victim_thread).expect("start the victim");
     sleep_until(wait, timer, now_ns() + 155 * MS);
     STOP.store(true, Relaxed);
     wait_ended(wait, timer, n as u64);
+    let (ran_after, ended) = (ran_of(budget), time::now());
+    let Some(ran_after) = ran_after else {
+        println!("svcbudget1 {name} FAILED no ran-{name}");
+        return;
+    };
     let (worst, median, cycles) = duty_windows();
     let e = e_of(which);
     // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
@@ -943,10 +974,17 @@ fn starve(
     let loss_us = (1000 - worst) * 8;
     let explained = 2 * C_US[which] + 2 * 10 + 4 * e;
     let remainder = loss_us.saturating_sub(explained);
-    let bound = 1000 - (explained + ALLOWANCE_US[which]) / 8;
+    let bound = 1000 - (explained + allowance_us(e)) / 8;
+    // The budget's own account: the ticks charged in the phase against ceil(P / T) periods of C
+    // and one overrun, and against the floor of one C.
+    let phase_us = time::ticks_to_ns(ended - began) / 1000;
+    let ran_us = time::ticks_to_ns(ran_after.saturating_sub(ran_before)) / 1000;
+    let ran_bound = phase_us.div_ceil(T_US) * C_US[which] + OVERRUN_US;
     println!(
-        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={}",
-        C_US[which], ALLOWANCE_US[which]
+        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={} ran_us={ran_us} ran_bound_us={ran_bound} ran_floor_us={} phase_us={phase_us}",
+        C_US[which],
+        allowance_us(e),
+        C_US[which]
     );
 }
 
@@ -1091,16 +1129,55 @@ fn wait_ended_clients(wait: &Handle<Channel>, timer: &Handle<Timer>, clients: u6
     println!("svcbudget1 a client did not end");
 }
 
+/// The service whose starvation phase alone the image runs (features `break-only-*`, for the
+/// images of `cargo xtask budget-breaks` in which that service binds no budget): the account of
+/// its budget is all they judge, so no control phase, no level-40 phase and no other service
+/// runs.
+fn only_service() -> Option<usize> {
+    if cfg!(feature = "break-only-ramfs") {
+        Some(0)
+    } else if cfg!(feature = "break-only-pipe") {
+        Some(1)
+    } else if cfg!(feature = "break-only-tty") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 /// The one-CPU probe: the replies, then for each service the starvation and the level-40 phase.
 fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Handle<Timer>) {
     replies(&start.process, wait, timer);
+    if let Some(which) = only_service() {
+        let observed = [
+            rt::budget::take(start, "ran-ramfs"),
+            rt::budget::take(start, "ran-pipe"),
+            rt::budget::take(start, "ran-tty"),
+        ];
+        starve(
+            &start.process,
+            &start.parent,
+            which,
+            &observed[which],
+            wait,
+            timer,
+        );
+        return;
+    }
     // The control phases first: they measure e for the two C of the services.
     let ramfs_budget = rt::budget::take(start, "ctl-ramfs");
     let pipe_budget = rt::budget::take(start, "ctl-pipe");
     control_budget(&start.process, ramfs_budget, 250, 0, wait, timer);
     control_budget(&start.process, pipe_budget, 75, 1, wait, timer);
-    for which in 0..SERVICES.len() {
-        starve(&start.process, &start.parent, which, wait, timer);
+    // The budgets of the services' request threads, read-only, from init (feature
+    // `table-service-budget`): the account of what each charged.
+    let observed = [
+        rt::budget::take(start, "ran-ramfs"),
+        rt::budget::take(start, "ran-pipe"),
+        rt::budget::take(start, "ran-tty"),
+    ];
+    for (which, budget) in observed.iter().enumerate() {
+        starve(&start.process, &start.parent, which, budget, wait, timer);
         level40(&start.process, &start.parent, which, wait, timer);
     }
 }
