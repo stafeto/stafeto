@@ -1531,11 +1531,10 @@ impl Tty {
     }
 
     /// The input the driver holds, taken in the request of a client that waits for it (at most
-    /// `PULLS` chunks): whether any came. The console is terminal 0.
+    /// `PULLS` chunks): whether any came. The console is terminal 0. Whatever the state of the
+    /// service's own read at the driver (none started, started and not armed, armed), a pull
+    /// takes what is there.
     fn take_driver_input(&mut self) -> bool {
-        if !matches!(self.input, Input::Waiting { armed: true, .. }) {
-            return false;
-        }
         let active = self.active;
         self.select(0);
         let mut any = false;
