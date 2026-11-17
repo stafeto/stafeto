@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::vec;
 use std::vec::Vec;
 
+#[derive(Clone)]
 pub struct MemDevice {
     medium: Vec<u8>,
     cache: BTreeMap<u64, [u8; SECTOR]>,

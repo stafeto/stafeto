@@ -107,6 +107,7 @@ pub struct Table {
     /// The primary header was damaged and the backup one was read.
     pub from_backup: bool,
     entries_crc: u32,
+    entries_lba: u64,
 }
 
 impl Table {
@@ -208,7 +209,11 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
         return Ok(None);
     }
     let (first_usable, last_usable) = (le64(&sector, 40), le64(&sector, 48));
-    if first_usable > last_usable || last_usable > last {
+    // The usable sectors lie past the start entries and before the end entries.
+    if first_usable > last_usable
+        || first_usable < entries_lba.min(2) + ENTRY_SECTORS
+        || last_usable >= last - ENTRY_SECTORS
+    {
         return Ok(None);
     }
     let mut disk = [0; 16];
@@ -255,6 +260,7 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
         total,
         from_backup: lba != 1,
         entries_crc: crc,
+        entries_lba,
     }))
 }
 
@@ -489,11 +495,15 @@ pub fn create<D: Device>(dev: &mut D, spec: &[New], mut seed: u64) -> Result<Tab
     read(dev)
 }
 
-/// Sets the attribute word of the entry at `index` and writes both copies of the table (the end
-/// copy first).
+/// Sets the attribute word of the entry at `index` and writes both copies of the table.
+///
+/// The 32 sectors of entries come from the copy that `read` validated, so a copy whose entries never
+/// reached the disk cannot give a valid header over empty entries. The copy that was not read comes
+/// first (the end copy when the start one was read), then the one that was read, each entries,
+/// flush, header, flush: at every cut one copy is whole.
 pub fn set_attributes<D: Device>(dev: &mut D, index: u32, attributes: u64) -> Result<Table, Error> {
     let table = read(dev)?;
-    let part = table
+    table
         .parts
         .iter()
         .flatten()
@@ -501,31 +511,47 @@ pub fn set_attributes<D: Device>(dev: &mut D, index: u32, attributes: u64) -> Re
         .ok_or(Error::NoPartition)?;
     let (sector_of, at) = (u64::from(index) / 4, (index as usize % 4) * ENTRY_BYTES);
     let last = table.last;
+    let end_entries = last - ENTRY_SECTORS;
+    let (read_entries, read_header) = if table.from_backup {
+        (table.entries_lba, last)
+    } else {
+        (table.entries_lba, 1)
+    };
+    let (other_entries, other_header) = if table.from_backup {
+        (2, 1)
+    } else {
+        (end_entries, last)
+    };
+    let header = |lba: u64, entries_lba: u64, crc: u32| Header {
+        lba,
+        alternate: if lba == 1 { last } else { 1 },
+        first_usable: table.first_usable,
+        last_usable: table.last_usable,
+        disk: table.disk,
+        entries_lba,
+        entries_crc: crc,
+    };
+    // The other copy: every sector of the validated entries, the attribute word changed, and the
+    // checksum of what is written.
     let mut crc = 0;
-    let backup_entries = last - ENTRY_SECTORS;
-    for (entries, header_lba) in [(backup_entries, last), (2, 1)] {
-        let mut sector = [0u8; SECTOR];
-        dev.read(entries + sector_of, &mut sector)?;
-        sector[at + 48..at + 56].copy_from_slice(&attributes.to_le_bytes());
-        // The partition's own bytes stay as they are; only the word changed.
-        let _ = part;
-        dev.write(entries + sector_of, &sector)?;
-        dev.flush()?;
-        crc = walk_entries(dev, entries, |_, _| {})?;
-        write_header(
-            dev,
-            &Header {
-                lba: header_lba,
-                alternate: if header_lba == 1 { last } else { 1 },
-                first_usable: table.first_usable,
-                last_usable: table.last_usable,
-                disk: table.disk,
-                entries_lba: entries,
-                entries_crc: crc,
-            },
-        )?;
-        dev.flush()?;
+    let mut sector = [0u8; SECTOR];
+    for i in 0..ENTRY_SECTORS {
+        dev.read(read_entries + i, &mut sector)?;
+        if i == sector_of {
+            sector[at + 48..at + 56].copy_from_slice(&attributes.to_le_bytes());
+        }
+        crc = crc32(crc, &sector);
+        dev.write(other_entries + i, &sector)?;
     }
-    let _ = crc;
+    dev.flush()?;
+    write_header(dev, &header(other_header, other_entries, crc))?;
+    dev.flush()?;
+    // The copy that was read: its one sector, then its header.
+    dev.read(read_entries + sector_of, &mut sector)?;
+    sector[at + 48..at + 56].copy_from_slice(&attributes.to_le_bytes());
+    dev.write(read_entries + sector_of, &sector)?;
+    dev.flush()?;
+    write_header(dev, &header(read_header, read_entries, crc))?;
+    dev.flush()?;
     read(dev)
 }

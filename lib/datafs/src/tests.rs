@@ -207,6 +207,30 @@ fn gpt_is_made_read_and_set() {
 }
 
 #[test]
+fn a_table_whose_usable_sectors_cover_the_table_is_refused() {
+    // Both copies say the usable sectors reach over the entries (the end ones, or the start ones),
+    // with valid checksums.
+    let patch = |dev: &mut MemDevice, lba: u64, at: usize, value: u64| {
+        let mut sector = [0u8; SECTOR];
+        dev.read(lba, &mut sector).unwrap();
+        sector[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        sector[16..20].fill(0);
+        let crc = gpt::crc32(0, &sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        dev.write(lba, &sector).unwrap();
+    };
+    for (at, value) in [(48usize, 131_072 - 5), (40, 2)] {
+        let mut dev = MemDevice::new(131_072);
+        let layout = gpt::default_layout(dev.sectors()).unwrap();
+        gpt::create(&mut dev, &layout, 7).unwrap();
+        assert!(gpt::read(&mut dev).is_ok());
+        patch(&mut dev, 1, at, value);
+        patch(&mut dev, 131_071, at, value);
+        assert_eq!(gpt::read(&mut dev), Err(gpt::Error::NoTable), "{at}");
+    }
+}
+
+#[test]
 fn gpt_has_the_standard_crc() {
     assert_eq!(gpt::crc32(0, b"123456789"), 0xCBF4_3926);
 }
@@ -772,6 +796,42 @@ mod volumes {
         assert_eq!(disk.medium(), &before[..]);
     }
 
+    /// Opens the volume on boot `seed`; on the first call after a cut writes a file, later calls
+    /// read it back.
+    fn boot(disk: &mut MemDevice, seed: u64, write: bool) -> Result<volume::Did, String> {
+        let mut state = storage();
+        let (mut fs, did, part) = volume::open(&mut *disk, &mut state, seed)
+            .map_err(|e| format!("boot {seed}: {e:?}"))?;
+        if part.kind != gpt::TYPE_DATA {
+            return Err(format!("boot {seed}: another partition"));
+        }
+        if write {
+            let f = fs.open(b"/boot", Open::WRITE.with(Open::CREATE)).unwrap();
+            fs.write(f, b"second boot").unwrap();
+            fs.sync(f).unwrap();
+            fs.close(f).unwrap();
+        } else {
+            let f = fs
+                .open(b"/boot", Open::READ)
+                .map_err(|e| format!("boot {seed}: {e:?}"))?;
+            let mut out = [0u8; 16];
+            let n = fs.read(f, &mut out).unwrap();
+            fs.close(f).unwrap();
+            if &out[..n] != b"second boot" {
+                return Err(format!("boot {seed}: the data differs"));
+            }
+        }
+        fs.unmount().unwrap();
+        Ok(did)
+    }
+
+    fn three_boots(disk: &mut MemDevice) -> Result<(), String> {
+        boot(disk, 2, true)?;
+        boot(disk, 3, false)?;
+        boot(disk, 4, false)?;
+        Ok(())
+    }
+
     #[test]
     fn a_cut_in_the_first_use_leaves_a_disk_that_opens() {
         let (_, _, total) = {
@@ -781,8 +841,13 @@ mod volumes {
             let _ = fs;
             (0, 0, disk.written)
         };
-        for cut in (0..total).step_by(3) {
-            for survive in [Survive::None, Survive::All, Survive::Random(cut)] {
+        for cut in 0..total {
+            for survive in [
+                Survive::None,
+                Survive::All,
+                Survive::Random(cut),
+                Survive::Prefix(1),
+            ] {
                 let mut disk = MemDevice::new(131_072);
                 disk.cut_after(Some(cut));
                 {
@@ -790,9 +855,41 @@ mod volumes {
                     let _ = volume::open(&mut disk, &mut state, 1);
                 }
                 disk.power_cycle(survive);
-                let mut state = storage();
-                let opened = volume::open(&mut disk, &mut state, 2);
-                assert!(opened.is_ok(), "cut {cut} {survive:?}: {:?}", opened.err());
+                let result = three_boots(&mut disk);
+                assert!(result.is_ok(), "cut {cut} {survive:?}: {result:?}");
+            }
+        }
+    }
+
+    /// A cut at every sector of `set_attributes` itself, in every way the cache can survive.
+    #[test]
+    fn a_cut_in_set_attributes_leaves_a_disk_that_opens() {
+        // A formatted volume whose attribute is cleared, so that either answer of the sweep opens.
+        let mut disk = MemDevice::new(131_072);
+        let part = {
+            let mut state = storage();
+            let (_, _, part) = volume::open(&mut disk, &mut state, 1).unwrap();
+            part
+        };
+        gpt::set_attributes(&mut disk, part.index, 0).unwrap();
+        let base = disk.written;
+        let mut whole = disk.clone();
+        gpt::set_attributes(&mut whole, part.index, gpt::FORMATTED).unwrap();
+        let writes = whole.written - base;
+        assert!(writes >= 35, "{writes}");
+        for cut in 0..=writes {
+            for survive in [
+                Survive::None,
+                Survive::All,
+                Survive::Random(cut),
+                Survive::Prefix(1),
+            ] {
+                let mut d = disk.clone();
+                d.cut_after(Some(cut));
+                let _ = gpt::set_attributes(&mut d, part.index, gpt::FORMATTED);
+                d.power_cycle(survive);
+                let result = three_boots(&mut d);
+                assert!(result.is_ok(), "cut {cut} {survive:?}: {result:?}");
             }
         }
     }
