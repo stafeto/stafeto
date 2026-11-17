@@ -282,6 +282,9 @@ fn crash_now() -> ! {
 
 /// The disk service: the buffer of four cells and its INFO.
 fn connect_disk(process: &Handle<Process>) -> Result<Disk, &'static str> {
+    if RAW[BLK_SESSION].load(Acquire) == 0 {
+        return Err("no data volume on this machine");
+    }
     let session = view::<Channel>(BLK_SESSION);
     let object = sys::mem_create(u64::from(proto_blk::BUFFER_SIZE)).map_err(|_| "no memory")?;
     sys::mem_map(

@@ -341,6 +341,28 @@ pub const NVME_QEMU_BLK: Record = Record {
     ..BLK
 };
 
+/// The own arguments of the data volume of QEMU's machine (`nvme-blk`, after the addresses of the DMA
+/// objects): the kind 1 (the serial number of Identify Controller) and the serial of the disk
+/// that `xtask nvme-persist` gives the second controller (`serial=stafeto-data`). The service serves
+/// a controller with another serial number never: the ESP's is `stafeto-esp`.
+const NVME_QEMU_DATA_WANT: &[u8] = b"\x01stafeto-data";
+
+/// The data volume of QEMU's machine with edk2: the NVMe disk service under the name `datadisk`,
+/// which `datafs` connects to, with the check of the volume's identity (the serial number). The record
+/// is optional on this platform: a machine without the controller has no `datadisk`, and `datafs`
+/// serves nothing (`not mounted`).
+pub const NVME_QEMU_DATA: Record = Record {
+    name: "datadisk",
+    args: NVME_QEMU_DATA_WANT,
+    ..NVME_QEMU_BLK
+};
+
+/// The data volume that the Virtio disk of QEMU's `virt` gives, under the name `datadisk`.
+pub const BLK_DATADISK: Record = Record {
+    name: "datadisk",
+    ..BLK
+};
+
 /// The platform of QEMU's `virt` with `highmem-ecam=off` under edk2 (the machines of
 /// `xtask efi`): the ECAM of the machine below 4 GiB, buses 0 to 15, the walk over bus 0, which
 /// holds every function.
@@ -352,7 +374,7 @@ pub const QEMU_PLATFORM: crate::resolve::Platform = crate::resolve::Platform {
     },
     scan_last_bus: 0,
     io_shift: 0,
-    optional: &[],
+    optional: &["datadisk"],
 };
 
 /// The disk service of the probe of the package service: the Virtio disk, or with the feature
@@ -442,7 +464,7 @@ pub const DATAFS: Record = Record {
     trace: false,
     windows: &[],
     bindings: &[],
-    connects: &["blk"],
+    connects: &["datadisk"],
     args: &[],
     dma: &[],
     quiesce: &[],
@@ -493,7 +515,8 @@ pub const DATA_PROBE: Record = Record {
 
 /// The image of the data probe: the PL011's driver, the disk service, the data file service and the
 /// probe.
-pub const DATA_PROBE_TABLE: &[Record] = &[super::normal::TABLE[0], BLK, DATAFS, DATA_PROBE];
+pub const DATA_PROBE_TABLE: &[Record] =
+    &[super::normal::TABLE[0], BLK_DATADISK, DATAFS, DATA_PROBE];
 
 /// The host key service (services/datakey): a client of `datafs` and of the file service that
 /// puts the SSH host key of the volume into `/etc/dropbear` and says READY, and keeps a new key on
@@ -558,11 +581,16 @@ pub const DATAKEY_PROBE: Record = Record {
 pub const DATAKEY_PROBE_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     super::ramfs::RAM_LEGACY,
-    NVME_QEMU_BLK,
+    NVME_QEMU_DATA,
     DATAFS,
     DATAKEY,
     DATAKEY_PROBE,
 ];
+
+/// The image of the disk probe over the NVMe disk of QEMU's machine with edk2
+/// (`cargo xtask nvme-persist blk-probe`): the PL011's driver, the NVMe disk service under the name
+/// `blk`, which the probe connects to, and the probe.
+pub const BLK_PROBE_NVME_TABLE: &[Record] = &[super::normal::TABLE[0], NVME_QEMU_BLK, BLK_PROBE];
 
 /// The package service (pk3-design R2, R5, R15): level 32 for its main thread, below the
 /// disk (39) and the file service (48) it calls and above no one it serves but the
@@ -995,5 +1023,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_data_volume_is_the_optional_record_datadisk_that_datafs_connects_to() {
+        assert_eq!(NVME_QEMU_DATA.name, "datadisk");
+        assert_eq!(NVME_QEMU_DATA.program, "nvme-blk");
+        assert_eq!(BLK_DATADISK.name, "datadisk");
+        assert_eq!(DATAFS.connects, &["datadisk"]);
+        assert_eq!(DATAKEY_PROBE_TABLE[2].name, "datadisk");
+        assert!(DATA_PROBE_TABLE.iter().any(|r| r.name == "datadisk"));
+        assert!(DATA_PROBE_TABLE.iter().all(|r| r.name != "blk"));
+        assert!(QEMU_PLATFORM.optional.contains(&"datadisk"));
+        // The identity wanted comes in the own arguments: the kind 1 (serial) and the value that
+        // `xtask nvme-persist` gives the second controller.
+        assert_eq!(NVME_QEMU_DATA.args, b"\x01stafeto-data");
+        assert!(NVME_QEMU_BLK.args.is_empty());
+    }
+
+    #[test]
+    fn without_a_data_controller_the_table_goes_on_with_datafs_and_no_datadisk() {
+        // A machine with the ESP's controller alone: index 1 of the id is not there.
+        let mut config = pci::fake::Fake::default();
+        config.function(pci::Address::new(0, 0, 0), 0x1b36, 0x0008, 0x060000, false);
+        config.function(pci::Address::new(0, 1, 0), 0x1b36, 0x0010, 0x010802, false);
+        config.mem64(pci::Address::new(0, 1, 0), 0, 0x80_0000_0000, 0x4000);
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let found =
+            crate::resolve::resolve(DATAKEY_PROBE_TABLE, &QEMU_PLATFORM, &mut config, store)
+                .unwrap();
+        assert_eq!(found.skipped[0].unwrap().record, "datadisk");
+        assert!(found.table.iter().all(|r| r.name != "datadisk"));
+        let datafs = found.table.iter().find(|r| r.name == "datafs").unwrap();
+        assert!(datafs.connects.is_empty());
+        assert!(crate::table::check(found.table).is_ok());
+    }
+
+    #[test]
+    fn with_the_data_controller_the_table_keeps_datadisk() {
+        let found = resolved(DATAKEY_PROBE_TABLE);
+        let datadisk = found.iter().find(|r| r.name == "datadisk").unwrap();
+        assert_eq!(datadisk.windows.len(), 2);
+        let datafs = found.iter().find(|r| r.name == "datafs").unwrap();
+        assert_eq!(datafs.connects, &["datadisk"]);
+        assert!(crate::table::check(&found).is_ok());
     }
 }

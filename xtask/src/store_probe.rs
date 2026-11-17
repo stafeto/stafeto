@@ -1134,7 +1134,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1149,8 +1149,26 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 /// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB; `steps` runs the first scenario
 /// under -icount with the steps of the services counted and holds the NVMe service's to 0.9 of term B.
 pub fn nvme_persist(args: &[String]) -> Result<(), String> {
-    if args.first().map(String::as_str) == Some("key") {
-        return nvme_persist_key();
+    match args.first().map(String::as_str) {
+        Some("key") => {
+            let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+            let (case, breaks) = match rest.as_slice() {
+                [] => (KeyCase::Normal, false),
+                ["nodisk"] => (KeyCase::NoDisk, false),
+                ["wrongdisk"] => (KeyCase::WrongDisk, false),
+                ["wrongdisk", "breaks"] => (KeyCase::WrongDisk, true),
+                ["wrongdisk", "blank"] => (KeyCase::WrongBlank, false),
+                ["wrongdisk", "blank", "breaks"] => (KeyCase::WrongBlank, true),
+                other => {
+                    return Err(format!(
+                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]]: {other:?}"
+                    ));
+                }
+            };
+            return nvme_persist_key(case, breaks);
+        }
+        Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
+        _ => {}
     }
     let (breaks, shape, steps) = match args.first().map(String::as_str) {
         None => (false, Shape::Plain, false),
@@ -1160,7 +1178,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         Some("steps") => (false, Shape::Plain, true),
         Some(other) => {
             return Err(format!(
-                "usage: nvme-persist [breaks|lba4096|mdts1|steps]: {other}"
+                "usage: nvme-persist [breaks|lba4096|mdts1|steps|key|blk-probe]: {other}"
             ));
         }
     };
@@ -1201,6 +1219,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         (_, _, Shape::Plain) => "",
         (_, _, Shape::Lba4096) => "-4096",
         (_, _, Shape::Mdts1) => "-mdts1",
+        (_, _, Shape::Absent | Shape::Wrong) => "-key",
     };
     let name: &str = &format!("boot-nvme-persist{tag}.img");
     let esp_name = format!("efi-disk-nvme-persist{tag}.raw");
@@ -1411,13 +1430,90 @@ fn said(lines: &[String], text: &str) -> bool {
     lines.iter().any(|l| l.contains(text))
 }
 
-/// `cargo xtask nvme-persist key`: the host key service on the NVMe data disk, two machines on one
-/// file. The first finds a blank volume: the service reports no key, the probe (the boot script of
-/// Dropbear without the shell) makes one and prints its fingerprint, and the service keeps the key on
-/// the volume. The second starts on the same file: the service puts the key it finds into the
-/// file service, the probe keeps it, and the fingerprint is the same.
-fn nvme_persist_key() -> Result<(), String> {
-    let programs: &'static [ImageProgram] = &PROGRAMS_KEY;
+/// What the machine of `nvme-persist key` has as its data disk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyCase {
+    /// A blank disk with the serial the record wants: the key outlives the boot.
+    Normal,
+    /// No second controller: the record `datadisk` is left out, the service of the data files
+    /// answers "not mounted", the key is new on each boot.
+    NoDisk,
+    /// A controller whose serial number is another one, over a file that stands for an ESP: the
+    /// service of the disk leaves it alone.
+    WrongDisk,
+    /// The same, with the first MiB of the file zeroed: `datafs` would take it for a blank disk and
+    /// partition it, so only the check of the identity protects it.
+    WrongBlank,
+}
+
+/// The size of the file that stands for an ESP in the case `WrongDisk`.
+const STAND_IN_BYTES: usize = 16 << 20;
+/// The serial of the controller over that file: the boot disk's, which the record never names.
+const WRONG_SERIAL: &str = "stafeto-esp";
+/// The line of the service of the disk that leaves a volume alone.
+const LEFT_ALONE: &str = "nvme: datadisk is not the data volume, left alone";
+
+/// The SHA-256 of a file as text.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = [0u8; 64];
+    Ok(pkgfmt::sha::hex(&pkgfmt::sha::sha256(&bytes), &mut buf).to_string())
+}
+
+/// A file of non-zero bytes that stands for an ESP: a service that wrote to it or formatted it
+/// would change its digest.
+fn write_stand_in(path: &Path, blank_start: bool) -> Result<(), String> {
+    let mut bytes = vec![0u8; STAND_IN_BYTES];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 1;
+    }
+    if blank_start {
+        // The first MiB is zero: the test of `datafs` for a blank disk.
+        bytes[..1 << 20].fill(0);
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn no_restart_loop(lines: &[String], what: &str) -> Result<(), String> {
+    match lines.iter().find(|l| l.contains("; restarts in ")) {
+        Some(line) => Err(format!("{what}: a service restarts: {line}")),
+        None => Ok(()),
+    }
+}
+
+/// `cargo xtask nvme-persist key [nodisk|wrongdisk [breaks]]`: the host key service on the NVMe
+/// data disk, two machines on one file. The first finds a blank volume: the service reports no key,
+/// the probe (the boot script
+/// of Dropbear's stand-in) makes one, and the service keeps it on the volume. The second starts on
+/// the same file: the service puts the key it finds into the file service, the probe keeps it, and
+/// the fingerprint is the same.
+///
+/// `nodisk`: the machine has no data controller. The record `datadisk` is left out of the table, the
+/// data file service serves nothing, the probe (the shell's stand-in) comes up and ends, nothing
+/// restarts, and the key is new on each of two boots. `wrongdisk`: the controller the record
+/// names has another serial number, over a file that stands for the ESP. The disk service
+/// registers, says it left the volume alone, and refuses every operation: the file's SHA-256 is
+/// the same after the boot, the data file service says not mounted, and the key is new. With
+/// `breaks` the check of the identity always passes (`break-nvme-identity`), and the case must
+/// then fail.
+fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
+    let tag = match (case, breaks) {
+        (KeyCase::Normal, _) => "",
+        (KeyCase::NoDisk, _) => "-nodisk",
+        (KeyCase::WrongDisk, false) => "-wrongdisk",
+        (KeyCase::WrongDisk, true) => "-wrongdisk-break",
+        (KeyCase::WrongBlank, false) => "-wrongblank",
+        (KeyCase::WrongBlank, true) => "-wrongblank-break",
+    };
+    let mut list = PROGRAMS_KEY.to_vec();
+    if breaks {
+        for program in &mut list {
+            if program.0 == "nvme-blk" {
+                program.3 = &["break-nvme-identity"];
+            }
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
     let dirs = ["/etc/dropbear"].map(|path| rootfs::RootFile {
         path,
         mode: 0o755,
@@ -1425,36 +1521,43 @@ fn nvme_persist_key() -> Result<(), String> {
         gid: 0,
         source: None,
     });
-    let image = write_boot_image_files(
-        "boot-nvme-persist-key.img",
-        programs,
-        BOOT_PROFILE,
-        &[],
-        dirs.into(),
-    )?;
+    let image_name: &'static str = Box::leak(format!("boot-nvme-persist-key{tag}.img").into());
+    let image = write_boot_image_files(image_name, programs, BOOT_PROFILE, &[], dirs.into())?;
     let kernel = build(Variant::Normal)?;
     let firmware = efi::firmware()?;
     let loader = efi::build_loader(&[])?;
-    let esp = target_dir().join("efi-disk-nvme-persist-key.raw");
+    let esp = target_dir().join(format!("efi-disk-nvme-persist-key{tag}.raw"));
     let artifacts = Artifacts {
         boot_image: image,
         ..kernel.clone()
     };
     efi::make_disk(&loader, &artifacts, &esp)?;
-    let file = Disk::new("nvme-key");
-    write_disk(&file, None)?;
+    let file = Disk::new(&format!("nvme-key{tag}"));
+    let shape = match case {
+        KeyCase::Normal => Shape::Plain,
+        KeyCase::NoDisk => Shape::Absent,
+        KeyCase::WrongDisk | KeyCase::WrongBlank => Shape::Wrong,
+    };
+    if case != KeyCase::Normal && case != KeyCase::NoDisk {
+        write_stand_in(&file.0, case == KeyCase::WrongBlank)?;
+    } else {
+        write_disk(&file, None)?;
+    }
     let run = || {
         nvme_run_of(
             &firmware,
             &esp,
             &file.0,
             &kernel.elf,
-            Shape::Plain,
+            shape,
             false,
             WITHIN,
             "datakey-probe",
         )
     };
+    if case != KeyCase::Normal {
+        return nvme_key_without_volume(case, breaks, &file.0, &run);
+    }
     let first = run()?;
     if !said(&first, "datakey: no host key on /data")
         || !said(&first, "datakey: host key saved to /data")
@@ -1492,6 +1595,200 @@ fn nvme_persist_key() -> Result<(), String> {
     Ok(())
 }
 
+/// The cases of `nvme-persist key` without a usable data volume, two boots each.
+fn nvme_key_without_volume(
+    case: KeyCase,
+    breaks: bool,
+    file: &Path,
+    run: &dyn Fn() -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let name = match case {
+        KeyCase::NoDisk => "nvme-persist key nodisk",
+        KeyCase::WrongBlank => "nvme-persist key wrongdisk blank",
+        _ => "nvme-persist key wrongdisk",
+    };
+    let blank = case == KeyCase::WrongBlank;
+    let judge = |lines: &[String], boot: &str| -> Result<String, String> {
+        no_restart_loop(lines, &format!("{name}, {boot} boot"))?;
+        if blank && breaks {
+            // The break must be caught by the file's digest alone: the lines are not looked at.
+            return Ok(String::new());
+        }
+        // The data file service says it has no volume, whatever the reason.
+        if !said(lines, "datafs: no disk: ") {
+            return Err(format!(
+                "{name}, {boot} boot: the data file service did not say it has no disk: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datafs"))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if said(lines, "datakey: host key saved") || said(lines, "datakey: host key restored") {
+            return Err(format!("{name}, {boot} boot: a key was kept or restored"));
+        }
+        let left = lines.iter().filter(|l| l.contains(LEFT_ALONE)).count();
+        match case {
+            KeyCase::NoDisk if left != 0 || said(lines, "nvme: ") => Err(format!(
+                "{name}, {boot} boot: the disk service ran with no data controller"
+            )),
+            KeyCase::NoDisk if !said(lines, "init: left out: ") => Err(format!(
+                "{name}, {boot} boot: init did not say it left the record out"
+            )),
+            KeyCase::WrongDisk | KeyCase::WrongBlank if left != 1 => Err(format!(
+                "{name}, {boot} boot: {left} lines {LEFT_ALONE:?}, one expected"
+            )),
+            _ => key_fingerprint(lines),
+        }
+    };
+    let before = if case != KeyCase::NoDisk {
+        Some(file_sha256(file)?)
+    } else {
+        None
+    };
+    let boots = if case == KeyCase::NoDisk { 2 } else { 1 };
+    let mut keys = Vec::new();
+    for boot in ["first", "second"].into_iter().take(boots) {
+        let outcome = run().and_then(|lines| judge(&lines, boot));
+        match outcome {
+            Ok(key) => keys.push(key),
+            Err(why) if breaks && !blank => {
+                println!("{name} breaks: break-nvme-identity is caught: {why}");
+                return Ok(());
+            }
+            Err(why) => return Err(why),
+        }
+    }
+    if let Some(before) = before {
+        let after = file_sha256(file)?;
+        if before != after {
+            let why = format!(
+                "the file of the wrong disk changed: SHA-256 {before} before the boot, {after} after"
+            );
+            if breaks {
+                println!(
+                    "{name} breaks: break-nvme-identity is caught because the SHA-256 of the file changed: {why}"
+                );
+                return Ok(());
+            }
+            return Err(why);
+        }
+        if blank && breaks {
+            return Err(
+                "break-nvme-identity passed: the SHA-256 of the blank-start file is unchanged"
+                    .into(),
+            );
+        }
+    }
+    if breaks {
+        return Err("break-nvme-identity passed the probe".into());
+    }
+    if keys.len() == 2 && keys[0] == keys[1] {
+        return Err(format!(
+            "{name}: the key is the same on two boots with no volume: FNV:{}",
+            keys[0]
+        ));
+    }
+    match case {
+        KeyCase::NoDisk => println!(
+            "nvme-persist key nodisk: no data controller, the record datadisk is left out, the data file service says it has no disk, nothing restarts, and the key is new on each boot (FNV:{} then FNV:{}): ok",
+            keys[0], keys[1]
+        ),
+        _ => println!(
+            "nvme-persist key wrongdisk: the controller with another serial number is left alone, the file that stands for the ESP has the same SHA-256 after the boot ({}), nothing restarts, and the data file service has no disk: ok",
+            file_sha256(file)?
+        ),
+    }
+    Ok(())
+}
+
+/// `cargo xtask nvme-persist blk-probe`: the probe of the disk service (tests/blk-probe, the
+/// runs 1 and 2 of `cargo xtask blk-probe`) over the NVMe disk service on QEMU's machine with edk2:
+/// the refusals, a pattern written and flushed, CANCEL; then the machine again on the same file, the
+/// pattern read back, a CRASH of the disk service, and the restarted service read again. The
+/// record is `blk`, the name the probe connects to; init stops the controller before it starts the
+/// service again.
+fn nvme_blk_probe() -> Result<(), String> {
+    let programs: &'static [ImageProgram] = &[
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-blk-probe-nvme", "nvme-store"],
+        ),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        (
+            "nvme-blk",
+            "nvme-blk",
+            blk_probe::BLK_STACK_SIZE,
+            &["crash"],
+        ),
+        ("blk-probe", "blk-probe", CHILD_STACK_SIZE, &[]),
+    ];
+    let image = build_boot_image("boot-nvme-persist-blk-probe.img", programs, BOOT_PROFILE)?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join("efi-disk-nvme-persist-blk-probe.raw");
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let file = Disk::new("nvme-blk-probe");
+    qemu::store_file(&file.0, blk_probe::DISK_BYTES, true)?;
+    let run = || {
+        nvme_run_of(
+            &firmware,
+            &esp,
+            &file.0,
+            &kernel.elf,
+            Shape::Plain,
+            false,
+            WITHIN,
+            "blk-probe",
+        )
+    };
+    let verdict = |lines: &[String], starts: usize, wanted: &[&str]| -> Result<(), String> {
+        let seen = lines
+            .iter()
+            .filter(|l| l.starts_with("nvme: ") && l.contains(" sn stafeto-data,"))
+            .count();
+        if seen != starts {
+            return Err(format!(
+                "{seen} starts of the disk service, {starts} expected: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("nvme: "))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        for marker in [blk_probe::NO_BUFFER, blk_probe::INFO].iter().chain(wanted) {
+            let n = lines.iter().filter(|l| l.contains(*marker)).count();
+            if n != 1 {
+                return Err(format!(
+                    "{n} lines {marker:?}, one expected; the probe said {:?}",
+                    lines
+                        .iter()
+                        .filter(|l| l.contains("blk-probe: "))
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        Ok(())
+    };
+    let first = run()?;
+    verdict(&first, 1, &blk_probe::WRITE_LINES)
+        .map_err(|e| format!("nvme-persist blk-probe (writing): {e}"))?;
+    let second = run()?;
+    verdict(&second, 2, &blk_probe::CHECK_LINES)
+        .map_err(|e| format!("nvme-persist blk-probe (checking): {e}"))?;
+    println!(
+        "nvme-persist blk-probe: refusals, a pattern of 4 MiB and the disk's tail written and flushed over NVMe, CANCEL, the same read after a new start of QEMU, a CRASH and a restart of the disk service: ok"
+    );
+    Ok(())
+}
+
 /// How the data disk's controller is made: as QEMU makes it by default, with a namespace of 4 KiB
 /// blocks (`nvme-ns`), or with a transfer limit of two pages (`mdts=1`: the library cuts each cell of
 /// 16 KiB into two commands).
@@ -1500,6 +1797,11 @@ enum Shape {
     Plain,
     Lba4096,
     Mdts1,
+    /// No data controller at all (`key nodisk`).
+    Absent,
+    /// A controller with the serial of the boot disk, over a file that stands for an ESP
+    /// (`key wrongdisk`).
+    Wrong,
 }
 
 impl Shape {
@@ -1509,6 +1811,8 @@ impl Shape {
             Shape::Plain => format!("{base},drive=data"),
             Shape::Lba4096 => format!("{base},id=data-controller"),
             Shape::Mdts1 => format!("{base},drive=data,mdts=1"),
+            Shape::Absent => String::new(),
+            Shape::Wrong => format!("nvme,serial={WRONG_SERIAL},bus=pcie.0,addr=0x4,drive=data"),
         }
     }
 
@@ -1518,6 +1822,7 @@ impl Shape {
             Shape::Plain => " blocks of 512 bytes ",
             Shape::Lba4096 => " blocks of 4096 bytes ",
             Shape::Mdts1 => "mdts 1 (8192 bytes)",
+            Shape::Absent | Shape::Wrong => "",
         }
     }
 }
@@ -1565,11 +1870,13 @@ fn nvme_run_of(
         .and_then(|n| n.to_str())
         .unwrap_or("nvme-persist");
     let mut cmd = efi::command(&efi::EFI, firmware, esp, true, vars)?;
-    cmd.arg("-drive").arg(format!(
-        "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
-        data.display()
-    ));
-    cmd.args(["-device", &shape.device()]);
+    if shape != Shape::Absent {
+        cmd.arg("-drive").arg(format!(
+            "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+            data.display()
+        ));
+        cmd.args(["-device", &shape.device()]);
+    }
     if shape == Shape::Lba4096 {
         cmd.args([
             "-device",
