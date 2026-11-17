@@ -1,0 +1,3 @@
+# EC2 t4g.small, Amazon Linux 2023 neighbour (cargo xtask aws neighbour --blank-sdf): one line per NVMe controller; role is the EBS block device the volume is attached as (root = the root device, xvda); name_hex is bytes 3072..3104 of Identify Controller
+pci=0000:00:04.0 role=root model=Amazon_Elastic_Block_Store method=python-ioctl name_hex=7876646120202020202020202020202020202020202020202020202020202020
+pci=0000:00:1f.0 role=sdf model=Amazon_Elastic_Block_Store method=python-ioctl name_hex=7364662020202020202020202020202020202020202020202020202020202020
