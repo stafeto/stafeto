@@ -24,6 +24,7 @@ use netd::owners::Owners;
 use netd::passes::Passes;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State, orphan_is_over};
 use netd::ports::{Binding, PortMap, Proto};
+use netd::queue::{self, Oldest, ReapBudget, member_timeout_s};
 use netd::reuse::{Groups, Members, NO_GROUP};
 use netd::ring::{OrphanQueue, WakeBudget};
 use proto_net::sockets::{self, opt};
@@ -83,10 +84,11 @@ pub const CONNECT_NS: u64 = 75_000_000_000;
 /// The interval of the probes of KEEPALIVE (RFC 1122, 4.2.3.6).
 const KEEPALIVE_NS: u64 = 7_200_000_000_000;
 
-/// Seconds a socket of a queue may hear nothing from its peer (a handshake
-/// that never ended, a connection nobody accepted) before it closes and
-/// `reap_queue` replaces it. `accept` clears it for the connection it hands out.
-pub const QUEUE_IDLE_S: u64 = 120;
+/// Seconds an established socket of a queue may hear nothing from its peer
+/// (a connection nobody accepted) before it closes and `reap_queue` replaces
+/// it; a handshake that never ended has `queue::EMBRYO_S`. `accept` clears the
+/// timeout for the connection it hands out.
+pub use netd::queue::QUEUE_IDLE_S;
 /// The orphans one step of the sweep looks at.
 const SWEEP: usize = 4;
 /// How long an aborted stream waits for its RST, in nanoseconds.
@@ -195,6 +197,17 @@ pub struct Sock {
     /// For a listening description: the places of its queue.
     pub members: [u16; BACKLOG_MAX],
     pub member_count: u8,
+    /// For a listening description: the size of the queue that `listen`
+    /// asked for (the largest of its calls). A queue that `accept` or the
+    /// reap could not refill is topped up to it later.
+    pub backlog: u8,
+    /// For a socket of a queue: when it left LISTEN for a connection.
+    pub embryo_at: u64,
+    /// For a listening description: SYNs dropped for want of room, closed
+    /// sockets of its queue replaced, half-open sockets recycled.
+    pub syn_dropped: u32,
+    pub queue_reaped: u32,
+    pub embryo_recycled: u32,
     /// The long operations that wait on the description, by their index.
     pub waiters: u128,
     /// When the last session let go of a stream.
@@ -238,6 +251,11 @@ impl Sock {
         error: 0,
         members: [0; BACKLOG_MAX],
         member_count: 0,
+        backlog: 0,
+        embryo_at: 0,
+        syn_dropped: 0,
+        queue_reaped: 0,
+        embryo_recycled: 0,
         waiters: 0,
         orphan_at: 0,
         hold: 0,
@@ -343,6 +361,9 @@ pub struct Counters {
     /// Closed sockets of a queue (reset by the peer, or a handshake that timed out) replaced
     /// by `reap_queue`.
     pub queue_reaped: u64,
+    /// Half-open sockets (SYN-RECEIVED) of a queue that a SYN took over
+    /// when the queue had no room and no closed socket.
+    pub embryo_recycled: u64,
     /// Queue sockets of a member of a group that found no set without the
     /// queue sockets of another member: the queue is shorter.
     pub set_barred: u64,
@@ -457,6 +478,9 @@ pub struct Net {
     /// those no session holds.
     pub attention: Mask,
     pub connecting: Mask,
+    /// The sockets of a queue that left LISTEN and have not yet been seen
+    /// established (their timeout is `EMBRYO_S`).
+    pub embryos: Mask,
     pub orphans: Mask,
     /// The streams no session holds, oldest first (place and the time they
     /// were let go of); an entry whose place has since gone is skipped.
@@ -798,6 +822,7 @@ impl Net {
         self.wake_due.clear(i);
         self.attention.clear(i);
         self.connecting.clear(i);
+        self.embryos.clear(i);
         self.orphans.clear(i);
         self.places.free(i);
         if sock.port_held {
@@ -1241,6 +1266,17 @@ impl Net {
         }
         let t = stack.tcp(handle);
         let state = t.state();
+        if self.embryos.has(i) && state != tcp::State::SynReceived {
+            // The handshake of a socket of a queue ended (or the socket
+            // closed): it is no longer half-open, and an established one that
+            // is silent has `QUEUE_IDLE_S`.
+            self.embryos.clear(i);
+            if !matches!(state, tcp::State::Closed | tcp::State::Listen)
+                && self.socks[i].listener != NO_PLACE
+            {
+                t.set_timeout(Some(duration(member_timeout_s(true) * 1_000_000_000)));
+            }
+        }
         if matches!(
             state,
             tcp::State::CloseWait
@@ -1436,7 +1472,23 @@ impl Net {
                 // not give the service the next number the orphan expects, so
                 // any SYN does). The orphan is let go of only when a socket of
                 // a queue takes the SYN.
-                let existing = self.demux.find(&conn);
+                let mut existing = self.demux.find(&conn);
+                // A queue socket that closed (the peer's RST, a handshake that
+                // timed out) and still holds the four is replaced now: the SYN
+                // goes to the listening description as any other and does not
+                // meet a reset from the dead socket.
+                if let Some(place) = existing
+                    && queue::closed_member_on_four(
+                        syn,
+                        self.socks[place].listener != NO_PLACE,
+                        self.socks[place]
+                            .handle
+                            .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed),
+                    )
+                {
+                    self.reap_member(stack, place);
+                    existing = self.demux.find(&conn);
+                }
                 let orphan = match existing {
                     Some(place) if syn && self.reusable_orphan(stack, place) => Some(place),
                     Some(place) => return Some(place),
@@ -1455,19 +1507,25 @@ impl Net {
                 let Some(lead) = lead else {
                     return orphan;
                 };
-                let picked = match self.pick_member(stack, lead) {
-                    Some(found) => Some(found),
-                    // Sockets of the queue that closed (the peer's RST, the
-                    // timeout of a handshake that never ended) are replaced
-                    // before the SYN is given up.
-                    None if self.reap_queues(stack, lead) => self.pick_member(stack, lead),
-                    None => None,
-                };
+                let mut picked = self.pick_member(stack, lead);
+                // Sockets of the queue that closed (the peer's RST, the
+                // timeout of a handshake that never ended) are replaced
+                // before the SYN is given up.
+                if picked.is_none() && self.reap_queues(stack, lead) {
+                    picked = self.pick_member(stack, lead);
+                }
+                // With none closed, the oldest half-open socket makes room
+                // (an established one never does).
+                if picked.is_none() && self.recycle_embryo(stack, lead) {
+                    picked = self.pick_member(stack, lead);
+                }
                 let Some((member, listener)) = picked else {
                     // A queue with no room drops the SYN: the peer sends it
                     // again after its timeout, as it does to a busy server.
                     self.drop_frame = true;
                     self.counters.syn_dropped += 1;
+                    let l = &mut self.socks[lead];
+                    l.syn_dropped = l.syn_dropped.saturating_add(1);
                     return None;
                 };
                 if let Some(place) = orphan {
@@ -1607,29 +1665,42 @@ impl Net {
     /// Replaces the sockets of the queue of listening description `lead` (and
     /// of every member of its group) that are closed with fresh ones that
     /// listen. A socket of a queue that the peer reset after the handshake, or
-    /// whose handshake never ended and timed out (`QUEUE_IDLE_S`), leaves
-    /// LISTEN for good; `accept` takes only the connections that stand, so
-    /// without this each of them would keep a place of the queue for ever.
-    /// True when a socket was replaced.
+    /// whose handshake never ended and timed out (`EMBRYO_S`, `QUEUE_IDLE_S`),
+    /// leaves LISTEN for good; `accept` takes only the connections that stand,
+    /// so without this each of them would keep a place of the queue for ever.
+    /// The work of one SYN is bound (`ReapBudget`): it stops at the first
+    /// fresh socket that listens, or after `REBUILD_MAX` rebuilds, and the
+    /// SYNs that follow reap the rest. A queue that is short of its backlog
+    /// is topped up in the same budget. True when a socket was rebuilt or
+    /// added.
     fn reap_queues(&mut self, stack: &mut Stack<'static>, lead: usize) -> bool {
+        let mut budget = ReapBudget::new();
         let group = self.socks[lead].group;
         if group == NO_GROUP {
-            return self.reap_queue(stack, lead);
+            return self.reap_queue(stack, lead, &mut budget);
         }
         let mut reaped = false;
         for i in 0..self.groups.members(usize::from(group)).len() {
+            if !budget.open() {
+                break;
+            }
             let listener = usize::from(self.groups.members(usize::from(group))[i]);
             if self.socks[listener].listening {
-                reaped |= self.reap_queue(stack, listener);
+                reaped |= self.reap_queue(stack, listener, &mut budget);
             }
         }
         reaped
     }
 
-    fn reap_queue(&mut self, stack: &mut Stack<'static>, listener: usize) -> bool {
+    fn reap_queue(
+        &mut self,
+        stack: &mut Stack<'static>,
+        listener: usize,
+        budget: &mut ReapBudget,
+    ) -> bool {
         let mut reaped = false;
         let mut k = 0;
-        while k < usize::from(self.socks[listener].member_count) {
+        while k < usize::from(self.socks[listener].member_count) && budget.open() {
             let m = usize::from(self.socks[listener].members[k]);
             let closed = self.socks[m]
                 .handle
@@ -1638,30 +1709,137 @@ impl Net {
                 k += 1;
                 continue;
             }
-            self.release_place(stack, m);
-            let sock = self.socks[listener];
-            let last = usize::from(sock.member_count) - 1;
-            let mut own = sock.members;
-            own[k] = own[last];
             reaped = true;
-            self.counters.queue_reaped += 1;
-            match self.member(stack, &sock, listener, own, last) {
-                Some(fresh) => {
-                    let l = &mut self.socks[listener];
-                    l.members[k] = fresh as u16;
-                    l.room = l.room.saturating_add(1);
-                    k += 1;
+            let built = self.rebuild_member(stack, listener, k);
+            budget.charge(built);
+            if built {
+                k += 1;
+            }
+            // Else the slot at `k` is now the former last one: look at it.
+        }
+        reaped |= self.top_up(stack, listener, budget);
+        reaped
+    }
+
+    /// The socket at index `k` of the queue of `listener` is let go of and a
+    /// fresh one that listens takes its slot. True when one was built; else
+    /// the queue is one shorter (`listen_short`) until `top_up`.
+    fn rebuild_member(&mut self, stack: &mut Stack<'static>, listener: usize, k: usize) -> bool {
+        let m = usize::from(self.socks[listener].members[k]);
+        self.release_place(stack, m);
+        // The place `m` is free before the new one is asked for, so the
+        // table has room and `place_for` never calls `evict` here.
+        debug_assert!(self.places.used() < SOCKETS_LIMIT);
+        let sock = self.socks[listener];
+        let last = usize::from(sock.member_count) - 1;
+        let mut own = sock.members;
+        own[k] = own[last];
+        self.counters.queue_reaped += 1;
+        let l = &mut self.socks[listener];
+        l.queue_reaped = l.queue_reaped.saturating_add(1);
+        match self.member(stack, &sock, listener, own, last) {
+            Some(fresh) => {
+                let l = &mut self.socks[listener];
+                l.members[k] = fresh as u16;
+                l.room = l.room.saturating_add(1);
+                true
+            }
+            None => {
+                let l = &mut self.socks[listener];
+                l.members[k] = l.members[last];
+                l.member_count -= 1;
+                self.counters.listen_short += 1;
+                false
+            }
+        }
+    }
+
+    /// The queue socket at place `m` closed: it is rebuilt in its queue.
+    fn reap_member(&mut self, stack: &mut Stack<'static>, m: usize) {
+        let listener = usize::from(self.socks[m].listener);
+        let sock = &self.socks[listener];
+        let found =
+            (0..usize::from(sock.member_count)).find(|&k| usize::from(sock.members[k]) == m);
+        if let Some(k) = found {
+            self.rebuild_member(stack, listener, k);
+        }
+    }
+
+    /// A queue short of the backlog that was asked for (a replacement that
+    /// could not be built, `accept` that found no place) gets sockets again,
+    /// within `budget`. True when one was added.
+    pub fn top_up(
+        &mut self,
+        stack: &mut Stack<'static>,
+        listener: usize,
+        budget: &mut ReapBudget,
+    ) -> bool {
+        let mut added = false;
+        while budget.open()
+            && queue::missing(
+                self.socks[listener].backlog,
+                self.socks[listener].member_count,
+            ) > 0
+        {
+            let sock = self.socks[listener];
+            let count = usize::from(sock.member_count);
+            let Some(m) = self.member(stack, &sock, listener, sock.members, count) else {
+                budget.charge(false);
+                break;
+            };
+            budget.charge(true);
+            let l = &mut self.socks[listener];
+            l.members[count] = m as u16;
+            l.member_count += 1;
+            l.room = l.room.saturating_add(1);
+            added = true;
+        }
+        added
+    }
+
+    /// The queue of `lead` (or of a member of its group) has no room and no
+    /// closed socket: the socket that left LISTEN the longest ago and has
+    /// not finished its handshake (SYN-RECEIVED) is aborted and rebuilt, so
+    /// that the SYN gets in. A socket whose handshake ended is never taken.
+    /// True when one was.
+    fn recycle_embryo(&mut self, stack: &mut Stack<'static>, lead: usize) -> bool {
+        let group = self.socks[lead].group;
+        let mut oldest = Oldest::new();
+        let mut visit = |net: &Self, stack: &mut Stack<'static>, listener: usize| {
+            let l = &net.socks[listener];
+            for k in 0..usize::from(l.member_count) {
+                let m = usize::from(l.members[k]);
+                if net.embryos.has(m)
+                    && net.socks[m]
+                        .handle
+                        .is_some_and(|h| stack.tcp(h).state() == tcp::State::SynReceived)
+                {
+                    oldest.offer(m, net.socks[m].embryo_at);
                 }
-                None => {
-                    // The slot at `k` is now the former last one: look at it.
-                    let l = &mut self.socks[listener];
-                    l.members[k] = l.members[last];
-                    l.member_count -= 1;
-                    self.counters.listen_short += 1;
+            }
+        };
+        if group == NO_GROUP {
+            visit(self, stack, lead);
+        } else {
+            for i in 0..self.groups.members(usize::from(group)).len() {
+                let listener = usize::from(self.groups.members(usize::from(group))[i]);
+                if self.socks[listener].listening {
+                    visit(self, stack, listener);
                 }
             }
         }
-        reaped
+        let Some(m) = oldest.place() else {
+            return false;
+        };
+        if let Some(h) = self.socks[m].handle {
+            stack.tcp(h).abort();
+        }
+        let listener = usize::from(self.socks[m].listener);
+        self.reap_member(stack, m);
+        self.counters.embryo_recycled += 1;
+        let l = &mut self.socks[listener];
+        l.embryo_recycled = l.embryo_recycled.saturating_add(1);
+        true
     }
 
     /// After the stack took a SYN for a listening description: the stack hands
@@ -1687,6 +1865,7 @@ impl Net {
             let t = stack.tcp(handle);
             if t.state() == tcp::State::Listen {
                 if let Some(key) = self.socks[m].key.take() {
+                    self.embryos.clear(m);
                     self.demux.remove(&key);
                     let queue = usize::from(self.socks[m].listener);
                     self.socks[queue].room = self.socks[queue].room.saturating_add(1);
@@ -1695,6 +1874,17 @@ impl Net {
                 && let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint())
             {
                 let (local, remote) = (peer_of(local), peer_of(remote));
+                let half_open = t.state() == tcp::State::SynReceived;
+                // A handshake that does not end is cut after `EMBRYO_S`;
+                // `sync` raises it to `QUEUE_IDLE_S` when the connection
+                // stands.
+                stack
+                    .tcp(handle)
+                    .set_timeout(Some(duration(member_timeout_s(!half_open) * 1_000_000_000)));
+                self.socks[m].embryo_at = now_ns();
+                if half_open {
+                    self.embryos.set(m);
+                }
                 let queue = usize::from(self.socks[m].listener);
                 if queue != chosen {
                     // The sets keep the queues of the members apart, so this
@@ -1753,7 +1943,7 @@ impl Net {
             self.schedule_cursor = g + 1;
             self.touched.clear(g);
             for i in g * GROUP..(g + 1) * GROUP {
-                if self.attention.has(i) || self.connecting.has(i) {
+                if self.attention.has(i) || self.connecting.has(i) || self.embryos.has(i) {
                     self.wake_due.set(i);
                 }
                 let listener = usize::from(self.socks[i].listener);
