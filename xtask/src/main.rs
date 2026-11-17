@@ -2379,6 +2379,8 @@ commands:
             `httpd -f -p 80 -h /www &` fetches the page of the image
   efi [EFI|EFI_EL2] boot the system through the EFI loader under edk2 from a GPT disk with an ESP and compare
             the kernel's boot report with the same machine started with -kernel
+  efi-time  boot an image with the clock service through the loader under edk2 and check that the loader writes the
+            firmware's time into boot-time and the clock service starts there (within 120 s of the host)
   efi-vz    boot the disk of the EFI loader on Apple VZ (VZEFIBootLoader) to the shell
   efi-fixtures take the firmware's tables and memory map and QEMU's own tree as the samples of the host test of firmware-tree
   efi-breaks the deliberate breaks of the loader: each fails its host test and, where it can, its run under edk2
@@ -2446,6 +2448,7 @@ fn main() {
         Some("random-restart-breaks") => entropy::random_restart_breaks(),
         Some("entropy-seed") => entropy::seed_probe(),
         Some("its-slow") => its_slow(),
+        Some("efi-time") => efi::time(),
         Some("efi-vz") => efi::vz(),
         Some("efi-fixtures") => efi::fixtures(&args[1..]),
         Some("run") => run(&args[1..]),
@@ -3984,9 +3987,11 @@ fn write_elf_image(
         }
     }
     // A VZ machine has no PL031: its runner writes the time of the host into
-    // this file before it boots the image (tools/vz-run.swift).
+    // this file before it boots the image (tools/vz-run.swift). The images the
+    // EFI loader boots (EC2 and the probe of the loader's time) get the time
+    // of the firmware there (boot/efi-loader).
     let seed = rtc::seed_file(0);
-    if name.contains("vz")
+    if ["vz", "aws", "efi"].iter().any(|part| name.contains(part))
         && sources
             .iter()
             .any(|(file, _, _)| *file == "posix-clock-service")
@@ -10338,6 +10343,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("efi EFI", || efi::run(&["EFI".to_string()])),
         job("efi EFI_EL2", || efi::run(&["EFI_EL2".to_string()])),
         job("efi breaks", efi::breaks),
+        job("efi time", efi::time),
         job("smp 4 GICv2", || smp_boot(&qemu::VIRT, GIC_V2_LINE)),
         job("smp 4 GICv3", || smp_boot(&qemu::VIRT_V3, GIC_V3_LINE)),
         job("smp 4 EL2 GICv2", || smp_boot(&qemu::VIRT_EL2, GIC_V2_LINE)),

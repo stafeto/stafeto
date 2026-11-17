@@ -38,6 +38,8 @@
 #        net: ena mac 02:..., link unknown     (EC2 sends no link event; `link up` or `unknown` both pass)
 #        ena: link up                          (a line of its own, shortly after)
 #        entropy: seeded from the boot page (64 bytes)
+#        efi-loader: time N from GetTime       (the firmware's time, written into boot-time)
+#        clock: ready (started at N from the boot image)   (N within seconds of the host's date +%s)
 #        ec2-key: ...                          (the type and comment of the key pair)
 #        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
@@ -73,7 +75,8 @@
 #                                              added) `consumers` equal to the workers of nginx-fast (2),
 #                                              `rx_consumer` and `tx_consumer` above 0 after the
 #                                              curl of 8080, `tx_refused 0`, `rx_full 0`
-#        date -u -s "YYYY-MM-DD HH:MM:SS"      first: the clock starts at 2026-01-01 and `pkg` refuses the
+#        date -u                               within a few seconds of the host's `date -u` (before pkg update)
+#        date -u -s "YYYY-MM-DD HH:MM:SS"      only if the clock is wrong: it starts at 2026-01-01 and `pkg` refuses the
 #                                              certificate of stafeto.github.io until it is set
 #        pkg update; pkg search nginx          the index of the series 0.5 from stafeto.github.io
 #        pkg install htop; TERM=vt100 htop     a package from the store in memory (the image has no
