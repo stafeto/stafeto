@@ -107,21 +107,25 @@ pub fn key_script() -> &'static [u8] {
 }
 
 /// What a run of `ssh` came to.
-struct Ended {
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: String,
+pub(crate) struct Ended {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
 }
 
 impl Ended {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
 }
 
 /// Runs `command` with `stdin` written to it, waiting up to `within`; the
 /// process is killed when the time is up.
-fn run_for(mut command: Command, stdin: &[u8], within: Duration) -> Result<Ended, String> {
+pub(crate) fn run_for(
+    mut command: Command,
+    stdin: &[u8],
+    within: Duration,
+) -> Result<Ended, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -182,13 +186,13 @@ fn run_for(mut command: Command, stdin: &[u8], within: Duration) -> Result<Ended
 /// starts with (the curve25519 exchange is the quick one on an emulated CPU,
 /// and Ed25519 is the host key made first), and a file of known hosts of the
 /// run.
-struct Client {
-    port: u16,
-    dir: PathBuf,
+pub(crate) struct Client {
+    pub(crate) port: u16,
+    pub(crate) dir: PathBuf,
 }
 
 impl Client {
-    fn command(&self, user: &str, key: Option<&Path>, batch: bool) -> Command {
+    pub(crate) fn command(&self, user: &str, key: Option<&Path>, batch: bool) -> Command {
         let mut command = Command::new("ssh");
         command
             .args(["-F", "/dev/null", "-p", &self.port.to_string()])
@@ -216,7 +220,7 @@ impl Client {
 
 /// `ssh-keygen` makes the key `name` in `dir` without a passphrase: the
 /// private file and the public line.
-fn make_key(dir: &Path, name: &str) -> Result<(PathBuf, String), String> {
+pub(crate) fn make_key(dir: &Path, name: &str) -> Result<(PathBuf, String), String> {
     let path = dir.join(name);
     let made = Command::new("ssh-keygen")
         .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
@@ -233,7 +237,7 @@ fn make_key(dir: &Path, name: &str) -> Result<(PathBuf, String), String> {
 }
 
 /// The version line of `ssh`, which the run needs on the host.
-fn host_ssh() -> Result<String, String> {
+pub(crate) fn host_ssh() -> Result<String, String> {
     let said = Command::new("ssh")
         .arg("-V")
         .output()

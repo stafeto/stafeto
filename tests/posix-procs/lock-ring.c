@@ -32,14 +32,18 @@ static int ring_read(unsigned index, struct ring_record *record) {
     int ok = read(fd, record, sizeof(*record)) == (ssize_t)sizeof(*record);
     close(fd); return ok;
 }
+/* A gate has no deadline of its own: the coordinator owns every bound (the
+ * barriers below) and always ends by publishing the awaited file or the abort
+ * file. A coordinator that dies is reported by init, and the probe stops. */
 static int ring_gate(const char *path) {
     struct timespec tick = {0, 10000000};
-    for (unsigned n = 0; n < 300; ++n) {
+    for (;;) {
         int fd = open(path, O_RDONLY);
         if (fd >= 0) { close(fd); return 1; }
+        fd = open("/tmp/lock-ring-abort", O_RDONLY);
+        if (fd >= 0) { close(fd); return 0; }
         nanosleep(&tick, NULL);
     }
-    return 0;
 }
 static int ring_publish(const char *path) {
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0666);
@@ -85,13 +89,17 @@ static int ring_wait(void) {
     return phase == 'X' ? -1 : 0;
 }
 static void *ring_worker(void *unused) { (void)unused; ring_wait(); return NULL; }
+static unsigned ring_barrier_rounds;
+/* The phases only advance, so a record that showed the wanted phase is not read again:
+ * each round costs ramfs only the records still missing. */
 static int ring_barrier(char wanted, unsigned count) {
     struct timespec tick = {0, 10000000};
-    for (unsigned n = 0; n < 300; ++n) {
-        unsigned got = 0;
+    unsigned char seen[16] = {0};
+    unsigned got = 0;
+    for (ring_barrier_rounds = 0; ring_barrier_rounds < 300; ++ring_barrier_rounds) {
         for (unsigned i = 0; i < count; ++i) {
             struct ring_record record;
-            if (ring_read(i, &record) && record.phase == wanted) ++got;
+            if (!seen[i] && ring_read(i, &record) && record.phase == wanted) { seen[i] = 1; ++got; }
         }
         if (got == count) return 1;
         nanosleep(&tick, NULL);
@@ -101,7 +109,7 @@ static int ring_barrier(char wanted, unsigned count) {
 static void ring_signal(int sig) { (void)sig; }
 static int ring_coordinator(void) {
     int bad = 0;
-    if (!ring_barrier('H', 16)) return -1;
+    if (!ring_barrier('H', 16)) { printf("posix-procs: ring barrier H timed out\n"); return -1; }
     struct ring_record records[16];
     unsigned roots[4], generations[4];
     for (unsigned i = 0; i < 16; ++i) {
@@ -119,7 +127,23 @@ static int ring_coordinator(void) {
     if (ring_publish("/tmp/lock-ring-start")) return -1;
     pthread_t worker;
     if (pthread_create(&worker, NULL, ring_worker, NULL)) return -1;
-    if (!ring_barrier('S', 15) || ring_publish("/tmp/lock-ring-last")) bad = 1;
+    struct timespec began, ended;
+    clock_gettime(CLOCK_MONOTONIC, &began);
+    int slept = ring_barrier('S', 15);
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    printf("posix-procs: ring barrier S %s after %u rounds, %ld ms\n", slept ? "met" : "timed out", ring_barrier_rounds,
+           (long)((ended.tv_sec - began.tv_sec) * 1000 + (ended.tv_nsec - began.tv_nsec) / 1000000));
+    if (!slept) {
+        bad = 1;
+        printf("posix-procs: ring barrier S sleeping:");
+        for (unsigned i = 0; i < 15; ++i) {
+            struct ring_record record;
+            if (ring_read(i, &record) && record.phase == 'S') printf(" %u", i);
+        }
+        printf("\n");
+    }
+    /* Published on every path, so that index 15 never decides for itself. */
+    if (ring_publish("/tmp/lock-ring-last")) bad = 1;
     struct timespec tick = {0, 10000000};
     unsigned succeeded = 0, deadlocked = 0, done = 0;
     for (unsigned n = 0; n < 300; ++n) {
@@ -156,9 +180,9 @@ static int ring_run(unsigned family) {
     if (!family) {
         for (unsigned i = 0; i < 16; ++i) {
             char path[64]; ring_path(path, sizeof(path), "file", i);
-            if (ring_publish(path)) { printf("posix-procs: ring create file index=%u errno=%d\n", i, errno); return 1; }
+            if (ring_publish(path)) { printf("posix-procs: ring create file index=%u errno=%d\n", i, errno); ring_publish("/tmp/lock-ring-abort"); return 1; }
         }
-        if (ring_publish("/tmp/lock-ring-files-ready")) { printf("posix-procs: ring create ready errno=%d\n", errno); return 1; }
+        if (ring_publish("/tmp/lock-ring-files-ready")) { printf("posix-procs: ring create ready errno=%d\n", errno); ring_publish("/tmp/lock-ring-abort"); return 1; }
     } else if (!ring_gate("/tmp/lock-ring-files-ready")) { printf("posix-procs: ring files-ready timeout family=%u errno=%d\n", family, errno); return 1; }
     struct sigaction action = {0}; action.sa_handler = ring_signal; sigemptyset(&action.sa_mask);
     if (sigaction(SIGUSR1, &action, NULL)) return 1;
@@ -173,6 +197,7 @@ static int ring_run(unsigned family) {
     }
     if (ring_setup(4 * family)) return 1;
     int bad = family ? ring_wait() : ring_coordinator();
+    if (!family && bad) ring_publish("/tmp/lock-ring-abort");
     if (bad) printf("posix-procs: ring own part failed family=%u bad=%d\n", family, bad);
     for (unsigned i = 0; i < 3; ++i) {
         int status = 0;

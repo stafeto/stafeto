@@ -6,12 +6,12 @@
 # end, and each one waits for what it needs (the network) by itself. A service
 # of the image joins by shipping a file in /etc/rc.d and putting its name in
 # the list after the names whose work it needs: a server that reads
-# /root/.ssh/authorized_keys goes after `ec2-key`.
+# /root/.ssh/authorized_keys goes after `ec2-key`, and `landing` goes before the web servers.
 
 # The console, for the lines the scripts print.
 exec </dev/null >/dev/console 2>&1
 
-for name in ec2-key dropbear fast; do
+for name in ec2-key dropbear landing web fast; do
     if [ -f "/etc/rc.d/$name" ]; then
         ash "/etc/rc.d/$name"
     fi
