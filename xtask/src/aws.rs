@@ -2824,7 +2824,7 @@ mod tests {
         let map = format!(
             "# tools: nvme=/usr/sbin/nvme\n\
              nvme0 pci=0000:00:1f.0 model=Amazon_Elastic_Block_Store serial=vol0aaaa method=nvme-cli name_hex=736466{pad}\n\
-             nvme1 pci=0000:00:04.0 model=Amazon_Elastic_Block_Store serial=vol0bbbb method=python-ioctl name_hex=7864766100{}\n\
+             nvme1 pci=0000:00:04.0 model=Amazon_Elastic_Block_Store serial=vol0bbbb method=python-ioctl name_hex=7876646100{}\n\
              nvme2 pci=0000:00:09.0 model=Other serial=x method=none name_hex=\n",
             "00".repeat(27)
         );
