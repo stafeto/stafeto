@@ -65,6 +65,15 @@ fn main(_: u64) -> u64 {
     ) else {
         return NOT_REGISTERED;
     };
+    // The same notification for the service itself, when it leaves finished jobs for a later step.
+    let Ok(again) = sys::handle_label(
+        &channel,
+        Rights::NOTIFY | Rights::TRANSFER,
+        LABEL_DONE,
+        level,
+    ) else {
+        return NOT_REGISTERED;
+    };
     let Ok(jobs) = sys::channel_create(worker::LEVEL) else {
         return NOT_REGISTERED;
     };
@@ -79,6 +88,16 @@ fn main(_: u64) -> u64 {
         worker::RAW[i].store(raw.0, Release);
     }
     worker::JOBS_CHANNEL.store(jobs.into_raw().0, Release);
+    // The loop works under a budget from here on: the first touch of a page of the table of jobs
+    // or of the volume's memory is a fault the kernel serves, and it must not land in a step.
+    touch(
+        TABLE.get().cast::<u8>(),
+        core::mem::size_of::<[Job; JOBS]>(),
+    );
+    touch(
+        STORAGE.get().cast::<u8>(),
+        core::mem::size_of::<datafs::Storage>(),
+    );
     let Ok(_thread) = worker::start(&s.process) else {
         return NOT_REGISTERED;
     };
@@ -87,6 +106,7 @@ fn main(_: u64) -> u64 {
     let mut service = Datafs {
         parent: Handle::borrowed(s.parent.raw()),
         kick,
+        again,
         pending: [const { None }; JOBS],
         forgotten: [0; JOBS],
         forgotten_count: 0,
@@ -109,9 +129,27 @@ fn main(_: u64) -> u64 {
     STOPPED
 }
 
+/// Writes a zero into each page of the `len` bytes at `base`, so that every page is mapped. It runs
+/// before the worker thread starts: no one else uses the memory yet, and the bytes are zeros.
+fn touch(base: *mut u8, len: usize) {
+    let mut at = 0;
+    while at < len {
+        // SAFETY: `at` is within the static; the bytes are zeros and no other thread runs yet.
+        unsafe { base.add(at).write_volatile(0) };
+        at += PAGE;
+    }
+}
+
+const PAGE: usize = 4096;
+
+/// The finished jobs the main thread answers in one step; the rest follow in later steps.
+const SETTLE_AT_ONCE: usize = 4;
+
 struct Datafs {
     parent: core::mem::ManuallyDrop<Handle<Channel>>,
     kick: Handle<Channel>,
+    /// A notification of the service to itself with the label of the worker's.
+    again: Handle<Channel>,
     /// The deferred reply of each job in flight.
     pending: [Option<Pending>; JOBS],
     /// The sessions that went while every job was in use: their files close when a job is free.
@@ -150,17 +188,29 @@ impl Datafs {
     }
 
     /// Sends the reply of every finished job and frees it.
+    /// At most `SETTLE_AT_ONCE` replies go in one step, so that a step stays short whatever the worker
+    /// has finished; when more are done, the service tells itself again and the rest follow.
     fn settle(&mut self) {
+        let mut sent = 0;
+        let mut more = false;
         for i in 0..JOBS {
             if state(i).load(Acquire) != DONE {
                 continue;
             }
+            if sent == SETTLE_AT_ONCE {
+                more = true;
+                break;
+            }
+            sent += 1;
             // SAFETY: the job is DONE: the worker has finished with it.
             let job = unsafe { &*job(i) };
             if let Some(pending) = self.pending[i].take() {
                 let _ = pending.answer(&job.reply[..job.reply_len], Outgoing::new());
             }
             state(i).store(FREE, Release);
+        }
+        if more {
+            let _ = sys::notify(&self.again, 1);
         }
         self.close_forgotten();
     }

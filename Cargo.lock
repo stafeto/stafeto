@@ -194,6 +194,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "datakey"
+version = "0.5.0"
+dependencies = [
+ "abi",
+ "posix-fs",
+ "proto-data",
+ "proto-fs",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "datakey-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-fs",
+ "proto-fs",
+ "rt",
+]
+
+[[package]]
 name = "defmt"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

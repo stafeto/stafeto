@@ -1134,7 +1134,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1149,6 +1149,9 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 /// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB; `steps` runs the first scenario
 /// under -icount with the steps of the services counted and holds the NVMe service's to 0.9 of term B.
 pub fn nvme_persist(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("key") {
+        return nvme_persist_key();
+    }
     let (breaks, shape, steps) = match args.first().map(String::as_str) {
         None => (false, Shape::Plain, false),
         Some("breaks") => (true, Shape::Plain, false),
@@ -1367,6 +1370,128 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The programs of the image of the host key probe: the services of the data volume on the NVMe disk,
+/// the host key service and the probe that stands in for the boot script of Dropbear.
+const PROGRAMS_KEY: [ImageProgram; 7] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-datakey-probe", "nvme-store"],
+    ),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]),
+    ("datafsd", "datafsd", 32 * 1024, &[]),
+    ("datakey", "datakey", 128 * 1024, &[]),
+    ("datakey-probe", "datakey-probe", 128 * 1024, &[]),
+];
+
+/// The line of the fingerprint the probe prints, in the form of the boot script's line.
+const KEY_LINE: &str = "ssh: host key FNV:";
+
+/// The fingerprint line of a run.
+fn key_fingerprint(lines: &[String]) -> Result<String, String> {
+    let found: Vec<String> = lines
+        .iter()
+        .filter_map(|l| {
+            let at = l.find(KEY_LINE)?;
+            Some(l[at + KEY_LINE.len()..].trim().to_owned())
+        })
+        .collect();
+    match found.as_slice() {
+        [one] if one.len() == 16 => Ok(one.clone()),
+        other => Err(format!(
+            "one fingerprint line wanted, the run printed {other:?}"
+        )),
+    }
+}
+
+fn said(lines: &[String], text: &str) -> bool {
+    lines.iter().any(|l| l.contains(text))
+}
+
+/// `cargo xtask nvme-persist key`: the host key service on the NVMe data disk, two machines on one
+/// file. The first finds a blank volume: the service reports no key, the probe (the boot script of
+/// Dropbear without the shell) makes one and prints its fingerprint, and the service keeps the key on
+/// the volume. The second starts on the same file: the service puts the key it finds into the
+/// file service, the probe keeps it, and the fingerprint is the same.
+fn nvme_persist_key() -> Result<(), String> {
+    let programs: &'static [ImageProgram] = &PROGRAMS_KEY;
+    let dirs = ["/etc", "/etc/dropbear"].map(|path| rootfs::RootFile {
+        path,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        source: None,
+    });
+    let image = write_boot_image_files(
+        "boot-nvme-persist-key.img",
+        programs,
+        BOOT_PROFILE,
+        &[],
+        dirs.into(),
+    )?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join("efi-disk-nvme-persist-key.raw");
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let file = Disk::new("nvme-key");
+    write_disk(&file, None)?;
+    let run = || {
+        nvme_run_of(
+            &firmware,
+            &esp,
+            &file.0,
+            &kernel.elf,
+            Shape::Plain,
+            false,
+            WITHIN,
+            "datakey-probe",
+        )
+    };
+    let first = run()?;
+    if !said(&first, "datakey: no host key on /data")
+        || !said(&first, "datakey: host key saved to /data")
+    {
+        return Err(format!(
+            "the first boot did not find a blank volume and keep the key: {:?}",
+            first
+                .iter()
+                .filter(|l| l.contains("datakey"))
+                .collect::<Vec<_>>()
+        ));
+    }
+    let before = key_fingerprint(&first)?;
+    let second = run()?;
+    if !said(&second, "datakey: host key restored from /data")
+        || said(&second, "datakey: no host key")
+    {
+        return Err(format!(
+            "the second boot did not restore the key: {:?}",
+            second
+                .iter()
+                .filter(|l| l.contains("datakey"))
+                .collect::<Vec<_>>()
+        ));
+    }
+    let after = key_fingerprint(&second)?;
+    if before != after {
+        return Err(format!(
+            "the fingerprint of the host key changed between two boots of one volume: {before} then {after}"
+        ));
+    }
+    println!(
+        "nvme-persist key: the host key made on the first boot of a blank NVMe data volume was kept by datakey, and the second boot of the same volume restored it (fingerprint FNV:{before} on both): ok"
+    );
+    Ok(())
+}
+
 /// How the data disk's controller is made: as QEMU makes it by default, with a namespace of 4 KiB
 /// blocks (`nvme-ns`), or with a transfer limit of two pages (`mdts=1`: the library cuts each cell of
 /// 16 KiB into two commands).
@@ -1409,6 +1534,31 @@ fn nvme_run(
     icount: bool,
     within: Duration,
 ) -> Result<Vec<String>, String> {
+    nvme_run_of(
+        firmware,
+        esp,
+        data,
+        elf,
+        shape,
+        icount,
+        within,
+        "store-probe",
+    )
+}
+
+/// `nvme_run` for the probe called `probe`: its line of failure starts with `<probe>: failed`, and
+/// the machine stops when init says the probe ended.
+#[allow(clippy::too_many_arguments)]
+fn nvme_run_of(
+    firmware: &efi::Firmware,
+    esp: &Path,
+    data: &Path,
+    elf: &Path,
+    shape: Shape,
+    icount: bool,
+    within: Duration,
+    probe: &str,
+) -> Result<Vec<String>, String> {
     // The variables of the firmware are copied to a file named after the disk of the run.
     let vars = esp
         .file_stem()
@@ -1431,15 +1581,13 @@ fn nvme_run(
         // the idle one runs the services past the deadlines of their heartbeats.
         cmd.args(qemu::ICOUNT).args(["-smp", "1"]);
     }
-    let output = run_until(cmd, within, Some("init: store-probe ended: "), elf)?;
-    if let Some(failed) = output
-        .lines
-        .iter()
-        .find(|l| l.starts_with("store-probe: failed"))
-    {
+    let ends = format!("init: {probe} ended: ");
+    let output = run_until(cmd, within, Some(&ends), elf)?;
+    let failed_start = format!("{probe}: failed");
+    if let Some(failed) = output.lines.iter().find(|l| l.starts_with(&failed_start)) {
         return Err(failed.clone());
     }
-    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_stopped_on(&output, &format!("{ends}exit code 0, not restarted"))?;
     Ok(apart(&output.lines))
 }
 

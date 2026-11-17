@@ -32,8 +32,9 @@ const POINTS: u64 = 12;
 /// The tag of the service's lines of steps (rt::service::report_steps).
 const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
-/// and the check send (the worker thread does the disk's work, so these steps are the queue's).
-const STEP_KINDS: [(usize, &str); 9] = [
+/// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
+/// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
+const STEP_KINDS: [(usize, &str); 11] = [
     (1, "Open"),
     (2, "Close"),
     (3, "Read"),
@@ -43,6 +44,8 @@ const STEP_KINDS: [(usize, &str); 9] = [
     (11, "Unlink"),
     (13, "Rename"),
     (14, "Readdir"),
+    (64, "the notices and the heartbeat"),
+    (65, "the service's own step"),
 ];
 
 /// The steps of the loop in the lines of the two runs: every kind the probe used came, and no step

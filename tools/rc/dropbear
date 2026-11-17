@@ -3,13 +3,16 @@
 # program (an image that holds no package dropbear), nothing starts and one
 # line says so.
 #
-# The host key is an Ed25519 key made here, before the server starts and so
-# before anyone can connect (`dropbearkey` waits for the entropy service's
-# seed in `getrandom`). One line on the console gives its fingerprint, for the
-# owner to compare with what `ssh` shows at the first connection:
+# The host key is an Ed25519 key. An image with a data volume starts the service `datakey` before
+# this script: it puts the key it kept on the volume into /etc/dropbear, and this script uses that
+# key, so the fingerprint stays the same from boot to boot. With no key in /etc/dropbear (a first
+# boot, or an image with no data volume) the script makes one here, before the server starts and so
+# before anyone can connect (`dropbearkey` waits for the entropy service's seed in `getrandom`), and
+# `datakey` keeps a new key on the volume where there is one. One line on the console gives the
+# fingerprint, for the owner to compare with what `ssh` shows at the first connection:
 #   ssh: host key SHA256:...
-# The key lives in /etc/dropbear, which is in memory: a new instance start
-# makes a new key.
+# /etc/dropbear is in memory: with no data volume a new instance start makes a new key. The key
+# itself is never printed, and the image holds no key (the build checks it).
 #
 # The server runs in the foreground (-F) under a loop of its own that starts
 # it again a second after it ends (it starts when the network has its address, so
