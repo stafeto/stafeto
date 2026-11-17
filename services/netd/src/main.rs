@@ -161,7 +161,9 @@ const RETURN: u64 = 128;
 pub(crate) const BACK: u64 = 256;
 /// The map of a shared buffer a BUFFER waits for (`Net::map_waiting`).
 const MAP: u64 = 512;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP;
+/// The step that answers one parked wait that cannot block (`netd::zero`).
+const ZERO: u64 = 1024;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP | ZERO;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The label of the sweep's timer on the switch thread's channel.
@@ -1301,6 +1303,11 @@ struct Driver<'a> {
     own_said: bool,
     /// The bits of the notifications to itself that are on their way.
     told: u64,
+    /// The steps in a row, and the steps put off for a request that waits in the queue. The
+    /// bits put off stay in `told`, so that neither the stack nor the switch tells them again.
+    yielding: netd::gates::Yielding,
+    /// What of its counters the profile has.
+    yield_seen: [u32; 3],
     /// The doorbell held for the work queued behind a step.
     bell: netd::ring::Hold,
     /// The queue was looked at in the event that is on.
@@ -1398,6 +1405,8 @@ impl<'a> Driver<'a> {
             second: None,
             own_said: false,
             told: 0,
+            yielding: netd::gates::Yielding::new(),
+            yield_seen: [0; 3],
             bell: netd::ring::Hold::new(),
             bell_checked: false,
             cleanup_due: false,
@@ -2210,6 +2219,12 @@ impl Driver<'_> {
             self.inst.net.demux.probe_max
         );
         rt::println!(
+            "net: yield deferred {} idle {} served {}",
+            self.yielding.deferred,
+            self.yielding.idle,
+            self.yielding.served
+        );
+        rt::println!(
             "net: bells tx {} frames {}",
             switch::INNER.bells_tx(),
             tx.tx
@@ -2399,9 +2414,27 @@ const METHODS: &[u16] = &[
 ];
 
 impl Driver<'_> {
+    /// The wait of a set does not report before the steps of the wire told ahead of it, and no
+    /// step runs in a request: the wait is parked (`steps_pending`, `Net::epoll_wait`) and the
+    /// step of waking answers it (`netd::zero`).
+    #[inline(never)]
+    fn before_wait(&mut self) {
+        #[cfg(feature = "probe")]
+        let kept = (u64::from(self.held_tx) * TX) | (u64::from(self.held_rx) * RX);
+        #[cfg(not(feature = "probe"))]
+        let kept = 0;
+        if (self.told | self.yielding.owed() | kept) & (TX | RX | RX1 | WAKE) != 0 {
+            self.inst.net.steps_pending = true;
+        }
+    }
+
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        self.inst.net.steps_pending = false;
+        if method == Method::EpollWait.number() || method == Method::EpollWaitTake.number() {
+            self.before_wait();
+        }
         // VERIFY_SESSION goes through the root alone, and the root has no
         // other request.
         // The first instance sends it to the home of a session (`HOME_LABEL`), as it sends
@@ -2458,7 +2491,35 @@ impl Driver<'_> {
         answer
     }
 
-    fn handle_notification(&mut self, n: Notice) {
+    /// Tells the steps put off (`netd::gates::Yielding`). Their bits are still in `told`, so
+    /// nobody told them again meanwhile.
+    fn tell_owed(&mut self, bits: u64) {
+        if bits != 0 && sys::notify(&self.notify, bits).is_err() {
+            self.told &= !bits;
+            self.cleanup_due |= bits & CLEANUP != 0;
+        }
+    }
+
+    /// The counters of `Yielding`: steps put off, steps told again with no request served, and
+    /// after one.
+    fn yielding_counts(&self) -> [u32; 3] {
+        [
+            self.yielding.deferred,
+            self.yielding.idle,
+            self.yielding.served,
+        ]
+    }
+
+    /// The profile counts what `Yielding` counted since the last time (outside the steps).
+    fn count_yielding(&mut self) {
+        let now = self.yielding_counts();
+        let seen = core::mem::replace(&mut self.yield_seen, now);
+        profile::add(Counter::YieldDeferred, u64::from(now[0] - seen[0]));
+        profile::add(Counter::YieldIdle, u64::from(now[1] - seen[1]));
+        profile::add(Counter::YieldServed, u64::from(now[2] - seen[2]));
+    }
+
+    fn handle_notification(&mut self, mut n: Notice) {
         match n.source {
             // Init labels the bindings of a record of two devices
             // (`proto_init::binding_label`): the line says whose interrupt it
@@ -2471,10 +2532,21 @@ impl Driver<'_> {
             // The first line's interrupts come to the switch thread.
             Source::Interrupt => {}
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
+                // A request that waits in the queue goes ahead of the steps that follow one
+                // another (`netd::gates::Yielding`).
+                let steps = self
+                    .yielding
+                    .arrive(n.bits & STEP_BITS, RX | TX | WAKE | ZERO);
+                if steps == 0 {
+                    return;
+                }
+                n.bits = steps | (n.bits & !STEP_BITS);
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP];
+                let order = [
+                    RX, RX1, TX, WAKE, ZERO, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP,
+                ];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -2509,8 +2581,23 @@ impl Driver<'_> {
                         let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
-                        if left {
+                        // The waits that cannot block and are parked count this step: the
+                        // wire is quiet when no step of sending or receiving (of either device)
+                        // is told. Answers are the step ZERO's, one a step.
+                        self.inst
+                            .net
+                            .count_zero((self.told | self.yielding.owed()) & (TX | RX | RX1) == 0);
+                        if self.inst.net.zero_due() {
+                            self.tell(ZERO);
+                        }
+                        if left || self.inst.net.zero_waiting() {
                             self.tell(WAKE);
+                        }
+                    }
+                    ZERO => {
+                        rt::service::step_own();
+                        if self.inst.net.answer_zero() {
+                            self.tell(ZERO);
                         }
                     }
                     CLEANUP => {
@@ -2633,11 +2720,22 @@ impl Service<0> for Driver<'_> {
     fn between_notifications(&mut self, _: Notice) {
         self.bell_release();
         self.bell_checked = false;
+        let notify = &self.notify;
+        // The slot of label 0 holds the steps the stack told itself (and the switch's): it is
+        // one of the notifications in the queue and no request. The steps put off stay in
+        // `told` and have no slot.
+        let own = u64::from(self.told & !self.yielding.owed() & STEP_BITS != 0);
+        let owed = self.yielding.after(now_ns(), || queued(notify, own));
+        self.count_yielding();
+        self.tell_owed(owed);
     }
 
     fn between_requests(&mut self) {
         self.bell_release();
         self.bell_checked = false;
+        let owed = self.yielding.served(now_ns());
+        self.count_yielding();
+        self.tell_owed(owed);
         // The totals a request asked for (`GETOPT BUFFERED`): said after its step ended and its
         // answer went, so that the lines of the console do not count in the step. These builds
         // send the answer at once (`OWES_REPLY`); the others send it with the next receive, after
@@ -2665,6 +2763,11 @@ impl Service<0> for Driver<'_> {
     fn notification(&mut self, n: Notice) {
         self.handle_notification(n);
     }
+}
+
+/// Whether more than `own` slots stand in the queue of the service's channel.
+fn queued(notify: &Handle<Channel>, own: u64) -> bool {
+    sys::channel_info(notify).is_ok_and(|info| info.queued > own)
 }
 
 /// The channels of the instances, by number, for the first instance to tell whose session a

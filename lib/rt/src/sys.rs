@@ -477,6 +477,15 @@ pub fn thread_ran(thread: &Handle<Thread>) -> Result<u64, Error> {
     Ok(x[5])
 }
 
+/// object_info(THREAD_STATE) x5 and x7 of one call: the counter ticks the thread has run and the
+/// times a higher level took it off the CPU (the count wraps at 2^16). One call, so that the two
+/// numbers belong to the same moment and a step reads both at the price of one.
+pub fn thread_ran_preempts(thread: &Handle<Thread>) -> Result<(u64, u64), Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok((x[5], x[7]))
+}
+
 /// object_info(THREAD_STATE) x5 and x6: the counter ticks the thread has
 /// run, and those of them it spent in the kernel (its system time; the
 /// rest is its user time).

@@ -16,7 +16,8 @@ Subcommands:
           3.12.3; the programs of the images use it).
   programs [NAME...]
           link the dynamic programs of the images (busybox, busybox-utils,
-          bash, nano, htop, ncdu, doom, nginx, nginx-fast; all by default) from the objects their build scripts left, into
+          bash, nano, htop, ncdu, doom, openssl, curl, dropbear, nginx,
+          nginx-fast; all by default) from the objects their build scripts left, into
           target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the
@@ -846,6 +847,7 @@ def program_inputs() -> dict:
                        ROOT / "target" / "f-stack" / "ff_stafeto_glue.o"],
         "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
         "curl": [ROOT / "target" / "curl" / "curl.o"],
+        "dropbear": [ROOT / "target" / "dropbear" / "dropbear.o"],
         "nginx": [ROOT / "target" / "nginx" / "nginx.o"],
     }
 

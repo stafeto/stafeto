@@ -264,6 +264,7 @@ const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
 const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
 const EPOLL_WAIT_OK: &str = "net-probe: epoll wait ok 64 after 64 stale";
+const EPOLL_HELD_OK: &str = "net-probe: epoll wait after a send while the steps are held ok";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -698,6 +699,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.epoll_sets {
         once.push((EPOLL_WAKE, 1));
         once.push((EPOLL_WAIT_OK, 1));
+        once.push((EPOLL_HELD_OK, 1));
         once.push((EPOLL_CLOSE, 1));
         once.push((EPOLL_REQUESTS, 1));
         once.push((EPOLL_OK, 1));
@@ -802,37 +804,7 @@ pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
 /// `longest_over_starts` for the service that prints its steps under `tag`
 /// (the pipe service prints under 4).
 pub fn longest_over_starts_of(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
-    let mut out: Vec<(usize, u64, u64)> = Vec::new();
-    for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [
-            "service",
-            "step:",
-            found,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] = words.as_slice()
-        else {
-            continue;
-        };
-        if *found != tag {
-            continue;
-        }
-        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
-        else {
-            continue;
-        };
-        match out.iter_mut().find(|(k, ..)| *k == kind) {
-            Some(row) if row.1 >= ticks => {}
-            Some(row) => *row = (kind, ticks, detail),
-            None => out.push((kind, ticks, detail)),
-        }
-    }
-    out
+    crate::step_line::longest_warned(lines, tag, STEP_MAX)
 }
 
 /// The longest step of waking (`which` "wake") or of departure ("cleanup")
@@ -855,29 +827,11 @@ fn longest_named(lines: &[String], which: &str) -> u64 {
 /// its lines), the numbers 4, 8 and 16 the batch is chosen from.
 fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
     let mut out: Vec<(usize, u64)> = Vec::new();
-    for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [
-            "service",
-            "step:",
-            NET_TAG,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] = words.as_slice()
-        else {
+    for step in lines.iter().filter_map(|l| crate::step_line::parse(l)) {
+        let (kind, ticks, detail) = (step.kind, step.judged(), step.detail as usize);
+        if step.tag != NET_TAG {
             continue;
-        };
-        let (Ok(kind), Ok(ticks), Ok(detail)) = (
-            kind.parse::<usize>(),
-            ticks.parse::<u64>(),
-            detail.parse::<usize>(),
-        ) else {
-            continue;
-        };
+        }
         if kind != EPOLL_SET_KIND || ![4, 8, 16].contains(&detail) {
             continue;
         }

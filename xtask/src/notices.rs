@@ -46,6 +46,7 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
         "pixman" => read(target.join("pixman/COPYING")),
         "openssl" => read(target.join(format!("openssl/openssl-{}/LICENSE.txt", version(name)?))),
         "curl" => read(target.join(format!("curl/curl-{}/COPYING", version(name)?))),
+        "dropbear" => read(target.join(format!("dropbear/dropbear-{}/LICENSE", version(name)?))),
         "pcre2" => read(target.join(format!("nginx/pcre2-{}/LICENCE.md", version(name)?))),
         "nginx" | "nginx-fast" => {
             read(target.join(format!("nginx/nginx-{}/LICENSE", version(name)?)))

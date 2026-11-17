@@ -12,6 +12,7 @@
 //! in place, so the stack of the program stays small. The pool of buffers
 //! takes a page only when a socket touches it.
 
+use crate::calls::ZeroWait;
 use crate::stack::{GROUP, GROUPS, GroupSet, Sh, Stack};
 use core::mem::{ManuallyDrop, MaybeUninit};
 use netd::buffers::Buffers;
@@ -474,6 +475,12 @@ pub struct Net {
     /// The service is asked for a step of departure or of waking.
     pub cleanup_wanted: bool,
     pub wake_wanted: bool,
+    /// Steps of the wire are told ahead of the request that is handled: a wait of a set is
+    /// parked (`Driver::before_wait`, `Net::epoll_wait`).
+    pub steps_pending: bool,
+    /// The waits that cannot block, parked behind the steps of the wire; the step of waking
+    /// answers them (`netd::zero`).
+    pub zero: [Option<netd::zero::Slot<ZeroWait>>; netd::zero::PARKED_MAX],
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
     wake_cursor: usize,
@@ -582,6 +589,7 @@ impl Net {
             addr_of_mut!((*at).process).write(Some(Handle::borrowed(process.raw())));
             addr_of_mut!((*at).buffers).write(buffers);
             rt::bss::fill_none(addr_of_mut!((*at).waiting));
+            rt::bss::fill_none(addr_of_mut!((*at).zero));
             // The ports are the service's, for all its instances (`ports::CLAIMS`).
             (*at).tcp_ports.share(claims, who, Proto::Tcp);
             (*at).udp_ports.share(claims, who, Proto::Udp);

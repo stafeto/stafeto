@@ -40,3 +40,4 @@ pub mod ring;
 pub mod spsc;
 pub mod switchlogic;
 pub mod verify;
+pub mod zero;

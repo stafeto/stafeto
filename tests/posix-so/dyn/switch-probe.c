@@ -34,6 +34,11 @@
  *                                end the whole run (`spin rate N min10 M`): the share of CPU 0
  *                                the levels below the switch get is this rate in a flood
  *                                against the rate of a quiet system
+ *   switch-probe ask SECS        for SECS seconds, every 100 ms, ask the network service for an
+ *                                option of a new socket (a socket, an option, a close: three
+ *                                requests, the ones `posix-net stat` makes) and say the longest
+ *                                wait of a request in the time of the guest at the end:
+ *                                `ask calls N max_us M`
  *
  * Lines: `switch-probe: attached c N g G addr A/P mac M block F+C`,
  * `switch-probe: MODE refused K` (K frames refused by the switch since the
@@ -397,6 +402,50 @@ static void broken(int fill)
 	fflush(stdout);
 }
 
+#define SO_STAFETO_BUFFERED 0x7352
+
+static uint64_t now_us(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
+/* Every 100 ms for `secs` seconds a socket, an option and a close, each timed from the call to
+ * its return; the line at the end says how many requests were made and the longest wait. */
+static void ask(unsigned secs)
+{
+	uint64_t began = now_us(), max = 0, calls = 0, t;
+
+	while (now_us() - began < (uint64_t)secs * 1000000u) {
+		unsigned value = 0;
+		socklen_t len = sizeof value;
+		int fd;
+
+		t = now_us();
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (fd < 0)
+			fail("socket");
+		if (now_us() - t > max)
+			max = now_us() - t;
+		t = now_us();
+		if (getsockopt(fd, SOL_SOCKET, SO_STAFETO_BUFFERED, &value, &len) != 0)
+			fail("getsockopt");
+		if (now_us() - t > max)
+			max = now_us() - t;
+		t = now_us();
+		close(fd);
+		if (now_us() - t > max)
+			max = now_us() - t;
+		calls += 3;
+		pause_ms(100);
+	}
+	printf("switch-probe: ask calls %llu max_us %llu\n", (unsigned long long)calls,
+	       (unsigned long long)max);
+	fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "attach";
@@ -409,6 +458,10 @@ int main(int argc, char **argv)
 
 	if (!strcmp(mode, "spin") && argc > 2) {
 		spin((unsigned)atoi(argv[2]));
+		return 0;
+	}
+	if (!strcmp(mode, "ask") && argc > 2) {
+		ask((unsigned)atoi(argv[2]));
 		return 0;
 	}
 	if (!strcmp(mode, "saturate"))
