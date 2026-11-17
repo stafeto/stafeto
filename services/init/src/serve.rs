@@ -25,8 +25,9 @@
 //! it decided (init::restart), the worker tears the instance down, and the
 //! record's timer, whose slot is at the record's ceiling and whose expiries
 //! carry a label of its own, ends the pause before its restart; a service
-//! whose watchdog finds it silent twice in a row is killed by the worker
-//! from above its ceiling, which is a failure too (init::watch); each start
+//! whose watchdog finds it silent twice in a row (the second expiry on
+//! time, up to a cap on late ones) is killed by the worker from above its
+//! ceiling, which is a failure too (init::watch); each start
 //! waits while init's quota falls short of what the instance needs
 //! (init::quota). Each handler is bounded by the records of the table; the
 //! main thread loads, maps and kills nothing itself, and lets go of no last
@@ -1246,7 +1247,8 @@ impl Init {
     /// An expiry of the timer of the record at `place` (its label names it,
     /// `timed`): a record that waits for its pause or its quota starts; a
     /// service whose watchdog deadline came is marked suspect, then silent
-    /// one period later (init::watch). An expiry before the deadline is
+    /// at the next expiry one period later, if that one is on time, up to a
+    /// cap on late ones (init::watch). An expiry before the deadline is
     /// stale (spec 10). Init acts on this record alone: a record whose
     /// timer is masked by a higher service does not come here until that
     /// service lets the processor down to its slot.
