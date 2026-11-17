@@ -375,16 +375,16 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::GPU);
     cmd.args(qemu::TABLET);
     cmd.args(qemu::ICOUNT);
-    // The many windows end last: they are held until the first client has
-    // seen the eight.
+    // The first client ends last: it waits for the many windows to go, and
+    // then a moment more.
     let output = run_until(
         cmd,
         crate::BOOT_TIMEOUT * 4,
-        Some("init: focus-many ended: "),
+        Some("init: focus-a ended: "),
         &kernel.elf,
     )?;
-    qemu::expect_stopped_on(&output, ENDED[4])?;
-    for ended in &ENDED[..4] {
+    qemu::expect_stopped_on(&output, ENDED[0])?;
+    for ended in &ENDED[1..] {
         qemu::expect_marker(&output, ended)?;
     }
     qemu::expect_marker(&output, MANY)?;

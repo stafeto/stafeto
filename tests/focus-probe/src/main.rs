@@ -650,6 +650,8 @@ impl Probe<'_> {
             // window stays until the others made eight of them.
             self.until(&display, "the eight windows never came", |d| d.open == 8)?;
             self.until(&display, "the many windows never went", |d| d.open == 1)?;
+            // The last of the programs to end: xtask stops on this one.
+            self.sleep(100_000_000);
             return Ok(());
         }
         // The tablet: its click, in the window's coordinates, after the moves
