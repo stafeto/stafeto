@@ -992,7 +992,7 @@ impl Net {
     /// `own[..count]` already: a smoltcp socket that listens on its port and
     /// has its options. The queue of a member of a group stands in sets no
     /// other member's queue stands in.
-    fn member(
+    pub(crate) fn member(
         &mut self,
         stack: &mut Stack<'static>,
         sock: &Sock,
@@ -1008,6 +1008,9 @@ impl Net {
             grouped.then_some((listener, own, count)),
         )?;
         let handle = self.socks[m].handle?;
+        stack
+            .tcp(handle)
+            .set_timeout(Some(Duration::from_secs(crate::net::QUEUE_IDLE_S)));
         if stack
             .tcp(handle)
             .listen(listen_endpoint(sock.address, sock.port))
@@ -1290,6 +1293,7 @@ impl Net {
                 Address::v4(ip, u32::from(port))
             });
         let local = stack.tcp(handle).local_endpoint().map(peer_of);
+        stack.tcp(handle).set_timeout(None);
         self.places.set_state(m, State::Live);
         self.touch(m);
         // The accepted socket shares the port of the listening description

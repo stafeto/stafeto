@@ -82,6 +82,11 @@ pub const ORPHAN_NS: u64 = 60_000_000_000;
 pub const CONNECT_NS: u64 = 75_000_000_000;
 /// The interval of the probes of KEEPALIVE (RFC 1122, 4.2.3.6).
 const KEEPALIVE_NS: u64 = 7_200_000_000_000;
+
+/// Seconds a socket of a queue may hear nothing from its peer (a handshake
+/// that never ended, a connection nobody accepted) before it closes and
+/// `reap_queue` replaces it. `accept` clears it for the connection it hands out.
+pub const QUEUE_IDLE_S: u64 = 120;
 /// The orphans one step of the sweep looks at.
 const SWEEP: usize = 4;
 /// How long an aborted stream waits for its RST, in nanoseconds.
@@ -335,6 +340,9 @@ pub struct Counters {
     pub listen_short: u64,
     /// SYNs dropped for want of room in the queue of a listening description.
     pub syn_dropped: u64,
+    /// Closed sockets of a queue (reset by the peer, or a handshake that timed out) replaced
+    /// by `reap_queue`.
+    pub queue_reaped: u64,
     /// Queue sockets of a member of a group that found no set without the
     /// queue sockets of another member: the queue is shorter.
     pub set_barred: u64,
@@ -1447,7 +1455,15 @@ impl Net {
                 let Some(lead) = lead else {
                     return orphan;
                 };
-                let Some((member, listener)) = self.pick_member(stack, lead) else {
+                let picked = match self.pick_member(stack, lead) {
+                    Some(found) => Some(found),
+                    // Sockets of the queue that closed (the peer's RST, the
+                    // timeout of a handshake that never ended) are replaced
+                    // before the SYN is given up.
+                    None if self.reap_queues(stack, lead) => self.pick_member(stack, lead),
+                    None => None,
+                };
+                let Some((member, listener)) = picked else {
                     // A queue with no room drops the SYN: the peer sends it
                     // again after its timeout, as it does to a busy server.
                     self.drop_frame = true;
@@ -1586,6 +1602,66 @@ impl Net {
         };
         let listener = self.groups.pick_member(usize::from(group), &mut members)?;
         members.found.map(|m| (m, listener))
+    }
+
+    /// Replaces the sockets of the queue of listening description `lead` (and
+    /// of every member of its group) that are closed with fresh ones that
+    /// listen. A socket of a queue that the peer reset after the handshake, or
+    /// whose handshake never ended and timed out (`QUEUE_IDLE_S`), leaves
+    /// LISTEN for good; `accept` takes only the connections that stand, so
+    /// without this each of them would keep a place of the queue for ever.
+    /// True when a socket was replaced.
+    fn reap_queues(&mut self, stack: &mut Stack<'static>, lead: usize) -> bool {
+        let group = self.socks[lead].group;
+        if group == NO_GROUP {
+            return self.reap_queue(stack, lead);
+        }
+        let mut reaped = false;
+        for i in 0..self.groups.members(usize::from(group)).len() {
+            let listener = usize::from(self.groups.members(usize::from(group))[i]);
+            if self.socks[listener].listening {
+                reaped |= self.reap_queue(stack, listener);
+            }
+        }
+        reaped
+    }
+
+    fn reap_queue(&mut self, stack: &mut Stack<'static>, listener: usize) -> bool {
+        let mut reaped = false;
+        let mut k = 0;
+        while k < usize::from(self.socks[listener].member_count) {
+            let m = usize::from(self.socks[listener].members[k]);
+            let closed = self.socks[m]
+                .handle
+                .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed);
+            if !closed {
+                k += 1;
+                continue;
+            }
+            self.release_place(stack, m);
+            let sock = self.socks[listener];
+            let last = usize::from(sock.member_count) - 1;
+            let mut own = sock.members;
+            own[k] = own[last];
+            reaped = true;
+            self.counters.queue_reaped += 1;
+            match self.member(stack, &sock, listener, own, last) {
+                Some(fresh) => {
+                    let l = &mut self.socks[listener];
+                    l.members[k] = fresh as u16;
+                    l.room = l.room.saturating_add(1);
+                    k += 1;
+                }
+                None => {
+                    // The slot at `k` is now the former last one: look at it.
+                    let l = &mut self.socks[listener];
+                    l.members[k] = l.members[last];
+                    l.member_count -= 1;
+                    self.counters.listen_short += 1;
+                }
+            }
+        }
+        reaped
     }
 
     /// After the stack took a SYN for a listening description: the stack hands
