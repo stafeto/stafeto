@@ -320,12 +320,13 @@ fn probe_only(
         if only.is_none() || only.as_deref() == Some(REAP) {
             let reap = reap_counters(&output.lines)?;
             println!(
-                "posix-net steps: the accept queue of port {}: syn_dropped {}, queue_reaped {}, embryo_recycled {}; the longest step of the service in the run is {} ticks",
+                "posix-net steps: the accept queue of port {}: syn_dropped {}, queue_reaped {}, embryo_recycled {}; the longest step of the service in the run is {} ticks, of its own work (kind 65, where the frames are routed) {} ticks",
                 reap.port,
                 reap.syn_dropped,
                 reap.queue_reaped,
                 reap.embryo_recycled,
-                rows.iter().map(|r| r.1).max().unwrap_or(0)
+                rows.iter().map(|r| r.1).max().unwrap_or(0),
+                rows.iter().find(|r| r.0 == 65).map_or(0, |r| r.1)
             );
         }
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
