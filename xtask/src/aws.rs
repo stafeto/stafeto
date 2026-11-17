@@ -39,7 +39,7 @@ const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
        xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
-       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
+       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
        xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
@@ -56,7 +56,8 @@ pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     let is_hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
-    let prefixes: [(&str, usize); 6] = [
+    let prefixes: [(&str, usize); 7] = [
+        ("key-", 17),
         ("ami-", 17),
         ("snap-", 17),
         ("vol-", 17),
@@ -180,9 +181,23 @@ enum Kind {
     Snapshot,
     Image,
     Group,
+    Key,
 }
 
 impl Kind {
+    /// The order of removal: a group cannot go while an instance holds it, a snapshot while an
+    /// image uses it.
+    fn rank(self) -> u8 {
+        match self {
+            Kind::Instance => 0,
+            Kind::Image => 1,
+            Kind::Volume => 2,
+            Kind::Snapshot => 3,
+            Kind::Key => 4,
+            Kind::Group => 5,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Kind::Instance => "instance",
@@ -190,6 +205,7 @@ impl Kind {
             Kind::Snapshot => "snapshot",
             Kind::Image => "image",
             Kind::Group => "group",
+            Kind::Key => "key",
         }
     }
     fn parse(s: &str) -> Option<Kind> {
@@ -199,6 +215,7 @@ impl Kind {
             Kind::Snapshot,
             Kind::Image,
             Kind::Group,
+            Kind::Key,
         ]
         .into_iter()
         .find(|k| k.name() == s)
@@ -364,6 +381,11 @@ fn exists(kind: Kind, id: &str) -> Result<bool, String> {
             "--group-ids",
             "SecurityGroups[0].GroupId",
         ),
+        Kind::Key => (
+            "describe-key-pairs",
+            "--key-pair-ids",
+            "KeyPairs[0].KeyPairId",
+        ),
     };
     lives(aws(&["ec2", cmd, ids, id, "--query", q]))
 }
@@ -386,6 +408,9 @@ fn delete(s: &Session, kind: Kind, id: &str) -> Result<(), String> {
         }
         Kind::Image => {
             aws(&["ec2", "deregister-image", "--image-id", id])?;
+        }
+        Kind::Key => {
+            aws(&["ec2", "delete-key-pair", "--key-pair-id", id])?;
         }
         Kind::Group => {
             // A group of the pair names itself in its rules: they go first (a closed
@@ -443,14 +468,7 @@ fn release<T>(s: &Session, kind: Kind, id: &str, result: Result<T, String>) -> R
 fn clean(s: &Session) -> Result<(), String> {
     let mut live = s.live();
     live.reverse();
-    let rank = |k: Kind| match k {
-        Kind::Instance => 0,
-        Kind::Image => 1,
-        Kind::Volume => 2,
-        Kind::Snapshot => 3,
-        Kind::Group => 4,
-    };
-    live.sort_by_key(|(k, _)| rank(*k));
+    live.sort_by_key(|(k, _)| k.rank());
     let mut failed = Vec::new();
     for (kind, id) in live {
         if let Err(e) = delete(s, kind, &id) {
@@ -459,6 +477,7 @@ fn clean(s: &Session) -> Result<(), String> {
         }
     }
     if failed.is_empty() {
+        let _ = std::fs::remove_file(s.dir.join("address"));
         Ok(())
     } else {
         Err(format!("{} resources were not removed", failed.len()))
@@ -524,6 +543,17 @@ fn project_resources() -> Result<Vec<(Kind, String)>, String> {
     )? {
         all.push((Kind::Group, g));
     }
+    let keys = aws(&[
+        "ec2",
+        "describe-key-pairs",
+        "--filters",
+        "Name=tag:project,Values=stafeto",
+        "--query",
+        "KeyPairs[].KeyPairId",
+    ])?;
+    for k in keys.split_whitespace() {
+        all.push((Kind::Key, k.to_string()));
+    }
     Ok(all)
 }
 
@@ -543,13 +573,7 @@ fn sweep(args: &[String]) -> Result<(), String> {
     if remove {
         let s = Session::open(Some("0".into()))?;
         let mut order = found.clone();
-        order.sort_by_key(|(k, _)| match k {
-            Kind::Instance => 0,
-            Kind::Image => 1,
-            Kind::Volume => 2,
-            Kind::Snapshot => 3,
-            Kind::Group => 4,
-        });
+        order.sort_by_key(|(k, _)| k.rank());
         for (kind, id) in order {
             if let Err(e) = delete(&s, kind, &id) {
                 eprintln!("sweep: {e}");
@@ -562,6 +586,7 @@ fn sweep(args: &[String]) -> Result<(), String> {
         Kind::Volume,
         Kind::Snapshot,
         Kind::Image,
+        Kind::Key,
         Kind::Group,
     ] {
         let ids: Vec<String> = found
@@ -643,6 +668,227 @@ fn closed_group(s: &Session) -> Result<String, String> {
     Ok(g)
 }
 
+// ---- the try-out session ---------------------------------------------------------------------
+
+/// The TCP ports the try-out group opens, and only to the operator's address.
+const TRY_PORTS: [u16; 4] = [22, 80, 443, 8080];
+/// What the try-out instance may start towards the internet: HTTPS for `pkg`, and DNS. The
+/// answers to the operator's connections are return traffic of the group's state; DHCP is
+/// link-local and no group filters it.
+const TRY_EGRESS: [(&str, u16); 3] = [("tcp", 443), ("tcp", 53), ("udp", 53)];
+/// The most instances the project may have alive when a try-out session starts one.
+const TRY_MAX_LIVE: usize = 2;
+
+/// The `/32` block of an address as `checkip` printed it. Anything that is no single IPv4
+/// address, and the unspecified address, gives an error: no rule is ever made from a guess.
+fn operator_cidr(text: &str) -> Result<String, String> {
+    let ip: std::net::Ipv4Addr = text
+        .trim()
+        .parse()
+        .map_err(|_| "the public address of this host could not be read".to_string())?;
+    if ip.is_unspecified() || ip.is_broadcast() {
+        return Err("the public address of this host could not be read".into());
+    }
+    Ok(format!("{ip}/32"))
+}
+
+/// The public address of this host, as the AWS check service sees it.
+fn operator_address() -> Result<String, String> {
+    let o = Command::new("curl")
+        .args(["-s", "--max-time", "15", "https://checkip.amazonaws.com"])
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !o.status.success() {
+        return Err("the public address of this host could not be found (checkip failed)".into());
+    }
+    operator_cidr(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// An inbound rule of the try-out group: one TCP port from one block.
+fn try_ingress_rule(port: u16, cidr: &str) -> String {
+    format!("IpProtocol=tcp,FromPort={port},ToPort={port},IpRanges=[{{CidrIp={cidr}}}]")
+}
+
+/// An outbound rule of the try-out group: one port to any address.
+fn try_egress_rule((protocol, port): (&str, u16)) -> String {
+    format!("IpProtocol={protocol},FromPort={port},ToPort={port},IpRanges=[{{CidrIp=0.0.0.0/0}}]")
+}
+
+/// Whether the rows of a `describe-security-groups` answer (protocol, from, to, number of
+/// IPv4 ranges, the first range, numbers of IPv6 ranges, prefix lists and group pairs; one
+/// rule per line) are exactly the rules `want` gives, each for `cidr` only.
+fn rules_are(text: &str, want: &[(&str, u16)], cidr: &str) -> bool {
+    let mut rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    rows.sort();
+    let mut expected: Vec<Vec<String>> = want
+        .iter()
+        .map(|(p, n)| {
+            let n = n.to_string();
+            [*p, &n, &n, "1", cidr, "0", "0", "0"]
+                .map(String::from)
+                .to_vec()
+        })
+        .collect();
+    expected.sort();
+    rows.len() == expected.len()
+        && rows
+            .iter()
+            .zip(&expected)
+            .all(|(r, e)| r.len() == e.len() && r.iter().zip(e).all(|(a, b)| a == b))
+}
+
+const RULE_COLUMNS: &str = "[IpProtocol,FromPort,ToPort,length(IpRanges),IpRanges[0].CidrIp,length(Ipv6Ranges),length(PrefixListIds),length(UserIdGroupPairs)]";
+
+/// The guard of the try-out group: it lets in the four TCP ports from `cidr` and nothing
+/// else, and out the three of `TRY_EGRESS` only.
+fn assert_try(group: &str, cidr: &str) -> Result<(), String> {
+    let ingress = aws(&[
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group,
+        "--query",
+        &format!("SecurityGroups[0].IpPermissions[].{RULE_COLUMNS}"),
+    ])?;
+    let ports: Vec<(&str, u16)> = TRY_PORTS.iter().map(|p| ("tcp", *p)).collect();
+    if !rules_are(&ingress, &ports, cidr) {
+        return Err(format!(
+            "group {} lets in more than the four ports from the operator's address: no instance starts in it",
+            redact(group)
+        ));
+    }
+    let egress = aws(&[
+        "ec2",
+        "describe-security-groups",
+        "--group-ids",
+        group,
+        "--query",
+        &format!("SecurityGroups[0].IpPermissionsEgress[].{RULE_COLUMNS}"),
+    ])?;
+    if !rules_are(&egress, &TRY_EGRESS, "0.0.0.0/0") {
+        return Err(format!(
+            "group {} lets out more than HTTPS and DNS: no instance starts in it",
+            redact(group)
+        ));
+    }
+    Ok(())
+}
+
+/// The session's group of the try-out: the four ports from `cidr`, HTTPS and DNS out.
+fn try_group(s: &Session, cidr: &str) -> Result<String, String> {
+    if let Some((_, g)) = s.live().into_iter().find(|(k, _)| *k == Kind::Group) {
+        return Ok(g);
+    }
+    let (_, vpc) = default_subnet()?;
+    s.note("intent", Kind::Group, "stafeto-try")?;
+    let mut args: Vec<String> = ["ec2", "create-security-group", "--group-name"]
+        .map(String::from)
+        .to_vec();
+    args.push(format!("stafeto-try-{}", s.id));
+    args.extend(
+        [
+            "--description",
+            "stafeto: try-out, four ports from the operator",
+            "--vpc-id",
+            &vpc,
+        ]
+        .map(String::from),
+    );
+    args.extend(s.tag_spec(&["security-group"]));
+    args.extend(["--query", "GroupId"].map(String::from));
+    let g = aws_s(&args)?;
+    s.note("created", Kind::Group, &g)?;
+    aws(&[
+        "ec2",
+        "revoke-security-group-egress",
+        "--group-id",
+        &g,
+        "--ip-permissions",
+        "IpProtocol=-1,IpRanges=[{CidrIp=0.0.0.0/0}]",
+    ])?;
+    for port in TRY_PORTS {
+        aws(&[
+            "ec2",
+            "authorize-security-group-ingress",
+            "--group-id",
+            &g,
+            "--ip-permissions",
+            &try_ingress_rule(port, cidr),
+        ])?;
+    }
+    for rule in TRY_EGRESS {
+        aws(&[
+            "ec2",
+            "authorize-security-group-egress",
+            "--group-id",
+            &g,
+            "--ip-permissions",
+            &try_egress_rule(rule),
+        ])?;
+    }
+    Ok(g)
+}
+
+/// The session's key pair: an ed25519 key made in the session's directory (the private part
+/// stays there and is never printed) and its public part imported under the session's tags.
+/// The name of the key pair is returned.
+fn try_key(s: &Session) -> Result<String, String> {
+    let name = format!("stafeto-try-{}", s.id);
+    if s.live().iter().any(|(k, _)| *k == Kind::Key) {
+        return Ok(name);
+    }
+    let key = s.dir.join("try-key");
+    if !key.exists() {
+        let st = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "stafeto-try", "-f"])
+            .arg(&key)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !st.success() {
+            return Err("ssh-keygen failed".into());
+        }
+    }
+    s.note("intent", Kind::Key, &name)?;
+    let mut args: Vec<String> = [
+        "ec2",
+        "import-key-pair",
+        "--key-name",
+        &name,
+        "--public-key-material",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.push(format!("fileb://{}.pub", key.display()));
+    args.extend(s.tag_spec(&["key-pair"]));
+    args.extend(["--query", "KeyPairId"].map(String::from));
+    let id = aws_s(&args)?;
+    s.note("created", Kind::Key, &id)?;
+    Ok(name)
+}
+
+/// The public IPv4 address of a running instance, once EC2 has it; the caller writes it to
+/// the session's directory and prints it redacted only.
+fn public_address(id: &str) -> Result<String, String> {
+    for _ in 0..60 {
+        let a = aws(&[
+            "ec2",
+            "describe-instances",
+            "--instance-ids",
+            id,
+            "--query",
+            "Reservations[0].Instances[0].PublicIpAddress",
+        ])?;
+        if a.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Ok(a);
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    Err("the instance has no public address".into())
+}
+
 /// The guard that no group of an instance lets anything in.
 fn assert_closed(group: &str) -> Result<(), String> {
     let r = aws(&[
@@ -690,6 +936,8 @@ struct Launch<'a> {
     public_ip: bool,
     /// The address in the subnet the interface takes, when the caller fixes it.
     private_ip: Option<&'a str>,
+    /// The key pair the instance gets (`--key-name`): the try-out session's.
+    key_name: Option<&'a str>,
 }
 
 /// Starts one instance with every guard; the journal has it and its volumes.
@@ -752,6 +1000,9 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
             "--block-device-mappings".to_string(),
             format!("DeviceName=/dev/sdf,Ebs={{SnapshotId={snap},VolumeType=gp3,DeleteOnTermination=true}}"),
         ]);
+    }
+    if let Some(k) = l.key_name {
+        args.extend(["--key-name".to_string(), k.to_string()]);
     }
     if let Some(u) = l.user_data {
         args.extend(["--user-data".to_string(), format!("file://{}", u.display())]);
@@ -1216,7 +1467,28 @@ fn boot(args: &[String]) -> Result<(), String> {
         .and_then(|t| t.parse().ok())
         .unwrap_or(300);
     let stop = args.iter().any(|a| a == "--stop");
+    let try_out = args.iter().any(|a| a == "--try");
+    if try_out && stop {
+        return Err("--try keeps the instance running: it does not go with --stop".into());
+    }
     let s = Session::open(flag(args, "--session"))?;
+    // The try-out session: the key pair, the group open to this host alone, a public address.
+    let (group, key) = if try_out {
+        let live = live_instances()?;
+        if live >= TRY_MAX_LIVE {
+            return Err(format!(
+                "{live} instances of the project are alive: a try-out session allows {TRY_MAX_LIVE}"
+            ));
+        }
+        let cidr = operator_address()?;
+        let key = try_key(&s)?;
+        let g = try_group(&s, &cidr)?;
+        assert_try(&g, &cidr)?;
+        println!("try-out: key pair and group of session {} are ready", s.id);
+        (Some(g), Some(key))
+    } else {
+        (None, None)
+    };
     let (id, started) = launch(
         &s,
         &Launch {
@@ -1224,12 +1496,21 @@ fn boot(args: &[String]) -> Result<(), String> {
             ty: &ty,
             user_data: None,
             extra_snapshot: None,
-            group: None,
-            public_ip: false,
+            group: group.as_deref(),
+            public_ip: try_out,
             private_ip: None,
+            key_name: key.as_deref(),
         },
     )?;
     let result = (|| {
+        if try_out {
+            // The address goes to the session's directory for the commands that follow and
+            // to no log.
+            let a = public_address(&id)?;
+            std::fs::write(s.dir.join("address"), format!("{a}\n"))
+                .map_err(|e| format!("address: {e}"))?;
+            println!("public address {}", redact(&a));
+        }
         // The MAC of the instance's interface, to compare with the one the
         // device reports: the last three octets only.
         match eni_mac(&id) {
@@ -1271,11 +1552,17 @@ fn boot(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })();
-    let result = if !stop || result.is_err() {
+    let result = if !(stop || try_out) || result.is_err() {
         release(&s, Kind::Instance, &id, result)
     } else {
         result
     };
+    if try_out && result.is_ok() {
+        println!(
+            "the try-out instance stays up: remove everything with `xtask aws clean --session {}`",
+            s.id
+        );
+    }
     println!(
         "estimated cost of this instance: {:.3} USD",
         cost(started.elapsed(), PRICE_SMALL)
@@ -1545,6 +1832,7 @@ fn neighbour(args: &[String]) -> Result<(), String> {
             group: None,
             public_ip: false,
             private_ip: None,
+            key_name: None,
         },
     )?;
     let result = (|| {
@@ -1637,6 +1925,7 @@ fn dump_run(s: &Session) -> Result<(), String> {
             group: None,
             public_ip: false,
             private_ip: None,
+            key_name: None,
         },
     )?;
     let snap = (|| {
@@ -1961,6 +2250,7 @@ fn pair(args: &[String]) -> Result<(), String> {
                     group: Some(&group),
                     public_ip: internet,
                     private_ip: None,
+                    key_name: None,
                 },
             )?);
         }
@@ -1986,6 +2276,7 @@ fn pair(args: &[String]) -> Result<(), String> {
                 group: Some(&group),
                 public_ip: false,
                 private_ip: Some(&nip),
+                key_name: None,
             },
         )?);
         let nid = neighbour
@@ -2255,6 +2546,102 @@ mod tests {
         assert!(t[1].contains("project") && t[2].starts_with("ResourceType=volume"));
     }
 
+    #[test]
+    fn the_operators_address_becomes_a_single_host_block() {
+        assert_eq!(operator_cidr("203.0.113.7\n").unwrap(), "203.0.113.7/32");
+        assert!(operator_cidr("").is_err());
+        assert!(operator_cidr("<html>error</html>").is_err());
+        assert!(operator_cidr("0.0.0.0").is_err());
+        assert!(operator_cidr("1.2.3.4/0").is_err());
+        assert!(operator_cidr("::1").is_err());
+    }
+
+    #[test]
+    fn the_try_out_rules_open_four_tcp_ports_to_one_block() {
+        assert_eq!(
+            try_ingress_rule(8080, "203.0.113.7/32"),
+            "IpProtocol=tcp,FromPort=8080,ToPort=8080,IpRanges=[{CidrIp=203.0.113.7/32}]"
+        );
+        assert_eq!(TRY_PORTS, [22, 80, 443, 8080]);
+        let all: String = TRY_PORTS
+            .iter()
+            .map(|p| try_ingress_rule(*p, "203.0.113.7/32"))
+            .collect();
+        assert!(!all.contains("0.0.0.0/0"));
+        assert_eq!(
+            try_egress_rule(("udp", 53)),
+            "IpProtocol=udp,FromPort=53,ToPort=53,IpRanges=[{CidrIp=0.0.0.0/0}]"
+        );
+    }
+
+    #[test]
+    fn the_guard_of_the_try_out_group_takes_the_four_rules_and_nothing_else() {
+        let cidr = "203.0.113.7/32";
+        let good = "tcp\t22\t22\t1\t203.0.113.7/32\t0\t0\t0\n\
+                    tcp\t80\t80\t1\t203.0.113.7/32\t0\t0\t0\n\
+                    tcp\t443\t443\t1\t203.0.113.7/32\t0\t0\t0\n\
+                    tcp\t8080\t8080\t1\t203.0.113.7/32\t0\t0\t0";
+        let ports: Vec<(&str, u16)> = TRY_PORTS.iter().map(|p| ("tcp", *p)).collect();
+        assert!(rules_are(good, &ports, cidr));
+        assert!(!rules_are(
+            &good.replace("203.0.113.7/32", "0.0.0.0/0"),
+            &ports,
+            cidr
+        ));
+        assert!(!rules_are(&good.replace("\t0\n", "\t1\n"), &ports, cidr));
+        assert!(!rules_are(
+            &good.replace("tcp\t22\t22", "tcp\t23\t23"),
+            &ports,
+            cidr
+        ));
+        assert!(!rules_are("", &ports, cidr));
+        let extra = format!("{good}\ntcp\t9\t9\t1\t203.0.113.7/32\t0\t0\t0");
+        assert!(!rules_are(&extra, &ports, cidr));
+        let out = "tcp\t443\t443\t1\t0.0.0.0/0\t0\t0\t0\n\
+                   udp\t53\t53\t1\t0.0.0.0/0\t0\t0\t0\n\
+                   tcp\t53\t53\t1\t0.0.0.0/0\t0\t0\t0";
+        assert!(rules_are(out, &TRY_EGRESS, "0.0.0.0/0"));
+        assert!(!rules_are(
+            &out.replace("443", "80"),
+            &TRY_EGRESS,
+            "0.0.0.0/0"
+        ));
+    }
+
+    #[test]
+    fn key_pair_ids_and_addresses_of_the_try_out_are_hidden() {
+        assert_eq!(redact("key-0123456789abcdef0 gone"), "key-... gone");
+        assert_eq!(
+            redact("public address 203.0.113.7 ssh root@203.0.113.7"),
+            "public address <ip> ssh root@<ip>"
+        );
+        assert_eq!(Kind::parse("key"), Some(Kind::Key));
+        assert!(Kind::Key.rank() < Kind::Group.rank());
+    }
+
+    #[test]
+    fn a_launch_with_a_key_pair_names_it() {
+        with_fake(&[], |s, dir| {
+            launch(
+                s,
+                &Launch {
+                    ami: "ami-0123456789abcdef0",
+                    ty: "t4g.small",
+                    user_data: None,
+                    extra_snapshot: None,
+                    group: Some("sg-0123456789abcdef0"),
+                    public_ip: true,
+                    private_ip: None,
+                    key_name: Some("stafeto-try-1"),
+                },
+            )
+            .unwrap();
+            let c = calls(dir);
+            assert!(c.contains("--key-name stafeto-try-1"), "{c}");
+            assert!(c.contains("AssociatePublicIpAddress=true"), "{c}");
+        });
+    }
+
     // ---- a fake CLI ----------------------------------------------------
 
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2324,6 +2711,7 @@ exit 0
                 group: None,
                 public_ip: false,
                 private_ip: None,
+                key_name: None,
             },
         )
     }

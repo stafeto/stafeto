@@ -11,17 +11,33 @@
 # boot, nginx on 80 and 443 over the sockets of the network service, and nginx-fast on 8080
 # through the switch.
 #
+#   0. A fresh worktree needs its dependencies built once, before step 1 (without them
+#      `cargo xtask aws image` stops with "build its package first"):
+#        cargo xtask relibc
+#        tools/build-busybox.py
+#        tools/build-dropbear.py
+#        tools/build-openssl.py
+#        tools/build-curl.py
+#        tools/build-nginx.py
+#        tools/build-fstack.py
+#      (one run each; about four minutes in all).
 #   1. Build and register the image (nginx, nginx-fast, Dropbear, pkg and the page are in it):
 #        cargo xtask aws image --session S
 #      The image check of the plan's security floor has run before on the lists of the image
 #      (`cargo xtask net-try` repeats it and runs the image on QEMU): nothing in /etc/dropbear,
 #      every account locked with !, no private key in any file, only ports 22, 80, 443 and 8080.
-#   2. Launch it with the key pair of the owner, a security group open to the owner's address
+#   2. Launch it with a key pair of the session, a security group open to this host's address
 #      alone on 22, 80, 443 and 8080, and read the console:
-#        cargo xtask aws boot --ami AMI --end "fast: nginx-fast on 8080" --serial 180 --session S
+#        cargo xtask aws boot --try --ami AMI --end "fast: nginx-fast on 8080" --serial 180 --session S
+#      `--try` makes the key pair (kept in the session's directory, imported under the session's
+#      tags), the group open to this host's public address alone (a /32 found with checkip) on
+#      TCP 22, 80, 443 and 8080, and gives the instance a public address, written to the file
+#      `address` of the session's directory (target/aws/S) and printed redacted. The instance
+#      stays up after the command; `clean` removes it, the group and the key pair.
 #      Lines that must appear (the order of the last four may vary: each runs in a subshell):
-#        net: ena mac 02:..., link up
-#        entropy: seeded from the boot page (32 bytes)
+#        net: ena mac 02:..., link unknown     (EC2 sends no link event; `link up` or `unknown` both pass)
+#        ena: link up                          (a line of its own, shortly after)
+#        entropy: seeded from the boot page (64 bytes)
 #        ec2-key: ...                          (the type and comment of the key pair)
 #        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
@@ -40,7 +56,7 @@
 #        curl http://ADDRESS/                  the page, 200
 #        curl -k https://ADDRESS/              the same page over TLS 1.3 (the certificate is self-signed)
 #        curl http://ADDRESS:8080/             the same page from nginx-fast
-#        ssh root@ADDRESS                      the key pair of the instance gets in; the fingerprint of
+#        ssh -i target/aws/S/try-key root@ADDRESS                      the key pair of the instance gets in; the fingerprint of
 #                                              the host key is the one of the console line
 #        nmap -Pn -p 1-65535 ADDRESS           a full TCP scan: only 22, 80, 443 and 8080 are open
 #        nmap -Pn -sU --top-ports 200 ADDRESS  UDP: nothing answers but what the security group
@@ -57,8 +73,9 @@
 #        pkg update; pkg search nginx          the index of the series 0.5 from stafeto.github.io
 #        pkg install htop; htop                a package from the store in memory
 #        ps; cat /proc/meminfo                 nginx, nginx-fast and dropbear are running; the
-#                                              memory the table holds fits the 2 GiB (the line
-#                                              `init: free pages` of the console is 16 384 or more)
+#                                              memory fits the 2 GiB (the console line `frames N
+#                                              MiB free` before the services shows what there is;
+#                                              the full image prints no `init: free pages` line)
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #
