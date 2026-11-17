@@ -308,7 +308,11 @@ const NVME_QEMU_WINDOWS: &[Window] = &[
         },
     },
 ];
-/// The budget of the request thread: 100 us of each 10 ms (1 % of CPU 0), at 32 once spent.
+/// The level the disk service works at once its budget is spent: it has no work of its own to
+/// leave undone, so it keeps the level above the POSIX processes.
+pub const NVME_LOW: u8 = 32;
+
+/// The budget of the request thread: 100 us of each 10 ms (1 % of CPU 0), at 32 once spent (`NVME_LOW`).
 /// A request takes one copy of a cell (about 5 us on t4g) and a doorbell, so about 15 commands
 /// fit one period, 24 MiB/s, which the store and the keys of the system never come near; the
 /// polling of the queue while a command is out (500 us) is counted in it.
@@ -317,7 +321,7 @@ pub const NVME_BUDGETS: &[Budget] = &[Budget {
     cpu: 0,
     c_ns: 100_000,
     t_ns: 10 * MS,
-    low: super::ramfs::SERVICE_LOW,
+    low: NVME_LOW,
 }];
 
 /// The disk service over the second NVMe controller of QEMU's machine with edk2 (the data disk
@@ -808,7 +812,7 @@ mod tests {
         assert!(blk.free < blk.priority && !blk.budgets.is_empty());
         // The budget has the name the service binds, and the level it works at once spent.
         assert_eq!(NVME_BUDGETS[0].name, "serve");
-        assert_eq!(NVME_BUDGETS[0].low, super::super::ramfs::SERVICE_LOW);
+        assert_eq!(NVME_BUDGETS[0].low, NVME_LOW);
     }
 
     #[test]

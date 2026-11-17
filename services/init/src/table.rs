@@ -395,10 +395,9 @@ pub struct Gate {
 /// the sum of C/T of the budgets of the table on a CPU is at most this
 /// (spec 8). The rest is for the levels below the budgets and for the trusted
 /// work that has none (the kernel, the interrupts, the drivers, init), which
-/// the layout takes at 5 %. The three general services work at level 32 once
-/// their budget is spent (`ramfs::SERVICE_LOW`), so the levels of the POSIX
-/// processes do not get this rest from them (it is the share of the levels at 33 and
-/// above that the budgets protect).
+/// the layout takes at 5 %. The three general services work at level 1 once
+/// their budget is spent (`ramfs::SERVICE_LOW`), under every process, so the levels of the
+/// POSIX processes get this rest and what the services' C leave.
 pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 
 /// What the budgets of CPU 0 leave free of `BUDGET_SHARE_MAX_PPM` for the budgets the table
@@ -407,8 +406,8 @@ pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 /// finds its room. The reserve keeps the table's budgets on CPU 0 at 71 % of the 75 % the
 /// limit allows, so the work no budget covers (the kernel, the interrupts, the drivers, init,
 /// the levels above the budgets) keeps its 25 % and more. It promises the levels of the POSIX
-/// processes nothing: the three services work at level 32 once their budget is spent, above
-/// them (the guarantee of the budgets is for the levels at 33 and above).
+/// processes nothing by itself: the three services work at level 1 once their budget is spent,
+/// under them.
 pub const CPU0_RESERVE_PPM: u64 = 30_000;
 
 /// A time budget of one thread of a record (spec 8, `budget_create`):
@@ -4292,8 +4291,9 @@ mod tests {
             );
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works
-        // above them.
+        // above them, and one that spent its budget works under them.
         assert_eq!(ramfs::SERVICE_FREE, 31);
+        assert_eq!(ramfs::SERVICE_LOW, 1);
         assert!(ramfs::SERVICE_FREE >= ramfs::RAM_LEGACY.priority.min(31));
     }
 
