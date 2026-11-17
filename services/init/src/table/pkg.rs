@@ -16,7 +16,10 @@
 //! instance that ended goes, with the Virtio reset while the function
 //! decodes its BAR, then the command word 0.
 
-use super::{Binding, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Wait, Window, Write};
+use super::{
+    At, Binding, Budget, Confirm, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Wait,
+    Window, Write,
+};
 use crate::PAGE;
 use crate::watch::Watch;
 use virtio_pci::qemu;
@@ -179,6 +182,187 @@ pub const MEMBLK: Record = Record {
     ..BLK
 };
 
+/// The PCI id of the NVMe controller of QEMU (`-device nvme`): Red Hat's vendor id and device
+/// 0x0010.
+pub const QEMU_NVME_ID: u32 = 0x1b36_0010;
+/// The bytes of BAR 0 the NVMe service maps: the registers and the doorbells, the MSI-X table
+/// and its pending bits lie in the first 16 KiB on EBS and on QEMU.
+const NVME_BAR_LEN: u64 = 4 * PAGE;
+/// `CC` and `CSTS` of the controller (NVM Express Base Specification, the controller
+/// properties) and the bits the stop uses.
+const NVME_CC: u64 = 0x14;
+const NVME_CSTS: u64 = 0x1c;
+/// `CC` as the library programs it (`nvme::regs::cc_enable`: enabled, 64-byte submission and
+/// 16-byte completion entries) with a normal shutdown asked for (SHN = 01).
+const NVME_CC_SHUTDOWN: u32 = 1 | 6 << 16 | 4 << 20 | 1 << 14;
+/// `CSTS.RDY`, and `CSTS.SHST` (bits 3:2) at 10, the shutdown processing complete.
+const NVME_RDY: u32 = 1;
+const NVME_SHST_MASK: u32 = 0b11 << 2;
+const NVME_SHST_COMPLETE: u32 = 0b10 << 2;
+/// The stop of the controller, in the order of the specification: a normal shutdown (the
+/// controller flushes what it holds and says so in `CSTS.SHST`), written only while the
+/// controller is ready, then `CC` 0 (the controller stops its DMA, which `CSTS.RDY` 0 says).
+/// When a confirmation fails, init keeps the DMA objects and marks the record broken.
+static NVME_STOP: [Write; 2] = [
+    Write {
+        window: "bar",
+        offset: NVME_CC,
+        bits: 32,
+        value: NVME_CC_SHUTDOWN,
+        settled: 0,
+        only_if: Some(Gate {
+            window: "bar",
+            offset: NVME_CSTS,
+            bits: NVME_RDY,
+        }),
+        confirm: Some(Confirm {
+            window: "bar",
+            offset: NVME_CSTS,
+            mask: NVME_SHST_MASK,
+            value: NVME_SHST_COMPLETE,
+        }),
+    },
+    Write {
+        window: "bar",
+        offset: NVME_CC,
+        bits: 32,
+        value: 0,
+        settled: 0,
+        only_if: None,
+        confirm: Some(Confirm {
+            window: "bar",
+            offset: NVME_CSTS,
+            mask: NVME_RDY,
+            value: 0,
+        }),
+    },
+];
+/// The command word of the function goes to 0 after the stop (bus mastering and memory
+/// decoding off, through the page of its configuration), also when a step of the stop did not
+/// confirm.
+static NVME_RELEASE: [Write; 1] = [Write {
+    window: "ecam",
+    offset: 4,
+    bits: 32,
+    value: 0,
+    settled: 0xFFFF,
+    only_if: None,
+    confirm: None,
+}];
+/// The command word the start writes: memory decoding, bus mastering and INTx off (`pci::enable`),
+/// before each load of the service.
+const NVME_COMMAND: u32 = pci::MEMORY | pci::BUS_MASTER | pci::INTX_DISABLE;
+static NVME_START: [Write; 1] = [Write {
+    window: "ecam",
+    offset: 4,
+    bits: 32,
+    value: NVME_COMMAND,
+    settled: NVME_COMMAND,
+    only_if: None,
+    confirm: None,
+}];
+/// The memory of the controller: the queues, the lists of PRPs and the buffer of Identify in
+/// one uncached object of 32 KiB (`nvme::MEM_BYTES`), and the four cells of 16 KiB, cached (the
+/// DMA is coherent on EC2 and under QEMU). The controller addresses both as the physical
+/// addresses init gives the service, `nvme` first.
+const NVME_DMA: &[Dma] = &[
+    Dma {
+        name: "nvme",
+        size: 8 * PAGE,
+        uncached: true,
+        duplicate: false,
+    },
+    Dma {
+        name: "cells",
+        size: 16 * PAGE,
+        uncached: false,
+        duplicate: false,
+    },
+];
+/// The two MSI-X vectors of the function: 0 for the admin queue, 1 for the I/O pair. Each is an
+/// event of the function's MSI device, bound with the label of its binding.
+const NVME_QEMU_BINDINGS: &[Binding] = &[
+    Binding::msi_of("irq0", QEMU_NVME_ID, 1, 0),
+    Binding::msi_of("irq1", QEMU_NVME_ID, 1, 1),
+];
+const NVME_QEMU_WINDOWS: &[Window] = &[
+    Window {
+        name: "bar",
+        base: 0,
+        len: NVME_BAR_LEN,
+        duplicate: false,
+        at: At::Bar {
+            id: QEMU_NVME_ID,
+            index: 1,
+            bar: 0,
+        },
+    },
+    Window {
+        name: "ecam",
+        base: 0,
+        len: PAGE,
+        duplicate: false,
+        at: At::Config {
+            id: QEMU_NVME_ID,
+            index: 1,
+        },
+    },
+];
+/// The budget of the request thread: 100 us of each 10 ms (1 % of CPU 0), at 32 once spent.
+/// A request takes one copy of a cell (about 5 us on t4g) and a doorbell, so about 15 commands
+/// fit one period, 24 MiB/s, which the store and the keys of the system never come near; the
+/// polling of the queue while a command is out (500 us) is counted in it.
+pub const NVME_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 100_000,
+    t_ns: 10 * MS,
+    low: super::ramfs::SERVICE_LOW,
+}];
+
+/// The disk service over the second NVMe controller of QEMU's machine with edk2 (the data disk
+/// beside the ESP's: `xtask nvme-persist`), under the name and at the level of the Virtio
+/// driver, so `pkgd` finds it the same way. The function is found by its PCI id and index,
+/// the walk of the platform gives its BAR as the firmware set it. The DMA of the device is
+/// coherent, and init stops the controller before it lets the objects go. Beyond the
+/// mappings, the client's buffer of 16 pages and the BAR's 4 need page tables.
+pub const NVME_QEMU_BLK: Record = Record {
+    program: "nvme-blk",
+    quota: 96 * PAGE,
+    windows: NVME_QEMU_WINDOWS,
+    bindings: NVME_QEMU_BINDINGS,
+    args: &[],
+    dma: NVME_DMA,
+    quiesce: &NVME_STOP,
+    start: &NVME_START,
+    release: &NVME_RELEASE,
+    budgets: NVME_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
+    ..BLK
+};
+
+/// The platform of QEMU's `virt` with `highmem-ecam=off` under edk2 (the machines of
+/// `xtask efi`): the ECAM of the machine below 4 GiB, buses 0 to 15, the walk over bus 0, which
+/// holds every function.
+pub const QEMU_PLATFORM: crate::resolve::Platform = crate::resolve::Platform {
+    ecam: pci::Ecam {
+        base: qemu::ECAM,
+        first_bus: 0,
+        last_bus: 15,
+    },
+    scan_last_bus: 0,
+    io_shift: 0,
+    optional: &[],
+};
+
+/// The disk service of the probe of the package service: the Virtio disk, or with the feature
+/// `nvme-store` the NVMe disk (`cargo xtask nvme-persist`).
+pub const PROBE_BLK: Record = if cfg!(feature = "nvme-store") {
+    NVME_QEMU_BLK
+} else {
+    BLK
+};
+
 /// The disk service of the images with a package service: the Virtio disk, or with the feature
 /// `memory-store` the memory disk (`cargo xtask pkg-probe memory`).
 pub const STORE_BLK: Record = if cfg!(feature = "memory-store") {
@@ -289,7 +473,7 @@ pub const STORE_PROBE_TABLE: &[Record] = &[
     },
     super::ramfs::CLOCK_RTC,
     super::ramfs::PIPE,
-    BLK,
+    PROBE_BLK,
     PKGD,
     STORE_PROBE,
     super::entropy::RNG,
@@ -481,5 +665,171 @@ mod tests {
     fn the_probe_is_no_higher_than_the_service() {
         const { assert!(BLK_PROBE.ceiling <= BLK.priority) };
         assert_eq!(BLK_PROBE.connects, &[BLK.name]);
+    }
+
+    /// QEMU's machine under edk2: the host bridge, the ESP's NVMe at 00:01.0 and the data
+    /// disk's at 00:04.0, each with a 64-bit BAR of 16 KiB above 4 GiB.
+    fn qemu_with_two_disks() -> pci::fake::Fake {
+        let mut f = pci::fake::Fake::default();
+        f.function(pci::Address::new(0, 0, 0), 0x1b36, 0x0008, 0x060000, false);
+        f.function(pci::Address::new(0, 1, 0), 0x1b36, 0x0010, 0x010802, false);
+        f.mem64(pci::Address::new(0, 1, 0), 0, 0x80_0000_0000, 0x4000);
+        f.function(pci::Address::new(0, 4, 0), 0x1b36, 0x0010, 0x010802, false);
+        f.mem64(pci::Address::new(0, 4, 0), 0, 0x80_0001_0000, 0x4000);
+        f
+    }
+
+    fn resolved(table: &[Record]) -> Vec<Record> {
+        let mut config = qemu_with_two_disks();
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        crate::resolve::resolve(table, &QEMU_PLATFORM, &mut config, store)
+            .unwrap()
+            .table
+            .to_vec()
+    }
+
+    #[test]
+    fn the_nvme_disk_is_the_disk_service_at_the_level_of_the_virtio_driver() {
+        let r = NVME_QEMU_BLK;
+        assert_eq!((r.name, r.program), ("blk", "nvme-blk"));
+        assert_eq!((r.priority, r.ceiling), (39, 39));
+        const { assert!(PKGD.ceiling <= NVME_QEMU_BLK.priority) };
+        assert_eq!(r.restart, Restart::Always);
+        assert!(r.trusted && r.connects.is_empty() && r.args.is_empty());
+        // The queues' object uncached (8 pages, nvme::MEM_BYTES), the four cells cached.
+        let dma: Vec<_> = r.dma.iter().map(|d| (d.name, d.size, d.uncached)).collect();
+        assert_eq!(dma, [("nvme", 8 * PAGE, true), ("cells", 16 * PAGE, false)]);
+        assert_eq!(r.dma[0].size, nvme::device::MEM_BYTES as u64);
+        assert_eq!(r.dma[1].size, nvme::device::CELLS_BYTES as u64);
+        // The window of BAR 0 holds the MSI-X table and its pending bits (offsets 0x2000 and
+        // 0x3000 on EBS).
+        assert_eq!(r.windows[0].len, 4 * PAGE);
+        // Vector 0 for the admin queue, 1 for the pair, the second function of the id.
+        assert_eq!(
+            r.bindings
+                .iter()
+                .map(|b| (b.name, b.of))
+                .collect::<Vec<_>>(),
+            [
+                ("irq0", Some((QEMU_NVME_ID, 1))),
+                ("irq1", Some((QEMU_NVME_ID, 1)))
+            ]
+        );
+        assert_eq!(QEMU_NVME_ID, 0x1b36_0010);
+    }
+
+    #[test]
+    fn the_nvme_disk_is_stopped_by_a_shutdown_then_cc_zero_and_the_command_word_goes_to_zero() {
+        let [shutdown, disable] = NVME_QEMU_BLK.quiesce else {
+            panic!("two writes expected");
+        };
+        // The value is the library's CC with SHN = 01.
+        assert_eq!(
+            shutdown.value,
+            nvme::regs::cc_enable() | nvme::regs::CC_SHN_NORMAL
+        );
+        assert_eq!((shutdown.offset, u64::from(nvme::regs::CC)), (0x14, 0x14));
+        // It goes while the controller is ready, and its confirmation is SHST = 10.
+        let gate = shutdown
+            .only_if
+            .expect("only a controller that runs is told to shut down");
+        assert_eq!(
+            (gate.window, gate.offset, gate.bits),
+            ("bar", u64::from(nvme::regs::CSTS), nvme::regs::CSTS_RDY)
+        );
+        let confirm = shutdown.confirm.unwrap();
+        assert_eq!(
+            (confirm.offset, confirm.mask, confirm.value),
+            (
+                u64::from(nvme::regs::CSTS),
+                nvme::regs::CSTS_SHST_MASK,
+                nvme::regs::CSTS_SHST_COMPLETE << nvme::regs::CSTS_SHST_SHIFT
+            )
+        );
+        // Then CC = 0, confirmed by RDY = 0.
+        assert_eq!((disable.offset, disable.value), (0x14, 0));
+        let confirm = disable.confirm.unwrap();
+        assert_eq!((confirm.offset, confirm.mask, confirm.value), (0x1c, 1, 0));
+        // The command word: 0 after, memory decoding and bus mastering before.
+        assert_eq!(NVME_QEMU_BLK.release[0].value, 0);
+        assert_eq!(NVME_QEMU_BLK.start[0].value, 0x0406);
+    }
+
+    #[test]
+    fn the_nvme_record_finds_the_second_controller_its_bar_and_its_two_vectors() {
+        let table: Vec<Record> = STORE_PROBE_TABLE
+            .iter()
+            .map(|r| if r.name == "blk" { NVME_QEMU_BLK } else { *r })
+            .collect();
+        let found = resolved(&table);
+        let blk = found.iter().find(|r| r.name == "blk").unwrap();
+        // The function at 00:04.0 (RID 0x20); the ESP's controller at 00:01.0 (RID 0x08) is index 0.
+        let bar = blk.windows.iter().find(|w| w.name == "bar").unwrap();
+        assert_eq!((bar.base, bar.len), (0x80_0001_0000, 4 * PAGE));
+        let ecam = blk.windows.iter().find(|w| w.name == "ecam").unwrap();
+        assert_eq!(ecam.base, QEMU_PLATFORM.ecam.base + (4 << 15));
+        let events: Vec<_> = blk.bindings.iter().map(|b| b.event()).collect();
+        assert_eq!(events, [Some((0x20, 0)), Some((0x20, 1))]);
+        assert_eq!(crate::table::msi_events(blk, 0x20), 2);
+        assert!(crate::table::check(&found).is_ok());
+    }
+
+    #[test]
+    fn the_budgets_of_cpu_zero_with_the_nvme_service_stay_in_the_room_of_the_shell_image() {
+        // The shell image's budgets on CPU 0 (the network service 60 %, the three services 8 %)
+        // and the NVMe service's 1 %, with the reserve of 3 % for the process service and the
+        // package service: 72 % of the 75 % the table allows.
+        let table: Vec<Record> = super::super::base::BASE_TABLE
+            .iter()
+            .map(|r| if r.name == "blk" { NVME_QEMU_BLK } else { *r })
+            .collect();
+        let on_zero: u64 = table
+            .iter()
+            .flat_map(|r| r.budgets.iter())
+            .filter(|b| b.cpu == 0)
+            .map(Budget::share_ppm)
+            .sum();
+        assert_eq!(NVME_BUDGETS[0].share_ppm(), 10_000);
+        assert_eq!(
+            on_zero + crate::table::CPU0_RESERVE_PPM,
+            if super::super::ramfs::RAM_BUDGET_ON {
+                720_000
+            } else {
+                670_000
+            }
+        );
+        assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
+        // The table passes the check (the admission of every CPU, `free` below the level).
+        let found = resolved(&table);
+        assert!(crate::table::check(&found).is_ok());
+        let blk = found.iter().find(|r| r.name == "blk").unwrap();
+        assert_eq!(blk.free, super::super::ramfs::SERVICE_FREE);
+        assert!(blk.free < blk.priority && !blk.budgets.is_empty());
+        // The budget has the name the service binds, and the level it works at once spent.
+        assert_eq!(NVME_BUDGETS[0].name, "serve");
+        assert_eq!(NVME_BUDGETS[0].low, super::super::ramfs::SERVICE_LOW);
+    }
+
+    #[test]
+    fn a_table_with_the_nvme_disk_left_without_its_second_controller_is_refused() {
+        let mut config = pci::fake::Fake::default();
+        config.function(pci::Address::new(0, 1, 0), 0x1b36, 0x0010, 0x010802, false);
+        config.mem64(pci::Address::new(0, 1, 0), 0, 0x80_0000_0000, 0x4000);
+        let store: &'static mut crate::resolve::Store =
+            Box::leak(Box::new(crate::resolve::Store::EMPTY));
+        let table: Vec<Record> = STORE_PROBE_TABLE
+            .iter()
+            .map(|r| if r.name == "blk" { NVME_QEMU_BLK } else { *r })
+            .collect();
+        let refused = crate::resolve::resolve(&table, &QEMU_PLATFORM, &mut config, store);
+        assert!(matches!(
+            refused,
+            Err(crate::resolve::Refusal {
+                record: "blk",
+                cause: crate::resolve::Cause::NoFunction { index: 1, .. },
+                ..
+            })
+        ));
     }
 }

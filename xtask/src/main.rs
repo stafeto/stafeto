@@ -2372,6 +2372,7 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
+  nvme-persist [breaks|lba4096|mdts1|steps] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2408,6 +2409,7 @@ fn main() {
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
         Some("nvme-breaks") => nvme_breaks(),
+        Some("nvme-persist") => store_probe::nvme_persist(&args[1..]),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
         Some("its-drop") => its_drop(),
@@ -10448,6 +10450,19 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The package service on that disk: a store the host wrote is attached,
         // a disk of zeros is formatted, and under -icount its steps are measured.
         job("store-probe", || store_probe::command(&[])),
+        job("nvme-persist", || store_probe::nvme_persist(&[])),
+        job("nvme-persist breaks", || {
+            store_probe::nvme_persist(&["breaks".to_string()])
+        }),
+        job("nvme-persist lba4096", || {
+            store_probe::nvme_persist(&["lba4096".to_string()])
+        }),
+        job("nvme-persist mdts1", || {
+            store_probe::nvme_persist(&["mdts1".to_string()])
+        }),
+        job("nvme-persist steps", || {
+            store_probe::nvme_persist(&["steps".to_string()])
+        }),
         job("store-probe steps", || {
             store_probe::command(&["steps".into()])
         }),
@@ -13779,6 +13794,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "virtio-blk",
         "--package",
+        "nvme-blk",
+        "--package",
         "blk-probe",
         "--package",
         "pkgd",
@@ -13789,7 +13806,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
