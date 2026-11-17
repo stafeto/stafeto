@@ -646,10 +646,9 @@ impl Probe<'_> {
             return Ok(());
         }
         if cfg!(feature = "quick") {
-            // The run under -icount has no monitor to move the tablet: this
-            // window stays until the others made eight of them.
-            self.wait_open(&display, 8)?;
-            self.wait_open(&display, 1)?;
+            // The run under -icount has no monitor to move the tablet: the
+            // injector holds the last key until the many windows went, so
+            // this window is there when they make eight.
             // The last of the programs to end: xtask stops on this one.
             self.sleep(100_000_000);
             return Ok(());
@@ -953,6 +952,17 @@ impl Probe<'_> {
             expected_crc([true, false], true, Some((CLICK.0 as u32, CLICK.1 as u32)))
         );
         self.sleep(SNAPSHOT_NS);
+        if cfg!(feature = "quick") {
+            // The many windows come and go first (the run under -icount).
+            let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+            while self.describe(&display).map_err(say("DESCRIBE"))?.created < 9 {
+                if time::ticks_to_ns(time::now()) > end {
+                    return Err("the many windows never came");
+                }
+                self.sleep(RETRY_NS);
+            }
+            self.wait_open(&display, 1)?;
+        }
         // The focus passed to the first window.
         self.key(&display, KEY_F)?;
         rt::println!("focus-probe: the keys are injected");
