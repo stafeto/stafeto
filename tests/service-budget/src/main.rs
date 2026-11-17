@@ -44,6 +44,9 @@ const VICTIM_LEVEL: u8 = 34;
 /// 1 once their budgets are spent, so the guarantee covers every level above 1, a POSIX
 /// process's level (10) among them.
 const LOW_VICTIM_LEVEL: u8 = 10;
+/// The level of the greedy clients: 20, and 5 in the phase of the victim at 10, which they must
+/// stay below (a client above the victim would take its time itself).
+static GREEDY_LEVEL: AtomicU64 = AtomicU64::new(20);
 /// The level the duty-cycled victim of the phase in progress works at.
 static DUTY_LEVEL: AtomicU64 = AtomicU64::new(VICTIM_LEVEL as u64);
 const PAGE: usize = 4096;
@@ -468,7 +471,10 @@ extern "C" fn local_server(channel: u64) -> ! {
 /// 649 per mille in 10 ms), so there is none; 24 clients keep a request queued instead.
 fn spawn_greedies(process: &Handle<Process>, cpu: u8) -> [Option<Handle<Thread>>; GREEDIES] {
     let n = CLIENTS.load(Relaxed);
-    core::array::from_fn(|i| (i < n).then(|| spawn_on(process, 2 + i, greedy, i as u64, 20, cpu)))
+    let level = GREEDY_LEVEL.load(Relaxed) as u8;
+    core::array::from_fn(|i| {
+        (i < n).then(|| spawn_on(process, 2 + i, greedy, i as u64, level, cpu))
+    })
 }
 
 fn start_all(threads: &[Option<Handle<Thread>>]) {
@@ -911,6 +917,7 @@ fn starve(
     level: u8,
 ) {
     DUTY_LEVEL.store(u64::from(level), Relaxed);
+    GREEDY_LEVEL.store(if level == VICTIM_LEVEL { 20 } else { 5 }, Relaxed);
     let phase = if level == VICTIM_LEVEL {
         "starve"
     } else {
@@ -955,7 +962,9 @@ fn starve(
     // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
     // the events explain: the remainder.
     let loss_us = (1000 - worst) * 8;
-    let explained = 2 * C_US[which] + 2 * 10 + 4 * e;
+    // Each of the two budgets of a service (`serve` and `turns`) may run out in each period, so
+    // up to four events in each of the two periods.
+    let explained = 2 * C_US[which] + 2 * 10 + 8 * e;
     let remainder = loss_us.saturating_sub(explained);
     let bound = 1000 - (explained + ALLOWANCE_US[which]) / 8;
     println!(

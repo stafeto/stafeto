@@ -64,6 +64,8 @@ const OPERATIONS: usize = 128;
 const CHUNK: u32 = 64;
 /// The messages of output one step gives the driver at most.
 const WRITES: usize = 1;
+/// The chunks of input a read that waits takes from the driver at most.
+const PULLS: usize = 8;
 /// The pieces of output a Flow request that resumes it (XON) gives the driver at most.
 const FLOW_PUSHES: usize = 32;
 /// The bytes of a client's write one step takes at most: a write of
@@ -1528,6 +1530,25 @@ impl Tty {
         true
     }
 
+    /// The input the driver holds, taken in the request of a client that waits for it (at most
+    /// `PULLS` chunks): whether any came. The console is terminal 0.
+    fn take_driver_input(&mut self) -> bool {
+        if !matches!(self.input, Input::Waiting { armed: true, .. }) {
+            return false;
+        }
+        let active = self.active;
+        self.select(0);
+        let mut any = false;
+        for _ in 0..PULLS {
+            if !self.pull() {
+                break;
+            }
+            any = true;
+        }
+        self.select(active);
+        any
+    }
+
     /// Every read that waits looks again: input came, or the settings
     /// changed.
     fn tell_readers(&mut self) {
@@ -1796,10 +1817,22 @@ impl Tty {
             None => at,
         };
         let mut out = [0; MAX_READ];
-        match self.devices[self.active]
-            .console
-            .read(&mut out[..read.count as usize], started, at)
+        let mut got =
+            self.devices[self.active]
+                .console
+                .read(&mut out[..read.count as usize], started, at);
+        // A read that finds nothing takes the input the driver holds for the service first: the
+        // steps that do it on their own (the turns) run at the service's own level only while
+        // its budget lasts, and the client that asks for the input is owed what has come.
+        if matches!(got, discipline::Read::Wait(_)) && self.active == 0 && self.take_driver_input()
         {
+            got = self.devices[self.active].console.read(
+                &mut out[..read.count as usize],
+                started,
+                at,
+            );
+        }
+        match got {
             discipline::Read::Ready(n) => {
                 self.finish(s, read.key);
                 self.tell_master_writers();
