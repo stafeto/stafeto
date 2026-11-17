@@ -135,9 +135,11 @@ fn touch(base: *mut u8, len: usize) {
     let mut at = 0;
     while at < len {
         // SAFETY: `at` is within the static; the bytes are zeros and no other thread runs yet.
-        unsafe { base.add(at).write_volatile(0) };
+        unsafe { base.add(at).write(0) };
         at += PAGE;
     }
+    // The memory may be read through the pointer from here on: the writes stay.
+    core::hint::black_box(base);
 }
 
 const PAGE: usize = 4096;
