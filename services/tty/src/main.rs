@@ -64,6 +64,8 @@ const OPERATIONS: usize = 128;
 const CHUNK: u32 = 64;
 /// The messages of output one step gives the driver at most.
 const WRITES: usize = 1;
+/// The pieces of output a request that settles the output sends to the driver at most.
+const FLOW_PUSHES: usize = 32;
 /// The bytes of a client's write one step takes at most: a write of
 /// more gets the count of those (the layer writes the rest).
 const WRITE_STEP: usize = 256;
@@ -296,8 +298,6 @@ fn main(_: u64) -> u64 {
         preparation: if notary.is_some() { 1 } else { 3 },
         notary,
         generations: None,
-        departure_left: 0,
-        departure_cursor: 0,
     };
     let config = Config {
         issued: 0,
@@ -420,8 +420,6 @@ struct Tty {
     notary: Option<Handle<Channel>>,
     generations: Option<Handle<Memory>>,
     preparation: u8,
-    departure_left: usize,
-    departure_cursor: usize,
 }
 
 /// The time on the scale of timer_set.
@@ -868,9 +866,13 @@ impl Tty {
         }
     }
 
-    fn tell_place(&self, label: u64) {
-        if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, label, self.level) {
-            let _ = sys::notify(&place, 1);
+    /// Tells the loop of the departures of the terminals in `mask` (bit `terminal`), on its own
+    /// channel, as the process service does: a client that asks next lifts the thread that holds
+    /// the notice (spec 6.6), so the hang-up is done before that client is answered.
+    fn tell_departures(&self, mask: u64) {
+        if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, DEPARTURES, self.level)
+        {
+            let _ = sys::notify(&place, mask);
         }
     }
 
@@ -1034,8 +1036,8 @@ impl Tty {
                 let _ = self.endpoints.set_link(self.active, i.generation, false);
             }
         }
-        self.departure_left = TERMINALS;
-        self.tell_place(DEPARTURES);
+        // One old connection per step: the terminal is asked again.
+        self.tell_departures(1 << self.active);
     }
 
     /// Tells the loop of a step, unless one is told already; a refused
@@ -1305,10 +1307,11 @@ impl Tty {
         true
     }
 
-    fn push(&mut self) {
+    /// A piece of output to the driver: whether more is ready to go.
+    fn push(&mut self) -> bool {
         self.mark_drains();
         if self.observe_drain() {
-            return;
+            return false;
         }
         let target = self.devices[self.active]
             .drainers
@@ -1327,23 +1330,28 @@ impl Tty {
             level: self.level,
             room_given: &mut self.room_given,
         };
-        match self.pump.run_prefix(
+        let more = match self.pump.run_prefix(
             &mut self.devices[self.active].console,
             &mut port,
             WRITES,
             target,
         ) {
-            Ok(Pumped::More) => self.kick(),
-            Ok(Pumped::Idle | Pumped::WaitsRoom) => {}
+            Ok(Pumped::More) => {
+                self.kick();
+                true
+            }
+            Ok(Pumped::Idle | Pumped::WaitsRoom) => false,
             Err(_) => {
                 self.reconnect();
                 self.kick();
+                false
             }
-        }
+        };
         self.tell_output();
         if target == Some(self.devices[self.active].console.sent_total()) {
             self.kick();
         }
+        more
     }
 
     /// The writes that wait hear of room, and the drains of an output that
@@ -1480,6 +1488,30 @@ impl Tty {
         self.tell_readers();
         self.kick();
         true
+    }
+
+    /// The output the service holds goes to the driver in the request that needs it gone, up to
+    /// `FLOW_PUSHES` pieces: when the driver had no room, it is asked for it now, as the
+    /// notification of its room would have it asked. A client that waits for the output does not
+    /// wait for the service's own step, which runs at level 1 once the budget is spent.
+    fn settle_output(&mut self) {
+        for _ in 0..FLOW_PUSHES {
+            if self.pump.waits_room() {
+                let mut port = Port {
+                    driver: &self.driver,
+                    channel: &self.channel,
+                    level: self.level,
+                    room_given: &mut self.room_given,
+                };
+                match port.room() {
+                    Ok(true) => self.pump.room_came(),
+                    _ => break,
+                }
+            }
+            if !self.push() {
+                break;
+            }
+        }
     }
 
     /// Every read that waits looks again: input came, or the settings
@@ -2455,9 +2487,18 @@ impl Tty {
             return status(code);
         }
         match control.word {
-            FLOW_OUT_OFF => self.devices[self.active].console.set_stopped(true),
+            FLOW_OUT_OFF => {
+                // The output accepted before the stop goes out first, up to the room the driver
+                // gave: the stop is owed the state the client left.
+                self.settle_output();
+                self.devices[self.active].console.set_stopped(true);
+            }
             FLOW_OUT_ON => {
                 self.devices[self.active].console.set_stopped(false);
+                // The output the stop held goes on in this request, up to the room the driver
+                // gave: a client that sends XON sees the output resume when the call returns.
+                // What the room does not take stays to the steps.
+                self.settle_output();
                 self.kick();
             }
             FLOW_IN_OFF | FLOW_IN_ON => {
@@ -3112,8 +3153,16 @@ impl Service<0> for Tty {
             Some(Method::WatchCancel) => self.watch_keyed(s, r, true),
             Some(Method::ReadStart) => self.read(s, r, false, false),
             Some(Method::ReadTake) => self.read(s, r, true, false),
-            Some(Method::WriteStart) => self.write(s, r, false, false),
-            Some(Method::WriteTake) => self.write(s, r, true, false),
+            Some(Method::WriteStart | Method::WriteTake) => {
+                let answer = self.write(s, r, r.method() == Method::WriteTake as u16, false);
+                // What the client wrote goes to the driver in its own request (up to the room
+                // the driver gave): the step that would send it runs at level 1 once the
+                // budget is spent.
+                if self.active == 0 {
+                    self.settle_output();
+                }
+                answer
+            }
             Some(Method::DrainStart) => self.drain(s, r, false),
             Some(Method::DrainTake) => self.drain(s, r, true),
             Some(Method::FlushQueues) => self.flush_queues(s, r),
@@ -3207,17 +3256,14 @@ impl Service<0> for Tty {
         match (n.source, n.label) {
             (Source::Session, DEPARTURES) => {
                 rt::service::step_own();
-                if self.departure_left == 0 {
-                    self.departure_left = TERMINALS;
+                // The bits are the terminals the process service names (one each).
+                for terminal in 0..TERMINALS {
+                    if n.bits & (1 << terminal) != 0 {
+                        self.select(terminal);
+                        self.departure();
+                    }
                 }
-                let terminal = self.departure_cursor;
-                self.departure_cursor = (terminal + 1) % TERMINALS;
-                self.departure_left -= 1;
-                self.select(terminal);
-                self.departure();
-                if self.departure_left != 0 {
-                    self.tell_place(DEPARTURES);
-                }
+                self.select(0);
             }
             (Source::Session, DRIVER_IN) => {
                 rt::service::step_own();

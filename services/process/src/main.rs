@@ -2985,7 +2985,7 @@ impl Processes {
                     let _ = delivered;
                 }
                 if let Some(notice) = self.terminal_notice.as_ref() {
-                    let _ = sys::notify(notice, 1);
+                    let _ = sys::notify(notice, 1 << terminal);
                 }
             }
             return Answer::Status(Status::Ok);
@@ -3022,7 +3022,7 @@ impl Processes {
             if leader {
                 self.terminals.drop_terminal(terminal);
                 if let Some(notice) = self.terminal_notice.as_ref() {
-                    let _ = sys::notify(notice, 1);
+                    let _ = sys::notify(notice, 1 << terminal);
                 }
             }
             return Answer::Status(Status::Ok);
@@ -3033,7 +3033,7 @@ impl Processes {
             }
             self.terminals.drop_terminal(terminal);
             if let Some(notice) = self.terminal_notice.as_ref() {
-                let _ = sys::notify(notice, 1);
+                let _ = sys::notify(notice, 1 << terminal);
             }
             return Answer::Status(Status::Ok);
         }
@@ -5145,9 +5145,9 @@ impl Service<0> for Processes {
         if let Some(r) = self.records.get(index)
             && r.label.pid() == r.sid
         {
-            self.terminals.leader_ended(r.sid);
+            let mask = self.terminals.leader_ended(r.sid);
             if let Some(notice) = self.terminal_notice.as_ref() {
-                let _ = sys::notify(notice, 1);
+                let _ = sys::notify(notice, mask.max(1));
             }
         }
         // The time of the process stays in the account of the pool once it

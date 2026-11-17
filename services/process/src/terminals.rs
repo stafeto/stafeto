@@ -187,12 +187,17 @@ impl Terminals {
         }
     }
 
-    pub fn leader_ended(&mut self, sid: u32) {
-        for t in &mut self.terminals {
+    /// The terminals whose link a session's leader ended, one bit each (bit `terminal`): the
+    /// notice to the terminal service carries them, so that it knows which departures to take.
+    pub fn leader_ended(&mut self, sid: u32) -> u64 {
+        let mut mask = 0;
+        for (i, t) in self.terminals.iter_mut().enumerate() {
             if t.link.is_some_and(|l| l.sid == sid) {
                 t.end(false);
+                mask |= 1 << i;
             }
         }
+        mask
     }
 }
 
