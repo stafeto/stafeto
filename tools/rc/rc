@@ -11,7 +11,7 @@
 # The console, for the lines the scripts print.
 exec </dev/null >/dev/console 2>&1
 
-for name in ec2-key dropbear; do
+for name in ec2-key dropbear fast; do
     if [ -f "/etc/rc.d/$name" ]; then
         ash "/etc/rc.d/$name"
     fi
