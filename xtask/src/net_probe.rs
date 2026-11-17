@@ -264,6 +264,7 @@ const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
 const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
 const EPOLL_WAIT_OK: &str = "net-probe: epoll wait ok 64 after 64 stale";
+const EPOLL_HELD_OK: &str = "net-probe: epoll wait after a send while the steps are held ok";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -698,6 +699,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.epoll_sets {
         once.push((EPOLL_WAKE, 1));
         once.push((EPOLL_WAIT_OK, 1));
+        once.push((EPOLL_HELD_OK, 1));
         once.push((EPOLL_CLOSE, 1));
         once.push((EPOLL_REQUESTS, 1));
         once.push((EPOLL_OK, 1));

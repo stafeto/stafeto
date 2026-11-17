@@ -161,7 +161,9 @@ const RETURN: u64 = 128;
 pub(crate) const BACK: u64 = 256;
 /// The map of a shared buffer a BUFFER waits for (`Net::map_waiting`).
 const MAP: u64 = 512;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP;
+/// The step that answers one parked wait that cannot block (`netd::zero`).
+const ZERO: u64 = 1024;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN | BACK | MAP | ZERO;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The label of the sweep's timer on the switch thread's channel.
@@ -2399,9 +2401,27 @@ const METHODS: &[u16] = &[
 ];
 
 impl Driver<'_> {
+    /// The wait of a set does not report before the steps of the wire told ahead of it, and no
+    /// step runs in a request: the wait is parked (`steps_pending`, `Net::epoll_wait`) and the
+    /// step of waking answers it (`netd::zero`).
+    #[inline(never)]
+    fn before_wait(&mut self) {
+        #[cfg(feature = "probe")]
+        let kept = (u64::from(self.held_tx) * TX) | (u64::from(self.held_rx) * RX);
+        #[cfg(not(feature = "probe"))]
+        let kept = 0;
+        if (self.told | kept) & (TX | RX | RX1 | WAKE) != 0 {
+            self.inst.net.steps_pending = true;
+        }
+    }
+
     fn handle_request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let began = profile::now();
         let method = r.method();
+        self.inst.net.steps_pending = false;
+        if method == Method::EpollWait.number() || method == Method::EpollWaitTake.number() {
+            self.before_wait();
+        }
         // VERIFY_SESSION goes through the root alone, and the root has no
         // other request.
         // The first instance sends it to the home of a session (`HOME_LABEL`), as it sends
@@ -2474,7 +2494,9 @@ impl Driver<'_> {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP];
+                let order = [
+                    RX, RX1, TX, WAKE, ZERO, CLEANUP, SWEEP, RESOLV, RETURN, BACK, MAP,
+                ];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -2509,8 +2531,21 @@ impl Driver<'_> {
                         let left = self.inst.net.wake(&mut self.inst.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
-                        if left {
+                        // The waits that cannot block and are parked count this step: the
+                        // wire is quiet when no step of sending or receiving (of either device)
+                        // is told. Answers are the step ZERO's, one a step.
+                        self.inst.net.count_zero(self.told & (TX | RX | RX1) == 0);
+                        if self.inst.net.zero_due() {
+                            self.tell(ZERO);
+                        }
+                        if left || self.inst.net.zero_waiting() {
                             self.tell(WAKE);
+                        }
+                    }
+                    ZERO => {
+                        rt::service::step_own();
+                        if self.inst.net.answer_zero() {
+                            self.tell(ZERO);
                         }
                     }
                     CLEANUP => {
