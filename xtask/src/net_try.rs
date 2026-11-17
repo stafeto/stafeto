@@ -1166,7 +1166,7 @@ fn persist(kernel: &Artifacts, image: &Path, dir: &Path, good: &Path) -> Result<
             ("the volume mounted", "datafs: data volume mounted"),
         ],
     )?;
-    if second.said("formatted") || second.said("datakey: no host key") {
+    if second.said("data volume formatted") || second.said("datakey: no host key") {
         return Err("the second boot formatted the volume or found no key".into());
     }
     let after = second.fingerprint()?;
