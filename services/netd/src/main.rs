@@ -147,6 +147,10 @@ rt::entry!(main);
 /// receiving, sending (also asked by a request), the departure of a session,
 /// the waking of operations, the sweep of the streams that close, and the
 /// write of `/etc/resolv.conf`.
+/// The least time between two lines of the queue counters on the console, and between two
+/// asked for by CONFIG, in nanoseconds.
+const QUEUES_EVERY_NS: u64 = 30_000_000_000;
+const QUEUES_ASKED_NS: u64 = 5_000_000_000;
 const RX: u64 = 16;
 const TX: u64 = 1;
 const CLEANUP: u64 = 2;
@@ -1319,6 +1323,13 @@ struct Driver<'a> {
     /// is no work of the service).
     #[cfg(feature = "probe")]
     report_due: bool,
+    /// When the counters of the queues were last said, and their sum then: a machine that
+    /// nobody can log in to (the console of a cloud instance is all there is) shows them
+    /// there, once in `QUEUES_EVERY_NS` and only when they changed.
+    queues_said: (u64, u64),
+    /// CONFIG came (`ifconfig`, a name lookup): the counters are said at the next chance, but
+    /// not twice in `QUEUES_ASKED_NS`.
+    queues_asked: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
     /// The step that ran last among those asked for together.
@@ -1412,6 +1423,8 @@ impl<'a> Driver<'a> {
             cleanup_due: false,
             #[cfg(feature = "probe")]
             report_due: false,
+            queues_said: (0, 0),
+            queues_asked: false,
             armed: None,
             last_step: 0,
             neighbours_at: 0,
@@ -2172,6 +2185,7 @@ impl Driver<'_> {
         {
             self.report_due = true;
         }
+        self.queues_asked = true;
         let (lease, mac) = if device == 0 {
             (self.inst.stack.lease, self.mac)
         } else {
@@ -2198,6 +2212,68 @@ impl Driver<'_> {
         Answer::Reply(Outgoing::new())
     }
 
+    /// The counters of the accept queues: the totals and the listening descriptions that
+    /// dropped, reaped or recycled.
+    fn report_queues(&self) {
+        let counters = &self.inst.net.counters;
+        rt::println!(
+            "net: queues syn_dropped {} queue_reaped {} embryo_recycled {}",
+            counters.syn_dropped,
+            counters.queue_reaped,
+            counters.embryo_recycled
+        );
+        rt::println!(
+            "net: queues sockets {} of {} demux {} listen_short {} key_stale {} syn_stray {} orphan_reused {} set_barred {}",
+            self.inst.net.places.used(),
+            netd::places::SOCKETS_LIMIT,
+            self.inst.net.demux.len(),
+            counters.listen_short,
+            counters.key_stale,
+            counters.syn_stray,
+            counters.orphan_reused,
+            counters.set_barred
+        );
+        for (place, l) in self.inst.net.socks.iter().enumerate() {
+            if l.listening && (l.syn_dropped | l.queue_reaped | l.embryo_recycled) != 0 {
+                rt::println!(
+                    "net: listener place {} port {} syn_dropped {} queue_reaped {} embryo_recycled {}",
+                    place,
+                    l.port,
+                    l.syn_dropped,
+                    l.queue_reaped,
+                    l.embryo_recycled
+                );
+            }
+        }
+    }
+
+    /// Says the counters of the queues when they changed since the last time and the last
+    /// time is `QUEUES_EVERY_NS` ago (the first time is the baseline of a boot), or when CONFIG
+    /// asked and `QUEUES_ASKED_NS` have passed.
+    fn say_queues(&mut self) {
+        let asked = core::mem::take(&mut self.queues_asked);
+        let c = &self.inst.net.counters;
+        let sum = c
+            .syn_dropped
+            .wrapping_add(c.queue_reaped)
+            .wrapping_add(c.embryo_recycled)
+            .wrapping_add(c.listen_short)
+            .wrapping_add(c.key_stale)
+            .wrapping_add(c.syn_stray);
+        let now = now_ns();
+        let since = now.saturating_sub(self.queues_said.0);
+        let due = if asked {
+            since >= QUEUES_ASKED_NS
+        } else {
+            (sum != self.queues_said.1 || self.queues_said.0 == 0) && since >= QUEUES_EVERY_NS
+        };
+        if !due {
+            return;
+        }
+        self.queues_said = (now, sum);
+        self.report_queues();
+    }
+
     /// The counters of the probe's line.
     #[cfg(feature = "probe")]
     fn report_frames(&self) {
@@ -2218,25 +2294,7 @@ impl Driver<'_> {
             self.inst.device.bad_sum,
             self.inst.net.demux.probe_max
         );
-        let counters = &self.inst.net.counters;
-        rt::println!(
-            "net: queues syn_dropped {} queue_reaped {} embryo_recycled {}",
-            counters.syn_dropped,
-            counters.queue_reaped,
-            counters.embryo_recycled
-        );
-        for (place, l) in self.inst.net.socks.iter().enumerate() {
-            if l.listening && (l.syn_dropped | l.queue_reaped | l.embryo_recycled) != 0 {
-                rt::println!(
-                    "net: listener place {} port {} syn_dropped {} queue_reaped {} embryo_recycled {}",
-                    place,
-                    l.port,
-                    l.syn_dropped,
-                    l.queue_reaped,
-                    l.embryo_recycled
-                );
-            }
-        }
+        self.report_queues();
         rt::println!(
             "net: yield deferred {} idle {} served {}",
             self.yielding.deferred,
@@ -2785,6 +2843,10 @@ impl Service<0> for Driver<'_> {
             // a boot of it checks that the records come whole.
             #[cfg(feature = "profile")]
             self.profile_snapshot();
+        }
+        // The probe builds say all of it in their own report.
+        if !cfg!(feature = "probe") {
+            self.say_queues();
         }
     }
 

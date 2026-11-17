@@ -55,6 +55,15 @@
 //!      send a SYN alone through the forwarding of the emulator (it finishes
 //!      each handshake), so the half-open entries are covered by the unit
 //!      tests of `queue` in the network service.
+//!    - 4g: Rounds of what a port scan does, from the host (stafeto-design#764):
+//!      connections to ports 80 and 443 that the host resets at once, closes
+//!      at once, opens and resets before the handshake ends, or holds and then
+//!      resets all together, the workers running. Right after each round, with
+//!      no pause, ONE request of the page over TLS, ONE over HTTP, and a
+//!      keep-alive connection opened before the round must still answer. Any
+//!      single failure fails the run. `NGINX_SCAN_ROUNDS` sets the rounds (5;
+//!      a larger number lifts the time bound of the run: it is a hunt for a
+//!      rare failure).
 //!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
@@ -1332,6 +1341,133 @@ fn tls_page_after(tls: &Tls, mode: &str, rounds: usize, per: usize) -> Result<()
     same_file(&format!("4f {mode}: the page"), &out, rootfs::www_index())
 }
 
+/// One round of step 4g from the host: against each of the two ports, `per`
+/// connections reset at once, `per` closed at once, `per` opened without
+/// blocking and reset before the handshake ends, and `per` held until all are
+/// open and then reset together. No pause: the caller asks for a page the
+/// moment this ends.
+const SCAN_CLIENT: &str = r#"
+import socket, struct, sys
+ports, per = [int(p) for p in sys.argv[1].split(",")], int(sys.argv[2])
+rst = struct.pack("ii", 1, 0)
+def opened(port):
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect(("127.0.0.1", port))
+    except OSError:
+        s.close()
+        return None
+    return s
+for port in ports:
+    for _ in range(per):
+        s = opened(port)
+        if s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+            s.close()
+    for _ in range(per):
+        s = opened(port)
+        if s:
+            s.close()
+    for _ in range(per):
+        s = socket.socket()
+        s.setblocking(False)
+        s.connect_ex(("127.0.0.1", port))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+        s.close()
+    held = [opened(port) for _ in range(per)]
+    for s in held:
+        if s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+            s.close()
+"#;
+
+/// The rounds of step 4g and whether the time bound of the run still holds:
+/// `NGINX_SCAN_ROUNDS` (a number from 1 up) raises them above the five of a
+/// plain run and lifts the bound.
+fn scan_rounds(text: Option<&str>) -> (usize, bool) {
+    match text.and_then(|t| t.trim().parse::<usize>().ok()) {
+        Some(n) if n >= 1 => (n, n > SCAN_ROUNDS),
+        _ => (SCAN_ROUNDS, false),
+    }
+}
+
+const SCAN_ROUNDS: usize = 5;
+const SCAN_PER: usize = 12;
+
+/// Step 4g. The first request after a round of scan traffic is the one that
+/// failed once on a real machine, so each check is made once, at once, and a
+/// failure ends the run with the round and the check named.
+pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<(), String> {
+    let ports = format!("{},{}", address.port(), tls.port);
+    let at = Instant::now();
+    for round in 1..=rounds {
+        let mut held = Connection::open(address, CLIENT_WITHIN)
+            .map_err(|e| format!("4g round {round}: the long-lived connection: {e}"))?;
+        same(
+            &format!("4g round {round}: the long-lived connection before the round"),
+            &held.get("/index.html")?,
+            rootfs::www_index(),
+        )?;
+        let ran = Command::new("python3")
+            .args(["-I", "-c", SCAN_CLIENT])
+            .arg(&ports)
+            .arg(SCAN_PER.to_string())
+            .output()
+            .map_err(|e| format!("4g round {round}: python3: {e}"))?;
+        if !ran.status.success() {
+            return Err(format!(
+                "4g round {round}: the client ended with {}: {}",
+                ran.status,
+                last_lines(&String::from_utf8_lossy(&ran.stderr))
+            ));
+        }
+        // The first requests, at once.
+        let out = tls.file(&format!("scan-{round}.html"));
+        let ended = tls.curl(
+            true,
+            &[
+                arg("--max-time"),
+                arg("20"),
+                arg("-o"),
+                arg(out.to_string_lossy()),
+                tls.url("/index.html"),
+            ],
+        )?;
+        if ended.code != 0 {
+            return Err(format!(
+                "4g round {round}: the first request over TLS after the scan traffic ended with {}: {}",
+                ended.code,
+                last_lines(&ended.said)
+            ));
+        }
+        same_file(
+            &format!("4g round {round}: the page over TLS"),
+            &out,
+            rootfs::www_index(),
+        )?;
+        let mut plain = Connection::open(address, CLIENT_WITHIN).map_err(|e| {
+            format!("4g round {round}: the first connection to HTTP after the scan traffic: {e}")
+        })?;
+        same(
+            &format!("4g round {round}: the page over HTTP"),
+            &plain.get("/index.html")?,
+            rootfs::www_index(),
+        )?;
+        same(
+            &format!("4g round {round}: the long-lived connection after the round"),
+            &held.get("/index.html")?,
+            rootfs::www_index(),
+        )?;
+    }
+    println!(
+        "nginx-probe: 4g {rounds} rounds of {} connections to each of two ports ended at once or before the handshake: every first request, over TLS and over HTTP, and the long-lived connection answered ({} ms)",
+        SCAN_PER * 4,
+        at.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 /// What h2load said, judged: TLS 1.3, h2, every request a 2xx; the rate in
 /// requests a second.
 fn h2load_verdict(said: &str) -> Result<f64, String> {
@@ -1460,6 +1596,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let (scan_rounds, longer) = scan_rounds(std::env::var("NGINX_SCAN_ROUNDS").ok().as_deref());
     let started = Instant::now();
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -1493,6 +1630,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             tls_unknown_ca(&tls)?;
             tls_in_guest(&mut run)?;
             tls_abuse(&mut run, &tls, &workers)?;
+            tls_scan(&tls, address, scan_rounds)?;
             h2load(tls.port)?;
         }
         // 5 (and 4b again), 6.
@@ -1526,7 +1664,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         );
     }
     let elapsed = started.elapsed();
-    if !steps && elapsed > RUN_WITHIN {
+    if !steps && !longer && elapsed > RUN_WITHIN {
         return Err(format!(
             "the run took {:.0} s, past {} s",
             elapsed.as_secs_f64(),
@@ -1593,6 +1731,17 @@ pub(crate) fn verdict(lines: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rounds_of_the_scan_step_come_from_the_environment() {
+        assert_eq!(scan_rounds(None), (5, false));
+        assert_eq!(scan_rounds(Some("")), (5, false));
+        assert_eq!(scan_rounds(Some("0")), (5, false));
+        assert_eq!(scan_rounds(Some("x")), (5, false));
+        assert_eq!(scan_rounds(Some("3")), (3, false));
+        assert_eq!(scan_rounds(Some("5")), (5, false));
+        assert_eq!(scan_rounds(Some("40")), (40, true));
+    }
 
     #[test]
     fn sha256_meets_the_vectors_of_fips_180() {

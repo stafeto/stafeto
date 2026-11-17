@@ -372,6 +372,10 @@ pub struct Counters {
     pub syn_stray: u64,
     /// Closed streams no session held whose four a new SYN took over before the sweep.
     pub orphan_reused: u64,
+    /// Queue sockets that took a SYN while they held the key of an earlier
+    /// connection (they had gone back to LISTEN after an RST): the key was
+    /// replaced by the new connection's.
+    pub key_stale: u64,
     /// The pages charged to the service when the first and the sixty-fourth
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
@@ -1930,10 +1934,30 @@ impl Net {
             let t = stack.tcp(handle);
             if t.state() == tcp::State::Listen {
                 self.release_key(m);
-            } else if self.socks[m].key.is_none()
-                && let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint())
-            {
+            } else if let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint()) {
                 let (local, remote) = (peer_of(local), peer_of(remote));
+                let four = Key::Conn {
+                    local: local.0,
+                    local_port: local.1,
+                    remote: remote.0,
+                    remote_port: remote.1,
+                };
+                // A socket that went back to LISTEN (the peer's RST in
+                // SYN-RECEIVED) holds the key of that connection until a SYN
+                // finds it listening. When this very SYN is the one it takes,
+                // it is no longer in LISTEN here and its old key would stay
+                // for the new connection: the final ACK of the peer would
+                // find no place and meet an RST.
+                if queue::key_is_stale(
+                    self.socks[m].key.is_some(),
+                    self.socks[m].key.is_some_and(|k| k == four),
+                ) {
+                    self.release_key(m);
+                    self.counters.key_stale += 1;
+                }
+                if self.socks[m].key.is_some() {
+                    continue;
+                }
                 let half_open = t.state() == tcp::State::SynReceived;
                 // A handshake that does not end is cut after `EMBRYO_S`;
                 // `sync` raises it to `QUEUE_IDLE_S` when the connection
@@ -1957,15 +1981,7 @@ impl Net {
                     }
                 }
                 self.socks[queue].room = self.socks[queue].room.saturating_sub(1);
-                self.register(
-                    m,
-                    Key::Conn {
-                        local: local.0,
-                        local_port: local.1,
-                        remote: remote.0,
-                        remote_port: remote.1,
-                    },
-                );
+                self.register(m, four);
             }
         }
     }

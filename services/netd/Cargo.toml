@@ -92,6 +92,17 @@ trace = { path = "../../lib/trace", optional = true }
 ena = { path = "../../lib/ena", features = ["model"] }
 virtio-console = { path = "../virtio-console" }
 virtio-rng = { path = "../virtio-rng" }
+# The stack on the host, for the checks of what it does with the segments of a scan
+# (`src/scan.rs`); the same features as the program's.
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "iface-neighbor-cache-count-16",
+] }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt, the device's crate and the stack.

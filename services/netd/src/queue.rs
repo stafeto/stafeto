@@ -136,6 +136,14 @@ pub const fn closed_member_on_four(syn: bool, queue_socket: bool, closed: bool) 
     syn && queue_socket && closed
 }
 
+/// Whether the key a queue socket holds is the key of an earlier
+/// connection: it has one and the connection it stands in now has another.
+/// A socket that went back to LISTEN after an RST keeps its key until a SYN
+/// finds it, and the SYN that takes it makes it a new connection at once.
+pub const fn key_is_stale(has_key: bool, key_is_current: bool) -> bool {
+    has_key && !key_is_current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +288,12 @@ mod tests {
         assert!(!closed_member_on_four(false, true, true));
         assert!(!closed_member_on_four(true, false, true));
         assert!(!closed_member_on_four(true, true, false));
+    }
+
+    #[test]
+    fn a_key_of_an_earlier_connection_is_replaced() {
+        assert!(key_is_stale(true, false));
+        assert!(!key_is_stale(true, true));
+        assert!(!key_is_stale(false, false));
     }
 }
