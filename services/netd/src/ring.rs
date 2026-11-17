@@ -237,12 +237,18 @@ pub const SYN_FRAME_TICKS: usize = 3_100;
 /// The work a SYN adds to its step in a queue that lacks sockets (`queue::ReapBudget`): at
 /// most `REBUILD_MAX` tries, each the release of a closed socket and a fresh one that
 /// listens (`REBUILD_TICKS`), and the recycling of a half-open socket (the abort and its
-/// rebuild, which takes one of the tries) at most `RECYCLE_TICKS`. The measurement of
-/// `REBUILD_TICKS` is given at its definition below.
+/// rebuild, which takes one of the tries) at most `RECYCLE_TICKS`.
+/// `REBUILD_TICKS` is a bound from `posix-net steps` with `POSIX_NET_ONLY=reap-queue` (run
+/// 44128405397 on main, kind 65): the step of the SYN that reaps four closed sockets takes
+/// 10 320 ticks, which less `SYN_FRAME_TICKS` and `STEP_TAIL_TICKS` leaves 1 055 a try, the
+/// release half and the build half together; 1 250 keeps the spread of builds.
 pub const REBUILD_TICKS: usize = 1_250;
 pub const RECYCLE_TICKS: usize = 1_500;
 /// A fresh socket that listens, the build half of a rebuild (the step of waking builds only).
-pub const BUILD_TICKS: usize = 800;
+/// Derived from the LISTEN step of `POSIX_NET_ONLY=scm-root`: 12 210 ticks for 16 builds on
+/// main (run 44128405397, kind 3) and 5 187 for 4 builds on this branch (run 44128383161):
+/// (12 210 - 5 187) / 12 = 585 a build, kept at 600.
+pub const BUILD_TICKS: usize = 600;
 /// The time a step of receiving may have used when it takes a SYN that is not its first frame
 /// (images that count steps only, as `RX_SOFT`): the margin less the SYN's frame, the tries
 /// of its reap, the recycling and the tail. A SYN past it waits for the next step and is the
@@ -1133,11 +1139,13 @@ mod tests {
         assert_eq!(SWITCH_BASE, 3);
         assert_eq!(SOFT_MEASURED, 5_600);
         assert_eq!(RX_SOFT_MEASURED, 4_700);
+        assert_eq!((WIRE_FRAME_TICKS, SYN_SOFT_MEASURED), (8_800, 3_900));
+        assert!(SYN_SOFT_MEASURED < RX_SOFT_MEASURED);
         assert_eq!(SWEEP_TICKS, 7_200);
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
         // here each sum is compared with the margin and with its value.
-        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 16_500, 6_200, 14_500]);
+        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 16_500, 5_400, 14_500]);
         for worst in WORST_STEPS {
             assert!(worst <= STEP_MARGIN, "{worst} over the margin");
         }
