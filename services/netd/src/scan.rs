@@ -384,3 +384,124 @@ fn a_udp_burst_does_not_keep_a_syn_from_its_syn_ack() {
     let (reply, _) = handshake(&mut rig, 40004, false);
     assert!(matches!(reply, Sent::Tcp(TcpControl::Syn, ..)));
 }
+
+// ----- the rules of `adopt` over the stack: SYN A, RST A, SYN B, ACK B -----
+
+use crate::queue::{self, KeyRule};
+use std::collections::HashMap;
+
+/// The table of destinations of the service for the sockets of the queue,
+/// driven by the rules of `queue.rs` after each SYN as `adopt` is: a key is a
+/// remote port, `keys[m]` the key socket `m` holds.
+struct Table {
+    by_key: HashMap<u16, usize>,
+    keys: [Option<u16>; 2],
+    /// The rule: the one `net.rs` uses, or the one it used before.
+    old_rule: bool,
+}
+
+/// The rule of `adopt` before the replacement of a stale key.
+fn old_rule(listening: bool, has_key: bool) -> KeyRule {
+    match (listening, has_key) {
+        (true, _) => KeyRule::Release,
+        (false, false) => KeyRule::Register,
+        (false, true) => KeyRule::Keep,
+    }
+}
+
+impl Table {
+    fn new(old_rule: bool) -> Table {
+        Table {
+            by_key: HashMap::new(),
+            keys: [None; 2],
+            old_rule,
+        }
+    }
+
+    fn adopt(&mut self, rig: &mut Rig<'_>) {
+        for m in 0..2 {
+            let listening = rig.state(m) == tcp::State::Listen;
+            let remote = rig
+                .sockets
+                .get::<tcp::Socket>(rig.queue[m])
+                .remote_endpoint()
+                .map(|e| e.port);
+            let rule = if self.old_rule {
+                old_rule(listening, self.keys[m].is_some())
+            } else {
+                queue::adopt_rule(
+                    listening,
+                    self.keys[m].is_some(),
+                    self.keys[m].is_some() && self.keys[m] == remote,
+                )
+            };
+            if matches!(rule, KeyRule::Release | KeyRule::Replace) {
+                if let Some(k) = self.keys[m].take() {
+                    self.by_key.remove(&k);
+                }
+            }
+            if matches!(rule, KeyRule::Register | KeyRule::Replace)
+                && let Some(port) = remote
+            {
+                self.keys[m] = Some(port);
+                self.by_key.insert(port, m);
+            }
+        }
+    }
+}
+
+/// The replay: a SYN from A, A's RST, a SYN from B (taken by the socket that
+/// went back to LISTEN, with no step of `sync` between), and B's ACK. With the
+/// rule of `adopt` B's key is registered and the ACK reaches the queue; the
+/// rule before it left the old key and the ACK found no place.
+fn replay(old: bool) -> (Vec<Sent>, tcp::State) {
+    let mut rig = rig();
+    let mut table = Table::new(old);
+    let (reply, next) = handshake(&mut rig, 40000, false);
+    table.adopt(&mut rig);
+    rig.feed(tcp_frame(
+        40000,
+        LISTEN_PORT,
+        TcpControl::Rst,
+        next,
+        Some(server_next(reply)),
+    ));
+    let (reply_b, next_b) = handshake(&mut rig, 40001, false);
+    table.adopt(&mut rig);
+    let ack = tcp_frame(
+        40001,
+        LISTEN_PORT,
+        TcpControl::None,
+        next_b,
+        Some(server_next(reply_b)),
+    );
+    if table.by_key.contains_key(&40001) {
+        let out = rig.feed(ack);
+        let m = table.by_key[&40001];
+        (out, rig.state(m))
+    } else {
+        // No key: the frame goes to the set of the service, which holds no socket.
+        let mut none = SocketSet::new(Box::leak(Box::new([SocketStorage::EMPTY])) as &mut [_]);
+        rig.wire.rx.push_back(ack);
+        rig.iface
+            .poll(Instant::from_millis(99), &mut rig.wire, &mut none);
+        let out = rig.wire.tx.drain(..).map(|f| sent(&f)).collect();
+        (out, rig.state(0))
+    }
+}
+
+#[test]
+fn the_ack_of_the_second_peer_finds_its_key_with_the_rule_of_adopt() {
+    let (out, state) = replay(false);
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(state, tcp::State::Established);
+}
+
+#[test]
+fn the_rule_before_the_replacement_loses_the_key_and_the_peer_is_reset() {
+    let (out, _) = replay(true);
+    assert!(
+        matches!(out.as_slice(), [Sent::Tcp(TcpControl::Rst, ..)]),
+        "{out:?}"
+    );
+}

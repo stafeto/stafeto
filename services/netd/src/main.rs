@@ -143,14 +143,15 @@ use virtio_pci::qemu;
 
 rt::entry!(main);
 
-/// The bits of the service's notification to itself, each a step of its own:
-/// receiving, sending (also asked by a request), the departure of a session,
-/// the waking of operations, the sweep of the streams that close, and the
-/// write of `/etc/resolv.conf`.
 /// The least time between two lines of the queue counters on the console, and between two
 /// asked for by CONFIG, in nanoseconds.
 const QUEUES_EVERY_NS: u64 = 30_000_000_000;
 const QUEUES_ASKED_NS: u64 = 5_000_000_000;
+
+/// The bits of the service's notification to itself, each a step of its own:
+/// receiving, sending (also asked by a request), the departure of a session,
+/// the waking of operations, the sweep of the streams that close, and the
+/// write of `/etc/resolv.conf`.
 const RX: u64 = 16;
 const TX: u64 = 1;
 const CLEANUP: u64 = 2;
@@ -1327,8 +1328,8 @@ struct Driver<'a> {
     /// nobody can log in to (the console of a cloud instance is all there is) shows them
     /// there, once in `QUEUES_EVERY_NS` and only when they changed.
     queues_said: (u64, u64),
-    /// CONFIG came (`ifconfig`, a name lookup): the counters are said at the next chance, but
-    /// not twice in `QUEUES_ASKED_NS`.
+    /// CONFIG came (`ifconfig`, a name lookup) and the counters are due: they are said at the
+    /// next chance, but not twice in `QUEUES_ASKED_NS`; a CONFIG inside that time says nothing.
     queues_asked: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,

@@ -1278,6 +1278,17 @@ impl Net {
         }
         let t = stack.tcp(handle);
         let state = t.state();
+        let queue_socket = self.socks[i].listener != NO_PLACE;
+        if queue::sync_releases(
+            queue_socket,
+            state == tcp::State::Listen,
+            self.socks[i].key.is_some(),
+        ) {
+            // The first place the service sees the socket back in LISTEN: its
+            // key leaves the table and the queue has room for it again.
+            self.release_key(i);
+        }
+        let t = stack.tcp(handle);
         if self.embryos.has(i) && state != tcp::State::SynReceived {
             // The handshake of a socket of a queue ended (or the socket
             // closed): it is no longer half-open, and an established one that
@@ -1933,7 +1944,11 @@ impl Net {
             };
             let t = stack.tcp(handle);
             if t.state() == tcp::State::Listen {
-                self.release_key(m);
+                if queue::adopt_rule(true, self.socks[m].key.is_some(), false)
+                    == queue::KeyRule::Release
+                {
+                    self.release_key(m);
+                }
             } else if let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint()) {
                 let (local, remote) = (peer_of(local), peer_of(remote));
                 let four = Key::Conn {
@@ -1943,20 +1958,22 @@ impl Net {
                     remote_port: remote.1,
                 };
                 // A socket that went back to LISTEN (the peer's RST in
-                // SYN-RECEIVED) holds the key of that connection until a SYN
-                // finds it listening. When this very SYN is the one it takes,
-                // it is no longer in LISTEN here and its old key would stay
-                // for the new connection: the final ACK of the peer would
-                // find no place and meet an RST.
-                if queue::key_is_stale(
+                // SYN-RECEIVED) is let go of by `sync`; one that took a SYN in
+                // the same receive step as the RST is not in LISTEN here and
+                // still holds the key of the earlier connection, which is
+                // replaced (the final ACK of the new peer would otherwise find
+                // no place and meet an RST).
+                match queue::adopt_rule(
+                    false,
                     self.socks[m].key.is_some(),
                     self.socks[m].key.is_some_and(|k| k == four),
                 ) {
-                    self.release_key(m);
-                    self.counters.key_stale += 1;
-                }
-                if self.socks[m].key.is_some() {
-                    continue;
+                    queue::KeyRule::Keep | queue::KeyRule::Release => continue,
+                    queue::KeyRule::Replace => {
+                        self.release_key(m);
+                        self.counters.key_stale += 1;
+                    }
+                    queue::KeyRule::Register => {}
                 }
                 let half_open = t.state() == tcp::State::SynReceived;
                 // A handshake that does not end is cut after `EMBRYO_S`;

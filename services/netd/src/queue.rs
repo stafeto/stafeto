@@ -144,6 +144,38 @@ pub const fn key_is_stale(has_key: bool, key_is_current: bool) -> bool {
     has_key && !key_is_current
 }
 
+/// What `adopt` does with a socket of a queue after the stack took a SYN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRule {
+    /// Leave the key as it is (none, or already the key of its connection).
+    Keep,
+    /// The socket listens again: its key goes.
+    Release,
+    /// The socket has no key and stands in a connection: it gets the key.
+    Register,
+    /// The socket holds the key of an earlier connection and stands in
+    /// another: the old key goes and the new one is registered.
+    Replace,
+}
+
+/// The rule of `adopt` for a queue socket: whether it listens, whether it
+/// holds a key, and whether that key is the one of the connection it stands in.
+pub const fn adopt_rule(listening: bool, has_key: bool, key_is_current: bool) -> KeyRule {
+    match (listening, has_key, key_is_current) {
+        (true, true, _) => KeyRule::Release,
+        (true, false, _) => KeyRule::Keep,
+        (false, false, _) => KeyRule::Register,
+        (false, true, true) => KeyRule::Keep,
+        (false, true, false) => KeyRule::Replace,
+    }
+}
+
+/// Whether `sync` of a queue socket releases its key: it is back in LISTEN
+/// (the peer's RST in SYN-RECEIVED) and still holds the key of that connection.
+pub const fn sync_releases(is_queue_socket: bool, listening: bool, has_key: bool) -> bool {
+    is_queue_socket && listening && has_key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +327,22 @@ mod tests {
         assert!(key_is_stale(true, false));
         assert!(!key_is_stale(true, true));
         assert!(!key_is_stale(false, false));
+    }
+
+    #[test]
+    fn the_rule_of_adopt_names_what_happens_to_the_key() {
+        assert_eq!(adopt_rule(true, true, false), KeyRule::Release);
+        assert_eq!(adopt_rule(true, false, false), KeyRule::Keep);
+        assert_eq!(adopt_rule(false, false, false), KeyRule::Register);
+        assert_eq!(adopt_rule(false, true, true), KeyRule::Keep);
+        assert_eq!(adopt_rule(false, true, false), KeyRule::Replace);
+    }
+
+    #[test]
+    fn sync_releases_the_key_of_a_queue_socket_back_in_listen() {
+        assert!(sync_releases(true, true, true));
+        assert!(!sync_releases(true, true, false));
+        assert!(!sync_releases(true, false, true));
+        assert!(!sync_releases(false, true, true));
     }
 }
