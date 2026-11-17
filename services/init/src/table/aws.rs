@@ -189,6 +189,9 @@ pub const NET: Record = Record {
     // the driver tries three resets a minute before it gives up.
     restart: Restart::Always,
     waits: &[],
+    // The consumers of the switch (`switch N` in `netd.conf`): the table of flows and the
+    // translation tables of the rings of the consumers.
+    quota: super::net::NETD.quota + super::net::SWITCH_QUOTA_PAGES * PAGE,
     ..super::net::NETD
 };
 

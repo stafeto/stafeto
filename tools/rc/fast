@@ -1,0 +1,26 @@
+# /etc/rc.d/fast: nginx-fast on port 8080, a consumer of the switch of the network
+# service. It starts only when the image has the program and its settings and
+# `/etc/netd.conf` asks for the switch (`aws image --switch`); otherwise one line says
+# why it stays off. Regular nginx on 80 uses the sockets of the service and needs
+# no line here: the image of the try-on page (part A5) starts it from its own file.
+#
+# Console lines of a good start: `fast: nginx-fast on 8080` and, from the service,
+# `net: switch` counters in `posix-net stat` with `consumers` above 0.
+
+if [ ! -x /bin/nginx-fast ] || [ ! -f /etc/nginx/nginx-fast.conf ]; then
+    echo "fast: no nginx-fast in this image, 8080 stays off"
+    exit 0
+fi
+if ! grep -q '^switch' /etc/netd.conf 2>/dev/null; then
+    echo "fast: netd.conf has no switch, 8080 stays off"
+    exit 0
+fi
+(
+    tries=0
+    while [ ! -s /etc/resolv.conf ] && [ "$tries" -lt 60 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    echo "fast: nginx-fast on 8080"
+    /bin/nginx-fast -c /etc/nginx/nginx-fast.conf
+) &

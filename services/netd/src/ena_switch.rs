@@ -8,8 +8,10 @@
 //! queues. `switch.rs` is not changed by it: the Virtio kinds take
 //! no new work in their step.
 //!
-//! One lane, no consumers and no tables of the switch: the stack sees every
-//! frame (the instances of the next step, RSS and `switch N` come with it).
+//! One lane. Without consumers (`switch N` absent from `netd.conf`) the stack sees every
+//! frame. With them the tables and the rings of the consumers are `netd::routed`'s, over the
+//! same wire and the same lane: the thread hands it the step, and takes from it the wakes of the
+//! consumers, the answers owed the stack and the delay of its timer.
 //!
 //! Where the interrupts go. Init binds the two events of the function's MSI
 //! device through this thread's channel, each with the label of its binding
@@ -26,14 +28,15 @@
 //! epoch and a notification; the thread never calls the admin machine.
 
 use crate::ena_service::{self as svc, Hw};
-use crate::switch::INNER;
+use crate::switch::{COMMANDS, INNER};
 use crate::trace::{self, P_N_STEP, P_N_WAKE};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
-use netd::enawire::{Ack, Rings, Vector, Wire};
+use netd::enawire::{Ack, Rings, Step, Vector, Wire};
 use netd::profile::{self, Counter};
 use netd::ring::{Stepper, drive};
+use netd::routed::Routed;
 use rt::handle::{Budget, Channel, Interrupt, Process, Thread, Timer};
 use rt::{Handle, Stack, sys};
 
@@ -63,7 +66,10 @@ pub struct EnaSwitch {
     vectors: [Vector; 2],
     timer: Handle<Timer>,
     _view: Handle<Channel>,
-    armed: bool,
+    /// When the timer fires, if it is set.
+    due: Option<u64>,
+    /// The consumers of the switch, none without `switch N`.
+    routed: Option<Routed>,
     /// The pair's vector is in use (the device has the table filled).
     msi: bool,
     wake: Wake,
@@ -82,6 +88,7 @@ impl EnaSwitch {
         irq: [Option<Handle<Interrupt>>; 2],
         msi: bool,
         priority: u8,
+        routed: Option<Routed>,
     ) -> Option<EnaSwitch> {
         let view = sys::handle_label(&channel, abi::Rights::RECEIVE, TIMER_LABEL, priority).ok()?;
         let timer = sys::timer_create(&view, priority).ok()?;
@@ -92,7 +99,8 @@ impl EnaSwitch {
             vectors: [Vector::new(); 2],
             timer,
             _view: view,
-            armed: false,
+            due: None,
+            routed,
             msi,
             wake: Wake::Other,
             rx_seen: 0,
@@ -100,9 +108,11 @@ impl EnaSwitch {
         })
     }
 
+    /// The timer fires `after` nanoseconds from now, unless it is set for an earlier time.
     fn arm(&mut self, after: u64) {
-        if !self.armed {
-            self.armed = sys::timer_set(&self.timer, now_ns() + after).is_ok();
+        let at = now_ns() + after;
+        if self.due.is_none_or(|due| at < due) && sys::timer_set(&self.timer, at).is_ok() {
+            self.due = Some(at);
         }
     }
 
@@ -151,7 +161,34 @@ impl EnaSwitch {
             tx_back: &lane.tx_back,
             starved: &lane.starved,
         };
-        let s = self.wire.step(&rings);
+        let s = match self.routed.as_mut() {
+            None => self.wire.step(&rings),
+            Some(routed) => {
+                let out = routed.step(
+                    &mut self.wire,
+                    &rings,
+                    now_ns(),
+                    &COMMANDS,
+                    &INNER.stats,
+                    &mut |handle| {
+                        let channel = Handle::<Channel>::borrowed(rt::abi::Handle(handle));
+                        let _ = sys::notify(&channel, proto_net::switch::WAKE_RING);
+                    },
+                );
+                if out.back {
+                    lane.tell_back();
+                }
+                if let Some(after) = out.timer {
+                    self.arm(after);
+                }
+                Step {
+                    passed: out.passed,
+                    lent: out.lent,
+                    more: out.more,
+                    broken: out.broken,
+                }
+            }
+        };
         if s.broken {
             svc::ask_reset();
         }
@@ -196,6 +233,9 @@ impl EnaSwitch {
         }
         let again = self.wire.settle();
         if again {
+            if let Some(routed) = self.routed.as_mut() {
+                routed.clear_idle();
+            }
             return true;
         }
         let after = if svc::POLL_FALLBACK.load(Ordering::Relaxed) {
@@ -288,7 +328,7 @@ extern "C" fn run(_: u64) -> ! {
             Ok(sys::Received::Notification { source, label, .. }) => {
                 INNER.switch_told.seen();
                 if source == abi::Source::Timer {
-                    switch.armed = false;
+                    switch.due = None;
                     switch.wake = Wake::Timer;
                 }
                 if source == abi::Source::Interrupt {
