@@ -10544,7 +10544,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-ec2-key", || net_ec2_key::probe(&qemu::VIRT)),
         // The try-out image of EC2 on QEMU: its page on 80, 443 and 8080, a login, `pkg search`
         // and the image check. Also in the group `net`.
-        job("net-try", || net_try::probe(&qemu::VIRT)),
+        job("net-try", || net_try::probe(&qemu::VIRT_2G)),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {

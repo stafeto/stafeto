@@ -580,6 +580,13 @@ pub fn command(args: &[String]) -> Result<(), String> {
 }
 
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
+    // The table holds 1.2 GiB of quotas (the memory the try-out is sized for is a t4g.small's 2 GiB).
+    if machine.ram() < 2 << 30 {
+        return Err(format!(
+            "net-try needs a machine of 2 GiB, {} has {}",
+            machine.name, machine.memory
+        ));
+    }
     println!("net-try: host client {}", host_ssh()?);
     // The key of the run goes first: the script of the image that writes it is made once, from
     // the key as it is when the lists of the image are first read.
