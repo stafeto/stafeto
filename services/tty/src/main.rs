@@ -54,6 +54,9 @@ const SESSIONS: usize = 320;
 const CLONES: usize = 320;
 /// The sets of holds: one for each clone, and one for each root.
 const HOLDSETS: usize = CLONES + ROOTS;
+/// The steps of the retirement of a departed session's holds that its notice makes: the closes
+/// of the 32 endpoints of a set at most, and the release of the set.
+const RETIRE_INLINE: usize = tty::endpoints::HOLDS + 8;
 /// The live clones of one root at most: one for each record of the process
 /// service, so that a tree of processes has a session each, and the other
 /// roots keep CLONES - ROOT_CLONES of them.
@@ -459,7 +462,7 @@ struct Tty {
     preparation: u8,
 }
 
-static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+static TURNS_STACK: rt::Stack<{ 4 * 1024 }> = rt::Stack::new();
 const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
 
 /// The time on the scale of timer_set.
@@ -1130,15 +1133,7 @@ impl Tty {
             }
             self.disconnect_work_due = false;
         }
-        if let Some(slot) = self.retired.first() {
-            if let Some(id) = self.holdsets[slot].holds.first() {
-                if let Ok(Some(effect)) = self.endpoints.close(&mut self.holdsets[slot].holds, id) {
-                    self.disconnect(effect.terminal);
-                }
-            } else {
-                self.holdsets.release(slot);
-                self.retired.pop();
-            }
+        if self.retire_step() {
             self.kick();
             return;
         }
@@ -1181,6 +1176,34 @@ impl Tty {
             return;
         }
         self.push();
+    }
+
+    /// One step of the retirement of the holds of a session that is gone: the close of one of
+    /// its endpoints, or the release of the set when none is left. False when no set waits.
+    fn retire_step(&mut self) -> bool {
+        let Some(slot) = self.retired.first() else {
+            return false;
+        };
+        if let Some(id) = self.holdsets[slot].holds.first() {
+            if let Ok(Some(effect)) = self.endpoints.close(&mut self.holdsets[slot].holds, id) {
+                self.disconnect(effect.terminal);
+            }
+        } else {
+            self.holdsets.release(slot);
+            self.retired.pop();
+        }
+        true
+    }
+
+    /// The retirement of the holds goes on in the notice of the departure as far as RETIRE_INLINE
+    /// steps take it, so that the terminals a client that exits held are free for the next client
+    /// that asks for one; the turns thread does the rest.
+    fn settle_holds(&mut self) {
+        for _ in 0..RETIRE_INLINE {
+            if !self.retire_step() {
+                break;
+            }
+        }
     }
 
     /// A new session with the driver, once the old one broke (the driver
@@ -3312,6 +3335,7 @@ impl Service<0> for Tty {
         if let Some(slot) = set {
             self.retire_holds(slot);
         }
+        self.settle_holds();
         self.kick();
     }
 
@@ -3324,6 +3348,7 @@ impl Service<0> for Tty {
         if let Some(slot) = set {
             self.retire_holds(slot);
         }
+        self.settle_holds();
         self.kick();
     }
 

@@ -258,7 +258,7 @@ fn image_layers(ram: &mut Ram<'static>, image: &'static [u8], now: proto_fs::Tim
     }
 }
 
-static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+static TURNS_STACK: rt::Stack<{ 4 * 1024 }> = rt::Stack::new();
 /// The message buffer of the turns thread: the page after that of the mapper.
 const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 8192;
 
@@ -750,6 +750,10 @@ struct Fs {
 
 /// The steps of the cleanup of a departed client that the notice of its departure makes.
 const DEPARTURE_INLINE: usize = 8;
+/// The time they may take in all, in ticks (the notice of a departure is a step of the service
+/// with a bound of its own, 18 369 ticks, which one step of the cleanup of about 2 400 ticks
+/// may pass when it starts below this).
+const DEPARTURE_INLINE_TICKS: u64 = 6_000;
 
 /// The free pages a request finds ready: the retired pages that bring the free list up to this
 /// many are moved to it before the request runs (at most this many steps).
@@ -1187,12 +1191,14 @@ impl Fs {
     }
 
     /// The steps of the cleanup of a departed client that its notice makes (at most
-    /// DEPARTURE_INLINE, fewer when its custody is empty or a step finds nothing to do); what
+    /// DEPARTURE_INLINE and DEPARTURE_INLINE_TICKS, fewer when its custody is empty or a step finds nothing to do); what
     /// is left goes on in the turns of the service.
     fn settle_departed(&mut self, fds: &mut Fds, label: u64) {
+        let began = rt::time::now();
         for _ in 0..DEPARTURE_INLINE {
             if Self::lock_custody_empty(self.wait_jobs, self.places, fds, label)
                 || !self.cleanup_step(fds, label)
+                || rt::time::now() - began > DEPARTURE_INLINE_TICKS
             {
                 break;
             }

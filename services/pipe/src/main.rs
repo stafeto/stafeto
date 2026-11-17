@@ -338,7 +338,10 @@ static CHANNEL: AtomicU64 = AtomicU64::new(0);
 static LEVEL: AtomicU64 = AtomicU64::new(1);
 static REGISTRAR: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
 const REGISTRAR_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
-static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+/// The steps a departure makes in its notice, and the time they may take in all, in ticks.
+const DEPARTURE_INLINE: usize = 8;
+const DEPARTURE_INLINE_TICKS: u64 = 6_000;
+static TURNS_STACK: rt::Stack<{ 4 * 1024 }> = rt::Stack::new();
 const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 8192;
 
 extern "C" fn register_root(_: u64) -> ! {
@@ -551,6 +554,26 @@ impl PipeService {
             if more {
                 self.kick();
             }
+        }
+    }
+
+    /// The steps of the release of the descriptions of a client that went that its notice makes
+    /// (at most DEPARTURE_INLINE, and no more than DEPARTURE_INLINE_TICKS in all), so that the
+    /// pipes and the descriptions it held are free for the next client that asks; what is left
+    /// goes on in the turns.
+    fn settle(&mut self) {
+        let began = rt::time::now();
+        let mut wakes = Wakes::default();
+        let mut more = true;
+        for _ in 0..DEPARTURE_INLINE {
+            more = self.cleanup_step(&mut wakes);
+            if !more || rt::time::now() - began > DEPARTURE_INLINE_TICKS {
+                break;
+            }
+        }
+        self.tell(&wakes);
+        if more {
+            self.kick();
         }
     }
 
@@ -1970,7 +1993,7 @@ impl Service<0> for PipeService {
         self.abandon(s);
         let ipc = self.pipes.ipc_gone(s.label());
         if self.pipes.gone(&mut s.data.held) || ipc {
-            self.kick();
+            self.settle();
         }
     }
 
@@ -1983,13 +2006,12 @@ impl Service<0> for PipeService {
             .place_of(label)
             .and_then(|place| self.births[place].take_if(|b| b.0 == label));
         self.clones.gone(label);
-        if self.pipes.ipc_gone(label) {
-            self.kick();
+        let mut work = self.pipes.ipc_gone(label);
+        if let Some((_, mut held, _)) = birth {
+            work |= self.pipes.gone(&mut held);
         }
-        if let Some((_, mut held, _)) = birth
-            && self.pipes.gone(&mut held)
-        {
-            self.kick();
+        if work {
+            self.settle();
         }
     }
 
