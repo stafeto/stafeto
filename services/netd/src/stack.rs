@@ -663,14 +663,21 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         let Some(dest) = device.stage() else { break };
         // A frame of the wire that comes after the soft share of the step (`RX_SOFT`, measured
         // images only) waits for the next step, as one the stack answers does: two full frames
-        // never make one step under -icount.
+        // never make one step under -icount. A SYN has a lower share (`SYN_SOFT`): the reap of
+        // its queue runs in `route` and adds up to four rebuilds. The frame held back is the
+        // first of the next step. (A SYN of the loopback cannot wait; the loopback's frames
+        // come first and each is at most `SYN_FRAME_TICKS`.)
         #[cfg(feature = "steps")]
-        if !first
-            && device.held_is_wire()
-            && rt::time::now().saturating_sub(entered) > netd::ring::RX_SOFT
-        {
-            device.defer_held();
-            break;
+        if !first && device.held_is_wire() {
+            let limit = if matches!(dest, Dest::Tcp { syn: true, .. }) {
+                netd::ring::SYN_SOFT
+            } else {
+                netd::ring::RX_SOFT
+            };
+            if rt::time::now().saturating_sub(entered) > limit {
+                device.defer_held();
+                break;
+            }
         }
         let place = net.route(stack, dest);
         if core::mem::take(&mut net.drop_frame) {

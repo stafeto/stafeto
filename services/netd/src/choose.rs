@@ -18,6 +18,15 @@
 //! bound of 0.9 of term B (18 369 ticks under -icount): the 15 percent cover
 //! the worst parts meeting in one step and the spread between builds.
 //!
+//! The images that count steps (`ring::RX_SOFT`) take a frame of the wire after
+//! the first only while the step has used no more than the soft share
+//! (`ring::RX_SOFT_MEASURED`). A wire frame costs more than the share, so two of
+//! them never make one step, and a step with a second frame costs at most the
+//! share, the frame and the tail of the step (`ring::STEP_TAIL_TICKS`),
+//! whatever the frames before it cost. The rule takes the batch of two when that
+//! sum is within the margin (`ring::STEP_MARGIN`) and the estimate above does
+//! not give more.
+//!
 //! The gate: a step of receiving with one frame, and a step of sending with
 //! one group and one frame, each within the budget. Past the gate, the batch of
 //! receiving is the largest of 16, 8, 4, 2 and 1 that fits, then the groups
@@ -29,6 +38,9 @@
 pub const BOUND: u64 = 18_369;
 /// What the sum of the parts may come to: 0.85 of the bound.
 pub const BUDGET: u64 = BOUND * 85 / 100;
+/// The frames of a step of receiving the soft share lets through: the first
+/// and one more.
+pub const SOFT_FRAMES: usize = 2;
 /// The batches to try, the largest first, and the groups per step.
 pub const BATCHES: [usize; 5] = [16, 8, 4, 2, 1];
 pub const GROUPS_PER_STEP: [usize; 3] = [4, 2, 1];
@@ -64,6 +76,12 @@ impl Parts {
         self.fixed_rx + frames as u64 * self.rx_price()
     }
 
+    /// The longest step of receiving with a second frame under the soft share:
+    /// the share, a frame of the price and the tail.
+    pub fn receiving_soft(&self) -> u64 {
+        crate::ring::RX_SOFT_MEASURED + self.rx_price() + crate::ring::STEP_TAIL_TICKS as u64
+    }
+
     /// The estimate of a step of sending of e groups and k frames.
     pub fn sending(&self, groups: usize, frames: usize) -> u64 {
         self.fixed_tx + groups as u64 * self.group + frames as u64 * self.tx_price()
@@ -92,10 +110,15 @@ pub fn choose(parts: &Parts) -> Result<Choice, Stop> {
     if receiving > BUDGET || sending > BUDGET {
         return Err(Stop { receiving, sending });
     }
-    let receive = BATCHES
+    let by_estimate = BATCHES
         .into_iter()
         .find(|&k| parts.receiving(k) <= BUDGET)
         .expect("the gate passed with one frame");
+    let receive = if parts.receiving_soft() <= crate::ring::STEP_MARGIN as u64 {
+        by_estimate.max(SOFT_FRAMES)
+    } else {
+        by_estimate
+    };
     let groups = GROUPS_PER_STEP
         .into_iter()
         .find(|&e| parts.sending(e, 1) <= BUDGET)
@@ -232,6 +255,25 @@ mod tests {
         // The cheaper wire frame leaves the loopback's price in force.
         p.frame_rx_wire = 100;
         assert_eq!(p.rx_price(), 500);
+    }
+
+    #[test]
+    fn the_soft_share_lets_a_second_frame_in_when_the_sum_fits_the_margin() {
+        use crate::ring::{RX_SOFT_MEASURED, STEP_MARGIN, STEP_TAIL_TICKS};
+        // The dearest frame the margin allows after the share and the tail:
+        // two of them cost more than the budget, one does not, and the share
+        // holds the second one back, so the batch is two.
+        let fit = STEP_MARGIN as u64 - RX_SOFT_MEASURED - STEP_TAIL_TICKS as u64;
+        let mut p = parts(1_000, 4_000, 500, 400, 1_000);
+        p.frame_rx_wire = fit;
+        assert!(p.receiving(2) > BUDGET && p.receiving(1) <= BUDGET);
+        assert_eq!(p.receiving_soft(), STEP_MARGIN as u64);
+        assert_eq!(choose(&p).unwrap().receive, SOFT_FRAMES);
+        // A frame so dear that the share, the frame and the tail pass the
+        // margin leaves the batch of one.
+        p.frame_rx_wire = fit + 1;
+        assert!(p.receiving_soft() > STEP_MARGIN as u64);
+        assert_eq!(choose(&p).unwrap().receive, 1);
     }
 
     #[test]
