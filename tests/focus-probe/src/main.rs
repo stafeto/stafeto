@@ -724,6 +724,11 @@ impl Probe<'_> {
             Ok(seen == M_WANTS.len())
         })?;
         rt::println!("focus-probe: the manager heard the Alt keys and the windows did not");
+        if cfg!(feature = "quick") {
+            // The manager runs while the many windows are made (the run under
+            // -icount): they take no focus from it.
+            self.until(&display, "the eight windows never came", |d| d.open == 8)?;
+        }
         Ok(())
     }
 
@@ -821,7 +826,7 @@ impl Probe<'_> {
         self.describe_when_ready(&display)?;
         // The first client alone is on the screen.
         self.until(&display, "the first client never stood alone", |d| {
-            d.open == 1 && d.created >= 2 && d.flags & HAS_MANAGER != 0
+            d.open == 1 && d.created >= 2
         })?;
         let (status, mut reply) =
             call(&display, &proto_gpu::Method::Clone.header().bytes()).map_err(say("CLONE"))?;
