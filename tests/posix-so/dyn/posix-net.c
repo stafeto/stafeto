@@ -2670,9 +2670,10 @@ static unsigned buffers_now(int name)
 /* The accept queue of a listener (16 sockets, the most the service keeps) fills
  * with connections that wait for accept; one more SYN finds no room and is
  * dropped. Then each of the 16 is reset by its peer before accept: their
- * sockets in the queue are closed, and the next 16 SYNs each find a closed one
- * and have it replaced. The counters of the listener are asked for while it
- * stands (the build for the steps says them on the console; xtask judges). */
+ * sockets in the queue are closed, and 16 more connections, none accepted
+ * before the last, each find a closed socket and have it replaced. The
+ * counters of the listener are asked for while it stands (the build for the
+ * steps says them on the console; xtask judges). */
 static void reap_queue(void)
 {
 	enum { Q = 16 };
@@ -2698,20 +2699,19 @@ static void reap_queue(void)
 		REQUIRE(close(c[i]) == 0);
 	}
 	pause_ms(300);
+	/* No accept between the connections: each SYN finds the queue without a
+	 * socket that listens (the accept that follows a connection gives one) and
+	 * has a closed one replaced. */
+	int n[Q];
 	for (int i = 0; i < Q; i++) {
-		int n = socket(AF_INET, SOCK_STREAM, 0);
-		REQUIRE(n >= 0);
-		nonblock(n);
-		errno = 0;
-		REQUIRE(connect(n, (struct sockaddr *)&a, sizeof a) == 0 || errno == EINPROGRESS);
-		pf.fd = n;
-		pf.revents = 0;
-		REQUIRE(poll(&pf, 1, 8000) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR));
+		n[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(n[i] >= 0);
+		REQUIRE(connect(n[i], (struct sockaddr *)&a, sizeof a) == 0);
+	}
+	for (int i = 0; i < Q; i++) {
 		int s = accept(lis, NULL, NULL);
 		REQUIRE(s >= 0);
-		REQUIRE(fcntl(n, F_SETFL, fcntl(n, F_GETFL) & ~O_NONBLOCK) == 0);
-		exchange(n, s, 'r');
-		REQUIRE(close(n) == 0 && close(s) == 0);
+		REQUIRE(close(s) == 0 && close(n[i]) == 0);
 	}
 	(void)buffers_now(SO_STAFETO_BUFFERED);
 	pause_ms(200);
