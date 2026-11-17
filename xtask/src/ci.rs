@@ -34,6 +34,7 @@ pub fn groups() -> Vec<String> {
     all.extend((1..=OPEN_POSIX_PARTS).map(|n| format!("open-posix-{n}")));
     all.extend((1..=GUEST_GROUPS).map(|n| format!("guests-{n}")));
     all.push("net".to_owned());
+    all.push("budgets".to_owned());
     all
 }
 
@@ -124,6 +125,8 @@ struct Split {
     /// The probes of the network (`NET_PREFIX`), which have a group of
     /// their own and no weight.
     net: Vec<String>,
+    /// The probes of `BUDGET_NAMED`, in their order.
+    budgets: Vec<String>,
 }
 
 /// The probes with this start of their name run in the group `net`.
@@ -193,7 +196,6 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("loader-channels", 19),
     ("image-gates", 5),
     ("ramfs-cleanup", 4),
-    ("service-budget", 25),
     ("posix-poll", 26),
     ("posix-sock", 25),
     ("posix-sock-steps", 11),
@@ -322,8 +324,13 @@ const KERNEL_PREFIXES: &[&str] = &[
     "init tests",
     "service tests",
     "kernel tests",
-    "budget-breaks",
 ];
+
+/// The probes of the group `budgets`: the budgets of the services and the breaks of the budgets.
+/// `budget-breaks` is an 18-minute flood of builds and boots, so the group has a runner of its
+/// own and runs them one after the other: no short timing test of the kernel group shares a host
+/// with it.
+const BUDGET_NAMED: [&str; 2] = ["service-budget", "budget-breaks"];
 
 fn weight(name: &str) -> u32 {
     WEIGHTS
@@ -335,8 +342,11 @@ fn weight(name: &str) -> u32 {
 /// The names of the boots of `ci` outside os-test, in their order, split:
 /// longest first into the group with the least expected time.
 fn split(names: &[String]) -> Split {
-    let (net, others): (Vec<&String>, Vec<&String>) = names
+    let (budgets, names): (Vec<&String>, Vec<&String>) = names
         .iter()
+        .partition(|n| BUDGET_NAMED.contains(&n.as_str()));
+    let (net, others): (Vec<&String>, Vec<&String>) = names
+        .into_iter()
         .partition(|n| n.starts_with(NET_PREFIX) || NET_NAMED.contains(&n.as_str()));
     let (kernel, rest): (Vec<&String>, Vec<&String>) = others
         .into_iter()
@@ -358,6 +368,7 @@ fn split(names: &[String]) -> Split {
         kernel: kernel.into_iter().cloned().collect(),
         guests,
         net: net.into_iter().cloned().collect(),
+        budgets: budgets.into_iter().cloned().collect(),
     }
 }
 
@@ -480,6 +491,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         kernel,
         guests,
         net,
+        budgets,
     } = split(&names);
     steps.push(step(
         "kernel",
@@ -527,6 +539,10 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     let net_needs = [RELIBC, BASE, ADDONS, NET_PACKAGES, KERNELS, IMAGES, LIBC_SO];
     steps.push(step("net", "network probes", &net_needs, move || {
         jobs::run_all(only(super::boot_jobs(Vec::new()), &net), njobs)
+    }));
+    // The budget probes, serial, on a runner of their own.
+    steps.push(step("budgets", "budget probes", &BOOT_NEEDS, move || {
+        jobs::run_all(only(super::boot_jobs(Vec::new()), &budgets), 1)
     }));
     // The images of nginx's measurement: the measurement itself runs by hand
     // on a Mac (HVF and VZ), so ci builds what it boots.
@@ -805,8 +821,10 @@ mod tests {
             kernel,
             guests,
             net,
+            budgets,
         } = split(&names);
         assert!(!kernel.is_empty());
+        assert_eq!(budgets, ["service-budget", "budget-breaks"]);
         assert_eq!(
             net,
             [
@@ -837,7 +855,12 @@ mod tests {
             ]
         );
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for name in kernel.iter().chain(guests.iter().flatten()).chain(&net) {
+        for name in kernel
+            .iter()
+            .chain(guests.iter().flatten())
+            .chain(&net)
+            .chain(&budgets)
+        {
             *seen.entry(name.clone()).or_default() += 1;
         }
         for name in &names {
@@ -852,7 +875,8 @@ mod tests {
             .map(|n| only(super::super::boot_jobs(Vec::new()), &guests[n]).len())
             .sum::<usize>()
             + only(super::super::boot_jobs(Vec::new()), &kernel).len()
-            + only(super::super::boot_jobs(Vec::new()), &net).len();
+            + only(super::super::boot_jobs(Vec::new()), &net).len()
+            + only(super::super::boot_jobs(Vec::new()), &budgets).len();
         assert_eq!(built, names.len());
     }
 
