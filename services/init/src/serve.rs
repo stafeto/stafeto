@@ -1575,6 +1575,11 @@ impl Init {
                 mark: proto_fs::BOOT_PROFILE,
                 duplicate: false,
             }
+        } else if let Some(mark) = table::comp_mark(client, name.as_bytes()) {
+            Grant {
+                mark,
+                duplicate: false,
+            }
         } else {
             Grant::PLAIN
         };

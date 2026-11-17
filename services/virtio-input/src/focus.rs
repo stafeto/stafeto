@@ -98,15 +98,18 @@ impl Focus {
     }
 
     /// An event of the device: into the ring when it passes and someone
-    /// has the focus; counted as dropped when no one has.
-    pub fn event(&mut self, event: Event) {
+    /// has the focus (true: the holder has something to read); counted as
+    /// dropped when no one has.
+    pub fn event(&mut self, event: Event) -> bool {
         if !event.passes() {
-            return;
+            return false;
         }
         if self.current.is_some() {
             self.ring.push(event);
+            true
         } else {
             self.dropped = self.dropped.saturating_add(1);
+            false
         }
     }
 
@@ -181,6 +184,28 @@ mod tests {
         assert_eq!(out[0].code, 31);
         // Not counted as dropped for want of a focus: there was one.
         assert_eq!(f.dropped(), 0);
+    }
+
+    #[test]
+    fn an_event_says_whether_the_holder_has_something_to_read() {
+        let mut f = Focus::new();
+        assert!(!f.event(Event::key(30, true)));
+        let label = f.grant();
+        assert!(f.event(Event::key(30, true)));
+        // A repeat does not pass: nothing to tell.
+        assert!(!f.event(Event {
+            kind: 1,
+            code: 30,
+            value: 2
+        }));
+        // The axes of a tablet pass.
+        assert!(f.event(Event {
+            kind: 3,
+            code: 0,
+            value: 100
+        }));
+        let mut out = [Event::default(); 4];
+        assert_eq!(f.read(label, &mut out), Ok((2, false)));
     }
 
     #[test]
