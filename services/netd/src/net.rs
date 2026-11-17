@@ -522,6 +522,9 @@ pub struct Net {
     /// The listening descriptions whose queue lacks sockets of its backlog
     /// (`listen` builds `REBUILD_MAX` at most); the step of waking builds more.
     pub short: Mask,
+    /// The listening descriptions with a socket of their queue that closed after the handshake
+    /// (the peer's RST): the step of waking rebuilds them, `REBUILD_MAX` sockets a step.
+    pub reap_due: Mask,
     wake_cursor: usize,
     /// Where the walk over the aborted streams resumes.
     rst_cursor: usize,
@@ -832,6 +835,7 @@ impl Net {
         self.rst_wait.clear(i);
         self.wake_due.clear(i);
         self.short.clear(i);
+        self.reap_due.clear(i);
         self.attention.clear(i);
         self.connecting.clear(i);
         self.embryos.clear(i);
@@ -1288,6 +1292,13 @@ impl Net {
             // key leaves the table and the queue has room for it again.
             self.release_key(i);
         }
+        if queue::marks_for_reap(queue_socket, state == tcp::State::Closed) {
+            // Closed, and it keeps its debit of the room until rebuilt: the
+            // step of waking rebuilds it, off the path of a SYN.
+            let listener = usize::from(self.socks[i].listener);
+            self.reap_due.set(listener);
+            self.wake_wanted = true;
+        }
         let t = stack.tcp(handle);
         if self.embryos.has(i) && state != tcp::State::SynReceived {
             // The handshake of a socket of a queue ended (or the socket
@@ -1537,7 +1548,16 @@ impl Net {
                     Some(place) if syn && self.reusable_orphan(stack, place) => {
                         Some((place, self.socks[place].orphan_at))
                     }
-                    Some(place) => return Some(place),
+                    Some(place) => {
+                        // A socket of a queue that has not been accepted: the
+                        // step of waking looks at it after the stack took the
+                        // frame (an RST closes it, and its listener is rebuilt).
+                        if self.socks[place].listener != NO_PLACE {
+                            self.wake_due.set(place);
+                            self.wake_wanted = true;
+                        }
+                        return Some(place);
+                    }
                     None => None,
                 };
                 if !syn {
@@ -2053,6 +2073,7 @@ impl Net {
             || self.closed_ops != 0
             || self.interest.due != 0
             || self.short.next(0).is_some()
+            || self.reap_due.next(0).is_some()
     }
 
     /// The queue of one listening description that lacks sockets gets up to
@@ -2060,6 +2081,16 @@ impl Net {
     /// ones). A place that gets none (the table is full) is left to the
     /// accepts and the SYNs.
     fn build_queue(&mut self, stack: &mut Stack<'static>) {
+        // The listener with closed sockets in its queue gets them rebuilt,
+        // within the same bound as a build (`REBUILD_MAX` rebuilds a step).
+        if let Some(l) = self.reap_due.next(0) {
+            let reaped =
+                self.socks[l].listening && self.reap_queue(stack, l, &mut ReapBudget::build());
+            if !reaped {
+                self.reap_due.clear(l);
+            }
+            return;
+        }
         let Some(l) = self.short.next(0) else {
             return;
         };

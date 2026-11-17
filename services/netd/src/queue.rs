@@ -176,6 +176,13 @@ pub const fn sync_releases(is_queue_socket: bool, listening: bool, has_key: bool
     is_queue_socket && listening && has_key
 }
 
+/// Whether a queue socket in this state makes its listening description
+/// due for a rebuild of its closed sockets: it closed (the peer's RST after
+/// the handshake) and keeps its place and its debit of the room.
+pub const fn marks_for_reap(is_queue_socket: bool, closed: bool) -> bool {
+    is_queue_socket && closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +351,42 @@ mod tests {
         assert!(!sync_releases(true, true, false));
         assert!(!sync_releases(true, false, true));
         assert!(!sync_releases(false, true, true));
+    }
+
+    #[test]
+    fn a_closed_queue_socket_marks_its_listener() {
+        assert!(marks_for_reap(true, true));
+        assert!(!marks_for_reap(true, false));
+        assert!(!marks_for_reap(false, true));
+    }
+
+    /// Four listeners of a group, 16 sockets each: connections that were
+    /// reset after the handshake leave closed sockets that keep their debit of
+    /// room. The old rule reaps only when no listener has room (and stops at
+    /// the first fresh socket), so the listeners the circle did not reach stay
+    /// without room; the new rule rebuilds each marked listener at once.
+    #[test]
+    fn marked_listeners_are_rebuilt_without_waiting_for_the_group_to_fill() {
+        // (room, closed) of each listener after a reset abuse.
+        let abused = [(0u8, 4u8), (0, 6), (0, 1), (5, 0)];
+        // Old: nobody reaps while listener 3 has room, listeners 0 to 2 stay out.
+        let usable_old = abused.iter().filter(|l| l.0 > 0).count();
+        assert_eq!(usable_old, 1);
+        // New: each listener with a closed socket is rebuilt, `REBUILD_MAX` a step.
+        let mut usable_new = 0;
+        let mut steps = 0;
+        for (room, closed) in abused {
+            let mut left = closed;
+            let mut room = room;
+            while left > 0 {
+                let n = left.min(REBUILD_MAX);
+                left -= n;
+                room += n;
+                steps += 1;
+            }
+            usable_new += usize::from(room > 0);
+        }
+        assert_eq!(usable_new, 4);
+        assert_eq!(steps, 4);
     }
 }
