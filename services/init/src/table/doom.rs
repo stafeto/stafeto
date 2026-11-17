@@ -7,7 +7,11 @@
 //! get too, and the screen and the keys: the input service and the display
 //! service (which may grant the focus), and a session with the display
 //! service in the launcher's `connects`, which every child of the shell
-//! inherits as its place `Display`. Doom
+//! inherits as its place `Display`. The display service the launcher names
+//! (`gpu`) is the compositor (`comp::COMPOSITOR_KEYS`): Doom draws in a
+//! buffer the compositor makes and the compositor puts it on the screen of
+//! the driver (`comp::DISPLAY`), which has the compositor as its one
+//! client. Doom
 //! keeps its zone of 6 MiB (`DEFAULT_RAM` of Doomgeneric) and the 3 MB of
 //! its program in memory, and the shell's 1 160 pages hold neither. A child
 //! of the shell gets the shell's quota, so the pool of the process service
@@ -17,6 +21,7 @@
 //! the few commands between them fit in.
 
 use super::Record;
+use super::comp;
 use super::input;
 use super::ramfs::{BUSYBOX_DIALOG_TABLE, POSIX_ABI_TABLE};
 use crate::PAGE;
@@ -51,5 +56,6 @@ pub const TABLE: &[Record] = &[
     BUSYBOX_DIALOG_TABLE[7],
     BUSYBOX_DIALOG_TABLE[8],
     input::INPUT,
-    input::GPU,
+    comp::DISPLAY,
+    comp::COMPOSITOR_KEYS,
 ];
