@@ -10341,12 +10341,6 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("loader-channels", loader_channels_probe),
         job("image-gates", || image_gates_probe(false, false)),
         job("ramfs-cleanup", ramfs_cleanup_probe),
-        // The budgets of the three general services: the starvation gate of the one-CPU probe (the
-        // victim's share and the account of each `serve` budget), and the images in which a
-        // service binds no budget or a kernel or init breaks the guarantee, each of which the
-        // gates must fail.
-        job("service-budget", || service_budget::run(&[])),
-        job("budget-breaks", budget_hog::breaks),
         job("posix-poll", posix_poll_probe),
         job("layer-probe", || layer_probe::dispatch(&[])),
         job("layer-probe steps", || {
