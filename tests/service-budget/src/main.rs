@@ -745,20 +745,27 @@ const C_IPC_US: u64 = 32;
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
 /// What the explanation of the loss leaves unexplained, per service, as the starvation gate
-/// allows it: 750, 800 and 800 us of the loss of 10 ms. The one-CPU probe on the runner showed
-/// remainders of 248 to 672 (ramfs), 630 to 710 (pipe) and 910 to 1030 us (tty) with the
-/// services at level 1 and two budgets each, so the gate for the victim at level 10 and for
-/// tty fails on some runs until the term that explains the rest is found (stafeto-design#751;
-/// suspects: the driver of the terminal's own time under `settle_output` and
-/// `take_driver_input`, and the events of the `turns` budget). An unbound RAM service keeps the
-/// victim at 968 per mille against the bound of 827.
+/// allows it: 750, 800 and 800 us of the loss of a window of 10 cycles. The window is the one
+/// with the least share of the victim's own time, and its span (about 11 ms) holds the starts
+/// of three periods, not two. The time stamps of the kernel in that window (one CPU, -icount) show
+/// the main thread of a service running above the victim for about 580 us (terminal), 660 us
+/// (pipe) and 1 200 us (RAM) where its budgets give 75, 75 and 250 us a period: the rest is the
+/// steps of the turns thread's relay, each up to 160 us where the `turns` budget is 25 or 50 us.
+/// An unbound RAM service keeps the victim at 968 per mille against the bound of 827.
 const ALLOWANCE_US: [u64; 3] = [750, 800, 800];
+/// The `turns` budgets of the three services, microseconds (carved out of C_US).
+const C_TURNS_US: [u64; 3] = [50, 25, 25];
+/// The longest stretch the main thread of a service ran at one go above the victim in the windows
+/// of the starvation phase, in the time stamps of the kernel: 135 to 160 us in each service.
+const S_TURN_US: [u64; 3] = [160, 160, 160];
 
 /// The cost of one timer event of a budget in microseconds, by C: [250, 75] (`control`), measured.
 static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The cycles of the duty-cycled victim: the time it ran and the time it was awake, in ticks.
 static CYC_RUN: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYC_WALL: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+/// The time the victim woke for each cycle, in ticks.
+static CYC_AT: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYCLES: AtomicU64 = AtomicU64::new(0);
 
 /// The e of the service `which` (index of SERVICES): the control phase of its C.
@@ -858,6 +865,7 @@ extern "C" fn victim_duty(_: u64) -> ! {
         if c < CYC_RUN.len() {
             CYC_RUN[c].store(run, Relaxed);
             CYC_WALL[c].store(wall, Relaxed);
+            CYC_AT[c].store(awake, Relaxed);
         }
         if time::now() >= end {
             VICTIM_DONE.store(true, Relaxed);
@@ -869,12 +877,15 @@ extern "C" fn victim_duty(_: u64) -> ! {
 }
 
 /// The least and the median of the victim's share of its own active time (per mille) over the
-/// windows of 10 consecutive cycles.
-fn duty_windows() -> (u64, u64, u64) {
+/// windows of 10 consecutive cycles, the number of cycles, and the span of the worst window in
+/// ticks: from the first wake of its cycles to the end of the last one's awake time (the ten
+/// awake stretches and the nine sleeps between them).
+fn duty_windows() -> (u64, u64, u64, u64) {
     let n = (CYCLES.load(Relaxed) as usize).min(CYC_RUN.len());
     let mut shares = [0u64; 512];
     let mut count = 0;
     let mut first = 2;
+    let (mut worst_first, mut worst_share) = (2, u64::MAX);
     while first + 10 <= n {
         let run: u64 = CYC_RUN[first..first + 10]
             .iter()
@@ -885,6 +896,9 @@ fn duty_windows() -> (u64, u64, u64) {
             .map(|b| b.load(Relaxed))
             .sum();
         let share = run * 1000 / wall.max(1);
+        if share < worst_share {
+            (worst_first, worst_share) = (first, share);
+        }
         let mut at = count;
         while at > 0 && shares[at - 1] > share {
             shares[at] = shares[at - 1];
@@ -895,9 +909,12 @@ fn duty_windows() -> (u64, u64, u64) {
         first += 1;
     }
     if count == 0 {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     }
-    (shares[0], shares[count / 2], n as u64)
+    let last = worst_first + 9;
+    let span = (CYC_AT[last].load(Relaxed) + CYC_WALL[last].load(Relaxed))
+        .saturating_sub(CYC_AT[worst_first].load(Relaxed));
+    (shares[0], shares[count / 2], n as u64, span)
 }
 
 /// The starvation phase against `SERVICES[which]`: 24 clients at 20 on CPU 0 ask the service the
@@ -958,18 +975,30 @@ fn starve(
     sleep_until(wait, timer, now_ns() + 155 * MS);
     STOP.store(true, Relaxed);
     wait_ended(wait, timer, n as u64);
-    let (worst, median, cycles) = duty_windows();
+    let (worst, median, cycles, span) = duty_windows();
     let e = e_of(which);
-    // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
-    // the events explain: the remainder.
+    // The victim's loss in the worst window of ten cycles (8 ms of them its own running time)
+    // against what the budgets explain: the remainder. The window spans more than the 10 ms of
+    // two periods, because the loss and the nine sleeps add to the 8 ms the victim runs, so the
+    // window holds the start of one period more than two: with the period T and the span W
+    // there are W / T + 1 starts, each at which the budgets of the service may take their C.
     let loss_us = (1000 - worst) * 8;
-    // Each of the two budgets of a service (`serve` and `turns`) may run out in each period, so
-    // up to four events in each of the two periods.
-    let explained = 2 * C_US[which] + 2 * 10 + 8 * e;
+    let span_us = time::ticks_to_ns(span) / 1000;
+    let starts = span_us / T_US + 1;
+    let bursts = (span_us / T_US) * C_US[which] + C_US[which].min(span_us % T_US);
+    // In each period the budgets of the service run out, `serve` and `turns`, each with a timer
+    // event for the exhaustion and one for the replenishment (four events), and the kernel's
+    // entries take 10 us. A turn that the main thread takes from the turns thread runs at the
+    // level of that thread, and its time is owed to the `turns` budget when the turn ends: the
+    // turn that finds the budget nearly spent runs on, up to a whole step, so a period holds the
+    // overrun of one step above the share `turns` was given. The step is S_TURN_US, the longest
+    // stretch the time stamps of the kernel showed a service's main thread run at one go.
+    let overrun = S_TURN_US[which].saturating_sub(C_TURNS_US[which]);
+    let explained = bursts + starts * (10 + 4 * e + overrun);
     let remainder = loss_us.saturating_sub(explained);
     let bound = 1000 - (explained + ALLOWANCE_US[which]) / 8;
     println!(
-        "svcbudget1 {name} {phase} clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={}",
+        "svcbudget1 {name} {phase} clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} span_us={span_us} starts={starts} remainder_us={remainder} allowance_us={}",
         C_US[which], ALLOWANCE_US[which]
     );
 }
