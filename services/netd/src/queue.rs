@@ -27,16 +27,33 @@ pub const QUEUE_IDLE_S: u64 = 120;
 pub struct ReapBudget {
     tried: u8,
     fresh: u8,
+    /// Whether the first fresh socket that listens ends the work (the SYN's
+    /// budget) or only the count of tries does (the build of a queue).
+    ends_at_fresh: bool,
 }
 
 impl ReapBudget {
     pub const fn new() -> Self {
-        Self { tried: 0, fresh: 0 }
+        Self {
+            tried: 0,
+            fresh: 0,
+            ends_at_fresh: true,
+        }
+    }
+
+    /// The work of one step that builds the sockets a queue lacks: it ends
+    /// after `REBUILD_MAX` tries, whatever stands.
+    pub const fn build() -> Self {
+        Self {
+            tried: 0,
+            fresh: 0,
+            ends_at_fresh: false,
+        }
     }
 
     /// Whether another rebuild may start.
     pub const fn open(&self) -> bool {
-        self.fresh == 0 && self.tried < REBUILD_MAX
+        (self.fresh == 0 || !self.ends_at_fresh) && self.tried < REBUILD_MAX
     }
 
     /// One rebuild was tried; `built` tells whether a fresh socket stands.
@@ -101,6 +118,18 @@ pub const fn missing(wanted: u8, have: u8) -> u8 {
     wanted.saturating_sub(have)
 }
 
+/// The sockets the call that makes a queue (`listen`) builds at once: the
+/// first ones, so that the listener accepts connections now, and no more than
+/// one step may spend (`REBUILD_MAX`). The rest of the backlog is built by
+/// `top_up` in the steps that follow.
+pub const fn first_build(wanted: usize) -> usize {
+    if wanted < REBUILD_MAX as usize {
+        wanted
+    } else {
+        REBUILD_MAX as usize
+    }
+}
+
 /// A SYN on the four of a queue socket that closed ends that socket (its
 /// place is rebuilt) and goes on to the listening description as any other.
 pub const fn closed_member_on_four(syn: bool, queue_socket: bool, closed: bool) -> bool {
@@ -110,6 +139,44 @@ pub const fn closed_member_on_four(syn: bool, queue_socket: bool, closed: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_builds_at_most_one_step_of_sockets() {
+        assert_eq!(first_build(1), 1);
+        assert_eq!(first_build(3), 3);
+        assert_eq!(first_build(4), 4);
+        assert_eq!(first_build(5), usize::from(REBUILD_MAX));
+        assert_eq!(first_build(16), usize::from(REBUILD_MAX));
+    }
+
+    #[test]
+    fn the_rest_of_a_backlog_takes_whole_steps_of_builds() {
+        // A queue of 16 is complete after four calls of 4, each within the
+        // bound of a step, and `missing` counts it down exactly.
+        let wanted = 16u8;
+        let mut have = first_build(usize::from(wanted)) as u8;
+        let mut steps = 1;
+        while missing(wanted, have) > 0 {
+            let mut b = ReapBudget::build();
+            while b.open() && missing(wanted, have) > 0 {
+                b.charge(true);
+                have += 1;
+            }
+            assert!(b.tried() <= REBUILD_MAX);
+            steps += 1;
+        }
+        assert_eq!((have, steps), (16, 4));
+    }
+
+    #[test]
+    fn a_build_budget_goes_on_past_fresh_sockets_until_its_tries_end() {
+        let mut b = ReapBudget::build();
+        for _ in 0..REBUILD_MAX {
+            assert!(b.open());
+            b.charge(true);
+        }
+        assert!(!b.open());
+    }
 
     #[test]
     fn one_fresh_socket_ends_the_reap() {

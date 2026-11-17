@@ -25,7 +25,7 @@ use netd::passes::Passes;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
 use netd::profile::{self, Counter};
-use netd::queue::ReapBudget;
+use netd::queue::{self, ReapBudget};
 use netd::reuse::NO_GROUP;
 use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
@@ -931,7 +931,13 @@ impl Net {
             let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
             let l = &mut self.socks[place];
             l.backlog = l.backlog.max(wanted as u8);
-            while usize::from(self.socks[place].member_count) < wanted {
+            // At most one step's worth of sockets is built here; the steps
+            // of waking and the SYNs and accepts that follow build the rest.
+            let target = usize::from(self.socks[place].member_count)
+                + queue::first_build(
+                    wanted.saturating_sub(usize::from(self.socks[place].member_count)),
+                );
+            while usize::from(self.socks[place].member_count) < target {
                 let own = self.socks[place].members;
                 let count = usize::from(self.socks[place].member_count);
                 let Some(m) = self.member(stack, &sock, place, own, count) else {
@@ -941,6 +947,10 @@ impl Net {
                 listener.members[usize::from(listener.member_count)] = m as u16;
                 listener.member_count += 1;
                 listener.room = listener.room.saturating_add(1);
+            }
+            if queue::missing(self.socks[place].backlog, self.socks[place].member_count) > 0 {
+                self.short.set(place);
+                self.wake_wanted = true;
             }
             return ok();
         }
@@ -960,7 +970,7 @@ impl Net {
         let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
         let mut count = 0;
         let mut members = [0u16; crate::net::BACKLOG_MAX];
-        for k in 0..wanted {
+        for k in 0..queue::first_build(wanted) {
             let Some(m) = self.member(stack, &sock, place, members, count) else {
                 break;
             };
@@ -981,6 +991,10 @@ impl Net {
         sock.backlog = wanted as u8;
         sock.room = count as u8;
         let (address, port) = (sock.address, sock.port);
+        if count < wanted {
+            self.short.set(place);
+            self.wake_wanted = true;
+        }
         self.register(
             place,
             Key::Bound {
@@ -1335,7 +1349,7 @@ impl Net {
         }
         // A queue that stayed short (no place for a replacement before) gets
         // one socket back.
-        self.top_up(stack, place, &mut ReapBudget::new());
+        self.top_up(stack, place, &mut ReapBudget::new(), false);
         let mut w = Writer::new();
         let name = self.places.name(m);
         let data = match sockets::write_accepted(&mut w, name, &peer) {
