@@ -3135,6 +3135,20 @@ impl Service<0> for Tty {
     };
     type Data = Client;
 
+    /// A request pays the work of a step while one is told (input from the driver, output, the
+    /// cleanup after sessions that went): the turns thread runs on its small budget once the
+    /// budgets are spent, and what a client can observe of that work is owed it in its call.
+    fn pay_backlog(&mut self, _: &mut [Option<Session<Client, 0>>]) -> bool {
+        if !(self.step_told || self.step_due) {
+            return false;
+        }
+        self.step_told = false;
+        self.step_due = false;
+        self.select(0);
+        self.work();
+        true
+    }
+
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.select(0);
         self.due();

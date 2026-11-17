@@ -15,11 +15,7 @@ fn protocol(error: Status) -> i32 {
     if error == Status::BadSize {
         EIO
     } else {
-        let errno = crate::error(error.into());
-        if errno == ENXIO {
-            rt::println!("fifo-debug: protocol {:?} gives ENXIO", error);
-        }
-        errno
+        crate::error(error.into())
     }
 }
 fn key(token: OpenToken) -> proto_fs::OpenKey {
@@ -221,14 +217,6 @@ pub(crate) fn open(
         }
     })();
     if let Err(errno) = result {
-        if errno == ENXIO {
-            rt::println!(
-                "fifo-debug: open ends with ENXIO, fifo stage {} flags {} phase {:?}",
-                recovery.fifo_stage,
-                recovery.fifo_flags,
-                recovery.phase
-            );
-        }
         let _ =
             crate::shared::with_files(|files| files.begin_open_cancel(claim).map_err(crate::error));
         let canonical = fifo_cleanup(transport, token, recovery)
@@ -638,12 +626,6 @@ fn fifo_open(
             }
             NamedPhase::Ready | NamedPhase::Taken => break,
             NamedPhase::Failed => {
-                rt::println!(
-                    "fifo-debug: Failed result {} flags {} stage {}",
-                    response.result,
-                    recovery.fifo_flags,
-                    recovery.fifo_stage
-                );
                 return Err(if response.result == proto_pipe::NO_READER {
                     ENXIO
                 } else {
@@ -766,9 +748,39 @@ fn fifo_take_and_ack(
     Ok(target)
 }
 
+/// One request of the cleanup to the pipe service, repeated while a signal takes it back from
+/// the queue: a cleanup that gives up at the first EINTR leaves its ticket in the service, and
+/// the next open of the same client meets it (a service that works at level 1 holds requests in
+/// its queue for long, so signals catch them there).
+fn cleanup_request(
+    session: &rt::handle::Handle<rt::handle::Channel>,
+    method: proto_pipe::Method,
+    recovery: Recovery,
+) -> Result<proto_pipe::NamedReply, Status> {
+    loop {
+        match rt::pipe::request(session, method, fifo_ticket(recovery), None) {
+            Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
+            other => return other.map(|response| response.state),
+        }
+    }
+}
+
 /// No path is replayed. A saved endpoint closes safely after uncertain Ack;
-/// an unacknowledged candidate is cancelled by its exact retained ticket.
-fn fifo_cleanup(transport: Transport, token: OpenToken, mut recovery: Recovery) -> bool {
+/// an unacknowledged candidate is cancelled by its exact retained ticket. Its requests are
+/// repeated after an interruption and run with the entries masked, as those of the take and
+/// the acknowledgements do.
+fn fifo_cleanup(transport: Transport, token: OpenToken, recovery: Recovery) -> bool {
+    let was_masked = rt::upcall::mask().unwrap_or(true);
+    let done = fifo_cleanup_requests(transport, token, recovery);
+    if !was_masked {
+        // SAFETY: the entries were open when the call began; with a deferral still held a
+        // pending request enters when it ends.
+        let _ = unsafe { rt::upcall::enable() };
+    }
+    done && fifo_cleanup_capability(token)
+}
+
+fn fifo_cleanup_requests(transport: Transport, token: OpenToken, mut recovery: Recovery) -> bool {
     use proto_pipe::Method;
     if recovery.fifo_stage == 0 {
         return true;
@@ -777,25 +789,30 @@ fn fifo_cleanup(transport: Transport, token: OpenToken, mut recovery: Recovery) 
         return false;
     };
     if recovery.fifo_ticket_generation == 0 && recovery.fifo_stage < 6 {
-        let Ok(response) = rt::pipe::request(
-            &session,
-            Method::PayerWitness,
-            proto_pipe::NamedTicket {
-                slot: token.slot() as u32,
-                generation: token.generation(),
-            },
-            None,
-        ) else {
+        let witness = loop {
+            match rt::pipe::request(
+                &session,
+                Method::PayerWitness,
+                proto_pipe::NamedTicket {
+                    slot: token.slot() as u32,
+                    generation: token.generation(),
+                },
+                None,
+            ) {
+                Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
+                other => break other,
+            }
+        };
+        let Ok(response) = witness else {
             return false;
         };
         recovery.fifo_ticket_slot = response.state.ticket.slot;
         recovery.fifo_ticket_generation = response.state.ticket.generation;
     }
     if recovery.fifo_ticket_generation != 0 {
-        let cancelled =
-            rt::pipe::request(&session, Method::NamedCancel, fifo_ticket(recovery), None);
+        let cancelled = cleanup_request(&session, Method::NamedCancel, recovery);
         if cancelled.is_ok() {
-            if rt::pipe::request(&session, Method::NamedAck, fifo_ticket(recovery), None).is_err() {
+            if cleanup_request(&session, Method::NamedAck, recovery).is_err() {
                 return false;
             }
         } else if recovery.fifo_stage < 5 {
@@ -807,11 +824,18 @@ fn fifo_cleanup(transport: Transport, token: OpenToken, mut recovery: Recovery) 
             id: recovery.fifo_endpoint_id,
             generation: recovery.fifo_endpoint_generation,
         };
-        match transport.pipe_endpoint_call(Method::Close, endpoint, None) {
-            Ok(_) | Err(posix_fs::FsError::BadFileDescriptor) => {}
-            Err(_) => return false,
+        loop {
+            match transport.pipe_endpoint_call(Method::Close, endpoint, None) {
+                Ok(_) | Err(posix_fs::FsError::BadFileDescriptor) => break,
+                Err(posix_fs::FsError::Interrupted) => continue,
+                Err(_) => return false,
+            }
         }
     }
+    true
+}
+
+fn fifo_cleanup_capability(token: OpenToken) -> bool {
     let Ok(_short) = crate::long::ShortScope::enter(true) else {
         return false;
     };

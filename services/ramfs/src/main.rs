@@ -2440,6 +2440,29 @@ impl Service<0> for Fs {
         }
     }
 
+    /// A request pays one unit of the service's own work while departed sessions, abandoned jobs or
+    /// pages wait to be given back: the thread of the own work (the turns) runs on its small
+    /// budget once the budgets are spent, and a client that asks for a session, a descriptor or a
+    /// page must not find the ones the exited processes held still taken.
+    fn pay_backlog(&mut self, sessions: &mut [Option<Session<Fds, 0>>]) -> bool {
+        if !(self.departures.pending()
+            || self.orphan_count != 0
+            || self.ram.storage.reclaim_pending())
+        {
+            return false;
+        }
+        self.maintenance(
+            sessions,
+            rt::service::Notice {
+                source: rt::abi::Source::Unlabeled,
+                label: 0,
+                bits: 1,
+                count: 1,
+            },
+        );
+        true
+    }
+
     fn before_request(&mut self) {
         self.request_began = rt::time::ticks_to_ns(rt::time::now());
     }

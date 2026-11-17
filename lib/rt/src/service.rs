@@ -120,6 +120,18 @@ pub trait Service<const K: usize> {
         let _ = notice;
     }
 
+    /// One unit of the service's own work that the request in hand pays for before it is
+    /// served, while the service has a backlog of such work (departed sessions whose objects
+    /// are not yet given back, pages to reclaim): true when there was a unit to do. A service
+    /// that runs its own work in a thread of its own (`Turns`) gets that work done only for the
+    /// budget of that thread once its budgets are spent, and what a client can observe of it
+    /// (a table that is full, a quota that is not yet given back) must not wait for that: the
+    /// loop calls this up to `PAY` times before each request. The default has no backlog.
+    fn pay_backlog(&mut self, sessions: &mut [Option<Session<Self::Data, K>>]) -> bool {
+        let _ = sessions;
+        false
+    }
+
     /// Before every request the loop took, once the receive has returned.
     fn before_request(&mut self) {}
 
@@ -501,6 +513,9 @@ pub fn run_with<S: Service<K>, const K: usize>(
                         }
                     }
                 } else {
+                    if turns.is_some() {
+                        pay(service, table, &mut ring, config.issued);
+                    }
                     let kind = steps::kind_of(bytes);
                     service.before_request();
                     #[cfg(not(feature = "step-stats"))]
@@ -633,6 +648,37 @@ pub fn run_with<S: Service<K>, const K: usize>(
             None => service.between_notifications(notice),
         }
     }
+}
+
+/// The units of the service's own work a request pays for at most (`Service::pay_backlog` and
+/// the departures noted in the ring).
+const PAY: usize = 4;
+
+/// The own work a request pays for before it is served: the departures the main thread noted
+/// and then the units the service reports (`Service::pay_backlog`), `PAY` of them at most.
+fn pay<S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &mut [Option<Session<S::Data, K>>],
+    ring: &mut Ring,
+    issued: u32,
+) {
+    for _ in 0..PAY {
+        // Each unit is a step of its own for the measure (a departure, or an own step), and the
+        // request that follows starts its count anew.
+        steps::restart();
+        let began = time::now();
+        if let Some(label) = ring.pop() {
+            steps::gone();
+            depart_label(service, table, label, issued);
+            let _ = steps::end(began, steps::NOTICE);
+        } else if service.pay_backlog(table) {
+            steps::own();
+            let _ = steps::end(began, steps::NOTICE);
+        } else {
+            break;
+        }
+    }
+    steps::restart();
 }
 
 /// The label of the requests of the thread of a service's own work, the turns. It has a bit
