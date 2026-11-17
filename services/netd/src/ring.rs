@@ -13,10 +13,15 @@ pub use virtio_net::books::{
 
 /// The frames a step of receiving takes and the frames a step of sending
 /// sends at most (the bound of a step, so that a flood leaves the loop its
-/// other work): by the measurement of stage P4a-1, which prices the frames
-/// of the wire at full size (7 168 ticks received, 5 632 sent, p90) beside
-/// those of the loopback (2 048 and 768): two frames received cost an
-/// estimated 15 360 ticks, a group and a frame sent 12 800. The features `batch-N` (receiving) and `send-N` (sending) build the other
+/// other work): by the measurement of `net-probe steps`, which prices the frames
+/// of the wire at full size beside those of the loopback (p90 ticks: a frame
+/// received 7 232 to 8 768 on the wire and 3 008 on the loopback, a frame sent
+/// 6 080 and 576; the wire's price differs by up to 1 000 ticks from run to run
+/// of one build). Two wire frames received cost more than the budget of the
+/// rule (`choose::BUDGET`), so the second frame of a step is taken only while the step is
+/// within the soft share (`RX_SOFT_MEASURED`): the step costs at most the share, a frame of
+/// the wire (`WIRE_FRAME_TICKS`) and the tail, whatever the price of the frames before it
+/// (the rule: `choose::choose`). The features `batch-N` (receiving) and `send-N` (sending) build the other
 /// values, for the measurement that chose these.
 #[cfg(feature = "batch-16")]
 pub const STEP_RX: usize = 16;
@@ -209,7 +214,7 @@ pub const SWITCH_TX: usize = 16;
 /// the wire costs up to `WIRE_FRAME_TICKS` and two of them past `RX_SOFT_MEASURED` would go over
 /// the margin). The other images keep the old behaviour on a real clock, where a tick is
 /// 41.67 ns and a loaded step runs 3 500 to 9 000 of them: no limit.
-pub const RX_SOFT_MEASURED: u64 = 6_000;
+pub const RX_SOFT_MEASURED: u64 = 5_500;
 pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
     RX_SOFT_MEASURED
 } else {
@@ -218,8 +223,15 @@ pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
 /// A frame of the wire in a step of receiving (the answer to it, a copy and the sum included)
 /// and the rest of any step of the service (the notification, the bell, the tail), in ticks
 /// under -icount.
-pub const WIRE_FRAME_TICKS: usize = 7_200;
+pub const WIRE_FRAME_TICKS: usize = 8_000;
 pub const STEP_TAIL_TICKS: usize = 3_000;
+/// The work a SYN adds to its step in a queue that lacks sockets (`queue::ReapBudget`): one
+/// rebuild of a queue socket (the release of a closed one and a fresh one that listens) costs
+/// 1 250 ticks under -icount, and the recycling of a half-open socket (the abort and its
+/// rebuild, which takes one of the tries) at most 1 500. The worst SYN is the soft share, the
+/// tries and the recycling, and the tail.
+pub const REBUILD_TICKS: usize = 1_250;
+pub const RECYCLE_TICKS: usize = 1_500;
 /// The buffers the stack gave back (of receiving, of sending) the switch
 /// takes in a step, each.
 pub const SWITCH_BACK: usize = 32;
@@ -398,11 +410,15 @@ pub const MAP_STEP_TICKS: usize = 2_500;
 /// The worst step of each part of the service by the sums of the step rule, in ticks: the
 /// switch with a chunk of the offload past the soft share (a piece of the sweep at the start of
 /// the step counts toward the share, so this sum covers it), the switch with its sweep, the stack
-/// receiving, and the step of a map.
-pub const WORST_STEPS: [usize; 4] = [
+/// receiving, the stack taking a SYN into a queue that lacks sockets, and the step of a map.
+pub const WORST_STEPS: [usize; 5] = [
     SOFT_MEASURED as usize + TSO_TICKS + SWITCH_BASE * 1_500 + STEP_TAIL_TICKS,
     SOFT_MEASURED as usize + SWEEP_TICKS + 1_500,
     RX_SOFT_MEASURED as usize + WIRE_FRAME_TICKS + STEP_TAIL_TICKS,
+    RX_SOFT_MEASURED as usize
+        + crate::queue::REBUILD_MAX as usize * REBUILD_TICKS
+        + RECYCLE_TICKS
+        + STEP_TAIL_TICKS,
     MAP_CALL_TICKS + MAP_STEP_TICKS,
 ];
 const _: () = {
@@ -1087,12 +1103,12 @@ mod tests {
         assert_eq!(STEP_MARGIN, 16_500);
         assert_eq!(SWITCH_BASE, 3);
         assert_eq!(SOFT_MEASURED, 5_600);
-        assert_eq!(RX_SOFT_MEASURED, 6_000);
+        assert_eq!(RX_SOFT_MEASURED, 5_500);
         assert_eq!(SWEEP_TICKS, 7_200);
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
         // here each sum is compared with the margin and with its value.
-        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_200, 14_500]);
+        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 15_000, 14_500]);
         for worst in WORST_STEPS {
             assert!(worst <= STEP_MARGIN, "{worst} over the margin");
         }
