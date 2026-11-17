@@ -189,3 +189,47 @@ fn the_tree_passes_the_kernels_checks_as_the_loader_placed_it() {
     assert_eq!(summary.cpus, 2);
     assert_eq!(summary.msi_entries, 1);
 }
+
+/// The measured map of the two EBS NVMe functions (cargo xtask aws neighbour): the first in walk
+/// order (index 0, 00:04.0) is the root volume, the second (index 1, 00:1f.0) the volume attached
+/// as /dev/sdf. The name field of Identify Controller (bytes 3072..3104) holds the device name
+/// without "/dev/" and pads it with spaces (0x20).
+#[test]
+fn the_second_nvme_function_in_walk_order_is_the_data_volume_and_the_first_is_the_root() {
+    let pci = std::fs::read_to_string(format!("{DIR}/pci.txt")).unwrap();
+    let walk: Vec<&str> = pci
+        .lines()
+        .filter(|l| l.contains("vendor=0x1d0f device=0x8061"))
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(walk, ["0000:00:04.0", "0000:00:1f.0"]);
+
+    let map = std::fs::read_to_string(format!("{DIR}/nvme-map.txt")).unwrap();
+    let rows: Vec<&str> = map.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(rows.len(), 2);
+    let field = |row: &str, key: &str| {
+        row.split_whitespace()
+            .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            .unwrap()
+            .to_string()
+    };
+    let name = |row: &str| -> Vec<u8> {
+        let hex = field(row, "name_hex");
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    };
+    let padded = |s: &str| {
+        let mut v = s.as_bytes().to_vec();
+        v.resize(32, b' ');
+        v
+    };
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(field(row, "pci"), walk[index]);
+        assert_eq!(field(row, "model"), "Amazon_Elastic_Block_Store");
+    }
+    assert_eq!(field(rows[0], "role"), "root");
+    assert_eq!(name(rows[0]), padded("xvda"));
+    assert_eq!(field(rows[1], "role"), "sdf");
+    assert_eq!(name(rows[1]), padded("sdf"));
+}

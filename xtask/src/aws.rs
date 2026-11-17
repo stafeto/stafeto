@@ -32,6 +32,8 @@ const REGION: &str = "eu-central-1";
 const ALLOWED_TYPES: [&str; 2] = ["t4g.small", "t4g.nano"];
 const MAX_LIVE: usize = 4;
 const BLOCK: usize = 512 * 1024;
+/// The value of `Launch::extra_snapshot` that attaches an empty 1 GiB volume as /dev/sdf.
+const BLANK_SDF: &str = "blank";
 /// The on-demand price of a t4g.small in eu-central-1 in USD per hour, as the
 /// price list showed it when this was written (unverified: it only sizes the
 /// estimate the commands print).
@@ -45,7 +47,7 @@ const USAGE: &str = "usage: xtask aws check
        xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--session S]
        xtask aws dump [--session S] [--all]
-       xtask aws neighbour [--snapshot SNAP] [--session S]
+       xtask aws neighbour [--snapshot SNAP | --blank-sdf] [--session S]
        xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
        xtask aws clean --session S
        xtask aws sweep [--remove]";
@@ -1171,9 +1173,14 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
     }
     args.extend(spec);
     if let Some(snap) = l.extra_snapshot {
+        let source = if snap == BLANK_SDF {
+            "VolumeSize=1".to_string()
+        } else {
+            format!("SnapshotId={snap}")
+        };
         args.extend([
             "--block-device-mappings".to_string(),
-            format!("DeviceName=/dev/sdf,Ebs={{SnapshotId={snap},VolumeType=gp3,DeleteOnTermination=true}}"),
+            format!("DeviceName=/dev/sdf,Ebs={{{source},VolumeType=gp3,DeleteOnTermination=true}}"),
         ]);
     }
     if let Some(k) = l.key_name {
@@ -2010,7 +2017,7 @@ fn serial_typing(
 
 // ---- the neighbour and the dump ---------------------------------------------------------------
 
-const NEIGHBOUR_SCRIPT: &str = r#"#!/bin/bash
+const NEIGHBOUR_SCRIPT: &str = r##"#!/bin/bash
 # stafeto neighbour: prints what a Linux sees of the firmware to the console, as
 # gzip and base64 records, a few at a time so that a poll of the last 64 KiB sees each.
 exec 2>/dev/null
@@ -2039,10 +2046,42 @@ if [ -b /dev/nvme1n1p1 ]; then
   for f in /mnt/esp/stafeto/dump/*; do [ -f "$f" ] && emit "dump-$(basename $f)" < "$f"; done
   ls -l /mnt/esp/stafeto /mnt/esp/stafeto/dump 2>&1 | emit esp-listing.txt
 fi
+# One line per NVMe controller: the PCI address, the model, the serial (the EBS volume
+# id), and bytes 3072..3104 of Identify Controller (the vendor area where EBS writes the
+# device name), read by nvme-cli or, without it, by one admin ioctl through python3.
+idctrl() {
+  if command -v nvme > /dev/null && nvme id-ctrl "$1" --raw-binary > /tmp/idc 2> /dev/null && [ "$(stat -c %s /tmp/idc)" -ge 3104 ]; then
+    echo nvme-cli; return 0
+  fi
+  if command -v python3 > /dev/null && python3 - "$1" > /tmp/idc <<'PY' 2> /dev/null
+import array, fcntl, struct, sys
+buf = array.array('B', bytes(4096))
+addr, _ = buf.buffer_info()
+cmd = struct.pack('BBHIIIQQIIIIIIIIII', 6, 0, 0, 0, 0, 0, 0, addr, 0, 4096, 1, 0, 0, 0, 0, 0, 0, 0)
+cmd = bytearray(cmd)
+fcntl.ioctl(open(sys.argv[1], 'rb'), 0xC0484E41, cmd)
+sys.stdout.buffer.write(buf.tobytes())
+PY
+  then
+    echo python-ioctl; return 0
+  fi
+  echo none; return 1
+}
+{
+  echo "# tools: nvme=$(command -v nvme) ebsnvme-id=$(command -v ebsnvme-id) python3=$(command -v python3)"
+  for c in /sys/class/nvme/nvme*; do
+    n=$(basename $c)
+    m=$(idctrl /dev/$n)
+    hex=$(dd if=/tmp/idc bs=1 skip=3072 count=32 2> /dev/null | od -An -v -tx1 | tr -d ' \n')
+    ebs=$(command -v ebsnvme-id > /dev/null && ebsnvme-id -b /dev/${n}n1 2> /dev/null)
+    echo "$n pci=$(basename $(readlink -f $c/device)) model=$(tr -s ' ' < $c/model | sed 's/ *$//' | tr ' ' '_') serial=$(tr -d ' ' < $c/serial) method=$m name_hex=$hex ebsnvme_id=$ebs"
+    rm -f /tmp/idc
+  done
+} | emit nvme-map.txt
 sleep 20
 echo STAFETO-NEIGHBOUR-DONE > $O
 sleep 300
-"#;
+"##;
 
 /// Joins the records `STAFETO-BEGIN name` ... `STAFETO-END name` of a console
 /// text into (name, base64 text) and decodes them.
@@ -2117,8 +2156,64 @@ fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
     o.status.success().then_some(o.stdout)
 }
 
+/// Matches the lines of `nvme-map.txt` (one per controller: `nvmeN pci=.. model=.. serial=..
+/// method=.. name_hex=..`) with the instance's block device mappings (`DEVICE<TAB>vol-ID` per
+/// line, as `describe-instances` prints them) and the root device name. The answer has one line
+/// per controller with the PCI address, the role (`root`, `sdf`, the device name, or `unknown`),
+/// the model, the method and the name field as hex and ASCII; no volume id is in it.
+fn nvme_summary(map: &str, mappings: &str, root: &str) -> String {
+    let devices: Vec<(&str, String)> = mappings
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?, f.next()?.replace('-', "")))
+        })
+        .collect();
+    let mut out = String::new();
+    for line in map.lines().filter(|l| !l.starts_with('#')) {
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+                .unwrap_or("")
+        };
+        let serial = field("serial");
+        let role = match devices
+            .iter()
+            .find(|(_, v)| !serial.is_empty() && *v == serial)
+        {
+            Some((d, _)) if *d == root => "root".to_string(),
+            Some((d, _)) => d.rsplit('/').next().unwrap_or(d).to_string(),
+            None => "unknown".to_string(),
+        };
+        let hex = field("name_hex");
+        let ascii: String = (0..hex.len() / 2)
+            .filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+            .map(|b| match b {
+                0 => '.',
+                0x20..=0x7e => b as char,
+                _ => '?',
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "pci={} role={} model={} method={} name_hex={} name_ascii={}",
+            field("pci"),
+            role,
+            field("model"),
+            field("method"),
+            hex,
+            ascii
+        );
+    }
+    out
+}
+
 fn neighbour(args: &[String]) -> Result<(), String> {
-    let snapshot = flag(args, "--snapshot");
+    let snapshot = if args.iter().any(|a| a == "--blank-sdf") {
+        Some(BLANK_SDF.to_string())
+    } else {
+        flag(args, "--snapshot")
+    };
     let s = Session::open(flag(args, "--session"))?;
     let script = s.dir.join("neighbour.sh");
     std::fs::write(&script, NEIGHBOUR_SCRIPT).map_err(|e| e.to_string())?;
@@ -2162,6 +2257,32 @@ fn neighbour(args: &[String]) -> Result<(), String> {
             got.len(),
             got.keys().collect::<Vec<_>>()
         );
+        if let Some(map) = got.get("nvme-map.txt") {
+            let mappings = aws(&[
+                "ec2",
+                "describe-instances",
+                "--instance-ids",
+                &id,
+                "--query",
+                "Reservations[0].Instances[0].BlockDeviceMappings[].[DeviceName,Ebs.VolumeId]",
+                "--output",
+                "text",
+            ])?;
+            let root = aws(&[
+                "ec2",
+                "describe-instances",
+                "--instance-ids",
+                &id,
+                "--query",
+                "Reservations[0].Instances[0].RootDeviceName",
+            ])?;
+            let summary = nvme_summary(&String::from_utf8_lossy(map), &mappings, &root);
+            std::fs::write(out.join("nvme-map-summary.txt"), &summary)
+                .map_err(|e| e.to_string())?;
+            println!("--- nvme map (no ids) ---\n{summary}--- end of nvme map ---");
+        } else {
+            println!("neighbour: no nvme-map.txt record arrived");
+        }
         Ok(())
     })();
     let result = release(&s, Kind::Instance, &id, result);
@@ -2696,6 +2817,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nvme_map_names_the_root_and_the_data_volume_without_their_ids() {
+        let pad = "00".repeat(29);
+        let map = format!(
+            "# tools: nvme=/usr/sbin/nvme\n\
+             nvme0 pci=0000:00:1f.0 model=Amazon_Elastic_Block_Store serial=vol0aaaa method=nvme-cli name_hex=736466{pad}\n\
+             nvme1 pci=0000:00:04.0 model=Amazon_Elastic_Block_Store serial=vol0bbbb method=python-ioctl name_hex=7876646100{}\n\
+             nvme2 pci=0000:00:09.0 model=Other serial=x method=none name_hex=\n",
+            "00".repeat(27)
+        );
+        let maps = "/dev/xvda\tvol-0bbbb\n/dev/sdf\tvol-0aaaa\n";
+        let s = nvme_summary(&map, maps, "/dev/xvda");
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("pci=0000:00:1f.0 role=sdf model=Amazon_Elastic_Block_Store method=nvme-cli name_hex=736466"));
+        assert!(lines[0].ends_with(&format!("name_ascii=sdf{}", ".".repeat(29))));
+        assert!(lines[1].contains("pci=0000:00:04.0 role=root "));
+        assert!(lines[1].contains("name_ascii=xvda"));
+        assert!(lines[2].contains("role=unknown"));
+        assert!(!s.contains("vol"));
+    }
 
     #[test]
     fn a_mac_is_cut_to_its_last_three_octets() {
