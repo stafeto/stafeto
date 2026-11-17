@@ -235,7 +235,9 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     let rw = Access::ReadWrite;
-    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err() {
+    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err()
+        || sys::memory_info(&legacy).map_or(true, |info| info.refs != LEGACY_REFS)
+    {
         return NOT_REGISTERED;
     }
     let mut service = Compositor {

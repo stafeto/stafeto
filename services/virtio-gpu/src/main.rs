@@ -78,7 +78,7 @@ const FB_AT: usize = 0x10_0100_0000;
 const MMIO_AT: usize = 0x10_1000_0000;
 /// The references of the instance itself to `fb`: its handle, its mapping
 /// and init's own handle to the object, which init keeps while the instance
-/// lives (services/init worker). More mean that an owner of the screen kept
+/// lives (services/init worker). More references mean that an owner of the screen kept
 /// a copy.
 const FB_REFS: u64 = 3;
 /// The sessions of the driver's channel: every POSIX process may hold one
@@ -171,6 +171,9 @@ fn main(_: u64) -> u64 {
         || sys::mem_map(&s.process, &fb, 0, fb_len, FB_AT, rw).is_err()
         || sys::mem_map(&s.process, &window, 0, page, MMIO_AT, rw).is_err()
         || !virtio_mmio::attach(DMA_AT, dma_pa, PAGES, QUEUE_PAGES)
+        // A change in what init keeps shows here at once, not as a BUSY that
+        // never ends.
+        || sys::memory_info(&fb).map_or(true, |info| info.refs != FB_REFS)
     {
         return NOT_MAPPED;
     }

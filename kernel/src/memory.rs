@@ -60,15 +60,17 @@ pub const CREATE_PORTION: usize = FRAMES_PER_SECTION;
 
 /// A memory object (spec 7.3): pages whose frames it takes whole when it
 /// is made and gives back in portions once nothing refers to it (spec
-/// 7.7); its handles and the long call that makes it keep it (spec 4).
+/// 7.7); its handles, its mappings, its handles in transit inside messages
+/// and the long call that makes it keep it (spec 4).
 pub struct Memory {
     /// Where its frames come from.
     backing: Backing,
     /// What its frames are charged to: its pages and the nodes of their
     /// list, which the payer's quota paid for at once (spec 7.5).
     budget: Account,
-    /// Its handles, and the reference `create` hands out while the object
-    /// is made: the references that keep it.
+    /// Its handles, its mappings, its handles in transit inside messages,
+    /// and the reference `create` hands out while the object is made: the
+    /// references that keep it (object_info MEMORY x4).
     refs: Refs,
     /// Its mappings now (object_info MEMORY): only `retain_mapping` and
     /// `release_mapping` change it.
