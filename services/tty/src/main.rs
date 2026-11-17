@@ -925,8 +925,12 @@ impl Tty {
                 let Some(notary) = self.notary.as_ref() else {
                     return;
                 };
+                // The process service tells of the departure of a process on the loop's own
+                // channel: a client that asks the terminal next (the survivor of a session whose
+                // leader went) lifts the thread that holds the notice (spec 6.6), so the hang-up
+                // is done before that client is answered. The steps that follow it are turns.
                 let Ok(notice) = sys::handle_label(
-                    &self.turns,
+                    &self.channel,
                     Rights::NOTIFY | Rights::TRANSFER,
                     DEPARTURES,
                     self.level,
@@ -1435,8 +1439,10 @@ impl Tty {
                 let handle = if armed {
                     None
                 } else {
+                    // The driver tells of input on the loop's own channel, for the same reason:
+                    // the client that reads next lifts the thread that holds the notice.
                     sys::handle_label(
-                        &self.turns,
+                        &self.channel,
                         Rights::NOTIFY | Rights::TRANSFER,
                         DRIVER_IN,
                         self.level,
