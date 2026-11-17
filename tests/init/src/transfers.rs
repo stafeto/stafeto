@@ -10,10 +10,20 @@ use crate::memory::memory_object;
 use crate::messages::{
     CLIENT_LABEL, PAST_NUMBERS, answer_all, raw_reply, raw_send, record, server, take_token,
 };
-use crate::processes::{Gift, Kid, PROVIDER_QUOTA, counts_at_rest, quota_of};
+use crate::processes::{
+    Gift, Kid, LEAF_QUOTA, PROVIDER_QUOTA, counts_at_rest, quota_of, reset_kid_marks,
+};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 26] = [
+pub(crate) const TESTS: [Test; 28] = [
+    (
+        "memory_refs_count_a_handle_in_another_process",
+        memory_refs_count_a_handle_in_another_process,
+    ),
+    (
+        "memory_refs_count_a_handle_in_transit",
+        memory_refs_count_a_handle_in_transit,
+    ),
     (
         "exited_threads_hold_no_numbers",
         exited_threads_hold_no_numbers,
@@ -1396,4 +1406,91 @@ fn shared_pages_show_both_sides() -> Outcome {
     )?;
     check(reply[6] == INIT_WORD, "the service did not see init's word")?;
     check(seen == CHILD_WORD, "init did not see the service's word")
+}
+
+/// The references of a memory object, `refs` of object_info MEMORY (x4):
+/// 0 when the call fails.
+fn refs_of(m: &Handle<Memory>) -> u64 {
+    sys::memory_info(m).map_or(0, |info| info.refs)
+}
+
+/// MEMORY counts a handle that another process holds (spec 4, 11): init's
+/// own handle is one reference, a copy in a child's table the second, and
+/// the child's end gives it back.
+fn memory_refs_count_a_handle_in_another_process() -> Outcome {
+    reset_kid_marks();
+    let m = memory_object(1)?;
+    let alone = refs_of(&m);
+    let c = channel(LEVEL)?;
+    let send = copy(&c, Rights::SEND)?;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let held = kid
+        .start()
+        .and_then(|()| {
+            kid.serve(
+                Role::Serve,
+                &[1],
+                &[
+                    Gift::Given(c.into_raw()),
+                    Gift::Given(copy_raw(&m, Rights::MAP_READ | Rights::TRANSFER)?),
+                ],
+            )
+        })
+        .and_then(|()| let_run())
+        .map(|()| refs_of(&m));
+    let answer = sys::try_send(&send, &[1]);
+    let state = kid.end();
+    kid.close()?;
+    let_run()?;
+    let after = refs_of(&m);
+    close(send)?;
+    close(m)?;
+    check(
+        alone == 1 && held == Ok(2),
+        "a handle in another process is not one reference of the object",
+    )?;
+    check(
+        answer.is_ok() && state == Ok(ProcessState::Exited { code: 0 }) && after == 1,
+        "the end of the other process did not give its reference back",
+    )
+}
+
+/// MEMORY counts a handle in transit inside a message (spec 4, 11): the
+/// copy a blocked client sent is one more reference while the message
+/// waits, it stays one when the receiver takes the handle, and closing it
+/// gives it back.
+fn memory_refs_count_a_handle_in_transit() -> Outcome {
+    reset_results();
+    let m = memory_object(1)?;
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    give(&[copy_raw(&m, Rights::MAP_READ | Rights::TRANSFER)?]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let queued = refs_of(&m);
+    let got = sys::try_receive(&c);
+    let waiting = refs_of(&m);
+    let (taken, replied) = match got {
+        Ok(Received::Message {
+            mut handles, token, ..
+        }) => (handles.take::<Memory>(0), token.reply(&[]).is_ok()),
+        _ => (Err(Error::BadState), false),
+    };
+    let held = refs_of(&m);
+    if let Ok(h) = taken {
+        close(h)?;
+    }
+    let_run()?;
+    let after = refs_of(&m);
+    close(t)?;
+    close(c)?;
+    close(m)?;
+    check(replied && ended(0), "the client did not get the reply")?;
+    check(
+        queued == 2 && waiting == 2 && held == 2,
+        "a handle in transit, or taken from the message, is not one reference of the object",
+    )?;
+    check(
+        after == 1,
+        "the closed handle did not give its reference back",
+    )
 }

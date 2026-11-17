@@ -76,6 +76,11 @@ rt::entry!(main);
 const DMA_AT: usize = 0x10_0000_0000;
 const FB_AT: usize = 0x10_0100_0000;
 const MMIO_AT: usize = 0x10_1000_0000;
+/// The references of the instance itself to `fb`: its handle, its mapping
+/// and init's own handle to the object, which init keeps while the instance
+/// lives (services/init worker). More references mean that an owner of the screen kept
+/// a copy.
+const FB_REFS: u64 = 3;
 /// The sessions of the driver's channel: every POSIX process may hold one
 /// `Display` session, init's or a clone, and the owner's session is one
 /// more; room beside them.
@@ -166,6 +171,9 @@ fn main(_: u64) -> u64 {
         || sys::mem_map(&s.process, &fb, 0, fb_len, FB_AT, rw).is_err()
         || sys::mem_map(&s.process, &window, 0, page, MMIO_AT, rw).is_err()
         || !virtio_mmio::attach(DMA_AT, dma_pa, PAGES, QUEUE_PAGES)
+        // A change in what init keeps shows here at once, not as a BUSY that
+        // never ends.
+        || sys::memory_info(&fb).map_or(true, |info| info.refs != FB_REFS)
     {
         return NOT_MAPPED;
     }
@@ -803,6 +811,12 @@ impl Driver {
             Setup::Failed => return Answer::Status(code(NO_DEVICE)),
             // The device is being set up: ask again.
             _ => return Answer::Status(code(CLEARING)),
+        }
+        // A former owner that kept a copy of `fb`, mapped or not, or sent
+        // one on, still reaches the buffer: the driver and init hold the
+        // only references it may have (FB_REFS).
+        if sys::memory_info(&self.fb).is_ok_and(|info| info.refs > FB_REFS) {
+            return Answer::Status(code(BUSY));
         }
         let label = match self.owner.open() {
             Ok(label) => label,

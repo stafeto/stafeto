@@ -262,6 +262,7 @@ fn mem_create_takes_the_whole_object_at_once() -> Outcome {
             size: PAGES * PAGE as u64,
             pages: PAGES,
             mappings: 0,
+            refs: 1,
         }),
         "MEMORY does not count every page of a new object as owned",
     )?;
@@ -294,7 +295,7 @@ fn closed_object_gives_its_frames_back() -> Outcome {
 
 /// object_info(MEMORY) takes a memory object's handle with no right needed
 /// and returns its size in bytes, the pages whose frames it owns, all of a
-/// new object, and its mappings, none yet, in x1-x3, and nothing past them
+/// new object, its mappings, none yet, and its references, in x1-x4, and nothing past them
 /// (spec 11). A process and the system resource are WRONG_TYPE for it, a
 /// memory object is WRONG_TYPE for the kinds of a process and for
 /// KERNEL_STATS, and a closed handle is BAD_HANDLE; x0 alone changes.
@@ -319,6 +320,7 @@ fn memory_info_cases(bare: u64, gone: u64) -> Outcome {
         size: 3 * PAGE as u64,
         pages: 3,
         mappings: 0,
+        refs: 2,
     };
     let wrong = [
         (own().raw().0, memory, Error::WrongType),
@@ -331,8 +333,8 @@ fn memory_info_cases(bare: u64, gone: u64) -> Outcome {
     .into_iter()
     .all(|(h, kind, error)| x0_alone::<N>(&[h, kind, 0], error.code()));
     check(
-        after[0] == 0 && after[1..4] == three.to_words() && after[4..] == x[4..],
-        "MEMORY through a copy with no rights did not give the size, the pages and no mapping in x1-x3 alone",
+        after[0] == 0 && after[1..5] == three.to_words() && after[5..] == x[5..],
+        "MEMORY through a copy with no rights did not give the size, the pages and no mapping and two references in x1-x4 alone",
     )?;
     check(
         wrong,
