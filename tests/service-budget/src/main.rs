@@ -756,12 +756,13 @@ static CYC_RUN: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYC_WALL: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYCLES: AtomicU64 = AtomicU64::new(0);
 
-/// The ticks `serve` of the service `which` has charged (`BudgetInfo::ran`), or 0.
-fn ran_of(budget: &Option<Handle<rt::handle::Budget>>) -> u64 {
+/// The ticks `serve` of the service has charged (`BudgetInfo::ran`), or None when init gave the
+/// probe no copy of the budget (a probe that reads nothing fails the run).
+fn ran_of(budget: &Option<Handle<rt::handle::Budget>>) -> Option<u64> {
     budget
         .as_ref()
         .and_then(|b| sys::budget_info(b).ok())
-        .map_or(0, |i| i.ran)
+        .map(|i| i.ran)
 }
 
 /// The e of the service `which` (index of SERVICES): the control phase of its C.
@@ -951,13 +952,21 @@ fn starve(
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
-    let (ran_before, began) = (ran_of(budget), time::now());
+    let Some(ran_before) = ran_of(budget) else {
+        println!("svcbudget1 {name} FAILED no ran-{name}");
+        return;
+    };
+    let began = time::now();
     start_all(&clients);
     sys::thread_start(&victim_thread).expect("start the victim");
     sleep_until(wait, timer, now_ns() + 155 * MS);
     STOP.store(true, Relaxed);
     wait_ended(wait, timer, n as u64);
     let (ran_after, ended) = (ran_of(budget), time::now());
+    let Some(ran_after) = ran_after else {
+        println!("svcbudget1 {name} FAILED no ran-{name}");
+        return;
+    };
     let (worst, median, cycles) = duty_windows();
     let e = e_of(which);
     // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
@@ -1120,9 +1129,41 @@ fn wait_ended_clients(wait: &Handle<Channel>, timer: &Handle<Timer>, clients: u6
     println!("svcbudget1 a client did not end");
 }
 
+/// The service whose starvation phase alone the image runs (features `break-only-*`, for the
+/// images of `cargo xtask budget-breaks` in which that service binds no budget): the account of
+/// its budget is all they judge, so no control phase, no level-40 phase and no other service
+/// runs.
+fn only_service() -> Option<usize> {
+    if cfg!(feature = "break-only-ramfs") {
+        Some(0)
+    } else if cfg!(feature = "break-only-pipe") {
+        Some(1)
+    } else if cfg!(feature = "break-only-tty") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 /// The one-CPU probe: the replies, then for each service the starvation and the level-40 phase.
 fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Handle<Timer>) {
     replies(&start.process, wait, timer);
+    if let Some(which) = only_service() {
+        let observed = [
+            rt::budget::take(start, "ran-ramfs"),
+            rt::budget::take(start, "ran-pipe"),
+            rt::budget::take(start, "ran-tty"),
+        ];
+        starve(
+            &start.process,
+            &start.parent,
+            which,
+            &observed[which],
+            wait,
+            timer,
+        );
+        return;
+    }
     // The control phases first: they measure e for the two C of the services.
     let ramfs_budget = rt::budget::take(start, "ctl-ramfs");
     let pipe_budget = rt::budget::take(start, "ctl-pipe");

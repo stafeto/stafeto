@@ -193,6 +193,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("loader-channels", 19),
     ("image-gates", 5),
     ("ramfs-cleanup", 4),
+    ("service-budget", 60),
     ("posix-poll", 26),
     ("posix-sock", 25),
     ("posix-sock-steps", 11),
@@ -321,6 +322,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "init tests",
     "service tests",
     "kernel tests",
+    "budget-breaks",
 ];
 
 fn weight(name: &str) -> u32 {
