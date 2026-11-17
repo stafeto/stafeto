@@ -89,13 +89,17 @@ static int ring_wait(void) {
     return phase == 'X' ? -1 : 0;
 }
 static void *ring_worker(void *unused) { (void)unused; ring_wait(); return NULL; }
+static unsigned ring_barrier_rounds;
+/* The phases only advance, so a record that showed the wanted phase is not read again:
+ * each round costs ramfs only the records still missing. */
 static int ring_barrier(char wanted, unsigned count) {
     struct timespec tick = {0, 10000000};
-    for (unsigned n = 0; n < 300; ++n) {
-        unsigned got = 0;
+    unsigned char seen[16] = {0};
+    unsigned got = 0;
+    for (ring_barrier_rounds = 0; ring_barrier_rounds < 300; ++ring_barrier_rounds) {
         for (unsigned i = 0; i < count; ++i) {
             struct ring_record record;
-            if (ring_read(i, &record) && record.phase == wanted) ++got;
+            if (!seen[i] && ring_read(i, &record) && record.phase == wanted) { seen[i] = 1; ++got; }
         }
         if (got == count) return 1;
         nanosleep(&tick, NULL);
@@ -127,7 +131,7 @@ static int ring_coordinator(void) {
     clock_gettime(CLOCK_MONOTONIC, &began);
     int slept = ring_barrier('S', 15);
     clock_gettime(CLOCK_MONOTONIC, &ended);
-    printf("posix-procs: ring barrier S %s after %ld ms\n", slept ? "met" : "timed out",
+    printf("posix-procs: ring barrier S %s after %u rounds, %ld ms\n", slept ? "met" : "timed out", ring_barrier_rounds,
            (long)((ended.tv_sec - began.tv_sec) * 1000 + (ended.tv_nsec - began.tv_nsec) / 1000000));
     if (!slept) {
         bad = 1;
