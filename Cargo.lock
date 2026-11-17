@@ -217,6 +217,7 @@ dependencies = [
  "firmware-tree",
  "kboot",
  "posix-random",
+ "rtc",
  "uefi",
  "uefi-raw",
 ]

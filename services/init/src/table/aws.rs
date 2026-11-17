@@ -346,7 +346,8 @@ pub const TABLE: &[Record] = &[
     // The process service with the pool of the shell's image and the quotas of a command of
     // the try-out (nginx, nginx-fast, the SSH server and its sessions).
     PROCESS_SERVICE,
-    // No PL031 on EC2: the clock starts at the time the image was built.
+    // No PL031 on EC2: the clock starts at the time of the firmware, which the EFI loader writes
+    // into the file `boot-time` of the image (UEFI GetTime); without it, at 2026-01-01.
     named(super::ramfs::POSIX_ABI_TABLE, "clock"),
     named(DIALOG, "pipe"),
     ENTROPY,
