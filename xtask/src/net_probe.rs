@@ -1568,10 +1568,9 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
 /// a step and the groups the pass of sending visits (the rule is
 /// `netd::choose`): the image with the breakdown of the step (feature
 /// `split`) runs `s` at 256 places, the rule reads the 90th percentiles of its
-/// parts, and the acceptance runs at the choice. The choice is written in
-/// `netd::ring`. The acceptance runs at the numbers `netd::ring` has and fails
-/// when a measured step passes the bound; the rule's own choice is printed and
-/// a difference from the code is a note.
+/// parts, and the acceptance runs at the numbers `netd::ring` has and fails
+/// when a measured step passes the bound; the rule's own choice is printed
+/// and a difference from the code is a note.
 pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     use netd::choose;
     let split_programs = measured_programs(None, &["split"]);
