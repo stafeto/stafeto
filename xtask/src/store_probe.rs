@@ -598,10 +598,23 @@ fn apart(lines: &[String]) -> Vec<String> {
 /// package service come while every service starts and print at once, and the console drops some of
 /// them under -icount.
 fn steady_lines(world: &World) -> Vec<String> {
-    full_lines(world, true)
-        .into_iter()
-        .filter(|l| !l.starts_with("pkgd: "))
-        .collect()
+    measured(true, full_lines(world, true))
+}
+
+/// The lines `wanted` of a run, less those of the package service when the run is measured
+/// (`steps`): the service prints them while every service starts, the kernel log holds a bounded
+/// number of records and says `[kernel log: N records lost]` when a burst overruns it, so a short
+/// line of the start (one record) may be among the lost. The lines of the probe come after the
+/// start and stay.
+fn measured(steps: bool, wanted: Vec<String>) -> Vec<String> {
+    if steps {
+        wanted
+            .into_iter()
+            .filter(|l| !l.starts_with("pkgd: "))
+            .collect()
+    } else {
+        wanted
+    }
 }
 
 /// `expect` for a run under -icount on the machine of the firmware, where the lines of the services come
@@ -745,7 +758,7 @@ fn steps() -> Result<(), String> {
     let file = Disk::new("steps");
     let layout = write_disk(&file, Some(&contents))?.ok_or("no layout")?;
     let lines = run(&image(true)?, &file.0, true)?;
-    expect(&lines, &disk_lines(&layout)[..4])?;
+    expect(&lines, &measured(true, disk_lines(&layout)[..4].to_vec()))?;
     // The full scenario under the same measurement: every method of the service comes.
     let full = full_run(true)?;
     let both = |tag: &str| merge(longest_steps(&lines, tag), longest_steps(&full, tag));
@@ -1104,13 +1117,16 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The second run: the same machine on the same disk file.
     let second = run(&image, &file.0, steps)?;
-    let wanted = [
+    let wanted = measured(
+        steps,
+        vec![
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
         "store-probe: restart: hello runs, big, the settings and the serial are in place, wide and keyb are not".to_string(),
         "store-probe: ok".to_string(),
         format!("store-probe: status generation={generation} free={free} disk={}", disk - 1),
-    ];
+        ],
+    );
     expect(&second, &wanted)?;
     println!(
         "store-probe: full: hello installed (signed by the development key, {blocks_hello} blocks), every refusal, NOT_ALLOWED without UID 0, a group of big and wide, the settings, the serial and the list of revocations, REMOVE; after the restart the packages, the settings and the serial are in place (generation {generation}, {free} blocks free): ok"
@@ -1334,13 +1350,16 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         steps,
         if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
     )?;
-    let wanted = [
+    let wanted = measured(
+        steps,
+        vec![
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
         "store-probe: restart: hello runs, big, the settings and the serial are in place, wide and keyb are not".to_string(),
         "store-probe: ok".to_string(),
         format!("store-probe: status generation={generation} free={free} disk={}", disk - 1),
-    ];
+        ],
+    );
     expect(&second, &wanted)?;
     println!(
         "nvme-persist: on QEMU's NVMe disk the full scenario of the store probe passed (hello, {blocks_hello} blocks, every refusal, a group of big and wide, the settings, the serial, REMOVE), QEMU was killed, and the machine started again on the same file found hello installed and running, the settings and the serial in place (generation {generation}, {free} blocks free): ok; {nvme_line}"
