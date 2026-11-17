@@ -1200,6 +1200,104 @@ fn tls_in_guest(run: &mut qemu::Run) -> Result<(), String> {
     Ok(())
 }
 
+/// The host side of step 4e: `ROUNDS` times, `PER_ROUND` connections to the
+/// forwarded TLS port, then each closed the way `mode` says: `reset` (RST at
+/// once), `hello` (three bytes of a record, then RST), `idle` (held for two
+/// seconds, then an ordinary close).
+const ABUSE_CLIENT: &str = r#"
+import socket, struct, sys, time
+port, mode, rounds, per = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+rst = struct.pack("ii", 1, 0)
+for _ in range(rounds):
+    conns = []
+    for _ in range(per):
+        s = socket.socket()
+        s.settimeout(3)
+        try:
+            s.connect(("127.0.0.1", port))
+        except OSError:
+            s.close()
+            continue
+        conns.append(s)
+    time.sleep(2 if mode == "idle" else 0.5)
+    for s in conns:
+        try:
+            if mode == "hello":
+                s.send(b"\x16\x03\x01")
+            if mode != "idle":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+        except OSError:
+            pass
+        s.close()
+"#;
+
+/// Step 4e: connections to the TLS port that end before any handshake, then
+/// an ordinary request. Each connection that the peer resets while it waits
+/// for `accept` leaves its socket of the queue closed, and the queues of the
+/// four workers (16 each) are gone after 64 of them: the SYNs of the next
+/// client go unanswered (stafeto-design#763). The workers are stopped
+/// (SIGSTOP) while the connections come and go, so that every connection
+/// is still in the queue when it ends.
+pub(crate) fn tls_abuse(run: &mut qemu::Run, tls: &Tls, workers: &[u32]) -> Result<(), String> {
+    let pids: Vec<String> = workers.iter().map(u32::to_string).collect();
+    let pids = pids.join(" ");
+    for (mode, stopped, rounds, per) in [
+        ("reset", true, 8, 12),
+        ("hello", true, 8, 12),
+        ("idle", false, 2, 40),
+    ] {
+        let at = Instant::now();
+        if stopped {
+            run.send(&format!("kill -STOP {pids}"))?;
+            marker(run, &format!("stop-{mode}"), DIALOG_STEP)?;
+        }
+        let ran = Command::new("python3")
+            .args(["-I", "-c", ABUSE_CLIENT])
+            .arg(tls.port.to_string())
+            .args([mode, &rounds.to_string(), &per.to_string()])
+            .output()
+            .map_err(|e| format!("4e {mode}: python3: {e}"));
+        if stopped {
+            run.send(&format!("kill -CONT {pids}"))?;
+            marker(run, &format!("cont-{mode}"), DIALOG_STEP)?;
+        }
+        let ran = ran?;
+        if !ran.status.success() {
+            return Err(format!(
+                "4e {mode}: the client ended with {}: {}",
+                ran.status,
+                last_lines(&String::from_utf8_lossy(&ran.stderr))
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let out = tls.file(&format!("abuse-{mode}.html"));
+        let ended = tls.curl(
+            true,
+            &[
+                arg("--max-time"),
+                arg("20"),
+                arg("-o"),
+                arg(out.to_string_lossy()),
+                tls.url("/index.html"),
+            ],
+        )?;
+        if ended.code != 0 {
+            return Err(format!(
+                "4e {mode}: after {rounds} rounds of {per} connections that ended before the handshake curl ended with {}: {}",
+                ended.code,
+                last_lines(&ended.said)
+            ));
+        }
+        same_file(&format!("4e {mode}: the page"), &out, rootfs::www_index())?;
+        println!(
+            "nginx-probe: 4e {mode}: {} connections ended before the handshake, the next request got the page ({} ms)",
+            rounds * per,
+            at.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
 /// What h2load said, judged: TLS 1.3, h2, every request a 2xx; the rate in
 /// requests a second.
 fn h2load_verdict(said: &str) -> Result<f64, String> {
@@ -1360,6 +1458,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         if !steps {
             tls_unknown_ca(&tls)?;
             tls_in_guest(&mut run)?;
+            tls_abuse(&mut run, &tls, &workers)?;
             h2load(tls.port)?;
         }
         // 5 (and 4b again), 6.
