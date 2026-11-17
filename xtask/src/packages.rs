@@ -672,6 +672,8 @@ pub fn check() -> Result<(), String> {
         "boot-fast-nginx.img",
         "boot-fast-scale.img",
         "boot-fast-switch.img",
+        "boot-aws.img",
+        "boot-aws-qemu.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -819,7 +821,13 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         "boot-full.img" => load(),
         other if without_name(other).is_some() => without(load()?, without_name(other).unwrap()),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
-        "boot-aws.img" => of(&[Group::Base]),
+        // The try-out on EC2 (and its image on QEMU): the base packages, the network ones
+        // (nginx, OpenSSL, curl, Dropbear) and the F-Stack ones (`nginx-fast`, a consumer of the
+        // switch, which `of` leaves out for the images with no second device).
+        "boot-aws.img" | "boot-aws-qemu.img" => Ok(load()?
+            .into_iter()
+            .filter(|p| [Group::Base, Group::Net, Group::Fstack].contains(&p.group()))
+            .collect()),
         "boot-net.img"
         | "boot-net-rc.img"
         | "boot-net-its.img"
