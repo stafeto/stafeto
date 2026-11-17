@@ -40,6 +40,12 @@ const MS: u64 = 1_000_000;
 /// at when their budget is spent, `low` in init's table: above every POSIX process, below the
 /// network service at 35), so the guarantee is judged for a victim above 32 and below 35.
 const VICTIM_LEVEL: u8 = 34;
+/// The level of the victim of the starvation phase of the lower levels: the services work at level
+/// 1 once their budgets are spent, so the guarantee covers every level above 1, a POSIX
+/// process's level (10) among them.
+const LOW_VICTIM_LEVEL: u8 = 10;
+/// The level the duty-cycled victim of the phase in progress works at.
+static DUTY_LEVEL: AtomicU64 = AtomicU64::new(VICTIM_LEVEL as u64);
 const PAGE: usize = 4096;
 /// The buckets of 1 ms the time of the victim is noted in.
 const BUCKETS: usize = 256;
@@ -818,10 +824,11 @@ extern "C" fn victim_duty(_: u64) -> ! {
     let end = END.load(Relaxed);
     let gap_ticks = time::ns_to_ticks(GAP_NS);
     let want = time::ns_to_ticks(800_000);
-    let Ok(channel) = sys::channel_create_wait(VICTIM_LEVEL) else {
+    let level = DUTY_LEVEL.load(Relaxed) as u8;
+    let Ok(channel) = sys::channel_create_wait(level) else {
         sys::thread_exit()
     };
-    let Ok(timer) = sys::timer_create(&channel, VICTIM_LEVEL) else {
+    let Ok(timer) = sys::timer_create(&channel, level) else {
         sys::thread_exit()
     };
     let mut i = 0u64;
@@ -901,7 +908,14 @@ fn starve(
     which: usize,
     wait: &Handle<Channel>,
     timer: &Handle<Timer>,
+    level: u8,
 ) {
+    DUTY_LEVEL.store(u64::from(level), Relaxed);
+    let phase = if level == VICTIM_LEVEL {
+        "starve"
+    } else {
+        "starve_low"
+    };
     let name = SERVICES[which];
     let n = GREEDIES;
     let sessions: [Option<Handle<Channel>>; GREEDIES] = core::array::from_fn(|i| {
@@ -927,7 +941,7 @@ fn starve(
     CYCLES.store(0, Relaxed);
     CLIENTS.store(n, Relaxed);
     let clients = spawn_greedies(process, 0);
-    let victim_thread = spawn_on(process, 0, victim_duty, 0, VICTIM_LEVEL, 0);
+    let victim_thread = spawn_on(process, 0, victim_duty, 0, level, 0);
     let now = time::now();
     START.store(now, Relaxed);
     END.store(now + time::ns_to_ticks(150 * MS), Relaxed);
@@ -945,7 +959,7 @@ fn starve(
     let remainder = loss_us.saturating_sub(explained);
     let bound = 1000 - (explained + ALLOWANCE_US[which]) / 8;
     println!(
-        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={}",
+        "svcbudget1 {name} {phase} clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={}",
         C_US[which], ALLOWANCE_US[which]
     );
 }
@@ -1100,7 +1114,22 @@ fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Han
     control_budget(&start.process, ramfs_budget, 250, 0, wait, timer);
     control_budget(&start.process, pipe_budget, 75, 1, wait, timer);
     for which in 0..SERVICES.len() {
-        starve(&start.process, &start.parent, which, wait, timer);
+        starve(
+            &start.process,
+            &start.parent,
+            which,
+            wait,
+            timer,
+            VICTIM_LEVEL,
+        );
+        starve(
+            &start.process,
+            &start.parent,
+            which,
+            wait,
+            timer,
+            LOW_VICTIM_LEVEL,
+        );
         level40(&start.process, &start.parent, which, wait, timer);
     }
 }

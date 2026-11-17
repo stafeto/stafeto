@@ -8,10 +8,11 @@
 //! spins 0.8 ms and sleeps 0.2 ms (the starvation phase), and a thread at 40 asks every 1037 us
 //! while 8 clients at 20 queue the dear request (the level-40 phase). The two-CPU probe
 //! (`two-cpu`) prints its numbers for information: its emulator advances the clock of CPU 0
-//! while CPU 1 runs. The guarantee the probe checks: a service whose budget is spent works at
-//! level 32 and takes at most C of each T from the levels 33 and above, which is why the victim
-//! sits at 34 (below the network service at 35); for the levels at or below 32 the three
-//! services are services without a budget and the probe promises nothing.
+//! while CPU 1 runs. The guarantee the probe checks: a service whose budgets are spent works at
+//! level 1 and takes at most C of each T (its `serve` and `turns` together) from every level
+//! above it, which is why a victim at 34 (below the network service at 35) and one at 10 (a
+//! POSIX process's level) are both held to the share the sum of the C leaves them. The own work
+//! of a service runs in its turns thread under the `turns` budget, carved out of `serve`.
 //!
 //! Two limits of the gates. The starvation gate is a regression check on the cost of a budget:
 //! it cannot see a missing budget, because the work 24 clients refill in a cycle is small (the
@@ -226,12 +227,15 @@ pub fn verdict(all: &[Numbers], control: &[(u64, u64, u64)]) -> Result<(), Strin
     Ok(())
 }
 
-/// The lines each service prints when it runs its request thread under its budget.
+/// The lines each service prints when it runs its request thread and its turns thread under
+/// their budgets.
 pub fn require_service_budget_lines(lines: &[String]) -> Result<(), String> {
     for service in SERVICES {
-        let wanted = format!("{service}: serve runs under its budget");
-        if !lines.iter().any(|l| l.contains(&wanted)) {
-            return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
+        for thread in ["serve", "turns"] {
+            let wanted = format!("{service}: {thread} runs under its budget");
+            if !lines.iter().any(|l| l.contains(&wanted)) {
+                return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
+            }
         }
     }
     Ok(())
@@ -297,6 +301,10 @@ pub struct One {
     pub worst10: u64,
     pub median10: u64,
     pub bound10: u64,
+    /// The same for the victim at a lower level (10), which the services at level 1 once
+    /// their budgets are spent must leave its share too.
+    pub low_worst10: u64,
+    pub low_bound10: u64,
     pub c_us: u64,
     pub e_us: u64,
     pub remainder_us: u64,
@@ -323,7 +331,7 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
     for name in SERVICES {
         let prefix = format!("svcbudget1 {name} ");
         let mut one = One::default();
-        let (mut starved, mut leveled) = (false, false);
+        let (mut starved, mut leveled, mut starved_low) = (false, false, false);
         for line in lines.iter().filter_map(|l| l.strip_prefix(&prefix)) {
             if line.starts_with("FAILED") {
                 return Err(format!("{name}: {line}"));
@@ -337,6 +345,10 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
                 one.median10 = number(line, "median10=")?;
                 one.bound10 = number(line, "bound10=")?;
                 one.c_us = number(line, "c_us=")?;
+            } else if line.starts_with("starve_low ") {
+                starved_low = true;
+                one.low_worst10 = number(line, "worst10=")?;
+                one.low_bound10 = number(line, "bound10=")?;
             } else if line.starts_with("level40 ") {
                 leveled = true;
                 one.requests_per_ping = number(line, "requests_per_ping=")?;
@@ -347,7 +359,7 @@ pub fn parse_one(lines: &[String]) -> Result<Vec<One>, String> {
                 one.bound_us = number(line, "bound_us=")?;
             }
         }
-        if !starved || !leveled {
+        if !starved || !leveled || !starved_low {
             return Err(format!("{name}: the lines of the phases are missing"));
         }
         all.push(one);
@@ -369,6 +381,12 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
             return Err(format!(
                 "{name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}",
                 o.worst10, o.bound10
+            ));
+        }
+        if o.low_worst10 < o.low_bound10 {
+            return Err(format!(
+                "{name}: the victim at level 10 kept {} per mille of its active time in its worst 10 cycles, under {}: the service took the CPU above the levels below its budgets",
+                o.low_worst10, o.low_bound10
             ));
         }
     }
@@ -394,7 +412,9 @@ pub fn verdict_level40(all: &[One]) -> Result<(), String> {
 fn one_table(all: &[One]) {
     for (name, o) in SERVICES.iter().zip(all) {
         println!(
-            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
+            "service-budget: {name}: victim at 10 {} per mille (bound {}); worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
+            o.low_worst10,
+            o.low_bound10,
             o.worst10,
             o.median10,
             o.bound10,
@@ -667,10 +687,15 @@ mod tests {
     fn the_lines_of_the_budgets_are_required_of_each_service() {
         let mut all: Vec<String> = SERVICES
             .iter()
-            .map(|s| format!("{s}: serve runs under its budget"))
+            .flat_map(|s| {
+                [
+                    format!("{s}: serve runs under its budget"),
+                    format!("{s}: turns runs under its budget"),
+                ]
+            })
             .collect();
         assert!(require_service_budget_lines(&all).is_ok());
-        all.remove(1);
+        all.remove(2);
         assert!(
             require_service_budget_lines(&all)
                 .unwrap_err()

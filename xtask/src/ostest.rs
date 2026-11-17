@@ -124,7 +124,7 @@ pub enum Ended {
 pub fn service_line(line: &str) -> bool {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    const EXACT: [&str; 11] = [
+    const EXACT: [&str; 14] = [
         "init: services started",
         "ramfs: ready",
         "posix-process: ready (records with their processes, root by init's table)",
@@ -137,6 +137,9 @@ pub fn service_line(line: &str) -> bool {
         "ramfs: serve runs under its budget",
         "pipe: serve runs under its budget",
         "tty: serve runs under its budget",
+        "ramfs: turns runs under its budget",
+        "pipe: turns runs under its budget",
+        "tty: turns runs under its budget",
     ];
     if EXACT.contains(&line) {
         return true;
