@@ -2218,6 +2218,25 @@ impl Driver<'_> {
             self.inst.device.bad_sum,
             self.inst.net.demux.probe_max
         );
+        let counters = &self.inst.net.counters;
+        rt::println!(
+            "net: queues syn_dropped {} queue_reaped {} embryo_recycled {}",
+            counters.syn_dropped,
+            counters.queue_reaped,
+            counters.embryo_recycled
+        );
+        for (place, l) in self.inst.net.socks.iter().enumerate() {
+            if l.listening && (l.syn_dropped | l.queue_reaped | l.embryo_recycled) != 0 {
+                rt::println!(
+                    "net: listener place {} port {} syn_dropped {} queue_reaped {} embryo_recycled {}",
+                    place,
+                    l.port,
+                    l.syn_dropped,
+                    l.queue_reaped,
+                    l.embryo_recycled
+                );
+            }
+        }
         rt::println!(
             "net: yield deferred {} idle {} served {}",
             self.yielding.deferred,
