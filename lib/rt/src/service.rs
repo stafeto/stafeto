@@ -1130,26 +1130,34 @@ fn request<S: Service<K>, const K: usize>(
         token: Some(token),
         reply: None,
     };
-    let at = seat.expect("seated");
-    let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
-    if let Answer::Status(refusal) = &answer
-        && r.token.is_some()
-        && service.refused_for_room(r.header.method, *refusal) != Refusal::Other
-    {
-        let settled = service.settle(table);
-        if bare && settled != Settled::Nothing {
-            let seat = session_index::<S, K>(service, table, label, place, issued);
-            if let Some(at) = seat {
-                answer = service.request(table[at].as_mut().expect("seated"), &mut r);
-                if let Answer::Status(again) = &answer
-                    && settled == Settled::Pending
-                    && service.refused_for_room(r.header.method, *again) == Refusal::Retry
+    let mut at = seat.expect("seated");
+    // One call site of the handler (two inlined copies double the frame of the loop): a request
+    // refused for room goes round once more after the steps of cleanup.
+    let (mut again, mut settled) = (false, Settled::Nothing);
+    let answer = loop {
+        let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
+        if let Answer::Status(refusal) = &answer {
+            if again {
+                if settled == Settled::Pending
+                    && service.refused_for_room(r.header.method, *refusal) == Refusal::Retry
                 {
                     answer = Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN));
                 }
+            } else if r.token.is_some()
+                && service.refused_for_room(r.header.method, *refusal) != Refusal::Other
+            {
+                settled = service.settle(table);
+                if bare
+                    && settled != Settled::Nothing
+                    && let Some(next) = session_index::<S, K>(service, table, label, place, issued)
+                {
+                    (at, again) = (next, true);
+                    continue;
+                }
             }
         }
-    }
+        break answer;
+    };
     let Some(token) = r.token.take() else {
         return;
     };

@@ -7196,48 +7196,39 @@ const TICK_NS: u64 = 16;
 
 /// The most a wait of kind `kind` of the service with the tag `tag` may last, in ticks. The
 /// tags are 2 for the RAM service, 4 for the pipe service and 5 for the terminal service; T and C
-/// come from the budgets in init's table. A service that has a budget makes its calls at the
-/// level `low` (32) once the budget is spent, and the levels above it work inside the wait:
+/// come from the budgets (`serve`) in init's table. A service that has a budget makes its calls
+/// at the level `low` (1) once the budget is spent, so a call waits for the replenishment that
+/// gives the calling thread its own level back, T - C, for each service in the chain that is
+/// demoted (a hop, counted once), and the levels above work inside the wait:
 ///
-/// - the waits of kinds 64 to 66 (a notification, maintenance, a session that is gone) may last
-///   until the replenishment gives the caller its own level back, T - C, so their bound is
-///   CALL_WAIT_MAX + ticks(T - C);
-/// - every request of the terminal service (tag 5) has the same CALL_WAIT_MAX + ticks(T - C): a
-///   request may call the process service (a TtySignal, a vouch), which queues the walk of a
-///   TtySignal and works at its own level less TTY_STEP_BELOW (52 - 3 = 49, below the
-///   terminal's 50) while it is queued. A terminal that spent its budget calls from 32, below
-///   that walk, and its call returns once the steps of the walk (a crowd of 64 members: eight
-///   steps of 7,000 ticks and more) have run or the replenishment gives it level 50 back, T - C
-///   at the most. Seen 86,546 ticks of kind 21 (the probe's TtySignal to a crowd of 64) and
-///   42,306 of kind 28 (Detach);
-/// - every other kind has CALL_WAIT_MAX + ticks(C1 + C2 + C3), the C of the three budgets, as
-///   each of the other two services and the service itself may take its C above 32 once inside
-///   the wait (a wait is shorter than T);
+/// - the waits of kinds 64 to 66 (a notification, maintenance, a session that is gone) and every
+///   request of the terminal service (tag 5: a request may call the process service, a
+///   TtySignal or a vouch, which queues the walk of a TtySignal) have one hop, the service's
+///   own: CALL_WAIT_MAX + ticks(T - C);
+/// - every other kind may call another of the three services, which may itself be demoted, so
+///   its bound is CALL_WAIT_MAX plus the hops of the three services, one each;
 /// - a service without a budget keeps CALL_WAIT_MAX.
+///
+/// Every term comes from the table's constants.
 fn call_wait_max(tag: &str, kind: usize) -> u64 {
-    let budgets = match tag {
+    let budgets = |tag: &str| match tag {
         "2" => init::table::ramfs::RAM_BUDGETS,
         "4" => init::table::ramfs::PIPE_BUDGETS,
         "5" => init::table::ramfs::TTY_BUDGETS,
         _ => &[],
     };
-    match budgets.first() {
-        Some(b) if (64..=66).contains(&kind) || tag == "5" => {
-            CALL_WAIT_MAX + (b.t_ns - b.c_ns) / TICK_NS
-        }
-        Some(_) => {
-            let c_ns: u64 = [
-                init::table::ramfs::RAM_BUDGETS,
-                init::table::ramfs::PIPE_BUDGETS,
-                init::table::ramfs::TTY_BUDGETS,
-            ]
-            .iter()
-            .filter_map(|b| b.first())
-            .map(|b| b.c_ns)
-            .sum();
-            CALL_WAIT_MAX + c_ns / TICK_NS
-        }
-        None => CALL_WAIT_MAX,
+    let hop = |tag: &str| {
+        budgets(tag)
+            .first()
+            .map_or(0, |b| (b.t_ns - b.c_ns) / TICK_NS)
+    };
+    if budgets(tag).is_empty() {
+        return CALL_WAIT_MAX;
+    }
+    if (64..=66).contains(&kind) || tag == "5" {
+        CALL_WAIT_MAX + hop(tag)
+    } else {
+        CALL_WAIT_MAX + hop("2") + hop("4") + hop("5")
     }
 }
 
@@ -14498,27 +14489,31 @@ mod tests {
         assert_eq!(call_wait_max("5", 10), 355_812);
         let seen = vec!["service wait: 5 kind 21 86546 ticks of 92072".to_owned()];
         assert!(check_waits(&seen, &["5"], "t").is_ok());
+        let ram_hop = if on("2") { 296_875 } else { 0 };
         for tag in ["4", "5"] {
             assert_eq!(call_wait_max(tag, 65), 355_812);
             assert_eq!(call_wait_max(tag, 64), 355_812);
             assert_eq!(call_wait_max(tag, 66), 355_812);
-            // The other kinds: the C of the three budgets, 400 us = 25 000 ticks.
-            let all = if init::table::ramfs::RAM_BUDGET_ON {
-                25_000
-            } else {
-                9_375
-            };
-            if tag == "4" {
-                assert_eq!(call_wait_max(tag, 63), CALL_WAIT_MAX + all);
-                assert_eq!(call_wait_max(tag, 10), CALL_WAIT_MAX + all);
-            }
         }
+        // The other kinds of the pipe service: the hops of the three services, one each.
+        assert_eq!(
+            call_wait_max("4", 63),
+            CALL_WAIT_MAX + ram_hop + 2 * 307_812
+        );
+        assert_eq!(
+            call_wait_max("4", 10),
+            CALL_WAIT_MAX + ram_hop + 2 * 307_812
+        );
         // The RAM service: (5 ms - 250 us) / 16 ns = 296 875 ticks more.
         let ram = if on("2") { 344_875 } else { CALL_WAIT_MAX };
         assert_eq!(call_wait_max("2", 65), ram);
         assert_eq!(
             call_wait_max("2", 25),
-            CALL_WAIT_MAX + if on("2") { 25_000 } else { 9_375 }
+            if on("2") {
+                CALL_WAIT_MAX + 296_875 + 2 * 307_812
+            } else {
+                CALL_WAIT_MAX
+            }
         );
         // A service without a budget keeps the bound.
         assert_eq!(call_wait_max("10", 65), CALL_WAIT_MAX);

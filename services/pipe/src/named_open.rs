@@ -106,8 +106,20 @@ impl PipeService {
         if let Some(ticket) = self.named.find(s.label(), open) {
             return self.named_answer(ticket, r, true);
         }
+        // A full table of tickets may hold tickets whose cleanup is still due (a signal took the
+        // cleanup of an interrupted open back): the request that finds no room does a few steps
+        // of that cleanup on its own lent time first. With cleanup left it is answered with
+        // TRY_AGAIN, and the library sends it again; with none, AGAIN.
         if !self.named_room() {
-            return status(proto_pipe::AGAIN);
+            let settled =
+                rt::service::settle_run(|| self.named.cleanup_due().then(|| self.named_cleanup()));
+            if !self.named_room() {
+                return if settled == rt::service::Settled::Pending {
+                    Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN))
+                } else {
+                    status(proto_pipe::AGAIN)
+                };
+            }
         }
         if s.data.held.count() + self.named.reservations(s.label()) >= HELD_MAX {
             return status(proto_pipe::MFILE);

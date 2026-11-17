@@ -389,8 +389,15 @@ impl<H> Waits<H> {
     /// marked for the sweep. Visits the registrations once.
     pub fn wake_all(&mut self, limit: usize, mut notify: impl FnMut(&H)) -> usize {
         let mut woken = 0;
+        // Nothing registered: no place is touched.
+        if self.free.iter().all(|w| *w == u64::MAX) {
+            return 0;
+        }
         for step in 0..CAPACITY {
             let i = (self.wake_cursor + step) % CAPACITY;
+            if self.free[i / 64] >> (i % 64) & 1 != 0 {
+                continue;
+            }
             let Some(r) = self.registrations[i].as_mut() else {
                 continue;
             };
