@@ -1,0 +1,31 @@
+[package]
+name = "datafsd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The data file service of stafeto: the files of the volume mounted at /data, littlefs on the data partition of a disk service"
+
+[[bin]]
+name = "datafsd"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's feature step-stats), for
+# the measurement under -icount.
+# `crash`: the service stops for good after the sector of the volume that
+# `STAFETO_DATAFS_CRASH_AT` names was written (`cargo xtask data-crash`): that write is torn at
+# the sector, the line `datafs: crash point N` is printed, and nothing is written again.
+[features]
+steps = ["rt/step-stats"]
+crash = []
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+datafs = { path = "../../lib/datafs" }
+proto-blk = { path = "../../proto/blk" }
+proto-data = { path = "../../proto/data" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

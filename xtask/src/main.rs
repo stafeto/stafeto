@@ -54,6 +54,7 @@ mod clock_probe;
 mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
+mod data_probe;
 mod disasm;
 mod display_probe;
 mod doom;
@@ -2228,6 +2229,8 @@ commands:
             new start of QEMU and a restart of the service, the errors the
             host injects, and the service's steps under -icount; with --hvf
             under HVF, with --plain on QEMU's emulation without -icount
+  data-probe the data file service in QEMU: a table with store and data, littlefs formatted, a series of synced file operations, the same tree after a new start of QEMU
+  data-crash [N] kill the data file service's machine in 12 places of its series of writes (or after sector N) and start it again on the same disk: every synced step is there and no file is torn
   store-probe [steps] run the package service in QEMU: a store written on the host is
             attached from the disk, the packages that fail their checks are skipped,
             a disk of zeros is formatted, the full scenario of installations, refusals,
@@ -2399,7 +2402,8 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught
+  datafs-breaks the deliberate breaks of lib/datafs fail its host tests
+  nvme-persist [breaks|lba4096|mdts1|steps|key] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2436,6 +2440,7 @@ fn main() {
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
         Some("nvme-breaks") => nvme_breaks(),
+        Some("datafs-breaks") => datafs_breaks(),
         Some("nvme-persist") => store_probe::nvme_persist(&args[1..]),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
@@ -2710,6 +2715,8 @@ fn main() {
         Some("pci-walk") => pci_walk::command_qemu(&args[1..]),
         Some("pci-walk-vz") => pci_walk::command(&args[1..]),
         Some("blk-probe") => blk_probe::command(&args[1..]),
+        Some("data-probe") => data_probe::command(&args[1..]),
+        Some("data-crash") => data_probe::crash(&args[1..]),
         Some("store-probe") => store_probe::command(&args[1..]),
         Some("store-crash") => store_probe::crash(&args[1..]),
         Some("init-wait") => init_wait::command(&args[1..]),
@@ -3018,6 +3025,41 @@ const NVME_BREAKS: [&str; 10] = [
     "break-nvme-sq-head",
     "break-nvme-abort-early",
 ];
+
+/// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
+/// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
+/// workload, the table of a new volume, the protocol) pass without it and fail with it.
+const DATAFS_BREAKS: [&str; 4] = [
+    "break-datafs-sync",
+    "break-datafs-consistent",
+    "break-datafs-busy",
+    "break-datafs-gpt-order",
+];
+
+fn datafs_breaks() -> Result<(), String> {
+    let mut ok = cargo();
+    ok.args(["test", "--package", "datafs", "--lib"]);
+    run_cmd(&mut ok)?;
+    for feature in DATAFS_BREAKS {
+        let mut broken = cargo();
+        broken.args([
+            "test",
+            "--package",
+            "datafs",
+            "--lib",
+            "--features",
+            feature,
+        ]);
+        match broken.output() {
+            Ok(o) if !o.status.success() => {
+                println!("datafs-breaks: {feature} is caught by the host tests of datafs");
+            }
+            Ok(_) => return Err(format!("{feature} passed the host tests of datafs")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
 
 fn nvme_breaks() -> Result<(), String> {
     let mut ok = cargo();
@@ -10503,12 +10545,21 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("nvme-persist steps", || {
             store_probe::nvme_persist(&["steps".to_string()])
         }),
+        job("nvme-persist key", || {
+            store_probe::nvme_persist(&["key".to_string()])
+        }),
         job("store-probe steps", || {
             store_probe::command(&["steps".into()])
         }),
         // The service built to stop at each crash point, the machine killed there and started
         // again on the same disk: the store is the whole old state or the whole new one.
         job("store-crash", || store_probe::crash(&[])),
+        // The data file service: files made, synced, renamed and removed on littlefs, the same tree
+        // after a new start of QEMU.
+        job("data-probe", data_probe::probe),
+        // The service built to stop after a chosen sector of its series, the machine killed there and
+        // started again on the same disk: every synced step is there and no file is torn.
+        job("data-crash", || data_probe::crash(&[])),
         // A record that waits for the package service's READY starts after it, at the
         // deadline of the wait, and when the service ends first.
         job("init-wait", || init_wait::command(&[])),
@@ -13589,6 +13640,10 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "nvme",
         "--package",
+        "datafs",
+        "--package",
+        "proto-data",
+        "--package",
         "proto-entropy",
         "--package",
         "posix-random",
@@ -13846,6 +13901,10 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "nvme-blk",
         "--package",
+        "datafsd",
+        "--package",
+        "data-probe",
+        "--package",
         "blk-probe",
         "--package",
         "pkgd",
@@ -13856,7 +13915,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15968,6 +16027,7 @@ mod entropy_in_images_tests {
     fn image_program_tables() -> Vec<(&'static str, &'static [ImageProgram])> {
         let tables: &[(&str, &[ImageProgram])] = &[
             ("blk_probe::PROGRAMS", &crate::blk_probe::PROGRAMS),
+            ("data_probe::PROGRAMS", &crate::data_probe::PROGRAMS),
             ("display_probe::PROGRAMS", &crate::display_probe::PROGRAMS),
             ("entropy::PROGRAMS", &crate::entropy::PROGRAMS),
             ("entropy::SEED_PROGRAMS", &crate::entropy::SEED_PROGRAMS),

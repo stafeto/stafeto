@@ -653,6 +653,7 @@ writes before it are, otherwise. The service is at level 39 with the budget `ser
 Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.SHST`) and `CC` 0
 before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
 it is given: the table names the data disk, and a disk with a system on it is never named.
+`cargo xtask nvme-persist key` runs the host key service (`datakey`) on the same kind of disk as the data volume of `datafs`: the first boot keeps the key that a stand-in for the boot script of Dropbear made, the second boot restores it, and the fingerprint line is the same on both.
 `cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
 a second NVMe controller over a file, stops QEMU once the probe has ended and nothing is in flight, and
 starts the machine again on the same file: the probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
