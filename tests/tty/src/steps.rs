@@ -471,7 +471,6 @@ pub fn input_flush_prefix(probe: &Probe, parent: &Handle<Channel>) -> Result<(),
 /// Full control-character output and mixed waits exercise shared limits.
 pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
     let stub = rt::service::connect(parent, "uart").map_err(|_| "no driver")?;
-    let before = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
     let mut out = [0; 16];
     let mut w = Writer::new();
     Control {
@@ -482,6 +481,10 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     .write(Method::Flow, &mut w)
     .map_err(fail)?;
     status_call(probe, w.as_bytes())?;
+    // The stop sends the output accepted before it in its own request (the steps that would
+    // have sent it earlier run at the service's level only while its budgets last), so the
+    // count the driver took is read once the stop has returned.
+    let before = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
     let mut w = Writer::new();
     Control {
         terminal: CONSOLE,
