@@ -29,8 +29,11 @@ fn pipe_protocol(error: Status) -> i32 {
 /// Entries stopped for the calls that carry a capability and for the cleanup
 /// of an open: a send that a signal interrupts while it is queued would drop
 /// the capability or leave the ticket of the pipe service behind, so the
-/// sends block and the request enters when the guard ends. A signal waits at
-/// most for one short call.
+/// sends block and the request enters when the guard ends. Each masked call
+/// returns a phase at once and waits at most CALL_WAIT_MAX + (T - C) of the
+/// service it calls. A signal waits for at most three such calls in a grant
+/// pass (the grant and two attaches) and four in the cleanup (payer witness,
+/// cancel, ack and close). The rendezvous wait for the peer is never masked.
 struct Masked(bool);
 impl Masked {
     fn enter() -> Self {
