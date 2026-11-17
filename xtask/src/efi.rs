@@ -386,15 +386,16 @@ pub fn vz() -> Result<(), String> {
     Ok(())
 }
 
-/// The most the firmware's time, the loader's and the clock service's may
-/// differ from the host's, in seconds.
-const TIME_SKEW: u64 = 120;
+/// The slack around the host's samples taken before and after the run, in
+/// seconds (the firmware's clock and the host's differ by rounding).
+const TIME_SKEW: u64 = 2;
 
 /// The seconds of the loader's line `efi-loader: time N from GetTime` and of
 /// the clock service's line `clock: ready (started at M from the boot
-/// image)`, each within `TIME_SKEW` of `host`, the clock's not before the
-/// loader's.
-pub fn time_lines(lines: &[String], host: u64) -> Result<(u64, u64), String> {
+/// image)`: the loader's between `before - TIME_SKEW` and
+/// `after + TIME_SKEW` (the host's samples around the run), the clock's
+/// equal to the loader's.
+pub fn time_lines(lines: &[String], before: u64, after: u64) -> Result<(u64, u64), String> {
     let number = |line: &String, before: &str, after: &str| -> Option<u64> {
         line.split_once(before)?.1.split(after).next()?.parse().ok()
     };
@@ -408,14 +409,14 @@ pub fn time_lines(lines: &[String], host: u64) -> Result<(u64, u64), String> {
         .ok_or(
             "the clock service printed no line `clock: ready (started at N from the boot image)`",
         )?;
-    if loader.abs_diff(host) > TIME_SKEW {
+    if loader + TIME_SKEW < before || loader > after + TIME_SKEW {
         return Err(format!(
-            "the loader's time {loader} is not within {TIME_SKEW} s of the host's {host}"
+            "the loader's time {loader} is outside the host's {before}..{after} (with {TIME_SKEW} s of slack)"
         ));
     }
-    if clock < loader || clock.abs_diff(host) > TIME_SKEW {
+    if clock != loader {
         return Err(format!(
-            "the clock started at {clock}: the loader said {loader}, the host's time is {host}"
+            "the clock started at {clock} and the loader said {loader}"
         ));
     }
     Ok((loader, clock))
@@ -443,23 +444,27 @@ pub fn time() -> Result<(), String> {
     make_disk(&loader, &a, &disk)?;
     wait_for_quiet_mac()?;
     let cmd = command(&EFI, &fw, &disk, true, "time")?;
-    let host = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
+    let host_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|e| e.to_string())
+    };
+    let before = host_now()?;
     let output = qemu::run_until(cmd, Duration::from_secs(180), Some("clock: ready"))?;
+    let after = host_now()?;
     crate::symbolize::backtrace(&output.lines, &a.elf);
     if let Some(p) = output.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
         return Err(format!("efi-time: {p}"));
     }
-    let (loader, clock) = time_lines(&output.lines, host).map_err(|e| {
+    let (loader, clock) = time_lines(&output.lines, before, after).map_err(|e| {
         format!(
             "efi-time: {e}; last lines: {:?}",
             output.lines.iter().rev().take(12).collect::<Vec<_>>()
         )
     })?;
     println!(
-        "efi-time: the loader wrote {loader} from GetTime, the clock service started at {clock}, the host said {host}: ok"
+        "efi-time: the loader wrote {loader} from GetTime, the clock service started at {clock}, the host said {before}..{after}: ok"
     );
     Ok(())
 }
@@ -765,28 +770,30 @@ mod tests {
 
     #[test]
     fn the_time_lines_are_read_and_checked_against_the_host() {
-        let host = 1_794_918_896;
+        let (before, after) = (1_794_918_896, 1_794_918_956);
         let lines = |loader: u64, clock: u64| {
             vec![
                 format!("efi-loader: time {loader} from GetTime"),
                 format!("clock: ready (started at {clock} from the boot image)"),
             ]
         };
-        assert_eq!(
-            time_lines(&lines(host - 3, host - 3), host),
-            Ok((host - 3, host - 3))
-        );
-        assert!(time_lines(&lines(host - 500, host - 500), host).is_err());
-        assert!(time_lines(&lines(host, host - 1), host).is_err());
-        assert!(time_lines(&lines(host, host + 500), host).is_err());
+        let check = |loader: u64, clock: u64| time_lines(&lines(loader, clock), before, after);
+        assert_eq!(check(before + 3, before + 3), Ok((before + 3, before + 3)));
+        assert!(check(before - 2, before - 2).is_ok());
+        assert!(check(after + 2, after + 2).is_ok());
+        assert!(check(before - 3, before - 3).is_err());
+        assert!(check(after + 3, after + 3).is_err());
+        assert!(check(before + 3, before + 4).is_err());
+        assert!(check(before + 3, before + 2).is_err());
+        let host = before;
         let mut no_loader = lines(host, host);
         no_loader.remove(0);
-        assert!(time_lines(&no_loader, host).is_err());
+        assert!(time_lines(&no_loader, before, after).is_err());
         let default = vec![
             "efi-loader: no time from GetTime (UNSUPPORTED)".to_string(),
             "clock: ready (unsynchronized start)".to_string(),
         ];
-        assert!(time_lines(&default, host).is_err());
+        assert!(time_lines(&default, before, after).is_err());
     }
 
     #[test]

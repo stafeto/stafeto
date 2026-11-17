@@ -713,12 +713,6 @@ fn main() -> Status {
     }
 }
 
-/// `GetMemoryMap` and `ExitBootServices` into `buf`, again on a stale key
-/// (UEFI 2.10, "EFI_BOOT_SERVICES.ExitBootServices()"), at most 4 times: the
-/// wrapper of the `uefi` crate retries once and resets the machine on a
-/// second failure, which hides the cause. Returns the final map and the
-/// attempts. After the first call only memory services are allowed, so a
-/// failure is said through the port of the SPCR.
 /// Writes the firmware's time (UEFI GetTime, read while the boot services
 /// run) into the file `boot-time` of the boot image in memory, where the
 /// clock service starts CLOCK_REALTIME on machines without a PL031 (EC2).
@@ -762,6 +756,12 @@ fn stamp_time(image: &mut [u8]) {
     }
 }
 
+/// `GetMemoryMap` and `ExitBootServices` into `buf`, again on a stale key
+/// (UEFI 2.10, "EFI_BOOT_SERVICES.ExitBootServices()"), at most 4 times: the
+/// wrapper of the `uefi` crate retries once and resets the machine on a
+/// second failure, which hides the cause. Returns the final map and the
+/// attempts. After the first call only memory services are allowed, so a
+/// failure is said through the port of the SPCR.
 fn exit_boot_services(buf: &mut [u8]) -> (Vec<Desc>, u32) {
     let handle = boot::image_handle();
     let max_tries = if cfg!(feature = "break-ebs-retry") {

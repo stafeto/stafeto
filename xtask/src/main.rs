@@ -10343,6 +10343,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("efi EFI", || efi::run(&["EFI".to_string()])),
         job("efi EFI_EL2", || efi::run(&["EFI_EL2".to_string()])),
         job("efi breaks", efi::breaks),
+        job("efi time", efi::time),
         job("smp 4 GICv2", || smp_boot(&qemu::VIRT, GIC_V2_LINE)),
         job("smp 4 GICv3", || smp_boot(&qemu::VIRT_V3, GIC_V3_LINE)),
         job("smp 4 EL2 GICv2", || smp_boot(&qemu::VIRT_EL2, GIC_V2_LINE)),
