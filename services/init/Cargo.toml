@@ -156,6 +156,9 @@ table-pci-walk-vz = []
 table-pci-walk-qemu = []
 # The disk service and its probe (xtask blk-probe).
 table-blk-probe = []
+# The data file service and its probe (xtask data-probe, data-crash).
+table-data-probe = []
+table-datakey-probe = []
 table-store-probe = []
 # The store probe on an NVMe disk found by the walk of QEMU's PCI bus under edk2 (xtask nvme-persist):
 # the disk service is the NVMe service and the platform is the one of the machines of `xtask efi`.

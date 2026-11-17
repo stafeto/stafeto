@@ -25,6 +25,7 @@ use netd::passes::Passes;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
 use netd::profile::{self, Counter};
+use netd::queue::ReapBudget;
 use netd::reuse::NO_GROUP;
 use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
@@ -928,6 +929,8 @@ impl Net {
             // A second `listen` with a larger backlog builds the queue up to
             // it; a smaller one changes nothing.
             let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
+            let l = &mut self.socks[place];
+            l.backlog = l.backlog.max(wanted as u8);
             while usize::from(self.socks[place].member_count) < wanted {
                 let own = self.socks[place].members;
                 let count = usize::from(self.socks[place].member_count);
@@ -975,6 +978,7 @@ impl Net {
         sock.listening = true;
         sock.members = members;
         sock.member_count = count as u8;
+        sock.backlog = wanted as u8;
         sock.room = count as u8;
         let (address, port) = (sock.address, sock.port);
         self.register(
@@ -992,7 +996,7 @@ impl Net {
     /// `own[..count]` already: a smoltcp socket that listens on its port and
     /// has its options. The queue of a member of a group stands in sets no
     /// other member's queue stands in.
-    fn member(
+    pub(crate) fn member(
         &mut self,
         stack: &mut Stack<'static>,
         sock: &Sock,
@@ -1008,6 +1012,9 @@ impl Net {
             grouped.then_some((listener, own, count)),
         )?;
         let handle = self.socks[m].handle?;
+        stack
+            .tcp(handle)
+            .set_timeout(Some(Duration::from_secs(crate::net::QUEUE_IDLE_S)));
         if stack
             .tcp(handle)
             .listen(listen_endpoint(sock.address, sock.port))
@@ -1290,7 +1297,9 @@ impl Net {
                 Address::v4(ip, u32::from(port))
             });
         let local = stack.tcp(handle).local_endpoint().map(peer_of);
+        stack.tcp(handle).set_timeout(None);
         self.places.set_state(m, State::Live);
+        self.embryos.clear(m);
         self.touch(m);
         // The accepted socket shares the port of the listening description
         // and keeps it after that one closes.
@@ -1324,6 +1333,9 @@ impl Net {
                 self.counters.listen_short += 1;
             }
         }
+        // A queue that stayed short (no place for a replacement before) gets
+        // one socket back.
+        self.top_up(stack, place, &mut ReapBudget::new());
         let mut w = Writer::new();
         let name = self.places.name(m);
         let data = match sockets::write_accepted(&mut w, name, &peer) {

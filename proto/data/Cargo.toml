@@ -1,0 +1,15 @@
+[package]
+name = "proto-data"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the data file service of stafeto (services/datafs): files and directories of the volume mounted at /data"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

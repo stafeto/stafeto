@@ -1,0 +1,34 @@
+[package]
+name = "datafs"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "littlefs over a block device as a library: the volume, files and directories as slots, the minimal GPT of the data volume, tested on the host with a cut of the power at every write"
+build = "build.rs"
+
+# No call of the kernel: tested on the host against a device in memory that loses power at a chosen write.
+[lib]
+bench = false
+
+[features]
+# The device in memory with the cut of the power (`datafs::mem`), for the tests of a service.
+model = []
+# The deliberate breaks of the host tests (`cargo xtask datafs-breaks`): each does one wrong thing a
+# test catches. `break-datafs-sync`: the flush of the volume does nothing, so a cut loses what was
+# synced. `break-datafs-consistent`: a mount leaves a half-done rename as it is. `break-datafs-busy`:
+# an open file may be removed. `break-datafs-gpt-order`: a new table is written start first.
+break-datafs-sync = []
+break-datafs-consistent = []
+break-datafs-busy = []
+break-datafs-gpt-order = []
+
+[dependencies]
+littlefs = { path = "../../third-party/littlefs" }
+proto-data = { path = "../../proto/data" }
+proto-wire = { path = "../../proto/wire" }
+abi = { path = "../abi" }
+
+[build-dependencies]
+cc = "1"

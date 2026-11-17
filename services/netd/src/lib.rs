@@ -34,6 +34,7 @@ pub mod pool;
 pub mod ports;
 pub mod profile;
 pub mod published;
+pub mod queue;
 pub mod resolv;
 pub mod reuse;
 pub mod ring;

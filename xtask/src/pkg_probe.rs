@@ -520,7 +520,8 @@ fn without_notices(lines: &[String]) -> Vec<String> {
 /// A line init writes to the console on its own account: the notice of the overruns of a time
 /// budget (`init: ramfs budget serve: at least 1 overruns, ...`). It comes when a budget runs
 /// out, whatever command is on the console then, so it can fall between the begin and end marks
-/// of `pkg check` or `pkg list` without being part of their output.
+/// of `pkg check` or `pkg list` without being part of their output. Every reading of `pkg list`
+/// drops these lines before it counts the packages.
 fn is_notice(line: &str) -> bool {
     line.starts_with("init: ") && line.contains(" budget ") && line.contains(" overruns")
 }
@@ -690,7 +691,7 @@ fn first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>, full: bool) -> Result<(), 
     ));
 
     // Step 2.
-    let lines = expect_code(run, "pkg list", "list1", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list1", 0, DIALOG_STEP)?);
     if lines.len() != image_count || !lines.iter().all(|l| l.ends_with("[image]")) {
         return Err(format!(
             "step 2: pkg list should list {image_count} lines of the image: {lines:?}"
@@ -737,7 +738,7 @@ fn first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>, full: bool) -> Result<(), 
     speed_report(&requests, took, began_install, &mut ctx.report)?;
 
     // Step 4.
-    let lines = expect_code(run, "pkg list", "list3", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list3", 0, DIALOG_STEP)?);
     need(&lines, "doomgeneric e257a095-1 stafeto", "step 4")?;
     need(&lines, "freedoom 0.13.0-1 stafeto [dependency]", "step 4")?;
     if lines.len() != image_count + 2 {
@@ -990,7 +991,7 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
 
     // Step 14: a dependency, the flag of the world, the removal that keeps what is needed.
     expect_code(run, "pkg install app", "app", 0, INSTALL_WITHIN)?;
-    let lines = expect_code(run, "pkg list", "list-app", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list-app", 0, DIALOG_STEP)?);
     need(&lines, "app 1.0-1 stafeto", "step 14")?;
     need(&lines, "lib 1.0-1 stafeto [dependency]", "step 14")?;
     let (lines, requests) = with_log(run, ctx, "pkg install lib", "lib", 0)?;
@@ -1002,7 +1003,7 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
     need(&lines, "pkg: lib: needed by app", "step 14")?;
     let lines = expect_code(run, "pkg remove app", "rm-app", 0, INSTALL_WITHIN)?;
     need(&lines, "removed app 1.0-1", "step 14")?;
-    let lines = expect_code(run, "pkg list", "list-lib", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list-lib", 0, DIALOG_STEP)?);
     need(&lines, "lib 1.0-1 stafeto", "step 14")?;
     if lines
         .iter()
@@ -1062,7 +1063,7 @@ fn manage(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         "pkg: sneaky: signed by a key the repository games does not trust",
         "step 16",
     )?;
-    let lines = expect_code(run, "pkg list", "list-games", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list-games", 0, DIALOG_STEP)?);
     need(&lines, "hello-games 1.0-1 games", "step 16")?;
     // The key is not changed and the repository is not removed while its package stands.
     let change = format!("pkg repo add games {} /test/bad.pub", games_address());
@@ -1099,7 +1100,7 @@ fn manage(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
             "step 17: the upgrade fetched the wrong files: {requests:?}"
         ));
     }
-    let lines = expect_code(run, "pkg list", "list-next", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "list-next", 0, DIALOG_STEP)?);
     need(&lines, "hello 2.0-1 stafeto", "step 17")?;
     if has(&lines, "hello 2.0-1 stafeto [dependency]") {
         return Err(format!(
@@ -1143,7 +1144,7 @@ fn manage(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
 
 /// The second boot, on the same disk: what was installed is there; Doom goes with its notices.
 fn second_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
-    let lines = expect_code(run, "pkg list", "b2-list", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "b2-list", 0, DIALOG_STEP)?);
     need(&lines, "doomgeneric e257a095-1 stafeto", "boot 2")?;
     need(&lines, "freedoom 0.13.0-1 stafeto [dependency]", "boot 2")?;
     need(&lines, "hello 2.0-1 stafeto", "boot 2")?;
@@ -1202,7 +1203,7 @@ fn second_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
 
 /// The third boot: the removals are the disk's, and the settings are gone with the repository.
 fn third_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
-    let lines = expect_code(run, "pkg list", "b3-list", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "b3-list", 0, DIALOG_STEP)?);
     need(&lines, "hello 2.0-1 stafeto", "boot 3")?;
     if lines.len() != ctx.image_count + 1 {
         return Err(format!(
@@ -1391,7 +1392,7 @@ fn memory_second_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), Stri
             "memory: after the reboot the store should hold 0 packages and the image {image_count}: {lines:?}"
         ));
     }
-    let lines = expect_code(run, "pkg list", "m2-list", 0, DIALOG_STEP)?;
+    let lines = without_notices(&expect_code(run, "pkg list", "m2-list", 0, DIALOG_STEP)?);
     if lines.len() != image_count || !lines.iter().all(|l| l.ends_with("[image]")) {
         return Err(format!(
             "memory: after the reboot pkg list should list the image alone: {lines:?}"

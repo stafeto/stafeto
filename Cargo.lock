@@ -81,6 +81,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "cc"
+version = "1.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -147,6 +157,62 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "data-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-data",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "datafs"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "cc",
+ "littlefs",
+ "proto-data",
+ "proto-wire",
+]
+
+[[package]]
+name = "datafsd"
+version = "0.5.0"
+dependencies = [
+ "abi",
+ "datafs",
+ "proto-blk",
+ "proto-data",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "datakey"
+version = "0.5.0"
+dependencies = [
+ "abi",
+ "posix-fs",
+ "proto-data",
+ "proto-fs",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "datakey-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-fs",
+ "proto-fs",
+ "rt",
 ]
 
 [[package]]
@@ -217,6 +283,7 @@ dependencies = [
  "firmware-tree",
  "kboot",
  "posix-random",
+ "rtc",
  "uefi",
  "uefi-raw",
 ]
@@ -298,6 +365,12 @@ dependencies = [
  "byteorder",
  "log",
 ]
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "firmware-tree"
@@ -473,6 +546,10 @@ name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
+
+[[package]]
+name = "littlefs"
+version = "2.11.3"
 
 [[package]]
 name = "loader"
@@ -1136,6 +1213,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-data"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-entropy"
 version = "0.1.0"
 dependencies = [
@@ -1440,6 +1525,12 @@ dependencies = [
  "proto-wire",
  "rt",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "smoltcp"
