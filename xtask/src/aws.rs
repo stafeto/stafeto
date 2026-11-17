@@ -38,7 +38,7 @@ const BLOCK: usize = 512 * 1024;
 const PRICE_SMALL: f64 = 0.0184;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
+       xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--switch] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP] [--session S]
@@ -1074,6 +1074,11 @@ fn image(args: &[String]) -> Result<(), String> {
         // Read once, where the program list of the image is made.
         // SAFETY: xtask is single-threaded here, before the image is built.
         unsafe { std::env::set_var("STAFETO_ENA_BREAK", if exits { "exit" } else { "1" }) };
+    }
+    if args.iter().any(|a| a == "--switch") {
+        // Read once, where the files of the image are made: `netd.conf` with `switch 8`.
+        // SAFETY: xtask is single-threaded here, before the image is built.
+        unsafe { std::env::set_var("STAFETO_AWS_SWITCH", "1") };
     }
     let its_align = args.iter().any(|a| a == "--its-align-4k");
     let its_int = its_align || args.iter().any(|a| a == "--its-int");

@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 69] = [
+const SYSTEM_PATHS: [&str; 70] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -320,6 +320,7 @@ const SYSTEM_PATHS: [&str; 69] = [
     "/etc/rc.d",
     "/etc/rc.d/ec2-key",
     "/etc/rc.d/dropbear",
+    "/etc/rc.d/fast",
     // The image with the network service: the page `httpd` serves and the
     // probe of the sockets.
     "/www",
@@ -1309,6 +1310,12 @@ pub fn rc_files() -> Vec<RootFile> {
             ROOT,
             Source::Bytes("dropbear", include_bytes!("../../tools/rc/dropbear")),
         ),
+        of(
+            "/etc/rc.d/fast",
+            0o755,
+            ROOT,
+            Source::Bytes("fast", include_bytes!("../../tools/rc/fast")),
+        ),
     ]
 }
 
@@ -1938,6 +1945,27 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             // The shell on EC2 runs the boot script, which fetches the key of the instance.
             if name == "boot-aws.img" {
                 files.extend(rc_files());
+                // `aws image --switch`: the switch of the network service on the ENA, with
+                // room for the consumers (nginx-fast on 8080 once the image has the package).
+                if std::env::var_os("STAFETO_AWS_SWITCH").is_some_and(|v| v == "1") {
+                    match files.iter_mut().find(|f| f.path == "/etc/netd.conf") {
+                        Some(f) => {
+                            f.source = Some(Source::Bytes(
+                                "netd-aws-switch.conf",
+                                crate::fast_nginx::SWITCH_NETD_CONF,
+                            ))
+                        }
+                        None => files.push(of(
+                            "/etc/netd.conf",
+                            0o644,
+                            ROOT,
+                            Source::Bytes(
+                                "netd-aws-switch.conf",
+                                crate::fast_nginx::SWITCH_NETD_CONF,
+                            ),
+                        )),
+                    }
+                }
             }
             files
         }
