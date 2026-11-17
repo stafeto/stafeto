@@ -91,10 +91,9 @@ impl Key {
 
     /// Writes zeros over the bytes.
     fn wipe(&mut self) {
-        for b in &mut self.bytes {
-            // SAFETY: a write to a byte of this array.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        self.bytes.fill(0);
+        // The zeros are kept: the array may be read through the pointer from here on.
+        core::hint::black_box(self.bytes.as_mut_ptr());
         self.len = 0;
     }
 }
