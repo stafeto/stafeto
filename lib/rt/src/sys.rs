@@ -1525,7 +1525,9 @@ fn send_with(
             return Ok(reply);
         }
         tries += 1;
-        if tries == TRY_AGAIN_MAX {
+        // A service's own step is bounded (its calls wait at most CALL_WAIT_MAX): a call from a
+        // process that runs a service loop (`service::run_in`) is refused as a full table is.
+        if tries == TRY_AGAIN_MAX || crate::service::runs_a_loop() {
             return Err(Error::LimitReached);
         }
     }

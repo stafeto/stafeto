@@ -64,8 +64,10 @@ const OPERATIONS: usize = 128;
 const CHUNK: u32 = 64;
 /// The messages of output one step gives the driver at most.
 const WRITES: usize = 1;
-/// The pieces of output a request that settles the output sends to the driver at most.
-const FLOW_PUSHES: usize = 32;
+/// The pieces of output a Flow request sends to the driver at most, and a write: each is a call
+/// to the driver and the step of a request is bounded.
+const FLOW_PUSHES: usize = 4;
+const WRITE_PUSHES: usize = 1;
 /// The bytes of a client's write one step takes at most: a write of
 /// more gets the count of those (the layer writes the rest).
 const WRITE_STEP: usize = 256;
@@ -1491,11 +1493,11 @@ impl Tty {
     }
 
     /// The output the service holds goes to the driver in the request that needs it gone, up to
-    /// `FLOW_PUSHES` pieces: when the driver had no room, it is asked for it now, as the
+    /// `pushes` pieces: when the driver had no room, it is asked for it now, as the
     /// notification of its room would have it asked. A client that waits for the output does not
     /// wait for the service's own step, which runs at level 1 once the budget is spent.
-    fn settle_output(&mut self) {
-        for _ in 0..FLOW_PUSHES {
+    fn settle_output(&mut self, pushes: usize) {
+        for _ in 0..pushes {
             if self.pump.waits_room() {
                 let mut port = Port {
                     driver: &self.driver,
@@ -2490,7 +2492,7 @@ impl Tty {
             FLOW_OUT_OFF => {
                 // The output accepted before the stop goes out first, up to the room the driver
                 // gave: the stop is owed the state the client left.
-                self.settle_output();
+                self.settle_output(FLOW_PUSHES);
                 self.devices[self.active].console.set_stopped(true);
             }
             FLOW_OUT_ON => {
@@ -2498,7 +2500,7 @@ impl Tty {
                 // The output the stop held goes on in this request, up to the room the driver
                 // gave: a client that sends XON sees the output resume when the call returns.
                 // What the room does not take stays to the steps.
-                self.settle_output();
+                self.settle_output(FLOW_PUSHES);
                 self.kick();
             }
             FLOW_IN_OFF | FLOW_IN_ON => {
@@ -3159,7 +3161,7 @@ impl Service<0> for Tty {
                 // the driver gave): the step that would send it runs at level 1 once the
                 // budget is spent.
                 if self.active == 0 {
-                    self.settle_output();
+                    self.settle_output(WRITE_PUSHES);
                 }
                 answer
             }

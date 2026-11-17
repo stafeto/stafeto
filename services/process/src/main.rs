@@ -5147,7 +5147,9 @@ impl Service<0> for Processes {
         {
             let mask = self.terminals.leader_ended(r.sid);
             if let Some(notice) = self.terminal_notice.as_ref() {
-                let _ = sys::notify(notice, mask.max(1));
+                // A leader whose terminal link was already ended names no terminal: all are asked.
+                let bits = if mask == 0 { u64::MAX } else { mask };
+                let _ = sys::notify(notice, bits);
             }
         }
         // The time of the process stays in the account of the pool once it

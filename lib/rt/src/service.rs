@@ -132,13 +132,13 @@ pub trait Service<const K: usize> {
         Settled::Nothing
     }
 
-    /// Whether `status`, the refusal of a request of `method` that carried no handles, is for a
-    /// resource the work of `settle` may have freed (a table of descriptions, pages): the loop
-    /// then settles and, once that made progress, asks the handler again. A handler this is true
-    /// for refuses before it has any effect. The default says no.
-    fn refused_for_room(&self, method: u16, status: Status) -> bool {
+    /// What `status`, the refusal of a request of `method` that carried no handles, is for: a
+    /// resource the work of `settle` may have freed (`Refusal`). The loop then settles and, once
+    /// that made progress, asks the handler again. A handler refuses before it has any effect
+    /// for a status this does not call `Other`. The default says `Other`.
+    fn refused_for_room(&self, method: u16, status: Status) -> Refusal {
         let _ = (method, status);
-        false
+        Refusal::Other
     }
 
     /// Before every request the loop took, once the receive has returned.
@@ -159,6 +159,20 @@ pub trait Service<const K: usize> {
 }
 
 pub use proto_wire::settle::{SETTLE_STEPS, SETTLE_TICKS, Settled};
+
+/// What a refusal is for (`Service::refused_for_room`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Nothing the cleanup frees.
+    Other,
+    /// Room that the cleanup may free: the loop settles and asks the handler again, and the
+    /// refusal stands if the room is still short.
+    Rerun,
+    /// As `Rerun`, and a request that finds cleanup left is answered with `TRY_AGAIN`, which a
+    /// client that sends again turns into the answer of the later try. A table whose full state
+    /// is only the cleanup's debt (the descriptions of sessions that went) has this.
+    Retry,
+}
 
 /// Runs `step` (true when it made progress, with `more` telling whether cleanup is left after
 /// it) up to `SETTLE_STEPS` times or until `SETTLE_TICKS` have passed (`proto_wire::settle::run`),
@@ -453,6 +467,15 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
     run_in(channel, service, config, &mut table)
 }
 
+/// Whether this process runs a service loop: its calls to other services are not sent again on
+/// `TRY_AGAIN` (`sys::send`).
+static LOOP_RUNS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process runs a service loop.
+pub fn runs_a_loop() -> bool {
+    LOOP_RUNS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// `run` with the table of sessions the caller gives, all of them free:
 /// a service with a table too big for its stack keeps it in its `.bss`.
 pub fn run_in<S: Service<K>, const K: usize>(
@@ -461,6 +484,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
     config: Config<'_>,
     table: &mut [Option<Session<S::Data, K>>],
 ) -> Error {
+    LOOP_RUNS.store(true, core::sync::atomic::Ordering::Relaxed);
     let mut beat = match config.heartbeat.map(|h| Beat::start(channel, h)) {
         None => None,
         Some(Ok(beat)) => Some(beat),
@@ -1110,7 +1134,7 @@ fn request<S: Service<K>, const K: usize>(
     let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
     if let Answer::Status(refusal) = &answer
         && r.token.is_some()
-        && service.refused_for_room(r.header.method, *refusal)
+        && service.refused_for_room(r.header.method, *refusal) != Refusal::Other
     {
         let settled = service.settle(table);
         if bare && settled != Settled::Nothing {
@@ -1119,7 +1143,7 @@ fn request<S: Service<K>, const K: usize>(
                 answer = service.request(table[at].as_mut().expect("seated"), &mut r);
                 if let Answer::Status(again) = &answer
                     && settled == Settled::Pending
-                    && service.refused_for_room(r.header.method, *again)
+                    && service.refused_for_room(r.header.method, *again) == Refusal::Retry
                 {
                     answer = Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN));
                 }

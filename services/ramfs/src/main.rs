@@ -709,7 +709,7 @@ struct Fs {
 /// The waiters of a lock a notice or a request tells at most (each is a call of the kernel, and
 /// the step of the service is bounded): the rest are marked for the sweep of the service's own
 /// work.
-const WAKES: usize = 8;
+const WAKES: usize = 2;
 
 /// The free pages a request finds ready: the retired pages that bring the free list up to this
 /// many are moved to it before the request runs (at most this many steps).
@@ -2383,7 +2383,7 @@ impl Service<0> for Fs {
         })
     }
 
-    fn refused_for_room(&self, method: u16, status: Status) -> bool {
+    fn refused_for_room(&self, method: u16, status: Status) -> rt::service::Refusal {
         // Opening (the prepayment comes before any effect on a file) and cloning refuse before
         // they take effect; the codes are the table of descriptions of the service (ENFILE) and
         // the pages and inodes (ENOSPC).
@@ -2397,10 +2397,15 @@ impl Service<0> for Fs {
         ]
         .iter()
         .any(|m| *m as u16 == method);
-        open && matches!(
-            status.code(),
-            proto_fs::TOO_MANY_FILES_IN_SYSTEM | proto_fs::NO_SPACE
-        )
+        match status.code() {
+            // Descriptions are freed by the departure steps alone: the request goes on when
+            // they are, and is sent again while they are not.
+            proto_fs::TOO_MANY_FILES_IN_SYSTEM if open => rt::service::Refusal::Retry,
+            // Pages and inodes may belong to the account of the client: the refusal stands
+            // when the steps do not free them.
+            proto_fs::NO_SPACE if open => rt::service::Refusal::Rerun,
+            _ => rt::service::Refusal::Other,
+        }
     }
 
     /// A never-used clone retains its paid birth until cleanup finishes.

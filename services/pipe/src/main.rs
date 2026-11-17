@@ -1957,11 +1957,15 @@ impl Service<0> for PipeService {
 
     /// The refusals that a release of descriptions cures: NFILE of a call that makes a pipe or a
     /// socket, before it has any effect.
-    fn refused_for_room(&self, method: u16, status: Status) -> bool {
-        status.code() == proto_pipe::NFILE
-            && [Method::Create, Method::SockCreate, Method::SockPair]
-                .iter()
-                .any(|m| *m as u16 == method)
+    fn refused_for_room(&self, method: u16, status: Status) -> rt::service::Refusal {
+        let makes = [Method::Create, Method::SockCreate, Method::SockPair]
+            .iter()
+            .any(|m| *m as u16 == method);
+        if status.code() == proto_pipe::NFILE && makes {
+            rt::service::Refusal::Retry
+        } else {
+            rt::service::Refusal::Other
+        }
     }
 
     /// The last copy of a session Clone made went before it sent anything:
