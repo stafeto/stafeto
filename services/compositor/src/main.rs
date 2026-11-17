@@ -68,6 +68,9 @@ const OPEN_TRIES: u32 = 150;
 const OPEN_PAUSE_NS: u64 = 5_000_000;
 /// The bytes of the buffer of the first revision: the screen's, 250 pages.
 const LEGACY_LEN: usize = SCREEN_BYTES as usize;
+/// The references the service itself holds to the buffer of the first
+/// revision: its handle and its mapping.
+const LEGACY_REFS: u64 = 2;
 /// The bytes of it one step clears.
 const CLEARED: usize = 16 * 1024;
 /// The sessions of the service's channel: the contexts, the windows, and
@@ -232,7 +235,9 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     let rw = Access::ReadWrite;
-    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err() {
+    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err()
+        || sys::memory_info(&legacy).map_or(true, |info| info.refs != LEGACY_REFS)
+    {
         return NOT_REGISTERED;
     }
     let mut service = Compositor {
@@ -742,9 +747,11 @@ impl Compositor {
         if self.scene.has_legacy() {
             return Answer::Status(code(BUSY));
         }
-        // A client that closed its window and kept its mapping still reaches
-        // the buffer: the service holds the only mapping it may have.
-        if sys::memory_info(&self.legacy).is_ok_and(|info| info.mappings > 1) {
+        // A client that closed its window and kept its handle, mapped or
+        // not, or sent a copy on, still reaches the buffer: the service
+        // holds the only two references it may have, its handle and its
+        // mapping.
+        if sys::memory_info(&self.legacy).is_ok_and(|info| info.refs > LEGACY_REFS) {
             return Answer::Status(code(BUSY));
         }
         // The last window's buffer is being cleared: ask again.

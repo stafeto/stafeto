@@ -19,7 +19,9 @@
 //!   then OPEN of proto_gpu, a pattern in the buffer the service made and
 //!   FLUSH of all of it and of a rectangle (the reply of FLUSH comes once
 //!   the frame is shown), a second OPEN BUSY, the cleared buffer. It ends
-//!   holding the window.
+//!   holding the window. After the CLOSE it keeps the buffer's mapping,
+//!   then the bare handle, and OPEN is BUSY each time until the handle is
+//!   closed.
 //!
 //! Each check prints its line, and the last says `comp-probe: ok`; xtask
 //! reads them.
@@ -823,9 +825,10 @@ impl Probe<'_> {
             return Err("a rectangle outside the screen was not INVALID");
         }
         rt::println!("comp-probe: FLUSH of a rectangle outside the screen is INVALID");
-        // CLOSE with the mapping kept: the next OPEN is BUSY while the
-        // buffer has a mapping besides the service's, and succeeds with a
-        // cleared buffer once the mapping is gone.
+        // CLOSE with the buffer kept: the next OPEN is BUSY while anyone
+        // besides the service holds a reference to it, a mapping first and
+        // then the bare handle, and succeeds with a cleared buffer once
+        // the handle is gone.
         plain(&owner, &proto_gpu::Method::Close.header().bytes()).map_err(say("CLOSE"))?;
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         loop {
@@ -844,6 +847,10 @@ impl Probe<'_> {
         // SAFETY: the probe uses `points` no more.
         unsafe { sys::mem_unmap(self.process, at, u64::from(proto_gpu::SCREEN_BYTES)) }
             .map_err(say("unmap"))?;
+        if call(&display, &open).map(|(s, _)| s) != Ok(proto_gpu::code(proto_gpu::BUSY)) {
+            return Err("OPEN with a handle kept and no mapping was not BUSY");
+        }
+        rt::println!("comp-probe: OPEN is BUSY while a closed window's handle is kept");
         drop(memory);
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         let (status, mut reply) = loop {
