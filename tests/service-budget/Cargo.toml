@@ -12,6 +12,13 @@ name = "service-budget"
 test = false
 bench = false
 
+[features]
+# The images of `cargo xtask budget-breaks` with one service unbound run the starvation phase of
+# that service alone.
+break-only-ramfs = []
+break-only-pipe = []
+break-only-tty = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-pipe = { path = "../../proto/pipe" }

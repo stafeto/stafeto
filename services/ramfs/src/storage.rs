@@ -386,16 +386,18 @@ impl Overlay {
         self.root = root;
     }
 }
-/// A detached chain retains its page charge without referencing a reusable overlay.
+/// A detached chain: its pages are no account's any more (the charge went when the chain was
+/// retired) and wait, `count` of them, to go to the free list, one at a time by the
+/// maintenance.
 #[derive(Clone, Copy)]
 struct RetiredPages {
     head: u16,
-    root: u16,
+    count: u16,
 }
 impl RetiredPages {
     const EMPTY: Self = Self {
         head: NONE,
-        root: NONE,
+        count: 0,
     };
 }
 
@@ -482,6 +484,8 @@ pub struct State {
     retired: [RetiredPages; PAGES],
     retired_head: usize,
     retired_len: usize,
+    /// The pages of all the chains of the FIFO: free in all but the list they are on.
+    retired_pages: usize,
     retired_turn: bool,
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
@@ -527,6 +531,7 @@ impl State {
             retired: [RetiredPages::EMPTY; PAGES],
             retired_head: 0,
             retired_len: 0,
+            retired_pages: 0,
             retired_turn: false,
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
@@ -560,6 +565,7 @@ impl State {
         self.retired.fill(RetiredPages::EMPTY);
         self.retired_head = 0;
         self.retired_len = 0;
+        self.retired_pages = 0;
         self.retired_turn = false;
         self.name_heads.fill(NONE);
         self.bucket_stamps.fill(0);
@@ -691,7 +697,20 @@ impl Storage<'_> {
         Ok(())
     }
 
+    /// The pages a request may count on: the free list and the retired FIFO behind it (a retired
+    /// page is owed by no account, so the quota of an account admits it).
+    fn free_pages(&self) -> usize {
+        self.state.page_len + self.state.retired_pages
+    }
+    /// Makes sure the free list holds a page when `free_pages` is not zero: with the list empty,
+    /// one retired page moves to it (one step), so a request does not wait for the maintenance.
+    fn ready_page(&mut self) {
+        if self.state.page_len == 0 && self.state.retired_len != 0 {
+            self.reclaim_retired_page();
+        }
+    }
     fn io_take_page(&mut self, root: u16, logical: usize) -> TempPage {
+        self.ready_page();
         self.state.page_len -= 1;
         let physical = self.state.page_free[self.state.page_len];
         self.state.accounts[root as usize]
@@ -757,7 +776,7 @@ impl Storage<'_> {
         if existing == NONE && (self.state.inode_len == 0 || usage.inodes == INODE_SHARE) {
             return Err(NO_SPACE);
         }
-        let mut credit = self.state.page_len.min((PAGE_SHARE - usage.pages) as usize);
+        let mut credit = self.free_pages().min((PAGE_SHARE - usage.pages) as usize);
         let wanted = requested.min((capacity - offset) as usize);
         let mut count = 0;
         while count < wanted {
@@ -940,7 +959,7 @@ impl Storage<'_> {
                 let usage = self.state.accounts[root as usize]
                     .expect("retained root")
                     .usage;
-                if self.state.page_len == 0 || usage.pages == PAGE_SHARE {
+                if self.free_pages() == 0 || usage.pages == PAGE_SHARE {
                     return Err(NO_SPACE);
                 }
                 tail = self.io_take_page(root, logical);
@@ -1078,12 +1097,13 @@ impl Storage<'_> {
             overlay.mapped_count = data.mapped_count;
             overlay.shadow_boot_sectors = data.shadow_boot_sectors;
             if retired != NONE {
-                let tail = (self.state.retired_head + self.state.retired_len) % PAGES;
-                self.state.retired[tail] = RetiredPages {
-                    head: retired,
-                    root: data.root,
-                };
-                self.state.retired_len += 1;
+                self.retire_chain(
+                    RetiredPages {
+                        head: retired,
+                        count: data.detached as u16,
+                    },
+                    data.root,
+                );
             }
         }
         let node = &mut self.state.nodes[data.token.slot as usize];
@@ -1420,7 +1440,7 @@ impl<'a> Storage<'a> {
     pub fn allocate_lock_page(&mut self, root: Root) -> Result<LockPage, u32> {
         let anchor = self.lock_anchor(root)?;
         let index = anchor.index() as usize;
-        if self.state.page_len == 0
+        if self.free_pages() == 0
             || self.state.accounts[index].as_ref().unwrap().usage.pages >= PAGE_SHARE
         {
             self.release_lock_anchor(anchor)?;
@@ -1468,6 +1488,13 @@ impl<'a> Storage<'a> {
             dentries: self.state.dentry_len as u16,
             pages: self.state.page_len as u16,
             descriptions: 0,
+        }
+    }
+    fn uncharge_pages(&mut self, root: usize, count: u16) {
+        let a = self.state.accounts[root].as_mut().expect("charged account");
+        a.usage.pages -= count;
+        if a.usage == Usage::EMPTY && a.pending == 0 && a.lock_refs == 0 {
+            self.state.accounts[root] = None;
         }
     }
     fn uncharge(&mut self, root: usize, field: fn(&mut Usage) -> &mut u16) {
@@ -2296,7 +2323,7 @@ impl<'a> Storage<'a> {
                 (first..=last).filter(|&p| overlay.pages[p] == NONE).count(),
             )
         };
-        if need > self.state.page_len
+        if need > self.free_pages()
             || self.state.accounts[a].unwrap().usage.pages as usize + need > PAGE_SHARE as usize
         {
             return Err(NO_SPACE);
@@ -2306,6 +2333,7 @@ impl<'a> Storage<'a> {
             if self.state.overlays[i].pages[p] != NONE {
                 continue;
             }
+            self.ready_page();
             self.state.page_len -= 1;
             let page = self.state.page_free[self.state.page_len];
             let start = p * PAGE;
@@ -2349,14 +2377,17 @@ impl<'a> Storage<'a> {
         }
         let data_generation = node.data_generation.checked_add(1).ok_or(NO_SPACE)?;
         let overlay = node.overlay;
-        let chain = if overlay == NONE {
-            RetiredPages::EMPTY
+        let (chain, root) = if overlay == NONE {
+            (RetiredPages::EMPTY, NONE)
         } else {
             let held = &self.state.overlays[overlay as usize];
-            RetiredPages {
-                head: held.head,
-                root: held.root,
-            }
+            (
+                RetiredPages {
+                    head: held.head,
+                    count: held.mapped_count,
+                },
+                held.root,
+            )
         };
         // Every existing nonempty chain owns a page. A nonempty live chain therefore
         // has a guaranteed credit before any of its pages can enter the retired FIFO.
@@ -2364,9 +2395,7 @@ impl<'a> Storage<'a> {
             return Err(NO_SPACE);
         }
         if chain.head != NONE {
-            let tail = (self.state.retired_head + self.state.retired_len) % PAGES;
-            self.state.retired[tail] = chain;
-            self.state.retired_len += 1;
+            self.retire_chain(chain, root);
         }
         if overlay != NONE {
             self.state.overlays[overlay as usize].pages.fill(NONE);
@@ -2400,19 +2429,30 @@ impl<'a> Storage<'a> {
         }
         false
     }
+    /// Puts a detached chain of `chain.count` pages of the account `root` on the FIFO and gives
+    /// back the charge of all of them now, in one step: the account owes nothing for pages
+    /// that wait for the maintenance, and the pages are free once the maintenance moves them.
+    fn retire_chain(&mut self, chain: RetiredPages, root: u16) {
+        let tail = (self.state.retired_head + self.state.retired_len) % PAGES;
+        self.state.retired[tail] = chain;
+        self.state.retired_len += 1;
+        self.state.retired_pages += usize::from(chain.count);
+        self.uncharge_pages(root as usize, chain.count);
+    }
     fn reclaim_retired_page(&mut self) {
         let entry = &mut self.state.retired[self.state.retired_head];
         let page = entry.head;
-        let root = entry.root;
         entry.head = self.state.page_next[page as usize];
+        entry.count -= 1;
         if entry.head == NONE {
+            debug_assert_eq!(entry.count, 0);
             *entry = RetiredPages::EMPTY;
             self.state.retired_head = (self.state.retired_head + 1) % PAGES;
             self.state.retired_len -= 1;
         }
+        self.state.retired_pages -= 1;
         self.state.page_free[self.state.page_len] = page;
         self.state.page_len += 1;
-        self.uncharge(root as usize, |u| &mut u.pages);
     }
     /// The inode queue keeps its original guaranteed credit for every live overlay.
     fn reclaim_inode_step(&mut self) -> bool {
@@ -2523,7 +2563,7 @@ impl Storage<'_> {
             .as_ref()
             .expect("paid result root");
         if count > crate::cwd::getcwd::MAX_PAGES
-            || count > self.state.page_len
+            || count > self.free_pages()
             || count > usize::from(PAGE_SHARE - a.usage.pages)
         {
             return Err(crate::cwd::getcwd::NO_MEMORY);
@@ -3217,8 +3257,8 @@ mod sorted_chain_tests {
         }
         check(storage, token);
         truncate(storage, token, PAGE as u64 + 1);
-        let retained = storage.usage(ACCOUNT).pages;
-        assert_eq!(retained, FILE_PAGES as u16 + 1);
+        // The pages the truncation detached are owed by nobody from its commit on.
+        assert_eq!(storage.usage(ACCOUNT).pages, 2);
         for _ in 0..PAGES * 2 {
             storage.reclaim_step();
         }

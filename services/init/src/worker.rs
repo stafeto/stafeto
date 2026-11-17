@@ -467,6 +467,8 @@ fn budgets(
             Some(place) => noticed(resource, overrun::label(place, index), b)?,
             None => sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?,
         };
+        #[cfg(feature = "table-service-budget")]
+        observed::keep(record.name, index, &budget);
         // The checks of the table keep the names apart from the others of the
         // start data, and START_DATA_MAX keeps all of them within the giver's.
         // A budget the service cannot take is an error: the record would start unbudgeted.
@@ -474,7 +476,57 @@ fn budgets(
             .give(b.name, budget.erase())
             .map_err(|_| Error::InvalidArgs)?;
     }
+    #[cfg(feature = "table-service-budget")]
+    observed::give(record.name, giver);
     Ok(())
+}
+
+/// The image of the probe of the service budgets (feature `table-service-budget`): the probe
+/// reads the ticks each service's `serve` budget has charged (`BudgetInfo::ran`), so init gives
+/// it a copy of each, with no right but TRANSFER (enough for `object_info`), under the names
+/// `ran-ramfs`, `ran-pipe` and `ran-tty`. The services start before the probe, in the order of
+/// the table.
+#[cfg(feature = "table-service-budget")]
+mod observed {
+    use super::{AtomicU64, Budget, Giver, Handle, Ordering, Rights, sys};
+
+    const SERVICES: [&str; 3] = ["ramfs", "pipe", "tty"];
+    const NAMES: [&str; 3] = ["ran-ramfs", "ran-pipe", "ran-tty"];
+    const PROBE: &str = "ramfs-probe";
+    static KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    /// Keeps a copy of the first budget of the service `record`, as the instance gets it.
+    pub fn keep(record: &str, index: usize, budget: &Handle<Budget>) {
+        let Some(at) = SERVICES.iter().position(|s| *s == record) else {
+            return;
+        };
+        if index != 0 {
+            return;
+        }
+        if let Ok(copy) = sys::handle_duplicate(budget, Rights::TRANSFER | Rights::DUPLICATE) {
+            let old = KEPT[at].swap(copy.into_raw().0, Ordering::AcqRel);
+            if old != 0 {
+                drop(Handle::<Budget>::from_raw(abi::Handle(old)));
+            }
+        }
+    }
+
+    /// Gives the probe its copies.
+    pub fn give(record: &str, giver: &mut Giver) {
+        if record != PROBE {
+            return;
+        }
+        for (name, kept) in NAMES.iter().zip(&KEPT) {
+            let raw = kept.load(Ordering::Acquire);
+            if raw == 0 {
+                continue;
+            }
+            let budget = Handle::<Budget>::borrowed(abi::Handle(raw));
+            if let Ok(copy) = sys::handle_duplicate(&budget, Rights::TRANSFER) {
+                let _ = giver.give(name, copy.erase());
+            }
+        }
+    }
 }
 
 /// Init's own copies of the budgets it made with a place for overruns, by

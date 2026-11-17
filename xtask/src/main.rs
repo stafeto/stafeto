@@ -220,6 +220,12 @@ const SERVICE_BUDGET_PROGRAMS: [ImageProgram; 6] = [
 const fn service_budget_unbound(at: usize) -> [ImageProgram; 6] {
     let mut programs = SERVICE_BUDGET_PROGRAMS;
     programs[at].3 = &["break-budget-unbound"];
+    // The probe of the image runs the starvation phase of that service alone.
+    programs[5].3 = match at {
+        1 => &["break-only-ramfs"],
+        2 => &["break-only-pipe"],
+        _ => &["break-only-tty"],
+    };
     programs
 }
 const SERVICE_BUDGET_RAMFS_UNBOUND: [ImageProgram; 6] = service_budget_unbound(1);
@@ -10347,6 +10353,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("loader-channels", loader_channels_probe),
         job("image-gates", || image_gates_probe(false, false)),
         job("ramfs-cleanup", ramfs_cleanup_probe),
+        // The budgets of the three general services: the account of each `serve` budget and the
+        // victim's cycles are gated (the victim's share is printed, stafeto/stafeto#430), and
+        // `budget-breaks` runs the kernel and init breaks and the images in which a service binds
+        // no budget, each of which the gates must fail.
+        job("service-budget", || service_budget::run(&[])),
+        job("budget-breaks", budget_hog::breaks),
         job("posix-poll", posix_poll_probe),
         job("layer-probe", || layer_probe::dispatch(&[])),
         job("layer-probe steps", || {
