@@ -221,6 +221,14 @@ pub(crate) fn open(
         }
     })();
     if let Err(errno) = result {
+        if errno == ENXIO {
+            rt::println!(
+                "fifo-debug: open ends with ENXIO, fifo stage {} flags {} phase {:?}",
+                recovery.fifo_stage,
+                recovery.fifo_flags,
+                recovery.phase
+            );
+        }
         let _ =
             crate::shared::with_files(|files| files.begin_open_cancel(claim).map_err(crate::error));
         let canonical = fifo_cleanup(transport, token, recovery)
