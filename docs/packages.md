@@ -92,6 +92,15 @@ them for the licence notes of the image.
   of the sources (`DOOM-LICENSE`, `DOOM-SOURCE`, `FREEDOOM-LICENSE`,
   `FREEDOOM-SOURCE`), and the check of the image compares the WAD with the
   one the build script unpacked.
+- pixman (`packages/pixman.toml`, MIT) is a base package that installs no file:
+  the composition service links its portable C paths statically
+  (`tools/build-pixman.py` fetches the pinned archive, checks its SHA-256 and
+  builds `target/pixman/libpixman.a` with the headers and the shim of
+  `ports/pixman`; `lib/pixman` links it). Nothing but the service links it, so
+  `xtask/src/packages.rs` names it in `SERVICE_LIBRARIES`, the one way a
+  package without files and without a package that links it in is accepted. Its
+  licence text is `COPYING` of the archive, and its notice directory
+  `/usr/share/licenses/pixman/` carries it with the note of the source.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its

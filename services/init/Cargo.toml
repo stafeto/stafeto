@@ -115,6 +115,8 @@ table-entropy-seed = []
 table-gpu = []
 # The probe of the composition service (xtask comp-probe).
 table-comp = []
+# The probe of focus and composition of two clients (xtask focus-probe).
+table-focus = []
 # The network service in the image of the shell, and the image of its probe
 # (xtask net-probe).
 table-net = []
@@ -255,5 +257,6 @@ rt = { path = "../../lib/rt" }
 # (netd::pci).
 [dev-dependencies]
 netd = { path = "../netd" }
+proto-comp = { path = "../../proto/comp" }
 pci = { path = "../../lib/pci", features = ["fake"] }
 nvme = { path = "../../lib/nvme" }

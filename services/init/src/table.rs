@@ -88,6 +88,33 @@ pub fn layer_grant(client: &Record, name: &[u8]) -> bool {
     name == RAM_LAYERS.as_bytes() && LAYER_CLIENTS.contains(&client.name) && !client.is_posix()
 }
 
+/// The label marks of the composition service's privileged sessions
+/// (proto_comp: MANAGER_MARK and INPUT_MARK): the clients the table names get a
+/// session of the compositor (the service `gpu`) with the mark, and nothing
+/// else gives one.
+pub const COMP_MANAGER_MARK: u64 = 1 << 60;
+pub const COMP_INPUT_MARK: u64 = 1 << 59;
+/// The window manager of the images that have one, and the probe that stands
+/// in for it.
+pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
+/// The programs that inject events as a device would: the probes only.
+pub const COMP_INJECTORS: &[&str] = &["focus-inject"];
+
+/// The mark of the compositor's session that `client` gets by asking for
+/// `service`: the manager's, the input's, or none.
+pub fn comp_mark(client: &Record, service: &[u8]) -> Option<u64> {
+    if service != b"gpu" || client.is_posix() {
+        return None;
+    }
+    if COMP_MANAGERS.contains(&client.name) {
+        Some(COMP_MANAGER_MARK)
+    } else if COMP_INJECTORS.contains(&client.name) {
+        Some(COMP_INPUT_MARK)
+    } else {
+        None
+    }
+}
+
 /// Only the RAM service receives the named-pipe broker authority.
 pub fn fifo_broker_grant(client: &Record, service: &[u8]) -> bool {
     client.name == RAM_SERVICE
@@ -1430,6 +1457,7 @@ pub mod comp;
 pub mod cycle;
 pub mod doom;
 pub mod entropy;
+pub mod focus;
 pub mod fstack;
 pub mod gpu;
 pub mod input;
@@ -1489,6 +1517,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-entropy-seed") as usize
     + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-comp") as usize
+    + cfg!(feature = "table-focus") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
@@ -1581,6 +1610,7 @@ const _: () = assert!(
     feature = "table-entropy-seed",
     feature = "table-gpu",
     feature = "table-comp",
+    feature = "table-focus",
     feature = "table-net",
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
@@ -1723,6 +1753,8 @@ pub const TABLE: &[Record] = entropy::SEED_TABLE;
 pub const TABLE: &[Record] = gpu::TABLE;
 #[cfg(feature = "table-comp")]
 pub const TABLE: &[Record] = comp::TABLE;
+#[cfg(feature = "table-focus")]
+pub const TABLE: &[Record] = focus::TABLE;
 #[cfg(feature = "table-net")]
 pub const TABLE: &[Record] = net::NET_TABLE;
 #[cfg(feature = "table-net-probe")]
@@ -1812,6 +1844,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     base::BASE_TABLE,
     gpu::TABLE,
     comp::TABLE,
+    focus::TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -2660,6 +2693,7 @@ mod tests {
             base::BASE_TABLE,
             gpu::TABLE,
             comp::TABLE,
+            focus::TABLE,
             input::TABLE,
             entropy::TABLE,
             normal::TABLE,
@@ -3705,6 +3739,19 @@ mod tests {
             ["display", "gpu", "comp-probe", "comp-probe-b"]
         );
         assert_eq!(
+            order_of(focus::TABLE),
+            [
+                "pointer",
+                "display",
+                "gpu",
+                "focus-a",
+                "focus-b",
+                "focus-wm",
+                "focus-inject",
+                "focus-many"
+            ]
+        );
+        assert_eq!(
             order_of(net::NET_PROBE_TABLE),
             ["ramfs", "rng", "entropy", "net", "net-probe"]
         );
@@ -3722,6 +3769,31 @@ mod tests {
             refused(ceiling::TABLE),
             "low at priority 40 is below the ceiling 50 of its client high"
         );
+    }
+
+    /// The compositor's marks are the protocol's, and only the clients the
+    /// table names get them, by the name of the compositor.
+    #[test]
+    fn the_compositor_marks_go_to_the_manager_and_the_injector_only() {
+        assert_eq!(COMP_MANAGER_MARK, proto_comp::MANAGER_MARK);
+        assert_eq!(COMP_INPUT_MARK, proto_comp::INPUT_MARK);
+        let named = |name: &str| focus::TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(
+            comp_mark(named("focus-wm"), b"gpu"),
+            Some(COMP_MANAGER_MARK)
+        );
+        assert_eq!(
+            comp_mark(named("focus-inject"), b"gpu"),
+            Some(COMP_INPUT_MARK)
+        );
+        assert_eq!(comp_mark(named("focus-a"), b"gpu"), None);
+        assert_eq!(comp_mark(named("focus-wm"), b"clock"), None);
+        // The marks are bits no label of init's count reaches, and apart from
+        // the compositor's own.
+        for mark in [COMP_MANAGER_MARK, COMP_INPUT_MARK] {
+            assert_eq!(mark & (1 << 63 | 1 << 62 | 1 << 61 | 1 << 58 | 1 << 57), 0);
+        }
+        assert_eq!(COMP_MANAGER_MARK & COMP_INPUT_MARK, 0);
     }
 
     /// The games image is the shell's dialog with the launcher's quota of
@@ -3805,8 +3877,9 @@ mod tests {
             .unwrap();
         // The pool of the network image less the two quotas of a command that
         // the package service takes from init.
+        // (and the pages the compositor's pixman took).
         assert_eq!(
-            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA,
+            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA + base::PIXMAN_PAGES,
             net::NET_TABLE[2].quota
         );
         // The service of the network is the one of the network image, and the
