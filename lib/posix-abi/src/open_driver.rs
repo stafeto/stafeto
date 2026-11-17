@@ -18,6 +18,37 @@ fn protocol(error: Status) -> i32 {
         crate::error(error.into())
     }
 }
+/// The error of a refusal of the pipe service, mapped as the descriptor calls map it.
+fn pipe_protocol(error: Status) -> i32 {
+    if error == Status::BadSize {
+        EIO
+    } else {
+        crate::error(posix_fs::pipe_error(error))
+    }
+}
+/// Entries stopped for the calls that carry a capability and for the cleanup
+/// of an open: a send that a signal interrupts while it is queued would drop
+/// the capability or leave the ticket of the pipe service behind, so the
+/// sends block and the request enters when the guard ends. Each masked call
+/// returns a phase at once and waits at most CALL_WAIT_MAX + (T - C) of the
+/// service it calls. A signal waits for at most three such calls in a grant
+/// pass (the grant and two attaches) and four in the cleanup (payer witness,
+/// cancel, ack and close). The rendezvous wait for the peer is never masked.
+struct Masked(bool);
+impl Masked {
+    fn enter() -> Self {
+        Self(rt::upcall::mask().unwrap_or(true))
+    }
+}
+impl Drop for Masked {
+    fn drop(&mut self) {
+        if !self.0 {
+            // SAFETY: the entries were open when the guard began; a short
+            // custody still held defers the request to its end.
+            let _ = unsafe { rt::upcall::enable() };
+        }
+    }
+}
 fn key(token: OpenToken) -> proto_fs::OpenKey {
     proto_fs::OpenKey {
         slot: token.slot() as u32,
@@ -523,7 +554,7 @@ fn fifo_open(
         );
         match response {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
-            Err(error) => return Err(protocol(error)),
+            Err(error) => return Err(pipe_protocol(error)),
             Ok(response) => {
                 recovery.fifo_ticket_slot = response.state.ticket.slot;
                 recovery.fifo_ticket_generation = response.state.ticket.generation;
@@ -554,6 +585,7 @@ fn fifo_open(
             return Err(EINTR);
         }
         let _short = crate::long::ShortScope::enter(true)?;
+        let masked = Masked::enter();
         let response = if !brokered {
             let raw = core::mem::take(&mut recovery.fifo_capability);
             let witness = (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -583,7 +615,7 @@ fn fifo_open(
                         | Status::Unknown(proto_fs::RESOLVING | proto_fs::AUTHENTICATING) => {
                             continue;
                         }
-                        error => Err(error),
+                        error => return Err(protocol(error)),
                     }
                 }
             }
@@ -592,7 +624,7 @@ fn fifo_open(
         };
         let response = match response {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
-            Err(error) => return Err(protocol(error)),
+            Err(error) => return Err(pipe_protocol(error)),
             Ok(response) => response,
         };
         // The paid ticket is resident before Query advances allocation. A
@@ -612,7 +644,7 @@ fn fifo_open(
                     continue;
                 }
                 Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
-                Err(error) => return Err(protocol(error)),
+                Err(error) => return Err(pipe_protocol(error)),
             }
         }
         let response = response.state;
@@ -634,6 +666,7 @@ fn fifo_open(
             }
             NamedPhase::Cancelled => return Err(EINTR),
         }
+        drop(masked);
         drop(_short);
         // Arm the ordinary thread channel with the complete paid ticket.
         let channel =
@@ -641,6 +674,7 @@ fn fifo_open(
         let handled = block.handled.load(Ordering::SeqCst);
         let arm = {
             let _short = crate::long::ShortScope::enter(true)?;
+            let _masked = Masked::enter();
             let notification = rt::sys::handle_label(
                 &channel,
                 rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
@@ -654,7 +688,7 @@ fn fifo_open(
                 fifo_ticket(*recovery),
                 Some(notification),
             )
-            .map_err(protocol)?
+            .map_err(pipe_protocol)?
         };
         if arm.state.phase != NamedPhase::Waiting {
             continue;
@@ -708,7 +742,7 @@ fn fifo_take_and_ack(
     let taken = loop {
         match rt::pipe::request(session, Method::NamedTake, fifo_ticket(*recovery), None) {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
-            other => break other.map_err(protocol)?.state,
+            other => break other.map_err(pipe_protocol)?.state,
         }
     };
     if taken.phase != NamedPhase::Taken {
@@ -738,7 +772,7 @@ fn fifo_take_and_ack(
         match rt::pipe::request(session, Method::NamedAck, fifo_ticket(*recovery), None) {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
             other => {
-                other.map_err(protocol)?;
+                other.map_err(pipe_protocol)?;
                 break;
             }
         }
@@ -750,7 +784,14 @@ fn fifo_take_and_ack(
 
 /// No path is replayed. A saved endpoint closes safely after uncertain Ack;
 /// an unacknowledged candidate is cancelled by its exact retained ticket.
-fn fifo_cleanup(transport: Transport, token: OpenToken, mut recovery: Recovery) -> bool {
+fn fifo_cleanup(transport: Transport, token: OpenToken, recovery: Recovery) -> bool {
+    // A signal that interrupts one of the sends while it is queued would end the
+    // cleanup early and leave the ticket and its job in the services.
+    let _masked = Masked::enter();
+    fifo_cleanup_masked(transport, token, recovery)
+}
+
+fn fifo_cleanup_masked(transport: Transport, token: OpenToken, mut recovery: Recovery) -> bool {
     use proto_pipe::Method;
     if recovery.fifo_stage == 0 {
         return true;
