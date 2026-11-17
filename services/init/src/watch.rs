@@ -7,9 +7,11 @@
 //! heartbeat only marks the service suspect and moves the deadline one
 //! period on: a service that more important ones kept off the processor
 //! gets that period to send its late heartbeat. A second expiry in a row
-//! is silence. Before its REGISTER an instance counts from its start. An
-//! expiry before the deadline is a stale one, of a deadline that moved
-//! since, and changes nothing.
+//! is silence, when it comes on time: one that comes late shows that the
+//! machine lost time, and the service gets the period again. Before its
+//! REGISTER an instance counts from its start. An expiry before the
+//! deadline is a stale one, of a deadline that moved since, and changes
+//! nothing.
 
 /// The heartbeat of a service and its watchdog, in nanoseconds: the
 /// period of its heartbeats and how long init waits for one. The checks of
@@ -20,6 +22,10 @@ pub struct Watch {
     pub period_ns: u64,
     pub deadline_ns: u64,
 }
+
+/// The lateness of a second expiry, as a part of the period, up to which the
+/// expiry still confirms silence (`Watched::expired`).
+const LATE_DIVISOR: u64 = 4;
 
 impl Watch {
     /// The watchdog of an instance armed at `now`: its start, or its
@@ -64,11 +70,17 @@ impl Watched {
         self.deadline
     }
 
-    /// An expiry of the timer seen at `now` (Action).
+    /// An expiry of the timer seen at `now` (Action). A second expiry that
+    /// came more than a quarter of a period after its deadline shows that the
+    /// machine lost time (a host that kept the emulator's processors off its
+    /// own, or a level above init that held the processor): init was late
+    /// itself, and the service may have been kept from running for as long.
+    /// Such an expiry judges nothing; the service gets its confirmation
+    /// period again from `now`.
     pub fn expired(&mut self, now: u64) -> Action {
         if now < self.deadline {
             Action::Stale
-        } else if self.suspect {
+        } else if self.suspect && now - self.deadline <= self.watch.period_ns / LATE_DIVISOR {
             Action::Silent
         } else {
             self.suspect = true;
@@ -116,9 +128,31 @@ mod tests {
         assert!(w.suspect());
         assert_eq!(w.expired(119), Action::Stale);
         assert_eq!(w.expired(120), Action::Silent);
-        // A late expiry counts from when it came.
+        // A late first expiry counts from when it came.
         let mut w = WATCH.arm(0);
         assert_eq!(w.expired(150), Action::Suspect { deadline: 170 });
+        assert_eq!(w.expired(170), Action::Silent);
+        // A second expiry up to a quarter of the period late still confirms.
+        let mut w = WATCH.arm(0);
+        assert_eq!(w.expired(100), Action::Suspect { deadline: 120 });
+        assert_eq!(w.expired(125), Action::Silent);
+    }
+
+    #[test]
+    fn a_late_second_expiry_gives_the_confirmation_period_again() {
+        // The machine lost time: init saw the second expiry 30 late, and the
+        // service had no more time than init.
+        let mut w = WATCH.arm(0);
+        assert_eq!(w.expired(100), Action::Suspect { deadline: 120 });
+        assert_eq!(w.expired(150), Action::Suspect { deadline: 170 });
+        assert!(w.suspect());
+        // A beat in the new period clears the mark.
+        assert_eq!(w.beat(160), 260);
+        assert!(!w.suspect());
+        // With no beat, an expiry on time confirms the silence.
+        let mut w = WATCH.arm(0);
+        w.expired(100);
+        w.expired(150);
         assert_eq!(w.expired(170), Action::Silent);
     }
 
