@@ -64,6 +64,8 @@ const OPERATIONS: usize = 128;
 const CHUNK: u32 = 64;
 /// The messages of output one step gives the driver at most.
 const WRITES: usize = 1;
+/// The pieces of output a Flow request that resumes it (XON) gives the driver at most.
+const FLOW_PUSHES: usize = 32;
 /// The bytes of a client's write one step takes at most: a write of
 /// more gets the count of those (the layer writes the rest).
 const WRITE_STEP: usize = 256;
@@ -222,6 +224,12 @@ fn main(_: u64) -> u64 {
     } else {
         rt::budget::take(&mut start, rt::budget::SERVE)
     };
+    // The budget of the thread of the service's own work, bound to it when it is made.
+    let turns_budget = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::TURNS)
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
@@ -243,10 +251,16 @@ fn main(_: u64) -> u64 {
         "tty preparation: Connect {} ticks (including startup wait)",
         time::now().saturating_sub(connect_began)
     );
-    let place = |label| sys::handle_label(&channel, Rights::NOTIFY, label, level);
+    // The own work of the service (the driver's input and room, the steps, the departures of
+    // processes, the timer of VTIME) is done by turns, in a thread with a budget of its own:
+    // every notification of these places comes to its channel.
+    let Ok(turns) = rt::service::Turns::new(level) else {
+        return NO_PLACES;
+    };
+    let place = |label| sys::handle_label(turns.channel(), Rights::NOTIFY, label, level);
     let (Ok(step), Ok(view)) = (
         place(STEP),
-        sys::handle_label(&channel, Rights::RECEIVE, TIMER, level),
+        sys::handle_label(turns.channel(), Rights::RECEIVE, TIMER, level),
     ) else {
         return NO_PLACES;
     };
@@ -261,6 +275,7 @@ fn main(_: u64) -> u64 {
     };
     let mut service = Tty {
         channel: Handle::borrowed(channel.raw()),
+        turns: Handle::borrowed(turns.channel().raw()),
         parent: Handle::borrowed(start.parent.raw()),
         level,
         clones: &mut tables.clones,
@@ -325,12 +340,32 @@ fn main(_: u64) -> u64 {
     if rt::budget::bind("tty", "serve", serve, &start.thread).is_err() {
         return NO_BUDGET;
     }
+    // SAFETY: TURNS_STACK is the turns thread's alone.
+    let started = unsafe {
+        turns.start(
+            "tty",
+            &start.process,
+            &channel,
+            TURNS_STACK.top(),
+            TURNS_BUFFER,
+            turns_budget,
+        )
+    };
+    if started.is_err() {
+        return NO_BUDGET;
+    }
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(5);
     #[cfg(feature = "quiet-steps")]
     rt::service::quiet_steps();
-    let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
+    let _ = rt::service::run_with(
+        &channel,
+        &mut service,
+        config,
+        &mut tables.sessions,
+        Some(&turns),
+    );
     STOPPED
 }
 
@@ -369,6 +404,8 @@ enum Input {
 struct Tty {
     /// The service's channel, which its own sessions are copies of.
     channel: ManuallyDrop<Handle<Channel>>,
+    /// The channel of the turns thread, where the service's own places and timers are.
+    turns: ManuallyDrop<Handle<Channel>>,
     /// The connection to init, for a session with a driver that started
     /// again.
     parent: ManuallyDrop<Handle<Channel>>,
@@ -424,6 +461,9 @@ struct Tty {
     departure_cursor: usize,
 }
 
+static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+
 /// The time on the scale of timer_set.
 fn now() -> u64 {
     time::ticks_to_ns(time::now())
@@ -465,6 +505,7 @@ fn call<'a>(
 /// The driver as the pump sees it.
 struct Port<'a> {
     driver: &'a Handle<Channel>,
+    /// The channel of the turns thread: the driver's room is told there.
     channel: &'a Handle<Channel>,
     level: u8,
     room_given: &'a mut bool,
@@ -869,7 +910,7 @@ impl Tty {
     }
 
     fn tell_place(&self, label: u64) {
-        if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, label, self.level) {
+        if let Ok(place) = sys::handle_label(&self.turns, Rights::NOTIFY, label, self.level) {
             let _ = sys::notify(&place, 1);
         }
     }
@@ -883,7 +924,7 @@ impl Tty {
                     return;
                 };
                 let Ok(notice) = sys::handle_label(
-                    &self.channel,
+                    &self.turns,
                     Rights::NOTIFY | Rights::TRANSFER,
                     DEPARTURES,
                     self.level,
@@ -1250,7 +1291,7 @@ impl Tty {
         if !self.room_given {
             let mut port = Port {
                 driver: &self.driver,
-                channel: &self.channel,
+                channel: &self.turns,
                 level: self.level,
                 room_given: &mut self.room_given,
             };
@@ -1305,10 +1346,10 @@ impl Tty {
         true
     }
 
-    fn push(&mut self) {
+    fn push(&mut self) -> bool {
         self.mark_drains();
         if self.observe_drain() {
-            return;
+            return false;
         }
         let target = self.devices[self.active]
             .drainers
@@ -1323,27 +1364,32 @@ impl Tty {
             });
         let mut port = Port {
             driver: &self.driver,
-            channel: &self.channel,
+            channel: &self.turns,
             level: self.level,
             room_given: &mut self.room_given,
         };
-        match self.pump.run_prefix(
+        let more = match self.pump.run_prefix(
             &mut self.devices[self.active].console,
             &mut port,
             WRITES,
             target,
         ) {
-            Ok(Pumped::More) => self.kick(),
-            Ok(Pumped::Idle | Pumped::WaitsRoom) => {}
+            Ok(Pumped::More) => {
+                self.kick();
+                true
+            }
+            Ok(Pumped::Idle | Pumped::WaitsRoom) => false,
             Err(_) => {
                 self.reconnect();
                 self.kick();
+                false
             }
-        }
+        };
         self.tell_output();
         if target == Some(self.devices[self.active].console.sent_total()) {
             self.kick();
         }
+        more
     }
 
     /// The writes that wait hear of room, and the drains of an output that
@@ -1388,7 +1434,7 @@ impl Tty {
                     None
                 } else {
                     sys::handle_label(
-                        &self.channel,
+                        &self.turns,
                         Rights::NOTIFY | Rights::TRANSFER,
                         DRIVER_IN,
                         self.level,
@@ -2458,6 +2504,15 @@ impl Tty {
             FLOW_OUT_OFF => self.devices[self.active].console.set_stopped(true),
             FLOW_OUT_ON => {
                 self.devices[self.active].console.set_stopped(false);
+                // The output the stop held goes on in this request, up to the room the driver
+                // gave: a client that sends XON sees the output resume when the call returns,
+                // whatever level the service's own steps run at. What the room does not take
+                // stays to the steps.
+                for _ in 0..FLOW_PUSHES {
+                    if !self.push() {
+                        break;
+                    }
+                }
                 self.kick();
             }
             FLOW_IN_OFF | FLOW_IN_ON => {

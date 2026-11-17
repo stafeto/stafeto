@@ -368,10 +368,9 @@ pub struct Gate {
 /// the sum of C/T of the budgets of the table on a CPU is at most this
 /// (spec 8). The rest is for the levels below the budgets and for the trusted
 /// work that has none (the kernel, the interrupts, the drivers, init), which
-/// the layout takes at 5 %. The three general services work at level 32 once
-/// their budget is spent (`ramfs::SERVICE_LOW`), so the levels of the POSIX
-/// processes do not get this rest from them (it is the share of the levels at 33 and
-/// above that the budgets protect).
+/// the layout takes at 5 %. The three general services work at level 1 once
+/// their budgets are spent (`ramfs::SERVICE_LOW`), under every process, so the levels of the
+/// POSIX processes get this rest and what the services' C leave.
 pub const BUDGET_SHARE_MAX_PPM: u64 = 750_000;
 
 /// What the budgets of CPU 0 leave free of `BUDGET_SHARE_MAX_PPM` for the budgets the table
@@ -4183,15 +4182,21 @@ mod tests {
 
     #[test]
     fn the_services_of_the_files_pipes_and_terminal_have_budgets_under_their_levels() {
-        // Each binds `serve`, on CPU 0, to its request thread; the threads it does not bind
-        // work at `SERVICE_FREE`.
-        for (record, c_ns) in [(ramfs::PIPE, 75_000), (ramfs::TTY, 75_000)] {
-            assert_eq!(record.budgets.len(), 1, "{}", record.name);
-            let b = record.budgets[0];
-            assert_eq!(
-                (b.name, b.cpu, b.c_ns, b.t_ns, b.low),
-                ("serve", 0, c_ns, 5_000_000, ramfs::SERVICE_LOW)
-            );
+        // Each binds `serve`, on CPU 0, to its request thread and `turns` to the thread of its
+        // own work, both falling to level 1; the threads it does not bind work at
+        // `SERVICE_FREE`. The two together are the C the service had with one.
+        for (record, serve, turns) in [(ramfs::PIPE, 50_000, 25_000), (ramfs::TTY, 50_000, 25_000)]
+        {
+            assert_eq!(record.budgets.len(), 2, "{}", record.name);
+            for (b, name, c_ns) in [
+                (record.budgets[0], "serve", serve),
+                (record.budgets[1], "turns", turns),
+            ] {
+                assert_eq!(
+                    (b.name, b.cpu, b.c_ns, b.t_ns, b.low),
+                    (name, 0, c_ns, 5_000_000, ramfs::SERVICE_LOW)
+                );
+            }
             assert_eq!(record.free, ramfs::SERVICE_FREE);
             assert!(record.free < record.priority && record.free <= record.ceiling);
             assert!(start_data_names(&record) <= START_DATA_MAX);
@@ -4202,18 +4207,25 @@ mod tests {
             ramfs::RAM_FIFO_CLOCKED,
         ] {
             assert_eq!(record.free, ramfs::RAM_FREE);
-            assert_eq!(record.budgets.len(), usize::from(ramfs::RAM_BUDGET_ON));
+            assert_eq!(record.budgets.len(), 2 * usize::from(ramfs::RAM_BUDGET_ON));
+            let c_ns: Vec<_> = record
+                .budgets
+                .iter()
+                .map(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low))
+                .collect();
             assert!(
-                record
-                    .budgets
-                    .iter()
-                    .all(|b| (b.name, b.cpu, b.c_ns, b.t_ns, b.low)
-                        == ("serve", 0, 250_000, 5_000_000, ramfs::SERVICE_LOW))
+                c_ns.is_empty()
+                    || c_ns
+                        == [
+                            ("serve", 0, 200_000, 5_000_000, ramfs::SERVICE_LOW),
+                            ("turns", 0, 50_000, 5_000_000, ramfs::SERVICE_LOW),
+                        ]
             );
         }
         // The POSIX processes end at 31: a thread of a service that has no budget never works
-        // above them.
+        // above them, and one that spent its budget works under them (`SERVICE_LOW` is 1).
         assert_eq!(ramfs::SERVICE_FREE, 31);
+        assert_eq!(ramfs::SERVICE_LOW, 1);
         assert!(ramfs::SERVICE_FREE >= ramfs::RAM_LEGACY.priority.min(31));
     }
 

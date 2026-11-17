@@ -163,6 +163,13 @@ fn main(_: u64) -> u64 {
     } else {
         rt::budget::take(&mut start, rt::budget::SERVE)
     };
+    // The budget of the thread of the service's own work (init's table), bound to it when it is
+    // made.
+    let turns_budget = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::TURNS)
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
@@ -171,7 +178,12 @@ fn main(_: u64) -> u64 {
     if rt::service::register(&start.parent, &channel).is_err() {
         return 3;
     }
-    let Ok(step) = sys::handle_label(&channel, Rights::NOTIFY, STEP, level) else {
+    // The own work of the service (the steps of the sessions that went) is done by turns, in a
+    // thread with a budget of its own.
+    let Ok(turns) = rt::service::Turns::new(level) else {
+        return 5;
+    };
+    let Ok(step) = sys::handle_label(turns.channel(), Rights::NOTIFY, STEP, level) else {
         return 5;
     };
     // The notary session with the process service, for the root of the
@@ -247,12 +259,32 @@ fn main(_: u64) -> u64 {
     if rt::budget::bind("pipe", "serve", serve, &start.thread).is_err() {
         return 6;
     }
+    // SAFETY: TURNS_STACK is the turns thread's alone.
+    let started = unsafe {
+        turns.start(
+            "pipe",
+            &start.process,
+            &channel,
+            TURNS_STACK.top(),
+            TURNS_BUFFER,
+            turns_budget,
+        )
+    };
+    if started.is_err() {
+        return 7;
+    }
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(4);
     #[cfg(feature = "quiet-steps")]
     rt::service::quiet_steps();
-    let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
+    let _ = rt::service::run_with(
+        &channel,
+        &mut service,
+        config,
+        &mut tables.sessions,
+        Some(&turns),
+    );
     4
 }
 
@@ -306,6 +338,8 @@ static CHANNEL: AtomicU64 = AtomicU64::new(0);
 static LEVEL: AtomicU64 = AtomicU64::new(1);
 static REGISTRAR: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
 const REGISTRAR_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 8192;
 
 extern "C" fn register_root(_: u64) -> ! {
     let parent = Handle::<Channel>::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)));

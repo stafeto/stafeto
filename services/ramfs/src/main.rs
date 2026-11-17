@@ -258,6 +258,10 @@ fn image_layers(ram: &mut Ram<'static>, image: &'static [u8], now: proto_fs::Tim
     }
 }
 
+static TURNS_STACK: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+/// The message buffer of the turns thread: the page after that of the mapper.
+const TURNS_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 8192;
+
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
         return 1;
@@ -271,6 +275,12 @@ fn main(_: u64) -> u64 {
         None
     } else {
         rt::budget::take(&mut start, rt::budget::SERVE)
+    };
+    // The budget of the thread of the service's own work, bound to it when it is made.
+    let turns_budget = if cfg!(feature = "break-budget-unbound") {
+        None
+    } else {
+        rt::budget::take(&mut start, rt::budget::TURNS)
     };
     // Legacy diagnostic timestamp source; clocked profiles replace this at startup.
     let Ok(args) = ServiceArgs::read(start.args()) else {
@@ -348,25 +358,34 @@ fn main(_: u64) -> u64 {
     let Ok(channel) = sys::channel_create(level) else {
         return 2;
     };
-    let mapper = mapper::Mapper::start(&start.process, &channel, level).ok();
+    // The own work of the service (maintenance, departures, lock work, the mapper's tell, the
+    // jobs of the pipe service) is done by turns, in a thread with a budget of its own: its
+    // timers and its tell handles are on the channel of that thread.
+    let Ok(turns) = rt::service::Turns::new(level) else {
+        return 2;
+    };
+    let mapper = mapper::Mapper::start(&start.process, turns.channel(), level).ok();
     if rt::service::register(&start.parent, &channel).is_err() {
         return 3;
     }
-    let Ok(wait_view) = sys::handle_label(&channel, Rights::RECEIVE, WAIT_TIMER_LABEL, level)
+    let Ok(wait_view) =
+        sys::handle_label(turns.channel(), Rights::RECEIVE, WAIT_TIMER_LABEL, level)
     else {
         return 3;
     };
     let Ok(wait_timer) = sys::timer_create(&wait_view, level) else {
         return 3;
     };
-    let Ok(pace_view) = sys::handle_label(&channel, Rights::RECEIVE, PACE_TIMER_LABEL, level)
+    let Ok(pace_view) =
+        sys::handle_label(turns.channel(), Rights::RECEIVE, PACE_TIMER_LABEL, level)
     else {
         return 3;
     };
     let Ok(pace_timer) = sys::timer_create(&pace_view, level) else {
         return 3;
     };
-    let Ok(audit_view) = sys::handle_label(&channel, Rights::RECEIVE, AUDIT_TIMER_LABEL, level)
+    let Ok(audit_view) =
+        sys::handle_label(turns.channel(), Rights::RECEIVE, AUDIT_TIMER_LABEL, level)
     else {
         return 3;
     };
@@ -374,7 +393,7 @@ fn main(_: u64) -> u64 {
         return 3;
     };
     let Ok(ipc_notify) = sys::handle_label(
-        &channel,
+        turns.channel(),
         Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
         IPC_JOBS_LABEL,
         level,
@@ -420,6 +439,20 @@ fn main(_: u64) -> u64 {
             drop(budget);
         }
         Err(_) => return 10,
+    }
+    // SAFETY: TURNS_STACK is the turns thread's alone.
+    let started = unsafe {
+        turns.start(
+            "ramfs",
+            &start.process,
+            &channel,
+            TURNS_STACK.top(),
+            TURNS_BUFFER,
+            turns_budget,
+        )
+    };
+    if started.is_err() {
+        return 11;
     }
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
@@ -467,6 +500,7 @@ fn main(_: u64) -> u64 {
         image_info_fault: None,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
+        turns: Handle::borrowed(turns.channel().raw()),
         parent: Handle::borrowed(start.parent.raw()),
         notary: None,
         // Optional dependency is resolved before serving; request steps never
@@ -509,7 +543,13 @@ fn main(_: u64) -> u64 {
     let _ = fs.register_lifetimes();
     #[cfg(feature = "steps")]
     rt::service::report_steps(2);
-    let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
+    let _ = rt::service::run_with(
+        &channel,
+        &mut fs,
+        config,
+        &mut tables.sessions,
+        Some(&turns),
+    );
     4
 }
 
@@ -656,6 +696,8 @@ struct Fs {
     /// The service's channel, which its own sessions are copies of, and
     /// its connection to init, which gives the notary session.
     channel: ManuallyDrop<Handle<Channel>>,
+    /// The channel of the turns thread: the service's own work is told there.
+    turns: ManuallyDrop<Handle<Channel>>,
     parent: ManuallyDrop<Handle<Channel>>,
     /// The notary session with the process service (init's VOUCHERS),
     /// asked for at the first OPEN_EXEC.
@@ -2359,7 +2401,7 @@ impl Service<0> for Fs {
         #[cfg(feature = "steps")]
         if self.steps_reclaim_owner == Some(label) {
             self.steps_reclaim_owner = None;
-            let _ = sys::notify(&self.channel, 1);
+            let _ = sys::notify(&self.turns, 1);
         }
         let index = Self::birth_index(label);
         if let Some(i) = self.birth_slot(label) {
@@ -2952,7 +2994,7 @@ impl Service<0> for Fs {
                 }
                 2 if self.steps_reclaim_owner == Some(r.label()) => {
                     self.steps_reclaim_owner = None;
-                    let _ = sys::notify(&self.channel, 1);
+                    let _ = sys::notify(&self.turns, 1);
                 }
                 _ => return status(proto_fs::INVALID_ARGUMENT),
             }
@@ -3887,13 +3929,13 @@ impl Fs {
 
     fn notify_maintenance(&self) {
         if self.legacy_pending || self.lock_work_pending() {
-            let _ = sys::notify(&self.channel, 1);
+            let _ = sys::notify(&self.turns, 1);
         }
     }
     /// A turn of maintenance for the work of locks alone.
     fn notify_lock_work(&self) {
         if self.lock_work_pending() {
-            let _ = sys::notify(&self.channel, 1);
+            let _ = sys::notify(&self.turns, 1);
         }
     }
     fn maintenance_dispatch(
@@ -4221,7 +4263,7 @@ impl Fs {
             return false;
         };
         self.lifetimes = Some(page);
-        let _ = sys::notify(&self.channel, 1);
+        let _ = sys::notify(&self.turns, 1);
         true
     }
     fn notary_register(&mut self) -> bool {
@@ -5531,7 +5573,7 @@ impl Fs {
                 self.orphan_count = self.orphan_count.checked_add(1).expect("bounded paid jobs");
                 assert!(self.orphan_count as usize <= ramfs::storage::PREPARATIONS);
             }
-            let _ = sys::notify(&self.channel, 1);
+            let _ = sys::notify(&self.turns, 1);
         } else {
             self.cancel_job(id, owner, Some(fds));
         }

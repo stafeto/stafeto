@@ -13,8 +13,9 @@ const MS: u64 = 1_000_000;
 /// 336 pages to the tables (the `tables=` figure of the release build went from 7 688 784 to
 /// 9 061 368 bytes, 335.1 pages: `State` holds 6 400 places of the image with their names and
 /// the tables of 64 layers), 160 to the page tables of the mappings of layers (a layer of
-/// 28.8 MB is 7 040 pages) and 5 to the thread that maps (stack and message buffer).
-const TABLES: u64 = 915 + 392 + 336 + 160 + 5;
+/// 28.8 MB is 7 040 pages) and 5 to the thread that maps (stack and message buffer), 5 more to the thread of the
+/// service's own work (the turns: stack and message buffer).
+const TABLES: u64 = 915 + 392 + 336 + 160 + 5 + 5;
 
 /// The level of the file, pipe and clock services.
 pub const SERVICE_LEVEL: u8 = 48;
@@ -23,10 +24,10 @@ pub const PROCESS_LEVEL: u8 = 52;
 
 /// The level the threads of the RAM, pipe and terminal services work at while they have no
 /// budget (`Record::free`): the highest level of the POSIX processes (their ceiling is 31). The
-/// request thread binds its budget before it serves, so it works at its own level (48 or 50)
-/// for its C of each T and at `low` after; a thread of these services that has none (the one
-/// that maps layers, the one that registers the root of the pipes) and the request thread of
-/// a service that does not bind never work above the POSIX processes.
+/// request thread and the thread of the service's own work (the turns) bind theirs before they
+/// serve, so they work at their own level (48 or 50) for their C of each T and at `low` after;
+/// a thread of these services that has none (the one that maps layers, the one that registers
+/// the root of the pipes) never works above the POSIX processes.
 pub const SERVICE_FREE: u8 = 31;
 
 /// The period of the budgets of the three services, 5 ms: the longest line of budgets of
@@ -35,58 +36,86 @@ pub const SERVICE_FREE: u8 = 31;
 /// frames meanwhile.
 const SERVICE_PERIOD_NS: u64 = 5 * MS;
 
-/// Whether the RAM service has its budget: the one line to change (to `false`) for an image
-/// without it. The pipe and terminal services keep theirs.
+/// Whether the RAM service has its budgets: the one line to change (to `false`) for an image
+/// without them. The pipe and terminal services keep theirs.
 pub const RAM_BUDGET_ON: bool = true;
 
-/// The level the request thread of the RAM, pipe and terminal services works at once its budget is
-/// spent (`low` of the three budgets): 32, above every POSIX process (their ceiling is 31) and
-/// below the network service (35). The guarantee of the budgets is that each of the three takes at
-/// most C of each T from the levels 33 and above; for the levels at or below 32 it is a service
-/// without a budget, and the share of 20 % of CPU 0 for the levels below the budgets is not
-/// promised (the thread would run at 1 and keep it, which the own work of a service does not
-/// bear yet).
-pub const SERVICE_LOW: u8 = 32;
+/// The level the threads of the RAM, pipe and terminal services work at once their budget is
+/// spent (`low` of the six budgets): 1, under every process, so that a service that spent its
+/// budget is a thread of the lowest level and the levels below the budgets keep what the sum of
+/// the C leaves them (23.3 % of CPU 0 in the table with the network service at stage 4, for the
+/// 20 % the release promises). The own work of the service (departures of sessions, the turns
+/// of maintenance, the grants of locks, hang-up, flow control) is done by the thread of its
+/// own, with the budget `turns` carved out of the one the service had (`serve`), so the sum of
+/// C of a service is what it was; what a client can observe the service finishes in the
+/// client's own request.
+pub const SERVICE_LOW: u8 = 1;
 
-/// The `free` level of the RAM records: `SERVICE_FREE` with the budget, 0 without it (a record
-/// without budgets has no `free`, `check_free`).
+/// The `free` level of the RAM records: `SERVICE_FREE` with the budgets, 0 without them (a
+/// record without budgets has no `free`, `check_free`).
 pub const RAM_FREE: u8 = if RAM_BUDGET_ON { SERVICE_FREE } else { 0 };
 
-/// The budget of the RAM service's request thread (`serve`), on CPU 0 where the thread runs:
-/// 250 us of each 5 ms (5 % of the CPU), its requests (paths, locks, metadata) being the
-/// longest and the most frequent of the three. The thread works at `low` 32 after that (`SERVICE_LOW`), where a
-/// request of a client below 32 costs at 32 and one of a client above it at the client's own
-/// level (spec 8, the loan).
+/// The budgets of the RAM service, on CPU 0 where its threads run: `serve` of the request
+/// thread, 200 us of each 5 ms (4 %), its requests (paths, locks, metadata) being the longest
+/// and the most frequent of the three, and `turns` of the thread of its own work, 50 us (1 %),
+/// 250 us together.
 pub const RAM_BUDGETS: &[Budget] = if RAM_BUDGET_ON {
-    &[Budget {
-        name: "serve",
-        cpu: 0,
-        c_ns: 250_000,
-        t_ns: SERVICE_PERIOD_NS,
-        low: SERVICE_LOW,
-    }]
+    &[
+        Budget {
+            name: "serve",
+            cpu: 0,
+            c_ns: 200_000,
+            t_ns: SERVICE_PERIOD_NS,
+            low: SERVICE_LOW,
+        },
+        Budget {
+            name: "turns",
+            cpu: 0,
+            c_ns: 50_000,
+            t_ns: SERVICE_PERIOD_NS,
+            low: SERVICE_LOW,
+        },
+    ]
 } else {
     &[]
 };
 
-/// The budget of the pipe service's request thread: 75 us of each 5 ms (1.5 %).
-pub const PIPE_BUDGETS: &[Budget] = &[Budget {
-    name: "serve",
-    cpu: 0,
-    c_ns: 75_000,
-    t_ns: SERVICE_PERIOD_NS,
-    low: SERVICE_LOW,
-}];
+/// The budgets of the pipe service: `serve` 50 us of each 5 ms (1 %) and `turns` 25 us (0.5 %).
+pub const PIPE_BUDGETS: &[Budget] = &[
+    Budget {
+        name: "serve",
+        cpu: 0,
+        c_ns: 50_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: SERVICE_LOW,
+    },
+    Budget {
+        name: "turns",
+        cpu: 0,
+        c_ns: 25_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: SERVICE_LOW,
+    },
+];
 
-/// The budget of the terminal service's request thread: 75 us of each 5 ms (1.5 %), the output
-/// being bound by the driver as well.
-pub const TTY_BUDGETS: &[Budget] = &[Budget {
-    name: "serve",
-    cpu: 0,
-    c_ns: 75_000,
-    t_ns: SERVICE_PERIOD_NS,
-    low: SERVICE_LOW,
-}];
+/// The budgets of the terminal service: `serve` 50 us of each 5 ms (1 %) and `turns` 25 us
+/// (0.5 %), the output being bound by the driver as well.
+pub const TTY_BUDGETS: &[Budget] = &[
+    Budget {
+        name: "serve",
+        cpu: 0,
+        c_ns: 50_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: SERVICE_LOW,
+    },
+    Budget {
+        name: "turns",
+        cpu: 0,
+        c_ns: 25_000,
+        t_ns: SERVICE_PERIOD_NS,
+        low: SERVICE_LOW,
+    },
+];
 
 const RAM_BASE: Record = Record {
     name: "ramfs",
@@ -114,7 +143,7 @@ const RAM_BASE: Record = Record {
     } else {
         (4096 + TABLES + 9 + 33 + 12 + 128) * PAGE
     },
-    handle_limit: 512,
+    handle_limit: 520,
     restart: Restart::Never,
     console: true,
     log: false,
@@ -648,8 +677,8 @@ pub const RELIBC_TABLE: &[Record] = &[
 pub const PIPE: Record = Record {
     name: "pipe",
     program: "pipe",
-    quota: 160 * PAGE,
-    handle_limit: 224,
+    quota: 165 * PAGE,
+    handle_limit: 232,
     restart: Restart::Never,
     budgets: PIPE_BUDGETS,
     free: SERVICE_FREE,
@@ -1022,8 +1051,8 @@ pub const TTY: Record = Record {
     priority: 50,
     ceiling: 50,
     // PT_LOAD 84 pages + stack 8 + generations 1; reserve 35 pages.
-    quota: 128 * PAGE,
-    handle_limit: 192,
+    quota: 133 * PAGE,
+    handle_limit: 200,
     restart: Restart::Never,
     connects: &["uart"],
     budgets: TTY_BUDGETS,

@@ -16,6 +16,9 @@ use crate::{Handle, sys};
 /// The name of the request thread's budget in the start data (init's table, `Budget::name`).
 pub const SERVE: &str = "serve";
 
+/// The name of the budget of the thread of the service's own work (`service::Turns`).
+pub const TURNS: &str = "turns";
+
 /// The budget init gave under `name`, if any: a record with none (a table with no budget for
 /// the service) runs unbudgeted.
 pub fn take(start: &mut Startup, name: &str) -> Option<Handle<Budget>> {
