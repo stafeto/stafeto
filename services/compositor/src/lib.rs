@@ -36,17 +36,18 @@ pub const MAX_WINDOWS: usize = 8;
 // The places a mask of `u8` names (`Scene::create`).
 const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
-/// The lines of one band of a frame that only copies a window that covers
-/// the damage: one step of the service (pixman's copy of 8 lines of 640 points
-/// takes about 14 000 ticks). Half of it where the band starts black or lays
-/// something over others, whose pixman operations cost more a point.
+/// The most lines of one band of a frame (`Scene::tile` makes a band
+/// shorter where its layers cost more).
 pub const BAND_ROWS: u32 = 8;
-/// The points one band lays over others at most (a band of a frame that
-/// has a window with an alpha, or the pointer, in it; with several such
-/// layers each counts): a band is this many points of all the layers, on
-/// the damage's lines and columns, at least one point. pixman's portable OVER
-/// takes about 25 ticks a point.
-pub const OVER_POINTS: u32 = 320;
+/// What a band costs the service in ticks (`Scene::tile`): at most
+/// BAND_TICKS in all, CALL_TICKS for each layer's call of pixman, and a tick
+/// count a point: a copy (measured 2.7), a layer laid over others (about 25)
+/// and the black (about 4). The step stays under 16 500.
+pub const BAND_TICKS: u32 = 15_000;
+pub const CALL_TICKS: u32 = 1_500;
+pub const OPAQUE_TICKS: u32 = 3;
+pub const OVER_TICKS: u32 = 25;
+pub const FILL_TICKS: u32 = 4;
 
 /// Linux's key codes the scene knows: the Alt keys and Tab.
 pub const KEY_TAB: u16 = 15;
@@ -228,6 +229,11 @@ pub const SCREEN: Rect = Rect {
 };
 
 pub use proto_comp::cursor::{CURSOR, CURSOR_H, CURSOR_W};
+
+/// The pointer's picture on a 4-byte boundary, as pixman wants its memory.
+#[repr(align(4))]
+struct Aligned([u8; CURSOR.len()]);
+static PICTURE: Aligned = Aligned(CURSOR);
 
 impl Scene {
     pub const fn new() -> Scene {
@@ -775,8 +781,8 @@ impl Scene {
 
     /// Starts a frame when none is in progress and damage waits: the
     /// damage, clipped to the screen. Each window's posted buffer is taken,
-    /// and a window that has its first buffer taken gets the focus and the
-    /// top place.
+    /// and, when no manager has subscribed, a window that has its first
+    /// buffer taken gets the focus and the top place.
     pub fn begin(&mut self) -> Option<Rect> {
         if self.frame {
             return None;
@@ -806,10 +812,15 @@ impl Scene {
                 first |= 1 << i;
             }
         }
-        for i in 0..MAX_WINDOWS {
-            if first & (1 << i) != 0 {
-                self.set_focus(i);
-                let _ = self.raise(i);
+        // With a manager the window's making was told to it (CREATE), and it
+        // decides who has the focus; without one the window that is shown
+        // first takes it.
+        if !self.manager {
+            for i in 0..MAX_WINDOWS {
+                if first & (1 << i) != 0 {
+                    self.set_focus(i);
+                    let _ = self.raise(i);
+                }
             }
         }
         self.frame = true;
@@ -856,11 +867,14 @@ impl Scene {
     }
 
     /// The size of the next band of a frame over `damage`, as columns and
-    /// lines. A band that lays something over what is below it (windows with
-    /// an alpha, the pointer's picture) holds OVER_POINTS points of all those
-    /// layers at most, at least one point; a band that only copies is the
-    /// damage's width and BAND_ROWS lines under a window that covers the
-    /// damage, and half as many where it starts black.
+    /// lines. A band costs a call for every layer it makes (each shown window
+    /// that touches the damage, the pointer's picture when it does, and the
+    /// black the band starts with when no window covers the damage) and
+    /// ticks for every point of each: OPAQUE_TICKS for a copy, OVER_TICKS for
+    /// a layer with an alpha or the pointer, FILL_TICKS for the black. The band
+    /// holds as many points as BAND_TICKS leaves after the calls, at least
+    /// one. The estimate counts every window that touches the damage, the
+    /// ones under a covering window too, so it never falls short.
     fn tile(&self, damage: Rect) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
@@ -868,15 +882,17 @@ impl Scene {
                 && r.y < damage.y + damage.h
                 && damage.y < r.y + r.h
         };
-        // The layers laid over others in the damage: windows with an alpha
-        // and the pointer's picture.
-        let argb = self
-            .windows
-            .iter()
-            .flatten()
-            .filter(|w| Scene::shown(w) && w.format == Format::Argb && touches(w.rect))
-            .count() as u32;
-        let cursor = u32::from(self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p))));
+        let (mut opaque, mut over) = (0u32, 0u32);
+        for w in self.windows.iter().flatten() {
+            if Scene::shown(w) && touches(w.rect) {
+                if w.format == Format::Argb {
+                    over += 1;
+                } else {
+                    opaque += 1;
+                }
+            }
+        }
+        over += u32::from(self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p))));
         let covered = self.windows.iter().flatten().any(|w| {
             Scene::shown(w)
                 && w.format == Format::Xrgb
@@ -885,17 +901,19 @@ impl Scene {
                 && w.rect.x + w.rect.w >= damage.x + damage.w
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
-        let layers = argb + cursor;
-        if let Some(share) = OVER_POINTS.checked_div(layers) {
-            let budget = share.max(1);
-            let w = damage.w.min(budget).max(1);
-            (w, (budget / w).clamp(1, BAND_ROWS / 2))
-        } else if covered {
-            (damage.w, BAND_ROWS)
-        } else {
-            // Black under the bands (pixman's fill costs about twice a copy).
-            (damage.w, BAND_ROWS / 2)
-        }
+        let fill = u32::from(!covered);
+        let calls = opaque + over + fill;
+        let per_point = OPAQUE_TICKS * opaque + OVER_TICKS * over + FILL_TICKS * fill;
+        let Some(points) = BAND_TICKS
+            .saturating_sub(CALL_TICKS * calls)
+            .checked_div(per_point)
+        else {
+            // Nothing to draw: the damage is black or untouched.
+            return (damage.w, BAND_ROWS);
+        };
+        let points = points.max(1);
+        let w = damage.w.min(points).max(1);
+        (w, (points / w).clamp(1, BAND_ROWS))
     }
 }
 
@@ -1020,7 +1038,7 @@ pub fn compose(
         if cx0 < cx1 && cy0 < cy1 {
             raster.blit(
                 fb,
-                &CURSOR,
+                &PICTURE.0,
                 CURSOR_W * 4,
                 Format::Argb,
                 (CURSOR_W, CURSOR_H),
@@ -1397,11 +1415,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + BAND_ROWS).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 7).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(BAND_ROWS));
+        assert_eq!(bands, HEIGHT.div_ceil(7));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -1732,7 +1750,7 @@ mod tests {
         assert_eq!(
             first,
             Band {
-                row: BAND_ROWS / 2,
+                row: BAND_ROWS,
                 col: 0
             }
         );
@@ -1753,27 +1771,108 @@ mod tests {
         assert_eq!(at(&fb, 3, 4), 0xFF);
     }
 
+    /// A raster that only counts what a band would cost pixman: the
+    /// calls and the ticks the model of `Scene::tile` gives them.
+    #[derive(Default)]
+    struct Cost {
+        calls: u32,
+        ticks: u32,
+    }
+
+    impl Raster for Cost {
+        fn black(&mut self, _: &mut [u8], r: Rect) {
+            self.calls += 1;
+            self.ticks += FILL_TICKS * r.w * r.h;
+        }
+
+        fn blit(
+            &mut self,
+            _: &mut [u8],
+            _: &[u8],
+            _: u32,
+            _: Format,
+            _: (u32, u32),
+            _: (u32, u32),
+            _: (u32, u32),
+            area: (u32, u32),
+            over: bool,
+        ) {
+            self.calls += 1;
+            self.ticks += if over { OVER_TICKS } else { OPAQUE_TICKS } * area.0 * area.1;
+        }
+    }
+
+    /// The most ticks one band of the frame over `d` costs, by the model.
+    fn worst_band(s: &Scene, d: Rect, src: &impl Source) -> (u32, u32) {
+        let mut fb = screen();
+        let mut at = Band { row: d.y, col: 0 };
+        let (mut worst, mut bands) = (0, 0);
+        while at.row < d.y + d.h {
+            let mut cost = Cost::default();
+            at = compose(s, d, at, &mut fb, src, &mut cost);
+            worst = worst.max(cost.calls * CALL_TICKS + cost.ticks);
+            bands += 1;
+        }
+        (worst, bands)
+    }
+
     #[test]
-    fn the_bands_over_others_hold_the_points_of_all_the_layers_at_most() {
+    fn a_band_holds_the_points_the_ticks_of_its_layers_allow() {
         let mut s = Scene::new();
         let a = s.create(1, 1, SCREEN, true, 0).unwrap();
-        s.pointer_to(5, 5);
         s.flush(a, SCREEN).unwrap();
         let d = s.begin().unwrap();
-        assert_eq!(d, SCREEN);
-        // The pointer is the one layer: one line of OVER_POINTS columns of
-        // the whole width, or more lines of a narrow damage.
-        assert_eq!(s.tile(d), (OVER_POINTS, 1));
-        assert_eq!(s.tile(rect(0, 0, 100, 50)), (100, OVER_POINTS / 100));
-        // Away from the pointer: a copy under a window that covers the
-        // damage is 8 lines of its width, and one that starts black 4.
-        assert_eq!(s.tile(rect(300, 300, 100, 50)), (100, BAND_ROWS));
+        s.end(true);
+        // One window that covers the damage: lines of the width.
+        // (the copy of a point is 3 in the model: 7 lines of 640).
+        assert_eq!(s.tile(d), (640, 7));
+        // The pointer over it: a layer laid over others costs 25 a point.
+        s.pointer_to(5, 5);
+        let (w, rows) = s.tile(d);
+        assert_eq!(rows, 1);
+        assert!(w < 640 && w * OVER_TICKS + 2 * CALL_TICKS <= BAND_TICKS + 3 * w);
+        // A damage nothing covers starts black: fewer lines.
         let mut t = Scene::new();
-        let a = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
-        t.flush(a, rect(0, 0, 50, 50)).unwrap();
+        let b = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
+        t.flush(b, rect(0, 0, 50, 50)).unwrap();
         t.begin().unwrap();
-        assert_eq!(t.tile(rect(10, 10, 50, 50)), (50, BAND_ROWS));
-        assert_eq!(t.tile(rect(0, 0, 100, 100)), (100, BAND_ROWS / 2));
+        assert_eq!(t.tile(rect(10, 10, 50, 50)).1, BAND_ROWS);
+        assert!(t.tile(rect(0, 0, 640, 400)).1 < BAND_ROWS);
+    }
+
+    #[test]
+    fn eight_windows_in_a_damage_make_bands_under_the_bound() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        // Eight windows, opaque and with an alpha in turn, staggered over
+        // one another, two contexts of four.
+        for k in 0..MAX_WINDOWS {
+            let r = rect(100 + 7 * k as u32, 100 + 5 * k as u32, 300, 200);
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, r, false, 0)
+                .unwrap();
+            if k % 2 == 1 {
+                s.set_format(i, Format::Argb);
+            }
+            s.attach(i, 1, 1200).unwrap();
+            src.0[i * BUFFERS] = vec![0x10; 1200 * 200];
+            s.post(i, 0, &[]).unwrap();
+        }
+        let d = s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.open(), 8);
+        // The damage of the whole screen, every window in it.
+        let (worst, bands) = worst_band(&s, SCREEN, &src);
+        assert!(
+            worst <= 16_500,
+            "a band of {worst} ticks by the model, {bands} bands"
+        );
+        // One window's rectangle, the others under or over it.
+        let (worst, _) = worst_band(&s, d, &src);
+        assert!(worst <= 16_500, "{worst}");
+        // The points of a band: far under what one window's copy holds.
+        let (w, rows) = s.tile(SCREEN);
+        assert!(w * rows < 640 * BAND_ROWS / 10, "{w} x {rows}");
     }
 
     #[test]
@@ -1785,45 +1884,43 @@ mod tests {
         s.attach(b, 1, 2400).unwrap();
         s.flush(a, SCREEN).unwrap();
         s.post(b, 0, &[]).unwrap();
-        let d = s.begin().unwrap();
-        s.end(true);
-        let damage = rect(0, 0, 600, 100);
-        assert!(d.w >= 600);
-        // One layer with an alpha: a line of OVER_POINTS columns.
-        assert_eq!(s.tile(damage), (OVER_POINTS, 1));
-        // Two such layers, the pointer too: 213 points of each.
-        s.pointer_to(1, 1);
-        let c = s.create(3, 3, rect(0, 0, 600, 100), false, 0).unwrap();
-        s.set_format(c, Format::Argb);
-        s.attach(c, 1, 2400).unwrap();
-        s.post(c, 0, &[]).unwrap();
         s.begin().unwrap();
         s.end(true);
-        assert_eq!(s.tile(damage), (OVER_POINTS / 3, 1));
-        // A frame over a damage wider than a band goes across it.
+        let damage = rect(0, 0, 600, 100);
+        let (w, rows) = s.tile(damage);
+        assert!(w < 600 && rows == 1, "{w} x {rows}");
         let src = flat(&[
             (a, 0, 7, (STRIDE * HEIGHT) as usize),
             (b, 0, 0x10, 2400 * 100),
-            (c, 0, 0x10, 2400 * 100),
         ]);
         let mut fb = screen();
-        let mut at = Band { row: 0, col: 0 };
-        let mut seen = Vec::new();
-        while at.row < 2 {
-            seen.push(at);
-            at = compose(&s, damage, at, &mut fb, &src, &mut Plain);
-        }
-        assert_eq!(seen[0], Band { row: 0, col: 0 });
-        assert_eq!(
-            seen[1],
-            Band {
-                row: 0,
-                col: OVER_POINTS / 3
-            }
-        );
-        assert_eq!(
-            seen.len(),
-            2 * 600usize.div_ceil((OVER_POINTS / 3) as usize)
-        );
+        let first = compose(&s, damage, Band::default(), &mut fb, &src, &mut Plain);
+        assert_eq!(first, Band { row: 0, col: w });
+        let (worst, _) = worst_band(&s, damage, &src);
+        assert!(worst <= 16_500);
+    }
+
+    #[test]
+    fn with_a_manager_the_first_frame_gives_no_focus_and_create_is_told() {
+        let mut s = Scene::new();
+        s.set_manager(true);
+        let a = make(&mut s, 1, 1, rect(0, 0, 100, 100), 1);
+        s.post(a, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.focus(), None);
+        assert!(events(&mut s, a).is_empty());
+        let mut out = [Event::default(); 4];
+        let (n, _) = s.take_manager_events(&mut out);
+        assert_eq!(&out[..n], [Event::new(CREATE, a as u16, 0)]);
+        // The manager decides.
+        s.focus_on(a).unwrap();
+        assert_eq!(events(&mut s, a), [Event::new(FOCUS_IN, 0, 0)]);
+        // Without it the first frame decides again.
+        s.set_manager(false);
+        let b = make(&mut s, 2, 2, rect(50, 50, 10, 10), 1);
+        s.post(b, 0, &[]).unwrap();
+        s.begin().unwrap();
+        assert_eq!(s.focus(), Some(b));
     }
 }

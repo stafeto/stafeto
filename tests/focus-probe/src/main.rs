@@ -31,8 +31,9 @@ use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
 use proto_comp::cursor::{CURSOR, CURSOR_H, CURSOR_W};
 use proto_comp::{
-    Attach, BUTTON, Create, Description, EVENTS_BIT, Event, FOCUS_IN, FOCUS_OUT, FORMAT_ARGB8888,
-    FORMAT_XRGB8888, HAS_MANAGER, KEY, MAX_EVENTS, MOVE, Method, Post, Rect, WindowRecord, manage,
+    Attach, BUTTON, CREATE, Create, Description, EVENTS_BIT, Event, FOCUS_IN, FOCUS_OUT,
+    FORMAT_ARGB8888, FORMAT_XRGB8888, HAS_MANAGER, KEY, MAX_EVENTS, MOVE, Method, Post, Rect,
+    WindowRecord, manage,
 };
 use proto_gpu::{HEIGHT, WIDTH};
 use proto_init::ServiceArgs;
@@ -112,6 +113,7 @@ fn main(_: u64) -> u64 {
         b"b" => probe.client(true),
         b"m" => probe.manager(),
         b"i" => probe.input(),
+        b"n" => probe.many(),
         _ => Err("an unknown role"),
     };
     match result {
@@ -564,6 +566,10 @@ impl Probe<'_> {
         if d.open != 0 && !second {
             return Err("the screen is not free");
         }
+        // The manager decides who has the focus: the windows wait for it.
+        self.until(&display, "the manager never subscribed", |d| {
+            d.flags & HAS_MANAGER != 0
+        })?;
         if second {
             // Wait for the first window to be on the screen.
             let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
@@ -636,8 +642,13 @@ impl Probe<'_> {
             Ok(seen == wants.len())
         })?;
         rt::println!("focus-probe: {name} events are exactly the focus and the keys it had");
-        if second || cfg!(feature = "quick") {
-            // The run under -icount has no monitor to move the tablet.
+        if second {
+            return Ok(());
+        }
+        if cfg!(feature = "quick") {
+            // The run under -icount has no monitor to move the tablet: this
+            // window stays until the others made eight of them.
+            self.until(&display, "the eight windows never came", |d| d.open == 8)?;
             return Ok(());
         }
         // The tablet: its click, in the window's coordinates, after the moves
@@ -689,8 +700,14 @@ impl Probe<'_> {
         let mut seen = 0;
         let mut switched = false;
         self.watch(&display, |e| {
+            if e.kind == CREATE {
+                // A window of the clients' size has the focus when it is made;
+                // the others (the many windows) have none.
+                self.focus_new(&display, e.code)?;
+                return Ok(false);
+            }
             if e.kind != KEY {
-                // The windows made and gone.
+                // The windows gone.
                 return Ok(false);
             }
             let got = (e.kind, e.code, e.value);
@@ -708,6 +725,27 @@ impl Probe<'_> {
         })?;
         rt::println!("focus-probe: the manager heard the Alt keys and the windows did not");
         Ok(())
+    }
+
+    /// FOCUS of window `id` when it is a window of the two clients (their
+    /// size), found by LIST: the manager's policy of the probe.
+    fn focus_new(&self, display: &Handle<Channel>, id: u16) -> Result<(), &'static str> {
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
+        let reply = sys::send(display, w.as_bytes()).map_err(say("LIST"))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut mine = false;
+        proto_comp::read_list(reply.bytes(&mut buffer), |r| {
+            mine |= r.id == u32::from(id) && r.w == A.w && r.h == A.h;
+        })
+        .map_err(say("LIST's reply"))?;
+        if !mine {
+            return Ok(());
+        }
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::FOCUS, u32::from(id), 0, 0, &mut w)
+            .map_err(say("MANAGE's bytes"))?;
+        plain(display, w.as_bytes()).map_err(say("FOCUS"))
     }
 
     /// LIST, then FOCUS of the shown window that has not the focus.
@@ -766,6 +804,81 @@ impl Probe<'_> {
             }
             self.sleep(RETRY_NS);
         }
+    }
+
+    /// The many windows: seven windows more over the screen's lower right,
+    /// four of this context and three of a clone's (a context has four), in
+    /// formats in turn, which with the first client's make the eight the
+    /// service has. None has the focus while the manager runs, and the bands of
+    /// the frames they make stay under the bound (xtask reads the steps of the
+    /// run under -icount, which is the one that has them: the other has the
+    /// screenshots, and these windows are not in them).
+    fn many(self) -> Result<(), &'static str> {
+        if !cfg!(feature = "quick") {
+            return Ok(());
+        }
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        // The first client alone is on the screen.
+        self.until(&display, "the first client never stood alone", |d| {
+            d.open == 1 && d.created >= 2 && d.flags & HAS_MANAGER != 0
+        })?;
+        let (status, mut reply) =
+            call(&display, &proto_gpu::Method::Clone.header().bytes()).map_err(say("CLONE"))?;
+        if status != Status::Ok {
+            return Err("CLONE was refused");
+        }
+        let clone = reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| "CLONE's handle")?;
+        let mut windows = [const { None }; 7];
+        let mut keep = [const { None }; 7];
+        for k in 0..7usize {
+            let rect = Rect {
+                x: 320 + 15 * k as u32,
+                y: 230 + 3 * k as u32,
+                w: 200,
+                h: 150,
+            };
+            let format = if k % 2 == 1 {
+                FORMAT_ARGB8888
+            } else {
+                FORMAT_XRGB8888
+            };
+            let session = if k < 4 { &display } else { &clone };
+            let (window, _) = self
+                .create_as(session, rect, format)
+                .map_err(say("WINDOW_CREATE of many"))?;
+            let (objects, at) = self.buffers(1, 200 * 150 * 4)?;
+            self.attach_as(&window, 800, &objects[..1], format)
+                .map_err(say("ATTACH of many"))?;
+            // SAFETY: `buffers` mapped this object for writing at this
+            // address, 200 by 150 points; one thread.
+            let points = unsafe { core::slice::from_raw_parts_mut(at[0] as *mut u32, 200 * 150) };
+            points.fill(if k % 2 == 1 { 0x8040_4040 } else { 0x0030_4050 });
+            self.post(&window, 0, &[]).map_err(say("POST of many"))?;
+            windows[k] = Some(window);
+            keep[k] = Some(objects);
+        }
+        self.until(&display, "the many windows never settled", |d| d.open == 8)?;
+        for window in windows.iter().flatten() {
+            let mut out = [Event::default(); MAX_EVENTS];
+            let (n, _) = self
+                .events(window, &mut out)
+                .map_err(say("EVENTS of many"))?;
+            if n != 0 {
+                rt::println!(
+                    "focus-probe: n: an event {:?} came to a window of the many",
+                    out[0]
+                );
+                return Err("a window made while a manager runs took the focus");
+            }
+        }
+        rt::println!("focus-probe: eight windows are shown and none of the seven took the focus");
+        // Held until the first client has seen them all.
+        self.sleep(200_000_000);
+        Ok(())
     }
 
     /// The input: the scene, one step at a time, each with the CRC of the

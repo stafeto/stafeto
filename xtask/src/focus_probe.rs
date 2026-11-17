@@ -89,12 +89,16 @@ const SURVIVOR: &str = "focus-probe: survivor crc ";
 const INJECTED: &str = "focus-probe: the keys are injected";
 /// The line of the tablet's driver about its device.
 const TABLET_LINE: &str = "virtio-input: virtio-mmio at 0xa001a00, line 61, status 0x0";
-const ENDED: [&str; 4] = [
+const ENDED: [&str; 5] = [
     "init: focus-a ended: exit code 0, not restarted",
     "init: focus-b ended: exit code 0, not restarted",
     "init: focus-wm ended: exit code 0, not restarted",
     "init: focus-inject ended: exit code 0, not restarted",
+    "init: focus-many ended: exit code 0, not restarted",
 ];
+/// The line the run under -icount has of the many windows, and the bound on
+/// their bands is the compositor's steps.
+const MANY: &str = "focus-probe: eight windows are shown and none of the seven took the focus";
 
 /// The lines the clients print once per check that passed, and how many
 /// times a run has each.
@@ -115,7 +119,7 @@ const CHECKS: [(&str, usize); 11] = [
         1,
     ),
     (INJECTED, 1),
-    ("focus-probe: ok", 4),
+    ("focus-probe: ok", 5),
     (comp_probe::READY, 1),
     (gpu_probe::SERVICE_LINE, 1),
     (gpu_probe::READY, 1),
@@ -371,17 +375,19 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::GPU);
     cmd.args(qemu::TABLET);
     cmd.args(qemu::ICOUNT);
-    // The first client ends last: it takes the last key the injector sends.
+    // The many windows end last: they are held until the first client has
+    // seen the eight.
     let output = run_until(
         cmd,
         crate::BOOT_TIMEOUT * 4,
-        Some("init: focus-a ended: "),
+        Some("init: focus-many ended: "),
         &kernel.elf,
     )?;
-    qemu::expect_stopped_on(&output, ENDED[0])?;
-    for ended in &ENDED[1..] {
+    qemu::expect_stopped_on(&output, ENDED[4])?;
+    for ended in &ENDED[..4] {
         qemu::expect_marker(&output, ended)?;
     }
+    qemu::expect_marker(&output, MANY)?;
     if let Some(failed) = output
         .lines
         .iter()

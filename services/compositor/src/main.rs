@@ -266,6 +266,8 @@ struct Compositor {
     axes: Axes,
     /// The channel the manager is told of events through, once it said.
     manager: Option<Handle<Channel>>,
+    /// The label of the session that subscribed: only its end clears it.
+    manager_label: u64,
     /// The first revision's window holds the keyboard's focus.
     focus_on: bool,
     /// The buffer of the window of the first revision: the service's own
@@ -322,6 +324,7 @@ fn main(_: u64) -> u64 {
         pointer: Device::new("pointer", POINTER),
         axes: Axes::default(),
         manager: None,
+        manager_label: 0,
         focus_on: false,
         legacy,
         cleared: None,
@@ -1307,6 +1310,7 @@ impl Compositor {
                     return Answer::Status(proto_comp::code(proto_comp::INVALID));
                 };
                 self.manager = Some(notify);
+                self.manager_label = r.label();
                 self.scene.set_manager(true);
                 Ok(())
             }
@@ -1439,8 +1443,11 @@ impl Service<1> for Compositor {
             return;
         }
         if is_manager(label) {
-            self.manager = None;
-            self.scene.set_manager(false);
+            if label == self.manager_label {
+                self.manager = None;
+                self.manager_label = 0;
+                self.scene.set_manager(false);
+            }
             return;
         }
         if is_input(label) {

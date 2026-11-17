@@ -155,8 +155,34 @@ mod imp {
         }
     }
 
+    /// Whether a surface of `width` by `height` points of `stride` bytes a
+    /// line lies inside `len` bytes at `at`, with points of 4 bytes on a
+    /// 4-byte boundary.
+    fn shaped(at: usize, len: usize, stride: u32, width: u32, height: u32) -> bool {
+        width > 0
+            && height > 0
+            && at % 4 == 0
+            && stride % 4 == 0
+            && u64::from(stride) >= u64::from(width) * 4
+            && u64::from(stride) * u64::from(height) <= len as u64
+            && i32::try_from(stride).is_ok()
+            && i32::try_from(width).is_ok()
+            && i32::try_from(height).is_ok()
+    }
+
+    /// Whether the rectangle at (`x`, `y`) of `w` by `h` lies inside a
+    /// surface of `width` by `height`.
+    fn inside(x: u32, y: u32, w: u32, h: u32, width: u32, height: u32) -> bool {
+        w > 0
+            && h > 0
+            && u64::from(x) + u64::from(w) <= u64::from(width)
+            && u64::from(y) + u64::from(h) <= u64::from(height)
+    }
+
     /// `op` of the `w` by `h` points at (`sx`, `sy`) of `src` onto
-    /// (`dx`, `dy`) of `dst`; false when pixman could not make its images.
+    /// (`dx`, `dy`) of `dst`; false when a surface is not what its bytes
+    /// hold or the rectangles are not inside them, and when pixman could not
+    /// make its images: nothing is drawn then.
     pub fn composite(
         images: &mut Images,
         over: bool,
@@ -168,6 +194,23 @@ mod imp {
         let (dbytes, dformat, dstride, dwidth, dheight) = dst;
         let (sbytes, sformat, sstride, swidth, sheight) = src;
         let (sx, sy, dx, dy) = at;
+        if !shaped(
+            dbytes.as_ptr() as usize,
+            dbytes.len(),
+            dstride,
+            dwidth,
+            dheight,
+        ) || !shaped(
+            sbytes.as_ptr() as usize,
+            sbytes.len(),
+            sstride,
+            swidth,
+            sheight,
+        ) || !inside(sx, sy, size.0, size.1, swidth, sheight)
+            || !inside(dx, dy, size.0, size.1, dwidth, dheight)
+        {
+            return false;
+        }
         let Some(d) = images.image(Key {
             bytes: dbytes.as_mut_ptr() as usize,
             format: dformat,
@@ -186,8 +229,9 @@ mod imp {
         }) else {
             return false;
         };
-        // SAFETY: both images wrap memory that outlives the call, and the
-        // rectangles lie inside them (the caller's contract).
+        // SAFETY: both images wrap memory that the checks above show holds
+        // the surfaces, which outlives the call, and the rectangles lie
+        // inside them.
         unsafe {
             pixman_image_composite32(
                 if over { OP_OVER } else { OP_SRC },
@@ -207,9 +251,22 @@ mod imp {
         true
     }
 
-    pub fn fill(dst: &mut [u8], stride: u32, x: u32, y: u32, w: u32, h: u32, value: u32) {
-        // SAFETY: the rectangle lies inside the buffer (the caller's
-        // contract); `stride` is in 32-bit words for pixman_fill.
+    /// The rectangle takes `value`; false (and nothing is drawn) when the
+    /// surface is not what its bytes hold or the rectangle is not inside it.
+    pub fn fill(
+        dst: &mut [u8],
+        stride: u32,
+        (width, height): (u32, u32),
+        (x, y, w, h): (u32, u32, u32, u32),
+        value: u32,
+    ) -> bool {
+        if !shaped(dst.as_ptr() as usize, dst.len(), stride, width, height)
+            || !inside(x, y, w, h, width, height)
+        {
+            return false;
+        }
+        // SAFETY: the checks above show the rectangle is inside the
+        // buffer; `stride` is in 32-bit words for pixman_fill.
         unsafe {
             pixman_fill(
                 dst.as_mut_ptr().cast::<u32>(),
@@ -222,6 +279,7 @@ mod imp {
                 value,
             );
         }
+        true
     }
 }
 
@@ -252,7 +310,8 @@ pub struct Source<'a> {
 /// The `w` by `h` points at (`sx`, `sy`) of `src` replace those at
 /// (`dx`, `dy`) of `dst` (pixman's SRC), or, with `over`, lie over them
 /// (OVER, premultiplied). The rectangles must lie inside the surfaces.
-/// False when pixman could not make its images.
+/// False, with nothing drawn, when a surface is not what its bytes hold, a
+/// rectangle is not inside them, or pixman could not make its images.
 #[cfg(target_os = "none")]
 pub fn composite(
     images: &mut Images,
@@ -273,8 +332,15 @@ pub fn composite(
     )
 }
 
-/// The rectangle of `dst` takes the colour `value` (an XRGB8888 point).
+/// The rectangle of `dst` takes the colour `value` (an XRGB8888 point);
+/// false when it is not inside the surface.
 #[cfg(target_os = "none")]
-pub fn fill(dst: &mut Target<'_>, x: u32, y: u32, w: u32, h: u32, value: u32) {
-    imp::fill(dst.bytes, dst.stride, x, y, w, h, value);
+pub fn fill(dst: &mut Target<'_>, x: u32, y: u32, w: u32, h: u32, value: u32) -> bool {
+    imp::fill(
+        dst.bytes,
+        dst.stride,
+        (dst.width, dst.height),
+        (x, y, w, h),
+        value,
+    )
 }

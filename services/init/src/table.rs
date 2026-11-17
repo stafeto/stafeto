@@ -3740,7 +3740,8 @@ mod tests {
                 "focus-a",
                 "focus-b",
                 "focus-wm",
-                "focus-inject"
+                "focus-inject",
+                "focus-many"
             ]
         );
         assert_eq!(

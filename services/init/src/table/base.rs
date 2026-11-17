@@ -61,7 +61,7 @@ pub const LAUNCHER: Record = Record {
 /// takes (its 16 896 pages of quota, the disk service's 64 and the table
 /// itself are out of init's 127 789 pages on 512 MiB). Nothing of the shell,
 /// `httpd` or a reload of nginx (nine processes, 30 440 pages) needs more than
-/// the 14 x 4 096 pages left.
+/// the 14 x 4 096 pages less `PIXMAN_PAGES` that the pool has.
 pub const COMMAND_QUOTAS: u64 = 14;
 
 /// The pages the pool of the process service gave up for the compositor's

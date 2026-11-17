@@ -86,6 +86,16 @@ const PROBE_WM: Record = Record {
     ..comp::PROBE
 };
 
+/// The many windows (role `n`, in the run under -icount): seven windows over
+/// the first client's, in two contexts, for the bound on the bands. Its quota
+/// is the seven buffers of 30 pages and the stack.
+const PROBE_MANY: Record = Record {
+    name: "focus-many",
+    program: "focus-probe",
+    args: b"n",
+    ..comp::PROBE
+};
+
 /// The injector (role `i`): the compositor's input session, which drives the
 /// scenes and prints the lines whose CRC xtask compares with the screen.
 const PROBE_INPUT: Record = Record {
@@ -104,4 +114,5 @@ pub const TABLE: &[Record] = &[
     PROBE_B,
     PROBE_WM,
     PROBE_INPUT,
+    PROBE_MANY,
 ];

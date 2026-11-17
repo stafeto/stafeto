@@ -30,8 +30,10 @@ and the header version 1 of both.
 - Events (stage G2). Each window has a ring of 64 events of 16 bytes; EVENTS,
   called on a window's session, takes up to 32 of them without waiting, and
   says LOST when older ones were dropped. The bit 3 of the channel
-  WINDOW_CREATE gave says a ring has something. A window that has its first
-  buffer taken into a frame gets the focus and the top place; the window with
+  WINDOW_CREATE gave says a ring has something. While no manager has subscribed, a window that has its first
+  buffer taken into a frame gets the focus and the top place (with a manager
+  it is told CREATE and the manager decides, so a client that makes windows
+  does not take the keyboard); the window with
   the focus gets the keys; a window gets the pointer's moves and buttons in its
   own coordinates (the window under the pointer, or the one a pressed button
   holds until it is released); a click on a window gives it the focus and the
@@ -74,8 +76,10 @@ keyboard's (`input`) and the pointer's (`pointer`, a second instance of
 of its own in GRANT, and the driver sends that channel the bit 1 whenever a
 step put events into the ring; the compositor reads them (READ, up to 32 at a
 time, without waiting) in its own step. The keyboard's focus is the first
-revision's window's while that window lives (Doom reads its keys from the
-service itself, as before) and the compositor's again when it goes. The tablet
+revision's window's while that window lives: the keyboard then goes straight to
+it whatever window has the focus (Doom reads its keys from the service itself,
+as before; no image with a manager and a first-revision window exists, and the
+base image has no manager) and the compositor's again when it goes. The tablet
 reports `EV_ABS` `ABS_X` and `ABS_Y` from 0 to 32 767 across the screen and
 `BTN_LEFT` as a key; the compositor scales them to the screen's 640 by 400. The
 image of the probe (`table::focus`) has the tablet on the transport 13; the
@@ -122,9 +126,12 @@ bands, a step each (the compositor's own bit starts the next band, so requests
 of clients pass between bands). A band that only copies is eight lines of the
 damage's width under a window that covers the damage, and four where it starts
 black (pixman's fill costs about twice its copy). A band that lays something
-over others (a window with an alpha, the pointer's picture) is 320 points of
-all those layers at most, down the damage and across it, since the portable
-OVER of pixman takes about 25 ticks a point, and then goes to the driver
+over others (a window with an alpha, the pointer's picture) holds fewer points:
+each shown window that touches the damage is a call of pixman (about 1 500 ticks)
+and a number of ticks a point (3 for a copy, 25 for a layer laid over others, 4
+for the black), and a band holds the points that 15 000 ticks leave after its
+calls, down the damage and across it, so that eight windows in one band stay
+under the bound, and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as
 soon as the commands are in the device's queue, and the driver says

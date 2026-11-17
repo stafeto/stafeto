@@ -10,8 +10,17 @@ use pixman::{Format as Px, Images, Source, Target, composite, fill};
 use proto_comp::Rect;
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
+/// One point on a 4-byte boundary, as pixman wants its memory.
+#[repr(align(4))]
+struct Point([u8; 4]);
+
 /// The operations over the screen's buffer, and the pixman images they keep.
-pub struct Pixman(Images);
+pub struct Pixman {
+    images: Images,
+    /// The layers and fills that were not drawn (pixman refused: no
+    /// memory in its arena, or a rectangle outside a surface).
+    refused: u32,
+}
 
 const fn format(f: Format) -> Px {
     match f {
@@ -25,17 +34,17 @@ impl Pixman {
     /// start of the service and not in the step of its first band: one
     /// point laid over one point.
     pub fn warm() -> Pixman {
-        let mut dst = [0u8; 4];
-        let src = [0u8; 4];
+        let mut dst = Point([0; 4]);
+        let src = Point([0; 4]);
         let mut target = Target {
-            bytes: &mut dst,
+            bytes: &mut dst.0,
             format: Px::Xrgb8888,
             stride: 4,
             width: 1,
             height: 1,
         };
         let from = Source {
-            bytes: &src,
+            bytes: &src.0,
             format: Px::Argb8888,
             stride: 4,
             width: 1,
@@ -54,7 +63,22 @@ impl Pixman {
         );
         // The two images of the warm-up wrapped memory of this frame.
         drop(images);
-        Pixman(Images::new())
+        Pixman {
+            images: Images::new(),
+            refused: 0,
+        }
+    }
+
+    /// One operation was refused: counted, and said the first time and at
+    /// every 256th.
+    fn refuse(&mut self, what: &str) {
+        self.refused = self.refused.wrapping_add(1);
+        if self.refused % 256 == 1 {
+            rt::println!(
+                "compositor: pixman refused {what} ({} so far)",
+                self.refused
+            );
+        }
     }
 }
 
@@ -67,7 +91,9 @@ impl Raster for Pixman {
             width: WIDTH,
             height: HEIGHT,
         };
-        fill(&mut target, r.x, r.y, r.w, r.h, 0);
+        if !fill(&mut target, r.x, r.y, r.w, r.h, 0) {
+            self.refuse("a fill");
+        }
     }
 
     fn blit(
@@ -96,6 +122,8 @@ impl Raster for Pixman {
             width: size.0,
             height: size.1,
         };
-        composite(&mut self.0, over, &mut target, source, from, to, area);
+        if !composite(&mut self.images, over, &mut target, source, from, to, area) {
+            self.refuse("a layer");
+        }
     }
 }
