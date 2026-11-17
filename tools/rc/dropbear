@@ -1,0 +1,58 @@
+# /etc/rc.d/dropbear: the SSH server, started at each boot after `ec2-key`
+# has written /root/.ssh/authorized_keys. Without that file, or without the
+# program (an image that holds no package dropbear), nothing starts and one
+# line says so.
+#
+# The host key is an Ed25519 key made here, before the server starts and so
+# before anyone can connect (`dropbearkey` waits for the entropy service's
+# seed in `getrandom`). One line on the console gives its fingerprint, for the
+# owner to compare with what `ssh` shows at the first connection:
+#   ssh: host key SHA256:...
+# The key lives in /etc/dropbear, which is in memory: a new instance start
+# makes a new key.
+#
+# The server runs in the foreground (-F) under a loop of its own that starts
+# it again a second after it ends (it starts when the network has its address, so
+# that no line repeats every second while it has none). No password login is possible (-s) and no port is forwarded (-j,
+# -k); the build leaves both out as well. The build has no syslog, so the log
+# goes to the standard error, the console.
+
+args="-F -s -j -k"
+key=/etc/dropbear/dropbear_ed25519_host_key
+
+if [ ! -x /bin/dropbear ]; then
+    echo "dropbear: no /bin/dropbear in this image, SSH stays off"
+    exit 0
+fi
+if [ ! -f /root/.ssh/authorized_keys ]; then
+    echo "dropbear: no /root/.ssh/authorized_keys, SSH stays off"
+    exit 0
+fi
+
+mkdir -p /etc/dropbear
+if [ ! -f "$key" ]; then
+    if ! /bin/dropbearkey -t ed25519 -f "$key" >/dev/null 2>&1; then
+        rm -f "$key"
+        echo "dropbear: no host key could be made, SSH stays off"
+        exit 1
+    fi
+fi
+fingerprint=$(/bin/dropbearkey -y -f "$key" 2>/dev/null | sed -n 's/^Fingerprint: //p')
+echo "ssh: host key $fingerprint"
+
+echo "dropbear: dropbear $args -r $key"
+(
+    # The server ends at once while the network has no address to listen on, and each try
+    # would print a line: it starts when the network service has written /etc/resolv.conf
+    # (its lease), or after a minute. (A loop with a filter for its lines would take two more
+    # processes of a pool that counts.)
+    tries=0
+    while [ ! -s /etc/resolv.conf ] && [ "$tries" -lt 60 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    while :; do
+        /bin/dropbear $args -r "$key"
+        sleep 1
+    done
+) &

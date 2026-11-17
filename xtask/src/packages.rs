@@ -636,6 +636,7 @@ pub fn check() -> Result<(), String> {
         "boot-ash-dialog.img",
         "boot-doom.img",
         "boot-net.img",
+        "boot-ssh-probe.img",
         "boot-net-rc.img",
         "boot-net-curl-steps.img",
         "boot-net-vz.img",
@@ -812,6 +813,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         "boot-net.img"
         | "boot-net-rc.img"
         | "boot-net-its.img"
+        | "boot-ssh-probe.img"
         | "boot-net-curl-steps.img"
         | "boot-net-tls.img"
         | "boot-net-tls-steps.img"
@@ -1171,7 +1173,7 @@ files = [
                 .all(|p| !matches!(p.group(), Group::Net | Group::Fstack))
         );
         let net = of_image("boot-net.img").unwrap();
-        for name in ["openssl", "curl", "ca-bundle", "f-stack"] {
+        for name in ["openssl", "curl", "ca-bundle", "f-stack", "dropbear"] {
             assert!(net.iter().any(|p| p.name == name), "{name}");
         }
         let probe = of_image("boot-fstack-probe.img").unwrap();
@@ -1214,7 +1216,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 23);
+        assert_eq!(packages.len(), 24);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
