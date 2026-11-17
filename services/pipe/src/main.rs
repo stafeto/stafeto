@@ -1940,6 +1940,30 @@ impl Service<0> for PipeService {
         }
     }
 
+    /// A request refused for room (the table of pipes or of named descriptions is full) lets go of
+    /// a few descriptions of the sessions that went on its own lent time (`Service::settle`):
+    /// the steps of the service's own cleanup.
+    fn settle(&mut self, _sessions: &mut [Option<Session<Client, 0>>]) -> rt::service::Settled {
+        rt::service::settle_run(|| {
+            if !(self.pipes.work_due() || self.watches.cleanup_due()) {
+                return None;
+            }
+            let mut wakes = Wakes::default();
+            let more = self.cleanup_step(&mut wakes);
+            self.tell(&wakes);
+            Some(more)
+        })
+    }
+
+    /// The refusals that a release of descriptions cures: NFILE of a call that makes a pipe or a
+    /// socket, before it has any effect.
+    fn refused_for_room(&self, method: u16, status: Status) -> bool {
+        status.code() == proto_pipe::NFILE
+            && [Method::Create, Method::SockCreate, Method::SockPair]
+                .iter()
+                .any(|m| *m as u16 == method)
+    }
+
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptions it was born with are let go of in steps.
     fn closed(&mut self, label: u64) {

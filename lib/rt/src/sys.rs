@@ -1511,6 +1511,37 @@ fn send_with(
     handles: &[abi::Handle],
     flags: u64,
 ) -> Result<Reply, Error> {
+    let mut tries = 0;
+    loop {
+        let reply = send_once(channel, bytes, handles, flags)?;
+        // A service that made progress in the cleanup the request was refused for, and has more
+        // to do, answers TRY_AGAIN to a request without handles (it had no effect): the request
+        // goes again, with the progress of one more step to its account, and the program never
+        // sees the answer. After `TRY_AGAIN_MAX` answers the call fails as a full table does.
+        let again = handles.is_empty()
+            && reply.len == proto_wire::HEADER_LEN
+            && reply.words[0] as u32 == proto_wire::TRY_AGAIN;
+        if !again {
+            return Ok(reply);
+        }
+        tries += 1;
+        if tries == TRY_AGAIN_MAX {
+            return Err(Error::LimitReached);
+        }
+    }
+}
+
+/// The answers TRY_AGAIN a call takes before it fails with LIMIT_REACHED: each is one step of
+/// cleanup at the service, so a departed session of 1 072 descriptions (portions of 16 and the
+/// steps of its places) is worked off well inside it.
+pub const TRY_AGAIN_MAX: u32 = 4096;
+
+fn send_once(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+    flags: u64,
+) -> Result<Reply, Error> {
     let args = message_regs(channel.raw().0, bytes, handles, flags)?;
     // The wait of a service's step for the answer is counted apart from
     // its own work (`service::waited`): the callee's steps carry their own

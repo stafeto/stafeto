@@ -120,6 +120,27 @@ pub trait Service<const K: usize> {
         let _ = notice;
     }
 
+    /// The steps of cleanup a refused request does on its own lent time (`Settled`): at most
+    /// `SETTLE_STEPS` steps, or `SETTLE_TICKS` ticks, of the work of the sessions that went
+    /// (descriptions, pages, places of the table) that frees what the request was refused for. The
+    /// loop calls it before it refuses a request for a full table of sessions and, with
+    /// `refused_for_room`, after a handler refused for a resource. Every call that returns
+    /// `Pending` or `Done` has made progress, so that the debt it works off is spent after a
+    /// bounded number of calls. The default has no such work.
+    fn settle(&mut self, sessions: &mut [Option<Session<Self::Data, K>>]) -> Settled {
+        let _ = sessions;
+        Settled::Nothing
+    }
+
+    /// Whether `status`, the refusal of a request of `method` that carried no handles, is for a
+    /// resource the work of `settle` may have freed (a table of descriptions, pages): the loop
+    /// then settles and, once that made progress, asks the handler again. A handler this is true
+    /// for refuses before it has any effect. The default says no.
+    fn refused_for_room(&self, method: u16, status: Status) -> bool {
+        let _ = (method, status);
+        false
+    }
+
     /// Before every request the loop took, once the receive has returned.
     fn before_request(&mut self) {}
 
@@ -135,6 +156,15 @@ pub trait Service<const K: usize> {
     fn notification(&mut self, n: Notice) {
         let _ = n;
     }
+}
+
+pub use proto_wire::settle::{SETTLE_STEPS, SETTLE_TICKS, Settled};
+
+/// Runs `step` (true when it made progress, with `more` telling whether cleanup is left after
+/// it) up to `SETTLE_STEPS` times or until `SETTLE_TICKS` have passed (`proto_wire::settle::run`),
+/// and says what that came to.
+pub fn settle_run(step: impl FnMut() -> Option<bool>) -> Settled {
+    proto_wire::settle::run(time::now, step)
 }
 
 /// A notification, as `receive` took it (spec 6.5).
@@ -1045,15 +1075,29 @@ fn request<S: Service<K>, const K: usize>(
         other => other,
     };
     let place = service.place(label);
-    let (header, s) =
-        match header.map(|h| (h, session::<S, K>(service, table, label, place, issued))) {
-            Ok((header, Some(s))) => (header, s),
-            Ok((_, None)) => {
-                let status = Status::Kernel(Error::LimitReached);
-                return owe(token, &proto_wire::reply(status), Outgoing::new(), owed);
-            }
-            Err(status) => return owe(token, &proto_wire::reply(status), Outgoing::new(), owed),
-        };
+    let header = match header {
+        Ok(header) => header,
+        Err(status) => return owe(token, &proto_wire::reply(status), Outgoing::new(), owed),
+    };
+    // A request that brought handles is asked of the handler once: they went into it.
+    let bare = handles.is_empty();
+    let mut seat = session_index::<S, K>(service, table, label, place, issued);
+    if seat.is_none() {
+        // The table is full of sessions that went and are not yet cleaned up: the request makes
+        // a few steps of that cleanup on its own lent time before it is refused.
+        let settled = service.settle(table);
+        if settled != Settled::Nothing {
+            seat = session_index::<S, K>(service, table, label, place, issued);
+        }
+        if seat.is_none() {
+            let status = if settled == Settled::Pending && bare {
+                Status::Unknown(proto_wire::TRY_AGAIN)
+            } else {
+                Status::Kernel(Error::LimitReached)
+            };
+            return owe(token, &proto_wire::reply(status), Outgoing::new(), owed);
+        }
+    }
     let mut r = Request {
         label,
         header,
@@ -1062,7 +1106,26 @@ fn request<S: Service<K>, const K: usize>(
         token: Some(token),
         reply: None,
     };
-    let answer = service.request(s, &mut r);
+    let at = seat.expect("seated");
+    let mut answer = service.request(table[at].as_mut().expect("seated"), &mut r);
+    if let Answer::Status(refusal) = &answer
+        && r.token.is_some()
+        && service.refused_for_room(r.header.method, *refusal)
+    {
+        let settled = service.settle(table);
+        if bare && settled != Settled::Nothing {
+            let seat = session_index::<S, K>(service, table, label, place, issued);
+            if let Some(at) = seat {
+                answer = service.request(table[at].as_mut().expect("seated"), &mut r);
+                if let Answer::Status(again) = &answer
+                    && settled == Settled::Pending
+                    && service.refused_for_room(r.header.method, *again)
+                {
+                    answer = Answer::Status(Status::Unknown(proto_wire::TRY_AGAIN));
+                }
+            }
+        }
+    }
     let Some(token) = r.token.take() else {
         return;
     };
@@ -1129,6 +1192,7 @@ fn depart_session<S: Service<K>, const K: usize>(
 /// in the first free one from PLACED on, when there is none; a session of
 /// another label at the service's place ends first. None when the table
 /// is full or the place lies past it.
+#[cfg(test)]
 fn session<'a, S: Service<K>, const K: usize>(
     service: &mut S,
     table: &'a mut [Option<Session<S::Data, K>>],
@@ -1136,6 +1200,18 @@ fn session<'a, S: Service<K>, const K: usize>(
     place: Option<usize>,
     issued: u32,
 ) -> Option<&'a mut Session<S::Data, K>> {
+    let found = session_index::<S, K>(service, table, label, place, issued)?;
+    table[found].as_mut()
+}
+
+/// `session`, the index of the place in the table.
+fn session_index<S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &mut [Option<Session<S::Data, K>>],
+    label: u64,
+    place: Option<usize>,
+    issued: u32,
+) -> Option<usize> {
     let found = match place {
         Some(i) => {
             debug_assert!(i < S::PLACED, "a place past those Service::place gives");
@@ -1170,7 +1246,7 @@ fn session<'a, S: Service<K>, const K: usize>(
     if slot.is_none() {
         *slot = Some(Session::new(label, S::Data::default(), issued));
     }
-    slot.as_mut()
+    Some(found)
 }
 
 /// Token::reply_handles; when the kernel refused the reply before it

@@ -706,6 +706,15 @@ struct Fs {
     cancel_reported: u32,
 }
 
+/// The waiters of a lock a notice or a request tells at most (each is a call of the kernel, and
+/// the step of the service is bounded): the rest are marked for the sweep of the service's own
+/// work.
+const WAKES: usize = 8;
+
+/// The free pages a request finds ready: the retired pages that bring the free list up to this
+/// many are moved to it before the request runs (at most this many steps).
+const SETTLE_PAGES: usize = 64;
+
 /// The clones the service keeps alive at most: one for each record of the
 /// process service and room beside them.
 const CLONES: usize = 320;
@@ -2341,6 +2350,11 @@ impl Service<0> for Fs {
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
         self.waits.poll();
+        // The locks of a departed client may have stood in a waiter's way: the waiters are
+        // told in the notice of the departure.
+        self.waits.wake_all(WAKES, |h| {
+            let _ = sys::notify(h, 1);
+        });
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
         let empty = Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label());
@@ -2350,6 +2364,43 @@ impl Service<0> for Fs {
     fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
         s.data.departed
             && !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label())
+    }
+
+    /// A request refused for room (the table of descriptions, the pages, the places of the
+    /// table) does the steps of cleanup that free it on its own lent time: the departure steps of
+    /// the sessions that went, then the retired pages and inodes. A step that makes no progress
+    /// ends the run: what waits for another service is left to the maintenance.
+    fn settle(&mut self, sessions: &mut [Option<Session<Fds, 0>>]) -> rt::service::Settled {
+        if !self.room_debt() {
+            return rt::service::Settled::Nothing;
+        }
+        rt::service::settle_run(|| {
+            let progressed = match self.departure_step(sessions) {
+                Some(true) => true,
+                Some(false) | None => self.ram.storage.reclaim_step(),
+            };
+            progressed.then(|| self.room_debt())
+        })
+    }
+
+    fn refused_for_room(&self, method: u16, status: Status) -> bool {
+        // Opening (the prepayment comes before any effect on a file) and cloning refuse before
+        // they take effect; the codes are the table of descriptions of the service (ENFILE) and
+        // the pages and inodes (ENOSPC).
+        let open = [
+            Method::Open,
+            Method::OpenStart,
+            Method::OpenPrepare,
+            Method::Clone,
+            Method::CloneExact,
+            Method::CloneMore,
+        ]
+        .iter()
+        .any(|m| *m as u16 == method);
+        open && matches!(
+            status.code(),
+            proto_fs::TOO_MANY_FILES_IN_SYSTEM | proto_fs::NO_SPACE
+        )
     }
 
     /// A never-used clone retains its paid birth until cleanup finishes.
@@ -2400,6 +2451,11 @@ impl Service<0> for Fs {
 
     fn before_request(&mut self) {
         self.request_began = rt::time::ticks_to_ns(rt::time::now());
+        // The pages of detached chains are free for a request that needs them: the free list
+        // is filled to a floor from the chains before the request runs, a page at a time, so
+        // that the work of the service's own turns does not stand between a client and the
+        // pages a file it truncated gave back.
+        self.ram.storage.settle_pages(SETTLE_PAGES);
     }
 
     fn between_requests(&mut self) {
@@ -3279,6 +3335,9 @@ impl Service<0> for Fs {
                     Ok(inode) => {
                         if let Some(inode) = inode {
                             self.waits.changed(inode);
+                            self.waits.wake_inode(inode, WAKES, |h| {
+                                let _ = sys::notify(h, 1);
+                            });
                         }
                         // The close of an alias leaves nothing to reclaim: only
                         // lock work calls for a turn of maintenance.
@@ -3896,6 +3955,50 @@ impl Fs {
             let _ = sys::notify(&self.channel, 1);
         }
     }
+    /// One step of the cleanup of a departed session (or of a birth no client claimed), the next
+    /// in the order of the places: None when no departure is due, else whether the step made
+    /// progress. The step of the maintenance and the step a refused request makes
+    /// (`Service::settle`) are this one.
+    fn departure_step(&mut self, sessions: &mut [Option<Session<Fds, 0>>]) -> Option<bool> {
+        let i = self.departures.next_place()?;
+        rt::service::step_detail(own_step::DEPARTURE);
+        let mut work;
+        let (label, complete) = if i < SESSIONS {
+            let s = sessions[i].as_mut().expect("retained departed session");
+            let label = s.label();
+            work = self.cleanup_step(&mut s.data, label);
+            (
+                label,
+                Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
+            )
+        } else {
+            let birth = &mut self.births[i - SESSIONS];
+            let (label, mut fds) = birth.take().expect("retained departed birth");
+            work = self.cleanup_step(&mut fds, label);
+            let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
+            self.births[i - SESSIONS] = Some((label, fds));
+            (label, complete)
+        };
+        if complete {
+            if i < SESSIONS {
+                sessions[i] = None;
+            } else {
+                self.births[i - SESSIONS] = None;
+            }
+            // The place of the label goes back after its last departure.
+            ramfs::maintenance::departure_finished(self.places, &mut self.departures, i, label);
+            self.clones.gone(label);
+            work = true;
+        }
+        Some(work)
+    }
+
+    /// Whether cleanup that frees what a refused request lacks is left: a departed session, or
+    /// pages and inodes on the queue of retired ones.
+    fn room_debt(&self) -> bool {
+        self.departures.pending() || self.ram.storage.reclaim_due()
+    }
+
     fn maintenance_dispatch(
         &mut self,
         sessions: &mut [Option<Session<Fds, 0>>],
@@ -4033,36 +4136,9 @@ impl Fs {
         }
         self.departure_turn = !self.departure_turn;
         if self.departure_turn
-            && let Some(i) = self.departures.next_place()
+            && let Some(done) = self.departure_step(sessions)
         {
-            rt::service::step_detail(own_step::DEPARTURE);
-            let (label, complete) = if i < SESSIONS {
-                let s = sessions[i].as_mut().expect("retained departed session");
-                let label = s.label();
-                work = self.cleanup_step(&mut s.data, label);
-                (
-                    label,
-                    Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
-                )
-            } else {
-                let birth = &mut self.births[i - SESSIONS];
-                let (label, mut fds) = birth.take().expect("retained departed birth");
-                work = self.cleanup_step(&mut fds, label);
-                let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
-                self.births[i - SESSIONS] = Some((label, fds));
-                (label, complete)
-            };
-            if complete {
-                if i < SESSIONS {
-                    sessions[i] = None;
-                } else {
-                    self.births[i - SESSIONS] = None;
-                }
-                // The place of the label goes back after its last departure.
-                ramfs::maintenance::departure_finished(self.places, &mut self.departures, i, label);
-                self.clones.gone(label);
-                work = true;
-            }
+            work = done;
             self.legacy_pending = self.maintenance_burst.again(
                 work,
                 work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
@@ -5381,6 +5457,11 @@ impl Fs {
             && self.locks.revision(captured.request.inode) != previous_revision
         {
             self.waits.changed(captured.request.inode);
+            // The grant goes out in the request that released the lock: the waiter's own
+            // Query decides, and the sweep of the service's own work stays a second way.
+            self.waits.wake_inode(captured.request.inode, WAKES, |h| {
+                let _ = sys::notify(h, 1);
+            });
         }
         if let Some(owner) = self.locks.take_started() {
             self.waits.owner_started(owner);

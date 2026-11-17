@@ -334,3 +334,98 @@ fn the_tables_of_numbers_come_from_a_pool_and_go_back_with_the_last_number() {
     assert_eq!(ram.wides.held(), 0);
     assert_eq!(ram.open_descriptions(), 0);
 }
+
+/// One step of the cleanup of a departed session, as `Fs::departure_step` makes it: a portion of
+/// the references retired, or a description closed.
+fn departure_step(ram: &mut Ram<'_>, fds: &mut Fds, locks: &mut SimpleLocks) -> Option<bool> {
+    let progressed = if !ram.detached(fds) {
+        ram.detach_session_descriptions(fds, locks) != 0
+    } else {
+        ram.release_step(fds)
+    };
+    progressed.then(|| !fds.custody_empty())
+}
+
+#[test]
+fn a_departed_session_of_a_thousand_descriptions_is_worked_off_in_bounded_retries() {
+    use proto_wire::settle::{SETTLE_STEPS, Settled, run};
+    let mut ram = Ram::default();
+    let mut fds = session(&mut ram, 1000);
+    let mut locks = SimpleLocks::default();
+    // The portions of the departure, then one description in each step.
+    let steps = 1000usize.div_ceil(CLONE_PORTION) + 1000;
+    let mut retries = 0;
+    loop {
+        let before = ram.open_descriptions();
+        let settled = run(|| 0, || departure_step(&mut ram, &mut fds, &mut locks));
+        retries += 1;
+        assert_ne!(
+            settled,
+            Settled::Nothing,
+            "a retry that finds a debt works at it"
+        );
+        assert!(
+            ram.open_descriptions() <= before,
+            "a retry never takes a description"
+        );
+        if settled == Settled::Done {
+            break;
+        }
+        assert!(retries <= steps, "no livelock");
+    }
+    assert_eq!(retries, steps.div_ceil(SETTLE_STEPS));
+    // The send of the library gives up after `TRY_AGAIN_MAX` answers: the debt is well inside.
+    assert!(retries < 4096 / 2);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert!(fds.custody_empty());
+}
+
+#[test]
+fn an_open_refused_for_the_table_of_descriptions_goes_on_after_the_steps_of_a_departed_session() {
+    use proto_wire::settle::{Settled, run};
+    let mut ram = Ram::default();
+    let mut locks = SimpleLocks::default();
+    let mut departed = std::vec::Vec::new();
+    for id in 0..8 {
+        let mut fds = Fds {
+            root: storage::Root {
+                id: id + 10,
+                generation: 1,
+            },
+            ..Fds::default()
+        };
+        for _ in 0..DESCRIPTIONS / 8 {
+            ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+        }
+        departed.push(fds);
+    }
+    let mut late = Fds::default();
+    let mut retries = 0;
+    // The refused open settles (steps of the sessions that went, in the order of their places)
+    // and asks again; a refusal with the debt left is the internal TRY_AGAIN.
+    loop {
+        match ram.open(&mut late, "/etc/motd", READ_ONLY) {
+            Ok(_) => break,
+            Err(code) => assert_eq!(code, TOO_MANY_FILES_IN_SYSTEM),
+        }
+        let settled = run(
+            || 0,
+            || {
+                departed
+                    .iter_mut()
+                    .find_map(|fds| departure_step(&mut ram, fds, &mut locks))
+            },
+        );
+        assert_ne!(
+            settled,
+            Settled::Nothing,
+            "the debt is worked at, never skipped"
+        );
+        retries += 1;
+        assert!(retries < 64, "one description is free after a few portions");
+    }
+    ram.release(&mut late);
+    for fds in &mut departed {
+        ram.release(fds);
+    }
+}

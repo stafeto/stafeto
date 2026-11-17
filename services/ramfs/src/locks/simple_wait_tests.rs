@@ -766,3 +766,58 @@ fn first_lock_of_an_owner_marks_only_its_waits_dirty() {
     f.hold_on(b, 302, 0, Kind::Read);
     assert_eq!(f.locks.take_started(), Some(Owner::Process(302)));
 }
+
+#[test]
+fn a_change_of_an_inode_wakes_the_waiters_on_it_at_once_and_only_once() {
+    let mut f = Fixture::new();
+    let a = f.captured.request.inode;
+    let b = f.second_inode();
+    f.hold_on(a, 300, 0, Kind::Write);
+    let on_a = f.wait_at(a, 0, 301, 0, 1, Kind::Write);
+    let on_b = f.wait_at(b, 1, 302, 0, 1, Kind::Write);
+    for id in [on_a, on_b] {
+        let slot = f.waits.slot(id).unwrap();
+        let r = f.waits.registrations[slot].as_mut().unwrap();
+        r.handle = Some(7);
+        r.dirty = false;
+    }
+    f.waits.changed(a);
+    let mut told = std::vec::Vec::new();
+    let n = f.waits.wake_inode(a, 8, |h| told.push(*h));
+    assert_eq!((n, told.len()), (1, 1));
+    // The mark is spent, and the waiter on the other inode was not told.
+    assert_eq!(f.waits.wake_inode(a, 8, |_| panic!("told twice")), 0);
+    assert_eq!(f.waits.wake_all(8, |_| {}), 2);
+}
+
+#[test]
+fn a_departure_tells_a_few_waiters_in_the_notice_and_marks_the_rest_for_the_sweep() {
+    let mut f = Fixture::new();
+    let a = f.captured.request.inode;
+    f.hold_on(a, 300, 0, Kind::Write);
+    let first = f.wait_at(a, 0, 301, 0, 1, Kind::Write);
+    let second = f.wait_at(a, 1, 302, 0, 1, Kind::Write);
+    for id in [first, second] {
+        let slot = f.waits.slot(id).unwrap();
+        let r = f.waits.registrations[slot].as_mut().unwrap();
+        r.handle = Some(7);
+        r.dirty = false;
+    }
+    // One notice at most: the other waiter is marked, and the next call goes on from there.
+    let mut told = 0;
+    assert_eq!(f.waits.wake_all(1, |_| told += 1), 1);
+    assert_eq!(told, 1);
+    let dirty = |f: &Fixture, id| {
+        let slot = f.waits.slot(id).unwrap();
+        f.waits.registrations[slot].as_ref().unwrap().dirty
+    };
+    assert_eq!(
+        [dirty(&f, first), dirty(&f, second)]
+            .iter()
+            .filter(|d| **d)
+            .count(),
+        1
+    );
+    assert_eq!(f.waits.wake_all(1, |_| told += 1), 1);
+    assert_eq!(told, 2);
+}

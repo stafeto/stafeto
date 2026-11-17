@@ -27,6 +27,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod settle;
+
 use core::mem::MaybeUninit;
 
 use abi::{Error, MESSAGE_MAX};
@@ -44,6 +46,11 @@ pub const NAME_LEN: usize = 16;
 pub const UNKNOWN_METHOD: u32 = 256;
 pub const BAD_VERSION: u32 = 257;
 pub const BAD_SIZE: u32 = 258;
+/// The internal answer of a service that made progress in the cleanup a request was refused
+/// for and has more to do: the request had no effect and no handles, and the library sends it
+/// again (`rt::sys::send`) without showing the answer to the program. It is no status of any
+/// protocol's table.
+pub const TRY_AGAIN: u32 = 259;
 
 /// The status of a reply: 0 for success, the codes of the kernel's errors
 /// (abi::Error, spec 12) with their numbers, so that a limit of a service
