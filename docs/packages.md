@@ -630,7 +630,7 @@ record never restarts it, since a new instance would show a running `pkgd` an em
 packages installed with `pkg` are gone after a reboot, like every file of the image; the service
 says so on the console (`mem-blk: 524288 sectors in memory; installed packages are gone after a
 reboot`). The official repository is the one of the series, `/etc/pkg/official` as in the base
-image. A disk on NVMe for EBS with a permanent store comes later (stafeto-design#757).
+image. The packages stay in memory on EC2. The data volume of the image (below) keeps the SSH host key.
 `cargo xtask pkg-probe memory` runs the install steps on this store (init's feature
 `memory-store` turns the base table's disk into the memory disk, on the 2 GiB machine with no
 disk), removes Doom, installs it again, and boots the machine anew: the store holds no package
@@ -685,8 +685,30 @@ machine; it does not cut a write short, and a service that never sends FLUSH wou
 of the store format over a cut at each point of a write is shown by `cargo xtask store-crash` (13 crash
 points, on the Virtio disk). The service writes the whole disk it serves, so the check of the volume's
 identity stands before every use of it. The partitions of one disk (windows of `nvme-blk` by partition) wait for the
-move of `pkgd` to the disk. The record for EC2's data volume comes with the switch of the image for EC2
-(stafeto-design#757).
+move of `pkgd` to the disk.
+
+**The data volume on EC2.** Each instance gets this volume, 2 GiB of gp3 billed to the launching account (about 0.19 USD a month in eu-central-1, approximate), deleted with the instance; `--no-data-volume` or a NoDevice mapping (below) launches without it. The image registered for EC2 carries a second block device mapping,
+`/dev/sdf`: an empty gp3 volume of 2 GiB with `DeleteOnTermination`, made at each launch and removed
+with the instance. Nitro shows it as the second NVMe function (`1d0f:8061`, walk index 1; the root
+volume is index 0; the record names index 1 of the measured walk order, and a root volume found there is refused by the name check), and EBS writes `sdf` into Identify Controller bytes
+3072..3104 (`sdf` and 29 spaces; the root volume reads `xvda` and spaces). The record `datadisk` of
+`table/aws.rs` asks for the EBS name `sdf` (kind 2), `datafs` and `datakey` follow it, and the boot
+script of Dropbear starts once `datakey` is ready (the launcher waits for it for 30 s). The first boot
+of the volume writes a partition table and formats it (`datafs: partition table written, data volume
+formatted`) and `datakey` keeps the host key that the boot script made (`datakey: host key saved to
+/data`). Every later boot, after a reboot or after a stop and start, mounts the volume and puts the key
+back (`datakey: host key restored from /data`), so the fingerprint of the line `ssh: host key SHA256:`
+stays the same. The same table is mirrored for QEMU (`table-aws-qemu`, `cargo xtask net-try`), where
+the volume is a second NVMe controller with the serial `stafeto-data`.
+
+To launch an instance without the data volume, map the device to nothing:
+`--block-device-mappings DeviceName=/dev/sdf,NoDevice=` (`cargo xtask aws boot --no-data-volume` does it).
+Init then leaves `datadisk` out (`init: left out: datadisk`), `datafs` says `no disk`, and the host key
+is new at every boot. To make the volume larger, give the launch a mapping of the same device name with
+a larger `VolumeSize`, for example `DeviceName=/dev/sdf,Ebs={VolumeSize=8,VolumeType=gp3,DeleteOnTermination=true}`;
+a first boot formats whatever size it finds. A volume that is attached after the boot is used from the
+next boot. `datafs` formats a volume only when its first MiB is zero, so attach no volume with data you keep as `/dev/sdf`. A different volume in the second NVMe function (the root volume where the data volume should be)
+shows another name, and the disk service leaves it alone.
 
 ## The package service
 

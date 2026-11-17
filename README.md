@@ -16,7 +16,7 @@ Download `stafeto-<version>-aarch64-virt-base.tar.xz` (the shell and the package
 ./run.sh --hvf        # hardware virtualization on a Mac with Apple silicon
 ```
 
-You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` and `ncdu` are in the image; `exit` or Ctrl-A X ends QEMU. Files live in RAM, so changes are gone after a restart. The release notes also tell how to launch the system on an AWS EC2 Graviton instance.
+You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` and `ncdu` are in the image; `exit` or Ctrl-A X ends QEMU. Files live in RAM, so changes are gone after a restart. The release notes also tell how to launch the system on an AWS EC2 Graviton instance. The EC2 image maps a second 2 GiB volume as `/dev/sdf` that keeps the SSH host key across reboots and stops (map `/dev/sdf` to `NoDevice` to launch without it, or give it a larger `VolumeSize`; a volume attached after the boot is used from the next boot; each instance pays for it, about 0.19 USD a month in eu-central-1 (approximate), and it is deleted with the instance; see `docs/packages.md`, "The data volume on EC2").
 
 ## What works today
 

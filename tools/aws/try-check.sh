@@ -41,12 +41,29 @@
 #        efi-loader: time N from GetTime       (the firmware's time, written into boot-time)
 #        clock: ready (started at N from the boot image)   (N within seconds of the host's date +%s)
 #        ec2-key: ...                          (the type and comment of the key pair)
-#        ssh: host key SHA256:...              (the fingerprint of the host key of this boot)
+#        nvme: Amazon Elastic Block Store fw ... sn ..., N blocks of 512 bytes ...
+#                                              (the disk service of the data volume found the second NVMe
+#                                              function, and EBS names it sdf; the record names the second
+#                                              function of the measured walk order, and a root volume found
+#                                              there is refused by the name check: `nvme: datadisk is not
+#                                              the data volume, left alone`; the line ends with the
+#                                              controller's mqes, to and dstrd)
+#        datafs: partition table written, data volume formatted, ...
+#                                              (the first boot of a volume) or
+#        datafs: data volume mounted, ...      (a later boot: mounted, never formatted again)
+#        datakey: no host key on /data, ...    (first boot) then datakey: host key saved to /data
+#        datakey: host key restored from /data (every later boot of the same volume)
+#        ssh: host key SHA256:...              (the fingerprint of the host key; the same on every boot of
+#                                              an instance with the data volume)
 #        dropbear: dropbear -F -s -j -k -r /etc/dropbear/dropbear_ed25519_host_key
 #        landing: page written for ADDRESS (t4g.small)
 #        web: certificate sha256 Fingerprint=...
 #        web: nginx on 80 and 443
 #        fast: nginx-fast on 8080
+#      Lines that must not appear with the data volume:
+#        init: left out: datadisk
+#        nvme: datadisk is not the data volume, left alone
+#        datafs: no disk: ...
 #      Lines that must not appear:
 #        web: no certificate could be made, 443 stays off
 #        fast: no nginx-fast in this image, 8080 stays off
@@ -85,6 +102,21 @@
 #                                              memory fits the 2 GiB (the console line `frames N
 #                                              MiB free` before the services shows what there is;
 #                                              the full image prints no `init: free pages` line)
+#   4a. The data volume (the image maps a second 2 GiB volume as /dev/sdf, deleted with the instance;
+#      a launch gives the owner nothing to do for it). Write down the fingerprint of the console line
+#      `ssh: host key SHA256:...` of step 2, then:
+#        reboot (in the session on the instance, or `aws ec2 reboot-instances`)
+#                                              the console line `datakey: host key restored from /data` and
+#                                              the same `ssh: host key SHA256:...`; no `datafs: ... formatted`
+#                                              line (the line says `data volume mounted`); `ssh` raises no host key warning
+#        stop and start the instance           the same again: the volume stays attached to a stopped
+#                                              instance, the fingerprint is the same
+#      A volume attached after the boot is not used until the next boot (`datafs` connects once).
+#   4b. One launch with the data volume left out (the fallback):
+#        cargo xtask aws boot --try --no-data-volume --ami AMI --end "fast: nginx-fast on 8080" --serial 180 --session S
+#      (`--no-data-volume` maps /dev/sdf to NoDevice.) The console shows `init: left out: datadisk`, `datafs: no
+#      disk`, and `ssh: host key SHA256:...` made at this boot; after a reboot the fingerprint differs. The
+#      page and the other servers work as before.
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #

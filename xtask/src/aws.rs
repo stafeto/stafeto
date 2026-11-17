@@ -34,6 +34,32 @@ const MAX_LIVE: usize = 4;
 const BLOCK: usize = 512 * 1024;
 /// The value of `Launch::extra_snapshot` that attaches an empty 1 GiB volume as /dev/sdf.
 const BLANK_SDF: &str = "blank";
+/// The value of `Launch::extra_snapshot` that leaves the data volume of the image out
+/// (`--no-data-volume`): /dev/sdf is mapped to no device, so the instance has one NVMe volume.
+const NO_DEVICE: &str = "none";
+/// The size of the data volume the image registers as /dev/sdf, in GiB (the SSH host key and the
+/// files of /data live there), and the mapping string for it.
+const DATA_VOLUME_GIB: u32 = 2;
+fn data_volume_mapping() -> String {
+    format!(
+        "DeviceName=/dev/sdf,Ebs={{VolumeSize={DATA_VOLUME_GIB},VolumeType=gp3,DeleteOnTermination=true}}"
+    )
+}
+
+/// The mapping a launch gives /dev/sdf besides the image's own: an empty 1 GiB volume, a volume
+/// made from a snapshot, or no device at all.
+fn launch_mapping(extra: &str) -> String {
+    match extra {
+        NO_DEVICE => "DeviceName=/dev/sdf,NoDevice=".to_string(),
+        BLANK_SDF => {
+            "DeviceName=/dev/sdf,Ebs={VolumeSize=1,VolumeType=gp3,DeleteOnTermination=true}"
+                .to_string()
+        }
+        snapshot => format!(
+            "DeviceName=/dev/sdf,Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}"
+        ),
+    }
+}
 /// The on-demand price of a t4g.small in eu-central-1 in USD per hour, as the
 /// price list showed it when this was written (unverified: it only sizes the
 /// estimate the commands print).
@@ -45,7 +71,7 @@ const TRY_LIFETIME_HOURS: u64 = 2;
 
 const USAGE: &str = "usage: xtask aws check
        xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
-       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--session S]
+       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--no-data-volume] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP | --blank-sdf] [--session S]
        xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
@@ -1172,16 +1198,8 @@ fn launch(s: &Session, l: &Launch) -> Result<(String, Instant), String> {
         }
     }
     args.extend(spec);
-    if let Some(snap) = l.extra_snapshot {
-        let source = if snap == BLANK_SDF {
-            "VolumeSize=1".to_string()
-        } else {
-            format!("SnapshotId={snap}")
-        };
-        args.extend([
-            "--block-device-mappings".to_string(),
-            format!("DeviceName=/dev/sdf,Ebs={{{source},VolumeType=gp3,DeleteOnTermination=true}}"),
-        ]);
+    if let Some(extra) = l.extra_snapshot {
+        args.extend(["--block-device-mappings".to_string(), launch_mapping(extra)]);
     }
     if let Some(k) = l.key_name {
         args.extend(["--key-name".to_string(), k.to_string()]);
@@ -1584,6 +1602,8 @@ fn register(s: &Session, snap: &str, name: &str) -> Result<String, String> {
         format!(
             "DeviceName=/dev/sda1,Ebs={{SnapshotId={snap},VolumeType=gp3,DeleteOnTermination=true}}"
         ),
+        // The data volume: a second, empty volume that goes away with the instance.
+        data_volume_mapping(),
     ]);
     args.extend(s.tag_spec(&["image"]));
     args.extend(["--query", "ImageId"].map(String::from));
@@ -1759,6 +1779,8 @@ fn boot(args: &[String]) -> Result<(), String> {
         .unwrap_or(300);
     let stop = args.iter().any(|a| a == "--stop");
     let try_out = args.iter().any(|a| a == "--try");
+    // One launch without the data volume: the instance shows the fallback of the image.
+    let no_data = args.iter().any(|a| a == "--no-data-volume");
     if try_out && stop {
         return Err("--try keeps the instance running: it does not go with --stop".into());
     }
@@ -1795,7 +1817,7 @@ fn boot(args: &[String]) -> Result<(), String> {
             ami: &ami,
             ty: &ty,
             user_data: None,
-            extra_snapshot: None,
+            extra_snapshot: no_data.then_some(NO_DEVICE),
             group: group.as_deref(),
             public_ip: try_out,
             private_ip: None,
@@ -2817,6 +2839,31 @@ pub fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_registers_a_second_volume_of_2_gib_that_goes_with_the_instance() {
+        assert_eq!(
+            data_volume_mapping(),
+            "DeviceName=/dev/sdf,Ebs={VolumeSize=2,VolumeType=gp3,DeleteOnTermination=true}"
+        );
+        // No snapshot is in it: the volume is made empty at each launch.
+        assert!(!data_volume_mapping().contains("Snapshot"));
+    }
+
+    #[test]
+    fn a_launch_maps_sdf_to_a_blank_volume_a_snapshot_or_no_device() {
+        assert_eq!(
+            launch_mapping(BLANK_SDF),
+            "DeviceName=/dev/sdf,Ebs={VolumeSize=1,VolumeType=gp3,DeleteOnTermination=true}"
+        );
+        assert_eq!(
+            launch_mapping("snap-0123"),
+            "DeviceName=/dev/sdf,Ebs={SnapshotId=snap-0123,VolumeType=gp3,DeleteOnTermination=true}"
+        );
+        // The same device name as the image's data volume, so it replaces that mapping.
+        assert_eq!(launch_mapping(NO_DEVICE), "DeviceName=/dev/sdf,NoDevice=");
+        assert!(data_volume_mapping().starts_with("DeviceName=/dev/sdf,"));
+    }
 
     #[test]
     fn the_nvme_map_names_the_root_and_the_data_volume_without_their_ids() {

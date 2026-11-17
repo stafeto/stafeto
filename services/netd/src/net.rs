@@ -515,6 +515,9 @@ pub struct Net {
     pub zero: [Option<netd::zero::Slot<ZeroWait>>; netd::zero::PARKED_MAX],
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
+    /// The listening descriptions whose queue lacks sockets of its backlog
+    /// (`listen` builds `REBUILD_MAX` at most); the step of waking builds more.
+    pub short: Mask,
     wake_cursor: usize,
     /// Where the walk over the aborted streams resumes.
     rst_cursor: usize,
@@ -824,6 +827,7 @@ impl Net {
         self.interest.drop_place(i, None);
         self.rst_wait.clear(i);
         self.wake_due.clear(i);
+        self.short.clear(i);
         self.attention.clear(i);
         self.connecting.clear(i);
         self.embryos.clear(i);
@@ -1750,7 +1754,7 @@ impl Net {
             }
             // Else the slot at `k` is now the former last one: look at it.
         }
-        reaped |= self.top_up(stack, listener, budget);
+        reaped |= self.top_up(stack, listener, budget, false);
         reaped
     }
 
@@ -1816,19 +1820,21 @@ impl Net {
         stack: &mut Stack<'static>,
         listener: usize,
         budget: &mut ReapBudget,
+        evict: bool,
     ) -> bool {
         let mut added = false;
         // On the path of a SYN the table may be full, and a new place would
         // evict a stream the bookkeeping of the SYN may hold: the queue stays
-        // short then and the next call tops it up.
+        // short then and the next call tops it up. The step of waking holds no
+        // such bookkeeping (`evict`): it takes a place as `listen` did.
         while budget.open()
-            && self.places.used() < SOCKETS_LIMIT
+            && (evict || self.places.used() < SOCKETS_LIMIT)
             && queue::missing(
                 self.socks[listener].backlog,
                 self.socks[listener].member_count,
             ) > 0
         {
-            debug_assert!(self.places.used() < SOCKETS_LIMIT);
+            debug_assert!(evict || self.places.used() < SOCKETS_LIMIT);
             let sock = self.socks[listener];
             let count = usize::from(sock.member_count);
             let Some(m) = self.member(stack, &sock, listener, sock.members, count) else {
@@ -2010,7 +2016,29 @@ impl Net {
 
     /// Whether the step of waking has places or operations left.
     pub fn wake_pending(&self) -> bool {
-        self.wake_due.next(0).is_some() || self.closed_ops != 0 || self.interest.due != 0
+        self.wake_due.next(0).is_some()
+            || self.closed_ops != 0
+            || self.interest.due != 0
+            || self.short.next(0).is_some()
+    }
+
+    /// The queue of one listening description that lacks sockets gets up to
+    /// `REBUILD_MAX` of them (a step of its own: `listen` built the first
+    /// ones). A place that gets none (the table is full) is left to the
+    /// accepts and the SYNs.
+    fn build_queue(&mut self, stack: &mut Stack<'static>) {
+        let Some(l) = self.short.next(0) else {
+            return;
+        };
+        let lacks = self.socks[l].listening
+            && queue::missing(self.socks[l].backlog, self.socks[l].member_count) > 0;
+        if !lacks || !self.top_up(stack, l, &mut ReapBudget::build(), true) {
+            self.short.clear(l);
+            return;
+        }
+        if queue::missing(self.socks[l].backlog, self.socks[l].member_count) == 0 {
+            self.short.clear(l);
+        }
     }
 
     /// The step of waking: for the places in `wake_due`, in turn, the
@@ -2018,6 +2046,12 @@ impl Net {
     /// step (WAKE_TELLS notifications, WAKE_CHECKS checks). A place not
     /// finished stays. True when places are left.
     pub fn wake(&mut self, stack: &mut Stack<'static>, now: u64) -> bool {
+        // A queue that lacks sockets is built in a step that has nothing else
+        // to do, so that the builds never add to a step that tells operations.
+        if self.closed_ops == 0 && self.wake_due.next(0).is_none() && self.interest.due == 0 {
+            self.build_queue(stack);
+            return self.wake_pending();
+        }
         let mut budget = WakeBudget::new();
         // The operations whose description closed.
         while self.closed_ops != 0 && budget.take_tell() {
