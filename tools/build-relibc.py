@@ -180,7 +180,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # _POSIX_THREAD_SPORADIC_SERVER are -1 (so is sysconf), SS_REPL_MAX is 4 in
 # limits.h, pthread_attr_setschedpolicy answers ENOTSUP, platform interface 24;
 # tagged pin-94d1e99d.
-COMMIT = "94d1e99d73b1b8e580350f983c019d9dc0a1d0c1"
+# An armed interval timer never reads back 0 (getitimer, timer_gettime,
+# setitimer's old value): a passed deadline that the helper has not reloaded
+# shows the rest of the current interval, a one-shot timer 1 ns; tagged
+# pin-41301394.
+COMMIT = "41301394daef002c6e94e9e5152667893b24a4ca"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
