@@ -707,15 +707,16 @@ What `datafs` does with the disk it is given:
 | State of the disk | What `datafs` does |
 | --- | --- |
 | A volume from the snapshot of the image (a table of `datafs`, `FORMATTED` set) | Mounts it from the first boot, writes nothing |
-| The same volume enlarged at launch | Moves the backup copy of the table to the new end of the disk (the entries first, then the backup header, then the primary header, then the old backup header is cleared, with a flush between the steps), keeps the partitions as large as they were, and mounts |
-| A volume of the user's own with a table of `datafs` | Mounts it |
+| The same volume enlarged at launch | Mounts it and rewrites the table: moves the backup copy of the table to the new end of the disk (the entries first, then the backup header, then the primary header, then the old backup header is cleared, with a flush between the steps), keeps the partitions as large as they were, and mounts |
+| A volume of the user's own with a table of `datafs` and `FORMATTED` set on `data` | Mounts it |
+| A table of `datafs` whose `data` partition lacks `FORMATTED` | Formats `data`, sets `FORMATTED` and mounts (the table is written once, for the attribute) |
 | A blank disk (no table, the first 1 MiB zero), as under QEMU | Writes the table, formats `data`, sets `FORMATTED` and mounts |
 | A valid table with no partition of `datafs` | Writes nothing (`no data partition in the table`) |
 | A `data` partition with `FORMATTED` that does not mount | Writes nothing (`the data volume does not mount, left alone`) |
 | Any other disk: a fresh gp3 volume, a file system, a table of another system, data | Writes nothing and prints `datafs: foreign at sector S offset O`, the line `datafs: lba1 ... lba-last ...` (whether those two sectors are zero) and `datafs: the disk holds something else, left alone and unused in this release`; the host key lives for one boot |
 | No volume (`--no-data-volume`) | `datafs: no disk`; the host key lives for one boot |
 
-A damaged primary header on an enlarged volume is not a table (the backup is no longer at the end), so the disk reads as something else and is left alone. A volume of the user's own is never formatted by `datafs`: only a disk that is blank in the strict sense is written. Turning a volume that looks blank into a data volume of stafeto by hand (`data format --yes-destroy`) is not built in this release (issue 434).
+A damaged primary header on an enlarged volume is not a table (the backup is no longer at the end), so the disk reads as something else and is left alone. No disk without a table of `datafs` is ever written, unless it is blank in the strict sense (no table, the first 1 MiB zero). A table of `datafs` can be rewritten (its attribute set, its backup moved), and a `data` partition of it without `FORMATTED` is formatted. A disk that is smaller than the one the table was made on has no table that `datafs` takes, and is left alone. Turning a volume that looks blank into a data volume of stafeto by hand (`data format --yes-destroy`) is not built in this release (issue 434).
 
 To launch an instance without the data volume, map the device to nothing:
 `--block-device-mappings DeviceName=/dev/sdf,NoDevice=` (`cargo xtask aws boot --no-data-volume` does it).

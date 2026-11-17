@@ -380,6 +380,72 @@ fn a_grown_disk_with_a_damaged_primary_is_not_a_table_and_not_blank() {
     assert_eq!(dev.medium(), &before[..]);
 }
 
+/// Rewrites a header sector with `change` applied and its checksum made again.
+fn rehash(dev: &mut MemDevice, lba: u64, change: impl FnOnce(&mut [u8; SECTOR])) {
+    let mut header = [0u8; SECTOR];
+    dev.read(lba, &mut header).unwrap();
+    change(&mut header);
+    header[16..20].fill(0);
+    let crc = gpt::crc32(0, &header[..92]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write(lba, &header).unwrap();
+    dev.power_cycle(Survive::All);
+}
+
+#[test]
+fn the_old_backup_is_cleared_only_when_it_is_a_header_of_this_table() {
+    let mut old = two_partitions(131_072);
+    let mut dev = grown(&mut old, 262_144);
+    // The primary names a sector inside the grown disk that holds other data.
+    let odd = 200_000u64;
+    dev.write(odd, &[0xABu8; SECTOR]).unwrap();
+    rehash(&mut dev, 1, |h| {
+        h[32..40].copy_from_slice(&odd.to_le_bytes())
+    });
+    assert!(gpt::read(&mut dev).unwrap().grown);
+    let table = gpt::relocate_backup(&mut dev).unwrap();
+    assert!(!table.grown);
+    let mut sector = [0u8; SECTOR];
+    dev.read(odd, &mut sector).unwrap();
+    assert!(sector.iter().all(|&b| b == 0xAB), "the sector was changed");
+}
+
+#[test]
+fn a_shrunk_disk_has_no_table_and_is_left_alone() {
+    let mut old = two_partitions(131_072);
+    let mut medium = old.medium().to_vec();
+    medium.truncate((131_072 - 100) * SECTOR);
+    let mut dev = MemDevice::from_medium(medium);
+    assert_eq!(gpt::read(&mut dev), Err(gpt::Error::NoTable));
+    assert!(matches!(gpt::classify(&mut dev), Ok(Class::Foreign(_))));
+    let before = dev.medium().to_vec();
+    let mut state = storage();
+    assert!(matches!(
+        crate::volume::open(&mut dev, &mut state, 1).err(),
+        Some(crate::volume::Refusal::Foreign(_))
+    ));
+    assert_eq!(dev.written, 0);
+    assert_eq!(dev.medium(), &before[..]);
+    let _ = &mut old;
+}
+
+#[test]
+fn a_primary_whose_entries_overlap_the_usable_sectors_is_not_taken() {
+    let mut dev = two_partitions(131_072);
+    // The entries of the start copy named at sector 40, which is past the first usable sector.
+    rehash(&mut dev, 1, |h| {
+        h[72..80].copy_from_slice(&40u64.to_le_bytes())
+    });
+    assert!(
+        gpt::read(&mut dev).unwrap().from_backup,
+        "the primary was taken"
+    );
+    rehash(&mut dev, 1, |h| {
+        h[72..80].copy_from_slice(&1u64.to_le_bytes())
+    });
+    assert!(gpt::read(&mut dev).unwrap().from_backup);
+}
+
 #[test]
 fn a_backup_that_overlaps_the_new_end_is_not_taken_as_grown() {
     // 131071 + 20 sectors: the new entries would cover the old backup header.
@@ -1071,6 +1137,18 @@ mod volumes {
                         "cut {cut} {survive:?} boot {seed}: {result:?}"
                     );
                 }
+                // The move is finished by now, and the table reads from the end copy alone.
+                let done = gpt::read(&mut d).unwrap();
+                assert!(
+                    !done.grown,
+                    "cut {cut} {survive:?}: still grown after three boots"
+                );
+                d.write(1, &[0u8; SECTOR]).unwrap();
+                d.power_cycle(Survive::All);
+                assert!(
+                    gpt::read(&mut d).is_ok(),
+                    "cut {cut} {survive:?}: no copy at the end"
+                );
             }
         }
     }

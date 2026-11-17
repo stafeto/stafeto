@@ -75,12 +75,6 @@ pub fn open<D: Device>(
         }
     };
     let part = table.find(&TYPE_DATA).ok_or(Refusal::NoPartition)?;
-    // A table of ours (it has our data partition) on a volume that grew gets its backup copy moved.
-    // A table with no such partition is not ours and is not written.
-    if table.grown {
-        gpt::relocate_backup(&mut device).map_err(|_| Refusal::Device)?;
-        did = Did::Relocated;
-    }
     if part.sectors() / BLOCK_SECTORS < BLOCKS_MIN {
         return Err(Refusal::TooSmall);
     }
@@ -105,6 +99,13 @@ pub fn open<D: Device>(
         }
     } else {
         fs.mount().map_err(|_| Refusal::Damaged)?;
+    }
+    // A table of ours (it has our data partition) on a volume that grew gets its backup copy moved,
+    // once the volume is known to be one that is used: a volume that is refused is not written. A
+    // table with no such partition is not ours and never gets here.
+    if table.grown {
+        gpt::relocate_backup(&mut fs.device().device).map_err(|_| Refusal::Device)?;
+        did = Did::Relocated;
     }
     Ok((fs, did, part))
 }

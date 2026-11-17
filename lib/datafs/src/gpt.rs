@@ -245,6 +245,10 @@ fn read_copy<D: Device>(dev: &mut D, lba: u64, last: u64) -> Result<Option<Table
     {
         return Ok(None);
     }
+    // The entries of the primary copy lie after the header and end before the usable sectors.
+    if lba == 1 && (entries_lba < 2 || entries_lba + ENTRY_SECTORS > first_usable) {
+        return Ok(None);
+    }
     let mut disk = [0; 16];
     disk.copy_from_slice(&sector[56..72]);
     let mut parts = [None; KEPT];
@@ -646,7 +650,20 @@ pub fn relocate_backup<D: Device>(dev: &mut D) -> Result<Table, Error> {
     dev.flush()?;
     write_header(dev, &header(1, table.entries_lba))?;
     dev.flush()?;
-    dev.write(table.alternate, &[0u8; SECTOR])?;
-    dev.flush()?;
+    // The old backup header goes only when it is one of this table's: the sector the primary named
+    // holds the signature, its own place, the primary's place, the disk GUID and a valid checksum.
+    dev.read(table.alternate, &mut sector)?;
+    let stored = le32(&sector, 16);
+    let mut copy = sector;
+    copy[16..20].fill(0);
+    let ours = &sector[..8] == b"EFI PART"
+        && le64(&sector, 24) == table.alternate
+        && le64(&sector, 32) == 1
+        && sector[56..72] == table.disk
+        && crc32(0, &copy[..92]) == stored;
+    if ours {
+        dev.write(table.alternate, &[0u8; SECTOR])?;
+        dev.flush()?;
+    }
     read(dev)
 }
