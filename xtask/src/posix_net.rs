@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 68] = [
+pub const CHECKS: [&str; 69] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -95,6 +95,7 @@ pub const CHECKS: [&str; 68] = [
     "fast-claim-off",
     "wait-churn",
     "home-fork",
+    "reap-queue",
 ];
 
 /// The check of the stack instances (`cargo xtask posix-net instances`): one worker on each CPU
@@ -272,6 +273,7 @@ fn probe_only(
     let started = Instant::now();
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        let only = only.clone();
         let lease = run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         let address = net_curl::lease_address(&lease).ok_or(format!("the lease line {lease:?}"))?;
         run.expect("# ", DIALOG_STEP)?;
@@ -314,7 +316,18 @@ fn probe_only(
             "posix-net steps: the longest step of the pipe service is kind {} with {} ticks and detail {}; every kind: {pipe:?}",
             worst_pipe.0, worst_pipe.1, worst_pipe.2
         );
-        let rows = steps_verdict(&output.lines)?;
+        let rows = steps_verdict(&output.lines, only.is_none())?;
+        if only.is_none() || only.as_deref() == Some(REAP) {
+            let reap = reap_counters(&output.lines)?;
+            println!(
+                "posix-net steps: the accept queue of port {}: syn_dropped {}, queue_reaped {}, embryo_recycled {}; the longest step of the service in the run is {} ticks",
+                reap.port,
+                reap.syn_dropped,
+                reap.queue_reaped,
+                reap.embryo_recycled,
+                rows.iter().map(|r| r.1).max().unwrap_or(0)
+            );
+        }
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
         println!(
             "posix-net steps: the longest step is kind {} with {} ticks and detail {} (the bound is {}); every kind: {rows:?}",
@@ -339,14 +352,87 @@ fn probe_only(
     Ok(())
 }
 
+/// The check that fills an accept queue, resets its connections and connects again.
+const REAP: &str = "reap-queue";
+
+/// What the service says of the listener of the check `reap-queue`.
+#[derive(Debug, PartialEq, Eq)]
+struct Reap {
+    port: u16,
+    syn_dropped: u32,
+    queue_reaped: u32,
+    embryo_recycled: u32,
+}
+
+/// The counters of the accept queue of the check `reap-queue`, from its note
+/// `port P resets N` and the line `net: listener place X port P syn_dropped D
+/// queue_reaped R embryo_recycled E` that the build with the feature `probe`
+/// prints while the listener stands. The one SYN that finds the queue full is
+/// dropped, and each of the N resets of queue sockets is replaced by the SYN
+/// that follows it.
+fn reap_counters(lines: &[String]) -> Result<Reap, String> {
+    let note = lines
+        .iter()
+        .find_map(|l| text_of(l)?.strip_prefix("reap-queue note: port "))
+        .ok_or("posix-net: no note of reap-queue")?;
+    let words: Vec<&str> = note.split_whitespace().collect();
+    let [port, "resets", resets] = words.as_slice() else {
+        return Err(format!("posix-net: the note of reap-queue is {note:?}"));
+    };
+    let (port, resets): (u16, u32) = (
+        port.parse().map_err(|_| format!("the port {port:?}"))?,
+        resets
+            .parse()
+            .map_err(|_| format!("the resets {resets:?}"))?,
+    );
+    let reap = lines
+        .iter()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let [
+                "net:",
+                "listener",
+                "place",
+                _,
+                "port",
+                p,
+                "syn_dropped",
+                d,
+                "queue_reaped",
+                r,
+                "embryo_recycled",
+                e,
+            ] = w.as_slice()
+            else {
+                return None;
+            };
+            Some(Reap {
+                port: p.parse().ok()?,
+                syn_dropped: d.parse().ok()?,
+                queue_reaped: r.parse().ok()?,
+                embryo_recycled: e.parse().ok()?,
+            })
+        })
+        .rfind(|r| r.port == port)
+        .ok_or_else(|| format!("posix-net: no line `net: listener` for port {port}"))?;
+    if reap.syn_dropped < 1 || reap.queue_reaped < resets {
+        return Err(format!(
+            "posix-net: the queue of port {port} dropped {} SYNs and replaced {} sockets, wanted at least 1 and {resets}",
+            reap.syn_dropped, reap.queue_reaped
+        ));
+    }
+    Ok(reap)
+}
+
 /// The longest step of each kind in the lines of a run under -icount, judged
 /// against the bound; CLONE and CLONE_MORE against the portion bound.
-fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
+fn steps_verdict(lines: &[String], whole: bool) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = net_probe::longest_over_starts(lines);
-    if !rows.iter().any(|r| r.0 == 19) {
+    // The run of one check (POSIX_NET_ONLY) has no fork in it.
+    if whole && !rows.iter().any(|r| r.0 == 19) {
         return Err(format!("no step of CLONE: {rows:?}"));
     }
-    if !rows.iter().any(|r| r.0 == 20) {
+    if whole && !rows.iter().any(|r| r.0 == 20) {
         return Err(format!("no step of CLONE_MORE: {rows:?}"));
     }
     if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
@@ -402,16 +488,41 @@ mod tests {
         let line =
             |kind: u32, ticks: u32| format!("service step: 14 kind {kind} {ticks} ticks detail 0");
         let ok = vec![line(19, 8_000), line(20, 8_600), line(65, 10_000)];
-        assert!(steps_verdict(&ok).is_ok());
+        assert!(steps_verdict(&ok, true).is_ok());
         let long = vec![line(19, 8_000), line(20, 17_000), line(65, 10_000)];
-        assert!(steps_verdict(&long).unwrap_err().contains("past 0.8"));
+        assert!(steps_verdict(&long, true).unwrap_err().contains("past 0.8"));
         let slow = vec![line(19, 8_000), line(20, 8_000), line(65, 19_000)];
-        assert!(steps_verdict(&slow).unwrap_err().contains("past 0.9"));
+        assert!(steps_verdict(&slow, true).unwrap_err().contains("past 0.9"));
         let none = vec![line(65, 10_000)];
         assert!(
-            steps_verdict(&none)
+            steps_verdict(&none, true)
                 .unwrap_err()
                 .contains("no step of CLONE")
         );
+    }
+
+    #[test]
+    fn the_counters_of_the_reaped_queue_are_read_and_judged() {
+        let said = |port: u16, dropped: u32, reaped: u32| {
+            vec![
+                "posix-net: reap-queue note: port 40001 resets 16".to_owned(),
+                format!(
+                    "net: listener place 9 port {port} syn_dropped {dropped} queue_reaped {reaped} embryo_recycled 0"
+                ),
+            ]
+        };
+        let ok = reap_counters(&said(40001, 1, 16)).unwrap();
+        assert_eq!((ok.syn_dropped, ok.queue_reaped), (1, 16));
+        assert!(reap_counters(&said(40001, 0, 16)).is_err());
+        assert!(reap_counters(&said(40001, 1, 15)).is_err());
+        assert!(reap_counters(&said(40002, 1, 16)).is_err());
+        assert!(reap_counters(&[]).is_err());
+    }
+
+    #[test]
+    fn a_run_of_one_check_needs_no_clone() {
+        let rows = vec!["service step: 14 kind 65 10000 ticks detail 0".to_owned()];
+        assert!(steps_verdict(&rows, false).is_ok());
+        assert!(steps_verdict(&rows, true).is_err());
     }
 }

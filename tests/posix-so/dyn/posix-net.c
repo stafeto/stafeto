@@ -2667,6 +2667,58 @@ static unsigned buffers_now(int name)
 	return value;
 }
 
+/* The accept queue of a listener (16 sockets, the most the service keeps) fills
+ * with connections that wait for accept; one more SYN finds no room and is
+ * dropped. Then each of the 16 is reset by its peer before accept: their
+ * sockets in the queue are closed, and the next 16 SYNs each find a closed one
+ * and have it replaced. The counters of the listener are asked for while it
+ * stands (the build for the steps says them on the console; xtask judges). */
+static void reap_queue(void)
+{
+	enum { Q = 16 };
+	int port, lis = listener(Q, &port);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	struct linger rst = { 1, 0 };
+	int c[Q];
+	for (int i = 0; i < Q; i++) {
+		c[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c[i] >= 0);
+		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == 0);
+	}
+	int extra = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(extra >= 0);
+	nonblock(extra);
+	errno = 0;
+	REQUIRE(connect(extra, (struct sockaddr *)&a, sizeof a) == -1 && errno == EINPROGRESS);
+	struct pollfd pf = { extra, POLLOUT, 0 };
+	REQUIRE(poll(&pf, 1, 300) == 0);
+	REQUIRE(close(extra) == 0);
+	for (int i = 0; i < Q; i++) {
+		REQUIRE(setsockopt(c[i], SOL_SOCKET, SO_LINGER, &rst, sizeof rst) == 0);
+		REQUIRE(close(c[i]) == 0);
+	}
+	pause_ms(300);
+	for (int i = 0; i < Q; i++) {
+		int n = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(n >= 0);
+		nonblock(n);
+		errno = 0;
+		REQUIRE(connect(n, (struct sockaddr *)&a, sizeof a) == 0 || errno == EINPROGRESS);
+		pf.fd = n;
+		pf.revents = 0;
+		REQUIRE(poll(&pf, 1, 8000) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR));
+		int s = accept(lis, NULL, NULL);
+		REQUIRE(s >= 0);
+		REQUIRE(fcntl(n, F_SETFL, fcntl(n, F_GETFL) & ~O_NONBLOCK) == 0);
+		exchange(n, s, 'r');
+		REQUIRE(close(n) == 0 && close(s) == 0);
+	}
+	(void)buffers_now(SO_STAFETO_BUFFERED);
+	pause_ms(200);
+	printf("posix-net: reap-queue note: port %d resets %d\n", port, Q);
+	REQUIRE(close(lis) == 0);
+}
+
 /* A reader of a stream on its own thread: `want` bytes in pieces of
  * `piece`, a pause of `pause_ms` after each, checked against `salt`. */
 struct reader {
@@ -3488,6 +3540,7 @@ static const struct {
 	{ "fast-claim-off", fast_claim_off },
 	{ "wait-churn", wait_churn },
 	{ "home-fork", home_fork },
+	{ "reap-queue", reap_queue },
 };
 
 /* Checks that run alone, in a process that has made no socket yet (named on the line). */
