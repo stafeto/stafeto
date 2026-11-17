@@ -564,6 +564,8 @@ fn fifo_open(
     };
     let mut brokered = false;
     let mut full = false;
+    // The witness is asked for again before the next grant (it takes a short custody of its own).
+    let mut rewitness = false;
     loop {
         if core::mem::take(&mut full) {
             // The end's queue of waiters is full: try again shortly. A caught signal ends the
@@ -572,6 +574,12 @@ fn fifo_open(
         }
         if crate::long::ending(&block.flags, true) {
             return Err(EINTR);
+        }
+        if core::mem::take(&mut rewitness)
+            && fifo_witness(token, claim, recovery, &session)? != NamedPhase::Witness
+        {
+            // The ticket was prepared: the call had reached the service.
+            brokered = true;
         }
         let _short = crate::long::ShortScope::enter(true)?;
         let response = if !brokered {
@@ -603,13 +611,7 @@ fn fifo_open(
                     match refused.status {
                         Status::Kernel(rt::abi::Error::Interrupted)
                         | Status::Unknown(proto_fs::RESOLVING | proto_fs::AUTHENTICATING) => {
-                            if lost
-                                && fifo_witness(token, claim, recovery, &session)?
-                                    != NamedPhase::Witness
-                            {
-                                // The ticket was prepared: the call had reached the service.
-                                brokered = true;
-                            }
+                            rewitness = lost;
                             continue;
                         }
                         error => Err(error),
