@@ -1,0 +1,54 @@
+# /etc/rc.d/web: nginx on ports 80 and 443.
+#
+# The certificate of the TLS server is made here, on the instance, at each boot: OpenSSL makes
+# an EC P-256 key and a self-signed certificate once the entropy service has its seed
+# (`openssl` waits for `getrandom`). The key is written under umask 077 into the memory of
+# the instance; no key is in the image. When no certificate can be made, nginx starts with
+# the package's settings (port 80 alone) and one line says so.
+#
+# Console lines of a good start:
+#   web: certificate sha256 Fingerprint=...
+#   web: nginx on 80 and 443
+# From nginx itself: `start worker process` for each of its two workers.
+
+conf=/etc/nginx/nginx-try.conf
+key=/etc/nginx/server.key
+crt=/etc/nginx/server.crt
+
+if [ ! -x /bin/nginx ] || [ ! -f "$conf" ]; then
+    echo "web: no nginx in this image, 80 and 443 stay off"
+    exit 0
+fi
+
+made=0
+if [ -x /bin/openssl ]; then
+    rm -f "$key" "$crt"
+    (
+        umask 077
+        /bin/openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -days 730 -config /etc/nginx/try-req.cnf -keyout "$key" -out "$crt" >/dev/null 2>&1
+    ) && [ -s "$key" ] && [ -s "$crt" ] && made=1
+fi
+if [ "$made" = 1 ]; then
+    chmod 644 "$crt"
+    chmod 600 "$key"
+    echo "web: certificate $(/bin/openssl x509 -in "$crt" -noout -fingerprint -sha256 2>/dev/null)"
+else
+    rm -f "$key" "$crt"
+    conf=/etc/nginx/nginx.conf
+    echo "web: no certificate could be made, 443 stays off"
+fi
+
+(
+    tries=0
+    while [ ! -s /etc/resolv.conf ] && [ "$tries" -lt 60 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    if [ "$made" = 1 ]; then
+        echo "web: nginx on 80 and 443"
+    else
+        echo "web: nginx on 80"
+    fi
+    /bin/nginx -c "$conf"
+) &
