@@ -29,9 +29,54 @@ const FILES: u32 = 9;
 const ENDS: &str = "init: data-probe ended: ";
 const ENDED: &str = "init: data-probe ended: exit code 0, not restarted";
 const POINTS: u64 = 12;
+/// The tag of the service's lines of steps (rt::service::report_steps).
+const DATAFS_TAG: &str = "17";
+/// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
+/// and the check send (the worker thread does the disk's work, so these steps are the queue's).
+const STEP_KINDS: [(usize, &str); 9] = [
+    (1, "Open"),
+    (2, "Close"),
+    (3, "Read"),
+    (4, "Write"),
+    (6, "Fsync"),
+    (10, "Mkdir"),
+    (11, "Unlink"),
+    (13, "Rename"),
+    (14, "Readdir"),
+];
+
+/// The steps of the loop in the lines of the two runs: every kind the probe used came, and no step
+/// is past 0.9 of term B (spec 3, section 6), the bound the other services' probes use.
+fn steps_verdict(
+    writing: &[String],
+    verifying: &[String],
+) -> Result<Vec<(usize, u64, u64)>, String> {
+    let mut rows = longest_steps(writing, DATAFS_TAG);
+    for row in longest_steps(verifying, DATAFS_TAG) {
+        match rows.iter_mut().find(|r| r.0 == row.0) {
+            Some(known) if known.1 < row.1 => *known = row,
+            Some(_) => {}
+            None => rows.push(row),
+        }
+    }
+    for (kind, name) in STEP_KINDS {
+        if !rows.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!("the data service: no step {name}: {rows:?}"));
+        }
+    }
+    if let Some(row) = rows.iter().find(|r| r.1 > blk_probe::STEP_MAX) {
+        return Err(format!(
+            "the data service: a step past 0.9 of term B ({}): {row:?}",
+            blk_probe::STEP_MAX
+        ));
+    }
+    Ok(rows)
+}
 
 const fn programs(crash: bool) -> [ImageProgram; 5] {
-    let datafs: &'static [&'static str] = if crash { &["crash"] } else { &[] };
+    // The crash runs stop the machine at a sector and count nothing else; the others print the
+    // longest step of each kind of the request loop (rt's step-stats).
+    let datafs: &'static [&'static str] = if crash { &["crash"] } else { &["steps"] };
     [
         ("init", "init", INIT_STACK_SIZE, &["table-data-probe"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
@@ -148,6 +193,7 @@ pub fn probe() -> Result<(), String> {
     qemu::store_file(&disk.0, DISK_BYTES, true)?;
     let writer = image("boot-data-probe-write.img", None, "write", 0)?;
     let lines = run_to_end(&built, machine(&built, &writer, &disk.0), "writing")?;
+    let written = lines.clone();
     let mut wanted: Vec<String> = (1..=STEPS)
         .map(|j| format!("data-probe: synced {j}"))
         .collect();
@@ -169,6 +215,8 @@ pub fn probe() -> Result<(), String> {
     if datafs_line(&lines, "data volume mounted").is_none() {
         return Err("data-probe (verifying): the service did not only mount the volume".into());
     }
+    let rows = steps_verdict(&written, &lines)?;
+    println!("data-probe: steps of the request loop (kind, ticks, whole step): {rows:?}");
     println!(
         "data-probe: a table with store and data, littlefs formatted, 12 steps of files made, synced, renamed and removed, the same tree after a new start of QEMU: ok"
     );
