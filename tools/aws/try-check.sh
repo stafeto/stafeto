@@ -67,11 +67,15 @@
 #      files and packages are gone after a reboot, that the host key changes at every boot, and
 #      the warning about secrets and the security group.
 #   4. In the session on the instance:
-#        posix-net stat                        `consumers` equal to the workers of nginx-fast (2),
+#        posix-net stat                        (a test program of tests/posix-so: the image has no
+#                                              /bin/posix-net, so this line runs only where it is
+#                                              added) `consumers` equal to the workers of nginx-fast (2),
 #                                              `rx_consumer` and `tx_consumer` above 0 after the
 #                                              curl of 8080, `tx_refused 0`, `rx_full 0`
+#        date -u -s "YYYY-MM-DD HH:MM:SS"      first: the clock starts at 2026-01-01 and `pkg` refuses the
+#                                              certificate of stafeto.github.io until it is set
 #        pkg update; pkg search nginx          the index of the series 0.5 from stafeto.github.io
-#        pkg install htop; htop                a package from the store in memory
+#        pkg install htop; TERM=vt100 htop     (the image has no terminfo for xterm)                a package from the store in memory
 #        ps; cat /proc/meminfo                 nginx, nginx-fast and dropbear are running; the
 #                                              memory fits the 2 GiB (the console line `frames N
 #                                              MiB free` before the services shows what there is;
