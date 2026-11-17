@@ -314,7 +314,12 @@ fn check_built(path: &Path) -> Result<(), String> {
 
 /// The notices of every package of the image `name` are in the built image at `path`.
 pub fn check_notices(path: &Path, name: &str) -> Result<(), String> {
-    let all = packages::of_image(name)?;
+    // A package with no file of its own (pcre2, musl-fts) has its notices in the packages linked
+    // with it, as `rootfs::layered` has it.
+    let all: Vec<_> = packages::of_image(name)?
+        .into_iter()
+        .filter(|p| !(p.files.is_empty() && p.dirs.is_empty()))
+        .collect();
     for package in &all {
         crate::notices::image_has_package_notices(path, name, &package.name)?;
     }
