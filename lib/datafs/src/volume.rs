@@ -13,14 +13,14 @@
 //!   volume is for its owner to look at).
 
 use crate::fs::{Fs, Storage};
-use crate::gpt::{self, Class, FORMATTED, Partition, TYPE_DATA};
+use crate::gpt::{self, Class, FORMATTED, Found, Partition, TYPE_DATA};
 use crate::{BLOCK_SECTORS, BLOCKS_MIN, Device, Window};
 
 /// Why no volume was opened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     /// Something else is on the disk.
-    Foreign,
+    Foreign(Found),
     /// A table with no data partition.
     NoPartition,
     /// The partition is too small for the file system.
@@ -34,7 +34,9 @@ pub enum Refusal {
 impl Refusal {
     pub const fn text(self) -> &'static str {
         match self {
-            Self::Foreign => "the disk holds something else, left alone",
+            Self::Foreign(_) => {
+                "the disk holds something else, left alone and unused in this release"
+            }
             Self::NoPartition => "no data partition in the table",
             Self::TooSmall => "the data partition is too small",
             Self::Damaged => "the data volume does not mount, left alone",
@@ -50,6 +52,9 @@ pub enum Did {
     Partitioned,
     /// The partition was formatted.
     Formatted,
+    /// The volume had grown: the backup copy of the table was moved to the new end, and the volume
+    /// mounted.
+    Relocated,
     Mounted,
 }
 
@@ -62,7 +67,7 @@ pub fn open<D: Device>(
     let mut did = Did::Mounted;
     let table = match gpt::classify(&mut device).map_err(|_| Refusal::Device)? {
         Class::Gpt(table) => table,
-        Class::Foreign => return Err(Refusal::Foreign),
+        Class::Foreign(found) => return Err(Refusal::Foreign(found)),
         Class::Blank => {
             let layout = gpt::default_layout(device.sectors()).ok_or(Refusal::Device)?;
             did = Did::Partitioned;
@@ -94,6 +99,13 @@ pub fn open<D: Device>(
         }
     } else {
         fs.mount().map_err(|_| Refusal::Damaged)?;
+    }
+    // A table of ours (it has our data partition) on a volume that grew gets its backup copy moved,
+    // once the volume is known to be one that is used: a volume that is refused is not written. A
+    // table with no such partition is not ours and never gets here.
+    if table.grown {
+        gpt::relocate_backup(&mut fs.device().device).map_err(|_| Refusal::Device)?;
+        did = Did::Relocated;
     }
     Ok((fs, did, part))
 }

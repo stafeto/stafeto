@@ -375,6 +375,7 @@ fn main(_: u64) -> u64 {
     if queues_pa == 0 || cells_pa == 0 || mapped.is_err() {
         return NOT_MAPPED;
     }
+    rt::println!("nvme: dma queues {queues_pa:#x} cells {cells_pa:#x}");
     // SAFETY: the window `bar` maps BAR 0 at BAR_AT for BAR_PAGES pages (init's table).
     let hw = Hw {
         bar: unsafe { Bar::new(BAR_AT, (BAR_PAGES * PAGE) as usize) },
@@ -475,6 +476,8 @@ fn main(_: u64) -> u64 {
         process: Handle::borrowed(s.process.raw()),
         _objects: [queues, cell_object],
         _windows: [ecam, bar],
+        slba: [0; CELLS_N],
+        errors: ERRORS_SHOWN,
     };
     #[cfg(feature = "steps")]
     rt::service::report_steps(15);
@@ -523,7 +526,16 @@ struct Disk {
     /// The DMA objects and the windows, mapped for the service's life.
     _objects: [Handle<Memory>; 2],
     _windows: [Handle<Memory>; 2],
+    /// The first block of the command in each place, for the line of an I/O error.
+    slba: [u64; CELLS_N],
+    /// The I/O errors that may still print a line.
+    errors: u8,
 }
+
+/// The places of the staging cells.
+const CELLS_N: usize = proto_blk::CELLS as usize;
+/// The I/O errors that print a line.
+const ERRORS_SHOWN: u8 = 4;
 
 /// `count` sectors between cell `place` of the DMA object and the client's cell of the same
 /// number: to the client for a read, from it for a write.
@@ -593,6 +605,19 @@ impl Disk {
     fn finish(&mut self, done: Completion) {
         let place = usize::from(done.tag);
         self.inflight = self.inflight.saturating_sub(1);
+        if let NvmeOutcome::Error { sct, sc, dnr } = done.outcome
+            && self.errors > 0
+        {
+            self.errors -= 1;
+            rt::println!(
+                "nvme: io error cid {} sct/sc {:#x}/{:#x} dnr {} slba {}",
+                u16::from(done.tag) << 2,
+                sct,
+                sc,
+                u8::from(dnr),
+                self.slba.get(place).copied().unwrap_or(0)
+            );
+        }
         let outcome = match done.outcome {
             NvmeOutcome::Ok => Outcome::Ok,
             NvmeOutcome::Error { .. } | NvmeOutcome::Aborted => Outcome::Io,
@@ -649,6 +674,9 @@ impl Disk {
         };
         if kind == Kind::Write {
             copy_cell(&self.nvme, place, io.count, false);
+        }
+        if let Some(at) = self.slba.get_mut(place) {
+            *at = lba;
         }
         let sent = match kind {
             Kind::Read => self.nvme.read(place as u8, lba, blocks),

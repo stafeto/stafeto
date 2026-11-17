@@ -1134,7 +1134,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
-/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe]`: the package service on an NVMe disk that outlives the machine.
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe]`: the package service on an NVMe disk that outlives the machine.
 /// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
 /// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
 /// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
@@ -1159,9 +1159,12 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 ["wrongdisk", "breaks"] => (KeyCase::WrongDisk, true),
                 ["wrongdisk", "blank"] => (KeyCase::WrongBlank, false),
                 ["wrongdisk", "blank", "breaks"] => (KeyCase::WrongBlank, true),
+                ["foreign"] => (KeyCase::Foreign, false),
+                ["image"] => (KeyCase::Image, false),
+                ["image", "grown"] => (KeyCase::ImageGrown, false),
                 other => {
                     return Err(format!(
-                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]]: {other:?}"
+                        "usage: nvme-persist key [nodisk|wrongdisk [blank] [breaks]|foreign|image [grown]]: {other:?}"
                     ));
                 }
             };
@@ -1444,6 +1447,15 @@ enum KeyCase {
     /// The same, with the first MiB of the file zeroed: `datafs` would take it for a blank disk and
     /// partition it, so only the check of the identity protects it.
     WrongBlank,
+    /// The serial the record wants over a file shaped like a fresh volume of EC2 (the first and the
+    /// last 4 KiB zero, bytes that are not zero between): the identity matches, and `datafs` itself
+    /// says the disk holds something else and leaves it alone.
+    Foreign,
+    /// The data image of the AMI (`cargo xtask data-image`): `datafs` mounts it on the first boot.
+    Image,
+    /// The same image with the file 1 GiB longer, as an enlarged volume is: the backup copy of the
+    /// table is moved to the new end and the volume mounts.
+    ImageGrown,
 }
 
 /// The size of the file that stands for an ESP in the case `WrongDisk`.
@@ -1504,6 +1516,9 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         (KeyCase::WrongDisk, true) => "-wrongdisk-break",
         (KeyCase::WrongBlank, false) => "-wrongblank",
         (KeyCase::WrongBlank, true) => "-wrongblank-break",
+        (KeyCase::Foreign, _) => "-foreign",
+        (KeyCase::Image, _) => "-image",
+        (KeyCase::ImageGrown, _) => "-image-grown",
     };
     let mut list = PROGRAMS_KEY.to_vec();
     if breaks {
@@ -1534,11 +1549,24 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     efi::make_disk(&loader, &artifacts, &esp)?;
     let file = Disk::new(&format!("nvme-key{tag}"));
     let shape = match case {
-        KeyCase::Normal => Shape::Plain,
+        KeyCase::Normal | KeyCase::Foreign | KeyCase::Image | KeyCase::ImageGrown => Shape::Plain,
         KeyCase::NoDisk => Shape::Absent,
         KeyCase::WrongDisk | KeyCase::WrongBlank => Shape::Wrong,
     };
-    if case != KeyCase::Normal && case != KeyCase::NoDisk {
+    if case == KeyCase::Foreign {
+        write_ec2_noise(&file.0)?;
+    } else if case == KeyCase::Image || case == KeyCase::ImageGrown {
+        data_image::make(&file.0, DISK_BYTES)?;
+        if case == KeyCase::ImageGrown {
+            let grown = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file.0)
+                .map_err(|e| format!("{}: {e}", file.0.display()))?;
+            grown
+                .set_len(DISK_BYTES + (1 << 30))
+                .map_err(|e| format!("{}: {e}", file.0.display()))?;
+        }
+    } else if case != KeyCase::Normal && case != KeyCase::NoDisk {
         write_stand_in(&file.0, case == KeyCase::WrongBlank)?;
     } else {
         write_disk(&file, None)?;
@@ -1555,6 +1583,12 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
             "datakey-probe",
         )
     };
+    if case == KeyCase::Foreign {
+        return nvme_key_foreign(&file.0, &run);
+    }
+    if case == KeyCase::Image || case == KeyCase::ImageGrown {
+        return nvme_key_image(case, &run);
+    }
     if case != KeyCase::Normal {
         return nvme_key_without_volume(case, breaks, &file.0, &run);
     }
@@ -1571,7 +1605,9 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         ));
     }
     let before = key_fingerprint(&first)?;
+    no_foreign_report(&first, "nvme-persist key, first boot")?;
     let second = run()?;
+    no_foreign_report(&second, "nvme-persist key, second boot")?;
     if !said(&second, "datakey: host key restored from /data")
         || said(&second, "datakey: no host key")
     {
@@ -1591,6 +1627,178 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     }
     println!(
         "nvme-persist key: the host key made on the first boot of a blank NVMe data volume was kept by datakey, and the second boot of the same volume restored it (fingerprint FNV:{before} on both): ok"
+    );
+    Ok(())
+}
+
+/// A blank volume and a valid one never print the lines of a foreign disk.
+fn no_foreign_report(lines: &[String], what: &str) -> Result<(), String> {
+    match lines
+        .iter()
+        .find(|l| l.contains("datafs: foreign at") || l.contains("datafs: lba1 "))
+    {
+        Some(line) => Err(format!("{what}: a line of a foreign disk: {line}")),
+        None => Ok(()),
+    }
+}
+
+/// A file shaped like a fresh volume of EC2: the first 4 KiB and the last 4 KiB zero, bytes that
+/// are never zero in between.
+fn write_ec2_noise(path: &Path) -> Result<(), String> {
+    let mut bytes = vec![0u8; STAND_IN_BYTES];
+    let end = bytes.len() - 4096;
+    for (i, b) in bytes[4096..end].iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 1;
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `nvme-persist key foreign`: the record's serial over a file shaped like a fresh volume of EC2.
+/// The service of the disk takes it, and `datafs` classifies it as foreign (the first byte that is
+/// not zero is at sector 8, offset 0; sector 1 and the last sector are zero), prints no byte of the
+/// disk, and leaves it alone: the file has the same SHA-256 after two boots, and the key of the
+/// host is new on each boot.
+fn nvme_key_foreign(
+    file: &Path,
+    run: &dyn Fn() -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let name = "nvme-persist key foreign";
+    let before = file_sha256(file)?;
+    let mut keys = Vec::new();
+    for boot in ["first", "second"] {
+        let lines = run()?;
+        no_restart_loop(&lines, name)?;
+        let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
+        for text in [
+            "datafs: foreign at sector 8 offset 0",
+            "datafs: lba1 zero lba-last zero",
+            "datafs: the disk holds something else, left alone and unused in this release",
+        ] {
+            if count(text) != 1 {
+                return Err(format!(
+                    "{name}, {boot} boot: {} lines with {text:?}, one expected: {:?}",
+                    count(text),
+                    lines
+                        .iter()
+                        .filter(|l| l.contains("datafs") || l.contains("nvme"))
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        if count("nvme: dma queues 0x") != 1 {
+            return Err(format!(
+                "{name}, {boot} boot: the line of the DMA addresses is missing"
+            ));
+        }
+        if said(&lines, "datafs: no disk: ") || said(&lines, "datafs: data volume") {
+            return Err(format!(
+                "{name}, {boot} boot: the volume was not left alone"
+            ));
+        }
+        if said(&lines, "datakey: host key saved") || said(&lines, "datakey: host key restored") {
+            return Err(format!("{name}, {boot} boot: a key was kept or restored"));
+        }
+        keys.push(key_fingerprint(&lines)?);
+    }
+    if keys[0] == keys[1] {
+        return Err(format!(
+            "{name}: the key is the same on two boots of a volume that is left alone: FNV:{}",
+            keys[0]
+        ));
+    }
+    let after = file_sha256(file)?;
+    if before != after {
+        return Err(format!(
+            "{name}: the file changed: SHA-256 {before} before the boots, {after} after"
+        ));
+    }
+    println!(
+        "{name}: datafs said where the first byte that is not zero is (sector 8 offset 0), printed no byte of the disk, left it alone (the file has the same SHA-256, {after}, after two boots), and the key is new on each boot (FNV:{} then FNV:{}): ok",
+        keys[0], keys[1]
+    );
+    Ok(())
+}
+
+/// `nvme-persist key image [grown]`: the data image of the AMI as the data disk. The first boot
+/// mounts it with no line of partitioning or formatting (with `grown`, one line that the backup
+/// of the table moved to the end, then the mount), the key made by the stand-in of the boot script
+/// is saved, and the second boot mounts again with no such line and restores the same key.
+fn nvme_key_image(
+    case: KeyCase,
+    run: &dyn Fn() -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let grown = case == KeyCase::ImageGrown;
+    let name = if grown {
+        "nvme-persist key image grown"
+    } else {
+        "nvme-persist key image"
+    };
+    let moved = "datafs: backup partition table moved to the end of the disk, data volume mounted";
+    let first = run()?;
+    let second = run()?;
+    for (lines, boot) in [(&first, "first"), (&second, "second")] {
+        no_restart_loop(lines, name)?;
+        no_foreign_report(lines, &format!("{name}, {boot} boot"))?;
+        let mounted = lines
+            .iter()
+            .filter(|l| l.contains("datafs: "))
+            .collect::<Vec<_>>();
+        let relocated = lines.iter().filter(|l| l.contains(moved)).count();
+        let plain = lines
+            .iter()
+            .filter(|l| l.contains("datafs: data volume mounted,"))
+            .count();
+        let wanted_relocated = usize::from(grown && boot == "first");
+        if relocated != wanted_relocated || relocated + plain != 1 {
+            return Err(format!(
+                "{name}, {boot} boot: {relocated} lines of a moved table and {plain} plain mounts, {wanted_relocated} and {} expected: {mounted:?}",
+                1 - wanted_relocated
+            ));
+        }
+        if said(lines, "datafs: data volume formatted")
+            || said(lines, "datafs: partition table written")
+        {
+            return Err(format!(
+                "{name}, {boot} boot: datafs formatted the volume: {mounted:?}"
+            ));
+        }
+    }
+    let datakey = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.contains("datakey"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if !said(&first, "datakey: no host key on /data")
+        || !said(&first, "datakey: host key saved to /data")
+    {
+        return Err(format!(
+            "{name}: the first boot did not keep the key: {:?}",
+            datakey(&first)
+        ));
+    }
+    if !said(&second, "datakey: host key restored from /data")
+        || said(&second, "datakey: no host key")
+    {
+        return Err(format!(
+            "{name}: the second boot did not restore the key: {:?}",
+            datakey(&second)
+        ));
+    }
+    let (before, after) = (key_fingerprint(&first)?, key_fingerprint(&second)?);
+    if before != after {
+        return Err(format!(
+            "{name}: the fingerprint changed between two boots: {before} then {after}"
+        ));
+    }
+    println!(
+        "{name}: the data image {}mounted on the first boot with no formatting, the key was saved and the second boot restored it (FNV:{before} on both): ok",
+        if grown {
+            "of a volume 1 GiB larger had its backup table moved to the end and "
+        } else {
+            ""
+        }
     );
     Ok(())
 }

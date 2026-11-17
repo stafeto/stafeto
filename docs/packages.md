@@ -675,7 +675,7 @@ controller has no such service, init leaves the record out and takes the name of
 key service then keeps no key, and the key of the node is new on each boot. A wrong or missing volume
 costs the data of the node and nothing else. A data volume attached after the boot is not used until the next boot: `datafs` connects once and init resolves the table once.
 
-`cargo xtask nvme-persist key` runs the host key service (`datakey`) on the same kind of disk as the data volume of `datafs`: the first boot keeps the key that a stand-in for the boot script of Dropbear made, the second boot restores it, and the fingerprint line is the same on both. `key nodisk` boots with no data controller (the key is new on each of two boots, and nothing restarts); `key wrongdisk` gives the controller another serial number over a file that stands for the ESP (the line `left alone` appears and the SHA-256 of the file is the same after the boot); `key wrongdisk blank` is the same with the first MiB of the file zeroed (a disk that `datafs` would take for blank and partition), and `key wrongdisk blank breaks` must fail because the SHA-256 of that file changed; `key wrongdisk breaks` builds the service with the feature `break-nvme-identity`, which makes the check always pass, and the case must then fail. `cargo xtask nvme-persist blk-probe` runs the probe of the disk service (`tests/blk-probe`) over the NVMe disk, with a CRASH and a restart of the service.
+`cargo xtask nvme-persist key` runs the host key service (`datakey`) on the same kind of disk as the data volume of `datafs`: the first boot keeps the key that a stand-in for the boot script of Dropbear made, the second boot restores it, and the fingerprint line is the same on both. `key nodisk` boots with no data controller (the key is new on each of two boots, and nothing restarts); `key wrongdisk` gives the controller another serial number over a file that stands for the ESP (the line `left alone` appears and the SHA-256 of the file is the same after the boot); `key wrongdisk blank` is the same with the first MiB of the file zeroed (a disk that `datafs` would take for blank and partition), and `key wrongdisk blank breaks` must fail because the SHA-256 of that file changed; `key wrongdisk breaks` builds the service with the feature `break-nvme-identity`, which makes the check always pass, and the case must then fail. `key foreign` gives the controller the serial the record wants over a file shaped like a fresh volume of EC2 (the first and the last 4 KiB zero, bytes that are not zero between): `datafs` prints `datafs: foreign at sector 8 offset 0` and `datafs: lba1 zero lba-last zero` (the place of the first byte that is not zero and whether sector 1 and the last sector hold anything; no byte of the disk is printed), leaves the file alone, and the key is new on each of two boots. `key image` makes the data volume the way the AMI carries it (`cargo xtask data-image`) and boots twice: no line of partitioning or formatting, the key saved, then restored; `key image grown` makes the file 1 GiB longer first, as an enlarged volume is, and the first boot prints one line that the backup of the table moved to the end of the disk. `cargo xtask nvme-persist blk-probe` runs the probe of the disk service (`tests/blk-probe`) over the NVMe disk, with a CRASH and a restart of the service.
 `cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
 a second NVMe controller over a file, stops QEMU once the probe has ended and nothing is in flight, and
 starts the machine again on the same file: the probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
@@ -688,26 +688,41 @@ identity stands before every use of it. The partitions of one disk (windows of `
 move of `pkgd` to the disk.
 
 **The data volume on EC2.** Each instance gets this volume, 2 GiB of gp3 billed to the launching account (about 0.19 USD a month in eu-central-1, approximate), deleted with the instance; `--no-data-volume` or a NoDevice mapping (below) launches without it. The image registered for EC2 carries a second block device mapping,
-`/dev/sdf`: an empty gp3 volume of 2 GiB with `DeleteOnTermination`, made at each launch and removed
-with the instance. Nitro shows it as the second NVMe function (`1d0f:8061`, walk index 1; the root
+`/dev/sdf`: a gp3 volume made from the second snapshot of the image, with `DeleteOnTermination`, made at each launch and removed
+with the instance. The snapshot holds the data volume ready: the table of `datafs` (the partitions `store` and `data`) and an empty file system with the attribute `FORMATTED` on `data`. `cargo xtask data-image <path> [--size 2G]` makes the file offline by running `datafs::volume::open` on a file, the code of the first boot of a blank disk, so no second formatter exists; the GUIDs of the disk and the partitions come from a fixed seed (the same in every image) and the file holds no time, so the output is the same on every run. `cargo xtask aws image` uploads the file as a snapshot after the boot disk's and registers `/dev/sdf` from it. Nitro shows the volume as the second NVMe function (`1d0f:8061`, walk index 1; the root
 volume is index 0; the record names index 1 of the measured walk order, and a root volume found there is refused by the name check), and EBS writes `sdf` into Identify Controller bytes
 3072..3104 (`sdf` and 29 spaces; the root volume reads `xvda` and spaces). The record `datadisk` of
 `table/aws.rs` asks for the EBS name `sdf` (kind 2), `datafs` and `datakey` follow it, and the boot
 script of Dropbear starts once `datakey` is ready (the launcher waits for it for 30 s). The first boot
-of the volume writes a partition table and formats it (`datafs: partition table written, data volume
-formatted`) and `datakey` keeps the host key that the boot script made (`datakey: host key saved to
+mounts the volume (`datafs: data volume mounted`, with no line of formatting) and `datakey` keeps the host key that the boot script made (`datakey: host key saved to
 /data`). Every later boot, after a reboot or after a stop and start, mounts the volume and puts the key
 back (`datakey: host key restored from /data`), so the fingerprint of the line `ssh: host key SHA256:`
 stays the same. The same table is mirrored for QEMU (`table-aws-qemu`, `cargo xtask net-try`), where
 the volume is a second NVMe controller with the serial `stafeto-data`.
 
+A new unencrypted gp3 volume does not read as zeros past its first 4 KiB (measured on a t4g.small: the first 4 KiB are zero and the bytes after them are not, different on each volume and the same on each read), and `datafs` does not treat such a volume as blank. The test for a blank disk stays strict on every platform (no table and the first 1 MiB all zero), because a weaker one would format a disk that holds a file system or data of its own. A volume that EBS makes from a snapshot reads as the snapshot does, which is why the image carries the volume made.
+
+What `datafs` does with the disk it is given:
+
+| State of the disk | What `datafs` does |
+| --- | --- |
+| A volume from the snapshot of the image (a table of `datafs`, `FORMATTED` set) | Mounts it from the first boot, writes nothing |
+| The same volume enlarged at launch | Mounts it and rewrites the table: moves the backup copy of the table to the new end of the disk (the entries first, then the backup header, then the primary header, then the old backup header is cleared, with a flush between the steps), keeps the partitions as large as they were, and mounts |
+| A volume of the user's own with a table of `datafs` and `FORMATTED` set on `data` | Mounts it |
+| A table of `datafs` whose `data` partition lacks `FORMATTED` | Formats `data`, sets `FORMATTED` and mounts (the table is written once, for the attribute) |
+| A blank disk (no table, the first 1 MiB zero), as under QEMU | Writes the table, formats `data`, sets `FORMATTED` and mounts |
+| A valid table with no partition of `datafs` | Writes nothing (`no data partition in the table`) |
+| A `data` partition with `FORMATTED` that does not mount | Writes nothing (`the data volume does not mount, left alone`) |
+| Any other disk: a fresh gp3 volume, a file system, a table of another system, data | Writes nothing and prints `datafs: foreign at sector S offset O`, the line `datafs: lba1 ... lba-last ...` (whether those two sectors are zero) and `datafs: the disk holds something else, left alone and unused in this release`; the host key lives for one boot |
+| No volume (`--no-data-volume`) | `datafs: no disk`; the host key lives for one boot |
+
+A damaged primary header on an enlarged volume is not a table (the backup is no longer at the end), so the disk reads as something else and is left alone. No disk without a table of `datafs` is ever written, unless it is blank in the strict sense (no table, the first 1 MiB zero). A table of `datafs` can be rewritten (its attribute set, its backup moved), and a `data` partition of it without `FORMATTED` is formatted. A disk that is smaller than the one the table was made on has no table that `datafs` takes, and is left alone. Turning a volume that looks blank into a data volume of stafeto by hand (`data format --yes-destroy`) is not built in this release (issue 434).
+
 To launch an instance without the data volume, map the device to nothing:
 `--block-device-mappings DeviceName=/dev/sdf,NoDevice=` (`cargo xtask aws boot --no-data-volume` does it).
 Init then leaves `datadisk` out (`init: left out: datadisk`), `datafs` says `no disk`, and the host key
-is new at every boot. To make the volume larger, give the launch a mapping of the same device name with
-a larger `VolumeSize`, for example `DeviceName=/dev/sdf,Ebs={VolumeSize=8,VolumeType=gp3,DeleteOnTermination=true}`;
-a first boot formats whatever size it finds. A volume that is attached after the boot is used from the
-next boot. `datafs` formats a volume only when its first MiB is zero, so attach no volume with data you keep as `/dev/sdf`. A different volume in the second NVMe function (the root volume where the data volume should be)
+is new at every boot. To make the volume larger, give the launch a mapping of the same device name with a larger `VolumeSize`, for example `DeviceName=/dev/sdf,Ebs={VolumeSize=8,VolumeType=gp3,DeleteOnTermination=true}`: the mapping of the launch changes the size and the volume still comes from the snapshot of the image (`tools/aws/try-check.sh` has the launch to confirm it). The first boot moves the backup of the table to the end of the larger disk and mounts the volume; the partitions keep the size they have, so the extra space is not used in this release. A volume that is attached after the boot is used from the
+next boot. A different volume in the second NVMe function (the root volume where the data volume should be)
 shows another name, and the disk service leaves it alone.
 
 ## The package service

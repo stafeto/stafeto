@@ -16,10 +16,10 @@
 //! session has no rule in and none out, so nothing reaches the instances from
 //! outside and the console is the only way to look at them.
 
-use crate::{Artifacts, Variant, build, efi};
+use crate::{Artifacts, Variant, build, data_image, efi};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -37,12 +37,14 @@ const BLANK_SDF: &str = "blank";
 /// The value of `Launch::extra_snapshot` that leaves the data volume of the image out
 /// (`--no-data-volume`): /dev/sdf is mapped to no device, so the instance has one NVMe volume.
 const NO_DEVICE: &str = "none";
-/// The size of the data volume the image registers as /dev/sdf, in GiB (the SSH host key and the
-/// files of /data live there), and the mapping string for it.
-const DATA_VOLUME_GIB: u32 = 2;
-fn data_volume_mapping() -> String {
+/// The mapping the image registers for /dev/sdf: a volume made from the snapshot of the data
+/// image (`cargo xtask data-image`: the table and the file system `datafs` mounts), 2 GiB as the
+/// snapshot is, that goes away with the instance. A fresh EBS volume reads as random bytes past its
+/// first 4 KiB, so `datafs` would never take an empty one for blank: the image brings the volume
+/// made.
+fn data_volume_mapping(snapshot: &str) -> String {
     format!(
-        "DeviceName=/dev/sdf,Ebs={{VolumeSize={DATA_VOLUME_GIB},VolumeType=gp3,DeleteOnTermination=true}}"
+        "DeviceName=/dev/sdf,Ebs={{SnapshotId={snapshot},VolumeType=gp3,DeleteOnTermination=true}}"
     )
 }
 
@@ -1512,8 +1514,12 @@ pub fn base64(bytes: &[u8]) -> String {
 /// all zero, 512 KiB each, with their SHA-256. Needs no bucket and no import
 /// role; it does not work with default encryption (`check` says so).
 fn direct_snapshot(s: &Session, disk: &Path, what: &str) -> Result<String, String> {
-    let data = std::fs::read(disk).map_err(|e| format!("{}: {e}", disk.display()))?;
-    let gib = data.len().div_ceil(1 << 30);
+    let mut file = std::fs::File::open(disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", disk.display()))?
+        .len() as usize;
+    let gib = len.div_ceil(1 << 30);
     let mut args: Vec<String> = ["ebs", "start-snapshot", "--volume-size"]
         .map(String::from)
         .to_vec();
@@ -1533,12 +1539,17 @@ fn direct_snapshot(s: &Session, disk: &Path, what: &str) -> Result<String, Strin
     s.note("created", Kind::Snapshot, &snap)?;
     let tmp = s.dir.join("block.bin");
     let mut sent = 0;
-    for (index, block) in data.chunks(BLOCK).enumerate() {
-        if block.iter().all(|b| *b == 0) {
+    // One block at a time: the data image is 2 GiB of mostly zeros.
+    let mut buf = vec![0u8; BLOCK];
+    for index in 0..len.div_ceil(BLOCK) {
+        let take = BLOCK.min(len - index * BLOCK);
+        buf.fill(0);
+        file.read_exact(&mut buf[..take])
+            .map_err(|e| format!("{}: {e}", disk.display()))?;
+        if buf.iter().all(|b| *b == 0) {
             continue;
         }
-        let mut full = block.to_vec();
-        full.resize(BLOCK, 0);
+        let full = buf.clone();
         std::fs::write(&tmp, &full).map_err(|e| e.to_string())?;
         let sum = base64(&sha256(&full)?);
         aws(&[
@@ -1577,7 +1588,8 @@ fn direct_snapshot(s: &Session, disk: &Path, what: &str) -> Result<String, Strin
     Ok(snap)
 }
 
-fn register(s: &Session, snap: &str, name: &str) -> Result<String, String> {
+/// Registers the image: the disk's snapshot as the root, and the data image's as /dev/sdf.
+fn register(s: &Session, snap: &str, data: &str, name: &str) -> Result<String, String> {
     let mut args: Vec<String> = [
         "ec2",
         "register-image",
@@ -1602,8 +1614,8 @@ fn register(s: &Session, snap: &str, name: &str) -> Result<String, String> {
         format!(
             "DeviceName=/dev/sda1,Ebs={{SnapshotId={snap},VolumeType=gp3,DeleteOnTermination=true}}"
         ),
-        // The data volume: a second, empty volume that goes away with the instance.
-        data_volume_mapping(),
+        // The data volume: made from the snapshot of the data image, and gone with the instance.
+        data_volume_mapping(data),
     ]);
     args.extend(s.tag_spec(&["image"]));
     args.extend(["--query", "ImageId"].map(String::from));
@@ -1685,8 +1697,17 @@ fn image(args: &[String]) -> Result<(), String> {
     } else {
         "plain"
     };
+    // The data volume, made offline by the code of the first boot of datafs (no AWS call yet).
+    let data_file = s.dir.join("data.raw");
+    data_image::make(&data_file, data_image::DEFAULT_SIZE)?;
     let snap = direct_snapshot(&s, &disk, flavour)?;
-    let ami = register(&s, &snap, &format!("stafeto-{flavour}-{}", s.id))?;
+    let data_snap = direct_snapshot(&s, &data_file, "data")?;
+    let ami = register(
+        &s,
+        &snap,
+        &data_snap,
+        &format!("stafeto-{flavour}-{}", s.id),
+    )?;
     println!(
         "image {} registered in {:.1} s; session {}",
         redact(&ami),
@@ -2841,13 +2862,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_image_registers_a_second_volume_of_2_gib_that_goes_with_the_instance() {
+    fn the_image_maps_sdf_to_the_snapshot_of_the_data_image() {
         assert_eq!(
-            data_volume_mapping(),
-            "DeviceName=/dev/sdf,Ebs={VolumeSize=2,VolumeType=gp3,DeleteOnTermination=true}"
+            data_volume_mapping("snap-0123456789abcdef1"),
+            "DeviceName=/dev/sdf,Ebs={SnapshotId=snap-0123456789abcdef1,VolumeType=gp3,DeleteOnTermination=true}"
         );
-        // No snapshot is in it: the volume is made empty at each launch.
-        assert!(!data_volume_mapping().contains("Snapshot"));
+        // The size comes from the snapshot: no VolumeSize in the mapping.
+        assert!(!data_volume_mapping("snap-1").contains("VolumeSize"));
+        // The data image is the 2 GiB the snapshot is made with.
+        assert_eq!(data_image::DEFAULT_SIZE, 2 << 30);
     }
 
     #[test]
@@ -2862,7 +2885,7 @@ mod tests {
         );
         // The same device name as the image's data volume, so it replaces that mapping.
         assert_eq!(launch_mapping(NO_DEVICE), "DeviceName=/dev/sdf,NoDevice=");
-        assert!(data_volume_mapping().starts_with("DeviceName=/dev/sdf,"));
+        assert!(data_volume_mapping("snap-1").starts_with("DeviceName=/dev/sdf,"));
     }
 
     #[test]
@@ -3146,6 +3169,14 @@ mod tests {
 d="$(dirname "$0")"
 echo "$*" >> "$d/calls"
 case "$*" in
+ *start-snapshot*)
+   [ -f "$d/ledgerpath" ] && { echo "--- start-snapshot"; cat "$(cat "$d/ledgerpath")"; } >> "$d/ledger_at_snapshot"
+   n=$(cat "$d/snapn" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$d/snapn"
+   echo snap-0123456789abcdef$n ;;
+ *put-snapshot-block*|*complete-snapshot*|*snapshot-completed*) ;;
+ *register-image*)
+   [ -f "$d/ledgerpath" ] && cp "$(cat "$d/ledgerpath")" "$d/ledger_at_register"
+   echo ami-0123456789abcdef0 ;;
  *run-instances*)
    touch "$d/created"
    if [ -f "$d/run_fails" ]; then echo "An error occurred (RequestLimitExceeded) when calling the RunInstances operation" >&2; exit 254; fi
@@ -3298,6 +3329,88 @@ exit 0
                 s.live().iter().any(|(k, _)| *k == Kind::Instance),
                 "clean can still find it"
             );
+        });
+    }
+
+    #[test]
+    fn the_image_uploads_two_snapshots_and_registers_sdf_from_the_second() {
+        with_fake(&[], |s, dir| {
+            // A root disk and a data image of two blocks and a few, zeros between.
+            let root = dir.join("root.raw");
+            let data = dir.join("data.raw");
+            let mut bytes = vec![0u8; 3 * BLOCK];
+            bytes[0] = 1;
+            bytes[2 * BLOCK + 5] = 2;
+            std::fs::write(&root, &bytes).unwrap();
+            data_image::make(&data, 16 << 20).unwrap();
+            let first = direct_snapshot(s, &root, "plain").unwrap();
+            let second = direct_snapshot(s, &data, "data").unwrap();
+            assert_eq!(first, "snap-0123456789abcdef1");
+            assert_eq!(second, "snap-0123456789abcdef2");
+            let ami = register(s, &first, &second, "stafeto-plain-9999").unwrap();
+            assert_eq!(ami, "ami-0123456789abcdef0");
+            let c = calls(dir);
+            // Zero blocks are not sent: two of the root's three, and the data image's few.
+            let blocks: Vec<&str> = c
+                .lines()
+                .filter(|l| l.contains("put-snapshot-block"))
+                .collect();
+            assert!(
+                blocks
+                    .iter()
+                    .filter(|l| l.contains("--snapshot-id snap-0123456789abcdef1"))
+                    .count()
+                    == 2,
+                "{c}"
+            );
+            assert!(
+                blocks
+                    .iter()
+                    .any(|l| l.contains("--snapshot-id snap-0123456789abcdef2")),
+                "{c}"
+            );
+            // Both snapshots carry the tags and the second one is 1 GiB at least.
+            for l in c.lines().filter(|l| l.contains("start-snapshot")) {
+                assert!(l.contains("Key=project,Value=stafeto"), "{l}");
+                assert!(l.contains("Key=session,Value=9999-"), "{l}");
+            }
+            let register_line = c.lines().find(|l| l.contains("register-image")).unwrap();
+            assert!(
+                register_line.contains(
+                    "DeviceName=/dev/sda1,Ebs={SnapshotId=snap-0123456789abcdef1,VolumeType=gp3,DeleteOnTermination=true}"
+                ),
+                "{register_line}"
+            );
+            assert!(
+                register_line.contains(
+                    "DeviceName=/dev/sdf,Ebs={SnapshotId=snap-0123456789abcdef2,VolumeType=gp3,DeleteOnTermination=true}"
+                ),
+                "{register_line}"
+            );
+            // The journal: each snapshot has its intent before the call and its id after, and the
+            // image its intent before the registration.
+            let at_snapshot = ledger_copy(dir, "ledger_at_snapshot");
+            let first_call = at_snapshot.split("--- start-snapshot").nth(1).unwrap();
+            assert!(
+                first_call.contains("intent\tsnapshot\tplain"),
+                "{at_snapshot}"
+            );
+            assert!(!first_call.contains("created"), "{at_snapshot}");
+            let second_call = at_snapshot.split("--- start-snapshot").nth(2).unwrap();
+            assert!(second_call.contains("created\tsnapshot\tsnap-0123456789abcdef1"));
+            assert!(second_call.contains("intent\tsnapshot\tdata"));
+            assert!(!second_call.contains("created\tsnapshot\tsnap-0123456789abcdef2"));
+            let at_register = ledger_copy(dir, "ledger_at_register");
+            assert!(at_register.contains("created\tsnapshot\tsnap-0123456789abcdef2"));
+            assert!(at_register.contains("intent\timage"));
+            assert!(!at_register.contains("created\timage"));
+            let live = s.live();
+            assert_eq!(
+                live.iter().filter(|(k, _)| *k == Kind::Snapshot).count(),
+                2,
+                "clean and sweep find both"
+            );
+            assert!(live.contains(&(Kind::Image, ami)));
         });
     }
 

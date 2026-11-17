@@ -1877,6 +1877,7 @@ dependencies = [
  "abi",
  "bootimg",
  "console-line",
+ "datafs",
  "entries",
  "fatfs",
  "firmware-tree",

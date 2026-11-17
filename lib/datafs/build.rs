@@ -6,7 +6,37 @@
 //! with the string functions of `csrc/shim.c` and its own `string.h`; for the host it is the host's
 //! compiler and library. littlefs never allocates (LFS_NO_MALLOC) and prints nothing.
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, process::Command};
+
+/// An archiver that indexes ELF objects. The `ar` of macOS archives them with no symbol index, and
+/// the linker then finds no `datafs_*`. The Rust toolchain's `llvm-ar` (the component
+/// `llvm-tools`, which the repository's toolchain file names) does it on every host. None when the
+/// environment names an archiver (`AR_aarch64_unknown_none` or `AR`, which `cc` reads) or the
+/// toolchain has none.
+fn elf_archiver() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=AR_aarch64_unknown_none");
+    println!("cargo:rerun-if-env-changed=AR");
+    if env::var_os("AR_aarch64_unknown_none").is_some() || env::var_os("AR").is_some() {
+        return None;
+    }
+    let rustc = env::var_os("RUSTC")?;
+    let out = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    let sysroot = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    let host = env::var("HOST").ok()?;
+    let tool = sysroot
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(if cfg!(windows) {
+            "llvm-ar.exe"
+        } else {
+            "llvm-ar"
+        });
+    tool.is_file().then_some(tool)
+}
 
 fn main() {
     let lfs =
@@ -36,6 +66,9 @@ fn main() {
         .flag_if_supported("-Wno-unused-function")
         .flag_if_supported("-Wno-unused-parameter");
     if bare {
+        if let Some(ar) = elf_archiver() {
+            build.archiver(&ar);
+        }
         build
             .include(own.join("csrc/include"))
             .compiler(env::var("CC_aarch64_unknown_none").unwrap_or_else(|_| "clang".into()))
@@ -56,8 +89,11 @@ fn main() {
             .flag("-fno-stack-protector")
             .flag("-mfix-cortex-a53-835769")
             .pic(false)
-            .opt_level_str("s")
-            .compile("datafs_shim");
+            .opt_level_str("s");
+        if let Some(ar) = elf_archiver() {
+            shim.archiver(&ar);
+        }
+        shim.compile("datafs_shim");
     }
     build.compile("datafs_c");
     println!("cargo:rerun-if-changed=csrc");

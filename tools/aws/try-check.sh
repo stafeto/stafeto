@@ -21,6 +21,8 @@
 #        tools/build-nginx.py
 #        tools/build-fstack.py
 #      (one run each; about four minutes in all).
+#      On macOS the C parts of littlefs are archived with the `llvm-ar` of the Rust toolchain (lib/datafs/build.rs,
+#      component `llvm-tools`), so no `AR` is set; Apple's `ar` leaves ELF archives with no symbol index.
 #   1. Build and register the image (nginx, nginx-fast, Dropbear, pkg and the page are in it):
 #        cargo xtask aws image --session S
 #      The image check of the plan's security floor has run before on the lists of the image
@@ -102,8 +104,11 @@
 #                                              memory fits the 2 GiB (the console line `frames N
 #                                              MiB free` before the services shows what there is;
 #                                              the full image prints no `init: free pages` line)
-#   4a. The data volume (the image maps a second 2 GiB volume as /dev/sdf, deleted with the instance;
-#      a launch gives the owner nothing to do for it). Write down the fingerprint of the console line
+#   4a. The data volume (the image maps a second 2 GiB volume as /dev/sdf, made from a second snapshot that
+#      carries the table of datafs and an empty file system; it is deleted with the instance; a launch gives the
+#      owner nothing to do for it). The console of the first boot shows `datafs: data volume mounted, N blocks, ...`
+#      with no `partition table written` and no `formatted` in it, then `datakey: no host key on /data` and
+#      `datakey: host key saved to /data`. Write down the fingerprint of the console line
 #      `ssh: host key SHA256:...` of step 2, then:
 #        reboot (in the session on the instance, or `aws ec2 reboot-instances`)
 #                                              the console line `datakey: host key restored from /data` and
@@ -117,6 +122,37 @@
 #      (`--no-data-volume` maps /dev/sdf to NoDevice.) The console shows `init: left out: datadisk`, `datafs: no
 #      disk`, and `ssh: host key SHA256:...` made at this boot; after a reboot the fingerprint differs. The
 #      page and the other servers work as before.
+#   4c. The enlarged volume (issue stafeto-design#765). Launch as in step 2 with the mapping of the volume enlarged:
+#        --block-device-mappings DeviceName=/dev/sdf,Ebs={VolumeSize=4,VolumeType=gp3,DeleteOnTermination=true}
+#      (`aws ec2 run-instances`; the mapping changes the size and the volume still comes from the snapshot of the
+#      image: the line below confirms it). The console shows, once, `datafs: backup partition table moved to the end
+#      of the disk, data volume mounted, N blocks, ...` and `datakey: host key saved to /data`; after a reboot
+#      `datafs: data volume mounted, ...` (no moved-table line) and `datakey: host key restored from /data` with the
+#      same fingerprint. The partitions keep their size, so N is the same as in step 4a.
+#   4d. A blank volume of the user's own attached as /dev/sdf. A launch mapping `/dev/sdf,Ebs={VolumeSize=1,...}`
+#      merges with the snapshot mapping of the AMI (EC2 refuses a size below the snapshot's, and a larger size
+#      still gives the volume of the snapshot, which is not blank), so the volume is attached after the launch:
+#        cargo xtask aws boot --try --no-data-volume --ami AMI ... --session S
+#        aws ec2 create-volume --size 1 --volume-type gp3 --availability-zone <the zone of the instance> (tag it as the session)
+#        aws ec2 attach-volume --device /dev/sdf --instance-id I --volume-id V
+#        stop and start the instance
+#      The volume reads as a fresh one does (the first 4 KiB zero, bytes after), so after the start the console shows
+#        datafs: foreign at sector S offset O                    (S is 8 or a later sector, for the measured volumes)
+#        datafs: lba1 zero lba-last zero
+#        datafs: the disk holds something else, left alone and unused in this release
+#      and no line of partitioning or formatting, `ssh: host key SHA256:...` made at this boot (the fingerprint
+#      differs after a reboot), nothing restarts. No byte of the volume is on the console. Also in every build:
+#      `nvme: dma queues 0x... cells 0x...` once, and `nvme: io error cid C sct/sc ... slba L` on the first errors.
+#      The probes of these lines on QEMU: `cargo xtask nvme-persist key image`, `key image grown`, `key foreign`.
+#   4e. The checklist of the verification on EC2 (one image, four launches, then the cleaning):
+#        default launch            mounts on the first boot (step 4a); the same key after stop and start
+#        sdf VolumeSize=4          the moved-table line once, then the mount (step 4c); the key persists
+#        a blank volume as sdf     launched with --no-data-volume, the volume created and attached, stop and start:
+#                                  left alone (step 4d)
+#        --no-data-volume          unchanged (step 4b)
+#        clean and sweep           `cargo xtask aws clean --session S`, then `cargo xtask aws sweep`: nothing of the
+#                                  project remains, the two snapshots of the image included once the image is
+#                                  deregistered by `clean`
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #

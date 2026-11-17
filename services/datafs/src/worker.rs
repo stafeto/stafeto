@@ -11,8 +11,9 @@ use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering::{Acquire, Release};
+use datafs::gpt::Found;
 use datafs::server::Server;
-use datafs::volume::{self, Did};
+use datafs::volume::{self, Did, Refusal};
 use datafs::{Device, DeviceError, SECTOR};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk};
 use proto_wire::{Status, Writer, long};
@@ -370,6 +371,9 @@ fn open_volume(disk: Disk) -> Option<Volume> {
                 Did::Partitioned => "partition table written, data volume formatted",
                 Did::Formatted => "data volume formatted",
                 Did::Mounted => "data volume mounted",
+                Did::Relocated => {
+                    "backup partition table moved to the end of the disk, data volume mounted"
+                }
             };
             rt::println!(
                 "datafs: {how}, {} blocks, {used} in use, partition at sector {}",
@@ -379,10 +383,30 @@ fn open_volume(disk: Disk) -> Option<Volume> {
             Some(fs)
         }
         Err(refusal) => {
+            if let Refusal::Foreign(found) = refusal {
+                say_foreign(&found);
+            }
             rt::println!("datafs: {}", refusal.text());
             None
         }
     }
+}
+
+/// The two lines of a refusal of a disk that holds something else: where the first byte that is
+/// not zero is, and whether the two sectors that a table would be in hold anything. No byte of the
+/// disk is printed: on the disk of a user they are the user's data.
+fn say_foreign(found: &Found) {
+    let word = |zero: bool| if zero { "zero" } else { "non-zero" };
+    rt::println!(
+        "datafs: foreign at sector {} offset {}",
+        found.sector,
+        found.offset
+    );
+    rt::println!(
+        "datafs: lba1 {} lba-last {}",
+        word(found.lba1_zero),
+        word(found.last_zero)
+    );
 }
 
 /// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.

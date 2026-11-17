@@ -202,8 +202,43 @@ fn gpt_is_made_read_and_set() {
     // A volume with anything else on it is foreign.
     let mut other = MemDevice::new(131_072);
     other.write(5, &[1u8; SECTOR]).unwrap();
-    assert_eq!(gpt::classify(&mut other), Ok(Class::Foreign));
+    assert!(matches!(
+        gpt::classify(&mut other),
+        Ok(Class::Foreign(found)) if found.sector == 5 && found.offset == 0
+    ));
     assert!(gpt::default_layout(2048).is_none());
+}
+
+#[test]
+fn foreign_says_where_the_first_byte_that_is_not_zero_is() {
+    let mut dev = MemDevice::new(131_072);
+    let mut sector = [0u8; SECTOR];
+    sector[300] = 9;
+    dev.write(7, &sector).unwrap();
+    // A later sector with other bytes does not change the answer.
+    dev.write(9, &[0xEEu8; SECTOR]).unwrap();
+    let Ok(Class::Foreign(found)) = gpt::classify(&mut dev) else {
+        panic!("not foreign");
+    };
+    assert_eq!((found.sector, found.offset), (7, 300));
+    assert!(found.lba1_zero && found.last_zero);
+    // Sector 1 and the last sector say only whether they hold anything.
+    dev.write(1, &[1u8; SECTOR]).unwrap();
+    dev.write(131_071, &[2u8; SECTOR]).unwrap();
+    let Ok(Class::Foreign(found)) = gpt::classify(&mut dev) else {
+        panic!("not foreign");
+    };
+    assert_eq!((found.sector, found.offset), (1, 0));
+    assert!(!found.lba1_zero && !found.last_zero);
+}
+
+#[test]
+fn blank_and_a_valid_table_have_no_foreign_report() {
+    let mut dev = MemDevice::new(131_072);
+    assert_eq!(gpt::classify(&mut dev), Ok(Class::Blank));
+    let layout = gpt::default_layout(dev.sectors()).unwrap();
+    gpt::create(&mut dev, &layout, 7).unwrap();
+    assert!(matches!(gpt::classify(&mut dev), Ok(Class::Gpt(_))));
 }
 
 #[test]
@@ -255,10 +290,168 @@ fn a_cut_while_the_table_is_made_leaves_blank_or_a_table() {
                     assert_eq!(table.total, 2, "cut {cut}: a table is whole or not there");
                 }
                 Class::Blank => {}
-                Class::Foreign => panic!("cut {cut} {survive:?}: neither a table nor blank"),
+                Class::Foreign(_) => panic!("cut {cut} {survive:?}: neither a table nor blank"),
             }
         }
     }
+}
+
+/// A table made on a disk of 131072 sectors, on a disk of `to` sectors: the medium grown with
+/// zeros, as a volume that is enlarged.
+fn grown(disk: &mut MemDevice, to: u64) -> MemDevice {
+    disk.power_cycle(Survive::All);
+    let mut medium = disk.medium().to_vec();
+    medium.resize(to as usize * SECTOR, 0);
+    MemDevice::from_medium(medium)
+}
+
+fn two_partitions(sectors: u64) -> MemDevice {
+    let mut dev = MemDevice::new(sectors);
+    let layout = gpt::default_layout(sectors).unwrap();
+    gpt::create(&mut dev, &layout, 11).unwrap();
+    dev.power_cycle(Survive::All);
+    dev
+}
+
+#[test]
+fn a_grown_disk_opens_and_the_backup_moves_to_the_end() {
+    let mut old = two_partitions(131_072);
+    let before = gpt::read(&mut old).unwrap();
+    assert!(!before.grown);
+    let mut dev = grown(&mut old, 262_144);
+    let table = gpt::read(&mut dev).unwrap();
+    assert!(table.grown && !table.from_backup);
+    assert_eq!(table.last, 262_143);
+    let moved = gpt::relocate_backup(&mut dev).unwrap();
+    assert!(!moved.grown);
+    // The partitions keep their size and place, and the usable sectors and the disk GUID too.
+    assert_eq!(moved.parts, before.parts);
+    assert_eq!(moved.total, before.total);
+    assert_eq!(
+        (moved.disk, moved.first_usable, moved.last_usable),
+        (before.disk, before.first_usable, before.last_usable)
+    );
+    // The copy at the new end is a table of its own: the primary header gone, it still reads.
+    dev.write(1, &[0u8; SECTOR]).unwrap();
+    let from_end = gpt::read(&mut dev).unwrap();
+    assert!(from_end.from_backup && !from_end.grown);
+    assert_eq!(from_end.parts, before.parts);
+    // The CRCs of the copy at the new end, checked here with no help of the reader.
+    let mut header = [0u8; SECTOR];
+    dev.read(262_143, &mut header).unwrap();
+    assert_eq!(&header[..8], b"EFI PART");
+    let stored = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    header[16..20].fill(0);
+    assert_eq!(gpt::crc32(0, &header[..92]), stored);
+    assert_eq!(
+        u64::from_le_bytes(header[24..32].try_into().unwrap()),
+        262_143
+    );
+    assert_eq!(u64::from_le_bytes(header[32..40].try_into().unwrap()), 1);
+    let at = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    assert_eq!(at, 262_143 - 32);
+    let mut crc = 0;
+    for i in 0..32 {
+        let mut sector = [0u8; SECTOR];
+        dev.read(at + i, &mut sector).unwrap();
+        crc = gpt::crc32(crc, &sector);
+    }
+    assert_eq!(crc, u32::from_le_bytes(header[88..92].try_into().unwrap()));
+    // The old backup header is cleared.
+    let mut old_header = [1u8; SECTOR];
+    dev.read(131_071, &mut old_header).unwrap();
+    assert!(old_header.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn a_grown_disk_with_a_damaged_primary_is_not_a_table_and_not_blank() {
+    let mut old = two_partitions(131_072);
+    let mut dev = grown(&mut old, 262_144);
+    // The primary header with one byte changed.
+    let mut header = [0u8; SECTOR];
+    dev.read(1, &mut header).unwrap();
+    header[50] ^= 1;
+    dev.write(1, &header).unwrap();
+    dev.power_cycle(Survive::All);
+    assert_eq!(gpt::read(&mut dev), Err(gpt::Error::NoTable));
+    assert!(matches!(gpt::classify(&mut dev), Ok(Class::Foreign(_))));
+    let before = dev.medium().to_vec();
+    assert_eq!(gpt::relocate_backup(&mut dev), Err(gpt::Error::NoTable));
+    assert_eq!(dev.medium(), &before[..]);
+}
+
+/// Rewrites a header sector with `change` applied and its checksum made again.
+fn rehash(dev: &mut MemDevice, lba: u64, change: impl FnOnce(&mut [u8; SECTOR])) {
+    let mut header = [0u8; SECTOR];
+    dev.read(lba, &mut header).unwrap();
+    change(&mut header);
+    header[16..20].fill(0);
+    let crc = gpt::crc32(0, &header[..92]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+    dev.write(lba, &header).unwrap();
+    dev.power_cycle(Survive::All);
+}
+
+#[test]
+fn the_old_backup_is_cleared_only_when_it_is_a_header_of_this_table() {
+    let mut old = two_partitions(131_072);
+    let mut dev = grown(&mut old, 262_144);
+    // The primary names a sector inside the grown disk that holds other data.
+    let odd = 200_000u64;
+    dev.write(odd, &[0xABu8; SECTOR]).unwrap();
+    rehash(&mut dev, 1, |h| {
+        h[32..40].copy_from_slice(&odd.to_le_bytes())
+    });
+    assert!(gpt::read(&mut dev).unwrap().grown);
+    let table = gpt::relocate_backup(&mut dev).unwrap();
+    assert!(!table.grown);
+    let mut sector = [0u8; SECTOR];
+    dev.read(odd, &mut sector).unwrap();
+    assert!(sector.iter().all(|&b| b == 0xAB), "the sector was changed");
+}
+
+#[test]
+fn a_shrunk_disk_has_no_table_and_is_left_alone() {
+    let mut old = two_partitions(131_072);
+    let mut medium = old.medium().to_vec();
+    medium.truncate((131_072 - 100) * SECTOR);
+    let mut dev = MemDevice::from_medium(medium);
+    assert_eq!(gpt::read(&mut dev), Err(gpt::Error::NoTable));
+    assert!(matches!(gpt::classify(&mut dev), Ok(Class::Foreign(_))));
+    let before = dev.medium().to_vec();
+    let mut state = storage();
+    assert!(matches!(
+        crate::volume::open(&mut dev, &mut state, 1).err(),
+        Some(crate::volume::Refusal::Foreign(_))
+    ));
+    assert_eq!(dev.written, 0);
+    assert_eq!(dev.medium(), &before[..]);
+    let _ = &mut old;
+}
+
+#[test]
+fn a_primary_whose_entries_overlap_the_usable_sectors_is_not_taken() {
+    let mut dev = two_partitions(131_072);
+    // The entries of the start copy named at sector 40, which is past the first usable sector.
+    rehash(&mut dev, 1, |h| {
+        h[72..80].copy_from_slice(&40u64.to_le_bytes())
+    });
+    assert!(
+        gpt::read(&mut dev).unwrap().from_backup,
+        "the primary was taken"
+    );
+    rehash(&mut dev, 1, |h| {
+        h[72..80].copy_from_slice(&1u64.to_le_bytes())
+    });
+    assert!(gpt::read(&mut dev).unwrap().from_backup);
+}
+
+#[test]
+fn a_backup_that_overlaps_the_new_end_is_not_taken_as_grown() {
+    // 131071 + 20 sectors: the new entries would cover the old backup header.
+    let mut old = two_partitions(131_072);
+    let mut dev = grown(&mut old, 131_072 + 20);
+    assert_eq!(gpt::read(&mut dev), Err(gpt::Error::NoTable));
 }
 
 // The workload of the crash tests: a list of steps, each one call of the interface that is durable
@@ -757,10 +950,10 @@ mod volumes {
         disk.flush().unwrap();
         let before = disk.medium().to_vec();
         let mut state = storage();
-        assert_eq!(
+        assert!(matches!(
             volume::open(&mut disk, &mut state, 1).err(),
-            Some(Refusal::Foreign)
-        );
+            Some(Refusal::Foreign(found)) if found.sector == 0 && found.offset == 0
+        ));
         assert_eq!(disk.medium(), &before[..]);
         // A table with no data partition.
         let mut disk = MemDevice::new(131_072);
@@ -892,5 +1085,143 @@ mod volumes {
                 assert!(result.is_ok(), "cut {cut} {survive:?}: {result:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_grown_volume_is_relocated_then_mounted() {
+        let mut disk = MemDevice::new(131_072);
+        boot(&mut disk, 2, true).unwrap();
+        let mut disk = grown(&mut disk, 262_144);
+        assert_eq!(boot(&mut disk, 3, false), Ok(Did::Relocated));
+        assert_eq!(boot(&mut disk, 4, false), Ok(Did::Mounted));
+    }
+
+    /// A cut at every sector of `relocate_backup`, in every way the cache can survive: three boots
+    /// open the volume and read the file.
+    #[test]
+    fn a_cut_in_relocate_backup_leaves_a_disk_that_opens() {
+        let mut small = MemDevice::new(131_072);
+        boot(&mut small, 2, true).unwrap();
+        let disk = grown(&mut small, 262_144);
+        let base = disk.written;
+        let mut whole = disk.clone();
+        gpt::relocate_backup(&mut whole).unwrap();
+        let writes = whole.written - base;
+        assert!(writes >= 35, "{writes}");
+        for cut in 0..=writes {
+            for survive in [
+                Survive::None,
+                Survive::All,
+                Survive::Random(cut),
+                Survive::Prefix(1),
+            ] {
+                let mut d = disk.clone();
+                d.cut_after(Some(cut));
+                let _ = gpt::relocate_backup(&mut d);
+                d.power_cycle(survive);
+                // Whichever copy is read, the other one is whole too: with the primary header gone
+                // the table still reads (a grown table has the old backup past the end of its
+                // data and no copy at the new end yet, so only a moved one is checked).
+                let table = gpt::read(&mut d).unwrap();
+                if !table.grown {
+                    let mut lost = d.clone();
+                    lost.write(1, &[0u8; SECTOR]).unwrap();
+                    lost.power_cycle(Survive::All);
+                    let again = gpt::read(&mut lost);
+                    assert!(again.is_ok(), "cut {cut} {survive:?}: no backup at the end");
+                }
+                for seed in 3..6 {
+                    let result = boot(&mut d, seed, false);
+                    assert!(
+                        result.is_ok(),
+                        "cut {cut} {survive:?} boot {seed}: {result:?}"
+                    );
+                }
+                // The move is finished by now, and the table reads from the end copy alone.
+                let done = gpt::read(&mut d).unwrap();
+                assert!(
+                    !done.grown,
+                    "cut {cut} {survive:?}: still grown after three boots"
+                );
+                d.write(1, &[0u8; SECTOR]).unwrap();
+                d.power_cycle(Survive::All);
+                assert!(
+                    gpt::read(&mut d).is_ok(),
+                    "cut {cut} {survive:?}: no copy at the end"
+                );
+            }
+        }
+    }
+
+    /// A grown volume whose first boot is cut inside `open` itself.
+    #[test]
+    fn a_cut_in_the_open_of_a_grown_volume_leaves_a_disk_that_opens() {
+        let mut small = MemDevice::new(131_072);
+        boot(&mut small, 2, true).unwrap();
+        let disk = grown(&mut small, 262_144);
+        let mut whole = disk.clone();
+        let base = whole.written;
+        {
+            let mut state = storage();
+            let _ = volume::open(&mut whole, &mut state, 1).unwrap();
+        }
+        for cut in 0..=(whole.written - base) {
+            let mut d = disk.clone();
+            d.cut_after(Some(cut));
+            {
+                let mut state = storage();
+                let _ = volume::open(&mut d, &mut state, 1);
+            }
+            d.power_cycle(Survive::Random(cut));
+            for seed in 3..6 {
+                let result = boot(&mut d, seed, false);
+                assert!(result.is_ok(), "cut {cut} boot {seed}: {result:?}");
+            }
+        }
+    }
+
+    /// A grown table with no data partition of ours is not ours: nothing is written.
+    #[test]
+    fn a_grown_foreign_table_is_not_written() {
+        let mut small = MemDevice::new(131_072);
+        let only_store = [gpt::New {
+            kind: gpt::TYPE_STORE,
+            first: 2048,
+            last: 4095,
+            name: "store",
+        }];
+        gpt::create(&mut small, &only_store, 3).unwrap();
+        let mut disk = grown(&mut small, 262_144);
+        let before = disk.medium().to_vec();
+        let mut state = storage();
+        assert_eq!(
+            volume::open(&mut disk, &mut state, 1).err(),
+            Some(Refusal::NoPartition)
+        );
+        assert_eq!(disk.medium(), &before[..]);
+    }
+
+    /// The shape a fresh volume of EC2 reads as: the first 4 KiB and the last 4 KiB zero, bytes
+    /// that look random in between. It is foreign, and nothing is written.
+    #[test]
+    fn a_volume_shaped_like_a_fresh_one_of_ec2_is_left_alone() {
+        let sectors = 131_072u64;
+        let mut medium = vec![0u8; sectors as usize * SECTOR];
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        for b in &mut medium[4096..(sectors as usize * SECTOR - 4096)] {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 24) as u8;
+        }
+        let mut disk = MemDevice::from_medium(medium);
+        let before = disk.medium().to_vec();
+        let mut storage = storage();
+        assert!(matches!(
+            volume::open(&mut disk, &mut storage, 1).err(),
+            Some(Refusal::Foreign(found)) if found.sector == 8 && found.lba1_zero
+        ));
+        assert_eq!(disk.written, 0);
+        assert_eq!(disk.medium(), &before[..]);
     }
 }

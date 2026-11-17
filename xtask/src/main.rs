@@ -54,6 +54,7 @@ mod clock_probe;
 mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
+mod data_image;
 mod data_probe;
 mod disasm;
 mod display_probe;
@@ -2414,8 +2415,9 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
+  data-image <path> [--size 2G] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
   datafs-breaks the deliberate breaks of lib/datafs fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
+  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2453,6 +2455,7 @@ fn main() {
         Some("ena-breaks") => ena_breaks(),
         Some("nvme-breaks") => nvme_breaks(),
         Some("datafs-breaks") => datafs_breaks(),
+        Some("data-image") => data_image::run(&args[1..]),
         Some("nvme-persist") => store_probe::nvme_persist(&args[1..]),
         Some("uart-breaks") => uart_breaks(),
         Some("its-int") => its_int(),
@@ -3041,11 +3044,12 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 4] = [
+const DATAFS_BREAKS: [&str; 5] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
     "break-datafs-gpt-order",
+    "break-datafs-relocate-order",
 ];
 
 fn datafs_breaks() -> Result<(), String> {
@@ -10592,6 +10596,19 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
                 "wrongdisk".to_string(),
                 "blank".to_string(),
                 "breaks".to_string(),
+            ])
+        }),
+        job("nvme-persist key foreign", || {
+            store_probe::nvme_persist(&["key".to_string(), "foreign".to_string()])
+        }),
+        job("nvme-persist key image", || {
+            store_probe::nvme_persist(&["key".to_string(), "image".to_string()])
+        }),
+        job("nvme-persist key image grown", || {
+            store_probe::nvme_persist(&[
+                "key".to_string(),
+                "image".to_string(),
+                "grown".to_string(),
             ])
         }),
         job("nvme-persist blk-probe", || {
