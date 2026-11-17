@@ -355,6 +355,44 @@ impl<H> Waits<H> {
             at = r.next;
         }
     }
+    /// Tells the waiters on `inode` that its locks changed, now: each registration that
+    /// `changed` marked and whose handle is armed gets its notice, in the request that
+    /// released the lock, so that the waiter does not wait for the sweep of the service's
+    /// own work. A notice is a hint (the waiter's next Query decides), so a waiter that
+    /// still conflicts asks and sleeps again. Visits the waiters of the inode only.
+    pub fn wake_inode(&mut self, inode: Token, mut notify: impl FnMut(&H)) -> usize {
+        let mut woken = 0;
+        let mut at = self.heads[inode.slot as usize];
+        while at != NONE {
+            let r = self.registrations[at as usize].as_mut().unwrap();
+            if r.captured.request.inode == inode
+                && r.linked
+                && r.dirty
+                && let Some(handle) = r.handle.as_ref()
+            {
+                notify(handle);
+                r.dirty = false;
+                woken += 1;
+            }
+            at = r.next;
+        }
+        woken
+    }
+    /// Tells every armed waiter now, for the departure of a client whose locks may have
+    /// stood in their way (the lock of a process that ended is gone for the waiter's Query
+    /// as soon as the page of lifetimes says so). Visits the registrations once.
+    pub fn wake_all(&mut self, mut notify: impl FnMut(&H)) -> usize {
+        let mut woken = 0;
+        for r in self.registrations.iter_mut().flatten() {
+            if r.linked
+                && let Some(handle) = r.handle.as_ref()
+            {
+                notify(handle);
+                woken += 1;
+            }
+        }
+        woken
+    }
     /// The owner's lock count went from zero to one: its waits no longer
     /// yield to the writer FIFO and must be evaluated again.
     pub fn owner_started(&mut self, owner: Owner) {

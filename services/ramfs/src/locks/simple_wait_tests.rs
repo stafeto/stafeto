@@ -766,3 +766,26 @@ fn first_lock_of_an_owner_marks_only_its_waits_dirty() {
     f.hold_on(b, 302, 0, Kind::Read);
     assert_eq!(f.locks.take_started(), Some(Owner::Process(302)));
 }
+
+#[test]
+fn a_change_of_an_inode_wakes_the_waiters_on_it_at_once_and_only_once() {
+    let mut f = Fixture::new();
+    let a = f.captured.request.inode;
+    let b = f.second_inode();
+    f.hold_on(a, 300, 0, Kind::Write);
+    let on_a = f.wait_at(a, 0, 301, 0, 1, Kind::Write);
+    let on_b = f.wait_at(b, 1, 302, 0, 1, Kind::Write);
+    for id in [on_a, on_b] {
+        let slot = f.waits.slot(id).unwrap();
+        let r = f.waits.registrations[slot].as_mut().unwrap();
+        r.handle = Some(7);
+        r.dirty = false;
+    }
+    f.waits.changed(a);
+    let mut told = std::vec::Vec::new();
+    let n = f.waits.wake_inode(a, |h| told.push(*h));
+    assert_eq!((n, told.len()), (1, 1));
+    // The mark is spent, and the waiter on the other inode was not told.
+    assert_eq!(f.waits.wake_inode(a, |_| panic!("told twice")), 0);
+    assert_eq!(f.waits.wake_all(|_| {}), 2);
+}

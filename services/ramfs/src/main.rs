@@ -2383,6 +2383,11 @@ impl Service<0> for Fs {
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
         self.waits.poll();
+        // The locks of a departed client may have stood in a waiter's way: the waiters are
+        // told in the notice of the departure.
+        self.waits.wake_all(|h| {
+            let _ = sys::notify(h, 1);
+        });
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
         let empty = Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label());
@@ -3321,6 +3326,9 @@ impl Service<0> for Fs {
                     Ok(inode) => {
                         if let Some(inode) = inode {
                             self.waits.changed(inode);
+                            self.waits.wake_inode(inode, |h| {
+                                let _ = sys::notify(h, 1);
+                            });
                         }
                         // The close of an alias leaves nothing to reclaim: only
                         // lock work calls for a turn of maintenance.
@@ -5423,6 +5431,11 @@ impl Fs {
             && self.locks.revision(captured.request.inode) != previous_revision
         {
             self.waits.changed(captured.request.inode);
+            // The grant goes out in the request that released the lock: the waiter's own
+            // Query decides, and the sweep of the service's own work stays a second way.
+            self.waits.wake_inode(captured.request.inode, |h| {
+                let _ = sys::notify(h, 1);
+            });
         }
         if let Some(owner) = self.locks.take_started() {
             self.waits.owner_started(owner);
