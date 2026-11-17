@@ -1526,7 +1526,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fast-switch-vz") as usize
     + cfg!(feature = "table-fast-switch-scale") as usize
     + cfg!(feature = "table-fast-switch-scale-vz") as usize
-    + cfg!(feature = "table-posix-map-big") as usize;
+    + cfg!(feature = "table-posix-map-big") as usize
+    + cfg!(feature = "table-aws-qemu") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -1618,7 +1619,8 @@ const _: () = assert!(
     feature = "table-fast-switch-scale",
     feature = "table-fast-switch-scale-vz",
     feature = "table-posix-map-big",
-    feature = "table-aws"
+    feature = "table-aws",
+    feature = "table-aws-qemu"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1675,6 +1677,8 @@ pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-aws")]
 pub const TABLE: &[Record] = aws::TABLE;
+#[cfg(feature = "table-aws-qemu")]
+pub const TABLE: &[Record] = aws::QEMU_TABLE;
 pub use crate::resolve::table;
 /// The platform a table with places by function (`At`) resolves them on.
 #[cfg(feature = "table-aws")]
@@ -3319,9 +3323,10 @@ mod tests {
     #[test]
     fn a_client_of_the_entropy_service_has_it_and_only_two_images_go_without_a_driver() {
         let mut seed_only = 0;
-        let tables = all_tables()
-            .into_iter()
-            .chain([aws::TABLE, entropy::SEED_TABLE]);
+        let tables =
+            all_tables()
+                .into_iter()
+                .chain([aws::TABLE, aws::QEMU_TABLE, entropy::SEED_TABLE]);
         for table in tables {
             let wants = table.iter().any(|r| r.connects.contains(&ENTROPY_SERVICE));
             let service = table.iter().find(|r| r.name == ENTROPY_SERVICE);

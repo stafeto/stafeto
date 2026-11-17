@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 70] = [
+const SYSTEM_PATHS: [&str; 75] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -321,6 +321,13 @@ const SYSTEM_PATHS: [&str; 70] = [
     "/etc/rc.d/ec2-key",
     "/etc/rc.d/dropbear",
     "/etc/rc.d/fast",
+    // The image of the try-out on EC2: the page written at boot, the web server's start, and the
+    // settings of nginx, of nginx-fast and of the certificate it makes.
+    "/etc/rc.d/landing",
+    "/etc/rc.d/web",
+    "/etc/nginx/nginx-try.conf",
+    "/etc/nginx/nginx-fast-try.conf",
+    "/etc/nginx/try-req.cnf",
     // The image with the network service: the page `httpd` serves and the
     // probe of the sockets.
     "/www",
@@ -1319,6 +1326,104 @@ pub fn rc_files() -> Vec<RootFile> {
     ]
 }
 
+/// The settings of nginx on EC2: the package's with two workers (the CPUs of a t4g.small) and the
+/// server of TLS 1.3 and HTTP/2 that `/etc/rc.d/web` gives a certificate at boot.
+pub fn try_nginx_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let text = crate::nginx_probe::replaced(
+            crate::nginx_probe::NGINX_CONF,
+            "worker_processes 4;",
+            "worker_processes 2;",
+        );
+        crate::nginx_probe::replaced(
+            &text,
+            "    server {\n",
+            &format!(
+                "    include {};\n    server {{\n",
+                crate::nginx_probe::TLS_CONF_PATH
+            ),
+        )
+    })
+}
+
+/// The settings of nginx-fast on EC2: the package's on port 8080 with two workers (the switch
+/// spreads the connections over them).
+pub fn try_fast_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let text = crate::nginx_probe::replaced(
+            crate::fast_nginx::NGINX_FAST_CONF,
+            "worker_processes 1;",
+            "worker_processes 2;",
+        );
+        crate::nginx_probe::replaced(&text, "listen 80;", "listen 8080;")
+    })
+}
+
+/// The boot script that writes the first page of the instance, with the version of the build in
+/// the text.
+pub fn landing_script() -> &'static [u8] {
+    static TEXT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        include_str!("../../tools/rc/landing")
+            .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
+            .into_bytes()
+    })
+}
+
+/// What the image of the try-out on EC2 adds to the shell's: the boot scripts of the page and of
+/// nginx, the settings of nginx and nginx-fast, the request of the certificate (the certificate
+/// and its key are made on the instance, none is in the image), the directory of the page, and
+/// the settings of the network service with the switch that nginx-fast is a consumer of.
+pub fn try_files() -> Vec<RootFile> {
+    vec![
+        dir("/www"),
+        of(
+            "/etc/rc.d/landing",
+            0o755,
+            ROOT,
+            Source::Bytes("landing", landing_script()),
+        ),
+        of(
+            "/etc/rc.d/web",
+            0o755,
+            ROOT,
+            Source::Bytes("web", include_bytes!("../../tools/rc/web")),
+        ),
+        of(
+            "/etc/nginx/nginx-try.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-try.conf", try_nginx_conf().as_bytes()),
+        ),
+        of(
+            crate::nginx_probe::TLS_CONF_PATH,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-tls.conf", crate::nginx_probe::TLS_CONF.as_bytes()),
+        ),
+        of(
+            "/etc/nginx/nginx-fast-try.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-fast-try.conf", try_fast_conf().as_bytes()),
+        ),
+        of(
+            "/etc/nginx/try-req.cnf",
+            0o644,
+            ROOT,
+            Source::Bytes("try-req.cnf", include_bytes!("../../tools/aws/try-req.cnf")),
+        ),
+        of(
+            "/etc/netd.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("netd-aws-switch.conf", crate::fast_nginx::SWITCH_NETD_CONF),
+        ),
+    ]
+}
+
 /// The files of the shell images with the network service: the shell's, the
 /// page `httpd -h /www` serves, and the probes of the sockets and of the
 /// resolver. `/etc/resolv.conf` is the network service's to write.
@@ -1762,6 +1867,8 @@ pub const IMAGES: &[&str] = &[
     "boot-full.img",
     "boot-pkg-probe.img",
     "boot-pkg-probe-memory.img",
+    "boot-aws.img",
+    "boot-aws-qemu.img",
     "boot-sporadic.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
@@ -1914,6 +2021,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 | "boot-pkg-probe.img"
                 | "boot-pkg-probe-memory.img"
                 | "boot-aws.img"
+                | "boot-aws-qemu.img"
         ) || crate::packages::without_name(name).is_some() =>
         {
             let mut files = dialog(name);
@@ -1922,7 +2030,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     files.push(dir(d));
                 }
             }
-            if name == "boot-pkg-probe.img" || name == "boot-pkg-probe-memory.img" {
+            if matches!(
+                name,
+                "boot-pkg-probe.img" | "boot-pkg-probe-memory.img" | "boot-aws-qemu.img"
+            ) {
                 for f in files
                     .iter_mut()
                     .filter(|f| f.path == crate::net_tls::CA_BUNDLE)
@@ -1942,28 +2053,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     &official_roots(),
                 ));
             }
-            // The shell on EC2 runs the boot script, which fetches the key of the instance.
-            if name == "boot-aws.img" {
+            // The shell on EC2 runs the boot script, which fetches the key of the instance, makes
+            // the page and starts the servers; the image of the try-out is the one on EC2 with
+            // the Virtio network device (`cargo xtask net-try`), which has no metadata service to
+            // fetch the key from: its script writes the key of the run.
+            if name == "boot-aws.img" || name == "boot-aws-qemu.img" {
                 files.extend(rc_files());
-                // `aws image --switch`: the switch of the network service on the ENA, with
-                // room for the consumers (nginx-fast on 8080 once the image has the package).
-                if std::env::var_os("STAFETO_AWS_SWITCH").is_some_and(|v| v == "1") {
-                    match files.iter_mut().find(|f| f.path == "/etc/netd.conf") {
-                        Some(f) => {
-                            f.source = Some(Source::Bytes(
-                                "netd-aws-switch.conf",
-                                crate::fast_nginx::SWITCH_NETD_CONF,
-                            ))
-                        }
-                        None => files.push(of(
-                            "/etc/netd.conf",
-                            0o644,
-                            ROOT,
-                            Source::Bytes(
-                                "netd-aws-switch.conf",
-                                crate::fast_nginx::SWITCH_NETD_CONF,
-                            ),
-                        )),
+                files.extend(try_files());
+                if name == "boot-aws-qemu.img" {
+                    let script = crate::net_try::key_script();
+                    for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/ec2-key") {
+                        f.source = Some(Source::Bytes("ec2-key-probe", script));
                     }
                 }
             }
@@ -2961,6 +3061,8 @@ mod tests {
                 "boot-net.img" => crate::net::programs(),
                 "boot-ssh-probe.img" => crate::net_ssh::programs(),
                 "boot-net-rc.img" => crate::net_ec2_key::programs(),
+                "boot-aws.img" => crate::aws_programs(),
+                "boot-aws-qemu.img" => crate::aws_qemu_programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),

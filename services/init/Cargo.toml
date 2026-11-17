@@ -52,6 +52,9 @@ table-posix-abi-vz = []
 table-busybox-dialog-vz = []
 # The shell on EC2 (t4g.small): the console is the 16550 of the SPCR.
 table-aws = []
+# The closest image on QEMU to the shell on EC2: its services over the Virtio network device
+# and the PL011 (xtask net-try).
+table-aws-qemu = []
 table-rtbench-vz = []
 table-rtbench-posix = []
 table-rtbench-posix-vz = []

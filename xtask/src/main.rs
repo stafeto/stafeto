@@ -95,6 +95,7 @@ mod net_probe;
 mod net_ssh;
 mod net_tls;
 mod net_trace;
+mod net_try;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
@@ -1063,6 +1064,19 @@ fn shell_program_list() -> Vec<ImageProgram> {
     programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
     programs
+}
+
+/// The programs of the image of the try-out on QEMU (init's table `table-aws-qemu`): those of the
+/// shell on EC2 and the driver of the Virtio RNG, which the entropy service of QEMU's machine
+/// reads where EC2's has the boot seed.
+pub(crate) fn aws_qemu_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = aws_programs().to_vec();
+        programs[0].3 = &["table-aws-qemu"];
+        programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "virtio-rng"));
+        programs
+    })
 }
 
 /// The programs of the shell on EC2 (init's table `table-aws`): the shell
@@ -2340,6 +2354,11 @@ commands:
             against a fake of the instance metadata service on the host: the
             key file and its modes, the request without a token (401), no key,
             and a refused token
+  net-try [MACHINE] boot the closest image on QEMU to the try-out on EC2 (boot-aws-qemu.img: the
+            services of the AWS table over virtio-net): the page on 80, 443 and 8080, a login
+            with a probe key, `pkg update` and `pkg search`, and the image check (no host key
+            or private key in the image, every account locked, only the ports 22, 80, 443 and
+            8080 answer)
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -2715,6 +2734,7 @@ fn main() {
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-ec2-key") => net_ec2_key::command(&args[1..]),
+        Some("net-try") => net_try::command(&args[1..]),
         Some("net-ec2-key-imds") => net_ec2_key::imds_command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
@@ -10522,6 +10542,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The boot script of EC2: the key of the instance from a fake of the metadata
         // service (IMDSv2) on the host, written for the SSH server. Also in the group `net`.
         job("net-ec2-key", || net_ec2_key::probe(&qemu::VIRT)),
+        // The try-out image of EC2 on QEMU: its page on 80, 443 and 8080, a login, `pkg search`
+        // and the image check. Also in the group `net`.
+        job("net-try", || net_try::probe(&qemu::VIRT)),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {
