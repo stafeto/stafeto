@@ -1349,7 +1349,7 @@ impl Net {
         }
         // A queue that stayed short (no place for a replacement before) gets
         // one socket back.
-        self.top_up(stack, place, &mut ReapBudget::new());
+        self.top_up(stack, place, &mut ReapBudget::new(), false);
         let mut w = Writer::new();
         let name = self.places.name(m);
         let data = match sockets::write_accepted(&mut w, name, &peer) {

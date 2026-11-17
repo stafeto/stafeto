@@ -210,11 +210,14 @@ pub const SWITCH_RX: usize = 8;
 pub const SWITCH_TX: usize = 16;
 /// The time in ticks a step of receiving may have used when it takes another frame of the wire:
 /// past it the frame waits for the next step, which the stack tells itself. The share belongs to
-/// the step rule under -icount (the images that count steps, feature `steps`, where a frame of
-/// the wire costs up to `WIRE_FRAME_TICKS` and two of them past `RX_SOFT_MEASURED` would go over
-/// the margin). The other images keep the old behaviour on a real clock, where a tick is
+/// the step rule under -icount (the images that count steps, feature `steps`). A frame of the
+/// wire costs up to `WIRE_FRAME_TICKS`, so a step that took one has used more than the share and
+/// takes no second wire frame, however small the share is (a full-size frame never costs less
+/// than 6 000 ticks); the share only decides how many cheap frames (the loopback's, 3 072 at
+/// most) may come before a wire frame, and the step then costs at most the share, the frame
+/// and the tail. The other images keep the old behaviour on a real clock, where a tick is
 /// 41.67 ns and a loaded step runs 3 500 to 9 000 of them: no limit.
-pub const RX_SOFT_MEASURED: u64 = 5_500;
+pub const RX_SOFT_MEASURED: u64 = 4_700;
 pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
     RX_SOFT_MEASURED
 } else {
@@ -222,16 +225,38 @@ pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
 };
 /// A frame of the wire in a step of receiving (the answer to it, a copy and the sum included)
 /// and the rest of any step of the service (the notification, the bell, the tail), in ticks
-/// under -icount.
-pub const WIRE_FRAME_TICKS: usize = 8_000;
+/// under -icount. The frame is the highest 90th percentile of the wire's price that
+/// `net-probe steps` measured in six runs of v0.5.0 and of main (8 768, the echo role).
+pub const WIRE_FRAME_TICKS: usize = 8_800;
 pub const STEP_TAIL_TICKS: usize = 3_000;
-/// The work a SYN adds to its step in a queue that lacks sockets (`queue::ReapBudget`): one
-/// rebuild of a queue socket (the release of a closed one and a fresh one that listens) costs
-/// 1 250 ticks under -icount, and the recycling of a half-open socket (the abort and its
-/// rebuild, which takes one of the tries) at most 1 500. The worst SYN is the soft share, the
-/// tries and the recycling, and the tail.
+/// A SYN that is not the first frame of its step: the stack takes it, the reap of its queue
+/// (inside `route`) and smoltcp's answer come after the share is checked. The price is a
+/// bound: the loopback frame's 90th percentile (`frame_rx` 3 072 at most in six runs of
+/// `net-probe steps`), which includes the answer; no probe isolates the SYN.
+pub const SYN_FRAME_TICKS: usize = 3_100;
+/// The work a SYN adds to its step in a queue that lacks sockets (`queue::ReapBudget`): at
+/// most `REBUILD_MAX` tries, each the release of a closed socket and a fresh one that
+/// listens (`REBUILD_TICKS`), and the recycling of a half-open socket (the abort and its
+/// rebuild, which takes one of the tries) at most `RECYCLE_TICKS`. The measurement of
+/// `REBUILD_TICKS` is given at its definition below.
 pub const REBUILD_TICKS: usize = 1_250;
 pub const RECYCLE_TICKS: usize = 1_500;
+/// A fresh socket that listens, the build half of a rebuild (the step of waking builds only).
+pub const BUILD_TICKS: usize = 800;
+/// The time a step of receiving may have used when it takes a SYN that is not its first frame
+/// (images that count steps only, as `RX_SOFT`): the margin less the SYN's frame, the tries
+/// of its reap, the recycling and the tail. A SYN past it waits for the next step and is the
+/// first there.
+pub const SYN_SOFT_MEASURED: u64 = (STEP_MARGIN
+    - SYN_FRAME_TICKS
+    - crate::queue::REBUILD_MAX as usize * REBUILD_TICKS
+    - RECYCLE_TICKS
+    - STEP_TAIL_TICKS) as u64;
+pub const SYN_SOFT: u64 = if cfg!(feature = "steps") {
+    SYN_SOFT_MEASURED
+} else {
+    u64::MAX
+};
 /// The buffers the stack gave back (of receiving, of sending) the switch
 /// takes in a step, each.
 pub const SWITCH_BACK: usize = 32;
@@ -411,14 +436,18 @@ pub const MAP_STEP_TICKS: usize = 2_500;
 /// switch with a chunk of the offload past the soft share (a piece of the sweep at the start of
 /// the step counts toward the share, so this sum covers it), the switch with its sweep, the stack
 /// receiving, the stack taking a SYN into a queue that lacks sockets, and the step of a map.
-pub const WORST_STEPS: [usize; 5] = [
+pub const WORST_STEPS: [usize; 6] = [
     SOFT_MEASURED as usize + TSO_TICKS + SWITCH_BASE * 1_500 + STEP_TAIL_TICKS,
     SOFT_MEASURED as usize + SWEEP_TICKS + 1_500,
     RX_SOFT_MEASURED as usize + WIRE_FRAME_TICKS + STEP_TAIL_TICKS,
-    RX_SOFT_MEASURED as usize
+    SYN_SOFT_MEASURED as usize
+        + SYN_FRAME_TICKS
         + crate::queue::REBUILD_MAX as usize * REBUILD_TICKS
         + RECYCLE_TICKS
         + STEP_TAIL_TICKS,
+    // The step of waking that builds the missing sockets of a queue: the tail covers its fixed
+    // part (the step of waking after the time limits measured 2 947), then the builds.
+    STEP_TAIL_TICKS + crate::queue::REBUILD_MAX as usize * BUILD_TICKS,
     MAP_CALL_TICKS + MAP_STEP_TICKS,
 ];
 const _: () = {
@@ -1103,12 +1132,12 @@ mod tests {
         assert_eq!(STEP_MARGIN, 16_500);
         assert_eq!(SWITCH_BASE, 3);
         assert_eq!(SOFT_MEASURED, 5_600);
-        assert_eq!(RX_SOFT_MEASURED, 5_500);
+        assert_eq!(RX_SOFT_MEASURED, 4_700);
         assert_eq!(SWEEP_TICKS, 7_200);
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
         // here each sum is compared with the margin and with its value.
-        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 15_000, 14_500]);
+        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 16_500, 6_200, 14_500]);
         for worst in WORST_STEPS {
             assert!(worst <= STEP_MARGIN, "{worst} over the margin");
         }

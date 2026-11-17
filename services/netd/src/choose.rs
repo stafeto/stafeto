@@ -20,11 +20,12 @@
 //!
 //! The images that count steps (`ring::RX_SOFT`) take a frame of the wire after
 //! the first only while the step has used no more than the soft share
-//! (`ring::RX_SOFT_MEASURED`), so that a step of receiving with a second frame
-//! costs at most the share, one frame and the tail of the step
-//! (`ring::STEP_TAIL_TICKS`), whatever the frames before it cost. The rule
-//! takes the batch of two when that sum is within the margin
-//! (`ring::STEP_MARGIN`) and the estimate above does not give more.
+//! (`ring::RX_SOFT_MEASURED`). A wire frame costs more than the share, so two of
+//! them never make one step, and a step with a second frame costs at most the
+//! share, the frame and the tail of the step (`ring::STEP_TAIL_TICKS`),
+//! whatever the frames before it cost. The rule takes the batch of two when that
+//! sum is within the margin (`ring::STEP_MARGIN`) and the estimate above does
+//! not give more.
 //!
 //! The gate: a step of receiving with one frame, and a step of sending with
 //! one group and one frame, each within the budget. Past the gate, the batch of

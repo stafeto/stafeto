@@ -1754,7 +1754,7 @@ impl Net {
             }
             // Else the slot at `k` is now the former last one: look at it.
         }
-        reaped |= self.top_up(stack, listener, budget);
+        reaped |= self.top_up(stack, listener, budget, false);
         reaped
     }
 
@@ -1820,19 +1820,21 @@ impl Net {
         stack: &mut Stack<'static>,
         listener: usize,
         budget: &mut ReapBudget,
+        evict: bool,
     ) -> bool {
         let mut added = false;
         // On the path of a SYN the table may be full, and a new place would
         // evict a stream the bookkeeping of the SYN may hold: the queue stays
-        // short then and the next call tops it up.
+        // short then and the next call tops it up. The step of waking holds no
+        // such bookkeeping (`evict`): it takes a place as `listen` did.
         while budget.open()
-            && self.places.used() < SOCKETS_LIMIT
+            && (evict || self.places.used() < SOCKETS_LIMIT)
             && queue::missing(
                 self.socks[listener].backlog,
                 self.socks[listener].member_count,
             ) > 0
         {
-            debug_assert!(self.places.used() < SOCKETS_LIMIT);
+            debug_assert!(evict || self.places.used() < SOCKETS_LIMIT);
             let sock = self.socks[listener];
             let count = usize::from(sock.member_count);
             let Some(m) = self.member(stack, &sock, listener, sock.members, count) else {
@@ -2030,7 +2032,7 @@ impl Net {
         };
         let lacks = self.socks[l].listening
             && queue::missing(self.socks[l].backlog, self.socks[l].member_count) > 0;
-        if !lacks || !self.top_up(stack, l, &mut ReapBudget::build()) {
+        if !lacks || !self.top_up(stack, l, &mut ReapBudget::build(), true) {
             self.short.clear(l);
             return;
         }
