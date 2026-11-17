@@ -383,6 +383,7 @@ dependencies = [
  "bootimg",
  "console-line",
  "netd",
+ "nvme",
  "pci",
  "proto-comp",
  "proto-fs",
@@ -566,6 +567,20 @@ dependencies = [
 [[package]]
 name = "nvme"
 version = "0.1.0"
+
+[[package]]
+name = "nvme-blk"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "nvme",
+ "pci",
+ "proto-blk",
+ "proto-init",
+ "proto-wire",
+ "rt",
+ "virtio-blk",
+]
 
 [[package]]
 name = "os-test-probe"
