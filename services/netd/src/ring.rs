@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(SOFT_MEASURED, 5_600);
         assert_eq!(RX_SOFT_MEASURED, 4_700);
         assert_eq!((WIRE_FRAME_TICKS, SYN_SOFT_MEASURED), (8_800, 3_900));
-        assert!(SYN_SOFT_MEASURED < RX_SOFT_MEASURED);
+        const { assert!(SYN_SOFT_MEASURED < RX_SOFT_MEASURED) };
         assert_eq!(SWEEP_TICKS, 7_200);
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
