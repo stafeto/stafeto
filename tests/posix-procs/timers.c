@@ -681,6 +681,55 @@ static int t_c_itimer(void) {
     return 0;
 }
 
+/* An armed timer never reads back 0 (0 means disarmed), also when its deadline
+ * has passed and the helper of the library has not yet reloaded it: the caller
+ * holds the processor at a priority above the helper's (32) on the CPU the
+ * helper inherits, spins past several intervals of CPU time, and reads the
+ * timer back. A periodic timer shows the rest of its current interval; a timer
+ * of one shot shows a time above 0 or, once its signal was sent, 0 with the
+ * signal waiting. Without the right to a real-time priority the spin still
+ * passes the deadline and the checks hold. */
+static int t_c_itimer_stall(void) {
+    static const int which[3] = {ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF};
+    static const int signals[3] = {SIGALRM, SIGVTALRM, SIGPROF};
+    siginfo_t info;
+    for (int k = 0; k < 3; k++) {
+        for (int once = 0; once < 2; once++) {
+            if (t_block(signals[k])) return 1;
+            struct itimerval set = {.it_value = {0, 10000}, .it_interval = {0, once ? 0 : 10000}}, back;
+            cpu_set_t only;
+            CPU_ZERO(&only);
+            int cpu = sched_getcpu();
+            if (cpu >= 0) {
+                CPU_SET(cpu, &only);
+                sched_setaffinity(0, sizeof only, &only);
+            }
+            if (setitimer(which[k], &set, NULL)) return 2;
+            struct sched_param high = {.sched_priority = 34}, low = {.sched_priority = 0};
+            int raised = sched_setscheduler(0, SCHED_FIFO, &high) == 0;
+            long long begin = t_now(k == 0 ? CLOCK_MONOTONIC : CLOCK_PROCESS_CPUTIME_ID);
+            volatile unsigned long spin = 0;
+            while (t_now(k == 0 ? CLOCK_MONOTONIC : CLOCK_PROCESS_CPUTIME_ID) - begin < 60 * T_MS)
+                for (int i = 0; i < 2000; i++) spin++;
+            int got = getitimer(which[k], &back);
+            if (raised) sched_setscheduler(0, SCHED_OTHER, &low);
+            if (got) return 3;
+            if (back.it_interval.tv_sec || back.it_interval.tv_usec != (once ? 0 : 10000)) return 4;
+            if (back.it_value.tv_sec || back.it_value.tv_usec > 10000) return 5;
+            if (!once && back.it_value.tv_usec <= 0) return 6;
+            if (once && back.it_value.tv_usec <= 0) {
+                if (t_take(signals[k], &info, 1000) != signals[k]) return 7;
+            }
+            /* Disarm and drain, for the next round. */
+            struct itimerval off;
+            memset(&off, 0, sizeof off);
+            if (setitimer(which[k], &off, NULL)) return 8;
+            while (t_take(signals[k], &info, 20) == signals[k]) {}
+        }
+    }
+    return 0;
+}
+
 static int t_c_sigwaitinfo_alarm(void) {
     t_block(SIGALRM);
     struct itimerval v = {.it_value = {0, 20000}};
@@ -1153,6 +1202,7 @@ static int timers_role(void) {
     t_child("the alarm has a place when the table of timers is full", t_c_alarm_full_table, 0, 0);
     t_child("SIGALRM ends a process that does not catch it", t_c_alarm_kills, 0, SIGALRM);
     t_child("setitimer and getitimer", t_c_itimer, 0, 0);
+    t_child("an armed interval timer never reads back 0 after a stall", t_c_itimer_stall, 0, 0);
     t_child("sigwaitinfo takes the alarm", t_c_sigwaitinfo_alarm, 0, 0);
     t_child("fork gives no timer and no alarm", t_c_fork, 0, 0);
     t_child("exec keeps the alarm and drops the timers", t_c_exec, 0, 0);
