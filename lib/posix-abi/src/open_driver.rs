@@ -626,6 +626,12 @@ fn fifo_open(
             }
             NamedPhase::Ready | NamedPhase::Taken => break,
             NamedPhase::Failed => {
+                rt::println!(
+                    "fifo-debug: Failed result {} flags {} stage {}",
+                    response.result,
+                    recovery.fifo_flags,
+                    recovery.fifo_stage
+                );
                 return Err(if response.result == proto_pipe::NO_READER {
                     ENXIO
                 } else {
