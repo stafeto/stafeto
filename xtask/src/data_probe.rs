@@ -129,9 +129,14 @@ fn image(
     write_boot_image_files(name, programs, BOOT_PROFILE, &env, Vec::new())
 }
 
-fn machine(built: &Built, image: &Path, disk: &Path) -> Command {
+/// The machine of a run. With `icount` the clock follows the instructions, so the steps of the
+/// request loop are the same in every run (the probe's two runs).
+fn machine(built: &Built, image: &Path, disk: &Path, icount: bool) -> Command {
     let mut cmd = qemu::command(&qemu::VIRT, &built.kernel.image, Some(image));
     cmd.args(qemu::HEADLESS).args(qemu::store(disk, None));
+    if icount {
+        cmd.args(qemu::ICOUNT);
+    }
     cmd
 }
 
@@ -192,7 +197,7 @@ pub fn probe() -> Result<(), String> {
     let disk = Disk::new("probe");
     qemu::store_file(&disk.0, DISK_BYTES, true)?;
     let writer = image("boot-data-probe-write.img", None, "write", 0)?;
-    let lines = run_to_end(&built, machine(&built, &writer, &disk.0), "writing")?;
+    let lines = run_to_end(&built, machine(&built, &writer, &disk.0, true), "writing")?;
     let written = lines.clone();
     let mut wanted: Vec<String> = (1..=STEPS)
         .map(|j| format!("data-probe: synced {j}"))
@@ -204,7 +209,11 @@ pub fn probe() -> Result<(), String> {
         return Err("data-probe (writing): the volume was not partitioned and formatted".into());
     }
     let verifier = image("boot-data-probe-verify.img", None, "verify", STEPS)?;
-    let lines = run_to_end(&built, machine(&built, &verifier, &disk.0), "verifying")?;
+    let lines = run_to_end(
+        &built,
+        machine(&built, &verifier, &disk.0, true),
+        "verifying",
+    )?;
     need(
         &lines,
         &[format!(
@@ -229,7 +238,7 @@ fn series_sectors(built: &Built) -> Result<u64, String> {
     let disk = Disk::new("crash-count");
     qemu::store_file(&disk.0, DISK_BYTES, true)?;
     let image = image("boot-data-crash-count.img", Some(0), "write", 0)?;
-    let lines = run_to_end(built, machine(built, &image, &disk.0), "counting")?;
+    let lines = run_to_end(built, machine(built, &image, &disk.0, false), "counting")?;
     datafs_line(&lines, "written ")
         .and_then(|l| l.strip_prefix("written ")?.trim().parse().ok())
         .ok_or_else(|| {
@@ -244,7 +253,7 @@ fn crash_point(built: &Built, point: u64) -> Result<(), String> {
     let crashed = image("boot-data-crash.img", Some(point), "write", 0)?;
     let marker = format!("datafs: crash point {point}");
     let output = run_until(
-        machine(built, &crashed, &disk.0),
+        machine(built, &crashed, &disk.0, false),
         BOOT_TIMEOUT * 6,
         Some(&marker),
         &built.kernel.elf,
@@ -264,7 +273,7 @@ fn crash_point(built: &Built, point: u64) -> Result<(), String> {
     let verifier = image("boot-data-crash-verify.img", None, "verify", last)?;
     let lines = run_to_end(
         built,
-        machine(built, &verifier, &disk.0),
+        machine(built, &verifier, &disk.0, false),
         &format!("point {point}"),
     )?;
     let ok = lines
