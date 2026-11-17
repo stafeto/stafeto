@@ -1418,7 +1418,7 @@ fn said(lines: &[String], text: &str) -> bool {
 /// file service, the probe keeps it, and the fingerprint is the same.
 fn nvme_persist_key() -> Result<(), String> {
     let programs: &'static [ImageProgram] = &PROGRAMS_KEY;
-    let dirs = ["/etc", "/etc/dropbear"].map(|path| rootfs::RootFile {
+    let dirs = ["/etc/dropbear"].map(|path| rootfs::RootFile {
         path,
         mode: 0o755,
         uid: 0,
