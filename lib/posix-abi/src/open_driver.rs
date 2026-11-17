@@ -15,7 +15,11 @@ fn protocol(error: Status) -> i32 {
     if error == Status::BadSize {
         EIO
     } else {
-        crate::error(error.into())
+        let errno = crate::error(error.into());
+        if errno == ENXIO {
+            rt::println!("fifo-debug: protocol {:?} gives ENXIO", error);
+        }
+        errno
     }
 }
 fn key(token: OpenToken) -> proto_fs::OpenKey {
