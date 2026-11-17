@@ -64,6 +64,9 @@ pub struct Routed {
     scratch: [u8; CELL],
     /// The buffers of the queue of sending on each account.
     inflight: [u16; MAX_CONSUMERS + 1],
+    /// The epoch of the wire the accounts were last made for: a new one returned every buffer
+    /// the old pair held (`Wire::sync`), so the accounts start from nothing.
+    epoch: u32,
     period: Period,
     /// The consumer whose frames come first in the next step.
     next_c: u8,
@@ -96,6 +99,7 @@ impl Routed {
             tables,
             scratch: [0; CELL],
             inflight: [0; MAX_CONSUMERS + 1],
+            epoch: 0,
             period: Period::new(),
             next_c: 0,
             blocked: false,
@@ -137,6 +141,10 @@ impl Routed {
         let mut out = Out::default();
         if self.idle_set {
             self.clear_idle();
+        }
+        if wire.epoch() != self.epoch {
+            self.epoch = wire.epoch();
+            self.inflight = [0; MAX_CONSUMERS + 1];
         }
         self.step_began = (self.ticks)();
         self.passed = false;
@@ -887,12 +895,12 @@ mod tests {
     #[test]
     fn a_frame_of_a_consumer_for_the_shared_address_is_turned_into_the_tables() {
         let mut r = rig();
-        // To a port the other member holds: the frame goes into its ring, not to the device.
+        // To a port the other member holds: the frame goes into its ring and stays off the device.
         let f = ip_frame(ME, ME, 6, &tcp_part(BLOCK0 + 512 * 2 + 1, 8080, 2));
         let sent = r.model.sent_frames().len();
         r.send(2, &f, sw::TX_FLAGS);
         r.step();
-        assert_eq!(r.model.sent_frames().len(), sent, "never on the wire");
+        assert_eq!(r.model.sent_frames().len(), sent, "the wire sees none");
         assert_eq!(r.stats.hairpin.load(Relaxed), 1);
         assert!(
             r.rings[..2].iter().any(|g| g.done(0).0.len > 0) || !r.lane.rx_ready.is_empty(),
@@ -957,5 +965,78 @@ mod tests {
         assert!(!out.more, "idle: nothing left to do");
         assert!(r.routed.idle_set);
         assert_eq!(r.woken.len(), 1, "no news, no second wake");
+    }
+
+    #[test]
+    fn a_reset_with_buffers_in_flight_closes_every_account() {
+        let mut r = rig();
+        // Frames queued and not completed: the model does not advance.
+        for k in 0..3u16 {
+            let f = ip_frame(ME, PEER, 6, &tcp_part(BLOCK0 + 512 * 2 + 9 + k, 80, 2));
+            r.send(2, &f, sw::TX_FLAGS);
+        }
+        r.step();
+        assert!(
+            r.routed.inflight.iter().sum::<u16>() > 0,
+            "frames are in flight"
+        );
+        let free_before = r.wire.tx_free();
+        // The admin side takes the pair down, then up again.
+        let info = r._ena.io_info().expect("up");
+        r.wire.sync(3, info);
+        r.step();
+        assert_eq!(r.routed.inflight, [0; MAX_CONSUMERS + 1], "down");
+        r.wire.sync(4, info);
+        r.step();
+        assert_eq!(r.routed.inflight, [0; MAX_CONSUMERS + 1], "up");
+        assert!(
+            r.wire.tx_free() >= free_before,
+            "the buffers are back in the pool"
+        );
+        // A consumer sends again and its account counts from zero.
+        let f = ip_frame(ME, PEER, 6, &tcp_part(BLOCK0 + 512 * 2 + 40, 80, 2));
+        r.send(2, &f, sw::TX_FLAGS);
+        r.step();
+        r.step();
+        assert!(r.routed.inflight[2] <= 1);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_frame_and_opens_no_account() {
+        let mut r = rig();
+        let mut n = Vec::new();
+        while let Some(b) = r.wire.tx_alloc() {
+            n.push(b);
+        }
+        // Take the pair down so that every submit is refused.
+        let info = r._ena.io_info().expect("up");
+        r.wire.sync(3, info);
+        let b = n.pop().unwrap();
+        assert!(!r.wire.submit(b, 60, 2), "refused");
+        assert_eq!(r.wire.counts().tx_dropped, 1);
+        assert_eq!(r.routed.inflight[2], 0);
+    }
+
+    #[test]
+    fn a_consumer_that_detaches_and_a_new_one_on_its_number_start_with_an_empty_account() {
+        let mut r = rig();
+        let f = ip_frame(ME, PEER, 6, &tcp_part(BLOCK0 + 512 * 2 + 9, 80, 2));
+        r.send(2, &f, sw::TX_FLAGS);
+        r.step();
+        assert_eq!(r.routed.inflight[2], 1);
+        // The completion arrives after the consumer left: the account still closes.
+        r.routed.tables.consumers[2] = None;
+        r.model.advance(MS);
+        r.step();
+        assert_eq!(r.routed.inflight[2], 0);
+        let rig2: &'static RingRig =
+            Box::leak(Box::new(RingRig::new(Layout::new(256, 64).unwrap())));
+        rig2.fill(&(0..64).collect::<Vec<_>>());
+        assert!(r.routed.tables.attach(2, 2, rig2.ring(), BLOCK0 + 512 * 2));
+        let g = ip_frame(ME, PEER, 6, &tcp_part(BLOCK0 + 512 * 2 + 10, 80, 2));
+        rig2.send(&g, sw::TX_FLAGS);
+        r.step();
+        r.step();
+        assert_eq!(r.model.sent_frames().last().unwrap(), &g);
     }
 }
