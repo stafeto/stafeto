@@ -62,6 +62,12 @@ pub enum Group {
     Net,
 }
 
+/// The packages that install nothing and are linked into a service of the
+/// base system, which is no package itself (pixman, linked into the
+/// composition service by `lib/pixman`): their description, their notice and
+/// their pinned source are all they have.
+pub const SERVICE_LIBRARIES: &[&str] = &["pixman"];
+
 /// A package: the content of its description.
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -456,8 +462,12 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
             }
         }
         // A package that installs nothing is the source of another one (the
-        // fts of pax, PCRE2 of nginx): some package links it in.
-        if !installs(p) && !packages.iter().any(|q| q.build_depends.contains(&p.name)) {
+        // fts of pax, PCRE2 of nginx): some package links it in, or a
+        // service of the system does (SERVICE_LIBRARIES).
+        if !installs(p)
+            && !SERVICE_LIBRARIES.contains(&p.name.as_str())
+            && !packages.iter().any(|q| q.build_depends.contains(&p.name))
+        {
             return Err(format!(
                 "{}: the package installs no file and no package links it in (build_depends)",
                 p.name
@@ -662,6 +672,8 @@ pub fn check() -> Result<(), String> {
         "boot-fast-nginx.img",
         "boot-fast-scale.img",
         "boot-fast-switch.img",
+        "boot-aws.img",
+        "boot-aws-qemu.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -809,7 +821,13 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         "boot-full.img" => load(),
         other if without_name(other).is_some() => without(load()?, without_name(other).unwrap()),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
-        "boot-aws.img" => of(&[Group::Base]),
+        // The try-out on EC2 (and its image on QEMU): the base packages, the network ones
+        // (nginx, OpenSSL, curl, Dropbear) and the F-Stack ones (`nginx-fast`, a consumer of the
+        // switch, which `of` leaves out for the images with no second device).
+        "boot-aws.img" | "boot-aws-qemu.img" => Ok(load()?
+            .into_iter()
+            .filter(|p| [Group::Base, Group::Net, Group::Fstack].contains(&p.group()))
+            .collect()),
         "boot-net.img"
         | "boot-net-rc.img"
         | "boot-net-its.img"
@@ -1010,6 +1028,15 @@ files = [
         user.depends = vec![p.name.clone()];
         user.build_depends = vec![p.name.clone()];
         assert!(refused(&[p, user]).contains("a package without files"));
+    }
+
+    #[test]
+    fn a_library_of_a_service_needs_no_package_that_links_it_in() {
+        let mut p = good();
+        p.name = SERVICE_LIBRARIES[0].to_owned();
+        p.files.clear();
+        p.program = None;
+        assert!(validate_set(&[p], None).is_ok());
     }
 
     #[test]
@@ -1216,7 +1243,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 24);
+        assert_eq!(packages.len(), 25);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);

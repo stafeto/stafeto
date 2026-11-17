@@ -1,13 +1,18 @@
 # /etc/rc.d/fast: nginx-fast on port 8080, a consumer of the switch of the network
 # service. It starts only when the image has the program and its settings and
-# `/etc/netd.conf` asks for the switch (`aws image --switch`); otherwise one line says
-# why it stays off. Regular nginx on 80 uses the sockets of the service and needs
-# no line here: the image of the try-on page (part A5) starts it from its own file.
+# `/etc/netd.conf` asks for the switch (the image of the try-out has it); otherwise one line
+# says why it stays off. The settings are `/etc/nginx/nginx-fast-try.conf` (the image of the
+# try-out: port 8080, two workers) or, without that file, the package's own. Regular nginx on
+# 80 and 443 uses the sockets of the service and starts from /etc/rc.d/web.
 #
 # Console lines of a good start: `fast: nginx-fast on 8080` and, from the service,
 # `net: switch` counters in `posix-net stat` with `consumers` above 0.
 
-if [ ! -x /bin/nginx-fast ] || [ ! -f /etc/nginx/nginx-fast.conf ]; then
+conf=/etc/nginx/nginx-fast-try.conf
+if [ ! -f "$conf" ]; then
+    conf=/etc/nginx/nginx-fast.conf
+fi
+if [ ! -x /bin/nginx-fast ] || [ ! -f "$conf" ]; then
     echo "fast: no nginx-fast in this image, 8080 stays off"
     exit 0
 fi
@@ -21,6 +26,6 @@ fi
         sleep 1
         tries=$((tries + 1))
     done
-    echo "fast: nginx-fast on 8080"
-    /bin/nginx-fast -c /etc/nginx/nginx-fast.conf
+    echo "fast: nginx-fast on $(sed -n 's/^ *listen *\([0-9]*\);.*/\1/p' "$conf" | head -n 1)"
+    /bin/nginx-fast -c "$conf"
 ) &
