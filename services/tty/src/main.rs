@@ -1530,6 +1530,30 @@ impl Tty {
         true
     }
 
+    /// The output the service holds goes to the driver in the request that needs it gone, up to
+    /// `FLOW_PUSHES` pieces: when the driver had no room, it is asked for it now, as the
+    /// notification of its room would have it asked (that notification reaches the turns thread,
+    /// which works on its small budget once the budgets are spent).
+    fn settle_output(&mut self) {
+        for _ in 0..FLOW_PUSHES {
+            if self.pump.waits_room() {
+                let mut port = Port {
+                    driver: &self.driver,
+                    channel: &self.turns,
+                    level: self.level,
+                    room_given: &mut self.room_given,
+                };
+                match port.room() {
+                    Ok(true) => self.pump.room_came(),
+                    _ => break,
+                }
+            }
+            if !self.push() {
+                break;
+            }
+        }
+    }
+
     /// The input the driver holds, taken in the request of a client that waits for it (at most
     /// `PULLS` chunks): whether any came. The console is terminal 0. Whatever the state of the
     /// service's own read at the driver (none started, started and not armed, armed), a pull
@@ -2537,11 +2561,7 @@ impl Tty {
                 // The output accepted before the stop goes out first, up to the room the driver
                 // gave: the steps that would have sent it run at the service's own level only
                 // while its budgets last, and the stop is owed the state the client left.
-                for _ in 0..FLOW_PUSHES {
-                    if !self.push() {
-                        break;
-                    }
-                }
+                self.settle_output();
                 self.devices[self.active].console.set_stopped(true);
             }
             FLOW_OUT_ON => {
@@ -2550,11 +2570,7 @@ impl Tty {
                 // gave: a client that sends XON sees the output resume when the call returns,
                 // whatever level the service's own steps run at. What the room does not take
                 // stays to the steps.
-                for _ in 0..FLOW_PUSHES {
-                    if !self.push() {
-                        break;
-                    }
-                }
+                self.settle_output();
                 self.kick();
             }
             FLOW_IN_OFF | FLOW_IN_ON => {
