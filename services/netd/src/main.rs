@@ -2272,20 +2272,29 @@ impl Driver<'_> {
         use core::sync::atomic::Ordering::Relaxed;
         let st = &switch::INNER.stats;
         let get = |a: &core::sync::atomic::AtomicU32| a.load(Relaxed);
+        // Three lines of six counters, each under 128 bytes (the longest line the console's
+        // driver puts out in one part): a longer line goes out in parts that the line of
+        // another writer can fall between.
         rt::println!(
-            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {} tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {} left {} looped {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
+            "net: switch consumers {} flows {} unconfirmed {} evicted {} expired {} rx_full {}",
             get(&st.consumers),
             get(&st.flows),
             get(&st.unconfirmed),
             get(&st.evicted),
             get(&st.expired),
-            get(&st.rx_full),
+            get(&st.rx_full)
+        );
+        rt::println!(
+            "net: switch tx_refused {} hairpin {} own_to_device {} rx_consumer {} tx_consumer {} park_given {}",
             get(&st.tx_refused),
             get(&st.hairpin),
             get(&st.own_to_device),
             get(&st.rx_consumer),
             get(&st.tx_consumer),
-            get(&st.park_given),
+            get(&st.park_given)
+        );
+        rt::println!(
+            "net: switch left {} looped {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
             get(&st.left),
             get(&st.looped),
             get(&st.budget_waits),

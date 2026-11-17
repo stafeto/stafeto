@@ -180,7 +180,12 @@ pub struct Scratch(PathBuf);
 
 impl Scratch {
     pub fn new() -> Result<Scratch, String> {
-        let dir = std::env::temp_dir().join(format!("stafeto-gpu-{}", std::process::id()));
+        // One directory for each probe: the probes of a group run in threads
+        // of one process, and two of them in one directory would bind the
+        // same monitor socket and delete each other's screenshots.
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("stafeto-gpu-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Scratch(dir))
     }

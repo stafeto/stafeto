@@ -164,11 +164,14 @@ impl Disk {
         } else {
             (sectors as *const u8, cell)
         };
-        // SAFETY: the request was admitted, so the sectors lie in the object and the cell
-        // within the client's buffer, both mapped; a raw copy, since the client may write its
-        // cell meanwhile and spoils only its own bytes.
-        unsafe { core::ptr::copy_nonoverlapping(from, to, len) };
-        self.start(s, r, place, kind, io.count)
+        // The operation is registered before the data pass, so that a table of operations
+        // that is full refuses the request with the object as it was.
+        self.start(s, r, place, kind, io.count, || {
+            // SAFETY: the request was admitted, so the sectors lie in the object and the cell
+            // within the client's buffer, both mapped; a raw copy, since the client may write
+            // its cell meanwhile and spoils only its own bytes.
+            unsafe { core::ptr::copy_nonoverlapping(from, to, len) };
+        })
     }
 
     fn flush(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
@@ -176,12 +179,13 @@ impl Disk {
             return Answer::Status(Status::BadSize);
         }
         match self.cells.admit_flush() {
-            Ok(place) => self.start(s, r, place, Kind::Flush, 0),
+            Ok(place) => self.start(s, r, place, Kind::Flush, 0, || {}),
             Err(refusal) => refuse(refusal),
         }
     }
 
-    /// The request in `place` is done: the answer waits in its place for TAKE.
+    /// The request in `place` is done: `data` moves its bytes once the operation is registered,
+    /// and the answer waits in its place for TAKE.
     fn start(
         &mut self,
         s: &mut Session<LongSession, 0>,
@@ -189,12 +193,14 @@ impl Disk {
         place: usize,
         kind: Kind,
         count: u32,
+        data: impl FnOnce(),
     ) -> Answer {
         let label = r.label();
         let key = match self.ops.start(&mut s.data, label) {
             Ok(key) => key,
             Err(error) => return Answer::Status(Status::Kernel(error)),
         };
+        data();
         self.cells.begin(place, kind, label, key, 0, count);
         let _ = self.cells.complete(place, Outcome::Ok);
         long_answer(r, long::Reply::Wait(key))

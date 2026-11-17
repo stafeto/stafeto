@@ -245,6 +245,28 @@ fn stat(run: &mut qemu::Run, tag: &str) -> Result<Stat, String> {
 
 /// `stat` with the time its answer may take.
 fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
+    // The counter lines are under the 128 bytes (`LINE_MAX` of the console's driver, which
+    // puts out a longer line in parts, and reassembles the 64-byte pieces of a line up to
+    // that length) and so come whole. A line that came without a counter is asked for again:
+    // the counters are cumulative. The retry is a safety net.
+    let mut last = String::new();
+    for _ in 0..STAT_ATTEMPTS {
+        match stat_once(run, tag, within) {
+            Ok(stat) => return Ok(stat),
+            Err(e) if e.starts_with(TORN) => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// How many times `stat` asks when the counter line comes cut.
+const STAT_ATTEMPTS: usize = 4;
+/// The start of the error for a counter line that came cut.
+const TORN: &str = "torn counter line";
+
+/// One `posix-net stat` and the parse of its lines.
+fn stat_once(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, String> {
     let from = run.lines().len();
     run.send("posix-net stat")?;
     // The service prints its counters when the request is over, so they may come after the
@@ -256,14 +278,22 @@ fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat,
     )?;
     let _ = tag;
     let lines: Vec<String> = run.lines()[from..].to_vec();
-    let line = lines
-        .iter()
-        .rev()
-        .find(|l| l.contains("net: switch consumers "))
-        .cloned()
-        .ok_or_else(|| {
-            format!("no line `net: switch consumers` after posix-net stat: {lines:?}")
-        })?;
+    // The counters come in three lines (`report_switch`), each under the 128 bytes of a part
+    // of the console; they are read as one.
+    let mut parts = Vec::new();
+    for head in [
+        "net: switch consumers ",
+        "net: switch tx_refused ",
+        "net: switch left ",
+    ] {
+        let part = lines
+            .iter()
+            .rev()
+            .find(|l| l.contains(head))
+            .ok_or_else(|| format!("no line `{head}` after posix-net stat: {lines:?}"))?;
+        parts.push(part.as_str());
+    }
+    let line = parts.join(" ");
     let by = lines
         .iter()
         .rev()
@@ -296,20 +326,25 @@ fn stat_within(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat,
         .rev()
         .find(|l| l.contains("net: frames rx "))
         .and_then(|l| counter(l, "orphan_reused"))
-        .ok_or("no orphan_reused in the line `net: frames rx`")?;
+        .ok_or_else(|| format!("{TORN}: no orphan_reused in the line `net: frames rx`"))?;
     Ok(Stat {
         orphan_reused,
         refused_by,
-        consumers: counter(&line, "consumers").ok_or("consumers")?,
-        hairpin: counter(&line, "hairpin").ok_or("hairpin")?,
-        own_to_device: counter(&line, "own_to_device").ok_or("own_to_device")?,
-        tx_refused: counter(&line, "tx_refused").ok_or("tx_refused")?,
-        park_given: counter(&line, "park_given").ok_or("park_given")?,
-        looped: counter(&line, "looped").ok_or("looped")?,
-        left: counter(&line, "left").ok_or("left")?,
+        consumers: counter(&line, "consumers").ok_or_else(|| torn(&line))?,
+        hairpin: counter(&line, "hairpin").ok_or_else(|| torn(&line))?,
+        own_to_device: counter(&line, "own_to_device").ok_or_else(|| torn(&line))?,
+        tx_refused: counter(&line, "tx_refused").ok_or_else(|| torn(&line))?,
+        park_given: counter(&line, "park_given").ok_or_else(|| torn(&line))?,
+        looped: counter(&line, "looped").ok_or_else(|| torn(&line))?,
+        left: counter(&line, "left").ok_or_else(|| torn(&line))?,
         rx_by,
         line,
     })
+}
+
+/// The error for a counter line that lacks a counter, which is a line cut by another writer.
+fn torn(line: &str) -> String {
+    format!("{TORN}: {line:?}")
 }
 
 /// The shell prompt and the lease (one device).
@@ -1821,6 +1856,8 @@ mod tests {
             std::fs::read_to_string(crate::root().join("services/netd/src/main.rs")).unwrap();
         for line in [
             "net: switch consumers ",
+            "net: switch tx_refused ",
+            "net: switch left ",
             "net: switch rx_by ",
             "refused_by {refused:?}",
         ] {

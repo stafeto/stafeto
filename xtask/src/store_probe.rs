@@ -39,6 +39,8 @@ const DISK_BYTES: u64 = 512 << 20;
 /// The tags of the services' lines of steps: the file service 2, the disk 15, the package service 16.
 const RAM_TAG: &str = "2";
 const PKGD_TAG: &str = "16";
+/// The longest a run of the machine with the NVMe disk may take on TCG, edk2 and the loader included.
+const WITHIN: Duration = Duration::from_secs(480);
 /// The kinds of the package service's steps that must come: all of its methods, the heartbeat,
 /// a notification and the departure of a session.
 const PKGD_STEP_KINDS: [(usize, &str); 20] = [
@@ -592,6 +594,46 @@ fn apart(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// The lines of the full scenario a measured run must show: those of the probe. The first lines of the
+/// package service come while every service starts and print at once, and the console drops some of
+/// them under -icount.
+fn steady_lines(world: &World) -> Vec<String> {
+    measured(true, full_lines(world, true))
+}
+
+/// The lines `wanted` of a run, less those of the package service when the run is measured
+/// (`steps`): the service prints them while every service starts, the kernel log holds a bounded
+/// number of records and says `[kernel log: N records lost]` when a burst overruns it, so a short
+/// line of the start (one record) may be among the lost. The lines of the probe come after the
+/// start and stay.
+fn measured(steps: bool, wanted: Vec<String>) -> Vec<String> {
+    if steps {
+        wanted
+            .into_iter()
+            .filter(|l| !l.starts_with("pkgd: "))
+            .collect()
+    } else {
+        wanted
+    }
+}
+
+/// `expect` for a run under -icount on the machine of the firmware, where the lines of the services come
+/// glued to each other: each wanted line is part of some line.
+fn expect_within(lines: &[String], wanted: &[String]) -> Result<(), String> {
+    for line in wanted {
+        if !lines.iter().any(|l| l.contains(line.as_str())) {
+            let said: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("pkgd") || l.contains("store-probe"))
+                .collect();
+            return Err(format!(
+                "no line {line:?}; pkgd and the probe said {said:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expect(lines: &[String], wanted: &[String]) -> Result<(), String> {
     for line in wanted {
         if !lines.iter().any(|l| l == line) {
@@ -716,7 +758,7 @@ fn steps() -> Result<(), String> {
     let file = Disk::new("steps");
     let layout = write_disk(&file, Some(&contents))?.ok_or("no layout")?;
     let lines = run(&image(true)?, &file.0, true)?;
-    expect(&lines, &disk_lines(&layout)[..4])?;
+    expect(&lines, &measured(true, disk_lines(&layout)[..4].to_vec()))?;
     // The full scenario under the same measurement: every method of the service comes.
     let full = full_run(true)?;
     let both = |tag: &str| merge(longest_steps(&lines, tag), longest_steps(&full, tag));
@@ -1067,22 +1109,338 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     let file = Disk::new(mode);
     write_disk(&file, None)?;
     let first = run(&image, &file.0, steps)?;
-    expect(&first, &full_lines(&world, steps))?;
+    if steps {
+        expect_within(&first, &steady_lines(&world))?;
+    } else {
+        expect(&first, &full_lines(&world, steps))?;
+    }
     let (generation, free, disk) = status_numbers(&first, "final status")?;
     // The second run: the same machine on the same disk file.
     let second = run(&image, &file.0, steps)?;
-    let wanted = [
+    let wanted = measured(
+        steps,
+        vec![
         "pkgd: roots stafeto-dev-root".to_string(),
         "pkgd: keyb: key revoked, skipped".to_string(),
         "store-probe: restart: hello runs, big, the settings and the serial are in place, wide and keyb are not".to_string(),
         "store-probe: ok".to_string(),
         format!("store-probe: status generation={generation} free={free} disk={}", disk - 1),
-    ];
+        ],
+    );
     expect(&second, &wanted)?;
     println!(
         "store-probe: full: hello installed (signed by the development key, {blocks_hello} blocks), every refusal, NOT_ALLOWED without UID 0, a group of big and wide, the settings, the serial and the list of revocations, REMOVE; after the restart the packages, the settings and the serial are in place (generation {generation}, {free} blocks free): ok"
     );
     Ok(first)
+}
+
+/// `cargo xtask nvme-persist [breaks|lba4096|mdts1|steps]`: the package service on an NVMe disk that outlives the machine.
+/// The machine is `EFI` (edk2, ITS, ACPI: the boot disk is the first NVMe controller, with the loader, the
+/// kernel and the boot image of the store probe), with a second NVMe controller over a file of zeros that
+/// is the store: init walks the bus, finds that controller by its PCI id and index, and the service
+/// `nvme-blk` (MSI-X on the ITS, the polling of the queue behind it) is the `blk` of the package
+/// service. The first run is the whole scenario of `store-probe full` (the format of the store, the
+/// installation of `hello`, every refusal, a group of packages, the settings, REMOVE), after which QEMU
+/// is killed once the probe has ended and nothing is in flight (the data are the ones the service
+/// and the controller took; the survival of the store format over a cut at each point of a write is
+/// the evidence of `store-crash`, 13 crash points, on Virtio); the second run starts the machine on the same file and the probe
+/// finds `hello` installed and running, the settings and the serial in place. With `breaks` the service
+/// writes one sector past where it is asked (`break-nvme-write-offset`), and the probe must not pass; `lba4096`
+/// gives the disk blocks of 4 KiB and `mdts1` a transfer limit of 8 KiB; `steps` runs the first scenario
+/// under -icount with the steps of the services counted and holds the NVMe service's to 0.9 of term B.
+pub fn nvme_persist(args: &[String]) -> Result<(), String> {
+    let (breaks, shape, steps) = match args.first().map(String::as_str) {
+        None => (false, Shape::Plain, false),
+        Some("breaks") => (true, Shape::Plain, false),
+        Some("lba4096") => (false, Shape::Lba4096, false),
+        Some("mdts1") => (false, Shape::Mdts1, false),
+        Some("steps") => (false, Shape::Plain, true),
+        Some(other) => {
+            return Err(format!(
+                "usage: nvme-persist [breaks|lba4096|mdts1|steps]: {other}"
+            ));
+        }
+    };
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let world = make_world(
+        &hello_elf()?,
+        steps,
+        if steps { "full-steps" } else { "full" },
+    )?;
+    let broken: &'static [&'static str] = if breaks {
+        &["break-nvme-write-offset"]
+    } else if steps {
+        &["steps"]
+    } else {
+        &[]
+    };
+    let mut list = if steps {
+        PROGRAMS_STEPS.to_vec()
+    } else {
+        PROGRAMS.to_vec()
+    };
+    for program in &mut list {
+        match program.0 {
+            "init" => program.3 = &["table-store-probe", "nvme-store"],
+            "virtio-blk" => {
+                *program = ("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, broken);
+            }
+            _ => {}
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
+    // The jobs of the ci run side by side in one tree: each variant has the files of its own.
+    let tag = match (breaks, steps, shape) {
+        (true, ..) => "-break",
+        (_, true, _) => "-steps",
+        (_, _, Shape::Plain) => "",
+        (_, _, Shape::Lba4096) => "-4096",
+        (_, _, Shape::Mdts1) => "-mdts1",
+    };
+    let name: &str = &format!("boot-nvme-persist{tag}.img");
+    let esp_name = format!("efi-disk-nvme-persist{tag}.raw");
+    let image = image_with(name, programs, world.files.clone(), None)?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join(&esp_name);
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    // The ci runs the variants as threads of one process: the data disk is named after the variant.
+    let file = Disk::new(&format!("nvme{tag}"));
+    write_disk(&file, None)?;
+    if breaks {
+        // The first run keeps what it wrote in memory, so it may pass; the machine that starts again
+        // on the file reads what the service wrote, and must not find the store whole.
+        let caught = |why: String| {
+            println!("nvme-persist breaks: break-nvme-write-offset is caught: {why}");
+            Ok(())
+        };
+        if let Err(why) = nvme_run(&firmware, &esp, &file.0, &kernel.elf, shape, steps, WITHIN) {
+            return caught(format!("the first run failed: {why}"));
+        }
+        return match nvme_run(
+            &firmware,
+            &esp,
+            &file.0,
+            &kernel.elf,
+            shape,
+            false,
+            BOOT_TIMEOUT * 6,
+        ) {
+            Err(why) => caught(format!("the run after the kill failed: {why}")),
+            Ok(lines) if !lines.iter().any(|l| l == "store-probe: ok") => {
+                caught("the probe did not say ok after the kill".into())
+            }
+            Ok(_) => Err("break-nvme-write-offset passed the probe".into()),
+        };
+    }
+    let blocks_hello = world.blocks("hello");
+    let first = nvme_run(
+        &firmware,
+        &esp,
+        &file.0,
+        &kernel.elf,
+        shape,
+        steps,
+        if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
+    )?;
+    if steps {
+        expect_within(&first, &steady_lines(&world))?;
+    } else {
+        expect(&first, &full_lines(&world, steps))?;
+    }
+    // The controller the service found, the interrupts that came, and nothing of the Virtio disk.
+    // Under -icount the lines of the services come glued to the lines of a step, and a long one may
+    // be cut: the text is read from its start, and the line of the controller is required whole
+    // only when the run is not measured.
+    let nvme_line = first.iter().find_map(|l| {
+        let at = l.find("nvme: ")?;
+        l.contains(" blocks of ").then(|| l[at..].to_string())
+    });
+    let nvme_line = match nvme_line {
+        Some(line) => {
+            if !line.contains(shape.said()) {
+                return Err(format!(
+                    "the controller is not the one asked for ({}): {line}",
+                    shape.said()
+                ));
+            }
+            if !line.contains("msi yes") {
+                return Err(format!("the NVMe service ran without MSI-X: {line}"));
+            }
+            line
+        }
+        None if steps => "the line of the controller was cut by the steps".to_string(),
+        None => return Err("the NVMe service said nothing of its controller".into()),
+    };
+    // The measured run may lose a line of the console; the interrupt is required of the others.
+    if !steps
+        && !first
+            .iter()
+            .any(|l| l.contains("nvme: first interrupt of vector 1"))
+    {
+        return Err("no interrupt of vector 1 came: the completions were found by polling".into());
+    }
+    if first
+        .iter()
+        .any(|l| l.contains("virtio-blk: ") || l.contains("nvme: reset"))
+    {
+        return Err("the Virtio disk ran, or the controller was reset in place".into());
+    }
+    if steps {
+        // Every method of the service came, and no step of it, the heartbeat's and the
+        // interrupt's included, is past 0.9 of term B.
+        let mut blk = longest_steps(&first, blk_probe::BLK_TAG);
+        // A line of a step is told only when it is a new longest of its kind, and with the lines
+        // of the services glued together under -icount one may be lost: a kind that did not come
+        // is looked for in a run on a fresh disk, two more at most, and the longest of each kind
+        // is kept.
+        let mut runs = 1;
+        while runs < 3
+            && BLK_STEP_KINDS
+                .iter()
+                .any(|(kind, _)| !blk.iter().any(|row| row.0 == *kind))
+        {
+            write_disk(&file, None)?;
+            let again = nvme_run(
+                &firmware,
+                &esp,
+                &file.0,
+                &kernel.elf,
+                shape,
+                true,
+                BOOT_TIMEOUT * 40,
+            )?;
+            expect_within(&again, &steady_lines(&world))?;
+            blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
+            runs += 1;
+        }
+        judge("the NVMe service", &blk, &BLK_STEP_KINDS)?;
+        check_waits(
+            &first,
+            &[PKGD_TAG, blk_probe::BLK_TAG, RAM_TAG],
+            "nvme-persist",
+        )?;
+        let text = blk
+            .iter()
+            .map(|(k, t, _)| format!("kind {k} {t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("nvme-persist steps: the NVMe service {text}");
+        println!(
+            "nvme-persist steps: every step of the NVMe service under 0.9 of term B ({}): ok; {nvme_line}",
+            blk_probe::STEP_MAX
+        );
+        return Ok(());
+    }
+    let (generation, free, disk) = status_numbers(&first, "final status")?;
+    // QEMU was killed with the probe's last line: the second run is on what the file holds.
+    let second = nvme_run(
+        &firmware,
+        &esp,
+        &file.0,
+        &kernel.elf,
+        shape,
+        steps,
+        if steps { BOOT_TIMEOUT * 40 } else { WITHIN },
+    )?;
+    let wanted = measured(
+        steps,
+        vec![
+        "pkgd: roots stafeto-dev-root".to_string(),
+        "pkgd: keyb: key revoked, skipped".to_string(),
+        "store-probe: restart: hello runs, big, the settings and the serial are in place, wide and keyb are not".to_string(),
+        "store-probe: ok".to_string(),
+        format!("store-probe: status generation={generation} free={free} disk={}", disk - 1),
+        ],
+    );
+    expect(&second, &wanted)?;
+    println!(
+        "nvme-persist: on QEMU's NVMe disk the full scenario of the store probe passed (hello, {blocks_hello} blocks, every refusal, a group of big and wide, the settings, the serial, REMOVE), QEMU was killed, and the machine started again on the same file found hello installed and running, the settings and the serial in place (generation {generation}, {free} blocks free): ok; {nvme_line}"
+    );
+    Ok(())
+}
+
+/// How the data disk's controller is made: as QEMU makes it by default, with a namespace of 4 KiB
+/// blocks (`nvme-ns`), or with a transfer limit of two pages (`mdts=1`: the library cuts each cell of
+/// 16 KiB into two commands).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Plain,
+    Lba4096,
+    Mdts1,
+}
+
+impl Shape {
+    fn device(self) -> String {
+        let base = "nvme,serial=stafeto-data,bus=pcie.0,addr=0x4";
+        match self {
+            Shape::Plain => format!("{base},drive=data"),
+            Shape::Lba4096 => format!("{base},id=data-controller"),
+            Shape::Mdts1 => format!("{base},drive=data,mdts=1"),
+        }
+    }
+
+    /// What the line of the service says of the controller.
+    fn said(self) -> &'static str {
+        match self {
+            Shape::Plain => " blocks of 512 bytes ",
+            Shape::Lba4096 => " blocks of 4096 bytes ",
+            Shape::Mdts1 => "mdts 1 (8192 bytes)",
+        }
+    }
+}
+
+/// One run of the machine `EFI` on the boot disk `esp` with the data disk `data` as a second NVMe
+/// controller (the function at 00:04.0; the boot disk's is at 00:01.0), until the probe ends: the lines
+/// of its output. QEMU is killed when the line comes, or after `within`.
+fn nvme_run(
+    firmware: &efi::Firmware,
+    esp: &Path,
+    data: &Path,
+    elf: &Path,
+    shape: Shape,
+    icount: bool,
+    within: Duration,
+) -> Result<Vec<String>, String> {
+    // The variables of the firmware are copied to a file named after the disk of the run.
+    let vars = esp
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("nvme-persist");
+    let mut cmd = efi::command(&efi::EFI, firmware, esp, true, vars)?;
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+        data.display()
+    ));
+    cmd.args(["-device", &shape.device()]);
+    if shape == Shape::Lba4096 {
+        cmd.args([
+            "-device",
+            "nvme-ns,drive=data,bus=data-controller,logical_block_size=4096,physical_block_size=4096",
+        ]);
+    }
+    if icount {
+        // One CPU, as the steps of the other services are measured: with two, the virtual time of
+        // the idle one runs the services past the deadlines of their heartbeats.
+        cmd.args(qemu::ICOUNT).args(["-smp", "1"]);
+    }
+    let output = run_until(cmd, within, Some("init: store-probe ended: "), elf)?;
+    if let Some(failed) = output
+        .lines
+        .iter()
+        .find(|l| l.starts_with("store-probe: failed"))
+    {
+        return Err(failed.clone());
+    }
+    qemu::expect_stopped_on(&output, ENDED)?;
+    Ok(apart(&output.lines))
 }
 
 /// The disk service built to stop answering at the first write of a package's data

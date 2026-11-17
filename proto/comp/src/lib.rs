@@ -13,10 +13,13 @@
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
-//! | DESCRIBE (17) | `Display` | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy` (u32 each) | NO_DEVICE |
+//! | DESCRIBE (17) | `Display`, manager, input | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy` (u32 each) | NO_DEVICE |
 //! | WINDOW_CREATE (18) | `Display` | `x`, `y`, `w`, `h`, `format`, `flags` (u32); one handle: a channel with NOTIFY and TRANSFER | status, `id` (u32); one handle: the window's session (SEND, TRANSFER) | INVALID, UNSUPPORTED, NO_DEVICE, LIMIT_REACHED |
 //! | ATTACH (19) | window | `count`, `stride`, `format` (u32); `count` memory objects with MAP_READ and TRANSFER | the status alone | BUSY, INVALID, UNSUPPORTED, REVOKED |
 //! | POST (20) | window | `buffer`, `count` (u32), then `count` rectangles of 4 u32 | the status alone, at once | BUSY, INVALID, NOT_ALLOWED, REVOKED |
+//! | EVENTS (21) | window or manager | the header alone | status, `count`, `flags` (u32 each: bit 0 is LOST), then `count` events of 16 bytes | NOT_ALLOWED, REVOKED |
+//! | MANAGE (22) | manager | `op`, `a`, `b`, `c` (u32 each); SUBSCRIBE has one handle: a channel with NOTIFY and TRANSFER | the status alone; LIST: status, `count`, then `count` records of 28 bytes | INVALID, NOT_ALLOWED |
+//! | INJECT (23) | input | one event of 16 bytes | the status alone | INVALID, NOT_ALLOWED |
 //!
 //! The context is the `Display` session. A window is a session of its own
 //! (a label the service gives): the window goes when the last copy of its
@@ -41,7 +44,36 @@
 //! and never waits for the client: a buffer the client did not post in time
 //! leaves the window on the screen as it was.
 //!
-//! DESCRIBE's `open` is the windows alive now, `created` the windows ever
+//! A window is XRGB8888 (a point is 0x00RRGGBB, opaque) or ARGB8888 (the
+//! colour already multiplied by the alpha in the top byte, laid over what
+//! is below). Opaque and transparent windows are told apart by the format
+//! of WINDOW_CREATE and ATTACH, which must agree.
+//!
+//! Events. The service keeps a ring of 64 events (EVENT_LEN bytes each) for
+//! every window, and a ring for the manager. EVENTS takes up to MAX_EVENTS
+//! of them without waiting; when more came than the ring holds the oldest
+//! went and the next EVENTS says LOST. The bit EVENTS_BIT (bit 3) of the
+//! channel WINDOW_CREATE gave says a ring has something to take. The
+//! window that has the focus gets the keys; a window gets the pointer's
+//! moves and buttons with the coordinates of its own (the window under the
+//! pointer, or the one a pressed button holds until it is released); a click
+//! on a window gives it the focus and the top place; a window that has
+//! its first buffer taken into a frame gets the focus and the top place
+//! at once. FOCUS_IN and FOCUS_OUT tell a window it won or lost the focus.
+//!
+//! The manager (the session init gave a program of the table's
+//! `manager`, a label with MANAGER_MARK) lists the windows, moves them,
+//! raises them, shows and hides them, and gives one the focus (MANAGE with
+//! the ops below), and reads CREATE and CLOSE of every window in its own
+//! ring. While a manager has subscribed, the Alt keys and the keys pressed
+//! with Alt held go to it alone: the window with the focus never sees them.
+//!
+//! The input session (a label with INPUT_MARK, given by init to the probes)
+//! injects an event as if the device had made it: a KEY, a MOVE with the
+//! screen's coordinates (the pointer goes there) or a BUTTON.
+//!
+//! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
+//! subscribed. Its `open` is the windows alive now, `created` the windows ever
 //! made, `frames` the frames shown, `busy` 1 while a frame is being made
 //! or waits to be: a probe that waits for `busy` to be 0 finds the screen
 //! settled.
@@ -62,8 +94,23 @@ pub const MAX_RECTS: usize = 4;
 /// The most bytes of one buffer's object: a megabyte, the screen's.
 pub const BUFFER_MAX: u64 = 1 << 20;
 
-/// The format of a point: proto_gpu's XRGB8888, the only one.
+/// The formats of a point: proto_gpu's XRGB8888, and ARGB8888 with the
+/// colour premultiplied by the alpha. 2 is no format (the probes refuse it).
 pub const FORMAT_XRGB8888: u32 = proto_gpu::FORMAT_XRGB8888;
+pub const FORMAT_ARGB8888: u32 = 3;
+
+/// The labels init gives a session of the manager and of the input
+/// (services/init `comp_mark`): bits the service's own labels never have
+/// (a clone's is bit 63, a window's 62, the driver's 61).
+pub const MANAGER_MARK: u64 = 1 << 60;
+pub const INPUT_MARK: u64 = 1 << 59;
+
+/// DESCRIBE's `flags`: a manager has subscribed.
+pub const HAS_MANAGER: u32 = 1;
+
+/// The bit the service sends a window's channel when its ring has events;
+/// bits 0 to 2 tell the buffer that is free.
+pub const EVENTS_BIT: u64 = 1 << 3;
 
 /// The codes of the service, apart from the kernel's, proto_wire's and
 /// proto_gpu's.
@@ -85,14 +132,20 @@ pub enum Method {
     WindowCreate = 18,
     Attach = 19,
     Post = 20,
+    Events = 21,
+    Manage = 22,
+    Inject = 23,
 }
 
 impl Method {
-    pub const ALL: [Method; 4] = [
+    pub const ALL: [Method; 7] = [
         Method::Describe,
         Method::WindowCreate,
         Method::Attach,
         Method::Post,
+        Method::Events,
+        Method::Manage,
+        Method::Inject,
     ];
 
     pub const fn number(self) -> u16 {
@@ -320,6 +373,291 @@ impl Post {
     }
 }
 
+/// The events a ring holds, and the most one EVENTS takes: a reply of 12 +
+/// 32 * 16 bytes fits the message.
+pub const RING: usize = 64;
+pub const MAX_EVENTS: usize = 32;
+/// EVENTS' `flags`: events were dropped since the last EVENTS.
+pub const LOST: u32 = 1;
+/// The bytes of an event.
+pub const EVENT_LEN: usize = 16;
+
+/// The kinds of an event.
+pub const KEY: u16 = 1;
+pub const MOVE: u16 = 2;
+pub const BUTTON: u16 = 3;
+pub const FOCUS_IN: u16 = 4;
+pub const FOCUS_OUT: u16 = 5;
+/// The manager's: a window was made, a window went. `code` is its id.
+pub const CREATE: u16 = 6;
+pub const CLOSE: u16 = 7;
+
+/// One event. KEY: `code` is Linux's key code, `value` 1 for pressed and 0
+/// for released. MOVE: `x` and `y` the pointer's place in the window's own
+/// coordinates (INJECT: in the screen's). BUTTON: `code` the button (Linux's
+/// BTN_LEFT, 0x110, and the others), `value` as a key's, `x` and `y` as a
+/// MOVE's. FOCUS_IN, FOCUS_OUT: no number.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Event {
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Event {
+    pub const fn new(kind: u16, code: u16, value: i32) -> Event {
+        Event {
+            kind,
+            code,
+            value,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    pub const fn at(kind: u16, code: u16, value: i32, x: i32, y: i32) -> Event {
+        Event {
+            kind,
+            code,
+            value,
+            x,
+            y,
+        }
+    }
+
+    pub const fn to_bytes(self) -> [u8; EVENT_LEN] {
+        let k = self.kind.to_le_bytes();
+        let c = self.code.to_le_bytes();
+        let v = self.value.to_le_bytes();
+        let x = self.x.to_le_bytes();
+        let y = self.y.to_le_bytes();
+        [
+            k[0], k[1], c[0], c[1], v[0], v[1], v[2], v[3], x[0], x[1], x[2], x[3], y[0], y[1],
+            y[2], y[3],
+        ]
+    }
+
+    pub const fn from_bytes(b: [u8; EVENT_LEN]) -> Event {
+        Event {
+            kind: u16::from_le_bytes([b[0], b[1]]),
+            code: u16::from_le_bytes([b[2], b[3]]),
+            value: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            x: i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            y: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+        }
+    }
+
+    /// INJECT's request: the header and the event.
+    pub fn write_inject(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::Inject.header().write(w)?;
+        w.bytes(&self.to_bytes())
+    }
+
+    /// The event of INJECT's body: BAD_SIZE unless it is 16 bytes, INVALID
+    /// for a kind that no input makes (INJECT takes KEY, MOVE and BUTTON).
+    pub fn read_inject(mut body: Reader<'_>) -> Result<Event, Status> {
+        let b = body.bytes(EVENT_LEN)?;
+        body.finish()?;
+        let mut raw = [0; EVENT_LEN];
+        raw.copy_from_slice(b);
+        let event = Event::from_bytes(raw);
+        match event.kind {
+            KEY | MOVE | BUTTON => Ok(event),
+            _ => Err(code(INVALID)),
+        }
+    }
+}
+
+/// EVENTS' reply: status 0, the count, the flags, the events.
+pub fn write_events(events: &[Event], lost: bool, w: &mut Writer) -> Result<(), Status> {
+    w.u32(Status::Ok.code())?;
+    w.u32(events.len() as u32)?;
+    w.u32(if lost { LOST } else { 0 })?;
+    for e in events {
+        w.bytes(&e.to_bytes())?;
+    }
+    Ok(())
+}
+
+/// The flags and the events of a reply of EVENTS, each event given to
+/// `each`; BAD_SIZE unless the reply is what the count says. A refusal is
+/// its status alone and comes back as the error.
+pub fn read_events(reply: &[u8], mut each: impl FnMut(Event)) -> Result<u32, Status> {
+    let mut r = Reader::new(reply);
+    let status = Status::from_code(r.u32()?);
+    if status != Status::Ok {
+        return Err(status);
+    }
+    let count = r.u32()?;
+    let flags = r.u32()?;
+    for _ in 0..count {
+        let b = r.bytes(EVENT_LEN)?;
+        let mut raw = [0; EVENT_LEN];
+        raw.copy_from_slice(b);
+        each(Event::from_bytes(raw));
+    }
+    r.finish()?;
+    Ok(flags)
+}
+
+/// The operations of MANAGE (`op`, then `a`, `b`, `c`).
+pub mod manage {
+    /// A channel with NOTIFY and TRANSFER in the request's handle: the
+    /// service sends it EVENTS_BIT when the manager's ring has events.
+    pub const SUBSCRIBE: u32 = 0;
+    /// The windows: the reply holds a record of WINDOW_RECORD bytes each.
+    pub const LIST: u32 = 1;
+    /// Window `a` goes to (`b`, `c`).
+    pub const MOVE: u32 = 2;
+    /// Window `a` goes to the top.
+    pub const RAISE: u32 = 3;
+    /// Window `a` has the focus and the top place.
+    pub const FOCUS: u32 = 4;
+    /// Window `a` is shown (`b` is 1) or hidden (0).
+    pub const VISIBLE: u32 = 5;
+    pub const LAST: u32 = VISIBLE;
+}
+
+/// MANAGE's request: the header, `op`, `a`, `b`, `c`.
+pub fn write_manage(op: u32, a: u32, b: u32, c: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Manage.header().write(w)?;
+    for n in [op, a, b, c] {
+        w.u32(n)?;
+    }
+    Ok(())
+}
+
+/// The four numbers of MANAGE's body; BAD_SIZE unless it is four, INVALID
+/// for an `op` the service has not.
+pub fn read_manage(mut body: Reader<'_>) -> Result<[u32; 4], Status> {
+    let n = [body.u32()?, body.u32()?, body.u32()?, body.u32()?];
+    body.finish()?;
+    if n[0] > manage::LAST {
+        return Err(code(INVALID));
+    }
+    Ok(n)
+}
+
+/// A window of LIST: its id (the number WINDOW_CREATE said), place and
+/// size, flags and its place in the order of depth (0 is the lowest).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowRecord {
+    pub id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub flags: u32,
+    pub depth: u32,
+}
+
+/// The bytes of a record of LIST.
+pub const WINDOW_RECORD: usize = 28;
+/// WindowRecord's `flags`: the window is shown (it has something and is not
+/// hidden), it has the focus.
+pub const SHOWN: u32 = 1;
+pub const FOCUSED: u32 = 2;
+
+impl WindowRecord {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for n in [
+            self.id, self.x, self.y, self.w, self.h, self.flags, self.depth,
+        ] {
+            w.u32(n)?;
+        }
+        Ok(())
+    }
+}
+
+/// LIST's reply: status 0, the count, the records.
+pub fn write_list(records: &[WindowRecord], w: &mut Writer) -> Result<(), Status> {
+    w.u32(Status::Ok.code())?;
+    w.u32(records.len() as u32)?;
+    for r in records {
+        r.write(w)?;
+    }
+    Ok(())
+}
+
+/// The records of a reply of LIST, each given to `each`.
+pub fn read_list(reply: &[u8], mut each: impl FnMut(WindowRecord)) -> Result<(), Status> {
+    let mut r = Reader::new(reply);
+    let status = Status::from_code(r.u32()?);
+    if status != Status::Ok {
+        return Err(status);
+    }
+    let count = r.u32()?;
+    for _ in 0..count {
+        each(WindowRecord {
+            id: r.u32()?,
+            x: r.u32()?,
+            y: r.u32()?,
+            w: r.u32()?,
+            h: r.u32()?,
+            flags: r.u32()?,
+            depth: r.u32()?,
+        });
+    }
+    r.finish()
+}
+
+/// The picture of the pointer, which the service lays over the screen and
+/// a probe computes the screen's CRC with.
+pub mod cursor {
+    /// The pointer's picture: 12 by 19 points, '#' black, 'o' white.
+    pub const CURSOR_W: u32 = 12;
+    pub const CURSOR_H: u32 = 19;
+    const CURSOR_ART: [&[u8; CURSOR_W as usize]; CURSOR_H as usize] = [
+        b"#           ",
+        b"##          ",
+        b"#o#         ",
+        b"#oo#        ",
+        b"#ooo#       ",
+        b"#oooo#      ",
+        b"#ooooo#     ",
+        b"#oooooo#    ",
+        b"#ooooooo#   ",
+        b"#oooooooo#  ",
+        b"#ooooo######",
+        b"#oo#oo#     ",
+        b"#o# #oo#    ",
+        b"##  #oo#    ",
+        b"#    #oo#   ",
+        b"     #oo#   ",
+        b"      #oo#  ",
+        b"      #oo#  ",
+        b"       ##   ",
+    ];
+
+    /// The bytes of the pointer's picture as ARGB8888, premultiplied (the
+    /// points are opaque or empty), CURSOR_W * 4 bytes a line.
+    pub const CURSOR: [u8; (CURSOR_W * CURSOR_H * 4) as usize] = {
+        let mut out = [0u8; (CURSOR_W * CURSOR_H * 4) as usize];
+        let mut y = 0;
+        while y < CURSOR_H as usize {
+            let mut x = 0;
+            while x < CURSOR_W as usize {
+                let point: u32 = match CURSOR_ART[y][x] {
+                    b'#' => 0xFF00_0000,
+                    b'o' => 0xFFFF_FFFF,
+                    _ => 0,
+                };
+                let b = point.to_le_bytes();
+                let at = (y * CURSOR_W as usize + x) * 4;
+                out[at] = b[0];
+                out[at + 1] = b[1];
+                out[at + 2] = b[2];
+                out[at + 3] = b[3];
+                x += 1;
+            }
+            y += 1;
+        }
+        out
+    };
+}
+
 /// The union of rectangles: the least rectangle that holds both; an empty
 /// side counts as no rectangle.
 pub fn union(a: Option<Rect>, b: Rect) -> Rect {
@@ -347,7 +685,7 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        assert_eq!(numbers, [17, 18, 19, 20]);
+        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header().version, proto_gpu::VERSION);
@@ -470,6 +808,79 @@ mod tests {
         w.u32(0).unwrap();
         w.u32(5).unwrap();
         assert_eq!(Post::read(Reader::new(w.as_bytes())), Err(code(INVALID)));
+    }
+
+    #[test]
+    fn an_event_round_trips_and_inject_takes_three_kinds() {
+        let e = Event::at(MOVE, 0, -3, 100, -200);
+        assert_eq!(Event::from_bytes(e.to_bytes()), e);
+        let mut w = Writer::new();
+        e.write_inject(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 8 + EVENT_LEN);
+        assert_eq!(Event::read_inject(Reader::new(&w.as_bytes()[8..])), Ok(e));
+        assert_eq!(
+            Event::read_inject(Reader::new(&w.as_bytes()[8..20])),
+            Err(Status::BadSize)
+        );
+        for kind in [0, FOCUS_IN, FOCUS_OUT, CREATE, CLOSE, 99] {
+            let mut w = Writer::new();
+            Event::new(kind, 0, 0).write_inject(&mut w).unwrap();
+            assert_eq!(
+                Event::read_inject(Reader::new(&w.as_bytes()[8..])),
+                Err(code(INVALID))
+            );
+        }
+    }
+
+    #[test]
+    fn events_and_lists_round_trip() {
+        let events = [Event::new(KEY, 30, 1), Event::at(BUTTON, 0x110, 1, 5, 6)];
+        let mut w = Writer::new();
+        write_events(&events, true, &mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 12 + 2 * EVENT_LEN);
+        let mut got = Vec::new();
+        assert_eq!(read_events(w.as_bytes(), |e| got.push(e)), Ok(LOST));
+        assert_eq!(got, events);
+        let refused = proto_wire::reply(code(REVOKED));
+        assert_eq!(read_events(&refused, |_| {}), Err(code(REVOKED)));
+        let a = WindowRecord {
+            id: 1,
+            x: 2,
+            y: 3,
+            w: 4,
+            h: 5,
+            flags: SHOWN | FOCUSED,
+            depth: 6,
+        };
+        let mut w = Writer::new();
+        write_list(&[a, a], &mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 8 + 2 * WINDOW_RECORD);
+        let mut got = Vec::new();
+        read_list(w.as_bytes(), |r| got.push(r)).unwrap();
+        assert_eq!(got, [a, a]);
+        // The most a reply holds.
+        let mut w = Writer::new();
+        write_events(&[Event::default(); MAX_EVENTS], false, &mut w).unwrap();
+    }
+
+    #[test]
+    fn manage_takes_four_numbers_and_a_known_op() {
+        let mut w = Writer::new();
+        write_manage(manage::MOVE, 1, 20, 30, &mut w).unwrap();
+        assert_eq!(
+            read_manage(Reader::new(&w.as_bytes()[8..])),
+            Ok([manage::MOVE, 1, 20, 30])
+        );
+        assert_eq!(
+            read_manage(Reader::new(&w.as_bytes()[8..20])),
+            Err(Status::BadSize)
+        );
+        let mut w = Writer::new();
+        write_manage(manage::LAST + 1, 0, 0, 0, &mut w).unwrap();
+        assert_eq!(
+            read_manage(Reader::new(&w.as_bytes()[8..])),
+            Err(code(INVALID))
+        );
     }
 
     #[test]

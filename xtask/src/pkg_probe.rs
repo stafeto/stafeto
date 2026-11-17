@@ -75,7 +75,7 @@ pub fn roots_file() -> Vec<u8> {
     std::fs::read(roots_path()).unwrap_or_default()
 }
 
-fn roots_path() -> PathBuf {
+pub(crate) fn roots_path() -> PathBuf {
     root().join("target/keys/stafeto-dev-root.pub")
 }
 
@@ -83,14 +83,14 @@ fn roots_path() -> PathBuf {
 type Log = Arc<Mutex<Vec<(Instant, String)>>>;
 
 /// The mirror: a child process whose output is read by a thread into the log. It ends with the value.
-struct Mirror {
+pub(crate) struct Mirror {
     child: Child,
     log: Log,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Mirror {
-    fn start(
+    pub(crate) fn start(
         directory: &Path,
         port: u16,
         certificate: &Path,
@@ -149,7 +149,7 @@ impl Mirror {
         Ok(mirror)
     }
 
-    fn lines(&self) -> Vec<String> {
+    pub(crate) fn lines(&self) -> Vec<String> {
         self.log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -197,11 +197,11 @@ fn gets_of_packages(requests: &[(Instant, String)]) -> usize {
         .count()
 }
 
-/// The state `good`: Doom and its WAD, signed by the development release key, serial
-/// `GOOD_SERIAL`, in `states/good`. The package files are those of `target/pkg`.
-fn make_good(states: &Path) -> Result<PathBuf, String> {
+/// A repository of the packages `names` with the index of serial `serial`, signed by the
+/// development release key, in `dir`. The package files are those of `target/pkg`.
+pub(crate) fn make_repository(dir: &Path, names: &[&str], serial: u64) -> Result<PathBuf, String> {
     let built = pkg::build(&pkg::Options {
-        names: DOOM.iter().map(|s| (*s).to_owned()).collect(),
+        names: names.iter().map(|s| (*s).to_owned()).collect(),
         key: None,
         cert: None,
         time: None,
@@ -210,22 +210,29 @@ fn make_good(states: &Path) -> Result<PathBuf, String> {
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        remove: Vec::new(),
     })?;
     let all = packages::load()?;
     repo::make(
         &built,
         &all,
         &repo::Options {
-            serial: GOOD_SERIAL,
+            serial,
             sources: false,
-            dir: Some(states.join("doom")),
+            dir: Some(dir.to_path_buf()),
             ..repo::Options::default()
         },
     )
 }
 
+/// The state `good`: Doom and its WAD, signed by the development release key, serial
+/// `GOOD_SERIAL`, in `states/good`. The package files are those of `target/pkg`.
+fn make_good(states: &Path) -> Result<PathBuf, String> {
+    make_repository(&states.join("doom"), &DOOM, GOOD_SERIAL)
+}
+
 /// The link `link` to the directory of a state, replaced in one step; its directory is made.
-fn point_at(link: &Path, state: &Path) -> Result<(), String> {
+pub(crate) fn point_at(link: &Path, state: &Path) -> Result<(), String> {
     if let Some(parent) = link.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -1362,8 +1369,13 @@ fn memory_first_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), Strin
             "memory: Doom should be in the store again: {lines:?}"
         ));
     }
-    ctx.report
-        .push("pkg install doom again: 2 packages in the store before the reboot".into());
+    // The files the install put back are the ones of a program that runs.
+    let demo = format!("doom -iwad {WAD} -timedemo demo1 -nodraw");
+    let timed = demo_run(run, &demo, "m1-demo")?;
+    ctx.report.push(format!(
+        "pkg install doom again: 2 packages in the store before the reboot, the demo runs: timed {} gametics",
+        timed.0
+    ));
     Ok(())
 }
 

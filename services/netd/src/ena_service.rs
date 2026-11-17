@@ -617,10 +617,6 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
             return NO_CONFIG;
         }
     };
-    if settings.consumers() > 0 {
-        rt::println!("net: the ENA kind has no consumers of the switch yet");
-        return NO_CONFIG;
-    }
     let Ok(mut got) = rt::service::register_with(&s.parent, &channel, Some(&switch_channel)) else {
         return NOT_REGISTERED;
     };
@@ -722,6 +718,7 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     let mut ports_key = [0; 16];
     ports_key.copy_from_slice(&key[8..24]);
     let demux_key = demux_secret(&ports_key, &key[24..32]);
+    let flows_key = demux_secret(&ports_key, b"switch-flows");
     // SAFETY: only this thread reaches TABLES, here once; the pointer is to zeroed memory of
     // the static.
     let tables = unsafe {
@@ -749,6 +746,29 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     } = tables;
     let lane = &crate::switch::INNER.lanes[netd::switchlogic::route::DEFAULT_INSTANCE];
     let mut device = NetDevice::new(RxRing::inner(lane), TxRing::inner(lane), mac);
+    // The switch's tables when the file asks for consumers (`switch N`). The sweep timer
+    // `make_switch_tables` makes is not used: the thread's own timer serves the sweep.
+    let (switch_tables, _sweep_timer) = match crate::make_switch_tables(
+        &s.process,
+        &switch_channel,
+        mac,
+        flows_key,
+        &settings,
+        level + 1,
+        instances,
+    ) {
+        Ok(made) => made,
+        Err(code) => return code,
+    };
+    let gate = (settings.consumers() > 0)
+        .then(|| {
+            sys::handle_duplicate(
+                &switch_channel,
+                Rights(Rights::NOTIFY.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
+            )
+            .ok()
+        })
+        .flatten();
     let (Some(storage0), Some(net0), Some(sessions0)) = (
         storages.iter_mut().next(),
         nets.iter_mut().next(),
@@ -775,7 +795,13 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
     // The switch thread: the wire over the pair, whose first epoch is odd (down) until the
     // admin side's `Up` of this bring-up has been seen (it was: the epoch is even already).
     let wire = Wire::new(hw, region, bufs);
-    let Some(switch) = EnaSwitch::new(wire, switch_channel, irq, msi, level + 1) else {
+    // The consumers' side is the routed layer over the wire (`netd::routed`); the tables'
+    // port bytes are the stack's to read (`turn_wanted`).
+    let routed = switch_tables.map(|tables| {
+        crate::switch::INNER.set_ports_base(tables.ports_ptr() as usize);
+        netd::routed::Routed::new(tables, rt::time::now, crate::now_ns)
+    });
+    let Some(switch) = EnaSwitch::new(wire, switch_channel, irq, msi, level + 1, routed) else {
         return NOT_STARTED;
     };
     let Ok(switch_thread) = ena_switch::start(
@@ -795,13 +821,13 @@ pub fn run(mut s: rt::startup::Startup, object: Handle<Memory>) -> u64 {
         view,
         mac,
         netd::books::AddressSync::new(),
-        crate::consumers::Side::new(0, None, crate::consumers::GATE_PRIORITY),
+        crate::consumers::Side::new(settings.consumers(), gate, crate::consumers::GATE_PRIORITY),
         #[cfg(feature = "trace")]
         crate::kdump::KernelDump::new(None),
     );
     driver0.cpus = cpus;
     driver0.instances = instances;
-    driver0.routed = false;
+    driver0.routed = settings.consumers() > 0;
     driver0.switch = Some((switch_thread, wake_switch));
     let mut free_slots = DRIVERS.fill().iter_mut();
     let driver = free_slots.next().expect("a slot").write(driver0);

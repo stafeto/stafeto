@@ -541,6 +541,9 @@ pub struct Options {
     /// Packages whose recipe gets one more line, so that their recipe changes
     /// (the probe of carrying makes a change this way).
     pub perturb: Vec<String>,
+    /// Paths of the selected packages that the package file leaves out: the file is a variant
+    /// for one image (`image_files`).
+    pub remove: Vec<String>,
 }
 
 pub struct Built {
@@ -581,7 +584,7 @@ pub fn image_files(
     };
     let missing: Vec<String> = layers
         .iter()
-        .filter(|l| l.replaced.is_empty() && !built(&l.package.name))
+        .filter(|l| l.replaced.is_empty() && l.removed.is_empty() && !built(&l.package.name))
         .map(|l| l.package.name.clone())
         .collect();
     if !missing.is_empty() {
@@ -595,12 +598,13 @@ pub fn image_files(
             replace: Vec::new(),
             previous: None,
             perturb: Vec::new(),
+            remove: Vec::new(),
         })?;
     }
     let plain = crate::target_dir().join("pkg");
     let mut files = Vec::new();
     for l in layers {
-        let dir = if l.replaced.is_empty() {
+        let dir = if l.replaced.is_empty() && l.removed.is_empty() {
             plain.clone()
         } else {
             let dir = plain
@@ -620,6 +624,7 @@ pub fn image_files(
                     .collect(),
                 previous: None,
                 perturb: Vec::new(),
+                remove: l.removed.iter().map(|p| (*p).to_string()).collect(),
             })?;
             dir
         };
@@ -828,6 +833,13 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
                 elf: false,
             };
         }
+        for path in &opts.remove {
+            let before = all_parts.len();
+            all_parts.retain(|part| part.path != *path);
+            if all_parts.len() == before {
+                return Err(format!("{}: no file {path} to leave out", p.name));
+            }
+        }
         let items: Vec<Item<'_>> = all_parts
             .iter()
             .map(|part| Item {
@@ -944,6 +956,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        remove: Vec::new(),
     };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<String, String> {

@@ -93,7 +93,22 @@ pub struct Wire<P: Platform + Clone> {
     /// The buffers of sending in the device's queue (`n - RX_BUFFERS`).
     tx_out: [u64; RX_BUFFERS / 64],
     book: TxBook,
+    /// Who each buffer of sending in the queue was submitted for (`submit`).
+    owner: [u8; RX_BUFFERS],
     counts: Counts,
+}
+
+/// What `Wire::rx_take` found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rx {
+    /// No completion waits.
+    Empty,
+    /// A frame of `len` bytes after the header, in receiving buffer `n`.
+    Frame { n: u16, len: usize },
+    /// A completion that was no frame: counted, the buffer is back in the queue.
+    Skipped,
+    /// A completion the pair does not know: the queue is out of step.
+    Broken,
 }
 
 fn bit(map: &[u64], n: usize) -> bool {
@@ -121,6 +136,7 @@ impl<P: Platform + Clone> Wire<P> {
             rx_out: [u64::MAX; RX_BUFFERS / 64],
             tx_out: [0; RX_BUFFERS / 64],
             book: TxBook::new(),
+            owner: [0; RX_BUFFERS],
             counts: Counts::default(),
         }
     }
@@ -194,12 +210,9 @@ impl<P: Platform + Clone> Wire<P> {
         unsafe { virtio_net::rings::buffer_at(self.bufs.va, n) }
     }
 
-    /// One step over `lane`: what the stack gave goes to the queues, the
-    /// completions of sending free their buffers, buffers are lent, the frames
-    /// of the wire go to the stack, and the doorbells ring.
-    pub fn step(&mut self, lane: &Rings<'_>) -> Step {
-        let mut out = Step::default();
-        // What the stack gave back.
+    /// What the stack gave back: buffers of receiving (a buffer of sending that came through
+    /// that ring goes to the pool) and buffers of sending it did not use.
+    pub fn take_back(&mut self, lane: &Rings<'_>) {
         for _ in 0..SWITCH_BACK {
             let Some(word) = lane.rx_back.pop() else {
                 break;
@@ -218,46 +231,64 @@ impl<P: Platform + Clone> Wire<P> {
             };
             self.book.release(word as u16);
         }
-        for _ in 0..SWITCH_TX {
-            let Some(word) = lane.tx_sub.pop() else {
-                break;
-            };
-            let (n, len, _) = unpack_frame(word);
-            let taken = usize::from(n) >= RX_BUFFERS
-                && usize::from(n) < BUFFERS
-                && self.io.as_mut().is_some_and(|io| io.tx_submit(n, len));
-            if taken {
-                set(&mut self.tx_out, usize::from(n) - RX_BUFFERS, true);
-                self.counts.tx += 1;
-            } else {
-                self.book.release(n);
-                self.counts.tx_dropped += 1;
-            }
+    }
+
+    /// The frame in sending buffer `n` goes in the queue of sending on `owner`'s account
+    /// (kept for `reclaim`). A buffer that is not a buffer of sending, or a queue that is down
+    /// or full, takes the buffer back to the pool and counts the frame as dropped. True when
+    /// queued.
+    pub fn submit(&mut self, n: u16, len: u16, owner: u8) -> bool {
+        let taken = usize::from(n) >= RX_BUFFERS
+            && usize::from(n) < BUFFERS
+            && self.io.as_mut().is_some_and(|io| io.tx_submit(n, len));
+        if taken {
+            let i = usize::from(n) - RX_BUFFERS;
+            set(&mut self.tx_out, i, true);
+            self.owner[i] = owner;
+            self.counts.tx += 1;
+        } else {
+            self.book.release(n);
+            self.counts.tx_dropped += 1;
         }
-        // What the device completed.
+        taken
+    }
+
+    /// The completions of sending: each buffer returns to the pool and `each` hears the owner it
+    /// was submitted for. True when a completion is one the pair does not know (the queue is
+    /// out of step).
+    pub fn reclaim(&mut self, mut each: impl FnMut(u8)) -> bool {
+        let mut broken = false;
         let mut done = [0u16; RECLAIM_STEP];
         let mut taken = 0;
-        if let Some(io) = self.io.as_mut() {
-            match io.tx_reclaim(RECLAIM_STEP, |n| {
-                done[taken] = n;
-                taken += 1;
-            }) {
-                Ok(_) => {}
-                Err(_) => out.broken = true,
-            }
+        if let Some(io) = self.io.as_mut()
+            && io
+                .tx_reclaim(RECLAIM_STEP, |n| {
+                    done[taken] = n;
+                    taken += 1;
+                })
+                .is_err()
+        {
+            broken = true;
         }
         for &n in &done[..taken] {
             let i = usize::from(n).wrapping_sub(RX_BUFFERS);
             if i < RX_BUFFERS && bit(&self.tx_out, i) {
                 set(&mut self.tx_out, i, false);
                 self.book.release(n);
+                each(self.owner[i]);
             } else {
-                out.broken = true;
+                broken = true;
             }
         }
-        // Buffers of sending for the stack.
+        broken
+    }
+
+    /// Lends buffers of sending to the stack while it holds fewer than `share` (the ring
+    /// `tx_supply` and `held`, which the caller counts elsewhere). True when the stack was out
+    /// of them and has some now (wake it).
+    pub fn lend(&mut self, lane: &Rings<'_>, share: usize, held: usize) -> bool {
         let mut lent = false;
-        while lane.tx_supply.len() < TX_SHARE {
+        while lane.tx_supply.len() + held < share {
             let Some(n) = self.book.alloc() else {
                 break;
             };
@@ -267,56 +298,136 @@ impl<P: Platform + Clone> Wire<P> {
             }
             lent = true;
         }
-        out.lent = lent && !lane.tx_supply.is_empty() && lane.starved.swap(false, Ordering::AcqRel);
+        lent && !lane.tx_supply.is_empty() && lane.starved.swap(false, Ordering::AcqRel)
+    }
+
+    /// A free buffer of sending for the caller's own frame; give it back with `tx_release`
+    /// or `submit`.
+    pub fn tx_alloc(&mut self) -> Option<u16> {
+        self.book.alloc()
+    }
+
+    pub fn tx_release(&mut self, n: u16) {
+        self.book.release(n);
+    }
+
+    /// The buffers of sending in the pool.
+    pub fn tx_free(&self) -> usize {
+        self.book.free()
+    }
+
+    /// The bytes of buffer `n` (receiving or sending) the caller holds: the frame lies
+    /// `HDR_LEN` bytes in.
+    pub fn bytes(&mut self, n: u16) -> &'static mut [u8] {
+        self.buffer(n)
+    }
+
+    /// The next frame of the wire: a buffer the device holds no more, with the length of its
+    /// frame, or the end of the completions. Completions that are no frame (in pieces, too
+    /// long, martian or not Ethernet) are counted and their buffers go back at once. A frame's
+    /// buffer is the caller's until it goes to a lane (`passed`) or back (`dropped`).
+    pub fn rx_take(&mut self) -> Rx {
+        let popped = match self.io.as_mut() {
+            Some(io) => io.rx_pop(),
+            None => Ok(None),
+        };
+        let rx = match popped {
+            Ok(Some(rx)) => rx,
+            Ok(None) => return Rx::Empty,
+            Err(_) => return Rx::Broken,
+        };
+        let i = usize::from(rx.n);
+        if !bit(&self.rx_out, i) {
+            // A completion of a buffer the device does not hold.
+            return Rx::Broken;
+        }
+        set(&mut self.rx_out, i, false);
+        let slice = self.buffer(rx.n);
+        slice[..HDR_LEN].fill(0);
+        let used = HDR_LEN + usize::from(rx.len);
+        let frame = rx.whole && rx.len > 0 && used <= slice.len();
+        match frames::classify(slice, used) {
+            RxFrame::Frame(len) if frame => Rx::Frame { n: rx.n, len },
+            _ => {
+                self.counts.rx_dropped += 1;
+                self.rx_free(rx.n);
+                Rx::Skipped
+            }
+        }
+    }
+
+    /// A frame from `rx_take` went to a lane or to a consumer.
+    pub fn passed(&mut self) {
+        self.counts.rx += 1;
+    }
+
+    /// A frame from `rx_take` was dropped (the tables, or no room): its buffer goes back.
+    pub fn dropped(&mut self, n: u16) {
+        self.counts.rx_dropped += 1;
+        self.rx_free(n);
+    }
+
+    /// A frame from `rx_take` was copied out for a consumer: its buffer goes back and the frame
+    /// counts as received.
+    pub fn consumed(&mut self, n: u16) {
+        self.counts.rx += 1;
+        self.rx_free(n);
+    }
+
+    /// Both doorbells. True when another step is due at once: completions the lane has room
+    /// for, or work the stack left in its rings.
+    pub fn bells(&mut self, lane: &Rings<'_>) -> bool {
+        match self.io.as_mut() {
+            Some(io) => {
+                io.rx_bell();
+                io.tx_bell();
+                RX_AHEAD > lane.rx_ready.len() && io.rx_ready()
+                    || !lane.tx_sub.is_empty()
+                    || !lane.rx_back.is_empty()
+                    || !lane.tx_back.is_empty()
+            }
+            None => false,
+        }
+    }
+
+    /// One step over `lane`: what the stack gave goes to the queues, the
+    /// completions of sending free their buffers, buffers are lent, the frames
+    /// of the wire go to the stack, and the doorbells ring.
+    pub fn step(&mut self, lane: &Rings<'_>) -> Step {
+        let mut out = Step::default();
+        self.take_back(lane);
+        for _ in 0..SWITCH_TX {
+            let Some(word) = lane.tx_sub.pop() else {
+                break;
+            };
+            let (n, len, _) = unpack_frame(word);
+            self.submit(n, len, 0);
+        }
+        out.broken |= self.reclaim(|_| {});
+        out.lent = self.lend(lane, TX_SHARE, 0);
         // The frames of the wire.
         let room = RX_AHEAD.saturating_sub(lane.rx_ready.len());
         let mut budget = SWITCH_RX.min(room);
         while budget > 0 {
-            let popped = match self.io.as_mut() {
-                Some(io) => io.rx_pop(),
-                None => Ok(None),
-            };
-            let rx = match popped {
-                Ok(Some(rx)) => rx,
-                Ok(None) => break,
-                Err(_) => {
+            match self.rx_take() {
+                Rx::Empty => break,
+                Rx::Broken => {
                     out.broken = true;
                     break;
                 }
-            };
-            budget -= 1;
-            let i = usize::from(rx.n);
-            if !bit(&self.rx_out, i) {
-                // A completion of a buffer the device does not hold.
-                out.broken = true;
-                continue;
-            }
-            set(&mut self.rx_out, i, false);
-            let slice = self.buffer(rx.n);
-            slice[..HDR_LEN].fill(0);
-            let used = HDR_LEN + usize::from(rx.len);
-            let frame = rx.whole && rx.len > 0 && used <= slice.len();
-            match frames::classify(slice, used) {
-                RxFrame::Frame(len)
-                    if frame && lane.rx_ready.push(pack_frame(rx.n, len as u16, false)) =>
-                {
-                    self.counts.rx += 1;
-                    out.passed = true;
-                }
-                _ => {
-                    self.counts.rx_dropped += 1;
-                    self.rx_free(rx.n);
+                Rx::Skipped => budget -= 1,
+                Rx::Frame { n, len } => {
+                    budget -= 1;
+                    if lane.rx_ready.push(pack_frame(n, len as u16, false)) {
+                        self.passed();
+                        out.passed = true;
+                    } else {
+                        self.dropped(n);
+                    }
                 }
             }
         }
-        if let Some(io) = self.io.as_mut() {
-            io.rx_bell();
-            io.tx_bell();
-            out.more = RX_AHEAD > lane.rx_ready.len() && io.rx_ready()
-                || !lane.tx_sub.is_empty()
-                || !lane.rx_back.is_empty()
-                || !lane.tx_back.is_empty();
-        }
+        out.more = self.bells(lane);
         out
     }
 

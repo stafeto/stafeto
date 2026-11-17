@@ -61,23 +61,35 @@ pub const LAUNCHER: Record = Record {
 /// takes (its 16 896 pages of quota, the disk service's 64 and the table
 /// itself are out of init's 127 789 pages on 512 MiB). Nothing of the shell,
 /// `httpd` or a reload of nginx (nine processes, 30 440 pages) needs more than
-/// the 14 x 4 096 pages left.
+/// the 14 x 4 096 pages less `PIXMAN_PAGES` that the pool has.
 pub const COMMAND_QUOTAS: u64 = 14;
+
+/// The pages the pool of the process service gave up for the compositor's
+/// pixman (stage G2 of the graphics design): the code of pixman is in the
+/// boot image and again in the process that runs it, together with its arena
+/// and the larger stack of the compositor, and the base image kept only 56
+/// pages over the 16 384 that `cargo xtask pkg-identity` asks for. The pool
+/// is tens of thousands of pages and the heaviest command (a reload of nginx,
+/// nine processes) needs 30 440, so it gives them up.
+pub const PIXMAN_PAGES: u64 = 150 * crate::PAGE;
 
 /// The process service of the base and the full image: the pool of the
 /// network image with `COMMAND_QUOTAS` quotas of a command.
 pub const BASE_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
-        + COMMAND_QUOTAS * NET_COMMAND_QUOTA,
+        + COMMAND_QUOTAS * NET_COMMAND_QUOTA
+        - PIXMAN_PAGES,
     ..NET_PROCESS_SERVICE
 };
 
 /// The table of the base and the full image.
 ///
 /// What init has free after the services started (the line `init: free pages`,
-/// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 16 440 pages of
-/// 127 388 on 512 MiB (16 813 before the compositor took its quota of 336 pages); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
+/// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 16 416 pages of
+/// 127 341 on 512 MiB (16 813 before the compositor took its quota of 336 pages, 16 440 before
+/// pixman took 64 pages of the compositor's quota and its code in the boot image and in the
+/// process, which `PIXMAN_PAGES` of the process pool paid); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
 /// of 54 MB leaves the memory of init about 11 000 pages smaller than the base image's, and the
 /// pool of the process service (16 quotas of 4 096 pages) stays; so the full image runs on 1 GiB
 /// (xtask `base_image::machine`), where the number is the one in docs/packages.md. The disk

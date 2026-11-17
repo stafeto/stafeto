@@ -92,6 +92,15 @@ them for the licence notes of the image.
   of the sources (`DOOM-LICENSE`, `DOOM-SOURCE`, `FREEDOOM-LICENSE`,
   `FREEDOOM-SOURCE`), and the check of the image compares the WAD with the
   one the build script unpacked.
+- pixman (`packages/pixman.toml`, MIT) is a base package that installs no file:
+  the composition service links its portable C paths statically
+  (`tools/build-pixman.py` fetches the pinned archive, checks its SHA-256 and
+  builds `target/pixman/libpixman.a` with the headers and the shim of
+  `ports/pixman`; `lib/pixman` links it). Nothing but the service links it, so
+  `xtask/src/packages.rs` names it in `SERVICE_LIBRARIES`, the one way a
+  package without files and without a package that links it in is accepted. Its
+  licence text is `COPYING` of the archive, and its notice directory
+  `/usr/share/licenses/pixman/` carries it with the note of the source.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its
@@ -621,11 +630,39 @@ record never restarts it, since a new instance would show a running `pkgd` an em
 packages installed with `pkg` are gone after a reboot, like every file of the image; the service
 says so on the console (`mem-blk: 524288 sectors in memory; installed packages are gone after a
 reboot`). The official repository is the one of the series, `/etc/pkg/official` as in the base
-image. A disk on NVMe for EBS with a permanent store comes after series 0.5.
+image. A disk on NVMe for EBS with a permanent store comes later (stafeto-design#757).
 `cargo xtask pkg-probe memory` runs the install steps on this store (init's feature
 `memory-store` turns the base table's disk into the memory disk, on the 2 GiB machine with no
 disk), removes Doom, installs it again, and boots the machine anew: the store holds no package
 and no file of Doom is there.
+
+### The store on an NVMe disk
+
+`services/nvme` (the program `nvme-blk`) is the `blk` of an image whose store is an NVMe disk: the
+same protocol as the Virtio driver (`proto/blk` version 1), over the library `lib/nvme`. Init finds
+the controller by its PCI id and its index in the walk of the bus (`At::Bar`, `At::Config`), and
+gives the service BAR 0, the function's page of configuration, the two MSI-X vectors (vector 0 for
+the admin queue, vector 1 for the I/O pair) and two DMA objects: the queues of 32 KiB, uncached,
+and the four cells of 16 KiB, cached (the DMA is coherent on EC2 and under QEMU). A completion is
+found by the interrupt of vector 1, or by the timer, which looks at the queue every 500 us while a
+command is out and no completion has come (and is the only way without MSI-X). A disk with blocks
+of 4 KiB reports `block` 4096, and a request that does not begin and end on a block is `INVALID`.
+`FLUSH` goes to the controller when it has a volatile write cache (VWC) and is done when the
+writes before it are, otherwise. The service is at level 39 with the budget `serve`, 100 us of each
+10 ms on CPU 0 (1 %, so the sum of CPU 0 in the shell image is 72 % of the 75 % the table allows).
+Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.SHST`) and `CC` 0
+before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
+it is given: the table names the data disk, and a disk with a system on it is never named.
+`cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
+a second NVMe controller over a file, stops QEMU once the probe has ended and nothing is in flight, and
+starts the machine again on the same file: the probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
+and with a transfer limit of 8 KiB; `breaks` runs a service that writes one sector off, which the
+probe must catch). The probe shows that what the service wrote is read back after a restart of the
+machine; it does not cut a write short, and a service that never sends FLUSH would pass it. The survival
+of the store format over a cut at each point of a write is shown by `cargo xtask store-crash` (13 crash
+points, on the Virtio disk). The service writes the whole disk, so choosing a volume and a partition
+table come before the record for EC2's volume. The record for EC2's volume comes with the switch of the image for EC2
+(stafeto-design#757).
 
 ## The package service
 
