@@ -254,13 +254,13 @@ impl Device for Disk {
 #[allow(clippy::absurd_extreme_comparisons)]
 #[cfg(feature = "crash")]
 fn crash_budget(count: &mut u32) -> bool {
-    if CRASH_AT == 0 || !ARMED.load(Acquire) {
+    if !ARMED.load(Acquire) {
         return false;
     }
     let before = WRITTEN.load(Acquire);
     let after = before + u64::from(*count);
     WRITTEN.store(after, Release);
-    if after < CRASH_AT {
+    if CRASH_AT == 0 || after < CRASH_AT {
         return false;
     }
     *count = CRASH_AT.saturating_sub(before) as u32;
