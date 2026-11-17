@@ -748,6 +748,9 @@ struct Fs {
     cancel_reported: u32,
 }
 
+/// The steps of the cleanup of a departed client that the notice of its departure makes.
+const DEPARTURE_INLINE: usize = 8;
+
 /// The free pages a request finds ready: the retired pages that bring the free list up to this
 /// many are moved to it before the request runs (at most this many steps).
 const SETTLE_PAGES: usize = 64;
@@ -1181,6 +1184,19 @@ impl Fs {
             .as_ref()
             .is_some_and(|(l, _)| *l == label)
             .then_some(i)
+    }
+
+    /// The steps of the cleanup of a departed client that its notice makes (at most
+    /// DEPARTURE_INLINE, fewer when its custody is empty or a step finds nothing to do); what
+    /// is left goes on in the turns of the service.
+    fn settle_departed(&mut self, fds: &mut Fds, label: u64) {
+        for _ in 0..DEPARTURE_INLINE {
+            if Self::lock_custody_empty(self.wait_jobs, self.places, fds, label)
+                || !self.cleanup_step(fds, label)
+            {
+                break;
+            }
+        }
     }
 
     /// A dead or superseded authority releases one retained reference per pass.
@@ -2386,6 +2402,11 @@ impl Service<0> for Fs {
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
+        // The departure goes on in the notice as far as a few steps take it, so that what a
+        // client that exits frees (its clones, its descriptions) is free for the next one that
+        // asks, and not for the turns thread, which runs when no other thread wants the CPU.
+        let label = s.label();
+        self.settle_departed(&mut s.data, label);
         self.waits.poll();
         // The locks of a departed client may have stood in a waiter's way: the waiters are
         // told in the notice of the departure.
@@ -2416,6 +2437,9 @@ impl Service<0> for Fs {
         if let Some(i) = self.birth_slot(label) {
             let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
             Self::depart_fields(self.ram, self.locks, self.identities, fds);
+            let (_, mut fds) = self.births[i].take().expect("exact retained birth");
+            self.settle_departed(&mut fds, label);
+            self.births[i] = Some((label, fds));
             self.waits.poll();
             self.lock_sweep.restart();
             self.lock_sweep_pending = self.locks.has_locks();
