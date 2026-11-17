@@ -103,6 +103,7 @@ name = "compositor"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "pixman",
  "proto-comp",
  "proto-gpu",
  "proto-init",
@@ -308,6 +309,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "focus-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "fscommon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,6 +385,7 @@ dependencies = [
  "netd",
  "nvme",
  "pci",
+ "proto-comp",
  "proto-fs",
  "proto-init",
  "proto-pipe",
@@ -607,6 +621,10 @@ dependencies = [
  "proto-wire",
  "rt",
 ]
+
+[[package]]
+name = "pixman"
+version = "0.1.0"
 
 [[package]]
 name = "pkg"

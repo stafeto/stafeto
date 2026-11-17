@@ -368,6 +368,13 @@ pub fn net_two_with(forwards: &[Forward]) -> Vec<String> {
 /// (`-display none`). The images that run the service add these arguments.
 pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mmio-bus.15"];
 
+/// The Virtio tablet of the pointer's input service (the second instance of
+/// services/virtio-input, `table/focus.rs`): the transport 13, address
+/// 0xa001a00, INTID 61, on the page 0xa001000 with the keyboard's. The
+/// monitor's `mouse_move` with absolute coordinates and `mouse_button` reach
+/// it (`-display none`).
+pub const TABLET: &[&str] = &["-device", "virtio-tablet-device,bus=virtio-mmio-bus.13"];
+
 /// The disk of a run (services/virtio-blk): a modern virtio-blk-pci at
 /// device 1 of bus 0, where `virtio_pci::qemu::DISK` expects it, over the
 /// raw file `image`. No legacy interface and no MSI-X (`vectors=0`), so the

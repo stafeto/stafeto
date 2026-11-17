@@ -65,6 +65,7 @@ mod fast_nginx;
 mod fast_probe;
 mod fast_scale;
 mod fast_switch;
+mod focus_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -2243,6 +2244,11 @@ commands:
             rectangle posted alone, two windows, the screen after a process ended and a window
             of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
             of the compositor and the display driver under -icount; with --hvf under HVF
+  focus-probe [--hvf] run the probe of focus and composition of two clients in QEMU: a window
+            with an alpha over another, the screen after a click that raises one, after the
+            manager's Alt-Tab and after the second client ended, each compared with QEMU's
+            screenshot by CRC-32, the keys of the window with the focus alone, a click of
+            QEMU's tablet, and the steps of the services under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2694,6 +2700,14 @@ fn main() {
                 comp_probe::probe(&qemu::HVF_V2)
             }),
             Some(_) => Err("comp-probe [--hvf]".to_owned()),
+        },
+        Some("focus-probe") => match args.get(1).map(String::as_str) {
+            None => focus_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                focus_probe::probe(&qemu::HVF_V3)?;
+                focus_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("focus-probe [--hvf]".to_owned()),
         },
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
@@ -10496,6 +10510,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // screenshot, the end of a process, a program of the first
         // revision, then the steps of the services under -icount.
         job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
+        // Focus and composition of two clients: a window with an alpha over
+        // another, a click and Alt-Tab that switch them, the keys of the
+        // window with the focus alone, a tablet's click, and the steps of
+        // the compositor and of the tablet's driver under -icount.
+        job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -13782,6 +13801,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "comp-probe",
         "--package",
+        "focus-probe",
+        "--package",
         "virtio-input",
         "--package",
         "input-probe",
@@ -13806,7 +13827,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15927,6 +15948,11 @@ mod entropy_in_images_tests {
             ),
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
             ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
+            ("focus_probe::PROGRAMS", &crate::focus_probe::PROGRAMS),
+            (
+                "focus_probe::STEPS_PROGRAMS",
+                &crate::focus_probe::STEPS_PROGRAMS,
+            ),
             (
                 "comp_probe::STEPS_PROGRAMS",
                 &crate::comp_probe::STEPS_PROGRAMS,

@@ -33,4 +33,5 @@ proto-wire = { path = "../../proto/wire" }
 # The program alone runs on stafeto: the host tests of the library build
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
+pixman = { path = "../../lib/pixman" }
 rt = { path = "../../lib/rt" }
