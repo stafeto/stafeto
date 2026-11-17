@@ -649,6 +649,7 @@ impl Probe<'_> {
             // The run under -icount has no monitor to move the tablet: this
             // window stays until the others made eight of them.
             self.until(&display, "the eight windows never came", |d| d.open == 8)?;
+            self.until(&display, "the many windows never went", |d| d.open == 1)?;
             return Ok(());
         }
         // The tablet: its click, in the window's coordinates, after the moves
@@ -728,6 +729,7 @@ impl Probe<'_> {
             // The manager runs while the many windows are made (the run under
             // -icount): they take no focus from it.
             self.until(&display, "the eight windows never came", |d| d.open == 8)?;
+            self.until(&display, "the many windows never went", |d| d.open == 1)?;
         }
         Ok(())
     }
