@@ -34,6 +34,8 @@ pub const IDC_MDTS: usize = 77;
 pub const IDC_VER: usize = 80;
 pub const IDC_NN: usize = 516;
 pub const IDC_VWC: usize = 525;
+/// The vendor specific area: EBS puts the name of the block device here.
+pub const IDC_VENDOR_NAME: usize = 3072;
 // Offsets in Identify Namespace (bytes).
 pub const IDN_NSZE: usize = 0;
 pub const IDN_NLBAF: usize = 25;

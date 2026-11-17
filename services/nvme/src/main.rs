@@ -109,6 +109,9 @@ const STEPS: usize = 8;
 const VECTORS: usize = 2;
 const IO_VECTOR: u16 = 1;
 
+/// The name of the record the identity is checked for, in the line of a refusal.
+const DATA_NAME: &str = "datadisk";
+
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;
 const NOT_REGISTERED: u64 = 3;
@@ -433,6 +436,14 @@ fn main(_: u64) -> u64 {
         found.nn,
         if plan.is_some() { "yes" } else { "no" }
     );
+    // The identity of the volume, before any request: a controller that is not the one the record
+    // names (the ESP of a machine, the root volume of an instance) is registered and refuses every
+    // operation, so no client reads it, writes it or formats it.
+    let want = nvme_blk::Want::parse(own);
+    let refused = !nvme_blk::matches(&found.serial, &found.vendor_name, &want);
+    if refused {
+        rt::println!("nvme: {DATA_NAME} is not the data volume, left alone");
+    }
     let Ok(view) = sys::handle_label(&channel, Rights::RECEIVE, TIMER_LABEL, level) else {
         return NOT_REGISTERED;
     };
@@ -441,6 +452,7 @@ fn main(_: u64) -> u64 {
     };
     let mut disk = Disk {
         nvme: controller,
+        refused,
         cells: Cells::new(sectors, FLAG_FLUSH),
         ops: LongOps::new(),
         info: Info {
@@ -484,6 +496,8 @@ fn main(_: u64) -> u64 {
 /// session that holds the shared buffer and the timer that looks at the queue.
 struct Disk {
     nvme: Nvme<Hw>,
+    /// The controller is not the volume the record names: every operation is refused.
+    refused: bool,
     cells: Cells,
     ops: LongOps<OPERATIONS>,
     info: Info,
@@ -806,6 +820,19 @@ impl Disk {
     }
 }
 
+/// The methods of the service: CRASH only with the feature `crash`.
+#[cfg(feature = "crash")]
+const METHODS: &[u16] = &[
+    Method::Info.number(),
+    Method::Read.number(),
+    Method::Write.number(),
+    Method::Flush.number(),
+    Method::Buffer.number(),
+    Method::Take.number(),
+    Method::Cancel.number(),
+    Method::Crash.number(),
+];
+#[cfg(not(feature = "crash"))]
 const METHODS: &[u16] = &[
     Method::Info.number(),
     Method::Read.number(),
@@ -816,12 +843,35 @@ const METHODS: &[u16] = &[
     Method::Cancel.number(),
 ];
 
+/// CRASH: a load from page 0 ends the service with a fault while the controller still has its
+/// queues; init stops the controller before it lets the DMA objects go, and starts the service
+/// again.
+#[cfg(feature = "crash")]
+fn crash(r: &Request<'_>) -> Answer {
+    if r.body().finish().is_err() {
+        return Answer::Status(Status::BadSize);
+    }
+    // SAFETY: the load is the fault the method exists for; the thread never runs after it.
+    unsafe {
+        core::arch::asm!(
+            "ldr {t}, [{a}]",
+            t = out(reg) _,
+            a = in(reg) 0_usize,
+            options(nostack, readonly),
+        )
+    };
+    Answer::Status(Status::Kernel(Error::BadState))
+}
+
 impl Service<0> for Disk {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = METHODS;
     type Data = LongSession;
 
     fn request(&mut self, s: &mut Session<LongSession, 0>, r: &mut Request<'_>) -> Answer {
+        if self.refused {
+            return Answer::Status(code(proto_blk::IO));
+        }
         match Method::from_number(r.method()) {
             Some(Method::Info) => self.info(r),
             Some(Method::Read) => self.io(s, r, Kind::Read),
@@ -830,6 +880,8 @@ impl Service<0> for Disk {
             Some(Method::Buffer) => self.give_buffer(r),
             Some(Method::Take) => self.take(s, r),
             Some(Method::Cancel) => self.cancel(s, r),
+            #[cfg(feature = "crash")]
+            Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }

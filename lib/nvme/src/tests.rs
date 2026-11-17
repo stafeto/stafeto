@@ -272,6 +272,7 @@ fn a_controller_comes_up_and_identify_is_read() {
     assert_eq!(&i.serial[..17], b"MODEL-SERIAL-0001");
     assert!(i.model.starts_with(b"stafeto model controller"));
     assert!(i.firmware.starts_with(b"1.0 "));
+    assert!(i.vendor_name.starts_with(b"/dev/sdf\0"));
     assert_eq!((i.nn, i.vwc, i.mdts), (1, true, 3));
     // 4 KiB << 3 is more than a cell.
     assert_eq!(i.max_transfer, CELL);

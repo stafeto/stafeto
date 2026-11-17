@@ -653,7 +653,29 @@ writes before it are, otherwise. The service is at level 39 with the budget `ser
 Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.SHST`) and `CC` 0
 before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
 it is given: the table names the data disk, and a disk with a system on it is never named.
-`cargo xtask nvme-persist key` runs the host key service (`datakey`) on the same kind of disk as the data volume of `datafs`: the first boot keeps the key that a stand-in for the boot script of Dropbear made, the second boot restores it, and the fingerprint line is the same on both.
+
+**The data volume.** The data file service (`datafs`, the files of `/data`) connects to the service
+`datadisk`, the NVMe record of the data volume. On EC2 the data volume is a second EBS volume, and the
+PCI function of the root volume is never given to any service, so no fault of the software can write
+into the ESP. The name `blk` stays with the disk of the package service (`pkgd`, which keeps to the
+memory disk on EC2), and the data volume never has it. The record names the identity of the volume it
+may serve, in the own arguments after the two physical addresses: a kind byte and a value. Kind 1 is the
+serial number of the controller (Identify Controller bytes 4..24; QEMU's `serial=stafeto-data`), kind 2
+the name of the block device that EBS puts into the vendor specific area (bytes 3072..3104, `sdf` or
+`/dev/sdf`, padded with spaces or zeros; both spellings of one name are the same name, any other value
+must be equal), and no bytes at all means no check (the record `blk`). `nvme-blk` compares the identity
+once the controller is up and before it takes a request. A controller that does not show the wanted
+identity is registered all the same: the service prints one line (`nvme: datadisk is not the data volume,
+left alone`), answers every request with the code IO, and issues no write and no format. It does not
+restart, so init has no loop to run.
+
+The record `datadisk` is optional on a platform (`Platform::optional`): a machine with no second
+controller has no such service, init leaves the record out and takes the name off the connections of
+`datafs`, and `datafs` says `no disk`, registers, and answers every request with `not mounted`. The host
+key service then keeps no key, and the key of the node is new on each boot. A wrong or missing volume
+costs the data of the node and nothing else.
+
+`cargo xtask nvme-persist key` runs the host key service (`datakey`) on the same kind of disk as the data volume of `datafs`: the first boot keeps the key that a stand-in for the boot script of Dropbear made, the second boot restores it, and the fingerprint line is the same on both. `key nodisk` boots with no data controller (the key is new on each of two boots, and nothing restarts); `key wrongdisk` gives the controller another serial number over a file that stands for the ESP (the line `left alone` appears and the SHA-256 of the file is the same after the boot); `key wrongdisk breaks` builds the service with the feature `break-nvme-identity`, which makes the check always pass, and the case must then fail. `cargo xtask nvme-persist blk-probe` runs the probe of the disk service (`tests/blk-probe`) over the NVMe disk, with a CRASH and a restart of the service.
 `cargo xtask nvme-persist` runs the whole scenario of the store probe on QEMU's `EFI` machine with
 a second NVMe controller over a file, stops QEMU once the probe has ended and nothing is in flight, and
 starts the machine again on the same file: the probe finds the installed package running (`lba4096` and `mdts1` run it on a disk of 4 KiB blocks
@@ -661,8 +683,9 @@ and with a transfer limit of 8 KiB; `breaks` runs a service that writes one sect
 probe must catch). The probe shows that what the service wrote is read back after a restart of the
 machine; it does not cut a write short, and a service that never sends FLUSH would pass it. The survival
 of the store format over a cut at each point of a write is shown by `cargo xtask store-crash` (13 crash
-points, on the Virtio disk). The service writes the whole disk, so choosing a volume and a partition
-table come before the record for EC2's volume. The record for EC2's volume comes with the switch of the image for EC2
+points, on the Virtio disk). The service writes the whole disk it serves, so the check of the volume's
+identity stands before every use of it. The partitions of one disk (windows of `nvme-blk` by partition) wait for the
+move of `pkgd` to the disk. The record for EC2's data volume comes with the switch of the image for EC2
 (stafeto-design#757).
 
 ## The package service
