@@ -33,6 +33,11 @@ if [ ! -f /root/.ssh/authorized_keys ]; then
 fi
 
 mkdir -p /etc/dropbear
+# A key that came back from the volume must be one the server can use: another is made.
+if [ -f "$key" ] && ! /bin/dropbearkey -y -f "$key" >/dev/null 2>&1; then
+    echo "dropbear: the key in $key is not usable, a new one is made"
+    rm -f "$key"
+fi
 if [ ! -f "$key" ]; then
     if ! /bin/dropbearkey -t ed25519 -f "$key" >/dev/null 2>&1; then
         rm -f "$key"

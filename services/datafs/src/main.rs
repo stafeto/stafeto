@@ -108,7 +108,7 @@ fn main(_: u64) -> u64 {
         kick,
         again,
         pending: [const { None }; JOBS],
-        forgotten: [0; JOBS],
+        forgotten: [0; SESSIONS],
         forgotten_count: 0,
         ready: false,
     };
@@ -153,7 +153,7 @@ struct Datafs {
     /// The deferred reply of each job in flight.
     pending: [Option<Pending>; JOBS],
     /// The sessions that went while every job was in use: their files close when a job is free.
-    forgotten: [u64; JOBS],
+    forgotten: [u64; SESSIONS],
     forgotten_count: usize,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
     ready: bool,
@@ -177,10 +177,17 @@ impl Datafs {
         let _ = sys::notify(&self.kick, 1);
     }
 
-    /// The closes of the sessions that went and found no job free.
+    /// The closes of the sessions that went and found no job free. At most `SETTLE_AT_ONCE` go in one
+    /// step; when more wait and jobs are free, the service tells itself again and the rest follow.
     fn close_forgotten(&mut self) {
+        let mut queued = 0;
         while self.forgotten_count > 0 {
             let Some(i) = self.free_job() else { return };
+            if queued == SETTLE_AT_ONCE {
+                let _ = sys::notify(&self.again, 1);
+                return;
+            }
+            queued += 1;
             self.forgotten_count -= 1;
             let owner = self.forgotten[self.forgotten_count];
             self.queue(i, GONE, owner, &[]);
@@ -246,7 +253,7 @@ impl Service<0> for Datafs {
         }
         match self.free_job() {
             Some(i) => self.queue(i, GONE, label, &[]),
-            None if self.forgotten_count < JOBS => {
+            None if self.forgotten_count < SESSIONS => {
                 self.forgotten[self.forgotten_count] = label;
                 self.forgotten_count += 1;
             }

@@ -141,7 +141,15 @@ fn write_ram(key: &Key) -> Result<(), FsError> {
         }
     };
     let closed = files.close(fd);
-    result.and(closed)
+    let outcome = result.and(closed);
+    if outcome.is_err() {
+        // No part of a key stays behind: the file is emptied again (the file service has no removal
+        // for a service), and the boot script makes a new key when the file holds none.
+        if let Ok(fd) = files.open(RAM_KEY, proto_fs::WRITE_ONLY | proto_fs::TRUNCATE) {
+            let _ = files.close(fd);
+        }
+    }
+    outcome
 }
 
 /// The session with `datafs`.
@@ -199,6 +207,10 @@ impl Data {
             let n = reply.word(0) as usize;
             if n == 0 {
                 break Ok(());
+            }
+            // The count lies inside the bytes of the reply.
+            if n > reply.len.saturating_sub(8) {
+                break Err(Status::BadSize);
             }
             if len + n > KEY_MAX {
                 break Err(Status::Unknown(p::TOO_BIG));
@@ -272,6 +284,8 @@ fn main(_: u64) -> u64 {
     let mut key = Key::new();
     let found = match (&data, files_ok) {
         (Some(data), true) => match data.read(&mut key) {
+            // A key of no bytes is no key.
+            Ok(true) if key.len == 0 => Found::NoKey,
             Ok(true) => {
                 match write_ram(&key) {
                     Ok(()) => rt::println!("datakey: host key restored from /data"),

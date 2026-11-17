@@ -9,7 +9,8 @@
 //!
 //! `ssh: host key FNV:<16 hex digits>`
 //!
-//! Then the probe waits eight seconds, in which `datakey` keeps a new key on the volume, and ends. The
+//! Then the probe waits until `datakey` ends (it keeps a new key on the volume first), for two minutes at
+//! most, and ends. The
 //! bytes of the key are never printed.
 
 #![no_std]
@@ -76,7 +77,7 @@ fn main(_: u64) -> u64 {
     }
     // The service registers once it has put the key of the volume into the file service: the
     // session comes then (an end of the service after that makes it fail, and the key is in place).
-    let _ = rt::service::connect(&start.parent, "datakey");
+    let session = rt::service::connect(&start.parent, "datakey").ok();
     let Ok(startup) = StartupFiles::connect(&start.parent, false) else {
         rt::println!("datakey-probe: failed: no file service");
         return 2;
@@ -105,9 +106,16 @@ fn main(_: u64) -> u64 {
             return 2;
         }
     }
-    let until = rt::time::now() + 8 * rt::time::frequency();
-    while rt::time::now() < until {
-        let _ = rt::sys::yield_now();
+    // The service ends once it has kept a new key (or has none to wait for): a request to it then
+    // fails. A look every tenth of a second, and a limit of two minutes.
+    if let Some(session) = session {
+        let limit = rt::time::now() + 120 * rt::time::frequency();
+        while rt::time::now() < limit && rt::sys::send(&session, &[0]).is_ok() {
+            let until = rt::time::now() + rt::time::frequency() / 10;
+            while rt::time::now() < until {
+                let _ = rt::sys::yield_now();
+            }
+        }
     }
     rt::println!("datakey-probe: ended");
     0
