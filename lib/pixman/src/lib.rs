@@ -161,8 +161,8 @@ mod imp {
     fn shaped(at: usize, len: usize, stride: u32, width: u32, height: u32) -> bool {
         width > 0
             && height > 0
-            && at % 4 == 0
-            && stride % 4 == 0
+            && at.is_multiple_of(4)
+            && stride.is_multiple_of(4)
             && u64::from(stride) >= u64::from(width) * 4
             && u64::from(stride) * u64::from(height) <= len as u64
             && i32::try_from(stride).is_ok()
