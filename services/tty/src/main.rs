@@ -3231,8 +3231,16 @@ impl Service<0> for Tty {
             Some(Method::WatchCancel) => self.watch_keyed(s, r, true),
             Some(Method::ReadStart) => self.read(s, r, false, false),
             Some(Method::ReadTake) => self.read(s, r, true, false),
-            Some(Method::WriteStart) => self.write(s, r, false, false),
-            Some(Method::WriteTake) => self.write(s, r, true, false),
+            Some(Method::WriteStart | Method::WriteTake) => {
+                let answer = self.write(s, r, r.method() == Method::WriteTake as u16, false);
+                // What the client wrote goes to the driver in its own request (up to the room
+                // the driver gave): the steps that would send it run at the service's own level
+                // only while its budgets last.
+                if self.active == 0 {
+                    self.settle_output();
+                }
+                answer
+            }
             Some(Method::DrainStart) => self.drain(s, r, false),
             Some(Method::DrainTake) => self.drain(s, r, true),
             Some(Method::FlushQueues) => self.flush_queues(s, r),
