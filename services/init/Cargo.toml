@@ -110,6 +110,8 @@ table-entropy-vz = []
 table-entropy-seed = []
 # The probe of the display service (xtask gpu-probe).
 table-gpu = []
+# The probe of the composition service (xtask comp-probe).
+table-comp = []
 # The network service in the image of the shell, and the image of its probe
 # (xtask net-probe).
 table-net = []
