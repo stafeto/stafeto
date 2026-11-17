@@ -648,8 +648,8 @@ impl Probe<'_> {
         if cfg!(feature = "quick") {
             // The run under -icount has no monitor to move the tablet: this
             // window stays until the others made eight of them.
-            self.until(&display, "the eight windows never came", |d| d.open == 8)?;
-            self.until(&display, "the many windows never went", |d| d.open == 1)?;
+            self.wait_open(&display, 8)?;
+            self.wait_open(&display, 1)?;
             // The last of the programs to end: xtask stops on this one.
             self.sleep(100_000_000);
             return Ok(());
@@ -730,8 +730,8 @@ impl Probe<'_> {
         if cfg!(feature = "quick") {
             // The manager runs while the many windows are made (the run under
             // -icount): they take no focus from it.
-            self.until(&display, "the eight windows never came", |d| d.open == 8)?;
-            self.until(&display, "the many windows never went", |d| d.open == 1)?;
+            self.wait_open(&display, 8)?;
+            self.wait_open(&display, 1)?;
         }
         Ok(())
     }
@@ -886,7 +886,20 @@ impl Probe<'_> {
         }
         rt::println!("focus-probe: eight windows are shown and none of the seven took the focus");
         // Held until the first client has seen them all.
-        self.sleep(200_000_000);
+        self.sleep(500_000_000);
+        Ok(())
+    }
+
+    /// DESCRIBE until `n` windows are open, whether or not a frame is being
+    /// made, at most WAIT_NS.
+    fn wait_open(&self, display: &Handle<Channel>, n: u32) -> Result<(), &'static str> {
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while self.describe(display).map_err(say("DESCRIBE"))?.open != n {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the windows never were the number wanted");
+            }
+            self.sleep(RETRY_NS);
+        }
         Ok(())
     }
 
