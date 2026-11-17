@@ -2376,7 +2376,7 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// so a lower bound; a preemption by another process costs more. A step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
-/// be above 0, and under -icount near the timer's, with the time of the
+/// be above 0 when the second burn lasted over two periods of the timer, and under -icount near the timer's, with the time of the
 /// second burn above the first.
 fn a_preemption_is_counted_and_costed() -> Outcome {
     let (pure, none, elapsed) = timed_burn()?;
@@ -2390,7 +2390,7 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
     // The helper runs at once, above init, and waits: that preemption is
     // before the burn.
     let helper = spawn(0, timer_helper, arg, HIGH, Policy::Fifo)?;
-    let (charged, count, _) = timed_burn()?;
+    let (charged, count, elapsed2) = timed_burn()?;
     HELPER_STOP.store(1, Relaxed);
     while HELPER_DONE.load(Relaxed) == 0 {
         // A deadline that passed fires in the call itself.
@@ -2402,8 +2402,14 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
     close(c)?;
     let one_cpu = sys::cpu_info(0).map_err(|_| "CPU info failed")?.cpus == 1;
     if one_cpu {
+        // The period comes from the first burn, and a timer fires once a period after the
+        // helper armed it, which was before the second burn began: a burn that lasts over
+        // two periods holds a deadline whatever the phase. A second burn that is shorter
+        // (the first one was stretched, by the host or by the translation of its code)
+        // owes no preemption.
+        let period = HELPER_PERIOD_NS.load(Relaxed);
         check(
-            count > 0,
+            count > 0 || time::ticks_to_ns(elapsed2) <= 2 * period,
             "a thread above init woken by a timer did not preempt it",
         )?;
     }
