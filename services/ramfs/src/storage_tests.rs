@@ -644,11 +644,6 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
     ram.storage
         .truncate_zero(first, proto_fs::Timestamp::legacy_ns(5000))
         .unwrap();
-    assert_eq!(
-        ram.storage.write(first, FIRST, 0, b"refused"),
-        Err(NO_SPACE)
-    );
-    assert_eq!(ram.storage.node(first).unwrap().length, 0);
     for (root, _, name) in &files {
         ram.storage.unlink(ROOT, name.as_bytes(), *root).unwrap();
     }
@@ -839,4 +834,39 @@ fn a_truncated_chain_is_owed_by_nobody_and_its_pages_wait_for_the_maintenance() 
     assert_eq!(ram.storage.available().pages, free - 3);
     while ram.storage.reclaim_step() {}
     assert_eq!(ram.storage.available().pages, free);
+}
+
+#[test]
+fn an_allocation_right_after_a_large_truncate_needs_no_maintenance() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let big = create(&mut ram, FIRST, b"big");
+    let rest = create(&mut ram, FIRST, b"rest");
+    let other = create(&mut ram, SECOND, b"other");
+    let all = |pages: usize| vec![1u8; pages * 4096];
+    // Every page of the pool is taken: 3072 by the first account, the rest by the second.
+    let big_pages = 2048;
+    let rest_pages = usize::from(PAGE_SHARE) - big_pages;
+    let other_pages = PAGES - usize::from(PAGE_SHARE);
+    for (token, root, pages) in [
+        (big, FIRST, big_pages),
+        (rest, FIRST, rest_pages),
+        (other, SECOND, other_pages),
+    ] {
+        let data = all(pages);
+        assert_eq!(ram.storage.write(token, root, 0, &data), Ok(data.len()));
+    }
+    assert_eq!(ram.storage.available().pages, 0);
+    ram.storage
+        .truncate_zero(big, proto_fs::Timestamp::legacy_ns(1))
+        .unwrap();
+    // The pages wait on the FIFO and no maintenance step has run: a write takes them at once.
+    assert_eq!(ram.storage.available().pages, 0);
+    assert_eq!(ram.storage.usage(FIRST).pages as usize, rest_pages);
+    let two = [3u8; 4096 * 2];
+    assert_eq!(ram.storage.write(big, FIRST, 0, &two), Ok(two.len()));
+    assert_eq!(ram.storage.usage(FIRST).pages as usize, rest_pages + 2);
+    // The counts stay exact: the pages of the list and of the FIFO add up to what is free.
+    assert_eq!(ram.storage.available().pages, 0);
+    while ram.storage.reclaim_step() {}
+    assert_eq!(ram.storage.available().pages as usize, big_pages - 2);
 }

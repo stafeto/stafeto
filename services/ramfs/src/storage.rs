@@ -697,7 +697,20 @@ impl Storage<'_> {
         Ok(())
     }
 
+    /// The pages a request may count on: the free list and the retired FIFO behind it (a retired
+    /// page is owed by no account, so the quota of an account admits it).
+    fn free_pages(&self) -> usize {
+        self.state.page_len + self.state.retired_pages
+    }
+    /// Makes sure the free list holds a page when `free_pages` is not zero: with the list empty,
+    /// one retired page moves to it (one step), so a request does not wait for the maintenance.
+    fn ready_page(&mut self) {
+        if self.state.page_len == 0 && self.state.retired_len != 0 {
+            self.reclaim_retired_page();
+        }
+    }
     fn io_take_page(&mut self, root: u16, logical: usize) -> TempPage {
+        self.ready_page();
         self.state.page_len -= 1;
         let physical = self.state.page_free[self.state.page_len];
         self.state.accounts[root as usize]
@@ -763,7 +776,7 @@ impl Storage<'_> {
         if existing == NONE && (self.state.inode_len == 0 || usage.inodes == INODE_SHARE) {
             return Err(NO_SPACE);
         }
-        let mut credit = self.state.page_len.min((PAGE_SHARE - usage.pages) as usize);
+        let mut credit = self.free_pages().min((PAGE_SHARE - usage.pages) as usize);
         let wanted = requested.min((capacity - offset) as usize);
         let mut count = 0;
         while count < wanted {
@@ -946,7 +959,7 @@ impl Storage<'_> {
                 let usage = self.state.accounts[root as usize]
                     .expect("retained root")
                     .usage;
-                if self.state.page_len == 0 || usage.pages == PAGE_SHARE {
+                if self.free_pages() == 0 || usage.pages == PAGE_SHARE {
                     return Err(NO_SPACE);
                 }
                 tail = self.io_take_page(root, logical);
@@ -1427,7 +1440,7 @@ impl<'a> Storage<'a> {
     pub fn allocate_lock_page(&mut self, root: Root) -> Result<LockPage, u32> {
         let anchor = self.lock_anchor(root)?;
         let index = anchor.index() as usize;
-        if self.state.page_len == 0
+        if self.free_pages() == 0
             || self.state.accounts[index].as_ref().unwrap().usage.pages >= PAGE_SHARE
         {
             self.release_lock_anchor(anchor)?;
@@ -2310,7 +2323,7 @@ impl<'a> Storage<'a> {
                 (first..=last).filter(|&p| overlay.pages[p] == NONE).count(),
             )
         };
-        if need > self.state.page_len
+        if need > self.free_pages()
             || self.state.accounts[a].unwrap().usage.pages as usize + need > PAGE_SHARE as usize
         {
             return Err(NO_SPACE);
@@ -2320,6 +2333,7 @@ impl<'a> Storage<'a> {
             if self.state.overlays[i].pages[p] != NONE {
                 continue;
             }
+            self.ready_page();
             self.state.page_len -= 1;
             let page = self.state.page_free[self.state.page_len];
             let start = p * PAGE;
@@ -2549,7 +2563,7 @@ impl Storage<'_> {
             .as_ref()
             .expect("paid result root");
         if count > crate::cwd::getcwd::MAX_PAGES
-            || count > self.state.page_len
+            || count > self.free_pages()
             || count > usize::from(PAGE_SHARE - a.usage.pages)
         {
             return Err(crate::cwd::getcwd::NO_MEMORY);
