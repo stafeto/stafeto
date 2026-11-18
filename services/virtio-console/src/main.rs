@@ -68,9 +68,9 @@ const BAR_AT: usize = 0x10_2000_0000;
 /// The period of the reads of the kernel log.
 const LOG_PERIOD_NS: u64 = 50_000_000;
 /// The time the driver gives the kernel log and its own output to reach the
-/// port once init asked it to stop (`Driver::stop`), less than the 500 ms
-/// init gives a record to end.
-const STOP_DRAIN_NS: u64 = 300_000_000;
+/// port once init asked it to stop (`Driver::stop`), less than the 2 s init
+/// gives the console (shutdown::CONSOLE_STOP_NS).
+const STOP_DRAIN_NS: u64 = 1_500_000_000;
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// The priority of the slot of label 0 of the driver's channel.
@@ -622,7 +622,7 @@ impl Driver {
                 })
             };
             let mut peek = |k: u64, cursor: u64, into: &mut uart::log::Records| {
-                sys::log_peek_other(log, k, cursor, into).ok()
+                sys::log_peek_console(log, k, cursor, into).ok()
             };
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
@@ -1042,7 +1042,20 @@ impl Driver {
         let out = &self.state.output;
         let drained =
             self.left == 0 && out.log_done() && out.clients_empty() && !self.port.sending();
-        if drained || time::ticks_to_ns(time::now()) >= by {
+        if drained {
+            sys::process_exit(0)
+        }
+        if time::ticks_to_ns(time::now()) >= by {
+            // What the driver took and did not send is gone: the ring's
+            // `seen` cursor passed it, so the end of the system will not
+            // print it. One line tells how much, through debug_write, which
+            // the end path prints.
+            let lost = self.state.output.unsent();
+            if lost > 0 {
+                let _ = rt::console::write_fmt(format_args!(
+                    "virtio-console: stopped with {lost} bytes of the log not sent\n"
+                ));
+            }
             sys::process_exit(0)
         }
     }

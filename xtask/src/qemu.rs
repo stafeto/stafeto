@@ -1354,20 +1354,20 @@ pub fn expect_system_off(o: &Outcome) -> Result<(), String> {
 }
 
 /// A run that ended with init's exit: no line the console driver showed
-/// before the line with `stopped` comes again between that line and
-/// SYSTEM_OFF_LINE. The kernel's end path prints what the driver did not
+/// before the line with `from` (init's line of the stop of the console
+/// record) comes again between that line and SYSTEM_OFF_LINE. The kernel's end path prints what the driver did not
 /// take; a record the driver took (`peek_shared` on another CPU) printed
 /// again is the repeat this finds. Empty lines and the kernel's count of
 /// lost records are not compared.
-pub fn expect_no_replay_at_the_end(lines: &[String], stopped: &str) -> Result<(), String> {
-    let Some(at) = lines.iter().position(|l| l.contains(stopped)) else {
+pub fn expect_no_replay_at_the_end(lines: &[String], from: &str) -> Result<(), String> {
+    let Some(at) = lines.iter().position(|l| l.contains(from)) else {
         return Err(format!(
-            "no line with {stopped:?}; last lines: {:?}",
+            "no line with {from:?}; last lines: {:?}",
             tail(lines)
         ));
     };
     let Some(off) = lines[at..].iter().position(|l| l == SYSTEM_OFF_LINE) else {
-        return Err(format!("no line {SYSTEM_OFF_LINE:?} after {stopped:?}"));
+        return Err(format!("no line {SYSTEM_OFF_LINE:?} after {from:?}"));
     };
     for line in &lines[at + 1..at + off] {
         if line.trim().is_empty() || line.starts_with("[kernel log:") {
@@ -1375,7 +1375,7 @@ pub fn expect_no_replay_at_the_end(lines: &[String], stopped: &str) -> Result<()
         }
         if lines[..=at].iter().any(|l| l == line) {
             return Err(format!(
-                "the line {line:?} shown before {stopped:?} comes again before {SYSTEM_OFF_LINE:?}"
+                "the line {line:?} shown before {from:?} comes again before {SYSTEM_OFF_LINE:?}"
             ));
         }
     }
@@ -2464,11 +2464,11 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     #[test]
     fn a_line_shown_before_the_stop_does_not_come_again_before_system_off() {
         let l = |v: &[&str]| lines(v);
-        let stopped = "init: stopped in ";
+        let stopped = "init: stopping uart";
         let good = l(&[
             "a",
             "power: button",
-            "init: stopped in 5 ms",
+            "init: stopping uart",
             "late",
             SYSTEM_OFF_LINE,
         ]);
@@ -2476,7 +2476,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         let replay = l(&[
             "a",
             "power: button",
-            "init: stopped in 5 ms",
+            "init: stopping uart",
             "a",
             SYSTEM_OFF_LINE,
         ]);
@@ -2487,15 +2487,15 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         );
         let lost = l(&[
             "a",
-            "init: stopped in 5 ms",
+            "init: stopping uart",
             "[kernel log: 3 records lost]",
             "",
             SYSTEM_OFF_LINE,
         ]);
         assert!(expect_no_replay_at_the_end(&lost, stopped).is_ok());
         assert!(expect_no_replay_at_the_end(&l(&["a", SYSTEM_OFF_LINE]), stopped).is_err());
-        assert!(expect_no_replay_at_the_end(&l(&["init: stopped in 5 ms"]), stopped).is_err());
-        let after = l(&["a", "init: stopped in 5 ms", SYSTEM_OFF_LINE, "a"]);
+        assert!(expect_no_replay_at_the_end(&l(&["init: stopping uart"]), stopped).is_err());
+        let after = l(&["a", "init: stopping uart", SYSTEM_OFF_LINE, "a"]);
         assert!(expect_no_replay_at_the_end(&after, stopped).is_ok());
     }
 

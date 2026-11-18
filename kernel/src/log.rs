@@ -93,25 +93,32 @@ pub fn take(t: NonNull<Thread>) -> LogBatch {
         .take(|i, r| thread::write_words(t, i * LOG_RECORD, &r.words()))
 }
 
-/// Non-destructive read from `first`, also returning the next sequence.
+/// Read of the ring of this CPU from `first`, also returning the next
+/// sequence; no cursor of the ring moves.
 pub fn peek(t: NonNull<Thread>, first: u64) -> (LogBatch, u64) {
     local().ring.lock().peek(first, |i, r| {
         thread::write_words(t, i * LOG_RECORD, &r.words())
     })
 }
 
-/// Non-destructive read of the ring of another CPU, the `k`th other than
-/// this one in the order of their numbers (1 for the first), from `first`;
-/// the owner's cursor stays, and the ring's `seen` cursor moves past what
-/// this gave (`Ring::peek_shared`). None for a `k` past the CPUs that are up.
-pub fn peek_other(t: NonNull<Thread>, k: usize, first: u64) -> Option<(LogBatch, u64)> {
+/// Read of the ring of another CPU, the `k`th other than this one in the
+/// order of their numbers (1 for the first), from `first`; the owner's
+/// cursor stays, and with `advance` (the console's read) the ring's `seen`
+/// cursor moves past what this gave (`Ring::peek_shared`). None for a `k` past
+/// the CPUs that are up.
+pub fn peek_other(
+    t: NonNull<Thread>,
+    k: usize,
+    first: u64,
+    advance: bool,
+) -> Option<(LogBatch, u64)> {
     let me = crate::arch::cpu::this().index();
     let cpu = (0..crate::smp::cpus()).filter(|&c| c != me).nth(k - 1)?;
     let ring = crate::arch::cpu::block(cpu).local.ring.as_ptr();
     // SAFETY: the rings of the CPUs that are up live for good, and only
     // their owners write them.
     Some(unsafe {
-        Ring::peek_shared(ring, first, |i, r| {
+        Ring::peek_shared(ring, first, advance, |i, r| {
             let mut words = r.words();
             // Byte 10, zero in a record that `take` gives, says the kernel
             // showed this one on its console: the driver that reads the

@@ -895,6 +895,13 @@ pub const INFO_LOG: u64 = 9;
 /// (the kth other than the caller's, 1 for the first) goes in the bits from
 /// this one up, with the cursor plus 1 below.
 pub const LOG_OTHER_SHIFT: u32 = 56;
+/// object_info LOG x2, bit 55 of a peek at another CPU's ring: the reader is
+/// the console, and what it was given counts as shown for the end of the
+/// system (the ring's `seen` cursor moves). The kernel honours the bit for a
+/// process that maps a device window (a driver) and ignores it for any
+/// other, so a reader that only looks at the log hides nothing from the
+/// owner's `take` and from the panic. The cursor takes the bits below it.
+pub const LOG_PEEK_SEEN: u64 = 1 << 55;
 // Kind 10 went with PROCESS_IDENTITY: process IDs live in the process
 // service (spec 11); a retired kind fails with INVALID_ARGS.
 /// LABEL takes a labelled copy of a channel, with no right needed, and in

@@ -1784,10 +1784,11 @@ enum Variant {
     /// numbers of `service-budget breaks` are printed for information.
     LiftAgainNotice,
     LiftAgainReply,
+    LogSeenBreak,
 }
 
 impl Variant {
-    const ALL: [Variant; 76] = [
+    const ALL: [Variant; 77] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1863,6 +1864,7 @@ impl Variant {
         Variant::LiftAgainNoticeTest,
         Variant::LiftAgainNotice,
         Variant::LiftAgainReply,
+        Variant::LogSeenBreak,
         Variant::LiftAgainReplyTest,
     ];
 
@@ -1950,6 +1952,7 @@ impl Variant {
             Variant::LiftAgainReplyTest => Some("ktest,break-relift-reply"),
             Variant::LiftAgainNotice => Some("break-relift-notice"),
             Variant::LiftAgainReply => Some("break-relift-reply"),
+            Variant::LogSeenBreak => Some("break-log-seen"),
         }
     }
 
@@ -2050,6 +2053,7 @@ impl Variant {
             Variant::LiftAgainReplyTest => "stafeto-ktest-relift-reply",
             Variant::LiftAgainNotice => "stafeto-relift-notice",
             Variant::LiftAgainReply => "stafeto-relift-reply",
+            Variant::LogSeenBreak => "stafeto-log-seen-break",
         }
     }
 }
@@ -10528,6 +10532,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("init end off", init_end_off),
         job("init end reset", init_end_reset),
         job("power button", || power_button(&qemu::VIRT)),
+        job("power button seen break", power_button_seen_break),
         job("power button GICv3", || power_button(&qemu::VIRT_V3)),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
@@ -12571,7 +12576,7 @@ const SMP_PROBE_LINES: [&str; 14] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
-    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
+    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 three times",
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
     "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
@@ -13411,8 +13416,27 @@ fn init_end_reset() -> Result<(), String> {
 /// on the GICv3 one; EC2 has a GICv3, but its line (39, level, a Graviton GIC) is covered only
 /// by the run on EC2.
 fn power_button(m: &qemu::Machine) -> Result<(), String> {
+    power_button_on(m, Variant::Normal)
+}
+
+/// The probe of the power button on the kernel that leaves the `seen` cursor of the log rings
+/// (`break-log-seen`): the end of the system prints again what the driver showed, and the probe
+/// must reject it.
+fn power_button_seen_break() -> Result<(), String> {
+    match power_button_on(&qemu::VIRT, Variant::LogSeenBreak) {
+        Err(e) => {
+            println!("power button seen break: caught by the probe ({e})");
+            Ok(())
+        }
+        Ok(()) => {
+            Err("the kernel that leaves the seen cursor passed the power button probe".into())
+        }
+    }
+}
+
+fn power_button_on(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(60);
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(variant)?;
     let image = build_boot_image(
         "boot-power-button.img",
         &POWER_BUTTON_PROGRAMS,
@@ -13471,7 +13495,7 @@ fn power_button(m: &qemu::Machine) -> Result<(), String> {
     }
     // The driver on the second CPU reads the ring of the first with a peek: the end path of the
     // kernel must not print again what it showed.
-    qemu::expect_no_replay_at_the_end(&outcome.lines, "init: stopped in ")
+    qemu::expect_no_replay_at_the_end(&outcome.lines, "init: stopping uart")
         .map_err(|e| format!("power button on {}: {e}", m.name))?;
     println!(
         "power button on {}: one press, the stop in order, one line off, no panic, powered off",

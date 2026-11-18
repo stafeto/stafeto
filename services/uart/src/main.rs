@@ -74,15 +74,16 @@ const LOG_BATCHES: usize = 64 / LOG_BATCH + 1;
 
 /// The codes of a start that failed: the start data, `log` among them;
 /// REGISTER, the window or the binding; the map of the window; the loop.
-/// The time the driver gives the kernel log and its own output to reach the
-/// port once init asked it to stop (`Uart::stop`), less than the 500 ms
-/// init gives a record to end.
-const STOP_DRAIN_NS: u64 = 300_000_000;
 const NO_START_DATA: u64 = 1;
 const NO_LOG: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
 const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
+/// The time the driver gives the kernel log and its own output to reach the
+/// port once init asked it to stop (`Uart::stop`), less than the 2 s init gives
+/// the console (shutdown::CONSOLE_STOP_NS): 3.4 KB leave in 300 ms at 115 200
+/// baud, and a stop wave of the other services leaves some tens of lines.
+const STOP_DRAIN_NS: u64 = 1_500_000_000;
 
 /// What the driver keeps in its data segment (spec 13.5): the rings of
 /// output and input, the writes that wait, the clients of ROOM, a batch of
@@ -536,7 +537,7 @@ impl Uart {
                 })
             };
             let mut peek = |k: u64, cursor: u64, into: &mut uart::log::Records| {
-                sys::log_peek_other(log, k, cursor, into).ok()
+                sys::log_peek_console(log, k, cursor, into).ok()
             };
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
@@ -995,7 +996,20 @@ impl Uart {
             && out.log_done()
             && out.clients_empty()
             && uart::regs::drained(self.regs.read(FR));
-        if drained || time::ticks_to_ns(time::now()) >= by {
+        if drained {
+            sys::process_exit(0)
+        }
+        if time::ticks_to_ns(time::now()) >= by {
+            // What the driver took and did not send is gone: the ring's
+            // `seen` cursor passed it, so the end of the system will not
+            // print it. One line tells how much, through debug_write, which
+            // the end path prints.
+            let lost = self.state.output.unsent();
+            if lost > 0 {
+                let _ = rt::console::write_fmt(format_args!(
+                    "uart: stopped with {lost} bytes of the log not sent\n"
+                ));
+            }
             sys::process_exit(0)
         }
     }

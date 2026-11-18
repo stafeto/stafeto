@@ -538,6 +538,11 @@ bytes = 64
 why = "the text of debug_write: eight words, 64 bytes"
 
 [[copy]]
+function = "kernel::log::record"
+bytes = 64
+why = "the text of a record of the kernel log: at most abi::LOG_TEXT = 64 bytes (Ring::push copies at most that and clears the rest of the record's 64); debug_write and the lines of the kernel reach it, and it is a function of its own with nine callers"
+
+[[copy]]
 function = "kernel::cleanup::portion"
 bytes = 4096
 why = "no object the kernel moves or fills is larger than a frame"

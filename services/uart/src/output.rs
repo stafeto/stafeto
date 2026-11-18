@@ -229,6 +229,13 @@ impl Output {
         self.log_at == self.log_len
     }
 
+    /// The bytes the driver holds that did not go out: the rest of the last
+    /// batch of the log and what the ring holds. A driver that exits now
+    /// loses them.
+    pub fn unsent(&self) -> usize {
+        (self.log_len - self.log_at) + self.ring_len
+    }
+
     /// Adds `bytes` to the text of the batch of the log, which starts
     /// over once the last went out whole: false, with nothing taken, when
     /// they do not fit.
@@ -390,6 +397,20 @@ impl Default for Output {
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn unsent_counts_the_rest_of_the_log_and_the_ring() {
+        let mut output = Output::new();
+        assert_eq!(output.unsent(), 0);
+        assert!(output.put_log(b"abcdef"));
+        assert_eq!(output.unsent(), 6);
+        assert!(output.put_raw(b"xy"));
+        assert_eq!(output.unsent(), 8);
+        let sent = take(&mut output, 3).len();
+        assert_eq!(output.unsent(), 8 - sent);
+        drain(&mut output);
+        assert_eq!(output.unsent(), 0);
+    }
 
     #[test]
     fn software_flush_preserves_log_and_replay_preserves_new_output() {

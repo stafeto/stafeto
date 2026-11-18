@@ -657,25 +657,50 @@ pub fn log_take(
 }
 
 /// `log_peek` on the ring of the `k`th other CPU (1 for the first, in the
-/// order of the CPUs' numbers), which its owner writes meanwhile: nothing in
-/// it changes. INVALID_ARGS for a `k` past the CPUs. A driver that shows the
-/// log takes its own CPU's ring (`log_take`) and peeks at the others'.
+/// order of the CPUs' numbers), which its owner writes meanwhile: the ring
+/// and its cursors stay, so a reader that only looks hides nothing from the
+/// owner and from the end of the system. INVALID_ARGS for a `k` past the CPUs.
+/// A driver that shows the log takes its own CPU's ring (`log_take`) and
+/// reads the others' with `log_peek_console`.
 pub fn log_peek_other(
     resource: &Handle<Resource>,
     k: u64,
     next: u64,
     records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
 ) -> Result<(LogBatch, u64), Error> {
+    peek_other(resource, k, next, 0, records)
+}
+
+/// `log_peek_other` for the driver of the console: what it was given counts
+/// as shown, so the kernel's end of the system does not print it again and
+/// does not count it lost (abi::LOG_PEEK_SEEN). The kernel honours it for a
+/// process with a device window and reads it as a plain peek for any other.
+pub fn log_peek_console(
+    resource: &Handle<Resource>,
+    k: u64,
+    next: u64,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<(LogBatch, u64), Error> {
+    peek_other(resource, k, next, abi::LOG_PEEK_SEEN, records)
+}
+
+fn peek_other(
+    resource: &Handle<Resource>,
+    k: u64,
+    next: u64,
+    flags: u64,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<(LogBatch, u64), Error> {
     if next == 0 || k == 0 {
         return Err(Error::InvalidArgs);
     }
-    if k >= 1 << (64 - abi::LOG_OTHER_SHIFT) || next >= 1 << abi::LOG_OTHER_SHIFT {
+    if k >= 1 << (64 - abi::LOG_OTHER_SHIFT) || next >= abi::LOG_PEEK_SEEN {
         return Err(Error::InvalidArgs);
     }
     let args = [
         resource.raw().0,
         abi::INFO_LOG,
-        k << abi::LOG_OTHER_SHIFT | next,
+        k << abi::LOG_OTHER_SHIFT | flags | next,
     ];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     let batch = LogBatch::from_words([x[1], x[2], x[3]]);
