@@ -737,6 +737,24 @@ fn judge(who: &str, rows: &[(usize, u64, u64)], kinds: &[(usize, &str)]) -> Resu
     }
 }
 
+/// The records the kernel log lost in a run: the numbers of its `[kernel log: N records lost]`
+/// lines. The burst at the start of the NVMe service's clients overruns the bounded log, and the
+/// step lines of the first calls (Info, Buffer) are among the records it loses, so a missing
+/// kind is reported with these numbers (stafeto/stafeto#455).
+fn lost_records(lines: &[String]) -> Vec<u64> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let at = l.find("[kernel log: ")?;
+            l[at + "[kernel log: ".len()..]
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
 /// The longest of each kind in two runs.
 fn merge(a: Vec<(usize, u64, u64)>, b: Vec<(usize, u64, u64)>) -> Vec<(usize, u64, u64)> {
     let mut out = a;
@@ -1327,6 +1345,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         // is looked for in a run on a fresh disk, two more at most, and the longest of each kind
         // is kept.
         let mut runs = 1;
+        let mut lost = vec![lost_records(&first)];
         while runs < 3
             && BLK_STEP_KINDS
                 .iter()
@@ -1344,9 +1363,12 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             )?;
             expect_within(&again, &steady_lines(&world))?;
             blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
+            lost.push(lost_records(&again));
             runs += 1;
         }
-        judge("the NVMe service", &blk, &BLK_STEP_KINDS)?;
+        judge("the NVMe service", &blk, &BLK_STEP_KINDS).map_err(|e| {
+            format!("{e}; records the kernel log lost in each of {runs} runs: {lost:?}")
+        })?;
         check_waits(
             &first,
             &[PKGD_TAG, blk_probe::BLK_TAG, RAM_TAG],
@@ -2497,6 +2519,47 @@ fn doom(machine: &qemu::Machine) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The console of run 44340066432 (guests-1, `nvme-persist steps`), from the line of the
+    /// first step to the line that follows the loss: the records of the first calls are gone.
+    const LOST_START: [&str; 9] = [
+        "nvme: serve runs under its budget",
+        "service step: 15 kind 66 779 ticks detail 0",
+        "service gap: 15 kind 66 8513 ticks of 9292",
+        "nvme: first interrupt of vector 0",
+        "[kernel log: 16 records lost]",
+        "pkgd: roots stafeto-dev-root",
+        "service step: 15 kind 2 3500 ticks detail 0",
+        "service step: 15 kind 65 2734 ticks detail 0",
+        "service step: 15 kind 6 5064 ticks detail 0",
+    ];
+
+    fn console(text: &[&str]) -> Vec<String> {
+        text.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_records_lost_are_counted_and_a_missing_kind_is_named() {
+        let mut lines = console(&LOST_START);
+        lines.push("[kernel log: 23 records lost]".to_owned());
+        assert_eq!(lost_records(&lines), [16, 23]);
+        let rows = longest_steps(&lines, blk_probe::BLK_TAG);
+        let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
+        let why = judge("the NVMe service", &rows, &kinds).unwrap_err();
+        assert!(why.contains("no step Info"), "{why}");
+    }
+
+    #[test]
+    fn a_run_with_the_first_calls_passes_the_judge() {
+        let mut lines = console(&LOST_START);
+        lines.push("service step: 15 kind 5 8058 ticks detail 0".to_owned());
+        lines.push("service step: 15 kind 1 2192 ticks detail 0".to_owned());
+        let rows = longest_steps(&lines, blk_probe::BLK_TAG);
+        let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
+        assert_eq!(judge("the NVMe service", &rows, &kinds), Ok(()));
+    }
+
     use super::apart;
 
     #[test]
