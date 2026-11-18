@@ -69,6 +69,7 @@ pub const STOP_TABLE: &[Record] = &[
     // and the file it holds open are still there when `datafs` gets its stop notice.
     Record {
         log: true,
+        console: true,
         connects: &["datafs"],
         waits: &[Wait {
             service: "datafs",
@@ -83,6 +84,7 @@ pub const STOP_TABLE: &[Record] = &[
     // It asks once the writer answered: the writer is a service with a wait of its own, so `power`
     // cannot wait for it by a record.
     Record {
+        console: true,
         connects: &["stop-writer"],
         kind: Kind::Service(Watch {
             period_ns: 20 * MS,
@@ -171,6 +173,8 @@ mod tests {
         assert!(power.connects.contains(&"stop-writer"));
         let writer = STOP_TABLE.iter().find(|r| r.name == "stop-writer").unwrap();
         assert!(writer.connects.contains(&"datafs") && writer.log);
+        // Both print lines the probe reads.
+        assert!(writer.console && power.console);
         assert_eq!(writer.waits.len(), 1);
         assert_eq!(STOP_TABLE.iter().filter(|r| r.is_posix()).count(), 2);
     }

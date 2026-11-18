@@ -2180,7 +2180,6 @@ fn nvme_stop_handlers(breaks: bool) -> Result<(), String> {
         "datafs: stopped, ",
         "init: stopping datadisk",
         "init: datadisk device stopped and confirmed",
-        "init: stopping stop-writer",
         "init: stopping uart",
         "init: stopped in ",
         qemu::SYSTEM_OFF_LINE,
@@ -2200,6 +2199,10 @@ fn nvme_stop_handlers(breaks: bool) -> Result<(), String> {
             ],
         )
         .map_err(|e| format!("{which}: {e}"))?;
+        // The writer and the console's driver are in the last wave, in the order of the table:
+        // the writer stops after `datafs` whichever line comes first.
+        qemu::expect_in_order(lines, &["datafs: stopped, ", "init: stopping stop-writer"])
+            .map_err(|e| format!("{which}: {e}"))?;
         for wanted in [
             "relibc-stop: handler ready",
             "relibc-stop: ignorer ready",
@@ -2246,6 +2249,13 @@ fn nvme_stop_handlers(breaks: bool) -> Result<(), String> {
     let first = boot("first boot")?;
     if breaks {
         let second = boot("second boot")?;
+        // The writer must have spoken: a silent console would let any run pass.
+        if !second.iter().any(|l| l.contains("stop-writer: ")) {
+            return Err(
+                "nvme-persist stop-handlers breaks: no line of stop-writer on the second boot, the probe saw nothing"
+                    .into(),
+            );
+        }
         if second
             .iter()
             .any(|l| l.contains("stop-writer: /stop/f whole, 20000 bytes"))
