@@ -290,11 +290,20 @@ impl Service<0> for Datafs {
     /// away, and `notification` ends the process when that is done. Init kills the service at its
     /// deadline should the disk not answer.
     fn stop(&mut self) {
-        if STOPPING.swap(true, Release) {
-            return;
+        // The break image exits at once, as the default handler of rt::service does: the probe of
+        // the stop handlers (xtask nvme-persist stop-handlers breaks) must catch it.
+        #[cfg(feature = "break-datafs-stop")]
+        sys::process_exit(0);
+        // The time first: the worker reads it as soon as it sees the flag.
+        #[cfg(not(feature = "break-datafs-stop"))]
+        {
+            if STOPPING.load(Acquire) {
+                return;
+            }
+            STOP_AT.store(rt::time::now().max(1), Release);
+            STOPPING.store(true, Release);
+            let _ = sys::notify(&self.kick, 1);
         }
-        STOP_AT.store(rt::time::now(), Release);
-        let _ = sys::notify(&self.kick, 1);
     }
 }
 

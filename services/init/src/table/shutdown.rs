@@ -50,9 +50,11 @@ const fn posix_program(name: &'static str, args: &'static [u8], root: bool) -> R
 /// The table of the probe of the stop handlers of `datafs` and of the process service (feature
 /// `table-stop-handlers`, `cargo xtask nvme-persist stop-handlers`, with nvme-store): the PL011's
 /// driver, the RAM files, the process and clock services, the entropy service on the boot seed, the
-/// NVMe data disk with `datafs`, two POSIX programs and `power`. `power` (tests/svc role `w`)
-/// waits for the file service, writes `/stop/f` through its session with no sync and no close
-/// (or reads it back when an earlier boot left it), and asks init to stop the system.
+/// NVMe data disk with `datafs`, two POSIX programs, `stop-writer` and `power`. `stop-writer`
+/// (tests/svc role `W`) waits for the file service, writes `/stop/f` through its session with no
+/// sync and no close (or reads it back when an earlier boot left it) and keeps the session open
+/// to the end; `power` (role `w`) asks it for an answer, waits a while, and asks init to stop the
+/// system.
 pub const STOP_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     super::ramfs::RAM_CLOCKED,
@@ -63,12 +65,25 @@ pub const STOP_TABLE: &[Record] = &[
     super::pkg::DATAFS,
     posix_program("stop-handle", b"relibc-stop\0handle\0", true),
     posix_program("stop-ignore", b"relibc-stop\0ignore\0", false),
+    // The writer is in the last tier of the stop (`log`: the tier of the console), so its session
+    // and the file it holds open are still there when `datafs` gets its stop notice.
     Record {
+        log: true,
         connects: &["datafs"],
         waits: &[Wait {
             service: "datafs",
             deadline_ms: 30_000,
         }],
+        kind: Kind::Service(Watch {
+            period_ns: 20 * MS,
+            deadline_ns: 20_000 * MS,
+        }),
+        ..echo("stop-writer", 30, WATCH, b"W")
+    },
+    // It asks once the writer answered: the writer is a service with a wait of its own, so `power`
+    // cannot wait for it by a record.
+    Record {
+        connects: &["stop-writer"],
         kind: Kind::Service(Watch {
             period_ns: 20 * MS,
             deadline_ns: 20_000 * MS,
@@ -128,14 +143,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} is in no wave"))
         };
         assert_eq!(wave_of("power"), 0);
-        assert!(wave_of("power") < wave_of("datafs"));
+        // The writer keeps its session with `datafs` open until the file service has stopped.
+        assert!(wave_of("datafs") < wave_of("stop-writer"));
+        assert_eq!(wave_of("stop-writer"), wave_of("uart"));
         assert!(wave_of("datafs") < wave_of("datadisk"));
         assert!(wave_of("datadisk") < wave_of("uart"));
         assert_eq!(wave_of("uart"), order.len() - 1);
         // The POSIX programs end with the process service, in its wave.
         assert_eq!(wave_of("stop-handle"), wave_of("posix"));
         assert_eq!(wave_of("stop-ignore"), wave_of("posix"));
-        assert!(wave_of("posix") < wave_of("datafs"));
         // The two records of the files and of the processes get their own deadlines.
         let of = |name: &str| &STOP_TABLE[place(name)];
         assert_eq!(shutdown::stop_ns(of("datafs")), shutdown::FILES_STOP_NS);
@@ -143,11 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_handlers_power_record_is_a_service_that_waits_for_the_files() {
+    fn the_stop_handlers_power_and_writer_records_are_services_that_hold_the_files_open() {
         let power = STOP_TABLE.iter().find(|r| r.name == "power").unwrap();
         assert!(!power.is_client() && !power.is_posix());
-        assert!(power.connects.contains(&"datafs"));
-        assert_eq!(power.waits.len(), 1);
+        assert!(power.connects.contains(&"stop-writer"));
+        let writer = STOP_TABLE.iter().find(|r| r.name == "stop-writer").unwrap();
+        assert!(writer.connects.contains(&"datafs") && writer.log);
+        assert_eq!(writer.waits.len(), 1);
         assert_eq!(STOP_TABLE.iter().filter(|r| r.is_posix()).count(), 2);
     }
 }

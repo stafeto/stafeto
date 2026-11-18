@@ -25,11 +25,11 @@ pub enum Act {
 /// The counts of the stop line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Report {
-    /// Processes that were sent SIGTERM.
+    /// Processes SIGTERM was posted to (one whose action ignores it is not counted).
     pub termed: u32,
-    /// Of them, the ones that ended by themselves within the wait.
+    /// Processes that were alive at the sweep and ended before the kill.
     pub ended: u32,
-    /// Processes that were sent SIGKILL.
+    /// Processes that were alive at the kill and got SIGKILL.
     pub killed: u32,
 }
 
@@ -39,6 +39,7 @@ pub struct Stop {
     over: bool,
     until: u64,
     termed: u32,
+    alive: u32,
     killed: u32,
 }
 
@@ -49,6 +50,7 @@ impl Stop {
             over: false,
             until: 0,
             termed: 0,
+            alive: 0,
             killed: 0,
         }
     }
@@ -68,9 +70,10 @@ impl Stop {
         Act::Term
     }
 
-    /// SIGTERM went to `sent` processes at `now`; the wait starts.
-    pub fn termed(&mut self, now: u64, sent: u32) {
-        self.termed = sent;
+    /// SIGTERM was posted to `posted` of the `alive` processes at `now`; the wait starts.
+    pub fn termed(&mut self, now: u64, posted: u32, alive: u32) {
+        self.termed = posted;
+        self.alive = alive;
         self.until = now.saturating_add(WAIT_NS);
     }
 
@@ -86,16 +89,16 @@ impl Stop {
         }
     }
 
-    /// SIGKILL went to `sent` processes.
-    pub fn killed(&mut self, sent: u32) {
-        self.killed = sent;
+    /// SIGKILL went to the `alive` processes that were left.
+    pub fn killed(&mut self, alive: u32) {
+        self.killed = alive;
         self.over = true;
     }
 
     pub const fn report(&self) -> Report {
         Report {
             termed: self.termed,
-            ended: self.termed.saturating_sub(self.killed),
+            ended: self.alive.saturating_sub(self.killed),
             killed: self.killed,
         }
     }
@@ -128,7 +131,8 @@ mod tests {
         let mut stop = Stop::new();
         assert_eq!(stop.begin(3), Act::Term);
         assert!(stop.running());
-        stop.termed(10 * S, 3);
+        // SIGTERM is posted to two of the three: one ignores it.
+        stop.termed(10 * S, 2, 3);
         assert_eq!(stop.check(10 * S, 3), Act::Wait(13 * S));
         // One ends by itself: the others are still waited for.
         assert_eq!(stop.check(11 * S, 2), Act::Wait(13 * S));
@@ -139,7 +143,7 @@ mod tests {
         assert_eq!(
             stop.report(),
             Report {
-                termed: 3,
+                termed: 2,
                 ended: 1,
                 killed: 2
             }
@@ -150,7 +154,7 @@ mod tests {
     fn all_ending_inside_the_wait_skips_the_kill() {
         let mut stop = Stop::new();
         assert_eq!(stop.begin(2), Act::Term);
-        stop.termed(0, 2);
+        stop.termed(0, 2, 2);
         assert_eq!(stop.check(S, 1), Act::Wait(3 * S));
         assert_eq!(stop.check(2 * S, 0), Act::Exit);
         assert_eq!(
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_wait_fits_inside_the_record_deadline() {
-        assert!(WAIT_NS < 5 * S);
+        const { assert!(WAIT_NS < 5 * S) };
     }
 
     #[test]

@@ -83,9 +83,11 @@ pub static STARTING: AtomicBool = AtomicBool::new(true);
 /// The volume is mounted: requests may be served.
 pub static READY: AtomicBool = AtomicBool::new(false);
 
-/// The stop notice came: no new request is taken, the worker drains its queue.
+/// The stop notice came: no new request is taken, the worker drains its queue. The stuck-job
+/// watch of PR #441 must not fire while this is set: a drain that waits on the disk is the stop
+/// at work. Whoever merges the two does it knowingly.
 pub static STOPPING: AtomicBool = AtomicBool::new(false);
-/// The counter tick of the stop notice.
+/// The counter tick of the stop notice, stored before `STOPPING`; 0 means not yet.
 pub static STOP_AT: AtomicU64 = AtomicU64::new(0);
 /// The jobs the worker finished since the stop notice.
 pub static STOP_JOBS: AtomicU64 = AtomicU64::new(0);

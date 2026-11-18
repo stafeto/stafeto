@@ -2427,9 +2427,11 @@ impl Processes {
     }
 
     /// Sends `signal` from init (pid 1) to every process that is not ended, by the paths of kill:
-    /// a post on the page, or the kill of the process for SIGKILL. The number of the processes sent.
-    fn sweep(&mut self, signal: u8) -> u32 {
-        let mut sent = 0;
+    /// a post on the page, or the kill of the process for SIGKILL. Returns the number of the
+    /// processes the signal was posted to (an ignored signal is not counted), and the number of
+    /// the processes that were alive.
+    fn sweep(&mut self, signal: u8) -> (u32, u32) {
+        let (mut posted, mut alive) = (0, 0);
         for i in 0..RECORDS {
             if !self
                 .records
@@ -2445,10 +2447,12 @@ impl Processes {
                 status: 0,
                 value: 0,
             };
-            self.timer_signal(i, signal, info);
-            sent += 1;
+            alive += 1;
+            if self.timer_signal(i, signal, info) != Posted::Ignored {
+                posted += 1;
+            }
         }
-        sent
+        (posted, alive)
     }
 
     /// The next step of the stop, if one is on: on after the ends and the timer.
@@ -2472,8 +2476,8 @@ impl Processes {
     }
 
     fn stop_kill(&mut self) {
-        let sent = self.sweep(SIGKILL);
-        self.stop.killed(sent);
+        let (_, alive) = self.sweep(SIGKILL);
+        self.stop.killed(alive);
         self.stop_exit();
     }
 
@@ -5095,6 +5099,13 @@ impl Service<0> for Processes {
                 }
                 Answer::Status(Status::from_code(result.err().unwrap_or(0)))
             }
+            // While the service stops no process is made: the caller may try again, which it
+            // does not live to see.
+            n if (n == Method::SpawnStart as u16 || n == Method::ForkStart as u16)
+                && self.stop.running() =>
+            {
+                refuse(proto_process::AGAIN)
+            }
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r, false),
             n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r, false),
@@ -5148,8 +5159,10 @@ impl Service<0> for Processes {
         }
         match self.stop.begin(self.live_count()) {
             Act::Term => {
-                let sent = self.sweep(SIGTERM);
-                self.stop.termed(Self::timer_now(), sent);
+                let (posted, alive) = self.sweep(SIGTERM);
+                // A process stopped by SIGSTOP takes the SIGTERM once it continues.
+                self.sweep(SIGCONT);
+                self.stop.termed(Self::timer_now(), posted, alive);
                 self.stop_step();
             }
             _ => self.stop_exit(),

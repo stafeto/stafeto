@@ -107,9 +107,10 @@ fn ask(s: &Startup, channel: &rt::Handle<rt::handle::Channel>) -> u64 {
     serve(s, channel, &mut Quiet { ignore: false })
 }
 
-/// How long `power_data` waits before it writes: the POSIX programs of the table say they are
-/// ready by then.
-const NEIGHBOURS_NS: u64 = 2_500_000_000;
+/// How long `power_data` waits after the file is written, for the POSIX programs of the table to
+/// say they are ready. Nothing the stand-in can see tells it, so the wait is long: processes
+/// start slowly under TCG with edk2, and the probe fails with a clear line when one is late.
+const NEIGHBOURS_NS: u64 = 8_000_000_000;
 /// The size of the file `/stop/f` and the salt of its bytes.
 const FILE_BYTES: usize = 20_000;
 const SALT: u32 = 7;
@@ -175,7 +176,7 @@ fn file(session: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
         }
         at += n;
     }
-    rt::println!("power: wrote /stop/f, {FILE_BYTES} bytes, no sync and no close");
+    rt::println!("stop-writer: wrote /stop/f, {FILE_BYTES} bytes, no sync and no close");
     Ok(())
 }
 
@@ -191,28 +192,30 @@ fn verify(session: &rt::Handle<rt::handle::Channel>, handle: u32) -> Result<(), 
             break;
         }
         if at + n > FILE_BYTES {
-            rt::println!("power: /stop/f is longer than it was written");
+            rt::println!("stop-writer: /stop/f is longer than it was written");
             return Err("too long");
         }
         fill(&mut expected[..n], at);
         if reply[8..8 + n] != expected[..n] {
-            rt::println!("power: /stop/f differs at byte {at}");
+            rt::println!("stop-writer: /stop/f differs at byte {at}");
             return Err("differs");
         }
         at += n;
     }
     if at != FILE_BYTES {
-        rt::println!("power: /stop/f is {at} bytes of {FILE_BYTES}");
+        rt::println!("stop-writer: /stop/f is {at} bytes of {FILE_BYTES}");
         return Err("short");
     }
-    rt::println!("power: /stop/f whole, {at} bytes");
+    rt::println!("stop-writer: /stop/f whole, {at} bytes");
     Ok(())
 }
 
-/// The role `power-data`: `power` of the probe of the stop handlers. It waits for the POSIX programs
-/// of the table, then writes `/stop/f` through its session with `datafs` (or, when the file is
-/// there from an earlier boot, reads it back), and asks init to stop the system at once.
-pub fn power_data(mut s: Startup) -> u64 {
+/// The role `stop-writer` (`W`) of the probe of the stop handlers: registers, writes `/stop/f`
+/// through its session with `datafs` (or, when the file is there from an earlier boot, reads it
+/// back), and then serves the channel with the session still open. Its record is in the last wave of
+/// the stop (the console's tier), so the session and the open file are there when `datafs` gets its
+/// stop notice. A failure is printed and the service goes on, so that `power` still asks for the stop.
+pub fn writer(mut s: Startup) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
@@ -223,16 +226,48 @@ pub fn power_data(mut s: Startup) -> u64 {
         return FAILED;
     }
     let Ok(session) = rt::service::connect(&s.parent, "datafs") else {
-        rt::println!("power: no session with datafs");
+        rt::println!("stop-writer: no session with datafs");
         return FAILED;
     };
+    if let Err(why) = file(&session) {
+        rt::println!("stop-writer: file failed: {why}");
+    }
+    // The session lives as long as the service.
+    let code = serve(&s, &channel, &mut Quiet { ignore: false });
+    drop(session);
+    code
+}
+
+/// The role `power-data` (`w`): `power` of the probe of the stop handlers. Its session with
+/// `stop-writer` answers once the file is written (or read back); then it waits for the POSIX
+/// programs of the table, and asks init to stop the system.
+pub fn power_data(mut s: Startup) -> u64 {
+    if let Ok(console) = s.take::<Resource>("console") {
+        rt::console::set(console);
+    }
+    let Ok(channel) = sys::channel_create(crate::base(&s)) else {
+        return FAILED;
+    };
+    if rt::service::register(&s.parent, &channel).is_err() {
+        return FAILED;
+    }
+    let Ok(writer) = rt::service::connect(&s.parent, "stop-writer") else {
+        rt::println!("power: no session with stop-writer");
+        return FAILED;
+    };
+    // The reply comes when the writer serves, after its file.
+    let mut w = Writer::new();
+    if Header::new(crate::method::ECHO, VERSION)
+        .write(&mut w)
+        .is_err()
+        || sys::send(&writer, w.as_bytes()).is_err()
+    {
+        rt::println!("power: stop-writer did not answer");
+        return FAILED;
+    }
     let Ok(waiter) = Waiter::new(&channel, 0, crate::base(&s)) else {
         return FAILED;
     };
     let _ = waiter.receive_until(&channel, time::ticks_to_ns(time::now()) + NEIGHBOURS_NS);
-    if let Err(why) = file(&session) {
-        rt::println!("power: file failed: {why}");
-        return FAILED;
-    }
     ask(&s, &channel)
 }

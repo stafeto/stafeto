@@ -17,8 +17,8 @@
 //! every period and one that never does (burner.rs, init's journal of
 //! overruns), `q` a service that ignores init's stop notice and `p` the
 //! stand-in of the power button's service, which asks init to stop the
-//! system (stopper.rs, the table `table-shutdown`), and `w` the same after a file written to
-//! `/data` (the table `table-stop-handlers`). A service registers
+//! system (stopper.rs, the table `table-shutdown`), `w` the same after the file written by `W` to
+//! `/data`, which keeps its session open (the table `table-stop-handlers`). A service registers
 //! its channel with init (rt::service::register) and serves it with its
 //! heartbeat (rt::service::run). The program ends with the code of its
 //! role, or FAILED when its start data did not come.
@@ -60,6 +60,7 @@ const BURNER: u8 = b'b';
 const QUIET: u8 = b'q';
 const POWER: u8 = b'p';
 const POWER_DATA: u8 = b'w';
+const WRITER: u8 = b'W';
 
 /// The code of a role that could not do its part.
 const FAILED: u64 = 1;
@@ -113,6 +114,7 @@ fn main(_: u64) -> u64 {
         Some(&QUIET) => stopper::quiet(s),
         Some(&POWER) => stopper::power(s),
         Some(&POWER_DATA) => stopper::power_data(s),
+        Some(&WRITER) => stopper::writer(s),
         _ => FAILED,
     }
 }

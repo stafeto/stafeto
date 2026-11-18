@@ -466,14 +466,23 @@ fn stop_decision() -> Drain {
     let queued = (0..JOBS)
         .filter(|&i| state(i).load(Acquire) == QUEUED)
         .count();
-    let since = rt::time::now().saturating_sub(STOP_AT.load(Acquire));
+    // 0 is a stop time not stored yet: no time has passed.
+    let at = STOP_AT.load(Acquire);
+    let since = if at == 0 {
+        0
+    } else {
+        rt::time::now().saturating_sub(at)
+    };
     datafs::stop::drain(queued, rt::time::ticks_to_ns(since))
 }
 
 /// The stop: closes what is still open, unmounts the volume and makes its writes durable.
 fn put_away(server: &mut Server, volume: &mut Option<Volume>) {
     let Some(fs) = volume.as_mut() else { return };
-    server.close_all(fs);
+    let failed = server.close_all(fs);
+    if failed > 0 {
+        rt::println!("datafs: {failed} files did not close");
+    }
     if fs.unmount().is_err() {
         rt::println!("datafs: unmount failed");
     }

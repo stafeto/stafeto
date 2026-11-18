@@ -1172,7 +1172,10 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         }
         Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
         Some("shutdown") if args.len() == 1 => return nvme_shutdown(),
-        Some("stop-handlers") if args.len() == 1 => return nvme_stop_handlers(),
+        Some("stop-handlers") if args.len() == 1 => return nvme_stop_handlers(false),
+        Some("stop-handlers") if args.len() == 2 && args[1] == "breaks" => {
+            return nvme_stop_handlers(true);
+        }
         _ => {}
     }
     let (breaks, shape, steps) = match args.first().map(String::as_str) {
@@ -2121,22 +2124,38 @@ const PROGRAMS_STOP: [ImageProgram; 10] = [
 /// service signals its two POSIX programs (the one with a handler for SIGTERM ends by itself, the
 /// one that ignores it is killed), `datafs` finishes its queue, closes the file and unmounts (its line
 /// comes before the disk's `stopped and confirmed`), and the machine powers off with no panic. The
-/// second boot mounts the volume and `power` reads `/stop/f` back whole.
-fn nvme_stop_handlers() -> Result<(), String> {
+/// second boot mounts the volume and `stop-writer` reads `/stop/f` back whole.
+///
+/// `stop-writer` (the last tier of the stop) keeps its session and the open file until `datafs` has
+/// stopped, so the file is closed by the stop handler of `datafs` (`close_all`); the cleanup of a
+/// session that went never gets to close it. With `breaks` the stop handler of `datafs` exits at once
+/// (`break-datafs-stop`) and the run must fail: the file is short or missing after the next boot.
+fn nvme_stop_handlers(breaks: bool) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
-    let image = build_boot_image("boot-nvme-stop-handlers.img", &PROGRAMS_STOP, BOOT_PROFILE)?;
+    let mut list = PROGRAMS_STOP.to_vec();
+    if breaks {
+        for program in &mut list {
+            if program.0 == "datafsd" {
+                program.3 = &["break-datafs-stop"];
+            }
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
+    let tag = if breaks { "-break" } else { "" };
+    let image_name: &'static str = Box::leak(format!("boot-nvme-stop-handlers{tag}.img").into());
+    let image = build_boot_image(image_name, programs, BOOT_PROFILE)?;
     let kernel = build(Variant::Normal)?;
     let firmware = efi::firmware()?;
     let loader = efi::build_loader(&[])?;
-    let esp = target_dir().join("efi-disk-nvme-stop-handlers.raw");
+    let esp = target_dir().join(format!("efi-disk-nvme-stop-handlers{tag}.raw"));
     let artifacts = Artifacts {
         boot_image: image,
         ..kernel.clone()
     };
     efi::make_disk(&loader, &artifacts, &esp)?;
-    let file = Disk::new("nvme-stop-handlers");
+    let file = Disk::new(&format!("nvme-stop-handlers{tag}"));
     qemu::store_file(&file.0, blk_probe::DISK_BYTES, true)?;
     let boot = |which: &str| -> Result<Vec<String>, String> {
         let mut cmd = efi::command(
@@ -2157,25 +2176,27 @@ fn nvme_stop_handlers() -> Result<(), String> {
     };
     let stop_order: &[&str] = &[
         "init: stopping the system (off)",
-        "posix: stopped, 2 signalled, 1 ended after SIGTERM, 1 killed",
         "init: stopping datafs",
         "datafs: stopped, ",
         "init: stopping datadisk",
         "init: datadisk device stopped and confirmed",
+        "init: stopping stop-writer",
         "init: stopping uart",
         "init: stopped in ",
         qemu::SYSTEM_OFF_LINE,
     ];
     let check = |lines: &[String], which: &str| -> Result<(), String> {
         qemu::expect_in_order(lines, stop_order).map_err(|e| format!("{which}: {e}"))?;
-        // The process service ends its two programs before the file service stops, and the
-        // program with a handler says so before the line of the process service.
+        // The process service signals its two programs: the one with a handler for SIGTERM ends
+        // by itself (SIGTERM was posted to it alone, the ignorer's action drops it) and the
+        // ignorer is killed after the wait. The writer holds its session with `datafs` open
+        // until the last wave, so `datafs` has an open file at its stop notice.
         qemu::expect_in_order(
             lines,
             &[
                 "init: stopping the system (off)",
                 "relibc-stop: handler got SIGTERM and exits",
-                "posix: stopped, ",
+                "posix: stopped, 1 signalled, 1 ended after SIGTERM, 1 killed",
             ],
         )
         .map_err(|e| format!("{which}: {e}"))?;
@@ -2210,7 +2231,10 @@ fn nvme_stop_handlers() -> Result<(), String> {
             "datafs: flush failed",
             "its DMA memory stays kept",
             "did not stop within the whole stop",
-            "power: file failed",
+            "stop-writer: file failed",
+            "stop-writer: no session",
+            "files did not close",
+            "power: stop-writer did not answer",
             "power: SHUTDOWN refused",
         ] {
             if let Some(line) = lines.iter().find(|l| l.contains(unwanted)) {
@@ -2220,10 +2244,26 @@ fn nvme_stop_handlers() -> Result<(), String> {
         Ok(())
     };
     let first = boot("first boot")?;
+    if breaks {
+        let second = boot("second boot")?;
+        if second
+            .iter()
+            .any(|l| l.contains("stop-writer: /stop/f whole, 20000 bytes"))
+        {
+            return Err(
+                "nvme-persist stop-handlers breaks: a datafs that exits at once at the stop left the file whole, the probe does not prove the stop handler"
+                    .into(),
+            );
+        }
+        println!(
+            "nvme-persist stop-handlers breaks: a datafs that exits at once at the stop notice is caught: the file written just before the stop did not read back whole"
+        );
+        return Ok(());
+    }
     check(&first, "first boot")?;
     for wanted in [
         "datafs: partition table written, data volume formatted",
-        "power: wrote /stop/f, 20000 bytes, no sync and no close",
+        "stop-writer: wrote /stop/f, 20000 bytes, no sync and no close",
     ] {
         if !first.iter().any(|l| l.contains(wanted)) {
             return Err(format!("first boot: no line {wanted:?}"));
@@ -2239,13 +2279,13 @@ fn nvme_stop_handlers() -> Result<(), String> {
     }
     if !second
         .iter()
-        .any(|l| l.contains("power: /stop/f whole, 20000 bytes"))
+        .any(|l| l.contains("stop-writer: /stop/f whole, 20000 bytes"))
     {
         return Err(format!(
             "second boot: the file written just before the stop did not read back whole: {:?}",
             second
                 .iter()
-                .filter(|l| l.contains("power:") || l.contains("datafs:"))
+                .filter(|l| l.contains("stop-writer:") || l.contains("datafs:"))
                 .collect::<Vec<_>>()
         ));
     }

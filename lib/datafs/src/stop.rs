@@ -5,7 +5,10 @@
 //! no new request, and its worker runs the jobs already queued. The record of the service gives
 //! init 3 s to end; the drain keeps well inside it so that the volume can still be unmounted.
 
-/// How long the worker runs queued jobs after the stop notice.
+/// How long the worker runs queued jobs after the stop notice. The limit is tested between jobs:
+/// a job that began before it runs to its end. If init kills the service at its deadline of 3 s,
+/// the volume is as after a power cut: littlefs stays consistent, and the acknowledged writes to
+/// files that are still open are lost.
 pub const DRAIN_NS: u64 = 2_000_000_000;
 
 /// What the worker does next while the service stops.
@@ -50,6 +53,6 @@ mod tests {
 
     #[test]
     fn the_drain_ends_well_inside_the_record_deadline() {
-        assert!(DRAIN_NS <= 2_000_000_000 && DRAIN_NS < 3_000_000_000);
+        const { assert!(DRAIN_NS <= 2_000_000_000 && DRAIN_NS < 3_000_000_000) };
     }
 }

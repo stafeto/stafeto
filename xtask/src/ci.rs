@@ -292,6 +292,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("nvme-persist blk-probe", 80),
     ("nvme-persist shutdown", 80),
     ("nvme-persist stop-handlers", 100),
+    ("nvme-persist stop-handlers breaks", 100),
     ("store-crash", 25),
     ("data-probe", 12),
     ("data-crash", 60),
