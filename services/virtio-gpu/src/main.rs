@@ -912,15 +912,14 @@ impl Driver {
             // The device is being set up: ask again.
             _ => return Answer::Status(code(CLEARING)),
         }
-        // A former owner that kept a copy of `fb`, the pool or the cursor's
-        // picture, mapped or not, or sent one on, still reaches the
-        // memory: the driver and init hold the only references it may have
-        // (BASE_REFS).
-        if self
-            .objects
-            .iter()
-            .any(|m| sys::memory_info(m).is_ok_and(|info| info.refs > BASE_REFS))
-        {
+        // A former owner that kept a copy of `fb`, mapped or not, or sent
+        // one on, still reaches the buffer: the driver and init hold the
+        // only references it may have (BASE_REFS). The pool and the cursor's
+        // picture are checked by SOURCE alone: a program that outlives a
+        // restart of the compositor with its copy of the pool blocks the
+        // pool, and the new compositor opens the screen and composes
+        // without the direct path until the program ends.
+        if sys::memory_info(&self.objects[0]).is_ok_and(|info| info.refs > BASE_REFS) {
             return Answer::Status(code(BUSY));
         }
         let label = match self.owner.open() {
