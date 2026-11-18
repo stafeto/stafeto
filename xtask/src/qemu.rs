@@ -911,6 +911,30 @@ impl Run {
             .map_err(|e| format!("typing {bytes:?}: {e}"))
     }
 
+    /// Waits up to `timeout` for the child to exit by itself (a machine that powers itself
+    /// off), then ends the run: the outcome has the child's status, or `timed_out` when it
+    /// still ran at the deadline.
+    pub fn exit_within(mut self, timeout: Duration) -> Outcome {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.wait(deadline) {
+                Wait::Came => {}
+                Wait::Deadline => return self.end(End::TimedOut),
+                Wait::Ended if self.line_start < self.transcript.bytes.len() => self.end_line(),
+                Wait::Ended => break,
+            }
+        }
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return self.end(End::Exited(status));
+            }
+            if Instant::now() >= deadline {
+                return self.end(End::TimedOut);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Stops the run: its child is killed unless it exited, and the reader
     /// ends with the output and is joined; gives the lines.
     pub fn stop(self) -> Outcome {

@@ -1590,6 +1590,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fast-switch-scale-vz") as usize
     + cfg!(feature = "table-posix-map-big") as usize
     + cfg!(feature = "table-shutdown") as usize
+    + cfg!(feature = "table-power-button") as usize
     + cfg!(feature = "table-aws-qemu") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
@@ -1688,6 +1689,7 @@ const _: () = assert!(
     feature = "table-posix-map-big",
     feature = "table-aws",
     feature = "table-shutdown",
+    feature = "table-power-button",
     feature = "table-aws-qemu"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
@@ -1749,6 +1751,8 @@ pub const TABLE: &[Record] = aws::TABLE;
 pub const TABLE: &[Record] = aws::QEMU_TABLE;
 #[cfg(feature = "table-shutdown")]
 pub const TABLE: &[Record] = shutdown::TABLE;
+#[cfg(feature = "table-power-button")]
+pub const TABLE: &[Record] = shutdown::POWER_BUTTON_TABLE;
 pub use crate::resolve::table;
 /// The platform a table with places by function (`At`) resolves them on.
 #[cfg(feature = "table-aws")]

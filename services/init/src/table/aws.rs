@@ -407,6 +407,60 @@ pub const DATADISK: Record = Record {
     ..super::pkg::NVME_QEMU_BLK
 };
 
+/// The GPIO block of a t4g.small, `GPO0` in its DSDT (`ARMH0061`, a PL061): its page and its
+/// interrupt, level-triggered, GSIV 39 (INTID 39, SPI 7). `_AEI` gives pin 3 the power button
+/// (`_E03`) as a rising-edge GpioInt. QEMU `virt` has the block at the same place on the same
+/// line (`fixtures/graviton-t4g/DSDT.aml`, bytes 3870 to 4060).
+pub const GPIO_BASE: u64 = 0x0903_0000;
+pub const GPIO_LINE: u32 = 39;
+/// GPIOIE of the PL061: the interrupt mask the stop clears, so that no pin of the block raises
+/// the line once the service is gone.
+const GPIO_IE: u64 = 0x410;
+
+/// The service of the power button (services/power): the window over the GPIO page and the
+/// binding of its line. It is the one record init answers SHUTDOWN for (`POWER_SERVICE`), so
+/// it is a native service that connects to nothing. A stop of its instance masks the block's
+/// interrupts.
+pub const POWER: Record = Record {
+    name: super::POWER_SERVICE,
+    program: "power",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 45,
+    ceiling: 45,
+    quota: 32 * PAGE,
+    handle_limit: 32,
+    restart: Restart::Always,
+    console: true,
+    log: false,
+    args: &[],
+    windows: &[Window {
+        name: "regs",
+        base: GPIO_BASE,
+        len: PAGE,
+        duplicate: false,
+        at: At::Fixed,
+    }],
+    bindings: &[Binding {
+        name: "irq",
+        line: GPIO_LINE,
+        edge: false,
+        of: None,
+    }],
+    quiesce: &[Write {
+        window: "regs",
+        offset: GPIO_IE,
+        bits: 32,
+        value: 0,
+        settled: 0xFF,
+        only_if: None,
+        confirm: None,
+    }],
+    ..CONSOLE
+};
+
 pub const TABLE: &[Record] = &[
     CONSOLE,
     named(DIALOG, "ramfs"),
@@ -426,6 +480,7 @@ pub const TABLE: &[Record] = &[
     DATADISK,
     super::pkg::DATAFS,
     super::pkg::DATAKEY,
+    POWER,
 ];
 
 /// The closest image on QEMU to the table above (`cargo xtask net-try`): the services of the
@@ -448,6 +503,7 @@ pub const QEMU_TABLE: &[Record] = &[
     super::pkg::NVME_QEMU_DATA,
     super::pkg::DATAFS,
     super::pkg::DATAKEY,
+    POWER,
 ];
 
 /// The pages of RAM of a t4g.small: 2 GiB.
@@ -493,7 +549,8 @@ mod tests {
                 "pkgd",
                 "datadisk",
                 "datafs",
-                "datakey"
+                "datakey",
+                "power"
             ]
         );
         // The posix record is the shell dialog's, with its larger quota; the
@@ -528,11 +585,130 @@ mod tests {
             );
             if r.name == "net" || r.name == "datadisk" {
                 assert!(r.windows.iter().all(|w| w.at != At::Fixed));
+            } else if r.name == "power" {
+                assert!(r.windows.iter().all(|w| w.base == GPIO_BASE));
+                assert_eq!(r.bindings.len(), 1);
             } else {
                 assert!(r.windows.iter().all(|w| w.base == SPCR_PORT));
                 assert!(r.bindings.is_empty());
             }
         }
+    }
+
+    /// The window, the line and the pin of the power button are the bytes of the DSDT of the
+    /// t4g sample: the device `GPO0` (`ARMH0061`) with Memory32Fixed 0x09030000 of 0x1000 bytes,
+    /// the Extended Interrupt 39 (level), and `_AEI` with a rising-edge GpioInt on pin 3 whose
+    /// method `_E03` notifies the power button.
+    #[test]
+    fn the_power_record_is_the_gpio_block_the_dsdt_names_with_its_interrupt_and_pin() {
+        let dsdt =
+            include_bytes!("../../../../boot/firmware-tree/tests/fixtures/graviton-t4g/DSDT.aml");
+        let find = |needle: &[u8], from: usize| {
+            from + dsdt[from..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("the bytes are in the DSDT")
+        };
+        let device = find(b"GPO0", 0);
+        assert!(dsdt[device..].starts_with(b"GPO0"));
+        let hid = find(b"ARMH0061", device);
+        // Memory32Fixed (0x86, length 9): read-write, base, length.
+        let mem = find(&[0x86, 0x09, 0x00, 0x01], hid);
+        let base = u32::from_le_bytes(dsdt[mem + 4..mem + 8].try_into().unwrap());
+        let len = u32::from_le_bytes(dsdt[mem + 8..mem + 12].try_into().unwrap());
+        assert_eq!((u64::from(base), u64::from(len)), (GPIO_BASE, PAGE));
+        // Extended Interrupt (0x89): flags 0x01 (consumer, level, active high), one
+        // interrupt, its number.
+        let irq = find(&[0x89, 0x06, 0x00, 0x01, 0x01], mem);
+        let line = u32::from_le_bytes(dsdt[irq + 5..irq + 9].try_into().unwrap());
+        assert_eq!(line, GPIO_LINE);
+        // `_AEI`: GpioInt (0x8C) with edge, active high in its interrupt flags (0x0001), and
+        // the pin of its table, for the pins 3 and 4; `_E03` notifies PWRB.
+        let aei = find(b"_AEI", irq);
+        let gpio = find(&[0x8C, 0x1B, 0x00, 0x01, 0x00], aei);
+        assert_eq!(&dsdt[gpio + 7..gpio + 9], [0x01, 0x00], "edge, active high");
+        let pin = u16::from_le_bytes(dsdt[gpio + 0x17..gpio + 0x19].try_into().unwrap());
+        assert_eq!(u32::from(pin), power::PIN);
+        let e03 = find(b"_E03", aei);
+        assert!(dsdt[e03..e03 + 16].windows(4).any(|w| w == b"PWRB"));
+        // The record has that window and that line, level, as a native service.
+        for table in [TABLE, QEMU_TABLE] {
+            let record = table.iter().find(|r| r.name == "power").unwrap();
+            assert_eq!(record.windows.len(), 1);
+            assert_eq!(
+                (record.windows[0].base, record.windows[0].len),
+                (base.into(), len.into())
+            );
+            assert_eq!(
+                record.bindings,
+                [Binding {
+                    name: "irq",
+                    line,
+                    edge: false,
+                    of: None
+                }]
+            );
+            assert!(!record.is_client() && !record.is_posix() && record.connects.is_empty());
+            assert!(record.args.is_empty());
+            assert_eq!(record.program, "power");
+        }
+        assert_eq!((power::BASE, power::LINE), (GPIO_BASE, GPIO_LINE));
+        // The stop masks every pin of the block.
+        assert_eq!(
+            POWER
+                .quiesce
+                .iter()
+                .map(|w| (w.window, w.offset, w.value))
+                .collect::<Vec<_>>(),
+            [("regs", power::GPIOIE as u64, 0)]
+        );
+    }
+
+    /// The tables with `power` pass the check of the name (`check_power`), and the stop goes
+    /// in waves with `power` in the first and the console's driver last.
+    #[test]
+    fn power_stops_first_and_the_console_last_on_both_tables() {
+        for table in [TABLE, QEMU_TABLE] {
+            assert!(crate::table::check(table).is_ok());
+            let alive = (1u32 << table.len()) - 1;
+            let first = crate::shutdown::wave(table, alive);
+            let names = |mask: u32| -> Vec<&str> {
+                (0..table.len())
+                    .filter(|p| mask & (1 << p) != 0)
+                    .map(|p| table[p].name)
+                    .collect()
+            };
+            assert!(
+                names(first).contains(&"power"),
+                "power has no record that connects to it"
+            );
+            let mut left = alive & !first;
+            let mut last = Vec::new();
+            while left != 0 {
+                let wave = crate::shutdown::wave(table, left);
+                assert_ne!(wave, 0);
+                last = names(wave);
+                left &= !wave;
+            }
+            assert_eq!(last, ["uart"]);
+        }
+    }
+
+    #[test]
+    fn a_power_record_that_is_a_client_or_connects_to_the_process_service_is_refused() {
+        let mut client = *TABLE.iter().find(|r| r.name == "power").unwrap();
+        client.kind = Kind::Client;
+        client.windows = &[];
+        client.bindings = &[];
+        client.quiesce = &[];
+        let bad: Vec<Record> = TABLE
+            .iter()
+            .map(|r| if r.name == "power" { client } else { *r })
+            .collect();
+        assert!(matches!(
+            crate::table::check(&bad),
+            Err(crate::table::TableError::Power { .. })
+        ));
     }
 
     #[test]
@@ -716,7 +892,8 @@ mod tests {
                 "pkgd",
                 "datadisk",
                 "datafs",
-                "datakey"
+                "datakey",
+                "power"
             ]
         );
         let of =

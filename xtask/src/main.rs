@@ -1114,6 +1114,9 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
+        // The service of the power button (init's record `power`): the PL061 pin the EC2
+        // button is wired to asks init to stop the system.
+        programs.push(("power", "power", 32 * 1024, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -1242,6 +1245,14 @@ const CEILING_PROGRAMS: [ImageProgram; 2] = [
 /// with abi::INIT_END_OFF or abi::INIT_END_RESET.
 const END_OFF_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-off"])];
 const END_RESET_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-reset"])];
+/// The image of the probe of the power button (the ci job `power button`, init's table
+/// `table-power-button`): the PL011's driver and the service `power`, on the kernel booted with
+/// no firmware.
+const POWER_BUTTON_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-power-button"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("power", "power", 32 * 1024, &[]),
+];
 /// The profiles the programs of those boot images build with (spec 5.4,
 /// 15.2): the image that ships with `--release`, the test images with
 /// `checked`, the strict build of rt.
@@ -10515,6 +10526,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("bad tables", bad_tables_are_refused),
         job("init end off", init_end_off),
         job("init end reset", init_end_reset),
+        job("power button", power_button),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
         }),
@@ -11839,6 +11851,11 @@ fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
         ("boot-ceiling.img", &CEILING_PROGRAMS[..], TEST_PROFILE),
         ("boot-end-off.img", &END_OFF_PROGRAMS[..], TEST_PROFILE),
         ("boot-end-reset.img", &END_RESET_PROGRAMS[..], TEST_PROFILE),
+        (
+            "boot-power-button.img",
+            &POWER_BUTTON_PROGRAMS[..],
+            TEST_PROFILE,
+        ),
     ] {
         build_boot_image(name, programs, profile)?;
         for (_, package, _, _) in programs {
@@ -13375,6 +13392,70 @@ fn init_end_reset() -> Result<(), String> {
     let verdict = qemu::expect_system_reset(&outcome.lines);
     driven.and(verdict)?;
     println!("init end reset: one line, no panic, a second boot");
+    Ok(())
+}
+
+/// The power button (the decision of #435, step D): the kernel is booted with no firmware, so
+/// QEMU `virt` routes the monitor's `system_powerdown` to pin 3 of its PL061 (with edk2 and ACPI
+/// the machine has a GED device for it instead). The service `power` takes the interrupt and asks
+/// init to stop the system: its line, init's lines of the stop, `stafeto: system off`, no panic,
+/// and QEMU's status 0.
+fn power_button() -> Result<(), String> {
+    const WITHIN: Duration = Duration::from_secs(60);
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-power-button.img",
+        &POWER_BUTTON_PROGRAMS,
+        TEST_PROFILE,
+    )?;
+    let scratch = gpu_probe::Scratch::new()?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().display()
+    ));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let driven = (|| {
+        let mut monitor = monitor::Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+        // The service has set the pin up and opened the line: a press before that is lost.
+        run.expect_line(
+            "the line of power",
+            |l| l.contains("power: watching pin 3"),
+            WITHIN,
+        )?;
+        monitor.command("system_powerdown", Duration::from_secs(10))?;
+        Ok::<(), String>(())
+    })();
+    let outcome = run.exit_within(WITHIN);
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    qemu::expect_system_off(&outcome)?;
+    driven?;
+    qemu::expect_in_order(
+        &outcome.lines,
+        &[
+            "power: watching pin 3",
+            "power: button",
+            "init: stopping the system (off)",
+            "init: stopping power",
+            "init: power stopped: ",
+            "init: stopping uart",
+            "init: stopped in ",
+            qemu::SYSTEM_OFF_LINE,
+        ],
+    )
+    .map_err(|e| format!("power button: {e}"))?;
+    let buttons = outcome
+        .lines
+        .iter()
+        .filter(|l| l.contains("power: button"))
+        .count();
+    if buttons != 1 {
+        return Err(format!(
+            "power button: {buttons} lines `power: button`, one expected"
+        ));
+    }
+    println!("power button: one press, the stop in order, one line off, no panic, powered off");
     Ok(())
 }
 
@@ -16295,6 +16376,7 @@ mod entropy_in_images_tests {
             ("main::CEILING_PROGRAMS", &CEILING_PROGRAMS),
             ("main::END_OFF_PROGRAMS", &END_OFF_PROGRAMS),
             ("main::END_RESET_PROGRAMS", &END_RESET_PROGRAMS),
+            ("main::POWER_BUTTON_PROGRAMS", &POWER_BUTTON_PROGRAMS),
             ("main::SOCK_PROGRAMS", &SOCK_PROGRAMS),
             ("main::SOCK_PROGRAMS_STEPS", &SOCK_PROGRAMS_STEPS),
             ("main::IPC_PROGRAMS", &IPC_PROGRAMS),
@@ -16426,7 +16508,7 @@ mod entropy_in_images_tests {
             ("aws_programs", aws_programs()),
             ("aws_qemu_programs", aws_qemu_programs()),
         ] {
-            for program in ["nvme-blk", "datafsd", "datakey"] {
+            for program in ["nvme-blk", "datafsd", "datakey", "power"] {
                 assert!(
                     programs.iter().any(|p| p.1 == program),
                     "{name} has no {program}"

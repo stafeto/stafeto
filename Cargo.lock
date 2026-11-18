@@ -459,6 +459,7 @@ dependencies = [
  "nvme",
  "nvme-blk",
  "pci",
+ "power",
  "proto-comp",
  "proto-fs",
  "proto-init",
@@ -1171,6 +1172,16 @@ name = "posix-types"
 version = "0.1.0"
 dependencies = [
  "proto-fs",
+]
+
+[[package]]
+name = "power"
+version = "0.5.1"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]
