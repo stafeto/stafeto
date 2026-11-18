@@ -849,7 +849,10 @@ fn instance_entry(launch: &mut instance::Launch<'_, Driver<'_>>) -> u64 {
     driver.tx_step(false);
     driver.rx1_step(false);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(14);
+    {
+        rt::service::report_steps(14);
+        rt::service::table_steps();
+    }
     let config = launch.config.take().expect("the loop starts once");
     let _ = rt::service::run_in(launch.channel, driver, config, &mut *launch.sessions);
     STOPPED

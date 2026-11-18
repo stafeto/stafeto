@@ -327,7 +327,10 @@ fn main(_: u64) -> u64 {
     }
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
-    rt::service::report_steps(5);
+    {
+        rt::service::report_steps(5);
+        rt::service::table_steps();
+    }
     #[cfg(feature = "quiet-steps")]
     rt::service::quiet_steps();
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);

@@ -619,7 +619,10 @@ fn main(_: u64) -> u64 {
     };
     owner.timer = Some(timer);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(1);
+    {
+        rt::service::report_steps(1);
+        rt::service::table_steps();
+    }
     rt::println!("posix-process: ready (records with their processes, root by init's table)");
     rt::println!(
         "posix-process: loader {}",

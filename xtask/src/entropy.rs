@@ -1197,4 +1197,29 @@ mod tests {
             assert!(steps_verdict(&missing).is_err(), "row {i}");
         }
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let step = |tag: u8, kind: usize, ticks: u64| {
+            format!("service step: {tag} kind {kind} {ticks} ticks detail 0")
+        };
+        let good = vec![
+            step(10, 1, 900),
+            step(10, 2, 1500),
+            step(10, 65, 3000),
+            step(10, 64, 1_100),
+            step(11, 5, 1200),
+            step(11, 6, 1300),
+            step(11, 8, 5600),
+            step(11, 65, 2000),
+        ];
+        let lost = crate::step_line::tabled(&good);
+        assert_eq!(
+            steps_verdict(&lost).map(|[a, b]| (a.len(), b.len())),
+            Ok((4, 4))
+        );
+        let mut long = lost.clone();
+        long.push("service table: 11 kind 8 99999 ticks detail 0 preempts 0".to_owned());
+        assert!(steps_verdict(&long).is_err());
+    }
 }

@@ -453,4 +453,14 @@ mod tests {
     fn the_bound_is_the_specs() {
         assert_eq!(STEP_MAX, 18_369);
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let lines: Vec<String> = [(1, 3000), (2, 1500), (3, 2500), (65, 6000), (64, 4000)]
+            .iter()
+            .map(|&(k, t)| step(k, t))
+            .collect();
+        let lost = crate::step_line::tabled(&lines);
+        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(5));
+    }
 }

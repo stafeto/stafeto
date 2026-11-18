@@ -755,15 +755,10 @@ fn lost_records(lines: &[String]) -> Vec<u64> {
         .collect()
 }
 
-/// The longest step of each kind of the NVMe service in a run: the table the service tells after
-/// the burst at the start (`service table:` lines, whole when the run did enough steps), and the
-/// lines of a new longest, which the kernel log may have lost in the burst, as the fallback and
-/// for the steps after the last table. The longer of the two is kept for each kind.
+/// The longest step of each kind of the NVMe service in a run: the table the service tells
+/// after the burst at the start and the lines of a new longest (`step_line::longest`).
 fn step_rows(lines: &[String]) -> Vec<(usize, u64, u64)> {
-    merge(
-        step_line::table(lines, blk_probe::BLK_TAG),
-        longest_steps(lines, blk_probe::BLK_TAG),
-    )
+    longest_steps(lines, blk_probe::BLK_TAG)
 }
 
 /// The longest of each kind in two runs.
