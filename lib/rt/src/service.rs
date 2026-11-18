@@ -694,6 +694,8 @@ mod steps {
     /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
     static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
+    /// The kind the table in progress goes on from (`KINDS` when no table is in progress).
+    static CURSOR: AtomicUsize = AtomicUsize::new(KINDS);
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -714,22 +716,26 @@ mod steps {
         TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
-    /// The longest step of every kind seen, one line each:
-    /// `service table: T kind K N ticks detail D preempts P`. The lines of a new longest are
-    /// told once and the kernel log, which is bounded, loses records of a burst, so a reader
-    /// that needs every kind takes them from this table, told after the burst.
-    fn print_table(tag: u8) {
-        for kind in 0..KINDS {
-            let took = LONGEST[kind].load(Ordering::Relaxed);
-            if took == 0 {
-                continue;
-            }
-            let detail = DETAILS[kind].load(Ordering::Relaxed);
-            let preempts = LONGEST_PREEMPTS[kind].load(Ordering::Relaxed);
-            crate::println!(
-                "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
-            );
-        }
+    /// The line of the next kind of the table, from the kind `CURSOR` is at: `service table: T
+    /// kind K N ticks detail D preempts P`, the longest step of that kind seen. The lines of a new
+    /// longest are told once and the kernel log, which is bounded, loses records of a burst, so a
+    /// reader that needs every kind takes them from the table, told after the burst. The table
+    /// goes out one line after each step that follows (`end`), as the line of a new longest does:
+    /// a caller whose request arrives while the service prints waits behind one line at most,
+    /// where the 15 to 35 lines of a whole table would hold it for some 90,000 ticks.
+    fn print_table_line(tag: u8) {
+        let from = CURSOR.load(Ordering::Relaxed);
+        let Some(kind) = (from..KINDS).find(|&k| LONGEST[k].load(Ordering::Relaxed) != 0) else {
+            CURSOR.store(KINDS, Ordering::Relaxed);
+            return;
+        };
+        CURSOR.store(kind + 1, Ordering::Relaxed);
+        let took = LONGEST[kind].load(Ordering::Relaxed);
+        let detail = DETAILS[kind].load(Ordering::Relaxed);
+        let preempts = LONGEST_PREEMPTS[kind].load(Ordering::Relaxed);
+        crate::println!(
+            "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
+        );
     }
 
     /// The CPU ticks the loop's thread has run (object_info THREAD_STATE x5), the time of its own
@@ -901,12 +907,16 @@ mod steps {
             }
         }
         // The table goes out after the reply and after the sample is taken, as the line of a new
-        // longest does: the print is in no step's time, and it comes before the next Receive.
+        // longest does, one line in each step from the one that reaches a power of two on, so
+        // that no request waits behind more than one line (`print_table_line`).
         let from = TABLE_FROM.load(Ordering::Relaxed);
         if printing && from != 0 {
             let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
             if done >= from && done.is_power_of_two() {
-                print_table(tag);
+                CURSOR.store(0, Ordering::Relaxed);
+            }
+            if CURSOR.load(Ordering::Relaxed) < KINDS {
+                print_table_line(tag);
             }
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
@@ -949,10 +959,11 @@ pub fn report_steps(tag: u8) {
 }
 
 /// Makes the loop of this service tell the table of its longest steps again, one line of
-/// `service table: T kind K N ticks detail D preempts P` for each kind, at each power of two of
-/// the steps it did from 128 on (feature `step-stats`; nothing without it). The line of a new
-/// longest of `report_steps` goes out once, in the burst at the start of a run, where the
-/// bounded kernel log loses records; the table comes after it.
+/// `service table: T kind K N ticks detail D preempts P` for each kind, from each power of two of
+/// the steps it did from 128 on, one line after each of the steps that follow (feature
+/// `step-stats`; nothing without it). The line of a new longest of `report_steps` goes out once,
+/// in the burst at the start of a run, where the bounded kernel log loses records; the table
+/// comes after it. One line a step keeps the wait of a caller behind the print to one line.
 pub fn table_steps() {
     steps::table(128);
 }
