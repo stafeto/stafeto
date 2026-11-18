@@ -62,6 +62,16 @@
    run this way, and xtask takes that one panic, after `TESTS DONE` and
    with the expected code, as the end of the run.
 
+   Two exit codes of `init` are reserved for a planned end of the system
+   (`abi::INIT_END_OFF` and `abi::INIT_END_RESET`). On either, the kernel
+   takes the console back, shows the unshown records of its log, prints one
+   line, `stafeto: system off` or `stafeto: system reset`, and calls PSCI
+   `SYSTEM_OFF` or `SYSTEM_RESET`. No `KERNEL PANIC` line and no backtrace
+   come with it. QEMU is not run with `-no-reboot`, so on `INIT_END_RESET` it
+   reboots the guest: a second `stafeto <version> booting` follows the
+   line. Every other exit code, a fault and a kill of `init` end in
+   the panics above, as before.
+
    An SError or FIQ taken at EL0 stops the machine. The report starts with
    the line `system error at EL0, thread 0x...`, followed by the
    program's registers and a panic naming the entry point: this is a
@@ -83,7 +93,8 @@
    programs and faults a driver did not get to show come before the
    report and the line `KERNEL PANIC`. A run ends with PSCI `SYSTEM_OFF`, after up to
    10 ms for the console's transmitter to go idle, and QEMU exits with
-   status 0, at a panic, `init`'s end among them, and at the end of the
+   status 0, at a panic, `init`'s end among them, at `init`'s exit with
+   `abi::INIT_END_OFF`, and at the end of the
    kernel tests, which print `TESTS DONE total=N failed=M` first. The normal build does
    not end: `init` lives on with the UART driver and the shell, and xtask
    stops a boot on the shell's line

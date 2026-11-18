@@ -1114,6 +1114,9 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
+        // The service of the power button (init's record `power`): the PL061 pin the EC2
+        // button is wired to asks init to stop the system.
+        programs.push(("power", "power", 32 * 1024, &[]));
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
@@ -1237,6 +1240,18 @@ const CYCLE_PROGRAMS: [ImageProgram; 2] = [
 const CEILING_PROGRAMS: [ImageProgram; 2] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ceiling"]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+];
+/// The images of the probes of init's end (spec 7.9): init exits at once
+/// with abi::INIT_END_OFF or abi::INIT_END_RESET.
+const END_OFF_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-off"])];
+const END_RESET_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-reset"])];
+/// The image of the probe of the power button (the ci job `power button`, init's table
+/// `table-power-button`): the PL011's driver and the service `power`, on the kernel booted with
+/// no firmware.
+const POWER_BUTTON_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-power-button"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("power", "power", 32 * 1024, &[]),
 ];
 /// The profiles the programs of those boot images build with (spec 5.4,
 /// 15.2): the image that ships with `--release`, the test images with
@@ -2417,7 +2432,7 @@ commands:
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   data-image <path> [--size 2G] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
   datafs-breaks the deliberate breaks of lib/datafs fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service
+  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe|shutdown|stop-handlers [breaks]] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service; shutdown: init stops the system (SHUTDOWN) with the NVMe controller stopped and the machine off; stop-handlers [breaks]: the same with two POSIX programs and a file on /data, the stop handlers of the process service and datafs, and the file read back whole on the next boot
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -10509,6 +10524,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             svc_tests(&qemu::VIRT_V3).map(drop)
         }),
         job("bad tables", bad_tables_are_refused),
+        job("init end off", init_end_off),
+        job("init end reset", init_end_reset),
+        job("power button", || power_button(&qemu::VIRT)),
+        job("power button GICv3", || power_button(&qemu::VIRT_V3)),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
         }),
@@ -10613,6 +10632,15 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("nvme-persist blk-probe", || {
             store_probe::nvme_persist(&["blk-probe".to_string()])
+        }),
+        job("nvme-persist shutdown", || {
+            store_probe::nvme_persist(&["shutdown".to_string()])
+        }),
+        job("nvme-persist stop-handlers", || {
+            store_probe::nvme_persist(&["stop-handlers".to_string()])
+        }),
+        job("nvme-persist stop-handlers breaks", || {
+            store_probe::nvme_persist(&["stop-handlers".to_string(), "breaks".to_string()])
         }),
         job("store-probe steps", || {
             store_probe::command(&["steps".into()])
@@ -11828,6 +11856,13 @@ fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
         ("boot-svc.img", &SVC_PROGRAMS[..], TEST_PROFILE),
         ("boot-cycle.img", &CYCLE_PROGRAMS[..], TEST_PROFILE),
         ("boot-ceiling.img", &CEILING_PROGRAMS[..], TEST_PROFILE),
+        ("boot-end-off.img", &END_OFF_PROGRAMS[..], TEST_PROFILE),
+        ("boot-end-reset.img", &END_RESET_PROGRAMS[..], TEST_PROFILE),
+        (
+            "boot-power-button.img",
+            &POWER_BUTTON_PROGRAMS[..],
+            TEST_PROFILE,
+        ),
     ] {
         build_boot_image(name, programs, profile)?;
         for (_, package, _, _) in programs {
@@ -13319,6 +13354,121 @@ fn bad_tables_are_refused() -> Result<(), String> {
         qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
     }
     println!("bad tables refused: {} images", REFUSED.len());
+    Ok(())
+}
+
+/// Spec 7.9: init's exit with abi::INIT_END_OFF powers the machine off
+/// with one line and no panic, and QEMU exits with status 0 in time.
+fn init_end_off() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-end-off.img", &END_OFF_PROGRAMS, TEST_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &kernel.elf)?;
+    qemu::expect_system_off(&o)?;
+    println!("init end off: one line, no panic, powered off");
+    Ok(())
+}
+
+/// Spec 7.9: init's exit with abi::INIT_END_RESET resets the machine with
+/// one line and no panic. QEMU is not run with `-no-reboot`, so it boots
+/// again: the probe waits for the line and the second banner, then quits
+/// QEMU through the monitor.
+fn init_end_reset() -> Result<(), String> {
+    const WITHIN: Duration = Duration::from_secs(60);
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-end-reset.img", &END_RESET_PROGRAMS, TEST_PROFILE)?;
+    let scratch = gpu_probe::Scratch::new()?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().display()
+    ));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let driven = (|| {
+        let mut monitor = monitor::Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+        run.expect_line("the reset line", |l| l == qemu::SYSTEM_RESET_LINE, WITHIN)?;
+        run.expect_line("the second banner", qemu::is_banner, WITHIN)?;
+        // QEMU ends with the command: the monitor's answer may never come.
+        let _ = monitor.command("quit", Duration::from_secs(5));
+        Ok::<(), String>(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    let verdict = qemu::expect_system_reset(&outcome.lines);
+    driven.and(verdict)?;
+    println!("init end reset: one line, no panic, a second boot");
+    Ok(())
+}
+
+/// The power button (the decision of #435, step D): the kernel is booted with no firmware, so
+/// QEMU `virt` routes the monitor's `system_powerdown` to pin 3 of its PL061 (with edk2 and ACPI
+/// the machine has a GED device for the button and no PL061 at that address). The service
+/// `power` takes the interrupt and asks init to stop the system: its line, init's lines of the
+/// stop, `stafeto: system off`, no panic, and QEMU's status 0. It runs on the GICv2 machine and
+/// on the GICv3 one; EC2 has a GICv3, but its line (39, level, a Graviton GIC) is covered only
+/// by the run on EC2.
+fn power_button(m: &qemu::Machine) -> Result<(), String> {
+    const WITHIN: Duration = Duration::from_secs(60);
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-power-button.img",
+        &POWER_BUTTON_PROGRAMS,
+        TEST_PROFILE,
+    )?;
+    let scratch = gpu_probe::Scratch::new()?;
+    let mut cmd = qemu::command(m, &kernel.image, Some(&image));
+    cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().display()
+    ));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let driven = (|| {
+        let mut monitor = monitor::Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+        // The service has set the pin up and opened the line: a press before that is lost.
+        run.expect_line(
+            "the line of power",
+            |l| l.contains("power: watching pin 3"),
+            WITHIN,
+        )?;
+        monitor.command("system_powerdown", Duration::from_secs(10))?;
+        Ok::<(), String>(())
+    })();
+    let outcome = run.exit_within(WITHIN);
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    qemu::expect_system_off(&outcome)?;
+    driven?;
+    qemu::expect_in_order(
+        &outcome.lines,
+        &[
+            "power: watching pin 3",
+            "power: button",
+            "init: stopping the system (off)",
+            "init: stopping power",
+            "init: power stopped: ",
+            "init: stopping uart",
+            "init: stopped in ",
+            qemu::SYSTEM_OFF_LINE,
+        ],
+    )
+    .map_err(|e| format!("power button on {}: {e}", m.name))?;
+    let buttons = outcome
+        .lines
+        .iter()
+        .filter(|l| l.contains("power: button"))
+        .count();
+    if buttons != 1 {
+        return Err(format!(
+            "power button on {}: {buttons} lines `power: button`, one expected",
+            m.name
+        ));
+    }
+    println!(
+        "power button on {}: one press, the stop in order, one line off, no panic, powered off",
+        m.name
+    );
     Ok(())
 }
 
@@ -16237,6 +16387,9 @@ mod entropy_in_images_tests {
             ("main::SVC_PROGRAMS", &SVC_PROGRAMS),
             ("main::CYCLE_PROGRAMS", &CYCLE_PROGRAMS),
             ("main::CEILING_PROGRAMS", &CEILING_PROGRAMS),
+            ("main::END_OFF_PROGRAMS", &END_OFF_PROGRAMS),
+            ("main::END_RESET_PROGRAMS", &END_RESET_PROGRAMS),
+            ("main::POWER_BUTTON_PROGRAMS", &POWER_BUTTON_PROGRAMS),
             ("main::SOCK_PROGRAMS", &SOCK_PROGRAMS),
             ("main::SOCK_PROGRAMS_STEPS", &SOCK_PROGRAMS_STEPS),
             ("main::IPC_PROGRAMS", &IPC_PROGRAMS),
@@ -16368,7 +16521,7 @@ mod entropy_in_images_tests {
             ("aws_programs", aws_programs()),
             ("aws_qemu_programs", aws_qemu_programs()),
         ] {
-            for program in ["nvme-blk", "datafsd", "datakey"] {
+            for program in ["nvme-blk", "datafsd", "datakey", "power"] {
                 assert!(
                     programs.iter().any(|p| p.1 == program),
                     "{name} has no {program}"
