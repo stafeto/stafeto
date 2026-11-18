@@ -133,12 +133,15 @@ fn image(
 }
 
 /// The machine of a run. With `icount` the clock follows the instructions, so the steps of the
-/// request loop are the same in every run (the probe's two runs).
+/// request loop are the same in every run (the probe's two runs). The clock is the one of
+/// `sleep=on` (the network probes' choice): while the guest waits for the disk in `wfi`, time
+/// follows the host's, and does not jump to the guest's own deadline (the 10 s wait of datafs for
+/// the disk service) before the completion of the host's file I/O comes (stafeto/stafeto#459).
 fn machine(built: &Built, image: &Path, disk: &Path, icount: bool) -> Command {
     let mut cmd = qemu::command(&qemu::VIRT, &built.kernel.image, Some(image));
     cmd.args(qemu::HEADLESS).args(qemu::store(disk, None));
     if icount {
-        cmd.args(qemu::ICOUNT);
+        cmd.args(["-icount", "shift=4,sleep=on"]);
     }
     cmd
 }
