@@ -337,16 +337,59 @@ def stage(args: argparse.Namespace) -> None:
         names.update(source_names(licenses))
     (out / "sources.txt").write_text("\n".join(sorted(names)) + "\n")
 
-    kernel = work / f"stafeto-{version}-kernel"
+    kernel = work / kernel_archive(version).removesuffix(".tar.xz")
     kernel.mkdir()
     shutil.copy(args.image, kernel / "Image")
     shutil.copy(args.elf, kernel / "kernel.elf")
     write_tar_xz(out / f"{kernel.name}.tar.xz", kernel)
 
-    sources = work / f"stafeto-{version}-gpl-sources"
+    sources = work / sources_archive(version).removesuffix(".tar.xz")
     stage_sources(sources, version, args.cache, sorted(names))
     write_tar_xz(out / f"{sources.name}.tar.xz", sources)
     shutil.rmtree(work)
+
+
+def release_files(version: str) -> list[tuple[list[str], str]]:
+    """The files of the release, in the order of the table in docs/release.md: the
+    file names of a row and its content. `pack` writes these names and
+    tools/release-notes.py lists them, so the notes cannot name a file that is not
+    built. The names of the SBOM and the index are those `pack` gives its copies."""
+    rows: list[tuple[list[str], str]] = []
+    for flavour, (image_name, memory, _) in FLAVOURS.items():
+        what = (f"`Image`, `{image_name}`, `run.sh`, `README.md`, `LICENSES/`" if flavour == "base"
+                else f"the same with `{image_name}` and a `run.sh` that starts the machine with {memory}")
+        rows.append(([run_archive(version, flavour)], what))
+    rows += [
+        ([kernel_archive(version)], "the kernel `Image` and `kernel.elf` with symbols"),
+        ([sources_archive(version)],
+         "the sources of the GPL packages, our tree and relibc at its pin"),
+        ([sbom_name(version)],
+         "the packages with versions, licences, URLs and SHA-256"),
+        ([index_name(version), index_name(version) + ".sig"],
+         "the signed index of the packages on the day of the release"),
+        (["SHA256SUMS"], "SHA-256 of every file above"),
+    ]
+    return rows
+
+
+def run_archive(version: str, flavour: str) -> str:
+    return f"stafeto-{version}-aarch64-virt-{flavour}.tar.xz"
+
+
+def kernel_archive(version: str) -> str:
+    return f"stafeto-{version}-kernel.tar.xz"
+
+
+def sources_archive(version: str) -> str:
+    return f"stafeto-{version}-gpl-sources.tar.xz"
+
+
+def sbom_name(version: str) -> str:
+    return f"stafeto-{version}-sbom.spdx.json"
+
+
+def index_name(version: str) -> str:
+    return f"stafeto-{version}-INDEX"
 
 
 def pack(args: argparse.Namespace) -> None:
@@ -359,7 +402,7 @@ def pack(args: argparse.Namespace) -> None:
     images = {"base": args.base_image, "full": args.full_image}
     release = release_words(version)
     for flavour, (image_name, memory, about) in FLAVOURS.items():
-        run = work / f"stafeto-{version}-aarch64-virt-{flavour}"
+        run = work / run_archive(version, flavour).removesuffix(".tar.xz")
         run.mkdir()
         shutil.copy(args.image, run / "Image")
         shutil.copy(images[flavour], run / image_name)
@@ -371,13 +414,13 @@ def pack(args: argparse.Namespace) -> None:
             image=image_name, memory=memory, about=about, release=release[0], limit=release[1]))
         shutil.copytree(staged / flavour / "LICENSES", run / "LICENSES")
         write_tar_xz(out / f"{run.name}.tar.xz", run)
-    for name in (f"stafeto-{version}-kernel.tar.xz", f"stafeto-{version}-gpl-sources.tar.xz"):
+    for name in (kernel_archive(version), sources_archive(version)):
         shutil.copy(staged / name, out / name)
-    shutil.copy(args.index, out / f"stafeto-{version}-INDEX")
-    shutil.copy(args.index_sig, out / f"stafeto-{version}-INDEX.sig")
+    shutil.copy(args.index, out / index_name(version))
+    shutil.copy(args.index_sig, out / f"{index_name(version)}.sig")
     names = (staged / "sources.txt").read_text().split()
     digests = package_digests(args.index, args.packages)
-    (out / f"stafeto-{version}-sbom.spdx.json").write_text(
+    (out / sbom_name(version)).write_text(
         json.dumps(sbom(version, relibc_commit(), names, digests), indent=2) + "\n")
     refuse_linux_guest(out, ROOT / "target" / "linux-guest")
     lines = [f"{sha256_file(p)}  {p.name}" for p in sorted(out.iterdir())]
