@@ -20,6 +20,8 @@ bench = false
 [features]
 steps = ["rt/step-stats"]
 crash = []
+# The stop handler exits at once (the probe of the stop handlers must catch it).
+break-datafs-stop = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

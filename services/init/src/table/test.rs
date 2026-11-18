@@ -16,14 +16,19 @@ use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
 /// The heartbeat and the watchdog of most services.
-const WATCH: Watch = Watch {
+pub(super) const WATCH: Watch = Watch {
     period_ns: 20 * MS,
     deadline_ns: 100 * MS,
 };
 
 /// An echo service at `level`, its priority and ceiling, with `watch` and
 /// the own arguments `args`.
-const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) -> Record {
+pub(super) const fn echo(
+    name: &'static str,
+    level: u8,
+    watch: Watch,
+    args: &'static [u8],
+) -> Record {
     Record {
         name,
         program: "svc",

@@ -36,6 +36,7 @@ use posix_process_service::rejoin::{self, Outcome, Refusal, Rejoin};
 use posix_process_service::roots::{Registration, Roots, registration};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
+use posix_process_service::stopping::{Act, Stop};
 use posix_process_service::terminals::Terminals;
 use posix_process_service::timers::{self, Timers};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
@@ -43,9 +44,9 @@ use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
     LoaderRoot, Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL,
-    SI_QUEUE, SI_TIMER, SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS,
-    Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult,
-    WaitStart,
+    SI_QUEUE, SI_TIMER, SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SIGTERM,
+    SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED,
+    WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -307,6 +308,8 @@ struct Processes {
     records: Records<Handle<Process>>,
     /// The counter ticks the processes that ended ran (List's pool).
     retired_ticks: u64,
+    /// The stop of the service (`stopping`).
+    stop: Stop,
     /// The CPU the last placement chose (`place`).
     placed_last: u8,
     /// The placement window (`place`): when it began (0: none yet), the
@@ -2412,6 +2415,83 @@ impl Processes {
         }
     }
 
+    /// The processes that are not ended.
+    fn live_count(&self) -> u32 {
+        (0..RECORDS)
+            .filter(|&i| {
+                self.records
+                    .get(i)
+                    .is_some_and(|r| !matches!(r.state, State::Zombie(_)))
+            })
+            .count() as u32
+    }
+
+    /// Sends `signal` from init (pid 1) to every process that is not ended, by the paths of kill:
+    /// a post on the page, or the kill of the process for SIGKILL. Returns the number of the
+    /// processes the signal was posted to (an ignored signal is not counted), and the number of
+    /// the processes that were alive.
+    fn sweep(&mut self, signal: u8) -> (u32, u32) {
+        let (mut posted, mut alive) = (0, 0);
+        for i in 0..RECORDS {
+            if !self
+                .records
+                .get(i)
+                .is_some_and(|r| !matches!(r.state, State::Zombie(_)))
+            {
+                continue;
+            }
+            let info = Info {
+                code: SI_USER,
+                pid: INIT_PID,
+                uid: 0,
+                status: 0,
+                value: 0,
+            };
+            alive += 1;
+            if self.timer_signal(i, signal, info) != Posted::Ignored {
+                posted += 1;
+            }
+        }
+        (posted, alive)
+    }
+
+    /// The next step of the stop, if one is on: on after the ends and the timer.
+    fn stop_step(&mut self) {
+        if !self.stop.running() {
+            return;
+        }
+        let live = self.live_count();
+        match self.stop.check(Self::timer_now(), live) {
+            Act::Wait(until) => {
+                if self.timer.is_some() {
+                    self.timer_arm(Some(until));
+                } else {
+                    // No timer to wait on: the kill goes at once.
+                    self.stop_kill();
+                }
+            }
+            Act::Kill => self.stop_kill(),
+            Act::Exit | Act::Term => self.stop_exit(),
+        }
+    }
+
+    fn stop_kill(&mut self) {
+        let (_, alive) = self.sweep(SIGKILL);
+        self.stop.killed(alive);
+        self.stop_exit();
+    }
+
+    fn stop_exit(&mut self) -> ! {
+        let report = self.stop.report();
+        rt::println!(
+            "posix: stopped, {} signalled, {} ended after SIGTERM, {} killed",
+            report.termed,
+            report.ended,
+            report.killed
+        );
+        sys::process_exit(0)
+    }
+
     /// The time now on the scale of the kernel's timers.
     fn timer_now() -> u64 {
         rt::time::ticks_to_ns(rt::time::now())
@@ -2486,6 +2566,7 @@ impl Processes {
         // Counted apart from the other notices in the steps mode.
         rt::service::step_own();
         self.timer_armed = u64::MAX;
+        self.stop_step();
         let now = Self::timer_now();
         let mut budget = timers::EXPIRY_BUDGET;
         let (list, listed) = self.timers.due(now);
@@ -5018,6 +5099,13 @@ impl Service<0> for Processes {
                 }
                 Answer::Status(Status::from_code(result.err().unwrap_or(0)))
             }
+            // While the service stops no process is made: the caller may try again, which it
+            // does not live to see.
+            n if (n == Method::SpawnStart as u16 || n == Method::ForkStart as u16)
+                && self.stop.running() =>
+            {
+                refuse(proto_process::AGAIN)
+            }
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r, false),
             n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r, false),
@@ -5061,6 +5149,24 @@ impl Service<0> for Processes {
     /// The client of `s` went: its waits go.
     fn gone(&mut self, s: &mut Session<LongSession, 0>) {
         self.ops.gone(&mut s.data);
+    }
+
+    /// The stop notice of init: SIGTERM to every process, up to 3 s for their ends, SIGKILL to the
+    /// rest, one line and exit 0. At init's deadline the kernel ends what is left with the service.
+    fn stop(&mut self) {
+        if self.stop.running() {
+            return;
+        }
+        match self.stop.begin(self.live_count()) {
+            Act::Term => {
+                let (posted, alive) = self.sweep(SIGTERM);
+                // A process stopped by SIGSTOP takes the SIGTERM once it continues.
+                self.sweep(SIGCONT);
+                self.stop.termed(Self::timer_now(), posted, alive);
+                self.stop_step();
+            }
+            _ => self.stop_exit(),
+        }
     }
     /// The telling of a step of the walks (STEP): one step of the walk at
     /// the head of the queue (`walk_step`).
@@ -5192,5 +5298,6 @@ impl Service<0> for Processes {
             self.child_ended(parent, index, end);
         }
         self.kick();
+        self.stop_step();
     }
 }

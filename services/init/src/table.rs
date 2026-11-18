@@ -143,6 +143,11 @@ pub fn loader_grant(client: &str, service: &[u8]) -> bool {
 /// under this name (serve.rs); the service pays for the process. Init
 /// never sends the service a request (spec 6.7).
 pub const PROCESS_SERVICE: &str = "posix";
+/// The name of the record that may ask init to stop the system (proto_init
+/// SHUTDOWN, serve.rs). A table that has it makes it a native service
+/// (`check_power`): the start channel of a POSIX record carries TRANSFER, and a
+/// process of the process service could hand it to another.
+pub const POWER_SERVICE: &str = "power";
 /// The services init gives a notary session of the process service on
 /// CONNECT (proto_process::NOTARY): through it they ask who a client is
 /// (Vouch) and map the page of the credentials generations (Register).
@@ -824,6 +829,10 @@ pub enum TableError<'a> {
     Free {
         record: &'static str,
     },
+    /// The record named POWER_SERVICE is a client or a POSIX process.
+    Power {
+        record: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -953,6 +962,10 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has a `free` above its ceiling, or one that is set with budgets and not below its priority"
             ),
+            TableError::Power { record } => write!(
+                f,
+                "{record} may stop the system: it is a service of its own that does not connect to {PROCESS_SERVICE}"
+            ),
         }
     }
 }
@@ -1030,6 +1043,7 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     check_waits(table)?;
     check_budgets(table)?;
     check_free(table)?;
+    check_power(table)?;
     Ok(order(table))
 }
 
@@ -1135,6 +1149,15 @@ fn check_free(table: &[Record]) -> Result<(), TableError<'static>> {
         }
     }
     Ok(())
+}
+
+/// The record named POWER_SERVICE, if the table has one, is a service that does not connect
+/// to the process service.
+fn check_power(table: &[Record]) -> Result<(), TableError<'static>> {
+    match table.iter().find(|r| r.name == POWER_SERVICE) {
+        Some(r) if r.is_client() || r.is_posix() => Err(TableError::Power { record: r.name }),
+        _ => Ok(()),
+    }
 }
 
 /// The waits of `table` (spec 5, section 4): each names another record that
@@ -1475,6 +1498,7 @@ pub mod net;
 pub mod normal;
 pub mod pkg;
 pub mod ramfs;
+pub mod shutdown;
 pub mod test;
 pub mod vz;
 
@@ -1565,6 +1589,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-fast-switch-scale") as usize
     + cfg!(feature = "table-fast-switch-scale-vz") as usize
     + cfg!(feature = "table-posix-map-big") as usize
+    + cfg!(feature = "table-shutdown") as usize
+    + cfg!(feature = "table-stop-handlers") as usize
+    + cfg!(feature = "table-power-button") as usize
     + cfg!(feature = "table-aws-qemu") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
@@ -1662,6 +1689,9 @@ const _: () = assert!(
     feature = "table-fast-switch-scale-vz",
     feature = "table-posix-map-big",
     feature = "table-aws",
+    feature = "table-shutdown",
+    feature = "table-stop-handlers",
+    feature = "table-power-button",
     feature = "table-aws-qemu"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
@@ -1721,6 +1751,12 @@ pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
 pub const TABLE: &[Record] = aws::TABLE;
 #[cfg(feature = "table-aws-qemu")]
 pub const TABLE: &[Record] = aws::QEMU_TABLE;
+#[cfg(feature = "table-shutdown")]
+pub const TABLE: &[Record] = shutdown::TABLE;
+#[cfg(feature = "table-stop-handlers")]
+pub const TABLE: &[Record] = shutdown::STOP_TABLE;
+#[cfg(feature = "table-power-button")]
+pub const TABLE: &[Record] = shutdown::POWER_BUTTON_TABLE;
 pub use crate::resolve::table;
 /// The platform a table with places by function (`At`) resolves them on.
 #[cfg(feature = "table-aws")]

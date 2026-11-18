@@ -13,6 +13,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use datafs::gpt::Found;
 use datafs::server::Server;
+use datafs::stop::Drain;
 use datafs::volume::{self, Did, Refusal};
 use datafs::{Device, DeviceError, SECTOR};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk};
@@ -423,6 +424,9 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     loop {
         while let Some(i) = oldest() {
+            if STOPPING.load(Acquire) && stop_decision() == Drain::GiveUp {
+                break;
+            }
             // SAFETY: the job is QUEUED: the main thread has finished with it and does not touch it
             // until it is DONE.
             let job = unsafe { &mut *job(i) };
@@ -447,9 +451,51 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 }
             }
             state(i).store(DONE, Release);
+            if STOPPING.load(Acquire) {
+                STOP_JOBS.fetch_add(1, Release);
+            }
             let _ = sys::notify(wake, 1);
         }
+        if STOPPING.load(Acquire) {
+            put_away(&mut server, &mut volume);
+            UNMOUNTED.store(true, Release);
+            let _ = sys::notify(wake, 1);
+            // The main thread ends the process once it has sent the replies.
+            loop {
+                let _ = sys::receive(&kicks);
+            }
+        }
         let _ = sys::receive(&kicks);
+    }
+}
+
+/// The drain step for the jobs queued now, after the time since the stop notice.
+fn stop_decision() -> Drain {
+    let queued = (0..JOBS)
+        .filter(|&i| state(i).load(Acquire) == QUEUED)
+        .count();
+    // 0 is a stop time not stored yet: no time has passed.
+    let at = STOP_AT.load(Acquire);
+    let since = if at == 0 {
+        0
+    } else {
+        rt::time::now().saturating_sub(at)
+    };
+    datafs::stop::drain(queued, rt::time::ticks_to_ns(since))
+}
+
+/// The stop: closes what is still open, unmounts the volume and makes its writes durable.
+fn put_away(server: &mut Server, volume: &mut Option<Volume>) {
+    let Some(fs) = volume.as_mut() else { return };
+    let failed = server.close_all(fs);
+    if failed > 0 {
+        rt::println!("datafs: {failed} files did not close");
+    }
+    if fs.unmount().is_err() {
+        rt::println!("datafs: unmount failed");
+    }
+    if fs.device().flush().is_err() {
+        rt::println!("datafs: flush failed");
     }
 }
 

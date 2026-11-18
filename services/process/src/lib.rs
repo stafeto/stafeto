@@ -25,6 +25,7 @@ pub mod rejoin;
 pub mod roots;
 pub mod shares;
 pub mod signals;
+pub mod stopping;
 pub mod terminals;
 pub mod timers;
 pub mod waits;
