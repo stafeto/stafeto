@@ -29,6 +29,9 @@ impl<T> Shared<T> {
 /// The requests in flight at once, and the notice of a session that went.
 pub const JOBS: usize = 12;
 
+/// The jobs one session may have in flight at once: no session fills the table alone.
+pub const SESSION_JOBS: usize = 4;
+
 pub const FREE: u8 = 0;
 pub const QUEUED: u8 = 1;
 pub const DONE: u8 = 2;
@@ -45,6 +48,9 @@ pub struct Job {
     pub queued_at: AtomicU64,
     pub kind: u8,
     pub owner: u64,
+    /// The label the request thread made for the call (CLONE, EXPORT) or read from the pass the call
+    /// brought (ADOPT); 0 for the rest.
+    pub aux: u64,
     pub request_len: usize,
     pub request: [u8; abi::MESSAGE_MAX],
     pub reply_len: usize,
@@ -59,6 +65,7 @@ impl Job {
             queued_at: AtomicU64::new(0),
             kind: REQUEST,
             owner: 0,
+            aux: 0,
             request_len: 0,
             request: [0; abi::MESSAGE_MAX],
             reply_len: 0,
