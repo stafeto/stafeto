@@ -1987,6 +1987,45 @@ mod tests {
     }
 
     #[test]
+    fn a_first_revision_window_made_under_a_manager_gets_its_focus_in_its_ring() {
+        let mut s = Scene::new();
+        s.set_manager(true);
+        let n = make(&mut s, 1, 1, rect(0, 0, 100, 100), 1);
+        s.post(n, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        // The manager is told of each making and gives the focus: the
+        // native window first, then the window of the first revision.
+        s.focus_on(n).unwrap();
+        let l = s.create(2, 2, SCREEN, true, 0).unwrap();
+        let mut out = [Event::default(); 8];
+        let (got, _) = s.take_manager_events(&mut out);
+        assert_eq!(
+            &out[..got],
+            [
+                Event::new(CREATE, n as u16, 0),
+                Event::new(CREATE, l as u16, 0)
+            ]
+        );
+        // Nothing gave the window the focus yet: the first take of its
+        // buffer, with a manager, leaves it to the manager.
+        s.flush(l, SCREEN).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.focus(), Some(n));
+        assert!(events(&mut s, l).is_empty());
+        // The manager's FOCUS: the window's ring (what EVENTS of its session
+        // reads) has FOCUS_IN, the native window FOCUS_OUT, and the keys are
+        // the first revision's.
+        s.focus_on(l).unwrap();
+        assert_eq!(events(&mut s, l), [Event::new(FOCUS_IN, 0, 0)]);
+        assert_eq!(events(&mut s, n).last(), Some(&Event::new(FOCUS_OUT, 0, 0)));
+        s.key(30, true);
+        let mut keys = [Event::default(); 4];
+        assert_eq!(s.take_keys(l, &mut keys), (1, false));
+    }
+
+    #[test]
     fn a_ring_keeps_the_last_events_and_says_what_it_lost() {
         let mut s = Scene::new();
         let (_, b) = two(&mut s);

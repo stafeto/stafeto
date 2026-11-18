@@ -604,7 +604,39 @@ impl Probe<'_> {
                 }
             }
             if n == 0 && !self.wait_bits(EVENTS_BIT) {
+                rt::println!("focus-probe: no event of a window in {WAIT_NS} ns");
                 return Err("the events never came");
+            }
+        }
+    }
+
+    /// Takes the events of a window that has no channel of its own to say
+    /// they came (the window of the first revision: OPEN gives none), by
+    /// asking again after a pause, until `each` says it has enough (true);
+    /// the events it saw are printed as they come, so that a failure shows
+    /// the last of them.
+    fn poll(
+        &self,
+        name: &str,
+        session: &Handle<Channel>,
+        mut each: impl FnMut(&Event) -> Result<bool, &'static str>,
+    ) -> Result<(), &'static str> {
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        loop {
+            let mut out = [Event::default(); MAX_EVENTS];
+            let (n, _) = self.events(session, &mut out).map_err(say("EVENTS"))?;
+            for e in &out[..n] {
+                rt::println!("focus-probe: {name}: event {e:?}");
+                if each(e)? {
+                    return Ok(());
+                }
+            }
+            if n == 0 {
+                if time::ticks_to_ns(time::now()) > end {
+                    rt::println!("focus-probe: {name}: no event in {WAIT_NS} ns");
+                    return Err("the events never came");
+                }
+                self.sleep(RETRY_NS);
             }
         }
     }
@@ -863,6 +895,14 @@ impl Probe<'_> {
                 return Ok(d);
             }
             if time::ticks_to_ns(time::now()) > end {
+                rt::println!(
+                    "focus-probe: {what}: the service said created {} open {} frames {} busy {} manager {}",
+                    d.created,
+                    d.open,
+                    d.frames,
+                    d.busy,
+                    d.flags & HAS_MANAGER != 0
+                );
                 return Err(what);
             }
             self.sleep(RETRY_NS);
@@ -1057,6 +1097,7 @@ impl Probe<'_> {
         rt::println!("focus-probe: p window is up");
         let mut seen = 0;
         self.watch(&window, |e| {
+            rt::println!("focus-probe: p: event {e:?}");
             let got = (e.kind, e.code, e.value);
             if seen >= P_WANTS.len() || got != P_WANTS[seen] {
                 rt::println!("focus-probe: p: event {seen} is {got:?}");
@@ -1137,7 +1178,7 @@ impl Probe<'_> {
         plain(&owner, w.as_bytes()).map_err(say("FLUSH"))?;
         // The window is shown. The manager answers its making with FOCUS: the
         // window says so with FOCUS_IN in its ring.
-        self.watch(&owner, |e| Ok(e.kind == FOCUS_IN))?;
+        self.poll("o", &owner, |e| Ok(e.kind == FOCUS_IN))?;
         // A window made and closed again tells the injector that all of it
         // happened: the windows made are three and the open ones two.
         let (marker, _) = self
@@ -1164,6 +1205,7 @@ impl Probe<'_> {
             let mut wrong = None;
             let mut got = 0;
             proto_input::read_events(reply.bytes(&mut buffer), |e: KeyEvent| {
+                rt::println!("focus-probe: o: key event {e:?}");
                 got += 1;
                 let key = (e.code, e.value);
                 if e.kind != proto_input::EV_KEY || seen >= O_WANTS.len() || key != O_WANTS[seen] {
@@ -1179,6 +1221,7 @@ impl Probe<'_> {
             }
             if got == 0 {
                 if time::ticks_to_ns(time::now()) > end {
+                    rt::println!("focus-probe: o: {seen} of {} keys came", O_WANTS.len());
                     return Err("the keys never came");
                 }
                 self.sleep(RETRY_NS);
