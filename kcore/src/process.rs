@@ -11,6 +11,27 @@
 use crate::must::Must;
 use abi::{Error, ProcessState};
 
+/// What the kernel does when init ended (spec 7.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitEnd {
+    /// Power the machine off (PSCI SYSTEM_OFF).
+    Off,
+    /// Reset the machine (PSCI SYSTEM_RESET).
+    Reset,
+    /// Panic with the report of the end.
+    Panic,
+}
+
+/// The outcome of init's end in `state`: only an exit with one of the two
+/// reserved codes powers off or resets; every other end panics.
+pub fn init_end(state: ProcessState) -> InitEnd {
+    match state {
+        ProcessState::Exited { code } if code == abi::INIT_END_OFF => InitEnd::Off,
+        ProcessState::Exited { code } if code == abi::INIT_END_RESET => InitEnd::Reset,
+        _ => InitEnd::Panic,
+    }
+}
+
 pub struct Life {
     /// Threads that started and have not ended.
     live: u32,
@@ -87,6 +108,22 @@ mod tests {
         far: 0x1000,
         elr: 0x40_0000,
     };
+
+    #[test]
+    fn init_end_chooses_off_reset_or_panic() {
+        let exit = |code| ProcessState::Exited { code };
+        assert_eq!(init_end(exit(abi::INIT_END_OFF)), InitEnd::Off);
+        assert_eq!(init_end(exit(abi::INIT_END_RESET)), InitEnd::Reset);
+        for code in [0, 1, 2, abi::PANIC_EXIT_CODE, u64::MAX] {
+            assert_eq!(init_end(exit(code)), InitEnd::Panic, "code {code}");
+        }
+        // Neighbours of the reserved codes still panic.
+        assert_eq!(init_end(exit(abi::INIT_END_OFF + 1)), InitEnd::Panic);
+        assert_eq!(init_end(exit(abi::INIT_END_RESET - 1)), InitEnd::Panic);
+        assert_eq!(init_end(FAULT), InitEnd::Panic);
+        assert_eq!(init_end(ProcessState::Killed), InitEnd::Panic);
+        assert_eq!(init_end(ProcessState::Alive), InitEnd::Panic);
+    }
 
     #[test]
     fn last_started_thread_ends_the_process() {

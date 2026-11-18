@@ -135,6 +135,16 @@ pub trait Service<const K: usize> {
     fn notification(&mut self, n: Notice) {
         let _ = n;
     }
+
+    /// The stop notice of init (proto_init::STOP_NOTICE): the system goes
+    /// down and init asks the service to end. The loop calls it before
+    /// `notification` sees the notice, so no handler of the service takes the
+    /// notice for another. The default ends the process at once with code 0;
+    /// a service with state to put away overrides it and exits itself, within
+    /// the bound of its record (init kills it at its deadline).
+    fn stop(&mut self) {
+        sys::process_exit(0)
+    }
 }
 
 /// A notification, as `receive` took it (spec 6.5).
@@ -525,6 +535,16 @@ pub fn run_in<S: Service<K>, const K: usize>(
         let dispatch = || {
             match (notice.source, notice.label, &mut beat) {
                 (Source::Timer, 0, Some(beat)) => beat.expired(),
+                // Init's stop notice: its label is one only init's copy of the
+                // channel carries (NOTIFY is held by init and the service).
+                // Whatever the bits: a CLIENT_GONE of the copy that comes by itself
+                // is swallowed, since it names no session (`place` and `closed`
+                // of a service would take the label for a client's).
+                (Source::Session, proto_init::STOP_NOTICE, _) => {
+                    if proto_init::wants_stop(notice.bits) {
+                        service.stop()
+                    }
+                }
                 (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
                     steps::gone();
                     let bits = notice.bits & !CLIENT_GONE;

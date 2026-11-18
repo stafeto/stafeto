@@ -801,6 +801,65 @@ mod served {
         u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
     }
 
+    /// A file written through the protocol with no sync and no close, its session still there when
+    /// the service stops: `close_all`, the unmount and the flush of the stop put it on the medium
+    /// whole, and a machine that starts again from that medium reads all of it.
+    #[test]
+    fn the_stop_puts_an_open_unsynced_file_on_the_medium_whole() {
+        const BYTES: usize = 20_000;
+        let fill = |k: usize| (k as u32).wrapping_mul(31).wrapping_add(7) as u8;
+        let run = |stop: bool| -> Vec<u8> {
+            let mut state = storage();
+            let mut server = Server::new();
+            let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
+            fs.format().unwrap();
+            fs.mount().unwrap();
+            let opened = call(&mut server, &mut fs, 1, |w| {
+                p::open(b"/f", p::WRITE | p::CREATE | p::TRUNCATE, w)
+            })
+            .unwrap();
+            let handle = word(&opened, 0);
+            let mut at = 0;
+            while at < BYTES {
+                let n = (BYTES - at).min(900);
+                let chunk: Vec<u8> = (at..at + n).map(fill).collect();
+                call(&mut server, &mut fs, 1, |w| p::write(handle, &chunk, w)).unwrap();
+                at += n;
+            }
+            if stop {
+                assert_eq!(server.close_all(&mut fs), 0);
+                assert_eq!(server.open_count(), 0);
+                fs.unmount().unwrap();
+                fs.device().flush().unwrap();
+            }
+            // The machine starts again: what was not flushed is lost.
+            let mut device = fs.into_device();
+            device.power_cycle(Survive::None);
+            let mut state = storage();
+            let mut fs = Fs::new(device, &mut state).unwrap();
+            if fs.mount().is_err() {
+                return Vec::new();
+            }
+            let Ok(f) = fs.open(b"/f", Open::READ) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = fs.read(f, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        };
+        let whole: Vec<u8> = (0..BYTES).map(fill).collect();
+        assert_eq!(run(true), whole);
+        // Without the stop, the same file is short or missing: the test can fail.
+        assert_ne!(run(false), whole);
+    }
+
     #[test]
     fn a_session_works_through_the_protocol() {
         let mut rig = Rig {

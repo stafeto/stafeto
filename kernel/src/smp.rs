@@ -5,10 +5,8 @@
 //! tree lists at head.S's `secondary_entry` with the MMU off; the CPU
 //! drops to EL1, turns its MMU on over the kernel's tables, sets up its
 //! registers, its GIC interface and its timer, reports itself in its CPU
-//! block and idles in `wfi`, serving the kernel's SGIs. Nothing is
-//! scheduled on it yet: the scheduler stays on CPU 0 (stages 3 and 4). A
-//! CPU other than CPU 0 touches no kernel structure but its own block and
-//! the atomics here: the console and OBJ are for CPU 0 until then.
+//! block, then schedules the threads placed on it (`sched::resume`) and
+//! serves the kernel's SGIs.
 //!
 //! The probe of the SGIs lets every CPU ping every other and checks each
 //! pong: what a sender wrote before its SGI is there when the SGI comes.

@@ -131,6 +131,11 @@ impl Jobs {
         &self.queue
     }
 
+    /// Whether a job of the record at `place` waits or runs.
+    pub fn holds(&self, place: usize) -> bool {
+        self.queue.holds(place) || self.current.is_some_and(|j| j.record == place)
+    }
+
     /// Puts `job` in the queue (Queue::push, whose refusal gives it back):
     /// the level the worker goes to at once while it does a job, above the
     /// job that came when its record is the higher; None for an idle
