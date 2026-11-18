@@ -229,6 +229,36 @@ pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
 /// `net-probe steps` measured in six runs of v0.5.0 and of main (8 768, the echo role).
 pub const WIRE_FRAME_TICKS: usize = 8_800;
 pub const STEP_TAIL_TICKS: usize = 3_000;
+/// A frame of the wire in a step of sending (the buffer, the sum and the copy included), in
+/// ticks under -icount: the 90th percentile of `net-probe steps` was 6 080 (ping role) and
+/// 5 312 (echo role) in all three runs of probe run 44317789053; 6 500 keeps the spread of
+/// builds. A measured p90 above its constant is a warning of `net-probe steps`; it fails only
+/// when the step would pass the bound (`choose::Ceilings`).
+pub const WIRE_TX_FRAME_TICKS: usize = 6_500;
+/// The pass over one group of sockets without its frames (`split::GROUP`): 3 776 in all three
+/// runs of probe run 44317789053, kept at 4 000. `TX_FIXED_TICKS` is the rest of a step of
+/// sending that is not a group or a frame (`fixed_tx`: 3 392 in the same runs, kept at 3 400; it covers what `tx_step` does before and
+/// after `egress`: `step_own`, `follow_address`, `begin_step`, `events`, `addresses`, `ask_neighbours`).
+/// The rule of `choose` reads them as the constants of the code, and `net-probe steps` fails
+/// when a measured frame passes its constant.
+pub const TX_GROUP_TICKS: usize = 4_000;
+pub const TX_FIXED_TICKS: usize = 3_400;
+/// The price of a frame of the loopback, received and sent, 90th percentile, in ticks
+/// (`frame_rx` 3 136 at most in the runs of probe run 44317789053, `frame_tx` 576).
+pub const LOOP_RX_FRAME_TICKS: usize = 3_200;
+pub const LOOP_TX_FRAME_TICKS: usize = 600;
+/// The time in ticks a step of sending may have used when it visits a second group (images
+/// that count steps only, as `RX_SOFT`): past it the group waits for the next step. A group
+/// that sends a wire frame costs `TX_GROUP_TICKS` and `WIRE_TX_FRAME_TICKS`, so the step costs
+/// at most the share, the group, the frame and the fixed part of the step: the margin less
+/// those three, 2 600.
+pub const TX_SOFT_MEASURED: u64 =
+    (STEP_MARGIN - TX_GROUP_TICKS - WIRE_TX_FRAME_TICKS - TX_FIXED_TICKS) as u64 / 100 * 100;
+pub const TX_SOFT: u64 = if cfg!(feature = "steps") {
+    TX_SOFT_MEASURED
+} else {
+    u64::MAX
+};
 /// A SYN that is not the first frame of its step: the stack takes it, the reap of its queue
 /// (inside `route`) and smoltcp's answer come after the share is checked. The price is a
 /// bound: the loopback frame's 90th percentile (`frame_rx` 3 072 at most in six runs of
@@ -441,8 +471,9 @@ pub const MAP_STEP_TICKS: usize = 2_500;
 /// The worst step of each part of the service by the sums of the step rule, in ticks: the
 /// switch with a chunk of the offload past the soft share (a piece of the sweep at the start of
 /// the step counts toward the share, so this sum covers it), the switch with its sweep, the stack
-/// receiving, the stack taking a SYN into a queue that lacks sockets, and the step of a map.
-pub const WORST_STEPS: [usize; 6] = [
+/// receiving, the stack taking a SYN into a queue that lacks sockets, the step of a map, and the
+/// stack sending with a second group.
+pub const WORST_STEPS: [usize; 7] = [
     SOFT_MEASURED as usize + TSO_TICKS + SWITCH_BASE * 1_500 + STEP_TAIL_TICKS,
     SOFT_MEASURED as usize + SWEEP_TICKS + 1_500,
     RX_SOFT_MEASURED as usize + WIRE_FRAME_TICKS + STEP_TAIL_TICKS,
@@ -455,7 +486,11 @@ pub const WORST_STEPS: [usize; 6] = [
     // part (the step of waking after the time limits measured 2 947), then the builds.
     STEP_TAIL_TICKS + crate::queue::REBUILD_MAX as usize * BUILD_TICKS,
     MAP_CALL_TICKS + MAP_STEP_TICKS,
+    // The stack sending: a second group visited within the share, which sends a wire frame
+    // (one frame: `STEP_TX` is 1 in the images that count steps, asserted below).
+    TX_SOFT_MEASURED as usize + TX_GROUP_TICKS + WIRE_TX_FRAME_TICKS + TX_FIXED_TICKS,
 ];
+const _: () = assert!(!cfg!(feature = "steps") || STEP_TX == 1);
 const _: () = {
     let mut i = 0;
     while i < WORST_STEPS.len() {
@@ -1145,15 +1180,22 @@ mod tests {
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
         // here each sum is compared with the margin and with its value.
-        assert_eq!(WORST_STEPS, [16_200, 14_300, 16_500, 16_500, 5_400, 14_500]);
+        assert_eq!(TX_SOFT_MEASURED, 2_600);
+        assert_eq!(
+            WORST_STEPS,
+            [16_200, 14_300, 16_500, 16_500, 5_400, 14_500, 16_500]
+        );
         for worst in WORST_STEPS {
             assert!(worst <= STEP_MARGIN, "{worst} over the margin");
         }
         // The images that do not count steps keep the shares of a real clock.
         if !cfg!(feature = "steps") {
-            assert_eq!((SWITCH_SOFT, RX_SOFT), (7_000, u64::MAX));
+            assert_eq!((SWITCH_SOFT, RX_SOFT, TX_SOFT), (7_000, u64::MAX, u64::MAX));
         } else {
-            assert_eq!((SWITCH_SOFT, RX_SOFT), (SOFT_MEASURED, RX_SOFT_MEASURED));
+            assert_eq!(
+                (SWITCH_SOFT, RX_SOFT, TX_SOFT),
+                (SOFT_MEASURED, RX_SOFT_MEASURED, TX_SOFT_MEASURED)
+            );
         }
         // The sweep at the end of a step follows the share of the image.
         assert_eq!(SWEEP_SOFT, SWITCH_SOFT);
