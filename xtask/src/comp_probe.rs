@@ -153,6 +153,7 @@ const DRIVER_KINDS: [(usize, &str); 3] = [(5, "Subscribe"), (6, "Commit"), (65, 
 /// were ready once, every check of the clients passed once, none failed,
 /// and the window of the first revision came back once.
 pub fn verdict(lines: &[String]) -> Result<(), String> {
+    let lines = &crate::qemu::unglued(lines, RELEASED);
     let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
     if let Some(failed) = lines.iter().find(|l| l.starts_with("comp-probe: failed")) {
         return Err(failed.clone());
@@ -346,6 +347,24 @@ mod tests {
         let mut lines = good_run();
         lines.retain(|l| l != RELEASED);
         assert!(verdict(&lines).unwrap_err().contains("screen released"));
+    }
+
+    #[test]
+    fn a_release_that_came_inside_the_line_of_a_client_still_counts() {
+        // Run 44364602842: the line of the compositor came in the middle of a client's line.
+        let mut lines = good_run();
+        let busy = "comp-probe: OPEN is BUSY while a closed window's mapping is kept";
+        assert!(
+            lines.iter().any(|l| l == busy),
+            "the check is in the good run"
+        );
+        lines.retain(|l| l != busy && l != RELEASED);
+        lines.push(RELEASED.to_owned());
+        lines.push(format!(
+            "comp-probe: OPEN is BUSY while a closed window's mapping is{RELEASED}"
+        ));
+        lines.push(" kept".to_owned());
+        assert_eq!(verdict(&lines), Ok(()));
     }
 
     fn step(tag: &str, kind: usize, ticks: u64) -> String {

@@ -755,6 +755,17 @@ fn lost_records(lines: &[String]) -> Vec<u64> {
         .collect()
 }
 
+/// The longest step of each kind of the NVMe service in a run: the table the service tells after
+/// the burst at the start (`service table:` lines, whole when the run did enough steps), and the
+/// lines of a new longest, which the kernel log may have lost in the burst, as the fallback and
+/// for the steps after the last table. The longer of the two is kept for each kind.
+fn step_rows(lines: &[String]) -> Vec<(usize, u64, u64)> {
+    merge(
+        step_line::table(lines, blk_probe::BLK_TAG),
+        longest_steps(lines, blk_probe::BLK_TAG),
+    )
+}
+
 /// The longest of each kind in two runs.
 fn merge(a: Vec<(usize, u64, u64)>, b: Vec<(usize, u64, u64)>) -> Vec<(usize, u64, u64)> {
     let mut out = a;
@@ -1344,7 +1355,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     if steps {
         // Every method of the service came, and no step of it, the heartbeat's and the
         // interrupt's included, is past 0.9 of term B.
-        let mut blk = longest_steps(&first, blk_probe::BLK_TAG);
+        let mut blk = step_rows(&first);
         // A line of a step is told only when it is a new longest of its kind, and with the lines
         // of the services glued together under -icount one may be lost: a kind that did not come
         // is looked for in a run on a fresh disk, two more at most, and the longest of each kind
@@ -1367,7 +1378,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 BOOT_TIMEOUT * 40,
             )?;
             expect_within(&again, &steady_lines(&world))?;
-            blk = merge(blk, longest_steps(&again, blk_probe::BLK_TAG));
+            blk = merge(blk, step_rows(&again));
             lost.push(lost_records(&again));
             runs += 1;
         }
@@ -2856,6 +2867,25 @@ mod tests {
         let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
         let why = judge("the NVMe service", &rows, &kinds).unwrap_err();
         assert!(why.contains("no step Info"), "{why}");
+    }
+
+    #[test]
+    fn the_table_after_the_burst_fills_the_kinds_the_lost_lines_carried() {
+        let mut lines = console(&LOST_START);
+        lines.extend(console(&[
+            "service table: 15 kind 1 2192 ticks detail 0 preempts 0",
+            "service table: 15 kind 2 3914 ticks detail 0 preempts 0",
+            "service table: 15 kind 5 8058 ticks detail 0 preempts 0",
+            "service table: 15 kind 6 5064 ticks detail 0 preempts 0",
+            "service table: 15 kind 66 779 ticks detail 0 preempts 0",
+        ]));
+        let rows = step_rows(&lines);
+        let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
+        assert_eq!(judge("the NVMe service", &rows, &kinds), Ok(()));
+        assert!(rows.contains(&(5, 8058, 0)));
+        // A later line of a longer step wins over the table.
+        lines.push("service step: 15 kind 5 9000 ticks detail 0".to_owned());
+        assert!(step_rows(&lines).contains(&(5, 9000, 0)));
     }
 
     #[test]
