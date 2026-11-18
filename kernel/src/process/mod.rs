@@ -1059,12 +1059,27 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
 }
 
 /// Init ended (spec 7.9): init lives for good, and any end of it is a
-/// panic. An exit panics with the line «init exited with code N», which
+/// panic, except an exit with abi::INIT_END_OFF or abi::INIT_END_RESET,
+/// which print one line and call PSCI SYSTEM_OFF or SYSTEM_RESET. Any
+/// other exit panics with the line «init exited with code N», which
 /// xtask takes as the end of a run of the test init; a fault or a kill
 /// panics with its report. In test builds the running test judges init's
 /// end instead, and the tests go on (testpoint::init_ended).
 fn init_ended(state: ProcessState) -> ! {
     crate::testpoint::init_ended();
+    match kcore::process::init_end(state) {
+        kcore::process::InitEnd::Off => {
+            crate::panicking::take_console();
+            kprintln!("stafeto: system off");
+            crate::psci::system_off()
+        }
+        kcore::process::InitEnd::Reset => {
+            crate::panicking::take_console();
+            kprintln!("stafeto: system reset");
+            crate::psci::system_reset()
+        }
+        kcore::process::InitEnd::Panic => {}
+    }
     match state {
         ProcessState::Exited { code } => ::core::panic!("init exited with code {code}"),
         ProcessState::Fault { esr, far, elr } => {

@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kboot::bootinfo::PsciConduit;
 
 const SYSTEM_OFF: u64 = 0x8400_0008;
+const SYSTEM_RESET: u64 = 0x8400_0009;
 /// CPU_ON, SMC64 calling convention (PSCI 1.x, 5.6) [G37].
 const CPU_ON: u64 = 0xC400_0003;
 static CONDUIT: AtomicU8 = AtomicU8::new(0);
@@ -32,6 +33,26 @@ pub fn system_off() -> ! {
         match CONDUIT.load(Ordering::Relaxed) {
             1 => core::arch::asm!("hvc #0", inout("x0") SYSTEM_OFF => _, clobber_abi("C")),
             2 => core::arch::asm!("smc #0", inout("x0") SYSTEM_OFF => _, clobber_abi("C")),
+            _ => {}
+        }
+    }
+    loop {
+        // SAFETY: waiting for an event has no side effects.
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+    }
+}
+
+/// Resets the machine through PSCI SYSTEM_RESET once the console's
+/// transmitter is idle, up to 10 ms; parks the CPU when no conduit is known
+/// or the call returns.
+pub fn system_reset() -> ! {
+    crate::console::drain();
+    // SAFETY: SYSTEM_RESET does not return when it succeeds; the SMC calling
+    // convention clobbers x0-x17, which clobber_abi("C") covers.
+    unsafe {
+        match CONDUIT.load(Ordering::Relaxed) {
+            1 => core::arch::asm!("hvc #0", inout("x0") SYSTEM_RESET => _, clobber_abi("C")),
+            2 => core::arch::asm!("smc #0", inout("x0") SYSTEM_RESET => _, clobber_abi("C")),
             _ => {}
         }
     }
