@@ -73,10 +73,14 @@
 //!      flood of SYNs past the room of the queues. Right after it ONE request
 //!      over TLS, ONE over HTTP and a keep-alive connection opened before the
 //!      scan must answer, and the counters of the network service on the
-//!      console (`net: queues ...`) must show `syn_dropped`, `queue_reaped`
-//!      and `key_stale` raised against the report before the scan
-//!      (`embryo_recycled` is printed with them). The step waits for the
-//!      reports (up to 35 s before, 80 s after).
+//!      console (`net: queues ...`) must show `queue_reaped` raised against
+//!      the report before the scan, the sockets in use and the entries of the
+//!      demultiplexer back within a small bound of their level before it (no
+//!      leak: `scan_replay::SOCKETS_SLACK`, `DEMUX_SLACK`), and `listen_short`
+//!      0 (`syn_dropped`, `embryo_recycled` and `key_stale` are printed with
+//!      them and need not change: they depend on how well the queues kept
+//!      up). The first request has 5 s. The step waits for the reports (up to
+//!      35 s before, 80 s after).
 //!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
