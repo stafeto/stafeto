@@ -13,6 +13,11 @@
 //! - `filter-mirror` (tx) copies every frame the guest sends to a second
 //!   chardev socket (the guest's traffic to the forwarding goes on as before).
 //!
+//! The sockets are connected right after QEMU starts and the mirror is read
+//! for the whole run (frames are dropped unless a scan records them): a
+//! chardev server with no client makes QEMU print "filter mirror send
+//! failed" on every transmit of the guest.
+//!
 //! The scanner is a made-up host on the guest's network (`PEER_IP`, `PEER_MAC`)
 //! that xtask plays frame by frame (`rawframe`). The forwarding sees the
 //! guest's SYN-ACKs to it as segments of no connection and may answer with an
@@ -24,6 +29,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,15 +88,21 @@ struct Seen {
 pub struct Tap {
     inject: Arc<Mutex<UnixStream>>,
     seen: Arc<Mutex<Seen>>,
+    recording: Arc<AtomicBool>,
+    /// Set by the reader when the mirror's stream ended.
+    ended: Arc<AtomicBool>,
 }
 
-fn connect(path: &Path, within: Duration) -> Result<UnixStream, String> {
+fn connect(role: &str, path: &Path, within: Duration) -> Result<UnixStream, String> {
     let until = Instant::now() + within;
     loop {
         match UnixStream::connect(path) {
             Ok(s) => return Ok(s),
             Err(e) if Instant::now() >= until => {
-                return Err(format!("{}: {e}", path.display()));
+                return Err(format!(
+                    "the {role} socket of the network filters, {}: {e} (QEMU makes it at start)",
+                    path.display()
+                ));
             }
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
@@ -99,19 +111,38 @@ fn connect(path: &Path, within: Duration) -> Result<UnixStream, String> {
 
 impl Tap {
     pub fn connect(p: &Paths) -> Result<Tap, String> {
-        let inject = Arc::new(Mutex::new(connect(&p.inject, Duration::from_secs(10))?));
-        let mut mirror = connect(&p.mirror, Duration::from_secs(10))?;
+        let inject = Arc::new(Mutex::new(connect(
+            "injection (indev of filter-redirector)",
+            &p.inject,
+            Duration::from_secs(10),
+        )?));
+        let mut mirror = connect(
+            "mirror (outdev of filter-mirror)",
+            &p.mirror,
+            Duration::from_secs(10),
+        )?;
         let seen = Arc::new(Mutex::new(Seen::default()));
+        let recording = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
         let (reply, notes) = (inject.clone(), seen.clone());
+        let (on, done) = (recording.clone(), ended.clone());
         thread::spawn(move || {
             let mut stream = Unframer::default();
             let mut buf = vec![0u8; 65536];
             loop {
                 let n = match mirror.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) | Err(_) => {
+                        done.store(true, Ordering::SeqCst);
+                        return;
+                    }
                     Ok(n) => n,
                 };
                 stream.push(&buf[..n]);
+                if !on.load(Ordering::SeqCst) {
+                    // Between scans the frames are read and dropped.
+                    while stream.pop().is_some() {}
+                    continue;
+                }
                 while let Some(frame) = stream.pop() {
                     match rawframe::parse(&frame) {
                         Frame::ArpRequest {
@@ -141,7 +172,17 @@ impl Tap {
                 }
             }
         });
-        Ok(Tap { inject, seen })
+        Ok(Tap {
+            inject,
+            seen,
+            recording,
+            ended,
+        })
+    }
+
+    /// Turns the reading of the guest's frames on or off.
+    pub fn record(&self, on: bool) {
+        self.recording.store(on, Ordering::SeqCst);
     }
 
     /// Frames to the guest, in one write (they reach the device together).
@@ -150,11 +191,9 @@ impl Tap {
         for f in frames {
             bytes.extend_from_slice(&rawframe::framed(f));
         }
-        self.inject
-            .lock()
-            .unwrap()
-            .write_all(&bytes)
-            .map_err(|e| format!("the injection socket: {e}"))
+        self.inject.lock().unwrap().write_all(&bytes).map_err(|e| {
+            format!("writing to the injection socket (indev of filter-redirector): {e}")
+        })
     }
 
     fn synack(&self, port: u16, guest_port: u16) -> Option<u32> {
@@ -266,9 +305,14 @@ pub fn replay(tap: &Tap, ports: &[u16]) -> Result<Replayed, String> {
     }
     if done.handshakes_ended == 0 {
         return Err(format!(
-            "no SYN-ACK of the guest reached the scanner ({} of {} SYNs answered): the filters or the guest's neighbour entry are not working",
+            "no SYN-ACK of the guest reached the scanner after 5 s ({} of {} SYNs answered; the mirror socket {}): the filters or the guest's neighbour entry are not working",
             tap.synacks(),
-            mine.len()
+            mine.len(),
+            if tap.ended.load(Ordering::SeqCst) {
+                "was closed by QEMU"
+            } else {
+                "is open"
+            }
         ));
     }
     tap.send(&closing)?;
@@ -449,5 +493,67 @@ mod tests {
         assert!(a.contains("filter-mirror,id=scan-f-out,netdev=n0,queue=tx,outdev=scan-out"));
         assert!(crate::qemu::net(&[]).join(" ").contains("user,id=n0"));
         assert_eq!(crate::qemu::NET_MAC, "52:54:00:12:34:56");
+    }
+
+    #[test]
+    fn the_mirror_is_drained_always_and_read_only_while_recording() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("sr{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = paths(&dir);
+        let (_inject, mirror) = (
+            UnixListener::bind(&p.inject).unwrap(),
+            UnixListener::bind(&p.mirror).unwrap(),
+        );
+        let tap = Tap::connect(&p).unwrap();
+        let (mut qemu, _) = mirror.accept().unwrap();
+        let synack = |port: u16| {
+            rawframe::framed(
+                &Segment {
+                    src_mac: GUEST_MAC,
+                    dst_mac: PEER_MAC,
+                    src_ip: GUEST_IP,
+                    dst_ip: PEER_IP,
+                    src_port: 80,
+                    dst_port: port,
+                    seq: 9,
+                    ack: 1,
+                    flags: SYN | ACK,
+                }
+                .frame(),
+            )
+        };
+        let waits = |f: &dyn Fn() -> bool| {
+            for _ in 0..100 {
+                if f() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        qemu.write_all(&synack(5000)).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(tap.synack(5000, 80), None);
+        tap.record(true);
+        qemu.write_all(&synack(5001)).unwrap();
+        assert!(waits(&|| tap.synack(5001, 80) == Some(9)));
+        assert_eq!(tap.synack(5000, 80), None);
+        drop(qemu);
+        assert!(waits(&|| tap.ended.load(Ordering::SeqCst)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_socket_is_named() {
+        let dir = std::env::temp_dir().join(format!("sn{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = paths(&dir);
+        let e = connect("mirror", &p.mirror, Duration::from_millis(100)).unwrap_err();
+        assert!(
+            e.contains("mirror socket") && e.contains("scan-out.sock"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
