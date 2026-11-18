@@ -13,6 +13,10 @@ and a link to the pull requests merged since the previous tag follow.
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dist  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -24,10 +28,16 @@ def summary(version: str) -> str:
     return "\n".join([
         f"stafeto {version}: a POSIX system on its own capability microkernel for AArch64, to boot in QEMU.",
         "",
-        f"Download `stafeto-{version}-aarch64-virt.tar.xz`, unpack it and run `./run.sh` "
+        f"Download `{dist.run_archive(version, 'base')}`, unpack it and run `./run.sh` "
         "(`--cpus N` for several CPUs, `--hvf` on a Mac with Apple silicon). "
         "The README in the archive lists what is inside and the limits.",
     ])
+
+
+def files_table(version: str) -> list[str]:
+    """The rows of the table of files: the names `tools/dist.py` packs."""
+    return ["| " + ", ".join(f"`{name}`" for name in names) + f" | {content} |"
+            for names, content in dist.release_files(version)]
 
 
 def notes(version: str, tag: str, previous: str | None) -> str:
@@ -41,11 +51,7 @@ def notes(version: str, tag: str, previous: str | None) -> str:
         "",
         "| File | Content |",
         "| --- | --- |",
-        f"| `stafeto-{version}-aarch64-virt.tar.xz` | Image, boot image of the shell, `run.sh`, README, LICENSES |",
-        f"| `stafeto-{version}-kernel.tar.xz` | the kernel Image and the ELF file with symbols |",
-        f"| `stafeto-{version}-gpl-sources.tar.xz` | the sources of the GPL packages, our tree and relibc at its pin |",
-        f"| `stafeto-{version}-sbom.spdx.json` | the packages with versions, licences, URLs and SHA-256 |",
-        "| `SHA256SUMS` | SHA-256 of every file above |",
+        *files_table(version),
         "",
         f"The plans are in the [README]({repository}#where-it-is-going); "
         f"every change of this release is in the [merged pull requests]({changes}).",
