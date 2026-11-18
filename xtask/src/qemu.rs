@@ -1323,6 +1323,24 @@ pub fn expect_system_off(o: &Outcome) -> Result<(), String> {
     Ok(())
 }
 
+/// The lines of `marks` come in that order: each mark is found in a line after
+/// the line of the mark before it (a line holds the text of its mark).
+pub fn expect_in_order(lines: &[String], marks: &[&str]) -> Result<(), String> {
+    let mut from = 0;
+    for mark in marks {
+        match lines[from..].iter().position(|l| l.contains(mark)) {
+            Some(at) => from += at + 1,
+            None => {
+                return Err(format!(
+                    "no line with {mark:?} after line {from}; the order wanted: {marks:?}; last lines: {:?}",
+                    tail(lines)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The kernel's first line of a boot.
 pub fn is_banner(line: &str) -> bool {
     line.starts_with("stafeto ") && line.ends_with(" booting")
@@ -2351,6 +2369,19 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..good
         };
         assert!(expect_system_off(&hung).is_err());
+    }
+
+    /// The marks of a stop must come in their order, each after the one before.
+    #[test]
+    fn marks_are_found_in_their_order() {
+        let l = |v: &[&str]| lines(v);
+        let run = l(&["a 1", "b 2", "c 3", "b 4"]);
+        assert_eq!(expect_in_order(&run, &["a", "b", "c"]), Ok(()));
+        assert_eq!(expect_in_order(&run, &["a", "c", "b"]), Ok(()));
+        assert!(expect_in_order(&run, &["c", "a"]).is_err());
+        assert!(expect_in_order(&run, &["b", "b", "b"]).is_err());
+        assert!(expect_in_order(&run, &["z"]).is_err());
+        assert_eq!(expect_in_order(&run, &[]), Ok(()));
     }
 
     /// Spec 7.9: a reset shows the line between two banners.

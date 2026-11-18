@@ -1171,6 +1171,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             return nvme_persist_key(case, breaks);
         }
         Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
+        Some("shutdown") if args.len() == 1 => return nvme_shutdown(),
         _ => {}
     }
     let (breaks, shape, steps) = match args.first().map(String::as_str) {
@@ -1181,7 +1182,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         Some("steps") => (false, Shape::Plain, true),
         Some(other) => {
             return Err(format!(
-                "usage: nvme-persist [breaks|lba4096|mdts1|steps|key|blk-probe]: {other}"
+                "usage: nvme-persist [breaks|lba4096|mdts1|steps|key|blk-probe|shutdown]: {other}"
             ));
         }
     };
@@ -1993,6 +1994,95 @@ fn nvme_blk_probe() -> Result<(), String> {
         .map_err(|e| format!("nvme-persist blk-probe (checking): {e}"))?;
     println!(
         "nvme-persist blk-probe: refusals, a pattern of 4 MiB and the disk's tail written and flushed over NVMe, CANCEL, the same read after a new start of QEMU, a CRASH and a restart of the disk service: ok"
+    );
+    Ok(())
+}
+
+/// `cargo xtask nvme-persist shutdown`: init stops the system (proto_init SHUTDOWN) on QEMU's
+/// machine with edk2 and the NVMe disk service. The table is `table-shutdown`: `power` (a stand-in for
+/// the button's service, tests/svc role `p`) asks once its neighbours registered, `echo` ends at the
+/// stop notice, `quiet` ignores it and is killed at its deadline, `blk` is the NVMe service whose
+/// controller init stops (CC.SHN, then CC = 0) after its end, and the PL011's driver goes last. The
+/// run needs the lines of the stop in order, the stop of the disk service confirmed, the line
+/// `stafeto: system off`, no panic and QEMU's status 0.
+fn nvme_shutdown() -> Result<(), String> {
+    let programs: &'static [ImageProgram] = &[
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-shutdown", "nvme-store"],
+        ),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]),
+        ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ];
+    let image = build_boot_image("boot-nvme-shutdown.img", programs, BOOT_PROFILE)?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join("efi-disk-nvme-shutdown.raw");
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let file = Disk::new("nvme-shutdown");
+    qemu::store_file(&file.0, blk_probe::DISK_BYTES, true)?;
+    let mut cmd = efi::command(&efi::EFI, &firmware, &esp, true, "efi-disk-nvme-shutdown")?;
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+        file.0.display()
+    ));
+    cmd.args(["-device", &Shape::Plain.device()]);
+    let output = run_until(cmd, WITHIN, None, &kernel.elf)?;
+    qemu::expect_system_off(&output)?;
+    let lines = &output.lines;
+    qemu::expect_in_order(
+        lines,
+        &[
+            "init: stopping the system (off)",
+            "init: stopping power",
+            "init: power stopped: ",
+            "init: stopping blk",
+            "init: stopping echo",
+            "init: stopping quiet",
+            "init: quiet did not stop in 500 ms, killed",
+            "init: stopping uart",
+            "init: stopped in ",
+            qemu::SYSTEM_OFF_LINE,
+        ],
+    )
+    .map_err(|e| format!("nvme-persist shutdown: {e}"))?;
+    // The disk service ended in the wave of the killed service and its controller stopped
+    // before the console's wave began.
+    qemu::expect_in_order(
+        lines,
+        &[
+            "init: stopping blk",
+            "init: blk device stopped and confirmed",
+            "init: stopping uart",
+        ],
+    )
+    .map_err(|e| format!("nvme-persist shutdown: {e}"))?;
+    for wanted in ["power: button", "init: echo stopped: exit code 0"] {
+        if !lines.iter().any(|l| l.contains(wanted)) {
+            return Err(format!("nvme-persist shutdown: no line {wanted:?}"));
+        }
+    }
+    for unwanted in [
+        "init: power did not stop",
+        "init: echo did not stop",
+        "init: blk did not stop",
+        "its DMA memory stays kept",
+        "did not stop within the whole stop",
+    ] {
+        if let Some(line) = lines.iter().find(|l| l.contains(unwanted)) {
+            return Err(format!("nvme-persist shutdown: unexpected line {line:?}"));
+        }
+    }
+    println!(
+        "nvme-persist shutdown: the waves in order, the quiet service killed at its deadline, the NVMe controller stopped and confirmed, one line off, no panic, powered off"
     );
     Ok(())
 }

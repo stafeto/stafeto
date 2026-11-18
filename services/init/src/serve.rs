@@ -14,7 +14,13 @@
 //! and loads, and ADOPTED brings its session, process and thread (spec 2,
 //! section 3.1): init holds the request and never sends one to a service
 //! (spec 6.7); HEARTBEAT
-//! answers a registered service and moves its watchdog deadline; LIST gives
+//! answers a registered service and moves its watchdog deadline; SHUTDOWN
+//! from the record named `power` (table::POWER_SERVICE) stops the system:
+//! init restarts and loads nothing from then on, gives each service of a wave
+//! (init::shutdown) a stop notice through a copy of its registered channel
+//! with the label proto_init::STOP_NOTICE, kills what has not ended at its
+//! deadline, and exits with abi::INIT_END_OFF or INIT_END_RESET once every
+//! record stopped and its device with it; LIST gives
 //! a page of the records, init first; STATS what the kernel, the worker and
 //! init's quota show; PING anyone. The notification of the worker thread
 //! brings the outcome of its job: the main thread starts the thread of the
@@ -44,6 +50,7 @@ use init::labels::Labels;
 use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
+use init::shutdown::{self, Mask};
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
@@ -51,7 +58,8 @@ use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
     Adoption, BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES, BudgetAsk, BudgetRelease, BudgetSharesAsk,
     BudgetSharesHead, Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method,
-    Record as Listed, RegisterReply, START_NAMES, State, Stats, VERSION, Work,
+    Record as Listed, RegisterReply, SHUTDOWN_RESET, START_NAMES, STOP_NOTICE, ShutdownAsk, State,
+    Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
 #[cfg(feature = "dma-watch")]
@@ -354,6 +362,17 @@ pub struct Init {
     started: usize,
     /// The overruns of the budgets of the table, counted for the journal.
     overruns: &'static mut Overruns,
+    /// The stop of the system, once SHUTDOWN came (`shutdown`).
+    stopping: Option<Stopping>,
+}
+
+/// The stop of the system (proto_init SHUTDOWN): what was asked, when it
+/// began, and the records of the wave that stops now (init::shutdown).
+#[derive(Clone, Copy)]
+struct Stopping {
+    kind: u32,
+    began: u64,
+    wave: Mask,
 }
 
 impl Init {
@@ -380,6 +399,7 @@ impl Init {
             adoption: None,
             started: 0,
             overruns: counts(),
+            stopping: None,
         }
     }
 
@@ -418,6 +438,11 @@ impl Init {
     /// POSIX record waits for the process service instead, which makes
     /// and loads its process and pays for it (`offer`).
     fn launch(&mut self, place: usize) {
+        // A stopping system starts nothing.
+        if self.stopping.is_some() {
+            self.entries[place].state = State::Ended;
+            return;
+        }
         self.entries[place].state = State::Loading;
         if !table::table()[place].waits.is_empty() && !self.entries[place].passed {
             self.hold(place);
@@ -577,6 +602,200 @@ impl Init {
         }
     }
 
+    /// SHUTDOWN from the record named `power` (proto_init): the system stops.
+    /// BAD_STATE for any other caller, BAD_SIZE for a body out of its layout,
+    /// INVALID_ARGS for a `kind` or `flags` off the rules. Init answers at
+    /// once and stops its records in waves (`begin_stop`, `advance`); a
+    /// second SHUTDOWN while it stops gets 0 and changes nothing.
+    fn shutdown(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if !shutdown::may_ask(&table::table()[place]) {
+            return refuse(Error::BadState);
+        }
+        let mut body = r.body();
+        let ask = match ShutdownAsk::read(&mut body) {
+            Ok(ask) => ask,
+            Err(status) => return Answer::Status(status),
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        if self.stopping.is_none() {
+            self.begin_stop(ask.kind);
+        }
+        Answer::Status(Status::Ok)
+    }
+
+    /// The system stops: no record restarts or loads from now on, no watchdog
+    /// speaks, the CONNECT requests that wait get BAD_STATE, and the first wave
+    /// gets its notice (`advance`).
+    fn begin_stop(&mut self, kind: u32) {
+        let what = if kind == SHUTDOWN_RESET {
+            "reset"
+        } else {
+            "off"
+        };
+        println!("init: stopping the system ({what})");
+        self.stopping = Some(Stopping {
+            kind,
+            began: now(),
+            wave: 0,
+        });
+        for place in 0..table::table().len() {
+            let busy =
+                self.jobs.holds(place) || self.jobs.current().is_some_and(|j| j.record == place);
+            let entry = &mut self.entries[place];
+            entry.watch = None;
+            entry.gate = None;
+            entry.deadline = None;
+            entry.adopting = false;
+            entry.offered = false;
+            for (pending, _, _) in entry.waiting.iter_mut().filter_map(Option::take) {
+                let status = proto_wire::reply(Status::Kernel(Error::BadState));
+                let _ = pending.answer(&status, Outgoing::new());
+            }
+            // A record with no instance and no job is done: it waits for a
+            // pause, for quota or for a gate, and starts no more.
+            if matches!(entry.held, Held::Empty) && !busy {
+                entry.state = State::Ended;
+            }
+        }
+        self.advance();
+    }
+
+    /// The records that still have to stop: those with an instance or a job
+    /// of the worker, as a mask by place.
+    fn unfinished(&self) -> Mask {
+        (0..table::table().len()).fold(0, |mask, place| {
+            let entry = &self.entries[place];
+            let done = matches!(entry.state, State::Ended | State::Broken)
+                && matches!(entry.held, Held::Empty)
+                && !self.jobs.holds(place);
+            if done { mask } else { mask | 1 << place }
+        })
+    }
+
+    /// Moves the stop on, once something happened: past the whole stop what
+    /// is left dies; when the wave is over the next one gets its notice; with
+    /// no wave left init exits. Nothing while the system does not stop.
+    fn advance(&mut self) {
+        loop {
+            let Some(stopping) = self.stopping else {
+                return;
+            };
+            if shutdown::overall_over(now(), stopping.began) {
+                for place in 0..table::table().len() {
+                    let what = format_args!("did not stop within the whole stop, killed");
+                    self.kill_stopping(place, what);
+                }
+            }
+            if stopping.wave & self.unfinished() != 0 {
+                return;
+            }
+            let next = shutdown::wave(table::table(), self.unfinished());
+            if next == 0 {
+                self.finish(stopping);
+            }
+            self.start_wave(next, stopping);
+        }
+    }
+
+    /// The records of `wave` get their notice (`notify_stop`) and a deadline;
+    /// a client, a service that has no channel and a record after the whole
+    /// stop are killed at once. The process of a POSIX record ends with the
+    /// process service, which has the longest bound: it gets that deadline.
+    fn start_wave(&mut self, wave: Mask, stopping: Stopping) {
+        if let Some(own) = self.stopping.as_mut() {
+            own.wave = wave;
+        }
+        let now = now();
+        let over = shutdown::overall_over(now, stopping.began);
+        for place in 0..table::table().len() {
+            if wave & (1 << place) == 0 {
+                continue;
+            }
+            let record = &table::table()[place];
+            let Some(instance) = self.entries[place].held.running() else {
+                // No instance: it is in the worker's hands or has none.
+                let busy = self.jobs.holds(place);
+                let entry = &mut self.entries[place];
+                if matches!(entry.held, Held::Empty) && !busy {
+                    entry.state = State::Ended;
+                }
+                continue;
+            };
+            if record.is_posix() {
+                let process = table::find(table::table(), table::PROCESS_SERVICE.as_bytes());
+                let to = process.map_or(record, |p| &table::table()[p]);
+                let at = shutdown::deadline(now, stopping.began, to);
+                self.set_deadline(place, at);
+                continue;
+            }
+            let noticed = !over && !record.is_client() && instance.channel.is_some();
+            if noticed && self.notify_stop(place) {
+                println!("init: stopping {}", record.name);
+                let at = shutdown::deadline(now, stopping.began, record);
+                self.set_deadline(place, at);
+            } else {
+                let what = format_args!("is killed: no notice to give");
+                self.kill_stopping(place, what);
+            }
+        }
+    }
+
+    /// The stop notice (proto_init::STOP_NOTICE) to the service at `place`:
+    /// a copy of its registered channel with NOTIFY and the reserved label,
+    /// and one notify, which blocks nobody. False when the copy could not be
+    /// made.
+    fn notify_stop(&self, place: usize) -> bool {
+        let record = &table::table()[place];
+        let Some(channel) = self.entries[place]
+            .held
+            .running()
+            .and_then(|i| i.channel.as_ref())
+        else {
+            return false;
+        };
+        match sys::handle_label(channel, Rights::NOTIFY, STOP_NOTICE, record.priority) {
+            Ok(copy) => {
+                let _ = sys::notify(&copy, 1);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The deadline of the record at `place` came while the system stops: an
+    /// instance that still runs is killed, and its device stops all the same.
+    fn stop_expired(&mut self, place: usize) {
+        let ms = shutdown::stop_ns(&table::table()[place]) / MS;
+        self.kill_stopping(place, format_args!("did not stop in {ms} ms, killed"));
+        self.advance();
+    }
+
+    /// Kills the running instance of the record at `place` and tears it
+    /// down (the worker's Kill: the process, then the stop of its device).
+    fn kill_stopping(&mut self, place: usize, what: fmt::Arguments) {
+        let Some(instance) = self.entries[place].held.take_running() else {
+            return;
+        };
+        println!("init: {} {what}", table::table()[place].name);
+        self.settle(place, Some(instance), None, Work::Kill);
+    }
+
+    /// Every record stopped and the worker is done: init says how long it
+    /// took and exits with the code the kernel takes for the end of the
+    /// system (abi::INIT_END_OFF, abi::INIT_END_RESET).
+    fn finish(&self, stopping: Stopping) -> ! {
+        let ms = now().saturating_sub(stopping.began) / MS;
+        println!("init: stopped in {ms} ms");
+        let code = if stopping.kind == SHUTDOWN_RESET {
+            abi::INIT_END_RESET
+        } else {
+            abi::INIT_END_OFF
+        };
+        sys::process_exit(code)
+    }
+
     /// The quota of an instance of the record at `place` in bytes: the
     /// record's; for the process service also what each POSIX record of
     /// the table takes from it (quota::need_pages), since the service
@@ -620,6 +839,10 @@ impl Init {
         while let Some(job) = self.jobs.pop() {
             let place = job.record;
             let gone = match job.work {
+                Work::Load if self.stopping.is_some() => {
+                    self.entries[place].state = State::Ended;
+                    continue;
+                }
                 Work::Load if !self.quota_fits(place) => continue,
                 Work::Load | Work::ShowLog => None,
                 _ => match self.entries[place].held.take_gone() {
@@ -749,6 +972,7 @@ impl Init {
             None => self.torn_down(job.record),
         }
         self.next();
+        self.advance();
     }
 
     /// An instance of the record at `place` loaded, or why not, which is a
@@ -758,7 +982,12 @@ impl Init {
         match result {
             Ok((spawned, dma)) => {
                 self.entries[place].held = Held::Running(Instance::loaded(spawned, dma));
-                self.run(place);
+                if self.stopping.is_some() {
+                    // It loaded while the system stops: it never runs.
+                    self.kill_stopping(place, format_args!("loaded as the system stops, killed"));
+                } else {
+                    self.run(place);
+                }
             }
             Err(e) => {
                 let what = format_args!("did not load: {e:?}");
@@ -804,7 +1033,7 @@ impl Init {
         // A record whose start channel cannot be made fails, and the next
         // one that waits is offered.
         loop {
-            if self.adoption.is_none() {
+            if self.adoption.is_none() || self.stopping.is_some() {
                 return;
             }
             let waiting = (0..table::table().len()).find(|&p| {
@@ -1071,6 +1300,13 @@ impl Init {
             sys::process_state(instance.process()),
             table::table()[place].is_posix(),
         );
+        if self.stopping.is_some() {
+            // The end of an instance while the system stops is what init asked
+            // for: no failure and no restart.
+            println!("init: {} stopped: {end}", table::table()[place].name);
+            self.settle(place, Some(instance), None, Work::Teardown);
+            return;
+        }
         let what = format_args!("ended: {end}");
         self.failed(place, Some(instance), lived, what, Work::Teardown);
     }
@@ -1108,7 +1344,12 @@ impl Init {
     ) {
         let name = table::table()[place].name;
         let now = now();
-        let verdict = self.accrue(place, now, lived);
+        // While the system stops no record restarts.
+        let verdict = if self.stopping.is_some() {
+            None
+        } else {
+            self.accrue(place, now, lived)
+        };
         match verdict {
             None => println!("init: {name} {what}, not restarted"),
             Some(Verdict::Broken) => println!(
@@ -1258,6 +1499,13 @@ impl Init {
         if !entry.deadline.is_some_and(time::reached) {
             return;
         }
+        // While the system stops the deadlines are those of the stop, and no
+        // watchdog confirms a silence.
+        if self.stopping.is_some() {
+            entry.deadline = None;
+            self.stop_expired(place);
+            return;
+        }
         // A record at its gate: the deadline of its waits.
         if let Some(gate) = entry.gate {
             if let Step::Start(why) = gate.expired(now) {
@@ -1399,6 +1647,7 @@ impl Init {
         if let Err(status) = reply.write(r.reply()) {
             return Answer::Status(status);
         }
+        let stopping = self.stopping.is_some();
         let Init {
             entries, labels, ..
         } = self;
@@ -1413,8 +1662,9 @@ impl Init {
             instance.channel = Some(channel);
         }
         entry.state = State::Running;
-        // From REGISTER on, the watchdog counts the heartbeats (spec 13.4).
-        let deadline = record.watch().map(|w| {
+        // From REGISTER on, the watchdog counts the heartbeats (spec 13.4); a
+        // stopping system has none.
+        let deadline = record.watch().filter(|_| !stopping).map(|w| {
             let armed = w.arm(now());
             entry.watch = Some(armed);
             armed.deadline()
@@ -1524,6 +1774,10 @@ impl Init {
         let Ok(Connect { name }) = Connect::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
+        // A stopping system gives no new session.
+        if self.stopping.is_some() {
+            return refuse(Error::BadState);
+        }
         let client = &table::table()[place];
         // The layer session of the RAM service is the RAM service under another name and
         // another mark, for the one client the table names (table::LAYER_CLIENTS).
@@ -1803,6 +2057,7 @@ impl Service<1> for Init {
         Method::Replaced.number(),
         Method::Ready.number(),
         Method::Budget.number(),
+        Method::Shutdown.number(),
     ];
     type Data = ();
 
@@ -1822,6 +2077,7 @@ impl Service<1> for Init {
             Some(Method::Replaced) => self.replaced(place, r),
             Some(Method::Ready) => self.ready(place, r),
             Some(Method::Budget) => self.budget(place, r),
+            Some(Method::Shutdown) => self.shutdown(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),
@@ -1864,6 +2120,7 @@ impl Service<1> for Init {
         } else if entry.adopting && entry.offered {
             self.adoption_failed(place, "the process service let it go");
         }
+        self.advance();
     }
 
     /// The worker's notification: the outcome of its job; the end of an
@@ -1881,5 +2138,6 @@ impl Service<1> for Init {
             }
             _ => {}
         }
+        self.advance();
     }
 }
