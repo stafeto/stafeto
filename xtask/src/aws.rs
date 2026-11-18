@@ -10,9 +10,11 @@
 //! the session before the call (the intent) and after it (the identifier); it
 //! carries the tags `project=stafeto` and `session=<id>` from the call that
 //! creates it; before any delete, stop or terminate the resource is looked up
-//! in the journals and its tags are read, and a resource without both is left
-//! alone; only `t4g.small` and `t4g.nano` run, with credits `standard`; at
-//! most two instances of the project live at once; the security group of a
+//! in the journals and its tags are read, and a resource whose `project` tag
+//! is not `stafeto`, or whose `session` tag names no session whose journal
+//! holds it, is left alone; only `t4g.small` and `t4g.nano` run, with credits
+//! `standard`; at most four instances of the project live at once (a try-out
+//! session allows two); the security group of a
 //! session has no rule in and none out, so nothing reaches the instances from
 //! outside and the console is the only way to look at them.
 
@@ -37,6 +39,42 @@ const BLANK_SDF: &str = "blank";
 /// The value of `Launch::extra_snapshot` that leaves the data volume of the image out
 /// (`--no-data-volume`): /dev/sdf is mapped to no device, so the instance has one NVMe volume.
 const NO_DEVICE: &str = "none";
+/// The prefix of a `Launch::extra_snapshot` value that gives the data volume of the image a larger
+/// size (`--data-volume-size`): the mapping names the device and the size and EC2 keeps the
+/// snapshot of the image's own mapping, so the volume still comes from it.
+const SIZE_PREFIX: &str = "size=";
+/// The smallest data volume: the snapshot of the data image is 2 GiB.
+const DATA_VOLUME_MIN_GIB: u32 = 2;
+/// The largest data volume `--data-volume-size` accepts. The cap protects the monthly budget
+/// (gp3 is billed per GiB-month); EC2 itself allows far larger volumes.
+const DATA_VOLUME_MAX_GIB: u32 = 32;
+/// The largest blank volume `--blank-volume` accepts. The cap protects the monthly budget, as the
+/// cap of the data volume does.
+const BLANK_VOLUME_MAX_GIB: u32 = 32;
+/// The price of gp3 in USD per GiB-month in eu-central-1 (unverified, as the prices above: it
+/// only sizes the estimate the try-out command prints).
+const PRICE_GP3_GIB_MONTH: f64 = 0.0952;
+/// The device a blank volume of `--blank-volume` is attached as (the image's data volume has /dev/sdf).
+const BLANK_DEVICE: &str = "/dev/sdg";
+
+/// The `Launch::extra_snapshot` value for a data volume of `gib` GiB.
+fn sized(gib: u32) -> String {
+    format!("{SIZE_PREFIX}{gib}")
+}
+
+/// A whole number of GiB from `min` to `max`, the value of the option `name`.
+fn parse_gib(name: &str, text: &str, min: u32, max: u32) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|n| (min..=max).contains(n))
+        .ok_or_else(|| format!("{name} takes a whole number of GiB from {min} to {max}"))
+}
+
+/// The hourly charge of the volumes a try-out launch adds, from their sizes in GiB.
+fn volume_rate(gibs: &[u32]) -> f64 {
+    f64::from(gibs.iter().sum::<u32>()) * PRICE_GP3_GIB_MONTH / 730.0
+}
+
 /// The mapping the image registers for /dev/sdf: a volume made from the snapshot of the data
 /// image (`cargo xtask data-image`: the table and the file system `datafs` mounts), 2 GiB as the
 /// snapshot is, that goes away with the instance. A fresh EBS volume reads as random bytes past its
@@ -53,6 +91,12 @@ fn data_volume_mapping(snapshot: &str) -> String {
 fn launch_mapping(extra: &str) -> String {
     match extra {
         NO_DEVICE => "DeviceName=/dev/sdf,NoDevice=".to_string(),
+        sized if sized.starts_with(SIZE_PREFIX) => {
+            format!(
+                "DeviceName=/dev/sdf,Ebs={{VolumeSize={},VolumeType=gp3,DeleteOnTermination=true}}",
+                &sized[SIZE_PREFIX.len()..]
+            )
+        }
         BLANK_SDF => {
             "DeviceName=/dev/sdf,Ebs={VolumeSize=1,VolumeType=gp3,DeleteOnTermination=true}"
                 .to_string()
@@ -73,12 +117,13 @@ const TRY_LIFETIME_HOURS: u64 = 2;
 
 const USAGE: &str = "usage: xtask aws check
        xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
-       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--no-data-volume] [--session S]
+       xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--no-data-volume | --data-volume-size GIB] [--blank-volume GIB] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP | --blank-sdf] [--session S]
        xtask aws pair --ami AMI [--count N] [--internet] [--serial SECONDS] [--delay S] [--gap S] [--session S]
-       xtask aws clean --session S
-       xtask aws sweep [--remove]";
+       xtask aws clean --session S [--keep-image]
+       xtask aws sweep [--remove]
+       (sweep lists every resource tagged project=stafeto; --remove deletes the ones in a journal, a tagged resource in no journal is listed, refused and left for you to remove by hand)";
 
 // ---- the CLI -------------------------------------------------------------------
 
@@ -339,12 +384,18 @@ fn live_of(ledger: &Path) -> Vec<(Kind, String)> {
     live
 }
 
-/// Every journal under target/aws: what any session left.
-fn all_live() -> Vec<(Kind, String)> {
+/// Every journal under target/aws: what any session left, with the id of the session whose
+/// journal holds it.
+fn all_live() -> Vec<(String, Kind, String)> {
     let mut all = Vec::new();
     if let Ok(dirs) = std::fs::read_dir(aws_dir()) {
         for d in dirs.flatten() {
-            all.extend(live_of(&d.path().join("ledger.tsv")));
+            let session = d.file_name().to_string_lossy().into_owned();
+            all.extend(
+                live_of(&d.path().join("ledger.tsv"))
+                    .into_iter()
+                    .map(|(k, i)| (session.clone(), k, i)),
+            );
         }
     }
     all
@@ -364,24 +415,54 @@ fn tag_of(resource: &str, key: &str) -> Result<String, String> {
     Ok(if t == "None" { String::new() } else { t })
 }
 
-/// The guard before any delete, stop or terminate: the resource is in a
-/// journal of this machine and carries `project=stafeto`.
-fn guard(kind: Kind, id: &str) -> Result<(), String> {
-    if !all_live().iter().any(|(k, i)| *k == kind && i == id) {
+/// The verdict of the guard, from the journals (session id, kind, id) and the two tags the
+/// resource carries (empty when it has none): the resource is in a journal, its `project` tag is
+/// `stafeto`, and its `session` tag is the id of a session whose journal holds it.
+fn guard_verdict(
+    journals: &[(String, Kind, String)],
+    kind: Kind,
+    id: &str,
+    project: &str,
+    session: &str,
+) -> Result<(), String> {
+    let holders: Vec<&str> = journals
+        .iter()
+        .filter(|(_, k, i)| *k == kind && i == id)
+        .map(|(s, _, _)| s.as_str())
+        .collect();
+    if holders.is_empty() {
         return Err(format!(
             "{} {} is not in any session journal: left alone",
             kind.name(),
             redact(id)
         ));
     }
-    if tag_of(id, "project")? != "stafeto" {
+    if project != "stafeto" {
         return Err(format!(
             "{} {} lacks the tag project=stafeto: left alone",
             kind.name(),
             redact(id)
         ));
     }
+    if !holders.contains(&session) {
+        return Err(format!(
+            "{} {} has a session tag that matches no journal holding it: left alone",
+            kind.name(),
+            redact(id)
+        ));
+    }
     Ok(())
+}
+
+/// The guard before any delete, stop or terminate: `guard_verdict` with the tags read from EC2.
+fn guard(kind: Kind, id: &str) -> Result<(), String> {
+    let journals = all_live();
+    if !journals.iter().any(|(_, k, i)| *k == kind && i == id) {
+        return guard_verdict(&journals, kind, id, "", "");
+    }
+    let project = tag_of(id, "project")?;
+    let session = tag_of(id, "session")?;
+    guard_verdict(&journals, kind, id, &project, &session)
 }
 
 /// Whether an error of a `describe-*` call says that the resource is gone:
@@ -499,18 +580,45 @@ fn release<T>(s: &Session, kind: Kind, id: &str, result: Result<T, String>) -> R
 
 /// The journal of `s` in reverse order, instances first: a group cannot go
 /// while an instance holds it, a snapshot while an image uses it.
-fn clean(s: &Session) -> Result<(), String> {
-    let mut live = s.live();
+fn clean_order(mut live: Vec<(Kind, String)>, keep_image: bool) -> Vec<(Kind, String)> {
     live.reverse();
     live.sort_by_key(|(k, _)| k.rank());
+    if keep_image {
+        // The image and the snapshots it is made from stay, so a second launch needs no
+        // second build.
+        live.retain(|(k, _)| !matches!(k, Kind::Image | Kind::Snapshot));
+    }
+    live
+}
+
+/// Removes what the session made. With `keep_image` the image and its snapshots stay (and stay
+/// in the journal, so a later `clean` without the option removes them).
+fn clean(s: &Session, keep_image: bool) -> Result<(), String> {
     let mut failed = Vec::new();
-    for (kind, id) in live {
+    // Volumes the session made whose journal line is missing.
+    match adopt_volumes(s) {
+        Ok(found) if !found.is_empty() => {
+            println!(
+                "clean: {} volumes found by their tags and journaled",
+                found.len()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("clean: the lookup of volumes by tag failed: {e}");
+            failed.push(e);
+        }
+    }
+    for (kind, id) in clean_order(s.live(), keep_image) {
         if let Err(e) = delete(s, kind, &id) {
             eprintln!("clean: {e}");
             failed.push(e);
         }
     }
     if failed.is_empty() {
+        if keep_image {
+            println!("clean: the image and its snapshots are kept");
+        }
         for f in ["address", "try-key", "try-key.pub"] {
             let _ = std::fs::remove_file(s.dir.join(f));
         }
@@ -602,7 +710,8 @@ fn live_instances() -> Result<usize, String> {
 
 /// `sweep`: lists what the project has and, with `--remove`, removes the part
 /// that is in a journal (the guard of every delete), then lists again. The
-/// exit is an error while anything remains.
+/// exit is an error while anything remains. A tagged resource that is in no journal is listed,
+/// its delete is refused by the guard, and it has to be removed by hand.
 fn sweep(args: &[String]) -> Result<(), String> {
     let remove = args.iter().any(|a| a == "--remove");
     let mut found = project_resources()?;
@@ -1012,28 +1121,36 @@ fn try_key(s: &Session) -> Result<String, String> {
     }
     let by_name = format!("Name=key-name,Values={name}");
     // A call of an earlier run may have made the key pair and died before its line.
-    if adopt(
+    let adopted = adopt(
         s,
         Kind::Key,
         &["describe-key-pairs"],
         &by_name,
         "KeyPairs[].KeyPairId",
-    )?
-    .is_some()
-    {
-        return Ok(name);
-    }
+    )?;
     let key = s.dir.join("try-key");
-    if !key.exists() {
-        let st = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "stafeto-try", "-f"])
-            .arg(&key)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if !st.success() {
-            return Err("ssh-keygen failed".into());
+    if let Some(id) = adopted {
+        // The pair of an earlier run holds the public key of that run. When the local key was
+        // lost or made again, the pair is replaced, or the instance would take a key nobody here
+        // holds.
+        let ours = local_fingerprint(&key)?;
+        let theirs = aws(&[
+            "ec2",
+            "describe-key-pairs",
+            "--key-pair-ids",
+            &id,
+            "--query",
+            "KeyPairs[0].KeyFingerprint",
+        ])?;
+        if same_fingerprint(&ours, &theirs) {
+            return Ok(name);
         }
+        println!(
+            "try-out: the key pair of the session holds another key than the local one: replacing it"
+        );
+        delete(s, Kind::Key, &id)?;
     }
+    local_fingerprint(&key)?;
     s.note("intent", Kind::Key, &name)?;
     let mut args: Vec<String> = [
         "ec2",
@@ -1061,6 +1178,50 @@ fn try_key(s: &Session) -> Result<String, String> {
         }
     }
     Ok(name)
+}
+
+/// The SHA256 fingerprint of the public key `key.pub`, made first when `key` does not exist.
+fn local_fingerprint(key: &Path) -> Result<String, String> {
+    if !key.exists() {
+        let st = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "stafeto-try", "-f"])
+            .arg(key)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !st.success() {
+            return Err("ssh-keygen failed".into());
+        }
+    }
+    let pubkey = format!("{}.pub", key.display());
+    let o = Command::new("ssh-keygen")
+        .args(["-l", "-E", "sha256", "-f", &pubkey])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !o.status.success() {
+        let name = Path::new(&pubkey)
+            .file_name()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        return Err(format!("ssh-keygen -l failed on the public key {name}"));
+    }
+    fingerprint_field(&String::from_utf8_lossy(&o.stdout))
+        .ok_or_else(|| "ssh-keygen -l printed no fingerprint".to_string())
+}
+
+/// The fingerprint in a line of `ssh-keygen -l`: `256 SHA256:xxxx comment (ED25519)`.
+fn fingerprint_field(line: &str) -> Option<String> {
+    line.split_whitespace().nth(1).map(String::from)
+}
+
+/// Whether two SHA256 fingerprints name one key: EC2 writes the digest as base64 with the
+/// padding, `ssh-keygen` as `SHA256:` and base64 without it.
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let plain = |f: &str| {
+        f.trim()
+            .trim_start_matches("SHA256:")
+            .trim_end_matches('=')
+            .to_string()
+    };
+    !plain(a).is_empty() && plain(a) == plain(b)
 }
 
 /// The public IPv4 address of a running instance, once EC2 has it; the caller writes it to
@@ -1802,6 +1963,23 @@ fn boot(args: &[String]) -> Result<(), String> {
     let try_out = args.iter().any(|a| a == "--try");
     // One launch without the data volume: the instance shows the fallback of the image.
     let no_data = args.iter().any(|a| a == "--no-data-volume");
+    let data_size = match flag(args, "--data-volume-size") {
+        None => None,
+        Some(_) if no_data => {
+            return Err("--data-volume-size does not go with --no-data-volume".into());
+        }
+        Some(n) => Some(parse_gib(
+            "--data-volume-size",
+            &n,
+            DATA_VOLUME_MIN_GIB,
+            DATA_VOLUME_MAX_GIB,
+        )?),
+    };
+    let data_mapping = data_size.map(sized);
+    // A blank volume besides the data volume: made, tagged, journaled and attached as /dev/sdg.
+    let blank = flag(args, "--blank-volume")
+        .map(|n| parse_gib("--blank-volume", &n, 1, BLANK_VOLUME_MAX_GIB))
+        .transpose()?;
     if try_out && stop {
         return Err("--try keeps the instance running: it does not go with --stop".into());
     }
@@ -1838,7 +2016,11 @@ fn boot(args: &[String]) -> Result<(), String> {
             ami: &ami,
             ty: &ty,
             user_data: None,
-            extra_snapshot: no_data.then_some(NO_DEVICE),
+            extra_snapshot: if no_data {
+                Some(NO_DEVICE)
+            } else {
+                data_mapping.as_deref()
+            },
             group: group.as_deref(),
             public_ip: try_out,
             private_ip: None,
@@ -1847,6 +2029,9 @@ fn boot(args: &[String]) -> Result<(), String> {
         },
     )?;
     let result = (|| {
+        if let Some(gib) = blank {
+            attach_blank_volume(&s, &id, gib)?;
+        }
         if try_out {
             // The address goes to the session's directory for the commands that follow and
             // to no log.
@@ -1907,9 +2092,15 @@ fn boot(args: &[String]) -> Result<(), String> {
             s.id,
             expires.as_deref().unwrap_or("")
         );
-        let rate = PRICE_SMALL + PRICE_IPV4;
+        let volumes = volume_rate(&[data_size, blank].into_iter().flatten().collect::<Vec<_>>());
+        let rate = PRICE_SMALL + PRICE_IPV4 + volumes;
+        let part = if volumes > 0.0 {
+            format!(" and the volumes {volumes:.4}")
+        } else {
+            String::new()
+        };
         println!(
-            "it costs {rate:.4} USD per hour, {:.2} USD per day, while it runs (the instance {PRICE_SMALL} and the public IPv4 address {PRICE_IPV4})",
+            "it costs {rate:.4} USD per hour, {:.2} USD per day, while it runs (the instance {PRICE_SMALL}, the public IPv4 address {PRICE_IPV4}{part})",
             rate * 24.0
         );
         return result;
@@ -1919,6 +2110,147 @@ fn boot(args: &[String]) -> Result<(), String> {
         cost(started.elapsed(), PRICE_SMALL)
     );
     result
+}
+
+/// The request that makes the blank volume of a session: gp3, `gib` GiB, in `zone`, with the
+/// tags of the session so that the guard, `clean` and `sweep` take it.
+fn blank_volume_args(s: &Session, zone: &str, gib: u32, instance: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "ec2",
+        "create-volume",
+        "--volume-type",
+        "gp3",
+        "--availability-zone",
+        zone,
+        "--size",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.push(gib.to_string());
+    args.extend(s.tag_spec(&["volume"]));
+    // One blank volume per instance: a repeated call is the same call and finds the volume
+    // the first one made.
+    args.extend([
+        "--client-token".to_string(),
+        format!("stafeto-vol-{}-{instance}", s.id),
+    ]);
+    args.extend(["--query", "VolumeId"].map(String::from));
+    args
+}
+
+/// The volumes of the session that EC2 has, journaled when the journal lacks them: a call that
+/// made a volume and died before its line leaves one that `clean` and the guard would not see.
+/// Returns the ids it journaled.
+fn adopt_volumes(s: &Session) -> Result<Vec<String>, String> {
+    let session = format!("Name=tag:session,Values={}", s.id);
+    let found = aws(&[
+        "ec2",
+        "describe-volumes",
+        "--filters",
+        "Name=tag:project,Values=stafeto",
+        &session,
+        "Name=status,Values=creating,available,in-use,error",
+        "--query",
+        "Volumes[].VolumeId",
+    ])?;
+    let mut added = Vec::new();
+    for id in found.split_whitespace().filter(|i| *i != "None") {
+        if !s.live().iter().any(|(k, i)| *k == Kind::Volume && i == id) {
+            s.note("created", Kind::Volume, id)?;
+            added.push(id.to_string());
+        }
+    }
+    Ok(added)
+}
+
+/// The mapping that makes a volume go with its instance.
+fn blank_delete_with_instance() -> String {
+    format!("DeviceName={BLANK_DEVICE},Ebs={{DeleteOnTermination=true}}")
+}
+
+/// Makes a blank volume of `gib` GiB in the zone of the instance and attaches it as /dev/sdg.
+/// The journal has the intent before the call and the id after it; a volume that cannot be
+/// attached is deleted again.
+fn attach_blank_volume(s: &Session, instance: &str, gib: u32) -> Result<(), String> {
+    aws(&[
+        "ec2",
+        "wait",
+        "instance-running",
+        "--instance-ids",
+        instance,
+    ])?;
+    let zone = aws(&[
+        "ec2",
+        "describe-instances",
+        "--instance-ids",
+        instance,
+        "--query",
+        "Reservations[0].Instances[0].Placement.AvailabilityZone",
+    ])?;
+    let args = blank_volume_args(s, zone.trim(), gib, instance);
+    s.note("intent", Kind::Volume, "blank")?;
+    let vol = match aws_s(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            // The call may have made the volume before it failed: journal what the session has
+            // and remove it.
+            return match adopt_volumes(s) {
+                Ok(found) => {
+                    let mut result = Err(e);
+                    for v in found {
+                        result = release(s, Kind::Volume, &v, result);
+                    }
+                    result
+                }
+                Err(look) => Err(format!(
+                    "{e}; and the lookup of a volume it may have made failed: {look}; run `xtask aws clean --session {}`",
+                    s.id
+                )),
+            };
+        }
+    };
+    s.note("created", Kind::Volume, &vol)?;
+    let mut attach_called = false;
+    let attached = (|| {
+        aws(&["ec2", "wait", "volume-available", "--volume-ids", &vol])?;
+        aws(&[
+            "ec2",
+            "attach-volume",
+            "--volume-id",
+            &vol,
+            "--instance-id",
+            instance,
+            "--device",
+            BLANK_DEVICE,
+        ])?;
+        attach_called = true;
+        aws(&["ec2", "wait", "volume-in-use", "--volume-ids", &vol])?;
+        aws(&[
+            "ec2",
+            "modify-instance-attribute",
+            "--instance-id",
+            instance,
+            "--block-device-mappings",
+            &blank_delete_with_instance(),
+        ])
+    })();
+    match attached {
+        Ok(_) => {
+            println!(
+                "attached a blank volume of {gib} GiB as {BLANK_DEVICE} ({})",
+                redact(&vol)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            if attach_called {
+                // A volume that is in use cannot be deleted: detach it and wait first.
+                let _ = aws(&["ec2", "detach-volume", "--volume-id", &vol, "--force"]);
+                let _ = aws(&["ec2", "wait", "volume-available", "--volume-ids", &vol]);
+            }
+            release(s, Kind::Volume, &vol, Err(e))
+        }
+    }
 }
 
 /// The MAC address of the first interface of the instance, as EC2 has it.
@@ -2850,7 +3182,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("neighbour") => neighbour(&args[1..]),
         Some("clean") => {
             let id = flag(args, "--session").ok_or("clean needs --session")?;
-            clean(&Session::open(Some(id))?)
+            clean(
+                &Session::open(Some(id))?,
+                args.iter().any(|a| a == "--keep-image"),
+            )
         }
         Some("sweep") => sweep(&args[1..]),
         _ => Err(USAGE.to_string()),
@@ -3181,6 +3516,10 @@ case "$*" in
    touch "$d/created"
    if [ -f "$d/run_fails" ]; then echo "An error occurred (RequestLimitExceeded) when calling the RunInstances operation" >&2; exit 254; fi
    echo i-0123456789abcdef0 ;;
+ *create-volume*)
+   [ -f "$d/ledgerpath" ] && cp "$(cat "$d/ledgerpath")" "$d/ledger_at_volume"
+   if [ -f "$d/volume_create_fails" ]; then echo vol-0123456789abcdef7 > "$d/tagged_volumes"; echo "An error occurred (RequestLimitExceeded) when calling the CreateVolume operation" >&2; exit 254; fi
+   echo vol-0123456789abcdef9 ;;
  *client-token*) if [ -f "$d/created" ]; then echo i-0123456789abcdef0; fi ;;
  *terminate-instances*)
    if [ -f "$d/terminate_fails" ]; then echo "An error occurred (Throttling) when calling the TerminateInstances operation" >&2; exit 254; fi
@@ -3192,11 +3531,19 @@ case "$*" in
    if [ -f "$d/describe_fails" ]; then echo "An error occurred (ExpiredToken) when calling the DescribeInstances operation" >&2; exit 254; fi
    if [ -f "$d/gone" ]; then echo "An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation" >&2; exit 254; fi
    if [ -f "$d/terminated" ]; then echo terminated; else echo running; fi ;;
+ *describe-tags*Values=session*)
+   if [ -f "$d/tag_other_session" ]; then echo 0000-0; else basename "$(dirname "$(cat "$d/ledgerpath")")"; fi ;;
  *describe-tags*) echo stafeto ;;
  *GroupName*) cat "$d/groupname" 2>/dev/null ;;
  *Name=group-name*) if [ -f "$d/group_exists" ]; then echo sg-0123456789abcdef1; fi ;;
  *IpPermissionsEgress*) cat "$d/egress_rows" 2>/dev/null ;;
  *'IpPermissions[]'*) cat "$d/ingress_rows" 2>/dev/null ;;
+ *KeyFingerprint*) cat "$d/fingerprint" 2>/dev/null ;;
+ *modify-instance-attribute*)
+   if [ -f "$d/modify_fails" ]; then echo "An error occurred (Throttling) when calling the ModifyInstanceAttribute operation" >&2; exit 254; fi ;;
+ *'Volumes[].VolumeId'*) cat "$d/tagged_volumes" 2>/dev/null ;;
+ *Placement*) echo eu-central-1a ;;
+ *delete-key-pair*) rm -f "$d/key_exists" ;;
  *describe-key-pairs*) if [ -f "$d/key_exists" ]; then echo key-0123456789abcdef0; fi ;;
  *import-key-pair*)
    [ -f "$d/ledgerpath" ] && cp "$(cat "$d/ledgerpath")" "$d/ledger_at_import"
@@ -3531,9 +3878,21 @@ exit 0
         });
     }
 
+    /// A local key pair in the session's directory, and the fingerprint EC2 would show for it
+    /// (the padded form EC2 uses) in the fake's answer.
+    fn seed_local_key(s: &Session, dir: &Path) {
+        let fp = local_fingerprint(&s.dir.join("try-key")).unwrap();
+        std::fs::write(
+            dir.join("fingerprint"),
+            format!("{}=\n", fp.trim_start_matches("SHA256:")),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn a_key_pair_that_exists_with_both_tags_is_adopted() {
         with_fake(&["key_exists"], |s, dir| {
+            seed_local_key(s, dir);
             try_key(s).unwrap();
             let c = calls(dir);
             assert!(!c.contains("import-key-pair"), "{c}");
@@ -3542,9 +3901,299 @@ exit 0
             }
             assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
         });
-        with_fake(&["import_fails"], |s, _| {
+        with_fake(&["import_fails"], |s, dir| {
+            seed_local_key(s, dir);
             try_key(s).unwrap();
             assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
+        });
+    }
+
+    #[test]
+    fn an_adopted_key_pair_with_another_fingerprint_is_replaced() {
+        with_fake(&["key_exists"], |s, dir| {
+            local_fingerprint(&s.dir.join("try-key")).unwrap();
+            std::fs::write(
+                dir.join("fingerprint"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+            )
+            .unwrap();
+            try_key(s).unwrap();
+            let c = calls(dir);
+            assert!(c.contains("delete-key-pair"), "{c}");
+            assert!(c.contains("import-key-pair"), "{c}");
+            assert!(s.live().iter().any(|(k, _)| *k == Kind::Key));
+        });
+    }
+
+    #[test]
+    fn fingerprints_compare_without_the_prefix_and_the_padding() {
+        assert_eq!(
+            fingerprint_field("256 SHA256:abcDEF+/12 stafeto-try (ED25519)\n").as_deref(),
+            Some("SHA256:abcDEF+/12")
+        );
+        assert!(same_fingerprint("SHA256:abcDEF+/12", "abcDEF+/12="));
+        assert!(same_fingerprint("abcDEF+/12=\n", "SHA256:abcDEF+/12"));
+        assert!(!same_fingerprint("SHA256:abcDEF+/12", "abcDEF+/13="));
+        assert!(!same_fingerprint("", ""));
+    }
+
+    fn two_journals() -> Vec<(String, Kind, String)> {
+        vec![
+            ("20260101-000001".into(), Kind::Volume, "vol-1".into()),
+            ("20260101-000002".into(), Kind::Volume, "vol-2".into()),
+            ("20260101-000002".into(), Kind::Instance, "i-2".into()),
+        ]
+    }
+
+    #[test]
+    fn the_guard_checks_the_journal_the_project_tag_and_the_session_tag() {
+        let j = two_journals();
+        assert!(guard_verdict(&j, Kind::Volume, "vol-1", "stafeto", "20260101-000001").is_ok());
+        let e = guard_verdict(&j, Kind::Volume, "vol-9", "stafeto", "20260101-000001").unwrap_err();
+        assert!(e.contains("not in any session journal"), "{e}");
+        let e = guard_verdict(&j, Kind::Volume, "vol-1", "other", "20260101-000001").unwrap_err();
+        assert!(e.contains("project=stafeto"), "{e}");
+        // The session tag of another session's journal, or none, leaves the resource alone.
+        for tag in ["20260101-000002", "", "20260101"] {
+            let e = guard_verdict(&j, Kind::Volume, "vol-1", "stafeto", tag).unwrap_err();
+            assert!(e.contains("session tag"), "{tag}: {e}");
+        }
+        // The kind is part of the question.
+        assert!(guard_verdict(&j, Kind::Instance, "vol-1", "stafeto", "20260101-000001").is_err());
+    }
+
+    #[test]
+    fn the_guard_takes_a_resource_held_by_the_session_its_tag_names() {
+        let mut j = two_journals();
+        j.push(("20260101-000001".into(), Kind::Instance, "i-2".into()));
+        assert!(guard_verdict(&j, Kind::Instance, "i-2", "stafeto", "20260101-000001").is_ok());
+        assert!(guard_verdict(&j, Kind::Instance, "i-2", "stafeto", "20260101-000002").is_ok());
+    }
+
+    #[test]
+    fn the_guard_refuses_a_delete_when_the_session_tag_names_another_session() {
+        with_fake(&["tag_other_session"], |s, _| {
+            // The session tag names another session than the one whose journal holds the
+            // volume: the delete is refused.
+            s.note("created", Kind::Volume, "vol-0123456789abcdef0")
+                .unwrap();
+            let e = guard(Kind::Volume, "vol-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("session tag"), "{e}");
+        });
+    }
+
+    #[test]
+    fn the_header_states_the_limit_the_code_has() {
+        assert_eq!(MAX_LIVE, 4);
+        let header = include_str!("aws.rs")
+            .lines()
+            .skip_while(|l| !l.starts_with("//!"))
+            .take_while(|l| l.starts_with("//!"))
+            .collect::<String>();
+        assert!(header.contains("at most four instances"), "{header}");
+        assert!(header.contains("`session` tag"), "{header}");
+    }
+
+    #[test]
+    fn the_volume_options_take_whole_gib_up_to_their_caps() {
+        assert_eq!(
+            parse_gib(
+                "--data-volume-size",
+                "8",
+                DATA_VOLUME_MIN_GIB,
+                DATA_VOLUME_MAX_GIB
+            ),
+            Ok(8)
+        );
+        assert_eq!(
+            parse_gib(
+                "--data-volume-size",
+                "32",
+                DATA_VOLUME_MIN_GIB,
+                DATA_VOLUME_MAX_GIB
+            ),
+            Ok(32)
+        );
+        for bad in ["1", "0", "-3", "abc", "", "33", "16384", "2.5"] {
+            assert!(
+                parse_gib(
+                    "--data-volume-size",
+                    bad,
+                    DATA_VOLUME_MIN_GIB,
+                    DATA_VOLUME_MAX_GIB
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse_gib("--blank-volume", "1", 1, BLANK_VOLUME_MAX_GIB),
+            Ok(1)
+        );
+        assert_eq!(
+            parse_gib("--blank-volume", "32", 1, BLANK_VOLUME_MAX_GIB),
+            Ok(32)
+        );
+        assert!(parse_gib("--blank-volume", "33", 1, BLANK_VOLUME_MAX_GIB).is_err());
+        assert!(parse_gib("--blank-volume", "0", 1, BLANK_VOLUME_MAX_GIB).is_err());
+    }
+
+    #[test]
+    fn a_larger_data_volume_names_the_size_and_no_snapshot() {
+        assert_eq!(
+            launch_mapping(&sized(8)),
+            "DeviceName=/dev/sdf,Ebs={VolumeSize=8,VolumeType=gp3,DeleteOnTermination=true}"
+        );
+        assert!(!launch_mapping(&sized(8)).contains("SnapshotId"));
+    }
+
+    #[test]
+    fn the_blank_volume_request_has_the_zone_the_size_and_both_tags() {
+        with_fake(&[], |s, _| {
+            let a = blank_volume_args(s, "eu-central-1a", 4, "i-0123456789abcdef0");
+            let line = a.join(" ");
+            assert!(
+                line.starts_with(
+                    "ec2 create-volume --volume-type gp3 --availability-zone eu-central-1a --size 4"
+                ),
+                "{line}"
+            );
+            assert!(
+                line.contains(
+                    "ResourceType=volume,Tags=[{Key=project,Value=stafeto},{Key=session,Value=9999-"
+                ),
+                "{line}"
+            );
+            assert!(line.contains("--client-token stafeto-vol-9999-"), "{line}");
+            assert!(line.contains("-i-0123456789abcdef0"), "{line}");
+            assert_eq!(
+                blank_delete_with_instance(),
+                "DeviceName=/dev/sdg,Ebs={DeleteOnTermination=true}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_blank_volume_is_journaled_before_the_call_and_attached_as_sdg() {
+        with_fake(&[], |s, dir| {
+            attach_blank_volume(s, "i-0123456789abcdef0", 3).unwrap();
+            let at_create = ledger_copy(dir, "ledger_at_volume");
+            assert!(at_create.contains("intent\tvolume\tblank"), "{at_create}");
+            assert!(!at_create.contains("created\tvolume"), "{at_create}");
+            assert!(
+                s.live()
+                    .contains(&(Kind::Volume, "vol-0123456789abcdef9".into()))
+            );
+            let c = calls(dir);
+            assert!(
+                c.contains("--availability-zone eu-central-1a --size 3"),
+                "{c}"
+            );
+            assert!(
+                c.contains("attach-volume --volume-id vol-0123456789abcdef9 --instance-id i-0123456789abcdef0 --device /dev/sdg"),
+                "{c}"
+            );
+            assert!(
+                c.contains(
+                    "--block-device-mappings DeviceName=/dev/sdg,Ebs={DeleteOnTermination=true}"
+                ),
+                "{c}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_failed_create_volume_journals_and_removes_a_volume_it_made() {
+        with_fake(&["volume_create_fails"], |s, dir| {
+            let e = attach_blank_volume(s, "i-0123456789abcdef0", 3).unwrap_err();
+            assert!(e.contains("RequestLimitExceeded"), "{e}");
+            let c = calls(dir);
+            assert!(c.contains("Name=tag:session,Values=9999-"), "{c}");
+            assert!(
+                c.contains("delete-volume --volume-id vol-0123456789abcdef7"),
+                "{c}"
+            );
+            assert!(s.live().is_empty(), "journaled and deleted: {:?}", s.live());
+        });
+    }
+
+    #[test]
+    fn clean_finds_a_tagged_volume_that_no_journal_line_names() {
+        with_fake(&[], |s, dir| {
+            std::fs::write(dir.join("tagged_volumes"), "vol-0123456789abcdef7\n").unwrap();
+            assert!(s.live().is_empty());
+            clean(s, false).unwrap();
+            let c = calls(dir);
+            assert!(
+                c.contains("delete-volume --volume-id vol-0123456789abcdef7"),
+                "{c}"
+            );
+            assert!(s.live().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_blank_volume_that_cannot_be_marked_for_deletion_is_detached_before_the_delete() {
+        with_fake(&["modify_fails"], |s, dir| {
+            let e = attach_blank_volume(s, "i-0123456789abcdef0", 3).unwrap_err();
+            assert!(e.contains("Throttling"), "{e}");
+            let c = calls(dir);
+            let at = |what: &str| c.find(what).unwrap_or_else(|| panic!("{what}: {c}"));
+            assert!(at("detach-volume") < at("delete-volume"), "{c}");
+            assert!(s.live().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_failed_attach_deletes_the_volume_without_a_detach() {
+        let calls_of = |c: &str| c.contains("detach-volume");
+        with_fake(&[], |s, dir| {
+            attach_blank_volume(s, "i-0123456789abcdef0", 3).unwrap();
+            assert!(!calls_of(&calls(dir)));
+        });
+    }
+
+    #[test]
+    fn the_try_out_estimate_adds_the_volumes() {
+        assert_eq!(volume_rate(&[]), 0.0);
+        let one = volume_rate(&[10]);
+        assert!((one - 10.0 * PRICE_GP3_GIB_MONTH / 730.0).abs() < 1e-12);
+        assert!((volume_rate(&[4, 6]) - one).abs() < 1e-12);
+    }
+
+    #[test]
+    fn clean_keeps_the_image_and_its_snapshots_when_asked() {
+        let live = vec![
+            (Kind::Snapshot, "snap-1".to_string()),
+            (Kind::Image, "ami-1".to_string()),
+            (Kind::Group, "sg-1".to_string()),
+            (Kind::Instance, "i-1".to_string()),
+            (Kind::Volume, "vol-1".to_string()),
+        ];
+        let all = clean_order(live.clone(), false);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].0, Kind::Instance);
+        let kept = clean_order(live, true);
+        let kinds: Vec<Kind> = kept.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [Kind::Instance, Kind::Volume, Kind::Group]);
+    }
+
+    #[test]
+    fn clean_with_keep_image_leaves_the_image_in_the_journal() {
+        with_fake(&["gone"], |s, _| {
+            s.note("created", Kind::Image, "ami-0123456789abcdef0")
+                .unwrap();
+            s.note("created", Kind::Snapshot, "snap-0123456789abcdef1")
+                .unwrap();
+            s.note("created", Kind::Instance, "i-0123456789abcdef0")
+                .unwrap();
+            clean(s, true).unwrap();
+            let live = s.live();
+            assert_eq!(live.len(), 2, "{live:?}");
+            assert!(
+                live.iter()
+                    .all(|(k, _)| matches!(k, Kind::Image | Kind::Snapshot))
+            );
         });
     }
 
@@ -3555,7 +4204,7 @@ exit 0
             assert!(s.dir.join("try-key.pub").exists());
             s.note("deleted", Kind::Key, "key-0123456789abcdef0")
                 .unwrap();
-            clean(s).unwrap();
+            clean(s, false).unwrap();
             assert!(!s.dir.join("try-key").exists());
             assert!(!s.dir.join("try-key.pub").exists());
         });

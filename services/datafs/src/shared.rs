@@ -41,6 +41,8 @@ pub struct Job {
     pub state: AtomicU8,
     /// The order of arrival: the worker takes the lowest.
     pub ticket: AtomicU64,
+    /// The instant the job was queued, in nanoseconds (`datafs::watch`).
+    pub queued_at: AtomicU64,
     pub kind: u8,
     pub owner: u64,
     pub request_len: usize,
@@ -54,6 +56,7 @@ impl Job {
         Job {
             state: AtomicU8::new(FREE),
             ticket: AtomicU64::new(0),
+            queued_at: AtomicU64::new(0),
             kind: REQUEST,
             owner: 0,
             request_len: 0,
@@ -85,6 +88,9 @@ pub static READY: AtomicBool = AtomicBool::new(false);
 
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());
+
+/// The instant, in nanoseconds, of the last disk call the worker completed (`datafs::watch`).
+pub static PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 /// The number of the next request.
 pub static TICKET: AtomicU64 = AtomicU64::new(1);
