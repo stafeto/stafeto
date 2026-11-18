@@ -29,8 +29,8 @@
 //! commands (Virtio 1.3, 5.7.6.10), whose chains the device returns with no
 //! answer to read. The owner asks for the records of the display's pipelines
 //! (PIPELINES) and for the memory of a pool or a cursor source (SOURCE), one
-//! copy of each for as long as it owns the screen. LAYERS, which binds
-//! sources to pipelines, is not served yet.
+//! copy of each for as long as it owns the screen, and binds sources to the
+//! pipelines with LAYERS (`layers`: the order of the device's commands).
 //!
 //! The input service (spec 3, 3.6) is the driver's own client: an OPEN asks
 //! it for a session of focus (GRANT) and passes it on to the owner with
@@ -59,9 +59,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::ManuallyDrop;
 use core::slice;
 use proto_gpu::{
-    BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, INVALID, IO, Method, NO_DEVICE, NO_INPUT,
-    NOT_ALLOWED, Pipelines, REVOKED, Rect, SOURCE_KIND_POOL, STRIDE, Screen, SourceInfo, VERSION,
-    code,
+    BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, INVALID, IO, KIND_CURSOR, KIND_PRIMARY, Layers,
+    Method, NO_DEVICE, NO_INPUT, NOT_ALLOWED, Pipelines, REVOKED, Rect, SOURCE_KIND_POOL, STRIDE,
+    Screen, SourceInfo, VERSION, code,
 };
 use proto_init::ServiceArgs;
 use proto_input::{self, Method as InputMethod};
@@ -78,6 +78,7 @@ use virtio_gpu::dma::{
     ANSWER_AT, COMMAND_AT, CURSOR_AT, CURSOR_QUEUE_SIZE, INFO_AT, PAGE, PAGES, QUEUE_PAGES,
     QUEUE_SIZE, STAGE_PAGE,
 };
+use virtio_gpu::layers::{self, Cursor, Frame, Row, Send, Step};
 use virtio_gpu::owner::{self, Denied, Object, Owner, Refusal, Source as Kind};
 use virtio_gpu::setup::{CURSOR_BYTES, RESOURCES, Setup};
 use virtio_mmio::{DmaHal, Isr, OpenError, StartError};
@@ -270,6 +271,10 @@ fn main(_: u64) -> u64 {
         focus_on: false,
         showing: None,
         queued: None,
+        queued_frame: None,
+        primary: commands::RESOURCE,
+        cursor: Cursor::new(),
+        fence: 0,
         subscriber: None,
         committing: false,
         objects: [fb, pool, cursor],
@@ -303,8 +308,12 @@ enum Job {
     ScanoutOn,
     /// SET_SCANOUT with resource 0, on the way back.
     ScanoutOff,
-    /// TRANSFER_TO_HOST_2D and RESOURCE_FLUSH, for a FLUSH.
+    /// The work of a frame: TRANSFER_TO_HOST_2D and RESOURCE_FLUSH for a
+    /// FLUSH or a COMMIT, and for a new source the transfer, SET_SCANOUT
+    /// and RESOURCE_FLUSH, up to three chains.
     Show,
+    /// The cursor's picture, TRANSFER_TO_HOST_2D with the fence flag.
+    CursorImage,
 }
 
 /// One command in the queue: its token, where its bytes and its answer
@@ -384,6 +393,13 @@ struct Driver {
     /// The FLUSH with the device, and the one that waits for it.
     showing: Option<Pending>,
     queued: Option<(Pending, Rect)>,
+    /// The work of a LAYERS frame that waits for the device, and the
+    /// source the scanout shows (0: not known).
+    queued_frame: Option<Frame>,
+    primary: u32,
+    /// The cursor pipeline, and the id of the next fence.
+    cursor: Cursor,
+    fence: u64,
     /// The channel SUBSCRIBE gave, which the end of a COMMIT is told on,
     /// and whether the show with the device is a COMMIT's.
     subscriber: Option<Handle<Channel>>,
@@ -399,7 +415,7 @@ struct Driver {
 impl Driver {
     /// The service's next command, when the device holds none: the setup
     /// from where it stands, then the scanout off of a screen on its way
-    /// back, then a FLUSH that waits.
+    /// back, then a FLUSH or a frame that waits, then the cursor's picture.
     fn pump(&mut self) {
         if self.flight.is_some() {
             return;
@@ -414,6 +430,10 @@ impl Driver {
                     self.issue_scanout(Job::ScanoutOff);
                 } else if let Some((pending, rect)) = self.queued.take() {
                     self.show(pending, rect);
+                } else if let Some(frame) = self.queued_frame.take() {
+                    self.start_frame(&frame);
+                } else if let Some(resource) = self.cursor.transfer_due() {
+                    self.issue_cursor_image(resource);
                 }
             }
         }
@@ -457,11 +477,9 @@ impl Driver {
 
     /// Puts a command of the cursor queue, written by `write`, into the
     /// page of commands and the queue, and rings its doorbell; false while
-    /// the queue holds a chain (it holds one at most: the caller keeps the
-    /// latest place and sends it when the chain is back) or when the queue
-    /// refuses. The step of LAYERS (the next step of the graphics work) is
-    /// the caller.
-    #[allow(dead_code)]
+    /// the queue holds a chain (it holds one at most: the cursor machine
+    /// keeps the latest place and sends it when the chain is back) or when the queue
+    /// refuses.
     fn send_cursor(&mut self, write: impl FnOnce(&mut [u8]) -> usize) -> bool {
         if self.cursor_flight.is_some() {
             return false;
@@ -511,6 +529,8 @@ impl Driver {
                 self.give_up();
             }
             self.cursor_flight = None;
+            let next = self.cursor.chain_returned();
+            self.emit(next);
         }
     }
 
@@ -592,31 +612,134 @@ impl Driver {
         sent
     }
 
-    /// The transfer and the flush of `rect` into the queue, two chains, and
-    /// the job that holds them. The device is idle. The flush chain is None
-    /// when the queue refused it (the job is then bad: the transfer that is
-    /// in comes back and nothing waits on it); the first is None when the
-    /// queue refused both.
-    fn show_chains(&mut self, rect: &Rect) -> Option<Option<Chain>> {
-        let transfer = self.submit(0, ANSWER_AT[0], HEADER, |b| {
-            commands::transfer_to_host_2d(b, rect, commands::RESOURCE)
-        });
-        let flush = transfer.and_then(|_| {
-            self.submit(1, ANSWER_AT[1], HEADER, |b| {
-                commands::resource_flush(b, rect, commands::RESOURCE)
-            })
-        });
-        let first = transfer?;
-        // A transfer in the queue with no flush after it is taken back by
-        // the interrupt that brings it, and nothing waits on it.
+    /// The commands of `frame` into the control queue, one chain each and
+    /// all of them before the doorbell, and the job that holds them. The
+    /// device is idle. The last chain is None when the queue refused a
+    /// command (the job is then bad: the chains that are in come back and
+    /// nothing waits on them); the result is None when the queue refused the
+    /// first.
+    fn frame_chains(&mut self, frame: &Frame) -> Option<Option<Chain>> {
+        let resource = frame.source;
+        let mut chains = [None; 3];
+        let mut bad = false;
+        for (slot, step) in frame.steps().iter().enumerate() {
+            let step = *step;
+            let chain = self.submit(slot, ANSWER_AT[slot], HEADER, |b| match step {
+                Step::Transfer(r) => commands::transfer_to_host_2d(b, &r, resource),
+                Step::Scanout => {
+                    commands::set_scanout(b, &Rect::SCREEN, commands::SCANOUT, resource)
+                }
+                Step::Flush(r) => commands::resource_flush(b, &r, resource),
+            });
+            if chain.is_none() {
+                bad = true;
+                break;
+            }
+            chains[slot] = chain;
+        }
+        let first = chains[0]?;
+        let last = chains.iter().flatten().last().copied();
+        // A chain in the queue with the rest refused is taken back by the
+        // interrupt that brings it, and nothing waits on it.
         self.flight = Some(Flight {
             job: Job::Show,
-            chains: [Some(first), flush, None],
+            chains,
             done: 0,
-            bad: flush.is_none(),
+            bad,
         });
         self.ring();
-        Some(flush)
+        Some(if bad { None } else { last.or(Some(first)) })
+    }
+
+    /// The transfer and the flush of `rect` of the target: the two chains
+    /// of a FLUSH or a COMMIT.
+    fn show_chains(&mut self, rect: &Rect) -> Option<Option<Chain>> {
+        self.frame_chains(&layers::frame(
+            commands::RESOURCE,
+            commands::RESOURCE,
+            Some(*rect),
+        ))
+    }
+
+    /// Starts the work of a LAYERS frame, the device idle: the scanout is
+    /// taken to show the frame's source from here on, and a job that comes
+    /// back bad makes it unknown again (`finish`). A refusal of the queue is
+    /// FRAME_FAILED.
+    fn start_frame(&mut self, frame: &Frame) {
+        match self.frame_chains(frame) {
+            Some(Some(_)) => {
+                self.primary = frame.source;
+                self.committing = true;
+            }
+            _ => {
+                self.primary = 0;
+                self.committing = false;
+                if let Some(subscriber) = &self.subscriber {
+                    let _ = sys::notify(subscriber, FRAME_FAILED);
+                }
+            }
+        }
+    }
+
+    /// Whether the device holds the work of a frame or one waits: a new
+    /// frame is BUSY then. The cursor's picture in the control queue is
+    /// not a frame's work: a frame after it waits for it.
+    fn frame_busy(&self) -> bool {
+        let shows = self.flight.as_ref().is_some_and(|f| f.job == Job::Show);
+        shows || self.queued.is_some() || self.queued_frame.is_some()
+    }
+
+    /// Starts `frame`, or lets it wait for the job the device holds.
+    fn begin_frame(&mut self, frame: Frame) {
+        if self.flight.is_some() {
+            self.queued_frame = Some(frame);
+        } else {
+            self.start_frame(&frame);
+        }
+    }
+
+    /// The fenced transfer of the cursor's whole picture, a job of one
+    /// chain; the cursor's update follows its return. The device is idle.
+    fn issue_cursor_image(&mut self, resource: u32) {
+        let id = self.fence;
+        self.fence += 1;
+        let size = proto_gpu::CURSOR_SIZE;
+        self.cursor.transfer_started();
+        let sent = self.one(Job::CursorImage, ANSWER_AT[0], HEADER, |b| {
+            let all = Rect {
+                x: 0,
+                y: 0,
+                w: size,
+                h: size,
+            };
+            commands::transfer_fenced(b, &all, size * 4, resource, id)
+        });
+        if !sent {
+            // The queue refused: the picture is not sent, the cursor stays as
+            // it was.
+            let next = self.cursor.transfer_done(false);
+            debug_assert!(next.is_none());
+        }
+    }
+
+    /// Sends what the cursor machine gave, if anything. A command the queue
+    /// refuses is dropped and the machine told.
+    fn emit(&mut self, send: Option<Send>) {
+        let Some(send) = send else {
+            return;
+        };
+        let sent = self.send_cursor(|b| match send {
+            Send::Update {
+                resource,
+                place,
+                hot,
+            } => commands::update_cursor(b, place, resource, hot),
+            Send::Move { place } => commands::move_cursor(b, place),
+        });
+        if !sent {
+            rt::println!("virtio-gpu: the cursor queue refused a command");
+            self.cursor.abandoned();
+        }
     }
 
     /// Starts a FLUSH: the transfer and the flush of the rectangle, two
@@ -750,7 +873,19 @@ impl Driver {
                 self.owner.scanout_off();
                 let _ = sys::notify(&self.notify, CLEAR);
             }
+            Job::CursorImage => {
+                // The picture is in the host's resource whatever the
+                // cursor queue holds: the update goes now, or waits for the
+                // chain that is out.
+                let send = self.cursor.transfer_done(!flight.bad);
+                self.emit(send);
+            }
             Job::Show => {
+                if flight.bad {
+                    // The scanout may or may not show the source asked for:
+                    // the next frame transfers and switches whatever it is.
+                    self.primary = 0;
+                }
                 let status = if flight.bad { code(IO) } else { Status::Ok };
                 if let Some(pending) = self.showing.take() {
                     let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
@@ -781,6 +916,7 @@ impl Driver {
             self.release(opening.label);
             return;
         }
+        self.primary = commands::RESOURCE;
         // With a session of focus the status is 0, without one NO_INPUT:
         // the screen is the client's all the same (proto_gpu).
         let status = if opening.focus {
@@ -806,6 +942,13 @@ impl Driver {
         }
         self.revoke_focus();
         self.subscriber = None;
+        self.queued_frame = None;
+        self.committing = false;
+        // The cursor goes off for the next owner, and the next owner's scanout
+        // starts at the target.
+        let hide = self.cursor.release();
+        self.emit(hide);
+        self.primary = commands::RESOURCE;
         if let Some((pending, _)) = self.queued.take() {
             let _ = pending.answer(&proto_wire::reply(code(REVOKED)), Outgoing::new());
         }
@@ -1029,16 +1172,18 @@ impl Driver {
         if self.subscriber.is_none() {
             return Answer::Status(code(NOT_ALLOWED));
         }
-        if self.flight.is_some() || self.queued.is_some() {
+        if self.frame_busy() {
             return Answer::Status(code(BUSY));
         }
-        match self.show_chains(&rect) {
-            Some(Some(_)) => {
-                self.committing = true;
-                Answer::Status(Status::Ok)
-            }
-            _ => Answer::Status(code(IO)),
-        }
+        // A LAYERS with the bound source and the rectangle: when the bound
+        // source is not known the target is shown whole.
+        let source = if self.primary == 0 {
+            commands::RESOURCE
+        } else {
+            self.primary
+        };
+        self.begin_frame(layers::frame(self.primary, source, Some(rect)));
+        Answer::Status(Status::Ok)
     }
 
     /// PIPELINES of the owner's session: the records of the display's
@@ -1094,6 +1239,62 @@ impl Driver {
         Answer::Reply([copy.erase()].into())
     }
 
+    /// LAYERS of the owner's session: the rows bind sources to pipelines
+    /// and take effect together; nothing is applied unless every row is
+    /// good and a row of the primary pipeline may start (BUSY while the
+    /// device holds the work of an earlier frame). The reply is the status
+    /// alone; a frame ends with FRAME_SHOWN or FRAME_FAILED on the
+    /// subscribed channel.
+    fn layers(&mut self, r: &mut Request<'_>) -> Answer {
+        let rows = match Layers::read(r.body()) {
+            Ok(rows) => rows,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if !self.owner.owns(r.label()) || self.setup != Setup::Ready {
+            return Answer::Status(code(REVOKED));
+        }
+        if let Err(status) = rows.check_virtio() {
+            return Answer::Status(status);
+        }
+        let pipelines = Pipelines::VIRTIO;
+        let kind_of = |id: u32| pipelines.find(id).map(|p| p.kind);
+        let frame_row = rows
+            .rows()
+            .iter()
+            .find(|row| kind_of(row.pipeline) == Some(KIND_PRIMARY));
+        let mut frame = None;
+        if let Some(row) = frame_row {
+            if self.subscriber.is_none() {
+                return Answer::Status(code(NOT_ALLOWED));
+            }
+            if self.frame_busy() {
+                return Answer::Status(code(BUSY));
+            }
+            frame = Some(layers::frame(self.primary, row.source, row.area()));
+        }
+        for row in rows.rows() {
+            if kind_of(row.pipeline) == Some(KIND_CURSOR) {
+                let send = self.cursor.row(Row {
+                    source: row.source,
+                    place: (row.x as u32, row.y as u32),
+                    hot: (row.hot_x, row.hot_y),
+                    changed: row.dw != 0,
+                });
+                self.emit(send);
+            }
+        }
+        if let Some(frame) = frame {
+            self.begin_frame(frame);
+        } else if self.flight.is_none() {
+            // A cursor transfer that is due starts at once.
+            self.pump();
+        }
+        Answer::Status(Status::Ok)
+    }
+
     /// CLOSE of the owner's session.
     fn close(&mut self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
@@ -1142,6 +1343,7 @@ const METHODS: &[u16] = &[
     Method::Clone.number(),
     Method::Pipelines.number(),
     Method::Source.number(),
+    Method::Layers.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -1154,6 +1356,7 @@ const METHODS: &[u16] = &[
     Method::Clone.number(),
     Method::Pipelines.number(),
     Method::Source.number(),
+    Method::Layers.number(),
 ];
 
 impl Service<1> for Driver {
@@ -1173,7 +1376,8 @@ impl Service<1> for Driver {
                 | Method::Subscribe
                 | Method::Commit
                 | Method::Pipelines
-                | Method::Source,
+                | Method::Source
+                | Method::Layers,
             ) if !owner_session => {
                 return Answer::Status(code(NOT_ALLOWED));
             }
@@ -1190,6 +1394,7 @@ impl Service<1> for Driver {
             Some(Method::Commit) => self.commit(r),
             Some(Method::Pipelines) => self.pipelines(r),
             Some(Method::Source) => self.source(r),
+            Some(Method::Layers) => self.layers(r),
             Some(Method::Clone) => self.clone_session(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),

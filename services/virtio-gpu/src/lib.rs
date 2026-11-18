@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod commands;
+pub mod layers;
 pub mod owner;
 pub mod setup;
 
