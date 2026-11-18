@@ -233,6 +233,9 @@ impl Service<0> for Datafs {
     type Data = ();
 
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
+        if STOPPING.load(Acquire) {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
         let Some(i) = self.free_job() else {
             return Answer::Status(busy());
         };
@@ -275,7 +278,23 @@ impl Service<0> for Datafs {
                 }
             }
             self.settle();
+            // The worker put the volume away and every reply it made has gone: the service ends.
+            if UNMOUNTED.load(Acquire) && (0..JOBS).all(|i| state(i).load(Acquire) != DONE) {
+                rt::println!("datafs: stopped, {} jobs finished", STOP_JOBS.load(Acquire));
+                sys::process_exit(0);
+            }
         }
+    }
+
+    /// The stop notice of init: no new request, the worker runs the queued jobs and puts the volume
+    /// away, and `notification` ends the process when that is done. Init kills the service at its
+    /// deadline should the disk not answer.
+    fn stop(&mut self) {
+        if STOPPING.swap(true, Release) {
+            return;
+        }
+        STOP_AT.store(rt::time::now(), Release);
+        let _ = sys::notify(&self.kick, 1);
     }
 }
 

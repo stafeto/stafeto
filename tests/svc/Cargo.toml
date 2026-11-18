@@ -17,6 +17,7 @@ abi = { path = "../../lib/abi" }
 posix-clock = { path = "../../lib/posix-clock" }
 posix-time = { path = "../../lib/posix-time" }
 proto-clock = { path = "../../proto/clock" }
+proto-data = { path = "../../proto/data" }
 proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }

@@ -160,6 +160,16 @@ impl Server {
         }
     }
 
+    /// Closes every file and directory still open, for the stop of the service: a file's data
+    /// reaches the volume when it is closed.
+    pub fn close_all<D: Device>(&mut self, fs: &mut Fs<'_, D>) {
+        for i in 0..OPEN {
+            if self.open[i].used {
+                let _ = self.release(fs, i);
+            }
+        }
+    }
+
     fn release<D: Device>(&mut self, fs: &mut Fs<'_, D>, index: usize) -> Result<(), Error> {
         let d = self.open[index];
         self.open[index].used = false;

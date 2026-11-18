@@ -1172,6 +1172,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         }
         Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
         Some("shutdown") if args.len() == 1 => return nvme_shutdown(),
+        Some("stop-handlers") if args.len() == 1 => return nvme_stop_handlers(),
         _ => {}
     }
     let (breaks, shape, steps) = match args.first().map(String::as_str) {
@@ -1182,7 +1183,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
         Some("steps") => (false, Shape::Plain, true),
         Some(other) => {
             return Err(format!(
-                "usage: nvme-persist [breaks|lba4096|mdts1|steps|key|blk-probe|shutdown]: {other}"
+                "usage: nvme-persist [breaks|lba4096|mdts1|steps|key|blk-probe|shutdown|stop-handlers]: {other}"
             ));
         }
     };
@@ -2083,6 +2084,173 @@ fn nvme_shutdown() -> Result<(), String> {
     }
     println!(
         "nvme-persist shutdown: the waves in order, the quiet service killed at its deadline, the NVMe controller stopped and confirmed, one line off, no panic, powered off"
+    );
+    Ok(())
+}
+
+/// The programs of the image of `nvme-persist stop-handlers`: the services of a POSIX image on
+/// the machine with edk2 (the entropy service has no driver there), the NVMe data disk with the
+/// file service, two POSIX programs of tests/relibc-stop and the test services (`power`).
+const PROGRAMS_STOP: [ImageProgram; 10] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-stop-handlers", "nvme-store"],
+    ),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("relibc-stop", "relibc-stop", POSIX_STACK_SIZE, &[]),
+    ("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]),
+    ("datafsd", "datafsd", 32 * 1024, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
+];
+
+/// `cargo xtask nvme-persist stop-handlers`: the stop handlers of `datafs` and of the process
+/// service, on QEMU's machine with edk2 and the NVMe data disk, two boots of one disk file. The
+/// first boot: `power` writes `/stop/f` (20 000 bytes) through its session with `datafs`, with no
+/// sync and no close, and asks init to stop the system. The stop must show, in order: the process
+/// service signals its two POSIX programs (the one with a handler for SIGTERM ends by itself, the
+/// one that ignores it is killed), `datafs` finishes its queue, closes the file and unmounts (its line
+/// comes before the disk's `stopped and confirmed`), and the machine powers off with no panic. The
+/// second boot mounts the volume and `power` reads `/stop/f` back whole.
+fn nvme_stop_handlers() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let image = build_boot_image("boot-nvme-stop-handlers.img", &PROGRAMS_STOP, BOOT_PROFILE)?;
+    let kernel = build(Variant::Normal)?;
+    let firmware = efi::firmware()?;
+    let loader = efi::build_loader(&[])?;
+    let esp = target_dir().join("efi-disk-nvme-stop-handlers.raw");
+    let artifacts = Artifacts {
+        boot_image: image,
+        ..kernel.clone()
+    };
+    efi::make_disk(&loader, &artifacts, &esp)?;
+    let file = Disk::new("nvme-stop-handlers");
+    qemu::store_file(&file.0, blk_probe::DISK_BYTES, true)?;
+    let boot = |which: &str| -> Result<Vec<String>, String> {
+        let mut cmd = efi::command(
+            &efi::EFI,
+            &firmware,
+            &esp,
+            true,
+            "efi-disk-nvme-stop-handlers",
+        )?;
+        cmd.arg("-drive").arg(format!(
+            "file={},if=none,format=raw,id=data,cache=writeback,werror=report,rerror=report",
+            file.0.display()
+        ));
+        cmd.args(["-device", &Shape::Plain.device()]);
+        let output = run_until(cmd, WITHIN, None, &kernel.elf)?;
+        qemu::expect_system_off(&output).map_err(|e| format!("{which}: {e}"))?;
+        Ok(output.lines)
+    };
+    let stop_order: &[&str] = &[
+        "init: stopping the system (off)",
+        "posix: stopped, 2 signalled, 1 ended after SIGTERM, 1 killed",
+        "init: stopping datafs",
+        "datafs: stopped, ",
+        "init: stopping datadisk",
+        "init: datadisk device stopped and confirmed",
+        "init: stopping uart",
+        "init: stopped in ",
+        qemu::SYSTEM_OFF_LINE,
+    ];
+    let check = |lines: &[String], which: &str| -> Result<(), String> {
+        qemu::expect_in_order(lines, stop_order).map_err(|e| format!("{which}: {e}"))?;
+        // The process service ends its two programs before the file service stops, and the
+        // program with a handler says so before the line of the process service.
+        qemu::expect_in_order(
+            lines,
+            &[
+                "init: stopping the system (off)",
+                "relibc-stop: handler got SIGTERM and exits",
+                "posix: stopped, ",
+            ],
+        )
+        .map_err(|e| format!("{which}: {e}"))?;
+        for wanted in [
+            "relibc-stop: handler ready",
+            "relibc-stop: ignorer ready",
+            "init: stopping power",
+            "init: stopping posix",
+        ] {
+            if !lines.iter().any(|l| l.contains(wanted)) {
+                return Err(format!("{which}: no line {wanted:?}"));
+            }
+        }
+        // Both programs were up before the stop began.
+        let began = lines
+            .iter()
+            .position(|l| l.contains("init: stopping the system"))
+            .ok_or_else(|| format!("{which}: no line of the stop"))?;
+        for ready in ["relibc-stop: handler ready", "relibc-stop: ignorer ready"] {
+            if !lines[..began].iter().any(|l| l.contains(ready)) {
+                return Err(format!("{which}: {ready:?} came after the stop began"));
+            }
+        }
+        // The ignorer never says it got the signal, and no service of the table overran its deadline.
+        for unwanted in [
+            "relibc-stop: ignorer got",
+            "init: power did not stop",
+            "init: posix did not stop",
+            "init: datafs did not stop",
+            "init: datadisk did not stop",
+            "datafs: unmount failed",
+            "datafs: flush failed",
+            "its DMA memory stays kept",
+            "did not stop within the whole stop",
+            "power: file failed",
+            "power: SHUTDOWN refused",
+        ] {
+            if let Some(line) = lines.iter().find(|l| l.contains(unwanted)) {
+                return Err(format!("{which}: unexpected line {line:?}"));
+            }
+        }
+        Ok(())
+    };
+    let first = boot("first boot")?;
+    check(&first, "first boot")?;
+    for wanted in [
+        "datafs: partition table written, data volume formatted",
+        "power: wrote /stop/f, 20000 bytes, no sync and no close",
+    ] {
+        if !first.iter().any(|l| l.contains(wanted)) {
+            return Err(format!("first boot: no line {wanted:?}"));
+        }
+    }
+    let second = boot("second boot")?;
+    check(&second, "second boot")?;
+    if !second
+        .iter()
+        .any(|l| l.contains("datafs: data volume mounted"))
+    {
+        return Err("second boot: the volume was not mounted from the first boot".into());
+    }
+    if !second
+        .iter()
+        .any(|l| l.contains("power: /stop/f whole, 20000 bytes"))
+    {
+        return Err(format!(
+            "second boot: the file written just before the stop did not read back whole: {:?}",
+            second
+                .iter()
+                .filter(|l| l.contains("power:") || l.contains("datafs:"))
+                .collect::<Vec<_>>()
+        ));
+    }
+    println!(
+        "nvme-persist stop-handlers: the process service ended the program with a handler by SIGTERM and killed the one that ignores it, datafs stopped before the disk's confirmed stop, the machine powered off, and the file written just before the stop read back whole after the next boot"
     );
     Ok(())
 }

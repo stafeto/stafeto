@@ -83,6 +83,15 @@ pub static STARTING: AtomicBool = AtomicBool::new(true);
 /// The volume is mounted: requests may be served.
 pub static READY: AtomicBool = AtomicBool::new(false);
 
+/// The stop notice came: no new request is taken, the worker drains its queue.
+pub static STOPPING: AtomicBool = AtomicBool::new(false);
+/// The counter tick of the stop notice.
+pub static STOP_AT: AtomicU64 = AtomicU64::new(0);
+/// The jobs the worker finished since the stop notice.
+pub static STOP_JOBS: AtomicU64 = AtomicU64::new(0);
+/// The worker put the volume away.
+pub static UNMOUNTED: AtomicBool = AtomicBool::new(false);
+
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());
 

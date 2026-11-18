@@ -28,12 +28,11 @@ const MS: u64 = 1_000_000;
 /// The time a record gets to stop when nothing says otherwise: an exit at
 /// once is all the default handler of rt::service does.
 pub const DEFAULT_STOP_NS: u64 = 500 * MS;
-/// The process service will send SIGTERM to its processes, wait 3 s for their
-/// ends, send SIGKILL and exit; that comes with its stop handler (a later step),
-/// and until then it exits at once at the notice.
+/// The process service sends SIGTERM to its processes, waits 3 s for their
+/// ends, sends SIGKILL and exits (its stop handler).
 pub const PROCESS_STOP_NS: u64 = 5_000 * MS;
-/// The file service will put the jobs of its queue away and exit; that comes
-/// with its stop handler (a later step), and until then it exits at once.
+/// The file service finishes the jobs of its queue (2 s at most), unmounts the volume and exits
+/// (its stop handler).
 pub const FILES_STOP_NS: u64 = 3_000 * MS;
 /// A disk service exits; its device stops after that (`Record::quiesce`).
 pub const DISK_STOP_NS: u64 = 1_000 * MS;

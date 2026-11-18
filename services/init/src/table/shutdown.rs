@@ -10,7 +10,7 @@
 //! `quiet` and `blk`; the console's driver last.
 
 use super::test::{WATCH, echo};
-use super::{Kind, Record};
+use super::{Kind, Record, Wait};
 use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
@@ -30,6 +30,50 @@ pub const TABLE: &[Record] = &[
             deadline_ns: 20_000 * MS,
         }),
         ..echo("power", 30, WATCH, b"p")
+    },
+];
+
+/// The two POSIX programs of tests/relibc-stop (the table allows one record with `root`): `handle` takes SIGTERM with a handler and exits,
+/// `ignore` ignores it and is killed by the process service after its wait.
+const fn posix_program(name: &'static str, args: &'static [u8], root: bool) -> Record {
+    Record {
+        name,
+        program: "relibc-stop",
+        root,
+        args,
+        connects: &["ramfs", "clock", "posix", "entropy"],
+        quota: 512 * crate::PAGE,
+        ..super::ramfs::POSIX
+    }
+}
+
+/// The table of the probe of the stop handlers of `datafs` and of the process service (feature
+/// `table-stop-handlers`, `cargo xtask nvme-persist stop-handlers`, with nvme-store): the PL011's
+/// driver, the RAM files, the process and clock services, the entropy service on the boot seed, the
+/// NVMe data disk with `datafs`, two POSIX programs and `power`. `power` (tests/svc role `w`)
+/// waits for the file service, writes `/stop/f` through its session with no sync and no close
+/// (or reads it back when an earlier boot left it), and asks init to stop the system.
+pub const STOP_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    super::ramfs::RAM_CLOCKED,
+    super::ramfs::POSIX_ABI_TABLE[1],
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::aws::ENTROPY,
+    super::pkg::NVME_QEMU_DATA,
+    super::pkg::DATAFS,
+    posix_program("stop-handle", b"relibc-stop\0handle\0", true),
+    posix_program("stop-ignore", b"relibc-stop\0ignore\0", false),
+    Record {
+        connects: &["datafs"],
+        waits: &[Wait {
+            service: "datafs",
+            deadline_ms: 30_000,
+        }],
+        kind: Kind::Service(Watch {
+            period_ns: 20 * MS,
+            deadline_ns: 20_000 * MS,
+        }),
+        ..echo("power", 30, WATCH, b"w")
     },
 ];
 
@@ -61,5 +105,49 @@ mod tests {
         let of = |name: &str| TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(shutdown::stop_ns(of("quiet")), shutdown::DEFAULT_STOP_NS);
         assert_eq!(shutdown::stop_ns(of("blk")), shutdown::DISK_STOP_NS);
+    }
+
+    #[test]
+    fn the_stop_handlers_table_passes_the_check_and_stops_the_files_before_their_disk() {
+        crate::table::check(STOP_TABLE).unwrap();
+        let place = |name: &str| STOP_TABLE.iter().position(|r| r.name == name).unwrap();
+        let mut alive = (1u32 << STOP_TABLE.len()) - 1;
+        let mut order = Vec::new();
+        loop {
+            let next = shutdown::wave(STOP_TABLE, alive);
+            if next == 0 {
+                break;
+            }
+            order.push(next);
+            alive &= !next;
+        }
+        let wave_of = |name: &str| {
+            order
+                .iter()
+                .position(|w| w & (1 << place(name)) != 0)
+                .unwrap_or_else(|| panic!("{name} is in no wave"))
+        };
+        assert_eq!(wave_of("power"), 0);
+        assert!(wave_of("power") < wave_of("datafs"));
+        assert!(wave_of("datafs") < wave_of("datadisk"));
+        assert!(wave_of("datadisk") < wave_of("uart"));
+        assert_eq!(wave_of("uart"), order.len() - 1);
+        // The POSIX programs end with the process service, in its wave.
+        assert_eq!(wave_of("stop-handle"), wave_of("posix"));
+        assert_eq!(wave_of("stop-ignore"), wave_of("posix"));
+        assert!(wave_of("posix") < wave_of("datafs"));
+        // The two records of the files and of the processes get their own deadlines.
+        let of = |name: &str| &STOP_TABLE[place(name)];
+        assert_eq!(shutdown::stop_ns(of("datafs")), shutdown::FILES_STOP_NS);
+        assert_eq!(shutdown::stop_ns(of("posix")), shutdown::PROCESS_STOP_NS);
+    }
+
+    #[test]
+    fn the_stop_handlers_power_record_is_a_service_that_waits_for_the_files() {
+        let power = STOP_TABLE.iter().find(|r| r.name == "power").unwrap();
+        assert!(!power.is_client() && !power.is_posix());
+        assert!(power.connects.contains(&"datafs"));
+        assert_eq!(power.waits.len(), 1);
+        assert_eq!(STOP_TABLE.iter().filter(|r| r.is_posix()).count(), 2);
     }
 }

@@ -52,6 +52,9 @@ end-reset = []
 # The probe of the stop of the system on the NVMe machine with edk2 (xtask nvme-persist shutdown): a stand-in
 # for the power button's service asks init to stop the system; build it with nvme-store.
 table-shutdown = []
+# The probe of the stop handlers of the file service and the process service (xtask nvme-persist
+# stop-handlers): the same machine with POSIX programs and a file written just before the stop.
+table-stop-handlers = []
 # The probe of the overruns in the journal (xtask budget-journal).
 table-budget-journal = []
 vz = []

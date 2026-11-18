@@ -1411,6 +1411,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "relibc-stop"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "relibc-threads"
 version = "0.1.0"
 dependencies = [
@@ -1627,6 +1634,7 @@ dependencies = [
  "posix-clock",
  "posix-time",
  "proto-clock",
+ "proto-data",
  "proto-init",
  "proto-uart",
  "proto-wire",
