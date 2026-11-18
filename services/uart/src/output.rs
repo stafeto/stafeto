@@ -49,6 +49,9 @@ pub struct Output {
     log: [u8; LOG_RING],
     log_start: usize,
     log_len: usize,
+    /// The bytes of the log that went out since a client's line last had
+    /// its turn: at a line start the log goes first only below LOG_BYTES.
+    log_run: usize,
     at: At,
     /// Bytes that go before all others: the CR LF that ends a line cut
     /// short, the LF after the CR of a newline.
@@ -82,6 +85,7 @@ impl Output {
             log: [0; LOG_RING],
             log_start: 0,
             log_len: 0,
+            log_run: 0,
             at: At::Start,
             pending: &[],
             pending_client: false,
@@ -291,10 +295,15 @@ impl Output {
             }
             match self.at {
                 At::Start => {
-                    if self.log_has() && (self.fence.is_none() || self.cut) {
+                    // The log goes first at a line start, unless a client's
+                    // line waits and a batch of log text (LOG_BYTES) went out
+                    // since the last turn of the clients: they alternate.
+                    let clients_turn = self.ring_len > 0 && self.log_run >= LOG_BYTES;
+                    if self.log_has() && (self.fence.is_none() || self.cut) && !clients_turn {
                         self.at = At::Log;
                     } else if self.cut {
                         self.cut = false;
+                        self.log_run = 0;
                         self.at = At::Client;
                         if self.long {
                             self.line_len = 0;
@@ -303,6 +312,7 @@ impl Output {
                             self.repeat = Some(0);
                         }
                     } else if self.ring_len > 0 {
+                        self.log_run = 0;
                         self.at = At::Client;
                     } else {
                         return None;
@@ -338,6 +348,7 @@ impl Output {
                         let b = self.log[self.log_start];
                         self.log_start = (self.log_start + 1) % LOG_RING;
                         self.log_len -= 1;
+                        self.log_run = self.log_run.saturating_add(1);
                         if b == b'\n' {
                             self.at = At::Start;
                             self.pending = b"\n";
@@ -675,5 +686,44 @@ mod tests {
             assert!(o.log_done());
             assert_eq!(o.log_room(), LOG_RING);
         }
+    }
+
+    #[test]
+    fn a_client_line_waits_behind_one_batch_of_log_at_most() {
+        let mut o = Output::new();
+        // Many batches of log, lines of 100 bytes, and one line of a client.
+        for n in 0..120 {
+            let mut line = [b'a'; 100];
+            line[..3].copy_from_slice(&[
+                b'0' + (n / 100) as u8,
+                b'0' + (n / 10 % 10) as u8,
+                b'0' + (n % 10) as u8,
+            ]);
+            line[99] = b'\n';
+            assert!(o.put_log(&line));
+        }
+        assert!(o.put(b"client line\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let at = out
+            .windows(11)
+            .position(|w| w == b"client line")
+            .expect("the client's line goes out");
+        // After at most LOG_BYTES of log and the line it ended in.
+        assert!(at <= LOG_BYTES + 101 + 1, "{at}");
+        // Not the end of the log: the log went on after it, whole.
+        assert!(out.len() - at > 5000, "{}", out.len() - at);
+        let log_bytes = out.iter().filter(|&&b| b == b'a').count();
+        assert_eq!(log_bytes, 120 * 96);
+        // A steady stream of clients is not starved by it either way: a
+        // second client line comes after the next batch.
+        let mut o = Output::new();
+        for _ in 0..120 {
+            assert!(o.put_log(b"log line of the batch, enough to run a while on end\n"));
+        }
+        assert!(o.put(b"one\ntwo\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let one = out.windows(3).position(|w| w == b"one").unwrap();
+        let two = out.windows(3).position(|w| w == b"two").unwrap();
+        assert!(one < two && two - one <= LOG_BYTES + 100, "{one} {two}");
     }
 }

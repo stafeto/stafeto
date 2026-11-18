@@ -15,10 +15,9 @@
 //! driver never waits for the host: a transmission ends at the interrupt
 //! that shows its buffer used, input comes at the interrupt, and a receive
 //! of no bytes, the end of the host's input, leaves output going. It shows
-//! the kernel log as the PL011's driver does: at its start, every
-//! uart::log::IDLE_NS (DRAIN_NS while it holds text) and again while
-//! records are left. A buffer goes through a
-//! bounce page, copied whole: up to port::RX_BYTES in, port::TX_BYTES out.
+//! the kernel log as the PL011's driver does: at its start and every
+//! uart::log::IDLE_NS (DRAIN_NS while it holds text or records are left).
+//! A buffer goes through a bounce page, copied whole: up to port::RX_BYTES in, port::TX_BYTES out.
 //! The driver is in the trusted base: the device writes where the
 //! driver's queues tell it (spec 9, no SMMU on VZ). The program ends with
 //! a code of its own when its start fails; init restarts it.
@@ -439,6 +438,7 @@ fn main(_: u64) -> u64 {
         t0: time::ticks_to_ns(time::now()),
         deadline: 0,
         left: 0,
+        peak: uart::log::Peak::new(),
         state,
     };
     driver.take_log();
@@ -460,6 +460,7 @@ fn main(_: u64) -> u64 {
         heartbeat: Some(heartbeat),
     };
     let _ = rt::service::run::<Driver, SESSIONS, HELD>(&channel, &mut driver, config);
+    driver.say_peak(true);
     STOPPED
 }
 
@@ -481,6 +482,8 @@ struct Driver {
     deadline: u64,
     /// The records of the kernel log left after the last batch.
     left: u64,
+    /// The largest backlog of the rings the driver saw (uart::log::Peak).
+    peak: uart::log::Peak,
     state: &'static mut State,
 }
 
@@ -561,15 +564,11 @@ impl Driver {
     /// An interrupt of the line (spec 9, 13.5): the kernel masked it at
     /// delivery. Reading the ISR clears the level of INTx and completes a
     /// receive and a transmission the device finished; the input goes into
-    /// the ring, the next transmission starts and the next batch of the
-    /// log comes once the last went out, then the line opens again
+    /// the ring and the next transmission starts, then the line opens again
     /// (irq_ack), source cleared first [G26].
     fn interrupt(&mut self) {
         if self.port.interrupt() {
             self.kick();
-            if self.left > 0 {
-                self.take_log();
-            }
         }
         self.pull();
         // The binding lives as long as the driver.
@@ -588,10 +587,11 @@ impl Driver {
 
     /// Takes batches of the kernel log into the ring of the output's log
     /// (spec 13.5, 16.3), as many as the rule of uart::log::take_more lets
-    /// a step take: up to STEP_BATCHES while records are left in the rings
+    /// a period take: up to STEP_BATCHES while records are left in the rings
     /// and a batch of text fits, whether or not the text taken before went
-    /// out. The port is paced on its own timer. A step that leaves records
-    /// behind is followed at once by another (`arm`).
+    /// out. The port is paced on its own timer. Only the timer's tick (and
+    /// the start, once) calls it, so STEP_BATCHES is the bound of the driver's
+    /// log work in a period, for all its entry points together.
     fn take_log(&mut self) {
         let mut taken = 0;
         loop {
@@ -620,6 +620,7 @@ impl Driver {
             };
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
+            self.peak.batch(batch);
             uart::log::text(records, batch, lines, |bytes| {
                 // A batch fits: take_more asked for the room of its worst.
                 let _ = output.put_log(bytes);
@@ -634,20 +635,30 @@ impl Driver {
         }
     }
 
-    /// Arms the timer (spec 10): at once when the last step left records
-    /// in the kernel's rings and a batch of text fits, else at the first
-    /// deadline t0 + k * period after now, the period uart::log::DRAIN_NS
-    /// while the driver holds text it has not sent and IDLE_NS when it
-    /// holds none.
+    /// Arms the timer (spec 10) at the first deadline t0 + k * period after
+    /// now, the period uart::log::DRAIN_NS while the driver holds text it
+    /// has not put out or the rings hold records it has not taken, and
+    /// IDLE_NS when none; those that passed are not made up. Never at once:
+    /// a step that took nothing must not ask for another.
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
         let room = self.state.output.log_room();
-        self.deadline = match uart::log::next_step(self.left, room) {
-            uart::log::Next::Now => now,
-            uart::log::Next::After(ns) => next_release(self.t0, ns, now),
-        };
+        let ns = uart::log::period_ns(self.left, room);
+        self.deadline = next_release(self.t0, ns, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
+    }
+
+    /// Says the largest backlog of the kernel's rings the driver saw, once
+    /// it is out (`idle`: the driver holds no log text and the rings no
+    /// records) or the driver ends (spec 13.5, 16.3).
+    fn say_peak(&mut self, ends: bool) {
+        let idle = ends || (self.left == 0 && self.state.output.log_done());
+        if let Some(peak) = self.peak.say(idle) {
+            self.say(format_args!(
+                "virtio-console: log backlog peak {peak} records\n"
+            ));
+        }
     }
 
     /// WRITE (spec 13.5, 13.8), as the PL011's driver answers it.
@@ -1017,6 +1028,7 @@ impl Service<HELD> for Driver {
             (Source::Interrupt, _) => self.interrupt(),
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
                 self.take_log();
+                self.say_peak(false);
                 self.arm();
             }
             _ => {}

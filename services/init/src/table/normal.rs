@@ -27,7 +27,7 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 60,
         ceiling: 60,
-        quota: 40 * PAGE,
+        quota: 32 * PAGE,
         handle_limit: 32,
         restart: Restart::Always,
         console: true,

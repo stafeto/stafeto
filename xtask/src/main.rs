@@ -185,8 +185,12 @@ type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
 /// runs, of the runs of init's test table and of the two tables init
 /// refuses (spec 15.2). Init comes first (spec 13.1). The driver of the
-/// image that ships has the method CRASH in subproject 1 (spec 13.5); its
-/// shell has the command `logburst` (feature `log-burst`).
+/// image that ships has the method CRASH in subproject 1 (spec 13.5). The
+/// shell of this image (`boot.img`, the image of the console dialog and of
+/// the runs of QEMU) has the command `logburst` (feature `log-burst`) for
+/// the probes of the console's drivers. The release images (`boot-base.img`,
+/// `boot-full.img`, `boot-aws.img`) are built from SHELL_SERVICES and hold a
+/// shell without it (`no_release_image_has_the_log_burst_shell`).
 const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &[]),
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
@@ -11414,7 +11418,24 @@ pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
     let done = format!("shell: logburst: {LOG_BURST} lines");
     run.expect_line(&done, |l| l == done, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
-    burst_whole(&run.lines()[from..])
+    burst_whole(&run.lines()[from..])?;
+    // The driver says the largest backlog of the kernel's rings it saw once
+    // the backlog is out (a line of the driver's own, which may come a tick
+    // after the burst, or from the boot): printed for the record.
+    println!("{}", backlog_peak(run.lines()));
+    Ok(())
+}
+
+/// The last line in which a console driver said the largest backlog of the
+/// kernel's rings it saw (`log backlog peak N records`), or that it said none.
+fn backlog_peak(lines: &[String]) -> String {
+    lines
+        .iter()
+        .rfind(|l| l.contains(": log backlog peak "))
+        .map_or_else(
+            || "console driver: no backlog above one batch said".to_owned(),
+            |l| format!("console driver: {l}"),
+        )
 }
 
 /// The lines of a burst in `lines`: the LOG_BURST of them, each whole, in
@@ -14299,28 +14320,61 @@ fn ci_lints() -> Result<(), String> {
 }
 
 #[cfg(test)]
-/// The check of the burst of the console probes: whole and in order
-/// passes; a missing line, a swapped pair and a mark of lost records
-/// fail.
-#[test]
-fn the_burst_check_wants_every_line_in_order_and_no_mark() {
-    let all: Vec<String> = (0..LOG_BURST).map(burst_line).collect();
-    assert!(burst_whole(&all).is_ok());
-    let mut with_noise = all.clone();
-    with_noise.insert(7, "uart: something else".into());
-    assert!(burst_whole(&with_noise).is_ok());
-    let mut gap = all.clone();
-    gap.remove(40);
-    assert!(burst_whole(&gap).unwrap_err().contains("missing [40]"));
-    let mut swapped = all.clone();
-    swapped.swap(3, 4);
-    assert!(burst_whole(&swapped).is_err());
-    let mut marked = all;
-    marked.insert(10, "[kernel log: 3 records lost]".into());
-    assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
-}
-
 mod tests {
+    /// The command `logburst` is for the probes: no release image list has
+    /// a program built with the feature `log-burst`.
+    #[test]
+    fn no_release_image_has_the_log_burst_shell() {
+        let lists: [(&str, &[super::ImageProgram]); 4] = [
+            (
+                "boot-base.img",
+                super::base_image::programs(super::base_image::BASE_IMAGE),
+            ),
+            (
+                "boot-full.img",
+                super::base_image::programs(super::base_image::FULL_IMAGE),
+            ),
+            ("boot-aws.img", super::aws_programs()),
+            ("SHELL_SERVICES", &super::SHELL_SERVICES),
+        ];
+        for (name, list) in lists {
+            for program in list {
+                assert!(
+                    !program.3.contains(&"log-burst"),
+                    "{name} holds {} built with log-burst",
+                    program.0
+                );
+            }
+        }
+        // The images that carry the probes' shell are the ones that say so.
+        assert!(
+            super::BOOT_PROGRAMS
+                .iter()
+                .any(|p| p.3.contains(&"log-burst"))
+        );
+    }
+
+    /// The check of the burst of the console probes: whole and in order
+    /// passes; a missing line, a swapped pair and a mark of lost records
+    /// fail.
+    #[test]
+    fn the_burst_check_wants_every_line_in_order_and_no_mark() {
+        let all: Vec<String> = (0..super::LOG_BURST).map(super::burst_line).collect();
+        assert!(burst_whole(&all).is_ok());
+        let mut with_noise = all.clone();
+        with_noise.insert(7, "uart: something else".into());
+        assert!(burst_whole(&with_noise).is_ok());
+        let mut gap = all.clone();
+        gap.remove(40);
+        assert!(burst_whole(&gap).unwrap_err().contains("missing [40]"));
+        let mut swapped = all.clone();
+        swapped.swap(3, 4);
+        assert!(burst_whole(&swapped).is_err());
+        let mut marked = all;
+        marked.insert(10, "[kernel log: 3 records lost]".into());
+        assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
+    }
+
     #[test]
     fn a_ram_step_past_the_bound_fails_and_one_past_the_margin_only_warns() {
         let bound = super::net_probe::STEP_MAX;

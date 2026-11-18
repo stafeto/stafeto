@@ -280,28 +280,33 @@ impl Sources {
 
 /// The drain of the kernel's rings into the output's ring of the log
 /// (spec 13.5, 16.3), as a decision apart from the calls: the driver takes
-/// every record the rings hold, a bounded part of it in each step, so a
-/// burst that fills a ring of the kernel in a few milliseconds is in the
-/// driver's buffer before the ring overwrites it.
+/// what the rings hold, a bounded part of it in each period, so a burst
+/// that fills a ring of the kernel in a few milliseconds is in the driver's
+/// buffer before the ring overwrites it.
 ///
-/// The batches one step takes at most. A step is then at most STEP_BATCHES
-/// times the calls of one batch (one object_info LOG of each source that has
-/// records, see `Sources::batch`); when records are left the driver asks for
-/// the next step at once.
-pub const STEP_BATCHES: usize = 6;
+/// The batches the driver takes in one period at most, all entry points
+/// together: only the timer's tick takes (and the driver's start, once
+/// before its first tick). A batch counts whatever text it adds, so the
+/// bound holds with the records of the trace build, which add none. A
+/// period then costs at most STEP_BATCHES times the calls of one batch
+/// (`Sources::batch`: one object_info LOG of each source that has
+/// records), and the driver, which has no budget of its own yet, takes at
+/// most 36 records in 10 ms, 3.6 a millisecond.
+pub const STEP_BATCHES: usize = 3;
 
 /// The period of the reads while the driver holds log text it has not put
-/// out, in nanoseconds: the kernel's ring of a CPU holds 64 records, and a
-/// step takes up to STEP_BATCHES of 12.
+/// out, or the rings hold records it has not taken, in nanoseconds: a
+/// period takes up to STEP_BATCHES of 12 records.
 pub const DRAIN_NS: u64 = 10_000_000;
 
 /// The period of the reads while it holds none, in nanoseconds. The ring of
 /// a CPU holds 64 records, so a writer that comes while the driver is idle
 /// loses none while it writes less than 64 records in one period: 3 records
-/// a millisecond.
+/// a millisecond, twice the rate of the boot burst of 150 records in 100 ms.
+/// An idle system wakes the driver 50 times a second.
 pub const IDLE_NS: u64 = 20_000_000;
 
-/// Whether the driver takes one more batch in this step: `taken` batches
+/// Whether the driver takes one more batch in this period: `taken` batches
 /// went in, `room` bytes of the output's ring of the log are free. A batch
 /// is taken only when its worst text fits, so nothing the driver took is
 /// dropped; with the buffer full the driver stops taking and the kernel
@@ -310,23 +315,48 @@ pub fn take_more(taken: usize, room: usize) -> bool {
     taken < STEP_BATCHES && room >= crate::output::LOG_BYTES
 }
 
-/// When the next step comes, after a step that ended with `left` records in
-/// the rings and `room` bytes free in the output's ring of the log: at once
-/// while records are left and a batch fits, every DRAIN_NS while text is
-/// held or records wait for room, every IDLE_NS otherwise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Next {
-    Now,
-    After(u64),
+/// The period until the next tick, after a step that ended with `left`
+/// records in the rings and `room` bytes free in the output's ring of the
+/// log: DRAIN_NS while text is held or records wait, IDLE_NS otherwise.
+/// Never "at once": a step that finds the log not accepted (a client's
+/// DRAIN is pending) or the buffer full takes nothing, and asking again
+/// immediately would spin at the driver's level.
+pub fn period_ns(left: u64, room: usize) -> u64 {
+    if room < crate::output::LOG_RING || left > 0 {
+        DRAIN_NS
+    } else {
+        IDLE_NS
+    }
 }
 
-pub fn next_step(left: u64, room: usize) -> Next {
-    if left > 0 && room >= crate::output::LOG_BYTES {
-        Next::Now
-    } else if room < crate::output::LOG_RING || left > 0 {
-        Next::After(DRAIN_NS)
-    } else {
-        Next::After(IDLE_NS)
+/// The largest backlog of the kernel's rings the driver saw in a run, in
+/// records (what a batch took and what the rings still held), and the
+/// largest it said. The driver says it once the backlog is out, when it
+/// is above one batch and above what it said before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Peak {
+    seen: u64,
+    said: u64,
+}
+
+impl Peak {
+    pub const fn new() -> Peak {
+        Peak { seen: 0, said: 0 }
+    }
+
+    /// A batch of `batch.count` records was taken with `batch.left` left.
+    pub fn batch(&mut self, batch: LogBatch) {
+        self.seen = self.seen.max(batch.count + batch.left);
+    }
+
+    /// The backlog to say now, if any: `idle` says the driver holds no
+    /// text and the rings no records, or the driver ends.
+    pub fn say(&mut self, idle: bool) -> Option<u64> {
+        if idle && self.seen > LOG_BATCH as u64 && self.seen > self.said {
+            self.said = self.seen;
+            return Some(self.seen);
+        }
+        None
     }
 }
 
@@ -627,8 +657,8 @@ mod tests {
             if held.is_empty() {
                 owed = owed.min(LINE);
             }
-            // The driver, as often as the rule asks within this millisecond.
-            while ms >= next_at {
+            // The driver: one step when its tick comes.
+            if ms >= next_at {
                 let mut taken = 0;
                 let mut left = kernel.ring.len() as u64;
                 loop {
@@ -653,15 +683,12 @@ mod tests {
                 run.longest_step = run.longest_step.max(taken);
                 run.peak_held = run.peak_held.max(held.len() * LINE);
                 let room = crate::output::LOG_RING - held.len() * LINE;
-                next_at = match (new, next_step(left, room)) {
-                    (false, _) => ms + 50,
-                    (true, Next::Now) => ms,
-                    (true, Next::After(ns)) => ms + (ns / 1_000_000) as u32,
-                };
-                if next_at == ms {
-                    // At once: the same millisecond, another step.
-                    continue;
-                }
+                next_at = ms
+                    + if new {
+                        (period_ns(left, room) / 1_000_000) as u32
+                    } else {
+                        50
+                    };
             }
         }
         run.lost += kernel.lost;
@@ -707,10 +734,39 @@ mod tests {
         assert!(take_more(0, crate::output::LOG_BYTES));
         assert!(!take_more(0, crate::output::LOG_BYTES - 1));
         assert!(!take_more(STEP_BATCHES, crate::output::LOG_RING));
-        assert_eq!(next_step(5, crate::output::LOG_RING), Next::Now);
-        assert_eq!(next_step(5, 10), Next::After(DRAIN_NS));
-        assert_eq!(next_step(0, 10), Next::After(DRAIN_NS));
-        assert_eq!(next_step(0, crate::output::LOG_RING), Next::After(IDLE_NS));
+        // The period is never zero, whatever is left: a step that takes
+        // nothing (log not accepted, buffer full) does not ask again at once.
+        assert_eq!(period_ns(5, crate::output::LOG_RING), DRAIN_NS);
+        assert_eq!(period_ns(5, 10), DRAIN_NS);
+        assert_eq!(period_ns(0, 10), DRAIN_NS);
+        assert_eq!(period_ns(0, crate::output::LOG_RING), IDLE_NS);
+        // The records a period takes at most, even when no batch adds text
+        // (the trace build): STEP_BATCHES batches of LOG_BATCH.
+        let mut taken = 0;
+        while take_more(taken, crate::output::LOG_RING) {
+            taken += 1;
+        }
+        assert_eq!(taken * LOG_BATCH, 36);
+    }
+
+    #[test]
+    fn the_peak_is_said_once_the_backlog_is_out_and_only_when_it_grew() {
+        let mut p = Peak::new();
+        let batch = |count, left| LogBatch {
+            count,
+            lost: 0,
+            left,
+        };
+        p.batch(batch(12, 0));
+        assert_eq!(p.say(true), None);
+        p.batch(batch(12, 40));
+        assert_eq!(p.say(false), None);
+        assert_eq!(p.say(true), Some(52));
+        assert_eq!(p.say(true), None);
+        p.batch(batch(12, 20));
+        assert_eq!(p.say(true), None);
+        p.batch(batch(12, 60));
+        assert_eq!(p.say(true), Some(72));
     }
 
     #[test]

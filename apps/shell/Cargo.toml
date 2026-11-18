@@ -19,7 +19,9 @@ bench = false
 
 # `log-burst`: the command `logburst`, which writes LOG_BURST lines into the
 # kernel log, a few at a time, for the probes of the console's drivers (xtask
-# console-dialog, console-restart-vz). Off in the images that ship.
+# console-dialog, console-restart-vz). On in `boot.img` and in the image of
+# console-restart-vz only; the release images (boot-base.img, boot-full.img,
+# boot-aws.img) hold a shell without it (an xtask test checks that).
 [features]
 log-burst = []
 
