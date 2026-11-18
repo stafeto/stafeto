@@ -484,16 +484,16 @@ fn budgets(
 /// The image of the probe of the service budgets (feature `table-service-budget`): the probe
 /// reads the ticks each service's `serve` budget has charged (`BudgetInfo::ran`), so init gives
 /// it a copy of each, with no right but TRANSFER (enough for `object_info`), under the names
-/// `ran-ramfs`, `ran-pipe` and `ran-tty`. The services start before the probe, in the order of
-/// the table.
+/// `ran-ramfs`, `ran-pipe` and `ran-tty`, and the same for the counting budget of the console
+/// driver's stub, `ran-uart`. The services start before the probe, in the order of the table.
 #[cfg(feature = "table-service-budget")]
 mod observed {
     use super::{AtomicU64, Budget, Giver, Handle, Ordering, Rights, sys};
 
-    const SERVICES: [&str; 3] = ["ramfs", "pipe", "tty"];
-    const NAMES: [&str; 3] = ["ran-ramfs", "ran-pipe", "ran-tty"];
+    const SERVICES: [&str; 4] = ["ramfs", "pipe", "tty", "uart"];
+    const NAMES: [&str; 4] = ["ran-ramfs", "ran-pipe", "ran-tty", "ran-uart"];
     const PROBE: &str = "ramfs-probe";
-    static KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static KEPT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
     /// Keeps a copy of the first budget of the service `record`, as the instance gets it.
     pub fn keep(record: &str, index: usize, budget: &Handle<Budget>) {

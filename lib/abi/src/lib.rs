@@ -1810,6 +1810,17 @@ impl Error {
 /// programs exit with.
 pub const PANIC_EXIT_CODE: u64 = 101;
 
+/// The exit code with which init asks the kernel to power the machine off
+/// (spec 7.9): the kernel prints one line and calls PSCI SYSTEM_OFF. The
+/// bytes read "STOP" in the high half; the test init exits with 0, 1 and 2,
+/// and a program that panicked with 101.
+pub const INIT_END_OFF: u64 = 0x5354_4f50_0000_0000;
+
+/// The exit code with which init asks the kernel to reset the machine
+/// (spec 7.9): the kernel prints one line and calls PSCI SYSTEM_RESET. The
+/// bytes read "RSET" in the high half.
+pub const INIT_END_RESET: u64 = 0x5253_4554_0000_0000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2434,6 +2445,15 @@ mod tests {
         assert!(!Error::LimitReached.keeps_handles());
         assert!(!Error::NoMemory.keeps_handles());
         assert!(!Error::Unknown(11).keeps_handles());
+    }
+
+    #[test]
+    fn the_end_codes_of_init_are_apart_from_the_codes_in_use() {
+        assert_ne!(INIT_END_OFF, INIT_END_RESET);
+        for used in [0, 1, 2, PANIC_EXIT_CODE, u64::MAX] {
+            assert_ne!(INIT_END_OFF, used);
+            assert_ne!(INIT_END_RESET, used);
+        }
     }
 
     #[test]

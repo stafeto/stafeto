@@ -169,6 +169,10 @@
 //! of the series hashes the version of this crate alone, so the tests of the
 //! bodies below (size and round trip of every message) are the guard of the
 //! wire format.
+//!
+//! SHUTDOWN (number 14, a method added to version 2: an old client never
+//! calls it, and a new client gets UNKNOWN_METHOD from an old init): the
+//! record named `power` asks init to stop the system (`ShutdownAsk`).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -194,10 +198,11 @@ pub enum Method {
     Replaced = 11,
     Ready = 12,
     Budget = 13,
+    Shutdown = 14,
 }
 
 impl Method {
-    pub const ALL: [Method; 12] = [
+    pub const ALL: [Method; 13] = [
         Method::Start,
         Method::Register,
         Method::Connect,
@@ -210,6 +215,7 @@ impl Method {
         Method::Replaced,
         Method::Ready,
         Method::Budget,
+        Method::Shutdown,
     ];
 
     pub const fn number(self) -> u16 {
@@ -370,6 +376,59 @@ impl BudgetAsk {
             t_ns: r.u64()?,
         };
         if ask.flags != 0 || ask.reserved != 0 {
+            return Err(Status::Kernel(abi::Error::InvalidArgs));
+        }
+        Ok(ask)
+    }
+}
+
+/// The kinds of SHUTDOWN: power the machine off, or reset it.
+pub const SHUTDOWN_OFF: u32 = 0;
+pub const SHUTDOWN_RESET: u32 = 1;
+
+/// The label of the stop notice: init sends it, through a copy of the
+/// channel a service registered, with NOTIFY and this label, to ask the
+/// service to stop (rt::service calls `Service::stop`, which by default
+/// exits at once). The count of labels init gives from 1 never comes near
+/// it, and the marks of the other protocols (bits 59 to 63) are not in it.
+pub const STOP_NOTICE: u64 = (1 << 58) | 0x5354_4f50;
+
+/// Whether a notification that carries the label STOP_NOTICE with `bits` asks
+/// the service to stop: any bit but CLIENT_GONE does. The CLIENT_GONE of the
+/// copy init made for the notice, which may come by itself (on several CPUs the
+/// kernel can deliver it apart from the notify), asks nothing and is no client
+/// of the service either: the loop swallows it.
+pub const fn wants_stop(bits: u64) -> bool {
+    bits & !abi::CLIENT_GONE != 0
+}
+
+/// The body of SHUTDOWN, 8 bytes: `kind` (SHUTDOWN_OFF or SHUTDOWN_RESET)
+/// and `flags`, zero. Only the record named `power` may ask: any other gets
+/// BAD_STATE; INVALID_ARGS for a `kind` past SHUTDOWN_RESET or a `flags`
+/// that is not zero, BAD_SIZE for a body of another size. Init answers at
+/// once and stops its services in waves, the reverse of their connections
+/// (init::shutdown), then exits with abi::INIT_END_OFF or INIT_END_RESET;
+/// a second SHUTDOWN while it stops gets 0 and changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownAsk {
+    pub kind: u32,
+    pub flags: u32,
+}
+
+impl ShutdownAsk {
+    pub const LEN: usize = 8;
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.kind)?;
+        w.u32(self.flags)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<ShutdownAsk, Status> {
+        let ask = ShutdownAsk {
+            kind: r.u32()?,
+            flags: r.u32()?,
+        };
+        if ask.kind > SHUTDOWN_RESET || ask.flags != 0 {
             return Err(Status::Kernel(abi::Error::InvalidArgs));
         }
         Ok(ask)
@@ -1808,9 +1867,48 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_body_round_trips_and_refuses_what_is_off_the_rules() {
+        let ask = ShutdownAsk {
+            kind: SHUTDOWN_RESET,
+            flags: 0,
+        };
+        let mut w = Writer::new();
+        ask.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), ShutdownAsk::LEN);
+        assert_eq!(ShutdownAsk::read(&mut Reader::new(w.as_bytes())), Ok(ask));
+        assert!(ShutdownAsk::read(&mut Reader::new(&w.as_bytes()[..7])).is_err());
+        let invalid = Err(Status::Kernel(abi::Error::InvalidArgs));
+        for (kind, flags) in [(2, 0), (0, 1)] {
+            let mut w = Writer::new();
+            ShutdownAsk { kind, flags }.write(&mut w).unwrap();
+            assert_eq!(ShutdownAsk::read(&mut Reader::new(w.as_bytes())), invalid);
+        }
+        assert_eq!((SHUTDOWN_OFF, SHUTDOWN_RESET), (0, 1));
+    }
+
+    #[test]
+    fn the_stop_notice_asks_for_a_stop_by_any_bit_but_client_gone() {
+        assert!(wants_stop(1));
+        assert!(wants_stop(abi::CLIENT_GONE | 1));
+        assert!(!wants_stop(abi::CLIENT_GONE));
+        assert!(!wants_stop(0));
+    }
+
+    #[test]
+    fn the_stop_notice_label_is_apart_from_the_other_labels() {
+        // The marks of the protocols sit in bits 59 to 63 and the binding
+        // labels in bit 61; the count of init's labels from 1 never reaches
+        // bit 58 in practice.
+        assert_eq!(STOP_NOTICE >> 59, 0);
+        assert_ne!(STOP_NOTICE & (1 << 58), 0);
+        assert_ne!(STOP_NOTICE & BINDING_LABEL, BINDING_LABEL);
+        assert!(STOP_NOTICE > u64::from(u32::MAX));
+    }
+
+    #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
@@ -1819,7 +1917,8 @@ mod tests {
         assert_eq!(Method::from_number(10), None);
         assert_eq!(Method::from_number(12), Some(Method::Ready));
         assert_eq!(Method::from_number(13), Some(Method::Budget));
-        assert_eq!(Method::from_number(14), None);
+        assert_eq!(Method::from_number(14), Some(Method::Shutdown));
+        assert_eq!(Method::from_number(15), None);
         assert_eq!(Method::Ready.header().bytes(), [12, 0, 2, 0, 0, 0, 0, 0]);
         assert_eq!(VERSION, 2);
         assert_eq!(Method::Start.header().bytes(), [1, 0, 2, 0, 0, 0, 0, 0]);

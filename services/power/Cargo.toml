@@ -1,0 +1,26 @@
+[package]
+name = "power"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The service of the power button: the PL061 GPIO pin that EC2 (and QEMU virt) wires to the button asks init to stop the system"
+
+# What the service decides, apart from the device and the calls: tested on the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "power"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }

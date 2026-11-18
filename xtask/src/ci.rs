@@ -290,6 +290,9 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("nvme-persist key image", 80),
     ("nvme-persist key image grown", 80),
     ("nvme-persist blk-probe", 80),
+    ("nvme-persist shutdown", 80),
+    ("nvme-persist stop-handlers", 100),
+    ("nvme-persist stop-handlers breaks", 100),
     ("store-crash", 25),
     ("data-probe", 12),
     ("data-crash", 60),
@@ -340,7 +343,7 @@ const BUDGET_NAMED: [&str; 2] = ["service-budget", "budget-breaks"];
 /// time, and these after them, so that no wall-clock check of a probe without `-icount` (the
 /// latencies of the kernel tests, the watchdog of init, the deadlines of the guests) runs
 /// beside one of these on the same runner. Floods share the second lane with each other.
-const HEAVY: [&str; 14] = [
+const HEAVY: [&str; 13] = [
     "smp 4 window",
     "smp 4 asid",
     "store-crash",
@@ -348,7 +351,6 @@ const HEAVY: [&str; 14] = [
     "random restart breaks",
     "efi breaks",
     "layer-probe steps",
-    "nvme-persist steps",
     "posix-procs smp 4",
     "net-probe",
     "fstack-device",
@@ -357,24 +359,39 @@ const HEAVY: [&str; 14] = [
     "posix-threads smp 4",
 ];
 
-/// Runs the probes of `names`: the others, then the `HEAVY` ones, each lane `njobs` at a time.
-/// The second lane runs when the first failed, and the errors join.
+/// The probes that run alone on their runner, after the other lanes: the steps of the NVMe
+/// service are read from the start of the console, where the kernel log loses records when the
+/// host is slow (stafeto/stafeto#455), so no other QEMU may run beside it.
+const SOLO: [&str; 1] = ["nvme-persist steps"];
+
+/// Runs the probes of `names` in three lanes: the others, then the `HEAVY` ones, each `njobs` at
+/// a time, then the `SOLO` ones one at a time. Every lane runs when an earlier one failed, and
+/// the errors join.
 fn run_lanes(names: &[String], njobs: usize) -> Result<(), String> {
-    let (mut heavy, light): (Vec<&String>, Vec<&String>) =
-        names.iter().partition(|n| HEAVY.contains(&n.as_str()));
-    heavy.sort_by_key(|n| std::cmp::Reverse(weight(n)));
-    let lane = |lane: Vec<&String>| {
-        let lane: Vec<String> = lane.into_iter().cloned().collect();
-        let mut jobs = only(super::boot_jobs(Vec::new()), &lane);
-        jobs.sort_by_key(|j| lane.iter().position(|n| n == j.name()));
-        jobs::run_all(jobs, njobs)
+    let lane_of = |n: &String| {
+        if SOLO.contains(&n.as_str()) {
+            2
+        } else {
+            usize::from(HEAVY.contains(&n.as_str()))
+        }
     };
-    let first = lane(light);
-    let second = lane(heavy);
-    match (first, second) {
-        (Ok(()), second) => second,
-        (first, Ok(())) => first,
-        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    let mut errors = Vec::new();
+    for (lane, limit) in [(0, njobs), (1, njobs), (2, 1)] {
+        let mut wanted: Vec<&String> = names.iter().filter(|n| lane_of(n) == lane).collect();
+        if lane == 1 {
+            wanted.sort_by_key(|n| std::cmp::Reverse(weight(n)));
+        }
+        let wanted: Vec<String> = wanted.into_iter().cloned().collect();
+        let mut jobs = only(super::boot_jobs(Vec::new()), &wanted);
+        jobs.sort_by_key(|j| wanted.iter().position(|n| n == j.name()));
+        if let Err(e) = jobs::run_all(jobs, limit) {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -934,6 +951,10 @@ mod tests {
         for heavy in HEAVY {
             assert!(names.iter().any(|n| n == heavy), "{heavy} is not a probe");
             assert!(!BUDGET_NAMED.contains(&heavy));
+            assert!(!SOLO.contains(&heavy));
+        }
+        for solo in SOLO {
+            assert!(names.iter().any(|n| n == solo), "{solo} is not a probe");
         }
     }
 

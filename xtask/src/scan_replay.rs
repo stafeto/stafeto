@@ -493,14 +493,18 @@ pub fn replay(tap: &Tap, ports: &[u16]) -> Result<Replayed, String> {
     Ok(done)
 }
 
-/// The counters of the accept queues that the network service says on the
-/// console (`net: queues ...`).
+/// The counters of the accept queues and the sockets in use that the network service says on
+/// the console (`net: queues ...`). `sockets` and `demux` are 0 until a report says them (a
+/// running service always has listeners, so 0 means no report).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Queues {
     pub syn_dropped: u64,
     pub queue_reaped: u64,
     pub embryo_recycled: u64,
     pub key_stale: u64,
+    pub sockets: u64,
+    pub demux: u64,
+    pub listen_short: u64,
 }
 
 fn field(line: &str, name: &str) -> Option<u64> {
@@ -518,6 +522,9 @@ pub fn latest(lines: &[String]) -> Queues {
             ("queue_reaped", &mut q.queue_reaped),
             ("embryo_recycled", &mut q.embryo_recycled),
             ("key_stale", &mut q.key_stale),
+            ("sockets", &mut q.sockets),
+            ("demux", &mut q.demux),
+            ("listen_short", &mut q.listen_short),
         ] {
             if let Some(n) = field(l, name) {
                 *slot = n;
@@ -527,26 +534,54 @@ pub fn latest(lines: &[String]) -> Queues {
     q
 }
 
-/// What the scan must have changed: the SYNs past the room are dropped, the
-/// established connections that were reset are reaped, and a SYN that found
-/// a socket back in LISTEN with the key of its last connection replaced the
-/// key. `embryo_recycled` is for the report: the forwarding's own RSTs may
-/// have reset the half-open sockets before the second flood found them.
+/// The sockets in use after the scan may exceed those before it by this much: the connections
+/// of the requests the step makes after the scan (the long-lived one, the first over HTTP, the
+/// one over TLS still closing) and a queue's own sockets rebuilt at the end of the scan (16
+/// places a worker). A leak of the scan (up to 1 064 SYNs, 400 sockets a flood) is far over it.
+/// Earlier runs read `sockets 147` before and `sockets 136` after.
+pub const SOCKETS_SLACK: u64 = 16;
+/// The same for the entries of the demultiplexer: 15 before and 3 after in earlier runs; the
+/// connections of the step's requests are the only ones allowed on top.
+pub const DEMUX_SLACK: u64 = 8;
+
+/// What a correct service shows after the scan: the established connections that were reset are
+/// reaped (`queue_reaped` rises), the sockets in use and the demultiplexer's entries are back
+/// near their level before it (no leak, within `SOCKETS_SLACK` and `DEMUX_SLACK`), and no
+/// listener came up short of sockets (`listen_short` 0). `syn_dropped`, `embryo_recycled` and
+/// `key_stale` are for the report: they depend on how well the queues kept up (`key_stale`
+/// counts only an RST and the next SYN of one set in one receive step, since the key is
+/// released in `sync`).
 pub fn judge(before: Queues, after: Queues) -> Result<(), String> {
     let mut missing = Vec::new();
-    for (name, b, a) in [
-        ("syn_dropped", before.syn_dropped, after.syn_dropped),
-        ("queue_reaped", before.queue_reaped, after.queue_reaped),
-        ("key_stale", before.key_stale, after.key_stale),
-    ] {
-        if a <= b {
-            missing.push(format!("{name} {b} -> {a}"));
-        }
+    if after.queue_reaped <= before.queue_reaped {
+        missing.push(format!(
+            "queue_reaped {} -> {} (it must rise)",
+            before.queue_reaped, after.queue_reaped
+        ));
+    }
+    if after.listen_short != 0 {
+        missing.push(format!(
+            "listen_short {} (it must be 0)",
+            after.listen_short
+        ));
+    }
+    // Zero before: the report before the scan was not seen, so there is no level to compare.
+    if before.sockets != 0 && after.sockets > before.sockets + SOCKETS_SLACK {
+        missing.push(format!(
+            "sockets {} -> {} (more than {} over)",
+            before.sockets, after.sockets, SOCKETS_SLACK
+        ));
+    }
+    if before.sockets != 0 && after.demux > before.demux + DEMUX_SLACK {
+        missing.push(format!(
+            "demux {} -> {} (more than {} over)",
+            before.demux, after.demux, DEMUX_SLACK
+        ));
     }
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(format!("the scan did not change: {}", missing.join(", ")))
+        Err(format!("after the scan: {}", missing.join(", ")))
     }
 }
 
@@ -651,35 +686,68 @@ mod tests {
                 syn_dropped: 10,
                 queue_reaped: 20,
                 embryo_recycled: 30,
-                key_stale: 50
+                key_stale: 50,
+                sockets: 9,
+                demux: 4,
+                listen_short: 0
             }
         );
         assert_eq!(latest(&[]), Queues::default());
     }
 
     #[test]
-    fn the_judgement_names_each_counter_that_stood() {
-        let before = Queues {
+    fn the_counters_include_the_sockets_in_use() {
+        let l = lines(&[
+            "net: queues sockets 147 of 1280 demux 15 listen_short 0 key_stale 0 syn_stray 0 orphan_reused 0 set_barred 0",
+        ]);
+        let q = latest(&l);
+        assert_eq!((q.sockets, q.demux, q.listen_short), (147, 15, 0));
+    }
+
+    fn level(reaped: u64, sockets: u64, demux: u64, short: u64) -> Queues {
+        Queues {
+            queue_reaped: reaped,
+            sockets,
+            demux,
+            listen_short: short,
+            ..Queues::default()
+        }
+    }
+
+    #[test]
+    fn a_correct_service_passes_whatever_syn_dropped_and_key_stale_did() {
+        // The run of stafeto#456 after the fix: reaped up, sockets and demux back down.
+        let before = level(253, 147, 15, 0);
+        let after = Queues {
             syn_dropped: 1,
-            queue_reaped: 2,
-            embryo_recycled: 3,
-            key_stale: 4,
-        };
-        let mut after = Queues {
-            syn_dropped: 5,
-            queue_reaped: 6,
-            embryo_recycled: 3,
-            key_stale: 7,
+            key_stale: 0,
+            ..level(434, 136, 3, 0)
         };
         assert!(judge(before, after).is_ok());
-        after.key_stale = 4;
-        after.syn_dropped = 1;
-        let e = judge(before, after).unwrap_err();
+    }
+
+    #[test]
+    fn the_judgement_names_each_requirement_that_failed() {
+        let before = level(253, 147, 15, 0);
+        let e = judge(before, level(253, 147, 15, 0)).unwrap_err();
+        assert!(e.contains("queue_reaped 253 -> 253"), "{e}");
+        assert!(!e.contains("sockets") && !e.contains("demux"), "{e}");
+        let e = judge(before, level(300, 147 + SOCKETS_SLACK + 1, 15, 2)).unwrap_err();
         assert!(
-            e.contains("key_stale 4 -> 4") && e.contains("syn_dropped 1 -> 1"),
+            e.contains("listen_short 2") && e.contains("sockets 147 -> 164"),
             "{e}"
         );
         assert!(!e.contains("queue_reaped"), "{e}");
+        let e = judge(before, level(300, 147, 15 + DEMUX_SLACK + 1, 0)).unwrap_err();
+        assert!(e.contains("demux 15 -> 24"), "{e}");
+        // At the bound a level passes.
+        assert!(judge(before, level(300, 147 + SOCKETS_SLACK, 15 + DEMUX_SLACK, 0)).is_ok());
+    }
+
+    #[test]
+    fn no_report_before_the_scan_leaves_the_levels_unjudged() {
+        let e = judge(level(0, 0, 0, 0), level(5, 900, 400, 0));
+        assert!(e.is_ok(), "{e:?}");
     }
 
     #[test]

@@ -35,10 +35,15 @@ rt::entry!(main);
 // The arguments init gives a record fit the start data of rt (spec 13.3).
 const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
 // Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
-// xtask), twice while `Init::new` builds it: 44 KiB at most, 20 left. The
-// handles of eight DMA objects of each record's instance (table::MAX_DMA,
-// for the network service with two devices) made it 22 000 bytes.
-const _: () = assert!(core::mem::size_of::<serve::Init>() <= 22 * 1024);
+// xtask), and `Init::new` holds the structure twice (the one it builds and
+// the one it returns): the limit keeps 2 x size well below the stack, so that
+// the frames of the handlers, the start of the services and the stop of the
+// system have room. `Init` measures 22 560 bytes (the handles of the eight
+// DMA objects of each record's instance, table::MAX_DMA, for the network
+// service with two devices, are most of it, and the state of the stop of the
+// system, shutdown::Stop in an Option, about 40 bytes): 2 x 22 560 is 44 KiB
+// of the 64, and the limit of 23 KiB allows 46.
+const _: () = assert!(core::mem::size_of::<serve::Init>() <= 23 * 1024);
 
 /// Where init maps the boot image, read-only, for as long as it lives: the
 /// programs it loads are read from there.
@@ -58,6 +63,13 @@ fn main(_: u64) -> u64 {
     // for the windows, the bindings and the consoles it gives.
     if let Ok(console) = sys::handle_duplicate(&init.resource, Rights::DEBUG) {
         rt::console::set(console);
+    }
+    // The probes of the kernel's end of the system (xtask init-end).
+    if cfg!(feature = "end-off") {
+        return abi::INIT_END_OFF;
+    }
+    if cfg!(feature = "end-reset") {
+        return abi::INIT_END_RESET;
     }
     if let Err(e) = table::check(TABLE) {
         println!("init: table refused: {e}");

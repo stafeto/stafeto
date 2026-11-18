@@ -73,10 +73,14 @@
 //!      flood of SYNs past the room of the queues. Right after it ONE request
 //!      over TLS, ONE over HTTP and a keep-alive connection opened before the
 //!      scan must answer, and the counters of the network service on the
-//!      console (`net: queues ...`) must show `syn_dropped`, `queue_reaped`
-//!      and `key_stale` raised against the report before the scan
-//!      (`embryo_recycled` is printed with them). The step waits for the
-//!      reports (up to 35 s before, 80 s after).
+//!      console (`net: queues ...`) must show `queue_reaped` raised against
+//!      the report before the scan, the sockets in use and the entries of the
+//!      demultiplexer back within a small bound of their level before it (no
+//!      leak: `scan_replay::SOCKETS_SLACK`, `DEMUX_SLACK`), and `listen_short`
+//!      0 (`syn_dropped`, `embryo_recycled` and `key_stale` are printed with
+//!      them and need not change: they depend on how well the queues kept
+//!      up). The first request has 5 s. The step waits for the reports (up to
+//!      35 s before, 80 s after).
 //!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
@@ -1486,6 +1490,11 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
     Ok(())
 }
 
+/// The seconds the first request after the scan of step 4h may take (curl `--max-time`): a
+/// service that stopped taking frames after the flood of unanswered RSTs answers late, as each
+/// frame it sends moves the queue on by one batch (stafeto#456).
+const FIRST_AFTER_SCAN_S: &str = "5";
+
 /// Step 4h: the scan of `scan_replay` against ports 80 and 443, the first
 /// requests after it, and the counters of the network service.
 fn tls_raw_scan(
@@ -1543,7 +1552,7 @@ fn tls_raw_scan(
         true,
         &[
             arg("--max-time"),
-            arg("20"),
+            arg(FIRST_AFTER_SCAN_S),
             arg("-o"),
             arg(out.to_string_lossy()),
             tls.url("/index.html"),
@@ -1569,7 +1578,7 @@ fn tls_raw_scan(
             .cloned()
             .collect();
         return Err(format!(
-            "4h: the first request over TLS after the scan ended with {}: {}; the replay: {done:?}; counters before {before:?}, after {:?}; the last counter lines (newest first): {said:?}; {capture}",
+            "4h: the first request over TLS after the scan did not finish in {FIRST_AFTER_SCAN_S} s (curl ended with {}): {}; the replay: {done:?}; counters before {before:?}, after {:?}; the last counter lines (newest first): {said:?}; {capture}",
             ended.code,
             last_lines(&ended.said),
             replay::latest(run.lines())
@@ -1910,6 +1919,11 @@ pub(crate) fn verdict(lines: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_request_after_the_scan_has_five_seconds() {
+        assert_eq!(FIRST_AFTER_SCAN_S, "5");
+    }
 
     #[test]
     fn the_rounds_of_the_scan_step_come_from_the_environment() {

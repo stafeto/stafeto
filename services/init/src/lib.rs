@@ -17,6 +17,7 @@ pub mod overrun;
 pub mod quota;
 pub mod resolve;
 pub mod restart;
+pub mod shutdown;
 pub mod table;
 pub mod waits;
 pub mod watch;

@@ -459,6 +459,7 @@ dependencies = [
  "nvme",
  "nvme-blk",
  "pci",
+ "power",
  "proto-comp",
  "proto-fs",
  "proto-init",
@@ -1175,6 +1176,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "power"
+version = "0.5.1"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1416,6 +1427,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "relibc-stop"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "relibc-threads"
 version = "0.1.0"
 dependencies = [
@@ -1632,6 +1650,7 @@ dependencies = [
  "posix-clock",
  "posix-time",
  "proto-clock",
+ "proto-data",
  "proto-init",
  "proto-uart",
  "proto-wire",

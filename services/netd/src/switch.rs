@@ -66,10 +66,10 @@ use netd::gates::{Run, Told};
 use netd::lanes as lane_rules;
 use netd::profile::{self, Counter};
 use netd::ring::{
-    CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS,
-    STACK_COPY_WEIGHT, STACK_SHARE, SUM_WEIGHT, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE,
-    SWITCH_BELL, SWITCH_CTX, SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TSO_WEIGHT,
-    TX_BUFFERS, TX_SHARE, bell_due, charge, drive, for_each_arp_copy,
+    CUT_WEIGHT, PARK_GIVE, Period, RECLAIM_STEP, RX_AHEAD, RX_BUFFERS, STACK_COPY_WEIGHT,
+    STACK_SHARE, SUM_WEIGHT, SWEEP_IDLE_NS, SWITCH_BACK, SWITCH_BASE, SWITCH_BELL, SWITCH_CTX,
+    SWITCH_ROUTED, SWITCH_RX, SWITCH_SOFT, SWITCH_TX, Stepper, TSO_WEIGHT, TX_BUFFERS, TX_SHARE,
+    bell_due, charge, drive, for_each_arp_copy,
 };
 use netd::spsc::{Spsc, pack_frame, unpack_frame};
 use netd::switchlogic::commands::{self, Commands};
@@ -238,11 +238,6 @@ fn offer_must(passed: &mut u8, k: usize, word: u32) {
     *passed |= 1 << k;
 }
 
-/// The buffers of receiving the stack gives back before it wakes the switch for them alone.
-fn back_lazy() -> usize {
-    RX_BACK_LAZY
-}
-
 impl Lane {
     const fn new() -> Lane {
         Lane {
@@ -320,24 +315,26 @@ impl Lane {
 
     /// The end of a step of the stack: `more` says another follows at once.
     /// The switch is woken when the run is over and a frame to send, a held
-    /// doorbell or a good deal of buffers waits for it, and inside a run when
-    /// the rings hold a good deal.
+    /// doorbell or `RX_BACK_LAZY` buffers wait for it, and inside a run when
+    /// the rings hold a good deal. The buffers count because the switch may have
+    /// stopped for want of room in the lane with frames left in the used ring of
+    /// the device: the device may have no buffer left, raises no interrupt, and
+    /// only this wake brings the buffers back (`lanes::switch_due`).
     pub fn kick(&self, more: bool) {
         fence(Ordering::SeqCst);
         let starved = self.starved.load(Ordering::SeqCst);
-        let due = if more {
-            self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= back_lazy() || starved
-        } else {
-            // One read-modify-write ends the run and reads what the switch
-            // held, so that neither misses the other.
-            let held = self.run.end();
-            // Buffers of receiving given back wait for the switch's next step
-            // (the queue has 256 of them), a frame to send does not.
-            held || !self.tx_sub.is_empty()
-                || self.rx_back.len() >= back_lazy()
-                || starved
-                || INNER.cut_wait.load(Ordering::SeqCst)
-        };
+        // One read-modify-write ends the run and reads what the switch held, so that
+        // neither misses the other.
+        let held = !more && self.run.end();
+        let cut_wait = !more && INNER.cut_wait.load(Ordering::SeqCst);
+        let due = lane_rules::switch_due(
+            more,
+            held,
+            self.tx_sub.len(),
+            self.rx_back.len(),
+            starved,
+            cut_wait,
+        );
         if due && INNER.switch_told.tell() {
             profile::count(Counter::WakeSwitch);
             let channel = Handle::<Channel>::borrowed(rt::abi::Handle(

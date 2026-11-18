@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kboot::bootinfo::PsciConduit;
 
 const SYSTEM_OFF: u64 = 0x8400_0008;
+const SYSTEM_RESET: u64 = 0x8400_0009;
 /// CPU_ON, SMC64 calling convention (PSCI 1.x, 5.6) [G37].
 const CPU_ON: u64 = 0xC400_0003;
 static CONDUIT: AtomicU8 = AtomicU8::new(0);
@@ -39,6 +40,29 @@ pub fn system_off() -> ! {
         // SAFETY: waiting for an event has no side effects.
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
+}
+
+/// Resets the machine through PSCI SYSTEM_RESET once the console's
+/// transmitter is idle, up to 10 ms. When no conduit is known the CPU
+/// parks (system_off). A call that returns (SYSTEM_RESET returns only with an error)
+/// prints its status in one line and powers the machine off: a stopped
+/// machine is better than a hung one.
+pub fn system_reset() -> ! {
+    crate::console::drain();
+    let mut status = SYSTEM_RESET;
+    // SAFETY: SYSTEM_RESET does not return when it succeeds; the SMC calling
+    // convention clobbers x0-x17, which clobber_abi("C") covers.
+    unsafe {
+        match CONDUIT.load(Ordering::Relaxed) {
+            1 => core::arch::asm!("hvc #0", inout("x0") status, clobber_abi("C")),
+            2 => core::arch::asm!("smc #0", inout("x0") status, clobber_abi("C")),
+            // No conduit: system_off parks the CPU as well.
+            _ => system_off(),
+        }
+    }
+    kprintln!("stafeto: PSCI SYSTEM_RESET returned {}", status as i32);
+    // system_off ends in a loop of wfe when its own call returns.
+    system_off()
 }
 
 /// PSCI CPU_ON: starts the CPU of `mpidr` (the affinity fields) at the

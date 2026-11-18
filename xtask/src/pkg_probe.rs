@@ -521,9 +521,12 @@ fn without_notices(lines: &[String]) -> Vec<String> {
 /// budget (`init: ramfs budget serve: at least 1 overruns, ...`). It comes when a budget runs
 /// out, whatever command is on the console then, so it can fall between the begin and end marks
 /// of `pkg check` or `pkg list` without being part of their output. Every reading of `pkg list`
-/// drops these lines before it counts the packages.
+/// drops these lines before it counts the packages. The network service writes its counters
+/// the same way (`net: queues ...`, about 30 s after the first request and then when one
+/// changes), and no line of `pkg list` starts with `net: `.
 fn is_notice(line: &str) -> bool {
-    line.starts_with("init: ") && line.contains(" budget ") && line.contains(" overruns")
+    (line.starts_with("init: ") && line.contains(" budget ") && line.contains(" overruns"))
+        || line.starts_with("net: ")
 }
 
 /// Fails with `what` and the lines that differ when the two readings of the store are not the
@@ -1432,6 +1435,13 @@ mod tests {
         use super::{is_notice, same_store};
         let notice = "init: pipe budget serve: at least 187 overruns, at least 5159 in all, kernel counts 5159";
         assert!(is_notice(notice));
+        assert!(is_notice(
+            "net: queues syn_dropped 0 queue_reaped 0 embryo_recycled 0"
+        ));
+        assert!(is_notice(
+            "net: queues sockets 1 of 1280 demux 1 listen_short 0 key_stale 0"
+        ));
+        assert!(!is_notice("nbase 10.1.0-1 stafeto"));
         assert!(!is_notice(
             "packages 2 on the disk, 10 in the image, 0 revoked"
         ));

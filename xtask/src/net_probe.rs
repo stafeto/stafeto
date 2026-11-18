@@ -1617,6 +1617,91 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     parts.frame_rx_wire = by_ping.frame_rx_wire.max(by_echo.frame_rx_wire);
     parts.frame_tx_wire = by_ping.frame_tx_wire.max(by_echo.frame_tx_wire);
     println!("net-probe: the parts the rule reads: {parts:?}");
+    // The step the constant `netd::ring::TX_SOFT_MEASURED` is set from: the margin less the
+    // measured group, the measured sent frame and the measured fixed part.
+    println!(
+        "net-probe: the step of sending with a second group: group {} + sent frame {} + fixed {} ticks (p90); the room for TX_SOFT_MEASURED is {} (the code has {}, TX_GROUP_TICKS {}, WIRE_TX_FRAME_TICKS {}, TX_FIXED_TICKS {})",
+        parts.group,
+        parts.tx_price(),
+        parts.fixed_tx,
+        parts.tx_soft_room(),
+        netd::ring::TX_SOFT_MEASURED,
+        netd::ring::TX_GROUP_TICKS,
+        netd::ring::WIRE_TX_FRAME_TICKS,
+        netd::ring::TX_FIXED_TICKS
+    );
+    // How often the second group of sending ran and how often the share held it back, per run.
+    for (what, run) in [
+        ("s", &lines),
+        ("wire", &wire_lines),
+        ("wire-echo", &echo_lines),
+    ] {
+        for line in run
+            .iter()
+            .filter(|l| l.contains("net: split second_group "))
+        {
+            println!("net-probe: second group of sending ({what}): {line}");
+        }
+    }
+    // The checks between the rule and the constants of the code. Each failure is printed as it
+    // is found and returned at the end, after the acceptance, so that the measured steps stay
+    // in the log. The rule on the constants must give the numbers of the code. A measured
+    // 90th percentile above its constant is a warning (the target); it fails only when the
+    // step would pass the bound, which the ceilings derive from the constants.
+    let mut strict_errors: Vec<String> = Vec::new();
+    let mut fail = |message: String| {
+        println!("net-probe: FAIL: {message}");
+        strict_errors.push(message);
+    };
+    let in_code = choose::Choice {
+        receive: netd::ring::STEP_RX,
+        groups: netd::ring::EGRESS_GROUPS,
+        send: netd::ring::STEP_TX,
+    };
+    match choose::choose(&choose::Parts::of_ring()) {
+        Ok(c) if c == in_code => {}
+        other => fail(format!(
+            "the rule on the constants of netd::ring gives {other:?}; netd::ring has {in_code:?}"
+        )),
+    }
+    let ceilings = choose::Ceilings::of_ring();
+    for (what, measured, constant, ceiling) in [
+        (
+            "a received frame of the wire (WIRE_FRAME_TICKS)",
+            parts.frame_rx_wire,
+            netd::ring::WIRE_FRAME_TICKS as u64,
+            ceilings.frame_rx_wire,
+        ),
+        (
+            "a sent frame of the wire (WIRE_TX_FRAME_TICKS)",
+            parts.frame_tx_wire,
+            netd::ring::WIRE_TX_FRAME_TICKS as u64,
+            ceilings.frame_tx_wire,
+        ),
+        (
+            "the pass over a group (TX_GROUP_TICKS)",
+            parts.group,
+            netd::ring::TX_GROUP_TICKS as u64,
+            ceilings.group,
+        ),
+        (
+            "the fixed part of a step of sending (TX_FIXED_TICKS)",
+            parts.fixed_tx,
+            netd::ring::TX_FIXED_TICKS as u64,
+            ceilings.fixed_tx,
+        ),
+    ] {
+        if measured > ceiling {
+            fail(format!(
+                "{what} costs {measured} ticks (p90), over {constant} and over {ceiling}, where the step passes the bound {}",
+                choose::BOUND
+            ));
+        } else if measured > constant {
+            println!(
+                "net-probe: warning: {what} costs {measured} ticks (p90), over {constant} (the step stays under the bound up to {ceiling})"
+            );
+        }
+    }
     let choice = match choose::choose(&parts) {
         Ok(choice) => choice,
         Err(stop) => {
@@ -1647,11 +1732,6 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     // estimate from 90th percentiles with a margin of 15 percent: when it picks
     // smaller numbers than the code has, the prices of the frames of the wire
     // have grown since the code adopted its numbers, and the note says so.
-    let in_code = choose::Choice {
-        receive: netd::ring::STEP_RX,
-        groups: netd::ring::EGRESS_GROUPS,
-        send: netd::ring::STEP_TX,
-    };
     if in_code != choice {
         println!(
             "net-probe: note: the rule picks {choice:?}; netd::ring has {in_code:?} (estimates {} and {} ticks against the budget {}); the acceptance judges the measured steps of the code",
@@ -1666,7 +1746,12 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
         &choice_features(in_code.receive, in_code.groups, in_code.send),
         true,
     )?;
-    portion_series(machine).map(drop)
+    portion_series(machine)?;
+    if strict_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(strict_errors.join("; "))
+    }
 }
 
 /// The lines of a run of role `B` about the buffers: the quota of the service

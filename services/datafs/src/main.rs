@@ -188,7 +188,17 @@ impl Datafs {
             // SAFETY: the instant is written before the job is QUEUED; it is read through the atomic.
             .map(|i| unsafe { (*job(i)).queued_at.load(Acquire) });
         let progress = PROGRESS.load(Acquire);
-        if datafs::watch::stuck(now, self.since, progress, queued, datafs::watch::STUCK_NS) {
+        // While the service stops the check is off: the drain waits on the disk, and init's deadline
+        // of 3 s bounds it (a stuck exit outside a stop is unchanged).
+        let stopping = STOPPING.load(Acquire);
+        if datafs::watch::must_exit(
+            stopping,
+            now,
+            self.since,
+            progress,
+            queued,
+            datafs::watch::STUCK_NS,
+        ) {
             rt::println!(
                 "datafs: no disk call completed in 20 s with a job waiting, the service ends"
             );
@@ -266,6 +276,9 @@ impl Service<0> for Datafs {
     type Data = ();
 
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
+        if STOPPING.load(Acquire) {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
         let Some(i) = self.free_job() else {
             return Answer::Status(busy());
         };
@@ -314,6 +327,31 @@ impl Service<0> for Datafs {
                 }
             }
             self.settle();
+            // The worker put the volume away and every reply it made has gone: the service ends.
+            if UNMOUNTED.load(Acquire) && (0..JOBS).all(|i| state(i).load(Acquire) != DONE) {
+                rt::println!("datafs: stopped, {} jobs finished", STOP_JOBS.load(Acquire));
+                sys::process_exit(0);
+            }
+        }
+    }
+
+    /// The stop notice of init: no new request, the worker runs the queued jobs and puts the volume
+    /// away, and `notification` ends the process when that is done. Init kills the service at its
+    /// deadline should the disk not answer.
+    fn stop(&mut self) {
+        // The break image exits at once, as the default handler of rt::service does: the probe of
+        // the stop handlers (xtask nvme-persist stop-handlers breaks) must catch it.
+        #[cfg(feature = "break-datafs-stop")]
+        sys::process_exit(0);
+        // The time first: the worker reads it as soon as it sees the flag.
+        #[cfg(not(feature = "break-datafs-stop"))]
+        {
+            if STOPPING.load(Acquire) {
+                return;
+            }
+            STOP_AT.store(rt::time::now().max(1), Release);
+            STOPPING.store(true, Release);
+            let _ = sys::notify(&self.kick, 1);
         }
     }
 }
