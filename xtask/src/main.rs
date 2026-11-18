@@ -16267,6 +16267,10 @@ mod entropy_in_images_tests {
             ("focus_probe::PROGRAMS", &crate::focus_probe::PROGRAMS),
             ("focus_probe::WM_PROGRAMS", &crate::focus_probe::WM_PROGRAMS),
             (
+                "focus_probe::WM_STEPS_PROGRAMS",
+                &crate::focus_probe::WM_STEPS_PROGRAMS,
+            ),
+            (
                 "focus_probe::STEPS_PROGRAMS",
                 &crate::focus_probe::STEPS_PROGRAMS,
             ),

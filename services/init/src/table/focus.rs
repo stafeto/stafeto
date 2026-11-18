@@ -119,15 +119,6 @@ pub const TABLE: &[Record] = &[
 
 // ------------------------------------------------------------ the window manager
 
-/// The compositor of the image of the window manager's probe: it has the
-/// keyboard's driver as an input service (the keys of a window of the first
-/// revision are read from the compositor, which holds the keyboard's focus),
-/// and no tablet.
-const WM_COMPOSITOR: Record = Record {
-    connects: &["display", "input"],
-    ..comp::COMPOSITOR
-};
-
 /// The window manager (the program `wm`, apps/wm): the compositor's manager
 /// session by its name (`table::COMP_MANAGERS`). It needs the pages of its
 /// program and its stack and nothing else.
@@ -167,12 +158,14 @@ const WM_PROBE_INPUT: Record = Record {
 };
 
 /// The image of the window manager's probe on QEMU: the compositor with a
-/// keyboard (no key is typed: the keys come from INJECT), the manager, a
-/// client of the first revision and a native one.
+/// keyboard (`comp::COMPOSITOR_KEYS`: it holds the keyboard's focus and
+/// serves the keys of the window of the first revision; no key is typed, the
+/// keys come from INJECT), the manager, a client of the first revision and a
+/// native one.
 pub const WM_TABLE: &[Record] = &[
     comp::DISPLAY,
     input::INPUT,
-    WM_COMPOSITOR,
+    comp::COMPOSITOR_KEYS,
     WM,
     WM_PROBE_NEW,
     WM_PROBE_OLD,

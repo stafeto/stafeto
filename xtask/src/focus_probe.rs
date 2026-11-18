@@ -112,6 +112,32 @@ pub const WM_PROGRAMS: [ImageProgram; 6] = [
     ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &[]),
 ];
 
+/// The image of the window manager's run under -icount: the compositor
+/// counts its steps (the driver's and the keyboard's need not).
+pub const WM_STEPS_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-focus-wm"]),
+    (
+        "virtio-gpu",
+        "virtio-gpu",
+        crate::gpu_probe::GPU_STACK_SIZE,
+        &[],
+    ),
+    (
+        "virtio-input",
+        "virtio-input",
+        input_probe::INPUT_STACK_SIZE,
+        &[],
+    ),
+    (
+        "compositor",
+        "compositor",
+        comp_probe::COMP_STACK_SIZE,
+        &["steps"],
+    ),
+    ("wm", "wm", CHILD_STACK_SIZE, &[]),
+    ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &[]),
+];
+
 const OVERLAP: &str = "focus-probe: overlap crc ";
 const CLICK: &str = "focus-probe: click crc ";
 const SWITCH: &str = "focus-probe: switch crc ";
@@ -291,6 +317,22 @@ const COMP_KINDS: [(usize, &str); 8] = [
     (23, "Inject"),
     (65, "a band of a frame and the end of a frame"),
 ];
+/// The kinds of the compositor's steps in the window manager's run: OPEN and
+/// FLUSH of the first revision, the READ of a window's session of keys (it
+/// shares the number 3 with CLOSE), and the requests of proto_comp the two
+/// clients, the manager and the injector make, and the compositor's own.
+const WM_COMP_KINDS: [(usize, &str); 10] = [
+    (1, "Open"),
+    (2, "Flush"),
+    (3, "READ of a window's keys"),
+    (17, "Describe"),
+    (18, "WindowCreate"),
+    (19, "Attach"),
+    (20, "Post"),
+    (21, "Events"),
+    (22, "Manage"),
+    (65, "a band of a frame and the end of a frame"),
+];
 /// The tablet driver's: GRANT, and its own (the interrupt).
 const INPUT_KINDS: [(usize, &str); 2] = [(1, "Grant"), (65, "the interrupt")];
 const INPUT_TAG: &str = "13";
@@ -321,6 +363,11 @@ fn rows_of(
         ));
     }
     Ok(rows)
+}
+
+/// The steps of the compositor in the window manager's run.
+pub fn wm_steps_verdict(lines: &[String]) -> Result<comp_probe::Rows, String> {
+    rows_of(lines, comp_probe::COMP_TAG, "compositor", &WM_COMP_KINDS)
 }
 
 /// The steps of the compositor and of the tablet's driver.
@@ -478,9 +525,10 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         "focus-probe on {}: the screen matched the guest's frames for two windows with an alpha, a click that raised one, the manager's switch and the screen after the second client ended; the keys went to the window with the focus only; the tablet's click reached the window under it",
         machine.name
     );
-    wm_probe(machine)?;
+    wm_probe(machine, false)?;
     if !machine.is_hvf() {
         steps(machine)?;
+        wm_probe(machine, true)?;
     }
     Ok(())
 }
@@ -489,13 +537,24 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 /// a keyboard's driver (no key is typed: the keys are injected), a native
 /// client and a client of the first revision. The guest's lines say what
 /// each client saw; the run ends when the last of the four programs has.
-fn wm_probe(machine: &qemu::Machine) -> Result<(), String> {
+/// With `counted` the run is under -icount with the compositor counting its
+/// steps, which must include the READ of a window's session of keys, and
+/// every one stays under the bound.
+fn wm_probe(machine: &qemu::Machine, counted: bool) -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-focus-wm.img", &WM_PROGRAMS, BOOT_PROFILE)?;
+    let (name, programs) = if counted {
+        ("boot-focus-wm-steps.img", &WM_STEPS_PROGRAMS)
+    } else {
+        ("boot-focus-wm.img", &WM_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::GPU);
     cmd.args(qemu::KEYBOARD);
+    if counted {
+        cmd.args(qemu::ICOUNT);
+    }
     let output = run_until(
         cmd,
         crate::BOOT_TIMEOUT * 4,
@@ -508,8 +567,24 @@ fn wm_probe(machine: &qemu::Machine) -> Result<(), String> {
     }
     wm_verdict(&output.lines)
         .map_err(|e| format!("focus-probe (window manager) on {}: {e}", machine.name))?;
+    if counted {
+        let rows = wm_steps_verdict(&output.lines)
+            .map_err(|e| format!("focus-probe (window manager) on {}: {e}", machine.name))?;
+        crate::check_waits(&output.lines, &[comp_probe::COMP_TAG], "focus-probe")?;
+        let text: Vec<String> = rows
+            .iter()
+            .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
+            .collect();
+        println!(
+            "focus-probe on {}: the longest steps of the compositor in the window manager's run under -icount, ticks (0.9 of term B {}): {}",
+            machine.name,
+            gpu_probe::STEP_MAX,
+            text.join(", ")
+        );
+        return Ok(());
+    }
     println!(
-        "focus-probe on {}: the window manager gave each new window the focus and switched the windows on Super and Tab; the keys went to the window with the focus only, the window of the first revision included; the manager ended on its chord and the compositor went on",
+        "focus-probe on {}: the window manager gave each new window the focus and switched the windows on Super and Tab; the keys went to the window with the focus only, the window of the first revision included, and a key it held was released when the focus left; the manager ended on its chord and the compositor went on",
         machine.name
     );
     Ok(())
@@ -665,6 +740,24 @@ mod tests {
                 .unwrap_err()
                 .contains("tablet's driver")
         );
+    }
+
+    #[test]
+    fn the_window_managers_steps_need_the_read_of_the_keys_and_stay_under_the_bound() {
+        let row = |kind: usize, ticks: u64| {
+            format!("service step: 17 kind {kind} {ticks} ticks detail 0")
+        };
+        let mut lines: Vec<String> = WM_COMP_KINDS.iter().map(|&(k, _)| row(k, 100)).collect();
+        assert!(wm_steps_verdict(&lines).is_ok());
+        let mut without = lines.clone();
+        without.retain(|l| !l.contains("kind 3 "));
+        assert!(
+            wm_steps_verdict(&without)
+                .unwrap_err()
+                .contains("READ of a window's keys")
+        );
+        lines.push(row(3, gpu_probe::STEP_MAX + 1));
+        assert!(wm_steps_verdict(&lines).unwrap_err().contains("term B"));
     }
 
     #[test]

@@ -86,6 +86,7 @@ const KEY_TAB: u16 = 15;
 const KEY_B: u16 = 48;
 const KEY_C: u16 = 46;
 const KEY_E: u16 = 18;
+const KEY_H: u16 = 35;
 const KEY_Q: u16 = 16;
 const KEY_SUPER: u16 = 125;
 const BTN_LEFT: u16 = 0x110;
@@ -546,9 +547,13 @@ const P_WANTS: [Want; 9] = [
     (KEY, KEY_F, 0),
 ];
 /// The keys the client of the first revision reads.
-const O_WANTS: [(u16, i32); 6] = [
+const O_WANTS: [(u16, i32); 8] = [
     (KEY_A, 1),
     (KEY_A, 0),
+    // Held while the focus leaves: the compositor releases it, and the real
+    // release, made while the other window has the focus, comes to nobody.
+    (KEY_H, 1),
+    (KEY_H, 0),
     (KEY_C, 1),
     (KEY_C, 0),
     (KEY_E, 1),
@@ -1022,12 +1027,6 @@ impl Probe<'_> {
 
 // ------------------------------------------------------------ the window manager's image
 
-/// How long the injector lets the manager answer the making of a window
-/// (CREATE, then FOCUS) and the second window's first frame come before the
-/// first key: the manager is another process, and the injector cannot see
-/// the focus or the windows' state.
-const SETTLE_NS: u64 = 1_000_000_000;
-
 impl Probe<'_> {
     /// The native client of the window manager's image.
     fn wm_new(self) -> Result<(), &'static str> {
@@ -1136,6 +1135,24 @@ impl Probe<'_> {
             .write(&mut w)
             .map_err(say("FLUSH's bytes"))?;
         plain(&owner, w.as_bytes()).map_err(say("FLUSH"))?;
+        // The window is shown. The manager answers its making with FOCUS: the
+        // window says so with FOCUS_IN in its ring.
+        self.watch(&owner, |e| Ok(e.kind == FOCUS_IN))?;
+        // A window made and closed again tells the injector that all of it
+        // happened: the windows made are three and the open ones two.
+        let (marker, _) = self
+            .create_as(
+                &display,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                FORMAT_XRGB8888,
+            )
+            .map_err(say("WINDOW_CREATE of the marker"))?;
+        drop(marker);
         rt::println!("focus-probe: o window is up");
         let mut seen = 0;
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
@@ -1183,14 +1200,17 @@ impl Probe<'_> {
     fn wm_input(self) -> Result<(), &'static str> {
         let display = self.display()?;
         self.describe_when_ready(&display)?;
-        // Both windows on the screen, the manager subscribed.
+        // Both windows are on the screen, the manager answered the making of
+        // each, and the client of the first revision made and closed its
+        // marker window to say so (three windows made, two open).
         self.until(&display, "the windows and the manager never came", |d| {
-            d.open == 2 && d.created == 2 && d.frames >= 2 && d.flags & HAS_MANAGER != 0
+            d.open == 2 && d.created == 3 && d.flags & HAS_MANAGER != 0
         })?;
-        self.sleep(SETTLE_NS);
         // The window of the first revision was made last: the manager gave
         // it the focus, and the key is its.
         self.key(&display, KEY_A)?;
+        // A key it holds while the focus leaves.
+        self.inject(&display, Event::new(KEY, KEY_H, 1))?;
         // The chord: the focus passes to the native window, and the
         // manager's FOCUS raises it, a frame.
         let d = self.until(&display, "the screen never settled", |_| true)?;
@@ -1198,6 +1218,7 @@ impl Probe<'_> {
         let d = self.until(&display, "the chord never switched the windows", |n| {
             n.frames > d.frames
         })?;
+        self.inject(&display, Event::new(KEY, KEY_H, 0))?;
         self.key(&display, KEY_B)?;
         // And back to the window of the first revision.
         self.chord(&display, KEY_TAB)?;

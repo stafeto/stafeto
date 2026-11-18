@@ -12,7 +12,10 @@
 //! Every call is a request that the compositor answers in one step: LIST
 //! carries at most MAX_WINDOWS records, and the ring is read 32 events at a
 //! time. The manager waits on its own channel, which the compositor notifies
-//! with EVENTS_BIT when the ring has something. It ends with code 0 on the
+//! with EVENTS_BIT when the ring has something, for a period at most: that
+//! channel never closes when the compositor ends (the manager holds its
+//! receiving side), so a quiet period ends with DESCRIBE, and a compositor
+//! that is gone refuses it. It ends with code 0 on the
 //! chord that ends it, and with a code of its own when the compositor is
 //! gone or a call fails otherwise (the compositor treats the end of its
 //! session as the manager's death and goes on by its own rules: the window
@@ -41,6 +44,9 @@ const MAX_WINDOWS: usize = 8;
 /// The pause between two tries of the compositor's screen, and how long the
 /// manager waits for it.
 const RETRY_NS: u64 = 20_000_000;
+/// How long the manager waits for events before it asks the compositor
+/// whether it is there.
+const PERIOD_NS: u64 = 1_000_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 /// The codes of the manager's end: no start data, no channel, no session
 /// with the compositor, a call that failed, the compositor gone.
@@ -94,12 +100,18 @@ fn status_of(bytes: &[u8]) -> Result<Status, u64> {
 }
 
 /// FOCUS of window `id`. The compositor refuses a window that went since
-/// the event, which is no failure of the manager's.
+/// the event with INVALID, which is no failure of the manager's; any other
+/// refusal is.
 fn focus(display: &Handle<Channel>, id: u32) -> Result<(), u64> {
     let mut w = Writer::new();
     write_manage(manage::FOCUS, id, 0, 0, &mut w).map_err(|_| FAILED)?;
-    sys::send(display, w.as_bytes()).map_err(refused)?;
-    Ok(())
+    let reply = sys::send(display, w.as_bytes()).map_err(refused)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match status_of(reply.bytes(&mut buffer))? {
+        Status::Ok => Ok(()),
+        status if status == proto_comp::code(proto_comp::INVALID) => Ok(()),
+        _ => Err(FAILED),
+    }
 }
 
 /// LIST, then FOCUS of the window `next_focus` names.
@@ -153,10 +165,25 @@ fn take(display: &Handle<Channel>, chords: &mut Chords) -> Result<(usize, bool),
     Ok((n, false))
 }
 
-/// Waits until a bit comes on `channel`: the compositor says by it that the
-/// ring has events.
-fn wait_for_events(channel: &Handle<Channel>) -> Result<(), u64> {
-    sys::receive(channel).map(|_| ()).map_err(refused)
+/// Waits until something comes on `channel` (the compositor says by a bit
+/// that the ring has events) or the period passes. The channel is the
+/// manager's own and never closes when the compositor ends, so a quiet
+/// period ends with DESCRIBE, which a compositor that is gone refuses with
+/// PEER_CLOSED.
+fn wait_for_events(
+    display: &Handle<Channel>,
+    channel: &Handle<Channel>,
+    waiter: &Waiter,
+) -> Result<(), u64> {
+    let deadline = time::ticks_to_ns(time::now()).saturating_add(PERIOD_NS);
+    match waiter.receive_until(channel, deadline) {
+        Ok(Waited::Got(_)) => Ok(()),
+        Ok(Waited::Expired) => {
+            sys::send(display, &Method::Describe.header().bytes()).map_err(refused)?;
+            Ok(())
+        }
+        Err(error) => Err(refused(error)),
+    }
 }
 
 /// DESCRIBE until the compositor has its screen (it says CLEARING while the
@@ -194,6 +221,7 @@ fn run(display: &Handle<Channel>, channel: &Handle<Channel>, level: u8) -> Resul
         return Err(FAILED);
     }
     rt::println!("wm: subscribed");
+    let waiter = Waiter::new(channel, 0, level).map_err(|_| NO_CHANNEL)?;
     let mut chords = Chords::new();
     loop {
         // The ring is read dry before each wait: the events that came before
@@ -207,6 +235,6 @@ fn run(display: &Handle<Channel>, channel: &Handle<Channel>, level: u8) -> Resul
                 break;
             }
         }
-        wait_for_events(channel)?;
+        wait_for_events(display, channel, &waiter)?;
     }
 }

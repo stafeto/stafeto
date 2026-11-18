@@ -113,7 +113,15 @@ focus and no other time (a window of the first revision takes no pointer
 events, so a stream of moves never pushes a key out of its ring). The keyboard's
 driver sees one holder of its focus, the compositor, which routes the keys by
 the rule of every window; where the image has no keyboard OPEN says NO_INPUT and
-gives no session of focus. The tablet
+gives no session of focus. A key's release goes where its press went (a window, the
+manager or nobody), so a tap of Super while a window holds a key leaves the
+release with the window; when the focus leaves a window of the first revision,
+which sees no FOCUS_OUT, the keys it still holds are released in its ring first
+and their real releases are dropped. When an input driver ends and init starts
+it again, the compositor takes its focus again (each grant's label carries a
+generation, so the end of an old grant is told from the new one), at its next
+own step and at OPEN; the connection to a driver that is starting again waits
+for it. The tablet
 reports `EV_ABS` `ABS_X` and `ABS_Y` from 0 to 32 767 across the screen and
 `BTN_LEFT` as a key; the compositor scales them to the screen's 640 by 400. The
 image of the probe (`table::focus`) has the tablet on the transport 13; the

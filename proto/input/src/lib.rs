@@ -13,10 +13,14 @@
 //!
 //! The service keeps at most one session of focus. Only the session init
 //! gave the display service (the table's `connects`) asks for one: GRANT
-//! makes it, a new label of the service, and revokes the one before; the
-//! display service passes it on to the owner of the screen, so the focus
-//! is always the owner's. REVOKE ends the focus when the screen goes back.
-//! A key pressed while no session has the focus is dropped.
+//! makes it, a new label of the service, and revokes the one before. A
+//! display service that is the driver of the screen passes it on to the owner
+//! of the screen, so the focus is always the owner's, and REVOKE ends the
+//! focus when the screen goes back. The composition service (services/compositor)
+//! keeps the focus for itself, with a channel of its own in GRANT, and gives
+//! a program of the first revision a session of its own that answers READ in
+//! this format from the ring of the program's window (proto_comp). A key
+//! pressed while no session has the focus is dropped.
 //!
 //! The focus holds 64 events (RING). When more come, the oldest is dropped
 //! and the next READ carries LOST, which it clears. READ never waits: it

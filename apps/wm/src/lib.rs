@@ -217,9 +217,11 @@ mod tests {
             c.event(&key(KEY_TAB, true)),
             Some(Command::Cycle { forward: false })
         );
-        // Super goes while Shift is down; Shift's release reaches a window,
-        // not the manager. The next chord is forward.
+        // Super goes while Shift is down; the manager forgets Shift with
+        // Super, and Shift's release, which comes later, changes nothing.
+        // The next chord is forward.
         c.event(&key(KEY_LEFTMETA, false));
+        assert_eq!(c.event(&key(KEY_LEFTSHIFT, false)), None);
         c.event(&key(KEY_LEFTMETA, true));
         assert_eq!(
             c.event(&key(KEY_TAB, true)),

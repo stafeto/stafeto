@@ -56,6 +56,27 @@ pub const KEY_TAB: u16 = 15;
 pub const KEY_LEFTMETA: u16 = 125;
 pub const KEY_RIGHTMETA: u16 = 126;
 
+/// The key codes whose presses are followed (Linux's keyboard codes are
+/// below 256), and what the owner of a press can be: nobody yet, a window
+/// (its place plus 1), the manager, or none (the press was dropped, or its
+/// release was already given: the release is dropped too).
+pub const KEYS_TRACKED: usize = 256;
+const OWNER_NONE: u8 = 0;
+const OWNER_DROPPED: u8 = 254;
+const OWNER_MANAGER: u8 = 255;
+
+/// Whether the compositor must take the focus of an input device again:
+/// the device is in the image (`present`) and the compositor does not hold
+/// its focus (`holds`), as after the driver ended and started again.
+pub const fn wants_focus(present: bool, holds: bool) -> bool {
+    present && !holds
+}
+
+/// The owner byte of window place `i`.
+const fn window_owner(i: usize) -> u8 {
+    i as u8 + 1
+}
+
 /// The state of a buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Buf {
@@ -208,8 +229,11 @@ pub struct Scene {
     /// pressed button holds.
     pointer: Option<(i32, i32)>,
     held: Option<usize>,
-    /// A Super key is held (the manager has subscribed).
-    modifier: bool,
+    /// The Super keys held, one bit each (left, right).
+    modifier: u8,
+    /// Who got the press of each key below KEYS_TRACKED: its release goes
+    /// to the same (OWNER_NONE: no press seen).
+    owner: [u8; KEYS_TRACKED],
     damage: Option<Rect>,
     frame: bool,
     seq: u32,
@@ -252,7 +276,8 @@ impl Scene {
             focus: None,
             pointer: None,
             held: None,
-            modifier: false,
+            modifier: 0,
+            owner: [OWNER_NONE; KEYS_TRACKED],
             damage: None,
             frame: false,
             seq: 0,
@@ -481,6 +506,12 @@ impl Scene {
             self.add_damage(w.rect);
         }
         self.rings[i].clear();
+        // The releases of what the window held are nobody's.
+        for o in &mut self.owner {
+            if *o == window_owner(i) {
+                *o = OWNER_DROPPED;
+            }
+        }
         if self.held == Some(i) {
             self.held = None;
         }
@@ -537,7 +568,7 @@ impl Scene {
         self.manager = on;
         if !on {
             self.manager_ring.clear();
-            self.modifier = false;
+            self.modifier = 0;
         }
     }
 
@@ -587,6 +618,17 @@ impl Scene {
             return;
         }
         if let Some(old) = self.focus.replace(i) {
+            // A window of the first revision sees no FOCUS_OUT: the keys it
+            // still holds are released in its ring before the focus goes,
+            // and their real releases are dropped.
+            if self.window(old).is_some_and(|w| w.legacy) {
+                for code in 0..KEYS_TRACKED {
+                    if self.owner[code] == window_owner(old) {
+                        self.owner[code] = OWNER_DROPPED;
+                        self.tell(old, Event::new(KEY, code as u16, 0));
+                    }
+                }
+            }
             self.tell(old, Event::new(FOCUS_OUT, 0, 0));
         }
         self.tell(i, Event::new(FOCUS_IN, 0, 0));
@@ -596,16 +638,45 @@ impl Scene {
     /// the keys under Super go to it; any other key goes to the window with
     /// the focus (a window of the first revision too: its ring holds the
     /// keys its session of focus reads), and is dropped when there is none.
+    /// A release goes where its press went, whoever has the focus or holds
+    /// Super by then.
     pub fn key(&mut self, code: u16, pressed: bool) {
-        let modifier = code == KEY_LEFTMETA || code == KEY_RIGHTMETA;
-        if modifier {
-            self.modifier = pressed;
+        let bit = match code {
+            KEY_LEFTMETA => 1,
+            KEY_RIGHTMETA => 2,
+            _ => 0,
+        };
+        if pressed {
+            self.modifier |= bit;
+        } else {
+            self.modifier &= !bit;
         }
         let event = Event::new(KEY, code, i32::from(pressed));
-        if self.manager && (modifier || self.modifier) {
-            self.tell_manager(event);
-        } else if let Some(i) = self.focus {
-            self.tell(i, event);
+        let routed = if self.manager && (bit != 0 || self.modifier != 0) {
+            OWNER_MANAGER
+        } else {
+            self.focus.map_or(OWNER_DROPPED, window_owner)
+        };
+        let target = match self.owner.get_mut(usize::from(code)) {
+            Some(owner) if pressed => {
+                *owner = routed;
+                routed
+            }
+            Some(owner) => match core::mem::replace(owner, OWNER_NONE) {
+                OWNER_NONE => routed,
+                known => known,
+            },
+            None => routed,
+        };
+        match target {
+            OWNER_DROPPED => {}
+            OWNER_MANAGER => self.tell_manager(event),
+            w => {
+                let i = usize::from(w) - 1;
+                if self.window(i).is_some() {
+                    self.tell(i, event);
+                }
+            }
         }
     }
 
@@ -1780,7 +1851,10 @@ mod tests {
         s.button(0x110, false);
         assert_eq!(s.focus(), Some(l));
         s.key(31, true);
-        assert_eq!(s.take_keys(l, &mut out), (1, false));
+        // Key 30 was still held when the focus left: its release is in the
+        // ring, then the new key.
+        assert_eq!(s.take_keys(l, &mut out), (2, false));
+        assert_eq!(&out[..2], [Event::new(KEY, 30, 0), Event::new(KEY, 31, 1)]);
     }
 
     #[test]
@@ -1816,6 +1890,100 @@ mod tests {
         s.key(16, true);
         assert!(s.delivered().manager);
         assert!(events(&mut s, b).is_empty());
+    }
+
+    #[test]
+    fn a_first_revision_window_is_released_of_the_keys_it_holds_when_the_focus_leaves() {
+        let mut s = Scene::new();
+        let (n, l) = old_and_new(&mut s);
+        s.key(17, true);
+        s.focus_on(n).unwrap();
+        // The release came before the focus left, and the key's real
+        // release, while the other window has the focus, goes nowhere.
+        s.key(17, false);
+        let mut out = [Event::default(); 8];
+        assert_eq!(s.take_keys(l, &mut out), (2, false));
+        assert_eq!(&out[..2], [Event::new(KEY, 17, 1), Event::new(KEY, 17, 0)]);
+        assert_eq!(
+            events(&mut s, n),
+            [Event::new(FOCUS_IN, 0, 0)],
+            "a release of another window's key is no key of this one"
+        );
+        // A key pressed and released with no focus change is not doubled.
+        s.focus_on(l).unwrap();
+        s.key(18, true);
+        s.key(18, false);
+        assert_eq!(s.take_keys(l, &mut out), (2, false));
+    }
+
+    #[test]
+    fn a_release_goes_to_the_window_that_got_the_press_even_under_super() {
+        let mut s = Scene::new();
+        let (a, b) = two(&mut s);
+        s.set_manager(true);
+        s.take_manager_events(&mut [Event::default(); 64]);
+        s.delivered();
+        // b holds W; Super is tapped; W is released under Super.
+        s.key(17, true);
+        s.key(KEY_LEFTMETA, true);
+        s.key(17, false);
+        s.key(KEY_LEFTMETA, false);
+        assert_eq!(
+            events(&mut s, b),
+            [Event::new(KEY, 17, 1), Event::new(KEY, 17, 0)]
+        );
+        assert!(events(&mut s, a).is_empty());
+        let mut out = [Event::default(); 8];
+        let (n, _) = s.take_manager_events(&mut out);
+        assert_eq!(
+            &out[..n],
+            [
+                Event::new(KEY, KEY_LEFTMETA, 1),
+                Event::new(KEY, KEY_LEFTMETA, 0)
+            ]
+        );
+        // And Tab pressed under Super and released after it: the manager's.
+        s.key(KEY_LEFTMETA, true);
+        s.key(KEY_TAB, true);
+        s.key(KEY_LEFTMETA, false);
+        s.key(KEY_TAB, false);
+        let (n, _) = s.take_manager_events(&mut out);
+        assert_eq!(n, 4);
+        assert!(events(&mut s, b).is_empty());
+    }
+
+    #[test]
+    fn two_super_keys_hold_the_manager_s_modifier_until_both_are_up() {
+        let mut s = Scene::new();
+        let (_, b) = two(&mut s);
+        s.set_manager(true);
+        s.take_manager_events(&mut [Event::default(); 64]);
+        s.key(KEY_LEFTMETA, true);
+        s.key(KEY_RIGHTMETA, true);
+        s.key(KEY_RIGHTMETA, false);
+        s.key(KEY_TAB, true);
+        assert!(events(&mut s, b).is_empty());
+        s.key(KEY_LEFTMETA, false);
+        s.key(KEY_TAB, false);
+        s.key(KEY_TAB, true);
+        assert_eq!(events(&mut s, b), [Event::new(KEY, KEY_TAB, 1)]);
+    }
+
+    #[test]
+    fn a_window_that_goes_drops_the_releases_of_its_keys() {
+        let mut s = Scene::new();
+        let (a, b) = two(&mut s);
+        s.key(17, true);
+        s.destroy(b);
+        s.key(17, false);
+        assert!(events(&mut s, a).iter().all(|e| e.kind != KEY));
+    }
+
+    #[test]
+    fn the_compositor_takes_a_devices_focus_again_when_it_is_there_and_not_held() {
+        assert!(wants_focus(true, false));
+        assert!(!wants_focus(true, true));
+        assert!(!wants_focus(false, false));
     }
 
     #[test]
