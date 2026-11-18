@@ -43,23 +43,26 @@ pub fn system_off() -> ! {
 }
 
 /// Resets the machine through PSCI SYSTEM_RESET once the console's
-/// transmitter is idle, up to 10 ms; parks the CPU when no conduit is known
-/// or the call returns.
+/// transmitter is idle, up to 10 ms. When no conduit is known the CPU
+/// parks (system_off). A call that returns (SYSTEM_RESET returns only with an error)
+/// prints its status in one line and powers the machine off: a stopped
+/// machine is better than a hung one.
 pub fn system_reset() -> ! {
     crate::console::drain();
+    let mut status = SYSTEM_RESET;
     // SAFETY: SYSTEM_RESET does not return when it succeeds; the SMC calling
     // convention clobbers x0-x17, which clobber_abi("C") covers.
     unsafe {
         match CONDUIT.load(Ordering::Relaxed) {
-            1 => core::arch::asm!("hvc #0", inout("x0") SYSTEM_RESET => _, clobber_abi("C")),
-            2 => core::arch::asm!("smc #0", inout("x0") SYSTEM_RESET => _, clobber_abi("C")),
-            _ => {}
+            1 => core::arch::asm!("hvc #0", inout("x0") status, clobber_abi("C")),
+            2 => core::arch::asm!("smc #0", inout("x0") status, clobber_abi("C")),
+            // No conduit: system_off parks the CPU as well.
+            _ => system_off(),
         }
     }
-    loop {
-        // SAFETY: waiting for an event has no side effects.
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    kprintln!("stafeto: PSCI SYSTEM_RESET returned {}", status as i32);
+    // system_off ends in a loop of wfe when its own call returns.
+    system_off()
 }
 
 /// PSCI CPU_ON: starts the CPU of `mpidr` (the affinity fields) at the

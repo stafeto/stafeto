@@ -59,6 +59,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = sys::handle_duplicate(&init.resource, Rights::DEBUG) {
         rt::console::set(console);
     }
+    // The probes of the kernel's end of the system (xtask init-end).
+    if cfg!(feature = "end-off") {
+        return abi::INIT_END_OFF;
+    }
+    if cfg!(feature = "end-reset") {
+        return abi::INIT_END_RESET;
+    }
     if let Err(e) = table::check(TABLE) {
         println!("init: table refused: {e}");
         return REFUSED;

@@ -1300,6 +1300,70 @@ pub fn expect_init_exit(o: &Outcome, after: &str, code: u64) -> Result<(), Strin
     }
 }
 
+/// The line the kernel prints before it powers the machine off at init's
+/// exit with abi::INIT_END_OFF (spec 7.9).
+pub const SYSTEM_OFF_LINE: &str = "stafeto: system off";
+/// The same before PSCI SYSTEM_RESET, at abi::INIT_END_RESET.
+pub const SYSTEM_RESET_LINE: &str = "stafeto: system reset";
+
+/// A run that ends with init's exit with abi::INIT_END_OFF (spec 7.9): the
+/// output has the line `stafeto: system off` exactly once, no line with
+/// KERNEL PANIC and none of init's exit panic, and the machine powered
+/// itself off in time with status 0.
+pub fn expect_system_off(o: &Outcome) -> Result<(), String> {
+    expect_powered_off(o)?;
+    expect_no_panic(&o.lines)?;
+    let said = o.lines.iter().filter(|l| *l == SYSTEM_OFF_LINE).count();
+    if said != 1 {
+        return Err(format!(
+            "{said} lines {SYSTEM_OFF_LINE:?}, one expected; last lines: {:?}",
+            tail(&o.lines)
+        ));
+    }
+    Ok(())
+}
+
+/// The kernel's first line of a boot.
+pub fn is_banner(line: &str) -> bool {
+    line.starts_with("stafeto ") && line.ends_with(" booting")
+}
+
+/// A run that ends with init's exit with abi::INIT_END_RESET (spec 7.9),
+/// which xtask ended through the monitor after the machine booted again:
+/// a banner, then the line `stafeto: system reset`, then another banner,
+/// and no panic anywhere. The exit status is left to the caller: it is
+/// that of a QEMU xtask told to quit.
+pub fn expect_system_reset(lines: &[String]) -> Result<(), String> {
+    expect_no_panic(lines)?;
+    let Some(reset) = lines.iter().position(|l| l == SYSTEM_RESET_LINE) else {
+        return Err(format!(
+            "no line {SYSTEM_RESET_LINE:?}; last lines: {:?}",
+            tail(lines)
+        ));
+    };
+    if !lines[..reset].iter().any(|l| is_banner(l)) {
+        return Err(format!("no boot banner before {SYSTEM_RESET_LINE:?}"));
+    }
+    if !lines[reset + 1..].iter().any(|l| is_banner(l)) {
+        return Err(format!(
+            "no second boot banner after {SYSTEM_RESET_LINE:?}; last lines: {:?}",
+            tail(lines)
+        ));
+    }
+    Ok(())
+}
+
+/// No line of the run has KERNEL PANIC or init's exit message.
+fn expect_no_panic(lines: &[String]) -> Result<(), String> {
+    match lines
+        .iter()
+        .find(|l| l.contains("KERNEL PANIC") || l.contains("init exited"))
+    {
+        Some(l) => Err(format!("the kernel panicked: {l:?}")),
+        None => Ok(()),
+    }
+}
+
 /// A run of tests in QEMU finished in time with status 0, or xtask
 /// stopped it on a line (run_until), some tests passed, none failed, and
 /// the run said so in its `TESTS DONE` line. A panic powers the machine
@@ -2260,6 +2324,66 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             exit,
             "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/stafeto.elf):",
         ]
+    }
+
+    const BANNER: &str = "stafeto 0.5.0 booting";
+
+    /// Spec 7.9: init's exit with INIT_END_OFF ends the run with its line
+    /// and no panic; a panic, a missing line, a double line, a hang and a
+    /// bad status each fail it.
+    #[test]
+    fn system_off_is_judged_by_its_line() {
+        let good = finished(&[BANNER, SYSTEM_OFF_LINE]);
+        assert_eq!(expect_system_off(&good), Ok(()));
+        assert!(expect_system_off(&finished(&[BANNER])).is_err());
+        assert!(expect_system_off(&finished(&[SYSTEM_OFF_LINE, SYSTEM_OFF_LINE])).is_err());
+        assert!(expect_system_off(&finished(&[SYSTEM_OFF_LINE, "", "KERNEL PANIC: x"])).is_err());
+        let exited = finished(&[SYSTEM_OFF_LINE, "init exited with code 0"]);
+        assert!(expect_system_off(&exited).is_err());
+        let failing = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..good.clone()
+        };
+        assert!(expect_system_off(&failing).is_err());
+        let hung = Outcome {
+            status: None,
+            timed_out: true,
+            ..good
+        };
+        assert!(expect_system_off(&hung).is_err());
+    }
+
+    /// Spec 7.9: a reset shows the line between two banners.
+    #[test]
+    fn system_reset_is_judged_by_its_line_and_the_next_boot() {
+        let l = |v: &[&str]| lines(v);
+        assert_eq!(
+            expect_system_reset(&l(&[BANNER, SYSTEM_RESET_LINE, BANNER])),
+            Ok(())
+        );
+        assert_eq!(
+            expect_system_reset(&l(&[
+                BANNER,
+                "x",
+                SYSTEM_RESET_LINE,
+                "y",
+                BANNER,
+                SYSTEM_RESET_LINE
+            ])),
+            Ok(())
+        );
+        // No second boot: the machine hung or powered off.
+        assert!(expect_system_reset(&l(&[BANNER, SYSTEM_RESET_LINE])).is_err());
+        // The off line is another end.
+        assert!(expect_system_reset(&l(&[BANNER, SYSTEM_OFF_LINE, BANNER])).is_err());
+        // A banner only after the line, none before it.
+        assert!(expect_system_reset(&l(&[SYSTEM_RESET_LINE, BANNER])).is_err());
+        assert!(
+            expect_system_reset(&l(&[BANNER, SYSTEM_RESET_LINE, BANNER, "KERNEL PANIC: x"]))
+                .is_err()
+        );
+        assert!(is_banner(BANNER));
+        assert!(!is_banner("init: stafeto booting soon"));
     }
 
     /// A report of one passed test, then `after`.

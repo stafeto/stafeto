@@ -1064,7 +1064,7 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
 /// other exit panics with the line «init exited with code N», which
 /// xtask takes as the end of a run of the test init; a fault or a kill
 /// panics with its report. In test builds the running test judges init's
-/// end instead, and the tests go on (testpoint::init_ended).
+/// end, and the tests go on (testpoint::init_ended).
 fn init_ended(state: ProcessState) -> ! {
     crate::testpoint::init_ended();
     match kcore::process::init_end(state) {

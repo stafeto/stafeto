@@ -67,7 +67,9 @@
    takes the console back, shows the unshown records of its log, prints one
    line, `stafeto: system off` or `stafeto: system reset`, and calls PSCI
    `SYSTEM_OFF` or `SYSTEM_RESET`. No `KERNEL PANIC` line and no backtrace
-   come with it. Every other exit code, a fault and a kill of `init` end in
+   come with it. QEMU is not run with `-no-reboot`, so on `INIT_END_RESET` it
+   reboots the guest: a second `stafeto <version> booting` follows the
+   line. Every other exit code, a fault and a kill of `init` end in
    the panics above, as before.
 
    An SError or FIQ taken at EL0 stops the machine. The report starts with

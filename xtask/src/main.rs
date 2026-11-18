@@ -1238,6 +1238,10 @@ const CEILING_PROGRAMS: [ImageProgram; 2] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ceiling"]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
+/// The images of the probes of init's end (spec 7.9): init exits at once
+/// with abi::INIT_END_OFF or abi::INIT_END_RESET.
+const END_OFF_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-off"])];
+const END_RESET_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &["end-reset"])];
 /// The profiles the programs of those boot images build with (spec 5.4,
 /// 15.2): the image that ships with `--release`, the test images with
 /// `checked`, the strict build of rt.
@@ -10509,6 +10513,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             svc_tests(&qemu::VIRT_V3).map(drop)
         }),
         job("bad tables", bad_tables_are_refused),
+        job("init end off", init_end_off),
+        job("init end reset", init_end_reset),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
         }),
@@ -11828,6 +11834,8 @@ fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
         ("boot-svc.img", &SVC_PROGRAMS[..], TEST_PROFILE),
         ("boot-cycle.img", &CYCLE_PROGRAMS[..], TEST_PROFILE),
         ("boot-ceiling.img", &CEILING_PROGRAMS[..], TEST_PROFILE),
+        ("boot-end-off.img", &END_OFF_PROGRAMS[..], TEST_PROFILE),
+        ("boot-end-reset.img", &END_RESET_PROGRAMS[..], TEST_PROFILE),
     ] {
         build_boot_image(name, programs, profile)?;
         for (_, package, _, _) in programs {
@@ -13319,6 +13327,51 @@ fn bad_tables_are_refused() -> Result<(), String> {
         qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
     }
     println!("bad tables refused: {} images", REFUSED.len());
+    Ok(())
+}
+
+/// Spec 7.9: init's exit with abi::INIT_END_OFF powers the machine off
+/// with one line and no panic, and QEMU exits with status 0 in time.
+fn init_end_off() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-end-off.img", &END_OFF_PROGRAMS, TEST_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &kernel.elf)?;
+    qemu::expect_system_off(&o)?;
+    println!("init end off: one line, no panic, powered off");
+    Ok(())
+}
+
+/// Spec 7.9: init's exit with abi::INIT_END_RESET resets the machine with
+/// one line and no panic. QEMU is not run with `-no-reboot`, so it boots
+/// again: the probe waits for the line and the second banner, then quits
+/// QEMU through the monitor.
+fn init_end_reset() -> Result<(), String> {
+    const WITHIN: Duration = Duration::from_secs(60);
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-end-reset.img", &END_RESET_PROGRAMS, TEST_PROFILE)?;
+    let scratch = gpu_probe::Scratch::new()?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().display()
+    ));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let driven = (|| {
+        let mut monitor = monitor::Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+        run.expect_line("the reset line", |l| l == qemu::SYSTEM_RESET_LINE, WITHIN)?;
+        run.expect_line("the second banner", qemu::is_banner, WITHIN)?;
+        // QEMU ends with the command: the monitor's answer may never come.
+        let _ = monitor.command("quit", Duration::from_secs(5));
+        Ok::<(), String>(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    let verdict = qemu::expect_system_reset(&outcome.lines);
+    driven.and(verdict)?;
+    println!("init end reset: one line, no panic, a second boot");
     Ok(())
 }
 
@@ -16237,6 +16290,8 @@ mod entropy_in_images_tests {
             ("main::SVC_PROGRAMS", &SVC_PROGRAMS),
             ("main::CYCLE_PROGRAMS", &CYCLE_PROGRAMS),
             ("main::CEILING_PROGRAMS", &CEILING_PROGRAMS),
+            ("main::END_OFF_PROGRAMS", &END_OFF_PROGRAMS),
+            ("main::END_RESET_PROGRAMS", &END_RESET_PROGRAMS),
             ("main::SOCK_PROGRAMS", &SOCK_PROGRAMS),
             ("main::SOCK_PROGRAMS_STEPS", &SOCK_PROGRAMS_STEPS),
             ("main::IPC_PROGRAMS", &IPC_PROGRAMS),
