@@ -552,4 +552,18 @@ mod tests {
                 .contains("Commit")
         );
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let lost = crate::step_line::tabled(&rows(None, None));
+        assert!(lost.iter().all(|l| l.starts_with("service table:")));
+        let (comp, driver) = steps_verdict(&lost).unwrap();
+        assert_eq!(
+            (comp.len(), driver.len()),
+            (COMP_KINDS.len(), DRIVER_KINDS.len())
+        );
+        let over =
+            crate::step_line::tabled(&rows(Some((COMP_TAG, 20, gpu_probe::STEP_MAX + 1)), None));
+        assert!(steps_verdict(&over).is_err());
+    }
 }
