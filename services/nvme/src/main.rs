@@ -480,7 +480,10 @@ fn main(_: u64) -> u64 {
         errors: ERRORS_SHOWN,
     };
     #[cfg(feature = "steps")]
-    rt::service::report_steps(15);
+    {
+        rt::service::report_steps(15);
+        rt::service::table_steps();
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
