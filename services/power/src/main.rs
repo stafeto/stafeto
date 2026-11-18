@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The service of the power button: it maps the page of the PL061 GPIO block (window `regs`),
-//! sets pin 3 to the rising edge, enables that pin's interrupt alone and waits for the binding
+//! makes pin 3 an input that detects the rising edge, enables that pin's interrupt alone (GPIOIE is written whole) and waits for the binding
 //! `irq`. On the interrupt it clears the edge (GPIOIC), prints `power: button` and asks init to
 //! stop the system with SHUTDOWN, kind off, once. The guest cannot tell a request to reboot from
 //! a request to stop, so the answer to the button is always the power-off (`power` of
@@ -14,8 +14,8 @@
 
 use abi::{Access, Source};
 use power::{
-    Config, GPIOIBE, GPIOIC, GPIOIE, GPIOIEV, GPIOIS, GPIOMIS, MASK, PAGE, edge_masked, enabled,
-    pressed,
+    CLEAR_ALL, Config, ENABLE, GPIODIR, GPIOIBE, GPIOIC, GPIOIE, GPIOIEV, GPIOIS, GPIOMIS, MASK,
+    PAGE, input, pressed, rising_edge,
 };
 use proto_init::{Method, SHUTDOWN_OFF, ServiceArgs, ShutdownAsk};
 use proto_wire::{Header, Reader, Status, Writer};
@@ -44,21 +44,37 @@ fn reg_write(offset: usize, value: u32) {
     unsafe { mmio::write32(REGS_AT + offset, value) }
 }
 
-/// The pin to the rising edge with its interrupt masked, an edge that came before cleared, then
-/// the interrupt enabled: the other pins of the block keep what they have.
-fn set_up() {
-    let c = edge_masked(Config {
+/// The registers GPIODIR, GPIOIS, GPIOIEV and GPIOIE as the firmware left them.
+struct Found {
+    dir: u32,
+    is: u32,
+    iev: u32,
+    ie: u32,
+}
+
+/// The block's interrupts masked, the button's pin an input that detects the rising edge, every
+/// pending edge cleared, then the interrupt of the button's pin enabled alone: nothing else the
+/// firmware left in GPIOIE stays enabled. The other pins keep their direction and detection.
+fn set_up() -> Found {
+    let found = Found {
+        dir: reg_read(GPIODIR),
         is: reg_read(GPIOIS),
-        ibe: reg_read(GPIOIBE),
         iev: reg_read(GPIOIEV),
         ie: reg_read(GPIOIE),
+    };
+    reg_write(GPIOIE, 0);
+    reg_write(GPIODIR, input(found.dir));
+    let c = rising_edge(Config {
+        is: found.is,
+        ibe: reg_read(GPIOIBE),
+        iev: found.iev,
     });
-    reg_write(GPIOIE, c.ie);
     reg_write(GPIOIS, c.is);
     reg_write(GPIOIBE, c.ibe);
     reg_write(GPIOIEV, c.iev);
-    reg_write(GPIOIC, MASK);
-    reg_write(GPIOIE, enabled(reg_read(GPIOIE)));
+    reg_write(GPIOIC, CLEAR_ALL);
+    reg_write(GPIOIE, ENABLE);
+    found
 }
 
 fn main(_: u64) -> u64 {
@@ -91,10 +107,17 @@ fn main(_: u64) -> u64 {
     {
         return NOT_MAPPED;
     }
-    set_up();
+    let found = set_up();
     // The line opens once the pin is set up.
     let _ = sys::irq_ack(&irq);
-    rt::println!("power: watching pin {} of the GPIO block", power::PIN);
+    rt::println!(
+        "power: watching pin {} of the GPIO block (found dir {:#x} is {:#x} iev {:#x} ie {:#x})",
+        power::PIN,
+        found.dir,
+        found.is,
+        found.iev,
+        found.ie
+    );
     let mut button = Button {
         parent: &s.parent,
         irq,

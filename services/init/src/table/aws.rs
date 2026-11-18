@@ -410,7 +410,13 @@ pub const DATADISK: Record = Record {
 /// The GPIO block of a t4g.small, `GPO0` in its DSDT (`ARMH0061`, a PL061): its page and its
 /// interrupt, level-triggered, GSIV 39 (INTID 39, SPI 7). `_AEI` gives pin 3 the power button
 /// (`_E03`) as a rising-edge GpioInt. QEMU `virt` has the block at the same place on the same
-/// line (`fixtures/graviton-t4g/DSDT.aml`, bytes 3870 to 4060).
+/// line (`fixtures/graviton-t4g/DSDT.aml`, bytes 3870 to 4060). QEMU `virt` has the block there
+/// only when no firmware with ACPI is loaded (with edk2 and ACPI the machine has the GED device
+/// and nothing at this address, so a register read ends in an external abort): `QEMU_TABLE`,
+/// which also boots under edk2, leaves `power` out, and the record is in this table and in the
+/// table of the probe of the button (direct boot) alone. Init cannot see the DSDT where it
+/// resolves places, and the walk of the PCI functions that leaves `datadisk` out has no
+/// counterpart for a device that is not on a bus.
 pub const GPIO_BASE: u64 = 0x0903_0000;
 pub const GPIO_LINE: u32 = 39;
 /// GPIOIE of the PL061: the interrupt mask the stop clears, so that no pin of the block raises
@@ -418,7 +424,8 @@ pub const GPIO_LINE: u32 = 39;
 const GPIO_IE: u64 = 0x410;
 
 /// The service of the power button (services/power): the window over the GPIO page and the
-/// binding of its line. It is the one record init answers SHUTDOWN for (`POWER_SERVICE`), so
+/// binding of its line. A press before the service has set the pin up is lost (on EC2 a stop
+/// request that came during the boot ends in EC2's forced stop). It is the one record init answers SHUTDOWN for (`POWER_SERVICE`), so
 /// it is a native service that connects to nothing. A stop of its instance masks the block's
 /// interrupts.
 pub const POWER: Record = Record {
@@ -503,7 +510,6 @@ pub const QEMU_TABLE: &[Record] = &[
     super::pkg::NVME_QEMU_DATA,
     super::pkg::DATAFS,
     super::pkg::DATAKEY,
-    POWER,
 ];
 
 /// The pages of RAM of a t4g.small: 2 GiB.
@@ -632,7 +638,11 @@ mod tests {
         let e03 = find(b"_E03", aei);
         assert!(dsdt[e03..e03 + 16].windows(4).any(|w| w == b"PWRB"));
         // The record has that window and that line, level, as a native service.
-        for table in [TABLE, QEMU_TABLE] {
+        // Only the table of EC2 has it: QEMU_TABLE boots under edk2 with ACPI too, where the
+        // address holds no PL061.
+        assert!(QEMU_TABLE.iter().all(|r| r.name != "power"));
+        {
+            let table = TABLE;
             let record = table.iter().find(|r| r.name == "power").unwrap();
             assert_eq!(record.windows.len(), 1);
             assert_eq!(
@@ -664,11 +674,12 @@ mod tests {
         );
     }
 
-    /// The tables with `power` pass the check of the name (`check_power`), and the stop goes
+    /// The table with `power` passes the check of the name (`check_power`), and the stop goes
     /// in waves with `power` in the first and the console's driver last.
     #[test]
-    fn power_stops_first_and_the_console_last_on_both_tables() {
-        for table in [TABLE, QEMU_TABLE] {
+    fn power_stops_in_the_first_wave_and_the_console_last() {
+        {
+            let table = TABLE;
             assert!(crate::table::check(table).is_ok());
             let alive = (1u32 << table.len()) - 1;
             let first = crate::shutdown::wave(table, alive);
@@ -892,8 +903,7 @@ mod tests {
                 "pkgd",
                 "datadisk",
                 "datafs",
-                "datakey",
-                "power"
+                "datakey"
             ]
         );
         let of =

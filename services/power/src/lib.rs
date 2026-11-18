@@ -26,6 +26,8 @@ pub const PIN: u32 = 3;
 /// The bit of the pin in every pin register.
 pub const MASK: u32 = 1 << PIN;
 
+/// GPIODIR: 1 makes the pin an output, 0 an input.
+pub const GPIODIR: usize = 0x400;
 /// GPIOIS: 0 detects an edge, 1 a level.
 pub const GPIOIS: usize = 0x404;
 /// GPIOIBE: 1 detects both edges (overrides GPIOIEV).
@@ -39,35 +41,35 @@ pub const GPIOMIS: usize = 0x418;
 /// GPIOIC: a write of 1 clears the edge interrupt of the pin.
 pub const GPIOIC: usize = 0x41C;
 
-/// The configuration registers of the block that the service writes.
+/// The detection registers of the block that the service writes for its pin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub is: u32,
     pub ibe: u32,
     pub iev: u32,
-    pub ie: u32,
 }
 
-/// The registers with the button's pin set to the rising edge and masked: IS and IBE clear,
-/// IEV set, IE clear. The other pins keep their bits, so the service leaves them alone.
-pub const fn edge_masked(c: Config) -> Config {
+/// The registers with the button's pin set to the rising edge: IS and IBE clear, IEV set. The
+/// other pins keep their bits.
+pub const fn rising_edge(c: Config) -> Config {
     Config {
         is: c.is & !MASK,
         ibe: c.ibe & !MASK,
         iev: c.iev | MASK,
-        ie: c.ie & !MASK,
     }
 }
 
-/// `ie` with the button's pin enabled and no other pin changed.
-pub const fn enabled(ie: u32) -> u32 {
-    ie | MASK
+/// GPIODIR with the button's pin an input; the other pins keep their direction.
+pub const fn input(dir: u32) -> u32 {
+    dir & !MASK
 }
 
-/// `ie` with the button's pin disabled and no other pin changed.
-pub const fn disabled(ie: u32) -> u32 {
-    ie & !MASK
-}
+/// What the set-up writes to GPIOIE: the button's pin alone, whatever bits the firmware left
+/// (a pin of the block with its interrupt enabled and an edge latched would hold the level line
+/// high with no one to clear it).
+pub const ENABLE: u32 = MASK;
+/// What the set-up writes to GPIOIC before it enables the pin: every pending edge of the block.
+pub const CLEAR_ALL: u32 = 0xFF;
 
 /// Whether the masked status GPIOMIS shows the button.
 pub const fn pressed(mis: u32) -> bool {
@@ -83,7 +85,9 @@ mod tests {
     /// of the enabled pins.
     #[derive(Default)]
     struct Pl061 {
+        dir: u32,
         config: Config,
+        ie: u32,
         ris: u32,
         level: u32,
     }
@@ -92,10 +96,11 @@ mod tests {
         fn write(&mut self, offset: usize, value: u32) {
             let value = value & 0xFF;
             match offset {
+                GPIODIR => self.dir = value,
                 GPIOIS => self.config.is = value,
                 GPIOIBE => self.config.ibe = value,
                 GPIOIEV => self.config.iev = value,
-                GPIOIE => self.config.ie = value,
+                GPIOIE => self.ie = value,
                 GPIOIC => self.ris &= !value,
                 other => panic!("the service writes {other:#x}"),
             }
@@ -103,11 +108,12 @@ mod tests {
 
         fn read(&self, offset: usize) -> u32 {
             match offset {
+                GPIODIR => self.dir,
                 GPIOIS => self.config.is,
                 GPIOIBE => self.config.ibe,
                 GPIOIEV => self.config.iev,
-                GPIOIE => self.config.ie,
-                GPIOMIS => self.ris & self.config.ie,
+                GPIOIE => self.ie,
+                GPIOMIS => self.ris & self.ie,
                 other => panic!("the service reads {other:#x}"),
             }
         }
@@ -134,21 +140,20 @@ mod tests {
         }
     }
 
-    /// The setup the service writes, in its order.
+    /// The set-up the service writes, in its order.
     fn setup(device: &mut Pl061) {
-        let c = edge_masked(Config {
+        device.write(GPIOIE, 0);
+        device.write(GPIODIR, input(device.read(GPIODIR)));
+        let c = rising_edge(Config {
             is: device.read(GPIOIS),
             ibe: device.read(GPIOIBE),
             iev: device.read(GPIOIEV),
-            ie: device.read(GPIOIE),
         });
-        device.write(GPIOIE, c.ie);
         device.write(GPIOIS, c.is);
         device.write(GPIOIBE, c.ibe);
         device.write(GPIOIEV, c.iev);
-        device.write(GPIOIC, MASK);
-        let ie = device.read(GPIOIE);
-        device.write(GPIOIE, enabled(ie));
+        device.write(GPIOIC, CLEAR_ALL);
+        device.write(GPIOIE, ENABLE);
     }
 
     #[test]
@@ -156,50 +161,41 @@ mod tests {
         assert_eq!(PIN, 3);
         assert_eq!(MASK, 0x08);
         assert_eq!(LINE, 32 + 7);
+        assert_eq!(ENABLE, 0x08);
     }
 
     #[test]
     fn the_offsets_are_those_of_the_pl061() {
-        assert_eq!(
-            [GPIOIS, GPIOIBE, GPIOIEV, GPIOIE, GPIOMIS, GPIOIC],
-            [0x404, 0x408, 0x40C, 0x410, 0x418, 0x41C]
-        );
-        for offset in [GPIOIS, GPIOIBE, GPIOIEV, GPIOIE, GPIOMIS, GPIOIC] {
+        let all = [GPIODIR, GPIOIS, GPIOIBE, GPIOIEV, GPIOIE, GPIOMIS, GPIOIC];
+        assert_eq!(all, [0x400, 0x404, 0x408, 0x40C, 0x410, 0x418, 0x41C]);
+        for offset in all {
             assert!(offset % 4 == 0 && offset + 4 <= PAGE);
         }
     }
 
     #[test]
-    fn the_edge_setup_changes_the_buttons_pin_only() {
+    fn the_set_up_changes_the_buttons_pin_only_in_the_detection_registers() {
         let before = Config {
             is: 0xF7,
             ibe: 0xFF,
             iev: 0x00,
-            ie: 0xA8,
         };
-        let after = edge_masked(before);
+        let after = rising_edge(before);
         assert_eq!(after.is, 0xF7 & !MASK);
         assert_eq!(after.ibe, 0xFF & !MASK);
         assert_eq!(after.iev, MASK);
-        assert_eq!(after.ie, 0xA0);
-        // Pin 4 (the sleep button of the DSDT) keeps whatever it had.
         let other = Config {
             is: 0x10,
             ibe: 0x10,
             iev: 0x10,
-            ie: 0x10,
         };
-        let changed = edge_masked(other);
-        for (a, b) in [
-            (changed.is, other.is),
-            (changed.ibe, other.ibe),
-            (changed.iev, other.iev),
-            (changed.ie, other.ie),
-        ] {
-            assert_eq!(a & 0x10, b & 0x10);
-        }
-        assert_eq!(enabled(0x10), 0x18);
-        assert_eq!(disabled(0x18), 0x10);
+        let changed = rising_edge(other);
+        assert_eq!(
+            (changed.is & 0x10, changed.ibe & 0x10, changed.iev & 0x10),
+            (0x10, 0x10, 0x10)
+        );
+        assert_eq!(input(0xFF), 0xF7);
+        assert_eq!(input(0x10), 0x10);
         assert!(pressed(0x08) && pressed(0xFF) && !pressed(0xF7) && !pressed(0));
     }
 
@@ -220,24 +216,36 @@ mod tests {
     }
 
     #[test]
-    fn pin_4_is_not_enabled_and_does_not_show() {
+    fn what_the_firmware_left_in_the_block_does_not_survive_the_set_up() {
+        let mut device = Pl061 {
+            dir: 0xFF,
+            ie: 0x10,
+            ris: 0x10,
+            ..Pl061::default()
+        };
+        device.config.is = 0xFF;
+        device.config.ibe = 0xFF;
+        setup(&mut device);
+        // Only the button's pin is enabled: the latched pin 4 raises no line.
+        assert_eq!(device.read(GPIOIE), MASK);
+        assert_eq!(device.read(GPIOMIS), 0);
+        assert_eq!(device.ris, 0, "every pending edge is cleared");
+        // The pin is an input detecting the rising edge only.
+        assert_eq!(device.dir & MASK, 0);
+        assert_eq!(device.config.is & MASK, 0);
+        assert_eq!(device.config.ibe & MASK, 0);
+        assert_eq!(device.config.iev & MASK, MASK);
+        device.drive(PIN, true);
+        assert!(pressed(device.read(GPIOMIS)));
+    }
+
+    #[test]
+    fn pin_4_does_not_show() {
         let mut device = Pl061::default();
         setup(&mut device);
         device.config.iev |= 1 << 4;
         device.drive(4, true);
-        assert!(!pressed(device.read(GPIOMIS)));
         assert_eq!(device.read(GPIOMIS), 0);
         assert_eq!(device.read(GPIOIE), MASK);
-    }
-
-    #[test]
-    fn an_edge_that_came_before_the_enable_is_cleared_by_the_setup() {
-        let mut device = Pl061::default();
-        device.config.iev = MASK;
-        device.drive(PIN, true);
-        device.drive(PIN, false);
-        assert_eq!(device.ris & MASK, MASK);
-        setup(&mut device);
-        assert_eq!(device.ris & MASK, 0);
     }
 }

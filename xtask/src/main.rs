@@ -10526,7 +10526,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("bad tables", bad_tables_are_refused),
         job("init end off", init_end_off),
         job("init end reset", init_end_reset),
-        job("power button", power_button),
+        job("power button", || power_button(&qemu::VIRT)),
+        job("power button GICv3", || power_button(&qemu::VIRT_V3)),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
         }),
@@ -13397,10 +13398,12 @@ fn init_end_reset() -> Result<(), String> {
 
 /// The power button (the decision of #435, step D): the kernel is booted with no firmware, so
 /// QEMU `virt` routes the monitor's `system_powerdown` to pin 3 of its PL061 (with edk2 and ACPI
-/// the machine has a GED device for it instead). The service `power` takes the interrupt and asks
-/// init to stop the system: its line, init's lines of the stop, `stafeto: system off`, no panic,
-/// and QEMU's status 0.
-fn power_button() -> Result<(), String> {
+/// the machine has a GED device for the button and no PL061 at that address). The service
+/// `power` takes the interrupt and asks init to stop the system: its line, init's lines of the
+/// stop, `stafeto: system off`, no panic, and QEMU's status 0. It runs on the GICv2 machine and
+/// on the GICv3 one; EC2 has a GICv3, but its line (39, level, a Graviton GIC) is covered only
+/// by the run on EC2.
+fn power_button(m: &qemu::Machine) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(60);
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
@@ -13409,7 +13412,7 @@ fn power_button() -> Result<(), String> {
         TEST_PROFILE,
     )?;
     let scratch = gpu_probe::Scratch::new()?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let mut cmd = qemu::command(m, &kernel.image, Some(&image));
     cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
     cmd.arg(format!(
         "unix:{},server=on,wait=off",
@@ -13444,7 +13447,7 @@ fn power_button() -> Result<(), String> {
             qemu::SYSTEM_OFF_LINE,
         ],
     )
-    .map_err(|e| format!("power button: {e}"))?;
+    .map_err(|e| format!("power button on {}: {e}", m.name))?;
     let buttons = outcome
         .lines
         .iter()
@@ -13452,10 +13455,14 @@ fn power_button() -> Result<(), String> {
         .count();
     if buttons != 1 {
         return Err(format!(
-            "power button: {buttons} lines `power: button`, one expected"
+            "power button on {}: {buttons} lines `power: button`, one expected",
+            m.name
         ));
     }
-    println!("power button: one press, the stop in order, one line off, no panic, powered off");
+    println!(
+        "power button on {}: one press, the stop in order, one line off, no panic, powered off",
+        m.name
+    );
     Ok(())
 }
 
