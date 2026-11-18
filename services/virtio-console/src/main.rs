@@ -67,6 +67,10 @@ const ECAM_AT: usize = 0x10_1000_0000;
 const BAR_AT: usize = 0x10_2000_0000;
 /// The period of the reads of the kernel log.
 const LOG_PERIOD_NS: u64 = 50_000_000;
+/// The time the driver gives the kernel log and its own output to reach the
+/// port once init asked it to stop (`Driver::stop`), less than the 500 ms
+/// init gives a record to end.
+const STOP_DRAIN_NS: u64 = 300_000_000;
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// The priority of the slot of label 0 of the driver's channel.
@@ -442,6 +446,7 @@ fn main(_: u64) -> u64 {
         t0: time::ticks_to_ns(time::now()),
         deadline: 0,
         left: 0,
+        stop_by: None,
         state,
     };
     driver.take_log();
@@ -484,6 +489,9 @@ struct Driver {
     deadline: u64,
     /// The records of the kernel log left after the last batch.
     left: u64,
+    /// Init asked the driver to stop: the time by which it exits whether
+    /// or not the log reached the port (`stop`).
+    stop_by: Option<u64>,
     state: &'static mut State,
 }
 
@@ -1006,8 +1014,36 @@ impl Service<HELD> for Driver {
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
                 self.take_log();
                 self.arm();
+                self.exit_if_drained();
             }
             _ => {}
+        }
+    }
+
+    /// Init's stop notice: the driver is the last of the system to stop, so
+    /// the log holds the last lines of the others. It goes on taking the
+    /// log on its tick and exits once the kernel has nothing more for it and
+    /// the device took all it was given, or at STOP_DRAIN_NS.
+    fn stop(&mut self) {
+        let by = time::ticks_to_ns(time::now()).saturating_add(STOP_DRAIN_NS);
+        self.stop_by = Some(by);
+        self.take_log();
+        self.arm();
+        self.exit_if_drained();
+    }
+}
+
+impl Driver {
+    /// After a tick, once init asked for the stop: the process ends when
+    /// the last take of the log found nothing and every byte went out, or
+    /// when the time is up.
+    fn exit_if_drained(&mut self) {
+        let Some(by) = self.stop_by else { return };
+        let out = &self.state.output;
+        let drained =
+            self.left == 0 && out.log_done() && out.clients_empty() && !self.port.sending();
+        if drained || time::ticks_to_ns(time::now()) >= by {
+            sys::process_exit(0)
         }
     }
 }

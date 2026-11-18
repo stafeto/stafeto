@@ -8,7 +8,8 @@
 //! console's port (console::is_kernels) a record goes to the port at once
 //! and is marked shown; otherwise it waits for the port's driver, which
 //! takes records with object_info LOG (`take`). The panic shows what
-//! nobody showed or took (`show_unshown`). What the kernel said before
+//! nobody showed, took or was given by a reader on another CPU
+//! (`show_unshown`). What the kernel said before
 //! it knew its port goes there once it does (`show_early`). On the port
 //! the kernel writes a piece of a line longer than a record without its
 //! header (console_line::strip): no driver is there to assemble the pieces.
@@ -16,6 +17,7 @@
 //! probe images, whose runner assembles the lines (xtask::untag).
 //! The ring keeps the record as it came.
 
+use crate::arch::cpu::MAX_CPUS;
 use crate::arch::timer;
 use crate::console;
 use crate::local::local;
@@ -24,8 +26,8 @@ use abi::{LOG_KERNEL_KIND, LOG_RECORD, LOG_TEXT_KIND, LogBatch};
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use kcore::log::Chunks;
 pub use kcore::log::Ring;
+use kcore::log::{Chunks, Source, merge_unseen};
 
 /// The records of the ring: 64 of 80 bytes, 5 120 bytes of .bss.
 #[cfg(not(feature = "trace"))]
@@ -100,8 +102,8 @@ pub fn peek(t: NonNull<Thread>, first: u64) -> (LogBatch, u64) {
 
 /// Non-destructive read of the ring of another CPU, the `k`th other than
 /// this one in the order of their numbers (1 for the first), from `first`;
-/// the owner's cursor stays, and nothing in the ring changes
-/// (`Ring::peek_shared`). None for a `k` past the CPUs that are up.
+/// the owner's cursor stays, and the ring's `seen` cursor moves past what
+/// this gave (`Ring::peek_shared`). None for a `k` past the CPUs that are up.
 pub fn peek_other(t: NonNull<Thread>, k: usize, first: u64) -> Option<(LogBatch, u64)> {
     let me = crate::arch::cpu::this().index();
     let cpu = (0..crate::smp::cpus()).filter(|&c| c != me).nth(k - 1)?;
@@ -153,21 +155,42 @@ pub fn show_early() {
     local().ring.lock().show(|r| port(r.text()));
 }
 
-/// The panic shows what nobody showed or took, oldest first, on the port
-/// it took back, once (spec 16.1). It reads the ring without the lock: one
-/// CPU, and a writer it interrupted, which never runs again, leaves at
+/// The panic shows what nobody showed, took or was given by a reader on
+/// another CPU (`Ring::peek_shared` moves the ring's `seen` cursor), oldest
+/// first across the rings of all the CPUs that are up, on the port it took
+/// back, once (spec 16.1). The ring of this CPU it reads without the lock:
+/// one CPU, and a writer it interrupted, which never runs again, leaves at
 /// most one record half written, whose text is at most abi::LOG_TEXT bytes.
+/// The other CPUs are not stopped: their rings are read the way the driver
+/// reads them, between two looks at the owner's seqlock, so a record is
+/// whole or left out, and a CPU stuck in the middle of a write gives
+/// nothing after a bounded wait. A record a driver on another CPU takes
+/// while the panic prints may come out twice. O(CPUs x 64), no bound
+/// needed: the panic path has none.
 pub fn show_unshown() {
     static SHOWN: AtomicBool = AtomicBool::new(false);
     if SHOWN.swap(true, Relaxed) {
         return;
     }
-    // SAFETY: the panic runs alone and never returns to a holder of the
-    // lock; see above.
-    let ring = unsafe { &*local().ring.as_ptr() };
-    for r in ring.unshown() {
-        port(r.text());
-    }
+    let me = crate::arch::cpu::this().index();
+    let cpus = crate::smp::cpus();
+    let sources: [Source<'_, LOG_RECORDS>; MAX_CPUS] = core::array::from_fn(|c| {
+        if c >= cpus {
+            return Source::none();
+        }
+        let ring = crate::arch::cpu::block(c).local.ring.as_ptr();
+        if c == me {
+            // SAFETY: the panic runs alone on this CPU and never returns
+            // to a holder of the lock; see above.
+            Source::own(unsafe { &*ring })
+        } else {
+            // SAFETY: the rings of the CPUs that are up live for good, and
+            // only their owners write them.
+            unsafe { Source::shared(ring) }
+        }
+    });
+    let mut spans = [(0, 0); MAX_CPUS];
+    merge_unseen(&sources, &mut spans, |r| port(r.text()));
 }
 
 /// A line of the kernel into its log, with the arguments of `format_args!`.

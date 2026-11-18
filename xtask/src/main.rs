@@ -13420,6 +13420,9 @@ fn power_button(m: &qemu::Machine) -> Result<(), String> {
     )?;
     let scratch = gpu_probe::Scratch::new()?;
     let mut cmd = qemu::command(m, &kernel.image, Some(&image));
+    // Two CPUs: the driver of the console may run on another CPU than init, and reads its ring
+    // with a peek (the `seen` cursor of the ring).
+    cmd.args(["-smp", "2"]);
     cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
     cmd.arg(format!(
         "unix:{},server=on,wait=off",
@@ -13466,6 +13469,10 @@ fn power_button(m: &qemu::Machine) -> Result<(), String> {
             m.name
         ));
     }
+    // The driver on the second CPU reads the ring of the first with a peek: the end path of the
+    // kernel must not print again what it showed.
+    qemu::expect_no_replay_at_the_end(&outcome.lines, "init: stopped in ")
+        .map_err(|e| format!("power button on {}: {e}", m.name))?;
     println!(
         "power button on {}: one press, the stop in order, one line off, no panic, powered off",
         m.name

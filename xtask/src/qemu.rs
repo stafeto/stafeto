@@ -1353,6 +1353,35 @@ pub fn expect_system_off(o: &Outcome) -> Result<(), String> {
     Ok(())
 }
 
+/// A run that ended with init's exit: no line the console driver showed
+/// before the line with `stopped` comes again between that line and
+/// SYSTEM_OFF_LINE. The kernel's end path prints what the driver did not
+/// take; a record the driver took (`peek_shared` on another CPU) printed
+/// again is the repeat this finds. Empty lines and the kernel's count of
+/// lost records are not compared.
+pub fn expect_no_replay_at_the_end(lines: &[String], stopped: &str) -> Result<(), String> {
+    let Some(at) = lines.iter().position(|l| l.contains(stopped)) else {
+        return Err(format!(
+            "no line with {stopped:?}; last lines: {:?}",
+            tail(lines)
+        ));
+    };
+    let Some(off) = lines[at..].iter().position(|l| l == SYSTEM_OFF_LINE) else {
+        return Err(format!("no line {SYSTEM_OFF_LINE:?} after {stopped:?}"));
+    };
+    for line in &lines[at + 1..at + off] {
+        if line.trim().is_empty() || line.starts_with("[kernel log:") {
+            continue;
+        }
+        if lines[..=at].iter().any(|l| l == line) {
+            return Err(format!(
+                "the line {line:?} shown before {stopped:?} comes again before {SYSTEM_OFF_LINE:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The lines of `marks` come in that order: each mark is found in a line after
 /// the line of the mark before it (a line holds the text of its mark).
 pub fn expect_in_order(lines: &[String], marks: &[&str]) -> Result<(), String> {
@@ -2430,6 +2459,44 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..good
         };
         assert!(expect_system_off(&hung).is_err());
+    }
+
+    #[test]
+    fn a_line_shown_before_the_stop_does_not_come_again_before_system_off() {
+        let l = |v: &[&str]| lines(v);
+        let stopped = "init: stopped in ";
+        let good = l(&[
+            "a",
+            "power: button",
+            "init: stopped in 5 ms",
+            "late",
+            SYSTEM_OFF_LINE,
+        ]);
+        assert!(expect_no_replay_at_the_end(&good, stopped).is_ok());
+        let replay = l(&[
+            "a",
+            "power: button",
+            "init: stopped in 5 ms",
+            "a",
+            SYSTEM_OFF_LINE,
+        ]);
+        assert!(
+            expect_no_replay_at_the_end(&replay, stopped)
+                .unwrap_err()
+                .contains("\"a\"")
+        );
+        let lost = l(&[
+            "a",
+            "init: stopped in 5 ms",
+            "[kernel log: 3 records lost]",
+            "",
+            SYSTEM_OFF_LINE,
+        ]);
+        assert!(expect_no_replay_at_the_end(&lost, stopped).is_ok());
+        assert!(expect_no_replay_at_the_end(&l(&["a", SYSTEM_OFF_LINE]), stopped).is_err());
+        assert!(expect_no_replay_at_the_end(&l(&["init: stopped in 5 ms"]), stopped).is_err());
+        let after = l(&["a", "init: stopped in 5 ms", SYSTEM_OFF_LINE, "a"]);
+        assert!(expect_no_replay_at_the_end(&after, stopped).is_ok());
     }
 
     /// The marks of a stop must come in their order, each after the one before.

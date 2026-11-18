@@ -2107,6 +2107,15 @@ fn nvme_shutdown() -> Result<(), String> {
             return Err(format!("nvme-persist shutdown: no line {wanted:?}"));
         }
     }
+    let buttons = lines.iter().filter(|l| l.contains("power: button")).count();
+    if buttons != 1 {
+        return Err(format!(
+            "nvme-persist shutdown: {buttons} lines `power: button`, one expected"
+        ));
+    }
+    // The machine has two CPUs: what the driver showed before the stop does not come again.
+    qemu::expect_no_replay_at_the_end(lines, "init: stopped in ")
+        .map_err(|e| format!("nvme-persist shutdown: {e}"))?;
     for unwanted in [
         "init: power did not stop",
         "init: echo did not stop",

@@ -7,12 +7,20 @@
 //! record the kernel showed on its console at once is marked shown; the
 //! others wait for a reader, which takes them in batches of up to
 //! LOG_BATCH (`take`): the cursor of what was taken is the ring's, so a
-//! new reader goes on where the last one stopped. A full ring writes over
-//! its oldest record, and counts it lost when nobody showed or took it.
+//! new reader goes on where the last one stopped. A reader on another CPU
+//! reads the ring without moving that cursor (`peek_shared`) and moves the
+//! `seen` cursor: what it was given counts as taken for the panic
+//! (`unshown`, `merge_unseen`) and for the count of lost records. A full ring
+//! writes over its oldest record, and counts it lost when nobody showed,
+//! took or was given it.
 
 use abi::{LOG_BATCH, LOG_KIND_AT, LOG_LEN_AT, LOG_RECORD, LOG_TEXT, LOG_TEXT_AT, LogBatch};
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
+
+/// How many looks at the seqlock `Source::shared` makes at one record of a
+/// ring whose owner may have stopped in the middle of a write.
+const SPINS: u32 = 1 << 20;
 
 /// A record of the ring: LOG_RECORD bytes, as abi::LOG_RECORD lays them
 /// out but for byte 10, which holds `shown` here (spec 16.3).
@@ -79,8 +87,12 @@ pub struct Ring<const N: usize> {
     records: [Record; N],
     /// The number of the next record.
     head: u64,
-    /// The number of the first record no read passed yet.
-    taken: u64,
+    /// The number of the first record no read of the owner passed yet. An
+    /// atomic since the panic of another CPU reads it.
+    taken: AtomicU64,
+    /// The number of the first record the reader on another CPU was not
+    /// given yet (`peek_shared`): it moves forward only.
+    seen: AtomicU64,
     /// Records nobody showed or took that were written over since the
     /// last read.
     lost: u64,
@@ -97,7 +109,8 @@ impl<const N: usize> Ring<N> {
         Ring {
             records: [Record::EMPTY; N],
             head: 0,
-            taken: 0,
+            taken: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
             lost: 0,
             seq: AtomicU64::new(0),
         }
@@ -108,9 +121,18 @@ impl<const N: usize> Ring<N> {
     }
 
     /// The number of the first record a read or the panic looks at: the
-    /// first no read passed, or the oldest left.
+    /// first no read passed and no reader of another CPU was given, or the
+    /// oldest left.
     fn first(&self) -> u64 {
-        self.taken.max(self.head.saturating_sub(N as u64))
+        Self::first_of(
+            self.taken.load(Ordering::Relaxed),
+            self.seen.load(Ordering::Relaxed),
+            self.head,
+        )
+    }
+
+    fn first_of(taken: u64, seen: u64, head: u64) -> u64 {
+        taken.max(seen).max(head.saturating_sub(N as u64))
     }
 
     /// Writes a record of `kind` with `text`, its first LOG_TEXT bytes, at
@@ -125,9 +147,10 @@ impl<const N: usize> Ring<N> {
         let place = (self.head % N as u64) as usize;
         let record = &mut self.records[place];
         if self.head >= N as u64
-            && self.head - N as u64 >= self.taken
             && !record.shown
             && matches!(record.kind, abi::LOG_TEXT_KIND | abi::LOG_KERNEL_KIND)
+            && self.head - N as u64 >= self.taken.load(Ordering::Relaxed)
+            && self.head - N as u64 >= self.seen.load(Ordering::Relaxed)
         {
             self.lost += 1;
         }
@@ -144,7 +167,9 @@ impl<const N: usize> Ring<N> {
     }
 
     /// `peek` for the ring of another CPU, which its owner writes while this
-    /// reads: nothing in the ring changes. Each record is copied between two
+    /// reads: the records and the owner's cursor stay, and the `seen` cursor
+    /// moves to the record after the last one this gave (or lost), never
+    /// back. Each record is copied between two
     /// looks at the seqlock and kept when the owner did not write meanwhile;
     /// one the owner wrote over is counted lost. The reader waits for the
     /// owner's push, a few instructions, which no interrupt cuts.
@@ -159,7 +184,8 @@ impl<const N: usize> Ring<N> {
     ) -> (LogBatch, u64) {
         // SAFETY: the caller's promise; every read is volatile, since the
         // owner may write the place meanwhile.
-        let (_, head) = unsafe { Self::stable(this, |r| core::ptr::read_volatile(&r.head)) };
+        let (_, head) = unsafe { Self::stable(this, None, |r| core::ptr::read_volatile(&r.head)) }
+            .expect("no limit on the looks");
         let oldest = head.saturating_sub(N as u64);
         let mut next = first.max(oldest).min(head);
         let mut lost = oldest.saturating_sub(first);
@@ -167,14 +193,15 @@ impl<const N: usize> Ring<N> {
         while next < head && count < LOG_BATCH {
             // SAFETY: as above.
             let (_, (copy, now)) = unsafe {
-                Self::stable(this, |r| {
+                Self::stable(this, None, |r| {
                     let place = &r.records[(next % N as u64) as usize];
                     (
                         core::ptr::read_volatile(place),
                         core::ptr::read_volatile(&r.head),
                     )
                 })
-            };
+            }
+            .expect("no limit on the looks");
             if now.saturating_sub(N as u64) > next {
                 // Written over meanwhile.
                 lost += 1;
@@ -184,6 +211,8 @@ impl<const N: usize> Ring<N> {
             }
             next += 1;
         }
+        // SAFETY: as above; `seen` is an atomic.
+        unsafe { (*this).seen.fetch_max(next, Ordering::Relaxed) };
         (
             LogBatch {
                 count: count as u64,
@@ -195,12 +224,22 @@ impl<const N: usize> Ring<N> {
     }
 
     /// `read` between two looks at the seqlock, again until the owner was
-    /// not writing.
+    /// not writing: at most `limit` looks when it is given (None when the
+    /// owner wrote all the time), without a limit otherwise.
     ///
     /// # Safety
     /// As for `peek_shared`.
-    unsafe fn stable<T>(this: *const Self, read: impl Fn(&Self) -> T) -> (u64, T) {
+    unsafe fn stable<T>(
+        this: *const Self,
+        limit: Option<u32>,
+        read: impl Fn(&Self) -> T,
+    ) -> Option<(u64, T)> {
+        let mut looks = 0u32;
         loop {
+            if limit.is_some_and(|l| looks >= l) {
+                return None;
+            }
+            looks = looks.saturating_add(1);
             // SAFETY: the caller's promise.
             let before = unsafe { (*this).seq.load(Ordering::Acquire) };
             if before & 1 == 0 {
@@ -209,7 +248,7 @@ impl<const N: usize> Ring<N> {
                 fence(Ordering::Acquire);
                 // SAFETY: as above.
                 if unsafe { (*this).seq.load(Ordering::Relaxed) } == before {
-                    return (before, value);
+                    return Some((before, value));
                 }
             }
             core::hint::spin_loop();
@@ -234,7 +273,7 @@ impl<const N: usize> Ring<N> {
             }
             n += 1;
         }
-        self.taken = n;
+        self.taken.store(n, Ordering::Relaxed);
         let left = (n..self.head).filter(|&m| !self.at(m).shown).count();
         LogBatch {
             count: count as u64,
@@ -280,12 +319,128 @@ impl<const N: usize> Ring<N> {
         }
     }
 
-    /// The records nobody showed or took, oldest first: what the panic
-    /// prints before its report (spec 16.1). O(N).
+    /// The records nobody showed, took or was given through `peek_shared`,
+    /// oldest first: what the panic prints before its report (spec 16.1).
+    /// O(N).
     pub fn unshown(&self) -> impl Iterator<Item = &Record> {
         (self.first()..self.head)
             .map(|n| self.at(n))
             .filter(|r| !r.shown)
+    }
+}
+
+/// A ring the panic reads (`merge_unseen`): its own CPU's, which it reads
+/// as it lies, or another CPU's, which its owner may write meanwhile.
+pub struct Source<'a, const N: usize>(Kind<'a, N>);
+
+enum Kind<'a, const N: usize> {
+    None,
+    Own(&'a Ring<N>),
+    Shared(*const Ring<N>),
+}
+
+impl<'a, const N: usize> Source<'a, N> {
+    /// No ring: gives nothing.
+    pub const fn none() -> Self {
+        Source(Kind::None)
+    }
+
+    /// The ring of the CPU that reads, which nobody writes: the panic runs
+    /// on that CPU, and a writer it interrupted never runs again.
+    pub fn own(ring: &'a Ring<N>) -> Self {
+        Source(Kind::Own(ring))
+    }
+
+    /// The ring of another CPU, read the way `peek_shared` reads it, with
+    /// a limit on the looks, since its owner may stop in the middle of a
+    /// write.
+    ///
+    /// # Safety
+    /// As for `Ring::peek_shared`.
+    pub unsafe fn shared(ring: *const Ring<N>) -> Self {
+        Source(Kind::Shared(ring))
+    }
+
+    /// The number of the first record the panic prints and the number of
+    /// the next one to be written. An empty span for a ring whose owner
+    /// is stuck.
+    fn span(&self) -> (u64, u64) {
+        match self.0 {
+            Kind::None => (0, 0),
+            Kind::Own(r) => (r.first(), r.head),
+            Kind::Shared(r) => {
+                // SAFETY: the caller's promise at `shared`.
+                let read = unsafe {
+                    Ring::stable(r, Some(SPINS), |r| {
+                        (
+                            core::ptr::read_volatile(&r.head),
+                            r.taken.load(Ordering::Relaxed),
+                            r.seen.load(Ordering::Relaxed),
+                        )
+                    })
+                };
+                match read {
+                    Some((_, (head, taken, seen))) => {
+                        (Ring::<N>::first_of(taken, seen, head), head)
+                    }
+                    None => (0, 0),
+                }
+            }
+        }
+    }
+
+    /// Record `n`, None when the owner wrote over it or is stuck writing it.
+    fn read(&self, n: u64) -> Option<Record> {
+        match self.0 {
+            Kind::None => None,
+            Kind::Own(r) => (n >= r.head.saturating_sub(N as u64) && n < r.head).then(|| *r.at(n)),
+            Kind::Shared(r) => {
+                // SAFETY: the caller's promise at `shared`.
+                let (_, (copy, head)) = unsafe {
+                    Ring::stable(r, Some(SPINS), |r| {
+                        (
+                            core::ptr::read_volatile(&r.records[(n % N as u64) as usize]),
+                            core::ptr::read_volatile(&r.head),
+                        )
+                    })
+                }?;
+                (head.saturating_sub(N as u64) <= n).then_some(copy)
+            }
+        }
+    }
+}
+
+/// What the panic prints of several rings (spec 16.1): the records of each
+/// that nobody showed, took or was given, from all of them in the order of
+/// their times, ties to the first ring. `spans` has a place for each
+/// source. The records each ring has when the call starts are the ones it
+/// gives; what its owner writes later stays. O(rings x N) looks at records.
+pub fn merge_unseen<const N: usize>(
+    sources: &[Source<'_, N>],
+    spans: &mut [(u64, u64)],
+    mut put: impl FnMut(&Record),
+) {
+    for (source, span) in sources.iter().zip(spans.iter_mut()) {
+        *span = source.span();
+    }
+    loop {
+        let mut best: Option<(usize, Record)> = None;
+        for (i, (source, span)) in sources.iter().zip(spans.iter_mut()).enumerate() {
+            while span.0 < span.1 {
+                match source.read(span.0) {
+                    Some(r) if !r.shown => {
+                        if best.is_none_or(|(_, b)| r.time < b.time) {
+                            best = Some((i, r));
+                        }
+                        break;
+                    }
+                    _ => span.0 += 1,
+                }
+            }
+        }
+        let Some((i, r)) = best else { return };
+        put(&r);
+        spans[i].0 += 1;
     }
 }
 
@@ -550,9 +705,14 @@ mod tests {
         };
         assert_eq!((own, batch, next), (shared, other, after));
         assert_eq!(
+            ring.taken.load(Ordering::Relaxed),
+            0,
+            "the owner's cursor stayed"
+        );
+        assert_eq!(
             ring.take(|_, _| {}).count,
-            8,
-            "the cursor of the owner stayed"
+            0,
+            "what the reader was given is taken"
         );
         // A cursor past the newest gives nothing and the newest back.
         // SAFETY: as above.
@@ -597,5 +757,238 @@ mod tests {
         let unshown: Vec<u64> = ring.unshown().map(number_of).collect();
         assert_eq!(unshown, [7, 8, 9, 10, 11, 12]);
         assert_eq!(ring.take(|_, _| {}).lost, 1);
+    }
+
+    /// A peek of the whole ring as the driver on another CPU makes it,
+    /// batch after batch: the numbers of the records it was given.
+    fn peek_all<const N: usize>(ring: &Ring<N>, from: &mut u64) -> Vec<u64> {
+        let mut got = Vec::new();
+        loop {
+            // SAFETY: the ring lives here and nothing writes it meanwhile.
+            let (batch, next) = unsafe {
+                Ring::peek_shared(ring as *const Ring<N>, *from, |_, r| got.push(number_of(r)))
+            };
+            *from = next;
+            if batch.count == 0 && batch.left == 0 {
+                return got;
+            }
+        }
+    }
+
+    fn merged<const N: usize>(sources: &[Source<'_, N>]) -> Vec<u64> {
+        let mut spans = vec![(0, 0); sources.len()];
+        let mut got = Vec::new();
+        merge_unseen(sources, &mut spans, |r| got.push(number_of(r)));
+        got
+    }
+
+    #[test]
+    fn a_shared_peek_moves_the_seen_cursor_and_never_back() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=6 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        assert_eq!(ring.seen.load(Ordering::Relaxed), 0);
+        let mut from = 0;
+        assert_eq!(peek_all(&ring, &mut from), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(ring.seen.load(Ordering::Relaxed), 6);
+        // A reader that starts again from 0 does not move it back.
+        let mut again = 0;
+        peek_all(&ring, &mut again);
+        assert_eq!(ring.seen.load(Ordering::Relaxed), 6);
+        // The owner's cursor stayed.
+        assert_eq!(ring.taken.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_unseen_after_a_peek_leave_out_the_peeked() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=5 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let mut from = 0;
+        peek_all(&ring, &mut from);
+        assert_eq!(ring.unshown().count(), 0);
+        for n in 6..=7 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let unshown: Vec<u64> = ring.unshown().map(number_of).collect();
+        assert_eq!(unshown, [6, 7]);
+        assert_eq!(merged(&[Source::own(&ring)]), [6, 7]);
+        // SAFETY: the ring lives here and nothing writes it meanwhile.
+        let shared = unsafe { Source::shared(&ring as *const Ring<8>) };
+        assert_eq!(merged(&[shared]), [6, 7]);
+    }
+
+    #[test]
+    fn the_lost_count_leaves_out_what_a_peek_gave() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=8 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let mut from = 0;
+        assert_eq!(peek_all(&ring, &mut from).len(), 8);
+        // Four seen records go: none counts as lost.
+        for n in 9..=12 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let batch = ring.take(|_, _| {});
+        assert_eq!((batch.count, batch.lost), (4, 0));
+        // Without a peek the same overwrites count.
+        let mut plain = Ring::<8>::new();
+        for n in 1..=12 {
+            plain.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        assert_eq!(plain.take(|_, _| {}).lost, 4);
+        // A reader that passed the first three only: the rest counts.
+        let mut quarter = Ring::<8>::new();
+        for n in 1..=8 {
+            quarter.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        quarter.seen.store(3, Ordering::Relaxed);
+        for n in 9..=12 {
+            quarter.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        assert_eq!(quarter.take(|_, _| {}).lost, 1, "record 4 was not seen");
+    }
+
+    #[test]
+    fn the_seen_cursor_survives_a_wrap_around() {
+        let mut ring = Ring::<8>::new();
+        let mut from = 0;
+        let mut seen = Vec::new();
+        for n in 1..=100u64 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+            if n % 5 == 0 {
+                seen.extend(peek_all(&ring, &mut from));
+            }
+        }
+        assert_eq!(seen, (1..=100).collect::<Vec<_>>());
+        assert_eq!(ring.seen.load(Ordering::Relaxed), 100);
+        assert_eq!(ring.unshown().count(), 0);
+        for n in 101..=103 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        assert_eq!(
+            ring.unshown().map(number_of).collect::<Vec<_>>(),
+            [101, 102, 103]
+        );
+        // A reader far behind loses the overwritten and moves seen to the end.
+        let mut ring = Ring::<8>::new();
+        for n in 1..=30 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let mut late = 0;
+        assert_eq!(peek_all(&ring, &mut late), (23..=30).collect::<Vec<_>>());
+        assert_eq!(ring.seen.load(Ordering::Relaxed), 30);
+    }
+
+    /// Two writers on one ring and one on another, a peeker that takes
+    /// the first ring now and then, in a fixed order of steps that a
+    /// generator picks: what the peeker was given and what the end path
+    /// prints are disjoint, and together they are what the rings still
+    /// hold and the peeker did not pass.
+    #[test]
+    fn two_writers_and_a_peeker_in_a_deterministic_model() {
+        let (mut a, b) = (Ring::<8>::new(), Ring::<8>::new());
+        let (mut from_a, mut from_b) = (0, 0);
+        let (mut seen_a, mut seen_b) = (Vec::new(), Vec::new());
+        let (mut count_a, mut count_b) = (0u64, 0u64);
+        let mut b = b;
+        let mut x = 12345u64;
+        for step in 0..600u64 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            match (x >> 33) % 6 {
+                // Two writers on the ring of the CPU of A: numbers from 1000 up.
+                0 | 1 => {
+                    count_a += 1;
+                    a.push(step, LOG_TEXT_KIND, &numbered(count_a), false);
+                }
+                2 => {
+                    count_a += 1;
+                    a.push(step, LOG_TEXT_KIND, &numbered(count_a), (x >> 40) & 1 == 1);
+                }
+                3 | 4 => {
+                    count_b += 1;
+                    b.push(step, LOG_TEXT_KIND, &numbered(count_b), false);
+                }
+                _ => {
+                    seen_a.extend(peek_all(&a, &mut from_a));
+                    if (x >> 45) & 1 == 1 {
+                        seen_b.extend(peek_all(&b, &mut from_b));
+                    }
+                }
+            }
+        }
+        // SAFETY: the rings live here and nothing writes them meanwhile.
+        let sources = unsafe {
+            [
+                Source::shared(&a as *const Ring<8>),
+                Source::shared(&b as *const Ring<8>),
+            ]
+        };
+        let mut spans = [(0, 0); 2];
+        let mut printed = [Vec::new(), Vec::new()];
+        let mut last = 0;
+        merge_unseen(&sources, &mut spans, |r| {
+            assert!(r.time >= last, "the times come in order");
+            last = r.time;
+            printed[0].push(r.time);
+            printed[1].push(number_of(r));
+        });
+        // Each ring alone: the unshown are the unseen that are not overwritten.
+        for (ring, seen, count) in [(&a, &seen_a, count_a), (&b, &seen_b, count_b)] {
+            let kept: Vec<u64> = ring.unshown().map(number_of).collect();
+            assert!(kept.iter().all(|n| !seen.contains(n)), "no record twice");
+            let head = count;
+            for n in kept {
+                assert!(
+                    n > head.saturating_sub(8),
+                    "only records the ring still holds"
+                );
+            }
+        }
+        // The merge gives the same records as the two rings' own lists.
+        let mut all: Vec<(u64, u64)> = Vec::new();
+        for ring in [&a, &b] {
+            all.extend(ring.unshown().map(|r| (r.time, number_of(r))));
+        }
+        all.sort();
+        let mut got: Vec<(u64, u64)> = printed[0]
+            .iter()
+            .copied()
+            .zip(printed[1].iter().copied())
+            .collect();
+        got.sort();
+        assert_eq!(got, all);
+    }
+
+    #[test]
+    fn the_merge_goes_by_time_over_rings_and_skips_the_shown() {
+        let (mut a, mut b) = (Ring::<8>::new(), Ring::<8>::new());
+        a.push(1, LOG_TEXT_KIND, &numbered(10), false);
+        b.push(2, LOG_TEXT_KIND, &numbered(20), false);
+        a.push(3, LOG_TEXT_KIND, &numbered(11), true);
+        a.push(4, LOG_TEXT_KIND, &numbered(12), false);
+        b.push(4, LOG_TEXT_KIND, &numbered(21), false);
+        b.push(9, LOG_TEXT_KIND, &numbered(22), false);
+        // SAFETY: the ring b lives here and nothing writes it meanwhile.
+        let sources = [
+            Source::own(&a),
+            unsafe { Source::shared(&b as *const Ring<8>) },
+            Source::none(),
+        ];
+        assert_eq!(merged(&sources), [10, 20, 12, 21, 22]);
+    }
+
+    #[test]
+    fn a_ring_the_owner_never_leaves_gives_nothing_and_does_not_hang() {
+        let ring = Ring::<8>::new();
+        ring.seq.store(1, Ordering::Relaxed);
+        // SAFETY: the ring lives here and nothing writes it.
+        let source = unsafe { Source::shared(&ring as *const Ring<8>) };
+        assert_eq!(merged(&[source]), Vec::<u64>::new());
     }
 }
