@@ -325,8 +325,8 @@ mod tests {
     fn the_soft_share_lets_a_second_group_in_when_the_sum_fits_the_margin() {
         use crate::ring::{STEP_MARGIN, STEP_TAIL_TICKS, TX_SOFT_MEASURED};
         // The dearest frame the margin allows after the share, a group and the tail.
-        let mut p = parts(1_000, 5_800, 500, 400, 2_500);
-        let fit = STEP_MARGIN as u64 - TX_SOFT_MEASURED - 2_500 - STEP_TAIL_TICKS as u64;
+        let mut p = parts(1_000, 3_400, 500, 400, 3_800);
+        let fit = STEP_MARGIN as u64 - TX_SOFT_MEASURED - 3_800 - STEP_TAIL_TICKS as u64;
         p.frame_tx_wire = fit;
         // Two groups pass the budget, one fits, so the estimate alone gives one.
         assert!(p.sending(2, 1) > BUDGET && p.sending(1, 1) <= BUDGET);

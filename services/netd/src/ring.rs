@@ -230,26 +230,25 @@ pub const RX_SOFT: u64 = if cfg!(feature = "steps") {
 pub const WIRE_FRAME_TICKS: usize = 8_800;
 pub const STEP_TAIL_TICKS: usize = 3_000;
 /// A frame of the wire in a step of sending (the buffer, the sum and the copy included), in
-/// ticks under -icount: the 90th percentile of `net-probe steps` is 6 080, kept with the spread
-/// of builds.
+/// ticks under -icount: the 90th percentile of `net-probe steps` was 6 080 (ping role) and
+/// 5 312 (echo role) in all three runs of probe run 44317789053; 6 100 keeps the spread of
+/// builds.
 pub const WIRE_TX_FRAME_TICKS: usize = 6_100;
-/// The pass over one group of sockets without its frames (`split::GROUP`), and the rest of a
-/// step of sending that is not a group or a frame (the walk over the deadlines, the set of the
-/// service, the tail of the step is counted apart), in ticks under -icount. These are starting
-/// values that the rule of `choose` reads as the constants of the code; `net-probe steps`
-/// prints the measured 90th percentiles beside them and fails when a frame passes its constant.
-pub const TX_GROUP_TICKS: usize = 2_500;
-pub const TX_FIXED_TICKS: usize = 5_800;
+/// The pass over one group of sockets without its frames (`split::GROUP`): 3 776 in all three
+/// runs of probe run 44317789053, kept at 3 800. `TX_FIXED_TICKS` is the rest of a step of
+/// sending that is not a group or a frame (`fixed_tx`: 3 392 in the same runs, kept at 3 400).
+/// The rule of `choose` reads them as the constants of the code, and `net-probe steps` fails
+/// when a measured frame passes its constant.
+pub const TX_GROUP_TICKS: usize = 3_800;
+pub const TX_FIXED_TICKS: usize = 3_400;
 /// The price of a frame of the loopback, received and sent, 90th percentile, in ticks
-/// (`frame_rx` 3 072 at most in six runs of `net-probe steps`, `frame_tx` 576).
-pub const LOOP_RX_FRAME_TICKS: usize = 3_100;
+/// (`frame_rx` 3 136 at most in the runs of probe run 44317789053, `frame_tx` 576).
+pub const LOOP_RX_FRAME_TICKS: usize = 3_200;
 pub const LOOP_TX_FRAME_TICKS: usize = 600;
 /// The time in ticks a step of sending may have used when it visits a second group (images
 /// that count steps only, as `RX_SOFT`): past it the group waits for the next step. A group
 /// that sends a wire frame costs `TX_GROUP_TICKS` and `WIRE_TX_FRAME_TICKS`, so the step costs
-/// at most the share, the group, the frame and the tail. The starting value is the margin less
-/// those three; the guest run of `net-probe steps` prints the room the measured group and frame
-/// leave, and the constant is set from it.
+/// at most the share, the group, the frame and the tail: the margin less those three, 3 600.
 pub const TX_SOFT_MEASURED: u64 =
     (STEP_MARGIN - TX_GROUP_TICKS - WIRE_TX_FRAME_TICKS - STEP_TAIL_TICKS) as u64 / 100 * 100;
 pub const TX_SOFT: u64 = if cfg!(feature = "steps") {
@@ -1176,7 +1175,7 @@ mod tests {
         assert_eq!(MAP_CALL_TICKS + MAP_STEP_TICKS, 14_500);
         // The sums of the rule are held to the margin at the constants too (the build fails);
         // here each sum is compared with the margin and with its value.
-        assert_eq!(TX_SOFT_MEASURED, 4_900);
+        assert_eq!(TX_SOFT_MEASURED, 3_600);
         assert_eq!(
             WORST_STEPS,
             [16_200, 14_300, 16_500, 16_500, 5_400, 14_500, 16_500]
