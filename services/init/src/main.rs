@@ -35,10 +35,14 @@ rt::entry!(main);
 // The arguments init gives a record fit the start data of rt (spec 13.3).
 const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
 // Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
-// xtask), twice while `Init::new` builds it: 46 KiB at most, 18 left. The
-// handles of eight DMA objects of each record's instance (table::MAX_DMA,
-// for the network service with two devices) made it 22 000 bytes, and the
-// state of the stop of the system (serve::Stopping) 22 500.
+// xtask), and `Init::new` holds the structure twice (the one it builds and
+// the one it returns): the limit keeps 2 x size well below the stack, so that
+// the frames of the handlers, the start of the services and the stop of the
+// system have room. `Init` measures 22 560 bytes (the handles of the eight
+// DMA objects of each record's instance, table::MAX_DMA, for the network
+// service with two devices, are most of it, and the state of the stop of the
+// system, shutdown::Stop in an Option, about 40 bytes): 2 x 22 560 is 44 KiB
+// of the 64, and the limit of 23 KiB allows 46.
 const _: () = assert!(core::mem::size_of::<serve::Init>() <= 23 * 1024);
 
 /// Where init maps the boot image, read-only, for as long as it lives: the

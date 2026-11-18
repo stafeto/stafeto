@@ -49,7 +49,7 @@ table-ceiling = []
 # abi::INIT_END_OFF or abi::INIT_END_RESET, and the kernel powers off or resets the machine.
 end-off = []
 end-reset = []
-# The probe of the stop of the system on the NVMe machine with edk2 (xtask init-shutdown): a stand-in
+# The probe of the stop of the system on the NVMe machine with edk2 (xtask nvme-persist shutdown): a stand-in
 # for the power button's service asks init to stop the system; build it with nvme-store.
 table-shutdown = []
 # The probe of the overruns in the journal (xtask budget-journal).

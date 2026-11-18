@@ -537,10 +537,13 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 (Source::Timer, 0, Some(beat)) => beat.expired(),
                 // Init's stop notice: its label is one only init's copy of the
                 // channel carries (NOTIFY is held by init and the service).
-                (Source::Session, proto_init::STOP_NOTICE, _)
-                    if notice.bits & !CLIENT_GONE != 0 =>
-                {
-                    service.stop()
+                // Whatever the bits: a CLIENT_GONE of the copy that comes by itself
+                // is swallowed, since it names no session (`place` and `closed`
+                // of a service would take the label for a client's).
+                (Source::Session, proto_init::STOP_NOTICE, _) => {
+                    if proto_init::wants_stop(notice.bits) {
+                        service.stop()
+                    }
                 }
                 (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
                     steps::gone();

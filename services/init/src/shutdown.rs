@@ -28,10 +28,12 @@ const MS: u64 = 1_000_000;
 /// The time a record gets to stop when nothing says otherwise: an exit at
 /// once is all the default handler of rt::service does.
 pub const DEFAULT_STOP_NS: u64 = 500 * MS;
-/// The process service sends SIGTERM to its processes, waits 3 s for their
-/// ends, sends SIGKILL and exits.
+/// The process service will send SIGTERM to its processes, wait 3 s for their
+/// ends, send SIGKILL and exit; that comes with its stop handler (a later step),
+/// and until then it exits at once at the notice.
 pub const PROCESS_STOP_NS: u64 = 5_000 * MS;
-/// The file service puts the jobs of its queue away and exits.
+/// The file service will put the jobs of its queue away and exit; that comes
+/// with its stop handler (a later step), and until then it exits at once.
 pub const FILES_STOP_NS: u64 = 3_000 * MS;
 /// A disk service exits; its device stops after that (`Record::quiesce`).
 pub const DISK_STOP_NS: u64 = 1_000 * MS;
@@ -128,8 +130,8 @@ fn tier_of(record: &Record) -> u8 {
     u8::from(record.log)
 }
 
-/// The deadline of a record that gets the notice at `now`: its time, but not
-/// past the end of the whole stop that began at `began`.
+/// The deadline of a record that gets the notice at `now`: its time, cut at
+/// the end of the whole stop that began at `began`.
 pub fn deadline(now: u64, began: u64, record: &Record) -> u64 {
     now.saturating_add(stop_ns(record))
         .min(began.saturating_add(OVERALL_NS))
@@ -139,6 +141,94 @@ pub fn deadline(now: u64, began: u64, record: &Record) -> u64 {
 /// what is left without a notice.
 pub fn overall_over(now: u64, began: u64) -> bool {
     now >= began.saturating_add(OVERALL_NS)
+}
+
+/// What init keeps of the stop of the system: what was asked, when it began,
+/// the records of the wave that stops now, those that got their notice (and
+/// so a deadline of the stop in place of their watchdog's), and the label of
+/// the timer of the whole stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stop {
+    pub kind: u32,
+    pub began: u64,
+    pub wave: Mask,
+    pub noticed: Mask,
+    pub overall_label: u64,
+}
+
+/// What an expiry of a record's timer means while the system stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// The record got its notice: its deadline came, it is killed.
+    Deadline,
+    /// The record has not been told yet: its watchdog goes on as before, so a
+    /// service that spins in a wave to come is still found.
+    Watchdog,
+}
+
+impl Stop {
+    pub const fn new(kind: u32, began: u64, overall_label: u64) -> Stop {
+        Stop {
+            kind,
+            began,
+            wave: 0,
+            noticed: 0,
+            overall_label,
+        }
+    }
+
+    /// When the whole stop ends: the time of the timer init arms at the
+    /// highest level, which kills what is left whatever the lower timers do.
+    pub fn overall_at(&self) -> u64 {
+        self.began.saturating_add(OVERALL_NS)
+    }
+
+    /// Whether the timer with `label` is the timer of the whole stop.
+    pub fn is_overall(&self, label: u64) -> bool {
+        label != 0 && label == self.overall_label
+    }
+
+    /// The records of `wave` got their notice, or the deadline of the process
+    /// service in place of one.
+    pub fn notice(&mut self, wave: Mask) {
+        self.wave = wave;
+        self.noticed |= wave;
+    }
+
+    /// The meaning of an expiry of the timer of the record at `place`.
+    pub fn expiry(&self, place: usize) -> Expiry {
+        if self.noticed & (1 << place) != 0 {
+            Expiry::Deadline
+        } else {
+            Expiry::Watchdog
+        }
+    }
+}
+
+/// What init does with a SHUTDOWN from `caller`, with the system stopping
+/// already or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// BAD_STATE: the caller is no `power`.
+    Refuse,
+    /// Status 0 and nothing changes: the stop is on.
+    Already,
+    /// Status 0, and the stop begins.
+    Begin,
+}
+
+/// The decision on SHUTDOWN from `caller`.
+pub fn decide(caller: &Record, stopping: bool) -> Decision {
+    match (may_ask(caller), stopping) {
+        (false, _) => Decision::Refuse,
+        (true, true) => Decision::Already,
+        (true, false) => Decision::Begin,
+    }
+}
+
+/// Whether CONNECT gets a session: a stopping system gives none (BAD_STATE).
+pub const fn connect_allowed(stopping: bool) -> bool {
+    !stopping
 }
 
 /// The longest a stop can take from SHUTDOWN to init's exit, in
@@ -229,6 +319,16 @@ mod tests {
             ..test::TABLE[0]
         });
         let waves = waves(&table);
+        assert_eq!(
+            waves,
+            [
+                vec!["posix", "busybox-probe", "datakey", "power"],
+                vec!["tty", "net", "pkgd", "datafs"],
+                vec!["ramfs", "entropy", "blk", "datadisk"],
+                vec!["clock", "pipe"],
+                vec!["uart"],
+            ]
+        );
         let power = index(&waves, "power");
         let posix = index(&waves, "posix");
         let datafs = index(&waves, "datafs");
@@ -256,6 +356,7 @@ mod tests {
 
     #[test]
     fn the_other_real_tables_stop_clients_before_their_services() {
+        use crate::table::{comp, entropy, focus, gpu, input, pkg, vz};
         for table in [
             aws::QEMU_TABLE,
             base::BASE_TABLE,
@@ -263,9 +364,84 @@ mod tests {
             test::TABLE,
             crate::table::net::NET_TABLE,
             crate::table::ramfs::TABLE,
+            vz::TABLE,
+            vz::POSIX_ABI_TABLE,
+            vz::POSIX_NATIVE_TABLE,
+            vz::BUSYBOX_DIALOG_TABLE,
+            vz::POSIX_TTY_TABLE,
+            vz::RTBENCH_TABLE,
+            vz::RTBENCH_POSIX_TABLE,
+            vz::TTY_TABLE,
+            pkg::BLK_PROBE_TABLE,
+            pkg::DATA_PROBE_TABLE,
+            pkg::DATAKEY_PROBE_TABLE,
+            pkg::STORE_PROBE_TABLE,
+            pkg::PKG_SLOT_TABLE,
+            pkg::INIT_WAIT_TABLE,
+            gpu::TABLE,
+            comp::TABLE,
+            input::TABLE,
+            focus::TABLE,
+            entropy::TABLE,
+            entropy::VZ_TABLE,
         ] {
             check_order(table);
         }
+    }
+
+    #[test]
+    fn a_second_shutdown_gets_zero_and_changes_nothing() {
+        let power = Record {
+            name: POWER_SERVICE,
+            ..test::TABLE[0]
+        };
+        assert_eq!(decide(&power, false), Decision::Begin);
+        assert_eq!(decide(&power, true), Decision::Already);
+    }
+
+    #[test]
+    fn a_shutdown_from_another_record_is_refused_stopping_or_not() {
+        for table in [aws::TABLE, base::BASE_TABLE, test::TABLE] {
+            for r in table {
+                assert_eq!(decide(r, false), Decision::Refuse, "{}", r.name);
+                assert_eq!(decide(r, true), Decision::Refuse, "{}", r.name);
+            }
+        }
+    }
+
+    #[test]
+    fn connect_is_refused_while_the_system_stops() {
+        assert!(connect_allowed(false));
+        assert!(!connect_allowed(true));
+    }
+
+    #[test]
+    fn a_record_that_got_no_notice_keeps_its_watchdog() {
+        let mut stop = Stop::new(0, 100, 7);
+        assert_eq!(stop.expiry(2), Expiry::Watchdog);
+        stop.notice(1 << 2);
+        assert_eq!(stop.expiry(2), Expiry::Deadline);
+        assert_eq!(stop.expiry(3), Expiry::Watchdog);
+        stop.notice(1 << 3);
+        assert_eq!(stop.expiry(2), Expiry::Deadline);
+        assert_eq!(stop.expiry(3), Expiry::Deadline);
+    }
+
+    #[test]
+    fn the_whole_stop_has_a_timer_of_its_own_at_its_end() {
+        let stop = Stop::new(1, 5_000, 9);
+        assert_eq!(stop.overall_at(), 5_000 + OVERALL_NS);
+        assert!(stop.is_overall(9));
+        assert!(!stop.is_overall(8));
+        // No label, no timer: a label of 0 is nobody's.
+        assert!(!Stop::new(0, 0, 0).is_overall(0));
+        // No record deadline goes past it.
+        let record = &aws::TABLE[0];
+        assert!(deadline(stop.began, stop.began, record) <= stop.overall_at());
+        assert_eq!(
+            deadline(stop.overall_at() - 1, stop.began, record),
+            stop.overall_at()
+        );
     }
 
     #[test]

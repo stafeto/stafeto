@@ -50,7 +50,7 @@ use init::labels::Labels;
 use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
-use init::shutdown::{self, Mask};
+use init::shutdown::{self, Decision, Expiry, Mask, Stop};
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
@@ -363,16 +363,7 @@ pub struct Init {
     /// The overruns of the budgets of the table, counted for the journal.
     overruns: &'static mut Overruns,
     /// The stop of the system, once SHUTDOWN came (`shutdown`).
-    stopping: Option<Stopping>,
-}
-
-/// The stop of the system (proto_init SHUTDOWN): what was asked, when it
-/// began, and the records of the wave that stops now (init::shutdown).
-#[derive(Clone, Copy)]
-struct Stopping {
-    kind: u32,
-    began: u64,
-    wave: Mask,
+    stopping: Option<Stop>,
 }
 
 impl Init {
@@ -608,7 +599,8 @@ impl Init {
     /// once and stops its records in waves (`begin_stop`, `advance`); a
     /// second SHUTDOWN while it stops gets 0 and changes nothing.
     fn shutdown(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        if !shutdown::may_ask(&table::table()[place]) {
+        let decision = shutdown::decide(&table::table()[place], self.stopping.is_some());
+        if decision == Decision::Refuse {
             return refuse(Error::BadState);
         }
         let mut body = r.body();
@@ -619,15 +611,18 @@ impl Init {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if self.stopping.is_none() {
+        if decision == Decision::Begin {
             self.begin_stop(ask.kind);
         }
         Answer::Status(Status::Ok)
     }
 
-    /// The system stops: no record restarts or loads from now on, no watchdog
-    /// speaks, the CONNECT requests that wait get BAD_STATE, and the first wave
-    /// gets its notice (`advance`).
+    /// The system stops: no record restarts or loads from now on, the CONNECT
+    /// requests that wait get BAD_STATE, and the first wave gets its notice
+    /// (`advance`). The watchdog of a record stays until the record gets its
+    /// notice, so that a service that spins in a wave to come is still found;
+    /// the whole stop has a timer of its own at init's highest level
+    /// (`arm_overall`), which kills what is left whatever the lower timers do.
     fn begin_stop(&mut self, kind: u32) {
         let what = if kind == SHUTDOWN_RESET {
             "reset"
@@ -635,18 +630,14 @@ impl Init {
             "off"
         };
         println!("init: stopping the system ({what})");
-        self.stopping = Some(Stopping {
-            kind,
-            began: now(),
-            wave: 0,
-        });
+        let began = now();
+        let label = self.arm_overall(began);
+        self.stopping = Some(Stop::new(kind, began, label));
         for place in 0..table::table().len() {
             let busy =
                 self.jobs.holds(place) || self.jobs.current().is_some_and(|j| j.record == place);
             let entry = &mut self.entries[place];
-            entry.watch = None;
             entry.gate = None;
-            entry.deadline = None;
             entry.adopting = false;
             entry.offered = false;
             for (pending, _, _) in entry.waiting.iter_mut().filter_map(Option::take) {
@@ -658,8 +649,38 @@ impl Init {
             if matches!(entry.held, Held::Empty) && !busy {
                 entry.state = State::Ended;
             }
+            // Only a watchdog's deadline stays: that of a pause, a quota wait
+            // or a gate goes with them.
+            if entry.watch.is_none() || !matches!(entry.held, Held::Running(_)) {
+                entry.watch = None;
+                entry.deadline = None;
+            }
         }
         self.advance();
+    }
+
+    /// Arms the timer of the whole stop (shutdown::OVERALL_NS from `began`) on
+    /// init's channel at its own level, above every record's ceiling, and
+    /// returns its label, 0 when it could not be made (the deadlines of the
+    /// records then end the stop). The handles live as long as init.
+    fn arm_overall(&mut self, began: u64) -> u64 {
+        let Some(label) = self.labels.next() else {
+            return 0;
+        };
+        let made = sys::handle_label(&self.channel, Rights::RECEIVE, label, MAIN)
+            .and_then(|view| sys::timer_create(&view, MAIN).map(|timer| (view, timer)));
+        match made {
+            Ok((view, timer)) => {
+                let _ = sys::timer_set(&timer, Stop::new(0, began, label).overall_at());
+                mem::forget(view);
+                mem::forget(timer);
+                label
+            }
+            Err(e) => {
+                println!("init: no timer for the whole stop: {e:?}");
+                0
+            }
+        }
     }
 
     /// The records that still have to stop: those with an instance or a job
@@ -703,9 +724,9 @@ impl Init {
     /// a client, a service that has no channel and a record after the whole
     /// stop are killed at once. The process of a POSIX record ends with the
     /// process service, which has the longest bound: it gets that deadline.
-    fn start_wave(&mut self, wave: Mask, stopping: Stopping) {
+    fn start_wave(&mut self, wave: Mask, stopping: Stop) {
         if let Some(own) = self.stopping.as_mut() {
-            own.wave = wave;
+            own.notice(wave);
         }
         let now = now();
         let over = shutdown::overall_over(now, stopping.began);
@@ -727,6 +748,7 @@ impl Init {
                 let process = table::find(table::table(), table::PROCESS_SERVICE.as_bytes());
                 let to = process.map_or(record, |p| &table::table()[p]);
                 let at = shutdown::deadline(now, stopping.began, to);
+                self.entries[place].watch = None;
                 self.set_deadline(place, at);
                 continue;
             }
@@ -734,6 +756,9 @@ impl Init {
             if noticed && self.notify_stop(place) {
                 println!("init: stopping {}", record.name);
                 let at = shutdown::deadline(now, stopping.began, record);
+                // From the notice on the deadline of the stop replaces the
+                // watchdog, whose heartbeats would move it.
+                self.entries[place].watch = None;
                 self.set_deadline(place, at);
             } else {
                 let what = format_args!("is killed: no notice to give");
@@ -785,7 +810,7 @@ impl Init {
     /// Every record stopped and the worker is done: init says how long it
     /// took and exits with the code the kernel takes for the end of the
     /// system (abi::INIT_END_OFF, abi::INIT_END_RESET).
-    fn finish(&self, stopping: Stopping) -> ! {
+    fn finish(&self, stopping: Stop) -> ! {
         let ms = now().saturating_sub(stopping.began) / MS;
         println!("init: stopped in {ms} ms");
         let code = if stopping.kind == SHUTDOWN_RESET {
@@ -1499,9 +1524,11 @@ impl Init {
         if !entry.deadline.is_some_and(time::reached) {
             return;
         }
-        // While the system stops the deadlines are those of the stop, and no
-        // watchdog confirms a silence.
-        if self.stopping.is_some() {
+        // A record that got the notice has the deadline of the stop; one that
+        // did not keeps its watchdog (shutdown::Stop::expiry).
+        if let Some(stop) = self.stopping
+            && stop.expiry(place) == Expiry::Deadline
+        {
             entry.deadline = None;
             self.stop_expired(place);
             return;
@@ -1647,7 +1674,6 @@ impl Init {
         if let Err(status) = reply.write(r.reply()) {
             return Answer::Status(status);
         }
-        let stopping = self.stopping.is_some();
         let Init {
             entries, labels, ..
         } = self;
@@ -1662,9 +1688,8 @@ impl Init {
             instance.channel = Some(channel);
         }
         entry.state = State::Running;
-        // From REGISTER on, the watchdog counts the heartbeats (spec 13.4); a
-        // stopping system has none.
-        let deadline = record.watch().filter(|_| !stopping).map(|w| {
+        // From REGISTER on, the watchdog counts the heartbeats (spec 13.4).
+        let deadline = record.watch().map(|w| {
             let armed = w.arm(now());
             entry.watch = Some(armed);
             armed.deadline()
@@ -1775,7 +1800,7 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         // A stopping system gives no new session.
-        if self.stopping.is_some() {
+        if !shutdown::connect_allowed(self.stopping.is_some()) {
             return refuse(Error::BadState);
         }
         let client = &table::table()[place];
@@ -2131,6 +2156,8 @@ impl Service<1> for Init {
             Source::Session if n.label == self.worker.label => self.accept(),
             Source::Exit => self.ended(n.label),
             Source::Budget => self.overran(n),
+            // The timer of the whole stop: `advance` below kills what is left.
+            Source::Timer if self.stopping.is_some_and(|s| s.is_overall(n.label)) => {}
             Source::Timer => {
                 if let Some(place) = self.timed(n.label) {
                     self.expired(place);

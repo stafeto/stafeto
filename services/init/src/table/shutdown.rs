@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The table of the probe of the stop of the system (feature
-//! `table-shutdown`, `cargo xtask init-shutdown`): the PL011's driver, the
+//! `table-shutdown`, `cargo xtask nvme-persist shutdown`): the PL011's driver, the
 //! NVMe disk service of QEMU's machine with edk2 under the name `blk`, two
 //! test services of tests/svc (`echo`, which ends at init's stop notice, and
 //! `quiet`, which ignores it), and `power`, which opens a session with each

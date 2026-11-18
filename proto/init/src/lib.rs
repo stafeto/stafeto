@@ -393,6 +393,15 @@ pub const SHUTDOWN_RESET: u32 = 1;
 /// it, and the marks of the other protocols (bits 59 to 63) are not in it.
 pub const STOP_NOTICE: u64 = (1 << 58) | 0x5354_4f50;
 
+/// Whether a notification that carries the label STOP_NOTICE with `bits` asks
+/// the service to stop: any bit but CLIENT_GONE does. The CLIENT_GONE of the
+/// copy init made for the notice, which may come by itself (on several CPUs the
+/// kernel can deliver it apart from the notify), asks nothing and is no client
+/// of the service either: the loop swallows it.
+pub const fn wants_stop(bits: u64) -> bool {
+    bits & !abi::CLIENT_GONE != 0
+}
+
 /// The body of SHUTDOWN, 8 bytes: `kind` (SHUTDOWN_OFF or SHUTDOWN_RESET)
 /// and `flags`, zero. Only the record named `power` may ask: any other gets
 /// BAD_STATE; INVALID_ARGS for a `kind` past SHUTDOWN_RESET or a `flags`
@@ -1875,6 +1884,14 @@ mod tests {
             assert_eq!(ShutdownAsk::read(&mut Reader::new(w.as_bytes())), invalid);
         }
         assert_eq!((SHUTDOWN_OFF, SHUTDOWN_RESET), (0, 1));
+    }
+
+    #[test]
+    fn the_stop_notice_asks_for_a_stop_by_any_bit_but_client_gone() {
+        assert!(wants_stop(1));
+        assert!(wants_stop(abi::CLIENT_GONE | 1));
+        assert!(!wants_stop(abi::CLIENT_GONE));
+        assert!(!wants_stop(0));
     }
 
     #[test]
