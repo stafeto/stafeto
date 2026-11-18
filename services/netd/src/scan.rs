@@ -17,7 +17,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{
     ArpOperation, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr,
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
-    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr, UdpPacket, UdpRepr,
 };
 use std::collections::VecDeque;
 
@@ -72,6 +72,18 @@ impl Device for Wire {
 }
 
 fn tcp_frame(sport: u16, dport: u16, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
+    tcp_frame_ts(sport, dport, control, seq, ack, None)
+}
+
+/// The same, with the TCP timestamp option when `ts` is `Some((tsval, tsecr))`.
+fn tcp_frame_ts(
+    sport: u16,
+    dport: u16,
+    control: TcpControl,
+    seq: u32,
+    ack: Option<u32>,
+    ts: Option<(u32, u32)>,
+) -> Vec<u8> {
     let tcp = TcpRepr {
         src_port: sport,
         dst_port: dport,
@@ -83,7 +95,7 @@ fn tcp_frame(sport: u16, dport: u16, control: TcpControl, seq: u32, ack: Option<
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None; 3],
-        timestamp: None,
+        timestamp: ts.map(|(tsval, tsecr)| TcpTimestampRepr { tsval, tsecr }),
         payload: &[],
     };
     let ip = Ipv4Repr {
@@ -155,6 +167,8 @@ fn udp_frame(sport: u16, dport: u16) -> Vec<u8> {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Sent {
     Tcp(TcpControl, u32, Option<u32>, u16),
+    /// A TCP segment with the timestamp option.
+    TcpTs(TcpControl, u32, Option<u32>, u16),
     Other,
 }
 
@@ -175,12 +189,17 @@ fn sent(frame: &[u8]) -> Sent {
         &ChecksumCapabilities::default(),
     )
     .unwrap();
-    Sent::Tcp(
+    let fields = (
         repr.control,
         repr.seq_number.0 as u32,
         repr.ack_number.map(|a| a.0 as u32),
         repr.dst_port,
-    )
+    );
+    if repr.timestamp.is_some() {
+        Sent::TcpTs(fields.0, fields.1, fields.2, fields.3)
+    } else {
+        Sent::Tcp(fields.0, fields.1, fields.2, fields.3)
+    }
 }
 
 const LISTEN_PORT: u16 = 443;
@@ -596,4 +615,258 @@ mod crafted {
         rig.feed(segment(41001, 201, 0, RST));
         assert_eq!(rig.states(), [tcp::State::Listen; 2]);
     }
+}
+
+// ----- the repeated SYN and the socket that went back to LISTEN -----
+
+use crate::queue::{drops_repeated_syn, replaces};
+
+/// The service in front of the stack for a frame: `route` as `net.rs` does it
+/// for a SYN. A key is a remote port. With `drop` a SYN on the four of a queue
+/// socket in SYN-RECEIVED is counted and not given to the stack; without it
+/// (the code before) every SYN goes to the set.
+struct Route {
+    drop: bool,
+    syn_on_embryo: u32,
+}
+
+impl Route {
+    fn feed(&mut self, rig: &mut Rig<'_>, sport: u16, frame: Vec<u8>, syn: bool) -> Vec<Sent> {
+        let holder = (0..rig.queue.len()).find(|&m| {
+            let t = rig.sockets.get::<tcp::Socket>(rig.queue[m]);
+            t.state() == tcp::State::SynReceived
+                && t.remote_endpoint().map(|e| e.port) == Some(sport)
+        });
+        if self.drop && holder.is_some() && drops_repeated_syn(syn, true, true) {
+            self.syn_on_embryo += 1;
+            return Vec::new();
+        }
+        rig.feed(frame)
+    }
+}
+
+/// How many queue sockets hold the four of the peer at `sport` outside LISTEN.
+fn holders(rig: &mut Rig<'_>, sport: u16) -> usize {
+    (0..rig.queue.len())
+        .filter(|&m| {
+            let t = rig.sockets.get::<tcp::Socket>(rig.queue[m]);
+            t.state() != tcp::State::Listen && t.remote_endpoint().map(|e| e.port) == Some(sport)
+        })
+        .count()
+}
+
+/// The set of the premise: socket 0 took the SYN of Y and was reset back to
+/// LISTEN, so socket 0 is the first that listens; socket 1 holds X half open.
+/// Socket 1 takes X first because socket 0 is half open with Y at that time.
+fn half_open_x(rig: &mut Rig<'_>) -> (Sent, u32) {
+    let (reply_y, next_y) = handshake(rig, 40000, false);
+    let (reply_x, next_x) = handshake(rig, 40001, false);
+    assert_eq!(rig.states(), [tcp::State::SynReceived; 2]);
+    let out = rig.feed(tcp_frame(
+        40000,
+        LISTEN_PORT,
+        TcpControl::Rst,
+        next_y,
+        Some(server_next(reply_y)),
+    ));
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(rig.states(), [tcp::State::Listen, tcp::State::SynReceived]);
+    (reply_x, next_x)
+}
+
+fn syn_x() -> Vec<u8> {
+    tcp_frame(40001, LISTEN_PORT, TcpControl::Syn, 1000, None)
+}
+
+#[test]
+fn without_the_drop_a_repeated_syn_makes_a_second_socket_on_the_four() {
+    let mut rig = rig();
+    let mut route = Route {
+        drop: false,
+        syn_on_embryo: 0,
+    };
+    let (reply_x, next_x) = half_open_x(&mut rig);
+    route.feed(&mut rig, 40001, syn_x(), true);
+    assert_eq!(holders(&mut rig, 40001), 2);
+    // The ACK of the first SYN-ACK is reset by the first socket of the set.
+    let out = route.feed(
+        &mut rig,
+        40001,
+        tcp_frame(
+            40001,
+            LISTEN_PORT,
+            TcpControl::None,
+            next_x,
+            Some(server_next(reply_x)),
+        ),
+        false,
+    );
+    assert!(
+        out.iter()
+            .any(|s| matches!(s, Sent::Tcp(TcpControl::Rst, ..))),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_repeated_syn_during_syn_received_leaves_one_socket_and_counts_once() {
+    let mut rig = rig();
+    let mut route = Route {
+        drop: true,
+        syn_on_embryo: 0,
+    };
+    let (reply_x, next_x) = half_open_x(&mut rig);
+    let out = route.feed(&mut rig, 40001, syn_x(), true);
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(route.syn_on_embryo, 1);
+    assert_eq!(holders(&mut rig, 40001), 1);
+    assert_eq!(rig.states(), [tcp::State::Listen, tcp::State::SynReceived]);
+    // The handshake completes on the first socket.
+    let out = route.feed(
+        &mut rig,
+        40001,
+        tcp_frame(
+            40001,
+            LISTEN_PORT,
+            TcpControl::None,
+            next_x,
+            Some(server_next(reply_x)),
+        ),
+        false,
+    );
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(rig.states(), [tcp::State::Listen, tcp::State::Established]);
+    assert_eq!(route.syn_on_embryo, 1);
+}
+
+/// The connection after an RST: a SYN with timestamps, the handshake, one
+/// byte from the server that the peer does not acknowledge. Gives whether the
+/// SYN-ACK carried the timestamp option and the milliseconds after which the
+/// server sent that byte again (None when it did not within 70 s).
+fn second_connection(rig: &mut Rig<'_>, m: usize) -> (bool, Option<i64>) {
+    let isn = 9000;
+    let out = rig.feed(tcp_frame_ts(
+        40005,
+        LISTEN_PORT,
+        TcpControl::Syn,
+        isn,
+        None,
+        Some((100, 0)),
+    ));
+    assert_eq!(out.len(), 1, "{out:?}");
+    let (stamped, server_isn) = match out[0] {
+        Sent::TcpTs(TcpControl::Syn, seq, Some(_), _) => (true, seq),
+        Sent::Tcp(TcpControl::Syn, seq, Some(_), _) => (false, seq),
+        other => panic!("{other:?}"),
+    };
+    let ts = stamped.then_some((101, 100));
+    let out = rig.feed(tcp_frame_ts(
+        40005,
+        LISTEN_PORT,
+        TcpControl::None,
+        isn + 1,
+        Some(server_isn + 1),
+        ts,
+    ));
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(rig.state(m), tcp::State::Established);
+    rig.sockets
+        .get_mut::<tcp::Socket>(rig.queue[m])
+        .send_slice(b"x")
+        .unwrap();
+    // The step that sends the byte.
+    rig.now += 1;
+    rig.iface.poll(
+        Instant::from_millis(rig.now),
+        &mut rig.wire,
+        &mut rig.sockets,
+    );
+    assert_eq!(rig.wire.tx.drain(..).count(), 1);
+    let sent_at = rig.now;
+    let mut again = None;
+    for _ in 0..70_000 {
+        rig.now += 1;
+        rig.iface.poll(
+            Instant::from_millis(rig.now),
+            &mut rig.wire,
+            &mut rig.sockets,
+        );
+        let n = rig.wire.tx.drain(..).count();
+        if n > 0 {
+            again = Some(rig.now - sent_at);
+            break;
+        }
+    }
+    (stamped, again)
+}
+
+/// The first connection of the socket: no timestamps in its SYN, an RST
+/// after the SYN-ACK. 20 s pass before the second connection.
+fn first_connection_reset(rig: &mut Rig<'_>, m: usize) {
+    let (reply, next) = handshake(rig, 40000, false);
+    assert_eq!(rig.state(m), tcp::State::SynReceived);
+    rig.feed(tcp_frame(
+        40000,
+        LISTEN_PORT,
+        TcpControl::Rst,
+        next,
+        Some(server_next(reply)),
+    ));
+    assert_eq!(rig.state(m), tcp::State::Listen);
+    rig.now += 20_000;
+}
+
+/// A socket the way `Stack::tcp_add` builds it, with the choice of the
+/// timestamps the service makes for its sockets in this rig.
+fn fresh_socket(rig: &mut Rig<'_>) -> SocketHandle {
+    let rx = tcp::SocketBuffer::new(Box::leak(vec![0u8; 2048].into_boxed_slice()));
+    let tx = tcp::SocketBuffer::new(Box::leak(vec![0u8; 2048].into_boxed_slice()));
+    let mut socket = tcp::Socket::new(rx, tx);
+    socket.set_tsval_generator(Some(|| 1));
+    socket
+        .listen(IpEndpoint::new(IpAddress::Ipv4(SERVER), LISTEN_PORT))
+        .unwrap();
+    rig.sockets.add(socket)
+}
+
+#[test]
+fn a_socket_reset_back_to_listen_is_replaced_and_the_next_connection_starts_fresh() {
+    let mut rig = rig();
+    // Socket 1 is out of the way: it holds a connection.
+    let first = rig.queue[0];
+    rig.sockets
+        .get_mut::<tcp::Socket>(first)
+        .set_tsval_generator(Some(|| 1));
+    first_connection_reset(&mut rig, 0);
+    // The rule of the rebuild: it listens again after a connection.
+    let state = rig.state(0);
+    assert!(replaces(
+        state == tcp::State::Closed,
+        state == tcp::State::Listen,
+        true
+    ));
+    // The replacement as `rebuild_member` does it: the old socket goes, a
+    // fresh one that listens takes its slot.
+    rig.sockets.remove(first);
+    rig.queue[0] = fresh_socket(&mut rig);
+    let (stamped, again) = second_connection(&mut rig, 0);
+    assert!(stamped, "the SYN-ACK of the fresh socket has no timestamp");
+    let again = again.expect("no retransmission within 70 s");
+    assert!((900..=1100).contains(&again), "{again} ms");
+}
+
+#[test]
+fn a_socket_reset_back_to_listen_that_stays_loses_timestamps_and_waits_long_to_retransmit() {
+    let mut rig = rig();
+    let first = rig.queue[0];
+    rig.sockets
+        .get_mut::<tcp::Socket>(first)
+        .set_tsval_generator(Some(|| 1));
+    first_connection_reset(&mut rig, 0);
+    // The premise of the replacement: the socket that stays no longer
+    // negotiates timestamps (the SYN of the first connection had none).
+    let (stamped, again) = second_connection(&mut rig, 0);
+    assert!(!stamped);
+    // The round-trip sample of the first connection spans its idle time.
+    assert!(again.is_none_or(|ms| ms > 20_000), "{again:?}");
 }

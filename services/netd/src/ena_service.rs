@@ -501,7 +501,7 @@ impl Admin {
             rt::println!("ena: pba {:#x} {:#x}", bar.read32(pba), bar.read32(pba + 4));
         }
         rt::println!(
-            "ena: stats irq0 {} irq1 {} rx by irq {} timer {} other {} keepalive {} resets {}",
+            "ena: stats irq0 {} irq1 {} rx by irq {} timer {} other {} keepalive {} resets {} rx_drops {} rx_overruns {}",
             STATS.irq[0].load(Ordering::Relaxed),
             STATS.irq[1].load(Ordering::Relaxed),
             STATS.rx_irq.load(Ordering::Relaxed),
@@ -509,6 +509,8 @@ impl Admin {
             STATS.rx_other.load(Ordering::Relaxed),
             ka.count,
             self.ena.resets().count,
+            ka.rx_drops,
+            ka.rx_overruns,
         );
     }
 

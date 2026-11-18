@@ -170,10 +170,51 @@ pub const fn adopt_rule(listening: bool, has_key: bool, key_is_current: bool) ->
     }
 }
 
-/// Whether `sync` of a queue socket releases its key: it is back in LISTEN
-/// (the peer's RST in SYN-RECEIVED) and still holds the key of that connection.
-pub const fn sync_releases(is_queue_socket: bool, listening: bool, has_key: bool) -> bool {
-    is_queue_socket && listening && has_key
+/// Whether `sync` finds a queue socket back in LISTEN after a connection (the
+/// peer's RST in SYN-RECEIVED): it holds the key of that connection, or it
+/// took a SYN (`had_connection`) and its key never went in the table. The
+/// key leaves the table and the socket is due for a replacement.
+pub const fn back_in_listen(
+    is_queue_socket: bool,
+    listening: bool,
+    has_key: bool,
+    had_connection: bool,
+) -> bool {
+    is_queue_socket && listening && (has_key || had_connection)
+}
+
+/// Whether the rebuild of a queue replaces the socket: it closed, or it
+/// listens again after a connection and holds the state of that one (its
+/// round-trip sample, which can set the retransmission timeout of the next
+/// connection up to a minute, and its choice of TCP timestamps).
+pub const fn replaces(closed: bool, listening: bool, relistened: bool) -> bool {
+    closed || (listening && relistened)
+}
+
+/// Whether `route` drops a SYN: its four is held by a queue socket in
+/// SYN-RECEIVED. A socket of the set that listens would take the SYN and
+/// hold a second half-open connection on the same four.
+pub const fn drops_repeated_syn(syn: bool, is_queue_socket: bool, syn_received: bool) -> bool {
+    syn && is_queue_socket && syn_received
+}
+
+/// How long the line of counters of the queues waits after the last one, in
+/// nanoseconds, when counters changed, and when CONFIG asked for it.
+pub const QUEUES_EVERY_NS: u64 = 30_000_000_000;
+pub const QUEUES_ASKED_NS: u64 = 5_000_000_000;
+
+/// Whether the line of the queue counters prints now. `said_at` is the time
+/// of the last line (0 before the first one, which is the baseline of a
+/// boot), `said_sum` the sum of the counters then. A CONFIG that asked
+/// prints after `QUEUES_ASKED_NS`; any other call prints when a counter
+/// changed and `QUEUES_EVERY_NS` have passed.
+pub const fn queues_due(asked: bool, now: u64, said_at: u64, said_sum: u64, sum: u64) -> bool {
+    let since = now.saturating_sub(said_at);
+    if asked {
+        since >= QUEUES_ASKED_NS
+    } else {
+        (sum != said_sum || said_at == 0) && since >= QUEUES_EVERY_NS
+    }
 }
 
 /// Whether a queue socket in this state makes its listening description
@@ -346,11 +387,44 @@ mod tests {
     }
 
     #[test]
-    fn sync_releases_the_key_of_a_queue_socket_back_in_listen() {
-        assert!(sync_releases(true, true, true));
-        assert!(!sync_releases(true, true, false));
-        assert!(!sync_releases(true, false, true));
-        assert!(!sync_releases(false, true, true));
+    fn a_queue_socket_back_in_listen_after_a_connection_is_due() {
+        assert!(back_in_listen(true, true, true, true));
+        assert!(back_in_listen(true, true, false, true));
+        assert!(!back_in_listen(true, true, false, false));
+        assert!(!back_in_listen(true, false, true, true));
+        assert!(!back_in_listen(false, true, true, true));
+    }
+
+    #[test]
+    fn the_rebuild_replaces_closed_and_relistened_sockets_only() {
+        assert!(replaces(true, false, false));
+        assert!(replaces(false, true, true));
+        assert!(!replaces(false, true, false));
+        assert!(!replaces(false, false, true));
+    }
+
+    #[test]
+    fn only_a_syn_on_a_half_open_queue_socket_is_dropped() {
+        assert!(drops_repeated_syn(true, true, true));
+        assert!(!drops_repeated_syn(false, true, true));
+        assert!(!drops_repeated_syn(true, false, true));
+        assert!(!drops_repeated_syn(true, true, false));
+    }
+
+    #[test]
+    fn the_queue_line_prints_the_baseline_then_changes_every_30_s() {
+        let s = 1_000_000_000;
+        // The baseline of a boot.
+        assert!(queues_due(false, 31 * s, 0, 0, 0));
+        assert!(!queues_due(false, 10 * s, 0, 0, 0));
+        // Unchanged: nothing, however late.
+        assert!(!queues_due(false, 500 * s, 40 * s, 7, 7));
+        // Changed, but inside 30 s: later.
+        assert!(!queues_due(false, 69 * s, 40 * s, 7, 8));
+        assert!(queues_due(false, 70 * s, 40 * s, 7, 8));
+        // CONFIG asked: 5 s apply, and the change is not needed.
+        assert!(!queues_due(true, 44 * s, 40 * s, 7, 7));
+        assert!(queues_due(true, 45 * s, 40 * s, 7, 7));
     }
 
     #[test]

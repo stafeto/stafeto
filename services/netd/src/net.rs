@@ -208,6 +208,8 @@ pub struct Sock {
     pub syn_dropped: u32,
     pub queue_reaped: u32,
     pub embryo_recycled: u32,
+    /// For a listening description: SYNs that reached `route` for its port.
+    pub syn_seen: u32,
     /// The long operations that wait on the description, by their index.
     pub waiters: u128,
     /// When the last session let go of a stream.
@@ -256,6 +258,7 @@ impl Sock {
         syn_dropped: 0,
         queue_reaped: 0,
         embryo_recycled: 0,
+        syn_seen: 0,
         waiters: 0,
         orphan_at: 0,
         hold: 0,
@@ -376,6 +379,14 @@ pub struct Counters {
     /// connection (they had gone back to LISTEN after an RST): the key was
     /// replaced by the new connection's.
     pub key_stale: u64,
+    /// SYNs that reached a listening description (`route`), all ports.
+    pub syn_seen: u64,
+    /// SYNs whose four is held by a queue socket in SYN-RECEIVED: dropped, so
+    /// that no second socket of the set takes them.
+    pub syn_on_embryo: u64,
+    /// Queue sockets that took a connection and could not register its four
+    /// because another place holds it.
+    pub dup_four: u64,
     /// The pages charged to the service when the first and the sixty-fourth
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
@@ -485,6 +496,10 @@ pub struct Net {
     /// The sockets of a queue that left LISTEN and have not yet been seen
     /// established (their timeout is `EMBRYO_S`).
     pub embryos: Mask,
+    /// The sockets of a queue that went back to LISTEN after a connection
+    /// (an RST in SYN-RECEIVED): they keep the state of that connection, so
+    /// the step of waking replaces them with fresh ones (`reap_due`).
+    pub relistened: Mask,
     pub orphans: Mask,
     /// The streams no session holds, oldest first (place and the time they
     /// were let go of); an entry whose place has since gone is skipped.
@@ -839,6 +854,7 @@ impl Net {
         self.attention.clear(i);
         self.connecting.clear(i);
         self.embryos.clear(i);
+        self.relistened.clear(i);
         self.orphans.clear(i);
         self.places.free(i);
         if sock.port_held {
@@ -1283,14 +1299,15 @@ impl Net {
         let t = stack.tcp(handle);
         let state = t.state();
         let queue_socket = self.socks[i].listener != NO_PLACE;
-        if queue::sync_releases(
+        if queue::back_in_listen(
             queue_socket,
             state == tcp::State::Listen,
             self.socks[i].key.is_some(),
+            self.socks[i].embryo_at != 0,
         ) {
             // The first place the service sees the socket back in LISTEN: its
             // key leaves the table and the queue has room for it again.
-            self.release_key(i);
+            self.relisten(i);
         }
         if queue::marks_for_reap(queue_socket, state == tcp::State::Closed) {
             // Closed, and it keeps its debit of the room until rebuilt: the
@@ -1479,6 +1496,13 @@ impl Net {
         }
     }
 
+    /// A SYN reached the listening description at `lead`.
+    fn count_syn(&mut self, lead: usize) {
+        self.counters.syn_seen += 1;
+        let l = &mut self.socks[lead];
+        l.syn_seen = l.syn_seen.saturating_add(1);
+    }
+
     /// The place a received frame is for, None for the set of the service.
     /// A SYN to a listening description goes to the first socket of its
     /// queue that is still listening; `adopt` runs after the stack took it.
@@ -1520,7 +1544,7 @@ impl Net {
                         .handle
                         .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
                 {
-                    self.release_key(place);
+                    self.relisten(place);
                     existing = None;
                 }
                 // A queue socket that closed (the peer's RST, a handshake that
@@ -1552,7 +1576,27 @@ impl Net {
                         // A socket of a queue that has not been accepted: the
                         // step of waking looks at it after the stack took the
                         // frame (an RST closes it, and its listener is rebuilt).
-                        if self.socks[place].listener != NO_PLACE {
+                        let queue = self.socks[place].listener;
+                        if queue != NO_PLACE {
+                            if syn {
+                                self.count_syn(usize::from(queue));
+                            }
+                            // A repeated SYN on a half-open four is not given
+                            // to the set: another socket of it that listens
+                            // would take it and make a second connection on
+                            // the same four. The peer's next segment is the
+                            // ACK of the first SYN-ACK.
+                            if queue::drops_repeated_syn(
+                                syn,
+                                true,
+                                self.socks[place].handle.is_some_and(|h| {
+                                    stack.tcp(h).state() == tcp::State::SynReceived
+                                }),
+                            ) {
+                                self.counters.syn_on_embryo += 1;
+                                self.drop_frame = true;
+                                return None;
+                            }
                             self.wake_due.set(place);
                             self.wake_wanted = true;
                         }
@@ -1573,6 +1617,7 @@ impl Net {
                 let Some(lead) = lead else {
                     return orphan.map(|(place, _)| place);
                 };
+                self.count_syn(lead);
                 let mut picked = self.pick_member(stack, lead);
                 // Sockets of the queue that closed (the peer's RST, the
                 // timeout of a handshake that never ended) are replaced
@@ -1774,10 +1819,12 @@ impl Net {
         let mut k = 0;
         while k < usize::from(self.socks[listener].member_count) && budget.open() {
             let m = usize::from(self.socks[listener].members[k]);
-            let closed = self.socks[m]
-                .handle
-                .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed);
-            if !closed {
+            let state = self.socks[m].handle.map(|h| stack.tcp(h).state());
+            if !queue::replaces(
+                state.is_none_or(|s| s == tcp::State::Closed),
+                state == Some(tcp::State::Listen),
+                self.relistened.has(m),
+            ) {
                 k += 1;
                 continue;
             }
@@ -1833,6 +1880,17 @@ impl Net {
         let found =
             (0..usize::from(sock.member_count)).find(|&k| usize::from(sock.members[k]) == m);
         found.is_some_and(|k| self.rebuild_member(stack, listener, k))
+    }
+
+    /// The queue socket at `m` went back to LISTEN after a connection: its
+    /// key goes, and the step of waking replaces it with a fresh socket (it
+    /// still holds the round-trip sample and the timestamp choice of that
+    /// connection) unless a SYN takes it first.
+    fn relisten(&mut self, m: usize) {
+        self.release_key(m);
+        self.relistened.set(m);
+        self.reap_due.set(usize::from(self.socks[m].listener));
+        self.wake_wanted = true;
     }
 
     /// The queue socket at `m` goes back to LISTEN: its key leaves the table
@@ -1967,7 +2025,7 @@ impl Net {
                 if queue::adopt_rule(true, self.socks[m].key.is_some(), false)
                     == queue::KeyRule::Release
                 {
-                    self.release_key(m);
+                    self.relisten(m);
                 }
             } else if let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint()) {
                 let (local, remote) = (peer_of(local), peer_of(remote));
@@ -2018,7 +2076,11 @@ impl Net {
                     }
                 }
                 self.socks[queue].room = self.socks[queue].room.saturating_sub(1);
+                self.relistened.clear(m);
                 self.register(m, four);
+                if self.socks[m].key.is_none() {
+                    self.counters.dup_four += 1;
+                }
             }
         }
     }

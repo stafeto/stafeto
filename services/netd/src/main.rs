@@ -143,11 +143,6 @@ use virtio_pci::qemu;
 
 rt::entry!(main);
 
-/// The least time between two lines of the queue counters on the console, and between two
-/// asked for by CONFIG, in nanoseconds.
-const QUEUES_EVERY_NS: u64 = 30_000_000_000;
-const QUEUES_ASKED_NS: u64 = 5_000_000_000;
-
 /// The bits of the service's notification to itself, each a step of its own:
 /// receiving, sending (also asked by a request), the departure of a session,
 /// the waking of operations, the sweep of the streams that close, and the
@@ -1326,10 +1321,10 @@ struct Driver<'a> {
     report_due: bool,
     /// When the counters of the queues were last said, and their sum then: a machine that
     /// nobody can log in to (the console of a cloud instance is all there is) shows them
-    /// there, once in `QUEUES_EVERY_NS` and only when they changed.
+    /// there, once in `queue::QUEUES_EVERY_NS` and only when they changed.
     queues_said: (u64, u64),
     /// CONFIG came (`ifconfig`, a name lookup) and the counters are due: they are said at the
-    /// next chance, but not twice in `QUEUES_ASKED_NS`; a CONFIG inside that time says nothing.
+    /// next chance, but not twice in `queue::QUEUES_ASKED_NS`; a CONFIG inside that time says nothing.
     queues_asked: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
@@ -2234,12 +2229,27 @@ impl Driver<'_> {
             counters.orphan_reused,
             counters.set_barred
         );
+        let d = self.losses();
+        rt::println!(
+            "net: queues syn_seen {} syn_on_embryo {} dup_four {} rx_dropped {} rx_martian {} tx_dropped {} tx_martian {} looped_dropped {} bad_sum {}",
+            counters.syn_seen,
+            counters.syn_on_embryo,
+            counters.dup_four,
+            d[0],
+            d[1],
+            d[2],
+            d[3],
+            d[4],
+            d[5]
+        );
         for (place, l) in self.inst.net.socks.iter().enumerate() {
-            if l.listening && (l.syn_dropped | l.queue_reaped | l.embryo_recycled) != 0 {
+            if l.listening && (l.syn_dropped | l.queue_reaped | l.embryo_recycled | l.syn_seen) != 0
+            {
                 rt::println!(
-                    "net: listener place {} port {} syn_dropped {} queue_reaped {} embryo_recycled {}",
+                    "net: listener place {} port {} syn_seen {} syn_dropped {} queue_reaped {} embryo_recycled {}",
                     place,
                     l.port,
+                    l.syn_seen,
                     l.syn_dropped,
                     l.queue_reaped,
                     l.embryo_recycled
@@ -2248,9 +2258,25 @@ impl Driver<'_> {
         }
     }
 
+    /// The frames lost before and after the stack: the device and the switch on
+    /// receiving (dropped, martian), on sending (dropped, martian), the loop ring, and the
+    /// segments with a bad sum.
+    fn losses(&self) -> [u64; 6] {
+        let (_, rx_dropped, rx_martian) = self.inst.device.rx.counters();
+        let tx = self.inst.device.tx.counters();
+        [
+            rx_dropped,
+            rx_martian,
+            tx.dropped,
+            tx.martian,
+            self.inst.device.looped.dropped(),
+            self.inst.device.bad_sum,
+        ]
+    }
+
     /// Says the counters of the queues when they changed since the last time and the last
-    /// time is `QUEUES_EVERY_NS` ago (the first time is the baseline of a boot), or when CONFIG
-    /// asked and `QUEUES_ASKED_NS` have passed.
+    /// time is `queue::QUEUES_EVERY_NS` ago (the first time is the baseline of a boot), or when CONFIG
+    /// asked and `queue::QUEUES_ASKED_NS` have passed.
     fn say_queues(&mut self) {
         let asked = core::mem::take(&mut self.queues_asked);
         let c = &self.inst.net.counters;
@@ -2260,15 +2286,13 @@ impl Driver<'_> {
             .wrapping_add(c.embryo_recycled)
             .wrapping_add(c.listen_short)
             .wrapping_add(c.key_stale)
-            .wrapping_add(c.syn_stray);
+            .wrapping_add(c.syn_stray)
+            .wrapping_add(c.syn_seen)
+            .wrapping_add(c.syn_on_embryo)
+            .wrapping_add(c.dup_four);
+        let sum = self.losses().iter().fold(sum, |a, &n| a.wrapping_add(n));
         let now = now_ns();
-        let since = now.saturating_sub(self.queues_said.0);
-        let due = if asked {
-            since >= QUEUES_ASKED_NS
-        } else {
-            (sum != self.queues_said.1 || self.queues_said.0 == 0) && since >= QUEUES_EVERY_NS
-        };
-        if !due {
+        if !netd::queue::queues_due(asked, now, self.queues_said.0, self.queues_said.1, sum) {
             return;
         }
         self.queues_said = (now, sum);
