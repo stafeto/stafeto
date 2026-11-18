@@ -619,29 +619,77 @@ mod crafted {
 
 // ----- the repeated SYN and the socket that went back to LISTEN -----
 
-use crate::queue::{drops_repeated_syn, replaces};
+use crate::queue::{SynOnFour, replaces, syn_on_four};
 
 /// The service in front of the stack for a frame: `route` as `net.rs` does it
-/// for a SYN. A key is a remote port. With `drop` a SYN on the four of a queue
-/// socket in SYN-RECEIVED is counted and not given to the stack; without it
-/// (the code before) every SYN goes to the set.
+/// for a SYN. A key is a remote port, `isn` the initial sequence number each
+/// socket took. With `drop` a SYN on the four of a queue socket that is not
+/// listening is dealt with as `queue::syn_on_four` says; without it (the code
+/// before) every SYN goes to the set.
 struct Route {
     drop: bool,
     syn_on_embryo: u32,
+    syn_on_held: u32,
+    syn_restart: u32,
+    isn: [Option<u32>; 2],
 }
 
 impl Route {
-    fn feed(&mut self, rig: &mut Rig<'_>, sport: u16, frame: Vec<u8>, syn: bool) -> Vec<Sent> {
-        let holder = (0..rig.queue.len()).find(|&m| {
-            let t = rig.sockets.get::<tcp::Socket>(rig.queue[m]);
-            t.state() == tcp::State::SynReceived
-                && t.remote_endpoint().map(|e| e.port) == Some(sport)
-        });
-        if self.drop && holder.is_some() && drops_repeated_syn(syn, true, true) {
-            self.syn_on_embryo += 1;
-            return Vec::new();
+    fn new(drop: bool) -> Route {
+        Route {
+            drop,
+            syn_on_embryo: 0,
+            syn_on_held: 0,
+            syn_restart: 0,
+            isn: [None; 2],
         }
-        rig.feed(frame)
+    }
+
+    /// `syn` is the initial sequence number when the frame is a SYN.
+    fn feed(
+        &mut self,
+        rig: &mut Rig<'_>,
+        sport: u16,
+        frame: Vec<u8>,
+        syn: Option<u32>,
+    ) -> Vec<Sent> {
+        if let (true, Some(seq)) = (self.drop, syn) {
+            let holder = (0..rig.queue.len()).find(|&m| {
+                let t = rig.sockets.get::<tcp::Socket>(rig.queue[m]);
+                !matches!(t.state(), tcp::State::Listen | tcp::State::Closed)
+                    && t.remote_endpoint().map(|e| e.port) == Some(sport)
+            });
+            if let Some(m) = holder {
+                let half_open = rig.state(m) == tcp::State::SynReceived;
+                match syn_on_four(half_open, self.isn[m] == Some(seq)) {
+                    SynOnFour::Retransmit => {
+                        self.syn_on_embryo += 1;
+                        return Vec::new();
+                    }
+                    SynOnFour::Held => {
+                        self.syn_on_held += 1;
+                        return Vec::new();
+                    }
+                    SynOnFour::Restart => {
+                        // `reap_member`: the socket goes, a fresh one listens.
+                        self.syn_restart += 1;
+                        rig.sockets.remove(rig.queue[m]);
+                        rig.queue[m] = fresh_socket(rig);
+                        self.isn[m] = None;
+                    }
+                }
+            }
+        }
+        let out = rig.feed(frame);
+        if let Some(seq) = syn {
+            // `adopt`: the sockets that left LISTEN record the number.
+            for m in 0..rig.queue.len() {
+                if rig.state(m) != tcp::State::Listen && self.isn[m].is_none() {
+                    self.isn[m] = Some(seq);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -681,12 +729,9 @@ fn syn_x() -> Vec<u8> {
 #[test]
 fn without_the_drop_a_repeated_syn_makes_a_second_socket_on_the_four() {
     let mut rig = rig();
-    let mut route = Route {
-        drop: false,
-        syn_on_embryo: 0,
-    };
+    let mut route = Route::new(false);
     let (reply_x, next_x) = half_open_x(&mut rig);
-    route.feed(&mut rig, 40001, syn_x(), true);
+    route.feed(&mut rig, 40001, syn_x(), Some(1000));
     assert_eq!(holders(&mut rig, 40001), 2);
     // The ACK of the first SYN-ACK is reset by the first socket of the set.
     let out = route.feed(
@@ -699,7 +744,7 @@ fn without_the_drop_a_repeated_syn_makes_a_second_socket_on_the_four() {
             next_x,
             Some(server_next(reply_x)),
         ),
-        false,
+        None,
     );
     assert!(
         out.iter()
@@ -711,12 +756,10 @@ fn without_the_drop_a_repeated_syn_makes_a_second_socket_on_the_four() {
 #[test]
 fn a_repeated_syn_during_syn_received_leaves_one_socket_and_counts_once() {
     let mut rig = rig();
-    let mut route = Route {
-        drop: true,
-        syn_on_embryo: 0,
-    };
+    let mut route = Route::new(true);
     let (reply_x, next_x) = half_open_x(&mut rig);
-    let out = route.feed(&mut rig, 40001, syn_x(), true);
+    route.isn[1] = Some(1000);
+    let out = route.feed(&mut rig, 40001, syn_x(), Some(1000));
     assert!(out.is_empty(), "{out:?}");
     assert_eq!(route.syn_on_embryo, 1);
     assert_eq!(holders(&mut rig, 40001), 1);
@@ -732,7 +775,7 @@ fn a_repeated_syn_during_syn_received_leaves_one_socket_and_counts_once() {
             next_x,
             Some(server_next(reply_x)),
         ),
-        false,
+        None,
     );
     assert!(out.is_empty(), "{out:?}");
     assert_eq!(rig.states(), [tcp::State::Listen, tcp::State::Established]);
@@ -869,4 +912,55 @@ fn a_socket_reset_back_to_listen_that_stays_loses_timestamps_and_waits_long_to_r
     assert!(!stamped);
     // The round-trip sample of the first connection spans its idle time.
     assert!(again.is_none_or(|ms| ms > 20_000), "{again:?}");
+}
+
+#[test]
+fn a_syn_with_another_number_on_a_half_open_four_rebuilds_the_socket_and_is_answered() {
+    let mut rig = rig();
+    let mut route = Route::new(true);
+    half_open_x(&mut rig);
+    route.isn[1] = Some(1000);
+    // The client restarted on the same four with another initial number.
+    let out = route.feed(
+        &mut rig,
+        40001,
+        tcp_frame(40001, LISTEN_PORT, TcpControl::Syn, 777_000, None),
+        Some(777_000),
+    );
+    assert_eq!(route.syn_restart, 1);
+    assert_eq!(route.syn_on_embryo, 0);
+    assert!(
+        matches!(out.as_slice(), [Sent::Tcp(TcpControl::Syn, _, Some(a), 40001)] if *a == 777_001),
+        "{out:?}"
+    );
+    assert_eq!(holders(&mut rig, 40001), 1);
+    assert_eq!(route.isn, [Some(777_000), None]);
+}
+
+#[test]
+fn a_syn_on_the_four_of_a_connection_that_stands_is_dropped_and_counted() {
+    let mut rig = rig();
+    let mut route = Route::new(true);
+    let (reply, next) = handshake(&mut rig, 40001, false);
+    route.isn[0] = Some(1000);
+    rig.feed(tcp_frame(
+        40001,
+        LISTEN_PORT,
+        TcpControl::None,
+        next,
+        Some(server_next(reply)),
+    ));
+    assert_eq!(rig.states(), [tcp::State::Established, tcp::State::Listen]);
+    for isn in [1000, 5000] {
+        let out = route.feed(
+            &mut rig,
+            40001,
+            tcp_frame(40001, LISTEN_PORT, TcpControl::Syn, isn, None),
+            Some(isn),
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+    assert_eq!(route.syn_on_held, 2);
+    assert_eq!(holders(&mut rig, 40001), 1);
+    assert_eq!(rig.states(), [tcp::State::Established, tcp::State::Listen]);
 }

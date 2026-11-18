@@ -210,6 +210,8 @@ pub struct Sock {
     pub embryo_recycled: u32,
     /// For a listening description: SYNs that reached `route` for its port.
     pub syn_seen: u32,
+    /// For a socket of a queue: the initial sequence number of the SYN it took.
+    pub isn: u32,
     /// The long operations that wait on the description, by their index.
     pub waiters: u128,
     /// When the last session let go of a stream.
@@ -259,6 +261,7 @@ impl Sock {
         queue_reaped: 0,
         embryo_recycled: 0,
         syn_seen: 0,
+        isn: 0,
         waiters: 0,
         orphan_at: 0,
         hold: 0,
@@ -384,6 +387,12 @@ pub struct Counters {
     /// SYNs whose four is held by a queue socket in SYN-RECEIVED: dropped, so
     /// that no second socket of the set takes them.
     pub syn_on_embryo: u64,
+    /// SYNs on the four of a queue socket whose connection stands or is
+    /// closing (not accepted yet): dropped, the old connection is left as it is.
+    pub syn_on_held: u64,
+    /// SYNs with another initial sequence number on the four of a half-open
+    /// queue socket (a client that restarted): the socket was rebuilt.
+    pub syn_restart: u64,
     /// Queue sockets that took a connection and could not register its four
     /// because another place holds it.
     pub dup_four: u64,
@@ -586,6 +595,8 @@ pub struct Net {
     /// The socket of a queue a SYN was just routed to, and the listening
     /// description it was chosen for.
     syn_member: Option<(usize, usize)>,
+    /// The initial sequence number of the SYN `syn_member` is for.
+    syn_isn: u32,
 }
 
 /// The time in nanoseconds of the guest.
@@ -1515,6 +1526,7 @@ impl Net {
                 remote,
                 remote_port,
                 syn,
+                seq,
             } => {
                 let conn = Key::Conn {
                     local,
@@ -1564,6 +1576,45 @@ impl Net {
                     budget.charge(built);
                     existing = self.demux.find(&conn);
                 }
+                // A SYN on the four of a queue socket that is neither listening
+                // nor closed is not given to the set: a socket of it that
+                // listens would take it and hold a second connection on the
+                // same four, with no key. A half-open socket whose SYN had
+                // the same initial sequence number is the peer's
+                // retransmission (dropped). One with another number is a
+                // client that restarted: the socket is rebuilt and the SYN goes
+                // to the listening description. A connection that stands is
+                // left as it is.
+                if let Some(place) = existing
+                    && syn
+                    && self.socks[place].listener != NO_PLACE
+                    && let Some(state) = self.socks[place].handle.map(|h| stack.tcp(h).state())
+                    && state != tcp::State::Listen
+                    && state != tcp::State::Closed
+                {
+                    match queue::syn_on_four(
+                        state == tcp::State::SynReceived,
+                        self.socks[place].isn == seq,
+                    ) {
+                        queue::SynOnFour::Retransmit | queue::SynOnFour::Held => {
+                            let held = state != tcp::State::SynReceived;
+                            self.count_syn(usize::from(self.socks[place].listener));
+                            if held {
+                                self.counters.syn_on_held += 1;
+                            } else {
+                                self.counters.syn_on_embryo += 1;
+                            }
+                            self.drop_frame = true;
+                            return None;
+                        }
+                        queue::SynOnFour::Restart => {
+                            self.counters.syn_restart += 1;
+                            let built = self.reap_member(stack, place);
+                            budget.charge(built);
+                            existing = self.demux.find(&conn);
+                        }
+                    }
+                }
                 // The orphan is noted with the time it was let go of: the
                 // place may be given to another stream before the SYN is
                 // placed (a rebuild can evict it), and that one is not ours
@@ -1576,27 +1627,7 @@ impl Net {
                         // A socket of a queue that has not been accepted: the
                         // step of waking looks at it after the stack took the
                         // frame (an RST closes it, and its listener is rebuilt).
-                        let queue = self.socks[place].listener;
-                        if queue != NO_PLACE {
-                            if syn {
-                                self.count_syn(usize::from(queue));
-                            }
-                            // A repeated SYN on a half-open four is not given
-                            // to the set: another socket of it that listens
-                            // would take it and make a second connection on
-                            // the same four. The peer's next segment is the
-                            // ACK of the first SYN-ACK.
-                            if queue::drops_repeated_syn(
-                                syn,
-                                true,
-                                self.socks[place].handle.is_some_and(|h| {
-                                    stack.tcp(h).state() == tcp::State::SynReceived
-                                }),
-                            ) {
-                                self.counters.syn_on_embryo += 1;
-                                self.drop_frame = true;
-                                return None;
-                            }
+                        if self.socks[place].listener != NO_PLACE {
                             self.wake_due.set(place);
                             self.wake_wanted = true;
                         }
@@ -1651,6 +1682,7 @@ impl Net {
                     self.release_place(stack, place);
                 }
                 self.syn_member = Some((member, listener));
+                self.syn_isn = seq;
                 Some(member)
             }
             Dest::Udp {
@@ -1829,7 +1861,7 @@ impl Net {
                 continue;
             }
             reaped = true;
-            let built = self.rebuild_member(stack, listener, k);
+            let built = self.rebuild_member(stack, listener, k, state == Some(tcp::State::Listen));
             budget.charge(built);
             if built {
                 k += 1;
@@ -1843,7 +1875,13 @@ impl Net {
     /// The socket at index `k` of the queue of `listener` is let go of and a
     /// fresh one that listens takes its slot. True when one was built; else
     /// the queue is one shorter (`listen_short`) until `top_up`.
-    fn rebuild_member(&mut self, stack: &mut Stack<'static>, listener: usize, k: usize) -> bool {
+    fn rebuild_member(
+        &mut self,
+        stack: &mut Stack<'static>,
+        listener: usize,
+        k: usize,
+        old_listening: bool,
+    ) -> bool {
         let m = usize::from(self.socks[listener].members[k]);
         self.release_place(stack, m);
         // The place `m` is free before the new one is asked for, so the
@@ -1860,7 +1898,7 @@ impl Net {
             Some(fresh) => {
                 let l = &mut self.socks[listener];
                 l.members[k] = fresh as u16;
-                l.room = l.room.saturating_add(1);
+                l.room = l.room.saturating_add(queue::rebuild_credit(old_listening));
                 true
             }
             None => {
@@ -1879,7 +1917,7 @@ impl Net {
         let sock = &self.socks[listener];
         let found =
             (0..usize::from(sock.member_count)).find(|&k| usize::from(sock.members[k]) == m);
-        found.is_some_and(|k| self.rebuild_member(stack, listener, k))
+        found.is_some_and(|k| self.rebuild_member(stack, listener, k, false))
     }
 
     /// The queue socket at `m` went back to LISTEN after a connection: its
@@ -1887,7 +1925,11 @@ impl Net {
     /// still holds the round-trip sample and the timestamp choice of that
     /// connection) unless a SYN takes it first.
     fn relisten(&mut self, m: usize) {
+        let credit =
+            queue::relisten_credit(self.socks[m].key.is_some(), self.socks[m].embryo_at != 0);
         self.release_key(m);
+        let queue = usize::from(self.socks[m].listener);
+        self.socks[queue].room = self.socks[queue].room.saturating_add(credit);
         self.relistened.set(m);
         self.reap_due.set(usize::from(self.socks[m].listener));
         self.wake_wanted = true;
@@ -2077,6 +2119,7 @@ impl Net {
                 }
                 self.socks[queue].room = self.socks[queue].room.saturating_sub(1);
                 self.relistened.clear(m);
+                self.socks[m].isn = self.syn_isn;
                 self.register(m, four);
                 if self.socks[m].key.is_none() {
                     self.counters.dup_four += 1;

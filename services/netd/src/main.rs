@@ -1324,7 +1324,7 @@ struct Driver<'a> {
     /// there, once in `queue::QUEUES_EVERY_NS` and only when they changed.
     queues_said: (u64, u64),
     /// CONFIG came (`ifconfig`, a name lookup) and the counters are due: they are said at the
-    /// next chance, but not twice in `queue::QUEUES_ASKED_NS`; a CONFIG inside that time says nothing.
+    /// next chance, at most once in `queue::QUEUES_ASKED_NS`; a CONFIG inside that time says nothing.
     queues_asked: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
@@ -2231,9 +2231,11 @@ impl Driver<'_> {
         );
         let d = self.losses();
         rt::println!(
-            "net: queues syn_seen {} syn_on_embryo {} dup_four {} rx_dropped {} rx_martian {} tx_dropped {} tx_martian {} looped_dropped {} bad_sum {}",
+            "net: queues syn_seen {} syn_on_embryo {} syn_on_held {} syn_restart {} dup_four {} rx_dropped {} rx_martian {} tx_dropped {} tx_martian {} looped_dropped {} bad_sum {}",
             counters.syn_seen,
             counters.syn_on_embryo,
+            counters.syn_on_held,
+            counters.syn_restart,
             counters.dup_four,
             d[0],
             d[1],
@@ -2287,10 +2289,16 @@ impl Driver<'_> {
             .wrapping_add(c.listen_short)
             .wrapping_add(c.key_stale)
             .wrapping_add(c.syn_stray)
-            .wrapping_add(c.syn_seen)
             .wrapping_add(c.syn_on_embryo)
+            .wrapping_add(c.syn_on_held)
+            .wrapping_add(c.syn_restart)
             .wrapping_add(c.dup_four);
-        let sum = self.losses().iter().fold(sum, |a, &n| a.wrapping_add(n));
+        // The drops count; `syn_seen` and the martian frames rise with ordinary traffic and
+        // are only printed when the line prints.
+        let d = self.losses();
+        let sum = [d[0], d[2], d[4], d[5]]
+            .iter()
+            .fold(sum, |a, &n| a.wrapping_add(n));
         let now = now_ns();
         if !netd::queue::queues_due(asked, now, self.queues_said.0, self.queues_said.1, sum) {
             return;

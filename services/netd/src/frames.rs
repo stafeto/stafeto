@@ -138,6 +138,8 @@ pub enum Dest {
         remote: [u8; 4],
         remote_port: u16,
         syn: bool,
+        /// The sequence number of the segment (the initial one of a SYN).
+        seq: u32,
     },
     /// A datagram of UDP to `local:local_port`.
     Udp {
@@ -173,6 +175,7 @@ pub fn target(frame: &[u8]) -> Dest {
             remote: src,
             remote_port: port(0),
             syn: part[13] & (TCP_SYN | TCP_ACK) == TCP_SYN,
+            seq: u32::from_be_bytes([part[4], part[5], part[6], part[7]]),
         },
         IPV4_PROTO_UDP if part.len() >= 8 => {
             // The DHCP client of the service listens on port 68.
@@ -403,11 +406,20 @@ mod tests {
                 local_port: 80,
                 remote: [127, 0, 0, 1],
                 remote_port: 5000,
-                syn: false
+                syn: false,
+                seq: 0
             }
         );
         t[14 + 20 + 13] = TCP_SYN;
-        assert!(matches!(target(&t), Dest::Tcp { syn: true, .. }));
+        t[14 + 20 + 4..14 + 20 + 8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        assert!(matches!(
+            target(&t),
+            Dest::Tcp {
+                syn: true,
+                seq: 0x0102_0304,
+                ..
+            }
+        ));
         t[14 + 20 + 13] = TCP_SYN | TCP_ACK;
         assert!(
             matches!(target(&t), Dest::Tcp { syn: false, .. }),

@@ -191,11 +191,45 @@ pub const fn replaces(closed: bool, listening: bool, relistened: bool) -> bool {
     closed || (listening && relistened)
 }
 
-/// Whether `route` drops a SYN: its four is held by a queue socket in
-/// SYN-RECEIVED. A socket of the set that listens would take the SYN and
-/// hold a second half-open connection on the same four.
-pub const fn drops_repeated_syn(syn: bool, is_queue_socket: bool, syn_received: bool) -> bool {
-    syn && is_queue_socket && syn_received
+/// What `route` does with a SYN whose four is held by a queue socket that
+/// neither listens nor is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynOnFour {
+    /// The socket is half open and the SYN has the initial sequence number it
+    /// recorded: the peer's retransmission. Dropped, so that no other socket of
+    /// the set takes it (the socket sends its own SYN-ACK again).
+    Retransmit,
+    /// The socket is half open and the SYN has another number: a client that
+    /// restarted on the same four. The socket is rebuilt and the SYN goes to
+    /// the listening description as any other.
+    Restart,
+    /// The connection stands (not yet accepted) or is closing: the SYN is
+    /// dropped and the old connection is left as it is.
+    Held,
+}
+
+/// The rule of `route` for a SYN on the four of a queue socket in a state
+/// other than LISTEN and CLOSED.
+pub const fn syn_on_four(syn_received: bool, same_isn: bool) -> SynOnFour {
+    match (syn_received, same_isn) {
+        (true, true) => SynOnFour::Retransmit,
+        (true, false) => SynOnFour::Restart,
+        (false, _) => SynOnFour::Held,
+    }
+}
+
+/// The room a queue socket that went back to LISTEN gives back beyond what
+/// `release_key` gives: its debit was taken when it left LISTEN (`adopt`), and
+/// `release_key` returns it only when the socket held the key.
+pub const fn relisten_credit(had_key: bool, had_connection: bool) -> u8 {
+    if !had_key && had_connection { 1 } else { 0 }
+}
+
+/// The room a rebuilt queue socket gives to its queue: one when the old socket
+/// still held its debit (closed, half open), none when it listened, because
+/// `relisten` gave the debit back already.
+pub const fn rebuild_credit(old_listening: bool) -> u8 {
+    if old_listening { 0 } else { 1 }
 }
 
 /// How long the line of counters of the queues waits after the last one, in
@@ -404,11 +438,36 @@ mod tests {
     }
 
     #[test]
-    fn only_a_syn_on_a_half_open_queue_socket_is_dropped() {
-        assert!(drops_repeated_syn(true, true, true));
-        assert!(!drops_repeated_syn(false, true, true));
-        assert!(!drops_repeated_syn(true, false, true));
-        assert!(!drops_repeated_syn(true, true, false));
+    fn a_syn_on_a_queue_four_is_told_from_its_retransmission() {
+        assert_eq!(syn_on_four(true, true), SynOnFour::Retransmit);
+        assert_eq!(syn_on_four(true, false), SynOnFour::Restart);
+        assert_eq!(syn_on_four(false, true), SynOnFour::Held);
+        assert_eq!(syn_on_four(false, false), SynOnFour::Held);
+    }
+
+    /// The room of a queue of `n` over SYN, SYN-ACK, RST and the rebuild: a
+    /// socket back in LISTEN gets its debit back once.
+    #[test]
+    fn the_room_returns_once_when_a_socket_back_in_listen_is_rebuilt() {
+        for has_key in [true, false] {
+            let n: u8 = 5;
+            let mut room = n;
+            // The SYN: `adopt` takes the debit (with or without a key).
+            room -= 1;
+            // The RST: `release_key` returns it with a key, `relisten` without.
+            if has_key {
+                room += 1;
+            }
+            room += relisten_credit(has_key, true);
+            assert_eq!(room, n);
+            // The rebuild of the socket that listens.
+            room += rebuild_credit(true);
+            assert_eq!(room, n, "key {has_key}");
+        }
+        // A socket that closed keeps its debit until the rebuild returns it.
+        let mut room: u8 = 4;
+        room += rebuild_credit(false);
+        assert_eq!(room, 5);
     }
 
     #[test]
