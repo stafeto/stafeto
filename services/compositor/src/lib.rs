@@ -49,10 +49,12 @@ pub const OPAQUE_TICKS: u32 = 3;
 pub const OVER_TICKS: u32 = 25;
 pub const FILL_TICKS: u32 = 4;
 
-/// Linux's key codes the scene knows: the Alt keys and Tab.
+/// Linux's key codes the scene knows: the Super keys (the manager's
+/// modifier: Doom binds Alt, Ctrl and Shift, so a program of the first
+/// revision keeps all of its keys) and Tab.
 pub const KEY_TAB: u16 = 15;
-pub const KEY_LEFTALT: u16 = 56;
-pub const KEY_RIGHTALT: u16 = 100;
+pub const KEY_LEFTMETA: u16 = 125;
+pub const KEY_RIGHTMETA: u16 = 126;
 
 /// The state of a buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,7 +208,8 @@ pub struct Scene {
     /// pressed button holds.
     pointer: Option<(i32, i32)>,
     held: Option<usize>,
-    alt: bool,
+    /// A Super key is held (the manager has subscribed).
+    modifier: bool,
     damage: Option<Rect>,
     frame: bool,
     seq: u32,
@@ -249,7 +252,7 @@ impl Scene {
             focus: None,
             pointer: None,
             held: None,
-            alt: false,
+            modifier: false,
             damage: None,
             frame: false,
             seq: 0,
@@ -527,14 +530,14 @@ impl Scene {
         core::mem::take(&mut self.delivered)
     }
 
-    /// The manager has subscribed: the Alt keys and the keys pressed with
-    /// Alt held are its alone from now on, and it is told of the windows
+    /// The manager has subscribed: the Super keys and the keys pressed with
+    /// Super held are its alone from now on, and it is told of the windows
     /// to come.
     pub fn set_manager(&mut self, on: bool) {
         self.manager = on;
         if !on {
             self.manager_ring.clear();
-            self.alt = false;
+            self.modifier = false;
         }
     }
 
@@ -546,6 +549,30 @@ impl Scene {
     /// were dropped.
     pub fn take_events(&mut self, i: usize, out: &mut [Event]) -> (usize, bool) {
         self.rings.get_mut(i).map_or((0, false), |r| r.take(out))
+    }
+
+    /// The keys of window `i`'s ring, for the session of focus of a window of
+    /// the first revision: up to `out.len()` KEY events (the other kinds in
+    /// the ring are dropped), and whether events were dropped.
+    pub fn take_keys(&mut self, i: usize, out: &mut [Event]) -> (usize, bool) {
+        let Some(ring) = self.rings.get_mut(i) else {
+            return (0, false);
+        };
+        let mut lost = false;
+        let mut n = 0;
+        let mut one = [Event::default(); 1];
+        while n < out.len() {
+            let (got, l) = ring.take(&mut one);
+            lost |= l;
+            if got == 0 {
+                break;
+            }
+            if one[0].kind == KEY {
+                out[n] = one[0];
+                n += 1;
+            }
+        }
+        (n, lost)
     }
 
     /// EVENTS of the manager.
@@ -565,16 +592,17 @@ impl Scene {
         self.tell(i, Event::new(FOCUS_IN, 0, 0));
     }
 
-    /// A key of the device or of INJECT. With a manager the Alt keys and
-    /// the keys under Alt go to it; any other key goes to the window with
-    /// the focus, and is dropped when there is none.
+    /// A key of the device or of INJECT. With a manager the Super keys and
+    /// the keys under Super go to it; any other key goes to the window with
+    /// the focus (a window of the first revision too: its ring holds the
+    /// keys its session of focus reads), and is dropped when there is none.
     pub fn key(&mut self, code: u16, pressed: bool) {
-        let alt = code == KEY_LEFTALT || code == KEY_RIGHTALT;
-        if alt {
-            self.alt = pressed;
+        let modifier = code == KEY_LEFTMETA || code == KEY_RIGHTMETA;
+        if modifier {
+            self.modifier = pressed;
         }
         let event = Event::new(KEY, code, i32::from(pressed));
-        if self.manager && (alt || self.alt) {
+        if self.manager && (modifier || self.modifier) {
             self.tell_manager(event);
         } else if let Some(i) = self.focus {
             self.tell(i, event);
@@ -626,8 +654,11 @@ impl Scene {
             damage = union(Some(damage), Scene::cursor_rect(old));
         }
         self.add_damage(damage);
+        // A window of the first revision takes no pointer: its ring holds the
+        // keys, which a stream of moves would push out.
         if let Some(i) = self.held.or_else(|| self.hit(at.0, at.1))
             && let Some(w) = self.window(i)
+            && !w.legacy
         {
             let e = Event::at(MOVE, 0, 0, at.0 - w.rect.x as i32, at.1 - w.rect.y as i32);
             self.tell(i, e);
@@ -655,6 +686,7 @@ impl Scene {
         };
         if let Some(i) = target
             && let Some(w) = self.window(i)
+            && !w.legacy
         {
             let e = Event::at(
                 BUTTON,
@@ -1609,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn the_manager_gets_the_alt_keys_and_the_windows_coming_and_going() {
+    fn the_manager_gets_the_super_keys_and_the_windows_coming_and_going() {
         let mut s = Scene::new();
         let (a, b) = two(&mut s);
         let mut out = [Event::default(); 64];
@@ -1628,21 +1660,21 @@ mod tests {
             )
         );
         assert!(s.delivered().manager);
-        // Alt, Tab under Alt, and Tab alone: the first two are the
+        // Super, Tab under Super, and Tab alone: the first two are the
         // manager's, the third the window's.
-        s.key(KEY_LEFTALT, true);
+        s.key(KEY_LEFTMETA, true);
         s.key(KEY_TAB, true);
         s.key(KEY_TAB, false);
-        s.key(KEY_LEFTALT, false);
+        s.key(KEY_LEFTMETA, false);
         s.key(KEY_TAB, true);
         let (n, _) = s.take_manager_events(&mut out);
         assert_eq!(
             &out[..n],
             [
-                Event::new(KEY, KEY_LEFTALT, 1),
+                Event::new(KEY, KEY_LEFTMETA, 1),
                 Event::new(KEY, KEY_TAB, 1),
                 Event::new(KEY, KEY_TAB, 0),
-                Event::new(KEY, KEY_LEFTALT, 0),
+                Event::new(KEY, KEY_LEFTMETA, 0),
             ]
         );
         assert_eq!(events(&mut s, b), [Event::new(KEY, KEY_TAB, 1)]);
@@ -1652,13 +1684,138 @@ mod tests {
         assert_eq!(s.focus(), Some(a));
         assert_eq!(s.hit(60, 60), Some(a));
         assert_eq!(s.focus_on(7), Err(Refusal::Invalid));
-        // Without a manager the Alt keys are the window's.
+        // Without a manager the Super keys are the window's.
         s.set_manager(false);
-        s.key(KEY_LEFTALT, true);
+        s.key(KEY_LEFTMETA, true);
         assert_eq!(
             events(&mut s, a).last(),
-            Some(&Event::new(KEY, KEY_LEFTALT, 1))
+            Some(&Event::new(KEY, KEY_LEFTMETA, 1))
         );
+    }
+
+    /// A window of the first revision shown with the focus, a native one
+    /// made before it (so below it).
+    fn old_and_new(s: &mut Scene) -> (usize, usize) {
+        let n = make(s, 1, 1, rect(0, 0, 100, 100), 1);
+        let l = s.create(2, 2, SCREEN, true, 0).unwrap();
+        s.post(n, 0, &[]).unwrap();
+        s.flush(l, SCREEN).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        s.delivered();
+        for i in [n, l] {
+            s.take_events(i, &mut [Event::default(); 64]);
+        }
+        assert_eq!(s.focus(), Some(l));
+        (n, l)
+    }
+
+    #[test]
+    fn the_keys_of_a_first_revision_window_follow_the_focus() {
+        let mut s = Scene::new();
+        let (n, l) = old_and_new(&mut s);
+        // The window of the first revision has the focus: its keys are the
+        // KEY events of its ring.
+        s.key(30, true);
+        s.key(30, false);
+        let mut out = [Event::default(); 8];
+        assert_eq!(
+            s.take_keys(l, &mut out),
+            (2, false),
+            "the keys of the focus"
+        );
+        assert_eq!(&out[..2], [Event::new(KEY, 30, 1), Event::new(KEY, 30, 0)]);
+        assert!(events(&mut s, n).is_empty());
+        // The focus goes to the native window: the first revision's gets no
+        // key, whatever the keyboard's driver does.
+        s.focus_on(n).unwrap();
+        s.key(31, true);
+        s.key(31, false);
+        assert_eq!(s.take_keys(l, &mut out), (0, false));
+        assert_eq!(
+            events(&mut s, n),
+            [
+                Event::new(FOCUS_IN, 0, 0),
+                Event::new(KEY, 31, 1),
+                Event::new(KEY, 31, 0)
+            ]
+        );
+        // And back: the keys of the time come to it; the focus events in its
+        // ring are not keys and are left out of what it reads.
+        s.focus_on(l).unwrap();
+        s.key(32, true);
+        assert_eq!(s.take_keys(l, &mut out), (1, false));
+        assert_eq!(out[0], Event::new(KEY, 32, 1));
+        // The window goes: the keys are the native window's again.
+        s.destroy(l);
+        s.key(33, true);
+        assert_eq!(s.take_keys(l, &mut out), (0, false));
+        assert_eq!(events(&mut s, n).last(), Some(&Event::new(KEY, 33, 1)));
+    }
+
+    #[test]
+    fn a_first_revision_window_takes_no_pointer_events_but_a_click_gives_it_the_focus() {
+        let mut s = Scene::new();
+        let (n, l) = old_and_new(&mut s);
+        // The window of the first revision covers the screen: moves and
+        // buttons over it leave its ring free for keys.
+        s.pointer_to(10, 10);
+        s.button(0x110, true);
+        s.button(0x110, false);
+        let mut out = [Event::default(); 64];
+        let (got, lost) = s.take_events(l, &mut out);
+        assert!(!lost);
+        assert_eq!(&out[..got], []);
+        assert_eq!(s.focus(), Some(l));
+        // A key is the only thing in the ring.
+        s.key(30, true);
+        assert_eq!(s.take_keys(l, &mut out), (1, false));
+        // The native window has the focus; a click where only the window of
+        // the first revision lies gives that window the focus, and the keys
+        // follow.
+        s.focus_on(n).unwrap();
+        assert_eq!(s.focus(), Some(n));
+        s.pointer_to(500, 300);
+        s.button(0x110, true);
+        s.button(0x110, false);
+        assert_eq!(s.focus(), Some(l));
+        s.key(31, true);
+        assert_eq!(s.take_keys(l, &mut out), (1, false));
+    }
+
+    #[test]
+    fn a_first_revision_ring_that_overflows_says_it_lost_keys() {
+        let mut s = Scene::new();
+        let (_, l) = old_and_new(&mut s);
+        for _ in 0..70 {
+            s.focus_on(l).unwrap();
+            s.key(30, true);
+        }
+        let mut out = [Event::default(); 64];
+        let (n, lost) = s.take_keys(l, &mut out);
+        assert!(lost);
+        assert_eq!(n, 64);
+    }
+
+    #[test]
+    fn the_modifier_of_the_manager_is_super_and_alt_ctrl_and_shift_are_the_windows() {
+        let mut s = Scene::new();
+        let (a, b) = two(&mut s);
+        s.set_manager(true);
+        s.take_manager_events(&mut [Event::default(); 64]);
+        // The keys a game binds (Ctrl 29, Shift 42, Alt 56) reach the window
+        // with the focus, and Tab under them.
+        for code in [29, 42, 56, KEY_TAB] {
+            s.key(code, true);
+        }
+        assert_eq!(events(&mut s, b).len(), 4);
+        assert!(events(&mut s, a).is_empty());
+        assert!(!s.delivered().manager);
+        // The right Super is the manager's as well.
+        s.key(KEY_RIGHTMETA, true);
+        s.key(16, true);
+        assert!(s.delivered().manager);
+        assert!(events(&mut s, b).is_empty());
     }
 
     #[test]
