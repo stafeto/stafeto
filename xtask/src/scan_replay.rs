@@ -56,12 +56,17 @@ const GUEST_MAC: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 pub struct Paths {
     pub inject: PathBuf,
     pub mirror: PathBuf,
+    /// The capture of every frame of the guest's device in both directions
+    /// (`filter-dump`, 128 bytes of each), for the summary of a failed
+    /// request.
+    pub pcap: PathBuf,
 }
 
 pub fn paths(dir: &Path) -> Paths {
     Paths {
         inject: dir.join("scan-in.sock"),
         mirror: dir.join("scan-out.sock"),
+        pcap: dir.join("scan.pcap"),
     }
 }
 
@@ -84,6 +89,11 @@ pub fn qemu_args(p: &Paths) -> Vec<String> {
         "filter-redirector,id=scan-f-in,netdev=n0,queue=tx,indev=scan-in".to_owned(),
         "-object".to_owned(),
         "filter-mirror,id=scan-f-out,netdev=n0,queue=rx,outdev=scan-out".to_owned(),
+        "-object".to_owned(),
+        format!(
+            "filter-dump,id=scan-dump,netdev=n0,file={},maxlen=128",
+            p.pcap.display()
+        ),
     ]
 }
 
@@ -143,6 +153,7 @@ pub struct Tap {
     inject: Arc<Mutex<UnixStream>>,
     seen: Arc<Mutex<Seen>>,
     recording: Arc<AtomicBool>,
+    pcap: PathBuf,
     /// Set by the reader when the mirror's stream ended.
     ended: Arc<AtomicBool>,
 }
@@ -249,6 +260,7 @@ impl Tap {
             inject,
             seen,
             recording,
+            pcap: p.pcap.clone(),
             ended,
         })
     }
@@ -266,6 +278,11 @@ impl Tap {
         n.first_tcp = None;
         n.arp_reply = false;
         n.arp_asked = false;
+    }
+
+    /// The capture file of the guest's device.
+    pub fn pcap(&self) -> &Path {
+        &self.pcap
     }
 
     /// The frames the mirror delivered since `forget`.
@@ -533,6 +550,84 @@ pub fn judge(before: Queues, after: Queues) -> Result<(), String> {
     }
 }
 
+/// The records of a capture file (libpcap, as `filter-dump` writes it): the
+/// seconds of each, with its frame (cut at `maxlen`).
+fn pcap_records(bytes: &[u8]) -> Vec<(f64, &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 24;
+    while at + 16 <= bytes.len() {
+        let word = |o: usize| u32::from_le_bytes(bytes[at + o..at + o + 4].try_into().unwrap());
+        let (sec, usec, len) = (word(0), word(4), word(8) as usize);
+        if at + 16 + len > bytes.len() {
+            break;
+        }
+        out.push((
+            f64::from(sec) + f64::from(usec) / 1e6,
+            &bytes[at + 16..at + 16 + len],
+        ));
+        at += 16 + len;
+    }
+    out
+}
+
+/// How many records the capture holds now: the mark of `capture_since`.
+pub fn capture_mark(pcap: &Path) -> usize {
+    std::fs::read(pcap)
+        .map(|b| pcap_records(&b).len())
+        .unwrap_or(0)
+}
+
+/// The TCP segments of the capture after record `mark` that are not the
+/// scanner's, as lines: the time from the first of them, the direction (the
+/// guest is 10.0.2.15), the flags and the sequence numbers; at most `limit`
+/// lines, then the totals of SYNs to and SYN-ACKs from the guest's port
+/// `port`.
+pub fn capture_since(pcap: &Path, mark: usize, port: u16, limit: usize) -> String {
+    let bytes = match std::fs::read(pcap) {
+        Ok(b) => b,
+        Err(e) => return format!("no capture ({}: {e})", pcap.display()),
+    };
+    let records = pcap_records(&bytes);
+    let (mut lines, mut syns, mut synacks, mut total) = (Vec::new(), 0, 0, 0);
+    let mut t0 = None;
+    for &(t, frame) in records.iter().skip(mark) {
+        let Frame::Tcp {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            ack,
+            flags,
+        } = rawframe::parse(frame)
+        else {
+            continue;
+        };
+        if src_ip == PEER_IP || dst_ip == PEER_IP {
+            continue;
+        }
+        total += 1;
+        let t0 = *t0.get_or_insert(t);
+        if dst_ip == GUEST_IP && dst_port == port && flags & (SYN | ACK) == SYN {
+            syns += 1;
+        }
+        if src_ip == GUEST_IP && src_port == port && flags & (SYN | ACK) == SYN | ACK {
+            synacks += 1;
+        }
+        if lines.len() < limit {
+            lines.push(format!(
+                "+{:.3}s {src_ip:?}:{src_port} > {dst_ip:?}:{dst_port} flags {flags:#04x} seq {seq} ack {ack}",
+                t - t0
+            ));
+        }
+    }
+    format!(
+        "capture after the mark: {total} TCP segments, {syns} SYNs to the guest's port {port}, {synacks} SYN-ACKs from it; the first {}: [{}]",
+        lines.len(),
+        lines.join("; ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +761,62 @@ mod tests {
         assert_eq!(tap.synack(5000, 80), None);
         drop(qemu);
         assert!(waits(&|| tap.ended.load(Ordering::SeqCst)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_capture_summary_lists_the_segments_of_other_hosts_after_the_mark() {
+        let dir = std::env::temp_dir().join(format!("sc{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c.pcap");
+        let mut bytes = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&[0xff, 0xff, 0, 0, 1, 0, 0, 0]);
+        let mut add = |t: u32, seg: Segment| {
+            let f = seg.frame();
+            for w in [t, 500_000, f.len() as u32, f.len() as u32] {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend_from_slice(&f);
+        };
+        let seg = |src: Ip, dst: Ip, sp: u16, dp: u16, flags: u8| Segment {
+            src_mac: GUEST_MAC,
+            dst_mac: PEER_MAC,
+            src_ip: src,
+            dst_ip: dst,
+            src_port: sp,
+            dst_port: dp,
+            seq: 5,
+            ack: 6,
+            flags,
+        };
+        let gw = [10, 0, 2, 2];
+        add(100, seg(gw, GUEST_IP, 1000, 443, SYN));
+        std::fs::write(&file, &bytes).unwrap();
+        let mark = capture_mark(&file);
+        assert_eq!(mark, 1);
+        let mut add = |t: u32, seg: Segment| {
+            let f = seg.frame();
+            for w in [t, 500_000, f.len() as u32, f.len() as u32] {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend_from_slice(&f);
+        };
+        add(101, seg(gw, GUEST_IP, 1001, 443, SYN));
+        add(101, seg(GUEST_IP, gw, 443, 1001, SYN | ACK));
+        add(102, seg(PEER_IP, GUEST_IP, 30001, 443, SYN));
+        add(103, seg(gw, GUEST_IP, 1001, 443, SYN));
+        std::fs::write(&file, &bytes).unwrap();
+        let text = capture_since(&file, mark, 443, 10);
+        assert!(
+            text.contains("3 TCP segments, 2 SYNs to the guest's port 443, 1 SYN-ACKs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("+0.000s [10, 0, 2, 2]:1001 > [10, 0, 2, 15]:443 flags 0x02"),
+            "{text}"
+        );
+        assert!(text.contains("+2.000s"), "{text}");
+        assert!(!text.contains("30001"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

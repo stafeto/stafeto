@@ -1537,6 +1537,7 @@ fn tls_raw_scan(
     tap.record(false);
     let done = done.map_err(|e| format!("4h: {e}"))?;
     // The first requests, at once.
+    let mark = replay::capture_mark(tap.pcap());
     let out = tls.file("raw-scan.html");
     let ended = tls.curl(
         true,
@@ -1549,10 +1550,29 @@ fn tls_raw_scan(
         ],
     )?;
     if ended.code != 0 {
+        // What would tell a defect of the service from a state only the
+        // replay makes: the segments the guest saw and sent for the request
+        // (the capture), what the replay did, and the counters of the queues
+        // as the service says them next (up to 35 s).
+        let capture = replay::capture_since(tap.pcap(), mark, 443, 60);
+        let _ = run.expect_line(
+            "the counters after the failed request",
+            |l| l.contains("net: queues sockets"),
+            Duration::from_secs(35),
+        );
+        let said: Vec<String> = run
+            .lines()
+            .iter()
+            .filter(|l| l.contains("net: queues") || l.contains("net: listener"))
+            .rev()
+            .take(14)
+            .cloned()
+            .collect();
         return Err(format!(
-            "4h: the first request over TLS after the scan ended with {}: {}",
+            "4h: the first request over TLS after the scan ended with {}: {}; the replay: {done:?}; counters before {before:?}, after {:?}; the last counter lines (newest first): {said:?}; {capture}",
             ended.code,
-            last_lines(&ended.said)
+            last_lines(&ended.said),
+            replay::latest(run.lines())
         ));
     }
     same_file("4h: the page over TLS", &out, rootfs::www_index())?;
