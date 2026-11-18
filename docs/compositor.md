@@ -148,7 +148,40 @@ that speak to the driver directly (the image of `gpu-probe`).
 
 The header version of proto_gpu stays 1 in revision 2. The loop of a service
 takes one version, and the series 0.5 of the ABI (`packages/abi.txt`) holds
-the version in the programs built for it. `proto_gpu::REVISION` is 2.
+the version in the programs built for it. `proto_gpu::REVISION` is 3.
+
+Revision 3 gives the owner of the screen the hardware layers, in the words of
+OpenWF Display. PIPELINES (9) lists the display hardware's pipelines: the
+virtio device has a primary pipeline that takes a source of the whole screen
+(640 by 400, XRGB8888) at 0, 0, and a cursor pipeline that takes a source of
+exactly 64 by 64 (ARGB8888, premultiplied) with a hot spot. SOURCE (10) hands
+the owner the memory object of a source, once for each kind: 1 is the pool
+buffer (source 2), 2 the cursor picture (source 3); source 1 is the
+compositing target, the buffer OPEN gave. LAYERS (11) binds up to four rows,
+a source to a pipeline with the place, the hot spot and the changed area, and
+the rows take effect together. The layouts are in the header of
+`proto/gpu/src/lib.rs`: a pipeline's record is 32 bytes, a LAYERS row 40, and
+a LAYERS request at most 172 bytes. The three methods belong to the owner's
+session alone. Until the driver implements them it answers UNKNOWN_METHOD.
+
+The driver keeps this order of the device's commands, and the compositor may
+rely on it:
+
+- A primary row with a new source: the whole of the source is transferred to
+  the host, then the scanout is set to it, then the whole screen is flushed.
+  The transfer is complete before the scanout changes. With the bound source
+  the row transfers and flushes its changed area, as COMMIT does, and COMMIT
+  stays as a LAYERS of one such row.
+- A cursor row with a new source: the picture is transferred with a fence, and
+  the cursor update is sent after the device answered that transfer. A
+  transfer behind the work of a frame waits for it.
+- A cursor row of source 0 hides the cursor; a row that only moves is a move.
+- A LAYERS of cursor rows alone is always taken. The cursor queue holds one
+  chain; the driver keeps the last place given while a chain is out and sends
+  that place alone when it returns, so the moves merge.
+- A LAYERS with a primary row while the device holds the work of an earlier
+  frame is BUSY, and the work ends with FRAME_SHOWN or FRAME_FAILED as for
+  COMMIT.
 
 ## Checks
 
