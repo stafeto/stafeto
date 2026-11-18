@@ -2046,6 +2046,7 @@ fn boot(args: &[String]) -> Result<(), String> {
             Ok(mac) => println!("interface mac ..:..:..:{}", last_octets(&mac)),
             Err(e) => println!("interface mac: {e}"),
         }
+        let mut serial_text: Option<(u64, String)> = None;
         if let Some(n) = flag(args, "--serial").and_then(|n| n.parse().ok()) {
             for _ in 0..40 {
                 if state(&id)? == "running" {
@@ -2054,19 +2055,27 @@ fn boot(args: &[String]) -> Result<(), String> {
                 std::thread::sleep(Duration::from_secs(3));
             }
             match serial(&s, &id, n) {
-                Ok(t) => {
-                    println!("--- serial console, first {n} s ---");
-                    for l in t.lines() {
-                        println!("{}", redact(l));
-                    }
-                    println!("--- end of serial console ---");
-                }
+                Ok(t) => serial_text = Some((n, t)),
                 Err(e) => println!("serial console: {e}"),
             }
         }
         let log = s.dir.join("console.log");
         let w = watch(&id, end.as_deref(), Duration::from_secs(timeout), &log)?;
-        print_console(&w.text);
+        if let Some((n, t)) = &serial_text {
+            // The serial capture starts when the connection is made. The console has the
+            // start of the boot, so the two are printed as one text.
+            let full = boot_text(&w.text, t);
+            let _ = std::fs::write(s.dir.join("boot.log"), &full);
+            println!(
+                "--- console output and serial console, first {n} s (identifiers redacted) ---"
+            );
+            for l in full.lines() {
+                println!("{}", redact(l));
+            }
+            println!("--- end of console output and serial console ---");
+        } else {
+            print_console(&w.text);
+        }
         println!(
             "boot ended: marker {}, instance state {} after {:.0} s",
             if w.ended { "seen" } else { "not seen" },
@@ -2458,36 +2467,70 @@ echo STAFETO-NEIGHBOUR-DONE > $O
 sleep 300
 "##;
 
+/// The base64 text of one line of a record, or `None` for a line that has none. A kernel
+/// message or a login prompt shares the console with the record: a line of such text
+/// has no base64 part, and a record line cut by a kernel message (`AAAA[   12.3] text`)
+/// gives the characters before the message. The gzip check of the whole record settles
+/// whether what was kept is right.
+fn record_fragment(line: &str) -> Option<&str> {
+    let is64 = |c: char| c.is_ascii_alphanumeric() || "+/=".contains(c);
+    if line.chars().all(is64) {
+        return Some(line);
+    }
+    let end = line.find(|c: char| !is64(c))?;
+    (end > 0 && line[end..].starts_with('[')).then(|| &line[..end])
+}
+
 /// Joins the records `STAFETO-BEGIN name` ... `STAFETO-END name` of a console
-/// text into (name, base64 text) and decodes them.
+/// text into (name, base64 text) and decodes them. Lines of other text between the
+/// two markers are skipped; a record the gzip check refuses is dropped.
 fn records(text: &str) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut name: Option<String> = None;
     let mut body = String::new();
     for line in text.lines() {
         let line = line.trim();
-        if let Some(n) = line.strip_prefix("STAFETO-BEGIN ") {
-            name = Some(n.trim().to_string());
+        // A marker can follow other text on its line (a prompt without a line end).
+        if let Some(at) = line.find("STAFETO-BEGIN ") {
+            name = Some(line[at + "STAFETO-BEGIN ".len()..].trim().to_string());
             body.clear();
-        } else if let Some(n) = line.strip_prefix("STAFETO-END ") {
-            if name.as_deref() == Some(n.trim())
+        } else if let Some(at) = line.find("STAFETO-END ") {
+            let n = line[at + "STAFETO-END ".len()..].trim();
+            if name.as_deref() == Some(n)
                 && let Some(bytes) = unbase64(&body).and_then(|b| gunzip(&b))
             {
-                out.insert(n.trim().to_string(), bytes);
+                out.insert(n.to_string(), bytes);
             }
             name = None;
         } else if name.is_some()
-            && line
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+            && let Some(part) = record_fragment(line)
         {
-            body.push_str(line);
-        } else if name.is_some() {
-            // Kernel or service text interleaved with the record: the record is lost.
-            name = None;
+            body.push_str(part);
         }
     }
     out
+}
+
+/// The text of a boot from the full console (`get-console-output`, which holds the
+/// start) and the serial capture (which starts when the connection is made and
+/// carries what was typed): the console, then the serial lines that follow what the
+/// console already has. The longest run of console lines at its end that begins the serial
+/// capture is the overlap.
+fn boot_text(console: &str, serial: &str) -> String {
+    let c: Vec<&str> = console.lines().map(str::trim_end).collect();
+    let s: Vec<&str> = serial.lines().map(str::trim_end).collect();
+    let overlap = (0..=c.len().min(s.len()))
+        .rev()
+        .find(|&n| c[c.len() - n..] == s[..n])
+        .unwrap_or(0);
+    let mut out: Vec<&str> = c;
+    if overlap == 0 && !s.is_empty() && !out.is_empty() {
+        out.push("--- the serial capture begins here ---");
+    }
+    out.extend(&s[overlap..]);
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
 }
 
 fn unbase64(s: &str) -> Option<Vec<u8>> {
@@ -3385,6 +3428,84 @@ mod tests {
         let r = records(&text);
         assert_eq!(r.get("a").map(Vec::as_slice), Some(&b"hi\n"[..]));
         assert!(!r.contains_key("b"));
+    }
+
+    fn gzip_of(data: &[u8]) -> String {
+        let mut c = Command::new("gzip")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(data).unwrap();
+        base64(&c.wait_with_output().unwrap().stdout)
+    }
+
+    #[test]
+    fn a_record_survives_kernel_lines_and_a_login_prompt_between_its_lines() {
+        let payload: Vec<u8> = (0..400u32).map(|i| (i * 7 % 251) as u8).collect();
+        let b = gzip_of(&payload);
+        let (x, rest) = b.split_at(b.len() / 3);
+        let (y, z) = rest.split_at(rest.len() / 2);
+        let text = format!(
+            "STAFETO-BEGIN r\n{x}\n[   12.345678] ena 0000:00:05.0: link up\n{y}\nip-10-0-0-1 login: \n{z}\nSTAFETO-END r\n"
+        );
+        assert_eq!(records(&text).get("r"), Some(&payload));
+    }
+
+    #[test]
+    fn a_record_line_cut_by_a_kernel_message_keeps_both_halves() {
+        let payload = b"the firmware tables\n".repeat(20);
+        let b = gzip_of(&payload);
+        let (x, y) = b.split_at(b.len() / 2);
+        let text =
+            format!("STAFETO-BEGIN r\n{x}[   13.5] random: crng init done\n{y}\nSTAFETO-END r\n");
+        assert_eq!(records(&text).get("r"), Some(&payload));
+    }
+
+    #[test]
+    fn a_marker_after_text_without_a_line_end_still_counts() {
+        let b = gzip_of(b"hi\n");
+        let text = format!("login: STAFETO-BEGIN r\n{b}\n[ 1.0] msg STAFETO-END r\n");
+        assert_eq!(
+            records(&text).get("r").map(Vec::as_slice),
+            Some(&b"hi\n"[..])
+        );
+    }
+
+    #[test]
+    fn a_damaged_record_is_dropped_and_the_next_one_is_kept() {
+        let good = gzip_of(b"ok\n");
+        let text = format!(
+            "STAFETO-BEGIN a\nAAAAAAAA login: BBBB\nSTAFETO-END a\nSTAFETO-BEGIN b\n{good}\nSTAFETO-END b\n"
+        );
+        let r = records(&text);
+        assert!(!r.contains_key("a"));
+        assert_eq!(r.get("b").map(Vec::as_slice), Some(&b"ok\n"[..]));
+    }
+
+    #[test]
+    fn the_boot_text_joins_the_console_start_and_the_serial_tail() {
+        let console = "EFI stub: Booting\nstafeto: kernel up\nnet: ena ready\n";
+        let serial = "net: ena ready\nstafeto-ok\n[ssh] Authenticated\n";
+        assert_eq!(
+            boot_text(console, serial),
+            "EFI stub: Booting\nstafeto: kernel up\nnet: ena ready\nstafeto-ok\n[ssh] Authenticated\n"
+        );
+        // No overlap: both are kept and the join is marked.
+        assert_eq!(
+            boot_text("a\nb\n", "c\n"),
+            "a\nb\n--- the serial capture begins here ---\nc\n"
+        );
+        assert_eq!(boot_text("", "c\n"), "c\n");
+        assert_eq!(boot_text("a\n", ""), "a\n");
+    }
+
+    #[test]
+    fn the_boot_text_is_redacted_line_by_line_when_printed() {
+        let t = boot_text("i-0123456789abcdef0 up\n", "");
+        let shown: Vec<String> = t.lines().map(redact).collect();
+        assert!(!shown.join("\n").contains("0123456789abcdef0"));
     }
 
     #[test]
