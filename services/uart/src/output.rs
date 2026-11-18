@@ -726,4 +726,46 @@ mod tests {
         let two = out.windows(3).position(|w| w == b"two").unwrap();
         assert!(one < two && two - one <= LOG_BYTES + 100, "{one} {two}");
     }
+
+    /// The console dialog after a burst of the log: a client's closing line
+    /// and its prompt (no newline) wait behind the log, and the driver's
+    /// notice, put into the ring of the log (`say_log`), comes last. Every
+    /// line comes whole: the closing line at a turn of the clients, the
+    /// prompt cut by the log and repeated, the notice on a line of its own,
+    /// never glued to the prompt.
+    #[test]
+    fn a_driver_notice_never_glues_to_a_prompt_behind_a_burst() {
+        let mut o = Output::new();
+        for n in 0..100 {
+            let mut line = [b'x'; 61];
+            line[..3].copy_from_slice(format!("{n:03}").as_bytes());
+            line[60] = b'\n';
+            assert!(o.put_log(&line));
+        }
+        assert!(o.put(b"shell: closing line\n"));
+        assert!(o.put(b"stafeto> "));
+        assert!(o.put_log(b"uart: log backlog peak 45 records\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("stafeto> uart"), "glued: {text:?}");
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        let at = |what: &str| lines.iter().position(|l| *l == what);
+        let closing = at("shell: closing line").expect("the closing line whole");
+        let notice = at("uart: log backlog peak 45 records").expect("the notice whole");
+        // The closing line has its turn in the middle of the burst, and the
+        // 100 lines of the burst come whole around it.
+        assert!(0 < closing && closing < 99, "{closing}");
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.len() == 60 && l.ends_with("xxxx"))
+                .count()
+                == 100
+        );
+        // The prompt comes whole as a line of its own (cut by the log with a
+        // CR LF) and again at the end, after the notice.
+        assert!(lines.iter().filter(|l| **l == "stafeto> ").count() >= 1);
+        assert!(notice < lines.len() - 1);
+        assert_eq!(*lines.last().unwrap(), "stafeto> ");
+    }
 }

@@ -384,6 +384,21 @@ impl Uart {
         self.kick();
     }
 
+    /// Formats a notice of the driver into the ring of the log, so that it
+    /// goes out as a whole line at a line start (Output): after a client's
+    /// open line, a prompt, the line is cut with a CR LF and goes again
+    /// once the notice is out. `say` puts bytes into the clients' ring and
+    /// would glue them to such a line.
+    fn say_log(&mut self, args: fmt::Arguments<'_>) {
+        let mut line = Line {
+            bytes: [0; LINE_MAX],
+            len: 0,
+        };
+        let _ = line.write_fmt(args);
+        let _ = self.state.output.put_log(&line.bytes[..line.len]);
+        self.kick();
+    }
+
     /// Starts output after bytes came into it outside a pass (spec 13.5):
     /// the writes that wait go into the ring as room allows, and while the
     /// transmit interrupt is masked the driver writes the first bytes to
@@ -567,7 +582,7 @@ impl Uart {
     fn say_peak(&mut self, ends: bool) {
         let idle = ends || (self.left == 0 && self.state.output.log_done());
         if let Some(peak) = self.peak.say(idle) {
-            self.say(format_args!("uart: log backlog peak {peak} records\n"));
+            self.say_log(format_args!("uart: log backlog peak {peak} records\n"));
         }
     }
 

@@ -499,6 +499,21 @@ impl Driver {
         self.kick();
     }
 
+    /// Formats a notice of the driver into the ring of the log, so that it
+    /// goes out as a whole line at a line start (Output): after a client's
+    /// open line, a prompt, the line is cut with a CR LF and goes again
+    /// once the notice is out. `say` puts bytes into the clients' ring and
+    /// would glue them to such a line.
+    fn say_log(&mut self, args: fmt::Arguments<'_>) {
+        let mut line = Line {
+            bytes: [0; LINE_MAX],
+            len: 0,
+        };
+        let _ = line.write_fmt(args);
+        let _ = self.state.output.put_log(&line.bytes[..line.len]);
+        self.kick();
+    }
+
     /// Starts output: the writes that wait go into the ring as room
     /// allows, and, when no transmission is with the device, the next
     /// bytes of the ring, up to port::TX_BYTES, go to it. The driver never
@@ -655,7 +670,7 @@ impl Driver {
     fn say_peak(&mut self, ends: bool) {
         let idle = ends || (self.left == 0 && self.state.output.log_done());
         if let Some(peak) = self.peak.say(idle) {
-            self.say(format_args!(
+            self.say_log(format_args!(
                 "virtio-console: log backlog peak {peak} records\n"
             ));
         }

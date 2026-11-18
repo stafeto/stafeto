@@ -11409,14 +11409,18 @@ fn burst_line(n: u32) -> String {
 /// driver of the console is idle (and has its ring of 64 records to
 /// empty in each period of uart::log::IDLE_NS). All lines come on the
 /// console, in order, each once, and no `[kernel log: N records lost]`
-/// comes with them (spec 13.5, 16.3). Ends at the prompt.
+/// comes with them (spec 13.5, 16.3). The shell's closing line comes among
+/// them, at a turn of the clients. Ends at a prompt.
 pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
     let from = run.lines().len();
     run.send("logburst")?;
-    let last = burst_line(LOG_BURST - 1);
-    run.expect_line("the last line of the burst", |l| l == last, DIALOG_STEP)?;
+    // The shell's closing line is client output and goes out at a client's
+    // turn, in the middle of the burst (the log and the clients alternate at
+    // a line start): it is waited for before the last line of the burst.
     let done = format!("shell: logburst: {LOG_BURST} lines");
     run.expect_line(&done, |l| l == done, DIALOG_STEP)?;
+    let last = burst_line(LOG_BURST - 1);
+    run.expect_line("the last line of the burst", |l| l == last, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
     burst_whole(&run.lines()[from..])?;
     // The driver says the largest backlog of the kernel's rings it saw once
