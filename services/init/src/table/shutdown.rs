@@ -92,6 +92,12 @@ pub const STOP_TABLE: &[Record] = &[
     },
 ];
 
+/// The table of the probe of the power button (feature `table-power-button`, `cargo xtask
+/// power-button`): the PL011's driver and the real service `power` (`aws::POWER`), on the
+/// kernel booted with no firmware. QEMU `virt` routes the monitor's `system_powerdown` to
+/// pin 3 of its PL061 only then; with edk2 and ACPI the machine has a GED device for it.
+pub const POWER_BUTTON_TABLE: &[Record] = &[super::normal::TABLE[0], super::aws::POWER];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +173,18 @@ mod tests {
         assert!(writer.connects.contains(&"datafs") && writer.log);
         assert_eq!(writer.waits.len(), 1);
         assert_eq!(STOP_TABLE.iter().filter(|r| r.is_posix()).count(), 2);
+    }
+
+    #[test]
+    fn the_power_button_table_is_the_console_and_the_real_power_record() {
+        use crate::table::POWER_SERVICE;
+        assert!(crate::table::check(POWER_BUTTON_TABLE).is_ok());
+        let names: Vec<&str> = POWER_BUTTON_TABLE.iter().map(|r| r.name).collect();
+        assert_eq!(names, ["uart", POWER_SERVICE]);
+        assert_eq!(POWER_BUTTON_TABLE[1], super::super::aws::POWER);
+        let alive = 0b11;
+        let first = shutdown::wave(POWER_BUTTON_TABLE, alive);
+        assert_eq!(first, 0b10, "power first, the console after");
+        assert_eq!(shutdown::wave(POWER_BUTTON_TABLE, alive & !first), 0b01);
     }
 }

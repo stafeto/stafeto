@@ -307,16 +307,8 @@ mod tests {
 
     #[test]
     fn the_aws_table_stops_in_the_order_of_the_decision() {
-        // The table of the shell on EC2 as it is with the second volume
-        // and the power service added by its own step: the order of the
-        // waves is that of this table plus `power`.
-        let mut table: Vec<Record> = aws::TABLE.to_vec();
-        table.push(Record {
-            name: crate::table::POWER_SERVICE,
-            program: "power",
-            connects: &[],
-            ..test::TABLE[0]
-        });
+        // The table of the shell on EC2, with its record `power`.
+        let table: Vec<Record> = aws::TABLE.to_vec();
         let waves = waves(&table);
         assert_eq!(
             waves,
@@ -401,7 +393,7 @@ mod tests {
     #[test]
     fn a_shutdown_from_another_record_is_refused_stopping_or_not() {
         for table in [aws::TABLE, base::BASE_TABLE, test::TABLE] {
-            for r in table {
+            for r in table.iter().filter(|r| r.name != POWER_SERVICE) {
                 assert_eq!(decide(r, false), Decision::Refuse, "{}", r.name);
                 assert_eq!(decide(r, true), Decision::Refuse, "{}", r.name);
             }
@@ -485,7 +477,7 @@ mod tests {
     fn only_the_record_named_power_may_ask() {
         let tables: [&[Record]; 4] = [aws::TABLE, aws::QEMU_TABLE, base::BASE_TABLE, test::TABLE];
         for table in tables {
-            for r in table {
+            for r in table.iter().filter(|r| r.name != POWER_SERVICE) {
                 assert!(!may_ask(r), "{} may stop the system", r.name);
             }
         }
