@@ -35,6 +35,11 @@ use std::time::Duration;
 
 use crate::{BOOT_PROFILE, Variant, build, build_boot_image, qemu};
 
+/// The arithmetic of the starvation gate, the file the probe prints its terms with: its host
+/// tests run here, and the gate reads the loss and its bound through it.
+#[path = "../../tests/service-budget/src/terms.rs"]
+mod terms;
+
 const TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The services of the phases, in the order of the probe.
@@ -304,10 +309,16 @@ pub struct One {
     pub cycles: u64,
     pub worst10: u64,
     pub median10: u64,
-    pub bound10: u64,
     pub c_us: u64,
     pub e_us: u64,
-    pub remainder_us: u64,
+    /// The counting budget of the console driver's stub: whether the probe had a copy, and the
+    /// time it ran and the times it ran out over the phase (its overruns stay 0 when the count is
+    /// whole).
+    pub driver_budget: bool,
+    pub driver_ran_us: u64,
+    pub driver_overruns: u64,
+    /// The worst window of ten cycles, when the victim made one.
+    pub worst: Option<Worst>,
     /// The ticks of the `serve` budget charged in the phase, its bound and its floor, in
     /// microseconds.
     pub ran_us: u64,
@@ -319,6 +330,77 @@ pub struct One {
     pub s_max_us: u64,
     pub s0_us: u64,
     pub bound_us: u64,
+}
+
+/// The worst window of ten cycles of one phase, as the probe prints it (`svcbudget1 <name>
+/// worst`), in microseconds: the terms of the loss and of its bound (`terms`).
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct Worst {
+    pub r_us: u64,
+    pub w_us: u64,
+    pub l_us: u64,
+    pub n: u64,
+    pub loss_us: u64,
+    pub serve_ran_us: u64,
+    pub serve_overruns: u64,
+    pub pending_max: u64,
+    pub drv_ran_us: u64,
+    pub drv_overruns: u64,
+    pub service_us: u64,
+    pub events_us: u64,
+    pub init_us: u64,
+    pub driver_term_us: u64,
+    pub bound_loss_us: u64,
+    pub bound_share: u64,
+    pub share: u64,
+    pub left_us: i64,
+}
+
+fn signed(line: &str, key: &str) -> Result<i64, String> {
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(key))
+        .ok_or_else(|| format!("missing {key} in {line:?}"))?
+        .parse()
+        .map_err(|e| format!("bad {key} in {line:?}: {e}"))
+}
+
+impl Worst {
+    fn read(line: &str) -> Result<Worst, String> {
+        let w = Worst {
+            r_us: number(line, "R_us=")?,
+            w_us: number(line, "W_us=")?,
+            l_us: number(line, "l_us=")?,
+            n: number(line, "n=")?,
+            loss_us: number(line, "loss_us=")?,
+            serve_ran_us: number(line, "serve_ran_us=")?,
+            serve_overruns: number(line, "serve_overruns=")?,
+            pending_max: number(line, "pending_max=")?,
+            drv_ran_us: number(line, "drv_ran_us=")?,
+            drv_overruns: number(line, "drv_overruns=")?,
+            service_us: number(line, "s_us=")?,
+            events_us: number(line, "events_us=")?,
+            init_us: number(line, "init_us=")?,
+            driver_term_us: number(line, "d_us=")?,
+            bound_loss_us: number(line, "bound_loss_us=")?,
+            bound_share: number(line, "bound_share=")?,
+            share: number(line, "share=")?,
+            left_us: signed(line, "x_us=")?,
+        };
+        // The probe's loss is W - R and its bound is the sum of its terms: a line that says
+        // otherwise is a fault of the probe.
+        let sum = terms::bound_us(w.service_us, w.events_us, w.init_us, w.driver_term_us);
+        if w.loss_us != terms::loss_us(w.r_us, w.w_us) || w.bound_loss_us != sum {
+            return Err(format!(
+                "the terms of the worst window do not add up: {line:?}"
+            ));
+        }
+        Ok(w)
+    }
+
+    /// The loss over its bound, in microseconds: positive when the terms do not explain it.
+    pub fn over_us(&self) -> i64 {
+        terms::over_bound(self.loss_us, self.bound_loss_us)
+    }
 }
 
 /// The lines of the one-CPU probe for each service.
@@ -363,14 +445,17 @@ fn parse_service(lines: &[String], name: &str, level40: bool) -> Result<One, Str
             starved = true;
             one.cycles = number(line, "cycles=")?;
             one.e_us = number(line, "e_us=")?;
-            one.remainder_us = number(line, "remainder_us=")?;
             one.worst10 = number(line, "worst10=")?;
             one.median10 = number(line, "median10=")?;
-            one.bound10 = number(line, "bound10=")?;
             one.c_us = number(line, "c_us=")?;
             one.ran_us = number(line, "ran_us=")?;
             one.ran_bound_us = number(line, "ran_bound_us=")?;
             one.ran_floor_us = number(line, "ran_floor_us=")?;
+            one.driver_budget = number(line, "driver_budget=")? != 0;
+            one.driver_ran_us = number(line, "driver_ran_us=")?;
+            one.driver_overruns = number(line, "driver_overruns=")?;
+        } else if line.starts_with("worst R_us=") {
+            one.worst = Some(Worst::read(line)?);
         } else if line.starts_with("level40 ") {
             leveled = true;
             one.requests_per_ping = number(line, "requests_per_ping=")?;
@@ -413,9 +498,9 @@ pub fn verdict_ran(all: &[One]) -> Result<(), String> {
 }
 
 /// The starvation gate of the one-CPU probe: each budget's account holds (`verdict_ran`) and the
-/// victim made its cycles. The victim's share in its worst 10 cycles against its bound is printed
-/// and does not fail the gate: the bound leaves a part of the loss unexplained under the service
-/// budgets of main (stafeto/stafeto#430).
+/// victim made its cycles. The victim's loss in its worst window of ten cycles against the sum of
+/// its terms (`S + E + 20 + I`, plus the driver's time for the terminal) is printed with every
+/// term and does not fail the gate yet: what is left (X) tells what the terms still miss (stafeto/stafeto#430).
 pub fn verdict_starve(all: &[One]) -> Result<(), String> {
     verdict_ran(all)?;
     for (name, o) in SERVICES.iter().zip(all) {
@@ -425,10 +510,43 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
                 o.cycles
             ));
         }
-        if o.worst10 < o.bound10 {
+        if o.driver_budget && o.driver_overruns > 0 {
             println!(
-                "service-budget: {name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {} (printed for information, stafeto/stafeto#430)",
-                o.worst10, o.bound10
+                "service-budget: {name}: the console driver's counting budget ran out {} times in the phase, so its time is counted in part (printed for information)",
+                o.driver_overruns
+            );
+        }
+        let Some(w) = &o.worst else {
+            println!("service-budget: {name}: no window of ten cycles to judge");
+            continue;
+        };
+        println!(
+            "service-budget: {name}: worst window R {} us, W {} us, l {} us, n {}, loss {} us = serve ran {} + driver ran {} + events {} + 20 + left {} (serve overruns {}, pending at most {}, driver overruns {}; the work of init and the heartbeats are in the left term)",
+            w.r_us,
+            w.w_us,
+            w.l_us,
+            w.n,
+            w.loss_us,
+            w.serve_ran_us,
+            w.drv_ran_us,
+            terms::events_us(o.e_us, w.serve_overruns),
+            w.left_us,
+            w.serve_overruns,
+            w.pending_max,
+            w.drv_overruns
+        );
+        if w.over_us() > 0 || w.share < w.bound_share {
+            println!(
+                "service-budget: {name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}: the loss of {} us is over S {} + E {} + 20 + I {} + D {} = {} us by {} us (printed for information, stafeto/stafeto#430)",
+                w.share,
+                w.bound_share,
+                w.loss_us,
+                w.service_us,
+                w.events_us,
+                w.init_us,
+                w.driver_term_us,
+                w.bound_loss_us,
+                w.over_us()
             );
         }
     }
@@ -454,13 +572,17 @@ pub fn verdict_level40(all: &[One]) -> Result<(), String> {
 fn one_table(all: &[One]) {
     for (name, o) in SERVICES.iter().zip(all) {
         println!(
-            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, unexplained {} us of the loss); budget charged {} us of at most {} (at least {}); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
+            "service-budget: {name}: worst 10 cycles {} per mille of the victim's active time (median {}, bound {}; C {} us, e {} us, left {} us of the loss); budget charged {} us of at most {} (at least {}); level 40: {} requests a ping, worst request {} us, worst wait {} us, bound {} us, headroom {} us (s_max {} us from the probe's own unloaded measurement, s0 {} us)",
             o.worst10,
             o.median10,
-            o.bound10,
+            o.worst
+                .as_ref()
+                .map_or_else(|| "n/a".to_owned(), |w| w.bound_share.to_string()),
             o.c_us,
             o.e_us,
-            o.remainder_us,
+            o.worst
+                .as_ref()
+                .map_or_else(|| "n/a".to_owned(), |w| w.left_us.to_string()),
             o.ran_us,
             o.ran_bound_us,
             o.ran_floor_us,
@@ -759,6 +881,64 @@ mod tests {
                 .unwrap_err()
                 .contains("no ran-ramfs")
         );
+    }
+
+    fn run_lines(ran: u64) -> Vec<String> {
+        [
+            "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1".to_owned(),
+            format!("svcbudget1 tty starve clients=24 cycles=150 worst10=923 median10=957 c_us=75 e_us=30 ran_us={ran} ran_bound_us=2919 ran_floor_us=75 phase_us=155000 driver_budget=1 driver_ran_us=900 driver_overruns=0"),
+            "svcbudget1 tty worst R_us=8000 W_us=8667 l_us=10470 n=2 loss_us=667 serve_ran_us=225 serve_overruns=2 pending_max=3 drv_ran_us=150 drv_overruns=0 beats=na c_us=75 e_us=30 s_us=375 events_us=180 entries_us=20 init_us=70 d_us=150 bound_loss_us=795 bound_share=909 share=923 x_us=92".to_owned(),
+            "svcbudget DONE".to_owned(),
+        ]
+        .to_vec()
+    }
+
+    #[test]
+    fn the_worst_window_is_read_with_its_terms_and_never_fails_the_gate() {
+        let one = parse_starve_only(&run_lines(2175), "tty").unwrap();
+        let w = one.worst.clone().unwrap();
+        assert_eq!((w.r_us, w.l_us, w.n, w.loss_us), (8000, 10470, 2, 667));
+        assert_eq!(
+            (w.serve_overruns, w.pending_max, w.drv_ran_us, w.left_us),
+            (2, 3, 150, 92)
+        );
+        assert!(one.driver_budget && one.driver_ran_us == 900);
+        // 667 is under its bound of 795: nothing over.
+        assert_eq!(w.over_us(), -128);
+        // A window over its bound is printed and the gate passes (the victim check is information).
+        let mut over = one.clone();
+        over.cycles = 150;
+        over.worst.as_mut().unwrap().bound_loss_us = 600;
+        over.worst.as_mut().unwrap().driver_term_us = 0;
+        over.worst.as_mut().unwrap().service_us = 330;
+        assert!(over.worst.as_ref().unwrap().over_us() > 0);
+        assert!(verdict_starve(&[over.clone(), over.clone(), over]).is_ok());
+    }
+
+    #[test]
+    fn a_worst_window_whose_terms_do_not_add_up_is_a_fault_of_the_probe() {
+        let mut lines = run_lines(2175);
+        lines[2] = lines[2].replace("bound_loss_us=795", "bound_loss_us=796");
+        assert!(
+            parse_starve_only(&lines, "tty")
+                .unwrap_err()
+                .contains("do not add up")
+        );
+        let mut lines = run_lines(2175);
+        lines[2] = lines[2].replace("loss_us=667", "loss_us=668");
+        assert!(parse_starve_only(&lines, "tty").is_err());
+    }
+
+    #[test]
+    fn the_unbound_images_still_fail_the_hard_part_with_the_new_lines() {
+        // An unbound service charges nothing: the account fails whatever the victim lost.
+        let one = parse_starve_only(&run_lines(0), "tty").unwrap();
+        assert!(
+            verdict_ran_of("tty", &one)
+                .unwrap_err()
+                .contains("not under its budget")
+        );
+        assert!(verdict_starve(&[one.clone(), one.clone(), one]).is_err());
     }
 
     #[test]
