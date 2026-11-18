@@ -368,6 +368,8 @@ impl<'a> Stack<'a> {
         passed: &mut GroupSet,
     ) {
         let now = instant(now_ns);
+        #[cfg(feature = "steps")]
+        let entered = rt::time::now();
         // The service's set only when it has work.
         if self.service_due || self.group_at[GROUPS].is_some_and(|at| at <= now_ns) {
             self.service_due = false;
@@ -408,6 +410,13 @@ impl<'a> Stack<'a> {
             let Some(g) = due.next(from).or_else(|| due.next(0)) else {
                 break;
             };
+            // A second group is visited only while the step is within the soft share of
+            // sending (`TX_SOFT`, measured images only): the step costs at most the share,
+            // the group, a frame of the wire and the tail. The group stays due.
+            #[cfg(feature = "steps")]
+            if ran >= 1 && rt::time::now().saturating_sub(entered) > netd::ring::TX_SOFT {
+                break;
+            }
             self.cursor = g + 1;
             ran += 1;
             let began = split::now();

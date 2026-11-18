@@ -27,6 +27,11 @@
 //! sum is within the margin (`ring::STEP_MARGIN`) and the estimate above does
 //! not give more.
 //!
+//! The same holds for sending (`ring::TX_SOFT_MEASURED`): a second group is visited only while
+//! the step is within the share, so the step costs at most the share, a group, a sent frame
+//! and the tail. The rule takes two groups with a single frame when that sum is within the
+//! margin, whatever the estimate of two groups gives.
+//!
 //! The gate: a step of receiving with one frame, and a step of sending with
 //! one group and one frame, each within the budget. Past the gate, the batch of
 //! receiving is the largest of 16, 8, 4, 2 and 1 that fits, then the groups
@@ -41,6 +46,8 @@ pub const BUDGET: u64 = BOUND * 85 / 100;
 /// The frames of a step of receiving the soft share lets through: the first
 /// and one more.
 pub const SOFT_FRAMES: usize = 2;
+/// The groups of a step of sending the soft share lets through: the first and one more.
+pub const SOFT_GROUPS: usize = 2;
 /// The batches to try, the largest first, and the groups per step.
 pub const BATCHES: [usize; 5] = [16, 8, 4, 2, 1];
 pub const GROUPS_PER_STEP: [usize; 3] = [4, 2, 1];
@@ -82,6 +89,37 @@ impl Parts {
         crate::ring::RX_SOFT_MEASURED + self.rx_price() + crate::ring::STEP_TAIL_TICKS as u64
     }
 
+    /// The longest step of sending with a second group under the soft share
+    /// (`ring::TX_SOFT_MEASURED`): the share, a group, a frame of the price and the tail.
+    pub fn sending_soft(&self) -> u64 {
+        crate::ring::TX_SOFT_MEASURED
+            + self.group
+            + self.tx_price()
+            + crate::ring::STEP_TAIL_TICKS as u64
+    }
+
+    /// The room the margin leaves for the share of sending after a group, a frame of the price
+    /// and the tail: the largest `TX_SOFT_MEASURED` these parts allow.
+    pub fn tx_soft_room(&self) -> u64 {
+        (crate::ring::STEP_MARGIN as u64)
+            .saturating_sub(self.group + self.tx_price() + crate::ring::STEP_TAIL_TICKS as u64)
+    }
+
+    /// The parts the code stands on: the constants of `netd::ring`, which the step rule reads
+    /// as they are. The rule on them must give `STEP_RX`, `EGRESS_GROUPS` and `STEP_TX`.
+    pub fn of_ring() -> Parts {
+        use crate::ring::*;
+        Parts {
+            fixed_rx: STEP_TAIL_TICKS as u64,
+            fixed_tx: TX_FIXED_TICKS as u64,
+            frame_rx: LOOP_RX_FRAME_TICKS as u64,
+            frame_tx: LOOP_TX_FRAME_TICKS as u64,
+            frame_rx_wire: WIRE_FRAME_TICKS as u64,
+            frame_tx_wire: WIRE_TX_FRAME_TICKS as u64,
+            group: TX_GROUP_TICKS as u64,
+        }
+    }
+
     /// The estimate of a step of sending of e groups and k frames.
     pub fn sending(&self, groups: usize, frames: usize) -> u64 {
         self.fixed_tx + groups as u64 * self.group + frames as u64 * self.tx_price()
@@ -119,14 +157,21 @@ pub fn choose(parts: &Parts) -> Result<Choice, Stop> {
     } else {
         by_estimate
     };
-    let groups = GROUPS_PER_STEP
+    let by_estimate = GROUPS_PER_STEP
         .into_iter()
         .find(|&e| parts.sending(e, 1) <= BUDGET)
         .expect("the gate passed with one group");
     let send = BATCHES
         .into_iter()
-        .find(|&k| parts.sending(groups, k) <= BUDGET)
+        .find(|&k| parts.sending(by_estimate, k) <= BUDGET)
         .expect("the gate passed with one frame");
+    // The soft share lets a second group in with a single frame of sending, the one the sum
+    // counts.
+    let groups = if send == 1 && parts.sending_soft() <= crate::ring::STEP_MARGIN as u64 {
+        by_estimate.max(SOFT_GROUPS)
+    } else {
+        by_estimate
+    };
     Ok(Choice {
         receive,
         groups,
@@ -274,6 +319,42 @@ mod tests {
         p.frame_rx_wire = fit + 1;
         assert!(p.receiving_soft() > STEP_MARGIN as u64);
         assert_eq!(choose(&p).unwrap().receive, 1);
+    }
+
+    #[test]
+    fn the_soft_share_lets_a_second_group_in_when_the_sum_fits_the_margin() {
+        use crate::ring::{STEP_MARGIN, STEP_TAIL_TICKS, TX_SOFT_MEASURED};
+        // The dearest frame the margin allows after the share, a group and the tail.
+        let mut p = parts(1_000, 5_800, 500, 400, 2_500);
+        let fit = STEP_MARGIN as u64 - TX_SOFT_MEASURED - 2_500 - STEP_TAIL_TICKS as u64;
+        p.frame_tx_wire = fit;
+        // Two groups pass the budget, one fits, so the estimate alone gives one.
+        assert!(p.sending(2, 1) > BUDGET && p.sending(1, 1) <= BUDGET);
+        assert_eq!(p.sending_soft(), STEP_MARGIN as u64);
+        let c = choose(&p).unwrap();
+        assert_eq!((c.groups, c.send), (SOFT_GROUPS, 1));
+        // One unit more leaves the group at one.
+        p.frame_tx_wire = fit + 1;
+        assert!(p.sending_soft() > STEP_MARGIN as u64);
+        assert_eq!(choose(&p).unwrap().groups, 1);
+        // The room for the share is what the sum has left.
+        assert_eq!(p.tx_soft_room(), TX_SOFT_MEASURED - 1);
+    }
+
+    #[test]
+    fn the_constants_of_the_code_give_the_numbers_of_the_code() {
+        use crate::ring::{EGRESS_GROUPS, STEP_RX, STEP_TX};
+        let p = Parts::of_ring();
+        // Two groups pass the budget by the estimate and the soft share lets them in.
+        assert!(p.sending(2, 1) > BUDGET);
+        assert_eq!(
+            choose(&p),
+            Ok(Choice {
+                receive: STEP_RX,
+                groups: EGRESS_GROUPS,
+                send: STEP_TX
+            })
+        );
     }
 
     #[test]

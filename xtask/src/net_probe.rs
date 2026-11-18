@@ -1617,6 +1617,46 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     parts.frame_rx_wire = by_ping.frame_rx_wire.max(by_echo.frame_rx_wire);
     parts.frame_tx_wire = by_ping.frame_tx_wire.max(by_echo.frame_tx_wire);
     println!("net-probe: the parts the rule reads: {parts:?}");
+    // The step the constant `netd::ring::TX_SOFT_MEASURED` is set from: the margin less the
+    // measured group, the measured sent frame and the tail.
+    println!(
+        "net-probe: the step of sending with a second group: group {} + sent frame {} + tail {} ticks (p90); the room for TX_SOFT_MEASURED is {} (the code has {}, TX_GROUP_TICKS {}, WIRE_TX_FRAME_TICKS {})",
+        parts.group,
+        parts.tx_price(),
+        netd::ring::STEP_TAIL_TICKS,
+        parts.tx_soft_room(),
+        netd::ring::TX_SOFT_MEASURED,
+        netd::ring::TX_GROUP_TICKS,
+        netd::ring::WIRE_TX_FRAME_TICKS
+    );
+    // The strict check between the rule and the constants of the code. It runs after the
+    // acceptance so that a failure still leaves the measured steps in the log.
+    let mut strict_errors = Vec::new();
+    let in_code = choose::Choice {
+        receive: netd::ring::STEP_RX,
+        groups: netd::ring::EGRESS_GROUPS,
+        send: netd::ring::STEP_TX,
+    };
+    match choose::choose(&choose::Parts::of_ring()) {
+        Ok(c) if c == in_code => {}
+        other => strict_errors.push(format!(
+            "the rule on the constants of netd::ring gives {other:?}; netd::ring has {in_code:?}"
+        )),
+    }
+    if parts.frame_rx_wire > netd::ring::WIRE_FRAME_TICKS as u64 {
+        strict_errors.push(format!(
+            "a received frame of the wire costs {} ticks (p90), over WIRE_FRAME_TICKS {}",
+            parts.frame_rx_wire,
+            netd::ring::WIRE_FRAME_TICKS
+        ));
+    }
+    if parts.frame_tx_wire > netd::ring::WIRE_TX_FRAME_TICKS as u64 {
+        strict_errors.push(format!(
+            "a sent frame of the wire costs {} ticks (p90), over WIRE_TX_FRAME_TICKS {}",
+            parts.frame_tx_wire,
+            netd::ring::WIRE_TX_FRAME_TICKS
+        ));
+    }
     let choice = match choose::choose(&parts) {
         Ok(choice) => choice,
         Err(stop) => {
@@ -1630,6 +1670,9 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
                 choose::BUDGET
             );
             acceptance(machine, "smallest", &choice_features(1, 1, 1), false)?;
+            for e in &strict_errors {
+                println!("net-probe: {e}");
+            }
             return Err("the gate is not passed; the stage waits for the expert".to_owned());
         }
     };
@@ -1647,11 +1690,6 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     // estimate from 90th percentiles with a margin of 15 percent: when it picks
     // smaller numbers than the code has, the prices of the frames of the wire
     // have grown since the code adopted its numbers, and the note says so.
-    let in_code = choose::Choice {
-        receive: netd::ring::STEP_RX,
-        groups: netd::ring::EGRESS_GROUPS,
-        send: netd::ring::STEP_TX,
-    };
     if in_code != choice {
         println!(
             "net-probe: note: the rule picks {choice:?}; netd::ring has {in_code:?} (estimates {} and {} ticks against the budget {}); the acceptance judges the measured steps of the code",
@@ -1666,7 +1704,12 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
         &choice_features(in_code.receive, in_code.groups, in_code.send),
         true,
     )?;
-    portion_series(machine).map(drop)
+    portion_series(machine)?;
+    if strict_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(strict_errors.join("; "))
+    }
 }
 
 /// The lines of a run of role `B` about the buffers: the quota of the service
