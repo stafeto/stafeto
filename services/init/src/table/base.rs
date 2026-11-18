@@ -71,7 +71,12 @@ pub const COMMAND_QUOTAS: u64 = 14;
 /// pages over the 16 384 that `cargo xtask pkg-identity` asks for. The pool
 /// is tens of thousands of pages and the heaviest command (a reload of nginx,
 /// nine processes) needs 30 440, so it gives them up.
-pub const PIXMAN_PAGES: u64 = 150 * crate::PAGE;
+///
+/// The NEON paths of pixman (`tools/build-pixman.py`) made the compositor's loaded segments 51
+/// pages larger (118 pages against 67 of the portable paths) and its file in the boot image 56
+/// pages larger: `boot-base.img` fell from 16 392 to 16 285 free pages, under the 16 384, and the
+/// 110 pages added here (150 to 260) bring it to 16 395.
+pub const PIXMAN_PAGES: u64 = 260 * crate::PAGE;
 
 /// The process service of the base and the full image: the pool of the
 /// network image with `COMMAND_QUOTAS` quotas of a command.
