@@ -8,10 +8,20 @@
 //! network backend (`n0`, the one `qemu::net` makes) give xtask the frames
 //! themselves:
 //!
-//! - `filter-redirector` (rx) takes frames from a chardev socket and hands
-//!   them to the guest's device, as if they had come off the wire;
-//! - `filter-mirror` (tx) copies every frame the guest sends to a second
-//!   chardev socket (the guest's traffic to the forwarding goes on as before).
+//! - `filter-redirector` (`queue=tx`) takes frames from a chardev socket and
+//!   hands them to the guest's device, as if they had come off the wire;
+//! - `filter-mirror` (`queue=rx`) copies every frame the guest sends to a
+//!   second chardev socket (the guest's traffic to the forwarding goes on as
+//!   before).
+//!
+//! The queue is named from the side of the netdev (the backend, slirp): `tx`
+//! holds the packets the netdev sends (to the guest), `rx` the packets sent
+//! to the netdev (by the guest) (qemu-options, `-object filter-buffer`). A
+//! frame read from `indev` of a filter on `tx` goes on as a packet of the
+//! netdev itself, so it reaches the guest (`redirector_to_filter` in
+//! net/filter-mirror.c passes it with `nf->netdev` as the sender; on `rx` it
+//! passes it with `nf->netdev->peer`, the guest's device, as the sender, so
+//! the frame would go to the backend).
 //!
 //! The sockets are connected right after QEMU starts and the mirror is read
 //! for the whole run (frames are dropped unless a scan records them): a
@@ -71,9 +81,9 @@ pub fn qemu_args(p: &Paths) -> Vec<String> {
             p.mirror.display()
         ),
         "-object".to_owned(),
-        "filter-redirector,id=scan-f-in,netdev=n0,queue=rx,indev=scan-in".to_owned(),
+        "filter-redirector,id=scan-f-in,netdev=n0,queue=tx,indev=scan-in".to_owned(),
         "-object".to_owned(),
-        "filter-mirror,id=scan-f-out,netdev=n0,queue=tx,outdev=scan-out".to_owned(),
+        "filter-mirror,id=scan-f-out,netdev=n0,queue=rx,outdev=scan-out".to_owned(),
     ]
 }
 
@@ -82,6 +92,50 @@ pub fn qemu_args(p: &Paths) -> Vec<String> {
 #[derive(Default)]
 struct Seen {
     synacks: HashMap<(u16, u16), u32>,
+    /// What the mirror delivered since `forget`: the frames, the first of
+    /// them and the first TCP segment described, and whether the guest's ARP
+    /// reply (or its own request for the scanner) came.
+    frames: usize,
+    first: Option<String>,
+    first_tcp: Option<String>,
+    arp_reply: bool,
+    arp_asked: bool,
+}
+
+/// A frame in a line: the two hardware addresses and what the frame is.
+fn describe(frame: &[u8]) -> String {
+    let mac = |m: &[u8]| {
+        m.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    if frame.len() < 14 {
+        return format!("{} bytes", frame.len());
+    }
+    let what = match rawframe::parse(frame) {
+        Frame::ArpRequest {
+            sender_ip,
+            target_ip,
+            ..
+        } => format!("ARP request {sender_ip:?} asks {target_ip:?}"),
+        Frame::ArpReply { sender_ip, .. } => format!("ARP reply from {sender_ip:?}"),
+        Frame::Tcp {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            flags,
+            ..
+        } => format!("TCP {src_ip:?}:{src_port} > {dst_ip:?}:{dst_port} flags {flags:#04x}"),
+        Frame::Other => format!("ethertype {:02x}{:02x}", frame[12], frame[13]),
+    };
+    format!(
+        "{} > {} {what} ({} bytes)",
+        mac(&frame[6..12]),
+        mac(&frame[0..6]),
+        frame.len()
+    )
 }
 
 /// The two sockets, connected, and the thread that reads the guest's frames.
@@ -144,6 +198,25 @@ impl Tap {
                     continue;
                 }
                 while let Some(frame) = stream.pop() {
+                    {
+                        let mut n = notes.lock().unwrap();
+                        n.frames += 1;
+                        if n.first.is_none() {
+                            n.first = Some(describe(&frame));
+                        }
+                        match rawframe::parse(&frame) {
+                            Frame::Tcp { .. } if n.first_tcp.is_none() => {
+                                n.first_tcp = Some(describe(&frame));
+                            }
+                            Frame::ArpReply { sender_ip, .. } if sender_ip == GUEST_IP => {
+                                n.arp_reply = true;
+                            }
+                            Frame::ArpRequest { target_ip, .. } if target_ip == PEER_IP => {
+                                n.arp_asked = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     match rawframe::parse(&frame) {
                         Frame::ArpRequest {
                             sender_mac,
@@ -183,6 +256,39 @@ impl Tap {
     /// Turns the reading of the guest's frames on or off.
     pub fn record(&self, on: bool) {
         self.recording.store(on, Ordering::SeqCst);
+    }
+
+    /// Starts a count of what the mirror delivers.
+    pub fn forget(&self) {
+        let mut n = self.seen.lock().unwrap();
+        n.frames = 0;
+        n.first = None;
+        n.first_tcp = None;
+        n.arp_reply = false;
+        n.arp_asked = false;
+    }
+
+    /// The frames the mirror delivered since `forget`.
+    pub fn frames(&self) -> usize {
+        self.seen.lock().unwrap().frames
+    }
+
+    /// What the mirror delivered since `forget`, in a line.
+    pub fn facts(&self) -> String {
+        let n = self.seen.lock().unwrap();
+        format!(
+            "the mirror delivered {} frames (the first: {}; the first TCP segment: {}); the guest's ARP reply {}, its own ARP request for the scanner {}; the mirror socket {}",
+            n.frames,
+            n.first.as_deref().unwrap_or("none"),
+            n.first_tcp.as_deref().unwrap_or("none"),
+            if n.arp_reply { "came" } else { "did not come" },
+            if n.arp_asked { "came" } else { "did not come" },
+            if self.ended.load(Ordering::SeqCst) {
+                "was closed by QEMU"
+            } else {
+                "is open"
+            }
+        )
     }
 
     /// Frames to the guest, in one write (they reach the device together).
@@ -267,7 +373,11 @@ pub fn replay(tap: &Tap, ports: &[u16]) -> Result<Replayed, String> {
     };
     // The guest learns the scanner's address from this request.
     tap.send(&[rawframe::arp_request(PEER_MAC, PEER_IP, GUEST_IP)])?;
-    thread::sleep(Duration::from_millis(100));
+    let until = Instant::now() + Duration::from_secs(1);
+    while !tap.seen.lock().unwrap().arp_reply && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let arp_answered = tap.seen.lock().unwrap().arp_reply;
 
     // 1.
     let mut mine = Vec::new();
@@ -305,14 +415,15 @@ pub fn replay(tap: &Tap, ports: &[u16]) -> Result<Replayed, String> {
     }
     if done.handshakes_ended == 0 {
         return Err(format!(
-            "no SYN-ACK of the guest reached the scanner after 5 s ({} of {} SYNs answered; the mirror socket {}): the filters or the guest's neighbour entry are not working",
+            "no SYN-ACK of the guest reached the scanner after 5 s ({} of {} SYNs answered; the ARP request was {} within 1 s); {}",
             tap.synacks(),
             mine.len(),
-            if tap.ended.load(Ordering::SeqCst) {
-                "was closed by QEMU"
+            if arp_answered {
+                "answered"
             } else {
-                "is open"
-            }
+                "not answered"
+            },
+            tap.facts()
         ));
     }
     tap.send(&closing)?;
@@ -489,8 +600,8 @@ mod tests {
     #[test]
     fn the_filters_name_the_backend_of_qemu_net() {
         let a = qemu_args(&paths(Path::new("/x"))).join(" ");
-        assert!(a.contains("filter-redirector,id=scan-f-in,netdev=n0,queue=rx,indev=scan-in"));
-        assert!(a.contains("filter-mirror,id=scan-f-out,netdev=n0,queue=tx,outdev=scan-out"));
+        assert!(a.contains("filter-redirector,id=scan-f-in,netdev=n0,queue=tx,indev=scan-in"));
+        assert!(a.contains("filter-mirror,id=scan-f-out,netdev=n0,queue=rx,outdev=scan-out"));
         assert!(crate::qemu::net(&[]).join(" ").contains("user,id=n0"));
         assert_eq!(crate::qemu::NET_MAC, "52:54:00:12:34:56");
     }
@@ -538,6 +649,20 @@ mod tests {
         tap.record(true);
         qemu.write_all(&synack(5001)).unwrap();
         assert!(waits(&|| tap.synack(5001, 80) == Some(9)));
+        assert_eq!(tap.frames(), 1);
+        assert!(
+            tap.facts()
+                .contains("TCP [10, 0, 2, 15]:80 > [10, 0, 2, 77]:5001"),
+            "{}",
+            tap.facts()
+        );
+        qemu.write_all(&rawframe::framed(&rawframe::arp_reply(
+            GUEST_MAC, GUEST_IP, PEER_MAC, PEER_IP,
+        )))
+        .unwrap();
+        assert!(waits(&|| tap.facts().contains("ARP reply came")));
+        tap.forget();
+        assert_eq!(tap.frames(), 0);
         assert_eq!(tap.synack(5000, 80), None);
         drop(qemu);
         assert!(waits(&|| tap.ended.load(Ordering::SeqCst)));

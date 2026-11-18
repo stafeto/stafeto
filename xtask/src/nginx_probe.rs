@@ -1510,6 +1510,11 @@ fn tls_raw_scan(
         Duration::from_secs(35),
     );
     let before = replay::latest(run.lines());
+    // Two seconds of the guest's own traffic through the mirror, with a
+    // request in flight: the proof that the filters deliver before the scan
+    // relies on them.
+    tap.forget();
+    tap.record(true);
     let mut held = Connection::open(address, CLIENT_WITHIN)
         .map_err(|e| format!("4h: the long-lived connection: {e}"))?;
     same(
@@ -1519,7 +1524,15 @@ fn tls_raw_scan(
         })?,
         rootfs::www_index(),
     )?;
-    tap.record(true);
+    std::thread::sleep(Duration::from_secs(2));
+    println!("nginx-probe: 4h before the scan: {}", tap.facts());
+    if tap.frames() == 0 {
+        return Err(format!(
+            "4h: the mirror (filter-mirror queue=rx, outdev) delivered no frame of the guest in 2 s of its traffic: {}",
+            tap.facts()
+        ));
+    }
+    tap.forget();
     let done = replay::replay(tap, &[80, 443]);
     tap.record(false);
     let done = done.map_err(|e| format!("4h: {e}"))?;
