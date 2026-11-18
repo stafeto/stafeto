@@ -183,9 +183,14 @@ pub fn update_cursor(out: &mut [u8], pos: (u32, u32), resource: u32, hot: (u32, 
     cursor_command(out, CMD_UPDATE_CURSOR, pos, resource, hot)
 }
 
-/// MOVE_CURSOR: the cursor moves to `pos`; the device ignores the rest.
-pub fn move_cursor(out: &mut [u8], pos: (u32, u32)) -> usize {
-    cursor_command(out, CMD_MOVE_CURSOR, pos, 0, (0, 0))
+/// MOVE_CURSOR: the cursor moves to `pos`. The specification says the
+/// other fields are ignored, but QEMU ends every cursor command, a move
+/// too, with `qemu_console_set_mouse(.., x, y, resource_id)`, whose last
+/// argument turns the pointer on or off: a move that carries resource 0
+/// hides the cursor. A move therefore carries the resource of the picture
+/// the cursor shows, as the Linux driver's does.
+pub fn move_cursor(out: &mut [u8], pos: (u32, u32), resource: u32) -> usize {
+    cursor_command(out, CMD_MOVE_CURSOR, pos, resource, (0, 0))
 }
 
 /// RESOURCE_FLUSH: the host shows the rectangle `r` of resource
@@ -290,12 +295,15 @@ mod tests {
     }
 
     #[test]
-    fn move_cursor_has_the_place_and_nothing_else() {
+    fn move_cursor_has_the_place_and_the_resource_of_the_picture() {
         let mut b = [0xFF; COMMAND_MAX];
-        assert_eq!(move_cursor(&mut b, (639, 399)), 56);
+        assert_eq!(move_cursor(&mut b, (639, 399), 3), 56);
         assert_eq!(word(&b, 0), 0x0301);
         assert_eq!([word(&b, 28), word(&b, 32)], [639, 399]);
-        assert!(b[40..56].iter().all(|&x| x == 0));
+        // QEMU turns the pointer on or off by the resource of every cursor
+        // command: a move with resource 0 would hide it.
+        assert_eq!(word(&b, 40), 3, "resource_id");
+        assert!(b[44..56].iter().all(|&x| x == 0));
         // A turn off is an UPDATE with resource 0.
         update_cursor(&mut b, (0, 0), 0, (0, 0));
         assert_eq!(word(&b, 40), 0);

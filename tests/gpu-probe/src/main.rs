@@ -467,7 +467,8 @@ impl Probe<'_> {
 
     /// PIPELINES and SOURCE of the owner: the records of the display, a
     /// pool and a cursor object of the right size, each once; the other
-    /// sessions and the other kinds refused; LAYERS not served yet.
+    /// sessions and the other kinds refused; LAYERS refused a pool or a
+    /// cursor source that SOURCE has not given.
     fn sources(
         &mut self,
         display: &Handle<Channel>,
@@ -487,9 +488,18 @@ impl Probe<'_> {
                 return Err("SOURCE of a kind that is none was not INVALID");
             }
         }
+        // A source that SOURCE has not given the owner is not its to bind:
+        // the pool and the cursor's picture are refused before SOURCE.
+        let unbound_pool = LayerRow::primary(PIPELINE_PRIMARY, SOURCE_POOL, Some(Rect::SCREEN));
+        let unbound_cursor = LayerRow::cursor(PIPELINE_CURSOR, SOURCE_CURSOR, 1, 1, (0, 0));
+        for row in [unbound_pool, unbound_cursor] {
+            if Self::layers_call(owner, &[row]) != Err(Fail::Status(code(INVALID))) {
+                return Err("LAYERS bound a source that SOURCE had not given");
+            }
+        }
         // The sizes of the objects: 256 pages for the pool, 4 for the
-        // picture of the cursor; both are zero, and the owner can write
-        // them but not copy them.
+        // picture of the cursor; both are zero, and the owner may write
+        // them and has no DUPLICATE to copy them with.
         for (n, (kind, info, bytes)) in [
             (SOURCE_KIND_POOL, SourceInfo::POOL, u64::from(BUFFER_BYTES)),
             (SOURCE_KIND_CURSOR, SourceInfo::CURSOR, 4 * 4096),
@@ -656,6 +666,29 @@ impl Probe<'_> {
             Self::layers_call(owner, &[cursor(x, y)]).map_err(|_| "LAYERS of the cursor")?;
             self.sleep(MOVE_PAUSE_NS);
         }
+        // The two longest paths of the driver's interrupt, for the steps
+        // under -icount: (a) a changed picture, whose transfer is in the
+        // control queue, followed at once by a switch to the pool: the
+        // interrupt that finishes the transfer sends the update and starts
+        // the queued switch of three chains; (b) a switch back to the
+        // target of three chains followed at once by a changed picture: the
+        // interrupt that reaps the switch starts the cursor's transfer.
+        let changed = |x, y| LayerRow {
+            dw: 64,
+            dh: 64,
+            ..cursor(x, y)
+        };
+        Self::layers_call(owner, &[changed(90, 100)]).map_err(|_| "LAYERS of a changed picture")?;
+        Self::layers_call(owner, &[pool(SOURCE_POOL)]).map_err(|_| "LAYERS of the pool again")?;
+        self.frame_done()?;
+        Self::layers_call(
+            owner,
+            &[LayerRow::primary(PIPELINE_PRIMARY, SOURCE_TARGET, None)],
+        )
+        .map_err(|_| "LAYERS of the target again")?;
+        Self::layers_call(owner, &[changed(90, 100)]).map_err(|_| "LAYERS of a changed picture")?;
+        self.frame_done()?;
+        self.sleep(MOVE_PAUSE_NS);
         // A frame and a cursor row in one request take effect together.
         Self::layers_call(
             owner,

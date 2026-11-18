@@ -716,7 +716,8 @@ impl Driver {
         });
         if !sent {
             // The queue refused: the picture is not sent, the cursor stays as
-            // it was.
+            // it was, and the next row with this source asks again.
+            rt::println!("virtio-gpu: the cursor's picture could not be sent");
             let next = self.cursor.transfer_done(false);
             debug_assert!(next.is_none());
         }
@@ -734,7 +735,7 @@ impl Driver {
                 place,
                 hot,
             } => commands::update_cursor(b, place, resource, hot),
-            Send::Move { place } => commands::move_cursor(b, place),
+            Send::Move { place, resource } => commands::move_cursor(b, place, resource),
         });
         if !sent {
             rt::println!("virtio-gpu: the cursor queue refused a command");
@@ -877,6 +878,9 @@ impl Driver {
                 // The picture is in the host's resource whatever the
                 // cursor queue holds: the update goes now, or waits for the
                 // chain that is out.
+                if flight.bad {
+                    rt::println!("virtio-gpu: the cursor's picture was not transferred");
+                }
                 let send = self.cursor.transfer_done(!flight.bad);
                 self.emit(send);
             }
@@ -1258,6 +1262,20 @@ impl Driver {
         }
         if let Err(status) = rows.check_virtio() {
             return Answer::Status(status);
+        }
+        // A pool or a cursor source is the owner's only once SOURCE gave it
+        // to this owner: another program's pool must not reach the screen
+        // through the owner's session (INVALID, as for a source the
+        // device does not have).
+        for row in rows.rows() {
+            let kind = match row.source {
+                proto_gpu::SOURCE_POOL => Some(Kind::Pool),
+                proto_gpu::SOURCE_CURSOR => Some(Kind::Cursor),
+                _ => None,
+            };
+            if kind.is_some_and(|k| !self.owner.holds(r.label(), k)) {
+                return Answer::Status(code(INVALID));
+            }
         }
         let pipelines = Pipelines::VIRTIO;
         let kind_of = |id: u32| pipelines.find(id).map(|p| p.kind);

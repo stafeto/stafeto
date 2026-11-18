@@ -92,8 +92,10 @@ pub enum Send {
         place: (u32, u32),
         hot: (u32, u32),
     },
-    /// MOVE_CURSOR.
-    Move { place: (u32, u32) },
+    /// MOVE_CURSOR, with the resource of the picture the cursor shows: the
+    /// device takes the resource of every cursor command as the pointer's
+    /// on flag.
+    Move { place: (u32, u32), resource: u32 },
 }
 
 /// A row of LAYERS for the cursor pipeline.
@@ -131,6 +133,9 @@ pub struct Cursor {
     again: bool,
     /// An update with a resource other than 0 went out and no hide since.
     shown: bool,
+    /// The host's picture is not known to be the source's: a transfer
+    /// failed. The next row with that source makes a transfer due again.
+    stale: bool,
     /// A chain is in the cursor queue.
     out: bool,
     /// The command that waits for the chain to return.
@@ -152,6 +157,7 @@ impl Cursor {
             image: Image::Current,
             again: false,
             shown: false,
+            stale: false,
             out: false,
             next: None,
         }
@@ -175,7 +181,7 @@ impl Cursor {
         self.next = Some(match (self.next, send) {
             // A move after an update that waits is the update at the new
             // place.
-            (Some(Send::Update { resource, hot, .. }), Send::Move { place }) => Send::Update {
+            (Some(Send::Update { resource, hot, .. }), Send::Move { place, .. }) => Send::Update {
                 resource,
                 place,
                 hot,
@@ -208,21 +214,36 @@ impl Cursor {
                 None
             };
         }
-        let rebind = row.source != self.source || row.changed;
+        let rebind = row.source != self.source || row.changed || self.stale;
+        let hot_changed = row.hot != self.hot;
         self.source = row.source;
         self.place = row.place;
         self.hot = row.hot;
         if rebind {
+            self.stale = false;
             match self.image {
                 Image::InFlight => self.again = true,
                 _ => self.image = Image::Needed,
             }
             return None;
         }
-        if self.image == Image::Current {
-            self.push(Send::Move { place: row.place })
+        if self.image != Image::Current {
+            // The update after the transfer takes this place and hot spot.
+            return None;
+        }
+        if hot_changed {
+            // The device takes the hot spot only on an update: no points
+            // changed, so no transfer.
+            self.push(Send::Update {
+                resource: row.source,
+                place: row.place,
+                hot: row.hot,
+            })
         } else {
-            None
+            self.push(Send::Move {
+                place: row.place,
+                resource: row.source,
+            })
         }
     }
 
@@ -251,7 +272,13 @@ impl Cursor {
             self.image = Image::Needed;
             return None;
         }
-        if !ok || self.source == 0 {
+        if !ok {
+            // The host's picture is not the source's: the next row with this
+            // source asks for the transfer again.
+            self.stale = true;
+            return None;
+        }
+        if self.source == 0 {
             return None;
         }
         self.push(Send::Update {
@@ -386,14 +413,23 @@ mod tests {
         // The first move goes out; the chain is out.
         assert_eq!(
             c.row(row(3, (1, 1), false)),
-            Some(Send::Move { place: (1, 1) })
+            Some(Send::Move {
+                place: (1, 1),
+                resource: 3
+            })
         );
         assert!(c.is_out());
         // Three more wait and keep the last place alone.
         for place in [(2, 2), (3, 3), (4, 4)] {
             assert_eq!(c.row(row(3, place, false)), None);
         }
-        assert_eq!(c.chain_returned(), Some(Send::Move { place: (4, 4) }));
+        assert_eq!(
+            c.chain_returned(),
+            Some(Send::Move {
+                place: (4, 4),
+                resource: 3
+            })
+        );
         // That one is out, nothing else waits.
         assert_eq!(c.chain_returned(), None);
         assert!(!c.is_out());
@@ -448,7 +484,10 @@ mod tests {
         let mut c = shown();
         assert_eq!(
             c.row(row(3, (1, 1), false)),
-            Some(Send::Move { place: (1, 1) })
+            Some(Send::Move {
+                place: (1, 1),
+                resource: 3
+            })
         );
         c.row(row(3, PLACE, true));
         c.transfer_started();
@@ -490,6 +529,84 @@ mod tests {
         assert_eq!(c.transfer_due(), Some(3));
         // A cursor never shown has nothing to hide.
         assert_eq!(Cursor::new().release(), None);
+    }
+
+    #[test]
+    fn a_move_carries_the_resource_of_the_picture_and_never_resource_0() {
+        let mut c = shown();
+        for place in [(1, 1), (2, 2), (3, 3)] {
+            if let Some(Send::Move { resource, .. }) = c.row(row(3, place, false)) {
+                assert_eq!(resource, 3);
+            }
+        }
+        assert_eq!(
+            c.chain_returned(),
+            Some(Send::Move {
+                place: (3, 3),
+                resource: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_new_hot_spot_alone_is_an_update_with_no_transfer() {
+        let mut c = shown();
+        let mut r = row(3, (5, 6), false);
+        r.hot = (4, 2);
+        assert_eq!(
+            c.row(r),
+            Some(Send::Update {
+                resource: 3,
+                place: (5, 6),
+                hot: (4, 2)
+            })
+        );
+        assert_eq!(c.transfer_due(), None, "the points did not change");
+        // The same hot spot again is a move.
+        assert_eq!(c.chain_returned(), None);
+        assert_eq!(
+            c.row(r),
+            Some(Send::Move {
+                place: (5, 6),
+                resource: 3
+            })
+        );
+        // While a transfer is due the hot spot joins the update that follows.
+        let mut c = shown();
+        c.row(row(3, PLACE, true));
+        let mut r = row(3, PLACE, false);
+        r.hot = (1, 1);
+        assert_eq!(c.row(r), None);
+        c.transfer_started();
+        assert_eq!(
+            c.transfer_done(true),
+            Some(Send::Update {
+                resource: 3,
+                place: PLACE,
+                hot: (1, 1)
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_transfer_is_tried_again_by_the_next_row_of_the_source() {
+        let mut c = Cursor::new();
+        c.row(row(3, PLACE, false));
+        c.transfer_started();
+        assert_eq!(c.transfer_done(false), None);
+        assert_eq!(c.transfer_due(), None);
+        // The next row with the same source, a plain place, makes the
+        // transfer due again, and nothing is sent before it returns.
+        assert_eq!(c.row(row(3, (8, 9), false)), None);
+        assert_eq!(c.transfer_due(), Some(3));
+        c.transfer_started();
+        assert_eq!(c.transfer_done(true), Some(update((8, 9))));
+        // After that a place is a move again.
+        c.chain_returned();
+        assert!(matches!(
+            c.row(row(3, (1, 1), false)),
+            Some(Send::Move { .. })
+        ));
     }
 
     #[test]

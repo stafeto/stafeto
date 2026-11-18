@@ -174,6 +174,12 @@ impl Owner {
         Ok(())
     }
 
+    /// Whether `label` owns the screen and has been given `source`: only
+    /// then may a LAYERS row bind that source.
+    pub fn holds(&self, label: u64, source: Source) -> bool {
+        self.owns(label) && self.sources[source as usize]
+    }
+
     /// The owner has `source` now: it is not given again until the next
     /// owner.
     pub fn source_given(&mut self, source: Source) {
@@ -441,8 +447,14 @@ mod tests {
         let next = o.open().expect("open again");
         assert_eq!(o.may_take(next, Source::Pool), Ok(()));
         assert_eq!(o.may_take(next, Source::Cursor), Ok(()));
+        // Only an owner that was given a source holds it.
+        assert!(!o.holds(next, Source::Pool));
+        o.source_given(Source::Pool);
+        assert!(o.holds(next, Source::Pool) && !o.holds(next, Source::Cursor));
+        assert!(!o.holds(next + 1, Source::Pool));
         // A released owner has none.
         o.release(next);
+        assert!(!o.holds(next, Source::Pool));
         assert_eq!(o.may_take(next, Source::Pool), Err(Denied::NotOwner));
     }
 

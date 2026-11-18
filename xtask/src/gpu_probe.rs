@@ -178,8 +178,13 @@ fn contains_in_order<T: PartialEq>(got: &[T], wanted: &[T]) -> bool {
 
 /// The device's trace against what the probe did: the scanout was set to
 /// resource 1 (OPEN), 2 (the pool) and 1 again (the target) in this order
-/// on the whole screen, and the cursor got an update from resource 3 at
-/// the first place and a move to each of the others, in order.
+/// on the whole screen, and the cursor got an update from resource 3 and
+/// then a move to each of the places that came after the update's, in
+/// order, every move with `res 0x3`: QEMU takes the resource of every
+/// cursor command as the pointer's on flag, so a move with resource 0
+/// would hide the cursor. The update may carry the place of a later move
+/// than the first, when the device had not returned the transfer by the
+/// time the next row came and the moves merged into the update.
 pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
     use qemu::GpuTrace::{Cursor, Scanout};
     let scanouts: Vec<u32> = events
@@ -201,41 +206,34 @@ pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
             "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1 in order expected"
         ));
     }
-    let mut wanted = vec![Cursor {
-        update: true,
-        x: CURSOR_PLACES[0].0,
-        y: CURSOR_PLACES[0].1,
-        res: 3,
-    }];
-    for (x, y) in &CURSOR_PLACES[1..] {
-        wanted.push(Cursor {
-            update: false,
-            x: *x,
-            y: *y,
-            res: 0,
-        });
-    }
-    // The device's own `res` of a move is not the cursor's resource: a move
-    // is matched by its place alone.
     let cursor: Vec<(bool, u32, u32, u32)> = events
-        .iter()
-        .filter_map(|e| match e {
-            Cursor { update, x, y, res } => Some((*update, *x, *y, if *update { *res } else { 0 })),
-            _ => None,
-        })
-        .collect();
-    let wanted: Vec<(bool, u32, u32, u32)> = wanted
         .iter()
         .filter_map(|e| match e {
             Cursor { update, x, y, res } => Some((*update, *x, *y, *res)),
             _ => None,
         })
         .collect();
-    if !contains_in_order(&cursor, &wanted) {
-        return Err(format!(
-            "the trace of the cursor is {cursor:?}, an update from resource 3 and the moves {:?} in order expected",
-            &CURSOR_PLACES[1..]
-        ));
+    let named = format!(
+        "the trace of the cursor is {cursor:?}, an update from resource 3 at one of {:?}, then a move with resource 3 to each later place expected",
+        &CURSOR_PLACES[..4]
+    );
+    // The first update from resource 3 at one of the places before the last.
+    let Some((first, from)) = cursor.iter().enumerate().find_map(|(at, e)| {
+        let (update, x, y, res) = *e;
+        let place = CURSOR_PLACES[..4].iter().position(|p| *p == (x, y));
+        (update && res == 3)
+            .then_some(place)
+            .flatten()
+            .map(|p| (at, p))
+    }) else {
+        return Err(named);
+    };
+    let wanted: Vec<(bool, u32, u32, u32)> = CURSOR_PLACES[from + 1..]
+        .iter()
+        .map(|(x, y)| (false, *x, *y, 3))
+        .collect();
+    if !contains_in_order(&cursor[first + 1..], &wanted) {
+        return Err(named);
     }
     Ok(())
 }
@@ -554,7 +552,7 @@ mod tests {
         let mut t = vec![scanout(1), scanout(2), scanout(1)];
         t.push(cursor(true, CURSOR_PLACES[0], 3));
         for p in &CURSOR_PLACES[1..] {
-            t.push(cursor(false, *p, 0));
+            t.push(cursor(false, *p, 3));
         }
         t.push(cursor(true, (0, 0), 0));
         t.push(scanout(0));
@@ -578,6 +576,28 @@ mod tests {
         assert!(trace_verdict(&t).unwrap_err().contains("cursor"));
         let mut t = good_trace();
         t.remove(5);
+        assert!(trace_verdict(&t).is_err());
+    }
+
+    #[test]
+    fn a_move_with_resource_0_fails_the_trace() {
+        // QEMU hides the pointer on such a move.
+        let mut t = good_trace();
+        t[5] = cursor(false, CURSOR_PLACES[2], 0);
+        assert!(trace_verdict(&t).is_err());
+    }
+
+    #[test]
+    fn a_merged_first_move_is_tolerated_and_a_lost_later_one_is_not() {
+        // The device returned the transfer late: the update carries the
+        // place of the second move, and only the moves after it follow.
+        let mut t = vec![scanout(1), scanout(2), scanout(1)];
+        t.push(cursor(true, CURSOR_PLACES[1], 3));
+        for p in &CURSOR_PLACES[2..] {
+            t.push(cursor(false, *p, 3));
+        }
+        assert_eq!(trace_verdict(&t), Ok(()));
+        t.pop();
         assert!(trace_verdict(&t).is_err());
     }
 

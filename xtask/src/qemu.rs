@@ -234,21 +234,16 @@ pub const GPU: &[&str] = &[
 pub const GPU_TRACE_EVENTS: [&str; 2] = ["virtio_gpu_update_cursor", "virtio_gpu_cmd_set_scanout"];
 
 /// The arguments that write those events to `file`. The build of QEMU in CI
-/// has the default `log` backend, which writes through the log (`-D`): the
-/// events are enabled with `-trace enable=` and, for the backends that
-/// check the log mask, with `-d trace:`. A QEMU with another backend
-/// writes no file, which `parse_gpu_trace` of an empty file reports.
+/// has the default `log` backend, which writes through the log (`-D`), so
+/// `-trace enable=` and `-D` are enough. A QEMU built with another trace
+/// backend writes no file, which `parse_gpu_trace` of an empty file
+/// reports.
 pub fn gpu_trace(file: &Path) -> Vec<String> {
     let mut args = Vec::new();
     for event in GPU_TRACE_EVENTS {
         args.push("-trace".to_owned());
         args.push(format!("enable={event}"));
     }
-    let mask: Vec<String> = GPU_TRACE_EVENTS
-        .iter()
-        .map(|e| format!("trace:{e}"))
-        .collect();
-    args.extend(["-d".to_owned(), mask.join(",")]);
     args.extend(["-D".to_owned(), file.display().to_string()]);
     args
 }
@@ -326,7 +321,7 @@ pub fn parse_gpu_trace(text: &str) -> Result<Vec<GpuTrace>, String> {
         }
     }
     if events.is_empty() {
-        return Err("the trace file has no event of the display: this QEMU has no `log` trace backend, or the file was not written".to_owned());
+        return Err("the trace file has no event of the display: this QEMU was built with another trace backend (the Homebrew build may be one); run the probe with a QEMU configured with `--enable-trace-backends=log`, the default of ./configure".to_owned());
     }
     Ok(events)
 }
@@ -2832,7 +2827,7 @@ mod gpu_trace_tests {
         assert!(
             parse_gpu_trace("")
                 .unwrap_err()
-                .contains("no `log` trace backend")
+                .contains("another trace backend")
         );
         assert!(parse_gpu_trace("12@1.2:other_event a 1\n").is_err());
         // A cursor line with neither word, or a broken number, is passed over.
@@ -2850,9 +2845,7 @@ mod gpu_trace_tests {
         let args = gpu_trace(Path::new("/tmp/t.log"));
         assert!(args.contains(&"enable=virtio_gpu_update_cursor".to_owned()));
         assert!(args.contains(&"enable=virtio_gpu_cmd_set_scanout".to_owned()));
-        assert!(args.contains(
-            &"trace:virtio_gpu_update_cursor,trace:virtio_gpu_cmd_set_scanout".to_owned()
-        ));
+        assert!(!args.contains(&"-d".to_owned()));
         let at = args.iter().position(|a| a == "-D").expect("-D");
         assert_eq!(args[at + 1], "/tmp/t.log");
     }
