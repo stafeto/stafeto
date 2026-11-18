@@ -310,6 +310,7 @@ pub fn console_restart() -> Result<(), String> {
         run.send("echo before the crash")?;
         run.expect_line("before the crash", whole("before the crash"), DIALOG_STEP)?;
         run.expect(PROMPT, DIALOG_STEP)?;
+        crate::log_burst(&mut run)?;
         run.send("crash uart")?;
         run.expect_line(CRASHING, whole(CRASHING), DIALOG_STEP)?;
         // Input while init watches the old object: the device would write

@@ -247,6 +247,11 @@ impl Shell {
                 // The driver lives, built without `crash`. The line fits.
                 let _ = writeln!(out, "shell: crash uart: {status:?}");
             }
+            #[cfg(feature = "log-burst")]
+            Command::LogBurst => {
+                log_burst();
+                let _ = writeln!(out, "shell: logburst: {} lines", command::LOG_BURST);
+            }
             Command::Unknown(line) => {
                 for piece in command::unknown(line) {
                     out.put(piece);
@@ -428,5 +433,21 @@ fn call<'b>(
     match Status::from_code(Reader::new(bytes).u32()?) {
         Status::Ok => Ok(bytes),
         status => Err(status),
+    }
+}
+
+/// `logburst` (feature `log-burst`): `LOG_BURST` lines of 59 bytes through
+/// debug_write, one record each, LOG_BURST_GROUP at a time with a pause of
+/// LOG_BURST_GAP_MS between the groups, which the shell spends in a loop:
+/// the driver of the console, at a level above the shell's, runs in it.
+#[cfg(feature = "log-burst")]
+fn log_burst() {
+    let gap = time::ns_to_ticks(command::LOG_BURST_GAP_MS * 1_000_000);
+    for n in 0..command::LOG_BURST {
+        println!("logburst {n:03} {:x<46}", "");
+        if (n + 1) % command::LOG_BURST_GROUP == 0 {
+            let until = time::now().saturating_add(gap);
+            while time::now() < until {}
+        }
     }
 }

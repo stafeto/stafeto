@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The output of the driver (spec 13.5): two streams of bytes, the
-//! clients' in a ring of TX_RING bytes and the kernel log's in the text of
-//! one batch, go out to the port as one, a line at a time. A stream whose
+//! clients' in a ring of TX_RING bytes and the kernel log's in a ring of
+//! LOG_RING bytes that holds the text of several batches, go out to the port as one, a line at a time. A stream whose
 //! line has begun goes on with it while it has bytes; at the start of a
 //! line the log goes first. When the line of one stream stops for want of
 //! bytes and the other has some, a CR LF ends it and the other goes on;
@@ -20,6 +20,10 @@ pub const TX_RING: usize = 4096;
 /// each putting out console_line::RECORD_OUT bytes at most, and the line
 /// of the records lost (uart::log::LOST_LINE).
 pub const LOG_BYTES: usize = 12 * console_line::RECORD_OUT + crate::log::LOST_LINE;
+/// The bytes of the ring of the log's text: what the driver has taken from
+/// the kernel's rings and has not put out, about 250 lines. A batch is
+/// taken only while LOG_BYTES of it are free.
+pub const LOG_RING: usize = 16 * 1024;
 /// The longest part of a line of the clients that goes out again.
 pub const REPEAT_MAX: usize = 128;
 
@@ -42,9 +46,12 @@ pub struct Output {
     ring: [u8; TX_RING],
     ring_start: usize,
     ring_len: usize,
-    log: [u8; LOG_BYTES],
-    log_at: usize,
+    log: [u8; LOG_RING],
+    log_start: usize,
     log_len: usize,
+    /// The bytes of the log that went out since a client's line last had
+    /// its turn: at a line start the log goes first only below LOG_BYTES.
+    log_run: usize,
     at: At,
     /// Bytes that go before all others: the CR LF that ends a line cut
     /// short, the LF after the CR of a newline.
@@ -75,9 +82,10 @@ impl Output {
             ring: [0; TX_RING],
             ring_start: 0,
             ring_len: 0,
-            log: [0; LOG_BYTES],
-            log_at: 0,
+            log: [0; LOG_RING],
+            log_start: 0,
             log_len: 0,
+            log_run: 0,
             at: At::Start,
             pending: &[],
             pending_client: false,
@@ -223,37 +231,39 @@ impl Output {
         }
     }
 
-    /// Whether the text of the last batch of the log went out whole: the
-    /// driver takes the next batch only then (spec 13.5).
+    /// Whether the text of the log went out whole: its ring is empty.
     pub fn log_done(&self) -> bool {
-        self.log_at == self.log_len
+        self.log_len == 0
     }
 
-    /// The bytes the driver holds that did not go out: the rest of the last
-    /// batch of the log and what the ring holds. A driver that exits now
+    /// The bytes the driver holds that did not go out: the text in the
+    /// log's ring and what the clients' ring holds. A driver that exits now
     /// loses them.
     pub fn unsent(&self) -> usize {
-        (self.log_len - self.log_at) + self.ring_len
+        self.log_len + self.ring_len
     }
 
-    /// Adds `bytes` to the text of the batch of the log, which starts
-    /// over once the last went out whole: false, with nothing taken, when
+    /// The bytes of the log's ring that are free.
+    pub fn log_room(&self) -> usize {
+        LOG_RING - self.log_len
+    }
+
+    /// Adds `bytes` to the log's ring: false, with nothing taken, when
     /// they do not fit.
     pub fn put_log(&mut self, bytes: &[u8]) -> bool {
-        if self.log_done() {
-            self.log_at = 0;
-            self.log_len = 0;
-        }
-        let Some(room) = self.log.get_mut(self.log_len..self.log_len + bytes.len()) else {
+        if bytes.len() > self.log_room() {
             return false;
-        };
-        room.copy_from_slice(bytes);
+        }
+        let at = (self.log_start + self.log_len) % LOG_RING;
+        let first = bytes.len().min(LOG_RING - at);
+        self.log[at..at + first].copy_from_slice(&bytes[..first]);
+        self.log[..bytes.len() - first].copy_from_slice(&bytes[first..]);
         self.log_len += bytes.len();
         true
     }
 
     fn log_has(&self) -> bool {
-        self.log_at < self.log_len
+        self.log_len > 0
     }
 
     /// Whether `next_byte` has nothing to give now.
@@ -292,10 +302,15 @@ impl Output {
             }
             match self.at {
                 At::Start => {
-                    if self.log_has() && (self.fence.is_none() || self.cut) {
+                    // The log goes first at a line start, unless a client's
+                    // line waits and a batch of log text (LOG_BYTES) went out
+                    // since the last turn of the clients: they alternate.
+                    let clients_turn = self.ring_len > 0 && self.log_run >= LOG_BYTES;
+                    if self.log_has() && (self.fence.is_none() || self.cut) && !clients_turn {
                         self.at = At::Log;
                     } else if self.cut {
                         self.cut = false;
+                        self.log_run = 0;
                         self.at = At::Client;
                         if self.long {
                             self.line_len = 0;
@@ -304,6 +319,7 @@ impl Output {
                             self.repeat = Some(0);
                         }
                     } else if self.ring_len > 0 {
+                        self.log_run = 0;
                         self.at = At::Client;
                     } else {
                         return None;
@@ -336,8 +352,10 @@ impl Output {
                 }
                 At::Log => {
                     if self.log_has() {
-                        let b = self.log[self.log_at];
-                        self.log_at += 1;
+                        let b = self.log[self.log_start];
+                        self.log_start = (self.log_start + 1) % LOG_RING;
+                        self.log_len -= 1;
+                        self.log_run = self.log_run.saturating_add(1);
                         if b == b'\n' {
                             self.at = At::Start;
                             self.pending = b"\n";
@@ -665,5 +683,110 @@ mod tests {
         assert!(o.log_done());
         assert!(o.put_log(b"0x92000006\n"));
         assert_eq!(drain(&mut o), b"0x92000006\r\nstafeto> ");
+    }
+
+    #[test]
+    fn the_ring_of_the_log_wraps_and_refuses_what_does_not_fit() {
+        let mut o = Output::new();
+        let line = [b'a'; 99];
+        let mut text = std::vec::Vec::new();
+        for _ in 0..3 {
+            // Fill to the brim in lines of 100 bytes, then empty it.
+            let mut put = 0;
+            while o.log_room() >= 100 {
+                assert!(o.put_log(&line) && o.put_log(b"\n"));
+                put += 100;
+            }
+            assert!(!o.put_log(&[b'x'; LOG_RING]));
+            assert_eq!(o.log_room(), LOG_RING - put);
+            text.clear();
+            text.extend(core::iter::from_fn(|| o.next_byte()));
+            assert!(o.is_idle());
+            // Each LF of the log goes out as CR LF.
+            assert_eq!(text.len(), put + put / 100);
+            assert!(o.log_done());
+            assert_eq!(o.log_room(), LOG_RING);
+        }
+    }
+
+    #[test]
+    fn a_client_line_waits_behind_one_batch_of_log_at_most() {
+        let mut o = Output::new();
+        // Many batches of log, lines of 100 bytes, and one line of a client.
+        for n in 0..120 {
+            let mut line = [b'a'; 100];
+            line[..3].copy_from_slice(&[
+                b'0' + (n / 100) as u8,
+                b'0' + (n / 10 % 10) as u8,
+                b'0' + (n % 10) as u8,
+            ]);
+            line[99] = b'\n';
+            assert!(o.put_log(&line));
+        }
+        assert!(o.put(b"client line\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let at = out
+            .windows(11)
+            .position(|w| w == b"client line")
+            .expect("the client's line goes out");
+        // After at most LOG_BYTES of log and the line it ended in.
+        assert!(at <= LOG_BYTES + 101 + 1, "{at}");
+        // Not the end of the log: the log went on after it, whole.
+        assert!(out.len() - at > 5000, "{}", out.len() - at);
+        let log_bytes = out.iter().filter(|&&b| b == b'a').count();
+        assert_eq!(log_bytes, 120 * 96);
+        // A steady stream of clients is not starved by it either way: a
+        // second client line comes after the next batch.
+        let mut o = Output::new();
+        for _ in 0..120 {
+            assert!(o.put_log(b"log line of the batch, enough to run a while on end\n"));
+        }
+        assert!(o.put(b"one\ntwo\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let one = out.windows(3).position(|w| w == b"one").unwrap();
+        let two = out.windows(3).position(|w| w == b"two").unwrap();
+        assert!(one < two && two - one <= LOG_BYTES + 100, "{one} {two}");
+    }
+
+    /// The console dialog after a burst of the log: a client's closing line
+    /// and its prompt (no newline) wait behind the log, and the driver's
+    /// notice, put into the ring of the log (`say_log`), comes last. Every
+    /// line comes whole: the closing line at a turn of the clients, the
+    /// prompt cut by the log and repeated, the notice on a line of its own,
+    /// never glued to the prompt.
+    #[test]
+    fn a_driver_notice_never_glues_to_a_prompt_behind_a_burst() {
+        let mut o = Output::new();
+        for n in 0..100 {
+            let mut line = [b'x'; 61];
+            line[..3].copy_from_slice(format!("{n:03}").as_bytes());
+            line[60] = b'\n';
+            assert!(o.put_log(&line));
+        }
+        assert!(o.put(b"shell: closing line\n"));
+        assert!(o.put(b"stafeto> "));
+        assert!(o.put_log(b"uart: log backlog peak 45 records\n"));
+        let out: Vec<u8> = core::iter::from_fn(|| o.next_byte()).collect();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("stafeto> uart"), "glued: {text:?}");
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        let at = |what: &str| lines.iter().position(|l| *l == what);
+        let closing = at("shell: closing line").expect("the closing line whole");
+        let notice = at("uart: log backlog peak 45 records").expect("the notice whole");
+        // The closing line has its turn in the middle of the burst, and the
+        // 100 lines of the burst come whole around it.
+        assert!(0 < closing && closing < 99, "{closing}");
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.len() == 60 && l.ends_with("xxxx"))
+                .count()
+                == 100
+        );
+        // The prompt comes whole as a line of its own (cut by the log with a
+        // CR LF) and again at the end, after the notice.
+        assert!(lines.iter().filter(|l| **l == "stafeto> ").count() >= 1);
+        assert!(notice < lines.len() - 1);
+        assert_eq!(*lines.last().unwrap(), "stafeto> ");
     }
 }
