@@ -56,11 +56,11 @@
 //!      each handshake), so the half-open entries are covered by the unit
 //!      tests of `queue` in the network service.
 //!    - 4g: Rounds of what a port scan does, from the host (stafeto-design#764):
-//!      connections to the TLS port that the host resets at once, closes
+//!      connections to ports 80 and 443 that the host resets at once, closes
 //!      at once, opens and resets before the handshake ends, or holds and then
 //!      resets all together, the workers running (`NGINX_SCAN_PORTS` `80` or
-//!      `both` aims them at the plain port too: step 5 then fails, see the
-//!      code). Right after each round, with no pause, ONE request of the page over TLS, ONE over HTTP, and a
+//!      `443` takes one port). Right after each round, with no pause, ONE
+//!      request of the page over TLS, ONE over HTTP, and a
 //!      keep-alive connection opened before the round must still answer. Any
 //!      single failure fails the run. `NGINX_SCAN_ROUNDS` sets the rounds (5;
 //!      a larger number lifts the time bound of the run: it is a hunt for a
@@ -1400,14 +1400,11 @@ const SCAN_PER: usize = 12;
 /// failed once on a real machine, so each check is made once, at once, and a
 /// failure ends the run with the round and the check named.
 pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<(), String> {
-    // Connections that end before they are accepted, on port 80 with the workers
-    // running, leave the new workers of the reload after them short of
-    // connections (stafeto-design#764, open): that port is in the rounds
-    // only when NGINX_SCAN_PORTS asks for it (`80` or `both`).
+    // Both ports by default; `NGINX_SCAN_PORTS` `80` or `443` takes one.
     let ports = match std::env::var("NGINX_SCAN_PORTS").as_deref() {
         Ok("80") => address.port().to_string(),
-        Ok("both") => format!("{},{}", address.port(), tls.port),
-        _ => tls.port.to_string(),
+        Ok("443") => tls.port.to_string(),
+        _ => format!("{},{}", address.port(), tls.port),
     };
     let at = Instant::now();
     for round in 1..=rounds {

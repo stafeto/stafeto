@@ -435,10 +435,10 @@ impl Table {
                     self.keys[m].is_some() && self.keys[m] == remote,
                 )
             };
-            if matches!(rule, KeyRule::Release | KeyRule::Replace) {
-                if let Some(k) = self.keys[m].take() {
-                    self.by_key.remove(&k);
-                }
+            if matches!(rule, KeyRule::Release | KeyRule::Replace)
+                && let Some(k) = self.keys[m].take()
+            {
+                self.by_key.remove(&k);
             }
             if matches!(rule, KeyRule::Register | KeyRule::Replace)
                 && let Some(port) = remote
