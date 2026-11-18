@@ -275,6 +275,9 @@ pub fn doom_headless(machine: &'static qemu::Machine) -> Result<(), String> {
 const TITLE: &str = "doom: title crc32 ";
 /// The line of the first level (episode 1, map 1).
 const LEVEL: &str = "doom: level 1 1";
+/// The start of every line of a level; Doom prints one for a level the
+/// player plays, after the title, with an episode and a map of 1 or above.
+const LEVEL_PREFIX: &str = "doom: level ";
 /// The command the probe types.
 const LAUNCH: &str = "doom -iwad /games/freedoom1.wad";
 /// Between two keys the probe sends: the machine under TCG needs the time
@@ -346,6 +349,90 @@ fn check_time(took: Duration, machine: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// What is wrong with `line` if it is a level line: one that comes before
+/// the title (`title_seen` false), or one with episode or map 0. The engine
+/// can draw a frame before its first tic, while its game state still holds
+/// the initial 0, which is the state of a level: that frame says `doom:
+/// level 0 0`, and the real level line of a platform that says each level
+/// once never comes.
+fn level_line_fault(line: &str, title_seen: bool) -> Option<String> {
+    let at = line.find(LEVEL_PREFIX)?;
+    if !title_seen {
+        return Some(format!(
+            "{line:?} came before the title screen: a frame was drawn before the first game tic"
+        ));
+    }
+    let mut numbers = line[at + LEVEL_PREFIX.len()..].split_whitespace();
+    let mut number = || numbers.next().and_then(|n| n.parse::<u32>().ok());
+    match (number(), number()) {
+        (Some(episode), Some(map)) if episode >= 1 && map >= 1 => None,
+        _ => Some(format!(
+            "{line:?} names no level (episode and map of 1 or above expected): a frame was drawn before the game state was set"
+        )),
+    }
+}
+
+/// The first fault in the `doom:` lines of a console text, in order: a
+/// level line before a title line, or one with episode or map 0.
+fn first_fault(lines: &[String]) -> Option<String> {
+    let mut title_seen = false;
+    for line in lines {
+        if line.contains(TITLE) {
+            title_seen = true;
+        } else if let Some(fault) = level_line_fault(line, title_seen) {
+            return Some(fault);
+        }
+    }
+    None
+}
+
+/// The lines Doom printed on the way, for a failure message.
+fn doom_lines(lines: &[String]) -> Vec<&String> {
+    lines.iter().filter(|l| l.contains("doom: ")).collect()
+}
+
+/// Waits for the line `wanted` names, and stops at once, with the reason, on
+/// a level line that is too early (`title_seen` false) or names no level.
+/// Every failure carries all the `doom:` lines of the run.
+fn expect_doom(
+    run: &mut qemu::Run,
+    what: &str,
+    wanted: impl Fn(&str) -> bool,
+    title_seen: bool,
+    within: Duration,
+) -> Result<String, String> {
+    let all = |run: &qemu::Run| format!("{:?}", doom_lines(&run.text()));
+    let line = run
+        .expect_line(what, |l| wanted(l) || l.contains(LEVEL_PREFIX), within)
+        .map_err(|e| {
+            let hint = first_fault(&run.text()).map_or(String::new(), |f| format!("; {f}"));
+            format!("{e}{hint}; doom lines of the run: {}", all(run))
+        })?;
+    if let Some(fault) = level_line_fault(&line, title_seen) {
+        return Err(format!(
+            "while waiting for {what}: {fault}; doom lines of the run: {}",
+            all(run)
+        ));
+    }
+    if !wanted(&line) {
+        return Err(format!(
+            "while waiting for {what}: got {line:?}; doom lines of the run: {}",
+            all(run)
+        ));
+    }
+    Ok(line)
+}
+
+/// The title line of a launch.
+fn expect_title(run: &mut qemu::Run, what: &str, within: Duration) -> Result<String, String> {
+    expect_doom(run, what, |l| l.contains(TITLE), false, within)
+}
+
+/// The line of the first level, after the title.
+fn expect_level(run: &mut qemu::Run, within: Duration) -> Result<String, String> {
+    expect_doom(run, "the first level", |l| l.contains(LEVEL), true, within)
+}
+
 /// The lines of a finished run that say the image faulted.
 fn faulted(lines: &[String]) -> Option<&String> {
     lines.iter().find(|line| {
@@ -395,14 +482,14 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     // 1 and 2: the title screen is on the screen as the guest drew it.
     run.send(LAUNCH)?;
     let began = Instant::now();
-    let line = run.expect_line("the title screen", |l| l.contains(TITLE), TITLE_WITHIN)?;
+    let line = expect_title(run, "the title screen", TITLE_WITHIN)?;
     let title = began.elapsed().as_secs_f64();
     gpu_probe::compare(&mut monitor, &picture, &line, TITLE)?;
     // 3: the menu, New Game, the episode, the skill: the first level.
     let menu = Instant::now();
     std::thread::sleep(KEY_PAUSE);
     monitor.sendkeys(&["ret", "ret", "ret", "ret"], KEY_PAUSE)?;
-    run.expect_line("the first level", |l| l.contains(LEVEL), LEVEL_WITHIN)?;
+    expect_level(run, LEVEL_WITHIN)?;
     let level = menu.elapsed().as_secs_f64();
     std::thread::sleep(Duration::from_secs(2));
     let before = monitor.screendump(&picture)?;
@@ -426,11 +513,7 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     run.expect("# ", DIALOG_STEP)?;
     run.send(&format!("{LAUNCH} &"))?;
     run.send("P=$!")?;
-    run.expect_line(
-        "the title screen of the first",
-        |l| l.contains(TITLE),
-        TITLE_WITHIN,
-    )?;
+    expect_title(run, "the title screen of the first", TITLE_WITHIN)?;
     run.send(&format!("{LAUNCH}; echo busy=$?"))?;
     run.expect_line(
         "the refusal of a second Doom",
@@ -443,11 +526,7 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     run.expect_line("ash after the kill", |l| l == "again", DIALOG_STEP)?;
     run.expect("# ", DIALOG_STEP)?;
     run.send(LAUNCH)?;
-    run.expect_line(
-        "the title screen again",
-        |l| l.contains(TITLE),
-        TITLE_WITHIN,
-    )?;
+    expect_title(run, "the title screen again", TITLE_WITHIN)?;
     run.type_raw(b"\x03")?;
     run.expect(gpu_probe::RELEASED, DIALOG_STEP * 3)?;
     run.send("echo ash-is-back")?;
@@ -612,7 +691,7 @@ pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
         // In the background, so that ash answers while Doom runs.
         run.send(&format!("{LAUNCH} &"))?;
         run.send("P=$!")?;
-        run.expect_line("the title", |l| l.contains(TITLE), TITLE_WITHIN)?;
+        expect_title(&mut run, "the title", TITLE_WITHIN)?;
         let mut memory = Vec::new();
         let mut read = |run: &mut qemu::Run, when: &str| -> Result<(), String> {
             run.send(
@@ -625,7 +704,7 @@ pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
         read(&mut run, "title")?;
         std::thread::sleep(KEY_PAUSE);
         monitor.sendkeys(&["ret", "ret", "ret", "ret"], KEY_PAUSE)?;
-        run.expect_line("the first level", |l| l.contains(LEVEL), LEVEL_WITHIN)?;
+        expect_level(&mut run, LEVEL_WITHIN)?;
         std::thread::sleep(Duration::from_secs(2));
         read(&mut run, "E1M1")?;
         run.send("kill $P")?;
@@ -665,10 +744,10 @@ fn drive_slowly(run: &mut qemu::Run, scratch: &Scratch) -> Result<(), String> {
     run.expect(SERVICES_STARTED, SLOW)?;
     run.expect("# ", SLOW)?;
     run.send(LAUNCH)?;
-    run.expect_line("the title screen", |l| l.contains(TITLE), SLOW)?;
+    expect_title(run, "the title screen", SLOW)?;
     std::thread::sleep(PAUSE);
     monitor.sendkeys(&["ret", "ret", "ret", "ret"], PAUSE)?;
-    run.expect_line("the first level", |l| l.contains(LEVEL), SLOW)?;
+    expect_level(run, SLOW)?;
     std::thread::sleep(PAUSE);
     monitor.sendkey("left", Some(1000))?;
     std::thread::sleep(PAUSE);
@@ -840,6 +919,53 @@ mod tests {
                 .unwrap_err()
                 .contains("181 s")
         );
+    }
+
+    #[test]
+    fn a_level_line_before_the_title_fails_at_once() {
+        // The failing run of stafeto#421: the level line of the frame
+        // drawn before the first tic comes before the title.
+        let run: Vec<String> = [
+            "W_Init: Init WADfiles.",
+            "doom: level 0 0",
+            "doom: title crc32 d8be0588",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let fault = first_fault(&run).unwrap();
+        assert!(fault.contains("came before the title screen"), "{fault}");
+        assert!(level_line_fault("doom: level 0 0", false).is_some());
+        assert!(level_line_fault("doom: level 1 1", false).is_some());
+    }
+
+    #[test]
+    fn a_level_line_with_episode_or_map_0_fails() {
+        for line in [
+            "doom: level 0 0",
+            "doom: level 0 1",
+            "doom: level 1 0",
+            "doom: level x",
+        ] {
+            let fault = level_line_fault(line, true).unwrap();
+            assert!(fault.contains("names no level"), "{fault}");
+        }
+    }
+
+    #[test]
+    fn the_normal_sequence_of_doom_lines_passes() {
+        let run: Vec<String> = [
+            "doom: state 3 tic 0 demo 0",
+            "doom: title crc32 c31bb822",
+            "doom: state 0 tic 1 demo 1",
+            "doom: state 3 tic 700 demo 0",
+            "doom: level 1 1",
+            "ramfs: budget 12",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(first_fault(&run), None);
+        assert_eq!(level_line_fault("doom: state 0 tic 1 demo 0", false), None);
+        assert_eq!(doom_lines(&run).len(), 5);
     }
 
     #[test]
