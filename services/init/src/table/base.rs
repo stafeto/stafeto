@@ -75,15 +75,20 @@ pub const COMMAND_QUOTAS: u64 = 14;
 pub const PIXMAN_PAGES: u64 = 150 * crate::PAGE;
 
 /// The pages the pool of the process service gave up for the display
-/// driver's new objects (stage G3 of the graphics design): `pool`, 256 pages,
-/// and `cursor`, 4 pages, which init makes and pays from its own quota like
-/// `fb`. The compositor still has the 250 pages of its own buffer for the
-/// first revision of the protocol until it shows the driver's pool directly
-/// (the same stage, a later step), and the base image kept 32 pages over
-/// the 16 384 that `cargo xtask pkg-identity` asks for; the pool is far
-/// larger than the heaviest command needs, so it gives them up, and takes
-/// the 250 back when the compositor's buffer goes.
-pub const DISPLAY_POOL_PAGES: u64 = 260 * crate::PAGE;
+/// driver's growth (stage G3 of the graphics design), counted by what init
+/// pays and measured on the base image: `pool`, 256 pages, and `cursor`, 4
+/// pages, which init makes and pays from its own quota like `fb` (260); the
+/// driver's code, which grew by 2 pages in the image and 2 pages loaded
+/// (4, from the loaded segments of `virtio-gpu` before and after, and the
+/// `init: free pages` lines of main, 16 387 of 127 332, and of this change,
+/// 16 383 of 127 330 without this give-up); and a margin of 4. The base
+/// image had 3 pages over the 16 384 that `cargo xtask pkg-identity` asks
+/// for; the figure is the change's own and is independent of `PIXMAN_PAGES`.
+/// The compositor still has the 250 pages of its own buffer for the first
+/// revision of the protocol until it shows the driver's pool directly (a
+/// later step), which takes the 250 back. The pool is far larger than the
+/// heaviest command needs.
+pub const DISPLAY_POOL_PAGES: u64 = 268 * crate::PAGE;
 
 /// The process service of the base and the full image: the pool of the
 /// network image with `COMMAND_QUOTAS` quotas of a command.
@@ -102,7 +107,7 @@ pub const BASE_PROCESS_SERVICE: Record = Record {
 /// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 16 416 pages of
 /// 127 341 on 512 MiB (16 813 before the compositor took its quota of 336 pages, 16 440 before
 /// pixman took 64 pages of the compositor's quota and its code in the boot image and in the
-/// process, which `PIXMAN_PAGES` of the process pool paid); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
+/// process, which `PIXMAN_PAGES` of the process pool paid; 16 387 of 127 332 on main at 227de814, the figure the display driver's growth `DISPLAY_POOL_PAGES` is counted from); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
 /// of 54 MB leaves the memory of init about 11 000 pages smaller than the base image's, and the
 /// pool of the process service (16 quotas of 4 096 pages) stays; so the full image runs on 1 GiB
 /// (xtask `base_image::machine`), where the number is the one in docs/packages.md. The disk

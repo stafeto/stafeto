@@ -214,13 +214,14 @@ fn source(session: &Handle<Channel>, kind: u32) -> Result<(SourceInfo, Handle<Me
     let mut buffer = [0; MESSAGE_MAX];
     let info =
         SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| Fail::Bad("SOURCE's reply"))?;
+    // `take` leaves the slot in the count: the count is read first.
+    if reply.handles.len() != 1 {
+        return Err(Fail::Bad("SOURCE's handle count"));
+    }
     let object = reply
         .handles
         .take::<Memory>(0)
         .map_err(|_| Fail::Bad("SOURCE's handle"))?;
-    if !reply.handles.is_empty() {
-        return Err(Fail::Bad("SOURCE's handle count"));
-    }
     Ok((info, object))
 }
 
