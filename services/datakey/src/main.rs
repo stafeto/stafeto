@@ -6,6 +6,8 @@
 //!
 //! At the start the service reads `/ssh/dropbear_ed25519_host_key` of the volume. A key there is written
 //! to `/etc/dropbear/dropbear_ed25519_host_key` with mode 0600, and the service says READY and ends.
+//! A key that is already in `/etc/dropbear` (the launcher started the boot script after its wait for this
+//! service, and the script made a key) is left as it is: the file is created with the exclusive flag.
 //! A volume with no key gets READY at once, and the service looks for the key the boot script makes
 //! (once a second, 120 times, at its heartbeat): a file that has the same bytes in two looks in a row is
 //! written to the volume as `.tmp`, synced, and renamed to its name, and the service ends. With no data
@@ -123,10 +125,13 @@ fn read_ram(key: &mut Key) -> Result<bool, FsError> {
     Ok(true)
 }
 
-/// Writes the key into the file service, mode 0600, from its start.
+/// Writes the key into the file service, mode 0600, from its start. The file is created here: a key that
+/// is already there (the boot script made one, because the launcher did not wait for this service any
+/// longer) is never replaced, so `/etc/dropbear` stays as the running server has it
+/// (`FsError::AlreadyExists`).
 fn write_ram(key: &Key) -> Result<(), FsError> {
     let files = files();
-    let flags = proto_fs::WRITE_ONLY | proto_fs::CREATE | proto_fs::TRUNCATE;
+    let flags = proto_fs::WRITE_ONLY | proto_fs::CREATE | proto_fs::EXCLUSIVE;
     let fd = files.open_policy(RAM_KEY, flags, 0o600, 0, DescriptorFlags::default())?;
     let mut done = 0;
     let result = loop {
@@ -288,6 +293,9 @@ fn main(_: u64) -> u64 {
             Ok(true) => {
                 match write_ram(&key) {
                     Ok(()) => rt::println!("datakey: host key restored from /data"),
+                    Err(FsError::AlreadyExists) => rt::println!(
+                        "datakey: /etc/dropbear has a key already, the key of /data is not restored"
+                    ),
                     Err(error) => rt::println!("datakey: the key could not be placed: {error:?}"),
                 }
                 Found::Restored
