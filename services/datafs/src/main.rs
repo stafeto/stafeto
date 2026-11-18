@@ -35,6 +35,7 @@ const NO_START_DATA: u64 = 1;
 const NOT_REGISTERED: u64 = 3;
 const BUDGET: u64 = 4;
 const STOPPED: u64 = 5;
+const STUCK: u64 = 6;
 
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
@@ -113,6 +114,7 @@ fn main(_: u64) -> u64 {
         forgotten: [0; SESSIONS],
         forgotten_count: 0,
         ready: false,
+        since: 0,
     };
     let config = Config {
         issued: 0,
@@ -161,9 +163,36 @@ struct Datafs {
     forgotten_count: usize,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
     ready: bool,
+    /// The instant the worker's start was over (0 while it is not), for the look at the oldest job.
+    since: u64,
+}
+
+/// The clock in nanoseconds.
+fn now_ns() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
 }
 
 impl Datafs {
+    /// The heartbeat proves the worker as well as the request thread: a job that has waited for more
+    /// than `STUCK_NS` ends the service, and init starts a new one.
+    fn watch_worker(&mut self) {
+        if STARTING.load(Acquire) {
+            return;
+        }
+        let now = now_ns();
+        if self.since == 0 {
+            self.since = now;
+        }
+        let queued = (0..JOBS)
+            .filter(|&i| state(i).load(Acquire) == QUEUED)
+            // SAFETY: the instant is written before the job is QUEUED; it is read through the atomic.
+            .map(|i| unsafe { (*job(i)).queued_at.load(Acquire) });
+        if datafs::watch::stuck(now, self.since, queued, datafs::watch::STUCK_NS) {
+            rt::println!("datafs: a job has waited more than 20 s, the service ends");
+            sys::process_exit(STUCK);
+        }
+    }
+
     fn free_job(&self) -> Option<usize> {
         (0..JOBS).find(|&i| state(i).load(Acquire) == FREE && self.pending[i].is_none())
     }
@@ -177,6 +206,7 @@ impl Datafs {
         job.request_len = bytes.len();
         job.request[..bytes.len()].copy_from_slice(bytes);
         job.ticket.store(next_ticket(), Release);
+        job.queued_at.store(now_ns(), Release);
         state(i).store(QUEUED, Release);
         let _ = sys::notify(&self.kick, 1);
     }
@@ -262,6 +292,12 @@ impl Service<0> for Datafs {
                 self.forgotten_count += 1;
             }
             None => {}
+        }
+    }
+
+    fn maintenance(&mut self, _: &mut [Option<Session<(), 0>>], notice: Notice) {
+        if notice.source == Source::Timer && notice.label == 0 {
+            self.watch_worker();
         }
     }
 
