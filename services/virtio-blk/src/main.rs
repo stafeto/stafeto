@@ -372,7 +372,10 @@ fn main(_: u64) -> u64 {
     let _ = sys::irq_ack(&driver.irq);
     driver.ask_for_id();
     #[cfg(feature = "steps")]
-    rt::service::report_steps(15);
+    {
+        rt::service::report_steps(15);
+        rt::service::table_steps_from(16);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
