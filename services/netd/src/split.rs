@@ -65,6 +65,16 @@ mod on {
         rt::time::now()
     }
 
+    /// How often a step of sending visited a second group and how often the soft share held
+    /// it back (`net: split second_group ran N skipped M`).
+    static SECOND_RAN: AtomicU64 = AtomicU64::new(0);
+    static SECOND_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn second_group(ran: bool) {
+        let counter = if ran { &SECOND_RAN } else { &SECOND_SKIPPED };
+        counter.fetch_add(1, Relaxed);
+    }
+
     pub fn record(part: usize, ticks: u64) {
         let bucket = ((ticks / WIDTH) as usize).min(BUCKETS - 1);
         HIST[part][bucket].fetch_add(1, Relaxed);
@@ -116,6 +126,11 @@ mod on {
                 MAX[part].load(Relaxed)
             );
         }
+        rt::println!(
+            "net: split second_group ran {} skipped {}",
+            SECOND_RAN.load(Relaxed),
+            SECOND_SKIPPED.load(Relaxed)
+        );
     }
 }
 
@@ -144,6 +159,8 @@ mod off {
     pub fn now() -> u64 {
         0
     }
+    #[inline(always)]
+    pub fn second_group(_: bool) {}
     #[inline(always)]
     pub fn record(_: usize, _: u64) {}
     #[inline(always)]

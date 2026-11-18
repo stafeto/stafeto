@@ -151,7 +151,15 @@ impl Disk {
     }
 
     /// TAKE of `key` until it is READY, with a deadline for the wait.
+    /// Waits for the disk call `key` and stamps the instant it completed, for the look of the request
+    /// thread at the worker's progress.
     fn finish(&self, key: u64) -> Result<(), Status> {
+        let done = self.finish_call(key);
+        PROGRESS.store(rt::time::ticks_to_ns(rt::time::now()), Release);
+        done
+    }
+
+    fn finish_call(&self, key: u64) -> Result<(), Status> {
         let mut w = Writer::new();
         BlkKey { key }.write(Blk::Take, &mut w)?;
         let mut notify =
