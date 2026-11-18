@@ -414,8 +414,12 @@ impl<'a> Stack<'a> {
             // sending (`TX_SOFT`, measured images only): the step costs at most the share,
             // the group, a frame of the wire and the tail. The group stays due.
             #[cfg(feature = "steps")]
-            if ran >= 1 && rt::time::now().saturating_sub(entered) > netd::ring::TX_SOFT {
-                break;
+            if ran >= 1 {
+                if rt::time::now().saturating_sub(entered) > netd::ring::TX_SOFT {
+                    split::second_group(false);
+                    break;
+                }
+                split::second_group(true);
             }
             self.cursor = g + 1;
             ran += 1;

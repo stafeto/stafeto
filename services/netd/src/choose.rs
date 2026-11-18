@@ -29,7 +29,7 @@
 //!
 //! The same holds for sending (`ring::TX_SOFT_MEASURED`): a second group is visited only while
 //! the step is within the share, so the step costs at most the share, a group, a sent frame
-//! and the tail. The rule takes two groups with a single frame when that sum is within the
+//! and the fixed part of the step. The rule takes two groups with a single frame when that sum is within the
 //! margin, whatever the estimate of two groups gives.
 //!
 //! The gate: a step of receiving with one frame, and a step of sending with
@@ -53,6 +53,39 @@ pub const BATCHES: [usize; 5] = [16, 8, 4, 2, 1];
 pub const GROUPS_PER_STEP: [usize; 3] = [4, 2, 1];
 /// The most the longest step at 256 places may differ from that at 8 places.
 pub const FLATNESS: u64 = 1_500;
+
+/// The most each measured part of the new soft shares may cost before the step passes the bound
+/// (`BOUND`), from the constants of `netd::ring`: a measured 90th percentile above its constant
+/// is a warning, above its ceiling a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ceilings {
+    /// A frame of the wire received: the bound less the share of receiving and the tail.
+    pub frame_rx_wire: u64,
+    /// A frame of the wire sent: the bound less the share, the group and the fixed part.
+    pub frame_tx_wire: u64,
+    /// The pass over a group: the bound less the share, the sent frame and the fixed part.
+    pub group: u64,
+    /// The fixed part of a step of sending: the bound less the share, the group and the frame.
+    pub fixed_tx: u64,
+}
+
+impl Ceilings {
+    pub fn of_ring() -> Ceilings {
+        use crate::ring::*;
+        let (share, group, frame, fixed) = (
+            TX_SOFT_MEASURED,
+            TX_GROUP_TICKS as u64,
+            WIRE_TX_FRAME_TICKS as u64,
+            TX_FIXED_TICKS as u64,
+        );
+        Ceilings {
+            frame_rx_wire: BOUND - RX_SOFT_MEASURED - STEP_TAIL_TICKS as u64,
+            frame_tx_wire: BOUND - share - group - fixed,
+            group: BOUND - share - frame - fixed,
+            fixed_tx: BOUND - share - group - frame,
+        }
+    }
+}
 
 /// The 90th percentiles of the parts of the steps, in ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,19 +123,17 @@ impl Parts {
     }
 
     /// The longest step of sending with a second group under the soft share
-    /// (`ring::TX_SOFT_MEASURED`): the share, a group, a frame of the price and the tail.
+    /// (`ring::TX_SOFT_MEASURED`): the share, a group, a frame of the price and the fixed part
+    /// of a step of sending (what `tx_step` does outside the share).
     pub fn sending_soft(&self) -> u64 {
-        crate::ring::TX_SOFT_MEASURED
-            + self.group
-            + self.tx_price()
-            + crate::ring::STEP_TAIL_TICKS as u64
+        crate::ring::TX_SOFT_MEASURED + self.group + self.tx_price() + self.fixed_tx
     }
 
     /// The room the margin leaves for the share of sending after a group, a frame of the price
-    /// and the tail: the largest `TX_SOFT_MEASURED` these parts allow.
+    /// and the fixed part: the largest `TX_SOFT_MEASURED` these parts allow.
     pub fn tx_soft_room(&self) -> u64 {
         (crate::ring::STEP_MARGIN as u64)
-            .saturating_sub(self.group + self.tx_price() + crate::ring::STEP_TAIL_TICKS as u64)
+            .saturating_sub(self.group + self.tx_price() + self.fixed_tx)
     }
 
     /// The parts the code stands on: the constants of `netd::ring`, which the step rule reads
@@ -323,10 +354,10 @@ mod tests {
 
     #[test]
     fn the_soft_share_lets_a_second_group_in_when_the_sum_fits_the_margin() {
-        use crate::ring::{STEP_MARGIN, STEP_TAIL_TICKS, TX_SOFT_MEASURED};
-        // The dearest frame the margin allows after the share, a group and the tail.
-        let mut p = parts(1_000, 3_400, 500, 400, 3_800);
-        let fit = STEP_MARGIN as u64 - TX_SOFT_MEASURED - 3_800 - STEP_TAIL_TICKS as u64;
+        use crate::ring::{STEP_MARGIN, TX_SOFT_MEASURED};
+        // The dearest frame the margin allows after the share, a group and the fixed part.
+        let mut p = parts(1_000, 3_400, 500, 400, 4_000);
+        let fit = STEP_MARGIN as u64 - TX_SOFT_MEASURED - 4_000 - 3_400;
         p.frame_tx_wire = fit;
         // Two groups pass the budget, one fits, so the estimate alone gives one.
         assert!(p.sending(2, 1) > BUDGET && p.sending(1, 1) <= BUDGET);
@@ -339,6 +370,20 @@ mod tests {
         assert_eq!(choose(&p).unwrap().groups, 1);
         // The room for the share is what the sum has left.
         assert_eq!(p.tx_soft_room(), TX_SOFT_MEASURED - 1);
+    }
+
+    #[test]
+    fn the_ceilings_leave_the_bound_after_the_other_parts() {
+        let c = Ceilings::of_ring();
+        assert_eq!(c.frame_rx_wire, 10_669);
+        assert_eq!(
+            (c.frame_tx_wire, c.group, c.fixed_tx),
+            (8_369, 5_869, 5_269)
+        );
+        assert!(c.frame_rx_wire > crate::ring::WIRE_FRAME_TICKS as u64);
+        assert!(c.frame_tx_wire > crate::ring::WIRE_TX_FRAME_TICKS as u64);
+        assert!(c.group > crate::ring::TX_GROUP_TICKS as u64);
+        assert!(c.fixed_tx > crate::ring::TX_FIXED_TICKS as u64);
     }
 
     #[test]
