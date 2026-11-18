@@ -712,6 +712,25 @@ mod steps {
         REPORT.store(tag, Ordering::Relaxed);
     }
 
+    /// The function that runs after each step (`super::step_after`), as a
+    /// pointer, 0 for none.
+    static AFTER: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn after(f: fn()) {
+        AFTER.store(f as usize, Ordering::Relaxed);
+    }
+
+    /// Runs the function of `after`, if one was given, once the step's
+    /// sample is taken: whatever it prints is no part of the step.
+    fn run_after() {
+        let f = AFTER.load(Ordering::Relaxed);
+        if f != 0 {
+            // SAFETY: the value came from a `fn()` in `after`.
+            let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f) };
+            f();
+        }
+    }
+
     pub fn table() {
         TABLE.store(true, Ordering::Relaxed);
     }
@@ -918,6 +937,7 @@ mod steps {
         if preempted > PREEMPTS[kind].fetch_max(preempted, Ordering::Relaxed) && printing {
             crate::println!("service preempt: {tag} kind {kind} {preempted} ticks of {whole}");
         }
+        run_after();
         sample
     }
 }
@@ -937,6 +957,7 @@ mod steps {
     pub fn detail(_: u64) {}
     pub fn own() {}
     pub fn report(_: u8) {}
+    pub fn after(_: fn()) {}
     pub fn table() {}
 }
 
@@ -945,6 +966,15 @@ mod steps {
 /// that count their steps get the lines of the one that asked.
 pub fn report_steps(tag: u8) {
     steps::report(tag);
+}
+
+/// Gives a function that the loop runs after each step, once the step's
+/// sample is taken, so that what it prints is no part of the step (feature
+/// `step-stats`; nothing without it). A service that measures what its
+/// steps do inside them (the compositor's cost of each kind of layer)
+/// tells the numbers from here.
+pub fn step_after(f: fn()) {
+    steps::after(f);
 }
 
 /// Makes the loop of this service tell the table of its longest steps again, one line of

@@ -430,6 +430,16 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&comp),
         text(&input)
     );
+    println!(
+        "focus-probe on {}: the cost of the layers inside the bands, ticks (CALL_TICKS {}, BAND_TICKS {}): {}",
+        machine.name,
+        compositor::CALL_TICKS,
+        compositor::BAND_TICKS,
+        comp_probe::raster_text(&comp_probe::raster_costs(
+            &output.lines,
+            comp_probe::COMP_TAG
+        ))
+    );
     Ok(())
 }
 

@@ -98,15 +98,24 @@ only.
 The windows are put together by pixman 0.46.4 (MIT), built from its pinned
 source by `tools/build-pixman.py` (`packages/pixman.toml`: version, URL and
 SHA-256 of the archive) as a static library that `lib/pixman` links into the
-compositor: its portable C paths, with no SIMD, no threads and no timers, over
-the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
+compositor: its AArch64 NEON paths (`pixman-arm-neon.c` and the two assembly
+files of meson's `a64-neon`) over its portable C paths, with no threads and no
+timers, over the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
 allocates from, and the few functions of a C library it calls). Two files of
 pixman are left out and replaced by one function each in the shim: the
 combiners of the wide formats and the accessors of images, which windows of 8
 bits to the channel never reach. The package installs no file: its licence
 notice is the one the distribution carries for it
 (`/usr/share/licenses/pixman/`), and `xtask packages` accepts it as a library
-of a service (`SERVICE_LIBRARIES`). The copy of a band and the lay of a band over
+of a service (`SERVICE_LIBRARIES`). pixman adds its NEON implementation to its
+table with no test of the CPU when it is built with `USE_ARM_A64_NEON` (every
+AArch64 CPU has the instructions), so nothing reads `/proc` or the auxiliary
+vector, and programs may use the FP and SIMD registers: the kernel saves and
+loads them at every switch between threads (`karch/src/fpsimd.S`,
+`kernel/src/thread.rs`, `run`), and programs are built for
+`aarch64-unknown-none`, with FP and SIMD. `STAFETO_PIXMAN_PORTABLE=1` (or
+`tools/build-pixman.py --portable`) builds the portable C paths alone. The
+copy of a band and the lay of a band over
 the screen are pixman's SRC and OVER; the glue is `lib/pixman` and
 `services/compositor/src/px.rs`.
 
@@ -158,7 +167,9 @@ a window, a rectangle of it posted alone, two windows, the black screen after
 the first client ended, and a window of the first revision (pattern and a
 rectangle). Under `-icount` it measures the steps of the compositor and of
 the driver: every step stays under 0.9 of term B, and a band of a frame, like
-a portion of the driver's clearing, under 16 328 ticks. `cargo xtask
+a portion of the driver's clearing, under 16 328 ticks, and tells what each kind of layer costs a point inside
+the bands (`service raster` lines of `px::cost`; the constants of
+`Scene::tile` are set from them). `cargo xtask
 doom-probe` runs Doom through the compositor.
 
 `cargo xtask focus-probe` (stage G2) runs the compositor with a tablet, two
@@ -176,8 +187,8 @@ under 16 328 ticks).
 
 ## Not yet
 
-The period of a frame and its counters, a window's resize, NEON paths of
-pixman, a window manager as a program of its own (the probe's manager is a role
+The period of a frame and its counters, a window's resize, the constants of
+the bands set from the NEON costs (the probes report them), a window manager as a program of its own (the probe's manager is a role
 of `focus-probe`), the pointer in the base image, the layers of the display
 controller and the bypass of the composition for one window, and the C
 functions for windows in `libc.so` (a change of the ABI series).

@@ -1900,6 +1900,7 @@ version = "0.5.1"
 dependencies = [
  "abi",
  "bootimg",
+ "compositor",
  "console-line",
  "datafs",
  "entries",

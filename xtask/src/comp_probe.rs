@@ -216,6 +216,116 @@ pub fn steps_verdict(lines: &[String]) -> Result<(Rows, Rows), String> {
 /// The longest step of each kind: kind, ticks, detail.
 pub type Rows = Vec<(usize, u64, u64)>;
 
+/// What the compositor measured inside its bands for one kind of layer
+/// (the line `service raster: T KIND calls C points P ticks N big B W small
+/// S L` of services/compositor's `px::cost`, told after the 1st, 2nd, 4th...
+/// frame): the totals up to that frame, the least and the greatest ticks a
+/// hundred points of an operation of 64 points or more, and the least and the
+/// greatest ticks of an operation of 8 points or fewer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterCost {
+    pub kind: String,
+    pub calls: u64,
+    pub points: u64,
+    pub ticks: u64,
+    pub big_best: u64,
+    pub big_worst: u64,
+    pub small_best: u64,
+    pub small_worst: u64,
+}
+
+impl RasterCost {
+    fn parse(line: &str, tag: &str) -> Option<RasterCost> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "raster:",
+            t,
+            kind,
+            "calls",
+            calls,
+            "points",
+            points,
+            "ticks",
+            ticks,
+            "big",
+            bb,
+            bw,
+            "small",
+            sb,
+            sw,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(RasterCost {
+            kind: (*kind).to_owned(),
+            calls: calls.parse().ok()?,
+            points: points.parse().ok()?,
+            ticks: ticks.parse().ok()?,
+            big_best: bb.parse().ok()?,
+            big_worst: bw.parse().ok()?,
+            small_best: sb.parse().ok()?,
+            small_worst: sw.parse().ok()?,
+        })
+    }
+
+    /// The mean ticks a point over the whole run, a hundred times.
+    fn mean_per_hundred(&self) -> u64 {
+        (self.ticks * 100).checked_div(self.points).unwrap_or(0)
+    }
+}
+
+/// The last line of each kind of layer of the service `tag` (the totals of
+/// the latest frame told), in the order the kinds first came.
+pub fn raster_costs(lines: &[String], tag: &str) -> Vec<RasterCost> {
+    let mut out: Vec<RasterCost> = Vec::new();
+    for cost in lines.iter().filter_map(|l| RasterCost::parse(l, tag)) {
+        match out.iter_mut().find(|c| c.kind == cost.kind) {
+            Some(old) => *old = cost,
+            None => out.push(cost),
+        }
+    }
+    out
+}
+
+/// The costs for the report of a probe: the ticks a point (mean, least and
+/// greatest over the big operations) and a small operation (least and
+/// greatest), against the constants of `Scene::tile`. The coordinator sets
+/// OPAQUE_TICKS (copy), OVER_TICKS (over), FILL_TICKS (black) and CALL_TICKS
+/// from the greatest of a point, rounded up, and BAND_TICKS stays.
+pub fn raster_text(costs: &[RasterCost]) -> String {
+    if costs.is_empty() {
+        return "no cost lines (the log lost them, or the frames came too few)".to_owned();
+    }
+    costs
+        .iter()
+        .map(|c| {
+            let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+            format!(
+                "{} (now {}): {} calls, {} points, a point mean {} least {} greatest {}, an operation of 8 points or fewer least {} greatest {}",
+                c.kind,
+                match c.kind.as_str() {
+                    "black" => compositor::FILL_TICKS,
+                    "copy" => compositor::OPAQUE_TICKS,
+                    _ => compositor::OVER_TICKS,
+                },
+                c.calls,
+                c.points,
+                hundredths(c.mean_per_hundred()),
+                hundredths(c.big_best),
+                hundredths(c.big_worst),
+                c.small_best,
+                c.small_worst,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Follows the run: the screenshots against the guest's CRC-lines, then
 /// the end of both clients.
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
@@ -303,6 +413,13 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&comp),
         text(&driver)
     );
+    println!(
+        "comp-probe on {}: the cost of the layers inside the bands, ticks (CALL_TICKS {}, BAND_TICKS {}): {}",
+        machine.name,
+        compositor::CALL_TICKS,
+        compositor::BAND_TICKS,
+        raster_text(&raster_costs(&output.lines, COMP_TAG))
+    );
     Ok(())
 }
 
@@ -386,6 +503,29 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn the_cost_lines_of_a_run_are_read_and_the_last_of_a_kind_counts() {
+        let lines: Vec<String> = [
+            "service raster: 17 copy calls 3 points 900 ticks 2700 big 280 330 small 40 50",
+            "service raster: 17 over calls 2 points 400 ticks 9000 big 2000 2500 small 0 0",
+            "service raster: 17 copy calls 6 points 1800 ticks 5000 big 270 330 small 40 60",
+            "service raster: 12 copy calls 1 points 1 ticks 1 big 1 1 small 1 1",
+            "service raster: 17 copy calls x",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = raster_costs(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 2);
+        assert_eq!((costs[0].kind.as_str(), costs[0].calls), ("copy", 6));
+        assert_eq!(costs[1].big_worst, 2500);
+        let text = raster_text(&costs);
+        assert!(text.contains(
+            "copy (now 3): 6 calls, 1800 points, a point mean 2.77 least 2.70 greatest 3.30"
+        ));
+        assert!(raster_text(&[]).contains("no cost lines"));
     }
 
     #[test]
