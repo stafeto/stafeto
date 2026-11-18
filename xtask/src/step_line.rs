@@ -45,11 +45,40 @@ pub fn judged(ticks: u64, preempts: u64) -> u64 {
 
 /// The line, when it is a line of a step (with or without the count of preemptions).
 pub fn parse(line: &str) -> Option<StepLine<'_>> {
+    parse_word(line, "step:")
+}
+
+/// The line `service table: T kind K N ticks detail D preempts P` of the table that a service
+/// tells after the burst at the start of a run (`rt::service::table_steps`).
+pub fn parse_table(line: &str) -> Option<StepLine<'_>> {
+    parse_word(line, "table:")
+}
+
+/// The longest step of each kind in the table lines of the service `tag` (the last table holds
+/// the longest of all the earlier ones), judged as `longest` does.
+pub fn table(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    for step in lines
+        .iter()
+        .filter_map(|l| parse_table(l))
+        .filter(|s| s.tag == tag)
+    {
+        let row = (step.kind, step.judged(), step.detail);
+        match out.iter_mut().find(|(k, ..)| *k == step.kind) {
+            Some(old) if old.1 > row.1 => {}
+            Some(old) => *old = row,
+            None => out.push(row),
+        }
+    }
+    out
+}
+
+fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let (tag, kind, ticks, detail, preempts) = match words.as_slice() {
         [
             "service",
-            "step:",
+            w,
             tag,
             "kind",
             kind,
@@ -57,10 +86,10 @@ pub fn parse(line: &str) -> Option<StepLine<'_>> {
             "ticks",
             "detail",
             detail,
-        ] => (tag, kind, ticks, detail, "0"),
+        ] if *w == word => (tag, kind, ticks, detail, "0"),
         [
             "service",
-            "step:",
+            w,
             tag,
             "kind",
             kind,
@@ -70,7 +99,7 @@ pub fn parse(line: &str) -> Option<StepLine<'_>> {
             detail,
             "preempts",
             preempts,
-        ] => (tag, kind, ticks, detail, *preempts),
+        ] if *w == word => (tag, kind, ticks, detail, *preempts),
         _ => return None,
     };
     Some(StepLine {
@@ -157,6 +186,25 @@ mod tests {
 
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_table_lines_are_read_apart_from_the_lines_of_a_new_longest() {
+        let l = "service table: 15 kind 5 8058 ticks detail 0 preempts 0";
+        assert!(parse(l).is_none());
+        let t = parse_table(l).unwrap();
+        assert_eq!((t.tag, t.kind, t.ticks), ("15", 5, 8058));
+        assert!(parse_table("service step: 15 kind 5 8058 ticks detail 0").is_none());
+        let got = table(
+            &lines(&[
+                "service table: 15 kind 5 8058 ticks detail 0 preempts 0",
+                "service table: 14 kind 5 9999 ticks detail 0 preempts 0",
+                "service table: 15 kind 5 8100 ticks detail 0 preempts 1",
+                "service table: 15 kind 1 2192 ticks detail 0 preempts 0",
+            ]),
+            "15",
+        );
+        assert_eq!(got, [(5, 8058, 0), (1, 2192, 0)]);
     }
 
     #[test]

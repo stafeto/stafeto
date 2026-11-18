@@ -129,6 +129,7 @@ pub fn crc_of(line: &str, prefix: &str) -> Result<u32, String> {
 /// went back at least three times (the first client's end, a CLOSE, the
 /// second client's end under the new instance).
 pub fn verdict(lines: &[String]) -> Result<(), String> {
+    let lines = &crate::qemu::unglued(lines, RELEASED);
     let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
     if let Some(failed) = lines.iter().find(|l| l.starts_with("gpu-probe: failed")) {
         return Err(failed.clone());

@@ -856,7 +856,8 @@ impl Run {
     }
 
     /// Waits up to `timeout` until the whole line `line` has come `times`
-    /// times in all the output so far: for an effect of a service that
+    /// times in all the output so far, one that came in the middle of another
+    /// program's line included (`unglued`): for an effect of a service that
     /// follows the end of the program that caused it, such as the clearing
     /// of a screen in portions.
     pub fn expect_times(
@@ -866,7 +867,12 @@ impl Run {
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
-        while self.lines.iter().filter(|l| l.as_str() == line).count() < times {
+        while unglued(&self.lines, line)
+            .iter()
+            .filter(|l| l.as_str() == line)
+            .count()
+            < times
+        {
             self.wait_on(deadline, &format!("{line:?} {times} times"))?;
         }
         Ok(())
@@ -1516,6 +1522,37 @@ pub fn hvf_host(os: &str, arch: &str, hv_support: &str, accels: &str) -> Result<
         return Err("qemu-system-aarch64 -accel help lists no hvf".into());
     }
     Ok(())
+}
+
+/// `lines` with each occurrence of the whole line `marker` that another program's line took in
+/// (two writers on one console: `text isgpu: screen released` and ` kept` on the next line)
+/// taken out of it, the line it interrupted joined again, and a line of `marker` of its own put
+/// at the end for it. A `marker` that stands at the start of a line is left where it is. Only
+/// for a marker that no text of any program holds as a part.
+pub fn unglued(lines: &[String], marker: &str) -> Vec<String> {
+    if marker.is_empty() {
+        return lines.to_vec();
+    }
+    let mut text = lines.join("\n");
+    let (mut from, mut extra) = (0, 0);
+    while let Some(at) = text[from..].find(marker).map(|i| i + from) {
+        let end = at + marker.len();
+        if at > 0 && !text[..at].ends_with('\n') {
+            let end = if text[end..].starts_with('\n') {
+                end + 1
+            } else {
+                end
+            };
+            text.replace_range(at..end, "");
+            extra += 1;
+            from = at;
+        } else {
+            from = end;
+        }
+    }
+    let mut out: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    out.extend(std::iter::repeat_n(marker.to_owned(), extra));
+    out
 }
 
 #[cfg(test)]
@@ -2612,5 +2649,25 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             "{e}"
         );
         assert!(took < Duration::from_secs(4), "{took:?}");
+    }
+    #[test]
+    fn a_marker_glued_into_another_line_is_counted_and_the_line_joined() {
+        let lines: Vec<String> = [
+            "gpu: screen released",
+            "comp-probe: OPEN is BUSY while a closed window's mapping isgpu: screen released",
+            " kept",
+            "comp-probe: ok",
+        ]
+        .map(String::from)
+        .to_vec();
+        let got = unglued(&lines, "gpu: screen released");
+        assert_eq!(
+            got.iter().filter(|l| *l == "gpu: screen released").count(),
+            2
+        );
+        assert!(got.contains(
+            &"comp-probe: OPEN is BUSY while a closed window's mapping is kept".to_string()
+        ));
+        assert_eq!(unglued(&got, "gpu: screen released"), got);
     }
 }

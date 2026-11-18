@@ -688,6 +688,14 @@ mod steps {
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The preemptions of the step whose raw time is in `LONGEST`.
+    static LONGEST_PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// Whether the table of the longest steps goes out again at each power of two of the steps
+    /// done from `TABLE_FROM` on (`table_steps`), and the steps done.
+    static TABLE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    /// The first count of steps that prints the table: the burst of the start of a run is over.
+    const TABLE_FROM: u64 = 128;
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -702,6 +710,28 @@ mod steps {
 
     pub fn report(tag: u8) {
         REPORT.store(tag, Ordering::Relaxed);
+    }
+
+    pub fn table() {
+        TABLE.store(true, Ordering::Relaxed);
+    }
+
+    /// The longest step of every kind seen, one line each:
+    /// `service table: T kind K N ticks detail D preempts P`. The lines of a new longest are
+    /// told once and the kernel log, which is bounded, loses records of a burst, so a reader
+    /// that needs every kind takes them from this table, told after the burst.
+    fn print_table(tag: u8) {
+        for kind in 0..KINDS {
+            let took = LONGEST[kind].load(Ordering::Relaxed);
+            if took == 0 {
+                continue;
+            }
+            let detail = DETAILS[kind].load(Ordering::Relaxed);
+            let preempts = LONGEST_PREEMPTS[kind].load(Ordering::Relaxed);
+            crate::println!(
+                "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
+            );
+        }
     }
 
     /// The CPU ticks the loop's thread has run (object_info THREAD_STATE x5), the time of its own
@@ -859,6 +889,7 @@ mod steps {
         // longest raw step too little, and the warning of a raw time above the bound names it.
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAILS[kind].store(detail, Ordering::Relaxed);
+            LONGEST_PREEMPTS[kind].store(n_preempt, Ordering::Relaxed);
             if printing {
                 // The count is left out when it is 0 (most steps): a reader takes a missing
                 // count as 0, and the console, which is slow, has less to write.
@@ -869,6 +900,12 @@ mod steps {
                         "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
                     );
                 }
+            }
+        }
+        if printing && TABLE.load(Ordering::Relaxed) {
+            let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+            if done >= TABLE_FROM && done.is_power_of_two() {
+                print_table(tag);
             }
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
@@ -900,6 +937,7 @@ mod steps {
     pub fn detail(_: u64) {}
     pub fn own() {}
     pub fn report(_: u8) {}
+    pub fn table() {}
 }
 
 /// Makes the loop of this service print each new longest step (feature
@@ -907,6 +945,15 @@ mod steps {
 /// that count their steps get the lines of the one that asked.
 pub fn report_steps(tag: u8) {
     steps::report(tag);
+}
+
+/// Makes the loop of this service tell the table of its longest steps again, one line of
+/// `service table: T kind K N ticks detail D preempts P` for each kind, at each power of two of
+/// the steps it did from 128 on (feature `step-stats`; nothing without it). The line of a new
+/// longest of `report_steps` goes out once, in the burst at the start of a run, where the
+/// bounded kernel log loses records; the table comes after it.
+pub fn table_steps() {
+    steps::table();
 }
 
 /// Records complete steps without printing between requests. Measurement
