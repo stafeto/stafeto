@@ -170,10 +170,85 @@ pub const fn adopt_rule(listening: bool, has_key: bool, key_is_current: bool) ->
     }
 }
 
-/// Whether `sync` of a queue socket releases its key: it is back in LISTEN
-/// (the peer's RST in SYN-RECEIVED) and still holds the key of that connection.
-pub const fn sync_releases(is_queue_socket: bool, listening: bool, has_key: bool) -> bool {
-    is_queue_socket && listening && has_key
+/// Whether `sync` finds a queue socket back in LISTEN after a connection (the
+/// peer's RST in SYN-RECEIVED): it holds the key of that connection, or it
+/// took a SYN (`had_connection`) and its key never went in the table. The
+/// key leaves the table and the socket is due for a replacement.
+pub const fn back_in_listen(
+    is_queue_socket: bool,
+    listening: bool,
+    has_key: bool,
+    had_connection: bool,
+) -> bool {
+    is_queue_socket && listening && (has_key || had_connection)
+}
+
+/// Whether the rebuild of a queue replaces the socket: it closed, or it
+/// listens again after a connection and holds the state of that one (its
+/// round-trip sample, which can set the retransmission timeout of the next
+/// connection up to a minute, and its choice of TCP timestamps).
+pub const fn replaces(closed: bool, listening: bool, relistened: bool) -> bool {
+    closed || (listening && relistened)
+}
+
+/// What `route` does with a SYN whose four is held by a queue socket that
+/// neither listens nor is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynOnFour {
+    /// The socket is half open and the SYN has the initial sequence number it
+    /// recorded: the peer's retransmission. Dropped, so that no other socket of
+    /// the set takes it (the socket sends its own SYN-ACK again).
+    Retransmit,
+    /// The socket is half open and the SYN has another number: a client that
+    /// restarted on the same four. The socket is rebuilt and the SYN goes to
+    /// the listening description as any other.
+    Restart,
+    /// The connection stands (not yet accepted) or is closing: the SYN is
+    /// dropped and the old connection is left as it is.
+    Held,
+}
+
+/// The rule of `route` for a SYN on the four of a queue socket in a state
+/// other than LISTEN and CLOSED.
+pub const fn syn_on_four(syn_received: bool, same_isn: bool) -> SynOnFour {
+    match (syn_received, same_isn) {
+        (true, true) => SynOnFour::Retransmit,
+        (true, false) => SynOnFour::Restart,
+        (false, _) => SynOnFour::Held,
+    }
+}
+
+/// The room a queue socket that went back to LISTEN gives back beyond what
+/// `release_key` gives: its debit was taken when it left LISTEN (`adopt`), and
+/// `release_key` returns it only when the socket held the key.
+pub const fn relisten_credit(had_key: bool, had_connection: bool) -> u8 {
+    if !had_key && had_connection { 1 } else { 0 }
+}
+
+/// The room a rebuilt queue socket gives to its queue: one when the old socket
+/// still held its debit (closed, half open), none when it listened, because
+/// `relisten` gave the debit back already.
+pub const fn rebuild_credit(old_listening: bool) -> u8 {
+    if old_listening { 0 } else { 1 }
+}
+
+/// How long the line of counters of the queues waits after the last one, in
+/// nanoseconds, when counters changed, and when CONFIG asked for it.
+pub const QUEUES_EVERY_NS: u64 = 30_000_000_000;
+pub const QUEUES_ASKED_NS: u64 = 5_000_000_000;
+
+/// Whether the line of the queue counters prints now. `said_at` is the time
+/// of the last line (0 before the first one, which is the baseline of a
+/// boot), `said_sum` the sum of the counters then. A CONFIG that asked
+/// prints after `QUEUES_ASKED_NS`; any other call prints when a counter
+/// changed and `QUEUES_EVERY_NS` have passed.
+pub const fn queues_due(asked: bool, now: u64, said_at: u64, said_sum: u64, sum: u64) -> bool {
+    let since = now.saturating_sub(said_at);
+    if asked {
+        since >= QUEUES_ASKED_NS
+    } else {
+        (sum != said_sum || said_at == 0) && since >= QUEUES_EVERY_NS
+    }
 }
 
 /// Whether a queue socket in this state makes its listening description
@@ -346,11 +421,69 @@ mod tests {
     }
 
     #[test]
-    fn sync_releases_the_key_of_a_queue_socket_back_in_listen() {
-        assert!(sync_releases(true, true, true));
-        assert!(!sync_releases(true, true, false));
-        assert!(!sync_releases(true, false, true));
-        assert!(!sync_releases(false, true, true));
+    fn a_queue_socket_back_in_listen_after_a_connection_is_due() {
+        assert!(back_in_listen(true, true, true, true));
+        assert!(back_in_listen(true, true, false, true));
+        assert!(!back_in_listen(true, true, false, false));
+        assert!(!back_in_listen(true, false, true, true));
+        assert!(!back_in_listen(false, true, true, true));
+    }
+
+    #[test]
+    fn the_rebuild_replaces_closed_and_relistened_sockets_only() {
+        assert!(replaces(true, false, false));
+        assert!(replaces(false, true, true));
+        assert!(!replaces(false, true, false));
+        assert!(!replaces(false, false, true));
+    }
+
+    #[test]
+    fn a_syn_on_a_queue_four_is_told_from_its_retransmission() {
+        assert_eq!(syn_on_four(true, true), SynOnFour::Retransmit);
+        assert_eq!(syn_on_four(true, false), SynOnFour::Restart);
+        assert_eq!(syn_on_four(false, true), SynOnFour::Held);
+        assert_eq!(syn_on_four(false, false), SynOnFour::Held);
+    }
+
+    /// The room of a queue of `n` over SYN, SYN-ACK, RST and the rebuild: a
+    /// socket back in LISTEN gets its debit back once.
+    #[test]
+    fn the_room_returns_once_when_a_socket_back_in_listen_is_rebuilt() {
+        for has_key in [true, false] {
+            let n: u8 = 5;
+            let mut room = n;
+            // The SYN: `adopt` takes the debit (with or without a key).
+            room -= 1;
+            // The RST: `release_key` returns it with a key, `relisten` without.
+            if has_key {
+                room += 1;
+            }
+            room += relisten_credit(has_key, true);
+            assert_eq!(room, n);
+            // The rebuild of the socket that listens.
+            room += rebuild_credit(true);
+            assert_eq!(room, n, "key {has_key}");
+        }
+        // A socket that closed keeps its debit until the rebuild returns it.
+        let mut room: u8 = 4;
+        room += rebuild_credit(false);
+        assert_eq!(room, 5);
+    }
+
+    #[test]
+    fn the_queue_line_prints_the_baseline_then_changes_every_30_s() {
+        let s = 1_000_000_000;
+        // The baseline of a boot.
+        assert!(queues_due(false, 31 * s, 0, 0, 0));
+        assert!(!queues_due(false, 10 * s, 0, 0, 0));
+        // Unchanged: nothing, however late.
+        assert!(!queues_due(false, 500 * s, 40 * s, 7, 7));
+        // Changed, but inside 30 s: later.
+        assert!(!queues_due(false, 69 * s, 40 * s, 7, 8));
+        assert!(queues_due(false, 70 * s, 40 * s, 7, 8));
+        // CONFIG asked: 5 s apply, and the change is not needed.
+        assert!(!queues_due(true, 44 * s, 40 * s, 7, 7));
+        assert!(queues_due(true, 45 * s, 40 * s, 7, 7));
     }
 
     #[test]
