@@ -65,6 +65,18 @@
 //!      single failure fails the run. `NGINX_SCAN_ROUNDS` sets the rounds (5;
 //!      a larger number lifts the time bound of the run: it is a hunt for a
 //!      rare failure).
+//!    - 4h: The scan itself, frame by frame (stafeto/stafeto#439). Two QEMU
+//!      filters on the user network give xtask the guest's device below the
+//!      forwarding (`scan_replay`): xtask plays a host that sends a bare SYN,
+//!      an RST in SYN-RECEIVED, the ACK of a SYN-ACK and an RST after it,
+//!      bursts of SYN A, RST A, SYN B that the guest takes in one step, and a
+//!      flood of SYNs past the room of the queues. Right after it ONE request
+//!      over TLS, ONE over HTTP and a keep-alive connection opened before the
+//!      scan must answer, and the counters of the network service on the
+//!      console (`net: queues ...`) must show `syn_dropped`, `queue_reaped`
+//!      and `key_stale` raised against the report before the scan
+//!      (`embryo_recycled` is printed with them). The step waits for the
+//!      reports (up to 35 s before, 80 s after).
 //!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
@@ -180,7 +192,7 @@ const SPREAD_GAP: Duration = Duration::from_millis(50);
 /// The connections sent in each `SPREAD_GAP`.
 const SPREAD_CONNECTIONS: usize = 1;
 /// The whole run on TCG without -icount.
-const RUN_WITHIN: Duration = Duration::from_secs(240);
+const RUN_WITHIN: Duration = Duration::from_secs(360);
 /// The kinds of the network service's steps (the methods of proto/net,
 /// 65 its own work) that nginx's traffic must show: own work, ACCEPT, SEND,
 /// RECV, CLONE (a fork), BUFFER, EPOLL_SET and EPOLL_WAIT.
@@ -1474,6 +1486,103 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
     Ok(())
 }
 
+/// Step 4h: the scan of `scan_replay` against ports 80 and 443, the first
+/// requests after it, and the counters of the network service.
+fn tls_raw_scan(
+    run: &mut qemu::Run,
+    tls: &Tls,
+    address: SocketAddr,
+    paths: &crate::scan_replay::Paths,
+) -> Result<(), String> {
+    use crate::scan_replay as replay;
+    let at = Instant::now();
+    let tap = replay::Tap::connect(paths).map_err(|e| format!("4h: the filters' sockets: {e}"))?;
+    // The report that the changes of the steps before it are in: the counters
+    // are said once in 30 s and only when one changed, so a quiet service
+    // says nothing and the last report stands.
+    // The reports said so far are behind a mark, so that the wait is for a
+    // new one.
+    run.send("echo raw-scan-start")?;
+    run.expect_line("the mark of 4h", |l| l == "raw-scan-start", DIALOG_STEP)?;
+    run.expect("# ", DIALOG_STEP)?;
+    let _ = run.expect_line(
+        "the counters before the scan",
+        |l| l.contains("net: queues sockets"),
+        Duration::from_secs(35),
+    );
+    let before = replay::latest(run.lines());
+    let mut held = Connection::open(address, CLIENT_WITHIN)
+        .map_err(|e| format!("4h: the long-lived connection: {e}"))?;
+    same(
+        "4h: the long-lived connection before the scan",
+        &held.get("/index.html")?,
+        rootfs::www_index(),
+    )?;
+    let done = replay::replay(&tap, &[80, 443]).map_err(|e| format!("4h: {e}"))?;
+    // The first requests, at once.
+    let out = tls.file("raw-scan.html");
+    let ended = tls.curl(
+        true,
+        &[
+            arg("--max-time"),
+            arg("20"),
+            arg("-o"),
+            arg(out.to_string_lossy()),
+            tls.url("/index.html"),
+        ],
+    )?;
+    if ended.code != 0 {
+        return Err(format!(
+            "4h: the first request over TLS after the scan ended with {}: {}",
+            ended.code,
+            last_lines(&ended.said)
+        ));
+    }
+    same_file("4h: the page over TLS", &out, rootfs::www_index())?;
+    let mut plain = Connection::open(address, CLIENT_WITHIN)
+        .map_err(|e| format!("4h: the first connection to HTTP after the scan: {e}"))?;
+    same(
+        "4h: the page over HTTP",
+        &plain.get("/index.html")?,
+        rootfs::www_index(),
+    )?;
+    same(
+        "4h: the long-lived connection after the scan",
+        &held.get("/index.html")?,
+        rootfs::www_index(),
+    )?;
+    // The counters: the first report after the scan may come before its last
+    // frames count, so reports are read until the judgement holds.
+    let deadline = Instant::now() + Duration::from_secs(80);
+    let (after, verdict) = loop {
+        let after = replay::latest(run.lines());
+        let verdict = replay::judge(before, after);
+        let left = deadline.saturating_duration_since(Instant::now());
+        if verdict.is_ok() || left.is_zero() {
+            break (after, verdict);
+        }
+        if run
+            .expect_line(
+                "the counters after the scan",
+                |l| l.contains("net: queues sockets"),
+                left,
+            )
+            .is_err()
+        {
+            let after = replay::latest(run.lines());
+            break (after, replay::judge(before, after));
+        }
+    };
+    println!(
+        "nginx-probe: 4h scan of guest ports 80 and 443 frame by frame: {} SYNs sent, {} SYN-ACKs read, {} handshakes ended and reset; counters {before:?} -> {after:?} ({} ms)",
+        done.syns,
+        done.synacks_seen,
+        done.handshakes_ended,
+        at.elapsed().as_millis()
+    );
+    verdict.map_err(|e| format!("4h: {e}; counters {before:?} -> {after:?}"))
+}
+
 /// What h2load said, judged: TLS 1.3, h2, every request a 2xx; the rate in
 /// requests a second.
 fn h2load_verdict(said: &str) -> Result<f64, String> {
@@ -1598,6 +1707,12 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             guest: 443,
         },
     ]));
+    // The filters of step 4h (the steps image measures under -icount and
+    // has no such step).
+    let tap_paths = crate::scan_replay::paths(&tls.dir);
+    if !steps {
+        cmd.args(crate::scan_replay::qemu_args(&tap_paths));
+    }
     if steps {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
@@ -1637,6 +1752,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             tls_in_guest(&mut run)?;
             tls_abuse(&mut run, &tls, &workers)?;
             tls_scan(&tls, address, scan_rounds)?;
+            tls_raw_scan(&mut run, &tls, address, &tap_paths)?;
             h2load(tls.port)?;
         }
         // 5 (and 4b again), 6.

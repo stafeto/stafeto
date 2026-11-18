@@ -631,6 +631,7 @@ dependencies = [
  "proto-pipe",
  "proto-process",
  "proto-wire",
+ "rawframe",
  "rt",
  "smoltcp",
  "trace",
@@ -1404,6 +1405,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawframe"
+version = "0.1.0"
+
+[[package]]
 name = "relibc-hello"
 version = "0.1.0"
 dependencies = [
@@ -1894,6 +1899,7 @@ dependencies = [
  "proto-net",
  "proto-pkg",
  "proto-wire",
+ "rawframe",
  "rtc",
  "virtio-pci",
 ]

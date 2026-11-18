@@ -1,0 +1,13 @@
+[package]
+name = "rawframe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Ethernet frames of ARP and TCP built and read on the host, and the length-prefixed stream of QEMU's chardev backends, for the probes that speak to a guest below its forwarding"
+
+[lib]
+bench = false
+
+[dependencies]

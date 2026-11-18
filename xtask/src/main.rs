@@ -128,6 +128,7 @@ mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod rtbench_check;
+mod scan_replay;
 mod service_budget;
 mod smpmeasure;
 mod store_probe;
