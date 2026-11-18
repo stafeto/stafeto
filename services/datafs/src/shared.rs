@@ -89,6 +89,9 @@ pub static READY: AtomicBool = AtomicBool::new(false);
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());
 
+/// The instant, in nanoseconds, of the last disk call the worker completed (`datafs::watch`).
+pub static PROGRESS: AtomicU64 = AtomicU64::new(0);
+
 /// The number of the next request.
 pub static TICKET: AtomicU64 = AtomicU64::new(1);
 

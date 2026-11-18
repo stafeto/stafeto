@@ -173,8 +173,8 @@ fn now_ns() -> u64 {
 }
 
 impl Datafs {
-    /// The heartbeat proves the worker as well as the request thread: a job that has waited for more
-    /// than `STUCK_NS` ends the service, and init starts a new one.
+    /// The heartbeat proves the worker as well as the request thread: while a job is in the table
+    /// and no disk call has completed for `STUCK_NS`, the service ends, and init starts a new one.
     fn watch_worker(&mut self) {
         if STARTING.load(Acquire) {
             return;
@@ -187,8 +187,11 @@ impl Datafs {
             .filter(|&i| state(i).load(Acquire) == QUEUED)
             // SAFETY: the instant is written before the job is QUEUED; it is read through the atomic.
             .map(|i| unsafe { (*job(i)).queued_at.load(Acquire) });
-        if datafs::watch::stuck(now, self.since, queued, datafs::watch::STUCK_NS) {
-            rt::println!("datafs: a job has waited more than 20 s, the service ends");
+        let progress = PROGRESS.load(Acquire);
+        if datafs::watch::stuck(now, self.since, progress, queued, datafs::watch::STUCK_NS) {
+            rt::println!(
+                "datafs: no disk call completed in 20 s with a job waiting, the service ends"
+            );
             sys::process_exit(STUCK);
         }
     }
