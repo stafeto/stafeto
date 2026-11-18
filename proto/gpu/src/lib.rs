@@ -106,10 +106,18 @@
 //!   control queue goes after it.
 //! - A cursor row with source 0 hides the cursor. A cursor row that only
 //!   moves is a move of the cursor.
+//! - The device reads the cursor's points only on its update command. A
+//!   cursor row with the same source and a nonzero changed area therefore
+//!   makes the driver transfer the whole picture again with a fence and
+//!   then send the cursor update; a plain move would never show the new
+//!   picture.
 //! - A LAYERS of cursor rows alone is always taken. The cursor queue
 //!   holds one chain; the driver keeps the last place it was given while
 //!   a chain is out, and sends that place alone when the chain returns, so
 //!   moves merge and none is queued behind another.
+//!
+//! Scaling and cropping (the source and destination rectangles of OpenWF)
+//! come later as a new method with a longer row; LAYERS stays as it is.
 //!
 //! The grammar of a row is checked by `LayerRow::check` against the
 //! tables of the device, with no sums that can overflow; BAD_SIZE is the
@@ -150,12 +158,13 @@ const _: () = assert!(SCREEN_BYTES <= BUFFER_BYTES);
 pub const FORMAT_XRGB8888: u32 = 1;
 /// The format of the cursor picture (a source's `format`): B, G, R, A in
 /// memory, the word 0xAARRGGBB, the colours multiplied by the alpha.
-pub const FORMAT_ARGB8888: u32 = 2;
-/// The bit of a format in a pipeline's `formats`: 1 for XRGB8888, 2 for
-/// ARGB8888; 0 for a number that is no format.
+pub const FORMAT_ARGB8888: u32 = 3;
+/// The bit of a format in a pipeline's `formats`: bit 0 for XRGB8888, bit 1
+/// for ARGB8888; 0 for a number that is no format (2 is none).
 pub const fn format_bit(format: u32) -> u32 {
     match format {
-        FORMAT_XRGB8888 | FORMAT_ARGB8888 => 1 << (format - 1),
+        FORMAT_XRGB8888 => FORMATS_XRGB8888,
+        FORMAT_ARGB8888 => FORMATS_ARGB8888,
         _ => 0,
     }
 }
@@ -403,8 +412,9 @@ pub const SOURCE_KIND_CURSOR: u32 = 2;
 
 /// A record of PIPELINES: one unit of the display hardware (OpenWF
 /// Display's WFDPipeline). Eight u32, 32 bytes, in this order: `id`,
-/// `kind`, `formats`, `max_w`, `max_h`, `flags`, `depth`, and a word that
-/// is zero. `max_w` and `max_h` are the largest source in points; a
+/// `kind`, `formats`, `max_w`, `max_h`, `flags`, `depth`, and a word
+/// reserved for a display number: 0 is the first display, and the records
+/// of revision 3 all say 0. `max_w` and `max_h` are the largest source in points; a
 /// CURSOR pipeline takes a source of exactly that size and a FULL_SCREEN
 /// one a source of the screen's. `depth` orders the pipelines on the
 /// screen, 0 at the bottom.
@@ -473,8 +483,9 @@ impl Pipeline {
         Ok(())
     }
 
-    /// A record: BAD_SIZE unless 32 bytes are left or the last word is not
-    /// zero, INVALID for an id of 0, a kind that is none of the three, no
+    /// A record: BAD_SIZE unless 32 bytes are left, INVALID for a last word
+    /// that is not zero (it is reserved for a display number, 0 the first
+    /// display), an id of 0, a kind that is none of the three, no
     /// format or an unknown one, an unknown flag, or a side of 0.
     pub fn read(r: &mut Reader<'_>) -> Result<Pipeline, Status> {
         let p = Pipeline {
@@ -486,10 +497,9 @@ impl Pipeline {
             flags: r.u32()?,
             depth: r.u32()?,
         };
-        if r.u32()? != 0 {
-            return Err(Status::BadSize);
-        }
-        let ok = p.id != 0
+        let reserved = r.u32()?;
+        let ok = reserved == 0
+            && p.id != 0
             && (KIND_PRIMARY..=KIND_OVERLAY).contains(&p.kind)
             && p.formats != 0
             && p.formats & !(FORMATS_XRGB8888 | FORMATS_ARGB8888) == 0
@@ -662,16 +672,16 @@ impl SourceInfo {
         Ok(kind)
     }
 
-    /// Whether the rows of the source are laid out in its object: nonzero
-    /// sides, `stride` at least a line of points, `format` known and the
-    /// whole in BUFFER_BYTES.
+    /// Whether the layout of the source is sound: nonzero sides, `stride`
+    /// at least a line of points, `format` known. The sum `stride * height`
+    /// is formed in 64 bits and cannot overflow. The size of the object is
+    /// the driver's to check.
     pub fn fits(&self) -> bool {
         self.id != 0
             && self.width != 0
             && self.height != 0
             && format_bit(self.format) != 0
             && u64::from(self.stride) >= u64::from(self.width) * 4
-            && u64::from(self.stride) * u64::from(self.height) <= u64::from(BUFFER_BYTES)
     }
 
     /// Whether `pipeline` takes the source: its format is among the
@@ -723,10 +733,12 @@ impl SourceInfo {
 /// A row of LAYERS: the binding of a source to a pipeline (OpenWF
 /// Display's wfdBindSourceToPipeline with the pipeline's place). Ten
 /// words, 40 bytes, in this order: `pipeline`, `source` (0: the pipeline
-/// is off), `x`, `y` (i32: where the picture's top left point lies on the
-/// screen; for a CURSOR pipeline where the pointer is, which is the top
-/// left point when the hot spot is 0, 0), `hot_x`, `hot_y` (the point of
-/// the picture that lies at `x`, `y`; CURSOR only), `dx`, `dy`, `dw`,
+/// is off), `x`, `y` (i32: for a CURSOR pipeline the place of the pointer,
+/// that is of the hot spot, always on the screen, so that the hot spot
+/// may put the picture partly off an edge; for an overlay the place of the
+/// picture's top left point; for a FULL_SCREEN pipeline 0, 0), `hot_x`,
+/// `hot_y` (the point of the picture that lies at `x`, `y`; CURSOR only),
+/// `dx`, `dy`, `dw`,
 /// `dh` (the area of the source that changed since the last row of this
 /// pipeline, in the source's points; `dw` of 0 says no point changed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,14 +865,20 @@ impl LayerRow {
     ///   pipeline takes, the screen's size for FULL_SCREEN, exactly 64 by
     ///   64 for the cursor of virtio.
     /// - a FULL_SCREEN pipeline's place is 0, 0; a CURSOR pipeline's place
-    ///   is a point of the screen (the device's field is unsigned); any
-    ///   other pipeline's place is free.
+    ///   (the hot spot) is a point of the `screen` given, which the caller
+    ///   takes from the full-screen primary pipeline's `max_w` and `max_h`
+    ///   (the device's field is unsigned); an overlay's place is free.
     /// - the hot spot is 0, 0 unless the pipeline has HOT_SPOT, and then a
     ///   point of the picture: `hot_x < width`, `hot_y < height`.
     /// - the changed area is empty (`dx`, `dy`, `dw`, `dh` all zero, or
     ///   `dw` or `dh` zero with the rest zero) or a rectangle inside the
     ///   source (`Rect::within`, no sum is formed that could overflow).
-    pub fn check(&self, pipeline: &Pipeline, source: Option<&SourceInfo>) -> Result<(), Status> {
+    pub fn check(
+        &self,
+        pipeline: &Pipeline,
+        source: Option<&SourceInfo>,
+        screen: (u32, u32),
+    ) -> Result<(), Status> {
         let bad = Err(code(INVALID));
         if self.pipeline != pipeline.id {
             return bad;
@@ -882,7 +900,10 @@ impl LayerRow {
         let place = if pipeline.has(PIPELINE_FULL_SCREEN) {
             (self.x, self.y) == (0, 0)
         } else if pipeline.kind == KIND_CURSOR {
-            (0..WIDTH as i32).contains(&self.x) && (0..HEIGHT as i32).contains(&self.y)
+            (self.x as i64) >= 0
+                && (self.x as i64) < i64::from(screen.0)
+                && (self.y as i64) >= 0
+                && (self.y as i64) < i64::from(screen.1)
         } else {
             true
         };
@@ -967,6 +988,11 @@ impl Layers {
     /// the tables do not have is INVALID, a pipeline in two rows is
     /// INVALID, and each row passes `LayerRow::check`.
     pub fn check(&self, pipelines: &[Pipeline], sources: &[SourceInfo]) -> Result<(), Status> {
+        let screen = pipelines
+            .iter()
+            .find(|p| p.kind == KIND_PRIMARY && p.has(PIPELINE_FULL_SCREEN))
+            .map(|p| (p.max_w, p.max_h))
+            .ok_or(code(INVALID))?;
         for (i, row) in self.rows().iter().enumerate() {
             if self.rows()[..i].iter().any(|o| o.pipeline == row.pipeline) {
                 return Err(code(INVALID));
@@ -979,7 +1005,7 @@ impl Layers {
                 0 => None,
                 id => Some(sources.iter().find(|s| s.id == id).ok_or(code(INVALID))?),
             };
-            row.check(pipeline, source)?;
+            row.check(pipeline, source, screen)?;
         }
         Ok(())
     }
@@ -1235,7 +1261,17 @@ mod tests {
             ],
             [1, 2, 4, 8]
         );
-        assert_eq!([FORMAT_XRGB8888, FORMAT_ARGB8888], [1, 2]);
+        assert_eq!([FORMAT_XRGB8888, FORMAT_ARGB8888], [1, 3]);
+        assert_eq!(
+            [
+                format_bit(1),
+                format_bit(2),
+                format_bit(3),
+                format_bit(4),
+                format_bit(0)
+            ],
+            [1, 0, 2, 0, 0]
+        );
         assert_eq!([FORMATS_XRGB8888, FORMATS_ARGB8888], [1, 2]);
         assert_eq!([PIPELINE_PRIMARY, PIPELINE_CURSOR], [1, 2]);
         assert_eq!([SOURCE_TARGET, SOURCE_POOL, SOURCE_CURSOR], [1, 2, 3]);
@@ -1340,7 +1376,7 @@ mod tests {
         // A record's last word is zero; an id is not twice; values are known.
         let mut bad = reply.clone();
         bad[12 + 28] = 1;
-        assert_eq!(Pipelines::read(&bad), Err(Status::BadSize));
+        assert_eq!(Pipelines::read(&bad), Err(code(INVALID)));
         let mut bad = reply.clone();
         bad[12 + 32] = 1;
         assert_eq!(Pipelines::read(&bad), Err(code(INVALID)));
@@ -1388,7 +1424,7 @@ mod tests {
             assert_eq!(SourceInfo::read(&reply), Ok(info));
         }
         let reply = bytes_of(|w| SourceInfo::CURSOR.write(Status::Ok, w));
-        assert_eq!(words(&reply), [0, 3, 64, 64, 256, 2]);
+        assert_eq!(words(&reply), [0, 3, 64, 64, 256, 3]);
         let reply = bytes_of(|w| SourceInfo::POOL.write(Status::Ok, w));
         assert_eq!(words(&reply), [0, 2, 640, 400, 2560, 1]);
     }
@@ -1435,7 +1471,7 @@ mod tests {
                 2 => bad.width = 0,
                 3 => bad.height = 0,
                 4 => bad.stride = 100,
-                _ => bad.format = 3,
+                _ => bad.format = 2,
             }
             let b = bytes_of(|w| bad.write(Status::Ok, w));
             assert_eq!(SourceInfo::read(&b), Err(code(INVALID)));
@@ -1592,28 +1628,28 @@ mod tests {
             format: 1,
         };
         let l = Layers::new(&[frame(7)]).unwrap();
-        assert_eq!(l.check(&[Pipeline::VIRTIO_PRIMARY], &[small]), bad);
+        assert_eq!(l.check(Pipelines::VIRTIO.as_slice(), &[small]), bad);
         let wide = SourceInfo {
             id: 8,
             width: 65,
             height: 64,
             stride: 260,
-            format: 2,
+            format: FORMAT_ARGB8888,
         };
         let l = Layers::new(&[LayerRow {
             source: 8,
             ..arrow()
         }])
         .unwrap();
-        assert_eq!(l.check(&[Pipeline::VIRTIO_CURSOR], &[wide]), bad);
+        assert_eq!(l.check(Pipelines::VIRTIO.as_slice(), &[wide]), bad);
         let narrow = SourceInfo {
             id: 8,
             width: 32,
             height: 64,
             stride: 128,
-            format: 2,
+            format: FORMAT_ARGB8888,
         };
-        assert_eq!(l.check(&[Pipeline::VIRTIO_CURSOR], &[narrow]), bad);
+        assert_eq!(l.check(Pipelines::VIRTIO.as_slice(), &[narrow]), bad);
         // A source of a format the pipeline does not take.
         let argb = SourceInfo {
             id: 9,
@@ -1621,7 +1657,7 @@ mod tests {
             ..SourceInfo::POOL
         };
         let l = Layers::new(&[frame(9)]).unwrap();
-        assert_eq!(l.check(&[Pipeline::VIRTIO_PRIMARY], &[argb]), bad);
+        assert_eq!(l.check(Pipelines::VIRTIO.as_slice(), &[argb]), bad);
         // The primary is at 0, 0 and never off.
         assert_eq!(check(LayerRow { x: 1, ..frame(2) }), bad);
         assert_eq!(check(LayerRow { y: -1, ..frame(2) }), bad);
@@ -1715,5 +1751,96 @@ mod tests {
     fn the_longest_layers_request_is_172_bytes() {
         let l = Layers::new(&[frame(2), arrow(), LayerRow::off(3), LayerRow::off(4)]).unwrap();
         assert_eq!(bytes_of(|w| l.write(w)).len(), 172);
+    }
+
+    #[test]
+    fn the_cursor_may_sit_at_every_edge_of_the_screen_with_a_hot_spot() {
+        let check = |x, y, hot| {
+            Layers::new(&[LayerRow::cursor(PIPELINE_CURSOR, SOURCE_CURSOR, x, y, hot)])
+                .unwrap()
+                .check_virtio()
+        };
+        // The hot spot of the picture lies at the pointer: the picture hangs
+        // off the right and bottom edges, or off the left and top ones.
+        assert_eq!(check(0, 0, (0, 0)), Ok(()));
+        assert_eq!(check(639, 399, (0, 0)), Ok(()));
+        assert_eq!(check(639, 399, (63, 63)), Ok(()));
+        assert_eq!(check(0, 0, (63, 63)), Ok(()));
+        assert_eq!(check(639, 0, (32, 7)), Ok(()));
+        assert_eq!(check(0, 399, (7, 32)), Ok(()));
+        assert_eq!(check(640, 399, (63, 63)), Err(code(INVALID)));
+        assert_eq!(check(639, 400, (63, 63)), Err(code(INVALID)));
+        assert_eq!(check(-1, 0, (63, 63)), Err(code(INVALID)));
+    }
+
+    #[test]
+    fn the_screen_of_the_cursor_bounds_is_the_primary_pipelines() {
+        let big = Pipeline {
+            max_w: 800,
+            max_h: 600,
+            ..Pipeline::VIRTIO_PRIMARY
+        };
+        let tables = [big, Pipeline::VIRTIO_CURSOR];
+        let at = |x, y| {
+            Layers::new(&[LayerRow::cursor(
+                PIPELINE_CURSOR,
+                SOURCE_CURSOR,
+                x,
+                y,
+                (0, 0),
+            )])
+            .unwrap()
+            .check(&tables, &SourceInfo::VIRTIO)
+        };
+        assert_eq!(at(799, 599), Ok(()));
+        assert_eq!(at(800, 0), Err(code(INVALID)));
+        assert_eq!(at(0, 600), Err(code(INVALID)));
+        // Without a full-screen primary pipeline the bounds are unknown.
+        let l = Layers::new(&[LayerRow::cursor(
+            PIPELINE_CURSOR,
+            SOURCE_CURSOR,
+            0,
+            0,
+            (0, 0),
+        )])
+        .unwrap();
+        assert_eq!(
+            l.check(&[Pipeline::VIRTIO_CURSOR], &SourceInfo::VIRTIO),
+            Err(code(INVALID))
+        );
+    }
+
+    #[test]
+    fn a_source_layout_has_no_size_cap_and_the_reserved_word_is_zero() {
+        let big = SourceInfo {
+            id: 5,
+            width: 4096,
+            height: 4096,
+            stride: 4096 * 4,
+            format: FORMAT_XRGB8888,
+        };
+        assert!(big.fits());
+        let huge = SourceInfo {
+            stride: u32::MAX,
+            height: u32::MAX,
+            ..big
+        };
+        assert!(huge.fits(), "the product is formed in 64 bits");
+        assert!(
+            !SourceInfo {
+                stride: 4096 * 4 - 1,
+                ..big
+            }
+            .fits()
+        );
+        assert!(!SourceInfo { format: 2, ..big }.fits());
+        let mut b = bytes_of(|w| Pipeline::VIRTIO_PRIMARY.write(w));
+        assert_eq!(words(&b)[7], 0);
+        b[28] = 1;
+        assert_eq!(Pipeline::read(&mut Reader::new(&b)), Err(code(INVALID)));
+        assert_eq!(
+            Pipeline::read(&mut Reader::new(&b[..31])),
+            Err(Status::BadSize)
+        );
     }
 }

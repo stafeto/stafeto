@@ -97,7 +97,7 @@ pub const BUFFER_MAX: u64 = 1 << 20;
 /// The formats of a point: proto_gpu's XRGB8888, and ARGB8888 with the
 /// colour premultiplied by the alpha. 2 is no format (the probes refuse it).
 pub const FORMAT_XRGB8888: u32 = proto_gpu::FORMAT_XRGB8888;
-pub const FORMAT_ARGB8888: u32 = 3;
+pub const FORMAT_ARGB8888: u32 = proto_gpu::FORMAT_ARGB8888;
 
 /// The labels init gives a session of the manager and of the input
 /// (services/init `comp_mark`): bits the service's own labels never have
@@ -681,6 +681,13 @@ pub fn union(a: Option<Rect>, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_format_numbers_are_those_of_gpu() {
+        assert_eq!(FORMAT_XRGB8888, 1);
+        assert_eq!(FORMAT_ARGB8888, 3);
+        assert_eq!(proto_gpu::format_bit(2), 0, "2 is no format");
+    }
 
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {

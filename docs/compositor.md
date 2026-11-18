@@ -163,6 +163,10 @@ the rows take effect together. The layouts are in the header of
 `proto/gpu/src/lib.rs`: a pipeline's record is 32 bytes, a LAYERS row 40, and
 a LAYERS request at most 172 bytes. The three methods belong to the owner's
 session alone. Until the driver implements them it answers UNKNOWN_METHOD.
+Scaling and cropping (source and destination rectangles, in the words of
+OpenWF) come later as a new method with a longer row; LAYERS stays as it is.
+The last word of a pipeline record is reserved for a display number, 0 being
+the first display, and must be zero.
 
 The driver keeps this order of the device's commands, and the compositor may
 rely on it:
@@ -176,6 +180,13 @@ rely on it:
   the cursor update is sent after the device answered that transfer. A
   transfer behind the work of a frame waits for it.
 - A cursor row of source 0 hides the cursor; a row that only moves is a move.
+  For a cursor, `x` and `y` are where the pointer (the hot spot) lies, always
+  on the screen, and the hot spot may put the picture partly off an edge; the
+  top left point is the place only for overlays.
+- The device reads the cursor's points only on its update command. A cursor
+  row with the same source and a nonzero changed area therefore makes the
+  driver transfer the whole picture again with a fence and then send the
+  cursor update; a plain move would never show the new picture.
 - A LAYERS of cursor rows alone is always taken. The cursor queue holds one
   chain; the driver keeps the last place given while a chain is out and sends
   that place alone when it returns, so the moves merge.
