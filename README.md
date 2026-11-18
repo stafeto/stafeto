@@ -23,11 +23,11 @@ You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` a
 - **Kernel.** A capability microkernel of about 210 KiB (212,997 bytes as measured by `cargo xtask kernel-size`, with no size limit) with 38 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels and sporadic-server time budgets, per-process quotas for kernel memory, memory that is never writable and executable at once.
 - **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (8,870 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
 - **Several CPUs.** Up to 8 CPUs are supported and 4 are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
-- **Time budgets.** A thread can be bound to a sporadic-server budget of C per period T (`budget_create`, `thread_bind_budget`, `reply_receive`), and `object_info(THREAD_STATE)` also returns the thread's preemption count. `init` gives budgets from its table to the network service and to the RAM file, pipe and terminal services. Each of these three takes at most C of each T from levels 33 and above and, once its budget is spent, works at level 32. Levels at or below 32 get no share guarantee in 0.5.0. `init` keeps a journal of overruns.
+- **Time budgets.** A thread can be bound to a sporadic-server budget of C per period T (`budget_create`, `thread_bind_budget`, `reply_receive`), and `object_info(THREAD_STATE)` also returns the thread's preemption count. `init` gives budgets from its table to the network service and to the RAM file, pipe and terminal services. Each of these three takes at most C of each T from levels 33 and above and, once its budget is spent, works at level 32. Levels at or below 32 get no share guarantee in the series 0.5. `init` keeps a journal of overruns.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.
 - **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,184 of 1,187 tests and the Open POSIX Test Suite 1,986 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`. `SCHED_SPORADIC` is defined for compilation and refused (`EINVAL` from `sched_setscheduler`, `sched_setparam` and `posix_spawn`, `ENOTSUP` from `pthread_setschedparam` and `pthread_attr_setschedpolicy`; `_POSIX_SPORADIC_SERVER` and `_POSIX_THREAD_SPORADIC_SERVER` are -1). The C layouts of `struct sched_param` (48 bytes), `pthread_attr_t` and `posix_spawnattr_t` (96 bytes) are final, and the release freezes the ABI series 0.5.
 - **Programs.** relibc is the C library. BusyBox 1.37 and the ready-made utilities linked into it give 103 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
-- **Network.** A TCP/IP service in user space with sockets and epoll, DHCP, `wget` and `curl` over TLS, and nginx, also on a user-space FreeBSD stack (F-Stack).
+- **Network.** A TCP/IP service in user space with sockets and epoll, DHCP, `wget` and `curl` over TLS, nginx, also on a user-space FreeBSD stack (F-Stack), and Dropbear SSH. On EC2 the stack runs over the ENA device and serves the same programs.
 - **Security.** A set-ID program takes only verified sessions (pipes, network, entropy) from its caller, a wait on a shared-memory address needs the right to the object, the stack canary comes from `AT_RANDOM`, which the loader fills from a boot seed, all C code is built with `-fstack-protector-strong`, and `crypt` salts are random. Packages are signed, and releases carry a signed index.
 - **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, Apple Virtualization.framework, and AWS EC2 Graviton (t4g.small in `eu-central-1`, booted through an EFI loader, with the ENA network device).
 
@@ -35,14 +35,14 @@ The details of each part and the known limits are in [docs/status.md](docs/statu
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0.
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0; 0.5.1 adds the try-out image for AWS (SSH, nginx, the package manager and a data volume for the host key).
 
 **Next, in this order**
 
 - Reliability: every service step held to its bound and checked in CI, the defects that reviews find fixed before new parts.
-- 0.5.1: budgets for the levels at or below 32, with a service that works at level 1 once its budget is spent and its own work under a budget of its own.
+- Budgets for the levels at or below 32: a service that works at level 1 once its budget is spent, with its own work under a budget of its own. It needs kernel support and comes in a later release.
+- POSIX access to `/data`, the data volume of the AWS image (0.6.0).
 - AWS step g1: two ENA queues with RSS, one stack instance per queue, and measurements against Linux on network-optimised Graviton instances.
-- A public image that anyone can try on AWS: SSH login with the instance key, nginx and nginx-fast, the package manager; then a measurement against Linux on Graviton network instances.
 - Then the rest of the list below.
 - Shared libraries: `libc.so` and a dynamic loader are in; next come `dlopen` of new libraries and more sharing of data pages between processes.
 - The nine POSIX utilities that need services of their own: `at`, `batch`, `lp`, `mailx`, `locale`, `localedef`, `gettext`, `ngettext` and `msgfmt`.
