@@ -1085,7 +1085,20 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 /// console's driver as the quiet stub of the steps of the terminal; and the probe, whose threads
 /// stand at 20, 34 (the victim, above the demoted level 32) and 40.
 pub const SERVICE_BUDGET_TABLE: &[Record] = &[
-    TTY_STEPS_TABLE[0],
+    Record {
+        // A counting budget for the stub (2 ms of each 5 ms at its own level 60, never
+        // demoted): the probe reads what the driver ran for the terminal service in each window
+        // of the victim (`BudgetInfo::ran`) and that it never ran out (`overruns` 0), which makes
+        // the count whole. The stub binds it to its request thread (tests/tty stub).
+        budgets: &[Budget {
+            name: "serve",
+            cpu: 0,
+            c_ns: 2 * MS,
+            t_ns: SERVICE_PERIOD_NS,
+            low: 60,
+        }],
+        ..TTY_STEPS_TABLE[0]
+    },
     RAM_LEGACY,
     PIPE,
     TTY,

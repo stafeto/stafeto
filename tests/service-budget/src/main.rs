@@ -34,6 +34,8 @@ use rt::{Handle, Stack, println, sys, time};
 
 rt::entry!(main);
 
+mod terms;
+
 const MS: u64 = 1_000_000;
 /// The level of the victims. The three services take at most C of each T from the levels 33 and
 /// above, and are services without a budget for the levels at or below 32 (the level they work
@@ -732,14 +734,6 @@ const C_IPC_US: u64 = 32;
 /// window with a heartbeat of the RAM service, init ran 2 688 ticks) and up to two notifications
 /// of the overruns of its budget (13 us each: 824 and 766 ticks), 69 us in all.
 const INIT_PER_SERVICE_US: u64 = 70;
-/// What the starvation gate allows beyond the terms it explains, per service: the events of one
-/// period of the budget (its exhaustion and its replenishment, 2 e, with e from the control phase
-/// of the same run) and the work of init for it (`INIT_PER_SERVICE_US`). No term comes from the
-/// measured run of the service itself.
-fn allowance_us(e: u64) -> u64 {
-    2 * e + INIT_PER_SERVICE_US
-}
-
 /// What one overrun of a budget is, microseconds: the kernel charges a loan at the end of the
 /// request, so a budget runs over by at most one step of its service before the next
 /// replenishment repays it (`B_K_US`, the kernel's longest stretch, and the longest step of a
@@ -754,7 +748,43 @@ static E_MEASURED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The cycles of the duty-cycled victim: the time it ran and the time it was awake, in ticks.
 static CYC_RUN: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYC_WALL: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+/// The clock at the start of each cycle and at its end (`CYC_T0` + `CYC_WALL`), in ticks.
+static CYC_T0: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static CYC_T1: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// What the victim reads of the two budgets around each cycle (`sample`): `ran`, `overruns` and
+/// `pending` of the `serve` budget of the phase's service, `ran` and `overruns` of the budget of
+/// the console driver (the stub of the probe image). The first set is read just before a cycle
+/// starts, the second just after it ends, so the difference of the end of the tenth cycle and the
+/// start of the first is what a window of ten cycles holds, the sleeps between them included.
+const SAMPLE_WORDS: usize = 5;
+type Sample = [AtomicU64; SAMPLE_WORDS];
+static SAMPLE_START: [Sample; 512] = [const { [const { AtomicU64::new(0) }; SAMPLE_WORDS] }; 512];
+static SAMPLE_END: [Sample; 512] = [const { [const { AtomicU64::new(0) }; SAMPLE_WORDS] }; 512];
+/// The raw handles of the two budgets the victim reads (0: none).
+static SERVE_BUDGET: AtomicU64 = AtomicU64::new(0);
+static DRIVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// Reads the two budgets into `slot`. A call is a kernel entry of some microseconds of the
+/// victim's own time, made between cycles.
+fn sample(slot: &Sample) {
+    let read = |raw: &AtomicU64| {
+        let raw = raw.load(Relaxed);
+        (raw != 0)
+            .then(|| Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw)))
+            .and_then(|b| sys::budget_info(&b).ok())
+    };
+    if let Some(i) = read(&SERVE_BUDGET) {
+        slot[0].store(i.ran, Relaxed);
+        slot[1].store(i.overruns, Relaxed);
+        slot[2].store(i.pending, Relaxed);
+    }
+    if let Some(i) = read(&DRIVER_BUDGET) {
+        slot[3].store(i.ran, Relaxed);
+        slot[4].store(i.overruns, Relaxed);
+    }
+}
 
 /// The ticks `serve` of the service has charged (`BudgetInfo::ran`), or None when init gave the
 /// probe no copy of the budget (a probe that reads nothing fails the run).
@@ -763,6 +793,14 @@ fn ran_of(budget: &Option<Handle<rt::handle::Budget>>) -> Option<u64> {
         .as_ref()
         .and_then(|b| sys::budget_info(b).ok())
         .map(|i| i.ran)
+}
+
+/// The times the budget ran out (`BudgetInfo::overruns`), or None with no copy of it.
+fn overruns_of(budget: &Option<Handle<rt::handle::Budget>>) -> Option<u64> {
+    budget
+        .as_ref()
+        .and_then(|b| sys::budget_info(b).ok())
+        .map(|i| i.overruns)
 }
 
 /// The e of the service `which` (index of SERVICES): the control phase of its C.
@@ -826,6 +864,19 @@ fn control_budget(
     println!(
         "svcbudget1 control c_us={c_us} worst10={worst} median10={median} loss_us={loss_us} e_us={e} e_worst_us={e_worst}"
     );
+    // The worst window of the phase by the exact terms: the victim ran R of the W = l = 10 ms (a
+    // bucket window has no sleeps), so the loss is W - R. No service runs here, so the terms are
+    // the spinner's budget and its events, `terms::control_left_us` over them is what the
+    // median-derived e leaves unexplained, and the heartbeats of init are not told (`beats=na`).
+    if let Some((least, _)) = windows_in(l, 0, 150) {
+        let (r, w) = (least / 1000, l as u64 * MS / 1000);
+        let loss = terms::loss_us(r, w);
+        println!(
+            "svcbudget1 control worst R_us={r} W_us={w} l_us={w} n={} loss_us={loss} c_us={c_us} e_us={e} beats=na x_us={}",
+            w / T_US,
+            terms::control_left_us(loss, c_us, T_US, w, e)
+        );
+    }
 }
 
 /// The victim of the starvation phase: it spins 0.8 ms of its own running time and sleeps 0.2 ms,
@@ -843,6 +894,10 @@ extern "C" fn victim_duty(_: u64) -> ! {
     };
     let mut i = 0u64;
     loop {
+        let c = CYCLES.load(Relaxed) as usize;
+        if c < SAMPLE_START.len() {
+            sample(&SAMPLE_START[c]);
+        }
         let awake = time::now();
         let (mut run, mut last) = (0u64, awake);
         while run < want {
@@ -856,12 +911,16 @@ extern "C" fn victim_duty(_: u64) -> ! {
                 run += gap;
             }
         }
-        let wall = time::now() - awake;
-        let c = CYCLES.fetch_add(1, Relaxed) as usize;
+        let ended = time::now();
+        let wall = ended - awake;
         if c < CYC_RUN.len() {
             CYC_RUN[c].store(run, Relaxed);
             CYC_WALL[c].store(wall, Relaxed);
+            CYC_T0[c].store(awake, Relaxed);
+            CYC_T1[c].store(ended, Relaxed);
+            sample(&SAMPLE_END[c]);
         }
+        CYCLES.store(c as u64 + 1, Relaxed);
         if time::now() >= end {
             VICTIM_DONE.store(true, Relaxed);
             sys::thread_exit()
@@ -903,13 +962,81 @@ fn duty_windows() -> (u64, u64, u64) {
     (shares[0], shares[count / 2], n as u64)
 }
 
+/// The terms of one window of ten cycles of the victim, in microseconds (`worst_window`).
+struct Window {
+    r: u64,
+    w: u64,
+    l: u64,
+    serve_ran: u64,
+    serve_overruns: u64,
+    pending_max: u64,
+    driver_ran: u64,
+    driver_overruns: u64,
+}
+
+/// The window of ten consecutive cycles in which the victim kept the least share of its awake
+/// time (the first two cycles are the start of the threads), with what the two budgets did in it:
+/// from the start of its first cycle to the end of its tenth.
+fn worst_window() -> Option<Window> {
+    let n = (CYCLES.load(Relaxed) as usize).min(CYC_RUN.len());
+    let sums = |first: usize| {
+        let run: u64 = CYC_RUN[first..first + 10]
+            .iter()
+            .map(|b| b.load(Relaxed))
+            .sum();
+        let wall: u64 = CYC_WALL[first..first + 10]
+            .iter()
+            .map(|b| b.load(Relaxed))
+            .sum();
+        (run, wall)
+    };
+    let mut worst: Option<(usize, u64, u64)> = None;
+    let mut first = 2;
+    while first + 10 <= n {
+        let (r, w) = sums(first);
+        // r / w < best_r / best_w, without a division.
+        if worst.is_none_or(|(_, br, bw)| r * bw < br * w) {
+            worst = Some((first, r, w));
+        }
+        first += 1;
+    }
+    let (first, r, w) = worst?;
+    let last = first + 9;
+    let us = |t: u64| time::ticks_to_ns(t) / 1000;
+    let start = &SAMPLE_START[first];
+    let end = &SAMPLE_END[last];
+    let diff = |word: usize| {
+        end[word]
+            .load(Relaxed)
+            .saturating_sub(start[word].load(Relaxed))
+    };
+    let pending_max = (first..=last)
+        .flat_map(|c| [&SAMPLE_START[c][2], &SAMPLE_END[c][2]])
+        .map(|p| p.load(Relaxed))
+        .max()
+        .unwrap_or(0);
+    Some(Window {
+        r: us(r),
+        w: us(w),
+        l: us(CYC_T1[last].load(Relaxed) - CYC_T0[first].load(Relaxed)),
+        serve_ran: us(diff(0)),
+        serve_overruns: diff(1),
+        pending_max,
+        driver_ran: us(diff(3)),
+        driver_overruns: diff(4),
+    })
+}
+
 /// The starvation phase against `SERVICES[which]`: 24 clients at 20 on CPU 0 ask the service the
 /// dear request without a pause, and the victim at 34 (`VICTIM_LEVEL`, above the demoted level
 /// 32) spins 0.8 ms and sleeps 0.2 ms; the clients refill the queue in each sleep. The service
-/// works above the victim for C of each T and at 32, below it, for the rest, so the victim loses
-/// what the budget and its events explain and no more: in 10 ms, two periods, 2 C, the two
-/// timer events of each period (4 e, e from the control phase) and the 2 x 10 us of the kernel's
-/// entries, with the allowance `allowance_us`. A victim at or below 32 would lose all of its
+/// works above the victim for C of each T and at 32, below it, for the rest. A window of ten
+/// cycles (from the start of the first to the end of the tenth, sleeps included, `l` of 10 to 11
+/// ms) holds `n = l / T` periods, and the victim loses at most `S + E + 20 + I` of it, `S = n C +
+/// min(C, l - n T)` and one overrun at the edge (the bound of the kernel), `E = 2 e (k + 1)` the
+/// timer events of the chunks (e from the control phase, k the overruns of the budget in the
+/// window), 20 us of the kernel's entries and `I` the allowance of init, plus the driver's time
+/// for the terminal (see `terms`). A victim at or below 32 would lose all of its
 /// time to the demoted service, which the guarantee does not cover. The line gives the worst and
 /// the median share of the victim's own active time over 10 cycles, and the ticks the service's
 /// `serve` budget charged over the phase against its bound, `ceil(P / T) * C` and one overrun,
@@ -920,6 +1047,7 @@ fn starve(
     parent: &Handle<Channel>,
     which: usize,
     budget: &Option<Handle<rt::handle::Budget>>,
+    driver: &Option<Handle<rt::handle::Budget>>,
     wait: &Handle<Channel>,
     timer: &Handle<Timer>,
 ) {
@@ -946,6 +1074,9 @@ fn starve(
     }
     reset();
     CYCLES.store(0, Relaxed);
+    // The victim reads the two budgets around each of its cycles.
+    SERVE_BUDGET.store(budget.as_ref().map_or(0, |b| b.raw().0), Relaxed);
+    DRIVER_BUDGET.store(driver.as_ref().map_or(0, |b| b.raw().0), Relaxed);
     CLIENTS.store(n, Relaxed);
     let clients = spawn_greedies(process, 0);
     let victim_thread = spawn_on(process, 0, victim_duty, 0, VICTIM_LEVEL, 0);
@@ -956,6 +1087,8 @@ fn starve(
         println!("svcbudget1 {name} FAILED no ran-{name}");
         return;
     };
+    let driver_before = ran_of(driver);
+    let driver_overruns_before = overruns_of(driver);
     let began = time::now();
     start_all(&clients);
     sys::thread_start(&victim_thread).expect("start the victim");
@@ -963,28 +1096,61 @@ fn starve(
     STOP.store(true, Relaxed);
     wait_ended(wait, timer, n as u64);
     let (ran_after, ended) = (ran_of(budget), time::now());
+    let driver_after = ran_of(driver);
+    let driver_overruns_after = overruns_of(driver);
     let Some(ran_after) = ran_after else {
         println!("svcbudget1 {name} FAILED no ran-{name}");
         return;
     };
     let (worst, median, cycles) = duty_windows();
     let e = e_of(which);
-    // The victim's loss in 10 ms of wall time (8 ms of them awake) against what the budget and
-    // the events explain: the remainder.
-    let loss_us = (1000 - worst) * 8;
-    let explained = 2 * C_US[which] + 2 * 10 + 4 * e;
-    let remainder = loss_us.saturating_sub(explained);
-    let bound = 1000 - (explained + allowance_us(e)) / 8;
     // The budget's own account: the ticks charged in the phase against ceil(P / T) periods of C
     // and one overrun, and against the floor of one C.
     let phase_us = time::ticks_to_ns(ended - began) / 1000;
     let ran_us = time::ticks_to_ns(ran_after.saturating_sub(ran_before)) / 1000;
     let ran_bound = phase_us.div_ceil(T_US) * C_US[which] + OVERRUN_US;
+    let driver_ran_us = time::ticks_to_ns(
+        driver_after
+            .unwrap_or(0)
+            .saturating_sub(driver_before.unwrap_or(0)),
+    ) / 1000;
     println!(
-        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} bound10={bound} c_us={} e_us={e} remainder_us={remainder} allowance_us={} ran_us={ran_us} ran_bound_us={ran_bound} ran_floor_us={} phase_us={phase_us}",
+        "svcbudget1 {name} starve clients={n} cycles={cycles} worst10={worst} median10={median} c_us={} e_us={e} ran_us={ran_us} ran_bound_us={ran_bound} ran_floor_us={} phase_us={phase_us} driver_budget={} driver_ran_us={driver_ran_us} driver_overruns={}",
         C_US[which],
-        allowance_us(e),
-        C_US[which]
+        C_US[which],
+        u8::from(driver.is_some()),
+        driver_overruns_after
+            .unwrap_or(0)
+            .saturating_sub(driver_overruns_before.unwrap_or(0))
+    );
+    // The worst window of ten cycles by the exact loss and the terms of the gate's bound (the
+    // module `terms`). The heartbeats of init are not told by the probe image (init would have to
+    // record them, which is a change of its production code), so `beats` is `na`.
+    let Some(w) = worst_window() else {
+        println!("svcbudget1 {name} worst none");
+        return;
+    };
+    let c = C_US[which];
+    let loss = terms::loss_us(w.r, w.w);
+    let service = terms::service_us(c, T_US, B_K_US, w.l);
+    let events = terms::events_us(e, w.serve_overruns);
+    let driver_term = if which == 2 { w.driver_ran } else { 0 };
+    let bound = terms::bound_us(service, events, INIT_PER_SERVICE_US, driver_term);
+    println!(
+        "svcbudget1 {name} worst R_us={} W_us={} l_us={} n={} loss_us={loss} serve_ran_us={} serve_overruns={} pending_max={} drv_ran_us={} drv_overruns={} beats=na c_us={c} e_us={e} s_us={service} events_us={events} entries_us={} init_us={INIT_PER_SERVICE_US} d_us={driver_term} bound_loss_us={bound} bound_share={} share={} x_us={}",
+        w.r,
+        w.w,
+        w.l,
+        w.l / T_US,
+        w.serve_ran,
+        w.serve_overruns,
+        w.pending_max,
+        w.driver_ran,
+        w.driver_overruns,
+        terms::ENTRIES_US,
+        terms::share_bound_permille(w.r, bound),
+        w.r * 1000 / w.w.max(1),
+        terms::left_us(loss, w.serve_ran, w.driver_ran, e, w.serve_overruns)
     );
 }
 
@@ -1154,11 +1320,13 @@ fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Han
             rt::budget::take(start, "ran-pipe"),
             rt::budget::take(start, "ran-tty"),
         ];
+        let driver = rt::budget::take(start, "ran-uart");
         starve(
             &start.process,
             &start.parent,
             which,
             &observed[which],
+            &driver,
             wait,
             timer,
         );
@@ -1176,8 +1344,19 @@ fn one_cpu(start: &mut rt::startup::Startup, wait: &Handle<Channel>, timer: &Han
         rt::budget::take(start, "ran-pipe"),
         rt::budget::take(start, "ran-tty"),
     ];
+    // The budget of the console driver's stub, which counts its time (2 ms of each 5 ms, `low`
+    // at its own level so that it never demotes) and charges it to nobody else.
+    let driver = rt::budget::take(start, "ran-uart");
     for (which, budget) in observed.iter().enumerate() {
-        starve(&start.process, &start.parent, which, budget, wait, timer);
+        starve(
+            &start.process,
+            &start.parent,
+            which,
+            budget,
+            &driver,
+            wait,
+            timer,
+        );
         level40(&start.process, &start.parent, which, wait, timer);
     }
 }
