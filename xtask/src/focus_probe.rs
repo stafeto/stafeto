@@ -775,4 +775,25 @@ mod tests {
         lines.push(row(65, PORTION_MAX + 1));
         assert!(steps_verdict(&lines).unwrap_err().contains("portion"));
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let row = |kind: usize, ticks: u64| {
+            format!("service step: 17 kind {kind} {ticks} ticks detail 0")
+        };
+        let mut lines: Vec<String> = COMP_KINDS.iter().map(|&(k, _)| row(k, 100)).collect();
+        lines.extend(
+            INPUT_KINDS
+                .iter()
+                .map(|&(k, _)| format!("service step: {INPUT_TAG} kind {k} 100 ticks detail 0")),
+        );
+        let lost = crate::step_line::tabled(&lines);
+        assert!(steps_verdict(&lost).is_ok());
+        let mut over = lost.clone();
+        over.push(format!(
+            "service table: 17 kind 65 {} ticks detail 0 preempts 0",
+            PORTION_MAX + 1
+        ));
+        assert!(steps_verdict(&over).unwrap_err().contains("portion"));
+    }
 }

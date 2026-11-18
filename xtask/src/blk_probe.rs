@@ -488,4 +488,19 @@ mod tests {
         ];
         assert!(images[0] != images[1] && images[1] != images[2] && images[0] != images[2]);
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let all: Vec<(usize, u64)> = BLK_STEP_KINDS.iter().map(|(k, _)| (*k, 9_000)).collect();
+        let lost = crate::step_line::tabled(&steps(&all));
+        assert!(lost.iter().all(|l| l.starts_with("service table:")));
+        assert!(steps_verdict(&lost).is_ok());
+        // The first line of the first kind lost, the others told: the table has the kind.
+        let mut some = steps(&all[1..]);
+        some.extend(crate::step_line::tabled(&steps(&all[..1])));
+        assert!(steps_verdict(&some).is_ok());
+        let mut over = all.clone();
+        over[0].1 = STEP_MAX + 1;
+        assert!(steps_verdict(&crate::step_line::tabled(&steps(&over))).is_err());
+    }
 }

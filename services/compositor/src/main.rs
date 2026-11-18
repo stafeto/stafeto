@@ -361,7 +361,10 @@ fn main(_: u64) -> u64 {
     service.take_own(Which::Keys);
     service.take_own(Which::Pointer);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(17);
+    {
+        rt::service::report_steps(17);
+        rt::service::table_steps_from(16);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {

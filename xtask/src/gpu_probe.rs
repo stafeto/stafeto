@@ -430,4 +430,24 @@ mod tests {
         assert_eq!(STEP_MAX, 18_369);
         assert_eq!(PORTION_MAX, 16_328);
     }
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let lines: Vec<String> = [
+            (1, 3000),
+            (2, 2500),
+            (3, 900),
+            (8, 2000),
+            (65, 5000),
+            (64, 4000),
+        ]
+        .iter()
+        .map(|&(k, t)| step(k, t))
+        .collect();
+        let lost = crate::step_line::tabled(&lines);
+        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(6));
+        let mut missing = lost.clone();
+        missing.remove(3);
+        assert!(steps_verdict(&missing).unwrap_err().contains("Clone"));
+    }
 }
