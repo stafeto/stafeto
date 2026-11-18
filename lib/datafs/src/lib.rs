@@ -24,6 +24,7 @@ pub mod server;
 #[cfg(test)]
 mod tests;
 pub mod volume;
+pub mod watch;
 
 pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, Storage, Whence};
 
