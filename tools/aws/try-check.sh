@@ -156,5 +156,46 @@
 #   5. Ten minutes of curl in a loop against 80, 443 and 8080: no `ena: reset` line, the
 #      keep-alive counters go on (`ena: keepalive N`).
 #
+#   6. The scan (issue stafeto-design#764: one request failed, once, right after a SYN scan). Needs `tcpdump` and
+#      `sudo` without a password on the operator's host (the packets seen there are the ones the instance
+#      sent: a reset from the instance and one from the operator's own network look alike at the client).
+#      A build of 0.5.1 or later says the counters of the network service on the console (`aws ec2
+#      get-console-output --latest`, a few minutes behind): `net: queues syn_dropped N queue_reaped N
+#      embryo_recycled N` and `net: queues sockets U of L demux D listen_short N key_stale N syn_stray N
+#      orphan_reused N set_barred N`, one baseline line about 30 s after the first request of a boot and a
+#      new one at most every 30 s (and only when a counter changed) after a request, and per listening port
+#      `net: listener place P port 443 syn_dropped N queue_reaped N embryo_recycled N` when one is not 0.
+#      `key_stale` counts SYNs that took a queue socket that still held the key of an earlier connection
+#      (the cause fixed for 764); it is the number to compare with the failures.
+#      For each scan S in: `nmap -Pn -sS -p 1-65535 ADDRESS`, `nmap -Pn -sU --top-ports 200 ADDRESS`, `nmap -Pn -sS -p 1-1024 ADDRESS`
+#      (the first and third twice), with ADDRESS the public address:
+#        a. Read the console and write down the three `net: queues` lines (the counters before).
+#        b. Start the capture in a second terminal and leave it until the request below is done:
+#             sudo tcpdump -i any -n -s 96 -w target/aws/S/scan-N.pcap host ADDRESS
+#        c. Run the scan. Do not wait for it to end if nmap runs long (`--host-timeout 200s`).
+#        d. At once, in the same shell line as the end of the scan (no pause), ONE request to each of
+#           80, 443 and 8080 and one ssh login, each with its own exit code and message kept:
+#             curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' http://ADDRESS/
+#             curl -sSk -o /dev/null -w '%{http_code} %{time_total}\n' https://ADDRESS/
+#             curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' http://ADDRESS:8080/
+#             ssh -i target/aws/S/try-key -o BatchMode=yes root@ADDRESS true
+#           and, before the scan, a session that stays open and is used after it:
+#             ssh -i target/aws/S/try-key root@ADDRESS 'while :; do date; sleep 1; done'  (output redirected to a file)
+#        e. Stop the capture. Read the console again (after about a minute; make one more request to
+#           trigger the line) and write down the three lines (the counters after).
+#      Repeat until a request fails, or twenty times in all. A failed request is read in the capture:
+#        - `tcpdump -nn -r scan-N.pcap 'tcp[tcpflags] & tcp-rst != 0 and src ADDRESS'` lists every reset
+#          the instance sent: a failure caused by the instance shows one answering the ACK or the first
+#          data segment of that connection (source port of curl), within a round trip of the SYN-ACK. The
+#          stale-key cause shows SYN, SYN-ACK, ACK, then RST from the instance with seq equal to the ACK
+#          number of the client's first data segment (an RST to an ACK that no socket holds).
+#        - A SYN with no SYN-ACK and a retransmission one second later: a queue without room (look at
+#          `syn_dropped` growing).
+#        - No RST from the instance and a RST from another address, or no answer at all: the operator's
+#          network (the table of a router or of the host's firewall full after a scan) is the cause and
+#          the instance is clear; `sudo pfctl -si` shows the states on macOS.
+#      A pass: twenty scans of each kind, no first request failed, the long-lived ssh session answered
+#      through every scan, `key_stale` is counted when the earlier failures were of this kind.
+#
 # End of the session: `cargo xtask aws clean --session S` terminates the instance and removes the group and the key pair.
 echo "see the comments of this file: the steps and the expected console lines"

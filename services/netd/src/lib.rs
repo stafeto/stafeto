@@ -39,6 +39,8 @@ pub mod resolv;
 pub mod reuse;
 pub mod ring;
 pub mod routed;
+#[cfg(test)]
+mod scan;
 pub mod spsc;
 pub mod stats;
 pub mod switchlogic;
