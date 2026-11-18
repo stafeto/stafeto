@@ -23,6 +23,15 @@
 //! KiB cleared, each one a step) is driven by the owner's machine
 //! (`owner`) and the driver's notifications to its own channel.
 //!
+//! The device has two more resources, 2 over the pool (`pool`, a buffer the
+//! owner may have shown directly, 256 pages) and 3 over the cursor's picture
+//! (`cursor`, 4 pages), and a second queue, `cursorq`, for the cursor's
+//! commands (Virtio 1.3, 5.7.6.10), whose chains the device returns with no
+//! answer to read. The owner asks for the records of the display's pipelines
+//! (PIPELINES) and for the memory of a pool or a cursor source (SOURCE), one
+//! copy of each for as long as it owns the screen. LAYERS, which binds
+//! sources to pipelines, is not served yet.
+//!
 //! The input service (spec 3, 3.6) is the driver's own client: an OPEN asks
 //! it for a session of focus (GRANT) and passes it on to the owner with
 //! the buffer and the owner's session; the screen's return asks it to end
@@ -32,9 +41,10 @@
 //! screen the client's all the same; so it is when GRANT fails.
 //!
 //! Init gives the driver `dma` (16 pages, contiguous and uncached: the
-//! queue, then the commands and their answers) and `fb` (256 pages,
-//! contiguous and cached) with their physical addresses first in the own
-//! arguments, the transport's address after them, the window `mmio` and
+//! two queues, then the commands and their answers), `fb` and `pool` (256
+//! pages each, contiguous and cached) and `cursor` (4 pages, contiguous and
+//! uncached) with their physical addresses first in the own arguments, in
+//! this order, the transport's address after them, the window `mmio` and
 //! the binding `irq`. The driver is in the trusted base: the device writes
 //! where the queue tells it (spec 9, no SMMU on QEMU's virt). Init stops
 //! the device (Status 0) before it lets the objects of an instance go. The
@@ -50,7 +60,8 @@ use core::mem::ManuallyDrop;
 use core::slice;
 use proto_gpu::{
     BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, INVALID, IO, Method, NO_DEVICE, NO_INPUT,
-    NOT_ALLOWED, REVOKED, Rect, STRIDE, Screen, VERSION, code,
+    NOT_ALLOWED, Pipelines, REVOKED, Rect, SOURCE_KIND_POOL, STRIDE, Screen, SourceInfo, VERSION,
+    code,
 };
 use proto_init::ServiceArgs;
 use proto_input::{self, Method as InputMethod};
@@ -64,9 +75,11 @@ use virtio_drivers::transport::Transport;
 use virtio_drivers::transport::mmio::MmioTransport;
 use virtio_gpu::commands::{self, COMMAND_MAX, HEADER, INFO_REPLY};
 use virtio_gpu::dma::{
-    ANSWER_AT, COMMAND_AT, INFO_AT, PAGE, PAGES, QUEUE_PAGES, QUEUE_SIZE, STAGE_PAGE,
+    ANSWER_AT, COMMAND_AT, CURSOR_AT, CURSOR_QUEUE_SIZE, INFO_AT, PAGE, PAGES, QUEUE_PAGES,
+    QUEUE_SIZE, STAGE_PAGE,
 };
-use virtio_gpu::owner::{self, Owner, Refusal};
+use virtio_gpu::owner::{self, Denied, Object, Owner, Refusal, Source as Kind};
+use virtio_gpu::setup::{CURSOR_BYTES, RESOURCES, Setup};
 use virtio_mmio::{DmaHal, Isr, OpenError, StartError};
 
 rt::entry!(main);
@@ -75,12 +88,15 @@ rt::entry!(main);
 /// transport's page.
 const DMA_AT: usize = 0x10_0000_0000;
 const FB_AT: usize = 0x10_0100_0000;
+const POOL_AT: usize = 0x10_0200_0000;
+const CURSOR_MAP_AT: usize = 0x10_0300_0000;
 const MMIO_AT: usize = 0x10_1000_0000;
-/// The references of the instance itself to `fb`: its handle, its mapping
-/// and init's own handle to the object, which init keeps while the instance
-/// lives (services/init worker). More references mean that an owner of the screen kept
-/// a copy.
-const FB_REFS: u64 = 3;
+/// The references of the instance itself to each of `fb`, `pool` and
+/// `cursor`: its handle, its mapping (it clears them) and init's own
+/// handle to the object, which init keeps while the instance lives
+/// (services/init worker). More references mean that an owner of the screen
+/// kept a copy.
+const BASE_REFS: u64 = 3;
 /// The sessions of the driver's channel: every POSIX process may hold one
 /// `Display` session, init's or a clone, and the owner's session is one
 /// more; room beside them.
@@ -93,8 +109,10 @@ const OWN: u64 = 1 << 63;
 /// The bit of the driver's notification to its own channel: a portion of
 /// clearing is due.
 const CLEAR: u64 = 1;
-/// The device's one queue that carries the commands, `controlq`.
+/// The device's queues: `controlq` carries the commands, `cursorq` the
+/// cursor's.
 const CONTROLQ: u16 = 0;
+const CURSORQ: u16 = 1;
 
 /// The codes of a start that failed: the start data or `dma`; REGISTER, the
 /// window or the binding; a map; no GPU at the transport; the device
@@ -144,14 +162,21 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let (Ok(dma), Ok(fb)) = (s.take::<Memory>("dma"), s.take::<Memory>("fb")) else {
+    let (Ok(dma), Ok(fb), Ok(pool), Ok(cursor)) = (
+        s.take::<Memory>("dma"),
+        s.take::<Memory>("fb"),
+        s.take::<Memory>("pool"),
+        s.take::<Memory>("cursor"),
+    ) else {
         return NO_START_DATA;
     };
     let args = ServiceArgs::read(s.args()).ok();
-    // The own arguments: the physical addresses of `dma` and `fb`, which
-    // init puts first, then the record's, where the transport is.
+    // The own arguments: the physical addresses of `dma`, `fb`, `pool` and
+    // `cursor`, which init puts first, then the record's, where the
+    // transport is.
     let own = args.map_or(&[][..], |a| a.own);
-    let (dma_pa, fb_pa, at) = (word(own, 0), word(own, 8), word(own, 16));
+    let (dma_pa, at) = (word(own, 0), word(own, 32));
+    let pas = [word(own, 8), word(own, 16), word(own, 24)];
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return NOT_REGISTERED;
@@ -166,14 +191,26 @@ fn main(_: u64) -> u64 {
     let page = PAGE as u64;
     let fb_len = u64::from(proto_gpu::BUFFER_BYTES);
     if dma_pa == 0
-        || fb_pa == 0
+        || pas.contains(&0)
         || sys::mem_map(&s.process, &dma, 0, PAGES as u64 * page, DMA_AT, rw).is_err()
         || sys::mem_map(&s.process, &fb, 0, fb_len, FB_AT, rw).is_err()
+        || sys::mem_map(&s.process, &pool, 0, fb_len, POOL_AT, rw).is_err()
+        || sys::mem_map(
+            &s.process,
+            &cursor,
+            0,
+            u64::from(CURSOR_BYTES),
+            CURSOR_MAP_AT,
+            rw,
+        )
+        .is_err()
         || sys::mem_map(&s.process, &window, 0, page, MMIO_AT, rw).is_err()
         || !virtio_mmio::attach(DMA_AT, dma_pa, PAGES, QUEUE_PAGES)
         // A change in what init keeps shows here at once, not as a BUSY that
         // never ends.
-        || sys::memory_info(&fb).map_or(true, |info| info.refs != FB_REFS)
+        || [&fb, &pool, &cursor]
+            .iter()
+            .any(|m| sys::memory_info(m).map_or(true, |info| info.refs != BASE_REFS))
     {
         return NOT_MAPPED;
     }
@@ -202,6 +239,11 @@ fn main(_: u64) -> u64 {
     else {
         return NOT_STARTED;
     };
+    let Ok(cursor_queue) =
+        VirtQueue::<DmaHal, CURSOR_QUEUE_SIZE>::new(&mut transport, CURSORQ, false, false)
+    else {
+        return NOT_STARTED;
+    };
     transport.finish_init();
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
     rt::println!("virtio-gpu: virtio-mmio at {at:#x}, line {line}, status {status:#x}");
@@ -211,11 +253,13 @@ fn main(_: u64) -> u64 {
     let mut driver = Driver {
         transport,
         queue,
+        cursor_queue,
+        cursor_flight: None,
         irq,
         channel: Handle::borrowed(channel.raw()),
         notify,
         level,
-        fb_pa,
+        pas,
         owner: Owner::new(),
         clones: Clones::new(),
         setup: Setup::Info,
@@ -228,7 +272,7 @@ fn main(_: u64) -> u64 {
         queued: None,
         subscriber: None,
         committing: false,
-        fb,
+        objects: [fb, pool, cursor],
         _maps: (dma, window),
     };
     driver.input = driver.connect_input();
@@ -247,19 +291,6 @@ fn main(_: u64) -> u64 {
     };
     let _ = rt::service::run::<Driver, SESSIONS, 1>(&channel, &mut driver, config);
     STOPPED
-}
-
-/// Where the device's setup stands: the commands go in this order, each
-/// from the answer to the one before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Setup {
-    Info,
-    Create,
-    Attach,
-    Ready,
-    /// A command of the setup failed, or could not be sent: no screen to
-    /// give.
-    Failed,
 }
 
 /// What the commands in the queue are for.
@@ -287,11 +318,11 @@ struct Chain {
     answer_len: usize,
 }
 
-/// The commands the device holds for one job (one or two chains), and how
+/// The commands the device holds for one job (up to three chains), and how
 /// many came back; `bad` once one answered with an error.
 struct Flight {
     job: Job,
-    chains: [Option<Chain>; 2],
+    chains: [Option<Chain>; 3],
     done: u8,
     bad: bool,
 }
@@ -322,13 +353,20 @@ enum Link {
 struct Driver {
     transport: MmioTransport<'static>,
     queue: VirtQueue<DmaHal, QUEUE_SIZE>,
+    /// `cursorq` and the token of the one chain it holds at most. The
+    /// device returns it with no answer, which is not read (the cursor's
+    /// answer is a header of the specification, QEMU writes none).
+    cursor_queue: VirtQueue<DmaHal, CURSOR_QUEUE_SIZE>,
+    cursor_flight: Option<u16>,
     irq: Handle<Interrupt>,
     /// The loop's channel, to make sessions from, and a copy with NOTIFY
     /// for the portions of clearing.
     channel: ManuallyDrop<Handle<Channel>>,
     notify: Handle<Channel>,
     level: u8,
-    fb_pa: u64,
+    /// The physical addresses of the objects of the three resources
+    /// (RESOURCES), `fb`, `pool` and `cursor`.
+    pas: [u64; 3],
     owner: Owner,
     /// The `Display` sessions CLONE gave that live, bounded for each
     /// client.
@@ -350,10 +388,11 @@ struct Driver {
     /// and whether the show with the device is a COMMIT's.
     subscriber: Option<Handle<Channel>>,
     committing: bool,
-    /// The buffer's object that the owners' copies come from (init gave it
-    /// DUPLICATE), and the DMA object and the window, mapped for the
-    /// driver's life.
-    fb: Handle<Memory>,
+    /// The objects the owners' copies come from (init gave them DUPLICATE),
+    /// the target `fb`, the pool and the cursor's picture, mapped for the
+    /// driver's life (the driver clears them); and the DMA object and the
+    /// window.
+    objects: [Handle<Memory>; 3],
     _maps: (Handle<Memory>, Handle<Memory>),
 }
 
@@ -367,8 +406,8 @@ impl Driver {
         }
         match self.setup {
             Setup::Info => self.issue_info(),
-            Setup::Create => self.issue_create(),
-            Setup::Attach => self.issue_attach(),
+            Setup::Create(i) => self.issue_create(i),
+            Setup::Attach(i) => self.issue_attach(i),
             Setup::Failed => {}
             Setup::Ready => {
                 if self.owner.wants_scanout_off() {
@@ -416,6 +455,65 @@ impl Driver {
         })
     }
 
+    /// Puts a command of the cursor queue, written by `write`, into the
+    /// page of commands and the queue, and rings its doorbell; false while
+    /// the queue holds a chain (it holds one at most: the caller keeps the
+    /// latest place and sends it when the chain is back) or when the queue
+    /// refuses. The step of LAYERS (the next step of the graphics work) is
+    /// the caller.
+    #[allow(dead_code)]
+    fn send_cursor(&mut self, write: impl FnOnce(&mut [u8]) -> usize) -> bool {
+        if self.cursor_flight.is_some() {
+            return false;
+        }
+        // SAFETY: the slot is in the page of commands, mapped read and
+        // write at DMA_AT; the device does not hold it (no chain of the
+        // cursor queue is in flight).
+        let buffer = unsafe {
+            slice::from_raw_parts_mut(stage(CURSOR_AT) as *mut u8, commands::CURSOR_COMMAND)
+        };
+        let len = write(buffer);
+        // SAFETY: the command lies in the page of commands and nothing
+        // touches it until `pop_used` gives it back.
+        let sent = unsafe {
+            let bytes = slice::from_raw_parts(stage(CURSOR_AT) as *const u8, len);
+            self.cursor_queue.add(&[bytes], &mut [])
+        };
+        let Ok(token) = sent else {
+            return false;
+        };
+        self.cursor_flight = Some(token);
+        if self.cursor_queue.should_notify() {
+            virtio_mmio::ring(&mut self.transport, CURSORQ);
+        }
+        true
+    }
+
+    /// Takes back the chain the device returned in the cursor queue. Its
+    /// answer is not judged: QEMU returns the chain with a length of 0 and
+    /// writes no header (the specification says OK_NODATA), so the driver
+    /// takes the return itself for the end of the command.
+    fn reap_cursor(&mut self) {
+        while let Some(token) = self.cursor_queue.peek_used() {
+            if self.cursor_flight != Some(token) {
+                rt::println!("virtio-gpu: a used cursor chain {token} with no command");
+                self.give_up();
+            }
+            // SAFETY: the same command `send_cursor` added with this token;
+            // the device is done with it.
+            let popped = unsafe {
+                let bytes =
+                    slice::from_raw_parts(stage(CURSOR_AT) as *const u8, commands::CURSOR_COMMAND);
+                self.cursor_queue.pop_used(token, &[bytes], &mut [])
+            };
+            if popped.is_err() {
+                rt::println!("virtio-gpu: the used cursor chain {token} could not be taken back");
+                self.give_up();
+            }
+            self.cursor_flight = None;
+        }
+    }
+
     /// Rings the doorbell, once the chains of a job are in.
     fn ring(&mut self) {
         if self.queue.should_notify() {
@@ -436,7 +534,7 @@ impl Driver {
         };
         self.flight = Some(Flight {
             job,
-            chains: [Some(chain), None],
+            chains: [Some(chain), None, None],
             done: 0,
             bad: false,
         });
@@ -455,25 +553,20 @@ impl Driver {
         }
     }
 
-    fn issue_create(&mut self) {
+    fn issue_create(&mut self, i: usize) {
+        let r = RESOURCES[i];
         let sent = self.one(Job::Create, ANSWER_AT[0], HEADER, |b| {
-            commands::resource_create_2d(
-                b,
-                commands::RESOURCE,
-                commands::FORMAT_B8G8R8X8,
-                proto_gpu::WIDTH,
-                proto_gpu::HEIGHT,
-            )
+            commands::resource_create_2d(b, r.id, r.format, r.width, r.height)
         });
         if !sent {
             self.fail_setup("RESOURCE_CREATE_2D");
         }
     }
 
-    fn issue_attach(&mut self) {
-        let pa = self.fb_pa;
+    fn issue_attach(&mut self, i: usize) {
+        let (r, pa) = (RESOURCES[i], self.pas[i]);
         let sent = self.one(Job::Attach, ANSWER_AT[0], HEADER, |b| {
-            commands::attach_backing(b, commands::RESOURCE, pa, proto_gpu::SCREEN_BYTES)
+            commands::attach_backing(b, r.id, pa, r.bytes)
         });
         if !sent {
             self.fail_setup("RESOURCE_ATTACH_BACKING");
@@ -518,7 +611,7 @@ impl Driver {
         // the interrupt that brings it, and nothing waits on it.
         self.flight = Some(Flight {
             job: Job::Show,
-            chains: [Some(first), flush],
+            chains: [Some(first), flush, None],
             done: 0,
             bad: flush.is_none(),
         });
@@ -550,6 +643,7 @@ impl Driver {
             self.config_changed();
         }
         self.reap();
+        self.reap_cursor();
         virtio_mmio::reopen(&self.irq);
     }
 
@@ -635,21 +729,20 @@ impl Driver {
                     None => rt::println!("virtio-gpu: no display info"),
                 }
                 // The info is for the log: a failure does not stop the setup.
-                self.setup = Setup::Create;
+                self.setup = self.setup.after(false);
             }
-            Job::Create | Job::Attach if flight.bad => {
-                rt::println!("virtio-gpu: the setup of the screen failed");
-                self.setup = Setup::Failed;
-            }
-            Job::Create => self.setup = Setup::Attach,
-            Job::Attach => {
-                self.setup = Setup::Ready;
-                rt::println!(
-                    "virtio-gpu: screen ready, {}x{}, stride {}",
-                    proto_gpu::WIDTH,
-                    proto_gpu::HEIGHT,
-                    STRIDE
-                );
+            Job::Create | Job::Attach => {
+                self.setup = self.setup.after(flight.bad);
+                match self.setup {
+                    Setup::Failed => rt::println!("virtio-gpu: the setup of the screen failed"),
+                    Setup::Ready => rt::println!(
+                        "virtio-gpu: screen ready, {}x{}, stride {}",
+                        proto_gpu::WIDTH,
+                        proto_gpu::HEIGHT,
+                        STRIDE
+                    ),
+                    _ => {}
+                }
             }
             Job::ScanoutOn => self.opened(!flight.bad),
             Job::ScanoutOff => {
@@ -720,17 +813,24 @@ impl Driver {
     }
 
     /// A portion of clearing is due (the driver notified itself): a step
-    /// of 16 KiB zeroed. The last one frees the screen.
+    /// of 16 KiB zeroed, of the target, then the pool, then the cursor's
+    /// picture. The last one frees the screen.
     fn clear_step(&mut self) {
         rt::service::step_own();
         let Some(portion) = self.owner.portion() else {
             return;
         };
-        // SAFETY: the buffer is the driver's mapping of `fb`, read and
-        // write, 256 pages; the portion lies within it (owner::Owner).
+        let base = match portion.object {
+            Object::Target => FB_AT,
+            Object::Pool => POOL_AT,
+            Object::Cursor => CURSOR_MAP_AT,
+        };
+        // SAFETY: the object is the driver's mapping of `fb`, `pool` or
+        // `cursor`, read and write, of the size the machine gives it
+        // (`Object::bytes`); the portion lies within it (owner::Owner).
         unsafe {
             core::ptr::write_bytes(
-                (FB_AT + portion.offset as usize) as *mut u8,
+                (base + portion.offset as usize) as *mut u8,
                 0,
                 portion.len as usize,
             )
@@ -812,10 +912,15 @@ impl Driver {
             // The device is being set up: ask again.
             _ => return Answer::Status(code(CLEARING)),
         }
-        // A former owner that kept a copy of `fb`, mapped or not, or sent
-        // one on, still reaches the buffer: the driver and init hold the
-        // only references it may have (FB_REFS).
-        if sys::memory_info(&self.fb).is_ok_and(|info| info.refs > FB_REFS) {
+        // A former owner that kept a copy of `fb`, the pool or the cursor's
+        // picture, mapped or not, or sent one on, still reaches the
+        // memory: the driver and init hold the only references it may have
+        // (BASE_REFS).
+        if self
+            .objects
+            .iter()
+            .any(|m| sys::memory_info(m).is_ok_and(|info| info.refs > BASE_REFS))
+        {
             return Answer::Status(code(BUSY));
         }
         let label = match self.owner.open() {
@@ -831,7 +936,7 @@ impl Driver {
         let rights = Rights::SEND | Rights::TRANSFER;
         let session = sys::handle_label(&self.channel, rights, label, self.level);
         let buffer = sys::handle_duplicate(
-            &self.fb,
+            &self.objects[0],
             Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
         );
         let (Ok(session), Ok(buffer)) = (session, buffer) else {
@@ -937,6 +1042,59 @@ impl Driver {
         }
     }
 
+    /// PIPELINES of the owner's session: the records of the display's
+    /// pipelines (`Pipelines::VIRTIO`), the primary and the cursor's.
+    fn pipelines(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if !self.owner.owns(r.label()) {
+            return Answer::Status(code(REVOKED));
+        }
+        match Pipelines::VIRTIO.write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// SOURCE of the owner's session: a copy of the memory object of the
+    /// pool or of the cursor's picture, with the layout of the source,
+    /// once for each kind while the owner has the screen. LIMIT_REACHED
+    /// for the second ask, BUSY while someone else holds a copy of the
+    /// object (a copy the owner kept from an earlier screen).
+    fn source(&mut self, r: &mut Request<'_>) -> Answer {
+        let kind = match SourceInfo::read_request(r.body()) {
+            Ok(kind) => kind,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let (which, info, object) = if kind == SOURCE_KIND_POOL {
+            (Kind::Pool, SourceInfo::POOL, &self.objects[1])
+        } else {
+            (Kind::Cursor, SourceInfo::CURSOR, &self.objects[2])
+        };
+        match self.owner.may_take(r.label(), which) {
+            Ok(()) => {}
+            Err(Denied::NotOwner) => return Answer::Status(code(REVOKED)),
+            Err(Denied::Given) => return Answer::Status(proto_gpu::LIMIT),
+        }
+        if sys::memory_info(object).is_ok_and(|info| info.refs > BASE_REFS) {
+            return Answer::Status(code(BUSY));
+        }
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let copy = match sys::handle_duplicate(object, rights) {
+            Ok(copy) => copy,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        if let Err(status) = info.write(Status::Ok, r.reply()) {
+            return Answer::Status(status);
+        }
+        self.owner.source_given(which);
+        Answer::Reply([copy.erase()].into())
+    }
+
     /// CLOSE of the owner's session.
     fn close(&mut self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
@@ -983,6 +1141,8 @@ const METHODS: &[u16] = &[
     Method::Subscribe.number(),
     Method::Commit.number(),
     Method::Clone.number(),
+    Method::Pipelines.number(),
+    Method::Source.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -993,6 +1153,8 @@ const METHODS: &[u16] = &[
     Method::Subscribe.number(),
     Method::Commit.number(),
     Method::Clone.number(),
+    Method::Pipelines.number(),
+    Method::Source.number(),
 ];
 
 impl Service<1> for Driver {
@@ -1006,9 +1168,14 @@ impl Service<1> for Driver {
         // and clone: the other method is not theirs.
         let owner_session = owner::is_owner_label(r.label());
         match method {
-            Some(Method::Flush | Method::Close | Method::Subscribe | Method::Commit)
-                if !owner_session =>
-            {
+            Some(
+                Method::Flush
+                | Method::Close
+                | Method::Subscribe
+                | Method::Commit
+                | Method::Pipelines
+                | Method::Source,
+            ) if !owner_session => {
                 return Answer::Status(code(NOT_ALLOWED));
             }
             Some(Method::Open | Method::Clone) if owner_session => {
@@ -1022,6 +1189,8 @@ impl Service<1> for Driver {
             Some(Method::Close) => self.close(r),
             Some(Method::Subscribe) => self.subscribe(r),
             Some(Method::Commit) => self.commit(r),
+            Some(Method::Pipelines) => self.pipelines(r),
+            Some(Method::Source) => self.source(r),
             Some(Method::Clone) => self.clone_session(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),

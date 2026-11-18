@@ -11,8 +11,11 @@
 //!   offset `y * stride + x * 4` is checked by the second screenshot);
 //!   rectangles outside the screen refused; a second OPEN, from the same
 //!   session and from a clone, gets BUSY; the owner's session cannot OPEN
-//!   or CLONE and a `Display` session cannot FLUSH or CLOSE. It ends
-//!   holding the screen: the end of the process returns it.
+//!   or CLONE and a `Display` session cannot FLUSH or CLOSE; the owner
+//!   takes PIPELINES (the two records of the display) and SOURCE (the pool
+//!   and the cursor's picture, each once, as objects of the right size
+//!   that are zero), and LAYERS is not served yet. It ends holding the
+//!   screen: the end of the process returns it.
 //! - `s`, the second: asks for the screen until it has seen it BUSY and
 //!   then free again, which is after the owner ended; the buffer it finds
 //!   is all zero. It shows a pattern and CLOSEs the screen: a FLUSH of the
@@ -30,8 +33,8 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights};
 use proto_gpu::{
-    BUFFER_BYTES, BUSY, CLEARING, HEIGHT, INVALID, Method, NO_INPUT, NOT_ALLOWED, REVOKED, Rect,
-    STRIDE, Screen, WIDTH, code,
+    BUFFER_BYTES, BUSY, CLEARING, HEIGHT, INVALID, LIMIT, Method, NO_INPUT, NOT_ALLOWED, Pipelines,
+    REVOKED, Rect, SOURCE_KIND_CURSOR, SOURCE_KIND_POOL, STRIDE, Screen, SourceInfo, WIDTH, code,
 };
 use proto_init::ServiceArgs;
 use proto_wire::{Status, Writer};
@@ -163,6 +166,42 @@ fn open(session: &Handle<Channel>) -> Result<Opened, Fail> {
         buffer,
         owner,
     })
+}
+
+/// PIPELINES: the records of the display, or the service's refusal.
+fn pipelines(session: &Handle<Channel>) -> Result<Pipelines, Fail> {
+    let (status, reply) = call(session, &Method::Pipelines.header().bytes())?;
+    if status != Status::Ok {
+        return Err(Fail::Status(status));
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    Pipelines::read(reply.bytes(&mut buffer)).map_err(|_| Fail::Bad("PIPELINES' reply"))
+}
+
+/// SOURCE of `kind`: the layout of the source and its memory object, or the
+/// service's refusal.
+fn source(session: &Handle<Channel>, kind: u32) -> Result<(SourceInfo, Handle<Memory>), Fail> {
+    let mut w = Writer::new();
+    Method::Source
+        .header()
+        .write(&mut w)
+        .map_err(Fail::Status)?;
+    w.u32(kind).map_err(Fail::Status)?;
+    let (status, mut reply) = call(session, w.as_bytes())?;
+    if status != Status::Ok {
+        return Err(Fail::Status(status));
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    let info =
+        SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| Fail::Bad("SOURCE's reply"))?;
+    let object = reply
+        .handles
+        .take::<Memory>(0)
+        .map_err(|_| Fail::Bad("SOURCE's handle"))?;
+    if !reply.handles.is_empty() {
+        return Err(Fail::Bad("SOURCE's handle count"));
+    }
+    Ok((info, object))
 }
 
 /// FLUSH of `rect` through the owner's session.
@@ -394,8 +433,82 @@ impl Probe<'_> {
             return Err("a method of the other kind of session was not refused");
         }
         rt::println!("gpu-probe: a session calls its own methods only");
+        self.sources(&display, &opened.owner)?;
         // The process ends with the screen: its end returns it.
         rt::println!("gpu-probe: the owner ends with the screen");
+        Ok(())
+    }
+
+    /// PIPELINES and SOURCE of the owner: the records of the display, a
+    /// pool and a cursor object of the right size, each once; the other
+    /// sessions and the other kinds refused; LAYERS not served yet.
+    fn sources(
+        &mut self,
+        display: &Handle<Channel>,
+        owner: &Handle<Channel>,
+    ) -> Result<(), &'static str> {
+        if pipelines(owner).map_err(|_| "PIPELINES")? != Pipelines::VIRTIO {
+            return Err("PIPELINES did not give the records of the display");
+        }
+        if pipelines(display) != Err(Fail::Status(code(NOT_ALLOWED)))
+            || source(display, SOURCE_KIND_POOL).err() != Some(Fail::Status(code(NOT_ALLOWED)))
+        {
+            return Err("PIPELINES or SOURCE of a Display session was not refused");
+        }
+        for kind in [0, 3, u32::MAX] {
+            if source(owner, kind).err() != Some(Fail::Status(code(INVALID))) {
+                return Err("SOURCE of a kind that is none was not INVALID");
+            }
+        }
+        // The sizes of the objects: 256 pages for the pool, 4 for the
+        // picture of the cursor; both are zero, and the owner can write
+        // them but not copy them.
+        for (kind, info, bytes) in [
+            (SOURCE_KIND_POOL, SourceInfo::POOL, u64::from(BUFFER_BYTES)),
+            (SOURCE_KIND_CURSOR, SourceInfo::CURSOR, 4 * 4096),
+        ] {
+            let (got, object) = source(owner, kind).map_err(|f| {
+                rt::println!("gpu-probe: SOURCE {kind}: {f:?}");
+                "SOURCE"
+            })?;
+            if got != info {
+                return Err("SOURCE gave the wrong layout");
+            }
+            let size = sys::memory_info(&object)
+                .map_err(|_| "the size of a source")?
+                .size;
+            if size != bytes || u64::from(got.stride) * u64::from(got.height) > size {
+                return Err("a source's object is not the right size");
+            }
+            if sys::handle_duplicate(&object, Rights::MAP_READ).err() != Some(Error::AccessDenied) {
+                return Err("the owner could duplicate a source");
+            }
+            let at = FB_AT + self.maps * FB_STEP;
+            self.maps += 1;
+            sys::mem_map(self.process, &object, 0, bytes, at, Access::ReadWrite)
+                .map_err(|_| "map a source")?;
+            // SAFETY: the object was just mapped, read and write, at `at`
+            // for `bytes` bytes; the probe is its only user, in one thread.
+            let words =
+                unsafe { core::slice::from_raw_parts_mut(at as *mut u32, bytes as usize / 4) };
+            if words.iter().any(|&w| w != 0) {
+                return Err("a source's object is not zero");
+            }
+            words[0] = 0x00DE_AD00;
+            // Once for each kind while the owner has the screen.
+            if source(owner, kind).err() != Some(Fail::Status(LIMIT)) {
+                return Err("a second SOURCE of a kind was not LIMIT_REACHED");
+            }
+            // The owner keeps its copy: the object belongs to it until the
+            // screen goes back.
+            core::mem::forget(object);
+        }
+        // LAYERS is the next step of the work: the service does not know
+        // the method yet.
+        if plain(owner, Method::Layers) != Err(Fail::Status(Status::UnknownMethod)) {
+            return Err("LAYERS was not an unknown method");
+        }
+        rt::println!("gpu-probe: PIPELINES and SOURCE gave the records and the objects");
         Ok(())
     }
 

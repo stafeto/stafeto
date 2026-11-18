@@ -6,14 +6,21 @@
 //! reads. Each command is a header of 24 bytes and its body, all numbers
 //! low byte first, written into the buffer the device reads; the answer
 //! is a header (`OK_NODATA`), or for GET_DISPLAY_INFO the header and 16
-//! modes. The service uses six commands, no 3D and no cursor.
+//! modes. The service uses six commands of the control queue, no 3D, and
+//! the two commands of the cursor queue (Virtio 1.3, 5.7.6.10), whose chain
+//! the device returns with no answer at all.
 
 use proto_gpu::Rect;
 
 /// The bytes of the header of a command and of an answer without data.
 pub const HEADER: usize = 24;
-/// The bytes of the longest command, TRANSFER_TO_HOST_2D.
+/// The bytes of the longest command: TRANSFER_TO_HOST_2D, and the two
+/// commands of the cursor queue, `struct virtio_gpu_update_cursor`
+/// (Virtio 1.3, 5.7.6.10: the header, `pos` of 16 bytes, `resource_id`,
+/// `hot_x`, `hot_y`, a padding word).
 pub const COMMAND_MAX: usize = 56;
+/// The bytes of a command of the cursor queue.
+pub const CURSOR_COMMAND: usize = 56;
 /// The bytes of the answer to GET_DISPLAY_INFO: the header and 16 modes of
 /// 24 bytes.
 pub const INFO_REPLY: usize = HEADER + 16 * 24;
@@ -25,6 +32,9 @@ pub const SET_SCANOUT: u32 = 0x0103;
 pub const RESOURCE_FLUSH: u32 = 0x0104;
 pub const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+/// The commands of the cursor queue (Virtio 1.3, 5.7.2 and 5.7.6.10).
+pub const CMD_UPDATE_CURSOR: u32 = 0x0300;
+pub const CMD_MOVE_CURSOR: u32 = 0x0301;
 
 /// The types of the answers: success without and with data. Every type
 /// from 0x1200 is an error.
@@ -35,6 +45,13 @@ pub const ERR_FROM: u32 = 0x1200;
 /// The format of the resource, B8G8R8X8_UNORM: the bytes B, G, R, X in
 /// memory, the word 0x00RRGGBB.
 pub const FORMAT_B8G8R8X8: u32 = 2;
+/// The format of the cursor's picture, B8G8R8A8_UNORM: the bytes B, G, R,
+/// A in memory, the word 0xAARRGGBB.
+pub const FORMAT_B8G8R8A8: u32 = 1;
+/// The flag of a request header that asks the device to finish the
+/// command before it answers the next ones of the queue (Virtio 1.3,
+/// 5.7.6.5); the answer carries it and the `fence_id` back.
+pub const FLAG_FENCE: u32 = 1;
 /// The resource of the screen, and the one scanout of the device.
 pub const RESOURCE: u32 = 1;
 pub const SCANOUT: u32 = 0;
@@ -112,6 +129,65 @@ pub fn transfer_to_host_2d(out: &mut [u8], r: &Rect, resource: u32) -> usize {
     COMMAND_MAX
 }
 
+/// TRANSFER_TO_HOST_2D of the rectangle `r` of resource `resource` whose
+/// backing has a stride of `stride` bytes, with the fence flag and
+/// `fence_id` in the header: the device finishes the transfer before it
+/// takes the next command (Virtio 1.3, 5.7.6.5), which a cursor's picture
+/// needs before UPDATE_CURSOR (5.7.6.6).
+pub fn transfer_fenced(
+    out: &mut [u8],
+    r: &Rect,
+    stride: u32,
+    resource: u32,
+    fence_id: u64,
+) -> usize {
+    header(out, TRANSFER_TO_HOST_2D, COMMAND_MAX);
+    put(out, 4, u64::from(FLAG_FENCE), 4);
+    put(out, 8, fence_id, 8);
+    rect(out, 24, r);
+    put(
+        out,
+        40,
+        u64::from(r.y) * u64::from(stride) + u64::from(r.x) * 4,
+        8,
+    );
+    put(out, 48, u64::from(resource), 4);
+    COMMAND_MAX
+}
+
+/// The command of the cursor queue, `struct virtio_gpu_update_cursor`
+/// (Virtio 1.3, 5.7.6.10): the header, `pos` (`scanout_id`, `x`, `y`, a
+/// padding word, bytes 24 to 39), `resource_id` (40), `hot_x` (44),
+/// `hot_y` (48) and a padding word (52).
+fn cursor_command(
+    out: &mut [u8],
+    kind: u32,
+    (x, y): (u32, u32),
+    resource: u32,
+    (hot_x, hot_y): (u32, u32),
+) -> usize {
+    header(out, kind, CURSOR_COMMAND);
+    put(out, 24, u64::from(SCANOUT), 4);
+    put(out, 28, u64::from(x), 4);
+    put(out, 32, u64::from(y), 4);
+    put(out, 40, u64::from(resource), 4);
+    put(out, 44, u64::from(hot_x), 4);
+    put(out, 48, u64::from(hot_y), 4);
+    CURSOR_COMMAND
+}
+
+/// UPDATE_CURSOR: the cursor takes its picture from `resource` (0 turns
+/// the cursor off), whose hot spot is at (`hot_x`, `hot_y`), and moves to
+/// `pos`.
+pub fn update_cursor(out: &mut [u8], pos: (u32, u32), resource: u32, hot: (u32, u32)) -> usize {
+    cursor_command(out, CMD_UPDATE_CURSOR, pos, resource, hot)
+}
+
+/// MOVE_CURSOR: the cursor moves to `pos`; the device ignores the rest.
+pub fn move_cursor(out: &mut [u8], pos: (u32, u32)) -> usize {
+    cursor_command(out, CMD_MOVE_CURSOR, pos, 0, (0, 0))
+}
+
 /// RESOURCE_FLUSH: the host shows the rectangle `r` of resource
 /// `resource`.
 pub fn resource_flush(out: &mut [u8], r: &Rect, resource: u32) -> usize {
@@ -183,6 +259,81 @@ mod tests {
         assert_eq!(RESOURCE_ATTACH_BACKING, 0x0106);
         assert_eq!(OK_NODATA, 0x1100);
         assert_eq!(OK_DISPLAY_INFO, 0x1101);
+    }
+
+    #[test]
+    fn the_cursor_command_numbers_are_the_specs() {
+        assert_eq!(CMD_UPDATE_CURSOR, 0x0300);
+        assert_eq!(CMD_MOVE_CURSOR, 0x0301);
+        assert_eq!(FORMAT_B8G8R8A8, 1);
+        assert_eq!(FLAG_FENCE, 1);
+        assert_eq!(CURSOR_COMMAND, 56);
+    }
+
+    #[test]
+    fn update_cursor_has_the_layout_of_the_spec() {
+        // Virtio 1.3, 5.7.6.10: hdr 0..24, pos.scanout_id 24, pos.x 28,
+        // pos.y 32, pos.padding 36, resource_id 40, hot_x 44, hot_y 48,
+        // padding 52.
+        let mut b = [0xFF; COMMAND_MAX];
+        assert_eq!(update_cursor(&mut b, (100, 200), 3, (7, 9)), 56);
+        assert_eq!(word(&b, 0), 0x0300);
+        assert!(b[4..24].iter().all(|&x| x == 0), "flags, fence, ctx, ring");
+        assert_eq!(word(&b, 24), 0, "scanout_id");
+        assert_eq!(word(&b, 28), 100, "pos.x");
+        assert_eq!(word(&b, 32), 200, "pos.y");
+        assert_eq!(word(&b, 36), 0, "pos.padding");
+        assert_eq!(word(&b, 40), 3, "resource_id");
+        assert_eq!(word(&b, 44), 7, "hot_x");
+        assert_eq!(word(&b, 48), 9, "hot_y");
+        assert_eq!(word(&b, 52), 0, "padding");
+    }
+
+    #[test]
+    fn move_cursor_has_the_place_and_nothing_else() {
+        let mut b = [0xFF; COMMAND_MAX];
+        assert_eq!(move_cursor(&mut b, (639, 399)), 56);
+        assert_eq!(word(&b, 0), 0x0301);
+        assert_eq!([word(&b, 28), word(&b, 32)], [639, 399]);
+        assert!(b[40..56].iter().all(|&x| x == 0));
+        // A turn off is an UPDATE with resource 0.
+        update_cursor(&mut b, (0, 0), 0, (0, 0));
+        assert_eq!(word(&b, 40), 0);
+    }
+
+    #[test]
+    fn a_fenced_transfer_has_the_flag_and_the_id_in_its_header() {
+        let mut b = [0xFF; COMMAND_MAX];
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 64,
+        };
+        assert_eq!(
+            transfer_fenced(&mut b, &r, 256, 3, 0x1122_3344_5566_7788),
+            56
+        );
+        assert_eq!(word(&b, 0), 0x0105);
+        assert_eq!(word(&b, 4), 1, "flags: FENCE");
+        assert_eq!(quad(&b, 8), 0x1122_3344_5566_7788, "fence_id");
+        assert_eq!(word(&b, 16), 0, "ctx_id");
+        assert_eq!([word(&b, 32), word(&b, 36)], [64, 64]);
+        assert_eq!(quad(&b, 40), 0);
+        assert_eq!(word(&b, 48), 3);
+        // The stride of the resource's own backing gives the offset.
+        let inner = Rect {
+            x: 2,
+            y: 3,
+            w: 1,
+            h: 1,
+        };
+        transfer_fenced(&mut b, &inner, 256, 3, 1);
+        assert_eq!(quad(&b, 40), 3 * 256 + 8);
+        // The plain transfer has no fence.
+        transfer_to_host_2d(&mut b, &Rect::SCREEN, RESOURCE);
+        assert_eq!(word(&b, 4), 0);
+        assert_eq!(quad(&b, 8), 0);
     }
 
     #[test]

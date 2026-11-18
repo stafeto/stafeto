@@ -61,7 +61,8 @@ pub const LAUNCHER: Record = Record {
 /// takes (its 16 896 pages of quota, the disk service's 64 and the table
 /// itself are out of init's 127 789 pages on 512 MiB). Nothing of the shell,
 /// `httpd` or a reload of nginx (nine processes, 30 440 pages) needs more than
-/// the 14 x 4 096 pages less `PIXMAN_PAGES` that the pool has.
+/// the 14 x 4 096 pages less `PIXMAN_PAGES` and `DISPLAY_POOL_PAGES` that the
+/// pool has.
 pub const COMMAND_QUOTAS: u64 = 14;
 
 /// The pages the pool of the process service gave up for the compositor's
@@ -73,13 +74,25 @@ pub const COMMAND_QUOTAS: u64 = 14;
 /// nine processes) needs 30 440, so it gives them up.
 pub const PIXMAN_PAGES: u64 = 150 * crate::PAGE;
 
+/// The pages the pool of the process service gave up for the display
+/// driver's new objects (stage G3 of the graphics design): `pool`, 256 pages,
+/// and `cursor`, 4 pages, which init makes and pays from its own quota like
+/// `fb`. The compositor still has the 250 pages of its own buffer for the
+/// first revision of the protocol until it shows the driver's pool directly
+/// (the same stage, a later step), and the base image kept 32 pages over
+/// the 16 384 that `cargo xtask pkg-identity` asks for; the pool is far
+/// larger than the heaviest command needs, so it gives them up, and takes
+/// the 250 back when the compositor's buffer goes.
+pub const DISPLAY_POOL_PAGES: u64 = 260 * crate::PAGE;
+
 /// The process service of the base and the full image: the pool of the
 /// network image with `COMMAND_QUOTAS` quotas of a command.
 pub const BASE_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
         + COMMAND_QUOTAS * NET_COMMAND_QUOTA
-        - PIXMAN_PAGES,
+        - PIXMAN_PAGES
+        - DISPLAY_POOL_PAGES,
     ..NET_PROCESS_SERVICE
 };
 

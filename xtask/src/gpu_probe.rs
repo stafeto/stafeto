@@ -69,7 +69,7 @@ const B_ENDS: &str = "init: gpu-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 12] = [
+const CHECKS: [(&str, usize); 13] = [
     ("gpu-probe: the owner's handles cannot be duplicated", 1),
     (
         "gpu-probe: screen 640x400, stride 2560, a cleared buffer",
@@ -78,6 +78,10 @@ const CHECKS: [(&str, usize); 12] = [
     ("gpu-probe: rectangles outside the screen are INVALID", 1),
     ("gpu-probe: a second OPEN is BUSY", 1),
     ("gpu-probe: a session calls its own methods only", 1),
+    (
+        "gpu-probe: PIPELINES and SOURCE gave the records and the objects",
+        1,
+    ),
     (
         "gpu-probe: the screen came back cleared when its owner ended",
         1,
@@ -102,13 +106,15 @@ const CHECKS: [(&str, usize); 12] = [
 /// The tag of the service's lines of steps (rt::service::report_steps).
 const GPU_TAG: &str = "12";
 /// The kinds of the service's steps that must come: OPEN, FLUSH, CLOSE,
-/// CLONE (the methods of proto_gpu), and its own steps: the interrupt and
-/// the portions of clearing (rt::service::step_own).
-const STEP_KINDS: [(usize, &str); 5] = [
+/// CLONE, PIPELINES, SOURCE (the methods of proto_gpu), and its own steps:
+/// the interrupt and the portions of clearing (rt::service::step_own).
+const STEP_KINDS: [(usize, &str); 7] = [
     (1, "Open"),
     (2, "Flush"),
     (3, "Close"),
     (8, "Clone"),
+    (9, "Pipelines"),
+    (10, "Source"),
     (65, "the interrupt and a portion of clearing"),
 ];
 /// The most one step of the service may take (spec 3, section 6): 0.9 of
@@ -392,18 +398,28 @@ mod tests {
             (2, 2500),
             (3, 900),
             (8, 2000),
+            (9, 1500),
+            (10, 2500),
             (65, 5000),
             (64, 4000),
         ]
         .iter()
         .map(|&(k, t)| step(k, t))
         .collect();
-        assert_eq!(steps_verdict(&lines).map(|r| r.len()), Ok(6));
+        assert_eq!(steps_verdict(&lines).map(|r| r.len()), Ok(8));
     }
 
     #[test]
     fn a_step_past_the_bound_or_a_missing_kind_fails() {
-        let base = [(1, 3000), (2, 2500), (3, 900), (8, 2000), (65, 5000)];
+        let base = [
+            (1, 3000),
+            (2, 2500),
+            (3, 900),
+            (8, 2000),
+            (9, 1500),
+            (10, 2500),
+            (65, 5000),
+        ];
         let make = |over: Option<(usize, u64)>, skip: Option<usize>| -> Vec<String> {
             base.iter()
                 .filter(|(k, _)| Some(*k) != skip)
