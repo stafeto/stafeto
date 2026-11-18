@@ -505,3 +505,95 @@ fn the_rule_before_the_replacement_loses_the_key_and_the_peer_is_reset() {
         "{out:?}"
     );
 }
+
+/// The frames the probe builds (`rawframe`, `cargo xtask nginx-probe` step 4h)
+/// are taken by the stack as a scan's segments: checksums that smoltcp
+/// verifies, a SYN that gets its SYN-ACK, an RST with the sequence number
+/// after the SYN that sends the socket back to LISTEN, and an ACK built from
+/// the SYN-ACK that completes the handshake.
+mod crafted {
+    use super::*;
+    use rawframe::{ACK, Frame, RST, SYN, Segment};
+
+    fn segment(port: u16, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+        Segment {
+            src_mac: PEER_MAC.0,
+            dst_mac: SERVER_MAC.0,
+            src_ip: PEER.octets(),
+            dst_ip: SERVER.octets(),
+            src_port: port,
+            dst_port: LISTEN_PORT,
+            seq,
+            ack,
+            flags,
+        }
+        .frame()
+    }
+
+    fn syn_ack(rig: &mut Rig<'_>, port: u16, isn: u32) -> u32 {
+        rig.wire.rx.push_back(segment(port, isn, 0, SYN));
+        rig.now += 1;
+        rig.iface.poll(
+            Instant::from_millis(rig.now),
+            &mut rig.wire,
+            &mut rig.sockets,
+        );
+        let out = std::mem::take(&mut rig.wire.tx);
+        assert_eq!(out.len(), 1);
+        let Frame::Tcp {
+            seq,
+            ack,
+            flags,
+            dst_port,
+            ..
+        } = rawframe::parse(&out[0])
+        else {
+            panic!("not TCP")
+        };
+        assert_eq!((flags, ack, dst_port), (SYN | ACK, isn + 1, port));
+        seq
+    }
+
+    #[test]
+    fn a_crafted_syn_is_answered_and_its_rst_sends_the_socket_back_to_listen() {
+        let mut rig = rig();
+        syn_ack(&mut rig, 40000, 5000);
+        assert!(rig.states().contains(&tcp::State::SynReceived));
+        let out = rig.feed(segment(40000, 5001, 0, RST));
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(rig.states(), [tcp::State::Listen; 2]);
+    }
+
+    #[test]
+    fn a_crafted_ack_completes_the_handshake_and_a_later_rst_closes_it() {
+        let mut rig = rig();
+        let server = syn_ack(&mut rig, 40001, 0xffff_fff0);
+        let out = rig.feed(segment(40001, 0xffff_fff1, server.wrapping_add(1), ACK));
+        assert!(out.is_empty(), "{out:?}");
+        assert!(rig.states().contains(&tcp::State::Established));
+        rig.feed(segment(40001, 0xffff_fff1, 0, RST));
+        assert!(rig.states().contains(&tcp::State::Closed));
+    }
+
+    #[test]
+    fn the_burst_of_the_probe_leaves_both_peers_reset_and_the_stack_listening() {
+        // SYN A, RST A and SYN B before the stack looks again, then B's RST.
+        let mut rig = rig();
+        for f in [
+            segment(41000, 100, 0, SYN),
+            segment(41000, 101, 0, RST),
+            segment(41001, 200, 0, SYN),
+        ] {
+            rig.wire.rx.push_back(f);
+        }
+        rig.now += 1;
+        rig.iface.poll(
+            Instant::from_millis(rig.now),
+            &mut rig.wire,
+            &mut rig.sockets,
+        );
+        assert!(rig.states().contains(&tcp::State::SynReceived));
+        rig.feed(segment(41001, 201, 0, RST));
+        assert_eq!(rig.states(), [tcp::State::Listen; 2]);
+    }
+}

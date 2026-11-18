@@ -18,6 +18,7 @@ break-stamps-split = []
 abi = { path = "../lib/abi" }
 console-line = { path = "../lib/console-line" }
 datafs = { path = "../lib/datafs" }
+rawframe = { path = "../lib/rawframe" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 # The records of the network service, whose quota `netd-quota` checks.
 init = { path = "../services/init" }

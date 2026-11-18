@@ -213,13 +213,13 @@ impl EnaSwitch {
         if s.more {
             return true;
         }
-        self.settle()
+        self.settle(&rings)
     }
 
     /// The end of a run: the interrupt of the pair is acknowledged and unmasked and the
     /// queue looked at once more; without vectors, or while the acknowledgement waits, a
     /// timer does the looking. True when a step must follow at once.
-    fn settle(&mut self) -> bool {
+    fn settle(&mut self, rings: &Rings<'_>) -> bool {
         if !self.wire.is_up() {
             // The admin side's notification brings the next step.
             return false;
@@ -231,7 +231,7 @@ impl EnaSwitch {
         if !self.acknowledge(1) {
             return false;
         }
-        let again = self.wire.settle();
+        let again = self.wire.settle(rings);
         if again {
             if let Some(routed) = self.routed.as_mut() {
                 routed.clear_idle();

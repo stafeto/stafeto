@@ -433,12 +433,14 @@ impl<P: Platform + Clone> Wire<P> {
 
     /// The end of a run: lets the device interrupt for the next completion of
     /// receiving (the vector is masked after each one), then looks at the queue
-    /// once more. True when a frame came in between and a step must follow.
-    pub fn settle(&mut self) -> bool {
+    /// once more. True when a frame came in between and a step must follow: only with room
+    /// in the lane for it (as in `bells`), since a full lane takes none and the step would
+    /// spin empty; the stack wakes the switch when it has drained the lane.
+    pub fn settle(&mut self, lane: &Rings<'_>) -> bool {
         match self.io.as_mut() {
             Some(io) => {
                 io.unmask_rx();
-                io.rx_ready()
+                RX_AHEAD > lane.rx_ready.len() && io.rx_ready()
             }
             None => false,
         }
@@ -747,6 +749,25 @@ mod tests {
     }
 
     #[test]
+    fn settle_asks_for_no_step_while_the_lane_is_full() {
+        let mut r = rig();
+        for i in 0..40u8 {
+            r.model.inject(&arp(i));
+        }
+        for _ in 0..8 {
+            r.step();
+        }
+        assert_eq!(r.lane.rx_ready.len(), RX_AHEAD);
+        assert!(r.wire.rx_ready(), "completions wait");
+        assert!(
+            !r.wire.settle(&r.lane.rings()),
+            "a full lane takes none: no empty step"
+        );
+        r.lane.rx_ready.pop();
+        assert!(r.wire.settle(&r.lane.rings()), "room again: a step");
+    }
+
+    #[test]
     fn a_reset_takes_the_buffers_of_sending_back_and_regives_the_ones_of_receiving() {
         let mut r = rig();
         // Two frames of the stack are in the device's queue, one buffer of
@@ -890,10 +911,13 @@ mod tests {
     fn settle_unmasks_the_vector_and_finds_a_frame_that_came_in_between() {
         let mut r = rig();
         r.model.inject(&arp(1));
-        assert!(r.wire.settle(), "a frame waits: another step");
+        assert!(
+            r.wire.settle(&r.lane.rings()),
+            "a frame waits: another step"
+        );
         r.step();
         r.lane.rx_ready.pop();
-        assert!(!r.wire.settle());
+        assert!(!r.wire.settle(&r.lane.rings()));
         assert!(r.model.fired().iter().filter(|f| f.1 == 6).count() <= 1);
         r.model.inject(&arp(2));
         assert_eq!(

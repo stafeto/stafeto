@@ -298,7 +298,12 @@ pub const SYN_SOFT: u64 = if cfg!(feature = "steps") {
 pub const SWITCH_BACK: usize = 32;
 /// The buffers of receiving the stack gives back before it wakes the switch
 /// for them alone (with a frame to send or a held doorbell it wakes it anyway).
-pub const RX_BACK_LAZY: usize = 64;
+/// At most `RX_AHEAD`: a switch that stopped for want of room in the lane leaves the
+/// rest of a burst in the used ring of the device, the device may have no buffer left
+/// and then raises no interrupt, so the stack that drained the lane must wake the
+/// switch for the buffers it gives back, whatever it sent.
+pub const RX_BACK_LAZY: usize = RX_AHEAD;
+const _: () = assert!(RX_BACK_LAZY <= RX_AHEAD);
 /// The frames of the wire the switch leaves for the stack at most: more
 /// stay in the queue of the device until the stack gave buffers back.
 pub const RX_AHEAD: usize = 32;

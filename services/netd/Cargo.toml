@@ -134,3 +134,5 @@ smoltcp = { version = "0.14.0", default-features = false, features = [
     "socket-tcp-reno",
     "iface-neighbor-cache-count-16",
 ] }
+# The frames of a scan, built as the probe builds them (`src/scan.rs` feeds them to the stack).
+rawframe = { path = "../../lib/rawframe" }
