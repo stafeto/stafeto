@@ -11410,7 +11410,9 @@ fn burst_line(n: u32) -> String {
 /// empty in each period of uart::log::IDLE_NS). All lines come on the
 /// console, in order, each once, and no `[kernel log: N records lost]`
 /// comes with them (spec 13.5, 16.3). The shell's closing line comes among
-/// them, at a turn of the clients. Ends at a prompt.
+/// them, at a turn of the clients. Ends at a prompt with the driver's
+/// output empty (`settled`), where a step that kills or restarts the driver
+/// can start.
 pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
     let from = run.lines().len();
     run.send("logburst")?;
@@ -11422,12 +11424,33 @@ pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
     let last = burst_line(LOG_BURST - 1);
     run.expect_line("the last line of the burst", |l| l == last, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
+    settled(run)?;
     burst_whole(&run.lines()[from..])?;
     // The driver says the largest backlog of the kernel's rings it saw once
     // the backlog is out (a line of the driver's own, which may come a tick
     // after the burst, or from the boot): printed for the record.
     println!("{}", backlog_peak(run.lines()));
     Ok(())
+}
+
+/// Waits until the console driver's rings are empty and its output is out,
+/// so that the step after a burst starts from an empty ring (a driver that
+/// dies with text in its ring loses it, and the line in flight is cut). The
+/// driver has put the notice of its backlog into its ring of the log within
+/// one idle period (uart::log::IDLE_NS, 20 ms) of the backlog going out;
+/// the probe waits a few periods, then sends `echo`: a client line goes
+/// after the log text queued before it (at most one batch of log at a line
+/// start), so its line and the prompt after it come out behind the notice.
+fn settled(run: &mut qemu::Run) -> Result<(), String> {
+    std::thread::sleep(Duration::from_millis(100));
+    run.send("echo burst settled")?;
+    run.expect("echo burst settled\r\n", DIALOG_STEP)?;
+    run.expect_line(
+        "the line after the burst",
+        |l| l == "burst settled",
+        DIALOG_STEP,
+    )?;
+    run.expect(PROMPT, DIALOG_STEP)
 }
 
 /// The last line in which a console driver said the largest backlog of the
@@ -15483,6 +15506,25 @@ mod tests {
         ]
         .map(String::from)
         .to_vec()
+    }
+
+    /// A driver that died with text in its ring (the console dialog's crash
+    /// right after a burst, before `settled`): its notice is cut and glued to
+    /// the kernel's line of the fault, and the shell's line of the crash never
+    /// came out. The judging names the missing line and does not pass it.
+    #[test]
+    fn a_crash_with_text_in_the_ring_is_not_passed() {
+        let run: Vec<String> = [
+            "stafeto> ",
+            "uart: log backlog peak 40 recoprocess fault: data abort from EL0 (EC 0x24) ESR=0x92000006 FAR=0x0 ELR=0x204630",
+            "init: uart ended: fault ESR=0x92000006 FAR=0x0 ELR=0x204630; restarts in 100 ms",
+            UART_LINE,
+            RECONNECTED,
+        ]
+        .map(String::from)
+        .to_vec();
+        let e = crash_lines(&run, "restarts in 100 ms").unwrap_err();
+        assert!(e.contains("0 lines of the shell's crashing"), "{e}");
     }
 
     /// Spec 13.6, 16.2: a `crash uart` passes with the kernel's line of the
