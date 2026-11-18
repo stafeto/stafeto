@@ -508,7 +508,10 @@ fn main(_: u64) -> u64 {
     let _ = fs.notary_register();
     let _ = fs.register_lifetimes();
     #[cfg(feature = "steps")]
-    rt::service::report_steps(2);
+    {
+        rt::service::report_steps(2);
+        rt::service::table_steps();
+    }
     let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
     4
 }

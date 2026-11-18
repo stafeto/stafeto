@@ -2704,4 +2704,34 @@ mod tests {
         assert_eq!(features(&STEPS_PROGRAMS), ["probe", "steps"]);
         assert_eq!(PROGRAMS[0].3, &["table-net-probe"]);
     }
+
+    #[test]
+    fn the_table_stands_for_the_traffic_lines_lost_in_the_burst() {
+        let all = [
+            (65, 3000),
+            (6, 2000),
+            (8, 2500),
+            (10, 2600),
+            (19, 4000),
+            (28, 1500),
+        ];
+        let lines: Vec<String> = all
+            .iter()
+            .map(|(k, t)| format!("service step: {NET_TAG} kind {k} {t} ticks detail 0"))
+            .collect();
+        let lost = crate::step_line::tabled(&lines);
+        assert_eq!(traffic_verdict(&lost).map(|r| r.len()), Ok(6));
+        // The service starts again in a run: each start has its table, the longest of all wins.
+        let mut twice = lost.clone();
+        twice.push(format!(
+            "service table: {NET_TAG} kind 8 {} ticks detail 0 preempts 0",
+            STEP_MAX + 1
+        ));
+        assert!(traffic_verdict(&twice).is_err());
+        assert!(
+            traffic_verdict(&lost[1..])
+                .unwrap_err()
+                .contains("own steps")
+        );
+    }
 }

@@ -690,12 +690,10 @@ mod steps {
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The preemptions of the step whose raw time is in `LONGEST`.
     static LONGEST_PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    /// Whether the table of the longest steps goes out again at each power of two of the steps
-    /// done from `TABLE_FROM` on (`table_steps`), and the steps done.
-    static TABLE: AtomicBool = AtomicBool::new(false);
+    /// The first count of steps from which the table of the longest steps goes out again at each
+    /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
+    static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
-    /// The first count of steps that prints the table: the burst of the start of a run is over.
-    const TABLE_FROM: u64 = 128;
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -712,8 +710,8 @@ mod steps {
         REPORT.store(tag, Ordering::Relaxed);
     }
 
-    pub fn table() {
-        TABLE.store(true, Ordering::Relaxed);
+    pub fn table(from: u64) {
+        TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
     /// The longest step of every kind seen, one line each:
@@ -902,9 +900,12 @@ mod steps {
                 }
             }
         }
-        if printing && TABLE.load(Ordering::Relaxed) {
+        // The table goes out after the reply and after the sample is taken, as the line of a new
+        // longest does: the print is in no step's time, and it comes before the next Receive.
+        let from = TABLE_FROM.load(Ordering::Relaxed);
+        if printing && from != 0 {
             let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
-            if done >= TABLE_FROM && done.is_power_of_two() {
+            if done >= from && done.is_power_of_two() {
                 print_table(tag);
             }
         }
@@ -937,7 +938,7 @@ mod steps {
     pub fn detail(_: u64) {}
     pub fn own() {}
     pub fn report(_: u8) {}
-    pub fn table() {}
+    pub fn table(_: u64) {}
 }
 
 /// Makes the loop of this service print each new longest step (feature
@@ -953,7 +954,14 @@ pub fn report_steps(tag: u8) {
 /// longest of `report_steps` goes out once, in the burst at the start of a run, where the
 /// bounded kernel log loses records; the table comes after it.
 pub fn table_steps() {
-    steps::table();
+    steps::table(128);
+}
+
+/// `table_steps` with the first count of steps that tells the table given: for a service that
+/// does few steps in the run of its probe (the first count is a power of two, or the next one
+/// after it is taken).
+pub fn table_steps_from(first: u64) {
+    steps::table(first);
 }
 
 /// Records complete steps without printing between requests. Measurement

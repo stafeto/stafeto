@@ -54,23 +54,12 @@ pub fn parse_table(line: &str) -> Option<StepLine<'_>> {
     parse_word(line, "table:")
 }
 
-/// The longest step of each kind in the table lines of the service `tag` (the last table holds
-/// the longest of all the earlier ones), judged as `longest` does.
-pub fn table(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
-    let mut out: Vec<(usize, u64, u64)> = Vec::new();
-    for step in lines
-        .iter()
-        .filter_map(|l| parse_table(l))
-        .filter(|s| s.tag == tag)
-    {
-        let row = (step.kind, step.judged(), step.detail);
-        match out.iter_mut().find(|(k, ..)| *k == step.kind) {
-            Some(old) if old.1 > row.1 => {}
-            Some(old) => *old = row,
-            None => out.push(row),
-        }
-    }
-    out
+/// A line of a new longest or a line of the table, read: the table lines hold the longest step
+/// of each kind after the burst at the start of a run, where the lines of a new longest may have
+/// been lost, and a reader that takes the longer of the two for each kind gets every kind the
+/// run did.
+fn parse_any(line: &str) -> Option<StepLine<'_>> {
+    parse(line).or_else(|| parse_table(line))
 }
 
 fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
@@ -112,12 +101,13 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
 }
 
 /// The longest step of each kind of the service `tag` in `lines`, by the judged time:
-/// (kind, judged ticks, detail), in the order the kinds came.
+/// (kind, judged ticks, detail), in the order the kinds came. The lines of a new longest and the
+/// lines of the table (`parse_table`) are both read.
 pub fn longest(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for step in lines
         .iter()
-        .filter_map(|l| parse(l))
+        .filter_map(|l| parse_any(l))
         .filter(|s| s.tag == tag)
     {
         let row = (step.kind, step.judged(), step.detail);
@@ -136,7 +126,7 @@ pub fn raw_warnings(lines: &[String], tag: &str, bound: u64) -> Vec<String> {
     let mut seen: Vec<(usize, u64, u64)> = Vec::new();
     for step in lines
         .iter()
-        .filter_map(|l| parse(l))
+        .filter_map(|l| parse_any(l))
         .filter(|s| s.tag == tag)
     {
         if step.ticks <= bound {
@@ -180,6 +170,22 @@ pub fn longest_warned(lines: &[String], tag: &str, bound: u64) -> Vec<(usize, u6
     longest(lines, tag)
 }
 
+/// The lines of a run whose lines of a new longest were all lost in the burst at the start and
+/// that kept the table of the service (for the tests of the probes that read it).
+#[cfg(test)]
+pub fn tabled(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| match parse(l) {
+            Some(s) => format!(
+                "service table: {} kind {} {} ticks detail {} preempts {}",
+                s.tag, s.kind, s.ticks, s.detail, s.preempts
+            ),
+            None => l.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,16 +201,29 @@ mod tests {
         let t = parse_table(l).unwrap();
         assert_eq!((t.tag, t.kind, t.ticks), ("15", 5, 8058));
         assert!(parse_table("service step: 15 kind 5 8058 ticks detail 0").is_none());
-        let got = table(
+    }
+
+    #[test]
+    fn a_kind_whose_line_was_lost_comes_from_the_table_and_the_longer_one_wins() {
+        let got = longest(
             &lines(&[
+                "service step: 15 kind 1 100 ticks detail 0",
                 "service table: 15 kind 5 8058 ticks detail 0 preempts 0",
                 "service table: 14 kind 5 9999 ticks detail 0 preempts 0",
-                "service table: 15 kind 5 8100 ticks detail 0 preempts 1",
                 "service table: 15 kind 1 2192 ticks detail 0 preempts 0",
+                "service table: 15 kind 6 5000 ticks detail 3 preempts 2",
+                "service step: 15 kind 6 5100 ticks detail 4",
             ]),
             "15",
         );
-        assert_eq!(got, [(5, 8058, 0), (1, 2192, 0)]);
+        assert_eq!(got, [(1, 2192, 0), (5, 8058, 0), (6, 5100, 4)]);
+        // A raw time above the bound is warned of when only the table has it.
+        let warned = raw_warnings(
+            &lines(&["service table: 15 kind 5 8058 ticks detail 0 preempts 1"]),
+            "15",
+            8000,
+        );
+        assert_eq!(warned.len(), 1);
     }
 
     #[test]

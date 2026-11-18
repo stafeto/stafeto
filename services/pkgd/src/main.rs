@@ -129,7 +129,10 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     #[cfg(feature = "steps")]
-    rt::service::report_steps(16);
+    {
+        rt::service::report_steps(16);
+        rt::service::table_steps_from(16);
+    }
     let mut service = Pkgd {
         process: Handle::borrowed(s.process.raw()),
         parent: Handle::borrowed(s.parent.raw()),
