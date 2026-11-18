@@ -7,7 +7,9 @@ test that run.sh and xtask build the same QEMU command is a test of xtask
 (`cargo test -p xtask dist_run`)."""
 
 import hashlib
+import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -149,6 +151,20 @@ class Pack(unittest.TestCase):
         for line in sums:
             value, name = line.split("  ")
             self.assertEqual(value, digest((self.out / name).read_bytes()))
+
+    def test_the_release_notes_table_names_the_files_that_are_packed(self):
+        self.pack()
+        spec = importlib.util.spec_from_file_location("release_notes", HERE / "release-notes.py")
+        notes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notes)
+        text = notes.notes("1.2.3", "v1.2.3", "v1.2.2")
+        table = [line for line in text.splitlines() if line.startswith("| `")]
+        listed = [name for line in table for name in re.findall(r"`([^`]+)`", line.split(" | ")[0])]
+        packed = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual(sorted(listed), packed)
+        self.assertEqual(listed, [name for names, _ in dist.release_files("1.2.3") for name in names])
+        self.assertNotIn("stafeto-1.2.3-aarch64-virt.tar.xz", text)
+        self.assertIn("`stafeto-1.2.3-INDEX`, `stafeto-1.2.3-INDEX.sig`", text)
 
     def test_the_archives_that_run(self):
         self.pack()
