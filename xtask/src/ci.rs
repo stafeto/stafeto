@@ -335,6 +335,49 @@ const KERNEL_PREFIXES: &[&str] = &[
 /// with it.
 const BUDGET_NAMED: [&str; 2] = ["service-budget", "budget-breaks"];
 
+/// The long or load-heavy probes: floods of connections, boots of many crash points or of
+/// builds, and boots on four CPUs of the host. A group runs the other probes first, two at a
+/// time, and these after them, so that no wall-clock check of a probe without `-icount` (the
+/// latencies of the kernel tests, the watchdog of init, the deadlines of the guests) runs
+/// beside one of these on the same runner. Floods share the second lane with each other.
+const HEAVY: [&str; 14] = [
+    "smp 4 window",
+    "smp 4 asid",
+    "store-crash",
+    "data-crash",
+    "random restart breaks",
+    "efi breaks",
+    "layer-probe steps",
+    "nvme-persist steps",
+    "posix-procs smp 4",
+    "net-probe",
+    "fstack-device",
+    "fast-scale",
+    "fast-switch",
+    "posix-threads smp 4",
+];
+
+/// Runs the probes of `names`: the others, then the `HEAVY` ones, each lane `njobs` at a time.
+/// The second lane runs when the first failed, and the errors join.
+fn run_lanes(names: &[String], njobs: usize) -> Result<(), String> {
+    let (mut heavy, light): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|n| HEAVY.contains(&n.as_str()));
+    heavy.sort_by_key(|n| std::cmp::Reverse(weight(n)));
+    let lane = |lane: Vec<&String>| {
+        let lane: Vec<String> = lane.into_iter().cloned().collect();
+        let mut jobs = only(super::boot_jobs(Vec::new()), &lane);
+        jobs.sort_by_key(|j| lane.iter().position(|n| n == j.name()));
+        jobs::run_all(jobs, njobs)
+    };
+    let first = lane(light);
+    let second = lane(heavy);
+    match (first, second) {
+        (Ok(()), second) => second,
+        (first, Ok(())) => first,
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    }
+}
+
 fn weight(name: &str) -> u32 {
     WEIGHTS
         .iter()
@@ -500,7 +543,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         "kernel",
         "kernel and image boots",
         &BOOT_NEEDS,
-        move || jobs::run_all(only(super::boot_jobs(Vec::new()), &kernel), njobs),
+        move || run_lanes(&kernel, njobs),
     ));
     // Checks that read the host's time on TCG run alone, after the rest.
     steps.push(step("kernel", "timing boots", &BOOT_NEEDS, || {
@@ -532,7 +575,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         let group = format!("guests-{}", n + 1);
         let probes = format!("guest probes {}", n + 1);
         steps.push(step(&group, &probes, &GUEST_NEEDS, move || {
-            jobs::run_all(only(super::boot_jobs(Vec::new()), &names), njobs)
+            run_lanes(&names, njobs)
         }));
         steps.push(step(&group, "measures", &BOOT_NEEDS, super::write_measures));
     }
@@ -541,7 +584,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     // from the weighted split of the guest probes: every boot named `net-`.
     let net_needs = [RELIBC, BASE, ADDONS, NET_PACKAGES, KERNELS, IMAGES, LIBC_SO];
     steps.push(step("net", "network probes", &net_needs, move || {
-        jobs::run_all(only(super::boot_jobs(Vec::new()), &net), njobs)
+        run_lanes(&net, njobs)
     }));
     // The budget probes, serial, on a runner of their own.
     steps.push(step("budgets", "budget probes", &BOOT_NEEDS, move || {
@@ -881,6 +924,17 @@ mod tests {
             + only(super::super::boot_jobs(Vec::new()), &net).len()
             + only(super::super::boot_jobs(Vec::new()), &budgets).len();
         assert_eq!(built, names.len());
+    }
+
+    /// Every heavy probe is a probe of the list, and none is in the group `budgets`, which runs
+    /// one probe at a time.
+    #[test]
+    fn the_heavy_probes_are_probes_of_the_list() {
+        let names = all_boot_names();
+        for heavy in HEAVY {
+            assert!(names.iter().any(|n| n == heavy), "{heavy} is not a probe");
+            assert!(!BUDGET_NAMED.contains(&heavy));
+        }
     }
 
     /// The groups are close in expected time.

@@ -40,9 +40,15 @@ if [ -f "$key" ] && ! /bin/dropbearkey -y -f "$key" >/dev/null 2>&1; then
 fi
 if [ ! -f "$key" ]; then
     if ! /bin/dropbearkey -t ed25519 -f "$key" >/dev/null 2>&1; then
-        rm -f "$key"
-        echo "dropbear: no host key could be made, SSH stays off"
-        exit 1
+        # `datakey` may have put the volume's key there while the key was being made: a file the
+        # server can use stays.
+        if /bin/dropbearkey -y -f "$key" >/dev/null 2>&1; then
+            :
+        else
+            rm -f "$key"
+            echo "dropbear: no host key could be made, SSH stays off"
+            exit 1
+        fi
     fi
 fi
 fingerprint=$(/bin/dropbearkey -y -f "$key" 2>/dev/null | sed -n 's/^Fingerprint: //p')
