@@ -17,6 +17,12 @@ name = "shell"
 test = false
 bench = false
 
+# `log-burst`: the command `logburst`, which writes LOG_BURST lines into the
+# kernel log, a few at a time, for the probes of the console's drivers (xtask
+# console-dialog, console-restart-vz). Off in the images that ship.
+[features]
+log-burst = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-init = { path = "../../proto/init" }

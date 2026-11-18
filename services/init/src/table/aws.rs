@@ -225,7 +225,7 @@ pub const CONSOLE: Record = Record {
     }),
     priority: 60,
     ceiling: 60,
-    quota: 32 * PAGE,
+    quota: 40 * PAGE,
     handle_limit: 32,
     restart: Restart::Always,
     console: true,

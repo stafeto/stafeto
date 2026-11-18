@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The output of the driver (spec 13.5): two streams of bytes, the
-//! clients' in a ring of TX_RING bytes and the kernel log's in the text of
-//! one batch, go out to the port as one, a line at a time. A stream whose
+//! clients' in a ring of TX_RING bytes and the kernel log's in a ring of
+//! LOG_RING bytes that holds the text of several batches, go out to the port as one, a line at a time. A stream whose
 //! line has begun goes on with it while it has bytes; at the start of a
 //! line the log goes first. When the line of one stream stops for want of
 //! bytes and the other has some, a CR LF ends it and the other goes on;
@@ -20,6 +20,10 @@ pub const TX_RING: usize = 4096;
 /// each putting out console_line::RECORD_OUT bytes at most, and the line
 /// of the records lost (uart::log::LOST_LINE).
 pub const LOG_BYTES: usize = 12 * console_line::RECORD_OUT + crate::log::LOST_LINE;
+/// The bytes of the ring of the log's text: what the driver has taken from
+/// the kernel's rings and has not put out, about 250 lines. A batch is
+/// taken only while LOG_BYTES of it are free.
+pub const LOG_RING: usize = 16 * 1024;
 /// The longest part of a line of the clients that goes out again.
 pub const REPEAT_MAX: usize = 128;
 
@@ -42,8 +46,8 @@ pub struct Output {
     ring: [u8; TX_RING],
     ring_start: usize,
     ring_len: usize,
-    log: [u8; LOG_BYTES],
-    log_at: usize,
+    log: [u8; LOG_RING],
+    log_start: usize,
     log_len: usize,
     at: At,
     /// Bytes that go before all others: the CR LF that ends a line cut
@@ -75,8 +79,8 @@ impl Output {
             ring: [0; TX_RING],
             ring_start: 0,
             ring_len: 0,
-            log: [0; LOG_BYTES],
-            log_at: 0,
+            log: [0; LOG_RING],
+            log_start: 0,
             log_len: 0,
             at: At::Start,
             pending: &[],
@@ -223,30 +227,32 @@ impl Output {
         }
     }
 
-    /// Whether the text of the last batch of the log went out whole: the
-    /// driver takes the next batch only then (spec 13.5).
+    /// Whether the text of the log went out whole: its ring is empty.
     pub fn log_done(&self) -> bool {
-        self.log_at == self.log_len
+        self.log_len == 0
     }
 
-    /// Adds `bytes` to the text of the batch of the log, which starts
-    /// over once the last went out whole: false, with nothing taken, when
+    /// The bytes of the log's ring that are free.
+    pub fn log_room(&self) -> usize {
+        LOG_RING - self.log_len
+    }
+
+    /// Adds `bytes` to the log's ring: false, with nothing taken, when
     /// they do not fit.
     pub fn put_log(&mut self, bytes: &[u8]) -> bool {
-        if self.log_done() {
-            self.log_at = 0;
-            self.log_len = 0;
-        }
-        let Some(room) = self.log.get_mut(self.log_len..self.log_len + bytes.len()) else {
+        if bytes.len() > self.log_room() {
             return false;
-        };
-        room.copy_from_slice(bytes);
+        }
+        let at = (self.log_start + self.log_len) % LOG_RING;
+        let first = bytes.len().min(LOG_RING - at);
+        self.log[at..at + first].copy_from_slice(&bytes[..first]);
+        self.log[..bytes.len() - first].copy_from_slice(&bytes[first..]);
         self.log_len += bytes.len();
         true
     }
 
     fn log_has(&self) -> bool {
-        self.log_at < self.log_len
+        self.log_len > 0
     }
 
     /// Whether `next_byte` has nothing to give now.
@@ -329,8 +335,9 @@ impl Output {
                 }
                 At::Log => {
                     if self.log_has() {
-                        let b = self.log[self.log_at];
-                        self.log_at += 1;
+                        let b = self.log[self.log_start];
+                        self.log_start = (self.log_start + 1) % LOG_RING;
+                        self.log_len -= 1;
                         if b == b'\n' {
                             self.at = At::Start;
                             self.pending = b"\n";
@@ -644,5 +651,29 @@ mod tests {
         assert!(o.log_done());
         assert!(o.put_log(b"0x92000006\n"));
         assert_eq!(drain(&mut o), b"0x92000006\r\nstafeto> ");
+    }
+
+    #[test]
+    fn the_ring_of_the_log_wraps_and_refuses_what_does_not_fit() {
+        let mut o = Output::new();
+        let line = [b'a'; 99];
+        let mut text = std::vec::Vec::new();
+        for _ in 0..3 {
+            // Fill to the brim in lines of 100 bytes, then empty it.
+            let mut put = 0;
+            while o.log_room() >= 100 {
+                assert!(o.put_log(&line) && o.put_log(b"\n"));
+                put += 100;
+            }
+            assert!(!o.put_log(&[b'x'; LOG_RING]));
+            assert_eq!(o.log_room(), LOG_RING - put);
+            text.clear();
+            text.extend(core::iter::from_fn(|| o.next_byte()));
+            assert!(o.is_idle());
+            // Each LF of the log goes out as CR LF.
+            assert_eq!(text.len(), put + put / 100);
+            assert!(o.log_done());
+            assert_eq!(o.log_room(), LOG_RING);
+        }
     }
 }

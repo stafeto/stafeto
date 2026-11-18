@@ -123,6 +123,9 @@ pub struct Source {
     left: u64,
     /// Records lost that no batch told of yet.
     lost: u64,
+    /// The last fetch of this batch found the ring empty: it is not asked
+    /// again until the next batch.
+    dry: bool,
 }
 
 impl Source {
@@ -135,6 +138,7 @@ impl Source {
             absent: false,
             left: 0,
             lost: 0,
+            dry: false,
         }
     }
 
@@ -221,6 +225,9 @@ impl Sources {
     ) -> LogBatch {
         let mut count = 0;
         let mut lost = 0;
+        for s in &mut self.sources {
+            s.dry = false;
+        }
         while count < LOG_BATCH {
             let mut best: Option<(u64, usize)> = None;
             for k in 0..SOURCES {
@@ -228,7 +235,7 @@ impl Sources {
                 if s.absent {
                     continue;
                 }
-                if s.next >= s.count {
+                if s.next >= s.count && !s.dry {
                     match fetch(k, &mut s.cursor, &mut s.records) {
                         None => {
                             s.absent = true;
@@ -239,6 +246,7 @@ impl Sources {
                             s.next = 0;
                             s.left = b.left;
                             s.lost += b.lost;
+                            s.dry = s.count == 0 && b.left == 0;
                         }
                     }
                 }
@@ -267,6 +275,58 @@ impl Sources {
             lost,
             left,
         }
+    }
+}
+
+/// The drain of the kernel's rings into the output's ring of the log
+/// (spec 13.5, 16.3), as a decision apart from the calls: the driver takes
+/// every record the rings hold, a bounded part of it in each step, so a
+/// burst that fills a ring of the kernel in a few milliseconds is in the
+/// driver's buffer before the ring overwrites it.
+///
+/// The batches one step takes at most. A step is then at most STEP_BATCHES
+/// times the calls of one batch (one object_info LOG of each source that has
+/// records, see `Sources::batch`); when records are left the driver asks for
+/// the next step at once.
+pub const STEP_BATCHES: usize = 6;
+
+/// The period of the reads while the driver holds log text it has not put
+/// out, in nanoseconds: the kernel's ring of a CPU holds 64 records, and a
+/// step takes up to STEP_BATCHES of 12.
+pub const DRAIN_NS: u64 = 10_000_000;
+
+/// The period of the reads while it holds none, in nanoseconds. The ring of
+/// a CPU holds 64 records, so a writer that comes while the driver is idle
+/// loses none while it writes less than 64 records in one period: 3 records
+/// a millisecond.
+pub const IDLE_NS: u64 = 20_000_000;
+
+/// Whether the driver takes one more batch in this step: `taken` batches
+/// went in, `room` bytes of the output's ring of the log are free. A batch
+/// is taken only when its worst text fits, so nothing the driver took is
+/// dropped; with the buffer full the driver stops taking and the kernel
+/// counts what its ring overwrites in `lost` of its next batch.
+pub fn take_more(taken: usize, room: usize) -> bool {
+    taken < STEP_BATCHES && room >= crate::output::LOG_BYTES
+}
+
+/// When the next step comes, after a step that ended with `left` records in
+/// the rings and `room` bytes free in the output's ring of the log: at once
+/// while records are left and a batch fits, every DRAIN_NS while text is
+/// held or records wait for room, every IDLE_NS otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    Now,
+    After(u64),
+}
+
+pub fn next_step(left: u64, room: usize) -> Next {
+    if left > 0 && room >= crate::output::LOG_BYTES {
+        Next::Now
+    } else if room < crate::output::LOG_RING || left > 0 {
+        Next::After(DRAIN_NS)
+    } else {
+        Next::After(IDLE_NS)
     }
 }
 
@@ -496,5 +556,176 @@ mod tests {
         assert!(out.contains(&a.to_vec()), "{out:?}");
         assert!(out.contains(&b.to_vec()), "{out:?}");
         assert!(out.contains(&b"entropy: seeded from the boot page (32 bytes)\n".to_vec()));
+    }
+
+    /// A model of the kernel's ring of one CPU (kcore::log): CAP records,
+    /// the oldest overwritten and counted when it is full, taken in batches.
+    struct Kernel {
+        ring: std::collections::VecDeque<u32>,
+        lost: u64,
+    }
+
+    const CAP: usize = 64;
+    /// The bytes of the text of one record in the model, and what the port
+    /// puts out in a millisecond (uart::irq TX_PASS and TX_GAP_NS).
+    const LINE: usize = 60;
+    const PORT_PER_MS: usize = 32;
+
+    impl Kernel {
+        fn push(&mut self, id: u32) {
+            if self.ring.len() == CAP {
+                self.ring.pop_front();
+                self.lost += 1;
+            }
+            self.ring.push_back(id);
+        }
+
+        fn take(&mut self) -> (Vec<u32>, u64, u64) {
+            let n = self.ring.len().min(LOG_BATCH);
+            let got: Vec<u32> = self.ring.drain(..n).collect();
+            (got, core::mem::take(&mut self.lost), self.ring.len() as u64)
+        }
+    }
+
+    /// What the driver delivers to the port in a run of the model.
+    #[derive(Default)]
+    struct Run {
+        delivered: Vec<u32>,
+        lost: u64,
+        peak_held: usize,
+        longest_step: usize,
+    }
+
+    /// `pushes` records arrive in the first `span_ms` milliseconds, evenly;
+    /// the driver, idle, has its first step `phase` milliseconds into the
+    /// run, and steps by the rule of `new` (take_more, next_step) or by the
+    /// old one (one batch each 50 ms); the port puts out PORT_PER_MS bytes
+    /// a millisecond, whole lines. Runs for `total_ms`.
+    fn run(pushes: u32, span_ms: u32, total_ms: u32, new: bool, phase: u32) -> Run {
+        let mut kernel = Kernel {
+            ring: Default::default(),
+            lost: 0,
+        };
+        let mut held: std::collections::VecDeque<u32> = Default::default();
+        let mut run = Run::default();
+        let mut owed = 0usize;
+        let mut next_at = phase;
+        let mut sent = 0;
+        for ms in 0..total_ms {
+            while sent < pushes
+                && u64::from(sent) * u64::from(span_ms) <= u64::from(ms) * u64::from(pushes)
+            {
+                kernel.push(sent);
+                sent += 1;
+            }
+            // The port: PORT_PER_MS bytes of the lines in `held`.
+            owed += PORT_PER_MS;
+            while owed >= LINE && !held.is_empty() {
+                run.delivered.push(held.pop_front().unwrap());
+                owed -= LINE;
+            }
+            if held.is_empty() {
+                owed = owed.min(LINE);
+            }
+            // The driver, as often as the rule asks within this millisecond.
+            while ms >= next_at {
+                let mut taken = 0;
+                let mut left = kernel.ring.len() as u64;
+                loop {
+                    let room = crate::output::LOG_RING - held.len() * LINE;
+                    let more = if new {
+                        take_more(taken, room)
+                    } else {
+                        taken < 1 && held.is_empty()
+                    };
+                    if !more {
+                        break;
+                    }
+                    let (got, lost, rest) = kernel.take();
+                    run.lost += lost;
+                    held.extend(got);
+                    taken += 1;
+                    left = rest;
+                    if left == 0 {
+                        break;
+                    }
+                }
+                run.longest_step = run.longest_step.max(taken);
+                run.peak_held = run.peak_held.max(held.len() * LINE);
+                let room = crate::output::LOG_RING - held.len() * LINE;
+                next_at = match (new, next_step(left, room)) {
+                    (false, _) => ms + 50,
+                    (true, Next::Now) => ms,
+                    (true, Next::After(ns)) => ms + (ns / 1_000_000) as u32,
+                };
+                if next_at == ms {
+                    // At once: the same millisecond, another step.
+                    continue;
+                }
+            }
+        }
+        run.lost += kernel.lost;
+        run
+    }
+
+    #[test]
+    fn a_boot_burst_of_150_records_comes_out_whole_with_the_drain() {
+        // Whatever the phase of the driver's idle tick against the burst.
+        for phase in 0..(IDLE_NS / 1_000_000) as u32 {
+            let r = run(150, 100, 1000, true, phase);
+            assert_eq!(r.lost, 0, "phase {phase}");
+            assert_eq!(r.delivered, (0..150).collect::<Vec<u32>>(), "phase {phase}");
+            assert!(r.longest_step <= STEP_BATCHES);
+            assert!(r.peak_held <= crate::output::LOG_RING);
+        }
+    }
+
+    #[test]
+    fn the_same_burst_loses_records_with_one_batch_each_50_ms() {
+        for phase in 0..50 {
+            let r = run(150, 100, 1000, false, phase);
+            assert!(r.lost > 0, "phase {phase}: {}", r.lost);
+            assert!(r.delivered.len() < 150);
+            assert_eq!(r.delivered.len() as u64 + r.lost, 150);
+        }
+    }
+
+    #[test]
+    fn with_the_buffer_full_the_driver_stops_and_the_kernel_counts() {
+        // 1500 records at once: more than the buffer (16 KiB, 273 lines of
+        // the model) and the ring together.
+        let r = run(1500, 1, 20_000, true, 0);
+        assert!(r.peak_held <= crate::output::LOG_RING);
+        assert!(r.lost > 0);
+        assert_eq!(r.delivered.len() as u64 + r.lost, 1500);
+        // What came out is in order.
+        assert!(r.delivered.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn the_decision_is_bounded_and_falls_back_to_idle() {
+        assert!(take_more(0, crate::output::LOG_BYTES));
+        assert!(!take_more(0, crate::output::LOG_BYTES - 1));
+        assert!(!take_more(STEP_BATCHES, crate::output::LOG_RING));
+        assert_eq!(next_step(5, crate::output::LOG_RING), Next::Now);
+        assert_eq!(next_step(5, 10), Next::After(DRAIN_NS));
+        assert_eq!(next_step(0, 10), Next::After(DRAIN_NS));
+        assert_eq!(next_step(0, crate::output::LOG_RING), Next::After(IDLE_NS));
+    }
+
+    #[test]
+    fn a_source_found_empty_is_asked_once_in_a_batch() {
+        let rings = [vec![], vec![], vec![raw(1, LOG_TEXT_KIND, b"x")]];
+        let mut sources = Sources::new();
+        let mut out: Records = [[0; LOG_RECORD]; LOG_BATCH];
+        let mut asked = [0; SOURCES];
+        let mut inner = ring(&rings);
+        let mut fetch = |k: usize, c: &mut u64, into: &mut Records| {
+            asked[k] += 1;
+            inner(k, c, into)
+        };
+        let batch = sources.batch(&mut fetch, &mut out);
+        assert_eq!(batch.count, 1);
+        assert!(asked.iter().all(|&n| n <= 2), "{asked:?}");
     }
 }

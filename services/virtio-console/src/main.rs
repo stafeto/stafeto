@@ -16,7 +16,8 @@
 //! that shows its buffer used, input comes at the interrupt, and a receive
 //! of no bytes, the end of the host's input, leaves output going. It shows
 //! the kernel log as the PL011's driver does: at its start, every
-//! LOG_PERIOD_NS and again while records are left. A buffer goes through a
+//! uart::log::IDLE_NS (DRAIN_NS while it holds text) and again while
+//! records are left. A buffer goes through a
 //! bounce page, copied whole: up to port::RX_BYTES in, port::TX_BYTES out.
 //! The driver is in the trusted base: the device writes where the
 //! driver's queues tell it (spec 9, no SMMU on VZ). The program ends with
@@ -65,8 +66,6 @@ rt::entry!(main);
 const DMA_AT: usize = 0x10_0000_0000;
 const ECAM_AT: usize = 0x10_1000_0000;
 const BAR_AT: usize = 0x10_2000_0000;
-/// The period of the reads of the kernel log.
-const LOG_PERIOD_NS: u64 = 50_000_000;
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
 /// The priority of the slot of label 0 of the driver's channel.
@@ -74,8 +73,6 @@ const CHANNEL_PRIORITY: u8 = 1;
 /// The sessions of the driver's channel, and what each holds at most.
 const SESSIONS: usize = 8;
 const HELD: usize = 2;
-/// Batches of the kernel log one read takes in a row at most.
-const LOG_BATCHES: usize = 64 / LOG_BATCH + 1;
 /// Reads of the device's status after its reset, at most, before the
 /// driver gives up: Virtio 1.2, 2.4.1, the reset is done once it reads 0.
 const RESET_READS: u32 = 1_000_000;
@@ -479,7 +476,7 @@ struct Driver {
     _view: Handle<Channel>,
     /// The DMA object and the two windows, mapped for the driver's life.
     _windows: [Handle<Memory>; 3],
-    /// The timer fires at t0 + k * LOG_PERIOD_NS; `deadline` is the next.
+    /// The timer fires at t0 + k * its period; `deadline` is the next.
     t0: u64,
     deadline: u64,
     /// The records of the kernel log left after the last batch.
@@ -589,10 +586,15 @@ impl Driver {
         }
     }
 
-    /// Takes batches of the kernel log into the output (spec 13.5, 16.3)
-    /// once the last went out whole, and sends them; LOG_BATCHES at most.
+    /// Takes batches of the kernel log into the ring of the output's log
+    /// (spec 13.5, 16.3), as many as the rule of uart::log::take_more lets
+    /// a step take: up to STEP_BATCHES while records are left in the rings
+    /// and a batch of text fits, whether or not the text taken before went
+    /// out. The port is paced on its own timer. A step that leaves records
+    /// behind is followed at once by another (`arm`).
     fn take_log(&mut self) {
-        for _ in 0..LOG_BATCHES {
+        let mut taken = 0;
+        loop {
             let State {
                 output,
                 records,
@@ -600,8 +602,8 @@ impl Driver {
                 lines,
                 ..
             } = &mut *self.state;
-            if !output.log_done() || !output.accepts_log() {
-                return;
+            if !output.accepts_log() || !uart::log::take_more(taken, output.log_room()) {
+                break;
             }
             let log = &self.log;
             // Ring 0 is this CPU's, taken; the others are peeked at, and
@@ -619,21 +621,31 @@ impl Driver {
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             uart::log::text(records, batch, lines, |bytes| {
-                // A batch fits (uart::output::LOG_BYTES).
+                // A batch fits: take_more asked for the room of its worst.
                 let _ = output.put_log(bytes);
             });
-            self.kick();
+            taken += 1;
             if self.left == 0 {
-                return;
+                break;
             }
+        }
+        if taken > 0 {
+            self.kick();
         }
     }
 
-    /// Arms the timer at the first deadline t0 + k * LOG_PERIOD_NS after
-    /// now (spec 10).
+    /// Arms the timer (spec 10): at once when the last step left records
+    /// in the kernel's rings and a batch of text fits, else at the first
+    /// deadline t0 + k * period after now, the period uart::log::DRAIN_NS
+    /// while the driver holds text it has not sent and IDLE_NS when it
+    /// holds none.
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
-        self.deadline = next_release(self.t0, LOG_PERIOD_NS, now);
+        let room = self.state.output.log_room();
+        self.deadline = match uart::log::next_step(self.left, room) {
+            uart::log::Next::Now => now,
+            uart::log::Next::After(ns) => next_release(self.t0, ns, now),
+        };
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
     }

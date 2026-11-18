@@ -185,11 +185,12 @@ type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
 /// runs, of the runs of init's test table and of the two tables init
 /// refuses (spec 15.2). Init comes first (spec 13.1). The driver of the
-/// image that ships has the method CRASH in subproject 1 (spec 13.5).
+/// image that ships has the method CRASH in subproject 1 (spec 13.5); its
+/// shell has the command `logburst` (feature `log-burst`).
 const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &[]),
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
-    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["log-burst"]),
 ];
 /// The boot image of Apple VZ: init with its VZ table, the driver of the
 /// Virtio console with CRASH, as the image that ships on QEMU, and the shell.
@@ -484,7 +485,7 @@ const VZ_WATCH_PROGRAMS: [ImageProgram; 3] = [
         UART_STACK_SIZE,
         &["crash"],
     ),
-    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["log-burst"]),
 ];
 /// The image of console-early-exit-vz: the first instance of the driver
 /// ends after BAR 1, with decoding off (`exit-before-decoding`).
@@ -1394,7 +1395,7 @@ const BROKEN: &str = "shell: uart is broken; no console left";
 const DRIVER_FAULT: &str = "process fault: data abort from EL0 (EC 0x24) ESR=0x";
 const UART_ENDED: &str = "init: uart ended: ";
 /// The lines of the shell's `help`, each whole (spec 13.6).
-const HELP_LINES: [&str; 8] = [
+const HELP_LINES: [&str; 9] = [
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
@@ -1403,6 +1404,7 @@ const HELP_LINES: [&str; 8] = [
     "bench       the round trip of a request and the latencies",
     "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
+    "logburst    write a burst of lines into the kernel log",
 ];
 /// The bytes of the line the console dialog types while `bench` runs:
 /// past the driver's ring of input (256 bytes), a READ (64) and the FIFO.
@@ -11357,6 +11359,9 @@ fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     let kept = "a".repeat(128 - "echo ".len());
     run.expect_line("the line typed ahead", |l| l == kept, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
+    // A burst of the kernel log, written while the driver is idle: every
+    // line comes, in order, with no mark of records lost.
+    log_burst(run)?;
     // Init writes its line into the kernel log once the shell started,
     // after the driver's first read: only the driver's timer shows it.
     run.expect_seen(SERVICES_STARTED, DIALOG_STEP)?;
@@ -11384,6 +11389,55 @@ fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     run.expect(PROMPT, DIALOG_STEP)?;
     a_broken_driver_gives_the_port_back(run)?;
     Ok(line)
+}
+
+/// The lines `logburst` of the shell writes (apps/shell, feature
+/// `log-burst`), the same count.
+const LOG_BURST: u32 = 150;
+
+/// The line number `n` of `logburst`.
+fn burst_line(n: u32) -> String {
+    format!("logburst {n:03} {}", "x".repeat(46))
+}
+
+/// The step of the console probes that sends `logburst`: the shell writes
+/// LOG_BURST lines into the kernel log at 2.5 lines a millisecond, while the
+/// driver of the console is idle (and has its ring of 64 records to
+/// empty in each period of uart::log::IDLE_NS). All lines come on the
+/// console, in order, each once, and no `[kernel log: N records lost]`
+/// comes with them (spec 13.5, 16.3). Ends at the prompt.
+pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
+    let from = run.lines().len();
+    run.send("logburst")?;
+    let last = burst_line(LOG_BURST - 1);
+    run.expect_line("the last line of the burst", |l| l == last, DIALOG_STEP)?;
+    let done = format!("shell: logburst: {LOG_BURST} lines");
+    run.expect_line(&done, |l| l == done, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    burst_whole(&run.lines()[from..])
+}
+
+/// The lines of a burst in `lines`: the LOG_BURST of them, each whole, in
+/// order, and no line of records lost.
+fn burst_whole(lines: &[String]) -> Result<(), String> {
+    if let Some(l) = lines.iter().find(|l| l.contains("[kernel log:")) {
+        return Err(format!("the burst lost records: {l}"));
+    }
+    let want: Vec<String> = (0..LOG_BURST).map(burst_line).collect();
+    let got: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("logburst ") && !l.starts_with("logburst:"))
+        .collect();
+    if got.len() != want.len() || got.iter().zip(&want).any(|(g, w)| *g != w) {
+        let missing: Vec<u32> = (0..LOG_BURST)
+            .filter(|&n| !lines.contains(&burst_line(n)))
+            .collect();
+        return Err(format!(
+            "{} lines of the burst came, {LOG_BURST} in order expected; missing {missing:?}",
+            got.len()
+        ));
+    }
+    Ok(())
 }
 
 /// `crash uart` with the driver restarting after init's `decision` (spec
@@ -14245,6 +14299,27 @@ fn ci_lints() -> Result<(), String> {
 }
 
 #[cfg(test)]
+/// The check of the burst of the console probes: whole and in order
+/// passes; a missing line, a swapped pair and a mark of lost records
+/// fail.
+#[test]
+fn the_burst_check_wants_every_line_in_order_and_no_mark() {
+    let all: Vec<String> = (0..LOG_BURST).map(burst_line).collect();
+    assert!(burst_whole(&all).is_ok());
+    let mut with_noise = all.clone();
+    with_noise.insert(7, "uart: something else".into());
+    assert!(burst_whole(&with_noise).is_ok());
+    let mut gap = all.clone();
+    gap.remove(40);
+    assert!(burst_whole(&gap).unwrap_err().contains("missing [40]"));
+    let mut swapped = all.clone();
+    swapped.swap(3, 4);
+    assert!(burst_whole(&swapped).is_err());
+    let mut marked = all;
+    marked.insert(10, "[kernel log: 3 records lost]".into());
+    assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
+}
+
 mod tests {
     #[test]
     fn a_ram_step_past_the_bound_fails_and_one_past_the_margin_only_warns() {

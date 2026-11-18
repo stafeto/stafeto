@@ -7,8 +7,8 @@
 //! `irq` of its level-triggered line in the reply to its REGISTER. It sets
 //! the PL011 up, serves its interrupts and WRITE and READ of proto_uart
 //! (CRASH too with the feature `crash`), and shows the kernel log: at its
-//! start, on a timer of its own every LOG_PERIOD_NS, and at once again
-//! while the kernel says records are left. What it decides comes from the
+//! start, on a timer of its own (every uart::log::IDLE_NS, every DRAIN_NS while
+//! it holds text) and at once again while the kernel says records are left. What it decides comes from the
 //! library (uart::irq, output, writes, input, log); here are the calls and
 //! the registers, which it reaches through rt::mmio alone [G34]. The
 //! program ends with a code of its own when its start fails; init
@@ -48,8 +48,6 @@ rt::entry!(main);
 /// Where the driver maps its window over the PL011.
 const REGS_AT: usize = 0x10_0000_0000;
 const PAGE: u64 = 4096;
-/// The period of the reads of the kernel log.
-const LOG_PERIOD_NS: u64 = 50_000_000;
 
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
@@ -68,9 +66,6 @@ const SESSIONS: usize = 8;
 /// RAM file service's 128.
 const CLONES: usize = 128;
 const HELD: usize = 2;
-/// Batches of the kernel log one read takes in a row at most, while each
-/// goes out whole at once: the whole ring of the kernel.
-const LOG_BATCHES: usize = 64 / LOG_BATCH + 1;
 
 /// The codes of a start that failed: the start data, `log` among them;
 /// REGISTER, the window or the binding; the map of the window; the loop.
@@ -324,7 +319,7 @@ struct Uart {
     /// The fixed timer and labelled receiver for paced output.
     tx_timer: Handle<Timer>,
     _tx_view: Handle<Channel>,
-    /// The timer fires at t0 + k * LOG_PERIOD_NS; `deadline` is the next.
+    /// The timer fires at t0 + k * its period; `deadline` is the next.
     t0: u64,
     deadline: u64,
     /// The records of the kernel log left after the last batch.
@@ -501,12 +496,15 @@ impl Uart {
         }
     }
 
-    /// Takes batches of the kernel log into the output (spec 13.5, 16.3)
-    /// once the last went out whole, and starts them: one, and the next
-    /// at once while records are left and each went out whole in its
-    /// start, LOG_BATCHES at most.
+    /// Takes batches of the kernel log into the ring of the output's log
+    /// (spec 13.5, 16.3), as many as the rule of uart::log::take_more lets
+    /// a step take: up to STEP_BATCHES while records are left in the rings
+    /// and a batch of text fits, whether or not the text taken before went
+    /// out. The port is paced on its own timer. A step that leaves records
+    /// behind is followed at once by another (`arm`).
     fn take_log(&mut self) {
-        for _ in 0..LOG_BATCHES {
+        let mut taken = 0;
+        loop {
             let State {
                 output,
                 records,
@@ -514,8 +512,8 @@ impl Uart {
                 lines,
                 ..
             } = &mut *self.state;
-            if !output.log_done() || !output.accepts_log() {
-                return;
+            if !output.accepts_log() || !uart::log::take_more(taken, output.log_room()) {
+                break;
             }
             let log = &self.log;
             // Ring 0 is this CPU's, taken; the others are peeked at, and
@@ -533,22 +531,34 @@ impl Uart {
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             uart::log::text(records, batch, lines, |bytes| {
-                // A batch fits (uart::output::LOG_BYTES).
+                // A batch fits: take_more asked for the room of its worst.
                 let _ = output.put_log(bytes);
             });
-            self.kick();
+            taken += 1;
             if self.left == 0 {
-                return;
+                break;
             }
+        }
+        if taken > 0 {
+            self.kick();
         }
     }
 
-    /// Arms the timer at the first deadline t0 + k * LOG_PERIOD_NS after
-    /// now (spec 10): those that passed are not made up.
+    /// Arms the timer (spec 10): at once when the last step left records
+    /// in the kernel's rings and a batch of text fits, else at the first
+    /// deadline t0 + k * period after now, the period uart::log::DRAIN_NS
+    /// while the driver holds text it has not put out and IDLE_NS when it
+    /// holds none; those that passed are not made up.
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
-        let period = if self.poll { POLL_NS } else { LOG_PERIOD_NS };
-        self.deadline = next_release(self.t0, period, now);
+        let room = self.state.output.log_room();
+        self.deadline = match uart::log::next_step(self.left, room) {
+            uart::log::Next::Now => now,
+            uart::log::Next::After(ns) => {
+                let ns = if self.poll { ns.min(POLL_NS) } else { ns };
+                next_release(self.t0, ns, now)
+            }
+        };
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
