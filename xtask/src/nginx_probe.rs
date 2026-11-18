@@ -1486,6 +1486,11 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
     Ok(())
 }
 
+/// The seconds the first request after the scan of step 4h may take (curl `--max-time`): a
+/// service that stopped taking frames after the flood of unanswered RSTs answers late, as each
+/// frame it sends moves the queue on by one batch (stafeto#456).
+const FIRST_AFTER_SCAN_S: &str = "5";
+
 /// Step 4h: the scan of `scan_replay` against ports 80 and 443, the first
 /// requests after it, and the counters of the network service.
 fn tls_raw_scan(
@@ -1543,7 +1548,7 @@ fn tls_raw_scan(
         true,
         &[
             arg("--max-time"),
-            arg("20"),
+            arg(FIRST_AFTER_SCAN_S),
             arg("-o"),
             arg(out.to_string_lossy()),
             tls.url("/index.html"),
@@ -1569,7 +1574,7 @@ fn tls_raw_scan(
             .cloned()
             .collect();
         return Err(format!(
-            "4h: the first request over TLS after the scan ended with {}: {}; the replay: {done:?}; counters before {before:?}, after {:?}; the last counter lines (newest first): {said:?}; {capture}",
+            "4h: the first request over TLS after the scan did not finish in {FIRST_AFTER_SCAN_S} s (curl ended with {}): {}; the replay: {done:?}; counters before {before:?}, after {:?}; the last counter lines (newest first): {said:?}; {capture}",
             ended.code,
             last_lines(&ended.said),
             replay::latest(run.lines())
@@ -1910,6 +1915,11 @@ pub(crate) fn verdict(lines: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_request_after_the_scan_has_five_seconds() {
+        assert_eq!(FIRST_AFTER_SCAN_S, "5");
+    }
 
     #[test]
     fn the_rounds_of_the_scan_step_come_from_the_environment() {
