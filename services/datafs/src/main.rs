@@ -188,7 +188,17 @@ impl Datafs {
             // SAFETY: the instant is written before the job is QUEUED; it is read through the atomic.
             .map(|i| unsafe { (*job(i)).queued_at.load(Acquire) });
         let progress = PROGRESS.load(Acquire);
-        if datafs::watch::stuck(now, self.since, progress, queued, datafs::watch::STUCK_NS) {
+        // While the service stops the check is off: the drain waits on the disk, and init's deadline
+        // of 3 s bounds it (a stuck exit outside a stop is unchanged).
+        let stopping = STOPPING.load(Acquire);
+        if datafs::watch::must_exit(
+            stopping,
+            now,
+            self.since,
+            progress,
+            queued,
+            datafs::watch::STUCK_NS,
+        ) {
             rt::println!(
                 "datafs: no disk call completed in 20 s with a job waiting, the service ends"
             );

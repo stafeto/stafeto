@@ -35,9 +35,30 @@ pub fn stuck(
     now.saturating_sub(quiet_from) > limit
 }
 
+/// Whether the service ends for a stuck worker: `stuck`, except while the service stops. During the
+/// stop init holds the deadline (3 s, far under `limit`), and a worker that waits on the disk is the
+/// stop at work.
+pub fn must_exit(
+    stopping: bool,
+    now: u64,
+    since: u64,
+    progress: u64,
+    queued: impl IntoIterator<Item = u64>,
+    limit: u64,
+) -> bool {
+    !stopping && stuck(now, since, progress, queued, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stuck_worker_ends_the_service_except_while_it_stops() {
+        assert!(must_exit(false, 200, 0, 100, [0], 50));
+        assert!(!must_exit(true, 200, 0, 100, [0], 50));
+        assert!(!must_exit(false, 150, 0, 100, [0], 50));
+    }
 
     #[test]
     fn a_long_job_with_steady_disk_calls_is_never_stuck() {

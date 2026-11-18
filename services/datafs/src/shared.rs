@@ -87,8 +87,8 @@ pub static STARTING: AtomicBool = AtomicBool::new(true);
 pub static READY: AtomicBool = AtomicBool::new(false);
 
 /// The stop notice came: no new request is taken, the worker drains its queue. The stuck-job
-/// watch of PR #441 must not fire while this is set: a drain that waits on the disk is the stop
-/// at work. Whoever merges the two does it knowingly.
+/// watch does not fire while this is set (`datafs::watch::must_exit`): a drain that waits on the
+/// disk is the stop at work. The disk calls of the stop still stamp `PROGRESS`.
 pub static STOPPING: AtomicBool = AtomicBool::new(false);
 /// The counter tick of the stop notice, stored before `STOPPING`; 0 means not yet.
 pub static STOP_AT: AtomicU64 = AtomicU64::new(0);
