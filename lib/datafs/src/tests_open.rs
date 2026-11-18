@@ -146,7 +146,7 @@ fn littlefs_gives_two_opens_of_one_name_no_common_view() {
 mod served {
     use super::*;
     use crate::mem::Survive;
-    use crate::server::{self, Server};
+    use crate::server::{self, Recovered, Server};
     use crate::{Device, Error};
     use proto_data as p;
     use proto_wire::{Status, Writer};
@@ -333,20 +333,26 @@ mod served {
         }
         let r = t.open(3, b"/log", p::READ);
         assert_eq!(t.read(3, r, 100), b"aaaAAAbbbBBBcccCCCdddDDDeeeEEE");
-        // The position after an append write is the end of that write; PWRITE appends too.
+        // The position after an append write is the end of that write; PWRITE is below.
         assert_eq!(word(&t.seek(1, a, 0, p::SEEK_CUR).unwrap(), 0), 27);
         t.write(1, a, b"zz");
         assert_eq!(word(&t.seek(1, a, 0, p::SEEK_CUR).unwrap(), 0), 32);
+        // PWRITE writes where it is told, append or not (POSIX.1-2024).
         t.call(1, 0, |w| p::pwrite(a, 0, b"!", w)).unwrap();
-        assert_eq!(t.pread(3, r, 100, 28), b"EEzz!");
+        assert_eq!(t.pread(3, r, 100, 0).len(), 32);
+        assert_eq!(t.pread(3, r, 4, 0), b"!aaA");
         // The flag is the description's: GET_FLAGS shows it, SET_FLAGS turns it off for one.
         let flags = t
             .call(1, 0, |w| p::handle_call(p::Method::GetFlags, a, w))
             .unwrap();
         assert_eq!(word(&flags, 0), p::WRITE | p::APPEND);
         t.call(1, 0, |w| p::set_flags(a, 0, w)).unwrap();
-        t.call(1, 0, |w| p::pwrite(a, 0, b"X", w)).unwrap();
-        assert_eq!(t.pread(3, r, 2, 0), b"Xa");
+        t.seek(1, a, 1, p::SEEK_SET).unwrap();
+        t.write(1, a, b"Q");
+        assert_eq!(t.pread(3, r, 4, 0), b"!QaA");
+        t.call(1, 0, |w| p::set_flags(a, p::APPEND, w)).unwrap();
+        t.write(1, a, b"R");
+        assert_eq!(t.pread(3, r, 100, 30), b"zzR");
         assert_eq!(
             t.call(1, 0, |w| p::set_flags(a, p::WRITE, w)),
             Err(p::code(p::INVALID))
@@ -400,7 +406,7 @@ mod served {
         assert!(t.fs.used_blocks().unwrap() >= used);
         t.close(2, g).unwrap();
         // The last close removed it: nothing under the orphans, the blocks are back.
-        assert_eq!(server::clean_orphans(&mut t.fs), Ok(0));
+        assert_eq!(server::recover_orphans(&mut t.fs), Ok(Recovered::default()));
         assert!(t.fs.used_blocks().unwrap() < used);
         t.close(3, n).unwrap();
         assert_eq!(t.server.node_count(), 0);
@@ -449,7 +455,7 @@ mod served {
         t.close(2, now).unwrap();
         t.close(1, f).unwrap();
         assert_eq!(t.list(2, b"/"), [".", "..", "target"]);
-        assert_eq!(server::clean_orphans(&mut t.fs), Ok(0));
+        assert_eq!(server::recover_orphans(&mut t.fs), Ok(Recovered::default()));
     }
 
     #[test]
@@ -474,10 +480,16 @@ mod served {
             "the orphan is on the volume"
         );
         assert!(fs.stat(b"/.orphans").is_ok());
-        assert_eq!(server::clean_orphans(&mut fs), Ok(1));
+        assert_eq!(
+            server::recover_orphans(&mut fs),
+            Ok(Recovered {
+                removed: 1,
+                ..Recovered::default()
+            })
+        );
         // The directory of the orphans stays, a pair of blocks.
         assert_eq!(fs.used_blocks().unwrap(), before + 2);
-        assert_eq!(server::clean_orphans(&mut fs), Ok(0));
+        assert_eq!(server::recover_orphans(&mut fs), Ok(Recovered::default()));
         assert_eq!(fs.stat(b"/big"), Err(Error::NoEntry));
     }
 
@@ -539,19 +551,121 @@ mod served {
             held.push(t.open(1, std::format!("/f{i}").as_bytes(), RW));
         }
         assert_eq!(t.try_open(1, b"/more", RW), Err(p::code(p::TOO_MANY_OPEN)));
-        // Another session still opens; a clone over the cap is refused, and a failed clone makes
-        // no session and takes no reference.
+        // The refusal took nothing: the same descriptions are all there is.
+        assert_eq!(t.server.open_count(), p::HELD_MAX);
+        // Another client still opens; a child that holds as many cannot take one more by CLONE_MORE.
         let other = t.open(2, b"/other", RW);
-        let sessions = t.server.session_count();
-        let refs_before = t.server.open_count();
+        let birth = word(
+            &t.call(1, 500, |w| p::clone(&held[..p::CLONE_MAX], w))
+                .unwrap(),
+            0,
+        );
         assert_eq!(
-            t.call(2, 500, |w| p::clone(&[other, held[0]], w)),
+            t.call(2, 0, |w| p::clone_more(birth, &[other], w)),
             Err(p::code(p::BAD_HANDLE))
         );
-        assert_eq!(t.server.session_count(), sessions);
-        assert_eq!(t.server.open_count(), refs_before);
         t.close(1, held[0]).unwrap();
         assert!(t.try_open(1, b"/more", RW).is_ok());
+        // The child holds all six still: it cannot open one either.
+        assert_eq!(
+            t.try_open(500, b"/child", RW),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+    }
+
+    #[test]
+    fn a_process_tree_has_limits_and_a_full_table_is_another_code() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        // Clones of one client are limited; a clone with nothing to hold is refused.
+        let f = t.open(1, b"/f", RW);
+        assert_eq!(
+            t.call(1, 100, |w| p::clone(&[], w)),
+            Err(p::code(p::INVALID))
+        );
+        for i in 0..p::ROOT_CLONES as u64 {
+            t.call(1, 100 + i, |w| p::clone(&[f], w)).unwrap();
+        }
+        assert_eq!(
+            t.call(1, 200, |w| p::clone(&[f], w)),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+        // A clone of a clone counts for the same tree.
+        assert_eq!(
+            t.call(100, 201, |w| p::clone(&[f], w)),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+        // Another client is not hurt: it has its own session and clones.
+        assert!(t.try_open(2, b"/g", RW).is_ok());
+        assert!(
+            t.call(2, 202, |w| p::clone(&[f], w)).is_err(),
+            "g is not its own f"
+        );
+        // The tree's distinct descriptions are limited too, over all its sessions.
+        let mut opened = 1;
+        let mut by = 1u64;
+        while opened < p::ROOT_DESCRIPTIONS {
+            if t.try_open(by, b"/f", p::READ).is_err() {
+                by = 100 + (by + 1) % 8;
+                continue;
+            }
+            opened += 1;
+        }
+        assert_eq!(
+            t.try_open(1, b"/f", p::READ),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+        assert_eq!(
+            t.try_open(100, b"/f", p::READ),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+        // Passes of a tree are limited as a whole.
+        for i in 0..p::PASSES_MAX as u64 {
+            t.call(1, 300 + i, |w| p::handle_call(p::Method::Export, f, w))
+                .unwrap();
+        }
+        assert_eq!(
+            t.call(100, 310, |w| p::handle_call(p::Method::Export, f, w)),
+            Err(p::code(p::TOO_MANY_OPEN))
+        );
+    }
+
+    #[test]
+    fn the_open_files_of_the_service_are_a_table_that_fills_for_everyone() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        // Two clients take every open file of the volume (FILES), by distinct names.
+        for i in 0..crate::FILES {
+            let owner = 1 + (i / p::HELD_MAX) as u64;
+            t.open(owner, std::format!("/f{i}").as_bytes(), RW);
+        }
+        assert_eq!(t.try_open(3, b"/one-more", RW), Err(p::code(p::TABLE_FULL)));
+        // A name that is open already shares its file and needs none.
+        assert!(t.try_open(3, b"/f0", p::READ).is_ok());
+        // Directories have a table too.
+        let mut dirs = Vec::new();
+        for _ in 0..crate::DIRS {
+            if let Ok(d) = t.try_open(4, b"/", p::DIRECTORY) {
+                dirs.push(word(&d, 0));
+            }
+        }
+        assert_eq!(dirs.len(), crate::DIRS);
+        assert_eq!(
+            t.try_open(4, b"/", p::DIRECTORY),
+            Err(p::code(p::TABLE_FULL))
+        );
+    }
+
+    #[test]
+    fn the_table_of_sessions_is_one_for_all_and_answers_table_full() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        for label in 1..=server::SESSIONS as u64 {
+            assert!(t.call(label, 0, p::statfs).is_ok());
+        }
+        assert_eq!(t.call(99, 0, p::statfs), Err(p::code(p::TABLE_FULL)));
+        t.server.gone(&mut t.fs, 5);
+        assert!(t.call(99, 0, p::statfs).is_ok());
     }
 
     #[test]
@@ -613,7 +727,7 @@ mod served {
         }
         assert_eq!(
             t.call(1, 2000, |w| p::handle_call(p::Method::Export, h, w)),
-            Err(Status::Kernel(abi::Error::LimitReached))
+            Err(p::code(p::TOO_MANY_OPEN))
         );
     }
 
@@ -622,7 +736,7 @@ mod served {
         let mut state = Storage::new();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
-        assert_eq!(f >> 16, 7);
+        assert_eq!(f >> 13, 7);
         // The service restarts: a new instance over the same volume, epoch 8.
         let mut next = Server::with_epoch(8);
         let ask = |s: &mut Server, fs: &mut Fs<'_, MemDevice>, h: u32| {
@@ -636,11 +750,11 @@ mod served {
         p::open(b"/f", p::READ, &mut w).unwrap();
         let r = next.handle(&mut t.fs, 1, 0, w.as_bytes());
         let g = word(p::reply(r.as_bytes()).unwrap().bytes(8).unwrap(), 0);
-        assert_eq!(g >> 16, 8);
+        assert_eq!(g >> 13, 8);
         assert_eq!(ask(&mut next, &mut t.fs, g), Ok(()));
         assert_eq!(ask(&mut next, &mut t.fs, 0), Err(p::code(p::BAD_HANDLE)));
         assert_eq!(
-            ask(&mut next, &mut t.fs, (8 << 16) | 99),
+            ask(&mut next, &mut t.fs, (8 << 13) | 99),
             Err(p::code(p::BAD_HANDLE))
         );
         // A handle that is current but held by another session is BAD_HANDLE.
@@ -664,6 +778,241 @@ mod served {
         assert_eq!(
             p::reply(reply.as_bytes()).map(drop),
             Err(Status::BadVersion)
+        );
+    }
+
+    /// What the rename of an open file does when the volume fails in the middle: the sync that
+    /// precedes the move fails first, and the node is as it was.
+    #[test]
+    fn a_move_that_cannot_sync_leaves_the_open_file_as_it_was() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        let f = t.open(1, b"/a", RW);
+        t.fill(1, f, &bytes(8192, 4));
+        let g = t.open(2, b"/a", p::READ);
+        // The disk refuses every write: the unlink cannot sync the file, and says so.
+        t.fs.device().cut_after(Some(0));
+        let refused = t.path(3, p::Method::Unlink, b"/a");
+        assert!(refused.is_err(), "{refused:?}");
+        t.fs.device().power_cycle(Survive::All);
+        // The name is there, and the open file still answers: nothing was closed under it.
+        assert_eq!(t.fs.stat(b"/a").map(|i| i.kind), Ok(crate::Kind::File));
+        assert!(
+            t.try_open(3, b"/a", p::READ).is_ok(),
+            "no wedge: the name opens"
+        );
+        assert_eq!(t.server.node_count(), 1);
+        let size = t
+            .call(2, 0, |w| p::handle_call(p::Method::Fstat, g, w))
+            .unwrap();
+        assert_eq!((word(&size, 0), word(&size, 8)), (p::KIND_FILE, 1));
+        // The owner's bytes were not dropped: its own fsync, with the disk back, puts them on the volume.
+        t.call(1, 0, |w| p::handle_call(p::Method::Fsync, f, w))
+            .unwrap();
+        assert_eq!(t.fs.stat(b"/a").unwrap().size, 8192);
+        // The disk is back: the same unlink succeeds, and the readers still read.
+        t.path(3, p::Method::Unlink, b"/a").unwrap();
+        let size = t
+            .call(2, 0, |w| p::handle_call(p::Method::Fstat, g, w))
+            .unwrap();
+        assert_eq!(word(&size, 8), 0, "unlinked: no link");
+        assert_eq!(t.pread_all(2, g).len(), 8192);
+    }
+
+    /// A rename whose reopen failed: the file moved, so the node has the new name and the old name
+    /// is free; the last close removes the orphan.
+    #[test]
+    fn a_failed_reopen_after_a_move_leaves_the_names_right() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        server::ensure_orphans(&mut t.fs).unwrap();
+        let f = t.open(1, b"/a", RW);
+        t.write(1, f, b"data");
+        t.server.fail_reopen = true;
+        // The unlink took the name away; the node is broken and says IO.
+        t.path(2, p::Method::Unlink, b"/a").unwrap();
+        t.server.fail_reopen = false;
+        assert_eq!(t.call(1, 0, |w| p::read(f, 1, w)), Err(p::code(p::IO)));
+        // The old name is free: it exists again as a new file, with no EXISTS from the old node.
+        let n = t.open(2, b"/a", RW | p::EXCLUSIVE);
+        t.write(2, n, b"new");
+        t.close(2, n).unwrap();
+        // The last close of the broken file removes its orphan.
+        t.close(1, f).unwrap();
+        assert_eq!(t.server.node_count(), 0);
+        assert_eq!(server::recover_orphans(&mut t.fs), Ok(Recovered::default()));
+        assert_eq!(t.fs.stat(b"/a").unwrap().size, 3);
+    }
+
+    #[test]
+    fn a_rename_over_an_open_file_that_fails_puts_the_old_file_back() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        let target = t.open(1, b"/t", RW);
+        t.write(1, target, b"old");
+        t.call(1, 0, |w| p::handle_call(p::Method::Fsync, target, w))
+            .unwrap();
+        let src = t.open(2, b"/s", RW);
+        t.write(2, src, b"src");
+        t.close(2, src).unwrap();
+        t.server.fail_second = true;
+        assert_eq!(
+            t.call(2, 0, |w| p::rename(b"/s", b"/t", w)),
+            Err(p::code(p::NO_SPACE))
+        );
+        t.server.fail_second = false;
+        // Both names are as they were, the open description reads and writes the file at /t.
+        assert_eq!(t.fs.stat(b"/t").unwrap().size, 3);
+        assert_eq!(t.fs.stat(b"/s").unwrap().size, 3);
+        t.seek(1, target, 0, p::SEEK_SET).unwrap();
+        assert_eq!(t.read(1, target, 10), b"old");
+        assert_eq!(t.list(1, b"/"), [".", "..", "s", "t"]);
+        // The mark is gone with the move back: a mount finds nothing to restore.
+        t.close(1, target).unwrap();
+        assert_eq!(server::recover_orphans(&mut t.fs), Ok(Recovered::default()));
+        assert_eq!(t.fs.stat(b"/t").unwrap().size, 3);
+    }
+
+    #[test]
+    fn the_epoch_of_each_mount_differs_and_makes_an_old_handle_stale() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        let one = server::bump_epoch(&mut t.fs).unwrap();
+        let two = server::bump_epoch(&mut t.fs).unwrap();
+        assert_eq!((one, two), (1, 2));
+        // It is in the volume: a mount of the same medium goes on from there.
+        let mut device = core::mem::replace(t.fs.device(), MemDevice::new(16));
+        device.power_cycle(Survive::All);
+        let mut state2 = Storage::new();
+        let mut fs = Fs::new(device, &mut state2).unwrap();
+        fs.mount().unwrap();
+        assert_eq!(server::bump_epoch(&mut fs), Ok(3));
+        let mut a = Server::with_epoch(one);
+        let mut b = Server::with_epoch(3);
+        let mut w = Writer::new();
+        p::open(b"/x", p::READ | p::WRITE | p::CREATE, &mut w).unwrap();
+        let h = word(
+            p::reply(a.handle(&mut fs, 1, 0, w.as_bytes()).as_bytes())
+                .unwrap()
+                .bytes(8)
+                .unwrap(),
+            0,
+        );
+        let mut w = Writer::new();
+        p::read(h, 1, &mut w).unwrap();
+        let r = b.handle(&mut fs, 1, 0, w.as_bytes());
+        assert_eq!(p::reply(r.as_bytes()).map(drop), Err(p::code(p::STALE)));
+        // The epoch fills the bits a handle has for it and never reads as 0.
+        assert_eq!(Server::with_epoch(1 << server::EPOCH_BITS).open_count(), 0);
+        assert_eq!(h >> 13, one);
+    }
+
+    #[test]
+    fn a_pass_is_kept_by_an_adopter_at_its_limit_and_adopted_later() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        let f = t.open(1, b"/f", RW);
+        t.call(1, 900, |w| p::handle_call(p::Method::Export, f, w))
+            .unwrap();
+        let mut mine = Vec::new();
+        for i in 0..p::HELD_MAX {
+            mine.push(t.open(2, std::format!("/g{i}").as_bytes(), RW));
+        }
+        // The session is full: the pass is not spent, and a retry after a close works.
+        assert_eq!(t.call(2, 900, p::adopt), Err(p::code(p::TOO_MANY_OPEN)));
+        assert_eq!(t.server.pass_count(), 1);
+        assert_eq!(t.server.open_count(), p::HELD_MAX + 1);
+        t.server.gone(&mut t.fs, 900 + 1_000_000);
+        assert_eq!(
+            t.server.pass_count(),
+            1,
+            "a label that is no pass changes nothing"
+        );
+        t.close(2, mine[0]).unwrap();
+        let adopted = t.call(2, 900, p::adopt).unwrap();
+        assert_eq!(word(&adopted, 0), f);
+        assert_eq!(t.server.pass_count(), 0);
+        t.close(1, f).unwrap();
+        t.close(2, f).unwrap();
+        assert_eq!(t.server.open_count(), p::HELD_MAX - 1);
+    }
+
+    #[test]
+    fn close_all_closes_shared_files_and_orphans_once_each() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        let a1 = t.open(1, b"/f", RW);
+        let _a2 = t.open(2, b"/f", RW);
+        let g = t.open(1, b"/g", RW);
+        t.fill(1, g, &bytes(30000, 3));
+        let birth = t.call(1, 700, |w| p::clone(&[a1, g], w)).unwrap();
+        let _ = birth;
+        t.write(1, a1, b"kept");
+        t.path(3, p::Method::Unlink, b"/g").unwrap();
+        t.call(1, 800, |w| p::handle_call(p::Method::Export, g, w))
+            .unwrap();
+        assert_eq!(t.server.node_count(), 2);
+        assert_eq!(t.server.close_all(&mut t.fs), 0);
+        assert_eq!(
+            (
+                t.server.open_count(),
+                t.server.node_count(),
+                t.server.pass_count()
+            ),
+            (0, 0, 0)
+        );
+        // What was written reached the volume; the orphan is gone; nothing is left to recover.
+        assert_eq!(t.fs.stat(b"/f").unwrap().size, 4);
+        assert_eq!(server::recover_orphans(&mut t.fs), Ok(Recovered::default()));
+        assert_eq!(t.fs.stat(b"/g"), Err(Error::NoEntry));
+    }
+
+    #[test]
+    fn fstat_tells_a_link_count_and_the_orphans_dir_is_made_at_mount() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        server::ensure_orphans(&mut t.fs).unwrap();
+        server::ensure_orphans(&mut t.fs).unwrap();
+        assert!(t.fs.stat(b"/.orphans").is_ok());
+        let f = t.open(1, b"/f", RW);
+        let fstat = |t: &mut Rig<'_>| {
+            let r = t
+                .call(1, 0, |w| p::handle_call(p::Method::Fstat, f, w))
+                .unwrap();
+            (word(&r, 0), word(&r, 4), word(&r, 8))
+        };
+        t.write(1, f, b"abc");
+        assert_eq!(fstat(&mut t), (p::KIND_FILE, 3, 1));
+        t.path(2, p::Method::Unlink, b"/f").unwrap();
+        assert_eq!(fstat(&mut t), (p::KIND_FILE, 3, 0));
+        let d = t.open(1, b"/", p::DIRECTORY);
+        let r = t
+            .call(1, 0, |w| p::handle_call(p::Method::Fstat, d, w))
+            .unwrap();
+        assert_eq!((word(&r, 0), word(&r, 8)), (p::KIND_DIRECTORY, 1));
+    }
+
+    /// An orphan that cannot be removed (a directory that is not empty, which nothing makes) does
+    /// not stop the recovery of the entries after it.
+    #[test]
+    fn the_recovery_goes_on_past_an_entry_it_cannot_remove() {
+        let mut state = Storage::new();
+        let mut t = Rig::new(&mut state);
+        server::ensure_orphans(&mut t.fs).unwrap();
+        t.fs.mkdir(b"/.orphans/1").unwrap();
+        let f = written(&mut t.fs, b"/.orphans/1/inside", b"x");
+        t.fs.close(f).unwrap();
+        for name in [b"/.orphans/2", b"/.orphans/3"] {
+            let f = written(&mut t.fs, name, b"y");
+            t.fs.close(f).unwrap();
+        }
+        assert_eq!(
+            server::recover_orphans(&mut t.fs),
+            Ok(Recovered {
+                removed: 2,
+                restored: 0,
+                failed: 1
+            })
         );
     }
 }

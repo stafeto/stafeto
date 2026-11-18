@@ -23,7 +23,7 @@
 //! | FSYNC (6) | `handle` u32 | none |
 //! | TRUNCATE (7) | `handle` u32, `size` u64 | none |
 //! | STAT (8) | the path | `kind` u32, `size` u32 |
-//! | FSTAT (9) | `handle` u32 | `kind` u32, `size` u32 |
+//! | FSTAT (9) | `handle` u32 | `kind` u32, `size` u32, `nlink` u32 (1; 0 for a file that was unlinked while open) |
 //! | MKDIR (10), UNLINK (11), RMDIR (12) | the path | none |
 //! | RENAME (13) | `from_len` u32, the path `from`, the path `to` | none |
 //! | READDIR (14) | `handle` u32 | `more` u32, `kind` u32, `size` u32, the name |
@@ -31,7 +31,7 @@
 //! | STATFS (16) | none | `blocks` u64, `used` u64, `block` u32 |
 //! | PREAD (17) | `handle` u32, `count` u32, `offset` u64 | `count` u32, the bytes |
 //! | PWRITE (18) | `handle` u32, `offset` u64, the bytes | `count` u32 |
-//! | CLONE (19) | `count` u32 (0 to `CLONE_MAX`), then that many handles | `birth` u32, and one handle: a new session of the service (SEND, TRANSFER) that holds the descriptions, for a child process |
+//! | CLONE (19) | `count` u32 (1 to `CLONE_MAX`), then that many handles | `birth` u32, and one handle: a new session of the service (SEND, TRANSFER) that holds the descriptions, for a child process |
 //! | CLONE_MORE (20) | `birth` u32, `count` u32 (1 to `CLONE_MAX`), then the handles | none |
 //! | EXPORT (21) | `handle` u32 | one handle: a pass for the description (TRANSFER alone) |
 //! | ADOPT (22) | none, and one handle: a pass | `handle` u32, `kind` u32 |
@@ -40,12 +40,17 @@
 //!
 //! READ and WRITE use the position of the description and move it; PREAD and PWRITE take the
 //! position in the call and leave the description's alone. A description opened with APPEND (or
-//! given it by SET_FLAGS) writes every WRITE and PWRITE at the end of the file, and the end is taken
-//! when the write runs: two writers never overwrite each other. Descriptions of one path share one
+//! given it by SET_FLAGS) writes every WRITE at the end of the file, and the end is taken when the
+//! write runs: two writers never overwrite each other. PWRITE writes at its offset whatever the
+//! flag says (POSIX.1-2024; Linux appends). Descriptions of one path share one
 //! file, so a write through one is seen by a read through another at once. UNLINK of a file that is
 //! open and RENAME over one succeed: the open descriptions keep the old file, which goes when the
 //! last of them closes (the service keeps it under a hidden directory meanwhile and removes what a
-//! stop left at the next mount).
+//! stop left at the next mount; FSTAT then answers `nlink` 0). A RENAME over an open file takes two
+//! commits of the volume (the old target moves to the hidden directory, then the source moves):
+//! the target carries a mark with its home name between them, and the next mount puts a marked file
+//! whose home name is missing back, so after a cut of the power the old name or the new is there once
+//! the service has mounted again. The service never answers a request before that mount work is done.
 //!
 //! CLONE makes a session of the service for a child and gives it the descriptions listed (one
 //! reference each, and the position shared with the parent). `birth` names that session for
@@ -53,8 +58,12 @@
 //! the session holds already is passed over. EXPORT makes a pass that holds one reference of the
 //! description; ADOPT, sent by whoever holds the pass, spends it and gives the description to the
 //! sender's session (the reference of the pass becomes the session's). A pass whose last copy goes
-//! unspent gives its reference up. A session holds `HELD_MAX` descriptions at most, and a session
-//! makes at most `PASSES_MAX` passes at a time.
+//! unspent gives its reference up. A session holds `HELD_MAX` descriptions at most (TOO_MANY_OPEN).
+//! The sessions of one process tree (a client and the clones made from it, and theirs) share
+//! `ROOT_CLONES` live clones, `ROOT_DESCRIPTIONS` distinct descriptions and `PASSES_MAX` unspent
+//! passes; past them TOO_MANY_OPEN. A table of the service that is full as a whole answers
+//! TABLE_FULL. An ADOPT refused for either limit leaves the pass unspent, and the service gives
+//! the pass handle back in the reply.
 //!
 //! FSYNC makes the file's data and its place in the tree durable before it answers. MKDIR, UNLINK,
 //! RMDIR and RENAME are durable when they answer, and RENAME is one step: after a cut of the power the
@@ -80,8 +89,12 @@ pub const BLOCK: u32 = 4096;
 pub const HELD_MAX: usize = 6;
 /// The descriptions CLONE and CLONE_MORE carry at most.
 pub const CLONE_MAX: usize = HELD_MAX;
-/// The passes one session has made and not spent at once.
+/// The passes one process tree has made and not spent at once.
 pub const PASSES_MAX: usize = 4;
+/// The live clones of one process tree (the sessions made by CLONE under one client).
+pub const ROOT_CLONES: usize = 8;
+/// The distinct descriptions the sessions of one process tree hold together.
+pub const ROOT_DESCRIPTIONS: usize = 10;
 
 /// The flags of OPEN.
 pub const READ: u32 = 1;
@@ -127,8 +140,11 @@ pub const CORRUPT: u32 = 1215;
 pub const STALE: u32 = 1216;
 /// The caller's identity does not allow the operation (EACCES).
 pub const ACCESS: u32 = 1217;
+/// A table of the service as a whole is full (descriptions, open files, directories, sessions,
+/// passes): ENFILE. TOO_MANY_OPEN is a limit of the session or of its process tree: EMFILE.
+pub const TABLE_FULL: u32 = 1218;
 
-pub const CODES: [u32; 17] = [
+pub const CODES: [u32; 18] = [
     NO_ENTRY,
     EXISTS,
     NOT_DIRECTORY,
@@ -146,6 +162,7 @@ pub const CODES: [u32; 17] = [
     CORRUPT,
     STALE,
     ACCESS,
+    TABLE_FULL,
 ];
 
 pub const fn code(code: u32) -> Status {

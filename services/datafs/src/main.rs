@@ -17,6 +17,7 @@ mod worker;
 
 use abi::{Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
+use datafs::admit::{self, Adopt, Forgotten, Held};
 use proto_data::{METHODS as DATA_METHODS, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
@@ -115,8 +116,7 @@ fn main(_: u64) -> u64 {
         again,
         pending: [const { None }; JOBS],
         outgoing: [const { None }; JOBS],
-        forgotten: [0; FORGOTTEN],
-        forgotten_count: 0,
+        forgotten: Forgotten::new(),
         ready: false,
         since: 0,
     };
@@ -152,8 +152,11 @@ fn touch(base: *mut u8, len: usize) {
 
 const PAGE: usize = 4096;
 
-/// The labels whose close waits for a free job: the sessions, and the passes of EXPORT.
-const FORGOTTEN: usize = 2 * SESSIONS;
+/// The labels whose close waits for a free job: everything that can close while the table is full
+/// (`admit::closers`). A label that does not fit is lost, and with it a session's descriptions.
+const FORGOTTEN: usize = admit::closers(SESSIONS, datafs::server::PASSES, JOBS);
+const _: () = assert!(SESSIONS == datafs::server::SESSIONS);
+const _: () = assert!(FORGOTTEN >= SESSIONS + datafs::server::PASSES + 3 * JOBS);
 
 /// Bit 63 marks the labels the service gives itself (the clones of CLONE and the passes of
 /// EXPORT), which no label of init has; the rest is a count that is never used twice.
@@ -176,10 +179,9 @@ struct Datafs {
     pending: [Option<Pending>; JOBS],
     /// The handle a job's reply carries when the worker says yes: the session of CLONE, the pass of
     /// EXPORT. A job the worker refuses lets it go.
-    outgoing: [Option<Handle<Any>>; JOBS],
+    outgoing: [Option<(Held, Handle<Any>)>; JOBS],
     /// The labels that went while every job was in use: what they held closes when a job is free.
-    forgotten: [u64; FORGOTTEN],
-    forgotten_count: usize,
+    forgotten: Forgotten<FORGOTTEN>,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
     ready: bool,
     /// The instant the worker's start was over (0 while it is not), for the look at the oldest job.
@@ -248,16 +250,16 @@ impl Datafs {
     /// step; when more wait and jobs are free, the service tells itself again and the rest follow.
     fn close_forgotten(&mut self) {
         let mut queued = 0;
-        while self.forgotten_count > 0 {
+        while !self.forgotten.is_empty() {
             let Some(i) = self.free_job() else { return };
             if queued == SETTLE_AT_ONCE {
                 let _ = sys::notify(&self.again, 1);
                 return;
             }
             queued += 1;
-            self.forgotten_count -= 1;
-            let owner = self.forgotten[self.forgotten_count];
-            self.queue(i, GONE, owner, 0, &[]);
+            if let Some(owner) = self.forgotten.pop() {
+                self.queue(i, GONE, owner, 0, &[]);
+            }
         }
     }
 
@@ -272,21 +274,24 @@ impl Datafs {
     /// A free job for a request of `owner`: None when the table is full or the session has its share
     /// in flight (no session fills the table alone).
     fn job_for(&self, owner: u64) -> Option<usize> {
-        let i = self.free_job()?;
         let mine = (0..JOBS)
             .filter(|&j| state(j).load(Acquire) != FREE)
             // SAFETY: the owner is written before the job is QUEUED and stays until it is FREE.
             .filter(|&j| unsafe { (*job(j)).owner } == owner)
             .count();
-        (mine < SESSION_JOBS).then_some(i)
+        admit::job_for(self.free_job(), mine, SESSION_JOBS)
     }
 
     /// ADOPT: the handle of the request is a pass of the service; its label goes to the worker, which
-    /// knows the description. The pass is spent whatever the worker says, except that no free job
-    /// gives it back in the reply, so the client may ask again.
+    /// knows the description. The thread keeps the pass until the worker answers: a refusal for a
+    /// limit leaves the pass unspent and it goes back in the reply (`admit::carries`), and so does
+    /// the pass of a request that found no job free.
     fn adopt(&mut self, r: &mut Request<'_>) -> Answer {
-        if r.handles.len() != 1 {
-            return Answer::Status(Status::BadSize);
+        let owner = r.label();
+        let job = self.job_for(owner);
+        match admit::adopt_plan(r.handles.len(), job.is_some()) {
+            Adopt::BadSize => return Answer::Status(Status::BadSize),
+            Adopt::GiveBack | Adopt::Queue => {}
         }
         let Ok(pass) = r.handles.take::<Channel>(0) else {
             return Answer::Status(Status::Kernel(abi::Error::WrongType));
@@ -294,8 +299,7 @@ impl Datafs {
         let Ok(label) = sys::copy_label(&self.channel, &pass) else {
             return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
         };
-        let owner = r.label();
-        let Some(i) = self.job_for(owner) else {
+        let Some(i) = job else {
             if r.reply().u32(busy().code()).is_err() {
                 return Answer::Status(busy());
             }
@@ -305,9 +309,8 @@ impl Datafs {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         self.pending[i] = Some(pending);
+        self.outgoing[i] = Some((Held::Spent, pass.erase()));
         self.queue(i, REQUEST, owner, label, r.bytes());
-        // The pass closes with this step: its CLIENT_GONE queues a job after this one.
-        drop(pass);
         Answer::Deferred
     }
 
@@ -328,15 +331,15 @@ impl Datafs {
             sent += 1;
             // SAFETY: the job is DONE: the worker has finished with it.
             let job = unsafe { &*job(i) };
-            let handle = self.outgoing[i].take();
+            let held = self.outgoing[i].take();
             if let Some(pending) = self.pending[i].take() {
-                // The handle goes with a reply whose status is 0 and closes otherwise.
-                let said_yes = job.reply[..job.reply_len].get(..4) == Some(&[0; 4][..]);
-                let handles = match handle {
-                    Some(h) if said_yes => [h].into(),
+                // `admit::carries` says whether the handle goes with the reply or closes.
+                let reply = &job.reply[..job.reply_len];
+                let handles = match held {
+                    Some((how, h)) if admit::carries(how, reply) => [h].into(),
                     _ => Outgoing::new(),
                 };
-                let _ = pending.answer(&job.reply[..job.reply_len], handles);
+                let _ = pending.answer(reply, handles);
             }
             state(i).store(FREE, Release);
         }
@@ -367,11 +370,11 @@ impl Service<0> for Datafs {
         // The calls that bring or make a handle are the request thread's: a kernel call each, no disk.
         let (aux, handle) = match Method::from_number(r.method()) {
             Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER) {
-                Ok(made) => (made.0, Some(made.1)),
+                Ok(made) => (made.0, Some((Held::Made, made.1))),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },
             Some(Method::Export) => match self.make(Rights::TRANSFER) {
-                Ok(made) => (made.0, Some(made.1)),
+                Ok(made) => (made.0, Some((Held::Made, made.1))),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },
             _ => (0, None),
@@ -404,11 +407,11 @@ impl Service<0> for Datafs {
     fn closed(&mut self, label: u64) {
         match self.free_job() {
             Some(i) => self.queue(i, GONE, label, 0, &[]),
-            None if self.forgotten_count < FORGOTTEN => {
-                self.forgotten[self.forgotten_count] = label;
-                self.forgotten_count += 1;
+            None => {
+                // The size of the list covers every label that can close at once.
+                let kept = self.forgotten.push(label);
+                debug_assert!(kept);
             }
-            None => {}
         }
     }
 

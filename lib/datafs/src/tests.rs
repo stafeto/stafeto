@@ -458,12 +458,12 @@ fn a_backup_that_overlaps_the_new_end_is_not_taken_as_grown() {
 // when it returns, so the state after a cut is the state of `done` steps or of `done + 1`.
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Node {
+pub(crate) enum Node {
     Dir,
     File(Vec<u8>),
 }
 
-type Tree = BTreeMap<String, Node>;
+pub(crate) type Tree = BTreeMap<String, Node>;
 
 #[derive(Clone, Debug)]
 enum Step {
@@ -476,7 +476,7 @@ enum Step {
     Remove(String),
 }
 
-fn pattern(len: usize, salt: u8) -> Vec<u8> {
+pub(crate) fn pattern(len: usize, salt: u8) -> Vec<u8> {
     (0..len)
         .map(|i| {
             (i as u8)
@@ -569,7 +569,7 @@ fn run<D: Device>(fs: &mut Fs<'_, D>, step: &Step) -> Result<(), Error> {
     }
 }
 
-fn read_tree<D: Device>(fs: &mut Fs<'_, D>) -> Result<Tree, Error> {
+pub(crate) fn read_tree<D: Device>(fs: &mut Fs<'_, D>) -> Result<Tree, Error> {
     fn walk<D: Device>(fs: &mut Fs<'_, D>, dir: &str, out: &mut Tree) -> Result<(), Error> {
         let d = fs.opendir(if dir.is_empty() { b"/" } else { dir.as_bytes() })?;
         let mut entries = Vec::new();

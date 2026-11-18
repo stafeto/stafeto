@@ -420,16 +420,30 @@ fn say_foreign(found: &Found) {
 
 /// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
 fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
-    // The epoch of this instance, in every handle it gives: a handle of an earlier instance
-    // answers STALE. The clock at the start differs from one instance to the next.
-    let mut server = Server::with_epoch((rt::time::now() >> 4) as u16);
+    // The mount work, before the first request: the hidden directory of the orphans, what a stop or
+    // a cut left in it, and the epoch of this instance, a count kept on the volume (the handles of
+    // an earlier instance answer STALE). Without a volume the epoch is the clock's.
+    let mut epoch = (rt::time::now() >> 4) as u32;
     if let Some(fs) = volume.as_mut() {
-        match datafs::server::clean_orphans(fs) {
-            Ok(0) => {}
-            Ok(n) => rt::println!("datafs: {n} files left by a stop removed"),
-            Err(_) => rt::println!("datafs: the orphans could not be cleaned"),
+        if datafs::server::ensure_orphans(fs).is_err() {
+            rt::println!("datafs: the directory of the orphans could not be made");
+        }
+        match datafs::server::recover_orphans(fs) {
+            Ok(done) if done.removed + done.restored + done.failed == 0 => {}
+            Ok(done) => rt::println!(
+                "datafs: orphans: {} removed, {} put back, {} left",
+                done.removed,
+                done.restored,
+                done.failed
+            ),
+            Err(_) => rt::println!("datafs: the orphans could not be dealt with"),
+        }
+        match datafs::server::bump_epoch(fs) {
+            Ok(count) => epoch = count,
+            Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
         }
     }
+    let mut server = Server::with_epoch(epoch);
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     loop {
         while let Some(i) = oldest() {
