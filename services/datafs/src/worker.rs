@@ -420,7 +420,16 @@ fn say_foreign(found: &Found) {
 
 /// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
 fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
-    let mut server = Server::new();
+    // The epoch of this instance, in every handle it gives: a handle of an earlier instance
+    // answers STALE. The clock at the start differs from one instance to the next.
+    let mut server = Server::with_epoch((rt::time::now() >> 4) as u16);
+    if let Some(fs) = volume.as_mut() {
+        match datafs::server::clean_orphans(fs) {
+            Ok(0) => {}
+            Ok(n) => rt::println!("datafs: {n} files left by a stop removed"),
+            Err(_) => rt::println!("datafs: the orphans could not be cleaned"),
+        }
+    }
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     loop {
         while let Some(i) = oldest() {
@@ -433,7 +442,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             let request = &job.request[..job.request_len];
             match (&mut volume, job.kind) {
                 (Some(fs), REQUEST) => {
-                    let reply = server.handle(fs, job.owner, request);
+                    let reply = server.handle(fs, job.owner, job.aux, request);
                     let bytes = reply.as_bytes();
                     job.reply[..bytes.len()].copy_from_slice(bytes);
                     job.reply_len = bytes.len();

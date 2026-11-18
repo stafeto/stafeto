@@ -793,7 +793,7 @@ mod served {
     ) -> Result<Vec<u8>, Status> {
         let mut w = Writer::new();
         build(&mut w).unwrap();
-        let reply = server.handle(fs, owner, w.as_bytes());
+        let reply = server.handle(fs, owner, 0, w.as_bytes());
         p::reply(reply.as_bytes()).map(|mut r| r.bytes(r.left()).unwrap().to_vec())
     }
 
@@ -890,18 +890,10 @@ mod served {
             p::handle_call(p::Method::Fsync, handle, w)
         })
         .unwrap();
-        // Another session cannot use the handle; the file in use cannot go.
+        // Another session cannot use the handle; a directory with a file in use cannot be renamed.
         assert_eq!(
             call(s, &mut fs, 2, |w| p::read(handle, 10, w)),
             Err(p::code(p::BAD_HANDLE))
-        );
-        assert_eq!(
-            call(s, &mut fs, 2, |w| p::path_call(
-                p::Method::Unlink,
-                b"/ssh/key",
-                w
-            )),
-            Err(p::code(p::BUSY))
         );
         assert_eq!(
             call(s, &mut fs, 2, |w| p::rename(b"/ssh", b"/other", w)),

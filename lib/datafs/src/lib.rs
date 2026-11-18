@@ -24,6 +24,8 @@ pub mod server;
 pub mod stop;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_open;
 pub mod volume;
 pub mod watch;
 

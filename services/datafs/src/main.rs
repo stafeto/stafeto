@@ -17,10 +17,10 @@ mod worker;
 
 use abi::{Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
-use proto_data::{METHODS as DATA_METHODS, VERSION};
+use proto_data::{METHODS as DATA_METHODS, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Channel, Outgoing, Process};
+use rt::handle::{Any, Channel, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, sys};
 use shared::*;
@@ -108,10 +108,14 @@ fn main(_: u64) -> u64 {
     rt::service::report_steps(17);
     let mut service = Datafs {
         parent: Handle::borrowed(s.parent.raw()),
+        channel: Handle::borrowed(channel.raw()),
+        level,
+        next_label: 1,
         kick,
         again,
         pending: [const { None }; JOBS],
-        forgotten: [0; SESSIONS],
+        outgoing: [const { None }; JOBS],
+        forgotten: [0; FORGOTTEN],
         forgotten_count: 0,
         ready: false,
         since: 0,
@@ -148,18 +152,33 @@ fn touch(base: *mut u8, len: usize) {
 
 const PAGE: usize = 4096;
 
+/// The labels whose close waits for a free job: the sessions, and the passes of EXPORT.
+const FORGOTTEN: usize = 2 * SESSIONS;
+
+/// Bit 63 marks the labels the service gives itself (the clones of CLONE and the passes of
+/// EXPORT), which no label of init has; the rest is a count that is never used twice.
+const OWN: u64 = 1 << 63;
+
 /// The finished jobs the main thread answers in one step; the rest follow in later steps.
 const SETTLE_AT_ONCE: usize = 4;
 
 struct Datafs {
     parent: core::mem::ManuallyDrop<Handle<Channel>>,
+    /// The service's own channel, for the labelled copies it gives away.
+    channel: core::mem::ManuallyDrop<Handle<Channel>>,
+    /// The priority of the slots of those copies: the thread's base priority.
+    level: u8,
+    next_label: u64,
     kick: Handle<Channel>,
     /// A notification of the service to itself with the label of the worker's.
     again: Handle<Channel>,
     /// The deferred reply of each job in flight.
     pending: [Option<Pending>; JOBS],
-    /// The sessions that went while every job was in use: their files close when a job is free.
-    forgotten: [u64; SESSIONS],
+    /// The handle a job's reply carries when the worker says yes: the session of CLONE, the pass of
+    /// EXPORT. A job the worker refuses lets it go.
+    outgoing: [Option<Handle<Any>>; JOBS],
+    /// The labels that went while every job was in use: what they held closes when a job is free.
+    forgotten: [u64; FORGOTTEN],
     forgotten_count: usize,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
     ready: bool,
@@ -211,11 +230,12 @@ impl Datafs {
     }
 
     /// Fills job `i` and hands it to the worker.
-    fn queue(&mut self, i: usize, kind: u8, owner: u64, bytes: &[u8]) {
+    fn queue(&mut self, i: usize, kind: u8, owner: u64, aux: u64, bytes: &[u8]) {
         // SAFETY: the job is FREE: the worker does not touch it until it is QUEUED.
         let job = unsafe { &mut *job(i) };
         job.kind = kind;
         job.owner = owner;
+        job.aux = aux;
         job.request_len = bytes.len();
         job.request[..bytes.len()].copy_from_slice(bytes);
         job.ticket.store(next_ticket(), Release);
@@ -237,8 +257,58 @@ impl Datafs {
             queued += 1;
             self.forgotten_count -= 1;
             let owner = self.forgotten[self.forgotten_count];
-            self.queue(i, GONE, owner, &[]);
+            self.queue(i, GONE, owner, 0, &[]);
         }
+    }
+
+    /// A new label of the service's own and a copy of its channel that carries it, with `rights`.
+    fn make(&mut self, rights: Rights) -> Result<(u64, Handle<Any>), abi::Error> {
+        let label = OWN | self.next_label;
+        let copy = sys::handle_label(&self.channel, rights, label, self.level)?;
+        self.next_label += 1;
+        Ok((label, copy.erase()))
+    }
+
+    /// A free job for a request of `owner`: None when the table is full or the session has its share
+    /// in flight (no session fills the table alone).
+    fn job_for(&self, owner: u64) -> Option<usize> {
+        let i = self.free_job()?;
+        let mine = (0..JOBS)
+            .filter(|&j| state(j).load(Acquire) != FREE)
+            // SAFETY: the owner is written before the job is QUEUED and stays until it is FREE.
+            .filter(|&j| unsafe { (*job(j)).owner } == owner)
+            .count();
+        (mine < SESSION_JOBS).then_some(i)
+    }
+
+    /// ADOPT: the handle of the request is a pass of the service; its label goes to the worker, which
+    /// knows the description. The pass is spent whatever the worker says, except that no free job
+    /// gives it back in the reply, so the client may ask again.
+    fn adopt(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(pass) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::Kernel(abi::Error::WrongType));
+        };
+        let Ok(label) = sys::copy_label(&self.channel, &pass) else {
+            return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
+        };
+        let owner = r.label();
+        let Some(i) = self.job_for(owner) else {
+            if r.reply().u32(busy().code()).is_err() {
+                return Answer::Status(busy());
+            }
+            return Answer::Reply([pass.erase()].into());
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        self.pending[i] = Some(pending);
+        self.queue(i, REQUEST, owner, label, r.bytes());
+        // The pass closes with this step: its CLIENT_GONE queues a job after this one.
+        drop(pass);
+        Answer::Deferred
     }
 
     /// Sends the reply of every finished job and frees it.
@@ -258,8 +328,15 @@ impl Datafs {
             sent += 1;
             // SAFETY: the job is DONE: the worker has finished with it.
             let job = unsafe { &*job(i) };
+            let handle = self.outgoing[i].take();
             if let Some(pending) = self.pending[i].take() {
-                let _ = pending.answer(&job.reply[..job.reply_len], Outgoing::new());
+                // The handle goes with a reply whose status is 0 and closes otherwise.
+                let said_yes = job.reply[..job.reply_len].get(..4) == Some(&[0; 4][..]);
+                let handles = match handle {
+                    Some(h) if said_yes => [h].into(),
+                    _ => Outgoing::new(),
+                };
+                let _ = pending.answer(&job.reply[..job.reply_len], handles);
             }
             state(i).store(FREE, Release);
         }
@@ -279,14 +356,32 @@ impl Service<0> for Datafs {
         if STOPPING.load(Acquire) {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
-        let Some(i) = self.free_job() else {
+        // ADOPT first: a refusal for want of a job gives the pass back.
+        if Method::from_number(r.method()) == Some(Method::Adopt) {
+            return self.adopt(r);
+        }
+        let owner = r.label();
+        let Some(i) = self.job_for(owner) else {
             return Answer::Status(busy());
+        };
+        // The calls that bring or make a handle are the request thread's: a kernel call each, no disk.
+        let (aux, handle) = match Method::from_number(r.method()) {
+            Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER) {
+                Ok(made) => (made.0, Some(made.1)),
+                Err(e) => return Answer::Status(Status::Kernel(e)),
+            },
+            Some(Method::Export) => match self.make(Rights::TRANSFER) {
+                Ok(made) => (made.0, Some(made.1)),
+                Err(e) => return Answer::Status(Status::Kernel(e)),
+            },
+            _ => (0, None),
         };
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         self.pending[i] = Some(pending);
-        self.queue(i, REQUEST, r.label(), r.bytes());
+        self.outgoing[i] = handle;
+        self.queue(i, REQUEST, owner, aux, r.bytes());
         Answer::Deferred
     }
 
@@ -299,11 +394,17 @@ impl Service<0> for Datafs {
                 && unsafe { (*job(i)).owner } == label;
             if mine {
                 self.pending[i] = None;
+                self.outgoing[i] = None;
             }
         }
+    }
+
+    /// The last copy of the handle of `label` went, whether it had a session or not (a session, a
+    /// clone's or a client's, or a pass): what it held closes in a job of the worker.
+    fn closed(&mut self, label: u64) {
         match self.free_job() {
-            Some(i) => self.queue(i, GONE, label, &[]),
-            None if self.forgotten_count < SESSIONS => {
+            Some(i) => self.queue(i, GONE, label, 0, &[]),
+            None if self.forgotten_count < FORGOTTEN => {
                 self.forgotten[self.forgotten_count] = label;
                 self.forgotten_count += 1;
             }
