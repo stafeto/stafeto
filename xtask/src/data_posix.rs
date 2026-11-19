@@ -15,7 +15,8 @@
 //! A caller at 31 on one CPU is not staged here.
 
 use crate::{
-    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, Variant, build, build_boot_image, qemu, run_until,
+    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, Variant, build, qemu, run_until,
+    write_boot_image_files,
 };
 use std::path::PathBuf;
 
@@ -59,8 +60,74 @@ pub const PROGRAMS: [ImageProgram; 11] = [
     ),
 ];
 
-/// The checks of the probe, in the order it runs them: the line of each is `posix-data: <name> ok`.
-pub const CHECKS: [&str; 29] = [
+/// The modes of `cargo xtask data-posix`: each is an image of its own, with the role the C program
+/// runs (`STAFETO_DATA_POSIX_MODE`), its volume and its checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    /// The reading paths of a volume made offline.
+    Read,
+    /// The writing paths: creation, write, truncation, rename, removal, permissions, limits.
+    Write,
+    /// The cap of 1,024 directories (about 3 million reads of the volume).
+    Cap,
+    /// The volume filled to its reserve and emptied again (31,000 writes).
+    Full,
+}
+
+impl Mode {
+    /// The role of the C program and the name of the mode.
+    pub fn role(self) -> &'static str {
+        match self {
+            Mode::Read => "run",
+            Mode::Write => "write-run",
+            Mode::Cap => "cap-run",
+            Mode::Full => "full-run",
+        }
+    }
+
+    fn image(self) -> &'static str {
+        match self {
+            Mode::Read => "boot-data-posix.img",
+            Mode::Write => "boot-data-posix-write.img",
+            Mode::Cap => "boot-data-posix-cap.img",
+            Mode::Full => "boot-data-posix-full.img",
+        }
+    }
+
+    /// The checks of the mode, in the order the probe runs them: the line of each is `posix-data:
+    /// <name> ok`.
+    pub fn checks(self) -> &'static [&'static str] {
+        match self {
+            Mode::Read => &READ_CHECKS,
+            Mode::Write => &WRITE_CHECKS,
+            Mode::Cap => &["directory cap"],
+            Mode::Full => &["enospc at the reserve then unlink"],
+        }
+    }
+
+    fn passed(self) -> &'static str {
+        match self {
+            Mode::Read => "posix-data: read checks passed",
+            Mode::Write => "posix-data: write checks passed",
+            Mode::Cap => "posix-data: cap checks passed",
+            Mode::Full => "posix-data: full checks passed",
+        }
+    }
+
+    /// The seconds the boot may take: the reads of the volume dominate the long modes (the cap: about
+    /// 3 million reads, the reserve: 31,000 messages of 1,012 bytes at about 1.4 ms each).
+    fn limit(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Mode::Read => 180,
+            Mode::Write => 20 * 60,
+            Mode::Cap => 40 * 60,
+            Mode::Full => 20 * 60,
+        })
+    }
+}
+
+/// The checks of the read role.
+pub const READ_CHECKS: [&str; 28] = [
     "read pub whole",
     "pread",
     "lseek",
@@ -85,22 +152,45 @@ pub const CHECKS: [&str; 29] = [
     "clofork stays with the parent",
     "set-ID program reads the descriptor",
     "real and effective access",
-    "writes refused",
     "datax is the RAM service",
     "errno for bad paths",
     "statvfs",
     "realpath",
 ];
 
+/// The checks of the write role.
+pub const WRITE_CHECKS: [&str; 20] = [
+    "create with umask 027",
+    "create owner is the effective uid",
+    "write pwrite and read back",
+    "O_APPEND from two processes 2000 lines",
+    "fork shares the write position",
+    "ftruncate grows with zeros",
+    "fsync returns",
+    "unlink while open reads on",
+    "rename over an open file",
+    "rename of directories and across",
+    "rmdir non-empty and cwd",
+    "times and chmod of an open file",
+    "chown by 1000",
+    "sticky directory",
+    "a non-owner cannot write",
+    "setuid then write",
+    "set-ID program writes through the descriptor",
+    "fsize EFBIG and SIGXFSZ",
+    "link symlink lock and exec refused",
+    "scm_rights passes a data descriptor",
+];
+
 const PREFIX: &str = "posix-data: ";
-const PASSED: &str = "posix-data: read checks passed";
 
 /// Reads the lines of the probe. Each check has exactly one line `ok`, in the order of `CHECKS`
 /// (the lines of the children, which print nothing but a failure, may stand between them); no line
 /// says a check failed; the line of the end comes once, after every check. The lines come glued to
 /// the kernel's and the services' lines, so the text is looked for inside the line.
-pub fn read_lines(lines: &[String]) -> Result<(), String> {
+pub fn read_lines(lines: &[String], mode: Mode) -> Result<(), String> {
     registered(lines)?;
+    let (checks, passed) = (mode.checks(), mode.passed());
     let mine: Vec<&str> = lines
         .iter()
         .filter_map(|l| l.find(PREFIX).map(|at| &l[at..]))
@@ -113,11 +203,11 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
     }
     let mut next = 0;
     for line in &mine {
-        if *line == PASSED {
-            if next != CHECKS.len() {
+        if *line == passed {
+            if next != checks.len() {
                 return Err(format!(
                     "the end came after {next} of {} checks",
-                    CHECKS.len()
+                    checks.len()
                 ));
             }
             next = usize::MAX;
@@ -132,7 +222,7 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
         if next == usize::MAX {
             return Err(format!("a line after the end: {line:?}"));
         }
-        match CHECKS.get(next) {
+        match checks.get(next) {
             Some(expected) if *expected == name => next += 1,
             Some(expected) => {
                 return Err(format!(
@@ -145,12 +235,12 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
     }
     match next {
         usize::MAX => Ok(()),
-        n if n < CHECKS.len() => Err(format!(
+        n if n < checks.len() => Err(format!(
             "the probe stopped after {n} of {} checks: the next is {:?}",
-            CHECKS.len(),
-            CHECKS[n]
+            checks.len(),
+            checks[n]
         )),
-        _ => Err(format!("no line {PASSED:?}")),
+        _ => Err(format!("no line {passed:?}")),
     }
 }
 
@@ -199,23 +289,49 @@ const DISK_BYTES: u64 = 64 << 20;
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
 
-/// `cargo xtask data-posix`.
-pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
+/// `cargo xtask data-posix [write|cap|full]`.
+pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None => probe(Mode::Read, machine),
+        Some("write") if args.len() == 1 => probe(Mode::Write, machine),
+        Some("cap") if args.len() == 1 => probe(Mode::Cap, machine),
+        Some("full") if args.len() == 1 => probe(Mode::Full, machine),
+        Some(other) => Err(format!(
+            "data-posix [write|cap|full]: unknown argument {other}"
+        )),
+    }
+}
+
+/// One mode: the image with the role of the mode, a volume made offline, QEMU until the probe ends,
+/// and the lines read.
+pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-data-posix.img", &PROGRAMS, BOOT_PROFILE)?;
-    let disk =
-        Disk(std::env::temp_dir().join(format!("stafeto-data-posix-{}.img", std::process::id())));
+    let image = write_boot_image_files(
+        mode.image(),
+        &PROGRAMS,
+        BOOT_PROFILE,
+        &[("STAFETO_DATA_POSIX_MODE", mode.role())],
+        Vec::new(),
+    )?;
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-data-posix-{}-{}.img",
+        std::process::id(),
+        mode.role()
+    )));
     crate::data_image::make_posix_volume(&disk.0, DISK_BYTES)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
-    let output = run_until(cmd, crate::BOOT_TIMEOUT * 6, Some(ENDS), &kernel.elf)?;
-    read_lines(&output.lines)?;
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?;
+    read_lines(&output.lines, mode)?;
     qemu::expect_stopped_on(&output, ENDED)?;
     println!(
-        "data-posix on {}: {} reading checks of /data in the POSIX layer over the data file service: ok",
+        "data-posix {:?} on {}: {} checks of /data in the POSIX layer over the data file service in {} s: ok",
+        mode,
         machine.name,
-        CHECKS.len()
+        mode.checks().len(),
+        started.elapsed().as_secs()
     );
     Ok(())
 }
@@ -225,30 +341,34 @@ mod tests {
     use super::*;
 
     fn good() -> Vec<String> {
+        good_of(Mode::Read)
+    }
+
+    fn good_of(mode: Mode) -> Vec<String> {
         let mut lines = vec![
             "init: starting".to_owned(),
             "datafs: root registered with the process service".to_owned(),
             "posix-abi: data: open /data/pub: step take_session status 0".to_owned(),
         ];
-        lines.extend(CHECKS.iter().map(|c| format!("posix-data: {c} ok")));
-        lines.push(PASSED.to_owned());
+        lines.extend(mode.checks().iter().map(|c| format!("posix-data: {c} ok")));
+        lines.push(mode.passed().to_owned());
         lines.push(ENDED.to_owned());
         lines
     }
 
     #[test]
     fn a_run_with_every_check_and_the_end_passes() {
-        assert_eq!(read_lines(&good()), Ok(()));
+        assert_eq!(read_lines(&good(), Mode::Read), Ok(()));
         // The lines come glued to another line's tail.
         let glued: Vec<String> = good().iter().map(|l| format!("[ 1.234] {l}")).collect();
-        assert_eq!(read_lines(&glued), Ok(()));
+        assert_eq!(read_lines(&glued, Mode::Read), Ok(()));
     }
 
     #[test]
     fn a_run_whose_root_was_not_registered_fails_early_and_says_what_the_service_said() {
         let mut none = good();
         none.retain(|l| !l.contains("root registered"));
-        let error = read_lines(&none).unwrap_err();
+        let error = read_lines(&none, Mode::Read).unwrap_err();
         assert!(error.contains("root was not registered") && error.contains("printed no line"));
         let mut refused = none.clone();
         refused.insert(
@@ -257,71 +377,121 @@ mod tests {
                 .to_owned(),
         );
         assert!(
-            read_lines(&refused)
+            read_lines(&refused, Mode::Read)
                 .unwrap_err()
                 .contains("no notary session")
         );
         let mut late = good();
         late[1] = "datafs: root registered after 3 failed attempts".to_owned();
-        assert_eq!(read_lines(&late), Ok(()));
+        assert_eq!(read_lines(&late, Mode::Read), Ok(()));
     }
 
     #[test]
     fn a_failed_check_a_missing_check_and_a_missing_end_are_refused() {
         let mut failed = good();
         failed[5] = "posix-data: stat pub FAILED".to_owned();
-        assert!(read_lines(&failed).unwrap_err().contains("stat pub FAILED"));
+        assert!(
+            read_lines(&failed, Mode::Read)
+                .unwrap_err()
+                .contains("stat pub FAILED")
+        );
         let mut line = good();
         line.insert(
             6,
             "posix-data: check failed at line 99: st.st_size == 5000 (errno 0)".to_owned(),
         );
-        assert!(read_lines(&line).unwrap_err().contains("check failed"));
+        assert!(
+            read_lines(&line, Mode::Read)
+                .unwrap_err()
+                .contains("check failed")
+        );
         let mut summary = good();
         summary.insert(2, "posix-data: 2 checks failed".to_owned());
-        assert!(read_lines(&summary).is_err());
+        assert!(read_lines(&summary, Mode::Read).is_err());
         let mut missing = good();
         missing.remove(7);
-        assert!(read_lines(&missing).is_err());
+        assert!(read_lines(&missing, Mode::Read).is_err());
         let mut no_end = good();
-        no_end.retain(|l| l != PASSED);
-        assert!(read_lines(&no_end).unwrap_err().contains("no line"));
+        no_end.retain(|l| l != Mode::Read.passed());
+        assert!(
+            read_lines(&no_end, Mode::Read)
+                .unwrap_err()
+                .contains("no line")
+        );
         let mut cut = good();
         cut.truncate(12);
-        assert!(read_lines(&cut).unwrap_err().contains("stopped after"));
+        assert!(
+            read_lines(&cut, Mode::Read)
+                .unwrap_err()
+                .contains("stopped after")
+        );
     }
 
     #[test]
     fn a_repeat_a_swap_an_extra_line_and_an_early_end_are_refused() {
         let mut repeat = good();
         repeat.insert(5, "posix-data: read pub whole ok".to_owned());
-        assert!(read_lines(&repeat).is_err());
+        assert!(read_lines(&repeat, Mode::Read).is_err());
         let mut swapped = good();
         swapped.swap(4, 5);
-        assert!(read_lines(&swapped).is_err());
+        assert!(read_lines(&swapped, Mode::Read).is_err());
         let mut extra = good();
-        let end = extra.iter().position(|l| l == PASSED).unwrap();
+        let end = extra.iter().position(|l| l == Mode::Read.passed()).unwrap();
         extra.insert(end, "posix-data: something else ok".to_owned());
-        assert!(read_lines(&extra).is_err());
+        assert!(read_lines(&extra, Mode::Read).is_err());
         let mut early = good();
-        let end = early.iter().position(|l| l == PASSED).unwrap();
+        let end = early.iter().position(|l| l == Mode::Read.passed()).unwrap();
         let last = early.remove(end - 1);
         early.insert(end, last);
-        assert!(read_lines(&early).is_err());
+        assert!(read_lines(&early, Mode::Read).is_err());
         let mut after = good();
         after.insert(after.len() - 1, "posix-data: stat pub ok".to_owned());
-        assert!(read_lines(&after).is_err());
+        assert!(read_lines(&after, Mode::Read).is_err());
     }
 
     #[test]
-    fn the_list_of_checks_is_the_one_of_the_c_probe() {
+    fn every_mode_passes_and_each_has_its_own_end() {
+        for mode in [Mode::Read, Mode::Write, Mode::Cap, Mode::Full] {
+            assert_eq!(read_lines(&good_of(mode), mode), Ok(()), "{mode:?}");
+            // The end of another mode is not the end of this one.
+            let mut other = good_of(mode);
+            let end = other.iter().position(|l| l == mode.passed()).unwrap();
+            other[end] = Mode::Read.passed().replace("read", "wrong");
+            assert!(read_lines(&other, mode).is_err(), "{mode:?}");
+        }
+        // A write run read as a read run has the wrong first check.
+        assert!(read_lines(&good_of(Mode::Write), Mode::Read).is_err());
+    }
+
+    /// The names the function `role` of data.c passes to `run_check`.
+    fn checks_of_function(source: &str, role: &str) -> Vec<String> {
+        let at = source
+            .find(&format!("static int {role}(void) {{"))
+            .unwrap_or_else(|| panic!("data.c has no {role}"));
+        let body = &source[at..];
+        let end = body.find("\n}\n").unwrap();
+        body[..end]
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("run_check(\""))
+            .map(|rest| rest.split('"').next().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_lists_of_checks_are_the_ones_of_the_c_probe() {
         let source = include_str!("../../tests/posix-data/data.c");
-        for check in CHECKS {
-            assert!(
-                source.contains(&format!("run_check(\"{check}\"")),
-                "{check} is not run by data.c"
+        for (role, mode) in [
+            ("first", Mode::Read),
+            ("write_run", Mode::Write),
+            ("cap_run", Mode::Cap),
+            ("full_run", Mode::Full),
+        ] {
+            let in_c = checks_of_function(source, role);
+            assert_eq!(
+                in_c,
+                mode.checks(),
+                "{role} of data.c and the list of {mode:?}"
             );
         }
-        assert_eq!(source.matches("run_check(\"").count(), CHECKS.len());
     }
 }

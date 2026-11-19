@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=data.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
+    println!("cargo:rerun-if-env-changed=STAFETO_DATA_POSIX_MODE");
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
@@ -28,6 +29,13 @@ fn main() {
             let brew = PathBuf::from("/opt/homebrew/opt/llvm/bin");
             if brew.exists() { brew } else { PathBuf::new() }
         });
+    // The role the init-started launcher passes to the program: the image of each mode of
+    // `cargo xtask data-posix` names its own (`run`, `write-run`, ...).
+    let mode = env::var("STAFETO_DATA_POSIX_MODE").unwrap_or_else(|_| "run".to_owned());
+    assert!(
+        mode.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+        "STAFETO_DATA_POSIX_MODE {mode:?} is a role name"
+    );
     let target = env::var("TARGET").expect("Cargo sets TARGET");
     assert_eq!(
         target, "aarch64-unknown-none",
@@ -60,6 +68,7 @@ fn main() {
             "-isystem",
         ])
         .arg(sysroot.join("include"))
+        .arg(format!("-DDATA_POSIX_MODE=\"{mode}\""))
         .args(["-c", "data.c", "-o"])
         .arg(out.join("data.o")));
     run(Command::new(tools.join("llvm-ar"))

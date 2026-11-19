@@ -2881,7 +2881,7 @@ fn main() {
         Some("posix-random-net-two") => entropy::random_net_two(false),
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
-        Some("data-posix") => data_posix::probe(&qemu::VIRT),
+        Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
@@ -11002,7 +11002,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             entropy::random_net_two(true)
         }),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
-        job("data-posix", || data_posix::probe(&qemu::VIRT)),
+        job("data-posix", || {
+            data_posix::probe(data_posix::Mode::Read, &qemu::VIRT)
+        }),
+        job("data-posix write", || {
+            data_posix::probe(data_posix::Mode::Write, &qemu::VIRT)
+        }),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and

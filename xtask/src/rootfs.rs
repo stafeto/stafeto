@@ -2456,7 +2456,14 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-data-posix.img" => {
+        "boot-data-posix.img"
+        | "boot-data-posix-write.img"
+        | "boot-data-posix-cap.img"
+        | "boot-data-posix-full.img"
+        | "boot-data-posix-crash.img"
+        | "boot-data-posix-verify.img"
+        | "boot-data-posix-restart.img"
+        | "boot-data-posix-throughput.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-data", 0o755, ROOT, "posix-data"),
@@ -3406,6 +3413,13 @@ mod tests {
             "boot-posix-random-rejoin-steps.img",
             "boot-posix-display.img",
             "boot-data-posix.img",
+            "boot-data-posix-write.img",
+            "boot-data-posix-cap.img",
+            "boot-data-posix-full.img",
+            "boot-data-posix-crash.img",
+            "boot-data-posix-verify.img",
+            "boot-data-posix-restart.img",
+            "boot-data-posix-throughput.img",
             "boot-posix-window.img",
             "boot-pkg-slot.img",
             "boot-display.img",

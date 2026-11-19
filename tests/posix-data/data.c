@@ -42,6 +42,10 @@
 
 extern char **environ;
 
+#ifndef DATA_POSIX_MODE
+#define DATA_POSIX_MODE "run"
+#endif
+
 #define DATA_TIME 1700000000L
 #define DATA_MANY 300
 
@@ -525,30 +529,6 @@ static int real_and_effective_access(void) {
     return 0;
 }
 
-static int writes_are_refused(void) {
-    int fd;
-    errno = 0;
-    DATA_CHECK(open("/data/pub", O_WRONLY) == -1 && errno == EROFS);
-    errno = 0;
-    DATA_CHECK(open("/data/pub", O_RDWR) == -1 && errno == EROFS);
-    errno = 0;
-    DATA_CHECK(open("/data/newfile", O_WRONLY | O_CREAT, 0644) == -1 && errno == EROFS);
-    fd = open("/data/pub", O_RDONLY);
-    DATA_CHECK(fd >= 0);
-    errno = 0;
-    DATA_CHECK(write(fd, "x", 1) == -1 && errno == EBADF);
-    DATA_CHECK(close(fd) == 0);
-    errno = 0;
-    DATA_CHECK(mkdir("/data/newdir", 0755) == -1 && errno == EROFS);
-    errno = 0;
-    DATA_CHECK(unlink("/data/pub") == -1 && errno == EROFS);
-    errno = 0;
-    DATA_CHECK(chmod("/data/pub", 0600) == -1 && errno == EROFS);
-    struct stat st;
-    DATA_CHECK(stat("/data/pub", &st) == 0 && (st.st_mode & 07777) == 0644 && st.st_size == 5000);
-    return 0;
-}
-
 static int datax_is_the_ram_service(void) {
     struct stat st, here;
     if (mkdir("/datax", 0755) != 0) DATA_CHECK(errno == EEXIST);
@@ -627,6 +607,715 @@ static void run_check(const char *name, int (*check)(void)) {
     }
 }
 
+/* ---- the checks of the write role (a volume made writable by the layer's write paths) ---- */
+
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <time.h>
+
+typedef int (*body_fn)(void);
+
+/* Runs `body` in a child that has changed its ids first (group first, then user): 0 when the body
+ * returned 0, the code it ended with otherwise. The child prints its own failures. */
+static int as_ids(unsigned uid, unsigned gid, body_fn body) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (setgid(gid) != 0 || setuid(uid) != 0) _exit(90);
+        _exit(body() == 0 ? 0 : 31);
+    }
+    return wait_ok(pid);
+}
+
+static void pause_ms(unsigned ms) {
+    struct timespec t = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+    nanosleep(&t, NULL);
+}
+
+/* Fills buf with `n` bytes of the write pattern of `salt` from `offset`. */
+static void make_pattern(unsigned char *buf, unsigned long offset, unsigned long n, unsigned salt) {
+    for (unsigned long i = 0; i < n; i++) buf[i] = pattern_at(salt, offset + i);
+}
+
+/* Writes the whole of `n` pattern bytes through `fd` (in as many calls as the layer needs). */
+static int write_pattern(int fd, unsigned long n, unsigned salt) {
+    unsigned char buf[3000];
+    unsigned long done = 0;
+    while (done < n) {
+        unsigned long k = n - done < sizeof buf ? n - done : sizeof buf;
+        make_pattern(buf, done, k, salt);
+        ssize_t w = write(fd, buf, k);
+        if (w <= 0) return -1;
+        done += (unsigned long)w;
+    }
+    return 0;
+}
+
+/* Whether the file at `path` is exactly `n` bytes of the pattern of `salt`. */
+static int file_is_pattern(const char *path, unsigned long n, unsigned salt) {
+    unsigned char buf[2048];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned long at = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r < 0) {
+            close(fd);
+            return 0;
+        }
+        if (r == 0) break;
+        if (!pattern_is(buf, at, (unsigned long)r, salt)) {
+            close(fd);
+            return 0;
+        }
+        at += (unsigned long)r;
+    }
+    close(fd);
+    return at == n;
+}
+
+static int umask_and_owner(void) {
+    struct stat st;
+    mode_t old = umask(027);
+    int fd = open("/data/w-umask", O_WRONLY | O_CREAT | O_EXCL, 0666);
+    umask(old);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    DATA_CHECK(stat("/data/w-umask", &st) == 0);
+    DATA_CHECK((st.st_mode & 07777) == 0640 && st.st_uid == 0 && st.st_gid == 0);
+    DATA_CHECK(S_ISREG(st.st_mode) && st.st_size == 0 && st.st_nlink == 1);
+    DATA_CHECK(unlink("/data/w-umask") == 0);
+    return 0;
+}
+
+static int create_as_user_body(void) {
+    struct stat st;
+    int fd = open("/data/w-shared/u", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    DATA_CHECK(stat("/data/w-shared/u", &st) == 0);
+    DATA_CHECK(st.st_uid == 1000 && st.st_gid == 100);
+    DATA_CHECK(mkdir("/data/w-shared/ud", 0755) == 0);
+    DATA_CHECK(stat("/data/w-shared/ud", &st) == 0 && st.st_uid == 1000 && S_ISDIR(st.st_mode));
+    return 0;
+}
+
+static int owner_from_the_effective_uid(void) {
+    DATA_CHECK(mkdir("/data/w-shared", 0777) == 0);
+    DATA_CHECK(chmod("/data/w-shared", 0777) == 0);
+    DATA_CHECK(as_ids(1000, 100, create_as_user_body) == 0);
+    DATA_CHECK(rmdir("/data/w-shared/ud") == 0 && unlink("/data/w-shared/u") == 0);
+    DATA_CHECK(rmdir("/data/w-shared") == 0);
+    return 0;
+}
+
+static int write_pwrite_and_read_back(void) {
+    unsigned char buf[100];
+    int fd = open("/data/w-rw", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    /* 5000 bytes in one call: several messages of the layer (1,012 bytes at most). */
+    unsigned char big[5000];
+    make_pattern(big, 0, sizeof big, 3);
+    DATA_CHECK(write(fd, big, sizeof big) == (ssize_t)sizeof big);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000);
+    make_pattern(buf, 0, sizeof buf, 9);
+    DATA_CHECK(pwrite(fd, buf, sizeof buf, 1000) == (ssize_t)sizeof buf);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000); /* pwrite leaves the position */
+    DATA_CHECK(close(fd) == 0);
+    unsigned char back[5000];
+    fd = open("/data/w-rw", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, back, sizeof back) == 5000);
+    DATA_CHECK(pattern_is(back, 0, 1000, 3));
+    DATA_CHECK(pattern_is(back + 1000, 0, 100, 9));
+    DATA_CHECK(pattern_is(back + 1100, 1100, 3900, 3));
+    DATA_CHECK(close(fd) == 0);
+    DATA_CHECK(unlink("/data/w-rw") == 0);
+    return 0;
+}
+
+#define APPEND_LINES 1000
+
+/* One process appends APPEND_LINES lines of a letter, each of about 60 bytes (one message). */
+static int append_lines(const char *path, char letter) {
+    int fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return 1;
+    for (int i = 0; i < APPEND_LINES; i++) {
+        char line[96];
+        int n = snprintf(line, sizeof line, "%c%04d-%.44s\n", letter, i,
+                         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ");
+        if (write(fd, line, (size_t)n) != n) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+static int append_from_two_processes(void) {
+    int fd = open("/data/w-append", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    char *argv[] = {"posix-data", "append-child", "B", NULL};
+    pid_t pid = 0;
+    DATA_CHECK(posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ) == 0);
+    DATA_CHECK(append_lines("/data/w-append", 'A') == 0);
+    DATA_CHECK(wait_ok(pid) == 0);
+    /* 2,000 lines of 56 bytes, whole: none cut by the other writer, each number once per letter. */
+    static unsigned char seen[2][APPEND_LINES];
+    memset(seen, 0, sizeof seen);
+    FILE *f = fopen("/data/w-append", "r");
+    DATA_CHECK(f != NULL);
+    char line[128];
+    int lines = 0;
+    while (fgets(line, sizeof line, f) != NULL) {
+        int number = 0;
+        if (strlen(line) != 56 || (line[0] != 'A' && line[0] != 'B') || line[5] != '-') {
+            printf("posix-data: a line is cut or mixed: %.60s\n", line);
+            fclose(f);
+            return 20;
+        }
+        for (int k = 1; k <= 4; k++) number = number * 10 + (line[k] - '0');
+        DATA_CHECK(number >= 0 && number < APPEND_LINES);
+        DATA_CHECK(!seen[line[0] == 'B'][number]);
+        seen[line[0] == 'B'][number] = 1;
+        lines++;
+    }
+    fclose(f);
+    DATA_CHECK(lines == 2 * APPEND_LINES);
+    DATA_CHECK(unlink("/data/w-append") == 0);
+    return 0;
+}
+
+static int fork_shares_the_write_position(void) {
+    int fd = open("/data/w-fork", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    unsigned char buf[100];
+    make_pattern(buf, 0, 100, 4);
+    DATA_CHECK(write(fd, buf, 100) == 100);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        make_pattern(buf, 100, 100, 4);
+        _exit(write(fd, buf, 100) == 100 && lseek(fd, 0, SEEK_CUR) == 200 ? 0 : 1);
+    }
+    DATA_CHECK(wait_ok(pid) == 0);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 200); /* the child's write moved ours */
+    make_pattern(buf, 200, 100, 4);
+    DATA_CHECK(write(fd, buf, 100) == 100);
+    DATA_CHECK(close(fd) == 0);
+    DATA_CHECK(file_is_pattern("/data/w-fork", 300, 4));
+    DATA_CHECK(unlink("/data/w-fork") == 0);
+    return 0;
+}
+
+static int ftruncate_grows_with_zeros(void) {
+    unsigned char buf[400];
+    int fd = open("/data/w-trunc", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write_pattern(fd, 300, 5) == 0);
+    DATA_CHECK(ftruncate(fd, 10000) == 0);
+    struct stat st;
+    DATA_CHECK(fstat(fd, &st) == 0 && st.st_size == 10000);
+    DATA_CHECK(pread(fd, buf, 400, 200) == 400);
+    DATA_CHECK(pattern_is(buf, 200, 100, 5));
+    for (int i = 100; i < 400; i++) DATA_CHECK(buf[i] == 0);
+    DATA_CHECK(ftruncate(fd, 150) == 0 && fstat(fd, &st) == 0 && st.st_size == 150);
+    DATA_CHECK(close(fd) == 0);
+    DATA_CHECK(truncate("/data/w-trunc", 20) == 0 && stat("/data/w-trunc", &st) == 0 && st.st_size == 20);
+    DATA_CHECK(file_is_pattern("/data/w-trunc", 20, 5));
+    /* O_TRUNC empties it; O_APPEND writes at the end whatever the position. */
+    fd = open("/data/w-trunc", O_WRONLY | O_TRUNC);
+    DATA_CHECK(fd >= 0 && fstat(fd, &st) == 0 && st.st_size == 0 && close(fd) == 0);
+    fd = open("/data/w-trunc", O_WRONLY | O_APPEND);
+    DATA_CHECK(fd >= 0 && write(fd, "abc", 3) == 3 && lseek(fd, 0, SEEK_SET) == 0 && write(fd, "def", 3) == 3);
+    DATA_CHECK(close(fd) == 0 && stat("/data/w-trunc", &st) == 0 && st.st_size == 6);
+    DATA_CHECK(unlink("/data/w-trunc") == 0);
+    return 0;
+}
+
+static int fsync_returns(void) {
+    int fd = open("/data/w-sync", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write_pattern(fd, 2000, 6) == 0);
+    DATA_CHECK(fsync(fd) == 0 && fdatasync(fd) == 0);
+    DATA_CHECK(close(fd) == 0 && file_is_pattern("/data/w-sync", 2000, 6));
+    int sync_fd = open("/data/w-sync", O_WRONLY | O_SYNC);
+    DATA_CHECK(sync_fd >= 0 && write(sync_fd, "x", 1) == 1 && close(sync_fd) == 0);
+    DATA_CHECK(unlink("/data/w-sync") == 0);
+    return 0;
+}
+
+static int unlink_while_open(void) {
+    unsigned char buf[200];
+    struct stat st;
+    int fd = open("/data/w-gone", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write_pattern(fd, 200, 7) == 0);
+    DATA_CHECK(unlink("/data/w-gone") == 0);
+    DATA_CHECK(fstat(fd, &st) == 0 && st.st_nlink == 0 && st.st_size == 200);
+    errno = 0;
+    DATA_CHECK(stat("/data/w-gone", &st) == -1 && errno == ENOENT);
+    DATA_CHECK(pread(fd, buf, 200, 0) == 200 && pattern_is(buf, 0, 200, 7));
+    DATA_CHECK(pwrite(fd, "tail", 4, 200) == 4);
+    DATA_CHECK(fstat(fd, &st) == 0 && st.st_size == 204);
+    DATA_CHECK(close(fd) == 0);
+    /* The name can be made anew, a new file. */
+    fd = open("/data/w-gone", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && fstat(fd, &st) == 0 && st.st_size == 0 && close(fd) == 0);
+    DATA_CHECK(unlink("/data/w-gone") == 0);
+    return 0;
+}
+
+static int rename_over_an_open_file(void) {
+    unsigned char buf[8];
+    int fd = open("/data/w-ra", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "oldbytes", 8) == 8);
+    int other = open("/data/w-rb", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(other >= 0 && write(other, "newbytes", 8) == 8 && close(other) == 0);
+    DATA_CHECK(rename("/data/w-rb", "/data/w-ra") == 0);
+    DATA_CHECK(pread(fd, buf, 8, 0) == 8 && memcmp(buf, "oldbytes", 8) == 0);
+    DATA_CHECK(close(fd) == 0);
+    fd = open("/data/w-ra", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read(fd, buf, 8) == 8 && memcmp(buf, "newbytes", 8) == 0);
+    DATA_CHECK(close(fd) == 0);
+    struct stat st;
+    errno = 0;
+    DATA_CHECK(stat("/data/w-rb", &st) == -1 && errno == ENOENT);
+    DATA_CHECK(unlink("/data/w-ra") == 0);
+    return 0;
+}
+
+static int rename_directories_and_across(void) {
+    struct stat st;
+    DATA_CHECK(mkdir("/data/w-d1", 0755) == 0 && mkdir("/data/w-d2", 0755) == 0);
+    int fd = open("/data/w-d1/f", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0);
+    DATA_CHECK(rename("/data/w-d1/f", "/data/w-d2/g") == 0);
+    errno = 0;
+    DATA_CHECK(stat("/data/w-d1/f", &st) == -1 && errno == ENOENT);
+    DATA_CHECK(stat("/data/w-d2/g", &st) == 0 && st.st_size == 1);
+    DATA_CHECK(rename("/data/w-d2", "/data/w-d3") == 0);
+    DATA_CHECK(stat("/data/w-d3/g", &st) == 0);
+    errno = 0;
+    DATA_CHECK(stat("/data/w-d2", &st) == -1 && errno == ENOENT);
+    /* A directory into its own subtree is EINVAL. */
+    errno = 0;
+    DATA_CHECK(rename("/data/w-d3", "/data/w-d3/inner") == -1 && errno == EINVAL);
+    /* Across the mount: the RAM file service is another file system. */
+    errno = 0;
+    DATA_CHECK(rename("/data/w-d3/g", "/tmp/w-moved") == -1 && errno == EXDEV);
+    errno = 0;
+    DATA_CHECK(rename("/tmp", "/data/w-tmp") == -1 && errno == EXDEV);
+    DATA_CHECK(unlink("/data/w-d3/g") == 0 && rmdir("/data/w-d3") == 0 && rmdir("/data/w-d1") == 0);
+    return 0;
+}
+
+static int rmdir_non_empty_and_cwd(void) {
+    char cwd[PATH_MAX];
+    DATA_CHECK(mkdir("/data/w-rm", 0755) == 0);
+    int fd = open("/data/w-rm/f", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(rmdir("/data/w-rm") == -1 && (errno == ENOTEMPTY || errno == EEXIST));
+    DATA_CHECK(unlink("/data/w-rm/f") == 0);
+    errno = 0;
+    DATA_CHECK(unlink("/data/w-rm") == -1 && errno == EISDIR);
+    DATA_CHECK(chdir("/data/w-rm") == 0);
+    errno = 0;
+    DATA_CHECK(rmdir("/data/w-rm") == -1 && errno == EBUSY); /* the current directory */
+    DATA_CHECK(getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/data/w-rm") == 0);
+    DATA_CHECK(chdir("/") == 0 && rmdir("/data/w-rm") == 0);
+    return 0;
+}
+
+static int times_and_chmod_of_an_open_file(void) {
+    struct stat before, after;
+    int fd = open("/data/w-times", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "abc", 3) == 3 && fsync(fd) == 0);
+    DATA_CHECK(fstat(fd, &before) == 0);
+    pause_ms(1100);
+    DATA_CHECK(write(fd, "def", 3) == 3 && fsync(fd) == 0 && fstat(fd, &after) == 0);
+    DATA_CHECK(after.st_mtime > before.st_mtime && after.st_ctime >= after.st_mtime);
+    before = after;
+    pause_ms(1100);
+    /* chmod 000: the description opened before keeps its right to write, ctime moves. */
+    DATA_CHECK(chmod("/data/w-times", 0000) == 0);
+    DATA_CHECK(write(fd, "ghi", 3) == 3);
+    DATA_CHECK(fstat(fd, &after) == 0 && (after.st_mode & 07777) == 0000);
+    DATA_CHECK(after.st_ctime > before.st_ctime);
+    errno = 0;
+    DATA_CHECK(open("/data/w-times", O_RDONLY) == 0 || errno == 0); /* root passes whatever the mode */
+    DATA_CHECK(close(fd) == 0 && unlink("/data/w-times") == 0);
+    return 0;
+}
+
+static int chown_by_user_body(void) {
+    int fd = open("/data/w-owned", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(chown("/data/w-owned", 2000, (gid_t)-1) == -1 && errno == EPERM);
+    DATA_CHECK(chown("/data/w-owned", (uid_t)-1, 100) == 0); /* its own group */
+    DATA_CHECK(chmod("/data/w-owned", 0600) == 0);
+    return 0;
+}
+
+static int chown_by_a_user_is_refused(void) {
+    DATA_CHECK(mkdir("/data/w-shared", 0777) == 0 && chmod("/data/w-shared", 0777) == 0);
+    DATA_CHECK(chmod("/data", 0777) == 0);
+    DATA_CHECK(as_ids(1000, 100, chown_by_user_body) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-owned", &st) == 0 && st.st_uid == 1000 && (st.st_mode & 07777) == 0600);
+    DATA_CHECK(unlink("/data/w-owned") == 0 && rmdir("/data/w-shared") == 0);
+    DATA_CHECK(chmod("/data", 0755) == 0);
+    return 0;
+}
+
+static int sticky_a_body(void) {
+    int fd = open("/data/w-sticky/a", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    return fd >= 0 && close(fd) == 0 ? 0 : 1;
+}
+
+static int sticky_b_body(void) {
+    errno = 0;
+    DATA_CHECK(unlink("/data/w-sticky/a") == -1 && errno == EPERM);
+    errno = 0;
+    DATA_CHECK(rename("/data/w-sticky/a", "/data/w-sticky/b") == -1 && errno == EPERM);
+    int fd = open("/data/w-sticky/b2", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    DATA_CHECK(unlink("/data/w-sticky/b2") == 0);
+    return 0;
+}
+
+static int sticky_directory(void) {
+    DATA_CHECK(mkdir("/data/w-sticky", 0777) == 0 && chmod("/data/w-sticky", 01777) == 0);
+    DATA_CHECK(as_ids(1000, 100, sticky_a_body) == 0);
+    DATA_CHECK(as_ids(2000, 200, sticky_b_body) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-sticky/a", &st) == 0); /* still there */
+    DATA_CHECK(unlink("/data/w-sticky/a") == 0 && rmdir("/data/w-sticky") == 0);
+    return 0;
+}
+
+static int other_user_cannot_write_body(void) {
+    errno = 0;
+    DATA_CHECK(open("/data/w-ro", O_WRONLY) == -1 && errno == EACCES);
+    errno = 0;
+    DATA_CHECK(open("/data/w-ro", O_RDWR | O_TRUNC) == -1 && errno == EACCES);
+    errno = 0;
+    DATA_CHECK(truncate("/data/w-ro", 0) == -1 && errno == EACCES);
+    int fd = open("/data/w-ro", O_RDONLY);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(open("/data/w-ro-dir/x", O_WRONLY | O_CREAT, 0644) == -1 && errno == EACCES);
+    errno = 0;
+    DATA_CHECK(unlink("/data/w-ro") == -1 && errno == EACCES);
+    return 0;
+}
+
+static int a_non_owner_cannot_write(void) {
+    int fd = open("/data/w-ro", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "keep", 4) == 4 && close(fd) == 0);
+    DATA_CHECK(mkdir("/data/w-ro-dir", 0755) == 0);
+    DATA_CHECK(as_ids(1000, 100, other_user_cannot_write_body) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-ro", &st) == 0 && st.st_size == 4);
+    DATA_CHECK(unlink("/data/w-ro") == 0 && rmdir("/data/w-ro-dir") == 0);
+    return 0;
+}
+
+static int setuid_then_write_body(void) {
+    int fd = open("/data/w-sw", O_WRONLY);
+    DATA_CHECK(fd >= 0);
+    DATA_CHECK(setuid(1000) == 0);
+    /* The description keeps the right it was opened with; a new open is checked by the new identity. */
+    DATA_CHECK(write(fd, "after", 5) == 5);
+    errno = 0;
+    DATA_CHECK(open("/data/w-sw", O_WRONLY) == -1 && errno == EACCES);
+    return 0;
+}
+
+static int setuid_then_write(void) {
+    int fd = open("/data/w-sw", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(setuid_then_write_body() == 0 ? 0 : 31);
+    DATA_CHECK(wait_ok(pid) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-sw", &st) == 0 && st.st_size == 5);
+    DATA_CHECK(unlink("/data/w-sw") == 0);
+    return 0;
+}
+
+static int child_write(char **argv) {
+    int fd = atoi(argv[2]);
+    return write(fd, "from the child", 14) == 14 ? 0 : 6;
+}
+
+static int setid_program_writes_through_a_descriptor(void) {
+    int fd = open("/data/w-suid", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    char fdtext[16];
+    snprintf(fdtext, sizeof fdtext, "%d", fd);
+    char *argv[] = {"posix-data", "child-write", fdtext, NULL};
+    pid_t pid = 0;
+    DATA_CHECK(posix_spawn(&pid, "/bin/posix-data-suid", NULL, NULL, argv, environ) == 0);
+    DATA_CHECK(wait_ok(pid) == 0);
+    DATA_CHECK(close(fd) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-suid", &st) == 0 && st.st_size == 14);
+    DATA_CHECK(unlink("/data/w-suid") == 0);
+    return 0;
+}
+
+static volatile sig_atomic_t fsize_signals;
+
+static void on_fsize(int sig) {
+    (void)sig;
+    fsize_signals++;
+}
+
+static int fsize_body(void) {
+    struct rlimit limit = {1000, 1000};
+    unsigned char buf[600];
+    DATA_CHECK(signal(SIGXFSZ, on_fsize) != SIG_ERR);
+    DATA_CHECK(setrlimit(RLIMIT_FSIZE, &limit) == 0);
+    int fd = open("/data/w-fsize", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    make_pattern(buf, 0, sizeof buf, 8);
+    DATA_CHECK(write(fd, buf, 600) == 600);
+    DATA_CHECK(write(fd, buf, 600) == 400); /* the part that fits */
+    errno = 0;
+    DATA_CHECK(write(fd, buf, 100) == -1 && errno == EFBIG);
+    DATA_CHECK(fsize_signals >= 1);
+    struct stat st;
+    DATA_CHECK(fstat(fd, &st) == 0 && st.st_size == 1000);
+    DATA_CHECK(close(fd) == 0);
+    return 0;
+}
+
+static int fsize_efbig_and_sigxfsz(void) {
+    DATA_CHECK(as_ids(0, 0, fsize_body) == 0);
+    DATA_CHECK(unlink("/data/w-fsize") == 0);
+    return 0;
+}
+
+static int refused_forms(void) {
+    int fd = open("/data/w-links", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    errno = 0;
+    DATA_CHECK(link("/data/w-links", "/data/w-links2") == -1 && errno == EMLINK);
+    errno = 0;
+    DATA_CHECK(symlink("/data/w-links", "/data/w-sym") == -1 && errno == EPERM);
+    errno = 0;
+    DATA_CHECK(mkfifo("/data/w-fifo", 0644) == -1 && errno == EPERM);
+    struct flock lock;
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    errno = 0;
+    DATA_CHECK(fcntl(fd, F_SETLK, &lock) == -1 && errno == ENOLCK);
+    DATA_CHECK(close(fd) == 0);
+    errno = 0;
+    char *argv[] = {"w-links", NULL};
+    DATA_CHECK(execv("/data/w-links", argv) == -1 && errno == EACCES);
+    errno = 0;
+    DATA_CHECK(access("/data/w-links", X_OK) == -1 && errno == EACCES);
+    DATA_CHECK(unlink("/data/w-links") == 0);
+    return 0;
+}
+
+static int child_scm(int sock) {
+    char data;
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {&data, 1};
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof control;
+    if (recvmsg(sock, &msg, 0) != 1) return 1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) return 2;
+    int fd;
+    memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    char head[4];
+    if (pread(fd, head, 4, 0) != 4 || memcmp(head, "AAAA", 4) != 0) return 3;
+    return write(fd, "BBBB", 4) == 4 ? 0 : 4; /* the position is shared: after the parent's bytes */
+}
+
+static int scm_rights_of_a_data_descriptor(void) {
+    int pair[2];
+    DATA_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    int fd = open("/data/w-scm", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "AAAA", 4) == 4);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pair[0]);
+        _exit(child_scm(pair[1]));
+    }
+    close(pair[1]);
+    char data = 'x';
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {&data, 1};
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    memset(control, 0, sizeof control);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof control;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    DATA_CHECK(sendmsg(pair[0], &msg, 0) == 1);
+    DATA_CHECK(wait_ok(pid) == 0);
+    DATA_CHECK(close(pair[0]) == 0);
+    unsigned char back[8];
+    DATA_CHECK(pread(fd, back, 8, 0) == 8 && memcmp(back, "AAAABBBB", 8) == 0);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 8);
+    DATA_CHECK(close(fd) == 0 && unlink("/data/w-scm") == 0);
+    return 0;
+}
+
+/* MKDIR is ENOSPC at the 1,024 directories of a volume (the root and the hidden directory among
+ * them), and passes again after a removal. */
+static int directory_cap(void) {
+    int made = 0;
+    char name[40];
+    DATA_CHECK(mkdir("/data/w-cap", 0755) == 0);
+    for (;; made++) {
+        snprintf(name, sizeof name, "/data/w-cap/d%d", made);
+        if (mkdir(name, 0755) != 0) break;
+    }
+    int refused = errno;
+    printf("posix-data: the directory cap came after %d more directories (errno %d)\n", made, refused);
+    DATA_CHECK(refused == ENOSPC);
+    DATA_CHECK(made > 900 && made < 1024);
+    /* Files and removals pass at the cap of directories; a removal makes room for one MKDIR. */
+    int fd = open("/data/w-cap/file", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0 && unlink("/data/w-cap/file") == 0);
+    snprintf(name, sizeof name, "/data/w-cap/d%d", made - 1);
+    DATA_CHECK(rmdir(name) == 0);
+    DATA_CHECK(mkdir(name, 0755) == 0);
+    for (int i = 0; i < made; i++) {
+        snprintf(name, sizeof name, "/data/w-cap/d%d", i);
+        DATA_CHECK(rmdir(name) == 0);
+    }
+    DATA_CHECK(rmdir("/data/w-cap") == 0);
+    return 0;
+}
+
+static int fill_user_body(void) {
+    errno = 0;
+    int fd = open("/data/w-user", O_WRONLY | O_CREAT, 0644);
+    if (fd >= 0) {
+        close(fd);
+        unlink("/data/w-user");
+        return 1;
+    }
+    return errno == ENOSPC ? 0 : 2;
+}
+
+static int fill_user_creates_body(void) {
+    int fd = open("/data/w-user", O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) return 1;
+    int ok = write(fd, "hi", 2) == 2;
+    close(fd);
+    unlink("/data/w-user");
+    return ok ? 0 : 2;
+}
+
+/* The reserve: with fewer than 64 free blocks a user other than root gets ENOSPC for a creation
+ * and root goes on; a removal gives room back (the count of free blocks catches up with the
+ * refresh walk of the service, which comes after a quiet of 2 s). */
+static int enospc_at_the_reserve_then_unlink(void) {
+    struct statvfs v;
+    unsigned char buf[1012];
+    DATA_CHECK(chmod("/data", 0777) == 0);
+    int fd = open("/data/w-big", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    make_pattern(buf, 0, sizeof buf, 1);
+    unsigned long calls = 0;
+    for (;;) {
+        if (calls % 500 == 0) {
+            DATA_CHECK(statvfs("/data", &v) == 0);
+            /* f_bavail leaves the reserve out: it is 0 when the reserve is reached. */
+            if (v.f_bavail <= 4) break;
+        }
+        ssize_t w = write(fd, buf, sizeof buf);
+        DATA_CHECK(w > 0);
+        calls++;
+    }
+    printf("posix-data: the volume reached its reserve after %lu writes\n", calls);
+    DATA_CHECK(as_ids(1000, 100, fill_user_body) == 0); /* ENOSPC for a creation by a user */
+    errno = 0;
+    DATA_CHECK(write(fd, buf, sizeof buf) > 0); /* root goes into the reserve */
+    DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
+    DATA_CHECK(unlink("/data/w-big") == 0);
+    /* The room comes back when the service has walked the volume (2 s of quiet, then the walk). */
+    int back = 0;
+    for (int i = 0; i < 40 && !back; i++) {
+        pause_ms(3000);
+        back = as_ids(1000, 100, fill_user_creates_body) == 0;
+    }
+    DATA_CHECK(back);
+    DATA_CHECK(chmod("/data", 0755) == 0);
+    return 0;
+}
+
+static int write_run(void) {
+    if (getuid() != 0) {
+        printf("posix-data: the probe is not user 0\n");
+        return 20;
+    }
+    run_check("create with umask 027", umask_and_owner);
+    run_check("create owner is the effective uid", owner_from_the_effective_uid);
+    run_check("write pwrite and read back", write_pwrite_and_read_back);
+    run_check("O_APPEND from two processes 2000 lines", append_from_two_processes);
+    run_check("fork shares the write position", fork_shares_the_write_position);
+    run_check("ftruncate grows with zeros", ftruncate_grows_with_zeros);
+    run_check("fsync returns", fsync_returns);
+    run_check("unlink while open reads on", unlink_while_open);
+    run_check("rename over an open file", rename_over_an_open_file);
+    run_check("rename of directories and across", rename_directories_and_across);
+    run_check("rmdir non-empty and cwd", rmdir_non_empty_and_cwd);
+    run_check("times and chmod of an open file", times_and_chmod_of_an_open_file);
+    run_check("chown by 1000", chown_by_a_user_is_refused);
+    run_check("sticky directory", sticky_directory);
+    run_check("a non-owner cannot write", a_non_owner_cannot_write);
+    run_check("setuid then write", setuid_then_write);
+    run_check("set-ID program writes through the descriptor", setid_program_writes_through_a_descriptor);
+    run_check("fsize EFBIG and SIGXFSZ", fsize_efbig_and_sigxfsz);
+    run_check("link symlink lock and exec refused", refused_forms);
+    run_check("scm_rights passes a data descriptor", scm_rights_of_a_data_descriptor);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: write checks passed\n");
+    return 0;
+}
+
+/* The directory cap alone: 1,016 directories made and removed take about 3 million reads of the
+ * volume (a removal looks up the pair before its own in the list of every pair). */
+static int cap_run(void) {
+    run_check("directory cap", directory_cap);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: cap checks passed\n");
+    return 0;
+}
+
+/* The reserve alone: the volume is filled to it in messages of 1,012 bytes (31,000 calls). */
+static int full_run(void) {
+    run_check("enospc at the reserve then unlink", enospc_at_the_reserve_then_unlink);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: full checks passed\n");
+    return 0;
+}
+
 static int first(void) {
     if (getuid() != 0) {
         printf("posix-data: the probe is not user 0\n");
@@ -656,7 +1345,6 @@ static int first(void) {
     run_check("clofork stays with the parent", clofork_stays_with_the_parent);
     run_check("set-ID program reads the descriptor", setid_program_reads_descriptor);
     run_check("real and effective access", real_and_effective_access);
-    run_check("writes refused", writes_are_refused);
     run_check("datax is the RAM service", datax_is_the_ram_service);
     run_check("errno for bad paths", errno_for_bad_paths);
     run_check("statvfs", statvfs_of_the_volume);
@@ -691,7 +1379,9 @@ static int child_closed(char **argv) {
  * ENOSYS); a program the loader starts can. The first role is therefore a launcher: it starts the
  * program from /bin with posix_spawn and passes on how it ended. */
 static int launcher(void) {
-    char *argv[] = {"posix-data", "run", NULL};
+    /* The role the image was built for: DATA_POSIX_MODE is "run" (the read checks) or the name of
+     * another role. */
+    char *argv[] = {"posix-data", DATA_POSIX_MODE, NULL};
     pid_t pid = 0;
     int code = posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ);
     if (code != 0) {
@@ -704,6 +1394,11 @@ static int launcher(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[1], "append-child") == 0) return append_lines("/data/w-append", argv[2][0]);
+    if (argc > 2 && strcmp(argv[1], "child-write") == 0) return child_write(argv);
+    if (argc > 1 && strcmp(argv[1], "write-run") == 0) return write_run();
+    if (argc > 1 && strcmp(argv[1], "cap-run") == 0) return cap_run();
+    if (argc > 1 && strcmp(argv[1], "full-run") == 0) return full_run();
     if (argc > 4 && strcmp(argv[1], "child-read") == 0) return child_read(argv);
     if (argc > 2 && strcmp(argv[1], "child-closed") == 0) return child_closed(argv);
     if (argc > 1 && strcmp(argv[1], "run") == 0) return first();
