@@ -104,6 +104,8 @@ table-busybox = []
 table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
 table-doom = []
+# The image of the LVGL demo's probe (xtask lvgl-probe).
+table-lvgl = []
 table-base = []
 # The store of the package service in memory: the base table's disk service is the memory disk
 # (xtask pkg-probe memory).

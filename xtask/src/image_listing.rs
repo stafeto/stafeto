@@ -158,6 +158,8 @@ fn build_named(name: &'static str) -> Result<PathBuf, String> {
         "boot-ash-dialog.img" => shell_programs(),
         "boot-doom.img" => doom::programs(),
         "boot-doom-steps.img" => doom::steps_programs(),
+        "boot-lvgl.img" => lvgl_image::programs(),
+        "boot-lvgl-steps.img" => lvgl_image::steps_programs(),
         "boot-net.img" | "boot-net-tls.img" => net::programs(),
         "boot-net-curl-steps.img" | "boot-net-tls-steps.img" => net_curl::steps_programs(),
         "boot-nginx-probe.img" => nginx_probe::programs(),
@@ -173,10 +175,12 @@ fn build_named(name: &'static str) -> Result<PathBuf, String> {
     build_boot_image(name, programs, BOOT_PROFILE)
 }
 
-const NAMES: [&str; 15] = [
+const NAMES: [&str; 17] = [
     "boot-ash-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
+    "boot-lvgl.img",
+    "boot-lvgl-steps.img",
     "boot-net.img",
     "boot-net-tls.img",
     "boot-nginx-probe.img",

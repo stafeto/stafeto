@@ -104,7 +104,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
-pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject"];
+pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the manager's, the input's, or none.
@@ -1494,6 +1494,7 @@ pub mod input;
 pub mod journal;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
+pub mod lvgl;
 pub mod net;
 pub mod normal;
 pub mod pkg;
@@ -1514,6 +1515,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
+    + cfg!(feature = "table-lvgl") as usize
     + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
@@ -1615,6 +1617,7 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
+    feature = "table-lvgl",
     feature = "table-base",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
@@ -1740,6 +1743,8 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-doom")]
 pub const TABLE: &[Record] = doom::TABLE;
+#[cfg(feature = "table-lvgl")]
+pub const TABLE: &[Record] = lvgl::TABLE;
 #[cfg(feature = "table-base")]
 pub const TABLE: &[Record] = base::BASE_TABLE;
 #[cfg(feature = "table-posix-dialog")]
@@ -3924,6 +3929,14 @@ mod tests {
         let wm = |name: &str| focus::WM_TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(comp_mark(wm("wm"), b"gpu"), Some(COMP_MANAGER_MARK));
         assert_eq!(comp_mark(wm("wm-inject"), b"gpu"), Some(COMP_INPUT_MARK));
+        // The LVGL demo's image: the injector alone has the input session.
+        let lvgl = |name: &str| lvgl::TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(
+            comp_mark(lvgl("lvgl-inject"), b"gpu"),
+            Some(COMP_INPUT_MARK)
+        );
+        assert_eq!(comp_mark(lvgl("lvgl-inject"), b"clock"), None);
+        assert_eq!(comp_mark(lvgl("gpu"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-new"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-old"), b"gpu"), None);
         assert_eq!(comp_mark(named("focus-wm"), b"clock"), None);
@@ -4055,6 +4068,7 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            lvgl::TABLE,
             window::TABLE,
             ramfs::DISPLAY_TABLE,
         ];

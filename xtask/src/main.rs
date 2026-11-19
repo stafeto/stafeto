@@ -83,6 +83,9 @@ mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
+mod lvgl_image;
+#[cfg(test)]
+mod lvgl_scenario;
 mod measure;
 mod monitor;
 mod nano_dialog;

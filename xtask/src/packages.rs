@@ -645,6 +645,7 @@ pub fn check() -> Result<(), String> {
     for image in [
         "boot-ash-dialog.img",
         "boot-doom.img",
+        "boot-lvgl.img",
         "boot-net.img",
         "boot-ssh-probe.img",
         "boot-net-rc.img",
@@ -866,6 +867,13 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         // service.
         "boot-fstack-probe.img" => of(&[Group::Base, Group::Addon, Group::Fstack]),
         "boot-doom.img" | "boot-doom-steps.img" => of(&[Group::Base, Group::Addon, Group::Game]),
+        // The images of the LVGL demo's probe: the games image without Doom and its data.
+        "boot-lvgl.img" | "boot-lvgl-steps.img" => {
+            Ok(of(&[Group::Base, Group::Addon, Group::Game])?
+                .into_iter()
+                .filter(|p| p.name != "doomgeneric" && p.name != "freedoom")
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }
