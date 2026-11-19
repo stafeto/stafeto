@@ -14,6 +14,7 @@ test = false
 bench = false
 
 [dependencies]
-# The layer with the data file service at /data (the feature `data`: libc.so has it, and a static
-# program has it when it asks).
-posix-crt = { path = "../../lib/posix-crt", features = ["data"] }
+# The layer with the data file service at /data (the features `data` and `trace` of
+# tools/layer-features.txt: libc.so has them, and a static program has them when it asks; `trace`
+# makes the layer print the step and the status behind each EIO).
+posix-crt = { path = "../../lib/posix-crt", features = ["data", "trace"] }

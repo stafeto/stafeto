@@ -14,8 +14,10 @@
  *   /many           0755 0:0       f000 to f299, empty, 0644
  *   every time is 1700000000 s; the root of the volume is 0755 0:0
  *
- * Started by init as a POSIX process of the root (user 0) after the data service said READY. The
- * first call under /data takes a session from the process service. The role "child-read" and the
+ * Started by init as a POSIX process of the root (user 0) after the data service said READY: the
+ * launcher role starts /bin/posix-data with posix_spawn (a loader-started process can fork), and that
+ * program (role "run") makes the checks. The first call under /data takes a session from the
+ * process service. The role "child-read" and the
  * role "child-closed" are the program started again by spawn and by exec.
  *
  * Every check prints "posix-data: <name> ok" or "posix-data: <name> FAILED" after the line of the
@@ -685,8 +687,25 @@ static int child_closed(char **argv) {
     return fcntl(fd, F_GETFD) == -1 && errno == EBADF ? 0 : 5;
 }
 
+/* The program init starts has no code in its map to copy, so it cannot fork (the layer answers
+ * ENOSYS); a program the loader starts can. The first role is therefore a launcher: it starts the
+ * program from /bin with posix_spawn and passes on how it ended. */
+static int launcher(void) {
+    char *argv[] = {"posix-data", "run", NULL};
+    pid_t pid = 0;
+    int code = posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ);
+    if (code != 0) {
+        printf("posix-data: the launcher could not start /bin/posix-data (error %d)\n", code);
+        return 20;
+    }
+    int status = wait_ok(pid);
+    if (status != 0) printf("posix-data: the program ended with %d\n", status);
+    return status == 0 ? 0 : 20;
+}
+
 int main(int argc, char **argv) {
     if (argc > 4 && strcmp(argv[1], "child-read") == 0) return child_read(argv);
     if (argc > 2 && strcmp(argv[1], "child-closed") == 0) return child_closed(argv);
-    return first();
+    if (argc > 1 && strcmp(argv[1], "run") == 0) return first();
+    return launcher();
 }

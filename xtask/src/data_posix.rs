@@ -100,6 +100,7 @@ const PASSED: &str = "posix-data: read checks passed";
 /// says a check failed; the line of the end comes once, after every check. The lines come glued to
 /// the kernel's and the services' lines, so the text is looked for inside the line.
 pub fn read_lines(lines: &[String]) -> Result<(), String> {
+    registered(lines)?;
     let mine: Vec<&str> = lines
         .iter()
         .filter_map(|l| l.find(PREFIX).map(|at| &l[at..]))
@@ -153,6 +154,36 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
     }
 }
 
+/// The data service says its root is registered with the process service (`rt::roots`: `datafs: root
+/// registered with the process service`, or after some failed attempts). Without it no process gets a
+/// session and every call under `/data` answers EIO, so the run fails here, early, with what the
+/// service said about it.
+fn registered(lines: &[String]) -> Result<(), String> {
+    if lines.iter().any(|l| {
+        l.contains("datafs: root registered with the process service")
+            || l.contains("datafs: root registered after ")
+    }) {
+        return Ok(());
+    }
+    let said: Vec<&str> = lines
+        .iter()
+        .filter(|l| {
+            l.contains("datafs: no notary session")
+                || l.contains("datafs: registering the root failed")
+                || l.contains("datafs: no thread to register the root")
+        })
+        .map(String::as_str)
+        .collect();
+    Err(format!(
+        "the data service's root was not registered with the process service, so no process has a session and every call under /data answers EIO: {}",
+        if said.is_empty() {
+            "the service printed no line about its root".to_owned()
+        } else {
+            format!("it said {said:?}")
+        }
+    ))
+}
+
 /// The disk of the run: a file of the process's name, removed at the end.
 struct Disk(PathBuf);
 
@@ -194,7 +225,11 @@ mod tests {
     use super::*;
 
     fn good() -> Vec<String> {
-        let mut lines = vec!["init: starting".to_owned()];
+        let mut lines = vec![
+            "init: starting".to_owned(),
+            "datafs: root registered with the process service".to_owned(),
+            "posix-abi: data: open /data/pub: step take_session status 0".to_owned(),
+        ];
         lines.extend(CHECKS.iter().map(|c| format!("posix-data: {c} ok")));
         lines.push(PASSED.to_owned());
         lines.push(ENDED.to_owned());
@@ -210,13 +245,35 @@ mod tests {
     }
 
     #[test]
+    fn a_run_whose_root_was_not_registered_fails_early_and_says_what_the_service_said() {
+        let mut none = good();
+        none.retain(|l| !l.contains("root registered"));
+        let error = read_lines(&none).unwrap_err();
+        assert!(error.contains("root was not registered") && error.contains("printed no line"));
+        let mut refused = none.clone();
+        refused.insert(
+            1,
+            "datafs: no notary session with the process service (ACCESS_DENIED): the root is not registered"
+                .to_owned(),
+        );
+        assert!(
+            read_lines(&refused)
+                .unwrap_err()
+                .contains("no notary session")
+        );
+        let mut late = good();
+        late[1] = "datafs: root registered after 3 failed attempts".to_owned();
+        assert_eq!(read_lines(&late), Ok(()));
+    }
+
+    #[test]
     fn a_failed_check_a_missing_check_and_a_missing_end_are_refused() {
         let mut failed = good();
-        failed[3] = "posix-data: stat pub FAILED".to_owned();
+        failed[5] = "posix-data: stat pub FAILED".to_owned();
         assert!(read_lines(&failed).unwrap_err().contains("stat pub FAILED"));
         let mut line = good();
         line.insert(
-            4,
+            6,
             "posix-data: check failed at line 99: st.st_size == 5000 (errno 0)".to_owned(),
         );
         assert!(read_lines(&line).unwrap_err().contains("check failed"));
@@ -224,23 +281,23 @@ mod tests {
         summary.insert(2, "posix-data: 2 checks failed".to_owned());
         assert!(read_lines(&summary).is_err());
         let mut missing = good();
-        missing.remove(5);
+        missing.remove(7);
         assert!(read_lines(&missing).is_err());
         let mut no_end = good();
         no_end.retain(|l| l != PASSED);
         assert!(read_lines(&no_end).unwrap_err().contains("no line"));
         let mut cut = good();
-        cut.truncate(10);
+        cut.truncate(12);
         assert!(read_lines(&cut).unwrap_err().contains("stopped after"));
     }
 
     #[test]
     fn a_repeat_a_swap_an_extra_line_and_an_early_end_are_refused() {
         let mut repeat = good();
-        repeat.insert(3, "posix-data: read pub whole ok".to_owned());
+        repeat.insert(5, "posix-data: read pub whole ok".to_owned());
         assert!(read_lines(&repeat).is_err());
         let mut swapped = good();
-        swapped.swap(2, 3);
+        swapped.swap(4, 5);
         assert!(read_lines(&swapped).is_err());
         let mut extra = good();
         let end = extra.iter().position(|l| l == PASSED).unwrap();
