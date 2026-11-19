@@ -246,6 +246,39 @@ pub fn make_filled(path: &Path, size: u64, profile: Profile) -> Result<(), Strin
         .map_err(|_| format!("{}: flush failed", path.display()))
 }
 
+/// The path and the bytes of the key the service of the host key keeps on the volume (datakey).
+pub const KEY_PATH: &str = "/ssh/dropbear_ed25519_host_key";
+
+/// A data volume as the 0.5.1 image's service left it after the host key was saved: the table and
+/// the file system of `make`, a directory `/ssh` and the key file in it, made with the plain calls
+/// of the file system and no attribute on any entry (the service of that release wrote none: its
+/// root, directories and files read as the defaults of the first mount of version 3). A host test
+/// shows no attribute of the version-3 service anywhere on it.
+pub fn make_v051(path: &Path, size: u64, key: &[u8]) -> Result<(), String> {
+    make(path, size)?;
+    let mut state = Box::new(Storage::new());
+    let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
+        .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
+    fs.mkdir(b"/ssh")
+        .map_err(|e| format!("/ssh: mkdir {e:?}"))?;
+    let flags = datafs::Open::WRITE.with(datafs::Open::CREATE);
+    let file = fs
+        .open(KEY_PATH.as_bytes(), flags)
+        .map_err(|e| format!("{KEY_PATH}: open {e:?}"))?;
+    fs.write(file, key)
+        .map_err(|e| format!("{KEY_PATH}: write {e:?}"))?;
+    fs.sync(file)
+        .map_err(|e| format!("{KEY_PATH}: sync {e:?}"))?;
+    fs.close(file)
+        .map_err(|e| format!("{KEY_PATH}: close {e:?}"))?;
+    fs.unmount()
+        .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
+    fs.into_device()
+        .device
+        .flush()
+        .map_err(|_| format!("{}: flush failed", path.display()))
+}
+
 /// `cargo xtask data-image <path> [--size 2G]`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let usage = "usage: xtask data-image <path> [--size 2G]";
@@ -347,6 +380,32 @@ mod tests {
                     fs.getattr(path, kind, &mut out).is_err(),
                     "{path:?} has attribute {kind:#x}"
                 );
+            }
+        }
+        fs.unmount().unwrap();
+        drop(fs);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_volume_of_the_old_release_has_the_key_and_no_attribute_anywhere() {
+        let path = temp("v051");
+        let key = [0x42u8; 120];
+        make_v051(&path, 64 << 20, &key).unwrap();
+        let mut state = Box::new(Storage::new());
+        let (mut fs, did, _) =
+            volume::open(FileDevice::open(&path).unwrap(), &mut state, 1).unwrap();
+        assert_eq!(did, Did::Mounted);
+        assert_eq!(fs.stat(KEY_PATH.as_bytes()).unwrap().size, 120);
+        let file = fs.open(KEY_PATH.as_bytes(), datafs::Open::READ).unwrap();
+        let mut back = [0u8; 200];
+        assert_eq!(fs.read(file, &mut back).unwrap(), 120);
+        assert_eq!(back[..120], key);
+        fs.close(file).unwrap();
+        for entry in [&b"/"[..], b"/ssh", KEY_PATH.as_bytes()] {
+            for kind in [0x70u8, 0x66, 0x69] {
+                let mut out = [0u8; 64];
+                assert!(fs.getattr(entry, kind, &mut out).is_err());
             }
         }
         fs.unmount().unwrap();

@@ -228,6 +228,24 @@ impl Data {
         Ok(true)
     }
 
+    /// The modes of the root, of `/ssh` and of the key file as the volume says them, in one line
+    /// (the probe of an upgrade reads it): `datakey: modes / 0755 /ssh 0700 key 0600`.
+    #[cfg(feature = "modes")]
+    fn modes(&self) {
+        let mode = |path: &[u8]| {
+            self.call(|w| p::path_call(Method::Stat, path, w))
+                .ok()
+                .and_then(|r| p::Stat::from_bytes(&r.bytes[4..r.len]).ok())
+                .map(|s| s.mode)
+        };
+        match (mode(b"/"), mode(DATA_DIR), mode(DATA_KEY)) {
+            (Some(root), Some(dir), Some(key)) => {
+                rt::println!("datakey: modes / {root:04o} /ssh {dir:04o} key {key:04o}")
+            }
+            other => rt::println!("datakey: modes could not be read: {other:?}"),
+        }
+    }
+
     /// The key written as `.tmp`, synced, and renamed to its name.
     fn save(&self, key: &Key) -> Result<(), Status> {
         match self.call(|w| p::mkdir(DATA_DIR, 0o700, w)) {
@@ -298,6 +316,8 @@ fn main(_: u64) -> u64 {
                     ),
                     Err(error) => rt::println!("datakey: the key could not be placed: {error:?}"),
                 }
+                #[cfg(feature = "modes")]
+                data.modes();
                 Found::Restored
             }
             Ok(false) => Found::NoKey,

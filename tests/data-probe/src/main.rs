@@ -53,6 +53,14 @@ const MIN: u32 = parse(match option_env!("STAFETO_DATA_PROBE_MIN") {
     Some(text) => text,
     None => "0",
 });
+/// The version 3 series (`STAFETO_DATA_PROBE_V3=1`, set for the writing and the verifying boot of
+/// `cargo xtask data-probe`; the crash runs leave it out, since it would move their count of sectors): the
+/// record of a native client's files, a CHMOD that survives the remount, and a session that is
+/// neither marked nor bound.
+const V3: bool = parse(match option_env!("STAFETO_DATA_PROBE_V3") {
+    Some(text) => text,
+    None => "0",
+}) == 1;
 /// 1 when the series ran to its end before the cut (so every step must be there).
 const STEPS: u32 = 12;
 
@@ -88,7 +96,7 @@ fn main(_: u64) -> u64 {
         rt::println!("data-probe: waited {WAIT_S} s");
     }
     let result = match MODE {
-        "write" => write(&client),
+        "write" => write(&client, &start),
         "verify" => verify(&client),
         // The boot that converts a volume made by an older release and ends (the host then boots
         // `fill` on the converted volume): nothing to ask, the sleep is the work.
@@ -293,7 +301,7 @@ fn removes(k: u32) -> Option<u32> {
     (k % 4 == 1).then_some(k + 3)
 }
 
-fn write(c: &Client) -> Result<(), Fail> {
+fn write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     match c.mkdir(b"/w") {
         Ok(()) | Err(Status::Unknown(p::EXISTS)) => {}
         Err(_) => return Err("mkdir /w"),
@@ -327,7 +335,142 @@ fn write(c: &Client) -> Result<(), Fail> {
     }
     rt::println!("data-probe: written");
     wire(c.call(p::statfs), "statfs")?;
+    if V3 {
+        v3_write(c, start)?;
+    }
     rt::println!("data-probe: finished");
+    Ok(())
+}
+
+/// The stat record of `path`.
+fn stat_of(c: &Client, path: &[u8]) -> Result<p::Stat, Fail> {
+    let reply = wire(c.call(|w| p::path_call(Method::Stat, path, w)), "stat")?;
+    wire(
+        p::Stat::from_bytes(&reply.bytes[4..reply.len]),
+        "the stat record",
+    )
+}
+
+/// The version 3 series, on the writing boot: the files of a native client (user 0, group 0) have
+/// the mode they were made with and a number each, a CHMOD changes the mode at once, and a session
+/// that is neither marked nor bound answers NOT_BOUND while a BIND with a copy that is no identity
+/// session answers ACCESS.
+fn v3_write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
+    wire(c.put(b"/v3a", 100, 5), "put v3a")?;
+    wire(c.put(b"/v3b", 100, 6), "put v3b")?;
+    wire(c.mkdir(b"/v3d"), "mkdir v3d")?;
+    let (a, b, d) = (
+        stat_of(c, b"/v3a")?,
+        stat_of(c, b"/v3b")?,
+        stat_of(c, b"/v3d")?,
+    );
+    // `put` opens with 0644, MKDIR is sent with 0755; the native client is user 0 and group 0.
+    if (a.mode, a.uid, a.gid) != (0o644, 0, 0) || (d.mode, d.uid, d.gid) != (0o755, 0, 0) {
+        rt::println!(
+            "data-probe: v3 stat {:o} {}:{} and {:o}",
+            a.mode,
+            a.uid,
+            a.gid,
+            d.mode
+        );
+        return Err("the record of a new file is not the mode and owner it was made with");
+    }
+    if a.kind != p::KIND_FILE || d.kind != p::KIND_DIRECTORY {
+        return Err("the kind of a new entry is wrong");
+    }
+    if a.ino == 0 || b.ino == 0 || d.ino == 0 || a.ino == b.ino || a.ino == d.ino || b.ino == d.ino
+    {
+        rt::println!("data-probe: v3 numbers {} {} {}", a.ino, b.ino, d.ino);
+        return Err("the numbers of new entries are not distinct and non-zero");
+    }
+    rt::println!("data-probe: v3 stat 0644 0:0 ino ok");
+    // The number is kept in a file, so that the verifying boot finds the same one.
+    let mut digits = [0u8; 20];
+    let mut n = a.ino;
+    let mut at = digits.len();
+    while n > 0 || at == digits.len() {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let handle = wire(
+        c.open(b"/v3ino", p::WRITE | p::CREATE | p::TRUNCATE),
+        "open v3ino",
+    )?;
+    wire(
+        c.call(|w| p::write(handle, &digits[at..], w)),
+        "write v3ino",
+    )?;
+    wire(
+        c.call(|w| p::handle_call(Method::Fsync, handle, w)),
+        "fsync v3ino",
+    )?;
+    wire(c.close(handle), "close v3ino")?;
+    wire(c.call(|w| p::chmod(b"/v3a", 0o600, w)), "chmod v3a")?;
+    if stat_of(c, b"/v3a")?.mode != 0o600 {
+        return Err("a CHMOD did not change the mode");
+    }
+    // A session of CLONE has neither the mark nor an identity: every request that names a path is
+    // NOT_BOUND until BIND, and a BIND that carries a channel that is no identity session of the
+    // process service is ACCESS (a table with no process service never vouches).
+    let held = wire(c.open(b"/v3a", p::READ), "open v3a")?;
+    let mut w = Writer::new();
+    wire(p::clone(&[held], &mut w), "clone")?;
+    let child = match sys::send(&c.session, w.as_bytes()) {
+        Ok(mut reply) => reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| "CLONE brought no session")?,
+        Err(_) => return Err("CLONE failed"),
+    };
+    let mut w = Writer::new();
+    wire(p::path_call(Method::Stat, b"/v3a", &mut w), "stat request")?;
+    let said = sys::send(&child, w.as_bytes())
+        .map(|r| {
+            let mut buffer = [0u8; MESSAGE_MAX];
+            p::reply(r.bytes(&mut buffer)).err()
+        })
+        .map_err(|_| "no answer from the cloned session")?;
+    if said != Some(Status::Unknown(p::NOT_BOUND)) {
+        rt::println!("data-probe: unbound session said {said:?}");
+        return Err("a session with no mark and no BIND was not refused with NOT_BOUND");
+    }
+    let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+    let foreign = sys::channel_create(level).map_err(|_| "no channel for the copy")?;
+    let bind = proto_wire::Header::new(Method::Bind.number(), p::VERSION).bytes();
+    let said = match sys::send_handles(&child, &bind, [foreign.erase()]) {
+        Ok(r) => {
+            let mut buffer = [0u8; MESSAGE_MAX];
+            p::reply(r.bytes(&mut buffer)).err()
+        }
+        Err(_) => return Err("no answer to BIND"),
+    };
+    if said != Some(Status::Unknown(p::ACCESS)) {
+        rt::println!("data-probe: bind with a foreign copy said {said:?}");
+        return Err("a BIND with a copy that is no identity session was not ACCESS");
+    }
+    rt::println!("data-probe: unbound session refused ok");
+    Ok(())
+}
+
+/// The version 3 series, on the verifying boot: the mode a CHMOD set and the number an entry got
+/// are there after the remount.
+fn v3_verify(c: &Client) -> Result<(), Fail> {
+    let a = stat_of(c, b"/v3a")?;
+    let number = wire(c.number(b"/v3ino"), "read v3ino")?;
+    if (a.mode, a.uid, a.gid) != (0o600, 0, 0) {
+        rt::println!(
+            "data-probe: v3 after the remount {:o} {}:{}",
+            a.mode,
+            a.uid,
+            a.gid
+        );
+        return Err("the mode a CHMOD set did not survive the remount");
+    }
+    if number != Some(a.ino as u32) || a.ino > u64::from(u32::MAX) {
+        return Err("the number of an entry changed over the remount");
+    }
+    rt::println!("data-probe: chmod survives a remount ok");
     Ok(())
 }
 
@@ -449,6 +592,9 @@ fn verify(c: &Client) -> Result<(), Fail> {
         return Err("the file written after the cut reads back wrong");
     }
     wire(c.close(handle), "close after")?;
+    if V3 {
+        v3_verify(c)?;
+    }
     rt::println!("data-probe: verify ok progress={done} files={files}");
     Ok(())
 }

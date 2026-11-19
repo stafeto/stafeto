@@ -41,16 +41,20 @@ const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
 /// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
 /// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
-const STEP_KINDS: [(usize, &str); 11] = [
+const STEP_KINDS: [(usize, &str); 15] = [
     (1, "Open"),
     (2, "Close"),
     (3, "Read"),
     (4, "Write"),
     (6, "Fsync"),
+    (8, "Stat"),
     (10, "Mkdir"),
     (11, "Unlink"),
     (13, "Rename"),
     (14, "Readdir"),
+    (19, "Clone"),
+    (25, "Bind"),
+    (26, "Chmod"),
     (64, "the notices and the heartbeat"),
     (65, "the service's own step"),
 ];
@@ -133,6 +137,20 @@ fn image(
         ("STAFETO_DATA_PROBE_MIN", min.as_str()),
         ("STAFETO_DATA_PROBE_WAIT_S", wait.as_str()),
         ("STAFETO_DATAFS_CRASH_AT", point.as_str()),
+        // The version 3 series runs in the two boots of `probe` and not in the crash runs, whose
+        // count of the sectors it would move.
+        (
+            "STAFETO_DATA_PROBE_V3",
+            if crash_at.is_none()
+                && !name.contains("crash")
+                && !name.contains("fill")
+                && !name.contains("settle")
+            {
+                "1"
+            } else {
+                "0"
+            },
+        ),
     ];
     let programs: &'static [ImageProgram] = if crash_at.is_some() {
         &PROGRAMS_CRASH
@@ -305,6 +323,10 @@ pub fn probe() -> Result<(), String> {
         .map(|j| format!("data-probe: synced {j}"))
         .collect();
     wanted.push("data-probe: written".into());
+    // The version 3 series: the record of a native client's files, and the refusals of a session
+    // with no mark and no BIND (NOT_BOUND) and of a BIND with a copy that is no identity session.
+    wanted.push("data-probe: v3 stat 0644 0:0 ino ok".into());
+    wanted.push("data-probe: unbound session refused ok".into());
     wanted.push("data-probe: finished".into());
     need(&lines, &wanted, "writing")?;
     if datafs_line(&lines, "partition table written, data volume formatted").is_none() {
@@ -325,9 +347,10 @@ pub fn probe() -> Result<(), String> {
     )?;
     need(
         &lines,
-        &[format!(
-            "data-probe: verify ok progress={STEPS} files={FILES}"
-        )],
+        &[
+            format!("data-probe: verify ok progress={STEPS} files={FILES}"),
+            "data-probe: chmod survives a remount ok".to_string(),
+        ],
         "verifying",
     )?;
     if datafs_line(&lines, "data volume mounted").is_none() {
