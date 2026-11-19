@@ -7440,7 +7440,15 @@ const WATCH_LEFT_TICKS: u64 = (1_000 - 250) * 62_500;
 /// The tag of the lines of steps of the console driver (services/uart, feature `steps`).
 const CONSOLE_DRIVER_TAG: &str = "18";
 
-/// The steps of the console driver (tag 18) each under 0.9 of term B, the notices too (kind 64
+/// The kinds of the calls the terminal service makes to the console driver on a loan, WRITE_SOME
+/// (11) and ROOM (12), and the longest such call allowed in ticks: B_K of 150 us, 9,375 ticks of
+/// 16 ns, which the bound of the terminal's window (`tests/service-budget`) holds as the overrun
+/// at the edge.
+const CONSOLE_LOAN_KINDS: [usize; 2] = [11, 12];
+const CONSOLE_LOAN_STEP_MAX: u64 = 150_000 / TICK_NS;
+
+/// The steps of the console driver (tag 18) each under 0.9 of term B (the calls on a loan under
+/// B_K), the notices too (kind 64
 /// holds the ticks that take the kernel log, the longest of its steps): the driver has to have
 /// printed a table with a step of the log tick (kind 64 or 65) and of the calls of the terminal
 /// (WRITE_SOME, 11).
@@ -7456,6 +7464,16 @@ fn check_console_driver_steps(lines: &[String]) -> Result<(), String> {
     if !rows.iter().any(|(k, ..)| *k == 64 || *k == 65) {
         return Err(format!(
             "the console driver printed no step of its log tick: {rows:?}"
+        ));
+    }
+    // The calls the terminal service makes on a loan (WRITE_SOME and ROOM, when the driver runs in
+    // the background and the time goes to the terminal's budget) may not be longer than the
+    // overrun at the edge, B_K of 150 us, that the bound of the terminal's window already holds.
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(kind, ticks, _)| {
+        CONSOLE_LOAN_KINDS.contains(kind) && *ticks > CONSOLE_LOAN_STEP_MAX
+    }) {
+        return Err(format!(
+            "the console driver: a call of kind {kind} served on a loan took {ticks} ticks (detail {detail}), past B_K, {CONSOLE_LOAN_STEP_MAX}"
         ));
     }
     let bound = TERM_B * 9 / 10;
@@ -15168,6 +15186,23 @@ mod tests {
             ]
         };
         assert!(check_console_driver_steps(&steps(TERM_B * 9 / 10)).is_ok());
+        // The calls on a loan stay under B_K, 9,375 ticks: 8,490 was measured.
+        assert_eq!(CONSOLE_LOAN_STEP_MAX, 9_375);
+        let mut loan = steps(14_000);
+        loan[0] = "service step: 18 kind 11 9375 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
+        loan[0] = "service step: 18 kind 11 9376 ticks detail 0".to_owned();
+        assert!(
+            check_console_driver_steps(&loan)
+                .unwrap_err()
+                .contains("on a loan")
+        );
+        loan[0] = "service step: 18 kind 12 12000 ticks detail 0".to_owned();
+        loan.insert(0, "service step: 18 kind 11 8490 ticks detail 0".to_owned());
+        assert!(check_console_driver_steps(&loan).is_err());
+        // Other kinds are held to 0.9 B only.
+        loan[1] = "service step: 18 kind 13 12000 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
         assert!(
             check_console_driver_steps(&steps(20_410))
                 .unwrap_err()
