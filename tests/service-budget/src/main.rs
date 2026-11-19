@@ -981,6 +981,7 @@ struct Window {
     pending_max: u64,
     driver_ran: u64,
     driver_overruns: u64,
+    driver_overruns_l: u64,
     driver_ran_l: u64,
 }
 
@@ -1048,6 +1049,7 @@ fn worst_window() -> Option<Window> {
         pending_max,
         driver_ran: us(awake(3)),
         driver_overruns: awake(4),
+        driver_overruns_l: diff(4),
         driver_ran_l: us(diff(3)),
     })
 }
@@ -1168,9 +1170,22 @@ fn starve(
     } else {
         0
     };
-    let bound = terms::bound_us(service, events, INIT_PER_SERVICE_US, driver_term);
+    // The timer events of the driver's own budget, by its overruns over the whole window: the
+    // stub spends about 5 % of the CPU against 1.5 %, so its budget runs out in every period.
+    let driver_events = if which == 2 {
+        terms::events_us(e, w.driver_overruns_l)
+    } else {
+        0
+    };
+    let bound = terms::bound_us(
+        service,
+        events,
+        INIT_PER_SERVICE_US,
+        driver_term,
+        driver_events,
+    );
     println!(
-        "svcbudget1 {name} worst R_us={} W_us={} l_us={} n={} loss_us={loss} serve_ran_us={} serve_overruns={} serve_ran_l_us={} serve_overruns_l={} pending_max={} drv_ran_us={} drv_overruns={} drv_ran_l_us={} beats=na c_us={c} e_us={e} s_us={service} events_us={events} entries_us={} init_us={INIT_PER_SERVICE_US} d_us={driver_term} bound_loss_us={bound} bound_share={} share={} x_us={}",
+        "svcbudget1 {name} worst R_us={} W_us={} l_us={} n={} loss_us={loss} serve_ran_us={} serve_overruns={} serve_ran_l_us={} serve_overruns_l={} pending_max={} drv_ran_us={} drv_overruns={} drv_overruns_l={} drv_ran_l_us={} beats=na c_us={c} e_us={e} s_us={service} events_us={events} entries_us={} init_us={INIT_PER_SERVICE_US} d_us={driver_term} events_d_us={driver_events} bound_loss_us={bound} bound_share={} share={} x_us={}",
         w.r,
         w.w,
         w.l,
@@ -1182,6 +1197,7 @@ fn starve(
         w.pending_max,
         w.driver_ran,
         w.driver_overruns,
+        w.driver_overruns_l,
         w.driver_ran_l,
         terms::ENTRIES_US,
         terms::share_bound_permille(w.r, bound),

@@ -364,6 +364,10 @@ pub struct Worst {
     pub drv_ran_us: u64,
     pub drv_overruns: u64,
     pub drv_ran_l_us: u64,
+    /// The overruns of the driver's budget over the awake spans (`drv_overruns`) and over the
+    /// whole window, and the timer events of its budget the bound counts (`E_d`).
+    pub drv_overruns_l: u64,
+    pub driver_events_us: u64,
     pub service_us: u64,
     pub events_us: u64,
     pub init_us: u64,
@@ -398,6 +402,8 @@ impl Worst {
             drv_ran_us: number(line, "drv_ran_us=")?,
             drv_overruns: number(line, "drv_overruns=")?,
             drv_ran_l_us: number(line, "drv_ran_l_us=")?,
+            drv_overruns_l: number(line, "drv_overruns_l=")?,
+            driver_events_us: number(line, "events_d_us=")?,
             service_us: number(line, "s_us=")?,
             events_us: number(line, "events_us=")?,
             init_us: number(line, "init_us=")?,
@@ -409,7 +415,13 @@ impl Worst {
         };
         // The probe's loss is W - R and its bound is the sum of its terms: a line that says
         // otherwise is a fault of the probe.
-        let sum = terms::bound_us(w.service_us, w.events_us, w.init_us, w.driver_term_us);
+        let sum = terms::bound_us(
+            w.service_us,
+            w.events_us,
+            w.init_us,
+            w.driver_term_us,
+            w.driver_events_us,
+        );
         if w.loss_us != terms::loss_us(w.r_us, w.w_us) || w.bound_loss_us != sum {
             return Err(format!(
                 "the terms of the worst window do not add up: {line:?}"
@@ -525,8 +537,10 @@ pub fn verdict_ran(all: &[One]) -> Result<(), String> {
 
 /// The starvation gate of the one-CPU probe: each budget's account holds (`verdict_ran`) and the
 /// victim made its cycles. The victim's loss in its worst window of ten cycles against the sum of
-/// its terms (`S + E + 20 + I`, plus the driver's time for the terminal) is printed with every
-/// term and does not fail the gate yet: what is left (X) tells what the terms still miss (stafeto/stafeto#430).
+/// its terms (`S + E + 20 + I`, plus the driver's budget and its events for the terminal) is
+/// printed with every term and fails the gate when the loss is over the bound or the share under
+/// `bound_share`. What is left (X) tells what the terms still miss and is only printed
+/// (stafeto/stafeto#430).
 pub fn verdict_starve(all: &[One]) -> Result<(), String> {
     verdict_ran(all)?;
     for (name, o) in SERVICES.iter().zip(all) {
@@ -566,8 +580,8 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
             );
         }
         if w.over_us() > 0 || w.share < w.bound_share {
-            println!(
-                "service-budget: {name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}: the loss of {} us is over S {} + E {} + 20 + I {} + D {} = {} us by {} us (printed for information, stafeto/stafeto#430)",
+            return Err(format!(
+                "{name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}: the loss of {} us is over S {} + E {} + 20 + I {} + D {} + E_d {} = {} us by {} us",
                 w.share,
                 w.bound_share,
                 w.loss_us,
@@ -575,9 +589,10 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
                 w.events_us,
                 w.init_us,
                 w.driver_term_us,
+                w.driver_events_us,
                 w.bound_loss_us,
                 w.over_us()
-            );
+            ));
         }
     }
     Ok(())
@@ -928,7 +943,7 @@ mod tests {
         [
             "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1".to_owned(),
             format!("svcbudget1 tty starve clients=24 cycles=150 worst10=923 median10=957 c_us=75 e_us=30 ran_us={ran} ran_bound_us=2919 ran_floor_us=75 phase_us=155000 driver_budget=1 driver_ran_us=900 driver_overruns=0"),
-            "svcbudget1 tty worst R_us=8000 W_us=8667 l_us=10470 n=2 loss_us=667 serve_ran_us=225 serve_overruns=2 serve_ran_l_us=260 serve_overruns_l=2 pending_max=3 drv_ran_us=150 drv_overruns=0 drv_ran_l_us=400 beats=na c_us=75 e_us=30 s_us=375 events_us=180 entries_us=20 init_us=70 d_us=150 bound_loss_us=795 bound_share=909 share=923 x_us=92".to_owned(),
+            "svcbudget1 tty worst R_us=8000 W_us=8667 l_us=10470 n=2 loss_us=667 serve_ran_us=225 serve_overruns=2 serve_ran_l_us=260 serve_overruns_l=2 pending_max=3 drv_ran_us=150 drv_overruns=0 drv_overruns_l=0 drv_ran_l_us=400 beats=na c_us=75 e_us=30 s_us=375 events_us=180 entries_us=20 init_us=70 d_us=150 events_d_us=0 bound_loss_us=795 bound_share=909 share=923 x_us=92".to_owned(),
             "svcbudget DONE".to_owned(),
         ]
         .to_vec()
@@ -952,14 +967,26 @@ mod tests {
         assert_eq!(w.left_floor_us(one.e_us), -90);
         // 667 is under its bound of 795: nothing over.
         assert_eq!(w.over_us(), -128);
-        // A window over its bound is printed and the gate passes (the victim check is information).
+        // A window over its bound fails the gate, by the loss or by the share.
         let mut over = one.clone();
         over.cycles = 150;
         over.worst.as_mut().unwrap().bound_loss_us = 600;
         over.worst.as_mut().unwrap().driver_term_us = 0;
         over.worst.as_mut().unwrap().service_us = 330;
         assert!(over.worst.as_ref().unwrap().over_us() > 0);
-        assert!(verdict_starve(&[over.clone(), over.clone(), over]).is_ok());
+        let err = verdict_starve(&[over.clone(), over.clone(), over.clone()]).unwrap_err();
+        assert!(err.contains("the victim kept 923 per mille"), "{err}");
+        // A window inside its bound passes, and so does one over only on the share.
+        let mut fine = one.clone();
+        fine.cycles = 150;
+        assert!(verdict_starve(&[fine.clone(), fine.clone(), fine.clone()]).is_ok());
+        let mut low_share = fine.clone();
+        low_share.worst.as_mut().unwrap().share = 908;
+        assert!(verdict_starve(&[fine.clone(), fine.clone(), low_share]).is_err());
+        let mut low_loss = fine.clone();
+        low_loss.worst.as_mut().unwrap().bound_loss_us = 600;
+        low_loss.worst.as_mut().unwrap().service_us = 330;
+        assert!(verdict_starve(&[fine.clone(), low_loss, fine]).is_err());
     }
 
     #[test]
@@ -969,7 +996,7 @@ mod tests {
         // driver 120, 3 overruns) leave 20, inside the allowance.
         let mut lines = run_lines(2175);
         lines[1] = lines[1].replace("e_us=30", "e_us=40");
-        lines[2] = "svcbudget1 tty worst R_us=8005 W_us=8635 l_us=11008 n=2 loss_us=630 serve_ran_us=150 serve_overruns=3 serve_ran_l_us=205 serve_overruns_l=5 pending_max=3 drv_ran_us=120 drv_overruns=0 drv_ran_l_us=538 beats=na c_us=75 e_us=40 s_us=375 events_us=480 entries_us=20 init_us=70 d_us=375 bound_loss_us=1320 bound_share=858 share=927 x_us=20".to_owned();
+        lines[2] = "svcbudget1 tty worst R_us=8005 W_us=8635 l_us=11008 n=2 loss_us=630 serve_ran_us=150 serve_overruns=3 serve_ran_l_us=205 serve_overruns_l=5 pending_max=3 drv_ran_us=120 drv_overruns=2 drv_overruns_l=3 drv_ran_l_us=538 beats=na c_us=75 e_us=40 s_us=375 events_us=480 entries_us=20 init_us=70 d_us=375 events_d_us=320 bound_loss_us=1640 bound_share=829 share=927 x_us=20".to_owned();
         let one = parse_starve_only(&lines, "tty").unwrap();
         let w = one.worst.clone().unwrap();
         assert_eq!(
@@ -995,9 +1022,9 @@ mod tests {
         assert!(w.left_us >= w.left_floor_us(40));
         // The driver's term is the bound of its budget (75 us of each 5 ms over l = 11,008 us
         // with one overrun at the edge), no longer the 538 us it ran: the loss of 630 us is
-        // inside the bound of 1,320 us and the share of 927 above the 858 it promises.
+        // inside the bound of 1,640 us (the driver's events, 320 us, included) and the share of 927 above the 829 it promises.
         assert_eq!(w.driver_term_us, terms::service_us(75, 5_000, 150, w.l_us));
-        assert_eq!((w.over_us(), w.bound_share), (-690, 858));
+        assert_eq!((w.over_us(), w.bound_share), (-1010, 829));
         assert!(w.share >= w.bound_share);
         assert!(verdict_starve(&[one.clone(), one.clone(), one]).is_ok());
     }

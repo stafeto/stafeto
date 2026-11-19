@@ -11,12 +11,13 @@
 //! for the share `s = 1000 R / W` per mille. What the budgets of the services explain is
 //!
 //! ```text
-//! L <= S + E + 20 + I (+ D)
+//! L <= S + E + 20 + I (+ D + E_d)
 //! S = n C + min(C, l - n T) + B   n = l / T rounded down, B one overrun at the edge
 //! E = 2 e (k + 1)                 k the overruns of the budget in the window
 //! I                               the allowance of init for the service
 //! D = n_d C_d + min(C_d, l - n_d T_d) + B   the console driver's budget, for the terminal phase
 //!                                 (`service_us` with the driver's C and T: 75 us of each 5 ms)
+//! E_d = 2 e (k_d + 1)             the events of the driver's budget, k_d its overruns in the window
 //! ```
 //!
 //! `S` is the bound of the kernel (the module comment of `kcore/src/budget.rs`) for a thread
@@ -74,9 +75,17 @@ pub const fn events_us(e: u64, k: u64) -> u64 {
 /// microseconds).
 pub const ENTRIES_US: u64 = 20;
 
-/// The bound of the loss of the window: `S + E + 20 + I + D`.
-pub const fn bound_us(service: u64, events: u64, init: u64, driver: u64) -> u64 {
-    service + events + ENTRIES_US + init + driver
+/// The bound of the loss of the window: `S + E + 20 + I + D + E_d`, where `E_d` is the timer
+/// events of the driver's own budget (`events_us` over its overruns in the window; 0 where the
+/// driver takes no part).
+pub const fn bound_us(
+    service: u64,
+    events: u64,
+    init: u64,
+    driver: u64,
+    driver_events: u64,
+) -> u64 {
+    service + events + ENTRIES_US + init + driver + driver_events
 }
 
 /// The share, per mille, the victim keeps at least when it loses no more than `bound` in a
@@ -173,18 +182,18 @@ mod tests {
     #[test]
     fn the_bound_of_the_run_holds_for_ramfs_and_pipe_and_shows_the_driver_of_tty() {
         // From the note: ramfs 1029 <= 750 + 150 + 180 + 20 + 70 = 1170, pipe 412 <= 645.
-        let ramfs = bound_us(service_us(250, T, B, 10_830), events_us(E, 2), INIT, 0);
+        let ramfs = bound_us(service_us(250, T, B, 10_830), events_us(E, 2), INIT, 0, 0);
         assert_eq!(ramfs, 1170);
         assert!(over_bound(1029, ramfs) < 0);
-        let pipe = bound_us(service_us(75, T, B, 10_210), events_us(E, 2), INIT, 0);
+        let pipe = bound_us(service_us(75, T, B, 10_210), events_us(E, 2), INIT, 0, 0);
         assert_eq!(pipe, 645);
         assert!(over_bound(412, pipe) < 0);
         // tty without the driver's term is over by 22, which is what is left for the driver.
-        let tty = bound_us(service_us(75, T, B, 10_470), events_us(E, 2), INIT, 0);
+        let tty = bound_us(service_us(75, T, B, 10_470), events_us(E, 2), INIT, 0, 0);
         assert_eq!(tty, 645);
         assert_eq!(over_bound(667, tty), 22);
         // With a driver term of 22 or more it holds.
-        assert!(over_bound(667, bound_us(375, 180, INIT, 22)) <= 0);
+        assert!(over_bound(667, bound_us(375, 180, INIT, 22, 0)) <= 0);
     }
 
     #[test]
@@ -248,13 +257,42 @@ mod tests {
         // ran in all (its sleeps in the window included).
         let driver = service_us(75, T, B, 11_008);
         assert_eq!(driver, 375);
-        let bound = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, driver);
+        let bound = bound_us(
+            service_us(75, T, B, 11_008),
+            events_us(e, 5),
+            INIT,
+            driver,
+            0,
+        );
         assert_eq!(bound, 375 + 480 + 20 + 70 + 375);
         // The loss of 630 us over the 8005 us the victim ran is inside it, with the share the
         // bound promises under what the victim kept (927 per mille).
         assert!(over_bound(630, bound) < 0);
         assert_eq!(share_bound_permille(8005, bound), 858);
         assert!(927 >= share_bound_permille(8005, bound));
+    }
+
+    #[test]
+    fn the_events_of_the_drivers_budget_are_in_the_bound_of_the_terminal() {
+        // The stub of the driver spends about 5 % against its 1.5 %, so its budget runs out in
+        // every period: over the window of 11,008 us it is 2 periods and an edge, say 3 overruns,
+        // each chunk with its two timer events (e 40): 2 * 40 * 4 = 320 us more of bound.
+        let e = 40;
+        assert_eq!(events_us(e, 3), 320);
+        let base = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 375, 0);
+        let with = bound_us(
+            service_us(75, T, B, 11_008),
+            events_us(e, 5),
+            INIT,
+            375,
+            events_us(e, 3),
+        );
+        assert_eq!(with - base, 320);
+        // A loss between the two bounds is inside only the second: 1,500 us against 1,320 and 1,640.
+        assert_eq!((base, with), (1_320, 1_640));
+        assert!(over_bound(1_500, base) > 0 && over_bound(1_500, with) < 0);
+        // No overruns still count one chunk: 2 e.
+        assert_eq!(events_us(e, 0), 80);
     }
 
     #[test]
