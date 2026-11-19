@@ -288,5 +288,114 @@ class Stage(unittest.TestCase):
                                  ["stafeto-9-kernel/Image", "stafeto-9-kernel/kernel.elf"])
 
 
+class PackagesOnly(unittest.TestCase):
+    """The files of a packages-only update (`pack-packages`) and its notes."""
+
+    OLD = b"the signed package before"
+    NEW = b"the signed package after"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.packages = self.dir / "pkg"
+        self.packages.mkdir()
+        self.busybox = dist.pkgdesc.load("busybox")["version"]
+        self.nano = dist.pkgdesc.load("nano")["version"]
+        # busybox is carried from the storage of 0.5.1; nano is built for the update.
+        (self.packages / f"busybox-{self.busybox}-1.stpkg").write_bytes(PACKAGE)
+        (self.packages / f"nano-{self.nano}-2.stpkg").write_bytes(self.NEW)
+        storage = "https://github.com/stafeto/packages/releases/download"
+        self.index = self.dir / "INDEX"
+        self.index.write_text(
+            "format 1\nrepository stafeto\nseries 0.5\nserial 3\n"
+            f"\nname busybox\nversion {self.busybox}-1\nsize {len(PACKAGE)}\nsha256 {digest(PACKAGE)}\n"
+            f"file {storage}/v0.5.1-aarch64/busybox-{self.busybox}-1.stpkg\nsummary s\n"
+            f"\nname nano\nversion {self.nano}-2\nsize {len(self.NEW)}\nsha256 {digest(self.NEW)}\n"
+            f"file {storage}/v0.5-pkgs.1-aarch64/nano-{self.nano}-2.stpkg\nsummary s\n")
+        self.previous = self.dir / "OLD"
+        self.previous.write_text(
+            "format 1\nrepository stafeto\nseries 0.5\nserial 2\n"
+            f"\nname busybox\nversion {self.busybox}-1\nsize {len(PACKAGE)}\nsha256 {digest(PACKAGE)}\n"
+            f"file {storage}/v0.5.1-aarch64/busybox-{self.busybox}-1.stpkg\nsummary s\n"
+            f"\nname nano\nversion {self.nano}-1\nsize {len(self.OLD)}\nsha256 {digest(self.OLD)}\n"
+            f"file {storage}/v0.5.1-aarch64/nano-{self.nano}-1.stpkg\nsummary s\n")
+        (self.dir / "INDEX.sig").write_bytes(b"sig")
+        self.out = self.dir / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def pack(self):
+        old = sys.argv
+        sys.argv = ["dist.py", "pack-packages", "--name", "0.5-pkgs.1", "--packages", str(self.packages),
+                    "--index", str(self.index), "--index-sig", str(self.dir / "INDEX.sig"), "--out", str(self.out)]
+        try:
+            dist.main()
+        finally:
+            sys.argv = old
+
+    def notes(self):
+        spec = importlib.util.spec_from_file_location("release_notes", HERE / "release-notes.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_files_of_the_update_are_the_index_the_sbom_and_the_sums(self):
+        self.pack()
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), [
+            "SHA256SUMS", "stafeto-0.5-pkgs.1-INDEX", "stafeto-0.5-pkgs.1-INDEX.sig",
+            "stafeto-0.5-pkgs.1-sbom.spdx.json"])
+        for line in (self.out / "SHA256SUMS").read_text().splitlines():
+            value, name = line.split("  ")
+            self.assertEqual(value, digest((self.out / name).read_bytes()))
+        self.assertEqual(sorted(n for names, _ in dist.packages_release_files("0.5-pkgs.1") for n in names),
+                         sorted(p.name for p in self.out.iterdir()))
+
+    def test_the_sbom_of_an_update_holds_every_package_of_the_index_with_the_sha256_of_its_file(self):
+        self.pack()
+        sbom = json.loads((self.out / "stafeto-0.5-pkgs.1-sbom.spdx.json").read_text())
+        found = {p["name"]: p for p in sbom["packages"]}
+        for name, data in (("busybox", PACKAGE), ("nano", self.NEW)):
+            self.assertEqual(found[name]["checksums"][1]["checksumValue"], digest(data))
+        self.assertEqual(found["busybox"]["versionInfo"], self.busybox)
+        self.assertEqual(sbom["name"], "stafeto-0.5-pkgs.1")
+
+    def test_a_package_file_that_is_missing_or_changed_stops_the_update(self):
+        (self.packages / f"busybox-{self.busybox}-1.stpkg").unlink()
+        with self.assertRaises(SystemExit) as stopped:
+            self.pack()
+        self.assertIn("busybox", str(stopped.exception))
+        (self.packages / f"busybox-{self.busybox}-1.stpkg").write_bytes(b"another file")
+        with self.assertRaises(SystemExit) as stopped:
+            self.pack()
+        self.assertIn("the index says", str(stopped.exception))
+
+    def test_a_tree_that_has_moved_on_from_the_index_stops_the_update(self):
+        self.index.write_text(self.index.read_text().replace(f"version {self.nano}-2", "version 0.0.1-2"))
+        with self.assertRaises(SystemExit) as stopped:
+            self.pack()
+        self.assertIn("packages/nano.toml", str(stopped.exception))
+
+    def test_the_notes_list_the_changed_packages_from_two_indexes(self):
+        text = self.notes().packages_notes("0.5-pkgs.1", "v0.5-pkgs.1", "v0.5.1", self.index, self.previous)
+        table = [line for line in text.splitlines() if line.startswith("| `")]
+        self.assertEqual(table[0], f"| `nano` | {self.nano}-1 | {self.nano}-2 | `v0.5-pkgs.1-aarch64` |")
+        self.assertFalse(any(line.startswith("| `busybox`") for line in table))
+        self.assertIn("compare/v0.5.1...v0.5-pkgs.1", text)
+        self.assertIn("`stafeto-0.5-pkgs.1-INDEX`, `stafeto-0.5-pkgs.1-INDEX.sig`", text)
+        self.assertIn("An update of the packages of the series 0.5", text)
+
+    def test_a_package_added_or_removed_has_its_row(self):
+        notes = self.notes()
+        gone = "\nname gone\nversion 1-1\nsize 1\nsha256 " + "0" * 64 + "\nfile https://example.org/v0.5.1-aarch64/gone-1-1.stpkg\nsummary s\n"
+        self.previous.write_text(self.previous.read_text() + gone)
+        rows = notes.changed_table(self.index, self.previous)
+        self.assertIn("| `gone` | 1-1 | - | - |", rows)
+        self.assertIn(f"| `nano` | {self.nano}-1 | {self.nano}-2 | `v0.5-pkgs.1-aarch64` |", rows)
+        # Read the other way round, the package that was removed is new.
+        added = notes.changed_table(self.previous, self.index)
+        self.assertIn("| `gone` | - | 1-1 | `v0.5.1-aarch64` |", added)
+
+
 if __name__ == "__main__":
     unittest.main()

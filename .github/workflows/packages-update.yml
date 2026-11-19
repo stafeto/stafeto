@@ -1,0 +1,395 @@
+name: packages-update
+
+# A tag `v<series>-pkgs.<k>` (for example `v0.5-pkgs.1`) runs the signing
+# pipeline of a release without a new version of the system: the packages of
+# the series whose recipe changed are built, the others are carried from the
+# newest signed index of the series, the index is signed with a serial above
+# the one on the pages, and the files wait in draft releases for the owner
+# (docs/release.md, "Packages-only updates"). Publishing the draft
+# `v<series>-pkgs.<k>` of stafeto/stafeto starts publish-packages.yml, as the
+# publication of a release of the system does. Four jobs keep the secrets away
+# from the code that builds the packages, as in release.yml:
+#
+#   ci     the groups of ci, called without secrets
+#   build  carries and builds the packages, with the refusals of an update;
+#          no secret, no environment
+#   sign   a clean machine that builds nothing but xtask; holds the release
+#          key alone, signs the packages again and the index
+#   draft  holds the token of stafeto/packages alone and creates the drafts
+#
+# `workflow_dispatch` from any branch is the dry run: ci and build as for a
+# tag, then the job `trial`, which has no environment and no secret and signs
+# with the development key. It leaves the files only in the artifacts of the
+# run for three days, and the list of carried and built packages in the
+# summary. A tag is set once the dry run of the same commit has built the
+# packages that the update is meant to change.
+on:
+  push:
+    tags: ["v*-pkgs.*"]
+  workflow_dispatch:
+    inputs:
+      series:
+        description: The series to update (the series of the version of the commit when empty)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# One run at a time for the releases of the system and the updates of packages:
+# two runs that sign at once would take the same serial of the index. Only tag
+# runs join the group: a manual run has a group of its own, so that it cannot
+# cancel a tag run that is waiting.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'release-pipeline' || format('dispatch-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  LLVM_VERSION: "23"
+  QEMU_VERSION: "11.1.2"
+
+jobs:
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: build
+    needs: ci
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: The series of this commit
+        id: version
+        env:
+          SERIES_INPUT: ${{ inputs.series }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          series=$(echo "$version" | cut -d. -f1,2)
+          if [ -n "$SERIES_INPUT" ] && [ "$SERIES_INPUT" != "$series" ]; then
+            echo "::error::the version of this commit is $version, of the series $series; the input asks for $SERIES_INPUT"
+            exit 1
+          fi
+          echo "series=$series" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup
+        with:
+          qemu: "false"
+
+      - name: Restore caches
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            target
+          key: release-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
+          restore-keys: |
+            ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-
+            ci3-${{ runner.arch }}-
+
+      - name: Source archives of the packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/dist-cache
+          key: dist-cache-${{ hashFiles('packages/*.toml') }}
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      # The records of the series come from the signed copy in its newest release
+      # (a release of the system or an earlier update); a series that is not
+      # published has nothing to update.
+      - name: Where the packages are carried from
+        env:
+          SERIES: ${{ steps.version.outputs.series }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          flag=$(python3 tools/pages.py previous --series "$SERIES" --releases releases.json --out anchor)
+          test -n "$flag" || { echo "::error::the series $SERIES is not published: a packages-only update has nothing to carry from"; exit 1; }
+
+      # The strict form of the tag, the series of the tag and of the version, the
+      # notes in docs/releases, the fingerprint of the ABI (frozen, with the
+      # series of the version), then the packages: carried where the recipe is
+      # that of the index, built otherwise, and the refusals of an update.
+      - name: cargo xtask release-build --packages-only
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          SERIES: ${{ steps.version.outputs.series }}
+        run: |
+          set -eo pipefail
+          if [ "$EVENT" = push ]; then
+            mode=(--tag "$TAG")
+          else
+            mode=(--trial)
+          fi
+          cargo xtask release-build --packages-only "${mode[@]}" --previous "anchor/$SERIES" 2>&1 | tee build.log
+
+      - name: The packages carried and built
+        if: always()
+        run: |
+          {
+            echo "### Packages of the update"
+            echo '```'
+            grep -E '^(carried|built|carry:) ' build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep what the signing job needs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-input
+          path: target/stafeto-release
+          retention-days: 3
+          if-no-files-found: error
+
+  sign:
+    name: sign
+    needs: build
+    # The dry run (workflow_dispatch) has no key: its files are signed by trial.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    environment: packages
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The dependencies of xtask as Cargo.lock pins them; their build scripts run here.
+      - name: The pinned toolchain and xtask, before any key is on the machine
+        run: |
+          rustup toolchain install
+          cargo build --locked -p xtask
+
+      - name: What the build job made
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: packages-input
+          path: target/stafeto-release
+
+      # Nothing from the build job reaches a shell of this job: the tag is read by xtask in its
+      # strict form, the serial comes from the published index, and xtask reads every file of
+      # the artifact in its strict form before the key is written.
+      - name: Only the files of an update are there
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+          cargo xtask release-check --packages-only --tag "$TAG"
+
+      - name: The release key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY" || { echo "::error::the secret RELEASE_SIGNING_KEY of the environment packages is empty or missing"; exit 1; }
+          # The certificate of the tree names the key; the secret holds that key.
+          name=$(basename "$(ls keys/*.cert | sort | tail -1)" .cert)
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/keys/$name.key"
+          echo "KEY=$RUNNER_TEMP/keys/$name.key" >> "$GITHUB_ENV"
+          echo "CERT=keys/$name.cert" >> "$GITHUB_ENV"
+
+      - name: Sign the packages and the index
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          dir=target/stafeto-release/pkg
+          series=$(echo "$VERSION" | cut -d. -f1,2)
+          cargo xtask pkg-sign --key "$KEY" --cert "$CERT" --dir "$dir"
+          cargo xtask repo --from "$dir" --official --key "$KEY" --cert "$CERT" \
+            --serial-after "https://stafeto.github.io/packages/$series/aarch64" --storage "${TAG}-aarch64"
+
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: Check the signed repository with the roots of the tree
+        run: cargo xtask repo --check --official --dir target/stafeto-release/pkg
+
+      - name: The files of the update
+        env:
+          TAG: ${{ github.ref_name }}
+        run: cargo xtask release-pack --packages-only --tag "$TAG"
+
+      - name: Keep the signed files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-signed
+          path: |
+            target/dist
+            target/stafeto-release/pkg
+          retention-days: 3
+          if-no-files-found: error
+
+  trial:
+    name: trial
+    needs: build
+    # The dry run: no environment, no secret, the development key.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: The pinned toolchain and xtask
+        run: |
+          rustup toolchain install
+          cargo build --locked -p xtask
+
+      - name: What the build job made
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: packages-input
+          path: target/stafeto-release
+
+      - name: Only the files of an update are there
+        run: |
+          echo "VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+          cargo xtask release-check --packages-only --trial
+
+      - name: Sign with the development key and check the repository
+        run: |
+          set -e
+          dir=target/stafeto-release/pkg
+          series=$(echo "$VERSION" | cut -d. -f1,2)
+          cargo xtask pkg-sign --dir "$dir"
+          cargo xtask repo --from "$dir" \
+            --serial-after "https://stafeto.github.io/packages/$series/aarch64" --storage "v$series-pkgs.trial-aarch64"
+          # The new packages are signed by the development key and the carried ones by the release key.
+          cargo xtask repo --check --with-official --dir "$dir"
+
+      - name: The files and the notes of the update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          series=$(echo "$VERSION" | cut -d. -f1,2)
+          cargo xtask release-pack --packages-only --trial
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          python3 tools/pages.py previous --series "$series" --releases releases.json --out anchor > /dev/null
+          python3 tools/release-notes.py --packages "$series-pkgs.trial" "v$series-pkgs.trial" "" \
+            target/stafeto-release/pkg/INDEX "anchor/$series/INDEX" > target/dist/release-notes.md
+          {
+            echo "### Notes of the update"
+            cat target/dist/release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the files of the trial
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-trial
+          path: |
+            target/dist
+            target/stafeto-release/pkg
+          retention-days: 3
+          if-no-files-found: error
+
+  draft:
+    name: draft
+    needs: [build, sign]
+    # The dry run (workflow_dispatch) leaves no draft.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: packages
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The series of this checkout
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "SERIES=$(echo "$version" | cut -d. -f1,2)" >> "$GITHUB_ENV"
+
+      # A draft of the series that waits, or a release of this name, stops the job before any draft is made.
+      - name: No draft of the series is waiting and the name is free
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          python3 tools/pages.py check-drafts --series "$SERIES" --tag "$TAG" --releases releases.json
+          # The index the update starts from, for the table of the packages it changes.
+          python3 tools/pages.py previous --series "$SERIES" --releases releases.json --out anchor > /dev/null
+
+      - name: A storage release of this name stops the job before any draft is made
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          test -n "$GH_TOKEN" || { echo "::error::the secret PACKAGES_TOKEN of the environment packages is empty or missing"; exit 1; }
+          if gh release view "$TAG-aarch64" --repo stafeto/packages >/dev/null 2>&1; then
+            echo "::error::stafeto/packages has a release $TAG-aarch64 already; the owner deletes the draft before a tag is set again"
+            exit 1
+          fi
+
+      - name: The signed files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: packages-signed
+          path: signed
+
+      - name: Check the sums
+        run: cd signed/dist && sha256sum --check SHA256SUMS
+
+      - name: Notes of the update
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          python3 tools/release-notes.py --packages "${TAG#v}" "$TAG" "$previous" \
+            "signed/dist/stafeto-${TAG#v}-INDEX" "anchor/$SERIES/INDEX" > release-notes.md
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --draft --latest=false --verify-tag \
+            --title "stafeto packages ${TAG#v}" --notes-file release-notes.md \
+            signed/dist/*
+
+      - name: Draft of the storage release in stafeto/packages
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -ef
+          dir=signed/stafeto-release/pkg
+          # The new packages and their sources; a carried package is already in the storage it came from.
+          files=$(python3 tools/pages.py new-files --dir "$dir")
+          # shellcheck disable=SC2086
+          gh release create "$TAG-aarch64" --draft --repo stafeto/packages \
+            --title "stafeto packages ${TAG#v}" \
+            --notes "The packages built for the update ${TAG#v} of stafeto, signed by the release key. Published by the workflow after the owner publishes the release $TAG of stafeto/stafeto." \
+            $files

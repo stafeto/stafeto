@@ -9,7 +9,9 @@ image and of the full image. `pack` runs after the packages are signed: the
 archives of the base image and of the full image with the signed boot images,
 the SBOM, the copy of the signed index and SHA256SUMS. xtask builds the kernel
 and the images and passes them here; the sources of the packages come from
-packages/*.toml at their SHA-256."""
+packages/*.toml at their SHA-256. `pack-packages` is the second step of a
+packages-only update (docs/release.md): the copy of the signed index, the SBOM
+of every package of the index and SHA256SUMS, with no archive of the system."""
 
 import argparse
 import gzip
@@ -430,6 +432,60 @@ def pack(args: argparse.Namespace) -> None:
         print(f"{p.stat().st_size:>10}  {p}")
 
 
+def index_versions(index: Path) -> dict[str, str]:
+    """The entries of an INDEX text: package name to its `version` field
+    (`<version>-<release>`)."""
+    found: dict[str, str] = {}
+    for block in index.read_text().split("\n\n")[1:]:
+        fields = dict(line.partition(" ")[::2] for line in block.splitlines())
+        if {"name", "version"} <= fields.keys():
+            found[fields["name"]] = fields["version"]
+    return found
+
+
+def packages_release_files(name: str) -> list[tuple[list[str], str]]:
+    """The files of a packages-only update, in the order of the table of its
+    notes: the file names of a row and its content. `pack_packages` writes
+    these names and tools/release-notes.py lists them."""
+    return [
+        ([index_name(name), index_name(name) + ".sig"],
+         "the signed index of the series with the update"),
+        ([sbom_name(name)],
+         "every package of the index with versions, licences, URLs and SHA-256"),
+        (["SHA256SUMS"], "SHA-256 of every file above"),
+    ]
+
+
+def pack_packages(args: argparse.Namespace) -> None:
+    """The files of a packages-only update in `args.out`: the signed index,
+    the SBOM of every package it lists and SHA256SUMS. `args.name` is
+    `<series>-pkgs.<k>`. Every package file of the index is in `args.packages`
+    (the carried ones too) with the size and SHA-256 the index signs, and the
+    version of its description in the tree is the version of its entry: the
+    SBOM names the sources of the tree, so a tree that has moved on stops it."""
+    name, out = args.name, args.out
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    shutil.copy(args.index, out / index_name(name))
+    shutil.copy(args.index_sig, out / f"{index_name(name)}.sig")
+    versions = index_versions(args.index)
+    digests = package_digests(args.index, args.packages)
+    missing = sorted(set(versions) - set(digests))
+    if missing:
+        raise SystemExit(f"dist: the packages {', '.join(missing)} of the index are not in {args.packages}")
+    for package, version in sorted(versions.items()):
+        described = pkgdesc.load(package)["version"]
+        if version.rsplit("-", 1)[0] != described:
+            raise SystemExit(f"dist: {package} is {version} in the index and {described} in packages/{package}.toml")
+    (out / sbom_name(name)).write_text(
+        json.dumps(sbom(name, relibc_commit(), sorted(versions), digests), indent=2) + "\n")
+    refuse_linux_guest(out, ROOT / "target" / "linux-guest")
+    lines = [f"{sha256_file(p)}  {p.name}" for p in sorted(out.iterdir())]
+    (out / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    for p in sorted(out.iterdir()):
+        print(f"{p.stat().st_size:>10}  {p}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     steps = parser.add_subparsers(dest="step", required=True)
@@ -454,8 +510,15 @@ def main() -> None:
     two.add_argument("--index", type=Path, required=True)
     two.add_argument("--index-sig", type=Path, required=True)
     two.add_argument("--out", type=Path, required=True)
+    three = steps.add_parser("pack-packages", help="the index, the SBOM and SHA256SUMS of a packages-only update")
+    three.add_argument("--name", required=True, help="<series>-pkgs.<k>")
+    three.add_argument("--packages", type=Path, required=True,
+                       help="the signed package files the index lists")
+    three.add_argument("--index", type=Path, required=True)
+    three.add_argument("--index-sig", type=Path, required=True)
+    three.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    {"stage": stage, "pack": pack}[args.step](args)
+    {"stage": stage, "pack": pack, "pack-packages": pack_packages}[args.step](args)
 
 
 if __name__ == "__main__":

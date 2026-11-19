@@ -211,6 +211,7 @@ pub(crate) fn make_repository(dir: &Path, names: &[&str], serial: u64) -> Result
         previous: None,
         perturb: Vec::new(),
         remove: Vec::new(),
+        packages_only: false,
     })?;
     let all = packages::load()?;
     repo::make(
