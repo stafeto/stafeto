@@ -393,13 +393,26 @@ pub const SHUTDOWN_RESET: u32 = 1;
 /// it, and the marks of the other protocols (bits 59 to 63) are not in it.
 pub const STOP_NOTICE: u64 = (1 << 58) | 0x5354_4f50;
 
+/// The bit of a nudge on the stop notice's label: a service that sends no sign of
+/// life gets it from init at the first missed one (init::watch), and answers
+/// with one line of what its heartbeat knows (rt::service). It asks nothing
+/// else: the service goes on, and sends no sign of life for it.
+pub const PROBE_BIT: u64 = 1 << 1;
+
 /// Whether a notification that carries the label STOP_NOTICE with `bits` asks
-/// the service to stop: any bit but CLIENT_GONE does. The CLIENT_GONE of the
-/// copy init made for the notice, which may come by itself (on several CPUs the
-/// kernel can deliver it apart from the notify), asks nothing and is no client
-/// of the service either: the loop swallows it.
+/// the service to stop: any bit but CLIENT_GONE and PROBE_BIT does. The
+/// CLIENT_GONE of the copy init made for the notice, which may come by itself
+/// (on several CPUs the kernel can deliver it apart from the notify), asks
+/// nothing and is no client of the service either: the loop swallows it.
 pub const fn wants_stop(bits: u64) -> bool {
-    bits & !abi::CLIENT_GONE != 0
+    bits & !(abi::CLIENT_GONE | PROBE_BIT) != 0
+}
+
+/// Whether a notification that carries the label STOP_NOTICE with `bits` is
+/// the nudge of a suspect service (PROBE_BIT). A stop asked in the same
+/// notification wins (`wants_stop`).
+pub const fn wants_probe(bits: u64) -> bool {
+    bits & PROBE_BIT != 0
 }
 
 /// The body of SHUTDOWN, 8 bytes: `kind` (SHUTDOWN_OFF or SHUTDOWN_RESET)
@@ -1892,6 +1905,20 @@ mod tests {
         assert!(wants_stop(abi::CLIENT_GONE | 1));
         assert!(!wants_stop(abi::CLIENT_GONE));
         assert!(!wants_stop(0));
+    }
+
+    #[test]
+    fn the_probe_bit_nudges_and_stops_nothing() {
+        assert!(wants_probe(PROBE_BIT));
+        assert!(wants_probe(abi::CLIENT_GONE | PROBE_BIT));
+        assert!(!wants_stop(PROBE_BIT));
+        assert!(!wants_stop(abi::CLIENT_GONE | PROBE_BIT));
+        assert!(!wants_probe(1));
+        assert!(!wants_probe(abi::CLIENT_GONE));
+        // Together with the stop bit the stop is asked, and the probe is there too.
+        assert!(wants_stop(1 | PROBE_BIT) && wants_probe(1 | PROBE_BIT));
+        // The stop notice init sends today (one notify with bit 0) is no probe.
+        assert_ne!(PROBE_BIT, 1);
     }
 
     #[test]

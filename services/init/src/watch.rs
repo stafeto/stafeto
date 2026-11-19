@@ -44,6 +44,8 @@ impl Watch {
             deadline: now.saturating_add(self.deadline_ns),
             suspect: false,
             late: 0,
+            refused: 0,
+            last_beat: None,
         }
     }
 }
@@ -57,6 +59,10 @@ pub struct Watched {
     suspect: bool,
     /// Late second expiries in a row that re-armed the deadline.
     late: u8,
+    /// The HEARTBEATs answered BAD_STATE since the watchdog was armed, and the instant of the last
+    /// one answered 0 (the lines of a silent service tell them).
+    refused: u32,
+    last_beat: Option<u64>,
 }
 
 /// What an expiry of the timer means.
@@ -76,6 +82,7 @@ impl Watched {
     /// deadline, and a mark of suspicion goes. Gives the new deadline, for
     /// the timer.
     pub fn beat(&mut self, now: u64) -> u64 {
+        self.last_beat = Some(now);
         self.deadline = now.saturating_add(self.watch.deadline_ns);
         self.suspect = false;
         self.late = 0;
@@ -106,6 +113,25 @@ impl Watched {
         Action::Suspect {
             deadline: self.deadline,
         }
+    }
+
+    /// `expired`, and whether this expiry is the first miss: a service that was not suspect before
+    /// it and is now, the one whose service init nudges (`proto_init::PROBE_BIT`). A late second
+    /// expiry that re-arms the deadline is no first miss.
+    pub fn expired_first(&mut self, now: u64) -> (Action, bool) {
+        let was = self.suspect;
+        let action = self.expired(now);
+        (action, !was && matches!(action, Action::Suspect { .. }))
+    }
+
+    /// A HEARTBEAT refused (BAD_STATE).
+    pub fn refuse(&mut self) {
+        self.refused = self.refused.saturating_add(1);
+    }
+
+    /// The HEARTBEATs refused so far, and the instant of the last one answered 0.
+    pub fn beats_refused(&self) -> (u32, Option<u64>) {
+        (self.refused, self.last_beat)
     }
 
     /// The deadline the timer is set to.
@@ -245,5 +271,38 @@ mod tests {
         let before = suspect;
         assert_eq!(suspect.expired(119), Action::Stale);
         assert_eq!(suspect, before);
+    }
+
+    /// The planted fault of path 3: a service whose HEARTBEATs init refuses. The count and the
+    /// instant of the last good one reach the line of the silent service, and the first miss
+    /// (the nudge) comes once.
+    #[test]
+    fn refused_beats_are_counted_and_the_first_miss_comes_once() {
+        let mut w = WATCH.arm(0);
+        assert_eq!(w.beats_refused(), (0, None));
+        assert_eq!(w.beat(40), 140);
+        w.refuse();
+        w.refuse();
+        assert_eq!(w.beats_refused(), (2, Some(40)));
+        assert_eq!(
+            w.expired_first(140),
+            (Action::Suspect { deadline: 160 }, true)
+        );
+        // A late second expiry re-arms and is no first miss; the on-time one is silence.
+        assert_eq!(
+            w.expired_first(200),
+            (Action::Suspect { deadline: 220 }, false)
+        );
+        assert_eq!(w.expired_first(220), (Action::Silent, false));
+        assert_eq!(w.beats_refused(), (2, Some(40)));
+    }
+
+    #[test]
+    fn a_beat_between_two_misses_makes_the_next_miss_a_first_one_again() {
+        let mut w = WATCH.arm(0);
+        assert!(w.expired_first(100).1);
+        w.beat(110);
+        assert_eq!(w.expired_first(50), (Action::Stale, false));
+        assert!(w.expired_first(210).1, "a new first miss is nudged again");
     }
 }

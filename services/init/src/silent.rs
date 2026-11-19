@@ -67,6 +67,75 @@ pub struct Look<'a> {
     /// None when init holds no handle to the thread or the call failed.
     pub thread: Option<ThreadLook>,
     pub budgets: &'a [BudgetLook],
+    /// What init knows besides the thread: its refused HEARTBEATs, the service's channel and
+    /// the CPUs' sleep. Only the line of a silent service has it.
+    pub diag: Option<Diag<'a>>,
+}
+
+/// What a CPU counts of its time, in microseconds (`object_info` CPU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuSleep {
+    /// The time since the CPU started, and the time it slept in `wfi`.
+    pub since_us: u64,
+    pub idle_us: u64,
+}
+
+/// The state of the service's channel (`object_info` CHANNEL): requests queued and receivers
+/// waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelLook {
+    pub queued: u64,
+    pub receivers: u64,
+}
+
+/// What init adds to the line of a silent service, to tell where its sign of life got lost: a
+/// service whose HEARTBEATs init refused (the count and the instant of the last answered 0), a
+/// channel with a request queued or no receiver, a CPU that slept through the service's deadline.
+pub struct Diag<'a> {
+    pub refused: u32,
+    pub last_beat_us: Option<u64>,
+    /// None when init holds no channel to the service or the call failed.
+    pub channel: Option<ChannelLook>,
+    /// The CPU init runs on, and what each CPU of the machine counts, in the order of its number.
+    pub init_cpu: Option<u64>,
+    pub cpus: &'a [CpuSleep],
+}
+
+/// Microseconds as `S.mmm ms`.
+struct Ms(u64);
+
+impl fmt::Display for Ms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:03} ms", self.0 / 1000, self.0 % 1000)
+    }
+}
+
+impl fmt::Display for Diag<'_> {
+    /// `; heartbeats refused R, last accepted at T ms|never; channel queued Q, receivers V|unknown;
+    /// init on cpu C; cpu 0 slept I of S ms; cpu 1 ...`
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "; heartbeats refused {}, last accepted ", self.refused)?;
+        match self.last_beat_us {
+            Some(us) => write!(f, "at {}", Ms(us))?,
+            None => f.write_str("never")?,
+        }
+        match self.channel {
+            Some(c) => write!(
+                f,
+                "; channel queued {}, receivers {}",
+                c.queued, c.receivers
+            )?,
+            None => f.write_str("; channel unknown")?,
+        }
+        match self.init_cpu {
+            Some(cpu) => write!(f, "; init on cpu {cpu}")?,
+            None => f.write_str("; init on cpu ?")?,
+        }
+        for (n, c) in self.cpus.iter().enumerate() {
+            write!(f, "; cpu {n} slept {} of {}", Ms(c.idle_us), Ms(c.since_us))?;
+        }
+        Ok(())
+    }
 }
 
 /// Init's clock and the lateness of the expiry that found the service silent.
@@ -159,6 +228,9 @@ impl fmt::Display for Look<'_> {
                 b.pending
             )?;
         }
+        if let Some(diag) = &self.diag {
+            write!(f, "{diag}")?;
+        }
         Ok(())
     }
 }
@@ -203,6 +275,7 @@ mod tests {
             }),
             thread: Some(thread(ThreadState::AwaitingReply)),
             budgets: &budgets,
+            diag: None,
         };
         assert_eq!(
             look.to_string(),
@@ -234,6 +307,7 @@ mod tests {
                 moment: None,
                 thread: Some(thread(state)),
                 budgets: &[],
+                diag: None,
             };
             let line = look.to_string();
             assert!(!seen.contains(&line));
@@ -248,6 +322,7 @@ mod tests {
             moment: None,
             thread: None,
             budgets: &[],
+            diag: None,
         };
         assert_eq!(
             unknown.to_string(),
@@ -288,9 +363,83 @@ mod tests {
             moment: None,
             thread: Some(thread(ThreadState::Ready)),
             budgets: &two,
+            diag: None,
         };
         let line = look.to_string();
         assert_eq!(line.matches("; budget ").count(), 2);
         assert!(!line.contains('\n'));
+    }
+
+    /// The planted fault of path 3 and 7: HEARTBEATs refused, a request queued with no receiver,
+    /// and a CPU that slept through the deadline, all on the one line of the silent service.
+    #[test]
+    fn the_line_of_a_silent_service_adds_the_refusals_the_channel_and_the_sleep_of_the_cpus() {
+        let budgets = [SERVE];
+        let cpus = [
+            CpuSleep {
+                since_us: 1_666_399_000,
+                idle_us: 1_600_000_500,
+            },
+            CpuSleep {
+                since_us: 1_660_000_000,
+                idle_us: 12,
+            },
+        ];
+        let look = Look {
+            name: "tty",
+            role: "silent service",
+            cpus: 1,
+            moment: Some(Moment {
+                now_us: 1_666_399,
+                late_us: 2_050,
+                late_count: 0,
+            }),
+            thread: Some(thread(ThreadState::Receiving)),
+            budgets: &budgets,
+            diag: Some(Diag {
+                refused: 3,
+                last_beat_us: Some(1_100_250),
+                channel: Some(ChannelLook {
+                    queued: 1,
+                    receivers: 0,
+                }),
+                init_cpu: Some(1),
+                cpus: &cpus,
+            }),
+        };
+        let line = look.to_string();
+        assert!(line.starts_with("init: tty silent service at 1666.399 ms, "));
+        assert!(line.ends_with(
+            "pending 2; heartbeats refused 3, last accepted at 1100.250 ms; \
+             channel queued 1, receivers 0; init on cpu 1; \
+             cpu 0 slept 1600000.500 ms of 1666399.000 ms; cpu 1 slept 0.012 ms of 1660000.000 ms"
+        ));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn what_init_could_not_read_is_said_so_and_a_boot_with_no_fault_prints_none_of_it() {
+        let diag = Diag {
+            refused: 0,
+            last_beat_us: None,
+            channel: None,
+            init_cpu: None,
+            cpus: &[],
+        };
+        assert_eq!(
+            diag.to_string(),
+            "; heartbeats refused 0, last accepted never; channel unknown; init on cpu ?"
+        );
+        // The line of the console driver has no `diag`: no new words there.
+        let driver = Look {
+            name: "uart",
+            role: "console driver",
+            cpus: 2,
+            moment: None,
+            thread: None,
+            budgets: &[],
+            diag: None,
+        };
+        assert!(!driver.to_string().contains("heartbeats"));
     }
 }

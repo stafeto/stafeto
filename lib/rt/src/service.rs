@@ -546,9 +546,17 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 // is swallowed, since it names no session (`place` and `closed`
                 // of a service would take the label for a client's).
                 (Source::Session, proto_init::STOP_NOTICE, _) => {
-                    if proto_init::wants_stop(notice.bits) {
-                        steps::stopping();
-                        service.stop()
+                    match on_stop_notice(notice.bits, beat.is_some()) {
+                        OnStopNotice::Stop => {
+                            steps::stopping();
+                            service.stop()
+                        }
+                        OnStopNotice::Probe => {
+                            if let Some(beat) = &beat {
+                                beat.probe();
+                            }
+                        }
+                        OnStopNotice::Nothing => {}
                     }
                 }
                 (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
@@ -591,6 +599,27 @@ pub fn run_in<S: Service<K>, const K: usize>(
             steps::end(began, steps::NOTICE);
         }
         service.between_notifications(notice);
+    }
+}
+
+/// What the loop does with a notification on init's label (`proto_init::STOP_NOTICE`).
+#[derive(Debug, PartialEq, Eq)]
+enum OnStopNotice {
+    Stop,
+    /// The nudge of a suspect service: one line of its heartbeat.
+    Probe,
+    Nothing,
+}
+
+/// A stop asked wins over a nudge; a nudge of a service that has no heartbeat, or that
+/// came with nothing else but CLIENT_GONE, changes nothing.
+fn on_stop_notice(bits: u64, has_heartbeat: bool) -> OnStopNotice {
+    if proto_init::wants_stop(bits) {
+        OnStopNotice::Stop
+    } else if has_heartbeat && proto_init::wants_probe(bits) {
+        OnStopNotice::Probe
+    } else {
+        OnStopNotice::Nothing
     }
 }
 
@@ -1369,6 +1398,8 @@ struct Wire<'a> {
     period: u64,
     priority: u8,
     deadline: u64,
+    /// The instant of the last arming, in ns.
+    armed_at: u64,
 }
 
 /// What the heartbeat's decision needs of the world, so that the decision
@@ -1376,8 +1407,8 @@ struct Wire<'a> {
 trait Beating {
     /// Whether the counter reached the deadline the timer was armed for.
     fn reached(&self) -> bool;
-    /// HEARTBEAT to init.
-    fn send(&mut self);
+    /// HEARTBEAT to init: the error of the send, if it failed.
+    fn send(&mut self) -> Result<(), Error>;
     /// The timer armed again for the deadline it has: a deadline already reached fires within
     /// the call itself.
     fn arm_again(&mut self) -> Result<(), Error>;
@@ -1385,13 +1416,39 @@ trait Beating {
     fn arm_next(&mut self) -> Result<(), Error>;
 }
 
-/// The unexpected things a heartbeat met: expiries judged stale and armings
-/// that failed, counted, and whether an arming waits for another try.
-#[derive(Default)]
+/// What a heartbeat met: expiries judged stale, armings that failed and sends that
+/// failed, counted, whether an arming waits for another try, and the totals
+/// the probe line of init's nudge tells (`Probe`).
 struct Tally {
     stale: u32,
     failed: u32,
     retry: bool,
+    /// Every expiry of the timer the loop took, stale ones too.
+    expiries: u32,
+    /// The HEARTBEATs whose send returned, and those whose send failed, with the error of the last.
+    sent: u32,
+    send_errors: u32,
+    last_send_error: Option<Error>,
+    /// Whether the first failed send went to the console.
+    send_told: bool,
+    /// How the last arming ended.
+    last_arm: Result<(), Error>,
+}
+
+impl Default for Tally {
+    fn default() -> Tally {
+        Tally {
+            stale: 0,
+            failed: 0,
+            retry: false,
+            expiries: 0,
+            sent: 0,
+            send_errors: 0,
+            last_send_error: None,
+            send_told: false,
+            last_arm: Ok(()),
+        }
+    }
 }
 
 /// What a step of the heartbeat has to tell: the first of each unexpected
@@ -1401,12 +1458,15 @@ enum Note {
     Nothing,
     FirstStale,
     FirstFailure(Error),
+    /// The first HEARTBEAT whose send failed, which `Wire::send` used to drop unseen.
+    FirstSendFailure(Error),
 }
 
 impl Tally {
     /// The outcome of an arming: a failure is counted and remembered for the
     /// next turn of the loop, a success clears the memory.
     fn armed(&mut self, outcome: Result<(), Error>) -> Note {
+        self.last_arm = outcome;
         match outcome {
             Ok(()) => {
                 self.retry = false;
@@ -1425,12 +1485,34 @@ impl Tally {
     }
 }
 
+impl Tally {
+    /// The first failed send, once, for a step that has nothing else to tell.
+    fn untold_send(&mut self) -> Note {
+        match self.last_send_error {
+            Some(e) if !self.send_told => {
+                self.send_told = true;
+                Note::FirstSendFailure(e)
+            }
+            _ => Note::Nothing,
+        }
+    }
+
+    /// `armed`, and when that has nothing to tell, a failed send nobody told yet.
+    fn armed_or_send(&mut self, outcome: Result<(), Error>) -> Note {
+        match self.armed(outcome) {
+            Note::Nothing => self.untold_send(),
+            note => note,
+        }
+    }
+}
+
 /// An expiry of the timer: one before the deadline is stale (the timer's
 /// slot kept it from an earlier deadline) and arms the timer again for the
 /// same deadline, so that no sign of life is lost to it; else HEARTBEAT goes
 /// and the timer is armed at the next deadline. Init answers HEARTBEAT at
 /// once; what it answers changes nothing here.
 fn expiry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
+    tally.expiries = tally.expiries.saturating_add(1);
     if !wire.reached() {
         tally.stale = tally.stale.saturating_add(1);
         let outcome = wire.arm_again();
@@ -1440,9 +1522,15 @@ fn expiry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
             (note, _) => note,
         };
     }
-    wire.send();
+    match wire.send() {
+        Ok(()) => tally.sent = tally.sent.saturating_add(1),
+        Err(e) => {
+            tally.send_errors = tally.send_errors.saturating_add(1);
+            tally.last_send_error = Some(e);
+        }
+    }
     let outcome = wire.arm_next();
-    tally.armed(outcome)
+    tally.armed_or_send(outcome)
 }
 
 /// The turn of the loop: an arming that failed is tried again.
@@ -1451,7 +1539,7 @@ fn retry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
         return Note::Nothing;
     }
     let outcome = wire.arm_next();
-    tally.armed(outcome)
+    tally.armed_or_send(outcome)
 }
 
 /// The t0 of a heartbeat of `period` registered at `now`: now, or with
@@ -1484,6 +1572,7 @@ impl<'a> Beat<'a> {
             period: h.period_ns,
             priority: h.priority,
             deadline: t0,
+            armed_at: 0,
         };
         wire.arm()?;
         Ok(Beat {
@@ -1514,6 +1603,87 @@ impl<'a> Beat<'a> {
             Note::FirstFailure(e) => crate::println!(
                 "service heartbeat: arming failed with {e:?}, tried again (period {period} ns, priority {priority})"
             ),
+            Note::FirstSendFailure(e) => crate::println!(
+                "service heartbeat: send failed with {e:?} (period {period} ns, priority {priority})"
+            ),
+        }
+    }
+
+    /// Init's nudge of a suspect service (`proto_init::PROBE_BIT`): the line
+    /// of what this heartbeat knows. No sign of life goes for it.
+    fn probe(&self) {
+        crate::println!("{}", self.probe_line());
+    }
+
+    fn probe_line(&self) -> Probe {
+        Probe {
+            cpu: sys::cpu_info(0).ok().map(|i| i.current),
+            now: time::ticks_to_ns(time::now()),
+            deadline: self.wire.deadline,
+            armed_at: self.wire.armed_at,
+            last_arm: self.tally.last_arm,
+            expiries: self.tally.expiries,
+            sent: self.tally.sent,
+            send_errors: self.tally.send_errors,
+            last_send_error: self.tally.last_send_error,
+        }
+    }
+}
+
+/// What a heartbeat tells when init nudges the service: the CPU the service runs
+/// on, its clock, the deadline its timer is armed for, the instant and the
+/// outcome of the last arming, and the counts of the expiries taken, the
+/// sends that returned and those that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Probe {
+    cpu: Option<u64>,
+    now: u64,
+    deadline: u64,
+    armed_at: u64,
+    last_arm: Result<(), Error>,
+    expiries: u32,
+    sent: u32,
+    send_errors: u32,
+    last_send_error: Option<Error>,
+}
+
+/// Nanoseconds as `S.mmm ms`.
+struct Ms(u64);
+
+impl core::fmt::Display for Ms {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{:03} ms", self.0 / 1_000_000, self.0 / 1000 % 1000)
+    }
+}
+
+impl core::fmt::Display for Probe {
+    /// `service heartbeat probe: cpu C, now N ms, deadline D ms, armed at A ms (Ok|E),
+    /// expiries F, sent S, send errors X (last E|none)`
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("service heartbeat probe: cpu ")?;
+        match self.cpu {
+            Some(cpu) => write!(f, "{cpu}")?,
+            None => f.write_str("?")?,
+        }
+        write!(
+            f,
+            ", now {}, deadline {}, armed at {} ",
+            Ms(self.now),
+            Ms(self.deadline),
+            Ms(self.armed_at)
+        )?;
+        match self.last_arm {
+            Ok(()) => f.write_str("(Ok)")?,
+            Err(e) => write!(f, "({e:?})")?,
+        }
+        write!(
+            f,
+            ", expiries {}, sent {}, send errors {} (last ",
+            self.expiries, self.sent, self.send_errors
+        )?;
+        match self.last_send_error {
+            Some(e) => write!(f, "{e:?})"),
+            None => f.write_str("none)"),
         }
     }
 }
@@ -1524,6 +1694,7 @@ impl Wire<'_> {
     fn arm(&mut self) -> Result<(), Error> {
         let now = time::ticks_to_ns(time::now());
         self.deadline = next_release(self.t0, self.period, now);
+        self.armed_at = time::ticks_to_ns(time::now());
         let armed = sys::timer_set(&self.timer, self.deadline);
         #[cfg(feature = "armed-probe")]
         probe(self.t0, self.deadline);
@@ -1536,11 +1707,12 @@ impl Beating for Wire<'_> {
         time::reached(self.deadline)
     }
 
-    fn send(&mut self) {
-        let _ = sys::send_beat(self.to, &Method::Heartbeat.header().bytes());
+    fn send(&mut self) -> Result<(), Error> {
+        sys::send_beat(self.to, &Method::Heartbeat.header().bytes()).map(drop)
     }
 
     fn arm_again(&mut self) -> Result<(), Error> {
+        self.armed_at = time::ticks_to_ns(time::now());
         sys::timer_set(&self.timer, self.deadline)
     }
 
@@ -1984,7 +2156,9 @@ mod long_portion_tests {
 
 #[cfg(test)]
 mod beat_tests {
-    use super::{Beating, Error, Note, Tally, expiry, next_release, retry, start_on};
+    use super::{Beating, Error, Ms, Note, Probe, Tally, expiry, next_release, retry, start_on};
+    extern crate std;
+    use std::string::ToString;
 
     /// A world for the decision: whether the deadline is reached, what the
     /// armings answer, and what was done.
@@ -1993,6 +2167,8 @@ mod beat_tests {
         arm_answers: [Result<(), Error>; 3],
         answered: usize,
         sent: u32,
+        send_answers: [Result<(), Error>; 3],
+        sends: usize,
         again: u32,
         next: u32,
     }
@@ -2004,6 +2180,8 @@ mod beat_tests {
                 arm_answers: [Ok(()); 3],
                 answered: 0,
                 sent: 0,
+                send_answers: [Ok(()); 3],
+                sends: 0,
                 again: 0,
                 next: 0,
             }
@@ -2019,8 +2197,11 @@ mod beat_tests {
         fn reached(&self) -> bool {
             self.reached
         }
-        fn send(&mut self) {
+        fn send(&mut self) -> Result<(), Error> {
             self.sent += 1;
+            let i = self.sends;
+            self.sends += 1;
+            self.send_answers.get(i).copied().unwrap_or(Ok(()))
         }
         fn arm_again(&mut self) -> Result<(), Error> {
             self.again += 1;
@@ -2079,6 +2260,131 @@ mod beat_tests {
         assert_eq!((t.stale, t.failed, t.retry), (1, 1, true));
         assert_eq!(retry(&mut w, &mut t), Note::Nothing);
         assert!(!t.retry);
+    }
+
+    /// The planted fault of path 2: the send of HEARTBEAT fails (the thread's count of requests
+    /// is spent, or init's end of the channel is closed) and the timer is armed all the same.
+    /// The first failure is told once with its error, the counts tell the rest.
+    #[test]
+    fn a_failed_send_is_counted_and_told_once_and_the_timer_goes_on() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        w.send_answers = [Err(Error::BadState), Err(Error::PeerClosed), Ok(())];
+        assert_eq!(
+            expiry(&mut w, &mut t),
+            Note::FirstSendFailure(Error::BadState)
+        );
+        assert_eq!((w.sent, w.next, t.send_errors, t.sent), (1, 1, 1, 0));
+        assert_eq!(
+            expiry(&mut w, &mut t),
+            Note::Nothing,
+            "the second is not told"
+        );
+        assert_eq!(
+            (t.send_errors, t.last_send_error),
+            (2, Some(Error::PeerClosed))
+        );
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((t.sent, t.send_errors, t.expiries), (1, 2, 3));
+    }
+
+    /// A failed send and a failed arming in one step: the arming's note goes first, and the
+    /// failed send is told at the next step that has nothing else to tell.
+    #[test]
+    fn a_failed_send_is_not_lost_behind_a_failed_arming() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        w.send_answers[0] = Err(Error::BadState);
+        w.arm_answers[0] = Err(Error::NoMemory);
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstFailure(Error::NoMemory));
+        assert_eq!(
+            retry(&mut w, &mut t),
+            Note::FirstSendFailure(Error::BadState)
+        );
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+    }
+
+    /// A normal run counts and tells nothing: the sends and the expiries only.
+    #[test]
+    fn a_normal_run_counts_its_sends_and_says_nothing() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        for _ in 0..3 {
+            assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        }
+        assert_eq!(
+            (t.expiries, t.sent, t.send_errors, t.last_send_error),
+            (3, 3, 0, None)
+        );
+        assert_eq!(t.last_arm, Ok(()));
+        let mut stale = Fake::new(false);
+        assert_eq!(expiry(&mut stale, &mut t), Note::FirstStale);
+        assert_eq!(
+            (t.expiries, t.sent),
+            (4, 3),
+            "a stale expiry counts and sends nothing"
+        );
+    }
+
+    #[test]
+    fn the_outcome_of_the_last_arming_is_kept() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        w.arm_answers[0] = Err(Error::BadState);
+        let _ = expiry(&mut w, &mut t);
+        assert_eq!(t.last_arm, Err(Error::BadState));
+        let _ = retry(&mut w, &mut t);
+        assert_eq!(t.last_arm, Ok(()));
+    }
+
+    #[test]
+    fn a_nudge_prints_and_never_stops_and_a_stop_still_stops() {
+        use super::OnStopNotice::{Nothing, Probe as Nudge, Stop};
+        use super::on_stop_notice;
+        let (gone, bit) = (abi::CLIENT_GONE, proto_init::PROBE_BIT);
+        assert_eq!(on_stop_notice(bit, true), Nudge);
+        assert_eq!(on_stop_notice(bit | gone, true), Nudge);
+        assert_eq!(
+            on_stop_notice(bit, false),
+            Nothing,
+            "no heartbeat, nothing to tell"
+        );
+        assert_eq!(on_stop_notice(1, true), Stop);
+        assert_eq!(on_stop_notice(1 | bit, true), Stop);
+        assert_eq!(on_stop_notice(gone, true), Nothing);
+    }
+
+    fn probe() -> Probe {
+        Probe {
+            cpu: Some(1),
+            now: 1_666_399_123,
+            deadline: 1_250_000_000,
+            armed_at: 1_000_000_000,
+            last_arm: Ok(()),
+            expiries: 5,
+            sent: 4,
+            send_errors: 0,
+            last_send_error: None,
+        }
+    }
+
+    #[test]
+    fn the_probe_line_names_the_cpu_the_timer_the_arming_and_the_counts() {
+        assert_eq!(
+            probe().to_string(),
+            "service heartbeat probe: cpu 1, now 1666.399 ms, deadline 1250.000 ms, \
+             armed at 1000.000 ms (Ok), expiries 5, sent 4, send errors 0 (last none)"
+        );
+        let faulty = Probe {
+            cpu: None,
+            last_arm: Err(Error::BadState),
+            send_errors: 2,
+            last_send_error: Some(Error::PeerClosed),
+            ..probe()
+        };
+        assert_eq!(
+            faulty.to_string(),
+            "service heartbeat probe: cpu ?, now 1666.399 ms, deadline 1250.000 ms, \
+             armed at 1000.000 ms (BadState), expiries 5, sent 4, send errors 2 (last PeerClosed)"
+        );
+        assert_eq!(Ms(7_000_999).to_string(), "7.000 ms");
     }
 
     /// On the grid two services of one period that register at different
