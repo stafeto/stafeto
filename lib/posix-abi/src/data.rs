@@ -169,15 +169,7 @@ enum Attempt {
 /// The root of the service from the process service (TakeRoot).
 fn take_root() -> Result<Handle<Channel>, Attempt> {
     let mut request = Writer::new();
-    proto_process::Method::TakeRoot
-        .header()
-        .write(&mut request)
-        .and_then(|()| {
-            proto_process::LoaderRoot {
-                root: proto_process::ROOT_DATA,
-            }
-            .write(&mut request)
-        })
+    proto_process::take_root(proto_process::ROOT_DATA, &mut request)
         .map_err(|_| Attempt::Failed(EIO))?;
     let mut reply = crate::process::send_again(&request).map_err(|error| {
         why!("TakeRoot not sent: {error:?}");
