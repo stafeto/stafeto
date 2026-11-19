@@ -26,6 +26,8 @@ use abi::{CLIENT_GONE, Error, INLINE_MAX, MESSAGE_MAX, Rights, Source};
 use proto_init::{Connect, Method, RegisterReply, START_NAMES};
 use proto_wire::{HEADER_LEN, Header, Name, Reader, Status, Writer};
 
+#[cfg(any(feature = "step-stats", test))]
+mod pairs;
 #[cfg(feature = "step-stats")]
 mod sample;
 #[cfg(feature = "step-stats")]
@@ -454,6 +456,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
     #[cfg_attr(feature = "step-stats", allow(unused_mut, unused_variables))]
     let mut owed = Owed::new(S::OWES_REPLY);
     loop {
+        if let Some(beat) = &mut beat {
+            beat.turn();
+        }
         #[cfg(feature = "step-stats")]
         let (began, incoming) = sys::receive_measured(channel);
         #[cfg(not(feature = "step-stats"))]
@@ -687,15 +692,22 @@ mod steps {
     static BEATS: AtomicU64 = AtomicU64::new(0);
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    /// The preemptions of the step whose raw time is in `LONGEST`.
-    static LONGEST_PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The longest raw step of each pair (kind, preemptions): 152 bytes a kind, 10 184 for the
+    /// 67 kinds, and 536 more for `KIND_LONGEST`, in `.bss` of the images with this feature only. The table at the end of a run
+    /// tells them (`print_table_line`).
+    static LONGEST: super::pairs::Pairs<KINDS> = super::pairs::Pairs::new();
+    /// The longest raw step of each kind, whose growth prints the line of a new longest during
+    /// the run, as it always did: the console is slow and a probe that reads it is sensitive to
+    /// its volume.
+    static KIND_LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The first count of steps from which the table of the longest steps goes out again at each
     /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
     static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
-    /// The kind the table in progress goes on from (`KINDS` when no table is in progress).
-    static CURSOR: AtomicUsize = AtomicUsize::new(KINDS);
+    /// The place the table in progress goes on from, over the pairs of all kinds (`TABLE_END` when
+    /// no table is in progress).
+    static CURSOR: AtomicUsize = AtomicUsize::new(TABLE_END);
+    const TABLE_END: usize = KINDS * super::pairs::PAIRS;
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -703,7 +715,6 @@ mod steps {
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The same for the steps of detail 16 (the terminal's Watch).
     static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
     /// The tag a new longest prints with: the service that asked (0: none).
     static REPORT: AtomicU8 = AtomicU8::new(0);
@@ -735,8 +746,9 @@ mod steps {
         TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
-    /// The line of the next kind of the table, from the kind `CURSOR` is at: `service table: T
-    /// kind K N ticks detail D preempts P`, the longest step of that kind seen. The lines of a new
+    /// The line of the next non-empty pair of the table, from the place `CURSOR` is at: `service
+    /// table: T kind K N ticks detail D preempts P`, the longest step of that kind and count of
+    /// preemptions seen. The lines of a new
     /// longest are told once and the kernel log, which is bounded, loses records of a burst, so a
     /// reader that needs every kind takes them from the table, told after the burst. The table
     /// goes out one line after each step that follows (`end`), as the line of a new longest does:
@@ -744,14 +756,12 @@ mod steps {
     /// where the 15 to 35 lines of a whole table would hold it for some 90,000 ticks.
     fn print_table_line(tag: u8) {
         let from = CURSOR.load(Ordering::Relaxed);
-        let Some(kind) = (from..KINDS).find(|&k| LONGEST[k].load(Ordering::Relaxed) != 0) else {
-            CURSOR.store(KINDS, Ordering::Relaxed);
+        let Some((kind, longest, next)) = LONGEST.next(from) else {
+            CURSOR.store(TABLE_END, Ordering::Relaxed);
             return;
         };
-        CURSOR.store(kind + 1, Ordering::Relaxed);
-        let took = LONGEST[kind].load(Ordering::Relaxed);
-        let detail = DETAILS[kind].load(Ordering::Relaxed);
-        let preempts = LONGEST_PREEMPTS[kind].load(Ordering::Relaxed);
+        CURSOR.store(next, Ordering::Relaxed);
+        let (took, detail, preempts) = (longest.ticks, longest.detail, longest.preempts);
         crate::println!(
             "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
         );
@@ -791,10 +801,7 @@ mod steps {
         QUIET.store(true, Ordering::Relaxed);
     }
     pub fn maximum(kind: usize) -> Option<(u64, u64)> {
-        Some((
-            LONGEST.get(kind)?.load(Ordering::Relaxed),
-            DETAILS[kind].load(Ordering::Relaxed),
-        ))
+        LONGEST.maximum(kind)
     }
 
     /// The longest step of `kind` whose detail was `detail` (32 or 16).
@@ -905,24 +912,22 @@ mod steps {
             crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
         }
         // A line prints when the raw time of the kind grows, as it always did, and carries the
-        // preemptions of that step. The console is slow and a probe that reads it is
-        // sensitive to its volume, so a step whose raw time is not a new longest prints
-        // nothing, though its time less the charge may be longer than that of the line before:
-        // a reader that judges by the lines takes at most the charge of the preemptions of the
-        // longest raw step too little, and the warning of a raw time above the bound names it.
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
-            DETAILS[kind].store(detail, Ordering::Relaxed);
-            LONGEST_PREEMPTS[kind].store(n_preempt, Ordering::Relaxed);
-            if printing {
-                // The count is left out when it is 0 (most steps): a reader takes a missing
-                // count as 0, and the console, which is slow, has less to write.
-                if n_preempt == 0 {
-                    crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
-                } else {
-                    crate::println!(
-                        "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
-                    );
-                }
+        // preemptions of that step. The pairs (kind, preemptions) are kept apart from it
+        // (`pairs`) and go out in the table: the greatest raw time of a pair is also its greatest
+        // time less the charge of its preemptions at any charge, so a reader of the table has the
+        // exact longest of a kind without the service knowing the charge. The bookkeeping runs
+        // here, after the sample is taken and the interval of the step is closed, so that no step
+        // of the loop pays for it.
+        LONGEST.record(kind, took, detail, n_preempt);
+        if took > KIND_LONGEST[kind].fetch_max(took, Ordering::Relaxed) && printing {
+            // The count is left out when it is 0 (most steps): a reader takes a missing count as
+            // 0, and the console, which is slow, has less to write.
+            if n_preempt == 0 {
+                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+            } else {
+                crate::println!(
+                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
+                );
             }
         }
         // The table goes out after the reply and after the sample is taken, as the line of a new
@@ -934,7 +939,7 @@ mod steps {
             if done >= from && done.is_power_of_two() {
                 CURSOR.store(0, Ordering::Relaxed);
             }
-            if CURSOR.load(Ordering::Relaxed) < KINDS {
+            if CURSOR.load(Ordering::Relaxed) < TABLE_END {
                 print_table_line(tag);
             }
         }
@@ -989,7 +994,8 @@ pub fn step_after(f: fn()) {
 }
 
 /// Makes the loop of this service tell the table of its longest steps again, one line of
-/// `service table: T kind K N ticks detail D preempts P` for each kind, from each power of two of
+/// `service table: T kind K N ticks detail D preempts P` for each pair of kind and preemptions that
+/// no other pair beats (`pairs`), from each power of two of
 /// the steps it did from 128 on, one line after each of the steps that follow (feature
 /// `step-stats`; nothing without it). The line of a new longest of `report_steps` goes out once,
 /// in the burst at the start of a run, where the bounded kernel log loses records; the table
@@ -1324,13 +1330,104 @@ fn probe(t0: u64, deadline: u64) {
     }
 }
 
-/// The heartbeat's timer and its deadlines, t0 + k * period.
+/// The heartbeat's timer and its deadlines, t0 + k * period, with the
+/// counts of what went unexpectedly (`Tally`).
 struct Beat<'a> {
+    wire: Wire<'a>,
+    tally: Tally,
+}
+
+/// The timer, the channel to init and the deadline of a heartbeat.
+struct Wire<'a> {
     to: &'a Handle<Channel>,
     timer: Handle<Timer>,
     t0: u64,
     period: u64,
+    priority: u8,
     deadline: u64,
+}
+
+/// What the heartbeat's decision needs of the world, so that the decision
+/// is a function a host test runs with a fake.
+trait Beating {
+    /// Whether the counter reached the deadline the timer was armed for.
+    fn reached(&self) -> bool;
+    /// HEARTBEAT to init.
+    fn send(&mut self);
+    /// The timer armed again for the deadline it has: a deadline already reached fires within
+    /// the call itself.
+    fn arm_again(&mut self) -> Result<(), Error>;
+    /// The timer armed at the first deadline after now.
+    fn arm_next(&mut self) -> Result<(), Error>;
+}
+
+/// The unexpected things a heartbeat met: expiries judged stale and armings
+/// that failed, counted, and whether an arming waits for another try.
+#[derive(Default)]
+struct Tally {
+    stale: u32,
+    failed: u32,
+    retry: bool,
+}
+
+/// What a step of the heartbeat has to tell: the first of each unexpected
+/// thing goes to the console once, and nothing in the normal case.
+#[derive(Debug, PartialEq, Eq)]
+enum Note {
+    Nothing,
+    FirstStale,
+    FirstFailure(Error),
+}
+
+impl Tally {
+    /// The outcome of an arming: a failure is counted and remembered for the
+    /// next turn of the loop, a success clears the memory.
+    fn armed(&mut self, outcome: Result<(), Error>) -> Note {
+        match outcome {
+            Ok(()) => {
+                self.retry = false;
+                Note::Nothing
+            }
+            Err(e) => {
+                self.failed = self.failed.saturating_add(1);
+                self.retry = true;
+                if self.failed == 1 {
+                    Note::FirstFailure(e)
+                } else {
+                    Note::Nothing
+                }
+            }
+        }
+    }
+}
+
+/// An expiry of the timer: one before the deadline is stale (the timer's
+/// slot kept it from an earlier deadline) and arms the timer again for the
+/// same deadline, so that no sign of life is lost to it; else HEARTBEAT goes
+/// and the timer is armed at the next deadline. Init answers HEARTBEAT at
+/// once; what it answers changes nothing here.
+fn expiry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
+    if !wire.reached() {
+        tally.stale = tally.stale.saturating_add(1);
+        let outcome = wire.arm_again();
+        let first = tally.stale == 1;
+        return match (tally.armed(outcome), first) {
+            (Note::Nothing, true) => Note::FirstStale,
+            (note, _) => note,
+        };
+    }
+    wire.send();
+    let outcome = wire.arm_next();
+    tally.armed(outcome)
+}
+
+/// The turn of the loop: an arming that failed is tried again.
+fn retry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
+    if !tally.retry {
+        return Note::Nothing;
+    }
+    let outcome = wire.arm_next();
+    tally.armed(outcome)
 }
 
 /// The t0 of a heartbeat of `period` registered at `now`: now, or with
@@ -1356,17 +1453,48 @@ impl<'a> Beat<'a> {
         }
         let t0 = grid_start(time::ticks_to_ns(time::now()), h.period_ns);
         let timer = sys::timer_create(channel, h.priority)?;
-        let mut beat = Beat {
+        let mut wire = Wire {
             to: h.to,
             timer,
             t0,
             period: h.period_ns,
+            priority: h.priority,
             deadline: t0,
         };
-        beat.arm()?;
-        Ok(beat)
+        wire.arm()?;
+        Ok(Beat {
+            wire,
+            tally: Tally::default(),
+        })
     }
 
+    /// An expiry of the timer (`expiry`).
+    fn expired(&mut self) {
+        let note = expiry(&mut self.wire, &mut self.tally);
+        self.say(note);
+    }
+
+    /// The turn of the loop begins: an arming that failed is tried again.
+    fn turn(&mut self) {
+        let note = retry(&mut self.wire, &mut self.tally);
+        self.say(note);
+    }
+
+    fn say(&self, note: Note) {
+        let (period, priority) = (self.wire.period, self.wire.priority);
+        match note {
+            Note::Nothing => {}
+            Note::FirstStale => crate::println!(
+                "service heartbeat: a stale expiry, armed again (period {period} ns, priority {priority})"
+            ),
+            Note::FirstFailure(e) => crate::println!(
+                "service heartbeat: arming failed with {e:?}, tried again (period {period} ns, priority {priority})"
+            ),
+        }
+    }
+}
+
+impl Wire<'_> {
     /// Arms the timer at the first deadline after now: those that passed
     /// are not made up in a burst (spec 10, 13.4).
     fn arm(&mut self) -> Result<(), Error> {
@@ -1377,17 +1505,23 @@ impl<'a> Beat<'a> {
         probe(self.t0, self.deadline);
         armed
     }
+}
 
-    /// An expiry of the timer: a stale one, before the deadline, changes
-    /// nothing; else HEARTBEAT goes, and the timer is armed again. Init
-    /// answers HEARTBEAT at once; what it answers changes nothing here.
-    fn expired(&mut self) {
-        if !time::reached(self.deadline) {
-            return;
-        }
+impl Beating for Wire<'_> {
+    fn reached(&self) -> bool {
+        time::reached(self.deadline)
+    }
+
+    fn send(&mut self) {
         let _ = sys::send_beat(self.to, &Method::Heartbeat.header().bytes());
-        // The loop's own timer: timer_set has no error to give.
-        let _ = self.arm();
+    }
+
+    fn arm_again(&mut self) -> Result<(), Error> {
+        sys::timer_set(&self.timer, self.deadline)
+    }
+
+    fn arm_next(&mut self) -> Result<(), Error> {
+        self.arm()
     }
 }
 
@@ -1826,7 +1960,102 @@ mod long_portion_tests {
 
 #[cfg(test)]
 mod beat_tests {
-    use super::{next_release, start_on};
+    use super::{Beating, Error, Note, Tally, expiry, next_release, retry, start_on};
+
+    /// A world for the decision: whether the deadline is reached, what the
+    /// armings answer, and what was done.
+    struct Fake {
+        reached: bool,
+        arm_answers: [Result<(), Error>; 3],
+        answered: usize,
+        sent: u32,
+        again: u32,
+        next: u32,
+    }
+
+    impl Fake {
+        fn new(reached: bool) -> Fake {
+            Fake {
+                reached,
+                arm_answers: [Ok(()); 3],
+                answered: 0,
+                sent: 0,
+                again: 0,
+                next: 0,
+            }
+        }
+        fn answer(&mut self) -> Result<(), Error> {
+            let i = self.answered;
+            self.answered += 1;
+            self.arm_answers.get(i).copied().unwrap_or(Ok(()))
+        }
+    }
+
+    impl Beating for Fake {
+        fn reached(&self) -> bool {
+            self.reached
+        }
+        fn send(&mut self) {
+            self.sent += 1;
+        }
+        fn arm_again(&mut self) -> Result<(), Error> {
+            self.again += 1;
+            self.answer()
+        }
+        fn arm_next(&mut self) -> Result<(), Error> {
+            self.next += 1;
+            self.answer()
+        }
+    }
+
+    #[test]
+    fn a_due_expiry_sends_and_arms_at_the_next_deadline_and_says_nothing() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((w.sent, w.again, w.next), (1, 0, 1));
+        assert_eq!((t.stale, t.failed, t.retry), (0, 0, false));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!(w.next, 1, "nothing to try again");
+    }
+
+    #[test]
+    fn a_stale_expiry_arms_the_timer_again_for_the_same_deadline() {
+        let (mut w, mut t) = (Fake::new(false), Tally::default());
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstStale);
+        assert_eq!((w.sent, w.again, w.next), (0, 1, 0));
+        assert_eq!(t.stale, 1);
+        // The second one is counted and armed, and not told again.
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((w.again, t.stale), (2, 2));
+    }
+
+    #[test]
+    fn a_failed_arming_is_counted_told_once_and_tried_again_on_the_next_turn() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        w.arm_answers = [Err(Error::BadState), Err(Error::BadState), Ok(())];
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstFailure(Error::BadState));
+        assert!(t.retry);
+        assert_eq!(
+            retry(&mut w, &mut t),
+            Note::Nothing,
+            "the second is not told"
+        );
+        assert_eq!((t.failed, w.next, t.retry), (2, 2, true));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((t.failed, w.next, t.retry), (2, 3, false));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!(w.next, 3, "armed: no more tries");
+    }
+
+    #[test]
+    fn a_stale_expiry_whose_arming_fails_tells_the_failure_and_is_tried_again() {
+        let (mut w, mut t) = (Fake::new(false), Tally::default());
+        w.arm_answers[0] = Err(Error::BadState);
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstFailure(Error::BadState));
+        assert_eq!((t.stale, t.failed, t.retry), (1, 1, true));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert!(!t.retry);
+    }
 
     /// On the grid two services of one period that register at different
     /// instants send at the same ones; off it each keeps its own phase.

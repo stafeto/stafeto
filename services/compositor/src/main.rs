@@ -1152,6 +1152,8 @@ impl Compositor {
     fn band(&mut self) {
         rt::service::step_own();
         rt::service::step_detail(STEP_BAND);
+        #[cfg(feature = "steps")]
+        let band_began = rt::time::now();
         let Some(job) = self.job.as_mut() else {
             return;
         };
@@ -1170,6 +1172,10 @@ impl Compositor {
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         let began = now_ns();
         let made = self.raster.made();
+        #[cfg(feature = "steps")]
+        px::cost::band_begin();
+        #[cfg(feature = "steps")]
+        let compose_began = rt::time::now();
         job.at = compose(
             &self.scene,
             job.damage,
@@ -1182,6 +1188,11 @@ impl Compositor {
         // detail with the band's number, so that a long band is told from a
         // band of images made.
         rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
+        #[cfg(feature = "steps")]
+        px::cost::band_end(
+            rt::time::now() - compose_began,
+            rt::time::now() - band_began,
+        );
         self.scene.band_done();
         let more = job.at.row < job.damage.y + job.damage.h;
         let now = now_ns();

@@ -112,6 +112,62 @@ pub mod cost {
             point_n: AtomicU64::new(0),
         }
     }; 3];
+    /// What a band spends outside its operations, by the layers it laid: for
+    /// each count of layers (1 to MAX_LAYERS - 1) how many bands, the least and
+    /// the greatest ticks of `compose` less the operations in it (the work of
+    /// `compose` around the calls: the stacking, the clip, the sources), and the
+    /// greatest step of the band's own code with the compose and the operations
+    /// of that band.
+    pub const MAX_LAYERS: usize = 10;
+
+    struct Split {
+        n: AtomicU64,
+        outside_least: AtomicU64,
+        outside_greatest: AtomicU64,
+        total_greatest: AtomicU64,
+        compose_at_greatest: AtomicU64,
+        ops_at_greatest: AtomicU64,
+    }
+
+    static SPLIT: [Split; MAX_LAYERS] = [const {
+        Split {
+            n: AtomicU64::new(0),
+            outside_least: AtomicU64::new(u64::MAX),
+            outside_greatest: AtomicU64::new(0),
+            total_greatest: AtomicU64::new(0),
+            compose_at_greatest: AtomicU64::new(0),
+            ops_at_greatest: AtomicU64::new(0),
+        }
+    }; MAX_LAYERS];
+    /// The operations of the band in progress: their ticks and the layers (the
+    /// operations other than the black).
+    static BAND_OPS: AtomicU64 = AtomicU64::new(0);
+    static BAND_LAYERS: AtomicU32 = AtomicU32::new(0);
+
+    /// A band begins: its operations are counted from zero.
+    pub fn band_begin() {
+        BAND_OPS.store(0, Ordering::Relaxed);
+        BAND_LAYERS.store(0, Ordering::Relaxed);
+    }
+
+    /// The band ended: `compose` took `compose` ticks, the band's code in all
+    /// `total`.
+    pub fn band_end(compose: u64, total: u64) {
+        let ops = BAND_OPS.load(Ordering::Relaxed);
+        let layers = (BAND_LAYERS.load(Ordering::Relaxed) as usize).min(MAX_LAYERS - 1);
+        let s = &SPLIT[layers];
+        let outside = compose.saturating_sub(ops);
+        s.n.fetch_add(1, Ordering::Relaxed);
+        s.outside_least.fetch_min(outside, Ordering::Relaxed);
+        s.outside_greatest.fetch_max(outside, Ordering::Relaxed);
+        // The service is one thread: the three go together.
+        if total > s.total_greatest.load(Ordering::Relaxed) {
+            s.total_greatest.store(total, Ordering::Relaxed);
+            s.compose_at_greatest.store(compose, Ordering::Relaxed);
+            s.ops_at_greatest.store(ops, Ordering::Relaxed);
+        }
+    }
+
     /// Frames done, and whether the one that just ended is yet to be told.
     static FRAMES: AtomicU32 = AtomicU32::new(0);
     static DUE: AtomicU32 = AtomicU32::new(0);
@@ -126,6 +182,10 @@ pub mod cost {
 
     /// One operation of `width` by `height` points that took `ticks`.
     pub fn record(kind: usize, width: u64, height: u64, ticks: u64) {
+        BAND_OPS.fetch_add(ticks, Ordering::Relaxed);
+        if kind != BLACK {
+            BAND_LAYERS.fetch_add(1, Ordering::Relaxed);
+        }
         let points = width * height;
         let k = &KINDS[kind];
         if height == 1 && points <= CALL_POINTS {
@@ -218,6 +278,20 @@ pub mod cost {
                 k.call_n.load(Ordering::Relaxed),
                 k.row_n.load(Ordering::Relaxed),
                 k.point_n.load(Ordering::Relaxed),
+            );
+        }
+        for (layers, s) in SPLIT.iter().enumerate() {
+            let n = s.n.load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            rt::println!(
+                "service band: 17 layers {layers} n {n} outside least {} greatest {} total greatest {} compose {} ops {}",
+                s.outside_least.load(Ordering::Relaxed),
+                s.outside_greatest.load(Ordering::Relaxed),
+                s.total_greatest.load(Ordering::Relaxed),
+                s.compose_at_greatest.load(Ordering::Relaxed),
+                s.ops_at_greatest.load(Ordering::Relaxed),
             );
         }
     }
@@ -613,24 +687,42 @@ pub mod calibration {
         );
     }
 
-    /// The shapes of the bands of layers, width by height, and the counts of layers.
-    /// The widths are the ones a band of layers gets (a part of a line of about 150
+    /// The shapes of the bands of layers, width by height, and the counts of layers
+    /// (9 is eight windows and the pointer's picture, the most the service lays).
+    /// The widths are the ones a band of layers gets (a part of a line of about 100
     /// points for eight, more lines for fewer) and a few others.
     const LAYER_SHAPES: [(u32, u32); 6] = [(16, 1), (64, 1), (150, 1), (150, 4), (76, 8), (8, 8)];
-    const LAYER_COUNTS: [usize; 4] = [1, 2, 4, 8];
-    /// Each layer's window is `LAYER_W` points wide and holds the rows of the
-    /// widest shape, 8 lines, in a source of its own: a page of 4 096 bytes holds
-    /// 6 lines of 168 points, so a source takes two pages.
-    const LAYER_W: u32 = 168;
-    const LAYER_H: u32 = 8;
-    const LAYER_SRC_BYTES: usize = 8192;
+    const LAYER_COUNTS: [usize; 5] = [1, 2, 4, 8, 9];
+    /// The windows of the bands are the size of the overload's: 320 by 200 points,
+    /// a stride of 1 280 bytes, painted with points of every alpha, each from a
+    /// source of its own: the sources lie at the offsets of a page in one region
+    /// of the screen's buffer (a window's buffer is 256 000 bytes), so that each
+    /// has an address of its own and its own image in pixman's table.
+    const LAYER_WINDOW_W: u32 = 320;
+    const LAYER_WINDOW_H: u32 = 200;
+    const LAYER_WINDOW_BYTES: usize = (LAYER_WINDOW_W * LAYER_WINDOW_H * 4) as usize;
+    const LAYER_SRC_STEP: usize = 4096;
+    const LAYERS_AT: usize = 131_072;
+    /// The target of the bands: 328 points by 12 lines (the band's rows lie in it
+    /// from the line `y0` of the screen), in the first pages of the buffer.
+    const LAYER_TARGET_W: u32 = 328;
+    const LAYER_TARGET_H: u32 = 12;
+    const LAYER_TARGET_BYTES: usize = (LAYER_TARGET_W * LAYER_TARGET_H * 4) as usize;
+    /// The line of the window at which the bands are made (a source offset of
+    /// its own), and the timed repeats of a band after the warm-up. The run
+    /// before the first request is bounded: the watchdog of init kills a service
+    /// silent for about 1.3 s, and the three kinds take the first half of that.
+    const LAYER_ROW: u32 = 96;
+    const LAYER_REPEAT: u32 = 2;
+    const _: () = assert!(LAYER_TARGET_BYTES <= BYTES);
 
     /// The pixel operations of a band of the calibration: pixman's, on a
-    /// small target of its own (the band's rows lie in its first lines), and no
-    /// cost lines of the probes.
+    /// small target of its own that holds the lines from `y0`, and no cost lines of
+    /// the probes.
     struct Plain<'a> {
         images: &'a mut pixman::Images,
         target: &'a mut [u8],
+        y0: u32,
     }
 
     impl compositor::Raster for Plain<'_> {
@@ -638,11 +730,11 @@ pub mod calibration {
             let mut target = Target {
                 bytes: self.target,
                 format: Px::Xrgb8888,
-                stride: LAYER_W * 4,
-                width: LAYER_W,
-                height: LAYER_H,
+                stride: LAYER_TARGET_W * 4,
+                width: LAYER_TARGET_W,
+                height: LAYER_TARGET_H,
             };
-            fill(&mut target, r.x, r.y, r.w, r.h, 0);
+            fill(&mut target, r.x, r.y - self.y0, r.w, r.h, 0);
         }
 
         fn blit(
@@ -660,9 +752,9 @@ pub mod calibration {
             let mut target = Target {
                 bytes: self.target,
                 format: Px::Xrgb8888,
-                stride: LAYER_W * 4,
-                width: LAYER_W,
-                height: LAYER_H,
+                stride: LAYER_TARGET_W * 4,
+                width: LAYER_TARGET_W,
+                height: LAYER_TARGET_H,
             };
             let source = Source {
                 bytes: src,
@@ -671,21 +763,44 @@ pub mod calibration {
                 width: size.0,
                 height: size.1,
             };
-            composite(self.images, over, &mut target, source, from, to, area);
+            composite(
+                self.images,
+                over,
+                &mut target,
+                source,
+                from,
+                (to.0, to.1 - self.y0),
+                area,
+            );
         }
     }
 
-    /// The sources of the windows of a band of layers: a region each.
+    /// The sources of the windows of a band of layers: a window each, from the
+    /// region, at the offsets of a page.
     struct Regions<'a>(&'a [u8]);
 
     impl compositor::Source for Regions<'_> {
         fn pixels(&self, window: usize, _buffer: u8) -> &[u8] {
-            &self.0[window * LAYER_SRC_BYTES..(window + 1) * LAYER_SRC_BYTES]
+            let at = window * LAYER_SRC_STEP;
+            &self.0[at..at + LAYER_WINDOW_BYTES]
+        }
+    }
+
+    /// Paints the region with points of every alpha, premultiplied (no colour
+    /// above its alpha): the content of a window that is drawn, where a fill of
+    /// one value is the best case of a branch.
+    fn paint(region: &mut [u8]) {
+        let (points, _) = region.as_chunks_mut::<4>();
+        for (i, point) in points.iter_mut().enumerate() {
+            let h = (i as u32).wrapping_mul(2_654_435_761);
+            let a = (h >> 24) as u8;
+            let c = |shift: u32| (((h >> shift) & 0xFF) as u8).min(a);
+            *point = [c(0), c(8), c(16), a];
         }
     }
 
     impl Pixman {
-        /// Measures whole bands of 1, 2, 4 and 8 layers laid over each other on the
+        /// Measures whole bands of 1, 2, 4, 8 and 9 layers laid over each other on the
         /// same rows (`compositor::compose_sized` over a scene of windows of
         /// ARGB8888, each from a source of its own), on the shapes of
         /// `LAYER_SHAPES` and the offsets of the target and of the sources, and tells
@@ -694,9 +809,7 @@ pub mod calibration {
         /// with. What it costs beyond the prices of its operations is the term of a
         /// layer (`compositor::LAYER`).
         pub fn calibrate_layers(&mut self, fb: &mut [u8]) {
-            // Two regions of the buffer: the target, 168 by 8 points, and the sources.
-            const TARGET_BYTES: usize = (LAYER_W * LAYER_H * 4) as usize;
-            let need = SRC_AT + TARGET_BYTES.div_ceil(4096) * 4096 + 8 * LAYER_SRC_BYTES;
+            let need = LAYERS_AT + LAYER_WINDOW_BYTES + 8 * LAYER_SRC_STEP;
             if fb.len() < need {
                 rt::println!("service calibration: the screen's buffer is too small for layers");
                 return;
@@ -704,64 +817,82 @@ pub mod calibration {
             let Ok(thread) = rt::sys::self_thread() else {
                 return;
             };
-            let (head, tail) = fb[SRC_AT..need].split_at_mut(TARGET_BYTES.div_ceil(4096) * 4096);
-            let target = &mut head[..TARGET_BYTES];
-            tail.fill(0x40);
+            let (head, tail) = fb.split_at_mut(LAYERS_AT);
+            let target = &mut head[..LAYER_TARGET_BYTES];
+            let len = LAYER_WINDOW_BYTES + 8 * LAYER_SRC_STEP;
+            paint(&mut tail[..len]);
+            let region: &[u8] = &tail[..len];
             for &count in &LAYER_COUNTS {
                 for &(w, h) in &LAYER_SHAPES {
+                    // The tall shapes of many layers are left out (a band of
+                    // many layers is a part of a line), the ninth layer is
+                    // told on the one line shapes of 64 points or more.
+                    if (count >= 4 && h >= 8) || (count == 9 && (h != 1 || w < 64)) {
+                        continue;
+                    }
                     let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
-                    for dx in 4..8u32 {
-                        for sx in 0..4u32 {
-                            // The windows lie `sx` points to the left of the band's
-                            // first column; all of them on one place.
-                            let mut scene = compositor::Scene::new();
-                            for i in 0..count {
-                                let r = proto_comp::Rect {
-                                    x: dx - sx,
-                                    y: 0,
-                                    w: LAYER_W - 8,
-                                    h: LAYER_H,
-                                };
-                                let Ok(k) =
-                                    scene.create(i as u64 + 1, 1 + (i / 4) as u64, r, false, 0)
-                                else {
-                                    return;
-                                };
-                                scene.set_format(k, compositor::Format::Argb);
-                                if scene.attach(k, 2, (LAYER_W - 8) * 4).is_err()
-                                    || scene.post(k, 0, &[]).is_err()
-                                {
-                                    return;
+                    for dy in [LAYER_ROW] {
+                        for dx in 4..8u32 {
+                            for sx in 0..4u32 {
+                                // The windows lie `sx` points to the left of the
+                                // band's first column; all of them on one place.
+                                let mut scene = compositor::Scene::new();
+                                for i in 0..count.min(8) {
+                                    let r = proto_comp::Rect {
+                                        x: dx - sx,
+                                        y: 0,
+                                        w: LAYER_WINDOW_W,
+                                        h: LAYER_WINDOW_H,
+                                    };
+                                    let Ok(k) =
+                                        scene.create(i as u64 + 1, 1 + (i / 4) as u64, r, false, 0)
+                                    else {
+                                        return;
+                                    };
+                                    scene.set_format(k, compositor::Format::Argb);
+                                    if scene.attach(k, 2, LAYER_WINDOW_W * 4).is_err()
+                                        || scene.post(k, 0, &[]).is_err()
+                                    {
+                                        return;
+                                    }
                                 }
-                            }
-                            let _ = scene.begin();
-                            scene.end(true);
-                            let damage = proto_comp::Rect { x: dx, y: 0, w, h };
-                            for turn in 0..=REPEAT {
-                                let mut plain = Plain {
-                                    images: &mut self.images,
-                                    target: &mut *target,
-                                };
-                                let regions = Regions(&*tail);
-                                let ticks = timed(&thread, || {
-                                    compositor::compose_sized(
-                                        &scene,
-                                        damage,
-                                        compositor::Band { row: 0, col: 0 },
-                                        (w, h),
-                                        &mut [],
-                                        &regions,
-                                        &mut plain,
-                                    );
-                                });
-                                // The first turn makes the images.
-                                if turn == 0 {
-                                    continue;
+                                if count == 9 {
+                                    // The ninth layer: the pointer's picture, over the band.
+                                    scene.pointer_to((dx + 1) as i32, dy as i32);
                                 }
-                                if let Some(ticks) = ticks {
-                                    least = least.min(ticks);
-                                    greatest = greatest.max(ticks);
-                                    n += 1;
+                                let _ = scene.begin();
+                                scene.end(true);
+                                let damage = proto_comp::Rect { x: dx, y: dy, w, h };
+                                for turn in 0..=LAYER_REPEAT {
+                                    let mut plain = Plain {
+                                        images: &mut self.images,
+                                        target: &mut *target,
+                                        y0: dy,
+                                    };
+                                    let regions = Regions(region);
+                                    // The band as the service makes it: `tile` (its
+                                    // cost is the band's) and the band of the shape named.
+                                    let ticks = timed(&thread, || {
+                                        let _ = scene.tile(damage);
+                                        compositor::compose_sized(
+                                            &scene,
+                                            damage,
+                                            compositor::Band { row: dy, col: 0 },
+                                            (w, h),
+                                            &mut [],
+                                            &regions,
+                                            &mut plain,
+                                        );
+                                    });
+                                    // The first turn makes the images.
+                                    if turn == 0 {
+                                        continue;
+                                    }
+                                    if let Some(ticks) = ticks {
+                                        least = least.min(ticks);
+                                        greatest = greatest.max(ticks);
+                                        n += 1;
+                                    }
                                 }
                             }
                         }
@@ -773,8 +904,9 @@ pub mod calibration {
                     }
                 }
             }
-            tail.fill(0);
+            // The target of the service holds zero before its first frame.
             target.fill(0);
+            tail[..len].fill(0);
         }
     }
 

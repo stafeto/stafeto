@@ -1942,7 +1942,18 @@ mod finalize_reply_tests {
                 OpenFinalizeAttempt::Ambiguous(_)
             ));
         }
-        for (packed, generation) in [(first, 0), (35u64 << 32, 1), (first | 1 << 60, 1)] {
+        // A number the session has places for is a finished open: 35 is one, 1 074 is the last.
+        for fd in [35, 1_074] {
+            let reply = reply(16, u64::from(fd) << 32, 1);
+            assert!(matches!(
+                Files::open_finalize_reply(&reply, key(), session()),
+                OpenFinalizeAttempt::Finished(found) if found.fd == fd
+            ));
+        }
+        // A number outside the places of a session (the first number is 3, and a session has
+        // `SESSION_PLACES` of them), a generation of 0 and a bit above the result word.
+        let past = u64::from(proto_fs::SESSION_FIRST + proto_fs::SESSION_PLACES as u32) << 32;
+        for (packed, generation) in [(first, 0), (past, 1), (first | 1 << 60, 1)] {
             assert!(matches!(
                 Files::open_finalize_reply(&reply(16, packed, generation), key(), session()),
                 OpenFinalizeAttempt::Ambiguous(_)
