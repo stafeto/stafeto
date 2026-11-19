@@ -714,7 +714,7 @@ pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
     if one == i64::MIN {
         return None;
     }
-    for count in [2u64, 4, 8] {
+    for count in [2u64, 4, 8, 9] {
         let mut greatest = i64::MIN;
         for c in costs.iter().filter(|c| c.kind == format!("layers{count}")) {
             if let Some(single) = band(1, c.w, c.h) {
@@ -733,6 +733,107 @@ pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
         term: term.max(0),
         fixed,
     })
+}
+
+/// The line `service band: T layers L n N outside least A greatest B total
+/// greatest G compose C ops O`: for the bands of L layers the service made, the
+/// least and the greatest ticks of `compose` less its operations (what the band
+/// spends around the calls), and, of the band whose own code took longest (G), the
+/// ticks of its `compose` and of its operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BandSplit {
+    pub layers: u64,
+    pub n: u64,
+    pub outside_least: u64,
+    pub outside_greatest: u64,
+    pub total: u64,
+    pub compose: u64,
+    pub ops: u64,
+}
+
+impl BandSplit {
+    fn parse(line: &str, tag: &str) -> Option<BandSplit> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "band:",
+            t,
+            "layers",
+            layers,
+            "n",
+            n,
+            "outside",
+            "least",
+            a,
+            "greatest",
+            b,
+            "total",
+            "greatest",
+            g,
+            "compose",
+            c,
+            "ops",
+            o,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(BandSplit {
+            layers: layers.parse().ok()?,
+            n: n.parse().ok()?,
+            outside_least: a.parse().ok()?,
+            outside_greatest: b.parse().ok()?,
+            total: g.parse().ok()?,
+            compose: c.parse().ok()?,
+            ops: o.parse().ok()?,
+        })
+    }
+}
+
+/// The last line of each count of layers of the service `tag`.
+pub fn band_splits(lines: &[String], tag: &str) -> Vec<BandSplit> {
+    let mut out: Vec<BandSplit> = Vec::new();
+    for c in lines.iter().filter_map(|l| BandSplit::parse(l, tag)) {
+        match out.iter_mut().find(|o| o.layers == c.layers) {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out.sort_by_key(|b| b.layers);
+    out
+}
+
+/// The bands the service made, by layers: what a band spends around its
+/// operations (`compose` less the calls, least and greatest, the greatest includes a
+/// preemption in the middle), and the band whose own code took longest: its ticks,
+/// of which the operations and what is around them, each by the layers it laid.
+pub fn band_split_text(splits: &[BandSplit]) -> String {
+    if splits.is_empty() {
+        return "bands by layers: no lines (a run without the steps feature)".to_owned();
+    }
+    let parts: Vec<String> = splits
+        .iter()
+        .map(|b| {
+            let layers = b.layers.max(1);
+            format!(
+                "{} layers ({} bands): around the operations {}..{} ticks ({}..{} a layer), longest band {} ticks of which the operations {} and around them {} ({} a layer)",
+                b.layers,
+                b.n,
+                b.outside_least,
+                b.outside_greatest,
+                b.outside_least / layers,
+                b.outside_greatest / layers,
+                b.total,
+                b.ops,
+                b.total.saturating_sub(b.ops),
+                b.total.saturating_sub(b.ops) / layers
+            )
+        })
+        .collect();
+    format!("bands by layers: {}", parts.join("; "))
 }
 
 /// The term of a layer told against the table.
@@ -1014,13 +1115,14 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}",
+        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}; {}",
         machine.name,
         full_frame_text(),
         compositor::BAND_TICKS,
         raster_text(&raster_costs(&output.lines, COMP_TAG)),
         calibration_text(&calibrations(&output.lines, COMP_TAG)),
-        fit_text(&shape_costs(&output.lines, COMP_TAG))
+        fit_text(&shape_costs(&output.lines, COMP_TAG)),
+        band_split_text(&band_splits(&output.lines, COMP_TAG))
     );
     Ok(())
 }
@@ -1368,6 +1470,28 @@ mod tests {
         }
         let t = layer_term(&shape_costs(&lines, COMP_TAG)).unwrap();
         assert_eq!(t.fixed, i64::from(compositor::BAND_FIXED_MEASURED));
+    }
+
+    #[test]
+    fn the_bands_by_layers_are_read_from_their_lines() {
+        let lines = vec![
+            "service band: 17 layers 8 n 100 outside least 3000 greatest 3400 total greatest 17000 compose 14500 ops 10000".to_owned(),
+            "service band: 17 layers 8 n 200 outside least 3000 greatest 3500 total greatest 17100 compose 14600 ops 10100".to_owned(),
+            "service band: 17 layers 1 n 5 outside least 400 greatest 500 total greatest 4000 compose 1500 ops 1000".to_owned(),
+            "service band: 12 layers 8 n 1 outside least 1 greatest 1 total greatest 1 compose 1 ops 1".to_owned(),
+        ];
+        let splits = band_splits(&lines, COMP_TAG);
+        assert_eq!(splits.len(), 2);
+        assert_eq!((splits[0].layers, splits[0].n), (1, 5));
+        assert_eq!(
+            (splits[1].layers, splits[1].n, splits[1].total),
+            (8, 200, 17_100)
+        );
+        let text = band_split_text(&splits);
+        assert!(text.contains(
+            "8 layers (200 bands): around the operations 3000..3500 ticks (375..437 a layer)"
+        ));
+        assert!(band_split_text(&[]).contains("no lines"));
     }
 
     #[test]

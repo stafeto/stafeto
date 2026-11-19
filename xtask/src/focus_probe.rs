@@ -729,7 +729,7 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "focus-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}",
+        "focus-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}; {}",
         machine.name,
         comp_probe::full_frame_text(),
         compositor::BAND_TICKS,
@@ -742,6 +742,10 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
             comp_probe::COMP_TAG
         )),
         comp_probe::fit_text(&comp_probe::shape_costs(
+            &output.lines,
+            comp_probe::COMP_TAG
+        )),
+        comp_probe::band_split_text(&comp_probe::band_splits(
             &output.lines,
             comp_probe::COMP_TAG
         ))

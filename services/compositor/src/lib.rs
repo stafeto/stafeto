@@ -1474,7 +1474,7 @@ impl Scene {
     /// calls (at most BAND_ROWS), or a part of one line, at least one point. The
     /// estimate counts every window that touches the damage, the ones under a
     /// covering window too, so it never falls short.
-    fn tile(&self, damage: Rect) -> (u32, u32) {
+    pub fn tile(&self, damage: Rect) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
                 && damage.x < r.x + r.w
