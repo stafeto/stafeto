@@ -188,7 +188,7 @@ pub const READ_CHECKS: [&str; 28] = [
 ];
 
 /// The checks of the write role.
-pub const WRITE_CHECKS: [&str; 20] = [
+pub const WRITE_CHECKS: [&str; 21] = [
     "create with umask 027",
     "create owner is the effective uid",
     "write pwrite and read back",
@@ -209,6 +209,7 @@ pub const WRITE_CHECKS: [&str; 20] = [
     "fsize EFBIG and SIGXFSZ",
     "link symlink lock and exec refused",
     "scm_rights passes a data descriptor",
+    "access W_OK utimensat and O_EXCL",
 ];
 
 const PREFIX: &str = "posix-data: ";

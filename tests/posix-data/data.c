@@ -1260,6 +1260,43 @@ static int enospc_at_the_reserve_then_unlink(void) {
     return 0;
 }
 
+static int access_w_user_body(void) {
+    errno = 0;
+    DATA_CHECK(access("/data/w-acc", W_OK) == -1 && errno == EACCES); /* another owner's 0644 file */
+    DATA_CHECK(access("/data/w-acc", R_OK) == 0);
+    DATA_CHECK(access("/data/w-acc-own", W_OK) == 0); /* its own */
+    struct timespec times[2] = {{5, 0}, {6, 0}};
+    errno = 0;
+    DATA_CHECK(utimensat(AT_FDCWD, "/data/w-acc", times, 0) == -1 && errno == EPERM);
+    DATA_CHECK(utimensat(AT_FDCWD, "/data/w-acc-own", times, 0) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/w-acc-own", &st) == 0 && st.st_atime == 5 && st.st_mtime == 6);
+    return 0;
+}
+
+static int access_w_utimensat_and_o_excl(void) {
+    int fd = open("/data/w-acc", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(open("/data/w-acc", O_WRONLY | O_CREAT | O_EXCL, 0644) == -1 && errno == EEXIST);
+    DATA_CHECK(access("/data/w-acc", W_OK) == 0); /* root writes whatever the mode says */
+    DATA_CHECK(chmod("/data", 0777) == 0);
+    fd = open("/data/w-acc-own", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && fchown(fd, 1000, 100) == 0 && close(fd) == 0);
+    DATA_CHECK(as_ids(1000, 100, access_w_user_body) == 0);
+    struct timespec times[2] = {{7, 0}, {8, 0}};
+    fd = open("/data/w-acc", O_RDWR);
+    DATA_CHECK(fd >= 0 && futimens(fd, times) == 0);
+    struct stat st;
+    DATA_CHECK(fstat(fd, &st) == 0 && st.st_mtime == 8 && st.st_atime == 7);
+    DATA_CHECK(close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(mknod("/data/w-node", S_IFCHR | 0600, 0) == -1 && errno == EPERM);
+    DATA_CHECK(unlink("/data/w-acc") == 0 && unlink("/data/w-acc-own") == 0);
+    DATA_CHECK(chmod("/data", 0755) == 0);
+    return 0;
+}
+
 static int write_run(void) {
     if (getuid() != 0) {
         printf("posix-data: the probe is not user 0\n");
@@ -1285,6 +1322,7 @@ static int write_run(void) {
     run_check("fsize EFBIG and SIGXFSZ", fsize_efbig_and_sigxfsz);
     run_check("link symlink lock and exec refused", refused_forms);
     run_check("scm_rights passes a data descriptor", scm_rights_of_a_data_descriptor);
+    run_check("access W_OK utimensat and O_EXCL", access_w_utimensat_and_o_excl);
     if (failures != 0) {
         printf("posix-data: %d checks failed\n", failures);
         return 20;
