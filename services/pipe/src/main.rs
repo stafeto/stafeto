@@ -2030,6 +2030,16 @@ impl Service<0> for PipeService {
 
     /// The client of `s` went: its operations go, and its descriptions
     /// are let go of in steps.
+    #[cfg(feature = "steps")]
+    fn measured_begin(&mut self) {
+        steps_parts::mark(0);
+    }
+
+    #[cfg(feature = "steps")]
+    fn before_request(&mut self) {
+        steps_parts::mark(1);
+    }
+
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
         self.abandon(s);
@@ -2084,7 +2094,15 @@ impl Service<0> for PipeService {
 /// counter ticks (wall time), and the longest continuation turn: what the
 /// function that runs after each step prints, so that the line is no part of
 /// any step (`steps` builds only). A request's parts go out when its step is a
-/// new longest of kind 14, with the figure of that step. With the feature
+/// new longest of kind 14, with the figure of that step. `copy` is the
+/// time from the end of the step's first thread-time read to the loop's call
+/// of `before_request` (the body out of the message buffer, and the kind of
+/// the request); `lookup` from there to the handler's entry (the header, the
+/// method table, the session's place, the request's record); `parse`,
+/// `ready` and `insert` are the handler's parts up to the record's insertion
+/// and `after` the rest of the handler (the subscription or the room check,
+/// and the kick). What the step has besides these is the first thread-time
+/// read, the reply and the end of the step. With the feature
 /// `watch-readout` the thread's own time and its kernel part over the request
 /// (two calls into the kernel, which lengthen the step) go with them.
 #[cfg(feature = "steps")]
@@ -2092,10 +2110,16 @@ mod steps_parts {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     const PARTS: usize = if cfg!(feature = "watch-readout") {
-        6
+        8
     } else {
-        4
+        6
     };
+    /// The counter at the loop's `measured_begin` and `before_request`.
+    static MARKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    pub fn mark(which: usize) {
+        MARKS[which].store(rt::time::now(), Ordering::Relaxed);
+    }
     static REQUEST: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static LONGEST_STEP: AtomicU64 = AtomicU64::new(0);
     /// The latest continuation turn: its ticks, the places in use and the
@@ -2130,6 +2154,12 @@ mod steps_parts {
         begin: u64,
         #[cfg(feature = "watch-readout")] times_begin: (u64, u64),
     ) {
+        let (mark_begin, mark_before) = (
+            MARKS[0].load(Ordering::Relaxed),
+            MARKS[1].load(Ordering::Relaxed),
+        );
+        REQUEST[4].store(mark_before.saturating_sub(mark_begin), Ordering::Relaxed);
+        REQUEST[5].store(begin.saturating_sub(mark_before), Ordering::Relaxed);
         let mut from = begin;
         for (part, &now) in REQUEST.iter().zip(&at) {
             part.store(now - from, Ordering::Relaxed);
@@ -2138,8 +2168,8 @@ mod steps_parts {
         #[cfg(feature = "watch-readout")]
         {
             let (ran, kernel) = times();
-            REQUEST[4].store(ran - times_begin.0, Ordering::Relaxed);
-            REQUEST[5].store(kernel - times_begin.1, Ordering::Relaxed);
+            REQUEST[6].store(ran - times_begin.0, Ordering::Relaxed);
+            REQUEST[7].store(kernel - times_begin.1, Ordering::Relaxed);
         }
     }
 
@@ -2164,7 +2194,8 @@ mod steps_parts {
         if parse == 0 {
             return;
         }
-        let [ready, insert, handler] = [1, 2, 3].map(|i| REQUEST[i].swap(0, Ordering::Relaxed));
+        let [ready, insert, after, copy, lookup] =
+            [1, 2, 3, 4, 5].map(|i| REQUEST[i].swap(0, Ordering::Relaxed));
         let step = rt::service::step_maximum(14).map_or(0, |(ticks, _)| ticks);
         if step <= LONGEST_STEP.load(Ordering::Relaxed) {
             return;
@@ -2172,13 +2203,13 @@ mod steps_parts {
         LONGEST_STEP.store(step, Ordering::Relaxed);
         #[cfg(feature = "watch-readout")]
         let (ran, kernel) = (
-            REQUEST[4].swap(0, Ordering::Relaxed),
-            REQUEST[5].swap(0, Ordering::Relaxed),
+            REQUEST[6].swap(0, Ordering::Relaxed),
+            REQUEST[7].swap(0, Ordering::Relaxed),
         );
         #[cfg(not(feature = "watch-readout"))]
         let (ran, kernel) = (0, 0);
         rt::println!(
-            "pipe: watch parts parse {parse} ready {ready} insert {insert} handler {handler} ran {ran} kernel {kernel} step {step}"
+            "pipe: watch parts copy {copy} lookup {lookup} parse {parse} ready {ready} insert {insert} after {after} ran {ran} kernel {kernel} step {step}"
         );
     }
 }
