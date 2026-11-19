@@ -336,8 +336,8 @@ A change (a POST, a window going) waits for the start of the next period: an
 absolute timer of the service's own channel fires at it and takes the frame
 (`timer_set` on the `clock_now` scale), and a stale expiry (a timer that fires after
 the frame it was set for was taken some other way) does nothing. A period holds
-at most the cap of work: 750 000 millionths of T, in bands of 15 000 ticks of 16 ns,
-which is 52 bands at 60 Hz. The bands the cap puts off go on at the start of the
+at most the cap of work: 750 000 millionths of T, in bands of 14 000 ticks of 16 ns,
+which is 55 bands at 60 Hz. The bands the cap puts off go on at the start of the
 next period, so a large frame spans several periods and the clients' requests,
 and the service's own steps, pass between its bands as before.
 
@@ -524,7 +524,7 @@ A window's resize, a frame clock that follows the display's own vertical blank
 (the period is the service's, and the free run is the only way without it), the
 sharing of the cap between clients, a call of pixman for the parts of windows that
 do not overlap (eight translucent windows on one place cost eight calls a band and
-16 periods a frame at 60 Hz under -icount), the window manager
+19 periods a frame at 60 Hz under -icount), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
