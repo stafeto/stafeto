@@ -114,6 +114,10 @@ fn regular(info: proto_fs::NodeInfo) -> Result<(u64, u64), c_int> {
 /// The flags the description of `fd` was opened with: the access mode in
 /// the low two bits and O_APPEND.
 fn open_flags(fd: c_int) -> Result<u32, c_int> {
+    // A file of the data volume: the service keeps the flags of the description.
+    if let Some(native) = call(|| posix_abi::data::status_flags(fd, None))? {
+        return Ok((native & 3) as u32 | if native & 0o2000 != 0 { APPEND } else { 0 });
+    }
     let number = u32::try_from(fd).map_err(|_| EBADF)?;
     call(|| {
         posix_abi::shared::held(number, |transport, target| {
@@ -318,6 +322,12 @@ fn file_mapping(
         return Err(EINVAL);
     }
     let (_, key) = file_info(fd)?;
+    // A shared mapping of a file of the data volume is ENODEV (the pages of the layer are filled
+    // by reads and written back through the RAM file service's pin alone); a private one reads
+    // the file as it is at the call.
+    if flags & MAP_SHARED != 0 && posix_abi::data::data_target(fd).is_some() {
+        return Err(ENODEV);
+    }
     // POSIX mmap: the descriptor is open for reading, whatever the
     // protection; a shared mapping that can be written needs it open for
     // writing, and not for appending.

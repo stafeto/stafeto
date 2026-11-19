@@ -298,10 +298,6 @@ pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offs
     if posix_abi::fastnet::is_fast(fd) {
         return -(posix_abi::fastnet::unsupported(fd) as isize);
     }
-    // A file of the data volume reads at the offset in the service's own steps.
-    if let Some(result) = data_pread(fd, buf, len, offset) {
-        return result;
-    }
     // SAFETY: the caller's promise.
     unsafe { read_at(Place::Fd(fd), buf, len, offset, true) }
 }
@@ -359,6 +355,13 @@ pub(crate) unsafe fn read_at(
     offset: i64,
     buffered: bool,
 ) -> isize {
+    // A file of the data volume reads at the offset in the service's own steps (the fill of a
+    // private mapping reads through here too).
+    if let Place::Fd(fd) = place
+        && let Some(result) = unsafe { data_pread(fd, buf, len, offset) }
+    {
+        return result;
+    }
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     // A read of more than one message goes in portions of up to READ_PORTION bytes, one step of
