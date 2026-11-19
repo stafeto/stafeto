@@ -75,15 +75,17 @@ A53_ERRATA = "-mfix-cortex-a53-835769"
 # Compiler-generated async unwind rows for C frames; no outlining.
 UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outliner=never")
 
-# The names the library may leave undefined: the functions of the C library
-# it calls (ftstdlib.h) and the two helpers the stack protector asks of it.
+# The names the library may leave undefined: the functions of the C library it
+# calls with this configuration (the object files of one build leave exactly
+# these) and the two helpers the stack protector asks of it. A name that is
+# not here stops the build, so a path that would pull in strtol, strtod,
+# calloc, snprintf or the like (the property strings, the debug memory)
+# shows at once.
 ALLOWED = {
-    "fopen", "fread", "fseek", "ftell", "fclose", "malloc", "calloc",
-    "realloc", "free", "qsort", "setjmp", "longjmp", "strtol", "snprintf",
-    "__stack_chk_fail", "__stack_chk_guard",
+    "fopen", "fread", "fseek", "ftell", "fclose", "malloc", "realloc", "free",
+    "qsort", "setjmp", "longjmp", "memcpy", "memmove", "memset", "strcmp",
+    "strlen", "strstr", "__stack_chk_fail", "__stack_chk_guard",
 }
-# Families of names the library may leave undefined: mem* and str*.
-ALLOWED_PREFIXES = ("mem", "str")
 # The names the library must never reach.
 FORBIDDEN = {"getenv", "secure_getenv", "mmap", "munmap", "dlopen", "dlsym", "dlclose"}
 FORBIDDEN_PREFIXES = ("pthread_", "sem_", "thrd_", "mtx_")
@@ -128,15 +130,21 @@ def run(log: Path, *args, cwd: Path | None = None) -> None:
         raise SystemExit(f"command failed: {' '.join(map(str, args))}")
 
 
+# The objects of the host build are Mach-O on macOS, where `nm` shows a C name
+# with a leading underscore; ELF objects (the guest's, and the host's on
+# Linux) show it as written.
+MACHO = HOST and sys.platform == "darwin"
+
+
 def symbol_names(listing: str) -> list[str]:
     """The names in the output of `llvm-nm --format=just-symbols` (one per
-    line; the C names of Mach-O's leading underscore are taken off)."""
+    line; the leading underscore of the C names of Mach-O is taken off)."""
     names = []
     for line in listing.splitlines():
         line = line.strip()
         if not line or line.endswith(":"):
             continue
-        names.append(line[1:] if HOST and line.startswith("_") else line)
+        names.append(line[1:] if MACHO and line.startswith("_") else line)
     return names
 
 
@@ -148,7 +156,7 @@ def undefined_violations(names: list[str]) -> list[str]:
         if (name in FORBIDDEN or name in FORBIDDEN_MATH
                 or name.startswith(FORBIDDEN_PREFIXES)):
             bad.append(f"{name} (a name the library never calls)")
-        elif name in ALLOWED or name.startswith(ALLOWED_PREFIXES):
+        elif name in ALLOWED:
             continue
         else:
             bad.append(f"{name} (not in the list of the C library's functions it may call)")
@@ -245,11 +253,13 @@ def main() -> None:
     source = BUILD / f"freetype-{VERSION}"
     clang, ar = tool("clang", "llvm"), tool("llvm-ar", "llvm")
     nm_tool, lld = tool("llvm-nm", "llvm"), tool("ld.lld", "lld")
-    flags = ["-O2", "-ffunction-sections", "-fdata-sections", "-DFT2_BUILD_LIBRARY",
+    # -funsigned-char: the char of AArch64 Linux, on the host sample too;
+    # -fwrapv: signed overflow wraps, as the 64-bit fixed-point code expects.
+    flags = ["-O2", "-fwrapv", "-ffunction-sections", "-fdata-sections", "-DFT2_BUILD_LIBRARY",
              "-DFT_CONFIG_MODULES_H=<ftmodule.h>", "-DFT_CONFIG_OPTIONS_H=<ftoption.h>",
              f"-I{PORT_DIR}", f"-I{source / 'include'}"]
     if HOST:
-        cc = (str(clang), "-fPIC", *flags)
+        cc = (str(clang), "-fPIC", "-funsigned-char", *flags)
     else:
         cc = (str(clang), "--target=aarch64-linux-gnu", "-nostdinc",
               "-isystem", str(RELIBC / "include"), "-mno-outline-atomics",
