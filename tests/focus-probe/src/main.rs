@@ -899,9 +899,10 @@ impl Probe<'_> {
     }
 
     /// The many windows: seven windows more over the screen's lower right,
-    /// four of this context and three of a clone's (a context has four), in
-    /// formats in turn, which with the first client's make the eight the
-    /// service has. None has the focus while the manager runs, and the bands of
+    /// four of this context and three of a clone's (a context has four), all of
+    /// ARGB8888 and all on one place, which with the first client's make the
+    /// eight the service has: a band over that place lays seven translucent
+    /// layers (the model of a band charges each layer after the first). None has the focus while the manager runs, and the bands of
     /// the frames they make stay under the bound (xtask reads the steps of the
     /// run under -icount, which is the one that has them: the other has the
     /// screenshots, and these windows are not in them).
@@ -928,16 +929,12 @@ impl Probe<'_> {
         let mut keep = [const { None }; 7];
         for k in 0..7usize {
             let rect = Rect {
-                x: 320 + 15 * k as u32,
-                y: 230 + 3 * k as u32,
+                x: 320,
+                y: 230,
                 w: 200,
                 h: 150,
             };
-            let format = if k % 2 == 1 {
-                FORMAT_ARGB8888
-            } else {
-                FORMAT_XRGB8888
-            };
+            let format = FORMAT_ARGB8888;
             let session = if k < 4 { &display } else { &clone };
             let (window, _) = self
                 .create_as(session, rect, format)
@@ -948,7 +945,7 @@ impl Probe<'_> {
             // SAFETY: `buffers` mapped this object for writing at this
             // address, 200 by 150 points; one thread.
             let points = unsafe { core::slice::from_raw_parts_mut(at[0] as *mut u32, 200 * 150) };
-            points.fill(if k % 2 == 1 { 0x8040_4040 } else { 0x0030_4050 });
+            points.fill(0x8040_4040);
             self.post(&window, 0, &[]).map_err(say("POST of many"))?;
             windows[k] = Some(window);
             keep[k] = Some(objects);
