@@ -2,7 +2,8 @@ name: publish-packages
 
 # Publishes the packages of a release and signs the indexes of the published
 # series again every week (docs/release.md). The event `release: published`
-# comes from the owner publishing a release without a suffix; `schedule` is
+# comes from the owner publishing a release without a suffix or an update of
+# packages (`v<series>-pkgs.<k>`, packages-update.yml); `schedule` is
 # the weekly signature; a push to `main` that changes the list of revocations
 # writes the new list to every series.
 #
