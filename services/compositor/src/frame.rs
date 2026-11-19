@@ -1243,9 +1243,12 @@ mod tests {
         let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
         assert_eq!(d, 199_851);
         assert_eq!(bound(d, &all, e, limit), Some(742_193));
-        // F: the whole screen, no load: the expected 42 bands and the limit of 45.
-        assert_eq!(own(42, false, false), 841_889);
-        assert_eq!(bound(841_889, &console, e, limit), Some(886_508));
+        // F: the whole screen, no load: the 31 bands the table gives, the 33 of a
+        // band of 14 000 ticks, and the limit of 45 that the probe holds.
+        assert_eq!(own(31, false, false), 662_281);
+        assert_eq!(bound(662_281, &console, e, limit), Some(706_900));
+        assert_eq!(own(33, false, false), 694_937);
+        assert_eq!(bound(694_937, &console, e, limit), Some(739_556));
         assert_eq!(own(45, false, false), 890_873);
         assert_eq!(bound(890_873, &console, e, limit), Some(935_492));
         // The network's budgets of the tables (60 percent of the CPU) leave no
