@@ -83,6 +83,14 @@ const LINES: [&str; 8] = [
 
 const ENDED: &str = "init: posix-window ended: exit code 0, not restarted";
 
+/// The lines that end the probe in failure: a check that failed, and the
+/// probe's process ending with a code other than 0.
+fn failure(line: &str) -> Option<String> {
+    let failed = line.starts_with("posix-window: check failed")
+        || (line.starts_with("init: posix-window ended: ") && line != ENDED);
+    failed.then(|| line.to_owned())
+}
+
 /// Follows the run: the three screenshots against the guest's CRC lines,
 /// then the end of the probe. The CRC-32 of each screenshot.
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
@@ -90,19 +98,23 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
     let mut shots = [0; 3];
     for (shot, prefix) in shots.iter_mut().zip(SHOTS) {
-        // A check that failed ends the probe: no CRC line will come, and the
-        // wait for it would run to the end of the time.
+        // A check that failed or an end with another code ends the probe: no
+        // CRC line will come, and the wait for it would run to the end of the
+        // time.
         let line = run.expect_line(
             prefix,
-            |l| l.contains(prefix) || l.starts_with("posix-window: check failed"),
+            |l| l.contains(prefix) || failure(l).is_some(),
             WITHIN,
         )?;
-        if line.starts_with("posix-window: check failed") {
-            return Err(line);
+        if let Some(failed) = failure(&line) {
+            return Err(failed);
         }
         *shot = gpu_probe::compare_shot(&mut monitor, &scratch.picture(), &line, prefix)?;
     }
-    run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
+    let line = run.expect_line(ENDED, |l| l == ENDED || failure(l).is_some(), WITHIN)?;
+    if let Some(failed) = failure(&line) {
+        return Err(failed);
+    }
     Ok(shots)
 }
 
@@ -176,6 +188,14 @@ mod tests {
             verdict(&run(), [0x0a0b_0c0d, 0x1122_3344, 0x0a0b_0c0d]),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_failed_check_or_an_end_with_another_code_stops_the_wait() {
+        assert!(failure("posix-window: check failed at line 355: x (errno 4)").is_some());
+        assert!(failure("init: posix-window ended: exit code 20, not restarted").is_some());
+        assert!(failure(ENDED).is_none());
+        assert!(failure("posix-window: window crc 79c130d2").is_none());
     }
 
     #[test]
