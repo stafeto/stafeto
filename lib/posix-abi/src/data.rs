@@ -7,8 +7,8 @@
 //! * A path belongs to `/data` by its absolute form (the current directory, the dots and the
 //!   slashes applied first, as for `/proc`): `/data` and everything below it, never `/datax`
 //!   (`posix_fs::data::volume_path`). The service gets the path below `/data`, absolute from the
-//!   root of the volume, with no dots. `..` is resolved by the dots rule of the layer, not by
-//!   asking the service, so `a/ghost/..` names `a` and does not fail for the missing `ghost`;
+//!   root of the volume, with no dots. `..` is resolved by the dots rule of the layer with no
+//!   question to the service, so `a/ghost/..` names `a` and does not fail for the missing `ghost`;
 //!   `/data/..` is `/`, a path of the RAM file service.
 //! * The session comes when it is first needed: TakeRoot asks the process service for the root of
 //!   the service, SESSION with a copy of the process's identity session gives a session that is
@@ -26,7 +26,7 @@
 //!   stays true. A forked child shares it; an exec or a spawn opens it again at the first path call.
 //! * Everything that changes the volume is EROFS in this part of the layer. The limits the service
 //!   keeps show as these errnos: at most 32 descriptions a session holds (EMFILE), a clone refused
-//!   for its tree's clones or the table (EAGAIN), and at most 2,048 metadata pairs on a volume (a
+//!   for its tree's clones or the table (EAGAIN), and at most 1,024 metadata pairs on a volume (a
 //!   later part's MKDIR over it answers ENOSPC).
 
 use crate::constants::*;
