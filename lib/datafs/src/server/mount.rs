@@ -54,32 +54,75 @@ pub struct Mounted {
     /// The volume's format mark is above this service's: the service refuses it (every request
     /// answers NOT_READY) and wrote nothing.
     pub refused: bool,
-    /// Entries that got a record (a volume of version 2 has none).
-    pub converted: usize,
-    /// Inline files moved out to blocks of their own (a volume made with inline data on).
-    pub moved: usize,
-    /// The walk of the tree ended: the format mark was written. False when it was cut short by its
-    /// bound (`CONVERT_MAX` records written); the next mount goes on. Entries deeper than
-    /// `CONVERT_DEPTH` directories are left with no record (they read as the closed default, which is
-    /// safe) and do not hold the mark back.
+    /// The records and the move-out of the inline files are still to do: the conversion job runs
+    /// after READY, one entry a step (`Server::convert_step`).
+    pub pending: bool,
+    /// Nothing is left to do: the volume had the mark 4.
     pub complete: bool,
 }
 
-/// The entries one run of the conversion writes at most (a record or a move-out each), and the depth
-/// it goes to.
-pub const CONVERT_MAX: usize = 8192;
+/// The depth of directories the conversion goes to.
 const CONVERT_DEPTH: usize = 32;
 
+/// The conversion job, one entry a step: the records of every entry that has none and the move-out
+/// of every inline file, in a walk of the tree that keeps the iterator of the directory it is in open
+/// between steps (a directory is read once; the walk goes back into a parent after a child directory
+/// with a skip of the entries done, which costs the entries and not a lookup of each).
+pub(super) struct Conversion {
+    /// Whether records are to be written (a volume with no mark or an older one) besides the move-out.
+    records: bool,
+    path: [u8; MAX_PATH + 1],
+    len: usize,
+    depth: usize,
+    /// The entries each level has gone past.
+    done: [usize; CONVERT_DEPTH],
+    dir: Option<Dir>,
+    root_done: bool,
+    pub(super) converted: usize,
+    pub(super) moved: usize,
+}
+
+impl Conversion {
+    fn new(records: bool) -> Conversion {
+        let mut path = [0u8; MAX_PATH + 1];
+        path[0] = b'/';
+        Conversion {
+            records,
+            path,
+            len: 1,
+            depth: 0,
+            done: [0; CONVERT_DEPTH],
+            dir: None,
+            root_done: false,
+            converted: 0,
+            moved: 0,
+        }
+    }
+}
+
+/// What a step of the conversion did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Step {
+    /// An entry was looked at (and written if it needed it): more to do.
+    More,
+    /// The walk ended and the mark 4 is written: the records given and the files moved out.
+    Done { converted: usize, moved: usize },
+}
+
 impl Server {
-    /// The work after the mount that gives the volume the records of version 3 (rule 12) and moves
-    /// the inline files out, after `ensure_orphans` and `recover_orphans` and before the first
-    /// request. A volume whose format mark is above `VOLUME_FORMAT` is refused and left as it is. A
-    /// volume with no mark or an older one gets the record of every entry that has none (the closed
-    /// default, a number from the counter at the root) and every inline file moved out; a volume with
-    /// the mark of the records (`RECORDS_FORMAT`) only the move-out; one with `VOLUME_FORMAT` nothing.
-    /// Then the mark: a cut in between starts the walk again at the next mount, and the entries done
-    /// are skipped at no write. The move-out is for the writes at the start or in the middle of an
-    /// old inline file, which are lost with CORRUPT in littlefs 2.11.3 once inline data is off.
+    /// The work after the mount before READY, bounded and cheap: the orphans are dealt with by the
+    /// caller, and this reads the format mark and counts the pairs and the directories. A volume whose
+    /// format mark is above `VOLUME_FORMAT` is refused and left as it is. A volume with the mark 4
+    /// (every entry has its record and no file is inline) needs nothing. Any other (no mark, an older
+    /// one, or the mark of the records, which the part A build wrote while it kept small files inside
+    /// the pairs of their directories) gets the conversion job: the record of every entry that has
+    /// none and every inline file moved out, one entry a step after READY (`convert_step`), then the
+    /// mark. Until the job reaches an entry it reads as before (the closed default with the number
+    /// its path gives, which the record then keeps, so a program sees the same owner, mode and
+    /// `st_ino` before and after), and an inline file is moved out when it is first opened for writing
+    /// or for truncation, so that no write meets the loss of littlefs 2.11.3 (see the notes of the
+    /// vendored copy). A cut in the middle leaves the mark as it was and the job starts again at the
+    /// next mount, skipping what it did at no write.
     pub fn mount_work<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<Mounted, Error> {
         let mut mark = [0u8; 4];
         let format = match fs.getattr(b"/", ATTR_FORMAT_TYPE, &mut mark) {
@@ -92,6 +135,7 @@ impl Server {
         self.ino_end = 0;
         // What the server remembers of directories and of the pairs starts empty at every mount.
         self.pairs = super::Pairs::NONE;
+        self.conversion = None;
         for c in &mut self.counts {
             c.used = false;
         }
@@ -104,24 +148,68 @@ impl Server {
         }
         let records = !format.is_some_and(|f| f >= RECORDS_FORMAT);
         let inline = !format.is_some_and(|f| f >= VOLUME_FORMAT);
+        self.count_at_mount(fs)?;
         if !records && !inline {
-            self.count_at_mount(fs)?;
             return Ok(Mounted {
                 complete: true,
                 ..Mounted::default()
             });
         }
-        let (converted, moved, complete) = self.convert(fs, records)?;
-        if complete {
-            fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())?;
-        }
-        self.count_at_mount(fs)?;
+        self.conversion = Some(Conversion::new(records));
         Ok(Mounted {
-            refused: false,
-            converted,
-            moved,
-            complete,
+            pending: true,
+            ..Mounted::default()
         })
+    }
+
+    /// The conversion job has steps to do.
+    pub fn conversion_pending(&self) -> bool {
+        self.conversion.is_some()
+    }
+
+    /// Gives up the job (the volume failed under it): the mark stays as it was and the next mount
+    /// starts again.
+    pub fn abandon_conversion<D: Device>(&mut self, fs: &mut Fs<'_, D>) {
+        if let Some(c) = self.conversion.take()
+            && let Some(dir) = c.dir
+        {
+            let _ = fs.closedir(dir);
+        }
+    }
+
+    /// One step of the conversion: the next entry of the directory the walk is in (opened at the
+    /// first step of a directory, kept open after it), its record written when it has none, an inline
+    /// file moved out, a directory gone into. The last step writes the mark 4.
+    pub fn convert_step<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<Step, Error> {
+        let Some(mut c) = self.conversion.take() else {
+            return Ok(Step::Done {
+                converted: 0,
+                moved: 0,
+            });
+        };
+        match self.convert_one(fs, &mut c) {
+            Ok(Some(done)) => {
+                // The job is over: the mark says every entry has its record and no file is inline.
+                match fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes()) {
+                    Ok(()) => Ok(done),
+                    Err(e) => {
+                        self.conversion = Some(c);
+                        Err(e)
+                    }
+                }
+            }
+            Ok(None) => {
+                self.conversion = Some(c);
+                Ok(Step::More)
+            }
+            Err(e) => {
+                if let Some(dir) = c.dir.take() {
+                    let _ = fs.closedir(dir);
+                }
+                self.conversion = Some(c);
+                Err(e)
+            }
+        }
     }
 
     /// The pairs and the directories are counted once the volume is in its final shape: the exact
@@ -141,141 +229,117 @@ impl Server {
         Ok(())
     }
 
-    /// Walks the tree, writes the record of every entry that has none (`records`) and moves out every
-    /// inline file. The root first. The records written and the files moved, and whether the walk
-    /// ended.
-    fn convert<D: Device>(
+    /// The work of one step: Some when the walk has ended.
+    fn convert_one<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
-        records: bool,
-    ) -> Result<(usize, usize, bool), Error> {
-        let mut converted = 0;
-        let mut moved = 0;
-        // The root has number 1 and the default `0755`.
-        if let Ok(root) = entry_of(fs, b"/", Kind::Directory)
-            && records
-            && root.standing == Standing::Missing
-        {
-            let mut a = default_attr(Kind::Directory, b"/");
-            a.ino = 1;
-            fs.setattr(b"/", ATTR_TYPE, &a.to_bytes())?;
-            converted += 1;
+        c: &mut Conversion,
+    ) -> Result<Option<Step>, Error> {
+        // The root's record first.
+        if !c.root_done {
+            c.root_done = true;
+            if c.records
+                && let Ok(root) = entry_of(fs, b"/", Kind::Directory)
+                && root.standing == Standing::Missing
+            {
+                let a = default_attr(Kind::Directory, b"/");
+                fs.setattr(b"/", ATTR_TYPE, &a.to_bytes())?;
+                c.converted += 1;
+            }
+            return Ok(None);
         }
-        let mut path = [0u8; MAX_PATH + 1];
-        path[0] = b'/';
-        let mut len = 1;
-        // The entry each level has gone past, so that a level that was closed for a write
-        // is opened again and skips what it did.
-        let mut done = [0usize; CONVERT_DEPTH];
-        let mut depth = 0;
-        'levels: loop {
-            let dir = fs.opendir(&path[..len])?;
-            let mut skip = done[depth];
-            loop {
-                let entry = match fs.readdir(dir) {
-                    Ok(Some(e)) => e,
-                    Ok(None) => {
-                        fs.closedir(dir)?;
-                        if depth == 0 {
-                            return Ok((converted, moved, true));
+        let dir = match c.dir {
+            Some(dir) => dir,
+            None => {
+                // The directory is opened again past the entries the walk did in it.
+                let dir = fs.opendir(&c.path[..c.len])?;
+                let mut skip = c.done[c.depth];
+                while skip > 0 {
+                    match fs.readdir(dir) {
+                        Ok(Some(e)) => {
+                            if e.name() != b"." && e.name() != b".." {
+                                skip -= 1;
+                            }
                         }
-                        // Up: drop the last name of the path.
-                        depth -= 1;
-                        len = path[..len]
-                            .iter()
-                            .rposition(|&b| b == b'/')
-                            .map_or(1, |i| i.max(1));
-                        continue 'levels;
-                    }
-                    Err(e) => {
-                        let _ = fs.closedir(dir);
-                        return Err(e);
-                    }
-                };
-                let name = entry.name();
-                if name == b"." || name == b".." {
-                    continue;
-                }
-                if skip > 0 {
-                    skip -= 1;
-                    continue;
-                }
-                done[depth] += 1;
-                let mut child = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
-                child[..len].copy_from_slice(&path[..len]);
-                let mut n = len;
-                if len > 1 {
-                    child[n] = b'/';
-                    n += 1;
-                }
-                if n + name.len() > MAX_PATH {
-                    continue;
-                }
-                child[n..n + name.len()].copy_from_slice(name);
-                n += name.len();
-                let child_path = &child[..n];
-                let rec = match entry_of(fs, child_path, entry.kind) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        fs.closedir(dir)?;
-                        return Err(Error::Io);
-                    }
-                };
-                let mut wrote = false;
-                if records && rec.standing == Standing::Missing {
-                    // The bound counts the records written and the files moved, so that a volume of
-                    // more entries than the bound still ends: each mount writes some, and the
-                    // entries done are skipped at no write.
-                    if converted + moved >= CONVERT_MAX {
-                        fs.closedir(dir)?;
-                        return Ok((converted, moved, false));
-                    }
-                    let mut a = default_attr(entry.kind, child_path);
-                    // A number from the counter; a failed reserve leaves the entry for the next mount.
-                    match self.next_ino(fs) {
-                        Ok(ino) => a.ino = ino,
-                        Err(_) => {
-                            fs.closedir(dir)?;
-                            return Err(Error::Io);
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = fs.closedir(dir);
+                            return Err(e);
                         }
                     }
-                    fs.closedir(dir)?;
-                    fs.setattr(child_path, ATTR_TYPE, &a.to_bytes())?;
-                    converted += 1;
-                    wrote = true;
                 }
-                // An inline file (found with a read, the directory still open) is moved out with the
-                // directory closed, as a record is written.
-                if entry.kind == Kind::File && fs.outline(child_path, true).unwrap_or(false) {
-                    if converted + moved >= CONVERT_MAX {
-                        if !wrote {
-                            fs.closedir(dir)?;
-                        }
-                        return Ok((converted, moved, false));
-                    }
-                    if !wrote {
-                        fs.closedir(dir)?;
-                        wrote = true;
-                    }
-                    fs.outline(child_path, false)?;
-                    moved += 1;
+                c.dir = Some(dir);
+                return Ok(None);
+            }
+        };
+        let entry = match fs.readdir(dir) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                fs.closedir(dir)?;
+                c.dir = None;
+                if c.depth == 0 {
+                    return Ok(Some(Step::Done {
+                        converted: c.converted,
+                        moved: c.moved,
+                    }));
                 }
-                if entry.kind == Kind::Directory && depth + 1 < CONVERT_DEPTH {
-                    if !wrote {
-                        fs.closedir(dir)?;
-                    }
-                    path[..n].copy_from_slice(&child[..n]);
-                    len = n;
-                    depth += 1;
-                    done[depth] = 0;
-                    continue 'levels;
-                }
-                if wrote {
-                    // Closed for the write: open again past what was done.
-                    continue 'levels;
-                }
+                // Up: drop the last name of the path.
+                c.depth -= 1;
+                c.len = c.path[..c.len]
+                    .iter()
+                    .rposition(|&b| b == b'/')
+                    .map_or(1, |i| i.max(1));
+                return Ok(None);
+            }
+            Err(e) => {
+                let _ = fs.closedir(dir);
+                c.dir = None;
+                return Err(e);
+            }
+        };
+        let name = entry.name();
+        if name == b"." || name == b".." {
+            return Ok(None);
+        }
+        c.done[c.depth] += 1;
+        let mut child = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
+        child[..c.len].copy_from_slice(&c.path[..c.len]);
+        let mut n = c.len;
+        if c.len > 1 {
+            child[n] = b'/';
+            n += 1;
+        }
+        if n + name.len() > MAX_PATH {
+            return Ok(None);
+        }
+        child[n..n + name.len()].copy_from_slice(name);
+        n += name.len();
+        let child_path = &child[..n];
+        // An entry a client removed or renamed since the walk read its name is passed over.
+        let Ok(rec) = entry_of(fs, child_path, entry.kind) else {
+            return Ok(None);
+        };
+        if c.records && rec.standing == Standing::Missing {
+            // The record is what the entry already shows (the closed default and the number its path
+            // gives), written down.
+            let a = default_attr(entry.kind, child_path);
+            if fs.setattr(child_path, ATTR_TYPE, &a.to_bytes()).is_ok() {
+                c.converted += 1;
             }
         }
+        if entry.kind == Kind::File && fs.outline(child_path, true).unwrap_or(false) {
+            fs.outline(child_path, false)?;
+            c.moved += 1;
+        }
+        if entry.kind == Kind::Directory && c.depth + 1 < CONVERT_DEPTH {
+            fs.closedir(dir)?;
+            c.dir = None;
+            c.path[..n].copy_from_slice(&child[..n]);
+            c.len = n;
+            c.depth += 1;
+            c.done[c.depth] = 0;
+        }
+        Ok(None)
     }
 }
 

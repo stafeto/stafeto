@@ -61,6 +61,9 @@ pub const LEVEL: u8 = 30;
 #[cfg(feature = "steps")]
 static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The instant the conversion job took its first step, in nanoseconds (0 before it).
+static CONVERSION_BEGAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The handle of the worker's budget, 0 when it has none.
 static WORK_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -545,15 +548,8 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
                     "datafs: the volume's format is newer than this service's: left alone and refused"
                 )
             }
-            Ok(done) if done.converted > 0 || done.moved > 0 || !done.complete => rt::println!(
-                "datafs: {} entries got attributes, {} inline files moved out{}",
-                done.converted,
-                done.moved,
-                if done.complete {
-                    ""
-                } else {
-                    ", more at the next mount"
-                }
+            Ok(done) if done.pending => rt::println!(
+                "datafs: the volume has no mark 4: the records and the inline files are done after READY, one entry a step"
             ),
             Ok(_) => {}
             Err(_) => rt::println!("datafs: the attributes of the volume could not be made"),
@@ -684,6 +680,38 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             loop {
                 let _ = sys::receive(&kicks);
             }
+        }
+        // The queue is empty. The conversion job of the mount work goes first, one entry a step: the
+        // loop above serves every job that has come before the next step, so a request waits for at
+        // most one entry (a lookup, a record, a move-out). The job is the worker's own work under its
+        // budget; the walks wait until it has ended.
+        if let Some(fs) = volume.as_mut()
+            && server.conversion_pending()
+            && !STOPPING.load(Acquire)
+        {
+            let mut begun = CONVERSION_BEGAN.load(Acquire);
+            if begun == 0 {
+                begun = rt::time::ticks_to_ns(rt::time::now()).max(1);
+                CONVERSION_BEGAN.store(begun, Release);
+            }
+            match server.convert_step(fs) {
+                Ok(datafs::server::Step::More) => {}
+                Ok(datafs::server::Step::Done { converted, moved }) => {
+                    let ms =
+                        rt::time::ticks_to_ns(rt::time::now()).saturating_sub(begun) / 1_000_000;
+                    rt::println!(
+                        "datafs: conversion ended after {ms} ms, {converted} entries got attributes, {moved} inline files moved out"
+                    );
+                }
+                Err(_) => {
+                    rt::println!(
+                        "datafs: the conversion of the volume failed: the mark stays and the next mount starts again"
+                    );
+                    server.abandon_conversion(fs);
+                }
+            }
+            tell_pairs();
+            continue;
         }
         // The queue is empty. A walk (the first after the mount, or the refresh) starts after the
         // queue has been quiet for `QUIET_NS` from the end of the last job: the requests of a boot

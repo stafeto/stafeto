@@ -185,6 +185,57 @@ fn run_to_end(built: &Built, cmd: Command, what: &str) -> Result<Vec<String>, St
     run_to_end_within(built, cmd, what, BOOT_TIMEOUT * 6)
 }
 
+/// The boot ends on the line of the service that holds `marker` (the machine is stopped there), with
+/// a limit of its own and the time the boot took told.
+fn run_to_line(
+    built: &Built,
+    cmd: Command,
+    what: &str,
+    limit: std::time::Duration,
+    marker: &str,
+) -> Result<Vec<String>, String> {
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, limit, Some(marker), &built.kernel.elf).map_err(|e| {
+        format!(
+            "data-probe ({what}): {e} (after {} s)",
+            started.elapsed().as_secs()
+        )
+    })?;
+    if !output.stopped_on_marker {
+        return Err(format!(
+            "data-probe ({what}): the line {marker:?} did not come in {} s",
+            limit.as_secs()
+        ));
+    }
+    println!(
+        "data-probe fill: the {what} took {} s of {} s allowed",
+        started.elapsed().as_secs(),
+        limit.as_secs()
+    );
+    Ok(output.lines)
+}
+
+/// READY must come at once, whatever the volume holds: the mount work reads the mark and counts the
+/// pairs (about two reads for each, 5,000 at the cap of 2,048), at most this long. The job comes
+/// after it.
+const READY_MS_MAX: u64 = 15_000;
+
+/// The times of the converting boot: READY (`datafs: ready after N ms`, at most `READY_MS_MAX`) and
+/// the job (`datafs: conversion ended after N ms, ...`).
+fn conversion_times(lines: &[String]) -> Result<(u64, u64), String> {
+    let number = |prefix: &str| {
+        qemu::number_after(lines, prefix).ok_or_else(|| format!("no number after {prefix:?}"))
+    };
+    let ready = number("datafs: ready after ")?;
+    let job = number("datafs: conversion ended after ")?;
+    if ready > READY_MS_MAX {
+        return Err(format!(
+            "READY came after {ready} ms, over {READY_MS_MAX} ms: the conversion held it, or the count of pairs did"
+        ));
+    }
+    Ok((ready, job))
+}
+
 /// The same with a limit of its own, and the time the boot took told: the boots of `fill` last
 /// minutes (the conversion of a full volume holds READY for as long as it takes), and the whole
 /// command has the 60 minutes of the probe workflow.
@@ -491,8 +542,10 @@ pub fn crash(args: &[String]) -> Result<(), String> {
 
 /// The lines of the service and of the probe that a measurement run reports, in the order they came.
 fn report(lines: &[String], what: &str) {
-    const WANTED: [&str; 12] = [
+    const WANTED: [&str; 14] = [
         "datafs: pairs ",
+        "datafs: conversion ended",
+        "datafs: the volume has no mark 4",
         "datafs: walk own work",
         "datafs: ready after",
         "datafs: first walk",
@@ -563,20 +616,32 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
         "data-probe fill ({cpus} CPUs): the disk of 2 GiB with a data partition of 1,023 MiB made in {} s",
         started.elapsed().as_secs()
     );
-    // The first boot converts the volume (the mount work holds READY for the conversion, and the
-    // walk it needs fills the window then: the line says the first walk was `made at mount`, a walk
-    // with no rate). The second boot finds nothing to convert and walks in the quiet, after READY:
-    // its line has the reads and the time, which give the device rate.
-    // The probe's mode `convert` sends one request, which is answered when the mount work is over
-    // (READY comes after the conversion: 142 s for 3,258 entries in the first run), and ends.
-    let convert = image("boot-data-probe-convert.img", None, "convert", 0, 0)?;
-    let converted = run_to_end_within(
+    // The first boot converts the volume. READY comes at once (the mount work reads the mark and
+    // counts the pairs); the conversion is a job of the worker after READY, one entry a step, and
+    // its own line says how long it took (`datafs: conversion ended after N ms`, 142 s as part of
+    // READY for 3,258 entries in the first run). The probe sleeps and the host stops the machine on
+    // that line. The walk the job's commits need fills the window, so the first walk of this boot
+    // is `made at mount`, with no rate: the second boot finds nothing to convert and walks in the
+    // quiet, after READY, and its line has the reads and the time, which give the device rate.
+    let convert = image(
+        "boot-data-probe-convert.img",
+        None,
+        "settle",
+        0,
+        CONVERT_LIMIT.as_secs() as u32,
+    )?;
+    let converted = run_to_line(
         built,
         machine(built, &convert, &disk.0, false),
         "converting boot",
         CONVERT_LIMIT,
+        "datafs: conversion ended",
     )?;
     need_ready(&converted, "converting boot")?;
+    let (ready_ms, job_ms) = conversion_times(&converted)?;
+    println!(
+        "data-probe fill ({cpus} CPUs): READY after {ready_ms} ms, the conversion job ended after {job_ms} ms (after READY, one entry a step)"
+    );
     report(
         &converted,
         &format!("{cpus} CPUs, the boot that converts the volume"),
@@ -956,6 +1021,21 @@ mod tests {
         let (mut settled, measured) = fixture(1);
         settled[0] = "datafs: first walk 200000 blocks used, 150000 reads, 60001 ms".into();
         assert!(super::fill_checks(&settled, &measured, 1).is_err());
+    }
+
+    #[test]
+    fn ready_must_come_at_once_and_the_conversion_job_has_its_own_line() {
+        let ok = lines(&[
+            "datafs: ready after 700 ms, 900 reads",
+            "datafs: conversion ended after 142361 ms, 3258 entries got attributes, 0 inline files moved out",
+        ]);
+        assert_eq!(super::conversion_times(&ok), Ok((700, 142_361)));
+        let slow = lines(&[
+            "datafs: ready after 15001 ms, 900 reads",
+            "datafs: conversion ended after 5 ms, 3 entries got attributes, 0 inline files moved out",
+        ]);
+        assert!(super::conversion_times(&slow).is_err());
+        assert!(super::conversion_times(&ok[..1]).is_err());
     }
 
     #[test]

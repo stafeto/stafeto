@@ -60,6 +60,23 @@ impl Rig {
         Rig::on(MemDevice::new(SECTORS))
     }
 
+    /// A rig on `device` whose conversion job has not run: the mount work only read the mark.
+    pub fn unconverted(device: MemDevice) -> Rig {
+        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let mut fs = Fs::new(device, state).unwrap();
+        fs.mount().unwrap();
+        let mut server = Server::new();
+        server.default_service = false;
+        server.set_now(1_000);
+        server::ensure_orphans(&mut fs).unwrap();
+        server.mount_work(&mut fs).unwrap();
+        let mut rig = Rig { server, fs };
+        rig.bind(OWNER, user(1000, 100, &[]));
+        rig.bind(GROUP, user(1001, 100, &[]));
+        rig.bind(OTHER, user(2000, 200, &[]));
+        rig
+    }
+
     pub fn on(device: MemDevice) -> Rig {
         let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
         let mut fs = Fs::new(device, state).unwrap();
@@ -72,7 +89,10 @@ impl Rig {
         server.set_now(1_000);
         server::ensure_orphans(&mut fs).unwrap();
         let mounted = server.mount_work(&mut fs).unwrap();
-        assert!(mounted.complete || mounted.refused);
+        assert!(mounted.complete || mounted.refused || mounted.pending);
+        // The conversion job runs to its end before the tests ask anything (the service runs it after
+        // READY, between requests; the tests of the job itself step it by hand).
+        convert_to_the_end(&mut server, &mut fs);
         let mut rig = Rig { server, fs };
         rig.bind(OWNER, user(1000, 100, &[]));
         rig.bind(GROUP, user(1001, 100, &[]));
@@ -1083,14 +1103,39 @@ fn a_volume_of_version_2_gets_its_attributes_at_the_first_mount_and_the_mark_the
         fs.unmount().unwrap();
         fs.into_device()
     };
-    let mut rig = Rig::on(device);
+    // The job has not run: the entries read as the closed default with the number their path gives.
+    let mut rig = Rig::unconverted(device);
+    let (key0, ssh0, root0) = (
+        rig.stat(ROOT, b"/ssh/host_key").unwrap(),
+        rig.stat(ROOT, b"/ssh").unwrap(),
+        rig.stat(ROOT, b"/").unwrap(),
+    );
+    assert!(rig.server.conversion_pending());
+    convert_to_the_end(&mut rig.server, &mut rig.fs);
+    // After it every program sees the same owner, mode, times and `st_ino`: the record keeps what the
+    // entry already showed.
     let key = rig.stat(ROOT, b"/ssh/host_key").unwrap();
     let ssh = rig.stat(ROOT, b"/ssh").unwrap();
     let root = rig.stat(ROOT, b"/").unwrap();
+    for (before, after) in [(&key0, &key), (&ssh0, &ssh), (&root0, &root)] {
+        assert_eq!(
+            (
+                before.ino,
+                before.mode,
+                before.uid,
+                before.gid,
+                before.mtime
+            ),
+            (after.ino, after.mode, after.uid, after.gid, after.mtime)
+        );
+    }
     assert_eq!((key.mode, key.uid, key.gid, key.size), (0o600, 0, 0, 10));
     assert_eq!((ssh.mode, ssh.uid, ssh.gid), (0o700, 0, 0));
     assert_eq!((root.mode, root.uid, root.gid), (0o755, 0, 0));
-    assert!(key.ino >> 63 == 0 && ssh.ino >> 63 == 0, "from the counter");
+    assert!(
+        key.ino >> 63 == 1 && ssh.ino >> 63 == 1,
+        "the number of the path"
+    );
     let mut mark = [0u8; 4];
     assert_eq!(
         rig.fs.getattr(b"/", ATTR_FORMAT_TYPE, &mut mark).unwrap(),
@@ -1109,7 +1154,7 @@ fn a_volume_of_version_2_gets_its_attributes_at_the_first_mount_and_the_mark_the
     assert_eq!(rig.read(ROOT, h, 100).unwrap(), b"secret key");
     // The second mount does no walk.
     let again = rig.server.mount_work(&mut rig.fs).unwrap();
-    assert_eq!((again.converted, again.complete), (0, true));
+    assert!(again.complete && !again.pending, "{again:?}");
 }
 
 #[test]
@@ -2501,23 +2546,26 @@ fn a_write_at_the_start_or_in_the_middle_of_an_old_inline_file_after_the_mount_w
 }
 
 #[test]
-fn the_mount_work_moves_the_inline_files_once_and_marks_the_volume() {
+fn the_conversion_job_moves_the_inline_files_once_and_marks_the_volume() {
     use crate::attr::{ATTR_FORMAT_TYPE, VOLUME_FORMAT};
     let mut state = Storage::new();
     let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
     fs.mount().unwrap();
     let mut server = Server::new();
     let first = server.mount_work(&mut fs).unwrap();
-    assert_eq!((first.converted, first.moved, first.complete), (0, 2, true));
+    assert!(first.pending && !first.complete, "{first:?}");
+    // READY does not wait for it: the mount work only read the mark and counted the pairs.
+    let (converted, moved) = convert_to_the_end(&mut server, &mut fs);
+    assert_eq!((converted, moved), (0, 2));
     let mut mark = [0u8; 4];
     fs.getattr(b"/", ATTR_FORMAT_TYPE, &mut mark).unwrap();
     assert_eq!(u32::from_le_bytes(mark), VOLUME_FORMAT);
     // The second mount reads the mark and walks nothing.
     let reads = fs.device().reads;
     let again = Server::new().mount_work(&mut fs).unwrap();
-    assert_eq!((again.converted, again.moved, again.complete), (0, 0, true));
+    assert!(again.complete && !again.pending, "{again:?}");
     assert!(
-        fs.device().reads - reads < 40,
+        fs.device().reads - reads < 60,
         "{} reads",
         fs.device().reads - reads
     );
@@ -2550,7 +2598,7 @@ fn a_move_out_that_is_skipped_leaves_the_write_lost_which_the_test_of_the_mount_
     fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())
         .unwrap();
     let mounted = Server::new().mount_work(&mut fs).unwrap();
-    assert_eq!(mounted.moved, 0);
+    assert!(mounted.complete && !mounted.pending);
     let f = fs.open(b"/ssh/host_key", crate::Open::READ_WRITE).unwrap();
     fs.seek(f, 8, crate::fs::Whence::Set).unwrap();
     fs.write(f, b"NEW!").unwrap();
@@ -2588,11 +2636,13 @@ fn what_the_move_out_costs_at_the_mount() {
         rig.fs.set_inline_max(u32::MAX);
         rig.fs.mount().unwrap();
         let reads = rig.fs.device().reads;
-        let mounted = Server::new().mount_work(&mut rig.fs).unwrap();
+        let mut server = Server::new();
+        let mounted = server.mount_work(&mut rig.fs).unwrap();
+        let before_job = rig.fs.device().reads - reads;
+        let (_, moved) = convert_to_the_end(&mut server, &mut rig.fs);
         let spent = rig.fs.device().reads - reads;
         std::println!(
-            "{label}: 600 files in 6 directories, {} moved, {spent} reads for the mount work: {:.1} reads for each file",
-            mounted.moved,
+            "{label}: 600 files in 6 directories, {moved} moved, {before_job} reads before READY ({mounted:?}), {spent} reads in all: {:.1} reads for each file",
             spent as f64 / 600.0
         );
     }
@@ -2633,5 +2683,120 @@ fn mkdir_near_the_cap_is_refused_only_after_a_recount_and_a_difference_is_told()
     assert!(
         rig.server.take_pairs_report().is_none(),
         "a confirmed refusal counted again"
+    );
+}
+
+/// Steps the conversion job of `server` until it ends (nothing to do for a volume that needs none):
+/// the records given and the files moved out.
+pub(crate) fn convert_to_the_end(
+    server: &mut Server,
+    fs: &mut Fs<'_, MemDevice>,
+) -> (usize, usize) {
+    let mut steps = 0;
+    while server.conversion_pending() {
+        match server.convert_step(fs).unwrap() {
+            server::Step::More => steps += 1,
+            server::Step::Done { converted, moved } => return (converted, moved),
+        }
+        assert!(steps < 200_000, "the conversion does not end");
+    }
+    (0, 0)
+}
+
+#[test]
+fn a_write_to_an_inline_file_the_job_has_not_reached_is_moved_out_first_and_not_lost() {
+    let mut rig = Rig::unconverted(part_a_volume());
+    assert!(rig.server.conversion_pending());
+    // A write at the start, then one in the middle, then a truncation, each before the job ran.
+    let h = rig
+        .open(ROOT, b"/ssh/host_key", p::READ | p::WRITE, 0)
+        .unwrap();
+    rig.call(ROOT, |w| p::pwrite(h, 0, b"NEW-", w)).unwrap();
+    rig.call(ROOT, |w| p::pwrite(h, 10, b"middle", w)).unwrap();
+    rig.call(ROOT, |w| p::handle_call(p::Method::Fsync, h, w))
+        .unwrap();
+    rig.close(ROOT, h);
+    let h = rig.open(ROOT, b"/ssh/host_key", p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    assert_eq!(&data[4..4 + 32], b"NEW-456789middle0123456789abcdef");
+    rig.close(ROOT, h);
+    // A reader that holds the file open when a writer comes: the node is shared, the move-out goes
+    // through it.
+    let reader = rig.open(ROOT, b"/note", p::READ, 0).unwrap();
+    let writer = rig.open(ROOT, b"/note", p::READ | p::WRITE, 0).unwrap();
+    rig.call(ROOT, |w| p::pwrite(writer, 2, b"LONG", w))
+        .unwrap();
+    rig.close(ROOT, writer);
+    let data = rig.ok(ROOT, |w| p::pread(reader, 64, 0, w));
+    assert_eq!(&data[4..4 + 12], b"a LONGt note");
+    rig.close(ROOT, reader);
+    // The job still has its work; when it ends the files are whole.
+    assert!(rig.server.conversion_pending());
+    convert_to_the_end(&mut rig.server, &mut rig.fs);
+    let h = rig.open(ROOT, b"/ssh/host_key", p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    assert_eq!(&data[4..4 + 32], b"NEW-456789middle0123456789abcdef");
+}
+
+#[test]
+fn ready_does_not_wait_for_the_job_and_a_request_is_served_between_its_steps() {
+    // 150 inline files in 3 directories (part A's volume).
+    let mut rig = Rig::on(MemDevice::new(65_536));
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_max(0);
+    rig.fs.mount().unwrap();
+    for d in 0..3 {
+        rig.mkdir(ROOT, std::format!("/d{d}").as_bytes(), 0o755)
+            .unwrap();
+        for n in 0..50 {
+            rig.put(
+                ROOT,
+                std::format!("/d{d}/f{n:02}").as_bytes(),
+                0o644,
+                b"small",
+            );
+        }
+    }
+    rig.fs
+        .setattr(
+            b"/",
+            crate::attr::ATTR_FORMAT_TYPE,
+            &crate::attr::RECORDS_FORMAT.to_le_bytes(),
+        )
+        .unwrap();
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_max(u32::MAX);
+    rig.fs.mount().unwrap();
+    let reads = rig.fs.device().reads;
+    let mut server = Server::new();
+    server.default_service = false;
+    let mounted = server.mount_work(&mut rig.fs).unwrap();
+    let before_ready = rig.fs.device().reads - reads;
+    assert!(mounted.pending);
+    assert!(
+        before_ready < 400,
+        "{before_ready} reads before READY: the job did not wait for the first request"
+    );
+    rig.server = server;
+    rig.bind(OWNER, user(1000, 100, &[]));
+    // One entry a step: each step is short, and requests between them are answered.
+    let (mut steps, mut longest) = (0u32, 0u64);
+    while rig.server.conversion_pending() {
+        let before = rig.fs.device().reads;
+        let step = rig.server.convert_step(&mut rig.fs).unwrap();
+        longest = longest.max(rig.fs.device().reads - before);
+        steps += 1;
+        if steps % 20 == 0 {
+            // A request between two steps: served at once, the same answer as ever.
+            assert_eq!(rig.stat(ROOT, b"/d1/f10").unwrap().size, 5);
+        }
+        if matches!(step, server::Step::Done { .. }) {
+            break;
+        }
+    }
+    assert!(steps >= 150, "{steps} steps for 150 files");
+    assert!(
+        longest < 400,
+        "a step read {longest} blocks: a request would wait for it"
     );
 }

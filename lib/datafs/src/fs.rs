@@ -30,6 +30,7 @@ unsafe extern "C" {
     fn datafs_pairs(d: *mut c_void, ctx: *mut c_void, out: *mut u32) -> c_int;
     fn datafs_outline(d: *mut c_void, ctx: *mut c_void, path: *const c_char, dry: c_int) -> c_int;
     fn datafs_set_inline(d: *mut c_void, max: u32);
+    fn datafs_file_inline(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_open(d: *mut c_void, ctx: *mut c_void, path: *const c_char, flags: c_int) -> c_int;
     fn datafs_close(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_read(d: *mut c_void, ctx: *mut c_void, slot: c_int, buf: *mut u8, size: u32) -> i64;
@@ -506,6 +507,13 @@ impl<'a, D: Device> Fs<'a, D> {
         // SAFETY: as above; the path is a C string that lives through the call.
         let r = self.call(|d, ctx| unsafe { datafs_outline(d, ctx, path.ptr(), c_int::from(dry)) });
         check(r).map(|n| n == 1)
+    }
+
+    /// Whether the open file is inline (its bytes inside the pair of its directory) and not empty.
+    pub fn file_inline(&mut self, file: File) -> Res<bool> {
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_file_inline(d, ctx, c_int::from(file.0)) }))
+            .map(|n| n == 1)
     }
 
     /// Walks the file system once and fills the allocator's window from it: every block the tree

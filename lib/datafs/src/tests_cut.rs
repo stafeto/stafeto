@@ -284,6 +284,7 @@ fn a_cut_in_the_recovery_is_finished_by_the_next_one() {
 mod attributes {
     use super::*;
     use crate::fs::Open;
+    use crate::tests_perm::convert_to_the_end;
     use crate::tests_perm::{OWNER, ROOT, Rig, SECTORS};
 
     const SURVIVE: [Survive; 3] = [Survive::None, Survive::All, Survive::Random(7)];
@@ -453,7 +454,9 @@ mod attributes {
         let mut server = server::Server::new();
         let before = fs.device().written;
         let report = server.mount_work(&mut fs).unwrap();
-        assert!(report.complete && report.moved == 2, "{report:?}");
+        assert!(report.pending, "{report:?}");
+        let (_, moved) = convert_to_the_end(&mut server, &mut fs);
+        assert_eq!(moved, 2);
         let sectors = fs.device().written - before;
         assert!(sectors >= 4, "{sectors} sectors");
         for cut in 0..=sectors {
@@ -464,6 +467,11 @@ mod attributes {
                 let mut server = server::Server::new();
                 fs.device().cut_after(Some(cut));
                 let _ = server.mount_work(&mut fs);
+                while server.conversion_pending() {
+                    if server.convert_step(&mut fs).is_err() {
+                        break;
+                    }
+                }
                 let mut device = fs.into_device();
                 device.power_cycle(survive);
                 // The volume mounts, and every file is whole: the old bytes, moved or not.
@@ -476,7 +484,8 @@ mod attributes {
                 // The next start finishes the work, and a write in the middle of the old key works.
                 let mut server = server::Server::new();
                 let done = server.mount_work(&mut fs).unwrap();
-                assert!(done.complete, "cut {cut}: {done:?}");
+                assert!(done.pending || done.complete, "cut {cut}: {done:?}");
+                convert_to_the_end(&mut server, &mut fs);
                 let f = fs.open(b"/ssh/host_key", Open::READ_WRITE).unwrap();
                 fs.seek(f, 8, crate::fs::Whence::Set).unwrap();
                 fs.write(f, b"NEW!").unwrap();
@@ -510,7 +519,9 @@ mod attributes {
         let mut server = server::Server::new();
         let before = fs.device().written;
         let report = server.mount_work(&mut fs).unwrap();
-        assert!(report.complete && report.converted >= 8, "{report:?}");
+        assert!(report.pending, "{report:?}");
+        let (converted, _) = convert_to_the_end(&mut server, &mut fs);
+        assert!(converted >= 8, "{converted} records");
         let sectors = fs.device().written - before;
         assert!(sectors >= 9, "{sectors} sectors");
         for cut in 0..=sectors {
@@ -521,6 +532,11 @@ mod attributes {
                 let mut server = server::Server::new();
                 fs.device().cut_after(Some(cut));
                 let _ = server.mount_work(&mut fs);
+                while server.conversion_pending() {
+                    if server.convert_step(&mut fs).is_err() {
+                        break;
+                    }
+                }
                 let mut device = fs.into_device();
                 device.power_cycle(survive);
                 // The next start finishes it: every entry has its record, the mark is there, the

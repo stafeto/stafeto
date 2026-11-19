@@ -263,14 +263,19 @@
 //! loses a write at the start or in the middle of an inline file (the close answers CORRUPT, the old
 //! bytes stay) once inline data is off, which the service keeps it, so the mount work of a volume
 //! with a mark under 4 moves out every non-empty inline file (open for writing, seek to the end,
-//! write no byte: one commit, the old file or the moved one after a cut) in the walk that gives the
-//! records, then writes the mark 4. The walk costs about 27 reads for each file and about 62 more for
-//! each file it moves, and holds READY for as long as it takes: a volume of many small files made by
-//! the part A build or the 0.5 release is converted at its first mount before the first request (at
-//! most `CONVERT_MAX` writes in one run; the next mount goes on). A service that writes the mark 3
-//! refuses a volume with the mark 4 (NOT_READY), which keeps a build that makes inline files from
-//! writing on a volume that has none. Every file takes a block of its own, and moving a file out takes
-//! one: on a nearly full volume that is NO_SPACE for the caller who is not user 0.
+//! write no byte: one commit, the old file or the moved one after a cut) and gives every entry its
+//! record, then writes the mark 4. This is a job of the service after READY, one entry a step with
+//! the requests served between the steps; READY waits only for reading the mark and counting the
+//! pairs. The record of an entry the job has not reached is the closed default with the number its
+//! path gives, and the record the job writes is that same one, so a program sees the same owner,
+//! mode, times and `st_ino` before and after. An inline file the job has not reached is moved out
+//! when it is first opened for writing or truncation, so that no write meets the loss. A cut leaves
+//! the mark as it was and the job starts again at the next mount, skipping what it did without a
+//! write. The walk costs about 27 reads for each file and about 62 more for each file it moves. A
+//! service that writes the mark 3 refuses a volume with the mark 4 (NOT_READY), which keeps a build
+//! that makes inline files from writing on a volume that has none. Every file takes a block of its
+//! own, and moving a file out takes one: on a nearly full volume that is NO_SPACE for the caller
+//! who is not user 0.
 //!
 //! # The size of a directory
 //!

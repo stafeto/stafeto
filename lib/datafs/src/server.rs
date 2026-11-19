@@ -37,7 +37,7 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 mod mount;
 mod names;
 
-pub use mount::{CONVERT_MAX, Mounted, Recovered, bump_epoch, ensure_orphans, recover_orphans};
+pub use mount::{Mounted, Recovered, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
 
 /// The sessions of the table: the loop of the service holds as many.
@@ -275,6 +275,8 @@ pub struct Server {
     /// The count of the metadata pairs of the volume: what the last walk of the list found
     /// (None before the first MKDIR after the mount) and the pairs the commits since may have added.
     pairs: Pairs,
+    /// The conversion job of the mount work, while it has steps to do (`convert_step`).
+    conversion: Option<mount::Conversion>,
     /// The caps (`PAIRS_MAX` and `DIRS_MAX`; the tests lower them).
     pairs_max: u64,
     dirs_max: u64,
@@ -479,6 +481,7 @@ impl Server {
             }; COUNT_CACHE],
             counts_hand: 0,
             pairs: Pairs::NONE,
+            conversion: None,
             pairs_max: PAIRS_MAX,
             dirs_max: DIRS_MAX,
             now: 0,
@@ -1714,6 +1717,21 @@ impl Server {
                         (ni, true)
                     }
                 };
+                // While the conversion job has not ended a file may be inline (its bytes inside the
+                // pair of its directory), and littlefs 2.11.3 loses a write at its start or in its
+                // middle with inline data off. A file about to be written or truncated is moved out
+                // first (seek to the end, write no byte: one commit) through the node's file, which
+                // every description of the path shares.
+                if self.conversion.is_some()
+                    && existing.is_some()
+                    && flags & (p::WRITE | p::TRUNCATE) != 0
+                {
+                    let file = File(self.nodes[ni].slot);
+                    if volume(fs.file_inline(file))? {
+                        volume(fs.seek(file, 0, Whence::End))?;
+                        volume(fs.write(file, &[]))?;
+                    }
+                }
                 if flags & p::TRUNCATE != 0 {
                     let file = File(self.nodes[ni].slot);
                     self.nodes[ni].at = None;

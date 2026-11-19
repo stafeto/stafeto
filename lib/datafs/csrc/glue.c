@@ -364,6 +364,16 @@ static int file_ok(struct datafs *d, int slot)
     return slot >= 0 && slot < DATAFS_FILES && d->file_used[slot];
 }
 
+// Whether the open file in `slot` is inline and not empty (see `datafs_outline`).
+int datafs_file_inline(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return (d->file[slot].flags & LFS_F_INLINE) && lfs_file_size(&d->lfs, &d->file[slot]) > 0;
+}
+
 int datafs_close(struct datafs *d, void *ctx, int slot)
 {
     d->ctx = ctx;
