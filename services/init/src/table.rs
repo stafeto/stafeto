@@ -613,6 +613,28 @@ pub fn first_cpu(log: bool, mask: u8) -> u8 {
     if log && mask & 0b0010 != 0 { 2 } else { 0 }
 }
 
+/// The CPU a budget of `record` is made on for an instance with the mask `mask` of CPUs that are
+/// up: the table's CPU for every record but the console driver. The driver (the record with `log`)
+/// stands on the CPU `first_cpu` asks for, CPU 1 on a machine that has it, and a budget binds only
+/// to a thread of its own CPU (thread_bind_budget answers INVALID_ARGS otherwise), so its budget
+/// is made where the thread is: CPU 1 when `first_cpu` asks for it, else the lowest CPU of the
+/// mask, where the loader leaves a thread it was asked nothing for.
+pub fn budget_cpu(log: bool, mask: u8, table_cpu: u8) -> u8 {
+    if !log {
+        return table_cpu;
+    }
+    match first_cpu(log, mask) {
+        0 => {
+            if mask == 0 {
+                table_cpu
+            } else {
+                mask.trailing_zeros() as u8
+            }
+        }
+        asked => asked - 1,
+    }
+}
+
 impl Record {
     /// A record of nothing: the filler of the buffers of a resolved table.
     pub const EMPTY: Record = Record {
@@ -1983,6 +2005,74 @@ mod tests {
         let mut tables = ALL_TABLES.to_vec();
         tables.push(lock_ring::TABLE);
         tables
+    }
+
+    /// The CPU a thread is left on when the loader is asked nothing for it, and the CPU asked for the
+    /// driver of the console, written out apart from `budget_cpu`.
+    fn thread_cpu(log: bool, mask: u8) -> u8 {
+        if log && mask & 0b0010 != 0 {
+            1
+        } else {
+            mask.trailing_zeros() as u8
+        }
+    }
+
+    /// Every record of every table whose program takes a budget at its start (the console drivers
+    /// `uart` and `virtio-console`, whose record is the one with `log`, and every record with a
+    /// budget `serve`) has the budget `rt::budget::SERVE` the program takes, with a `free` level
+    /// below its priority, and for each set of CPUs that are up the budget stands on the CPU the
+    /// instance's request thread does: a budget binds only to a thread of its own CPU (the cause of
+    /// the console driver that died with INVALID_ARGS on two CPUs, where it stands on CPU 1).
+    #[test]
+    fn the_budget_a_program_takes_at_its_start_is_in_its_record_on_the_cpu_of_its_thread() {
+        let mut drivers = 0;
+        let mut served = 0;
+        for table in all_tables() {
+            for r in table {
+                if matches!(r.program, "uart" | "virtio-console") {
+                    drivers += 1;
+                    assert!(
+                        r.log && r.budgets.iter().any(|b| b.name == "serve") && r.free > 0,
+                        "the console driver `{}` of a table has no budget `serve` or no free level",
+                        r.name
+                    );
+                    assert!(r.free < r.priority, "{}", r.name);
+                }
+                let Some(serve) = r.budgets.iter().find(|b| b.name == "serve") else {
+                    continue;
+                };
+                served += 1;
+                assert!(r.free > 0 && r.free < r.priority, "{}", r.name);
+                for up in [0b0001u8, 0b0011, 0b0111, 0b1111] {
+                    let (mask, _) = on_cpus(r.cpus, up);
+                    let cpu = budget_cpu(r.log, mask, serve.cpu);
+                    assert_eq!(cpu, thread_cpu(r.log, mask), "{} with CPUs {up:#b}", r.name);
+                    assert!(mask >> cpu & 1 != 0, "{} with CPUs {up:#b}", r.name);
+                }
+            }
+        }
+        assert!(drivers > 20 && served > 40, "{drivers} {served}");
+    }
+
+    /// The budget of the console driver, moved to CPU 1 where the driver stands on two or more
+    /// CPUs, still fits the share of CPU 1 in every table, with what the table has there.
+    #[test]
+    fn the_console_drivers_budget_on_cpu_1_fits_the_share_of_that_cpu() {
+        for table in all_tables() {
+            let moved: Vec<Record> = table
+                .iter()
+                .map(|r| {
+                    let mut r = *r;
+                    if r.log {
+                        let budgets: Vec<Budget> =
+                            r.budgets.iter().map(|b| Budget { cpu: 1, ..*b }).collect();
+                        r.budgets = Box::leak(budgets.into_boxed_slice());
+                    }
+                    r
+                })
+                .collect();
+            assert!(check_budgets(&moved).is_ok());
+        }
     }
 
     /// A record of `nvme-blk` named `datadisk` always says which volume it may serve: a kind byte of
