@@ -344,6 +344,9 @@ fn main(_: u64) -> u64 {
     let Ok(log) = s.take::<Resource>("log") else {
         return NO_LOG;
     };
+    // The budget of the loop (`serve`), taken before the arguments borrow the start data and
+    // bound below, once the driver is set up and before its loop begins.
+    let budget = rt::budget::take(&mut s, rt::budget::SERVE);
     let Ok(dma) = s.take::<Memory>("dma") else {
         return NO_START_DATA;
     };
@@ -455,6 +458,13 @@ fn main(_: u64) -> u64 {
     // The line opens once the queues are up: an input that came before
     // is read at the first interrupt.
     let _ = sys::irq_ack(&driver.irq);
+    // The loop is this thread: it works under its budget from here on. A budget the kernel
+    // refuses is told in a line (`rt::budget::bind`) and the driver serves with none: a system
+    // with no console is worse than a console driver with no budget. The line "virtio-console: serve
+    // runs under its budget" is not printed then. xtask fails the run for the refusal line in
+    // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
+    // for its absence.
+    let _ = rt::budget::bind("virtio-console", "serve", budget, &s.thread);
     let heartbeat = Heartbeat {
         to: &s.parent,
         period_ns: args.map_or(0, |a| a.period_ns),

@@ -242,6 +242,13 @@ impl Default for WatchSet {
         Self::new()
     }
 }
+/// The little-endian word at `at`, when the bytes hold it.
+#[inline(always)]
+fn le32(bytes: &[u8], at: usize) -> Option<u32> {
+    let word = bytes.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+}
+
 impl WatchSet {
     pub const fn new() -> Self {
         Self {
@@ -259,25 +266,45 @@ impl WatchSet {
             generation: self.generations[i],
         }
     }
+    /// The set of a WatchStart body: the count, then for each element its
+    /// endpoint (the id, and the generation of a named one) and its events.
+    /// The elements are decoded from one slice of the body, with no call of
+    /// the reader for each field (a set of 32 is decoded in a few
+    /// hundred ticks under -icount).
     pub fn parse(mut body: Reader<'_>) -> Result<Self, Status> {
-        let mut set = Self::new();
-        set.len = body.u32()? as usize;
-        if set.len == 0 || set.len > set.items.len() {
+        let len = body.u32()? as usize;
+        if len == 0 || len > proto_wire::watch::MAX {
             return Err(Status::BadSize);
         }
-        for i in 0..set.len {
-            let endpoint = Endpoint::parse(&mut body)?;
-            let events = body.u32()?;
-            if events & !proto_wire::watch::EVENTS != 0 {
+        let rest = body.bytes(body.left())?;
+        let mut set = Self::new();
+        set.len = len;
+        let mut at = 0;
+        for i in 0..len {
+            let id = le32(rest, at).ok_or(Status::BadSize)?;
+            at += 4;
+            let generation = if id & NAMED_END != 0 {
+                let low = u64::from(le32(rest, at).ok_or(Status::BadSize)?);
+                let high = u64::from(le32(rest, at + 4).ok_or(Status::BadSize)?);
+                at += 8;
+                low | high << 32
+            } else {
+                0
+            };
+            let events = le32(rest, at).ok_or(Status::BadSize)?;
+            at += 4;
+            if !(Endpoint { id, generation }).valid() || events & !proto_wire::watch::EVENTS != 0 {
                 return Err(Status::BadSize);
             }
             set.items[i] = proto_wire::watch::Item {
-                description: endpoint.id,
+                description: id,
                 events,
             };
-            set.generations[i] = endpoint.generation;
+            set.generations[i] = generation;
         }
-        body.finish()?;
+        if at != rest.len() {
+            return Err(Status::BadSize);
+        }
         Ok(set)
     }
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
@@ -315,6 +342,90 @@ impl WatchSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `WatchSet::parse` was before it decoded from one slice.
+    fn reference(mut body: Reader<'_>) -> Result<WatchSet, Status> {
+        let mut set = WatchSet::new();
+        set.len = body.u32()? as usize;
+        if set.len == 0 || set.len > set.items.len() {
+            return Err(Status::BadSize);
+        }
+        for i in 0..set.len {
+            let endpoint = Endpoint::parse(&mut body)?;
+            let events = body.u32()?;
+            if events & !proto_wire::watch::EVENTS != 0 {
+                return Err(Status::BadSize);
+            }
+            set.items[i] = proto_wire::watch::Item {
+                description: endpoint.id,
+                events,
+            };
+            set.generations[i] = endpoint.generation;
+        }
+        body.finish()?;
+        Ok(set)
+    }
+
+    #[test]
+    fn the_set_parses_as_it_did_through_the_reader() {
+        let ids = [
+            0,
+            5,
+            127,
+            128,
+            NAMED_END,
+            NAMED_END | 47,
+            NAMED_END | NAMED_MAX as u32,
+            crate::sock::SOCK_END | 3,
+            crate::sock::SOCK_END | NAMED_END | 1,
+            0xffff_ffff,
+        ];
+        let generations = [0u64, 1, 0x1_0000_0001, u64::MAX];
+        let events = [
+            0,
+            proto_wire::watch::READ,
+            proto_wire::watch::EVENTS,
+            u32::MAX,
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as usize % n
+        };
+        let (mut good, mut bad) = (0, 0);
+        for round in 0..6000 {
+            let len = round % 36;
+            let mut body = (len as u32).to_le_bytes().to_vec();
+            for _ in 0..len {
+                let id = ids[next(ids.len())];
+                body.extend(id.to_le_bytes());
+                if id & NAMED_END != 0 || next(8) == 0 {
+                    body.extend(generations[next(generations.len())].to_le_bytes());
+                }
+                body.extend(events[next(events.len())].to_le_bytes());
+            }
+            match next(6) {
+                0 if !body.is_empty() => {
+                    body.pop();
+                }
+                1 => body.push(0),
+                _ => {}
+            }
+            let (new, old) = (
+                WatchSet::parse(Reader::new(&body)),
+                reference(Reader::new(&body)),
+            );
+            assert_eq!(new, old, "{body:?}");
+            if new.is_ok() {
+                good += 1;
+            } else {
+                bad += 1;
+            }
+        }
+        assert!(good > 50 && bad > 50, "{good} good, {bad} bad");
+    }
 
     #[test]
     fn broker_captures_the_existing_resident_open_key_domain() {

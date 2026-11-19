@@ -250,8 +250,9 @@ pub const CONSOLE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
-    budgets: &[],
-    free: 0,
+    budgets: super::ramfs::CONSOLE_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
+    broken_after: None,
 };
 
 const fn same(a: &str, b: &str) -> bool {
@@ -465,6 +466,9 @@ pub const POWER: Record = Record {
         only_if: None,
         confirm: None,
     }],
+    // The power service is no console driver: it keeps no budget.
+    budgets: &[],
+    free: 0,
     ..CONSOLE
 };
 
@@ -853,7 +857,11 @@ mod tests {
         const KERNEL_PAGES: u64 = (64 << 20) / PAGE;
         const INIT_FREE: u64 = crate::table::base::INIT_RESERVE_PAGES;
         let held = pages_held(TABLE);
-        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE;
+        // The segments of the programs are paid at the load besides the quotas, and the 96 MiB of
+        // the image are the files; the zeroed statics are not in them. The data file service's
+        // allocator window is the one that grew with the volume: 128 KiB for a volume of 4 GiB.
+        const DATAFS_WINDOW_PAGES: u64 = 32;
+        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE + DATAFS_WINDOW_PAGES;
         assert!(
             need <= T4G_SMALL_PAGES,
             "the table holds {held} pages and with the image, the kernel and init's free pages {need} of the {T4G_SMALL_PAGES} of a t4g.small"
@@ -1021,11 +1029,14 @@ mod tests {
     }
 
     /// The budgets on CPU 0 of the EC2 table: the network service 40 % and 20 %, the file
-    /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the NVMe service 1 %
-    /// and the data file service 1 %, and the reserve of 3 % for the process service and the
-    /// package service: 73 % under the 75 % the table allows.
+    /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the console driver 1.5 %,
+    /// the NVMe service 1 % and the data file service 1 %, and the reserve of 3 % for the process
+    /// service and the package service: 74.5 % under the 75 % the table allows. The 0.5 % that is
+    /// left is headroom for no known user: the process service and the package service sit inside
+    /// the reserve of 3 %, so a new budget on CPU 0 has to come out of that reserve or from the
+    /// cut of another record's budget.
     #[test]
-    fn the_budgets_of_cpu_zero_on_ec2_are_73_percent_under_the_cap_of_75() {
+    fn the_budgets_of_cpu_zero_on_ec2_are_74_5_percent_under_the_cap_of_75() {
         for table in [TABLE, QEMU_TABLE] {
             let on_zero: u64 = table
                 .iter()
@@ -1035,8 +1046,8 @@ mod tests {
                 .sum();
             assert_eq!(
                 on_zero + crate::table::CPU0_RESERVE_PPM,
-                730_000,
-                "40 + 20 + 5 + 1.5 + 1.5 + 1 + 1 + 3 per cent"
+                745_000,
+                "40 + 20 + 5 + 1.5 + 1.5 + 1.5 + 1 + 1 + 3 per cent"
             );
             assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
         }

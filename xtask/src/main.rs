@@ -83,6 +83,10 @@ mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
+mod lvgl;
+mod lvgl_image;
+#[cfg(test)]
+mod lvgl_scenario;
 mod measure;
 mod monitor;
 mod nano_dialog;
@@ -119,6 +123,7 @@ mod pkg_slot;
 mod pkg_states;
 mod posix_display;
 mod posix_net;
+mod posix_window;
 mod probe_ca;
 mod qemu;
 mod release;
@@ -619,6 +624,7 @@ const POSIX_TTY_PROGRAMS: [ImageProgram; 12] = [
 ];
 const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_PROGRAMS;
+    programs[1].3 = &["steps"];
     programs[2].3 = &["trust-probe", "steps"];
     programs[5].3 = &["tty-probe", "steps"];
     programs
@@ -626,6 +632,7 @@ const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
 /// Full terminal control steps with sixteen live POSIX clients over a PTY.
 const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_STEPS_PROGRAMS;
+    programs[1].3 = &[];
     programs[2].3 = &["quiet-steps"];
     programs[5].3 = &[];
     programs[8].3 = &["quiet-control"];
@@ -819,7 +826,9 @@ const POSIX_FIFO_PROGRAMS: [ImageProgram; 10] = {
 };
 const POSIX_FIFO_STEPS_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_FIFO_PROGRAMS;
-    programs[1].3 = &["steps"];
+    // `fifo-steps` makes the probe wait idle for three seconds after its last check.
+    programs[5].3 = &["fifo-probe", "fifo-steps"];
+    programs[1].3 = &["steps", "audit-readout"];
     programs[2].3 = &["steps"];
     programs
 };
@@ -1045,7 +1054,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1062,7 +1071,26 @@ const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
     ("dropbear", "dropbear", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
+    // A static program on relibc (apps/lvgl-demo): its 256 KiB stack is the
+    // PT_GNU_STACK its build script asks for, and its build script runs the
+    // scripts of LVGL and FreeType.
+    ("lvgl-demo", "lvgl-demo", 0, &[]),
 ];
+/// The static package programs: those of PACKAGE_PROGRAMS without the feature
+/// `dynamic`, which their own crate's build links with relibc's `libc.a`
+/// (no `DT_NEEDED`, no interpreter, no undefined name), with the size of the
+/// `PT_GNU_STACK` that crate's build script asks for (the stack of a program
+/// started from its file). The checks of a dynamic program (the needed
+/// libraries, the symbol versions against libc.so) do not apply to them, and
+/// these (`check_static_elf`) do.
+const STATIC_PROGRAMS: [(&str, u32); 1] = [("lvgl-demo", 256 * 1024)];
+
+/// The stack a static package program's build asks for, or `None` for a
+/// program that is not static.
+fn static_stack(program: &str) -> Option<u32> {
+    STATIC_PROGRAMS.iter().find(|p| p.0 == program).map(|p| p.1)
+}
+
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build. The programs are
@@ -2310,6 +2338,15 @@ commands:
             QEMU's tablet, then the window manager program with a native client and one of
             the first revision (the chord, the keys, the manager's end), and the steps of
             the services under -icount; with --hvf under HVF
+  lvgl-probe [--hvf] run the probe of the LVGL demo in QEMU: the demo's first frame and the frame after
+            the scenario of 22 injected events, each compared three ways: the CRC-32 the demo prints,
+            the CRC-32 of QEMU's screenshot and the CRC-32 the reference program on the host
+            (target/lvgl-host/lvgl-ref) draws; and the state line, the turns, the frames, the glyph
+            evidence, the CRC of each band of 16 rows, the events taken by kind with none lost and
+            the largest use of LVGL's pool; then, on QEMU's own emulation, the same under -icount with
+            the longest steps of the compositor, the display driver and the tablet's driver
+  lvgl [--machine hvf] run the LVGL demo by hand: QEMU with the window of the screen (cocoa on a Mac)
+            and the console on the terminal; at the prompt of ash type `lvgl-demo`, click its widgets
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2438,6 +2475,7 @@ commands:
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -2785,6 +2823,15 @@ fn main() {
             }),
             Some(_) => Err("focus-probe [--hvf]".to_owned()),
         },
+        Some("lvgl-probe") => match args.get(1).map(String::as_str) {
+            None => lvgl::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                lvgl::probe(&qemu::HVF_V3)?;
+                lvgl::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("lvgl-probe [--hvf]".to_owned()),
+        },
+        Some("lvgl") => lvgl::window(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2832,6 +2879,7 @@ fn main() {
         Some("posix-random-net-two") => entropy::random_net_two(false),
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -3691,7 +3739,7 @@ fn write_boot_image_files(
             .iter()
             .filter(|p| is_dynamic(p.3))
             .map(|p| dynamic_name(p.1, p.3))
-            .collect();
+            .collect::<Result<_, _>>()?;
         if !dynamic.is_empty() {
             dynamic_programs(&dynamic)?;
         }
@@ -3700,7 +3748,7 @@ fn write_boot_image_files(
                 target
                     .join("libc-so")
                     .join("programs")
-                    .join(dynamic_name(package, features))
+                    .join(dynamic_name(package, features)?)
             } else {
                 cargo_output(&target, PROGRAM_TARGET, profile, package)
             };
@@ -3742,6 +3790,87 @@ fn write_boot_image_files(
 
 /// Strips the symbols and the non-loadable sections off `elf`, the image's
 /// copy of the linker's file.
+/// The checks of a static program's linked file, before it is stripped: no
+/// `PT_INTERP` and no `PT_DYNAMIC` (so no `DT_NEEDED`), a `PT_GNU_STACK` of
+/// `stack` bytes, and no undefined name.
+fn check_static_elf(elf: &Path, stack: u32) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    static_headers(&bytes, stack).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let nm = Command::new(llvm_tool("llvm-nm")?)
+        .args(["-u", "--format=just-symbols"])
+        .arg(elf)
+        .output()
+        .map_err(|e| format!("llvm-nm: {e}"))?;
+    let undefined = String::from_utf8_lossy(&nm.stdout).into_owned();
+    if !undefined.trim().is_empty() {
+        return Err(format!(
+            "{}: a static program leaves names undefined: {}",
+            elf.display(),
+            undefined.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    Ok(())
+}
+
+/// The program headers of a static program's ELF file: none of the types
+/// PT_INTERP (3) and PT_DYNAMIC (2), and a PT_GNU_STACK (0x6474e551) whose
+/// memory size is `stack`.
+fn static_headers(bytes: &[u8], stack: u32) -> Result<(), String> {
+    let word = |at: usize, len: usize| -> Option<u64> {
+        let field = bytes.get(at..at + len)?;
+        Some(field.iter().rev().fold(0, |n, b| n << 8 | u64::from(*b)))
+    };
+    if bytes.get(..4) != Some(b"\x7fELF".as_slice()) {
+        return Err("is no ELF file".to_owned());
+    }
+    let (Some(table), Some(size), Some(count)) = (word(32, 8), word(54, 2), word(56, 2)) else {
+        return Err("has no program headers".to_owned());
+    };
+    let mut gnu_stack = None;
+    for i in 0..count {
+        let at = (table + i * size) as usize;
+        match word(at, 4) {
+            Some(3) => {
+                return Err("names an interpreter (PT_INTERP): it is dynamically linked".to_owned());
+            }
+            Some(2) => {
+                return Err(
+                    "has a dynamic section (PT_DYNAMIC): it may name libraries (DT_NEEDED)"
+                        .to_owned(),
+                );
+            }
+            Some(0x6474_e551) => gnu_stack = word(at + 40, 8),
+            _ => {}
+        }
+    }
+    match gnu_stack {
+        Some(n) if n == u64::from(stack) => Ok(()),
+        Some(n) => Err(format!(
+            "has a stack segment of {n} bytes, {stack} expected"
+        )),
+        None => Err("has no stack segment (PT_GNU_STACK)".to_owned()),
+    }
+}
+
+/// Fails when the file at `elf` holds the text of `root`, the build directory.
+fn no_build_path(elf: &Path, root: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let text = root.to_string_lossy();
+    if bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+    {
+        return Err(format!(
+            "{} holds the build directory's path {text}",
+            elf.display()
+        ));
+    }
+    Ok(())
+}
+
 fn strip_elf(elf: &Path, objcopy: &Path) -> Result<(), String> {
     run_cmd(Command::new(objcopy).arg("--strip-all").arg(elf))
 }
@@ -3803,6 +3932,9 @@ fn write_elf_image(
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
+        if let Some(stack) = static_stack(file) {
+            check_static_elf(elf, stack)?;
+        }
         if *file == "ramfs" {
             disasm::ram_main_frame(elf, &objdump)?;
         }
@@ -3813,6 +3945,9 @@ fn write_elf_image(
             .windows(READY_MARK.len())
             .any(|w| w == READY_MARK);
         strip_elf(elf, &objcopy)?;
+        if static_stack(file).is_some() {
+            no_build_path(elf, &root())?;
+        }
     }
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
@@ -4830,6 +4965,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             );
         }
         check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
+        check_console_driver_steps(&output.lines)?;
         let tty = longest_steps(&output.lines, "5");
         // This POSIX fixture calls Acquire, SetPgrp, GetPgrp and GetSid.
         // The separate native control probe also measures Controlling.
@@ -5136,8 +5272,8 @@ fn is_dynamic(features: &[&str]) -> bool {
 /// The name of the dynamic program of `package` under target/libc-so/programs:
 /// the small BusyBox of the probes, the one with the utilities of the shell
 /// image, or the package's own.
-fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
-    match (package, features.contains(&"utilities")) {
+fn dynamic_name(package: &str, features: &[&str]) -> Result<&'static str, String> {
+    Ok(match (package, features.contains(&"utilities")) {
         ("busybox-probe", false) => "busybox",
         ("busybox-probe", true) => "busybox-utils",
         ("busybox-dyn", _) => "busybox",
@@ -5153,8 +5289,12 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("dropbear", _) => "dropbear",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
-        _ => panic!("no dynamic build of the program {package}"),
-    }
+        _ => {
+            return Err(format!(
+                "no dynamic build of the program {package} (build-libc-so.py programs links the programs of `dynamic_name`); a static program has no `dynamic` feature in PACKAGE_PROGRAMS and a line in STATIC_PROGRAMS"
+            ));
+        }
+    })
 }
 
 /// libc.so and the dynamic programs linked (after the scripts of their
@@ -5695,14 +5835,43 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
 /// The most a step of the terminal service's Watch takes with 16 elements.
 const WATCH_FULL_MAX: u64 = 18_000;
 
+/// The most a step of the pipe or terminal service may take besides the
+/// signal of life (kind 64): 0.9 of term B. The rest of B is the room for
+/// the interrupts that land in a step without a switch (1,310 ticks seen
+/// between two builds) and for the shift of phases between builds.
+const WATCH_STEP_MAX: u64 = TERM_B * 9 / 10;
+
+/// The most a step of the pipe service's WatchStart (tag 4, kind 14) may
+/// take: term B. The step's own work is about 12,900 ticks, and the longest
+/// steps observed carry 4,000 to 6,000 ticks more of a budget overrun
+/// episode, which is no work of the service (the request thread's budget is
+/// 4,687 ticks of each 5 ms and a step crosses it). This exception goes away
+/// when stafeto/stafeto#498 closes, and kind 14 is then held to
+/// `WATCH_STEP_MAX` like the other steps.
+const WATCH_START_MAX: u64 = TERM_B;
+
+/// The bound of a step of the pipe (tag "4") or terminal service: the signal
+/// of life (kind 64) is held to term B, the pipe service's WatchStart (kind
+/// 14) to `WATCH_START_MAX`, every other step to `WATCH_STEP_MAX`.
+fn watch_bound(tag: &str, kind: usize) -> u64 {
+    if kind == 64 {
+        RAM_STEP_MAX
+    } else if tag == "4" && kind == 14 {
+        WATCH_START_MAX
+    } else {
+        WATCH_STEP_MAX
+    }
+}
+
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
         let steps = longest_steps(lines, tag);
         for &(kind, ticks, _) in &steps {
-            if ticks == 0 || ticks > RAM_STEP_MAX {
+            let bound = watch_bound(tag, kind);
+            if ticks == 0 || ticks > bound {
                 return Err(format!(
-                    "watch service {tag}, kind {kind} exceeded {RAM_STEP_MAX}: {ticks}"
+                    "watch service {tag}, kind {kind} exceeded {bound}: {ticks}"
                 ));
             }
         }
@@ -5712,9 +5881,10 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
             .map(|line| line.replacen("service case:", "service step:", 1))
             .collect();
         let full = longest_steps(&cases, tag);
-        for &(_, ticks, _) in &full {
-            if ticks == 0 || ticks > RAM_STEP_MAX {
-                return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
+        for &(kind, ticks, _) in &full {
+            let bound = watch_bound(tag, kind);
+            if ticks == 0 || ticks > bound {
+                return Err(format!("watch full case exceeded {bound}: {ticks}"));
             }
         }
         // The pipe service's Watch holds 32 elements, the terminal's 16
@@ -6468,6 +6638,7 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
         qemu::expect_marker(&outcome, marker)?;
     }
     if steps {
+        qemu::expect_marker(&outcome, "posix-fifo: idle tail done")?;
         const FIFO_STEP_MAX: u64 = RAM_STEP_MAX * 9 / 10;
         check_waits(&outcome.lines, &["2", "4"], "FIFO service steps")?;
         let own = longest_steps(&outcome.lines, "2")
@@ -7433,6 +7604,56 @@ fn check_init_steps(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> 
 /// answered, and the service run again, within the deadline less the period.
 /// The counter of the image is 62.5 MHz (QEMU's virt), a tick 16 ns.
 const WATCH_LEFT_TICKS: u64 = (1_000 - 250) * 62_500;
+
+/// The tag of the lines of steps of the console driver (services/uart, feature `steps`).
+const CONSOLE_DRIVER_TAG: &str = "18";
+
+/// The kinds of the calls the terminal service makes to the console driver on a loan, WRITE_SOME
+/// (11) and ROOM (12), and the longest such call allowed in ticks: B_K of 150 us, 9,375 ticks of
+/// 16 ns, which the bound of the terminal's window (`tests/service-budget`) holds as the overrun
+/// at the edge.
+const CONSOLE_LOAN_KINDS: [usize; 2] = [11, 12];
+const CONSOLE_LOAN_STEP_MAX: u64 = 150_000 / TICK_NS;
+
+/// The steps of the console driver (tag 18) each under 0.9 of term B (the calls on a loan under
+/// B_K), the notices too (kind 64
+/// holds the ticks that take the kernel log, the longest of its steps): the driver has to have
+/// printed a table with a step of the log tick (kind 64 or 65) and of the calls of the terminal
+/// (WRITE_SOME, 11).
+fn check_console_driver_steps(lines: &[String]) -> Result<(), String> {
+    let rows = longest_steps(lines, CONSOLE_DRIVER_TAG);
+    for kind in [11usize] {
+        if !rows.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!(
+                "the console driver printed no step of kind {kind}: {rows:?}"
+            ));
+        }
+    }
+    if !rows.iter().any(|(k, ..)| *k == 64 || *k == 65) {
+        return Err(format!(
+            "the console driver printed no step of its log tick: {rows:?}"
+        ));
+    }
+    // The calls the terminal service makes on a loan (WRITE_SOME and ROOM, when the driver runs in
+    // the background and the time goes to the terminal's budget) may not be longer than the
+    // overrun at the edge, B_K of 150 us, that the bound of the terminal's window already holds.
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(kind, ticks, _)| {
+        CONSOLE_LOAN_KINDS.contains(kind) && *ticks > CONSOLE_LOAN_STEP_MAX
+    }) {
+        return Err(format!(
+            "the console driver: a call of kind {kind} served on a loan took {ticks} ticks (detail {detail}), past B_K, {CONSOLE_LOAN_STEP_MAX}"
+        ));
+    }
+    let bound = TERM_B * 9 / 10;
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(_, ticks, _)| *ticks > bound) {
+        return Err(format!(
+            "the console driver: a step of kind {kind} took {ticks} ticks (detail {detail}), past 0.9 of B, {bound}"
+        ));
+    }
+    let longest = rows.iter().map(|r| r.1).max().unwrap_or(0);
+    println!("console driver steps: the longest {longest} of {bound} (0.9 B)");
+    Ok(())
+}
 
 /// The heartbeats of the services (tags 1, 2, 4, 10, 11): each has a wait
 /// until init answered it, under CALL_WAIT_MAX with the other waits
@@ -9991,6 +10212,17 @@ const TTY_STEP_KINDS: [(usize, &str); 18] = [
 /// the measure of the steps follows (`tty_steps`).
 const ENDED_TTY: &str = "init: tty-probe ended: exit code 0, not restarted";
 
+/// The echo `^C` of the INTR the probe typed and the terminal's kernel log line `tty: SIGINT, no
+/// foreground process group`, in either order. The terminal writes the log line first and the echo
+/// after it; the console driver merges the two sources at a line start, and which comes out first
+/// depends on whether the driver took the log record before it served the echo's WRITE. With the
+/// driver above every other level that was always the echo; the driver at 32 after its budget is
+/// spent can be preempted in the middle of a step by the terminal and takes the record first.
+fn expect_interrupt_echo(run: &mut qemu::Run) -> Result<(), String> {
+    run.expect_seen("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+    run.expect("^C", DIALOG_STEP)
+}
+
 fn tty_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image("boot-tty-vz.img", &TTY_VZ_PROGRAMS, BOOT_PROFILE)?
@@ -10003,8 +10235,7 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect("tty-probe: canonical read waits", BOOT_TIMEOUT)?;
         // INTR drops what was typed before it and asks for SIGINT.
         run.type_raw(b"lost\x03")?;
-        run.expect("^C", DIALOG_STEP)?;
-        run.expect("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+        expect_interrupt_echo(&mut run)?;
         run.send("ab\x7fc")?;
         // The echo: the erase of the "b" and Enter as CR LF.
         run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;
@@ -10689,6 +10920,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             entropy::random_net_two(true)
         }),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        // The window library of C programs against QEMU's screenshots.
+        job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.
         job("display-probe", || display_probe::probe(&qemu::VIRT)),
@@ -10706,6 +10939,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // the steps of the compositor and of the tablet's driver under
         // -icount.
         job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
+        // The LVGL demo with FreeType text in a window of the second
+        // revision: its two frames against QEMU's screenshots and the host
+        // reference program's CRCs, the evidence of the glyph path, and the
+        // steps of the services under -icount.
+        job("lvgl-probe", || lvgl::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10846,6 +11084,9 @@ fn host_tests() -> Result<(), String> {
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
+        "tools/test_build_freetype.py",
+        "tools/test_build_lvgl.py",
+        "tools/test_lvgl_port.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
         "tools/test_dist.py",
@@ -11247,7 +11488,8 @@ fn two_gib_boot() -> Result<(), String> {
 /// answer. A line of TYPED_AHEAD bytes typed while `bench` runs, past the
 /// driver's ring of input, comes back as its first 128 bytes (spec 13.5,
 /// 13.6), and init's SERVICES_STARTED, which reaches the log after the
-/// driver's first read and only its timer shows, comes before the crash.
+/// driver's first read and only its timer shows, comes before the crash; the driver's mark `uart:
+/// serve runs under its budget` is on the console before the burst.
 /// Then `crash uart`: the driver restarts and the shell connects
 /// again (crash_uart); `ps` shows uart running at 60/60, failed and
 /// restarted once, and the shell running, never failed or restarted;
@@ -11419,6 +11661,24 @@ fn burst_line(n: u32) -> String {
     format!("logburst {n:03} {}", "x".repeat(46))
 }
 
+/// The mark of a console driver that works under its budget, from its boot (a driver that has run
+/// for the length of a dialog has printed it by the burst): `uart:` for the PL011 and the 16550, `virtio-console:`
+/// where that driver runs.
+fn require_driver_budget_mark(lines: &[String]) -> Result<(), String> {
+    const MARKS: [&str; 2] = [
+        "uart: serve runs under its budget",
+        "virtio-console: serve runs under its budget",
+    ];
+    if lines.iter().any(|l| MARKS.iter().any(|m| l.ends_with(m))) {
+        Ok(())
+    } else {
+        Err(format!(
+            "no line {:?} before the burst: the console driver runs unbudgeted",
+            MARKS[0]
+        ))
+    }
+}
+
 /// The step of the console probes that sends `logburst`: the shell writes
 /// LOG_BURST lines into the kernel log at 2.5 lines a millisecond, while the
 /// driver of the console is idle (and has its ring of 64 records to
@@ -11429,6 +11689,7 @@ fn burst_line(n: u32) -> String {
 /// output empty (`settled`), where a step that kills or restarts the driver
 /// can start.
 pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
+    require_driver_budget_mark(run.lines())?;
     let from = run.lines().len();
     run.send("logburst")?;
     // The shell's closing line is client output and goes out at a client's
@@ -14328,6 +14589,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-display-probe",
         "--package",
+        "posix-window-probe",
+        "--package",
         "pkg-slot-probe",
         "--package",
         "display-run",
@@ -14393,6 +14656,82 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The table of the static package programs and PACKAGE_PROGRAMS agree: a
+    /// program without the feature `dynamic` is in the table, with a stack,
+    /// and the table names no other.
+    #[test]
+    fn the_static_programs_are_those_without_the_dynamic_feature() {
+        let statics: Vec<&str> = super::PACKAGE_PROGRAMS
+            .iter()
+            .filter(|p| !super::is_dynamic(p.3))
+            .map(|p| p.0)
+            .collect();
+        let listed: Vec<&str> = super::STATIC_PROGRAMS.iter().map(|p| p.0).collect();
+        assert_eq!(statics, listed);
+        assert!(super::STATIC_PROGRAMS.iter().all(|p| p.1 >= 64 * 1024));
+        assert_eq!(super::static_stack("lvgl-demo"), Some(262_144));
+        assert_eq!(super::static_stack("curl"), None);
+    }
+
+    /// An ELF file of the program headers `types` (type, memory size).
+    fn elf_with(types: &[(u32, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64 + 56 * types.len()];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&(types.len() as u16).to_le_bytes());
+        for (i, (kind, memsz)) in types.iter().enumerate() {
+            let at = 64 + 56 * i;
+            bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            bytes[at + 40..at + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The checks of a static program's headers: no interpreter, no dynamic
+    /// section, and the stack segment the build script asked for.
+    #[test]
+    fn a_static_program_has_no_dynamic_section_and_its_stack() {
+        const LOAD: u32 = 1;
+        const DYNAMIC: u32 = 2;
+        const INTERP: u32 = 3;
+        const STACK: u32 = 0x6474_e551;
+        let good = elf_with(&[(LOAD, 0), (STACK, 262_144)]);
+        assert!(super::static_headers(&good, 262_144).is_ok());
+        let error = super::static_headers(&elf_with(&[(INTERP, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("PT_INTERP"), "{error}");
+        let error = super::static_headers(&elf_with(&[(DYNAMIC, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("DT_NEEDED"), "{error}");
+        let error =
+            super::static_headers(&elf_with(&[(LOAD, 0), (STACK, 65_536)]), 262_144).unwrap_err();
+        assert!(error.contains("65536 bytes, 262144 expected"), "{error}");
+        let error = super::static_headers(&elf_with(&[(LOAD, 0)]), 262_144).unwrap_err();
+        assert!(error.contains("no stack segment"), "{error}");
+        assert!(super::static_headers(b"not an elf", 1).is_err());
+    }
+
+    /// A file that holds the build directory's path is refused, one that does
+    /// not is passed.
+    #[test]
+    fn a_program_that_holds_the_build_directory_is_refused() {
+        let dir = std::env::temp_dir().join(format!("xtask-build-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let clean = dir.join("clean");
+        let dirty = dir.join("dirty");
+        std::fs::write(&clean, b"\x7fELF no path here").unwrap();
+        std::fs::write(&dirty, format!("a {}/src/x.c b", root.display())).unwrap();
+        assert!(no_build_path(&clean, &root).is_ok());
+        let error = no_build_path(&dirty, &root).unwrap_err();
+        assert!(
+            error.contains("holds the build directory's path"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The command `logburst` is for the probes: no release image list has
     /// a program built with the feature `log-burst`.
     #[test]
@@ -15121,6 +15460,100 @@ mod tests {
         assert!(check_init_steps(&[]).is_err());
     }
 
+    /// The echo of INTR and the kernel's line about SIGINT come in either order.
+    #[test]
+    fn the_echo_of_intr_and_the_sigint_line_are_taken_in_either_order() {
+        let script = |first: &str, second: &str| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "echo 'tty-probe: canonical read waits'; echo '{first}'; echo '{second}'; exec cat"
+            ));
+            qemu::Run::start(cmd, qemu::Input::Pipe).unwrap()
+        };
+        let line = "tty: SIGINT, no foreground process group";
+        for (first, second) in [("^C", line), (line, "^C")] {
+            let mut run = script(first, second);
+            run.expect("canonical read waits", Duration::from_secs(5))
+                .unwrap();
+            expect_interrupt_echo(&mut run).unwrap();
+            run.stop();
+        }
+    }
+
+    /// The steps of the console driver are measured and none passes 0.9 of B, the busy tick of
+    /// the log included.
+    #[test]
+    fn console_driver_steps_are_measured_and_under_nine_tenths_of_b() {
+        let steps = |tick: u64| -> Vec<String> {
+            vec![
+                "service step: 18 kind 11 8490 ticks detail 0".to_owned(),
+                format!("service step: 18 kind 64 {tick} ticks detail 112"),
+                "service step: 18 kind 65 1851 ticks detail 0".to_owned(),
+            ]
+        };
+        assert!(check_console_driver_steps(&steps(TERM_B * 9 / 10)).is_ok());
+        // The calls on a loan stay under B_K, 9,375 ticks: 8,490 was measured.
+        assert_eq!(CONSOLE_LOAN_STEP_MAX, 9_375);
+        let mut loan = steps(13_000);
+        loan[0] = "service step: 18 kind 11 9375 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
+        loan[0] = "service step: 18 kind 11 9376 ticks detail 0".to_owned();
+        assert!(
+            check_console_driver_steps(&loan)
+                .unwrap_err()
+                .contains("on a loan")
+        );
+        loan[0] = "service step: 18 kind 12 12000 ticks detail 0".to_owned();
+        loan.insert(0, "service step: 18 kind 11 8490 ticks detail 0".to_owned());
+        assert!(check_console_driver_steps(&loan).is_err());
+        // Other kinds are held to 0.9 B only.
+        loan[1] = "service step: 18 kind 13 12000 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
+        assert!(
+            check_console_driver_steps(&steps(20_410))
+                .unwrap_err()
+                .contains("detail 112")
+        );
+        // The tick of 24 records of run 44468779564 (23,092 ticks, detail 124) is over the bound;
+        // the tick of 12 records, about 13,000, is 71 % of it.
+        let mut two = steps(13_000);
+        two[1] = "service step: 18 kind 64 23092 ticks detail 124".to_owned();
+        assert!(
+            check_console_driver_steps(&two)
+                .unwrap_err()
+                .contains("23092")
+        );
+        // The table of the service stands for lines lost in the burst.
+        let mut table = steps(13_000);
+        table[1] = "service table: 18 kind 64 13000 ticks detail 112 preempts 0".to_owned();
+        assert!(check_console_driver_steps(&table).is_ok());
+        // Without a step of the calls, or of the log tick, the table was not printed.
+        assert!(check_console_driver_steps(&steps(100)[..1]).is_err());
+        assert!(check_console_driver_steps(&[]).is_err());
+        let calls_only = &steps(100)[..1];
+        assert!(
+            check_console_driver_steps(calls_only)
+                .unwrap_err()
+                .contains("log tick")
+        );
+    }
+
+    #[test]
+    fn the_console_dialog_requires_the_mark_of_the_drivers_budget() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(require_driver_budget_mark(&lines(&["uart: serve runs under its budget"])).is_ok());
+        assert!(
+            require_driver_budget_mark(&lines(&["virtio-console: serve runs under its budget"]))
+                .is_ok()
+        );
+        assert!(
+            require_driver_budget_mark(&lines(&["uart: serve has no budget", "tty: ready"]))
+                .unwrap_err()
+                .contains("unbudgeted")
+        );
+        assert!(require_driver_budget_mark(&[]).is_err());
+    }
+
     #[test]
     fn full_watch_case_survives_a_longer_single_item_maximum() {
         let mut lines = Vec::new();
@@ -15154,6 +15587,85 @@ mod tests {
             let mut worse = lines.clone();
             worse.push(bad.into());
             assert!(super::check_watch_steps(&worse).is_err(), "{bad}");
+        }
+    }
+
+    /// Each step of the pipe and terminal services but the signal of life
+    /// (kind 64) is held to 0.9 of term B.
+    #[test]
+    fn watch_steps_are_held_to_nine_tenths_of_b() {
+        let mut lines = Vec::new();
+        for (tag, methods, full) in [(4, [14, 15, 16], 32), (5, [25, 26, 27], 16)] {
+            for method in methods {
+                lines.push(format!(
+                    "service case: {tag} kind {method} 14000 ticks detail {full}"
+                ));
+            }
+            for kind in [64, 65] {
+                lines.push(format!(
+                    "service step: {tag} kind {kind} 1000 ticks detail 0"
+                ));
+            }
+        }
+        assert!(super::check_watch_steps(&lines).is_ok());
+        let limit = WATCH_STEP_MAX;
+        assert_eq!(limit, TERM_B * 9 / 10);
+        assert_eq!(WATCH_START_MAX, TERM_B);
+        for (bad, ok) in [
+            // WatchStart of the pipe service: held to term B.
+            (
+                "service step: 4 kind 14 18888 ticks detail 32".to_string(),
+                true,
+            ),
+            (
+                format!("service step: 4 kind 14 {TERM_B} ticks detail 32"),
+                true,
+            ),
+            (
+                format!("service step: 4 kind 14 {} ticks detail 32", TERM_B + 1),
+                false,
+            ),
+            (
+                format!("service case: 4 kind 14 {} ticks detail 32", TERM_B + 1),
+                false,
+            ),
+            (
+                "service case: 4 kind 14 18888 ticks detail 32".to_string(),
+                true,
+            ),
+            // Every other step is held to nine tenths of B.
+            (
+                "service step: 4 kind 15 18888 ticks detail 32".to_string(),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 15 {limit} ticks detail 32"),
+                true,
+            ),
+            (
+                "service case: 4 kind 16 18888 ticks detail 32".to_string(),
+                false,
+            ),
+            (
+                "service step: 5 kind 14 18888 ticks detail 0".to_string(),
+                false,
+            ),
+            (
+                format!("service step: 5 kind 26 {} ticks detail 16", limit + 1),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 65 {} ticks detail 0", limit + 1),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 64 {} ticks detail 0", limit + 1),
+                true,
+            ),
+        ] {
+            let mut probe = lines.clone();
+            probe.push(bad.clone());
+            assert_eq!(super::check_watch_steps(&probe).is_ok(), ok, "{bad}");
         }
     }
     use super::*;
@@ -16633,6 +17145,7 @@ mod entropy_in_images_tests {
             ),
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
+            ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
             // The images whose lists are built at run time, EC2's among them.
             ("main::shell_programs", shell_programs()),

@@ -342,9 +342,10 @@ impl Service<0> for Stub {
 }
 
 pub fn run(mut s: Startup) -> u64 {
-    // The image of the budget probe gives the stub a counting budget (`serve`): its request
-    // thread runs under it, so the probe can read the time the driver spends for the terminal
-    // service. The other images give none. (Taken before the arguments are borrowed.)
+    // The image of the budget probe gives the stub the budget of the real driver (`serve`): its
+    // request thread runs under it, so the probe holds the time the driver spends for the
+    // terminal service to that budget and can read it. The other images give none. (Taken
+    // before the arguments are borrowed.)
     if let Some(budget) = rt::budget::take(&mut s, rt::budget::SERVE)
         && rt::budget::bind("uart", "serve", Some(budget), &s.thread).is_err()
     {

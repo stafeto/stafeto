@@ -462,7 +462,14 @@ fn compute(tree: &Path) -> Result<Parts, String> {
         "--offline",
         "--prefix",
         "none",
-        "--all-features",
+        // The features libc.so is built with, from the file the script reads too (with the
+        // packet path's trace). All features would add the crates of the libraries that only
+        // statically linked programs use (the feature `window`). The target is the layer's
+        // (`LAYER_TARGET` of the script): the crates of the host's own cfg do not count.
+        "-F",
+        &layer_features(tree)?,
+        "--target",
+        "aarch64-unknown-none",
         "-e",
         "normal,build",
         "--format",
@@ -474,6 +481,32 @@ fn compute(tree: &Path) -> Result<Parts, String> {
     ]))?;
     let protocols = protocol_lines(&proto_crates(&tree_text, tree))?;
     Ok(Parts([libc_part, layouts, loader_lines(), protocols]))
+}
+
+/// The features of posix-crt that libc.so is built with, as the `-F` list of
+/// `cargo tree`: the file `tools/layer-features.txt`, which
+/// tools/build-libc-so.py reads for its build.
+pub fn layer_features(tree: &Path) -> Result<String, String> {
+    let path = tree.join("tools/layer-features.txt");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    features_list(&text)
+}
+
+fn features_list(text: &str) -> Result<String, String> {
+    let names: Vec<&str> = text.trim().split(',').collect();
+    if names
+        .iter()
+        .any(|n| n.is_empty() || n.contains(char::is_whitespace))
+    {
+        return Err(format!(
+            "tools/layer-features.txt: {text:?} is no list of features"
+        ));
+    }
+    Ok(names
+        .iter()
+        .map(|n| format!("posix-crt/{n}"))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 pub fn file_path(tree: &Path) -> PathBuf {
@@ -882,5 +915,37 @@ mod tests {
     fn a_line_diff_shows_what_went_and_what_came() {
         let d = line_diff(&lines(&["a", "b"]), &lines(&["b", "c"]));
         assert_eq!(d, lines(&["- a", "+ c"]));
+    }
+
+    #[test]
+    fn the_features_of_the_build_are_one_file_the_script_and_the_fingerprint_read() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let list = layer_features(&root).unwrap();
+        assert_eq!(
+            list, "posix-crt/shared,posix-crt/procfs,posix-crt/trace",
+            "a feature that libc.so gains goes into the file, and its crates into the fingerprint"
+        );
+        // Each is a feature of posix-crt; the window library is not among them.
+        let manifest = std::fs::read_to_string(root.join("lib/posix-crt/Cargo.toml")).unwrap();
+        let declared: Vec<&str> = manifest
+            .lines()
+            .filter_map(|l| l.split_once(" = ").map(|(name, _)| name.trim()))
+            .collect();
+        for name in list.split(',').map(|f| f.trim_start_matches("posix-crt/")) {
+            assert!(
+                declared.contains(&name),
+                "{name} is no feature of posix-crt"
+            );
+            assert_ne!(name, "window");
+        }
+        // The script takes its list from the file and holds none of its own.
+        let script = std::fs::read_to_string(root.join("tools/build-libc-so.py")).unwrap();
+        assert!(script.contains("layer-features.txt"));
+        assert!(
+            !script.contains("\"shared,procfs"),
+            "a list of features in the script"
+        );
+        assert!(features_list("shared, procfs").is_err());
+        assert!(features_list("").is_err());
     }
 }

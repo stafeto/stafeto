@@ -19,6 +19,7 @@
 pub mod admit;
 pub mod fs;
 pub mod gpt;
+pub mod idle;
 #[cfg(any(test, feature = "model"))]
 pub mod mem;
 pub mod server;
@@ -29,6 +30,8 @@ mod tests;
 mod tests_cut;
 #[cfg(test)]
 mod tests_open;
+#[cfg(test)]
+mod tests_scale;
 pub mod volume;
 pub mod watch;
 

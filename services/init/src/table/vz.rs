@@ -122,8 +122,9 @@ pub const CONSOLE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
-    budgets: &[],
-    free: 0,
+    budgets: super::ramfs::CONSOLE_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
+    broken_after: None,
 };
 
 /// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of

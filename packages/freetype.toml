@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# FreeType: the font engine the LVGL demo draws its text with. The package
+# installs no file of its own: tools/build-freetype.py builds the static
+# library target/freetype/libfreetype.a (the TrueType driver, the sfnt
+# container and the smooth rasterizer, with the configuration of
+# ports/freetype), and the package that links it names it in build_depends.
+# FreeType is used under the FreeType Licence (FTL), whose condition is a
+# line in the documentation of a distribution: "Portions of this software are
+# copyright (c) 2026 The FreeType Project (https://freetype.org). All rights
+# reserved." The SHA-256 is that of the archive on the official download
+# site of the project.
+# Format: docs/packages.md.
+
+name = "freetype"
+version = "2.14.3"
+kind = "optional"
+image = "games"
+release = "1"
+summary = "FreeType font engine, linked into programs that draw text"
+url = "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz"
+sha256 = "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"
+license = "FTL"
+license_file = "docs/FTL.TXT"
+build = "tools/build-freetype.py"
+notices = ["CREDIT = tree:ports/freetype/CREDIT.txt"]
+files = []

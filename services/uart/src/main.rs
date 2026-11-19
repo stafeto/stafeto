@@ -12,7 +12,10 @@
 //! comes from the library (uart::irq, output, writes, input, log); here are the calls and
 //! the registers, which it reaches through rt::mmio alone [G34]. The
 //! program ends with a code of its own when its start fails; init
-//! restarts it.
+//! restarts it. The loop runs under the budget init gives (150 us of each
+//! 10 ms, then level 32): while levels 33 to 59 are saturated the driver
+//! gets only that, so the receive FIFO of the PL011 can overflow and the
+//! kernel's log ring can overwrite records, which the next batch counts.
 
 #![no_std]
 #![no_main]
@@ -213,6 +216,9 @@ fn main(_: u64) -> u64 {
     let Ok(log) = s.take::<Resource>("log") else {
         return NO_LOG;
     };
+    // The budget of the loop (`serve`), taken before the arguments borrow the start data and
+    // bound below, once the driver is set up and before its loop begins.
+    let budget = rt::budget::take(&mut s, rt::budget::SERVE);
     let Some(state) = state() else {
         return NO_START_DATA;
     };
@@ -301,6 +307,26 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(heartbeat),
     };
+    // The loop is this thread: it works under its budget from here on. A budget the kernel
+    // refuses is told in a line (`rt::budget::bind`) and the driver serves with none: a system
+    // with no console is worse than a console driver with no budget. The line "uart: serve
+    // runs under its budget" is not printed then. xtask fails the run for the refusal line in
+    // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
+    // for its absence.
+    let _ = rt::budget::bind("uart", "serve", budget, &s.thread);
+    // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
+    // of the log that found no record (the idle tick), kind 64 is the other notices, and the
+    // detail of kind 64 tells which: 1 the interrupt of the line, 2 the transmit wake-up, 3 a
+    // tick that took no batch (a client's DRAIN is pending or the buffer is full), 100 + N a tick
+    // that took N records of the log. The methods of proto_uart keep their numbers (1 WRITE, 2
+    // READ, 7 READ_START, 8 READ_TAKE, 9 READ_CANCEL, 10 CLONE, 11 WRITE_SOME, 12 ROOM, 13
+    // DRAIN_START, 14 DRAIN_TAKE, 15 DRAIN_RELEASE, 19 DRAIN_STATE, 20 INPUT_FLUSH, 21
+    // OUTPUT_FLUSH).
+    #[cfg(feature = "steps")]
+    {
+        rt::service::report_steps(18);
+        rt::service::table_steps();
+    }
     let _ = rt::service::run::<Uart, SESSIONS, HELD>(&channel, &mut uart, config);
     uart.say_peak(true);
     STOPPED
@@ -526,9 +552,10 @@ impl Uart {
     /// and a batch of text fits, whether or not the text taken before went
     /// out. The port is paced on its own timer. Only the timer's tick (and
     /// the start, once) calls it, so STEP_BATCHES is the bound of the driver's
-    /// log work in a period, for all its entry points together.
-    fn take_log(&mut self) {
+    /// log work in a period, for all its entry points together. Gives the batches and the records taken.
+    fn take_log(&mut self) -> (usize, usize) {
         let mut taken = 0;
+        let mut records_taken = 0;
         loop {
             let State {
                 output,
@@ -556,6 +583,7 @@ impl Uart {
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             self.peak.batch(batch);
+            records_taken += (batch.count as usize).min(LOG_BATCH);
             uart::log::text(records, batch, lines, |bytes| {
                 // A batch fits: take_more asked for the room of its worst.
                 let _ = output.put_log(bytes);
@@ -568,6 +596,7 @@ impl Uart {
         if taken > 0 {
             self.kick();
         }
+        (taken, records_taken)
     }
 
     /// Arms the timer (spec 10) at the first deadline t0 + k * period after
@@ -987,17 +1016,33 @@ impl Service<HELD> for Uart {
     /// a stale expiry, before its deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
         match (n.source, n.label) {
-            (Source::Interrupt, _) => self.interrupt(),
+            (Source::Interrupt, _) => {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(1);
+                self.interrupt()
+            }
             (Source::Timer, TX_TIMER_LABEL)
                 if self.irqs.resume_transmit(time::ticks_to_ns(time::now())) =>
             {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(2);
                 self.kick();
             }
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
                 if self.poll {
                     self.interrupt();
                 }
-                self.take_log();
+                let (batches, records) = self.take_log();
+                #[cfg(feature = "steps")]
+                if records > 0 {
+                    rt::service::step_detail(100 + records as u64);
+                } else if batches == 0 {
+                    rt::service::step_detail(3);
+                } else {
+                    rt::service::step_own();
+                }
+                #[cfg(not(feature = "steps"))]
+                let _ = (batches, records);
                 self.say_peak(false);
                 self.arm();
                 self.exit_if_drained();

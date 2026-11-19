@@ -57,8 +57,9 @@ pub const TABLE: &[Record] = &[
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
         waits: &[],
-        budgets: &[],
-        free: 0,
+        budgets: super::ramfs::CONSOLE_BUDGETS,
+        free: super::ramfs::SERVICE_FREE,
+        broken_after: None,
     },
     // No heartbeat: it waits for input and has no periodic work (spec
     // 13.6); the console only for the message of its panic.
@@ -89,5 +90,6 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
 ];

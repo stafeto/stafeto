@@ -104,7 +104,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
-pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject"];
+pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the manager's, the input's, or none.
@@ -579,6 +579,11 @@ pub struct Record {
     /// have no budget) leaves the levels above `free` alone. A record with budgets has
     /// it below its level and a record without budgets has 0 (`check_free`).
     pub free: u8,
+    /// A service that ends with `code` this many times in a row is marked broken at once, whatever
+    /// else its failures are (`restart::Failures::failed_with`): the exit code of a failure that
+    /// restarting repeats (the data file service's stuck exit, whose restart mounts the same
+    /// damaged volume again). `None` for every other record.
+    pub broken_after: Option<(u64, u32)>,
 }
 
 /// A service a record waits for: its name, and how long the record waits at
@@ -613,6 +618,28 @@ pub fn first_cpu(log: bool, mask: u8) -> u8 {
     if log && mask & 0b0010 != 0 { 2 } else { 0 }
 }
 
+/// The CPU a budget of `record` is made on for an instance with the mask `mask` of CPUs that are
+/// up: the table's CPU for every record but the console driver. The driver (the record with `log`)
+/// stands on the CPU `first_cpu` asks for, CPU 1 on a machine that has it, and a budget binds only
+/// to a thread of its own CPU (thread_bind_budget answers INVALID_ARGS otherwise), so its budget
+/// is made where the thread is: CPU 1 when `first_cpu` asks for it, else the lowest CPU of the
+/// mask, where the loader leaves a thread it was asked nothing for.
+pub fn budget_cpu(log: bool, mask: u8, table_cpu: u8) -> u8 {
+    if !log {
+        return table_cpu;
+    }
+    match first_cpu(log, mask) {
+        0 => {
+            if mask == 0 {
+                table_cpu
+            } else {
+                mask.trailing_zeros() as u8
+            }
+        }
+        asked => asked - 1,
+    }
+}
+
 impl Record {
     /// A record of nothing: the filler of the buffers of a resolved table.
     pub const EMPTY: Record = Record {
@@ -642,6 +669,7 @@ impl Record {
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     };
 
     /// The watchdog of a service; None for a client.
@@ -1494,6 +1522,7 @@ pub mod input;
 pub mod journal;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
+pub mod lvgl;
 pub mod net;
 pub mod normal;
 pub mod pkg;
@@ -1501,6 +1530,7 @@ pub mod ramfs;
 pub mod shutdown;
 pub mod test;
 pub mod vz;
+pub mod window;
 
 /// The table features of the build: one at most.
 const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
@@ -1513,6 +1543,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
+    + cfg!(feature = "table-lvgl") as usize
     + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
@@ -1578,6 +1609,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-random-net") as usize
     + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
+    + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
     + cfg!(feature = "table-fstack-device") as usize
@@ -1613,6 +1645,7 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
+    feature = "table-lvgl",
     feature = "table-base",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
@@ -1678,6 +1711,7 @@ const _: () = assert!(
     feature = "table-posix-random-net",
     feature = "table-posix-random-net2",
     feature = "table-posix-display",
+    feature = "table-posix-window",
     feature = "table-display",
     feature = "table-fstack-probe",
     feature = "table-fstack-device",
@@ -1737,6 +1771,8 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-doom")]
 pub const TABLE: &[Record] = doom::TABLE;
+#[cfg(feature = "table-lvgl")]
+pub const TABLE: &[Record] = lvgl::TABLE;
 #[cfg(feature = "table-base")]
 pub const TABLE: &[Record] = base::BASE_TABLE;
 #[cfg(feature = "table-posix-dialog")]
@@ -1872,6 +1908,8 @@ pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
 pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
+#[cfg(feature = "table-posix-window")]
+pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-display")]
 pub const TABLE: &[Record] = ramfs::DISPLAY_TABLE;
 #[cfg(feature = "table-fstack-probe")]
@@ -1985,6 +2023,74 @@ mod tests {
         tables
     }
 
+    /// The CPU a thread is left on when the loader is asked nothing for it, and the CPU asked for the
+    /// driver of the console, written out apart from `budget_cpu`.
+    fn thread_cpu(log: bool, mask: u8) -> u8 {
+        if log && mask & 0b0010 != 0 {
+            1
+        } else {
+            mask.trailing_zeros() as u8
+        }
+    }
+
+    /// Every record of every table whose program takes a budget at its start (the console drivers
+    /// `uart` and `virtio-console`, whose record is the one with `log`, and every record with a
+    /// budget `serve`) has the budget `rt::budget::SERVE` the program takes, with a `free` level
+    /// below its priority, and for each set of CPUs that are up the budget stands on the CPU the
+    /// instance's request thread does: a budget binds only to a thread of its own CPU (the cause of
+    /// the console driver that died with INVALID_ARGS on two CPUs, where it stands on CPU 1).
+    #[test]
+    fn the_budget_a_program_takes_at_its_start_is_in_its_record_on_the_cpu_of_its_thread() {
+        let mut drivers = 0;
+        let mut served = 0;
+        for table in all_tables() {
+            for r in table {
+                if matches!(r.program, "uart" | "virtio-console") {
+                    drivers += 1;
+                    assert!(
+                        r.log && r.budgets.iter().any(|b| b.name == "serve") && r.free > 0,
+                        "the console driver `{}` of a table has no budget `serve` or no free level",
+                        r.name
+                    );
+                    assert!(r.free < r.priority, "{}", r.name);
+                }
+                let Some(serve) = r.budgets.iter().find(|b| b.name == "serve") else {
+                    continue;
+                };
+                served += 1;
+                assert!(r.free > 0 && r.free < r.priority, "{}", r.name);
+                for up in [0b0001u8, 0b0011, 0b0111, 0b1111] {
+                    let (mask, _) = on_cpus(r.cpus, up);
+                    let cpu = budget_cpu(r.log, mask, serve.cpu);
+                    assert_eq!(cpu, thread_cpu(r.log, mask), "{} with CPUs {up:#b}", r.name);
+                    assert!(mask >> cpu & 1 != 0, "{} with CPUs {up:#b}", r.name);
+                }
+            }
+        }
+        assert!(drivers > 20 && served > 40, "{drivers} {served}");
+    }
+
+    /// The budget of the console driver, moved to CPU 1 where the driver stands on two or more
+    /// CPUs, still fits the share of CPU 1 in every table, with what the table has there.
+    #[test]
+    fn the_console_drivers_budget_on_cpu_1_fits_the_share_of_that_cpu() {
+        for table in all_tables() {
+            let moved: Vec<Record> = table
+                .iter()
+                .map(|r| {
+                    let mut r = *r;
+                    if r.log {
+                        let budgets: Vec<Budget> =
+                            r.budgets.iter().map(|b| Budget { cpu: 1, ..*b }).collect();
+                        r.budgets = Box::leak(budgets.into_boxed_slice());
+                    }
+                    r
+                })
+                .collect();
+            assert!(check_budgets(&moved).is_ok());
+        }
+    }
+
     /// A record of `nvme-blk` named `datadisk` always says which volume it may serve: a kind byte of
     /// 1 (serial) or 2 (EBS name) and a value, so an EC2 record can never fall back to `Any` by
     /// left-out arguments. Only the record `blk` may have no check.
@@ -2066,6 +2172,7 @@ mod tests {
             waits: &[],
             budgets: &[],
             free: 0,
+            broken_after: None,
         }
     }
 
@@ -3919,6 +4026,14 @@ mod tests {
         let wm = |name: &str| focus::WM_TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(comp_mark(wm("wm"), b"gpu"), Some(COMP_MANAGER_MARK));
         assert_eq!(comp_mark(wm("wm-inject"), b"gpu"), Some(COMP_INPUT_MARK));
+        // The LVGL demo's image: the injector alone has the input session.
+        let lvgl = |name: &str| lvgl::TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(
+            comp_mark(lvgl("lvgl-inject"), b"gpu"),
+            Some(COMP_INPUT_MARK)
+        );
+        assert_eq!(comp_mark(lvgl("lvgl-inject"), b"clock"), None);
+        assert_eq!(comp_mark(lvgl("gpu"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-new"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-old"), b"gpu"), None);
         assert_eq!(comp_mark(named("focus-wm"), b"clock"), None);
@@ -4050,6 +4165,8 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            lvgl::TABLE,
+            window::TABLE,
             ramfs::DISPLAY_TABLE,
         ];
         for table in tables {
@@ -4067,6 +4184,7 @@ mod tests {
                     "rtbench-posix",
                     "posix-random",
                     "posix-display",
+                    "posix-window",
                     "display-run",
                     "posix-pty",
                 ]

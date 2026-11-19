@@ -97,7 +97,7 @@ pub const DMA_TAILS: &[Dma] = &[
 /// (5 %) that leaves the levels below the service at least 24.8 % of CPU 0 in every sliding
 /// window of 10 ms (and 20 % in any window of at least 15 ms),
 /// (10 - 4 - 2 - 1 - 0.5 - 0.02) / 10 with the switch (0.4; 1), the stack (0.2; 1), the services
-/// (1; 10), the trusted work and two overruns, however much the wire and the consumers send. The
+/// (1; 10) and the console driver (0.15; 10), the trusted work and two overruns, however much the wire and the consumers send. The
 /// bound holds while no busy client without a budget stands above the victim (the POSIX levels
 /// up to 31, stafeto-design#712); the derivation is the section "Window guarantee correction" of
 /// stafeto-design `plans/2026-11-14-budgets-4-5.md`. The records with two devices have no
@@ -197,6 +197,7 @@ pub const NETD: Record = Record {
     waits: &[],
     budgets: NETD_BUDGETS,
     free: 0,
+    broken_after: None,
 };
 
 /// The PCI devices of the network on VZ's bus 0 (services/netd/src/pci.rs).
@@ -659,6 +660,7 @@ pub const PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 // NET_TABLE copies the records of the shell's table by number: a table that

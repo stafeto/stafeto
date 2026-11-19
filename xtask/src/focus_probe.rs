@@ -354,7 +354,7 @@ const INPUT_TAG: &str = "13";
 
 /// Every kind came, every row is under STEP_MAX and the rows of the
 /// service's own kind under PORTION_MAX.
-fn rows_of(
+pub(crate) fn rows_of(
     lines: &[String],
     tag: &str,
     name: &str,

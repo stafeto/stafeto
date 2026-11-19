@@ -33,6 +33,11 @@ steps = ["rt/step-stats"]
 # `ramfs: prof <id> calls <n> reads <n> snaps <n>` at most ten times a second while they
 # change: the measurement of the calls a response of a server makes to the file service.
 profile = []
+# The line that closes a round of the audit tells its span, the budget time and the overruns in
+# it and in the gap before it (`ramfs: audit round N steps S span_us ...`): two reads of the
+# budget a round. Only the image of `posix-fifo-steps` turns it on; every other steps image
+# prints the plain line.
+audit-readout = []
 # The diagnostic of the layer probe: the number of mappings the service holds (0xfff0).
 layer-probe = []
 # Full dispatch samples in the dedicated filled-lock measurement image.
