@@ -1220,8 +1220,16 @@ pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usi
                 return Ok(None);
             };
             name[..entry.name().len()].copy_from_slice(entry.name());
+            // `..` of the root of the volume is the directory the volume is mounted in: the number
+            // `stat("/data/..")` gives, which is the RAM file service's (XSH readdir(): d_ino is
+            // the file serial number st_ino has).
+            let inode = if before == 1 && entry.name() == b".." {
+                parent_of_root(handle).unwrap_or(entry.ino)
+            } else {
+                entry.ino
+            };
             Ok(Some(posix_change::dirent::Item {
-                inode: entry.ino,
+                inode,
                 kind: entry.d_type(),
                 name_len: entry.name().len(),
                 before: before.cast_signed(),
@@ -1237,6 +1245,19 @@ pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usi
             Ok(())
         },
     )
+}
+
+/// The file serial number of the parent of the volume's root (the RAM file service's `/`), when
+/// `handle` is the root of the volume.
+fn parent_of_root(handle: u32) -> Option<u64> {
+    if where_is(handle).ok()?.bytes() != b"/" {
+        return None;
+    }
+    crate::shared::resolved(b"/", |transport, path| {
+        transport.stat_information(path).map_err(crate::error)
+    })
+    .ok()
+    .map(|info| info.inode)
 }
 
 /// The listing of `handle` stands at entry `want`: as it is when it stands there already, or
