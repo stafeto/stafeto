@@ -22,6 +22,12 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 const DATAFS_STACK_SIZE: u32 = 32 * 1024;
+/// The stack of the probe. Its calls are nested: `verify` holds a reply of 1 KiB (`MESSAGE_MAX`) and
+/// the checks of the version 3 series add `stat_of`, `Client::call` with its own reply and request
+/// and the copies the `Result`s make, each of a kilobyte or more; 16 KiB (`CHILD_STACK_SIZE`) was
+/// overrun by a write fault below the stack in the verifying boot. 32 KiB leaves the room of the
+/// deepest chain (about 8 frames of 2 KiB) twice over.
+const DATA_PROBE_STACK_SIZE: u32 = 32 * 1024;
 const DISK_BYTES: u64 = 64 << 20;
 const STEPS: u32 = 12;
 /// The files of the tree after the 12 steps: f2 to f4, f6 to f8 and f10 to f12.
@@ -96,7 +102,7 @@ const fn programs(crash: bool) -> [ImageProgram; 5] {
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]),
         ("datafsd", "datafsd", DATAFS_STACK_SIZE, datafs),
-        ("data-probe", "data-probe", CHILD_STACK_SIZE, &[]),
+        ("data-probe", "data-probe", DATA_PROBE_STACK_SIZE, &[]),
     ]
 }
 pub const PROGRAMS: [ImageProgram; 5] = programs(false);
@@ -497,9 +503,13 @@ pub fn fill() -> Result<(), String> {
     };
     let disk = Disk::new("fill");
     let started = std::time::Instant::now();
-    super::data_image::make_filled(&disk.0, 1 << 30, super::data_image::FILL_1G)?;
+    super::data_image::make_filled(
+        &disk.0,
+        super::data_image::FILL_DISK,
+        super::data_image::FILL_1G,
+    )?;
     println!(
-        "data-probe fill: the volume of 1 GiB made in {} s",
+        "data-probe fill: the disk of 2 GiB with a data partition of 1,023 MiB made in {} s",
         started.elapsed().as_secs()
     );
     let settle = image("boot-data-probe-settle.img", None, "settle", 0, 10)?;
@@ -559,6 +569,17 @@ pub fn command(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_probe_has_the_stack_its_nested_calls_need() {
+        // The verifying boot overran 16 KiB: the stack is not lowered again without a measurement.
+        assert!(super::DATA_PROBE_STACK_SIZE >= 32 * 1024);
+        assert!(
+            super::PROGRAMS
+                .iter()
+                .any(|p| p.0 == "data-probe" && p.2 == super::DATA_PROBE_STACK_SIZE)
+        );
+    }
+
     #[test]
     fn a_walk_line_is_read_only_in_the_form_of_a_walk_that_ran_to_its_end() {
         use super::parse_walk;

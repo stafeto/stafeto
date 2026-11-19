@@ -152,7 +152,20 @@ pub struct Profile {
     pub empty: u32,
 }
 
-/// The profile of the 1 GiB probe volume: 256 MiB of 2,000 files of 128 KiB, 512 MiB of 32 files of
+impl Profile {
+    /// The bytes of file data the profile writes.
+    pub const fn data_bytes(&self) -> u64 {
+        self.small_dirs as u64 * self.small_per as u64 * self.small_bytes as u64
+            + self.big as u64 * self.big_bytes as u64
+    }
+}
+
+/// The size of the disk file that holds a data partition of about 1 GiB: the layout gives `store`
+/// 1 GiB or half the disk, whichever is less, so a disk of 1 GiB would hold a data partition of 511
+/// MiB (the first fill ran out of space at the sixteenth large file). 2 GiB give `data` 1,023 MiB.
+pub const FILL_DISK: u64 = 2 << 30;
+
+/// The profile of the probe volume (a data partition of 1,023 MiB on a disk of `FILL_DISK`): 256 MiB of 2,000 files of 128 KiB, 512 MiB of 32 files of
 /// 16 MiB, 1,000 files in one directory and 200 empty directories: 3,260 entries, under the 8,192 a
 /// run of the conversion at mount writes, so that the first boot converts the volume whole.
 pub const FILL_1G: Profile = Profile {
@@ -297,8 +310,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
     if fill {
-        if size < 1 << 30 {
-            return Err("--fill needs --size 1G or more".to_string());
+        if size < FILL_DISK {
+            return Err(
+                "--fill needs --size 2G or more (the data partition is about 1 GiB)".to_string(),
+            );
         }
         make_filled(Path::new(path), size, FILL_1G)?;
         println!("data-image: {path}, {size} bytes, filled: Partitioned");
@@ -424,6 +439,21 @@ mod tests {
         fs.unmount().unwrap();
         drop(fs);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_fill_profile_fits_the_data_partition_of_its_disk_with_a_margin() {
+        // The partition the layout makes on the disk of the fill, in bytes.
+        let layout = datafs::gpt::default_layout(FILL_DISK / SECTOR as u64).unwrap();
+        let data = (layout[1].last - layout[1].first + 1) * SECTOR as u64;
+        assert!(data > 1000 << 20, "the data partition is {data} bytes");
+        // File data takes at most 80 % of the partition: the rest is the pairs of metadata, the
+        // skip pointers of large files, the reserve of 64 blocks and the room the probe's own
+        // writes (8 MiB) and removals need.
+        let fill = FILL_1G.data_bytes();
+        assert!(fill * 100 <= data * 80, "{fill} bytes of {data}");
+        // And the probe's removals (24 files of 16 MiB) are over a sixteenth of the partition.
+        assert!(24 * (16 << 20) > data / 16);
     }
 
     #[test]
