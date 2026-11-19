@@ -293,7 +293,7 @@ static void *vz_long_rmdir(void *unused) {
 }
 
 /* The repeats of the long rmdir, alone and against the flood; the printf of the line names three. */
-#define VZ_REPEATS 3
+#define VZ_STARVE_REPEATS 3
 
 static int vz_starvation(void) {
     /* Names until the table of the root is full. */
@@ -312,9 +312,9 @@ static int vz_starvation(void) {
      * milliseconds and the periodic work above the clients (the heartbeats of the services, the audit
      * round of the file service) comes every 250 ms, so one of three is clean. The directory is made
      * again before each repeat, outside the timed interval, with the table still full. */
-    unsigned long long quiet_ticks[VZ_REPEATS];
-    unsigned quiet_requests[VZ_REPEATS];
-    for (int r = 0; r < VZ_REPEATS; r++) {
+    unsigned long long quiet_ticks[VZ_STARVE_REPEATS];
+    unsigned quiet_requests[VZ_STARVE_REPEATS];
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
         vz_mark();
         VZ_CHECK(rmdir(VZ "/e") == 0);
         quiet_ticks[r] = files_volley_ticks() - vz_ticks0;
@@ -322,13 +322,13 @@ static int vz_starvation(void) {
         if (r == 0) vz_line("rmdir with a full table");
         VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
     }
-    unsigned long long took[VZ_REPEATS];
-    unsigned requests[VZ_REPEATS], restarts[VZ_REPEATS];
-    int within[VZ_REPEATS];
+    unsigned long long took[VZ_STARVE_REPEATS];
+    unsigned requests[VZ_STARVE_REPEATS], restarts[VZ_STARVE_REPEATS];
+    int within[VZ_STARVE_REPEATS];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 65536);
-    for (int r = 0; r < VZ_REPEATS; r++) {
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
         if (r > 0) VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
         vz_flood_stop = 0;
         vz_rmdir_done = 0;
@@ -358,7 +358,7 @@ static int vz_starvation(void) {
      * time); after it come the figures of every repeat, which the gate checks one by one. */
     int best = 0, quiet_best = 0, all_within = 1;
     unsigned most_restarts = 0;
-    for (int r = 0; r < VZ_REPEATS; r++) {
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
         if (took[r] < took[best]) best = r;
         if (quiet_ticks[r] < quiet_ticks[quiet_best]) quiet_best = r;
         if (!within[r]) all_within = 0;
