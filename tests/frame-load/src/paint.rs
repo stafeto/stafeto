@@ -4,8 +4,10 @@
 //! What the paced client draws in a period and what it posts. A stripe of
 //! colour moves down the window by `STEP_ROWS` rows each period, so every
 //! frame differs from the one before in exactly two stripes (where it was and
-//! where it is): the rectangle the client posts. In the scene F the whole
-//! window changes, and the client posts all of it.
+//! where it is): the rectangle the client posts. In the scene F the client
+//! declares the whole window changed (the service's cost follows the declared
+//! damage) and paints the stripes alone: what it draws in a period is the same
+//! few rows in both scenes.
 
 use crate::phases::Scene;
 
@@ -47,10 +49,13 @@ pub const fn window_of(scene: Scene) -> Option<Rect> {
 }
 
 /// The first row of the stripe in the period `step` of a window `h` rows high:
-/// it moves down by `STEP_ROWS` and starts again at the top, and never leaves
-/// the window.
+/// it moves down by `STEP_ROWS` to the bottom of the window and back up again,
+/// so that it never leaves the window and never jumps (two periods' stripes are
+/// always close, which keeps what the client paints small).
 pub const fn stripe_top(step: u64, h: u32) -> u32 {
-    ((step * STEP_ROWS as u64) % (h - STRIPE_ROWS + 1) as u64) as u32
+    let reach = (h - STRIPE_ROWS) as u64;
+    let at = (step * STEP_ROWS as u64) % (2 * reach);
+    (if at <= reach { at } else { 2 * reach - at }) as u32
 }
 
 /// The colour of the point (`x`, `y`) in the period `step`: the stripe is
@@ -66,10 +71,35 @@ pub fn colour(step: u64, x: u32, y: u32, h: u32) -> u32 {
     }
 }
 
-/// The rectangle that covers what differs between the frame of period
-/// `step - 1` and the frame of `step` (the stripe where it was and where it is,
-/// as one rectangle across the whole width). The whole window in the first
-/// period and for a scene whose whole window moves.
+/// The rectangle of the stripes of the period `step`: where the stripe was and
+/// where it is, as one rectangle across the whole width. The whole window in
+/// the first period.
+fn stripes(window: Rect, step: u64) -> Rect {
+    if step == 0 {
+        return Rect {
+            x: 0,
+            y: 0,
+            w: window.w,
+            h: window.h,
+        };
+    }
+    let before = stripe_top(step - 1, window.h);
+    let now = stripe_top(step, window.h);
+    // The stripes are the rows [top, top + STRIPE_ROWS); the rectangle spans
+    // from the first row of either to the last of either.
+    let low = before.min(now);
+    let high = before.max(now) + STRIPE_ROWS;
+    Rect {
+        x: 0,
+        y: low,
+        w: window.w,
+        h: high - low,
+    }
+}
+
+/// The rectangle the client posts in the period `step`: the stripes' in the
+/// scene P, the whole window in the first period and in the scene F (which
+/// declares all of it changed).
 pub fn damage(scene: Scene, step: u64) -> Option<Rect> {
     let window = window_of(scene)?;
     if step == 0 || scene == Scene::F {
@@ -80,18 +110,7 @@ pub fn damage(scene: Scene, step: u64) -> Option<Rect> {
             h: window.h,
         });
     }
-    let before = stripe_top(step - 1, window.h);
-    let now = stripe_top(step, window.h);
-    // The stripes are the rows [top, top + STRIPE_ROWS); the rectangle spans
-    // from the first row of either to the last of either.
-    let low = before.min(now);
-    let high = before.max(now) + STRIPE_ROWS;
-    Some(Rect {
-        x: 0,
-        y: low,
-        w: window.w,
-        h: high - low,
-    })
+    Some(stripes(window, step))
 }
 
 /// The rows the client must paint into the buffer it uses for the period
@@ -99,24 +118,39 @@ pub fn damage(scene: Scene, step: u64) -> Option<Rect> {
 /// differs from the frame of `step` where either of the two steps changed
 /// something: the union of the damage of `step - 1` and of `step`.
 pub fn redraw(scene: Scene, step: u64) -> Option<Rect> {
-    let now = damage(scene, step)?;
+    let window = window_of(scene)?;
+    let now = stripes(window, step);
     if step < 2 {
         return Some(Rect {
             x: 0,
             y: 0,
-            w: now.w,
-            h: window_of(scene)?.h,
+            w: window.w,
+            h: window.h,
         });
     }
-    let before = damage(scene, step - 1)?;
+    let before = stripes(window, step - 1);
     let top = now.y.min(before.y);
     let bottom = (now.y + now.h).max(before.y + before.h);
     Some(Rect {
         x: 0,
         y: top,
-        w: now.w,
+        w: window.w,
         h: bottom - top,
     })
+}
+
+/// One row of the frame of period `step`: row `y` of a window `h` rows high,
+/// into `row` (as wide as the window). The same points as `colour`, with the
+/// stripe worked out once for the row.
+pub fn fill(step: u64, y: u32, h: u32, row: &mut [u32]) {
+    let top = stripe_top(step, h);
+    if y >= top && y < top + STRIPE_ROWS {
+        row.fill(0x00FF_C020 | ((step as u32 & 0x3F) << 8));
+    } else {
+        for (x, p) in row.iter_mut().enumerate() {
+            *p = 0x0010_2040 | ((x as u32 & 0xFF) << 8) | (y & 0xFF);
+        }
+    }
 }
 
 /// The points of the window in the period `step`, row by row (for the tests and
@@ -244,6 +278,41 @@ mod tests {
     fn every_frame_is_unlike_the_one_before() {
         for step in 1..40 {
             assert_ne!(frames(Scene::P, step - 1), frames(Scene::P, step));
+        }
+    }
+
+    /// What the client paints in a period is a few rows of either scene, however
+    /// much it declares changed: the work does not grow with the window, so the
+    /// whole-screen scene measures the service and not the client.
+    #[test]
+    fn the_work_of_a_frame_is_bounded_in_both_scenes() {
+        for scene in [Scene::P, Scene::F] {
+            let window = window_of(scene).unwrap();
+            for step in 2..400 {
+                let r = redraw(scene, step).unwrap();
+                // Two stripes and the step between them.
+                assert!(
+                    r.h <= 2 * STRIPE_ROWS + STEP_ROWS,
+                    "{scene:?} {step}: {r:?}"
+                );
+                assert!(r.w * r.h <= 640 * 27);
+                assert_eq!(r.w, window.w);
+            }
+        }
+        // The scene F still declares all of the window.
+        assert_eq!(damage(Scene::F, 9).unwrap(), F_RECT);
+    }
+
+    #[test]
+    fn a_row_filled_is_the_row_of_colour() {
+        for step in [0u64, 1, 5, 77] {
+            for y in [0u32, 3, 40, 99] {
+                let mut row = vec![0u32; 160];
+                fill(step, y, 100, &mut row);
+                for (x, p) in row.iter().enumerate() {
+                    assert_eq!(*p, colour(step, x as u32, y, 100));
+                }
+            }
         }
     }
 

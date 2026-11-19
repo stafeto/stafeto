@@ -425,7 +425,11 @@ impl Env<'_> {
                     break;
                 }
                 self.sleep_until(due);
-                free |= self.bits.replace(0) & 0b11;
+                // A buffer comes back once the frame that replaced it is shown,
+                // some time into the period: the client waits for it up to the
+                // end of the period and posts at once, as a client that paces
+                // itself by the service's notices does.
+                self.wait_free(&mut free, due + PERIOD_NS);
                 let Some(buffer) = (0..2u32).find(|b| free & (1 << b) != 0) else {
                     idle += 1;
                     step += 1;
@@ -444,9 +448,8 @@ impl Env<'_> {
                     )
                 };
                 for y in redraw.y..redraw.y + redraw.h {
-                    for x in redraw.x..redraw.x + redraw.w {
-                        points[(y * (STRIDE / 4) + x) as usize] = paint::colour(step, x, y, rect.h);
-                    }
+                    let from = (y * (STRIDE / 4)) as usize;
+                    paint::fill(step, y, rect.h, &mut points[from..from + rect.w as usize]);
                 }
                 let Some(damage) = paint::damage(scene, step) else {
                     break;
@@ -462,6 +465,19 @@ impl Env<'_> {
             );
         }
         Ok(())
+    }
+
+    /// Collects the bits of the buffers the service gave back into `free`,
+    /// waiting for the first one until `deadline` when there is none.
+    fn wait_free(&self, free: &mut u64, deadline: u64) {
+        *free |= self.bits.replace(0) & 0b11;
+        while *free == 0 && now() < deadline {
+            match self.waiter.receive_until(&self.channel, deadline) {
+                Ok(Waited::Got(got)) => self.keep(&got),
+                _ => break,
+            }
+            *free |= self.bits.replace(0) & 0b11;
+        }
     }
 
     // ---- legacy ----

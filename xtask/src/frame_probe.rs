@@ -18,8 +18,8 @@
 //! - `full` (the scene F): the same, with the bound computed from the bands of
 //!   the frame as measured, when the frame has no more than 45 bands; with more
 //!   the phase is a load phase and says so;
-//! - `stress` (F with all the loads): skips are printed and expected, and the
-//!   loop of the CPU load turned;
+//! - `stress` (F with all the loads): at least half of the periods make a frame,
+//!   late and skipped frames are printed, and the loop of the CPU load turned;
 //! - `direct` (a window of the first revision shown from the pool): no late
 //!   frame, no skip, every frame direct, the time to compose under the bound;
 //! - every step of the services under the gates of the steps (18 369 ticks, a
@@ -57,6 +57,9 @@ const P_BANDS: u64 = 7;
 /// phase starts and are read 5 ms before it ends, which leaves about 237.
 const FRAMES_MIN: u64 = 230;
 const FRAMES_MAX: u64 = 242;
+/// The frames the whole screen under all the loads must still make: half of the
+/// periods.
+const STRESS_FRAMES_MIN: u64 = 120;
 /// The share of a period the service may use at most (52 bands under the
 /// cap, 849 056 ticks of 1 041 667): the CPU the levels below it can count on
 /// is what the budgets above leave of the rest.
@@ -324,10 +327,14 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 ));
             }
             Phase::Stress => {
-                if timed && p.skipped == 0 {
-                    return fail(
-                        "no skip under all the loads (the loads are not heavy)".to_owned(),
-                    );
+                // The whole screen under every load at once: the service keeps
+                // delivering frames. Skips and lateness are the report's; the
+                // frame of this scene fits a period, so none is required.
+                if timed && p.frames < STRESS_FRAMES_MIN {
+                    return fail(format!(
+                        "{} frames of 240 periods under all the loads ({STRESS_FRAMES_MIN} at least)",
+                        p.frames
+                    ));
                 }
                 let alone = loops(lines, Phase::Quiet).unwrap_or(0);
                 let share = loops(lines, phase)
@@ -346,8 +353,9 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     ));
                 }
                 said.push(format!(
-                    "frame-probe: stress: 240 periods, frames {}, skipped {}, cpu share {} (floor {})",
+                    "frame-probe: stress: 240 periods, frames {}, late {}, skipped {}, cpu share {} (floor {})",
                     p.frames,
+                    p.late,
                     p.skipped,
                     frac(share),
                     frac(floor)
@@ -536,7 +544,7 @@ mod tests {
             let (frames, direct, skipped, wakeups, bands, compose) = match phase {
                 Phase::Quiet => (0, 0, 0, 0, 0, 0),
                 Phase::Full => (240, 0, 0, 240, 240 * 40, 9_000),
-                Phase::Stress => (97, 0, 143, 240, 97 * 58, 14_000),
+                Phase::Stress => (200, 0, 0, 240, 200 * 40, 10_000),
                 Phase::Direct => (240, 240, 0, 240, 0, 1_000),
                 _ => (240, 0, 0, 240, 240 * 4, 2_950),
             };
@@ -593,10 +601,9 @@ mod tests {
             said.iter()
                 .any(|l| l.starts_with("frame-probe: net: 240 frames, late 0, skipped 0"))
         );
-        assert!(
-            said.iter()
-                .any(|l| l.starts_with("frame-probe: stress: 240 periods, frames 97, skipped 143"))
-        );
+        assert!(said.iter().any(|l| {
+            l.starts_with("frame-probe: stress: 240 periods, frames 200, late 0, skipped 0")
+        }));
         assert!(
             said.iter()
                 .any(|l| l.contains("direct: 240 frames, all direct"))
@@ -666,17 +673,17 @@ mod tests {
     }
 
     #[test]
-    fn no_skip_in_stress_fails_and_so_does_a_loop_that_did_not_turn() {
+    fn too_few_frames_in_stress_fail_and_so_does_a_loop_that_did_not_turn() {
         let mut lines = good();
         let l = lines
             .iter_mut()
             .find(|l| l.starts_with("frame-load: phase stress "))
             .unwrap();
-        *l = l.replace("skipped 143", "skipped 0");
+        *l = l.replace("frames 200", "frames 59");
         assert!(
             verdict(&lines, true)
                 .unwrap_err()
-                .starts_with("stress: no skip")
+                .starts_with("stress: 59 frames")
         );
         let mut lines = good();
         replace_line(
