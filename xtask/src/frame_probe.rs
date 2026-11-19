@@ -735,12 +735,13 @@ pub fn steps_verdict(lines: &[String]) -> Result<String, String> {
 
 /// `cargo xtask frame-probe [counters]`.
 pub fn probe(args: &[String]) -> Result<(), String> {
-    let timed = match args {
-        [] => true,
-        [word] if word == "counters" => false,
-        _ => return Err("frame-probe [counters]".to_owned()),
+    let (timed, trace) = match args {
+        [] => (true, false),
+        [word] if word == "counters" => (false, false),
+        [word] if word == "trace" => (true, true),
+        _ => return Err("frame-probe [counters|trace]".to_owned()),
     };
-    let lines = frame_image::run(timed)?;
+    let lines = frame_image::run_traced(timed, trace)?;
     // Told before the verdicts, so that a probe that fails still tells what the bands
     // of the overload (the only bands of eight layers of this run) cost.
     if timed {

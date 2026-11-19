@@ -36,17 +36,29 @@ const NET_LOAD_STACK_SIZE: u32 = 128 * 1024;
 /// The programs of `boot-frame.img`.
 pub fn programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| image_programs(&[]))
+    LIST.get_or_init(|| image_programs(&[], &[]))
 }
 
 /// The programs of `boot-frame-steps.img`: the display driver and the
 /// compositor count their steps.
 pub fn steps_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| image_programs(&["steps"]))
+    LIST.get_or_init(|| image_programs(&["steps"], &["steps"]))
 }
 
-fn image_programs(services: &'static [&'static str]) -> Vec<ImageProgram> {
+/// The programs of `boot-frame-steps.img` for a run that traces the bands: the compositor
+/// also reads the system time of its thread and the entries its lookups look at in the table
+/// of images (its feature `irq-trace`, which adds two calls of the kernel to a band: the
+/// steps of such a run are no verdict of the gates).
+pub fn trace_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| image_programs(&["steps"], &["irq-trace"]))
+}
+
+fn image_programs(
+    driver: &'static [&'static str],
+    compositor: &'static [&'static str],
+) -> Vec<ImageProgram> {
     vec![
         ("init", "init", INIT_STACK_SIZE, &["table-frame"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
@@ -71,13 +83,13 @@ fn image_programs(services: &'static [&'static str]) -> Vec<ImageProgram> {
             "virtio-gpu",
             "virtio-gpu",
             gpu_probe::GPU_STACK_SIZE,
-            services,
+            driver,
         ),
         (
             "compositor",
             "compositor",
             comp_probe::COMP_STACK_SIZE,
-            services,
+            compositor,
         ),
         ("frame-load", "frame-load", CHILD_STACK_SIZE, &[]),
         ("data-probe", "data-probe", CHILD_STACK_SIZE, &[]),
@@ -175,9 +187,16 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
 /// Boots the image (the one of the measures under -icount when `steps`), runs
 /// the phases and returns the lines of the run, the lines of the loads printed.
 pub fn run(steps: bool) -> Result<Vec<String>, String> {
+    run_traced(steps, false)
+}
+
+/// `run`, with the bands traced when `trace` (the steps image with `trace_programs`).
+pub fn run_traced(steps: bool, trace: bool) -> Result<Vec<String>, String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let (name, list) = if steps {
+    let (name, list) = if trace {
+        (STEPS_IMAGE, trace_programs())
+    } else if steps {
         (STEPS_IMAGE, steps_programs())
     } else {
         (IMAGE, programs())

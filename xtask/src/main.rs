@@ -2356,10 +2356,12 @@ commands:
             check that every load is alive: the paced client posts, the client of the first
             revision flushes, the CPU loop turns, files are written and the network loop makes
             rounds, each in its phases
-  frame-probe [counters] the frame time under the loads: boot-frame-steps.img under -icount, the eight
+  frame-probe [counters|trace] the frame time under the loads: boot-frame-steps.img under -icount, the eight
             phases judged against the bounds of the analysis (late, skipped, the time to
             compose, the steps of the services); with counters, boot-frame.img on QEMU's clock
-            and the counts alone
+            and the counts alone; with trace, the compositor also tells the bands by place
+            and by ticks and what the long ones spent in the kernel and in the table of images
+            (two more calls of the kernel in a band: the steps are not the gates' verdict)
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
