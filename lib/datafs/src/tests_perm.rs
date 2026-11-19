@@ -1612,7 +1612,7 @@ fn in_the_reserve_rename_and_attribute_changes_are_the_superusers_and_rmdir_pass
     // The same by description.
     let h = rig.open(OWNER, b"/pub/mine", p::READ, 0).unwrap();
     assert_eq!(rig.call(OWNER, |w| p::fchmod(h, 0o600, w)).err(), full);
-    // A refusal for lack of right still comes first: a stranger gets EPERM, not NO_SPACE.
+    // A refusal for lack of right still comes first: a stranger gets EPERM before any look at the room.
     assert_eq!(
         rig.chmod(OTHER, b"/pub/mine", 0o600).err(),
         Some(PERMISSION)
