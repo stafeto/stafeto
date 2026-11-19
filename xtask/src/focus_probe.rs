@@ -138,6 +138,11 @@ pub const WM_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &[]),
 ];
 
+/// Where the injected pointer moves first (the guest's CLICK) and where the
+/// tablet moves, in points of the screen.
+const CLICK_AT: (u32, u32) = (60, 60);
+const TABLET_AT: (u32, u32) = (200, 120);
+
 const OVERLAP: &str = "focus-probe: overlap crc ";
 const CLICK: &str = "focus-probe: click crc ";
 const SWITCH: &str = "focus-probe: switch crc ";
@@ -194,7 +199,7 @@ const WM_CHECKS: [(&str, usize); 12] = [
 
 /// The lines the clients print once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 11] = [
+const CHECKS: [(&str, usize); 12] = [
     ("focus-probe: a window is up", 1),
     ("focus-probe: b window is up", 1),
     (
@@ -211,6 +216,7 @@ const CHECKS: [(&str, usize); 11] = [
         1,
     ),
     (INJECTED, 1),
+    ("focus-probe: the pointer is on the cursor pipeline", 1),
     ("focus-probe: ok", 5),
     (comp_probe::READY, 1),
     (gpu_probe::SERVICE_LINE, 1),
@@ -333,6 +339,15 @@ const WM_COMP_KINDS: [(usize, &str); 10] = [
     (22, "Manage"),
     (65, "a band of a frame and the end of a frame"),
 ];
+/// The display driver's in this run: the compositor's PIPELINES and SOURCE
+/// when it opens the screen and its LAYERS for the pointer's moves (the
+/// cursor), and the driver's own (the interrupt).
+const DRIVER_KINDS: [(usize, &str); 4] = [
+    (9, "Pipelines"),
+    (10, "Source"),
+    (11, "Layers"),
+    (65, "the interrupt"),
+];
 /// The tablet driver's: GRANT, and its own (the interrupt).
 const INPUT_KINDS: [(usize, &str); 2] = [(1, "Grant"), (65, "the interrupt")];
 const INPUT_TAG: &str = "13";
@@ -370,12 +385,63 @@ pub fn wm_steps_verdict(lines: &[String]) -> Result<comp_probe::Rows, String> {
     rows_of(lines, comp_probe::COMP_TAG, "compositor", &WM_COMP_KINDS)
 }
 
-/// The steps of the compositor and of the tablet's driver.
-pub fn steps_verdict(lines: &[String]) -> Result<(comp_probe::Rows, comp_probe::Rows), String> {
+/// The steps of the compositor, of the tablet's driver and of the display
+/// driver.
+pub fn steps_verdict(
+    lines: &[String],
+) -> Result<(comp_probe::Rows, comp_probe::Rows, comp_probe::Rows), String> {
     Ok((
         rows_of(lines, comp_probe::COMP_TAG, "compositor", &COMP_KINDS)?,
         rows_of(lines, INPUT_TAG, "tablet's driver", &INPUT_KINDS)?,
+        rows_of(
+            lines,
+            comp_probe::DRIVER_TAG,
+            "display driver",
+            &DRIVER_KINDS,
+        )?,
     ))
+}
+
+/// The place the screen's points say for the tablet's `x`, `y`, as the
+/// compositor scales the device's axes (0 to 32 767) to the screen:
+/// `v * size / 32 768`. `Qmp::move_to` sends `x * 0x8000 / width`, so the
+/// place the cursor gets back can be a point under what the probe asked.
+fn tablet_place(x: u32, y: u32, width: u32, height: u32) -> (u32, u32) {
+    let axis = |v: u32, size: u32| (v * 0x8000 / size) * size / 0x8000;
+    (axis(x, width), axis(y, height))
+}
+
+/// QEMU's trace of the cursor against what the probe did: the compositor
+/// put the pointer on the device's cursor pipeline, so the first command is
+/// an update from resource 3 (the picture was transferred, then shown) at
+/// the place of the injected move, and each later move of the pointer is a
+/// move with resource 3 to its place, the last to the tablet's. No command
+/// carries resource 0: QEMU takes the resource of every cursor command as
+/// the pointer's on flag, so such a command would hide the cursor. The
+/// moves in between are merged by the driver and need not all show.
+fn cursor_trace_verdict(
+    events: &[qemu::GpuTrace],
+    injected: (u32, u32),
+    tablet: (u32, u32),
+) -> Result<(), String> {
+    let cursor: Vec<(bool, u32, u32, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            qemu::GpuTrace::Cursor { update, x, y, res } => Some((*update, *x, *y, *res)),
+            _ => None,
+        })
+        .collect();
+    let named = format!(
+        "the trace of the cursor is {cursor:?}, an update from resource 3 at {injected:?} first, then a move with resource 3 to {tablet:?}, and no command with resource 0 expected"
+    );
+    let first = cursor.first() == Some(&(true, injected.0, injected.1, 3));
+    let none_hidden = cursor.iter().all(|c| c.3 == 3);
+    let moved = gpu_probe::contains_in_order(&cursor, &[(false, tablet.0, tablet.1, 3)]);
+    if first && none_hidden && moved {
+        Ok(())
+    } else {
+        Err(named)
+    }
 }
 
 /// A connection to QEMU's QMP socket: the events of the input devices, which
@@ -456,8 +522,12 @@ impl Qmp {
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+    let mut survivor = String::new();
     for prefix in [OVERLAP, CLICK, SWITCH, SURVIVOR] {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
+        if prefix == SURVIVOR {
+            survivor = line.clone();
+        }
         let first = gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix);
         // A runner under load has dropped the monitor's connection once with
         // QEMU still up (the guest was waiting 2.5 s for this photograph). The
@@ -483,8 +553,15 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
         &scratch.socket().with_file_name("qmp.sock"),
         Duration::from_secs(20),
     )?;
-    qmp.move_to(200, 120, 640, 400)?;
+    qmp.move_to(TABLET_AT.0, TABLET_AT.1, 640, 400)?;
     std::thread::sleep(Duration::from_millis(300));
+    // The pointer is on the cursor pipeline, so its move leaves the screen's
+    // points as the last frame of the guest left them. The survivor's window
+    // is still up here (it waits for the click), so one more screenshot is
+    // compared with that frame's CRC, by the same helper as the others. No
+    // line of the guest marks the move, so the pause above is its only
+    // anchor; the trace of the cursor shows the move reached the device.
+    gpu_probe::compare(&mut monitor, &scratch.picture(), &survivor, SURVIVOR)?;
     qmp.left_button(true)?;
     std::thread::sleep(Duration::from_millis(300));
     qmp.left_button(false)?;
@@ -515,14 +592,25 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         scratch.socket().with_file_name("qmp.sock").display()
     ));
     cmd.args(qemu::GPU);
+    cmd.args(qemu::gpu_trace(&scratch.trace()));
     cmd.args(qemu::TABLET);
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch);
     let outcome = run.stop();
     driven.map_err(|e| format!("focus-probe on {}: {e}", machine.name))?;
     verdict(&outcome.lines, true).map_err(|e| format!("focus-probe on {}: {e}", machine.name))?;
+    let text = std::fs::read_to_string(scratch.trace())
+        .map_err(|e| format!("focus-probe on {}: the trace file: {e}", machine.name))?;
+    let events = qemu::parse_gpu_trace(&text)
+        .map_err(|e| format!("focus-probe on {}: {e}", machine.name))?;
+    cursor_trace_verdict(
+        &events,
+        (CLICK_AT.0, CLICK_AT.1),
+        tablet_place(TABLET_AT.0, TABLET_AT.1, 640, 400),
+    )
+    .map_err(|e| format!("focus-probe on {}: {e}", machine.name))?;
     println!(
-        "focus-probe on {}: the screen matched the guest's frames for two windows with an alpha, a click that raised one, the manager's switch and the screen after the second client ended; the keys went to the window with the focus only; the tablet's click reached the window under it",
+        "focus-probe on {}: the screen matched the guest's frames (no pointer in them: it is on the cursor pipeline) for two windows with an alpha, a click that raised one, the manager's switch and the screen after the second client ended; the keys went to the window with the focus only; the tablet's click reached the window under it; QEMU's trace shows the cursor's update from resource 3 and its moves to the tablet's place",
         machine.name
     );
     wm_probe(machine, false)?;
@@ -620,10 +708,10 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     {
         return Err(format!("focus-probe under -icount: {failed}"));
     }
-    let (comp, input) = steps_verdict(&output.lines)?;
+    let (comp, input, driver) = steps_verdict(&output.lines)?;
     crate::check_waits(
         &output.lines,
-        &[comp_probe::COMP_TAG, INPUT_TAG],
+        &[comp_probe::COMP_TAG, INPUT_TAG, comp_probe::DRIVER_TAG],
         "focus-probe",
     )?;
     let text = |rows: &[(usize, u64, u64)]| -> String {
@@ -633,11 +721,12 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
             .join(", ")
     };
     println!(
-        "focus-probe on {}: the longest steps under -icount, ticks (0.9 of term B {}, portions {PORTION_MAX}): compositor {}; tablet's driver {}",
+        "focus-probe on {}: the longest steps under -icount, ticks (0.9 of term B {}, portions {PORTION_MAX}): compositor {}; tablet's driver {}; display driver {}",
         machine.name,
         gpu_probe::STEP_MAX,
         text(&comp),
-        text(&input)
+        text(&input),
+        text(&driver)
     );
     println!(
         "focus-probe on {}: the cost of the layers inside the bands, ticks (CALL_TICKS {}, BAND_TICKS {}): {}",
@@ -770,6 +859,83 @@ mod tests {
         assert!(wm_steps_verdict(&lines).unwrap_err().contains("term B"));
     }
 
+    fn cursor(update: bool, (x, y): (u32, u32), res: u32) -> qemu::GpuTrace {
+        qemu::GpuTrace::Cursor { update, x, y, res }
+    }
+
+    #[test]
+    fn the_tablet_place_is_the_one_the_compositor_scales_to() {
+        // 120 * 0x8000 / 400 is 9830, which the compositor scales back to
+        // 119; 200 across is exact.
+        assert_eq!(tablet_place(200, 120, 640, 400), (200, 119));
+    }
+
+    #[test]
+    fn the_cursor_trace_needs_the_update_first_and_the_move_to_the_tablet() {
+        let tablet = tablet_place(TABLET_AT.0, TABLET_AT.1, 640, 400);
+        let good = vec![
+            qemu::GpuTrace::Scanout {
+                id: 0,
+                res: 1,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            },
+            cursor(true, CLICK_AT, 3),
+            cursor(false, (200, CLICK_AT.1), 3),
+            cursor(false, tablet, 3),
+        ];
+        assert_eq!(cursor_trace_verdict(&good, CLICK_AT, tablet), Ok(()));
+        // The update comes from the wrong resource.
+        let mut t = good.clone();
+        t[1] = cursor(true, CLICK_AT, 2);
+        assert!(cursor_trace_verdict(&t, CLICK_AT, tablet).is_err());
+        // A move that is not an update comes first.
+        let mut t = good.clone();
+        t[1] = cursor(false, CLICK_AT, 3);
+        assert!(cursor_trace_verdict(&t, CLICK_AT, tablet).is_err());
+        // The move to the tablet's place is missing.
+        let mut t = good.clone();
+        t.pop();
+        assert!(cursor_trace_verdict(&t, CLICK_AT, tablet).is_err());
+        // A move with resource 0 hides the cursor.
+        let mut t = good.clone();
+        t.insert(3, cursor(false, tablet, 0));
+        assert!(cursor_trace_verdict(&t, CLICK_AT, tablet).is_err());
+        // No event of the cursor at all.
+        assert!(cursor_trace_verdict(&good[..1], CLICK_AT, tablet).is_err());
+    }
+
+    #[test]
+    fn the_display_driver_needs_its_pipelines_source_and_layers_steps() {
+        let comp: Vec<String> = COMP_KINDS
+            .iter()
+            .map(|&(k, _)| format!("service step: 17 kind {k} 100 ticks detail 0"))
+            .collect();
+        let input: Vec<String> = INPUT_KINDS
+            .iter()
+            .map(|&(k, _)| format!("service step: {INPUT_TAG} kind {k} 100 ticks detail 0"))
+            .collect();
+        let driver = |skip: usize| -> Vec<String> {
+            DRIVER_KINDS
+                .iter()
+                .filter(|&&(k, _)| k != skip)
+                .map(|&(k, _)| {
+                    format!(
+                        "service step: {} kind {k} 100 ticks detail 0",
+                        comp_probe::DRIVER_TAG
+                    )
+                })
+                .collect()
+        };
+        let run = |skip: usize| [comp.clone(), input.clone(), driver(skip)].concat();
+        assert!(steps_verdict(&run(0)).is_ok());
+        assert!(steps_verdict(&run(11)).unwrap_err().contains("Layers"));
+        assert!(steps_verdict(&run(9)).unwrap_err().contains("Pipelines"));
+        assert!(steps_verdict(&run(10)).unwrap_err().contains("Source"));
+    }
+
     #[test]
     fn a_step_past_the_bound_fails() {
         let row = |kind: usize, ticks: u64| {
@@ -781,6 +947,12 @@ mod tests {
                 .iter()
                 .map(|&(k, _)| format!("service step: {INPUT_TAG} kind {k} 100 ticks detail 0")),
         );
+        lines.extend(DRIVER_KINDS.iter().map(|&(k, _)| {
+            format!(
+                "service step: {} kind {k} 100 ticks detail 0",
+                comp_probe::DRIVER_TAG
+            )
+        }));
         assert!(steps_verdict(&lines).is_ok());
         lines.push(row(65, PORTION_MAX + 1));
         assert!(steps_verdict(&lines).unwrap_err().contains("portion"));
@@ -797,6 +969,12 @@ mod tests {
                 .iter()
                 .map(|&(k, _)| format!("service step: {INPUT_TAG} kind {k} 100 ticks detail 0")),
         );
+        lines.extend(DRIVER_KINDS.iter().map(|&(k, _)| {
+            format!(
+                "service step: {} kind {k} 100 ticks detail 0",
+                comp_probe::DRIVER_TAG
+            )
+        }));
         let lost = crate::step_line::tabled(&lines);
         assert!(steps_verdict(&lost).is_ok());
         let mut over = lost.clone();
