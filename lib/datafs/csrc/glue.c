@@ -35,6 +35,9 @@ struct datafs {
     struct lfs_file_config file_cfg[DATAFS_FILES];
     uint8_t file_cache[DATAFS_FILES][BLOCK];
     uint8_t file_used[DATAFS_FILES];
+    struct lfs_attr file_attr[DATAFS_FILES];
+    uint8_t file_attr_data[DATAFS_FILES][64];
+    uint32_t erases;
     lfs_dir_t dir[DATAFS_DIRS];
     uint8_t dir_used[DATAFS_DIRS];
 };
@@ -59,10 +62,12 @@ static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off
 }
 
 // The blocks need no erase: the device overwrites in place.
+// The count is what the host measurements read: how many erases littlefs asks for.
 static int dev_erase(const struct lfs_config *c, lfs_block_t block)
 {
-    (void)c;
+    struct datafs *d = c->context;
     (void)block;
+    d->erases++;
     return 0;
 }
 
@@ -98,6 +103,40 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     for (int i = 0; i < DATAFS_FILES; i++) {
         d->file_cfg[i].buffer = d->file_cache[i];
     }
+}
+
+// The host measurements only: the allocator's window over a buffer the caller owns (`size` bytes,
+// a multiple of 8), set between `datafs_setup` and the next format or mount. The service never
+// calls this.
+void datafs_set_lookahead(struct datafs *d, uint8_t *buffer, uint32_t size)
+{
+    d->cfg.lookahead_size = size;
+    d->cfg.lookahead_buffer = buffer;
+}
+
+// The erases littlefs has asked for since the setup.
+uint32_t datafs_erases(const struct datafs *d) { return d->erases; }
+
+// The host measurements only: the first block, the next block to hand out and the size in blocks
+// of the allocator's window. The next block goes back to 0 at each walk of the volume.
+void datafs_window_state(const struct datafs *d, uint32_t *out)
+{
+    out[0] = d->lfs.lookahead.start;
+    out[1] = d->lfs.lookahead.next;
+    out[2] = d->lfs.lookahead.size;
+}
+
+// The host measurements only: the blocks of the window that are free and not yet handed out
+// (the zero bits from `next` to the end of the window), read from memory with no device access.
+int64_t datafs_window_free(const struct datafs *d)
+{
+    int64_t free_blocks = 0;
+    for (lfs_block_t i = d->lfs.lookahead.next; i < d->lfs.lookahead.size; i++) {
+        if (!(d->lfs.lookahead.buffer[i / 8] & (1U << (i % 8)))) {
+            free_blocks++;
+        }
+    }
+    return free_blocks;
 }
 
 int datafs_format(struct datafs *d, void *ctx)
@@ -158,6 +197,38 @@ int datafs_open(struct datafs *d, void *ctx, const char *path, int flags)
     return LFS_ERR_NOMEM;
 }
 
+// The host measurements only: a file opened with one user attribute in its configuration, which
+// littlefs writes when the file is synced.
+int datafs_open_attr(struct datafs *d, void *ctx, const char *path, int flags, uint8_t type,
+                     const void *buffer, uint32_t size)
+{
+    d->ctx = ctx;
+    if (size > sizeof(d->file_attr_data[0])) {
+        return LFS_ERR_INVAL;
+    }
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (!d->file_used[i]) {
+            for (uint32_t j = 0; j < size; j++) {
+                d->file_attr_data[i][j] = ((const uint8_t *)buffer)[j];
+            }
+            d->file_attr[i].type = type;
+            d->file_attr[i].buffer = d->file_attr_data[i];
+            d->file_attr[i].size = size;
+            d->file_cfg[i].attrs = &d->file_attr[i];
+            d->file_cfg[i].attr_count = 1;
+            int err = lfs_file_opencfg(&d->lfs, &d->file[i], path, flags, &d->file_cfg[i]);
+            if (err < 0) {
+                d->file_cfg[i].attrs = NULL;
+                d->file_cfg[i].attr_count = 0;
+                return err;
+            }
+            d->file_used[i] = 1;
+            return i;
+        }
+    }
+    return LFS_ERR_NOMEM;
+}
+
 static int file_ok(struct datafs *d, int slot)
 {
     return slot >= 0 && slot < DATAFS_FILES && d->file_used[slot];
@@ -170,7 +241,10 @@ int datafs_close(struct datafs *d, void *ctx, int slot)
         return LFS_ERR_BADF;
     }
     d->file_used[slot] = 0;
-    return lfs_file_close(&d->lfs, &d->file[slot]);
+    int err = lfs_file_close(&d->lfs, &d->file[slot]);
+    d->file_cfg[slot].attrs = NULL;
+    d->file_cfg[slot].attr_count = 0;
+    return err;
 }
 
 int64_t datafs_read(struct datafs *d, void *ctx, int slot, void *buffer, uint32_t size)
