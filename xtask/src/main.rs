@@ -10044,6 +10044,17 @@ const TTY_STEP_KINDS: [(usize, &str); 18] = [
 /// the measure of the steps follows (`tty_steps`).
 const ENDED_TTY: &str = "init: tty-probe ended: exit code 0, not restarted";
 
+/// The echo `^C` of the INTR the probe typed and the terminal's kernel log line `tty: SIGINT, no
+/// foreground process group`, in either order. The terminal writes the log line first and the echo
+/// after it; the console driver merges the two sources at a line start, and which comes out first
+/// depends on whether the driver took the log record before it served the echo's WRITE. With the
+/// driver above every other level that was always the echo; the driver at 32 after its budget is
+/// spent can be preempted in the middle of a step by the terminal and takes the record first.
+fn expect_interrupt_echo(run: &mut qemu::Run) -> Result<(), String> {
+    run.expect_seen("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+    run.expect("^C", DIALOG_STEP)
+}
+
 fn tty_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image("boot-tty-vz.img", &TTY_VZ_PROGRAMS, BOOT_PROFILE)?
@@ -10056,8 +10067,7 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect("tty-probe: canonical read waits", BOOT_TIMEOUT)?;
         // INTR drops what was typed before it and asks for SIGINT.
         run.type_raw(b"lost\x03")?;
-        run.expect("^C", DIALOG_STEP)?;
-        run.expect("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+        expect_interrupt_echo(&mut run)?;
         run.send("ab\x7fc")?;
         // The echo: the erase of the "b" and Enter as CR LF.
         run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;
@@ -15192,6 +15202,26 @@ mod tests {
         few.pop();
         assert!(check_init_steps(&few).unwrap_err().contains("kind 4"));
         assert!(check_init_steps(&[]).is_err());
+    }
+
+    /// The echo of INTR and the kernel's line about SIGINT come in either order.
+    #[test]
+    fn the_echo_of_intr_and_the_sigint_line_are_taken_in_either_order() {
+        let script = |first: &str, second: &str| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "echo 'tty-probe: canonical read waits'; echo '{first}'; echo '{second}'; exec cat"
+            ));
+            qemu::Run::start(cmd, qemu::Input::Pipe).unwrap()
+        };
+        let line = "tty: SIGINT, no foreground process group";
+        for (first, second) in [("^C", line), (line, "^C")] {
+            let mut run = script(first, second);
+            run.expect("canonical read waits", Duration::from_secs(5))
+                .unwrap();
+            expect_interrupt_echo(&mut run).unwrap();
+            run.stop();
+        }
     }
 
     /// The steps of the console driver are measured and none passes 0.9 of B, the busy tick of
