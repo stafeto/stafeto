@@ -9,6 +9,8 @@
 //! environment and the series is published, the jobs that publish and sign
 //! again do nothing and end green. No tool reads YAML here, so the tests read
 //! the text: a job starts at a line of two spaces and a name under `jobs:`.
+//! `packages-update.yml` (an update of packages without a new version of the
+//! system) is held to the same rules as `release.yml`.
 
 #![cfg(test)]
 
@@ -208,6 +210,178 @@ fn the_build_job_refuses_a_series_it_would_build_as_new_by_mistake() {
 }
 
 #[test]
+fn the_update_of_packages_keeps_the_key_in_the_signing_job_and_the_token_in_the_draft_job_alone() {
+    let update = jobs(&workflow("packages-update.yml"));
+    assert_eq!(
+        update.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["build", "ci", "draft", "sign", "trial"]
+    );
+    assert_eq!(secrets_named(&update["sign"]), ["RELEASE_SIGNING_KEY"]);
+    assert_eq!(secrets_named(&update["draft"]), ["PACKAGES_TOKEN"]);
+    assert!(has_environment(&update["sign"]) && has_environment(&update["draft"]));
+    // The jobs that run the code of the packages, and the dry run, hold neither a secret nor an environment.
+    for job in ["ci", "build", "trial"] {
+        assert!(secrets_named(&update[job]).is_empty(), "{job}");
+        assert!(!has_environment(&update[job]), "{job}");
+        assert!(!code(&update[job]).contains("secrets."), "{job}");
+    }
+    let ci = &update["ci"];
+    assert!(ci.contains("uses: ./.github/workflows/ci.yml"));
+    assert!(!ci.contains("secrets") && !ci.contains("with:") && ci.contains("contents: read"));
+    // The token is in the steps that call stafeto/packages, and the token of the run elsewhere.
+    for step in steps(&update["draft"]) {
+        if code(&step).contains("PACKAGES_TOKEN") {
+            assert!(
+                code(&step).contains("GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}"),
+                "{step}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_signing_job_of_an_update_builds_only_xtask_and_removes_the_key() {
+    let sign = code(&jobs(&workflow("packages-update.yml"))["sign"]);
+    let built = sign
+        .find("cargo build --locked -p xtask")
+        .expect("xtask is built");
+    let written = sign
+        .find("RELEASE_SIGNING_KEY: ${{")
+        .expect("the key is read");
+    assert!(built < written);
+    assert!(sign.contains("if: always()") && sign.contains("rm -rf \"$RUNNER_TEMP/keys\""));
+    assert!(!sign.contains("cache"), "a clean machine restores no cache");
+    assert!(
+        !sign.contains("tools/build-"),
+        "the signing job builds no package"
+    );
+    // The tag and every file of the artifact are read by xtask in their strict form before the key is there.
+    let checked = sign
+        .find("cargo xtask release-check --packages-only --tag")
+        .expect("the files and the tag are checked");
+    assert!(checked < written);
+    for word in [
+        "cat target",
+        "$(<",
+        "read ",
+        "needs.build.outputs",
+        "source target",
+        ". target",
+        "--trial",
+    ] {
+        assert!(
+            !sign.contains(word),
+            "the signing job must not use {word:?}"
+        );
+    }
+    // The serial is that of the published index, and the repository is checked before it is packed.
+    assert!(sign.contains("--serial-after"));
+    assert!(sign.contains("--storage \"${TAG}-aarch64\""));
+    let checked = sign.find("repo --check --official --dir").expect("checked");
+    assert!(checked > written);
+    assert!(checked < sign.find("release-pack --packages-only --tag").unwrap());
+    assert!(
+        code(&jobs(&workflow("packages-update.yml"))["draft"])
+            .contains("sha256sum --check SHA256SUMS")
+    );
+}
+
+#[test]
+fn the_update_starts_from_a_tag_and_a_dry_run_and_the_dry_run_has_no_key_and_no_draft() {
+    let text = workflow("packages-update.yml");
+    let all = jobs(&text);
+    let on = code(&text);
+    assert!(on.contains("tags: [\"v*-pkgs.*\"]") && on.contains("workflow_dispatch:"));
+    for trigger in ["pull_request:", "schedule:", "release:", "branches:"] {
+        assert!(!on.contains(trigger), "{trigger}");
+    }
+    // The tag makes the key and the drafts; the dry run makes neither.
+    assert!(all["sign"].contains("if: github.event_name == 'push'"));
+    assert!(all["draft"].contains("if: github.event_name == 'push'"));
+    assert!(all["trial"].contains("if: github.event_name == 'workflow_dispatch'"));
+    assert!(all["draft"].contains("contents: write"));
+    for job in ["ci", "build", "sign", "trial"] {
+        assert!(!all[job].contains("contents: write"), "{job}");
+        assert!(!all[job].contains("gh release create"), "{job}");
+    }
+    let trial = code(&all["trial"]);
+    assert!(trial.contains("--trial") && trial.contains("cargo xtask pkg-sign --dir"));
+    assert!(!trial.contains("--key") && !trial.contains("--official"));
+    assert!(trial.contains("release-pack --packages-only --trial"));
+    assert!(trial.contains("packages-trial") && trial.contains("retention-days: 3"));
+    assert!(code(&all["build"]).contains("--trial"));
+}
+
+#[test]
+fn the_build_job_of_an_update_carries_from_the_newest_anchor_and_refuses_a_series_not_published() {
+    let build = code(&jobs(&workflow("packages-update.yml"))["build"]);
+    assert!(build.contains("tools/pages.py previous"));
+    assert!(build.contains("repos/stafeto/stafeto/releases"));
+    assert!(build.contains("test -n \"$flag\""));
+    assert!(build.contains("cargo xtask release-build --packages-only"));
+    assert!(build.contains("--previous \"anchor/$SERIES\""));
+    assert!(build.contains("--tag \"$TAG\"") && build.contains("--trial"));
+    assert!(!build.contains("--no-abi"));
+    assert!(build.contains("timeout-minutes: 120"));
+}
+
+#[test]
+fn the_draft_job_of_an_update_stops_before_any_draft_when_one_waits_or_the_name_is_taken() {
+    let draft = code(&jobs(&workflow("packages-update.yml"))["draft"]);
+    let at = |needle: &str| draft.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    assert!(at("tools/pages.py check-drafts") < at("gh release create"));
+    assert!(
+        at("gh release view \"$TAG-aarch64\" --repo stafeto/packages") < at("gh release create")
+    );
+    assert!(draft.contains("--draft --latest=false --verify-tag"));
+    assert!(draft.contains("--repo stafeto/packages"));
+    assert!(draft.contains("tools/pages.py new-files"));
+    assert!(draft.contains("tools/release-notes.py --packages"));
+}
+
+#[test]
+fn no_value_of_the_event_is_written_into_a_script_of_the_update() {
+    let text = workflow("packages-update.yml");
+    // The tag and the inputs reach a script through the environment of its step alone.
+    for line in code(&text).lines() {
+        if line.contains("github.ref_name") || line.contains("inputs.") {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.starts_with("TAG: ")
+                    || trimmed.starts_with("SERIES_INPUT: ")
+                    || trimmed.starts_with("EVENT: "),
+                "{trimmed}"
+            );
+        }
+    }
+    for (name, job) in jobs(&text) {
+        for step in steps(&job) {
+            if let Some(at) = step.find("        run:") {
+                assert!(
+                    !step[at..].contains("${{"),
+                    "{name}: an expression in a script:\n{step}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_release_and_the_update_leave_each_others_tags_alone_and_share_one_queue() {
+    let release = workflow("release.yml");
+    let update = workflow("packages-update.yml");
+    assert!(code(&release).contains("tags: [\"v*\", \"!v*-pkgs.*\"]"));
+    assert!(code(&release).contains("--match 'v*' --exclude 'v*-pkgs.*'"));
+    for text in [&release, &update] {
+        let text = code(text);
+        assert!(text.contains(
+            "group: ${{ github.event_name == 'push' && 'release-pipeline' || format('dispatch-{0}', github.run_id) }}"
+        ));
+        assert!(text.contains("cancel-in-progress: false"));
+    }
+}
+
+#[test]
 fn the_token_check_is_started_by_hand_alone() {
     let text = code(&workflow("packages-token.yml"));
     assert!(text.contains("workflow_dispatch:"));
@@ -360,4 +534,40 @@ fn the_owner_is_told_to_guard_the_tags_and_main_before_a_secret_goes_into_the_en
     assert!(text.contains("collaborators?permission=admin"));
     // The setting that keeps a published release as it is comes before the first secret too.
     assert!(at("Immutable releases") < at("gh secret set RELEASE_SIGNING_KEY"));
+}
+
+#[test]
+fn a_manual_run_does_not_join_the_queue_of_the_tag_runs() {
+    // A dispatch by anyone who may write would otherwise cancel the pending run of a tag.
+    for name in ["release.yml", "packages-update.yml"] {
+        let text = code(&workflow(name));
+        let at = text
+            .find("concurrency:")
+            .unwrap_or_else(|| panic!("{name}"));
+        let group = text[at..].lines().nth(1).unwrap().trim();
+        assert!(
+            group.contains("github.event_name == 'push' && 'release-pipeline'"),
+            "{name}"
+        );
+        assert!(
+            group.contains("format('dispatch-{0}', github.run_id)"),
+            "{name}"
+        );
+        // The only literal name of the shared group is the one chosen for a push.
+        assert_eq!(text.matches("release-pipeline").count(), 1, "{name}");
+    }
+}
+
+#[test]
+fn the_check_with_both_roots_is_in_the_dry_run_alone() {
+    for name in names() {
+        for (job, body) in jobs(&workflow(&name)) {
+            let uses = code(&body).contains("--with-official");
+            assert_eq!(
+                uses,
+                name == "packages-update.yml" && job == "trial",
+                "{name}: {job}"
+            );
+        }
+    }
 }

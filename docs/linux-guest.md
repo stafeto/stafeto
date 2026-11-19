@@ -9,7 +9,7 @@ ground. The measurement itself (ladders, rates, tables) is the next part.
 
 Alpine Linux 3.24, aarch64, from the packages that
 `tools/linux-guest/alpine.lock` pins by SHA-256: `linux-virt` 6.18.60,
-nginx 1.30.6 and OpenSSL 3.5.9 (the versions of `packages/nginx.toml` and
+nginx 1.30.7 and OpenSSL 3.5.9 (the versions of `packages/nginx.toml` and
 `packages/openssl.toml`), musl, BusyBox, PCRE2, zlib, iperf3 and the
 `alpine-baselayout-data` files and the `openssl` program. The build resolves no dependency: it takes
 exactly the files of the lock, and every `DT_NEEDED` of every ELF file must be

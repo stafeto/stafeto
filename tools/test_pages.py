@@ -102,23 +102,21 @@ class Branch(unittest.TestCase):
         (directory / "INDEX.sig").write_bytes(signature if signature is not None else signed(text))
         return directory
 
-    def publish(self, text: str, signature: bytes | None = None, version="0.3.0", others: dict | None = None) -> int:
-        """Publishes `version` with the copy `text`; `others` maps the tags of other published
-        releases to their copies."""
-        series = ".".join(version.split(".")[:2])
-        listing, files = self.releases(**{series.replace(".", "_"): text})
-        listing[0]["tag_name"] = f"v{version}"
-        base = f"{pages.RELEASES}/v{version}/stafeto-{version}-INDEX"
-        listing[0]["assets"] = [{"name": f"stafeto-{version}-INDEX", "browser_download_url": base},
-                                {"name": f"stafeto-{version}-INDEX.sig", "browser_download_url": base + ".sig"}]
-        for tag, copy in (others or {}).items():
-            more, extra = self.releases(**{".".join(tag[1:].split(".")[:2]).replace(".", "_"): copy})
-            more[0]["tag_name"] = tag
+    def listing(self, copies: dict[str, str], drafts: tuple[str, ...] = ()) -> tuple[list[dict], dict[str, bytes]]:
+        """Releases of stafeto/stafeto for the tags of `copies`, each holding its signed copy."""
+        listing, files = [], {}
+        for tag, copy in copies.items():
             base = f"{pages.RELEASES}/{tag}/stafeto-{tag[1:]}-INDEX"
-            more[0]["assets"] = [{"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
-                                 {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]
-            files[base] = copy.encode()
-            listing += more
+            listing.append({"tag_name": tag, "draft": tag in drafts, "prerelease": False, "assets": [
+                {"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
+                {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]})
+            files[base], files[base + ".sig"] = copy.encode(), signed(copy)
+        return listing, files
+
+    def publish(self, text: str, signature: bytes | None = None, version="0.3.0", others: dict | None = None) -> int:
+        """Publishes `version` (`0.3.1`, or `0.3-pkgs.1`) with the copy `text`; `others` maps the
+        tags of other published releases to their copies."""
+        listing, files = self.listing({f"v{version}": text, **(others or {})})
         return pages.publish(self.pages, version, self.release(text, signature), self.revoked, self.command, True,
                              listing, files.get)
 
@@ -229,11 +227,14 @@ class Branch(unittest.TestCase):
 
     def test_the_serial_on_the_pages_goes_up_past_the_serial_of_the_release(self):
         self.publish(index(serial=5))
-        # The copy of the release carries 3, the pages have 5: the next serial is 6.
-        self.assertEqual(self.publish(index(serial=3), version="0.3.1"), 6)
-        self.assertIn("serial 6", self.remote("0.3/aarch64/INDEX"))
+        # The weeks take the pages to 7; the copy of the next release carries 6.
+        self.week(**{"0_3": index(serial=5)})
+        self.week(**{"0_3": index(serial=5)})
+        self.assertIn("serial 7", self.remote("0.3/aarch64/INDEX"))
+        self.assertEqual(self.publish(index(serial=6), version="0.3.1", others={"v0.3.0": index(serial=5)}), 8)
+        self.assertIn("serial 8", self.remote("0.3/aarch64/INDEX"))
         # A copy ahead of the pages keeps its own number.
-        self.assertEqual(self.publish(index(serial=9), version="0.3.2"), 9)
+        self.assertEqual(self.publish(index(serial=20), version="0.3.2", others={"v0.3.1": index(serial=6)}), 20)
         self.assertEqual(self.remote("series.txt"), "0.3\n")
 
     def test_a_second_series_is_added_to_the_list(self):
@@ -321,6 +322,97 @@ class Branch(unittest.TestCase):
         (self.pages / "series.txt").write_text("0.4\n")
         self.assertEqual(self.week(push=False, **{"0_4": index(series="0.4", serial=7)}), {"0.4": 8})
         self.assertIn("serial 5", (self.pages / "0.3/aarch64/INDEX").read_text())
+
+    # ---- packages-only updates (v<series>-pkgs.<k>) ----
+
+    def week_of(self, copies: dict[str, str], drafts: tuple[str, ...] = (), push: bool = True) -> dict:
+        listing, files = self.listing(copies, drafts)
+        return pages.weekly(self.pages, self.revoked, self.command, push, listing, self.dir / "anchors", get=files.__getitem__)
+
+    def test_an_update_of_packages_is_published_and_writes_the_anchor_and_not_the_release(self):
+        self.publish(index(serial=2), version="0.3.1")
+        self.assertEqual(self.remote("0.3/aarch64/release"), "0.3.1\n")
+        self.assertEqual(self.remote("0.3/aarch64/anchor"), "v0.3.1 2\n")
+        serial = self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+        self.assertEqual(serial, 3)
+        self.assertEqual(git(self.origin, "log", "-1", "--format=%s", "gh-pages").strip(), "publish 0.3-pkgs.1: serial 3")
+        self.assertEqual(self.remote("0.3/aarch64/release"), "0.3.1\n")
+        self.assertEqual(self.remote("0.3/aarch64/anchor"), "v0.3-pkgs.1 3\n")
+
+    def test_an_update_whose_copy_has_a_serial_not_above_the_others_is_refused(self):
+        self.publish(index(serial=2), version="0.3.1")
+        before = self.head()
+        for serial in (1, 2):
+            with self.assertRaises(SystemExit) as stopped:
+                self.publish(index(serial=serial), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+            self.assertIn("not above that of the copy of v0.3.1", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
+    def test_an_update_with_a_counter_below_another_update_is_refused(self):
+        listing, files = self.listing({"v0.3-pkgs.2": index(serial=4), "v0.3-pkgs.1": index(serial=5)})
+        with self.assertRaises(SystemExit) as stopped:
+            pages.check_copy("v0.3-pkgs.1", index(serial=5), listing, files.get)
+        self.assertIn("not the newest", str(stopped.exception))
+        # A counter above the others, with a serial above theirs, passes; the final releases do not count.
+        listing, files = self.listing({"v0.3.5": index(serial=2), "v0.3-pkgs.1": index(serial=3)})
+        pages.check_copy("v0.3-pkgs.2", index(serial=4), listing, files.get)
+
+    def test_a_release_of_the_system_after_an_update_passes_with_a_serial_above_it(self):
+        self.publish(index(serial=2), version="0.3.1")
+        self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+        others = {"v0.3.1": index(serial=2), "v0.3-pkgs.1": index(serial=3)}
+        with self.assertRaises(SystemExit):
+            self.publish(index(serial=3), version="0.3.2", others=others)
+        self.assertEqual(self.publish(index(serial=4), version="0.3.2", others=others), 4)
+        self.assertEqual(self.remote("0.3/aarch64/release"), "0.3.2\n")
+        self.assertEqual(self.remote("0.3/aarch64/anchor"), "v0.3.2 4\n")
+
+    def test_an_old_anchor_published_again_is_stopped_by_the_boundary_on_the_pages(self):
+        self.publish(index(serial=2), version="0.3.1")
+        self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+        before = self.head()
+        # The writer drafts v0.3-pkgs.1, so the list shows v0.3.1 alone, and publishes v0.3.1 again.
+        with self.assertRaises(SystemExit) as stopped:
+            self.publish(index(serial=2), version="0.3.1")
+        self.assertIn("not above 3, that of v0.3-pkgs.1", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+        # The anchor itself again, with the records of the pages, is a re-verification.
+        self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+
+    def test_the_week_takes_the_update_as_the_anchor_and_refuses_the_series_without_it(self):
+        self.publish(index(serial=2), version="0.3.1")
+        self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+        copies = {"v0.3.1": index(serial=2), "v0.3-pkgs.1": index(serial=3)}
+        self.assertEqual(self.week_of(copies), {"0.3": 4})
+        before = self.head()
+        with self.assertRaises(SystemExit) as stopped:
+            self.week_of(copies, drafts=("v0.3-pkgs.1",))
+        self.assertIn("not above 3, that of v0.3-pkgs.1", str(stopped.exception))
+        self.assertEqual(self.head(), before)
+
+    def test_the_week_follows_the_newest_serial_when_a_release_follows_an_update(self):
+        self.publish(index(serial=2), version="0.3.1")
+        self.publish(index(serial=3), version="0.3-pkgs.1", others={"v0.3.1": index(serial=2)})
+        copies = {"v0.3.1": index(serial=2), "v0.3-pkgs.1": index(serial=3)}
+        self.publish(index(serial=4), version="0.3.2", others=copies)
+        self.week_of({**copies, "v0.3.2": index(serial=4)}, push=False)
+        self.assertEqual((self.dir / "anchors" / "0.3" / "INDEX").read_text(), index(serial=4))
+
+    def test_the_drafts_of_a_series_stop_a_new_update(self):
+        def release(tag, draft=False):
+            return {"tag_name": tag, "draft": draft, "prerelease": False, "assets": []}
+        pages.check_drafts("0.3", "v0.3-pkgs.2", [release("v0.3.1"), release("v0.3-pkgs.1"), release("v0.4.0", True)])
+        for listing, word in (([release("v0.3.2", True)], "v0.3.2"), ([release("v0.3-pkgs.1", True)], "v0.3-pkgs.1")):
+            with self.assertRaises(SystemExit) as stopped:
+                pages.check_drafts("0.3", "v0.3-pkgs.2", listing)
+            self.assertIn(word, str(stopped.exception))
+        for listing in ([release("v0.3-pkgs.2", True)], [release("v0.3-pkgs.2")]):
+            with self.assertRaises(SystemExit) as stopped:
+                pages.check_drafts("0.3", "v0.3-pkgs.2", listing)
+            self.assertIn("has a release v0.3-pkgs.2 already", str(stopped.exception))
+        for tag in ("v0.3.2", "v0.4-pkgs.1"):
+            with self.assertRaises(SystemExit):
+                pages.check_drafts("0.3", tag, [])
 
 
 class Storage(unittest.TestCase):
@@ -443,10 +535,52 @@ class Previous(unittest.TestCase):
             return {"tag_name": tag, "draft": False, "prerelease": False, **kw, "assets": [
                 {"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
                 {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]}
+        serials = {"v0.3.0": 1, "v0.3.2": 2, "v0.3.10": 3, "v0.3.11": 9, "v0.4.0": 4, "v0.4.0-pre.1": 5, "v0.2.5": 6}
+        files = {f"{pages.RELEASES}/{t}/stafeto-{t[1:]}-INDEX": index(series=".".join(t[1:].split(".")[:2]), serial=n).encode()
+                 for t, n in serials.items()}
         found = pages.newest_copies([release("v0.3.0"), release("v0.3.2"), release("v0.3.10"),
                                      release("v0.3.11", draft=True), release("v0.4.0", prerelease=True),
-                                     release("v0.4.0-pre.1"), release("v0.2.5")])
+                                     release("v0.4.0-pre.1"), release("v0.2.5")], files.__getitem__)
         self.assertEqual({s: v["tag"] for s, v in found.items()}, {"0.3": "v0.3.10", "0.2": "v0.2.5"})
+
+
+    def test_the_copies_of_both_kinds_are_listed_and_the_others_are_not(self):
+        def release(tag, **kw):
+            base = f"{pages.RELEASES}/{tag}/stafeto-{tag[1:]}-INDEX"
+            return {"tag_name": tag, "draft": False, "prerelease": False, **kw, "assets": [
+                {"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
+                {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]}
+        found = pages.copies_of([release("v0.5.1"), release("v0.5-pkgs.2"), release("v0.5-pkgs.3", draft=True),
+                                 release("v0.5-pkgs.4", prerelease=True), release("v0.5-pkgs.0"),
+                                 release("v0.5-pkgs.01"), release("v0.5-pkgs.1x"), release("v0.5.1-pkgs.1")])
+        self.assertEqual([(c["kind"], c["series"], c["tag"], c["counter"]) for c in found],
+                         [("final", "0.5", "v0.5.1", 0), ("pkgs", "0.5", "v0.5-pkgs.2", 2)])
+
+    def test_the_newest_anchor_is_the_copy_with_the_highest_serial(self):
+        def release(tag):
+            base = f"{pages.RELEASES}/{tag}/stafeto-{tag[1:]}-INDEX"
+            return {"tag_name": tag, "draft": False, "prerelease": False, "assets": [
+                {"name": f"stafeto-{tag[1:]}-INDEX", "browser_download_url": base},
+                {"name": f"stafeto-{tag[1:]}-INDEX.sig", "browser_download_url": base + ".sig"}]}
+        serials = {"v0.5.1": 2, "v0.5-pkgs.1": 3}
+        files = {f"{pages.RELEASES}/{t}/stafeto-{t[1:]}-INDEX": index(series="0.5", serial=n).encode() for t, n in serials.items()}
+        listing = [release(t) for t in serials]
+        self.assertEqual(pages.newest_copies(listing, files.__getitem__)["0.5"]["tag"], "v0.5-pkgs.1")
+        serials["v0.5.2"] = 4
+        files[f"{pages.RELEASES}/v0.5.2/stafeto-0.5.2-INDEX"] = index(series="0.5", serial=4).encode()
+        self.assertEqual(pages.newest_copies(listing + [release("v0.5.2")], files.__getitem__)["0.5"]["tag"], "v0.5.2")
+
+    def test_a_build_carries_from_the_copy_of_an_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{pages.RELEASES}/v0.3-pkgs.1/stafeto-0.3-pkgs.1-INDEX"
+            listing = [{"tag_name": "v0.3-pkgs.1", "draft": False, "prerelease": False, "assets": [
+                {"name": "stafeto-0.3-pkgs.1-INDEX", "browser_download_url": base},
+                {"name": "stafeto-0.3-pkgs.1-INDEX.sig", "browser_download_url": base + ".sig"}]}]
+            files = {base: index(serial=7).encode(), base + ".sig": b"sig"}
+            out = Path(tmp) / "out"
+            where = pages.previous("0.3", self.tree(tmp, "0.3 1\n"), lambda url: None, listing, out, files.__getitem__)
+            self.assertEqual(where, str(out / "0.3"))
+            self.assertEqual((out / "0.3" / "INDEX").read_text(), index(serial=7))
 
 
 class Gate(unittest.TestCase):
@@ -480,6 +614,17 @@ class Gate(unittest.TestCase):
         go, reason = pages.gate("release", "false", "v0.2.0", ["stafeto-0.2.0-sbom.spdx.json"], None)
         self.assertFalse(go)
         self.assertIn("no stafeto-0.2.0-INDEX", reason)
+
+    def test_an_update_of_packages_with_the_signed_index_is_published(self):
+        assets = ["stafeto-0.3-pkgs.1-INDEX", "stafeto-0.3-pkgs.1-INDEX.sig", "SHA256SUMS"]
+        go, reason = pages.gate("release", "false", "v0.3-pkgs.1", assets, None)
+        self.assertTrue(go, reason)
+        self.assertFalse(pages.gate("release", "true", "v0.3-pkgs.1", assets, None)[0])
+        go, reason = pages.gate("release", "false", "v0.3-pkgs.1", ["SHA256SUMS"], None)
+        self.assertFalse(go)
+        self.assertIn("no stafeto-0.3-pkgs.1-INDEX", reason)
+        for tag in ("v0.3-pkgs.0", "v0.3-pkgs.01", "v0.3.1-pkgs.1", "v0.3-pkgs.1x", "v0.3-pkgs.trial"):
+            self.assertFalse(pages.gate("release", "false", tag, [f"stafeto-{tag[1:]}-INDEX", f"stafeto-{tag[1:]}-INDEX.sig"], None)[0], tag)
 
     def test_a_final_release_with_the_signed_index_is_published(self):
         assets = ["stafeto-0.3.0-INDEX", "stafeto-0.3.0-INDEX.sig", "SHA256SUMS"]
