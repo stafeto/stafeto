@@ -228,6 +228,7 @@ fn rows_of(
     kinds: &[(usize, &str)],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_steps(lines, tag);
+    crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)?;
     for (kind, what) in kinds {
         if !rows.iter().any(|(k, ..)| k == kind) {
             return Err(format!("the {name}: no step {what}: {rows:?}"));
@@ -239,11 +240,14 @@ fn rows_of(
             gpu_probe::STEP_MAX
         ));
     }
+    // A portion is a target of the kind of 0.9 B and is judged the same way: the greatest by
+    // kind of N - P * PREEMPT_CHARGE. The work no preemption touched is told beside it.
     if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
         return Err(format!(
             "the {name}: a portion or an interrupt past {PORTION_MAX}: {row:?}"
         ));
     }
+    crate::step_line::say_clean(lines, tag, name, 65);
     Ok(rows)
 }
 
@@ -1505,6 +1509,26 @@ mod tests {
         // A band past the portion bound fails for the own kind alone.
         assert!(steps_verdict(&rows(Some((COMP_TAG, 65, PORTION_MAX + 1)), None)).is_err());
         assert!(steps_verdict(&rows(Some((COMP_TAG, 20, PORTION_MAX + 1)), None)).is_ok());
+        // A portion is judged like 0.9 B, by N - P * 1 300: 18 807 with three preemptions passes
+        // (14 907), 17 000 with none and 18 000 with one (16 700) fail, and a kind with lines that
+        // all have preemptions is judged.
+        let with = |text: &str| {
+            let mut lines = rows(Some((COMP_TAG, 65, 100)), None);
+            lines.push(format!("service step: {COMP_TAG} kind 65 {text}"));
+            lines
+        };
+        assert!(steps_verdict(&with("18807 ticks detail 0 preempts 3")).is_ok());
+        assert!(steps_verdict(&with("17000 ticks detail 0")).is_err());
+        let error = steps_verdict(&with("18000 ticks detail 0 preempts 1")).unwrap_err();
+        assert!(error.contains("16700"), "{error}");
+        let only_preempted: Vec<String> = rows(None, None)
+            .into_iter()
+            .filter(|l| !l.contains(&format!("{COMP_TAG} kind 65 ")))
+            .chain([format!(
+                "service step: {COMP_TAG} kind 65 18000 ticks detail 0 preempts 1"
+            )])
+            .collect();
+        assert!(steps_verdict(&only_preempted).is_err());
         assert!(
             steps_verdict(&rows(None, Some((COMP_TAG, 19))))
                 .unwrap_err()

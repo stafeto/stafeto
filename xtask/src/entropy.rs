@@ -213,6 +213,7 @@ fn loop_steps(
     who: &str,
 ) -> Result<Rows, String> {
     let rows = longest_steps(lines, tag);
+    crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)?;
     for &(kind, name) in kinds {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("{who}: no step {name}: {rows:?}"));
@@ -477,6 +478,7 @@ pub fn random_probe(machine: &qemu::Machine) -> Result<(), String> {
 pub fn random_steps() -> Result<(), String> {
     let lines = random_run(&qemu::VIRT, true)?;
     let rows = longest_steps(&lines, "4");
+    crate::step_line::within_b(&lines, "4", crate::step_line::Kinds::Only(&[46]))?;
     let Some(row) = rows.iter().find(|r| r.0 == 46) else {
         return Err(format!(
             "the pipe service ran no VerifySession step: {rows:?}"
@@ -600,6 +602,9 @@ fn random_net_run(steps: bool, two: bool) -> Result<(), String> {
     )?;
     if steps {
         let mut rows = longest_steps(&output.lines, NETD_TAG);
+        if !two {
+            crate::step_line::within_b(&output.lines, NETD_TAG, crate::step_line::Kinds::All)?;
+        }
         let Some(verify) = rows.iter().find(|r| r.0 == NETD_VERIFY_KIND).copied() else {
             return Err(format!(
                 "the network service ran no VerifySession step: {rows:?}"
@@ -907,6 +912,7 @@ pub fn random_rejoin_steps() -> Result<(), String> {
         qemu::expect_marker(&output, line)?;
     }
     let rows = longest_steps(&output.lines, "1");
+    crate::step_line::within_b(&output.lines, "1", crate::step_line::Kinds::Only(&[4, 65]))?;
     let limit = RAM_STEP_MAX * 9 / 10;
     let Some(request) = rows.iter().find(|r| r.0 == 4) else {
         return Err("no step of EntropyRejoin (kind 4) was counted".into());
