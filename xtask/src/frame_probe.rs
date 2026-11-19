@@ -477,13 +477,20 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                         ));
                     }
                     said.push(format!(
-                        "frame-probe: overload: {} frames of {bands} bands, capped {}, skipped {}, late {}, cpu share {} (floor {})",
+                        "frame-probe: overload: {} frames of {bands} bands, capped {}, skipped {}, late {}, cpu share {} (floor {}), longest band step {} (gates {} and {})",
                         p.frames,
                         p.capped,
                         p.skipped,
                         p.late,
                         frac(share),
-                        frac(HOG_FLOOR_PPM)
+                        frac(HOG_FLOOR_PPM),
+                        match band_step_in(lines, Phase::HogRef, Phase::Overload) {
+                            (Some(t), _) => format!("{t} ticks in the phase"),
+                            (None, before) =>
+                                format!("none above the earlier greatest {before} ticks"),
+                        },
+                        crate::PORTION_MAX,
+                        crate::gpu_probe::STEP_MAX
                     ));
                 } else {
                     said.push(format!("frame-probe: overload: {} frames", p.frames));
@@ -546,6 +553,30 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
         );
     }
     Ok(said)
+}
+
+/// The longest step of the compositor's own kind (65: a band and the end of a
+/// frame) that the lines of the steps show between the end of the phase
+/// `from` and the end of the phase `to`, and the longest before them. The
+/// lines of a step come when a kind's greatest grows, so a phase with no line
+/// had no step above the earlier greatest.
+pub fn band_step_in(lines: &[String], from: Phase, to: Phase) -> (Option<u64>, u64) {
+    let at = |phase: Phase| {
+        lines
+            .iter()
+            .position(|l| l.starts_with(&format!("frame-load: phase {} ", phase.name())))
+    };
+    let (Some(a), Some(b)) = (at(from), at(to)) else {
+        return (None, 0);
+    };
+    let tag = crate::comp_probe::COMP_TAG;
+    let kind65 = |part: &[String]| {
+        crate::longest_steps(part, tag)
+            .into_iter()
+            .find(|r| r.0 == 65)
+            .map(|r| r.1)
+    };
+    (kind65(&lines[a..b]), kind65(&lines[..a]).unwrap_or(0))
 }
 
 /// The overruns of the budgets of the network service by the lines of init's
@@ -903,6 +934,45 @@ mod tests {
             .find(|l| l.starts_with("frame-load: phase overload "))
             .unwrap();
         *l = l.replace(from, to);
+    }
+
+    #[test]
+    fn the_longest_band_step_of_the_overload_is_read_from_the_lines() {
+        let tag = crate::comp_probe::COMP_TAG;
+        let mut lines = good();
+        // A step of 14 000 before the phase and one of 15 100 inside it.
+        let hog = lines
+            .iter()
+            .position(|l| l.starts_with("frame-load: phase hog-ref "))
+            .unwrap();
+        lines.insert(
+            hog,
+            format!("service step: {tag} kind 65 14000 ticks detail 0"),
+        );
+        let over = lines
+            .iter()
+            .position(|l| l.starts_with("frame-load: phase overload "))
+            .unwrap();
+        lines.insert(
+            over,
+            format!("service step: {tag} kind 65 15100 ticks detail 0"),
+        );
+        assert_eq!(
+            band_step_in(&lines, Phase::HogRef, Phase::Overload),
+            (Some(15_100), 14_000)
+        );
+        let said = verdict(&lines, true).unwrap();
+        assert!(
+            said.iter()
+                .any(|l| l.contains("longest band step 15100 ticks in the phase"))
+        );
+        // No line in the phase: nothing above the earlier greatest.
+        lines.remove(over);
+        let said = verdict(&lines, true).unwrap();
+        assert!(
+            said.iter()
+                .any(|l| l.contains("none above the earlier greatest 14000 ticks"))
+        );
     }
 
     #[test]
