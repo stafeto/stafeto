@@ -136,11 +136,13 @@ pub enum TimesRequest {
 }
 
 impl<'a> Identity<'a> {
+    #[inline]
     pub fn new(uid: u32, gid: u32, groups: &'a [u32]) -> Self {
         Self { uid, gid, groups }
     }
 
     /// The real pair when `real`, the effective pair otherwise.
+    #[inline]
     pub fn of(ids: Ids, groups: &'a [u32], real: bool) -> Self {
         Self {
             uid: if real { ids.uid } else { ids.euid },
@@ -150,12 +152,14 @@ impl<'a> Identity<'a> {
     }
 
     /// Whether the caller is a member of `gid`.
+    #[inline]
     pub fn in_group(&self, gid: u32) -> bool {
         self.gid == gid || self.groups.contains(&gid)
     }
 }
 
 /// The access decision for `bits` (any of `READ`, `WRITE`, `EXEC`) by class (XBD 4.7).
+#[inline]
 pub fn permits(id: Identity<'_>, attr: &Attr, bits: u32) -> bool {
     if id.uid == 0 {
         return bits & EXEC == 0 || attr.kind == Kind::Directory || attr.mode & 0o111 != 0;
@@ -173,6 +177,7 @@ pub fn permits(id: Identity<'_>, attr: &Attr, bits: u32) -> bool {
 }
 
 /// Whether the sticky bit of `parent` lets the caller remove or rename the entry `victim`.
+#[inline]
 pub fn sticky_allows(id: Identity<'_>, parent: &Attr, victim: &Attr) -> bool {
     parent.mode & S_ISVTX == 0 || id.uid == 0 || id.uid == parent.uid || id.uid == victim.uid
 }
@@ -204,6 +209,7 @@ pub fn creation(id: Identity<'_>, parent: &Attr, kind: Kind, mode: u32, umask: u
 /// Whether the caller may remove the entry `victim` from `parent` (XSH `unlink()`, `rmdir()`):
 /// [`Denial::Access`] without write and search on the parent, [`Denial::Permission`] when the
 /// sticky bit of the parent forbids it.
+#[inline]
 pub fn remove_allowed(id: Identity<'_>, parent: &Attr, victim: &Attr) -> Result<(), Denial> {
     if !permits(id, parent, WRITE | EXEC) {
         return Err(Denial::Access);
@@ -216,6 +222,7 @@ pub fn remove_allowed(id: Identity<'_>, parent: &Attr, victim: &Attr) -> Result<
 
 /// Whether the caller may put an entry in `to_parent`, over `target` when one exists there:
 /// write and search on the parent, and the sticky rule for the target it replaces.
+#[inline]
 pub fn place_allowed(
     id: Identity<'_>,
     to_parent: &Attr,
@@ -299,6 +306,7 @@ pub fn chown_result(
 }
 
 /// The mode after a successful write to a file: the set-ID bits are cleared (XSH `write()`).
+#[inline]
 pub fn mode_after_write(mode: u32) -> u32 {
     mode & !(S_ISUID | S_ISGID)
 }
