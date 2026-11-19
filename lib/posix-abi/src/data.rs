@@ -12,15 +12,27 @@
 //!   `/data/..` is `/`, a path of the RAM file service.
 //! * The session comes when it is first needed: TakeRoot asks the process service for the root of
 //!   the service, SESSION with a copy of the process's identity session gives a session that is
-//!   bound to the process. A process the process service has no root for (an image without the
-//!   service) finds `/data` in the RAM file service as before. A session that arrived in the slot
+//!   bound to the process. A path under `/data` never goes to the RAM file service: while the
+//!   process service has no root (UNREGISTERED: the service has not registered it yet at boot, or
+//!   it is marked broken) the layer asks again every millisecond for a second, then answers EIO. An
+//!   image that has no data service gets EIO after that second for a path under `/data`; its files
+//!   are never below `/data` (xtask refuses them). A session that arrived in the slot
 //!   Data (a fork, a spawn or an exec) is unbound or has lapsed: the first call that needs an
 //!   identity answers NOT_BOUND, and the layer sends BIND with a copy of the identity session and
 //!   asks once more. What a description holds is read without a binding.
 //! * A call the service answers WouldBlock (every job in use) is repeated every millisecond for a
-//!   second, then EIO. A service that went (PEER_CLOSED) drops the session: the descriptions of the
-//!   old instance answer EIO (the service says STALE to the handles of an earlier instance), and the
-//!   next path call takes a session of the new one.
+//!   second, then EIO. A service that went (PEER_CLOSED) drops the session, the description of the
+//!   current directory and the listings: the descriptions of the old instance answer EIO (the
+//!   service says STALE to the handles of an earlier instance), `close` of one succeeds with no
+//!   call, and the next path call takes a session of the new instance and opens the current
+//!   directory again from its string.
+//! * Waits. The retries sleep with a timed wait (`pause`, clock_nanosleep: a thread of any level
+//!   lets the service's worker run, and a signal ends it with EINTR). The session is taken under a
+//!   lock (`TAKE`) that blocks its waiters; the lock is held for one round trip at a time, never
+//!   across a sleep. A holder is in a critical section of the layer, so a signal handler cannot run
+//!   on its thread while it holds the lock: a handler that calls `open` finds the lock free or held
+//!   by another thread and never waits for itself. The listings have their own short lock, held
+//!   for memory work alone.
 //! * The current directory under `/data` holds a description of the directory opened for search
 //!   only, so that the service refuses to rename or remove it (EBUSY) and the string of the layer
 //!   stays true. A forked child shares it; an exec or a spawn opens it again at the first path call.
@@ -67,8 +79,6 @@ impl Vol {
 
 /// The session with the data file service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
-/// A thread is taking a session.
-static TAKING: AtomicBool = AtomicBool::new(false);
 
 /// The process's session with the data file service, which the start gives in the slot Data.
 ///
@@ -90,7 +100,6 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
-    TAKING.store(false, Ordering::Release);
     if SESSION.load(Ordering::Acquire) == 0 {
         CWD_HANDLE.store(NONE, Ordering::Release);
         CWD_CHECKED.store(false, Ordering::Release);
@@ -107,16 +116,16 @@ pub fn session() -> Option<rt::abi::Handle> {
     }
 }
 
-/// Why a session could not be had.
-enum Missing {
-    /// No service in the image: the path is the RAM file service's.
-    Absent,
-    /// The service is there and the session failed: the errno.
+/// Why a try to take the session did not end it.
+enum Attempt {
+    /// Not yet: the process service has no root (UNREGISTERED) or the service is busy.
+    Retry,
+    /// The errno of the failure.
     Failed(i32),
 }
 
 /// The root of the service from the process service (TakeRoot).
-fn take_root() -> Result<Handle<Channel>, Missing> {
+fn take_root() -> Result<Handle<Channel>, Attempt> {
     let mut request = Writer::new();
     proto_process::Method::TakeRoot
         .header()
@@ -127,16 +136,16 @@ fn take_root() -> Result<Handle<Channel>, Missing> {
             }
             .write(&mut request)
         })
-        .map_err(|_| Missing::Failed(EIO))?;
-    let mut reply = crate::process::send_again(&request).map_err(|_| Missing::Failed(EIO))?;
+        .map_err(|_| Attempt::Failed(EIO))?;
+    let mut reply = crate::process::send_again(&request).map_err(|_| Attempt::Failed(EIO))?;
     let mut buffer = [0; MESSAGE_MAX];
     match Reader::new(reply.bytes(&mut buffer)).u32() {
         Ok(0) => reply
             .handles
             .take::<Channel>(0)
-            .map_err(|_| Missing::Failed(EIO)),
-        Ok(proto_process::UNREGISTERED) => Err(Missing::Absent),
-        _ => Err(Missing::Failed(EIO)),
+            .map_err(|_| Attempt::Failed(EIO)),
+        Ok(proto_process::UNREGISTERED) => Err(Attempt::Retry),
+        _ => Err(Attempt::Failed(EIO)),
     }
 }
 
@@ -149,67 +158,80 @@ fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
 }
 
 /// A session from the root: SESSION with a copy of the identity session, which the service vouches
-/// for before it answers.
-fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Missing> {
+/// for before it answers. One try.
+fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
     let request = p::Method::Session.header().bytes();
-    let mut tries = 0;
-    loop {
-        let copy = identity_copy().map_err(Missing::Failed)?;
-        let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
-            Ok(reply) => reply,
-            Err(refused) if refused.error == Error::Interrupted => continue,
-            Err(_) => return Err(Missing::Failed(EIO)),
-        };
-        let mut buffer = [0; MESSAGE_MAX];
-        match Reader::new(reply.bytes(&mut buffer)).u32() {
-            Ok(0) => {
-                return reply
-                    .handles
-                    .take::<Channel>(0)
-                    .map_err(|_| Missing::Failed(EIO));
-            }
-            Ok(status) if status == busy_code() && tries < BUSY_TRIES => {
-                tries += 1;
-                pause();
-            }
-            Ok(status) => return Err(Missing::Failed(errno_of(status))),
-            Err(_) => return Err(Missing::Failed(EIO)),
-        }
+    let copy = identity_copy().map_err(Attempt::Failed)?;
+    let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
+        Ok(reply) => reply,
+        Err(refused) if refused.error == Error::Interrupted => return Err(Attempt::Retry),
+        Err(_) => return Err(Attempt::Failed(EIO)),
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    match Reader::new(reply.bytes(&mut buffer)).u32() {
+        Ok(0) => reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| Attempt::Failed(EIO)),
+        Ok(status) if status == busy_code() => Err(Attempt::Retry),
+        Ok(status) => Err(Attempt::Failed(errno_of(status))),
+        Err(_) => Err(Attempt::Failed(EIO)),
     }
 }
 
-/// The session of the process: the one it has, or one taken now (one thread takes it, the others
-/// wait). The raw handle stays valid while the process runs: a session that died is parked, not
-/// closed, so that a thread that read it before never sends to another channel under its number.
-fn ensure() -> Result<rt::abi::Handle, Missing> {
+/// The lock of the taking of the session: its waiters block (a futex), and its holder is in a
+/// critical section for one round trip.
+static TAKE: posix_sync::LayerLock = posix_sync::LayerLock::new();
+
+/// The session of the process: the one it has, or one taken now. The taker holds `TAKE`, so the
+/// others block until the session is there; a try that must wait (no root yet, a busy service)
+/// ends, lets the lock go and sleeps outside it, for a second at most (then EIO). The raw handle
+/// stays valid while the process runs: a session that died is parked and never closed, so that a thread
+/// that read it before never sends to another channel under its number.
+fn ensure() -> Result<rt::abi::Handle, i32> {
+    let mut tries = 0;
     loop {
         if let Some(session) = session() {
             return Ok(session);
         }
-        if TAKING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let made = take_root().and_then(|root| take_session(&root));
-            let result = match made {
+        let attempt = {
+            let _held = TAKE.lock();
+            if let Some(session) = session() {
+                return Ok(session);
+            }
+            match take_root().and_then(|root| take_session(&root)) {
                 Ok(session) => {
                     let raw = session.into_raw();
                     SESSION.store(raw.0, Ordering::Release);
-                    Ok(raw)
+                    return Ok(raw);
                 }
-                Err(missing) => Err(missing),
-            };
-            TAKING.store(false, Ordering::Release);
-            return result;
+                Err(attempt) => attempt,
+            }
+        };
+        match attempt {
+            Attempt::Retry if tries < BUSY_TRIES => {
+                tries += 1;
+                pause()?;
+            }
+            Attempt::Retry => return Err(EIO),
+            Attempt::Failed(errno) => return Err(errno),
         }
-        let _ = rt::sys::yield_now();
     }
 }
 
 /// The session died with its instance: a later call takes a session of the new one.
 fn forget(raw: rt::abi::Handle) {
     // The handle is parked, never closed (see `ensure`).
-    let _ = SESSION.compare_exchange(raw.0, 0, Ordering::AcqRel, Ordering::Acquire);
+    if SESSION
+        .compare_exchange(raw.0, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // What the old instance held is gone with it: the description of the current directory
+        // (the next path call opens it again from the string) and the listings.
+        CWD_HANDLE.store(NONE, Ordering::Release);
+        CWD_CHECKED.store(false, Ordering::Release);
+        LISTINGS.forget_all();
+    }
 }
 
 // ---------------------------------------------------------------- the calls
@@ -222,12 +244,18 @@ fn busy_code() -> u32 {
 /// The calls repeated for a busy service, a millisecond apart: one second.
 const BUSY_TRIES: u32 = 1000;
 
-/// Waits about a millisecond.
-fn pause() {
-    let until = rt::time::now().saturating_add(rt::time::ns_to_ticks(1_000_000));
-    while rt::time::now() < until {
-        let _ = rt::sys::yield_now();
-    }
+/// Waits a millisecond with a timed sleep: the thread leaves the processor whatever its level (the
+/// worker of the service runs), and a signal that is caught ends the wait with EINTR.
+fn pause() -> Result<(), i32> {
+    crate::threads::sleep::clock_nanosleep(
+        crate::clock::CLOCK_MONOTONIC,
+        0,
+        posix_types::Timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
+    )
+    .map_err(|(errno, _)| errno)
 }
 
 /// A reply: its bytes after the status (in `bytes`, `len` of them) and the handle it brought.
@@ -261,7 +289,7 @@ fn bind(session: rt::abi::Handle) -> Result<(), i32> {
             Ok(p::INVALID) => return Ok(()),
             Ok(status) if status == busy_code() && tries < BUSY_TRIES => {
                 tries += 1;
-                pause();
+                pause()?;
             }
             Ok(status) => return Err(errno_of(status)),
             Err(_) => return Err(EIO),
@@ -272,19 +300,33 @@ fn bind(session: rt::abi::Handle) -> Result<(), i32> {
 /// One request to the session, and its reply: NOT_BOUND binds and asks once more, a busy service is
 /// asked again for a second, a service that went drops the session (EIO).
 fn call(request: &[u8]) -> Result<Answer, i32> {
+    call_with(request, true)
+}
+
+/// `call`; with `take` false a process with no session fails with EIO at once and takes none (the
+/// close of a description needs none).
+fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
     let mut bound = false;
+    let mut reborn = false;
     let mut tries = 0;
     loop {
-        let session = ensure().map_err(|missing| match missing {
-            Missing::Absent => EIO,
-            Missing::Failed(errno) => errno,
-        })?;
+        let session = if take {
+            ensure()?
+        } else {
+            session().ok_or(EIO)?
+        };
         let channel = Handle::<Channel>::borrowed(session);
         let reply = match rt::sys::send(&channel, request) {
             Ok(reply) => reply,
             Err(Error::Interrupted) => continue,
             Err(Error::PeerClosed) => {
                 forget(session);
+                // A path call goes on at once with a session of the new instance; a call on a
+                // description of the old one is told STALE there (EIO).
+                if take && !reborn {
+                    reborn = true;
+                    continue;
+                }
                 return Err(EIO);
             }
             Err(_) => return Err(EIO),
@@ -308,7 +350,7 @@ fn call(request: &[u8]) -> Result<Answer, i32> {
         }
         if status == busy_code() && tries < BUSY_TRIES {
             tries += 1;
-            pause();
+            pause()?;
             continue;
         }
         return Err(errno_of(status));
@@ -320,16 +362,6 @@ fn ask(build: impl FnOnce(&mut Writer) -> Result<(), Status>) -> Result<Answer, 
     let mut w = Writer::new();
     build(&mut w).map_err(|_| EIO)?;
     call(w.as_bytes())
-}
-
-/// Whether `/data` is served: a session exists or can be had. False in an image with no data
-/// service; an error when it is there and no session could be made.
-fn served() -> Result<bool, i32> {
-    match ensure() {
-        Ok(_) => Ok(true),
-        Err(Missing::Absent) => Ok(false),
-        Err(Missing::Failed(errno)) => Err(errno),
-    }
 }
 
 // ---------------------------------------------------------------- paths
@@ -368,9 +400,6 @@ pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Vol>, i32> {
     let Some(volume) = pure::volume_path(absolute) else {
         return Ok(None);
     };
-    if !served()? {
-        return Ok(None);
-    }
     ensure_cwd()?;
     Ok(Vol::from(volume, path.last() == Some(&b'/')))
 }
@@ -503,10 +532,6 @@ pub fn sync_cwd(absolute: &[u8]) -> Result<(), i32> {
         left();
         return Ok(());
     };
-    if !served()? {
-        left();
-        return Ok(());
-    }
     let handle = open_search(volume)?;
     let old = CWD_HANDLE.swap(handle, Ordering::AcqRel);
     CWD_CHECKED.store(true, Ordering::Release);
@@ -548,8 +573,12 @@ fn ensure_cwd() -> Result<(), i32> {
     let Some(volume) = pure::volume_path(&cwd.0[..cwd.1]) else {
         return Ok(());
     };
-    if let Ok(handle) = open_search(volume) {
-        CWD_HANDLE.store(handle, Ordering::Release);
+    match open_search(volume) {
+        Ok(handle) => CWD_HANDLE.store(handle, Ordering::Release),
+        // The service could not be asked (it is gone or not back yet): the next path call tries
+        // again. Any other answer (the directory is gone) stands: relative paths fail there.
+        Err(EIO) => CWD_CHECKED.store(false, Ordering::Release),
+        Err(_) => {}
     }
     Ok(())
 }
@@ -582,7 +611,9 @@ pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
         return Err(EINVAL);
     }
     // Reading is all the volume gives in this part of the layer.
-    if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC | O_APPEND) != 0 {
+    // A write mode and a truncation need a writable volume. O_APPEND on a read-only description
+    // is legal and means nothing; O_CREAT makes a file only when there is none (below).
+    if flags & O_ACCMODE != 0 || flags & O_TRUNC != 0 {
         return Err(EROFS);
     }
     let mut asked = p::READ;
@@ -597,6 +628,8 @@ pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
             ask(|w| p::open(vol.bytes(), asked | p::DIRECTORY, 0, w))?,
             true,
         ),
+        // No file there and O_CREAT asks for one: the volume cannot be written.
+        Err(ENOENT) if flags & O_CREAT != 0 => return Err(EROFS),
         Err(errno) => return Err(errno),
     };
     let mut r = answer.reader();
@@ -606,6 +639,11 @@ pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
     if vol.trailing_slash && !directory {
         close_description(handle);
         return Err(ENOTDIR);
+    }
+    // O_CREAT with O_EXCL on a file that is there (XSH open()).
+    if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+        close_description(handle);
+        return Err(EEXIST);
     }
     let target = DataTarget { handle, directory };
     let flags_of = crate::descriptor_flags(flags);
@@ -627,7 +665,12 @@ pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
 /// a service that went has closed what the session held.
 pub fn close_description(handle: u32) {
     LISTINGS.forget(handle);
-    let _ = ask(|w| p::handle_call(p::Method::Close, handle, w));
+    // A process with no session (the old one died with its instance) holds nothing the service
+    // knows: the close succeeds with no call, and no session is taken for it.
+    let mut w = Writer::new();
+    if p::handle_call(p::Method::Close, handle, &mut w).is_ok() {
+        let _ = call_with(w.as_bytes(), false);
+    }
 }
 
 /// read of the description at its position: the bytes, 0 at the end of the file.
@@ -692,7 +735,7 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 /// The listings of the directory descriptions that have been read: one buffer for each (a batch of
 /// the service and where the next entry is), by the handle of the description.
 struct Listings {
-    lock: AtomicBool,
+    lock: posix_sync::LayerLock,
     slots: core::cell::UnsafeCell<[Option<(u32, pure::Listing)>; LISTING_SLOTS]>,
 }
 
@@ -703,26 +746,21 @@ unsafe impl Sync for Listings {}
 const LISTING_SLOTS: usize = 16;
 
 static LISTINGS: Listings = Listings {
-    lock: AtomicBool::new(false),
+    lock: posix_sync::LayerLock::raising(),
     slots: core::cell::UnsafeCell::new([const { None }; LISTING_SLOTS]),
 };
 
 impl Listings {
+    /// Runs `run` on the slots under the lock, which blocks its waiters and is held for memory work
+    /// alone (no call to the service inside), in a critical section: a signal handler never runs
+    /// on the holder's thread.
     fn with<R>(
         &self,
         run: impl FnOnce(&mut [Option<(u32, pure::Listing)>; LISTING_SLOTS]) -> R,
     ) -> R {
-        while self
-            .lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            let _ = rt::sys::yield_now();
-        }
+        let _held = self.lock.lock();
         // SAFETY: the lock is held.
-        let result = run(unsafe { &mut *self.slots.get() });
-        self.lock.store(false, Ordering::Release);
-        result
+        run(unsafe { &mut *self.slots.get() })
     }
 
     fn forget(&self, handle: u32) {
@@ -736,8 +774,6 @@ impl Listings {
     }
 
     fn forget_all(&self) {
-        // The child's own thread, before anything else runs: the lock was copied as it stood.
-        self.lock.store(false, Ordering::Release);
         self.with(|slots| slots.iter_mut().for_each(|slot| *slot = None));
     }
 }
@@ -891,7 +927,7 @@ pub fn clone_for_child(
             0 => return reply.handles.take::<Channel>(0).map(Some).map_err(|_| EIO),
             s if s == busy_code() && tries < BUSY_TRIES => {
                 tries += 1;
-                pause();
+                pause()?;
             }
             // The service has no place left for the clone (the tree's clones, descriptions or the
             // table): a limit of the moment.
