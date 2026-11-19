@@ -247,12 +247,40 @@ impl LockPage {
         self.anchor.root()
     }
 }
+/// The most lock pages that wait for the maintenance to release them: every entry is a distinct
+/// physical page, so the stack of all the pages cannot overflow and no request ever releases a
+/// page itself.
+pub const PARK_MAX: usize = PAGES;
+/// The pages the maintenance releases in one turn (`Storage::release_parked_turn`).
+pub const PARK_TURN: usize = 16;
+
+/// A parked lock page: the physical page and the index of the account that pays for it.
+#[derive(Clone, Copy)]
+struct ParkedPage {
+    physical: u16,
+    payer: u16,
+}
+impl ParkedPage {
+    const EMPTY: Self = Self {
+        physical: 0,
+        payer: 0,
+    };
+}
 #[derive(Clone, Copy)]
 struct Account {
     key: Root,
     usage: Usage,
     pending: u16,
     lock_refs: u16,
+    /// The pages of `usage.pages` that wait on the parking stack: still paid by this account,
+    /// owed to nobody's quota (`live_pages`).
+    parked: u16,
+}
+impl Account {
+    /// The pages the account's quota and reports count: the paid pages less the parked ones.
+    fn live_pages(&self) -> u16 {
+        self.usage.pages - self.parked
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,6 +515,10 @@ pub struct State {
     /// The pages of all the chains of the FIFO: free in all but the list they are on.
     retired_pages: usize,
     retired_turn: bool,
+    /// The lock pages that the table of locks emptied and the maintenance has not released yet:
+    /// each is still charged to its payer, which keeps the account alive with the page's anchor.
+    parked: [ParkedPage; PARK_MAX],
+    parked_len: usize,
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
     name_heads: [u16; BUCKETS],
@@ -533,6 +565,8 @@ impl State {
             retired_len: 0,
             retired_pages: 0,
             retired_turn: false,
+            parked: [ParkedPage::EMPTY; PARK_MAX],
+            parked_len: 0,
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
             name_heads: [NONE; BUCKETS],
@@ -567,6 +601,8 @@ impl State {
         self.retired_len = 0;
         self.retired_pages = 0;
         self.retired_turn = false;
+        self.parked.fill(ParkedPage::EMPTY);
+        self.parked_len = 0;
         self.name_heads.fill(NONE);
         self.bucket_stamps.fill(0);
         self.name_next.fill(NONE);
@@ -700,13 +736,15 @@ impl Storage<'_> {
     /// The pages a request may count on: the free list and the retired FIFO behind it (a retired
     /// page is owed by no account, so the quota of an account admits it).
     fn free_pages(&self) -> usize {
-        self.state.page_len + self.state.retired_pages
+        self.state.page_len + self.state.retired_pages + self.state.parked_len
     }
     /// Makes sure the free list holds a page when `free_pages` is not zero: with the list empty,
     /// one retired page moves to it (one step), so a request does not wait for the maintenance.
     fn ready_page(&mut self) {
         if self.state.page_len == 0 && self.state.retired_len != 0 {
             self.reclaim_retired_page();
+        } else if self.state.page_len == 0 && self.state.parked_len != 0 {
+            self.release_parked_page();
         }
     }
     fn io_take_page(&mut self, root: u16, logical: usize) -> TempPage {
@@ -770,9 +808,7 @@ impl Storage<'_> {
         } else {
             self.state.overlays[existing as usize].root as usize
         };
-        let usage = self.state.accounts[account]
-            .expect("retained account")
-            .usage;
+        let usage = self.live_usage(account);
         if existing == NONE && (self.state.inode_len == 0 || usage.inodes == INODE_SHARE) {
             return Err(NO_SPACE);
         }
@@ -956,9 +992,7 @@ impl Storage<'_> {
         if length < node.length && !length.is_multiple_of(PAGE as u64) && node.overlay != NONE {
             let logical = length as usize / PAGE;
             if self.state.overlays[node.overlay as usize].pages[logical] != NONE {
-                let usage = self.state.accounts[root as usize]
-                    .expect("retained root")
-                    .usage;
+                let usage = self.live_usage(root as usize);
                 if self.free_pages() == 0 || usage.pages == PAGE_SHARE {
                     return Err(NO_SPACE);
                 }
@@ -1393,6 +1427,7 @@ impl<'a> Storage<'a> {
             usage: Usage::EMPTY,
             pending: 0,
             lock_refs: 0,
+            parked: 0,
         });
         Ok(i)
     }
@@ -1442,7 +1477,7 @@ impl<'a> Storage<'a> {
         let anchor = self.lock_anchor(root)?;
         let index = anchor.index() as usize;
         if self.free_pages() == 0
-            || self.state.accounts[index].as_ref().unwrap().usage.pages >= PAGE_SHARE
+            || self.state.accounts[index].as_ref().unwrap().live_pages() >= PAGE_SHARE
         {
             self.release_lock_anchor(anchor)?;
             return Err(NO_SPACE);
@@ -1464,6 +1499,124 @@ impl<'a> Storage<'a> {
         self.release_lock_anchor(page.anchor)
             .expect("exact paid lock page");
     }
+    /// Parks an emptied lock page for the maintenance to release: a push and two counts, the
+    /// charge and the anchor stay where they are.
+    ///
+    /// The payer's account stays open until the turn releases the page, and the table of
+    /// accounts has `ROOTS` places: with the table full, a new root is refused (`NO_SPACE`)
+    /// until the turn that releases the last parked page of an account that holds nothing
+    /// else. The window is bounded by the turns that empty the stack (16 pages a turn, and a
+    /// turn at least every second one while locks or the audit wait).
+    pub fn park_lock_page(&mut self, page: LockPage) {
+        // The anchor goes with the entry: `release_parked_page` makes it again from the account,
+        // whose count of references the parked page keeps.
+        let LockPage { physical, anchor } = page;
+        let payer = anchor.index();
+        self.state.parked[self.state.parked_len] = ParkedPage { physical, payer };
+        self.state.parked_len += 1;
+        self.state.accounts[payer as usize]
+            .as_mut()
+            .expect("parked page keeps its account")
+            .parked += 1;
+    }
+    /// One turn of the maintenance for the parked lock pages: releases up to `PARK_TURN` of
+    /// them. The only caller is the turn of the service that is set aside for them, so that no
+    /// step of a client pays for a page of another and `reclaim_step` keeps its pace for the
+    /// queues of nodes. Tells whether it released a page.
+    pub fn release_parked_turn(&mut self) -> bool {
+        let count = PARK_TURN.min(self.state.parked_len);
+        for _ in 0..count {
+            self.release_parked_page();
+        }
+        count != 0
+    }
+    /// Test check of the page books: every physical page is in exactly one place (the free list,
+    /// the retired FIFO, the parking stack, a file, or the lock page `live_locks` names), and
+    /// every account is charged for exactly the pages it holds: its file pages, its live lock
+    /// pages (`(physical, payer)` in `live_locks`) and its parked pages. Returns the charge in
+    /// all the accounts.
+    #[cfg(test)]
+    pub(crate) fn assert_pages_exact(&self, live_locks: &[(u16, u16)]) -> usize {
+        extern crate std;
+        let mut place = std::vec![""; PAGES];
+        let mut put = |page: u16, name: &'static str| {
+            let slot = &mut place[page as usize];
+            assert!(slot.is_empty(), "page {page} is in {slot} and in {name}");
+            *slot = name;
+        };
+        for &page in &self.state.page_free[..self.state.page_len] {
+            put(page, "the free list");
+        }
+        let mut retired = 0;
+        for i in 0..self.state.retired_len {
+            let entry = self.state.retired[(self.state.retired_head + i) % PAGES];
+            let mut page = entry.head;
+            for _ in 0..entry.count {
+                put(page, "the retired FIFO");
+                page = self.state.page_next[page as usize];
+                retired += 1;
+            }
+        }
+        assert_eq!(retired, self.state.retired_pages);
+        let mut held = std::vec![0usize; ROOTS];
+        let mut parked = std::vec![0usize; ROOTS];
+        for entry in &self.state.parked[..self.state.parked_len] {
+            put(entry.physical, "the parking stack");
+            parked[entry.payer as usize] += 1;
+            held[entry.payer as usize] += 1;
+        }
+        for overlay in self.state.overlays.iter().filter(|o| o.root != NONE) {
+            for &page in overlay.pages.iter().filter(|&&p| p != NONE) {
+                put(page, "a file");
+                held[overlay.root as usize] += 1;
+            }
+        }
+        for &(page, payer) in live_locks {
+            put(page, "a live lock page");
+            held[payer as usize] += 1;
+        }
+        let mut charged = 0;
+        for (i, account) in self.state.accounts.iter().enumerate() {
+            let usage_pages = account.map_or(0, |a| usize::from(a.usage.pages));
+            assert_eq!(usage_pages, held[i], "the charge of account {i}");
+            assert_eq!(
+                account.map_or(0, |a| usize::from(a.parked)),
+                parked[i],
+                "the parked pages of account {i}"
+            );
+            charged += usage_pages;
+        }
+        // A page that is in no place has leaked.
+        assert!(
+            place.iter().all(|name| !name.is_empty()),
+            "a page is in no place"
+        );
+        charged
+    }
+    /// Test view: the accounts that are open.
+    #[cfg(test)]
+    pub(crate) fn open_accounts(&self) -> usize {
+        self.state.accounts.iter().flatten().count()
+    }
+    /// The lock pages that wait for the maintenance.
+    pub fn parked_backlog(&self) -> usize {
+        self.state.parked_len
+    }
+    /// Releases the page on top of the stack through the path of `release_lock_page`: the
+    /// charge goes, the anchor goes, the page joins the free list. Once for each parked page.
+    fn release_parked_page(&mut self) {
+        self.state.parked_len -= 1;
+        let ParkedPage { physical, payer } = self.state.parked[self.state.parked_len];
+        let account = self.state.accounts[payer as usize]
+            .as_mut()
+            .expect("parked page keeps its account");
+        account.parked -= 1;
+        let anchor = LockAnchor {
+            index: payer,
+            key: account.key,
+        };
+        self.release_lock_page(LockPage { physical, anchor });
+    }
     #[inline(always)]
     pub(crate) fn lock_page_words(&self, page: &LockPage, offset: usize) -> [u64; 5] {
         assert!(offset <= PAGE - 40);
@@ -1481,13 +1634,26 @@ impl<'a> Storage<'a> {
             .iter()
             .flatten()
             .find(|a| a.key == root)
-            .map_or(Usage::EMPTY, |a| a.usage)
+            .map_or(Usage::EMPTY, |a| Usage {
+                pages: a.live_pages(),
+                ..a.usage
+            })
+    }
+    /// The usage of the account `index` as its quota counts it (parked pages left out).
+    fn live_usage(&self, index: usize) -> Usage {
+        let a = self.state.accounts[index]
+            .as_ref()
+            .expect("retained account");
+        Usage {
+            pages: a.live_pages(),
+            ..a.usage
+        }
     }
     pub fn available(&self) -> Usage {
         Usage {
             inodes: self.state.inode_len as u16,
             dentries: self.state.dentry_len as u16,
-            pages: self.state.page_len as u16,
+            pages: (self.state.page_len + self.state.parked_len) as u16,
             descriptions: 0,
         }
     }
@@ -2325,7 +2491,7 @@ impl<'a> Storage<'a> {
             )
         };
         if need > self.free_pages()
-            || self.state.accounts[a].unwrap().usage.pages as usize + need > PAGE_SHARE as usize
+            || self.state.accounts[a].unwrap().live_pages() as usize + need > PAGE_SHARE as usize
         {
             return Err(NO_SPACE);
         }
@@ -2512,7 +2678,7 @@ impl<'a> Storage<'a> {
     /// Read-only capacity observation never allocates an expenditure account.
     pub fn filesystem_information(&self, root: Root) -> FileSystemInfo {
         let usage = self.usage(root);
-        let free_blocks = self.state.page_len as u64;
+        let free_blocks = (self.state.page_len + self.state.parked_len) as u64;
         let free_files = self.state.inode_len as u64;
         FileSystemInfo {
             block_size: PAGE as u64,
@@ -2566,7 +2732,7 @@ impl Storage<'_> {
             .expect("paid result root");
         if count > crate::cwd::getcwd::MAX_PAGES
             || count > self.free_pages()
-            || count > usize::from(PAGE_SHARE - a.usage.pages)
+            || count > usize::from(PAGE_SHARE - a.live_pages())
         {
             return Err(crate::cwd::getcwd::NO_MEMORY);
         }
