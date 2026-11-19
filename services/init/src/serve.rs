@@ -51,6 +51,7 @@ use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::shutdown::{self, Decision, Expiry, Mask, Stop};
+use init::silent::{BudgetLook, Look, Moment, ThreadLook};
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
@@ -1398,7 +1399,8 @@ impl Init {
     /// a failure (`failed`) whose line names the level the worker kills its
     /// instance from, above its ceiling and below its clients (init::work).
     /// Its later exit notification is skipped (`ended`).
-    fn silent(&mut self, place: usize) {
+    fn silent(&mut self, place: usize, at: u64) {
+        self.describe_silence(place, at);
         let job = Job::new(Work::Kill, place, &table::table()[place]);
         let level = worker_level(Some(job), self.jobs.queue());
         let Some(instance) = self.entries[place].held.take_running() else {
@@ -1407,6 +1409,79 @@ impl Init {
         let lived = now().saturating_sub(instance.started);
         let what = format_args!("went silent, killed from level {level}");
         self.failed(place, Some(instance), lived, what, Work::Kill);
+    }
+
+    /// Before the kill of a silent service: a line of init's clock, the late expiry and what the
+    /// kernel says of the service's thread and its budgets, and one of the console driver's
+    /// (init::silent). They print only here.
+    fn describe_silence(&self, place: usize, at: u64) {
+        let late = self.entries[place]
+            .watch
+            .as_ref()
+            .map_or((0, 0), |w| (at.saturating_sub(w.deadline()), w.late()));
+        let moment = Moment {
+            now_us: at / 1000,
+            late_us: late.0 / 1000,
+            late_count: late.1,
+        };
+        self.print_look(place, "silent service", Some(moment));
+        let driver = table::table().iter().position(|r| r.log);
+        if let Some(driver) = driver.filter(|&d| d != place) {
+            self.print_look(driver, "console driver", None);
+        }
+    }
+
+    /// The line of what the kernel says of the thread of the instance of `place` that runs, and of
+    /// the record's budgets.
+    fn print_look(&self, place: usize, role: &str, moment: Option<Moment>) {
+        let record = &table::table()[place];
+        let thread = self.entries[place]
+            .held
+            .running()
+            .and_then(|instance| instance.thread.as_ref())
+            .and_then(|thread| {
+                let info = sys::thread_info(thread).ok()?;
+                let (ran, preempts) = sys::thread_ran_preempts(thread).ok()?;
+                Some(ThreadLook {
+                    state: info.state,
+                    base: info.base,
+                    level: info.priority,
+                    ran_us: time::ticks_to_ns(ran) / 1000,
+                    preempts,
+                })
+            });
+        let mut looks = [BudgetLook::EMPTY; table::START_DATA_MAX];
+        let mut count = 0;
+        for (index, b) in record
+            .budgets
+            .iter()
+            .take(table::START_DATA_MAX)
+            .enumerate()
+        {
+            if let Some(info) = crate::worker::kernel_budget(place, index) {
+                let us = |ticks| time::ticks_to_ns(ticks) / 1000;
+                looks[count] = BudgetLook {
+                    name: b.name,
+                    budget_us: us(info.budget),
+                    period_us: us(info.period),
+                    left_us: us(info.left),
+                    low: info.low,
+                    state: info.state,
+                    overruns: info.overruns,
+                    pending: info.pending,
+                };
+                count += 1;
+            }
+        }
+        let look = Look {
+            name: record.name,
+            role,
+            cpus: record.cpus,
+            moment,
+            thread,
+            budgets: &looks[..count],
+        };
+        println!("{look}");
     }
 
     /// A failure of the record at `place` (spec 13.4, 16.2): `gone`, what
@@ -1641,7 +1716,7 @@ impl Init {
             State::Starting | State::Running => {
                 match entry.watch.as_mut().map(|w| w.expired(now)) {
                     Some(Action::Suspect { deadline }) => self.set_deadline(place, deadline),
-                    Some(Action::Silent) => self.silent(place),
+                    Some(Action::Silent) => self.silent(place, now),
                     _ => {}
                 }
             }
