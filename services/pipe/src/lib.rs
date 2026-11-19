@@ -1401,7 +1401,7 @@ mod tests {
         let mut r = rig();
         let queues = all_queues(&r);
         let (set, q) = watch_of(&queues);
-        r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
         assert_eq!(r.pool.pending(), Some((LABEL, KEY, r.at)));
         let first = portion(&mut r);
         assert_eq!(
@@ -1437,7 +1437,7 @@ mod tests {
         elements.extend([q[watches::WATCH_STEP_QUEUES - 1], q[0]]);
         elements.extend(&q[watches::WATCH_STEP_QUEUES..watches::WATCH_STEP_QUEUES + 14]);
         let (set, queues) = watch_of(&elements);
-        r.at = r.pool.insert(LABEL, KEY, set, queues).unwrap();
+        r.at = r.pool.insert(LABEL, KEY, &set, &queues).unwrap();
         assert_eq!(portion(&mut r).subscribed, watches::WATCH_STEP_QUEUES);
         let rest: usize = portions(&mut r).iter().map(|p| p.subscribed).sum();
         assert_eq!(rest, 14);
@@ -1454,7 +1454,7 @@ mod tests {
             let mut r = rig();
             let queues = all_queues(&r);
             let (set, q) = watch_of(&queues);
-            r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
+            r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
             portion(&mut r);
             if retire {
                 r.pool.retire(LABEL);
@@ -1481,7 +1481,7 @@ mod tests {
         let mut r = rig();
         let queues = all_queues(&r);
         let (set, q) = watch_of(&queues);
-        r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
         portion(&mut r);
         // The read ends are in the later portions: nobody is subscribed.
         let mut wakes = Wakes::default();
@@ -1499,7 +1499,7 @@ mod tests {
         let mut r = rig();
         let queues = all_queues(&r);
         let (set, q) = watch_of(&queues);
-        r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
         // Fill a read end, which a later portion subscribes to.
         assert!(queues.iter().position(|&q| q == r.rd[5]).unwrap() >= watches::WATCH_STEP_QUEUES);
         for i in 0..WAITERS as u64 {
@@ -1536,7 +1536,7 @@ mod tests {
             let mut r = rig();
             let elements: Vec<u32> = all_queues(&r)[..n].to_vec();
             let (set, q) = watch_of(&elements);
-            r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
+            r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
             let only = portion(&mut r);
             assert_eq!((only.subscribed, only.last), (n, true));
             assert_eq!(r.pool.pending(), None);

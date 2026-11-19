@@ -111,8 +111,8 @@ impl<const N: usize> Pool<N> {
         &mut self,
         label: u64,
         key: u64,
-        set: WatchSet,
-        queues: [u8; MAX],
+        set: &WatchSet,
+        queues: &[u8; MAX],
     ) -> Option<usize> {
         let (at, free) = self
             .list
@@ -122,8 +122,8 @@ impl<const N: usize> Pool<N> {
         *free = Some(Registration {
             label,
             key,
-            set,
-            queues,
+            set: *set,
+            queues: *queues,
             retired: false,
             cleaned: 0,
             registered: 0,
@@ -304,10 +304,10 @@ mod tests {
         let mut queues = [0; MAX];
         queues[1] = 1;
         assert_eq!(pool.pending(), None);
-        let a = pool.insert(1, 1, set, queues).unwrap();
-        let b = pool.insert(1, 2, set, queues).unwrap();
-        let c = pool.insert(2, 3, set, queues).unwrap();
-        let d = pool.insert(3, 4, set, queues).unwrap();
+        let a = pool.insert(1, 1, &set, &queues).unwrap();
+        let b = pool.insert(1, 2, &set, &queues).unwrap();
+        let c = pool.insert(2, 3, &set, &queues).unwrap();
+        let d = pool.insert(3, 4, &set, &queues).unwrap();
         assert_eq!(pool.pending(), Some((1, 1, a)));
         pool.complete(a);
         assert_eq!(pool.pending(), Some((1, 2, b)));
@@ -344,7 +344,7 @@ mod tests {
         let mut queues = [0; MAX];
         queues[0] = 14;
         queues[1] = 27;
-        assert!(pool.insert(1, 7, set, queues).is_some());
+        assert!(pool.insert(1, 7, &set, &queues).is_some());
         assert_eq!(
             pool.get(1, 7).unwrap().endpoint(1).generation,
             0x2_0000_0001

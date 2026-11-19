@@ -943,7 +943,7 @@ impl PipeService {
         s.data.waiting += 1;
         #[cfg(feature = "steps")]
         let t_ready = rt::time::now();
-        let placed = self.watches.insert(label, key, set, queues);
+        let placed = self.watches.insert(label, key, &set, &queues);
         #[cfg(feature = "steps")]
         let t_insert = rt::time::now();
         let mut refusal = if placed.is_some() {
