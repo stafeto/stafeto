@@ -86,23 +86,17 @@ pub const BAND_TICKS: u32 = 15_000;
 /// `the_constants_cover_the_measures_with_the_margin` holds every constant to
 /// its measure.
 ///
-/// What the runs of `comp-probe` and `focus-probe` showed. Before the table of
-/// the bands changed: the call of the black is 212, of a copy 765 to 851, of a
-/// layer laid over others 765 to 1 303. After it the bands are wide, no
-/// operation of 8 points or fewer, and none that is narrow and tall, comes out
-/// of the scenes (so the classes of the call and the row were empty), and the
-/// large operations tell: black least 0.44 to 0.46 a point, copy least 1.56 to
-/// 1.62 (the call in it, 0.15), layer laid over others least 5.78 at 480 points
-/// (its call in it, about 2.7). The greatest of each (black 0.48 to 0.99, copy
-/// 2.06 to 4.69, over 8 to 25) is wall time of the service's step and can hold a
-/// higher level that ran in the middle; `px::calibration` measures each class on
-/// shapes of its own, leaves out the operations a preemption landed in, and
-/// tells the spread, and the table takes its greatest. Until then the price
-/// of a point of a copy and of a layer laid over others, and the price of a
-/// row, stay estimates. At a price of a point of a copy of 1.62 the frame of
-/// the whole screen is 37 bands, at 2.06 it is 45 and at 2.42 it is 58 (more
-/// than the period of 60 Hz holds under -icount: the full phase of the frame
-/// probe is then no promise).
+/// What the fit showed (the same in both probes). The cost of a row at a width
+/// is the price of a row plus the width's points where the width is 64 points or
+/// more (copy: 144 ticks at 64 wide, 265 at 152, a slope of 1.37 a point and a
+/// row of 56), and cheaper at the narrow widths (4 to 12 wide: 16 to 30 ticks
+/// for a copy): the narrow rows do not cost more a point than the model says,
+/// so three terms suffice, and the model overstates a narrow tall shape (4 by
+/// 32: by 273 ticks for the black, 1 104 for a copy, 3 203 for a layer laid over
+/// others), which only makes a band of a narrow damage smaller than it could be.
+/// The alignment of the target and of the source changes an operation by up to
+/// half (a layer laid over others 64 by 32: 9 932 to 15 532 ticks), and the
+/// greatest is what the fit takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Price {
     pub kind: &'static str,
@@ -147,12 +141,14 @@ const fn price(
     }
 }
 
-/// The prices: black, copy, over. The row is a guess of 20 ticks until the
-/// class of narrow tall operations is measured.
+/// The prices: black, copy, over, each the upper fit of the model over the
+/// greatest ticks of 23 shapes of operations (`compositor::fit`, `px::calibration`),
+/// measured under -icount, the same in `comp-probe` and in `focus-probe`
+/// (the run is deterministic). Every entry is a measure.
 pub const PRICES: [Price; 3] = [
-    price("black", 212, 2_000, true, 53, false),
-    price("copy", 851, 2_000, true, 190, true),
-    price("over", 1_303, 2_000, true, 1_750, true),
+    price("black", 209, 2_400, false, 38, false),
+    price("copy", 759, 5_604, false, 137, false),
+    price("over", 754, 19_075, false, 427, false),
 ];
 pub const FILL: Price = PRICES[0];
 pub const OPAQUE: Price = PRICES[1];
@@ -2005,11 +2001,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + 9).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 13).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(9));
+        assert_eq!(bands, HEIGHT.div_ceil(13));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -2685,17 +2681,15 @@ mod tests {
         let d = s.begin().unwrap();
         s.end(true);
         // One window that covers the damage: lines of the width.
-        // (the copy of a point is 2.19 in the model, its call 979: 10 lines of 640).
-        assert_eq!(s.tile(d), (640, 9));
-        // The pointer over it: a layer laid over others costs 25 a point.
+        // (a copy of a point is 1.58 in the model, with a call of 873 and a row of
+        // 64: 13 lines of 640).
+        assert_eq!(s.tile(d), (640, 13));
+        // The pointer over it: a layer laid over others costs more a point and
+        // a line, so the band holds fewer lines of the width.
         s.pointer_to(5, 5);
         let (w, rows) = s.tile(d);
-        assert_eq!(rows, 1);
-        assert!(
-            w < 640
-                && (w * OVER.point + OVER.row + OPAQUE.row).div_ceil(100) + OPAQUE.call + OVER.call
-                    <= BAND_TICKS + 3 * w
-        );
+        assert_eq!(w, 640);
+        assert!((1..13).contains(&rows), "{rows}");
         // A damage nothing covers starts black: fewer lines.
         let mut t = Scene::new();
         let b = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
@@ -2721,17 +2715,35 @@ mod tests {
             assert_eq!(p.row, with_margin(p.row_measured), "{}", p.kind);
             assert_eq!(p.point, with_margin(p.point_measured), "{}", p.kind);
         }
-        // What the runs proved: the calls and the price of a point of the
-        // black are measures; the rows, and the points of a copy and of a layer
-        // laid over others, are estimates no run has under-run (a copy on large
-        // operations: mean 1.77; a layer laid over others: the least 7.02 with
-        // its call in it).
-        assert!(!PRICES[0].point_estimate);
-        assert!(PRICES[1].point_estimate && PRICES[2].point_estimate);
-        assert!(PRICES.iter().all(|p| p.row_estimate));
-        assert!(PRICES[0].point_measured >= 53 && PRICES[0].call_measured >= 212);
-        assert!(PRICES[1].point_measured >= 177 && PRICES[2].point_measured >= 702);
-        assert!(PRICES[1].call_measured >= 851 && PRICES[2].call_measured >= 1_303);
+        // Every entry is a measure of the fit, the same in both probes, and the
+        // costs of the large operations of the probes' scenes (the least all-in
+        // figures: a copy 1.56 to 1.62 a point at 3 840 to 5 120 points, a layer
+        // laid over others 5.78 at 480 points, the black 0.44 to 0.46) are under
+        // the model with the constants: the model errs only high.
+        assert!(PRICES.iter().all(|p| !p.row_estimate && !p.point_estimate));
+        let model = |p: Price, w: u32, h: u32| -> u64 {
+            u64::from(p.call)
+                + (u64::from(p.row) * u64::from(h)
+                    + u64::from(p.point) * u64::from(w) * u64::from(h))
+                .div_ceil(100)
+        };
+        // (kind, width, height, ticks a hundred points of the live least).
+        for (p, w, h, per_hundred) in [
+            (OPAQUE, 640u32, 8u32, 156u32),
+            (OPAQUE, 640, 6, 162),
+            (OVER, 480, 1, 578),
+            (OVER, 160, 3, 578),
+            (FILL, 640, 8, 46),
+            (FILL, 640, 8, 44),
+        ] {
+            let live = u64::from(per_hundred) * u64::from(w) * u64::from(h) / 100;
+            assert!(
+                model(p, w, h) >= live,
+                "{} {w}x{h}: {} < {live}",
+                p.kind,
+                model(p, w, h)
+            );
+        }
         // The margin of nothing would leave a measure above the constant.
         assert!(with_margin(190) > 190);
     }
@@ -2818,7 +2830,7 @@ mod tests {
         let mut s = settled(true);
         s.pointer_to(5, 5);
         // The tile of a frame over the pointer is that of a copy alone.
-        assert_eq!(s.tile(SCREEN), (640, 9));
+        assert_eq!(s.tile(SCREEN), (640, 13));
         s.add_damage(SCREEN);
         let d = s.begin().unwrap();
         let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);
@@ -3344,14 +3356,15 @@ mod tests {
         s.end(true);
         let damage = rect(0, 0, 600, 100);
         let (w, rows) = s.tile(damage);
-        assert!(w < 600 && rows == 1, "{w} x {rows}");
+        assert!(w <= 600 && (1..100).contains(&rows), "{w} x {rows}");
         let src = flat(&[
             (a, 0, 7, (STRIDE * HEIGHT) as usize),
             (b, 0, 0x10, 2400 * 100),
         ]);
         let mut fb = screen();
         let first = compose(&s, damage, Band::default(), &mut fb, &src, &mut Plain);
-        assert_eq!(first, Band { row: 0, col: w });
+        // The band is the whole width and a few lines.
+        assert_eq!((w, first), (600, Band { row: rows, col: 0 }));
         let (worst, _) = worst_band(&s, damage, &src);
         assert!(worst <= 16_500);
     }

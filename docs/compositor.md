@@ -291,17 +291,17 @@ megabyte at most.
 
 A frame takes the posted buffer of every window at its start, is made in
 bands, a step each (the compositor's own bit starts the next band, so requests
-of clients pass between bands). A band that only copies is nine lines of the
+of clients pass between bands). A band that only copies is thirteen lines of the
 damage's width under a window that covers the damage (at most 16 lines), and
 fewer where it starts black. A band that lays something
 over others (a window with an alpha, the pointer's picture) holds fewer points:
 each shown window that touches the damage is a call of pixman, a price for each
 of its lines and a price for each of its points (`compositor::PRICES`: the call
 in ticks, the line and the point in hundredths of a tick, for a copy, a layer
-laid over others and the black; each is the greatest of its class of operations
-measured under -icount with a margin of 15 %, or an estimate kept high until a
-probe measures it, and the table says which), and a band holds the lines of the
-damage's width that 15 000 ticks leave after its
+laid over others and the black; the upper fit of the model over the greatest
+ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
+the model errs only high), and a band holds the lines of the damage's width that
+15 000 ticks leave after its
 calls, down the damage and across it, so that eight windows in one band stay
 under the bound, and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
