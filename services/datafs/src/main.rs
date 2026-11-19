@@ -48,6 +48,7 @@ fn main(_: u64) -> u64 {
         rt::console::set(console);
     }
     let serve = rt::budget::take(&mut s, rt::budget::SERVE);
+    let work = rt::budget::take(&mut s, worker::WORK);
     let args = ServiceArgs::read(s.args()).ok();
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     // The record `datadisk` is optional: a machine without a data volume has none, and the service
@@ -105,7 +106,7 @@ fn main(_: u64) -> u64 {
         STORAGE.get().cast::<u8>(),
         core::mem::size_of::<datafs::Storage>(),
     );
-    let Ok(_thread) = worker::start(&s.process) else {
+    let Ok(_thread) = worker::start(&s.process, work) else {
         return NOT_REGISTERED;
     };
     #[cfg(feature = "steps")]

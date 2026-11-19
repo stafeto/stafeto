@@ -34,6 +34,18 @@ pub const fn may_yield(tries: u32) -> bool {
     tries < MAX_YIELDS
 }
 
+/// Whether a walk in the idle would help (the refresh): the blocks that removals, truncations and
+/// replacing renames gave back since the last walk (`freed`) are over a sixteenth of the volume
+/// (`blocks`) and the window's free bits (`window_free`) are under a sixteenth too (a walk inside a
+/// request is then about to happen, and the free count of STATFS is low by what was given back); or
+/// the window holds less than the volume (`window_short`: the allocator wrapped in the middle of a
+/// request) and the free count is low. A volume with a sixteenth or less given back has no refresh:
+/// the free count is low by that much at most.
+pub const fn refresh_wanted(blocks: u64, freed: u64, window_free: u64, window_short: bool) -> bool {
+    let sixteenth = blocks / 16;
+    window_short || (freed > sixteenth && window_free < sixteenth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +124,47 @@ mod tests {
     fn the_fourth_try_runs_to_its_end() {
         assert!([0, 1, 2].iter().all(|&t| may_yield(t)));
         assert!(!may_yield(3) && !may_yield(u32::MAX));
+    }
+
+    const BLOCKS: u64 = 262_144;
+
+    #[test]
+    fn the_refresh_starts_above_a_sixteenth_given_back_and_not_at_a_thirty_second() {
+        let low = BLOCKS / 32;
+        assert!(refresh_wanted(BLOCKS, BLOCKS / 16 + 1, low, false));
+        assert!(
+            !refresh_wanted(BLOCKS, BLOCKS / 16, low, false),
+            "exactly a sixteenth"
+        );
+        assert!(!refresh_wanted(BLOCKS, BLOCKS / 32, low, false));
+        // Plenty of free bits in the window: the free count is not low, no walk helps.
+        assert!(!refresh_wanted(BLOCKS, BLOCKS / 8, BLOCKS / 2, false));
+        // A window cut short is walked again whatever was given back.
+        assert!(refresh_wanted(BLOCKS, 0, BLOCKS / 2, true));
+    }
+
+    /// Removals of `each` blocks one after another with a quiet time after each: the walks the rule
+    /// asks for (a walk ends with the estimate at 0 and the window full of what was free).
+    fn walks_for(removals: u64, each: u64) -> u64 {
+        let (mut freed, mut walks) = (0, 0);
+        for _ in 0..removals {
+            freed += each;
+            if refresh_wanted(BLOCKS, freed, BLOCKS / 32, false) {
+                walks += 1;
+                freed = 0;
+            }
+        }
+        walks
+    }
+
+    #[test]
+    fn many_small_removals_make_few_walks() {
+        // Each removal gives back a sixty-fourth of the volume: a walk after the fifth (5/64 is over
+        // 4/64), so twenty removals make four walks and never one for each removal.
+        assert_eq!(walks_for(20, BLOCKS / 64), 4);
+        // Removals of a thirty-second each stay under a sixteenth for two of every three.
+        assert_eq!(walks_for(30, BLOCKS / 32), 10);
+        // Tiny removals never reach the sixteenth in a hundred.
+        assert_eq!(walks_for(100, 16), 0);
     }
 }

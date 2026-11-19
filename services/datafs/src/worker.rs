@@ -12,6 +12,8 @@ use crate::identity::{Identities, Notary};
 use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
+#[cfg(feature = "steps")]
+use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use datafs::gpt::Found;
 use datafs::server::Server;
@@ -54,7 +56,28 @@ pub fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
 /// The level of the thread: below the disk service (39) it calls, below the clients' ceiling.
 pub const LEVEL: u8 = 30;
 
-pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, abi::Error> {
+/// The handle of the worker's budget, 0 when it has none.
+static WORK_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The ticks the worker's budget has charged so far (the steps build, for the line of a walk).
+#[cfg(feature = "steps")]
+fn work_ran() -> u64 {
+    match WORK_BUDGET.load(Acquire) {
+        0 => 0,
+        raw => {
+            let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
+            sys::budget_info(&budget).map_or(0, |info| info.ran)
+        }
+    }
+}
+
+/// The name of the worker's budget in the start data (init's table, `DATAFS_BUDGETS`).
+pub const WORK: &str = "work";
+
+pub fn start(
+    process: &Handle<Process>,
+    budget: Option<Handle<rt::handle::Budget>>,
+) -> Result<Handle<rt::handle::Thread>, abi::Error> {
     let stack = sys::mem_create(STACK_SIZE as u64)?;
     sys::mem_map(
         process,
@@ -64,9 +87,12 @@ pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, ab
         STACK_AT,
         Access::ReadWrite,
     )?;
+    // The thread that has the budget stands on CPU 1 (the budget's CPU, which init gives only to an
+    // instance that may use it); a thread with none stands on the CPU of the loop.
+    let on = if budget.is_some() { 2 } else { 0 };
     // SAFETY: the stack is the thread's alone; the page below `STACK_AT` is never mapped.
-    let thread = unsafe {
-        sys::thread_create(
+    let create = |cpu: u8| unsafe {
+        sys::thread_create_on(
             process,
             work,
             STACK_AT + STACK_SIZE,
@@ -74,8 +100,26 @@ pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, ab
             LEVEL,
             abi::Policy::RoundRobin,
             MSGBUF,
+            None,
+            cpu,
         )
-    }?;
+    };
+    let (thread, budget) = match create(on) {
+        Ok(thread) => (thread, budget),
+        // CPU 1 is not up for this process: the thread stands on the loop's CPU and the budget,
+        // which is for CPU 1, goes unused.
+        Err(_) if on != 0 => (create(0)?, None),
+        Err(e) => return Err(e),
+    };
+    // The budget is bound before the thread begins. A kernel that refuses it leaves the worker at 30
+    // with no limit, as it ran before the budget: the line says so, and the service goes on (the
+    // request thread's budget, which the service does not start without, holds its own 1 %).
+    if let Ok(Some(kept)) = rt::budget::bind("datafs", "the worker", budget, &thread) {
+        // The handle stays for the life of the service: the steps build reads the ticks the budget
+        // has charged around a walk (`walk`).
+        WORK_BUDGET.store(kept.raw().0, Release);
+        core::mem::forget(kept);
+    }
     sys::thread_start(&thread)?;
     Ok(thread)
 }
@@ -547,6 +591,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     );
                 }
             }
+            #[cfg(feature = "steps")]
+            let began = rt::time::now();
             match (&mut volume, job.kind) {
                 // At the stop a job that would take blocks from an empty window would walk the
                 // whole volume inside the 3 s of the stop (an aborted walk empties the window):
@@ -595,6 +641,10 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     job.reply_len = bytes.len();
                 }
             }
+            #[cfg(feature = "steps")]
+            if job.kind == REQUEST {
+                longest_job(request, began);
+            }
             state(i).store(DONE, Release);
             idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
@@ -642,6 +692,28 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
     }
 }
 
+/// The longest job of each method so far, in microseconds, under the feature `steps` (the probe of
+/// the steps of the loop reads the lines): a job that takes longer than the last of its method says
+/// so, `datafs: job <method> longest <us> us`. The time is the worker's whole job, disk waits
+/// included, from the pick-up to the reply.
+#[cfg(feature = "steps")]
+fn longest_job(request: &[u8], began: u64) {
+    static LONGEST: [core::sync::atomic::AtomicU64; 64] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; 64];
+    let Some(number) = request.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let Some(method) = proto_data::Method::from_number(number) else {
+        return;
+    };
+    let us = rt::time::ticks_to_ns(rt::time::now().saturating_sub(began)) / 1000;
+    let slot = &LONGEST[usize::from(number) % LONGEST.len()];
+    if us > slot.load(Relaxed) {
+        slot.store(us, Relaxed);
+        rt::println!("datafs: job {method:?} longest {us} us");
+    }
+}
+
 /// What the worker keeps for its idle walks.
 struct Idle {
     /// The first walk after the mount has not been made yet.
@@ -665,8 +737,12 @@ fn refresh_wanted(fs: &Volume, idle: &Idle) -> bool {
     if idle.refresh_failed || STOPPING.load(Acquire) {
         return false;
     }
-    let sixteenth = fs.blocks() / 16;
-    fs.window_short() || (fs.freed_estimate() > sixteenth && fs.window_free() < sixteenth)
+    datafs::idle::refresh_wanted(
+        fs.blocks(),
+        fs.freed_estimate(),
+        fs.window_free(),
+        fs.window_short(),
+    )
 }
 
 /// How a walk ended.
@@ -696,7 +772,17 @@ fn walk(fs: &mut Volume, may_yield: bool) -> Walked {
     YIELDED.store(false, Release);
     YIELD_OK.store(may_yield, Release);
     WALKING.store(true, Release);
+    #[cfg(feature = "steps")]
+    let ran = work_ran();
     let ok = fs.walk().is_ok();
+    #[cfg(feature = "steps")]
+    if WORK_BUDGET.load(Acquire) != 0 {
+        // The CPU the worker took in the walk against the time it lasted: the share a walk takes
+        // from the programs below 30 under the budget (at most 30 % at level 30).
+        let cpu = rt::time::ticks_to_ns(work_ran().saturating_sub(ran)) / 1000;
+        let wall = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1000;
+        rt::println!("datafs: walk cpu {cpu} us of {wall} us");
+    }
     WALKING.store(false, Release);
     YIELD_OK.store(false, Release);
     let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1_000_000;
