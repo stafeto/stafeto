@@ -741,6 +741,14 @@ pub fn probe(args: &[String]) -> Result<(), String> {
         _ => return Err("frame-probe [counters]".to_owned()),
     };
     let lines = frame_image::run(timed)?;
+    // Told before the verdicts, so that a probe that fails still tells what the bands
+    // of the overload (the only bands of eight layers of this run) cost.
+    if timed {
+        println!(
+            "frame-probe: {}",
+            crate::comp_probe::band_report(&lines, crate::comp_probe::COMP_TAG)
+        );
+    }
     let said = verdict(&lines, timed).map_err(|e| format!("frame-probe: {e}"))?;
     for line in &said {
         println!("{line}");
