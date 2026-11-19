@@ -174,53 +174,52 @@ impl MetadataJournal {
             self.outcome = Some(outcome);
             return Ok(outcome);
         }
-        let owner = identity.uid == 0 || identity.uid == node.uid;
         let mut mode = node.mode;
         let mut uid = node.uid;
         let mut gid = node.gid;
         let mut times = node.times;
         let allowed = match self.intent {
-            MetadataIntent::Chmod(requested) => {
-                mode = requested & 0o7777;
-                if identity.uid != 0 && identity.gid != gid && !identity.groups.contains(gid) {
-                    mode &= !0o2000;
+            MetadataIntent::Chmod(requested) => match identity.chmod(&node, requested) {
+                Ok(result) => {
+                    mode = result;
+                    Ok(())
                 }
-                owner
-            }
+                Err(denial) => Err(denial),
+            },
             MetadataIntent::Chown {
                 uid: requested_uid,
                 gid: requested_gid,
-            } => {
-                uid = requested_uid.unwrap_or(uid);
-                gid = requested_gid.unwrap_or(gid);
-                // Directory set-ID bits retain group inheritance, including
-                // privileged changes and requests retaining both IDs.
-                if node.kind != crate::DIR {
-                    mode &= !0o6000;
+            } => match identity.chown(&node, requested_uid, requested_gid) {
+                Ok(result) => {
+                    mode = result.mode;
+                    uid = result.uid;
+                    gid = result.gid;
+                    Ok(())
                 }
-                identity.uid == 0
-                    || (owner
-                        && uid == node.uid
-                        && (gid == node.gid
-                            || gid == identity.gid
-                            || identity.groups.contains(gid)))
+                Err(denial) => Err(denial),
+            },
+            MetadataIntent::Times(settings) => identity.utimens(
+                &node,
+                if settings == [TimeSetting::Omit; 2] {
+                    posix_perm::TimesRequest::Omit
+                } else if settings == [TimeSetting::Now; 2] {
+                    posix_perm::TimesRequest::Now
+                } else {
+                    posix_perm::TimesRequest::Explicit
+                },
+            ),
+            MetadataIntent::Access { bits, .. } => {
+                if identity.permits(&node, bits) {
+                    Ok(())
+                } else {
+                    Err(posix_perm::Denial::Access)
+                }
             }
-            MetadataIntent::Times(settings) => {
-                // Only the owner sets a time of its own choosing; two "now"
-                // need write permission as well; two omissions need nothing.
-                owner
-                    || settings == [TimeSetting::Omit; 2]
-                    || (settings == [TimeSetting::Now; 2] && identity.permits(&node, 2))
-            }
-            MetadataIntent::Access { bits, .. } => identity.permits(&node, bits),
         };
-        let outcome = if !allowed {
-            MetadataOutcome::Failed(match self.intent {
-                MetadataIntent::Access { .. } => ACCESS_DENIED,
-                MetadataIntent::Times(settings) if settings == [TimeSetting::Now; 2] => {
-                    ACCESS_DENIED
-                }
-                _ => PERMISSION,
+        let outcome = if let Err(denial) = allowed {
+            MetadataOutcome::Failed(match denial {
+                posix_perm::Denial::Access => ACCESS_DENIED,
+                posix_perm::Denial::Permission => PERMISSION,
             })
         } else if !self.intent.needs_time() {
             MetadataOutcome::Unchanged

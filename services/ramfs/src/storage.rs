@@ -915,7 +915,7 @@ impl Storage<'_> {
         node.data_generation += 1;
         node.times[1] = now;
         node.times[2] = now;
-        node.mode &= !0o6000;
+        node.mode = posix_perm::mode_after_write(node.mode);
         data.private_overlay = false;
         data.committed = true;
         Ok(())
@@ -1057,7 +1057,8 @@ impl Storage<'_> {
         self.io_preflight(data.token)?;
         if data.length == 0 {
             self.truncate_zero(data.token, now)?;
-            self.state.nodes[data.token.slot as usize].mode &= !0o6000;
+            let node = &mut self.state.nodes[data.token.slot as usize];
+            node.mode = posix_perm::mode_after_write(node.mode);
             data.committed = true;
             return Ok(());
         }
@@ -1112,7 +1113,7 @@ impl Storage<'_> {
         node.data_generation += 1;
         node.times[1] = now;
         node.times[2] = now;
-        node.mode &= !0o6000;
+        node.mode = posix_perm::mode_after_write(node.mode);
         data.committed = true;
         Ok(())
     }
@@ -2365,7 +2366,8 @@ impl<'a> Storage<'a> {
         self.state.nodes[token.slot as usize].length =
             self.state.nodes[token.slot as usize].length.max(end as u64);
         self.state.nodes[token.slot as usize].data_generation = data_generation;
-        self.state.nodes[token.slot as usize].mode &= !0o6000;
+        let node = &mut self.state.nodes[token.slot as usize];
+        node.mode = posix_perm::mode_after_write(node.mode);
         Ok(bytes.len())
     }
     /// All fallible preflight precedes the single detachment of a live file's data.

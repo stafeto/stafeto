@@ -227,17 +227,21 @@ pub const SET_GID: u32 = 0o2000;
 /// on a node of `info`. Root may search any directory and execute a file
 /// with any execute bit.
 fn may(info: &NodeInfo, who: Who, bit: u32) -> bool {
-    if who.euid == 0 {
-        return info.kind == DIR || info.permissions & 0o111 != 0;
-    }
-    let class = if who.euid == info.uid {
-        info.permissions >> 6
-    } else if who.egid == info.gid {
-        info.permissions >> 3
-    } else {
-        info.permissions
+    let attr = posix_perm::Attr {
+        kind: if info.kind == DIR {
+            posix_perm::Kind::Directory
+        } else {
+            posix_perm::Kind::File
+        },
+        mode: info.permissions,
+        uid: info.uid,
+        gid: info.gid,
     };
-    class & bit != 0
+    posix_perm::permits(
+        posix_perm::Identity::new(who.euid, who.egid, &[]),
+        &attr,
+        bit,
+    )
 }
 
 /// One name of a directory as the listing gives it.
