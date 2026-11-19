@@ -2301,6 +2301,7 @@ commands:
             under HVF, with --plain on QEMU's emulation without -icount
   data-probe the data file service in QEMU: a table with store and data, littlefs formatted, a series of synced file operations, the same tree after a new start of QEMU
   data-crash [N] kill the data file service's machine in 12 places of its series of writes (or after sector N) and start it again on the same disk: every synced step is there and no file is torn
+  data-probe fill the measurements of the data file service on a volume of 1 GiB with small and large files made offline (the layout of an older release): the boot that converts it, then the boot that reports the mount time, the first call, the listing of 1,000 entries, RMDIR, the longest WRITE, the removals and the refresh walk, the longest job of each method and the CPU of the worker in a walk
   store-probe [steps] run the package service in QEMU: a store written on the host is
             attached from the disk, the packages that fail their checks are skipped,
             a disk of zeros is formatted, the full scenario of installations, refusals,

@@ -413,6 +413,7 @@ type Volume = datafs::Fs<'static, datafs::Window<Disk>>;
 
 extern "C" fn work(_: u64) -> ! {
     let process = view::<Process>(PROCESS);
+    let began = rt::time::ticks_to_ns(rt::time::now());
     let volume = match connect_disk(&process) {
         Ok(disk) => open_volume(disk),
         Err(why) => {
@@ -426,6 +427,15 @@ extern "C" fn work(_: u64) -> ! {
         rt::println!("datafs: no clock service, the times of files are the count since boot");
     }
     mount_work(&mut volume, &mut clock);
+    if let Some(fs) = volume.as_mut() {
+        // The time from the connection to the disk service to READY: the mount of littlefs and the
+        // mount work (orphans, attributes, epoch). The count of the reads is the device's.
+        let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(began) / 1_000_000;
+        rt::println!(
+            "datafs: ready after {ms} ms, {} reads",
+            fs.device().device.reads
+        );
+    }
     // A volume of a later format is refused: every request answers NOT_READY.
     READY.store(volume.is_some(), Release);
     STARTING.store(false, Release);

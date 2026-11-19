@@ -9,6 +9,13 @@
 //!   of an earlier step), and the number of the step written into `/progress` the same way, after which
 //!   the line `data-probe: synced N` goes out. Then `data-probe: written` and a STATFS, for the host
 //!   that cuts the power in the middle of this series (`cargo xtask data-crash`).
+//! - `settle`: no request; with `STAFETO_DATA_PROBE_WAIT_S` the probe sleeps that long, so the
+//!   service converts the volume at mount and walks it in the quiet, and the probe ends.
+//! - `fill`: the volume that `cargo xtask data-image --fill` made (1 GiB, small and large files, a
+//!   directory of 1,000 entries, 200 empty directories) and one boot has converted: the time of the
+//!   first call, of the listing, of RMDIR, of the longest WRITE of a file of 8 MiB, of the removal of
+//!   large files and of the free count before and after the refresh walk, one line each
+//!   (`data-probe: fill ...`), then `data-probe: fill done`.
 //! - `verify`: the tree a cut left, or a clean run left. `/progress` says the last step whose line
 //!   went out or the one after it (`STAFETO_DATA_PROBE_MIN` is the last line the host saw: the steps
 //!   it names must all be there). Every file of the tree is whole (the bytes its name says, no
@@ -83,6 +90,10 @@ fn main(_: u64) -> u64 {
     let result = match MODE {
         "write" => write(&client),
         "verify" => verify(&client),
+        // The boot that converts a volume made by an older release and ends (the host then boots
+        // `fill` on the converted volume): nothing to ask, the sleep is the work.
+        "settle" => Ok(()),
+        "fill" => measure_fill(&client, &start),
         _ => Err("unknown mode"),
     };
     match result {
@@ -439,5 +450,115 @@ fn verify(c: &Client) -> Result<(), Fail> {
     }
     wire(c.close(handle), "close after")?;
     rt::println!("data-probe: verify ok progress={done} files={files}");
+    Ok(())
+}
+
+/// Microseconds since the counter started.
+fn now_us() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now()) / 1000
+}
+
+/// The free blocks and the total of STATFS.
+fn statfs(c: &Client) -> Result<(u64, u64), Fail> {
+    let reply = wire(c.call(p::statfs), "statfs")?;
+    let pair = |at: usize| u64::from(reply.word(at)) | u64::from(reply.word(at + 4)) << 32;
+    Ok((pair(0), pair(8)))
+}
+
+/// The lines of `fill` (see the head of the file): each is one measurement of the service on a volume
+/// of 1 GiB that is mostly full. The times are the client's, from the send to the reply.
+fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
+    let at = now_us();
+    let (blocks, free) = statfs(c)?;
+    rt::println!(
+        "data-probe: fill first call {} us, {blocks} blocks, {free} free",
+        now_us() - at
+    );
+    // The listing of a directory of 1,000 entries, as the loop of a client reads it.
+    let dir = wire(c.open(b"/rd", p::DIRECTORY | p::READ), "open /rd")?;
+    let (begun, mut calls, mut entries, mut longest) = (now_us(), 0u32, 0u32, 0u64);
+    let mut more = true;
+    while more {
+        let at = now_us();
+        let reply = wire(
+            c.call(|w| p::handle_call(Method::Readdir, dir, w)),
+            "readdir",
+        )?;
+        longest = longest.max(now_us() - at);
+        calls += 1;
+        let mut batch = wire(
+            p::read_dir_reply(proto_wire::Reader::new(&reply.bytes[4..reply.len])),
+            "listing",
+        )?;
+        more = batch.more;
+        while wire(batch.next_entry(), "entry")?.is_some() {
+            entries += 1;
+        }
+    }
+    rt::println!(
+        "data-probe: fill readdir {entries} entries in {calls} calls, total {} us, longest {longest} us",
+        now_us() - begun
+    );
+    wire(c.close(dir), "close /rd")?;
+    // RMDIR of an empty directory in a volume of 200 of them and more.
+    let at = now_us();
+    wire(
+        c.call(|w| p::path_call(Method::Rmdir, b"/rm/e0", w)),
+        "rmdir",
+    )?;
+    rt::println!("data-probe: fill rmdir {} us", now_us() - at);
+    // A file of 8 MiB written in the largest writes: the longest call is the walk or the compaction
+    // that the window and the pairs of the volume take inside one request.
+    let handle = wire(
+        c.open(b"/fill-out", p::WRITE | p::CREATE | p::TRUNCATE),
+        "open fill-out",
+    )?;
+    let chunk = [0x5au8; p::MAX_WRITE];
+    let (begun, mut longest, mut wrote, mut calls) = (now_us(), 0u64, 0usize, 0u32);
+    while wrote < 8 << 20 {
+        let at = now_us();
+        let n = wire(c.call(|w| p::write(handle, &chunk, w)), "write")?.word(0) as usize;
+        longest = longest.max(now_us() - at);
+        if n == 0 {
+            return Err("a write took nothing");
+        }
+        wrote += n;
+        calls += 1;
+    }
+    wire(
+        c.call(|w| p::handle_call(Method::Fsync, handle, w)),
+        "fsync",
+    )?;
+    wire(c.close(handle), "close fill-out")?;
+    rt::println!(
+        "data-probe: fill write {wrote} bytes in {calls} calls, total {} us, longest call {longest} us",
+        now_us() - begun
+    );
+    // Large files removed: 24 of 16 MiB are 384 MiB, over a sixteenth of the volume, so the service
+    // walks again in the quiet after the removals and the free count of STATFS catches up.
+    let (_, before) = statfs(c)?;
+    let (begun, mut longest) = (now_us(), 0u64);
+    for b in 0..24u32 {
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"/big/b");
+        let mut digits = [0u8; 4];
+        let d = decimal(b, &mut digits);
+        name[6..6 + d].copy_from_slice(&digits[..d]);
+        let at = now_us();
+        wire(c.unlink(&name[..6 + d]), "unlink big")?;
+        longest = longest.max(now_us() - at);
+    }
+    rt::println!(
+        "data-probe: fill unlink 24 files of 16 MiB, total {} us, longest {longest} us",
+        now_us() - begun
+    );
+    let (_, low) = statfs(c)?;
+    let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+    sleep(level, 6_000_000_000);
+    let (_, after) = statfs(c)?;
+    rt::println!(
+        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after 6 s of quiet"
+    );
+    rt::println!("data-probe: fill done");
     Ok(())
 }

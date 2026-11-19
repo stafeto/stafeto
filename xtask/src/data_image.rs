@@ -115,6 +115,133 @@ pub fn make(path: &Path, size: u64) -> Result<Did, String> {
     Ok(did)
 }
 
+/// A file as a disk whose flush does nothing: the fill writes hundreds of MiB and syncs the file once
+/// at the end, since a crash of the host during the fill leaves a file that is made again.
+struct Quick(FileDevice);
+
+impl Device for Quick {
+    fn sectors(&self) -> u64 {
+        self.0.sectors()
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.0.read(sector, out)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), DeviceError> {
+        self.0.write(sector, data)
+    }
+
+    fn flush(&mut self) -> Result<(), DeviceError> {
+        Ok(())
+    }
+}
+
+/// What the fill puts on the volume, the way an older release leaves a volume (no attribute on any
+/// entry): `small_dirs` directories of `small_per` files of `small_bytes`, `big` files of
+/// `big_bytes`, a directory `/rd` of `listed` empty files and a directory `/rm` of `empty` empty
+/// directories (the probe removes one and lists the other).
+#[derive(Clone, Copy, Debug)]
+pub struct Profile {
+    pub small_dirs: u32,
+    pub small_per: u32,
+    pub small_bytes: usize,
+    pub big: u32,
+    pub big_bytes: usize,
+    pub listed: u32,
+    pub empty: u32,
+}
+
+/// The profile of the 1 GiB probe volume: 256 MiB of 2,000 files of 128 KiB, 512 MiB of 32 files of
+/// 16 MiB, 1,000 files in one directory and 200 empty directories: 3,260 entries, under the 8,192 a
+/// run of the conversion at mount writes, so that the first boot converts the volume whole.
+pub const FILL_1G: Profile = Profile {
+    small_dirs: 20,
+    small_per: 100,
+    small_bytes: 128 << 10,
+    big: 32,
+    big_bytes: 16 << 20,
+    listed: 1000,
+    empty: 200,
+};
+
+/// The bytes the fill writes: a pattern that is not zero, so that a block is never taken for blank.
+fn pattern(out: &mut [u8], salt: u32) {
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(31).wrapping_add(salt) as u8 | 1;
+    }
+}
+
+fn put<D: Device>(
+    fs: &mut datafs::Fs<'_, datafs::Window<D>>,
+    path: &str,
+    bytes: usize,
+    salt: u32,
+) -> Result<(), String> {
+    let flags = datafs::Open::WRITE.with(datafs::Open::CREATE);
+    let file = fs
+        .open(path.as_bytes(), flags)
+        .map_err(|e| format!("{path}: open {e:?}"))?;
+    let mut chunk = vec![0u8; 64 << 10];
+    let mut done = 0;
+    while done < bytes {
+        let n = (bytes - done).min(chunk.len());
+        pattern(&mut chunk[..n], salt.wrapping_add(done as u32));
+        let wrote = fs
+            .write(file, &chunk[..n])
+            .map_err(|e| format!("{path}: write {e:?}"))?;
+        if wrote != n {
+            return Err(format!("{path}: a short write"));
+        }
+        done += n;
+    }
+    fs.close(file).map_err(|e| format!("{path}: close {e:?}"))
+}
+
+/// Makes the file at `path` as `make` does and puts `profile` on it. The names: `/small/d<N>/f<M>`,
+/// `/big/b<N>`, `/rd/r<N>`, `/rm/e<N>`.
+pub fn make_filled(path: &Path, size: u64, profile: Profile) -> Result<(), String> {
+    make(path, size)?;
+    let mut state = Box::new(Storage::new());
+    let device = Quick(FileDevice::open(path)?);
+    let (mut fs, _, _) = volume::open(device, &mut state, SEED)
+        .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
+    let dir = |fs: &mut datafs::Fs<'_, datafs::Window<Quick>>, p: &str| {
+        fs.mkdir(p.as_bytes())
+            .map_err(|e| format!("{p}: mkdir {e:?}"))
+    };
+    for top in ["/small", "/big", "/rd", "/rm"] {
+        dir(&mut fs, top)?;
+    }
+    for d in 0..profile.small_dirs {
+        dir(&mut fs, &format!("/small/d{d}"))?;
+        for f in 0..profile.small_per {
+            put(
+                &mut fs,
+                &format!("/small/d{d}/f{f}"),
+                profile.small_bytes,
+                d * 977 + f,
+            )?;
+        }
+    }
+    for b in 0..profile.big {
+        put(&mut fs, &format!("/big/b{b}"), profile.big_bytes, b)?;
+    }
+    for r in 0..profile.listed {
+        put(&mut fs, &format!("/rd/r{r}"), 0, 0)?;
+    }
+    for e in 0..profile.empty {
+        dir(&mut fs, &format!("/rm/e{e}"))?;
+    }
+    fs.unmount()
+        .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
+    fs.into_device()
+        .device
+        .0
+        .flush()
+        .map_err(|_| format!("{}: flush failed", path.display()))
+}
+
 /// `cargo xtask data-image <path> [--size 2G]`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let usage = "usage: xtask data-image <path> [--size 2G]";
@@ -183,6 +310,44 @@ mod tests {
         fs.unmount().unwrap();
         drop(fs);
         let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
+    }
+
+    #[test]
+    fn a_filled_volume_has_what_the_profile_says_and_no_attribute_on_any_entry() {
+        let path = temp("fill");
+        let profile = Profile {
+            small_dirs: 2,
+            small_per: 3,
+            small_bytes: 5000,
+            big: 2,
+            big_bytes: 200_000,
+            listed: 7,
+            empty: 4,
+        };
+        make_filled(&path, 64 << 20, profile).unwrap();
+        let mut state = Box::new(Storage::new());
+        let (mut fs, did, _) =
+            volume::open(FileDevice::open(&path).unwrap(), &mut state, 1).unwrap();
+        assert_eq!(did, Did::Mounted);
+        assert_eq!(fs.stat(b"/small/d1/f2").unwrap().size, 5000);
+        assert_eq!(fs.stat(b"/big/b1").unwrap().size, 200_000);
+        assert_eq!(fs.stat(b"/rd/r6").unwrap().size, 0);
+        assert!(fs.stat(b"/rm/e3").is_ok());
+        assert!(fs.stat(b"/rm/e4").is_err());
+        // The layout of an older release: no attribute of the version-3 service (the record 0x70, the
+        // format mark 0x66, the counter 0x69) on the root or on an entry.
+        for path in [&b"/"[..], b"/small", b"/small/d0/f0", b"/big/b0", b"/rm/e0"] {
+            for kind in [0x70u8, 0x66, 0x69] {
+                let mut out = [0u8; 64];
+                assert!(
+                    fs.getattr(path, kind, &mut out).is_err(),
+                    "{path:?} has attribute {kind:#x}"
+                );
+            }
+        }
+        fs.unmount().unwrap();
+        drop(fs);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

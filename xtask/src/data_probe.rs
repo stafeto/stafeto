@@ -436,9 +436,100 @@ pub fn crash(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The lines of the service and of the probe that a measurement run reports, in the order they came.
+fn report(lines: &[String], what: &str) {
+    const WANTED: [&str; 10] = [
+        "datafs: ready after",
+        "datafs: first walk",
+        "datafs: refresh walk",
+        "datafs: walk cpu",
+        "datafs: job ",
+        "entries got attributes",
+        "datafs: data volume mounted",
+        "data-probe: fill",
+        "datafs: the budget of the worker",
+        "datafs: serve ran",
+    ];
+    println!("data-probe fill ({what}):");
+    for l in lines {
+        let start = l.find("datafs: ").or_else(|| l.find("data-probe: fill"));
+        if let Some(at) = start.filter(|_| WANTED.iter().any(|w| l.contains(w))) {
+            println!("  {}", &l[at..]);
+        }
+    }
+}
+
+/// `cargo xtask data-probe fill`: the measurements of the plan's step on a volume of 1 GiB with
+/// small and large files (`data_image::make_filled`, the layout an older release leaves, no
+/// attribute anywhere). The first boot converts the volume (the lines `entries got attributes` and
+/// `ready after`) and walks it in the quiet; the second boot, on the converted volume, reports the
+/// mount time, the first call, the listing of 1,000 entries, RMDIR, the longest WRITE, the removal of
+/// large files with the refresh walk after it, the longest job of each method (the service is built
+/// with `steps`) and the CPU the worker took in each walk. QEMU runs with real time (no `-icount`):
+/// the figures are those of the host's disk and CPU, for the table of the limit of the volume (the
+/// reads a second and the time of a walk).
+pub fn fill() -> Result<(), String> {
+    let built = Built {
+        kernel: build(Variant::Normal)?,
+    };
+    let disk = Disk::new("fill");
+    let started = std::time::Instant::now();
+    super::data_image::make_filled(&disk.0, 1 << 30, super::data_image::FILL_1G)?;
+    println!(
+        "data-probe fill: the volume of 1 GiB made in {} s",
+        started.elapsed().as_secs()
+    );
+    let settle = image("boot-data-probe-settle.img", None, "settle", 0, 10)?;
+    let lines = run_to_end(
+        &built,
+        machine(&built, &settle, &disk.0, false),
+        "converting boot",
+    )?;
+    need_ready(&lines, "converting boot")?;
+    report(&lines, "the boot that converts the volume");
+    let measure = image("boot-data-probe-fill.img", None, "fill", 0, 0)?;
+    let lines = run_to_end(
+        &built,
+        machine(&built, &measure, &disk.0, false),
+        "measuring boot",
+    )?;
+    need_ready(&lines, "measuring boot")?;
+    need(
+        &lines,
+        &["data-probe: fill done".to_string()],
+        "measuring boot",
+    )?;
+    for tag in [
+        "data-probe: fill first call",
+        "data-probe: fill readdir 1002 entries",
+        "data-probe: fill rmdir",
+        "data-probe: fill write",
+        "data-probe: fill unlink 24 files",
+        "data-probe: fill free blocks",
+    ] {
+        if !lines.iter().any(|l| l.contains(tag)) {
+            return Err(format!("data-probe fill: no line {tag:?}"));
+        }
+    }
+    report(&lines, "the boot that measures");
+    Ok(())
+}
+
+/// The service said it was ready, after how long.
+fn need_ready(lines: &[String], what: &str) -> Result<(), String> {
+    if lines.iter().any(|l| l.contains("datafs: ready after ")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "data-probe fill ({what}): no line `datafs: ready after`"
+        ))
+    }
+}
+
 pub fn command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(),
+        Some("fill") if args.len() == 1 => fill(),
         Some(other) => Err(format!("data-probe: unknown argument {other}")),
     }
 }
