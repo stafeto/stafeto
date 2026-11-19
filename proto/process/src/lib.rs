@@ -177,8 +177,10 @@
 //!
 //! TakeRoot (number 44), through the session of any record: body `LoaderRoot` (the root asked
 //! for, here `ROOT_DATA` alone), no handles. The reply is the status and a copy of the registered
-//! root of the data file service with SEND alone (no DUPLICATE and no TRANSFER), so that the
-//! process can send the root its two requests (SESSION and VERIFY_SESSION) and cannot pass it on.
+//! root of the data file service with SEND and TRANSFER (the kernel refuses a reply that carries a
+//! handle without TRANSFER; there is no DUPLICATE), so that the process can send the root its two
+//! requests (SESSION and VERIFY_SESSION) and cannot copy it. The root hands out only sessions whose
+//! identity the process service vouches for, so a copy handed on is harmless.
 //! UNREGISTERED when the service has sent none, PERMISSION for any other root and for a session
 //! that is a loader's or a notary's. The work is one `handle_duplicate`: the process service
 //! never calls the data service for it.
@@ -857,6 +859,14 @@ pub const fn root_of(label: u64) -> Option<u32> {
         i += 1;
     }
     found
+}
+
+/// The request of TakeRoot for `root` (`ROOT_DATA` alone is given): the header of method 44 and
+/// the body of LoaderRoot. The layer builds it with this, and the service's handler reads it with
+/// `LoaderRoot::read` after the header.
+pub fn take_root(root: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::TakeRoot.header().write(w)?;
+    LoaderRoot { root }.write(w)
 }
 
 /// The body of LoaderRoot: the root asked for (`ROOT_TERMINAL` and the
@@ -2321,6 +2331,27 @@ mod tests {
         assert_eq!(root_of(NOTARY | 7), None);
         assert_eq!(root_of(NOTARY | SET_ID | 7), None);
         assert_eq!(root_of(NOTARY | PIPE | NET), None);
+    }
+
+    /// The request the layer sends is the one the service's handler reads: the header names method
+    /// 44 at this version, and the body after it is a LoaderRoot of the root asked for. (The planted
+    /// fault: a body written with the root's index shifted, or another method number, fails here.)
+    #[test]
+    fn the_take_root_request_of_the_layer_is_the_one_the_service_reads() {
+        let mut w = Writer::new();
+        take_root(ROOT_DATA, &mut w).unwrap();
+        let bytes = w.as_bytes();
+        let mut r = Reader::new(bytes);
+        let header = proto_wire::Header::read(&mut r).unwrap();
+        assert_eq!(
+            (header.method, header.version),
+            (Method::TakeRoot as u16, VERSION)
+        );
+        assert_eq!(header.method, 44);
+        assert_eq!(
+            LoaderRoot::read(Reader::new(&bytes[proto_wire::HEADER_LEN..])),
+            Ok(LoaderRoot { root: ROOT_DATA })
+        );
     }
 
     #[test]
