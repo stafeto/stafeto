@@ -412,6 +412,19 @@ impl Scene {
         })
     }
 
+    /// The driver refused a row of the cursor pipeline, for good: the
+    /// pointer goes back into the frame (`set_cursor_plane(None)`, which
+    /// damages the arrow's rectangle), and no row is made again. When the
+    /// device may be showing the cursor the row that hides it is returned,
+    /// for the caller to send and not to wait for, so that the pointer is
+    /// never in the frame and on the device both. None when the device was
+    /// never shown the cursor.
+    pub fn cursor_refused(&mut self) -> Option<LayerRow> {
+        let plane = self.cursor?;
+        self.set_cursor_plane(None);
+        (plane.shown != Shown::Hidden).then(|| LayerRow::off(plane.pipeline))
+    }
+
     /// The driver took `row` (made by `cursor_row`).
     pub fn cursor_shown(&mut self, row: &LayerRow) {
         if let Some(plane) = &mut self.cursor {
@@ -2387,6 +2400,45 @@ mod tests {
         assert_eq!(s.cursor_row(), None);
         s.pointer_to(51, 60);
         assert_eq!(s.cursor_row().map(|r| (r.x, r.y)), Some((51, 60)));
+    }
+
+    #[test]
+    fn a_refused_row_gives_the_pointer_back_to_the_frame_and_no_row_follows() {
+        // Never shown on the device: nothing to hide, the frame draws it.
+        let mut s = settled(true);
+        s.pointer_to(10, 10);
+        assert!(s.cursor_row().is_some());
+        assert_eq!(s.cursor_refused(), None);
+        assert!(!s.cursor_plane());
+        assert_eq!(s.cursor_row(), None);
+        s.pointer_to(30, 30);
+        assert_eq!(s.cursor_row(), None);
+        // The arrow's place is damaged at once, and a later move damages
+        // both places again.
+        assert_eq!(
+            s.begin(),
+            Some(rect(10, 10, 30 + CURSOR_W - 10, 30 + CURSOR_H - 10))
+        );
+        // The frame draws the pointer from now on.
+        assert_eq!(s.drawn_pointer(), Some((30, 30)));
+    }
+
+    #[test]
+    fn a_refusal_after_the_cursor_was_shown_hides_it_and_it_is_in_one_place_only() {
+        let mut s = settled(true);
+        s.pointer_to(10, 10);
+        let row = s.cursor_row().unwrap();
+        s.cursor_shown(&row);
+        s.pointer_to(20, 20);
+        assert_eq!(s.drawn_pointer(), None);
+        assert_eq!(s.cursor_refused(), Some(LayerRow::off(PIPELINE_CURSOR)));
+        assert_eq!(s.drawn_pointer(), Some((20, 20)));
+        assert_eq!(s.cursor_row(), None);
+        // A second refusal has nothing to say.
+        assert_eq!(s.cursor_refused(), None);
+        // The picture the device showed is painted over, and the new one
+        // drawn, by the next frame.
+        assert!(s.busy());
     }
 
     #[test]

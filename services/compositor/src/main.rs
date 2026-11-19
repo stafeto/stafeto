@@ -82,7 +82,10 @@ const BUF_AT: usize = 0x11_0000_0000;
 const LEGACY_AT: usize = 0x12_0000_0000;
 /// Where the service maps the cursor's picture (source 3 of the driver),
 /// past the legacy buffer inside the same 2 MiB span, so that its page
-/// table is the one the legacy buffer already pays for.
+/// table is the one the legacy buffer already pays for. The legacy buffer
+/// at LEGACY_AT ends at 0x12_000F_A000; a mapping of 1 MiB placed at
+/// LEGACY_AT would end exactly at CURSOR_AT, with no gap. The bypass step
+/// must place its pool elsewhere or keep the gap.
 const CURSOR_AT: usize = 0x12_0010_0000;
 const PAGE: usize = 4096;
 /// The pages one step of the service maps or unmaps at most: a page costs
@@ -569,7 +572,10 @@ impl Compositor {
     /// the driver took, however many moves the step's events made. The
     /// driver takes it at once (it queues the move for the device) and
     /// merges moves itself, so the step never waits for the device. A
-    /// refusal is asked again at the next step of input.
+    /// refusal is final: the pointer goes back into the frame
+    /// (`Scene::cursor_refused`), after one row that hides the cursor if
+    /// the device may be showing it, whose answer is not looked at, and a
+    /// line says so once.
     fn move_cursor(&mut self) {
         let Some(row) = self.scene.cursor_row() else {
             return;
@@ -588,12 +594,31 @@ impl Compositor {
                 if status_of(reply.bytes(&mut buffer)) == Some(Status::Ok) {
                     self.scene.cursor_shown(&row);
                 } else {
-                    rt::println!("compositor: the cursor LAYERS was refused");
+                    self.give_up_cursor();
                 }
             }
             Err(Error::PeerClosed) => self.driver_gone(),
-            Err(_) => {}
+            Err(_) => self.give_up_cursor(),
         }
+    }
+
+    /// The driver will not take the cursor's rows: hide what it may show,
+    /// draw the pointer in the frame from now on, say so once.
+    fn give_up_cursor(&mut self) {
+        if let Some(off) = self.scene.cursor_refused()
+            && let Some(owner) = &self.screen
+        {
+            let mut request = Writer::new();
+            if Layers::new(&[off])
+                .and_then(|layers| layers.write(&mut request))
+                .is_ok()
+            {
+                let _ = sys::send(owner, request.as_bytes());
+            }
+        }
+        rt::println!(
+            "compositor: the cursor LAYERS was refused, the pointer is drawn in the frame"
+        );
     }
 
     /// `open_screen`, again every few milliseconds while the driver says it

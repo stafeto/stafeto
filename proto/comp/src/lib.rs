@@ -78,10 +78,10 @@
 //!
 //! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
 //! subscribed, and bit 1 (CURSOR_PLANE) once the service put the pointer's
-//! picture on the display's cursor pipeline. Its `open` is the windows alive now, `created` the windows ever
-//! made, `frames` the frames shown, `busy` 1 while a frame is being made
-//! or waits to be: a probe that waits for `busy` to be 0 finds the screen
-//! settled.
+//! picture on the display's cursor pipeline. Its `open` is the windows alive
+//! now, `created` the windows ever made, `frames` the frames shown, `busy` 1
+//! while a frame is being made or waits to be: a probe that waits for `busy`
+//! to be 0 finds the screen settled.
 
 #![cfg_attr(not(test), no_std)]
 

@@ -522,8 +522,12 @@ impl Qmp {
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+    let mut survivor = String::new();
     for prefix in [OVERLAP, CLICK, SWITCH, SURVIVOR] {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
+        if prefix == SURVIVOR {
+            survivor = line.clone();
+        }
         let first = gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix);
         // A runner under load has dropped the monitor's connection once with
         // QEMU still up (the guest was waiting 2.5 s for this photograph). The
@@ -551,6 +555,13 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     )?;
     qmp.move_to(TABLET_AT.0, TABLET_AT.1, 640, 400)?;
     std::thread::sleep(Duration::from_millis(300));
+    // The pointer is on the cursor pipeline, so its move leaves the screen's
+    // points as the last frame of the guest left them. The survivor's window
+    // is still up here (it waits for the click), so one more screenshot is
+    // compared with that frame's CRC, by the same helper as the others. No
+    // line of the guest marks the move, so the pause above is its only
+    // anchor; the trace of the cursor shows the move reached the device.
+    gpu_probe::compare(&mut monitor, &scratch.picture(), &survivor, SURVIVOR)?;
     qmp.left_button(true)?;
     std::thread::sleep(Duration::from_millis(300));
     qmp.left_button(false)?;
