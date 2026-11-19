@@ -4,7 +4,7 @@ This is what a POSIX program gets from the data volume: the directory `/data`, w
 
 ## What it is
 
-- **The mount point.** A path belongs to the volume when its absolute form is `/data` or begins with `/data/`. The layer reads the path as text (the current directory and the dots applied first), so `/datax` is an ordinary name of the RAM file service, and `/data/..` is `/`. The shell image has an empty directory `/data` of the RAM file service, so `ls /` shows it.
+- **The mount point.** A path belongs to the volume when its absolute form is `/data` or begins with `/data/`. The layer reads the path as text (the current directory and the dots applied first), so `/datax` is an ordinary name of the RAM file service, and `/data/..` is `/`. An image whose table has the data file service (the images of the try-out) has an empty directory `/data` of the RAM file service, so `ls /` shows it; an image with no service has no `/data`, so `du /` and `find /` meet nothing there.
 - **No volume, no RAM.** A path under `/data` never goes to the RAM file service. An image whose process service has no data root (no data service in the image, or it has not registered yet) answers EIO for such a path after one second of trying.
 - **Lexical dots.** `a/ghost/..` under `/data` names `a` and succeeds, where the RAM file service looks the name up and answers ENOENT.
 - **Links.** The volume has no symbolic or hard links: `symlink` is EPERM, `link` of a file is EMLINK, and `readlink` of an existing path is EINVAL. `rename` and `link` between `/data` and another file system are EXDEV.
@@ -43,6 +43,10 @@ This is what a POSIX program gets from the data volume: the directory `/data`, w
 | Clones of a process tree (`fork`, `posix_spawn`) | 32 | EAGAIN |
 
 Removal, writes, truncation and changes of mode and times are never refused by the two caps. Every file takes at least 4 KiB (inline data is off). A volume holds about 20,000 to 30,000 files with names up to 32 bytes and about 6,000 with names of 255 bytes. A creation near the cap recounts the pairs, which takes 1.5 to 2 s on an EBS gp3 volume, and one removal takes up to about 2 s there; a tree of a thousand directories takes about 18 minutes to remove (3.3 million reads at 3,000 reads a second).
+
+## When the volume is missing
+
+In an image that has the service, a missing volume or a service marked broken leaves no root with the process service, and every call by a path under `/data` answers EIO after the layer's second of tries. A listing of `/` still shows `/data` (the entry is the RAM file service's), and `ls -l /`, `ls /data`, `du /` and `find /` each stop for a second at that one path and report it (`du: /data: I/O error`) before they go on with the rest; they ask for `/data` once, so the stall is one second a command and not one for each entry. A program that calls `/data` in a loop sees the second at each call. This is accepted: the alternative, an answer that comes at once, would need the layer to know whether the service is meant to be there, which only init knows.
 
 ## Remaining risks
 

@@ -622,15 +622,19 @@ fn dialog(image: &str) -> Vec<RootFile> {
 /// the games image.
 fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     let mut files = library();
+    // The mount point of the data volume, for an image whose table has the data file service: the
+    // layer sends the paths there to the service by their text and the directory shows `/data` in
+    // `ls /`. An image with no service has no `/data` (a path there answers EIO after a second,
+    // so `du /` and `find /` would meet it).
+    if has_data_service(image) {
+        files.push(dir("/data"));
+    }
     files.extend([
         dir("/bin"),
         dir("/libexec"),
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
-        // The mount point of the data volume: the layer sends the paths there to the data file
-        // service by their text, and the directory shows `/data` in `ls /`.
-        dir("/data"),
         // The directory of the CPUs, which htop and `nproc --all` count: a
         // directory for each CPU the machine can have, of which the
         // listing (the layer's) names the CPUs that are up.
@@ -700,6 +704,11 @@ pub struct LayerPackage {
     /// The paths of the package that the image's package file leaves out (the probes of BusyBox
     /// in the image of EC2): the image holds a variant of the package file.
     pub removed: Vec<&'static str>,
+}
+
+/// The shell images whose init table has the data file service: the images of the try-out.
+pub fn has_data_service(name: &str) -> bool {
+    is_aws_image(name)
 }
 
 /// The images of the try-out on EC2 and on QEMU.
@@ -2884,6 +2893,17 @@ mod tests {
     }
 
     /// The data volume covers /data: a file of the image there would never be reached.
+    /// Only an image whose table has the data file service keeps the mount point: in the others a
+    /// path under /data answers EIO, so `du /` and `find /` would stop at the directory.
+    #[test]
+    fn only_an_image_with_the_data_service_has_the_mount_point() {
+        let has = |image: &str| files_of(image).iter().any(|f| f.path == "/data");
+        assert!(!has("boot-ash-dialog.img"));
+        assert!(!has("boot-full.img"));
+        assert!(has("boot-aws.img") && has("boot-aws-qemu.img"));
+        assert!(has_data_service("boot-aws.img") && !has_data_service("boot-ash-dialog.img"));
+    }
+
     #[test]
     fn no_file_of_the_image_is_under_the_data_volume() {
         let image = "boot-ash-dialog.img";
