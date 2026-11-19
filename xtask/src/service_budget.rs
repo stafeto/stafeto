@@ -341,11 +341,17 @@ pub struct Worst {
     pub l_us: u64,
     pub n: u64,
     pub loss_us: u64,
+    /// What the budgets counted over the victim's awake spans (the sum over the cycles of the two
+    /// samples around each), the terms of `left_us`.
     pub serve_ran_us: u64,
     pub serve_overruns: u64,
+    /// The same counters over the whole window, sleeps included (the bound's `S` is over it).
+    pub serve_ran_l_us: u64,
+    pub serve_overruns_l: u64,
     pub pending_max: u64,
     pub drv_ran_us: u64,
     pub drv_overruns: u64,
+    pub drv_ran_l_us: u64,
     pub service_us: u64,
     pub events_us: u64,
     pub init_us: u64,
@@ -374,9 +380,12 @@ impl Worst {
             loss_us: number(line, "loss_us=")?,
             serve_ran_us: number(line, "serve_ran_us=")?,
             serve_overruns: number(line, "serve_overruns=")?,
+            serve_ran_l_us: number(line, "serve_ran_l_us=")?,
+            serve_overruns_l: number(line, "serve_overruns_l=")?,
             pending_max: number(line, "pending_max=")?,
             drv_ran_us: number(line, "drv_ran_us=")?,
             drv_overruns: number(line, "drv_overruns=")?,
+            drv_ran_l_us: number(line, "drv_ran_l_us=")?,
             service_us: number(line, "s_us=")?,
             events_us: number(line, "events_us=")?,
             init_us: number(line, "init_us=")?,
@@ -395,6 +404,11 @@ impl Worst {
             ));
         }
         Ok(w)
+    }
+
+    /// The lowest `left_us` the account allows, `-e (k_W + 1)` (`terms::left_floor_us`).
+    pub fn left_floor_us(&self, e: u64) -> i64 {
+        terms::left_floor_us(e, self.serve_overruns)
     }
 
     /// The loss over its bound, in microseconds: positive when the terms do not explain it.
@@ -521,7 +535,7 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
             continue;
         };
         println!(
-            "service-budget: {name}: worst window R {} us, W {} us, l {} us, n {}, loss {} us = serve ran {} + driver ran {} + events {} + 20 + left {} (serve overruns {}, pending at most {}, driver overruns {}; the work of init and the heartbeats are in the left term)",
+            "service-budget: {name}: worst window R {} us, W {} us, l {} us, n {}, loss {} us = serve ran {} + driver ran {} + events {} + 20 + left {} (over the awake spans; serve overruns {}, pending at most {}, driver overruns {}; over the whole window serve ran {}, driver ran {}, serve overruns {}; the work of init and the heartbeats are in the left term)",
             w.r_us,
             w.w_us,
             w.l_us,
@@ -533,8 +547,18 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
             w.left_us,
             w.serve_overruns,
             w.pending_max,
-            w.drv_overruns
+            w.drv_overruns,
+            w.serve_ran_l_us,
+            w.drv_ran_l_us,
+            w.serve_overruns_l
         );
+        if w.left_us < w.left_floor_us(o.e_us) {
+            println!(
+                "service-budget: {name}: left {} us is under -e (k + 1) = {} us: the events and the spans of the service and the driver overlap by more than the account allows (printed for information)",
+                w.left_us,
+                w.left_floor_us(o.e_us)
+            );
+        }
         if w.over_us() > 0 || w.share < w.bound_share {
             println!(
                 "service-budget: {name}: the victim kept {} per mille of its active time in its worst 10 cycles, under {}: the loss of {} us is over S {} + E {} + 20 + I {} + D {} = {} us by {} us (printed for information, stafeto/stafeto#430)",
@@ -887,7 +911,7 @@ mod tests {
         [
             "svcbudget replies whole_with_handle=1 server_saw=3 took_handles=1".to_owned(),
             format!("svcbudget1 tty starve clients=24 cycles=150 worst10=923 median10=957 c_us=75 e_us=30 ran_us={ran} ran_bound_us=2919 ran_floor_us=75 phase_us=155000 driver_budget=1 driver_ran_us=900 driver_overruns=0"),
-            "svcbudget1 tty worst R_us=8000 W_us=8667 l_us=10470 n=2 loss_us=667 serve_ran_us=225 serve_overruns=2 pending_max=3 drv_ran_us=150 drv_overruns=0 beats=na c_us=75 e_us=30 s_us=375 events_us=180 entries_us=20 init_us=70 d_us=150 bound_loss_us=795 bound_share=909 share=923 x_us=92".to_owned(),
+            "svcbudget1 tty worst R_us=8000 W_us=8667 l_us=10470 n=2 loss_us=667 serve_ran_us=225 serve_overruns=2 serve_ran_l_us=260 serve_overruns_l=2 pending_max=3 drv_ran_us=150 drv_overruns=0 drv_ran_l_us=400 beats=na c_us=75 e_us=30 s_us=375 events_us=180 entries_us=20 init_us=70 d_us=150 bound_loss_us=795 bound_share=909 share=923 x_us=92".to_owned(),
             "svcbudget DONE".to_owned(),
         ]
         .to_vec()
@@ -903,6 +927,12 @@ mod tests {
             (2, 3, 150, 92)
         );
         assert!(one.driver_budget && one.driver_ran_us == 900);
+        // The counters over the whole window are read beside the awake ones.
+        assert_eq!(
+            (w.serve_ran_l_us, w.serve_overruns_l, w.drv_ran_l_us),
+            (260, 2, 400)
+        );
+        assert_eq!(w.left_floor_us(one.e_us), -90);
         // 667 is under its bound of 795: nothing over.
         assert_eq!(w.over_us(), -128);
         // A window over its bound is printed and the gate passes (the victim check is information).
@@ -913,6 +943,40 @@ mod tests {
         over.worst.as_mut().unwrap().service_us = 330;
         assert!(over.worst.as_ref().unwrap().over_us() > 0);
         assert!(verdict_starve(&[over.clone(), over.clone(), over]).is_ok());
+    }
+
+    #[test]
+    fn the_terminal_window_of_run_44389680495_reads_with_both_sets_of_terms() {
+        // Loss 630, serve ran 205 and driver ran 538 over the window (l 11008), events 480 (e 40,
+        // 5 overruns): left -613 with those terms. The awake terms of the example (serve 150,
+        // driver 120, 3 overruns) leave 20, inside the allowance.
+        let mut lines = run_lines(2175);
+        lines[1] = lines[1].replace("e_us=30", "e_us=40");
+        lines[2] = "svcbudget1 tty worst R_us=8005 W_us=8635 l_us=11008 n=2 loss_us=630 serve_ran_us=150 serve_overruns=3 serve_ran_l_us=205 serve_overruns_l=5 pending_max=3 drv_ran_us=120 drv_overruns=0 drv_ran_l_us=538 beats=na c_us=75 e_us=40 s_us=375 events_us=480 entries_us=20 init_us=70 d_us=538 bound_loss_us=1483 bound_share=843 share=927 x_us=20".to_owned();
+        let one = parse_starve_only(&lines, "tty").unwrap();
+        let w = one.worst.clone().unwrap();
+        assert_eq!(
+            terms::left_us(
+                w.loss_us,
+                w.serve_ran_l_us,
+                w.drv_ran_l_us,
+                40,
+                w.serve_overruns_l
+            ),
+            -613
+        );
+        assert_eq!(
+            terms::left_us(
+                w.loss_us,
+                w.serve_ran_us,
+                w.drv_ran_us,
+                40,
+                w.serve_overruns
+            ),
+            w.left_us
+        );
+        assert!(w.left_us >= w.left_floor_us(40));
+        assert!(verdict_starve(&[one.clone(), one.clone(), one]).is_ok());
     }
 
     #[test]

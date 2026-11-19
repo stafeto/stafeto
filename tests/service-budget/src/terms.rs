@@ -19,7 +19,27 @@
 //! ```
 //!
 //! `S` is the bound of the kernel (the module comment of `kcore/src/budget.rs`) for a thread
-//! that runs at its own level for `C` of each `T`.
+//! that runs at its own level for `C` of each `T`. The bound is taken over the whole window `l`:
+//! a service may take its pieces while the victim sleeps, and a bound over `l` is an upper
+//! bound.
+//!
+//! What the probe measures of the budgets is taken over the awake spans of the victim, the time
+//! the loss `L = W - R` is counted over. For each cycle `c` of the window the victim reads the
+//! counters just before its awake span (`SAMPLE_START[c]`) and just after it (`SAMPLE_END[c]`),
+//! and for `X` in the `ran` and the `overruns` of the service and of the driver
+//!
+//! ```text
+//! X_W = sum over c of (X(SAMPLE_END[c]) - X(SAMPLE_START[c]))      (`awake_sum`)
+//! left = L - serve_ran_W - drv_ran_W - 2 e (k_W + 1) - 20          k_W = serve overruns_W
+//! -e (k_W + 1) <= left                                              (`left_floor_us`)
+//! ```
+//!
+//! The same counters over the length of the window, `serve_ran_l` and `drv_ran_l`, take in the
+//! sleeps of the victim, where a service or the driver may run with the victim losing nothing,
+//! and are printed beside the awake sums for information. A timer event of the budget of the
+//! service that comes while the service or the driver runs is in their `ran` and in `E` both,
+//! which is why `left` may fall to `-e (k_W + 1)`; what is left above zero is the work of init
+//! and the heartbeats (`I`).
 
 // The probe prints the terms and the gate reads them: each uses only part of this file.
 #![allow(dead_code)]
@@ -78,6 +98,22 @@ pub const fn left_us(loss: u64, serve_ran: u64, driver_ran: u64, e: u64, overrun
         - driver_ran as i64
         - events_us(e, overruns) as i64
         - ENTRIES_US as i64
+}
+
+/// The sum over the cycles of a window of what a counter grew by between the two samples of the
+/// cycle (just before its awake span and just after it): `pairs` are `(start, end)` of each
+/// cycle. The sleeps of the victim between the cycles are not in it.
+pub fn awake_sum(pairs: impl IntoIterator<Item = (u64, u64)>) -> u64 {
+    pairs
+        .into_iter()
+        .map(|(start, end)| end.saturating_sub(start))
+        .sum()
+}
+
+/// The lowest `left` the account allows, `-e (k_W + 1)`: the timer events that come during the
+/// spans of the service or of the driver are in their `ran` and in `E`.
+pub const fn left_floor_us(e: u64, overruns: u64) -> i64 {
+    -((e * (overruns + 1)) as i64)
 }
 
 /// The terms of the control phase's worst window, where the victim runs against a spinner under
@@ -171,6 +207,46 @@ mod tests {
         assert_eq!(left_us(667, 225, 150, E, 3), 32);
         // More taken off than lost is negative.
         assert_eq!(left_us(100, 225, 0, E, 0), -205);
+    }
+
+    #[test]
+    fn the_awake_spans_leave_out_the_sleeps() {
+        // Three cycles of a victim: the counter grows 10 in each awake span and 40 in each sleep
+        // between them; the difference over the window takes in the two sleeps.
+        let pairs = [(100, 110), (150, 160), (200, 210)];
+        assert_eq!(awake_sum(pairs), 30);
+        assert_eq!(210 - 100, 110);
+        // A counter read that went backwards (a reset) counts nothing.
+        assert_eq!(awake_sum([(5, 3), (3, 9)]), 6);
+        assert_eq!(awake_sum([]), 0);
+    }
+
+    #[test]
+    fn the_terminal_window_of_run_44389680495_before_and_after_the_awake_sums() {
+        // From the issue: loss 630, serve ran 205, driver ran 538, events 480 (e 40 with 5 overruns
+        // gives it), over the whole window l: left -613 by the old formula.
+        let e = 40;
+        assert_eq!(events_us(e, 5), 480);
+        assert_eq!(left_us(630, 205, 538, e, 5), -613);
+        // The awake sums of the same window are an assumption for the example: the driver ran
+        // 120 us of its 538 while the victim was awake, the service 150 of 205, in 3 overruns.
+        // The remainder is then inside the allowance of the note, and above its floor.
+        let (serve_w, drv_w, k_w) = (150, 120, 3);
+        assert_eq!(
+            left_us(630, serve_w, drv_w, e, k_w),
+            630 - 150 - 120 - 320 - 20
+        );
+        assert_eq!(left_us(630, serve_w, drv_w, e, k_w), 20);
+        assert_eq!(left_floor_us(e, k_w), -160);
+        assert!(left_us(630, serve_w, drv_w, e, k_w) >= left_floor_us(e, k_w));
+        // The old remainder was below the floor of the awake account, which is the double count.
+        assert!(left_us(630, 205, 538, e, 5) < left_floor_us(e, 5));
+        assert_eq!(left_floor_us(e, 5), -240);
+        // The bound is taken over l and does not change.
+        assert_eq!(
+            bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 538),
+            375 + 480 + 20 + 70 + 538
+        );
     }
 
     #[test]
