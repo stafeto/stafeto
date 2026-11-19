@@ -731,16 +731,11 @@ pub fn layer_text(costs: &[ShapeCost]) -> String {
         .map(|(n, g)| format!("{n} layers {g}"))
         .collect();
     format!(
-        "layers: the greatest excess of a band of one layer over its operations is {} ticks, and of each layer added {} ticks (by count: {}; a term that is the same at 2, 4 and 8 is a constant a layer, one that grows with the count is not); the table has {} measured{} ({} with the margin)",
+        "layers: the greatest excess of a band of one layer over its operations is {} ticks, and of each layer added {} ticks (by count: {}; a term that is the same at 2, 4 and 8 is a constant a layer, one that grows with the count is not); the table has {} measured ({} with the margin)",
         t.one,
         t.term,
         counts.join(", "),
         compositor::LAYER_MEASURED,
-        if compositor::LAYER_ESTIMATE {
-            " (an estimate no probe has given)"
-        } else {
-            ""
-        },
         compositor::LAYER
     )
 }
