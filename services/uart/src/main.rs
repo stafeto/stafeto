@@ -12,7 +12,10 @@
 //! comes from the library (uart::irq, output, writes, input, log); here are the calls and
 //! the registers, which it reaches through rt::mmio alone [G34]. The
 //! program ends with a code of its own when its start fails; init
-//! restarts it.
+//! restarts it. The loop runs under the budget init gives (75 us of each
+//! 5 ms, then level 32): while levels 33 to 59 are saturated the driver
+//! gets only that, so the receive FIFO of the PL011 can overflow and the
+//! kernel's log ring can overwrite records, which the next batch counts.
 
 #![no_std]
 #![no_main]

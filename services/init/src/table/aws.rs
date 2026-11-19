@@ -1026,7 +1026,10 @@ mod tests {
     /// The budgets on CPU 0 of the EC2 table: the network service 40 % and 20 %, the file
     /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the console driver 1.5 %,
     /// the NVMe service 1 % and the data file service 1 %, and the reserve of 3 % for the process
-    /// service and the package service: 74.5 % under the 75 % the table allows.
+    /// service and the package service: 74.5 % under the 75 % the table allows. The 0.5 % that is
+    /// left is headroom for no known user: the process service and the package service sit inside
+    /// the reserve of 3 %, so a new budget on CPU 0 has to come out of that reserve or from the
+    /// cut of another record's budget.
     #[test]
     fn the_budgets_of_cpu_zero_on_ec2_are_74_5_percent_under_the_cap_of_75() {
         for table in [TABLE, QEMU_TABLE] {
