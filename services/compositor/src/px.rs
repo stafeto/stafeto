@@ -22,6 +22,10 @@ pub struct Pixman {
     refused: u32,
 }
 
+// The images pixman keeps cover every buffer the scene can name: three of each
+// window, the screen, the pointer's picture and the pool.
+const _: () = assert!(pixman::KEPT >= compositor::MAX_WINDOWS * proto_comp::BUFFERS + 3);
+
 const fn format(f: Format) -> Px {
     match f {
         Format::Xrgb => Px::Xrgb8888,
