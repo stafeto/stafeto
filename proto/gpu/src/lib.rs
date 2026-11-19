@@ -17,7 +17,7 @@
 //! | SUBSCRIBE (5) | the owner's | the header alone and one handle: a channel of the owner with NOTIFY and TRANSFER | the status alone | INVALID, NOT_ALLOWED |
 //! | COMMIT (6) | the owner's | `x`, `y`, `w`, `h` (u32) | the status alone, as soon as the commands are in the device's queue | INVALID, REVOKED, BUSY, IO |
 //! | PIPELINES (9) | the owner's | the header alone | status, `count`, `period_us` (u32 each), then `count` records of 32 bytes (`Pipeline`) | NOT_ALLOWED, REVOKED |
-//! | SOURCE (10) | the owner's | `kind` (u32: 1 pool, 2 cursor) | status, `id`, `width`, `height`, `stride`, `format` (u32 each); one handle, the source's memory object (MAP_READ, MAP_WRITE, TRANSFER) | LIMIT_REACHED, INVALID, REVOKED, BUSY |
+//! | SOURCE (10) | the owner's | `kind` (u32: 1 pool, 2 cursor) | status, `id`, `width`, `height`, `stride`, `format` (u32 each); one handle, the source's memory object (MAP_READ, MAP_WRITE, TRANSFER, and DUPLICATE for the pool) | LIMIT_REACHED, INVALID, REVOKED, BUSY |
 //! | LAYERS (11) | the owner's | `count` (u32, 1 to 4), then `count` rows of 40 bytes (`LayerRow`) | the status alone, as soon as the commands are in the device's queue | INVALID, REVOKED, BUSY, NOT_ALLOWED |
 //!
 //! The screen belongs to one owner at a time. OPEN of a free screen makes
@@ -83,7 +83,10 @@
 //! alpha, the word 0xAARRGGBB). SOURCE gives each kind once to an owner:
 //! a second SOURCE of the same kind is LIMIT_REACHED; BUSY means that
 //! somebody else still holds the source's object (more references than
-//! the base count).
+//! the base count). The pool's handle has DUPLICATE and the cursor's does
+//! not: the owner that shows the pool to the programs of the first revision
+//! gives each a copy without it, one window after another, and checks the
+//! references before each.
 //!
 //! The rules the driver keeps in the order of the device's commands, so
 //! that a service of composition may rely on them:
