@@ -92,6 +92,10 @@ impl Probe<'_> {
             .ok_or("no phase has the network load")?;
         self.sleep_to(schedule.start_of(first));
         let (mut rounds, mut bytes) = (0u64, 0u64);
+        // Where the time goes: the requests the service answered with AGAIN (its
+        // buffer full or nothing yet to read) and the longest round.
+        let mut again = [0u64; 2];
+        let mut longest = 0u64;
         while self.now() < end {
             // Far from the loop's phases the loop sleeps; between two phases that
             // have the load there is none.
@@ -99,10 +103,17 @@ impl Probe<'_> {
             if !phase.is_some_and(|p: Phase| p.loads().net) {
                 break;
             }
-            bytes += self.round(&net, client, server)?;
+            let began = self.now();
+            bytes += self.round(&net, client, server, &mut again)?;
+            longest = longest.max(self.now() - began);
             rounds += 1;
         }
-        rt::println!("net-probe: load rounds {rounds} bytes {bytes}");
+        rt::println!(
+            "net-probe: load rounds {rounds} bytes {bytes} send-again {} recv-again {} longest-round-ms {}",
+            again[0],
+            again[1],
+            longest / 1_000_000
+        );
         self.close(&net, client).map_err(|_| "CLOSE failed")?;
         self.close(&net, server).map_err(|_| "CLOSE failed")?;
         self.close(&net, listener).map_err(|_| "CLOSE failed")?;
@@ -116,6 +127,7 @@ impl Probe<'_> {
         net: &rt::Handle<rt::handle::Channel>,
         client: u32,
         server: u32,
+        again: &mut [u64; 2],
     ) -> Result<u64, &'static str> {
         let mut total = 0u64;
         for (from, to) in [(client, server), (server, client)] {
@@ -138,7 +150,7 @@ impl Probe<'_> {
                                 .map_err(|_| "SEND's data")?
                                 as usize;
                         }
-                        Err(fail) if is(&fail, AGAIN) => {}
+                        Err(fail) if is(&fail, AGAIN) => again[0] += 1,
                         Err(_) => return Err("SEND failed"),
                     }
                 }
@@ -159,7 +171,7 @@ impl Probe<'_> {
                     // Nothing yet: ask again at once. The load polls, so that the
                     // network service's own work and the requests it serves are what
                     // spend its budgets.
-                    Err(fail) if is(&fail, AGAIN) => {}
+                    Err(fail) if is(&fail, AGAIN) => again[1] += 1,
                     Err(_) => return Err("RECV failed"),
                 }
             }

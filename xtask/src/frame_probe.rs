@@ -134,7 +134,7 @@ pub fn budgets_share_ppm() -> u64 {
 /// the service's `Scene::tile`: `opaque` windows of XRGB8888, `over` of ARGB8888
 /// and `fill` black layers all touching the damage, no pointer. A band is as
 /// many whole lines as the ticks allow (at most BAND_ROWS) or, when not even
-/// one line fits, a run of the points of the rectangle.
+/// one line fits, a run of one line, the lines cut in as many runs as it takes.
 pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
     use compositor::{BAND_ROWS, BAND_TICKS, FILL, OPAQUE, OVER};
     let calls = OPAQUE.call * opaque + OVER.call * over + FILL.call * fill;
@@ -154,7 +154,11 @@ pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
         .checked_div(u64::from(per_point))
         .unwrap_or(0)
         .clamp(1, u64::from(w));
-    (u64::from(w) * u64::from(h)).div_ceil(run)
+    // A band is a run within one line and the next band starts the next piece
+    // of the same line or the next line: every line is cut in `ceil(w / run)`
+    // bands (the live run of the overload: 11 830 bands in 19.7 frames, 600
+    // each, where a count over all the points gave 424).
+    u64::from(h) * u64::from(w).div_ceil(run)
 }
 
 /// The bands of a frame of the overload: eight windows of 320 by 200 points
@@ -884,9 +888,13 @@ mod tests {
         let bands = overload_frame_bands();
         let cap = u64::from(frame_cap_bands());
         assert_eq!(cap, 52);
-        // 424 on the fitted table; a refit may move it a little.
-        assert!((380..=470).contains(&bands), "{bands} bands");
-        assert_eq!(PERIODS / (bands.div_ceil(cap) + 1), 24);
+        // 600 on the fitted table (200 lines of three runs of 151 points), which
+        // the live run confirmed; a refit may move it a little. The frame takes
+        // ceil(600 / 52) = 12 periods and the floor of frames is the periods over
+        // that count and one: the take at the start of a period after the frame
+        // is shown costs one more.
+        assert!((560..=640).contains(&bands), "{bands} bands");
+        assert_eq!(PERIODS / (bands.div_ceil(cap) + 1), 18);
     }
 
     fn overload_line(lines: &mut [String], from: &str, to: &str) {
