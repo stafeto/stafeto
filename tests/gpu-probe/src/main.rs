@@ -500,7 +500,7 @@ impl Probe<'_> {
         }
         // The sizes of the objects: 256 pages for the pool, 4 for the
         // picture of the cursor; both are zero, and the owner may write
-        // them and has no DUPLICATE to copy them with.
+        // them; only the pool has a DUPLICATE to copy it with.
         for (n, (kind, info, bytes)) in [
             (SOURCE_KIND_POOL, SourceInfo::POOL, u64::from(BUFFER_BYTES)),
             (SOURCE_KIND_CURSOR, SourceInfo::CURSOR, 4 * 4096),
@@ -521,8 +521,18 @@ impl Probe<'_> {
             if size != bytes || u64::from(got.stride) * u64::from(got.height) > size {
                 return Err("a source's object is not the right size");
             }
-            if sys::handle_duplicate(&object, Rights::MAP_READ).err() != Some(Error::AccessDenied) {
-                return Err("the owner could duplicate a source");
+            // The pool's copy has DUPLICATE (the compositor hands copies of
+            // it to the windows of the first revision); the cursor's has not.
+            let copy = sys::handle_duplicate(&object, Rights::MAP_READ);
+            if kind == SOURCE_KIND_POOL {
+                if copy.is_err() {
+                    return Err("the owner could not duplicate the pool");
+                }
+                // The copy is closed at once: the references are the base
+                // again before the owner's next call.
+                drop(copy);
+            } else if copy.err() != Some(Error::AccessDenied) {
+                return Err("the owner could duplicate the cursor's picture");
             }
             let map_at = FB_AT + self.maps * FB_STEP;
             at[n] = map_at;

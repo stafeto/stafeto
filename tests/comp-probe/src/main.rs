@@ -16,12 +16,22 @@
 //!   the end of the process frees them.
 //! - `l`, the program of the first revision: waits for the first client's
 //!   windows to go, a line with the CRC of the black screen they left,
-//!   then OPEN of proto_gpu, a pattern in the buffer the service made and
-//!   FLUSH of all of it and of a rectangle (the reply of FLUSH comes once
-//!   the frame is shown), a second OPEN BUSY, the cleared buffer. It ends
-//!   holding the window. After the CLOSE it keeps the buffer's mapping,
-//!   then the bare handle, and OPEN is BUSY each time until the handle is
-//!   closed.
+//!   then OPEN of proto_gpu, a pattern in the buffer (the display driver's
+//!   pool, which the service gives it) and FLUSH of all of it and of a
+//!   rectangle (the reply of FLUSH comes once the frame is shown), a second
+//!   OPEN BUSY, the cleared buffer. The window covers the screen with
+//!   nothing above it, so the display shows the pool as it is: DESCRIBE's
+//!   `bands` does not grow over three FLUSHes and `bypassed` grows by three
+//!   (xtask checks the trace of the device for the scanout of resource 2).
+//!   It then waits for the third client's window to come over its own, which
+//!   makes the service put the frame together (`bands` grows), and to go,
+//!   after which the frames are direct again. After the CLOSE it keeps the
+//!   buffer's mapping, then the bare handle, and OPEN is BUSY each time until
+//!   the handle is closed; the next window's buffer is cleared (the pool is
+//!   cleared once the frame that took the screen back is shown).
+//! - `x`, the third client: waits for the program of the first revision to
+//!   have its window shown directly, makes a window over it and a line with
+//!   the CRC of the screen as it should look, and ends.
 //!
 //! Each check prints its line, and the last says `comp-probe: ok`; xtask
 //! reads them.
@@ -84,6 +94,7 @@ fn main(_: u64) -> u64 {
     let result = match own {
         b"w" => probe.windows(),
         b"l" => probe.legacy(),
+        b"x" => probe.above(),
         _ => Err("an unknown role"),
     };
     match result {
@@ -224,6 +235,36 @@ fn second_pattern(x: u32, y: u32) -> u32 {
 }
 
 const MARK: u32 = 0x00FF_8000;
+/// The rectangle of the first revision's screen that it fills with MARK
+/// in its second FLUSH.
+const LEGACY_MARK: Rect = Rect {
+    x: 100,
+    y: 50,
+    w: 200,
+    h: 100,
+};
+
+/// The CRC of the screen of the first revision, with its marked rectangle,
+/// and the window of the third client over it when `above`.
+fn legacy_crc(above: bool) -> u32 {
+    let mut crc = Crc(0xFFFF_FFFF);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let r = LEGACY_MARK;
+            let mut point = if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                MARK
+            } else {
+                screen_pattern(x, y)
+            };
+            let s = SECOND;
+            if above && x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h {
+                point = second_pattern(x - s.x, y - s.y);
+            }
+            crc.point(point);
+        }
+    }
+    !crc.0
+}
 /// The rectangle of buffer 1 that differs from buffer 0, in window
 /// coordinates.
 const CHANGED: Rect = Rect {
@@ -704,6 +745,48 @@ impl Probe<'_> {
         Ok(())
     }
 
+    /// The third client: a window over the window of the first revision once
+    /// the service shows that window's buffer directly.
+    fn above(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        loop {
+            let d = self.describe_when_ready(&display)?;
+            if d.open == 1 && d.bypassed >= 4 && d.busy == 0 {
+                break;
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the window of the first revision was never shown directly");
+            }
+            self.sleep(RETRY_NS);
+        }
+        rt::println!("comp-probe: the window below is shown from its pool");
+        let (window, _) = self
+            .create(&display, SECOND, FORMAT_XRGB8888)
+            .map_err(say("WINDOW_CREATE over the pool"))?;
+        let (objects, at) = self.buffers(1, 100 * 100 * 4)?;
+        self.attach(&window, 400, &objects[..1])
+            .map_err(say("ATTACH"))?;
+        for y in 0..100u32 {
+            for x in 0..100u32 {
+                // SAFETY: the buffer is mapped for writing at `at[0]`, 100 by
+                // 100 points of 4 bytes, and this probe is the only user.
+                unsafe {
+                    (at[0] as *mut u32)
+                        .add((y * 100 + x) as usize)
+                        .write(second_pattern(x, y))
+                };
+            }
+        }
+        self.post(&window, 0, &[])
+            .map_err(say("POST over the pool"))?;
+        self.settled(&display)?;
+        rt::println!("comp-probe: above crc {:08x}", legacy_crc(true));
+        self.sleep(SNAPSHOT_NS);
+        rt::println!("comp-probe: the client over the pool ends with its window");
+        Ok(())
+    }
+
     /// The program of the first revision.
     fn legacy(self) -> Result<(), &'static str> {
         let display = self.display()?;
@@ -778,6 +861,7 @@ impl Probe<'_> {
             return Err("a second OPEN was not BUSY");
         }
         rt::println!("comp-probe: a second OPEN is BUSY");
+        let before = self.settled(&display)?;
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 points[(y * WIDTH + x) as usize] = screen_pattern(x, y);
@@ -795,15 +879,10 @@ impl Probe<'_> {
         }
         rt::println!("comp-probe: legacy crc {:08x}", !crc.0);
         self.sleep(SNAPSHOT_NS);
-        let inside = proto_gpu::Rect {
-            x: 100,
-            y: 50,
-            w: 200,
-            h: 100,
-        };
+        let inside = LEGACY_MARK;
         for y in inside.y..inside.y + inside.h {
             for x in inside.x..inside.x + inside.w {
-                points[(y * WIDTH + x) as usize] = 0x00FF_8000;
+                points[(y * WIDTH + x) as usize] = MARK;
             }
         }
         flush(inside).map_err(say("FLUSH of a rectangle"))?;
@@ -812,7 +891,11 @@ impl Probe<'_> {
             crc.point(p);
         }
         rt::println!("comp-probe: legacy partial crc {:08x}", !crc.0);
+        if !crc.0 != legacy_crc(false) {
+            return Err("the legacy partial crc differs from the pattern's");
+        }
         self.sleep(SNAPSHOT_NS);
+        flush(inside).map_err(say("the third FLUSH"))?;
         if !refused(
             flush(proto_gpu::Rect {
                 x: WIDTH,
@@ -825,6 +908,55 @@ impl Probe<'_> {
             return Err("a rectangle outside the screen was not INVALID");
         }
         rt::println!("comp-probe: FLUSH of a rectangle outside the screen is INVALID");
+        // Three FLUSHes were shown from the pool: no band was put together.
+        let after = self.settled(&display)?;
+        if after.bands != before.bands || after.bypassed != before.bypassed + 3 {
+            rt::println!(
+                "comp-probe: bands {} then {}, bypassed {} then {}",
+                before.bands,
+                after.bands,
+                before.bypassed,
+                after.bypassed
+            );
+            return Err("three FLUSHes of a window over the screen were not shown directly");
+        }
+        rt::println!(
+            "comp-probe: three FLUSHes were shown from the pool, no band was put together"
+        );
+        // A fourth FLUSH: the third client starts once it has seen four frames
+        // shown directly, so the check above has been made by then.
+        flush(inside).map_err(say("the fourth FLUSH"))?;
+        let fourth = self.settled(&display)?;
+        if fourth.bands != after.bands || fourth.bypassed != after.bypassed + 1 {
+            return Err("the fourth FLUSH was not shown directly");
+        }
+        // The third client puts a window over the window and ends: the frame
+        // that has it is put together (`bands` grow), and the one after it
+        // went is direct again. The service may be seen only after both (the
+        // third client can end at once when it does not wait for a
+        // screenshot), so the wait is for its window to have been made and
+        // gone.
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        let back = loop {
+            let d = self.settled(&display)?;
+            if d.created == fourth.created + 1 && d.open == 1 {
+                break d;
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the window over the pool never came and went");
+            }
+            self.sleep(RETRY_NS);
+        };
+        if back.bands <= fourth.bands {
+            return Err("a frame with a window above was not put together");
+        }
+        rt::println!("comp-probe: a window above the pool made the service put the frame together");
+        if back.bypassed != fourth.bypassed + 1 {
+            return Err("the frame after the window above went was not direct");
+        }
+        rt::println!("comp-probe: the window above went and the pool was shown again with no band");
+        rt::println!("comp-probe: legacy back crc {:08x}", legacy_crc(false));
+        self.sleep(SNAPSHOT_NS);
         // CLOSE with the buffer kept: the next OPEN is BUSY while anyone
         // besides the service holds a reference to it, a mapping first and
         // then the bare handle, and succeeds with a cleared buffer once
@@ -844,6 +976,20 @@ impl Probe<'_> {
             self.sleep(RETRY_NS);
         }
         rt::println!("comp-probe: OPEN is BUSY while a closed window's mapping is kept");
+        // The pool is cleared once the frame that took the screen back is
+        // shown, which the mapping kept here sees as zeros. The program then
+        // writes into it, as a program that kept its mapping can: the pool
+        // must be cleared again before a next window has it.
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while points.iter().any(|&p| p != 0) {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the closed window's buffer was never cleared");
+            }
+            self.sleep(RETRY_NS);
+        }
+        points[0] = 0x00DE_AD00;
+        points[(WIDTH * HEIGHT) as usize - 1] = 0x00BE_EF00;
+        rt::println!("comp-probe: the pool is cleared and written again through the kept mapping");
         // SAFETY: the probe uses `points` no more.
         unsafe { sys::mem_unmap(self.process, at, u64::from(proto_gpu::SCREEN_BYTES)) }
             .map_err(say("unmap"))?;

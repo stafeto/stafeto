@@ -22,6 +22,19 @@
 //! of the window with the focus or under the pointer, and the manager's.
 //! Whoever called then asks `delivered` which rings got something, to tell
 //! their owners.
+//!
+//! A frame reaches the screen in one of three ways (`FrameKind`). The
+//! composed frame puts the windows together in the target (`fb`) and the
+//! primary pipeline shows the target. The direct frame (`Plan::Bypass`,
+//! decided by `Scene::plan` when a frame starts) puts nothing together: one
+//! window of the first revision covers the whole screen with nothing above
+//! it, and the primary pipeline shows its buffer, the pool, as it is. When
+//! the rule stops holding the frame that follows is a rebind: the whole
+//! screen is put together in the target (the target is stale, for it was not
+//! kept while the pool was shown) and the primary pipeline is bound to the
+//! target after the last band, so that the screen shows the last frame of
+//! the window until the new one is whole. The pool is cleared only once the
+//! primary pipeline does not show it any more (`take_pool_clear`).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -70,6 +83,53 @@ const OWNER_MANAGER: u8 = 255;
 /// its focus (`holds`), as after the driver ended and started again.
 pub const fn wants_focus(present: bool, holds: bool) -> bool {
     present && !holds
+}
+
+/// What OPEN of the first revision does with the pool, as a decision of the
+/// pool's state alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolOpen {
+    /// A copy besides the service's own is out: BUSY.
+    Busy,
+    /// The clearing runs or waits for the frame that takes the screen back
+    /// from the pool: ask again.
+    Clearing,
+    /// The pool may hold pixels a program wrote after the last clearing
+    /// ended (a copy was given, or the pool is new): start the clearing, and
+    /// ask again.
+    StartClearing,
+    /// The pool is clean and the service's own: a window may have it.
+    Go,
+}
+
+/// The decision of OPEN. `refs` is the object's references now and `base`
+/// the count the service recorded after it mapped the pool: more means a
+/// program holds a copy. `dirty` is set when a copy is given and cleared only
+/// by a clearing that ended with no copy out (`dirty_after_clearing`), so a
+/// program that closed its window, kept its mapping and wrote after the
+/// clearing passed leaves the pool dirty until it is gone and cleared again.
+pub fn pool_open(
+    refs: u64,
+    base: u64,
+    dirty: bool,
+    clearing: bool,
+    release_pending: bool,
+) -> PoolOpen {
+    if refs > base {
+        PoolOpen::Busy
+    } else if clearing || release_pending {
+        PoolOpen::Clearing
+    } else if dirty {
+        PoolOpen::StartClearing
+    } else {
+        PoolOpen::Go
+    }
+}
+
+/// Whether the pool is still dirty when a clearing ends: it is when a copy
+/// was out then (the program could write after the clearing passed a place).
+pub const fn dirty_after_clearing(refs: u64, base: u64) -> bool {
+    refs != base
 }
 
 /// The owner byte of window place `i`.
@@ -135,6 +195,37 @@ pub struct Window {
     pub visible: bool,
     /// Whether a buffer was ever taken: the first take gives the focus.
     pub shown_once: bool,
+}
+
+/// What the primary pipeline of the display shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Primary {
+    /// The target the service puts the windows together in.
+    Target,
+    /// The pool, the buffer of a window of the first revision.
+    Pool,
+}
+
+/// How a frame reaches the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Bands into the target, which the primary pipeline shows: COMMIT.
+    Compose,
+    /// Bands over the whole screen into the target, then the primary
+    /// pipeline is bound to the target (a LAYERS row of source 1).
+    Rebind,
+    /// No bands: the primary pipeline is bound to the pool (a LAYERS row of
+    /// source 2 with the changed area).
+    Bypass,
+}
+
+/// What `Scene::plan` decides for the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Put the windows together.
+    Compose,
+    /// Show the buffer of this window (its place) as it is.
+    Bypass(usize),
 }
 
 /// What a finished frame frees of a window.
@@ -232,6 +323,22 @@ pub struct Scene {
     /// picture is then the device's, and the frame never draws it.
     cursor: Option<CursorPlane>,
     held: Option<usize>,
+    /// Whether the display can show the pool directly (the driver has a
+    /// primary pipeline that takes the screen's whole size and gave the
+    /// service the pool source), what the primary pipeline shows now, and
+    /// whether the target lacks what the pool showed since it was last
+    /// whole.
+    direct: bool,
+    primary: Primary,
+    stale: bool,
+    /// How the frame in progress (or the last one) reaches the screen, and
+    /// whether it covers the whole screen.
+    kind: FrameKind,
+    whole: bool,
+    /// The legacy window went and the pool waits to be cleared.
+    release: bool,
+    bypassed: u32,
+    bands: u32,
     /// The Super keys held, one bit each (left, right).
     modifier: u8,
     /// Who got the press of each key below KEYS_TRACKED: its release goes
@@ -302,6 +409,14 @@ impl Scene {
             pointer: None,
             cursor: None,
             held: None,
+            direct: false,
+            primary: Primary::Target,
+            stale: false,
+            kind: FrameKind::Compose,
+            whole: false,
+            release: false,
+            bypassed: 0,
+            bands: 0,
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
             damage: None,
@@ -334,6 +449,69 @@ impl Scene {
 
     pub fn frames(&self) -> u32 {
         self.frames
+    }
+
+    /// The frames shown without a band (the pool was the screen) and the
+    /// bands put together since the start.
+    pub fn bypassed(&self) -> u32 {
+        self.bypassed
+    }
+
+    pub fn bands(&self) -> u32 {
+        self.bands
+    }
+
+    /// A band of a frame was put together.
+    pub fn band_done(&mut self) {
+        self.bands = self.bands.wrapping_add(1);
+    }
+
+    /// The display can show the pool directly (or no more, with false: a
+    /// refusal of the driver is final).
+    pub fn set_direct(&mut self, on: bool) {
+        self.direct = on;
+    }
+
+    pub fn direct(&self) -> bool {
+        self.direct
+    }
+
+    /// What the primary pipeline shows, once the last frame shown ended.
+    pub fn primary(&self) -> Primary {
+        self.primary
+    }
+
+    /// Whether the target lacks what the pool showed.
+    pub fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// How the frame in progress, or the last one, reaches the screen.
+    pub fn frame_kind(&self) -> FrameKind {
+        self.kind
+    }
+
+    /// Whether the pool may be cleared: the primary pipeline does not show
+    /// it and no frame that binds it is on its way to the device.
+    pub fn pool_idle(&self) -> bool {
+        self.primary == Primary::Target && !(self.frame && self.kind == FrameKind::Bypass)
+    }
+
+    /// Whether a window of the first revision has gone and the pool still
+    /// waits to be cleared (a new window must not take it yet).
+    pub fn pool_release_pending(&self) -> bool {
+        self.release
+    }
+
+    /// True once, when the window of the first revision has gone and the
+    /// pool is idle: the pool's clearing starts then, and never while the
+    /// screen shows it.
+    pub fn take_pool_clear(&mut self) -> bool {
+        if self.release && self.pool_idle() {
+            self.release = false;
+            return true;
+        }
+        false
     }
 
     /// Whether a frame is in progress or damage waits for one.
@@ -603,6 +781,9 @@ impl Scene {
     /// told.
     pub fn destroy(&mut self, i: usize) -> Option<Window> {
         let w = self.windows.get_mut(i)?.take()?;
+        if w.legacy {
+            self.release = true;
+        }
         // A window of the first revision always has its line to say.
         if w.legacy || w.current.is_some() || w.posted.is_some() {
             self.add_damage(w.rect);
@@ -1032,13 +1213,62 @@ impl Scene {
                 }
             }
         }
-        self.frame = true;
-        Some(Rect {
+        let mut area = Rect {
             x: d.x,
             y: d.y,
             w: x1 - d.x,
             h: y1 - d.y,
-        })
+        };
+        self.kind = match self.plan() {
+            Plan::Bypass(_) => {
+                // The target is not kept while the pool is shown.
+                self.stale = true;
+                FrameKind::Bypass
+            }
+            Plan::Compose if self.primary == Primary::Pool => {
+                area = SCREEN;
+                FrameKind::Rebind
+            }
+            Plan::Compose => {
+                if self.stale {
+                    area = SCREEN;
+                }
+                FrameKind::Compose
+            }
+        };
+        self.whole = area == SCREEN;
+        self.frame = true;
+        Some(area)
+    }
+
+    /// What the next frame does: the rule of the direct scan-out. A frame
+    /// is shown from the pool, with no band, when all of these hold:
+    ///
+    /// 1. the display can show the pool (`set_direct`);
+    /// 2. the topmost shown window is of the first revision (its buffer is
+    ///    the pool), opaque, and covers the whole screen, which also means
+    ///    that no window under it is seen;
+    /// 3. no shown window is above it (a window that is hidden or has
+    ///    nothing taken is not shown);
+    /// 4. the pointer is not in the frame: it is on the cursor pipeline or
+    ///    not seen yet (a pointer drawn in the frame would lie in the
+    ///    window).
+    ///
+    /// The decision reads the scene alone, so a probe on the host can
+    /// tabulate it.
+    pub fn plan(&self) -> Plan {
+        if !self.direct || (self.pointer.is_some() && self.cursor.is_none()) {
+            return Plan::Compose;
+        }
+        let Some(top) = self.top(None) else {
+            return Plan::Compose;
+        };
+        match self.windows[top] {
+            Some(w) if w.legacy && w.format == Format::Xrgb && w.rect == SCREEN => {
+                Plan::Bypass(top)
+            }
+            _ => Plan::Compose,
+        }
     }
 
     /// The frame is shown (or failed): what it frees of each window.
@@ -1057,6 +1287,21 @@ impl Scene {
         self.frame = false;
         if shown {
             self.frames += 1;
+            match self.kind {
+                FrameKind::Bypass => {
+                    self.primary = Primary::Pool;
+                    self.bypassed = self.bypassed.wrapping_add(1);
+                }
+                FrameKind::Rebind => {
+                    self.primary = Primary::Target;
+                    self.stale = false;
+                }
+                FrameKind::Compose => {
+                    if self.whole {
+                        self.stale = false;
+                    }
+                }
+            }
         }
         out
     }
@@ -2486,6 +2731,351 @@ mod tests {
         s.end(true);
         // The device's cursor shows nothing yet: the next ask brings it.
         assert!(s.cursor_row().is_some());
+    }
+
+    /// A scene whose display can show the pool, with the pointer on the
+    /// cursor pipeline when `plane`.
+    fn direct(plane: bool) -> Scene {
+        let mut s = Scene::new();
+        s.set_direct(true);
+        if plane {
+            s.set_cursor_plane(Some((PIPELINE_CURSOR, SOURCE_CURSOR)));
+        }
+        s
+    }
+
+    /// A window of the first revision over the whole screen, flushed.
+    fn legacy_window(s: &mut Scene) -> usize {
+        let a = s.create(1, 1, SCREEN, true, 0).unwrap();
+        s.flush(a, SCREEN).unwrap();
+        a
+    }
+
+    /// Takes what is posted and ends the frame as shown, as the service does
+    /// (a direct frame has no band).
+    fn settle(s: &mut Scene) {
+        let _ = s.begin().expect("a frame");
+        s.end(true);
+    }
+
+    /// A window of the second revision at `r`, posted and shown.
+    fn shown_window(s: &mut Scene, label: u64, r: Rect) -> usize {
+        let i = make(s, label, 2, r, 1);
+        s.post(i, 0, &[]).unwrap();
+        settle(s);
+        i
+    }
+
+    #[test]
+    fn open_of_the_pool_is_decided_by_references_dirt_and_clearing() {
+        // base 5 references.
+        assert_eq!(pool_open(5, 5, false, false, false), PoolOpen::Go);
+        assert_eq!(pool_open(6, 5, false, false, false), PoolOpen::Busy);
+        // Busy comes before everything else.
+        assert_eq!(pool_open(7, 5, true, true, true), PoolOpen::Busy);
+        assert_eq!(pool_open(5, 5, true, true, false), PoolOpen::Clearing);
+        assert_eq!(pool_open(5, 5, false, false, true), PoolOpen::Clearing);
+        assert_eq!(pool_open(5, 5, true, false, false), PoolOpen::StartClearing);
+    }
+
+    #[test]
+    fn a_program_that_writes_after_the_clearing_leaves_the_pool_dirty() {
+        // The window went and a program kept its mapping: BUSY, and the
+        // clearing that runs meanwhile ends with the copy out.
+        let (base, mut dirty) = (5, true);
+        assert_eq!(pool_open(6, base, dirty, false, false), PoolOpen::Busy);
+        dirty = dirty_after_clearing(6, base);
+        assert!(dirty);
+        // It writes, and exits: the pool is the service's again but dirty,
+        // so OPEN clears it and does not give it.
+        assert_eq!(
+            pool_open(5, base, dirty, false, false),
+            PoolOpen::StartClearing
+        );
+        // The clearing that ends with no copy out makes it clean.
+        dirty = dirty_after_clearing(5, base);
+        assert!(!dirty);
+        assert_eq!(pool_open(5, base, dirty, false, false), PoolOpen::Go);
+        // A copy given dirties it again (the caller sets the flag).
+        assert_eq!(pool_open(6, base, true, false, false), PoolOpen::Busy);
+    }
+
+    #[test]
+    fn the_decision_table_of_the_direct_frame() {
+        // One window of the first revision over the whole screen.
+        let mut s = direct(true);
+        assert_eq!(s.plan(), Plan::Compose);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // A shown window above it.
+        let b = shown_window(&mut s, 2, rect(100, 50, 100, 100));
+        assert_eq!(s.plan(), Plan::Compose);
+        // The same window hidden: the window under it is the screen again.
+        s.set_visible(b, false).unwrap();
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        s.set_visible(b, true).unwrap();
+        assert_eq!(s.plan(), Plan::Compose);
+        // A window that went.
+        s.destroy(b);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // The display that cannot show the pool.
+        s.set_direct(false);
+        assert_eq!(s.plan(), Plan::Compose);
+    }
+
+    #[test]
+    fn the_pointer_decides_by_where_it_is_drawn() {
+        // On the cursor pipeline, seen or not: direct.
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        s.pointer_to(10, 10);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // Without a cursor pipeline a seen pointer is drawn in the frame,
+        // which a direct frame would not hold; one not yet seen is not.
+        let mut t = direct(false);
+        let a = legacy_window(&mut t);
+        settle(&mut t);
+        assert_eq!(t.plan(), Plan::Bypass(a));
+        t.pointer_to(10, 10);
+        assert_eq!(t.plan(), Plan::Compose);
+        // The driver refused the cursor row for good: the pointer is back in
+        // the frame, and the rule reads false at once.
+        let mut u = direct(true);
+        let a = legacy_window(&mut u);
+        settle(&mut u);
+        u.pointer_to(30, 30);
+        assert_eq!(u.plan(), Plan::Bypass(a));
+        u.cursor_refused();
+        assert_eq!(u.plan(), Plan::Compose);
+        // A pointer that was never seen costs the rule nothing, refused or
+        // not.
+        let mut v = direct(true);
+        let a = legacy_window(&mut v);
+        settle(&mut v);
+        v.cursor_refused();
+        assert_eq!(v.plan(), Plan::Bypass(a));
+    }
+
+    #[test]
+    fn a_window_that_is_not_an_opaque_one_of_the_first_revision_is_composed() {
+        // A window of the second revision over the whole screen.
+        let mut s = direct(true);
+        shown_window(&mut s, 1, SCREEN);
+        assert_eq!(s.plan(), Plan::Compose);
+        // With an alpha.
+        let mut s = direct(true);
+        let i = make(&mut s, 1, 1, SCREEN, 1);
+        s.set_format(i, Format::Argb);
+        s.post(i, 0, &[]).unwrap();
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Compose);
+        // A window of the first revision whose format says alpha.
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        s.set_format(a, Format::Argb);
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Compose);
+        // A window of the second revision under one of the first is not seen.
+        let mut s = direct(true);
+        shown_window(&mut s, 1, SCREEN);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // And over it, it is the screen.
+        shown_window(&mut s, 3, SCREEN);
+        assert_eq!(s.plan(), Plan::Compose);
+    }
+
+    /// The bands a frame over `d` makes, counted as the service counts them.
+    fn counted(s: &mut Scene, d: Rect, src: &impl Source) -> usize {
+        let mut fb = screen();
+        let n = draw(s, d, &mut fb, src);
+        for _ in 0..n {
+            s.band_done();
+        }
+        n
+    }
+
+    #[test]
+    fn a_direct_frame_has_no_band_and_a_frame_that_returns_carries_the_whole_screen() {
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        // Composed to direct: the changed area of the window, no band, and the
+        // target is stale from here on.
+        assert_eq!(s.begin(), Some(SCREEN));
+        assert_eq!(s.frame_kind(), FrameKind::Bypass);
+        assert!(s.stale());
+        assert_eq!(s.primary(), Primary::Target);
+        s.end(true);
+        assert_eq!(
+            (s.primary(), s.bypassed(), s.bands()),
+            (Primary::Pool, 1, 0)
+        );
+        // Direct to direct: the damage alone, still no band.
+        s.flush(a, rect(10, 10, 20, 20)).unwrap();
+        assert_eq!(s.begin(), Some(rect(10, 10, 20, 20)));
+        assert_eq!(s.frame_kind(), FrameKind::Bypass);
+        s.end(true);
+        assert_eq!((s.bypassed(), s.bands()), (2, 0));
+        // A window above posts a small rectangle: the frame is a return, and
+        // its area is the whole screen.
+        let b = make(&mut s, 2, 2, rect(100, 50, 100, 100), 1);
+        s.post(b, 0, &[]).unwrap();
+        let d = s.begin().unwrap();
+        assert_eq!(s.frame_kind(), FrameKind::Rebind);
+        assert_eq!(d, SCREEN);
+        // The screen shows the pool until the frame is shown.
+        assert_eq!(s.primary(), Primary::Pool);
+        assert!(!s.pool_idle());
+        let src = flat(&[
+            (0, 0, 0x40, (STRIDE * HEIGHT) as usize),
+            (b, 0, 0x80, 100 * 4 * 100),
+        ]);
+        let n = counted(&mut s, d, &src);
+        let whole = counted(&mut s, SCREEN, &src);
+        assert_eq!(n, whole);
+        s.end(true);
+        assert_eq!(s.primary(), Primary::Target);
+        assert!(!s.stale());
+        assert_eq!(s.bands() as usize, n + whole);
+        assert_eq!(s.bypassed(), 2);
+        // Composed frames over the target are of their damage again.
+        s.flush(a, rect(0, 0, 8, 8)).unwrap();
+        assert_eq!(s.begin(), Some(rect(0, 0, 8, 8)));
+        assert_eq!(s.frame_kind(), FrameKind::Compose);
+        s.end(true);
+        // The window above goes: the way back to the pool is direct again,
+        // with the damage as it is (the driver transfers the whole pool when
+        // the source changes, whatever the area says).
+        s.destroy(b);
+        s.flush(a, rect(0, 0, 8, 8)).unwrap();
+        assert_eq!(s.begin(), Some(rect(0, 0, 200, 150)));
+        assert_eq!(s.frame_kind(), FrameKind::Bypass);
+        s.end(true);
+        assert_eq!(s.bypassed(), 3);
+    }
+
+    #[test]
+    fn a_frame_in_the_target_after_a_direct_one_is_whole_even_without_a_window_above() {
+        // The pointer drawn into the frame again (the cursor was refused)
+        // takes the screen back from the pool: the whole screen.
+        let mut s = direct(true);
+        legacy_window(&mut s);
+        settle(&mut s);
+        s.pointer_to(10, 10);
+        assert_eq!(s.cursor_refused(), None);
+        assert_eq!(s.begin(), Some(SCREEN));
+        assert_eq!(s.frame_kind(), FrameKind::Rebind);
+    }
+
+    #[test]
+    fn a_failed_frame_keeps_the_binding_and_the_stale_target() {
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        // A failed frame into the direct state binds nothing.
+        s.begin().unwrap();
+        s.end(false);
+        assert_eq!((s.primary(), s.bypassed()), (Primary::Target, 0));
+        assert!(s.stale());
+        // The next composed frame is whole for it.
+        s.flush(a, rect(0, 0, 8, 8)).unwrap();
+        s.set_direct(false);
+        assert_eq!(s.begin(), Some(SCREEN));
+        assert_eq!(s.frame_kind(), FrameKind::Compose);
+        s.end(false);
+        assert!(s.stale());
+        s.add_damage(rect(0, 0, 8, 8));
+        assert_eq!(s.begin(), Some(SCREEN));
+        s.end(true);
+        assert!(!s.stale());
+        s.add_damage(rect(0, 0, 8, 8));
+        assert_eq!(s.begin(), Some(rect(0, 0, 8, 8)));
+    }
+
+    #[test]
+    fn the_pool_is_cleared_after_the_frame_that_unbound_it_is_shown() {
+        // The window goes while the screen shows its pool: the frame that
+        // returns the screen to the target comes first.
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        assert_eq!(s.primary(), Primary::Pool);
+        s.destroy(a);
+        assert!(!s.take_pool_clear());
+        assert_eq!(s.begin(), Some(SCREEN));
+        assert_eq!(s.frame_kind(), FrameKind::Rebind);
+        assert!(!s.take_pool_clear());
+        // A frame that failed unbound nothing.
+        s.end(false);
+        assert!(!s.take_pool_clear());
+        s.add_damage(SCREEN);
+        s.begin().unwrap();
+        assert!(!s.take_pool_clear());
+        s.end(true);
+        assert!(s.take_pool_clear());
+        // Once.
+        assert!(!s.take_pool_clear());
+    }
+
+    #[test]
+    fn the_pool_is_cleared_at_once_when_the_screen_does_not_show_it() {
+        // The window was covered, so the target is the screen.
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        shown_window(&mut s, 2, rect(0, 0, 50, 50));
+        assert_eq!(s.primary(), Primary::Target);
+        s.destroy(a);
+        assert!(s.take_pool_clear());
+        // A window that was never shown.
+        let mut t = direct(true);
+        let a = t.create(1, 1, SCREEN, true, 0).unwrap();
+        t.destroy(a);
+        assert!(t.take_pool_clear());
+    }
+
+    #[test]
+    fn a_direct_frame_on_its_way_holds_the_pool() {
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        s.begin().unwrap();
+        s.destroy(a);
+        // The device may read the pool while this frame is its job.
+        assert!(!s.take_pool_clear());
+        s.end(true);
+        assert!(!s.take_pool_clear());
+        s.begin().unwrap();
+        s.end(true);
+        assert!(s.take_pool_clear());
+    }
+
+    #[test]
+    fn the_counters_count_shown_frames_and_bands() {
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        settle(&mut s);
+        for _ in 0..3 {
+            s.flush(a, rect(0, 0, 4, 4)).unwrap();
+            settle(&mut s);
+        }
+        assert_eq!((s.bypassed(), s.bands(), s.frames()), (4, 0, 4));
+        // A failed direct frame is no frame and no bypass.
+        s.flush(a, rect(0, 0, 4, 4)).unwrap();
+        s.begin().unwrap();
+        s.end(false);
+        assert_eq!((s.bypassed(), s.frames()), (4, 4));
+        // A composed frame counts its bands and no bypass.
+        s.set_direct(false);
+        s.add_damage(rect(0, 0, 64, 8));
+        let d = s.begin().unwrap();
+        let src = flat(&[(0, 0, 0x40, (STRIDE * HEIGHT) as usize)]);
+        let n = counted(&mut s, d, &src);
+        s.end(true);
+        assert!(n >= 1);
+        assert_eq!((s.bypassed(), s.bands() as usize), (4, n));
     }
 
     #[test]

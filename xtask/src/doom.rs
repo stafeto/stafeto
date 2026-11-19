@@ -273,6 +273,15 @@ pub fn doom_headless(machine: &'static qemu::Machine) -> Result<(), String> {
 /// the title is on the screen, with the CRC-32 of its red, green and blue
 /// bytes.
 const TITLE: &str = "doom: title crc32 ";
+/// The CRC-32 of the first title screen, as the guest computed it before the
+/// compositor showed Doom's buffer directly (the driver alone, and the
+/// compositor's own frame): the screen the display shows is the same points
+/// on every path, so the line must still say it.
+const TITLE_CRC: &str = "c31bb822";
+/// Frames a second of the timed demo before the direct frame (stafeto#392):
+/// through the compositor's bands, and straight from the display driver.
+const COMPOSED_FPS: f64 = 73.5;
+const DIRECT_FPS: f64 = 190.1;
 /// The line of the first level (episode 1, map 1).
 const LEVEL: &str = "doom: level 1 1";
 /// The start of every line of a level; Doom prints one for a level the
@@ -347,6 +356,48 @@ fn check_time(took: Duration, machine: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// What is wrong with the title `line` when its CRC is not TITLE_CRC.
+fn title_crc_fault(line: &str) -> Option<String> {
+    let at = line.find(TITLE)?;
+    let crc = line[at + TITLE.len()..].trim();
+    (crc != TITLE_CRC).then(|| {
+        format!(
+            "the title screen's CRC-32 is {crc}, {TITLE_CRC} expected (the same screen on the direct path and through the compositor)"
+        )
+    })
+}
+
+/// The device's trace of a run of Doom: the scanout was the target (OPEN),
+/// then the pool (Doom's window covers the screen with nothing above it, so
+/// the display shows its buffer as it is, from the title on, the level
+/// included), then the target again (Doom left). The probe opens three Doom
+/// windows (the first to the end of its menu, the second in the background,
+/// the third ended by Ctrl-C), each reaching its title, so the sequence is
+/// 1, then 2 and 1 three times.
+fn doom_trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
+    let scanouts: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            qemu::GpuTrace::Scanout {
+                id: 0,
+                res,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            } => Some(*res),
+            _ => None,
+        })
+        .collect();
+    if gpu_probe::contains_in_order(&scanouts, &[1, 2, 1, 2, 1, 2, 1]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1, 2, 1, 2, 1 in order expected: Doom's buffer (resource 2) was not the screen of each of the three Doom windows"
+        ))
+    }
 }
 
 /// What is wrong with `line` if it is a level line: one that comes before
@@ -484,6 +535,9 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     let began = Instant::now();
     let line = expect_title(run, "the title screen", TITLE_WITHIN)?;
     let title = began.elapsed().as_secs_f64();
+    if let Some(fault) = title_crc_fault(&line) {
+        return Err(fault);
+    }
     gpu_probe::compare(&mut monitor, &picture, &line, TITLE)?;
     // 3: the menu, New Game, the episode, the skill: the first level.
     let menu = Instant::now();
@@ -552,7 +606,8 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
     image_has_doom_terms(&image, IMAGE)?;
     packages::check()?;
     let scratch = Scratch::new()?;
-    let cmd = probe_command(machine, &kernel.image, &image, &scratch);
+    let mut cmd = probe_command(machine, &kernel.image, &image, &scratch);
+    cmd.args(qemu::gpu_trace(&scratch.trace()));
     // The time of the probe is that of the machine, not of the build.
     let began = Instant::now();
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -578,8 +633,13 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
             machine.name
         ));
     }
+    let text = std::fs::read_to_string(scratch.trace())
+        .map_err(|e| format!("doom-probe on {}: the trace file: {e}", machine.name))?;
+    let events =
+        qemu::parse_gpu_trace(&text).map_err(|e| format!("doom-probe on {}: {e}", machine.name))?;
+    doom_trace_verdict(&events).map_err(|e| format!("doom-probe on {}: {e}", machine.name))?;
     println!(
-        "doom-probe on {}: the title screen matched QEMU's screenshot ({:.1} s), the menu led to E1M1 in {:.1} s ({} colours), a turn changed {:.1} % of the points, the menu left with code 0, a second Doom was refused with 1, Ctrl-C left too; {:.0} s in all",
+        "doom-probe on {}: the title screen matched QEMU's screenshot and the CRC of the direct path (the trace shows Doom's buffer as the scanout, resource 2) ({:.1} s), the menu led to E1M1 in {:.1} s ({} colours), a turn changed {:.1} % of the points, the menu left with code 0, a second Doom was refused with 1, Ctrl-C left too; {:.0} s in all",
         machine.name,
         seen.title,
         seen.level,
@@ -724,7 +784,7 @@ pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
     let (memory, tics, real) =
         measured.map_err(|e| format!("doom-measure on {}: {e}", machine.name))?;
     println!(
-        "doom-measure on {}: {:.1} frames a second ({tics} game tics in {real} real tics of 1/35 s); memory of the process (VmSize kB, VmRSS kB, statm pages): {}",
+        "doom-measure on {}: {:.1} frames a second ({tics} game tics in {real} real tics of 1/35 s; stafeto#392 measured {COMPOSED_FPS} through the compositor's bands and {DIRECT_FPS} straight from the driver, and the compositor now shows Doom's buffer directly); memory of the process (VmSize kB, VmRSS kB, statm pages): {}",
         machine.name,
         frames_per_second(tics, real),
         memory.join("; ")
@@ -966,6 +1026,43 @@ mod tests {
         assert_eq!(first_fault(&run), None);
         assert_eq!(level_line_fault("doom: state 0 tic 1 demo 0", false), None);
         assert_eq!(doom_lines(&run).len(), 5);
+    }
+
+    #[test]
+    fn the_title_crc_must_be_the_one_of_the_direct_path() {
+        assert_eq!(title_crc_fault("doom: title crc32 c31bb822"), None);
+        assert!(
+            title_crc_fault("doom: title crc32 d8be0588")
+                .unwrap()
+                .contains("c31bb822 expected")
+        );
+        // Not a title line: nothing to say.
+        assert_eq!(title_crc_fault("doom: level 1 1"), None);
+    }
+
+    #[test]
+    fn the_trace_of_doom_needs_its_buffer_as_the_scanout_and_the_target_after() {
+        let scanout = |res| qemu::GpuTrace::Scanout {
+            id: 0,
+            res,
+            w: 640,
+            h: 400,
+            x: 0,
+            y: 0,
+        };
+        let good: Vec<_> = [1, 2, 1, 2, 1, 2, 1].map(scanout).to_vec();
+        assert_eq!(doom_trace_verdict(&good), Ok(()));
+        // The first Doom alone is not enough.
+        let first_only: Vec<_> = [1, 2, 1].map(scanout).to_vec();
+        assert!(doom_trace_verdict(&first_only).is_err());
+        let composed: Vec<_> = [1, 1].map(scanout).to_vec();
+        assert!(
+            doom_trace_verdict(&composed)
+                .unwrap_err()
+                .contains("resource 2")
+        );
+        let never_back: Vec<_> = [1, 2].map(scanout).to_vec();
+        assert!(doom_trace_verdict(&never_back).is_err());
     }
 
     #[test]

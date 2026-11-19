@@ -1234,7 +1234,14 @@ impl Driver {
         if sys::memory_info(object).is_ok_and(|info| info.refs > BASE_REFS) {
             return Answer::Status(code(BUSY));
         }
-        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        // The pool's copy also has DUPLICATE: the owner is the compositor,
+        // which hands the pool to one window of the first revision after
+        // another as copies without it, and checks the object's references
+        // before each. The cursor's picture stays the owner's.
+        let mut rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        if which == Kind::Pool {
+            rights = rights | Rights::DUPLICATE;
+        }
         let copy = match sys::handle_duplicate(object, rights) {
             Ok(copy) => copy,
             Err(error) => return Answer::Status(Status::Kernel(error)),

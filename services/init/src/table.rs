@@ -3845,7 +3845,13 @@ mod tests {
         assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
         assert_eq!(
             order_of(comp::TABLE),
-            ["display", "gpu", "comp-probe", "comp-probe-b"]
+            [
+                "display",
+                "gpu",
+                "comp-probe",
+                "comp-probe-b",
+                "comp-probe-c"
+            ]
         );
         assert_eq!(
             order_of(focus::TABLE),

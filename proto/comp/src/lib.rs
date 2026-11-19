@@ -15,7 +15,7 @@
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
-//! | DESCRIBE (17) | `Display`, manager, input | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy` (u32 each) | NO_DEVICE |
+//! | DESCRIBE (17) | `Display`, manager, input | the header alone | status, `width`, `height`, `format`, `flags`, `open`, `created`, `frames`, `busy`, `bypassed`, `bands` (u32 each) | NO_DEVICE |
 //! | WINDOW_CREATE (18) | `Display` | `x`, `y`, `w`, `h`, `format`, `flags` (u32); one handle: a channel with NOTIFY and TRANSFER | status, `id` (u32); one handle: the window's session (SEND, TRANSFER) | INVALID, UNSUPPORTED, NO_DEVICE, LIMIT_REACHED |
 //! | ATTACH (19) | window | `count`, `stride`, `format` (u32); `count` memory objects with MAP_READ and TRANSFER | the status alone | BUSY, INVALID, UNSUPPORTED, REVOKED |
 //! | POST (20) | window | `buffer`, `count` (u32), then `count` rectangles of 4 u32 | the status alone, at once | BUSY, INVALID, NOT_ALLOWED, REVOKED |
@@ -81,7 +81,16 @@
 //! picture on the display's cursor pipeline. Its `open` is the windows alive
 //! now, `created` the windows ever made, `frames` the frames shown, `busy` 1
 //! while a frame is being made or waits to be: a probe that waits for `busy`
-//! to be 0 finds the screen settled.
+//! to be 0 finds the screen settled. `bypassed` counts the frames the display
+//! showed straight from the buffer of a window of the first revision (the
+//! window covers the whole screen with nothing above it, so the service put
+//! nothing together), `bands` the bands of the frames it did put together,
+//! both since the service started.
+//!
+//! The flag `SCANOUT` (bit 0) of WINDOW_CREATE's `flags` is reserved for a
+//! window of the second revision whose buffer the display could show
+//! directly; the service answers UNSUPPORTED to any nonzero `flags` until it
+//! is defined.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -183,6 +192,13 @@ pub struct Description {
     pub created: u32,
     pub frames: u32,
     pub busy: u32,
+    /// The frames shown straight from a window's buffer (no band), and the
+    /// bands put together, both since the service started. A probe that
+    /// reads `bands` before and after some frames and finds it unchanged
+    /// while `bypassed` grew by their number knows the frames cost the
+    /// service no copy.
+    pub bypassed: u32,
+    pub bands: u32,
 }
 
 impl Description {
@@ -197,6 +213,8 @@ impl Description {
             self.created,
             self.frames,
             self.busy,
+            self.bypassed,
+            self.bands,
         ] {
             w.u32(n)?;
         }
@@ -221,6 +239,8 @@ impl Description {
             created: r.u32()?,
             frames: r.u32()?,
             busy: r.u32()?,
+            bypassed: r.u32()?,
+            bands: r.u32()?,
         };
         r.finish()?;
         Ok(d)
@@ -742,12 +762,14 @@ mod tests {
             created: 2,
             frames: 3,
             busy: 1,
+            bypassed: 2,
+            bands: 77,
         };
         let mut w = Writer::new();
         d.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 36);
+        assert_eq!(w.as_bytes().len(), 44);
         assert_eq!(Description::read(w.as_bytes()), Ok(d));
-        assert_eq!(Description::read(&w.as_bytes()[..32]), Err(Status::BadSize));
+        assert_eq!(Description::read(&w.as_bytes()[..36]), Err(Status::BadSize));
         let refused = proto_wire::reply(code(NO_DEVICE));
         assert_eq!(Description::read(&refused), Err(code(NO_DEVICE)));
     }
