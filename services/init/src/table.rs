@@ -193,13 +193,14 @@ pub const PACKAGE_SERVICE: &str = "pkgd";
 pub const TERMINAL_SERVICE: &str = "tty";
 /// The services that send their root to the process service with Register
 /// (proto_process::ROOT_MARKS), each with the mark init gives its notary
-/// session and no other entry: the terminal, channel, network and entropy
+/// session and no other entry: the terminal, channel, network, entropy and data
 /// services.
 pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (TERMINAL_SERVICE, proto_process::TERMINAL),
     (PIPE_SERVICE, proto_process::PIPE),
     (NET_SERVICE, proto_process::NET),
     (ENTROPY_SERVICE, proto_process::ENTROPY),
+    (DATA_SERVICE, proto_process::DATAFS),
 ];
 
 /// The label mark of the notary session of the voucher `name`: NOTARY, with
@@ -4510,15 +4511,41 @@ mod tests {
         }
     }
 
-    /// The data file service is a voucher with the plain notary session: no mark of a root, no
-    /// right to say a file is set-ID, and it is not a POSIX process, so `connects` has no `posix`
-    /// (a record that connects to it is one, and gets no notary session).
+    /// The data file service is a voucher whose notary session carries the mark of its root (it
+    /// registers the root the process service hands to every process with TakeRoot) and no other:
+    /// no right to say a file is set-ID, and it is not a POSIX process, so `connects` has no
+    /// `posix` (a record that connects to it is one, and gets no notary session). No other
+    /// service of any table gets the mark.
     #[test]
     fn the_data_file_service_is_a_plain_voucher() {
         assert!(VOUCHERS.contains(&DATA_SERVICE));
-        assert_eq!(notary_mark(DATA_SERVICE), proto_process::NOTARY);
+        assert_eq!(
+            notary_mark(DATA_SERVICE),
+            proto_process::NOTARY | proto_process::DATAFS
+        );
+        assert_eq!(
+            proto_process::root_of(notary_mark(DATA_SERVICE)),
+            Some(proto_process::ROOT_DATA)
+        );
         assert!(!SET_ID_VOUCHERS.contains(&DATA_SERVICE));
-        assert!(!ROOT_SERVICES.iter().any(|(name, _)| *name == DATA_SERVICE));
+        // The mark goes to the data service alone, whatever else a table holds.
+        for name in [
+            "clock",
+            RAM_SERVICE,
+            TERMINAL_SERVICE,
+            PIPE_SERVICE,
+            NET_SERVICE,
+        ] {
+            assert_eq!(notary_mark(name) & proto_process::DATAFS, 0, "{name}");
+        }
+        assert_eq!(
+            ROOT_SERVICES
+                .iter()
+                .filter(|(_, mark)| *mark == proto_process::DATAFS)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            [DATA_SERVICE]
+        );
         for table in data_tables() {
             for r in table.iter().filter(|r| r.name == DATA_SERVICE) {
                 assert!(!r.is_posix() && !r.is_client());

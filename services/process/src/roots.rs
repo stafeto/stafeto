@@ -8,7 +8,7 @@
 //! that service; a service that restarts registers again, and the new root
 //! replaces the old.
 
-use proto_process::{ROOT_TERMINAL, ROOTS, root_of};
+use proto_process::{PERMISSION, ROOT_DATA, ROOT_TERMINAL, ROOTS, UNREGISTERED, root_of};
 
 /// What a Register through a notary session asks, by the label and the
 /// number of handles it brought.
@@ -40,6 +40,13 @@ pub const fn registration(label: u64, handles: usize) -> Registration {
     }
 }
 
+/// Whether a process may ask for the root of `which` with TakeRoot: the root of the data file
+/// service alone. The other roots go to the loaders of set-ID programs (LoaderRoot) and to no
+/// process, because a session taken from them would carry no identity of the process's own.
+pub const fn takeable(which: u32) -> bool {
+    which == ROOT_DATA
+}
+
 /// The registered roots, by root.
 pub struct Roots<H> {
     held: [Option<H>; ROOTS],
@@ -56,6 +63,15 @@ impl<H> Roots<H> {
     /// root of an instance that went) comes back to be let go of.
     pub fn register(&mut self, which: u32, root: H) -> Option<H> {
         self.held.get_mut(which as usize)?.replace(root)
+    }
+
+    /// The root TakeRoot gives for `which`: PERMISSION for any root but `ROOT_DATA`, UNREGISTERED
+    /// when the service sent none.
+    pub fn taken(&self, which: u32) -> Result<&H, u32> {
+        if !takeable(which) {
+            return Err(PERMISSION);
+        }
+        self.get(which).ok_or(UNREGISTERED)
     }
 
     /// The root of the service of `which`, if it registered one.
@@ -91,7 +107,12 @@ mod tests {
             Registration::Refused
         );
         // The marked services, each with its own shape.
-        for (mark, root) in [(PIPE, 1), (NET, 2), (ENTROPY, 3)] {
+        for (mark, root) in [
+            (PIPE, 1),
+            (NET, 2),
+            (ENTROPY, 3),
+            (proto_process::DATAFS, 4),
+        ] {
             assert_eq!(
                 registration(NOTARY | mark | 4, 1),
                 Registration::Root { root, at: 0 }
@@ -109,6 +130,29 @@ mod tests {
             registration(NOTARY | TERMINAL | 4, 1),
             Registration::Refused
         );
+    }
+
+    /// TakeRoot gives the root of the data file service and refuses every other root, whether or
+    /// not its service registered one. (The planted fault: `takeable` true for `ROOT_NET`.)
+    #[test]
+    fn take_root_gives_the_data_root_and_no_other() {
+        let mut roots = Roots::<u32>::new();
+        for which in 0..ROOTS as u32 {
+            roots.register(which, 100 + which);
+        }
+        for which in 0..ROOTS as u32 {
+            if which == ROOT_DATA {
+                assert_eq!(roots.taken(which), Ok(&104));
+            } else {
+                assert_eq!(roots.taken(which), Err(PERMISSION), "root {which}");
+            }
+        }
+        assert_eq!(roots.taken(proto_process::ROOT_NET), Err(PERMISSION));
+        assert_eq!(roots.taken(ROOTS as u32), Err(PERMISSION));
+        // The data service has not registered: UNREGISTERED and no root.
+        let empty = Roots::<u32>::new();
+        assert_eq!(empty.taken(ROOT_DATA), Err(UNREGISTERED));
+        assert!(takeable(ROOT_DATA) && !takeable(ROOT_DATA + 1));
     }
 
     #[test]
