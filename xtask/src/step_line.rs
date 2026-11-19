@@ -60,6 +60,13 @@ impl StepLine<'_> {
 /// preemptions and one pair for 8 and more (`rt::service`'s step statistics). In one pair the
 /// greatest raw time is the greatest judged time at any charge, and the pair of 8 and more is
 /// judged with 8 preemptions: stricter than the true count of the line, which is the safe side.
+///
+/// The pairs reach xtask in the tables, at powers of two of the steps done and once at an ordered
+/// stop, and a run that ends otherwise may hold a pair that beat its maximum after the last
+/// table. That understatement is accepted: a hidden step is no longer than the raw maximum printed
+/// for its kind, so it cannot pass the check against B (`over_bound`); against 0.9 B the figure
+/// is understated by at most `P * PREEMPT_CHARGE` from the printed maximum, P being the
+/// preemptions of the hidden step.
 pub const PAIR_TOP: u64 = 8;
 
 /// The time less the measured charge of `preempts` preemptions (against 0.9 B).
@@ -97,6 +104,11 @@ impl Kinds<'_> {
 
 /// The hard check against B (`crate::TERM_B`) of the steps of the service `tag` of the kinds a
 /// probe judges (`over_bound`): an error that names the step, for the probes to return.
+///
+/// A kind is exempt from B only together with its exemption from 0.9 B in the same probe, and
+/// with a stated reason (a start-up step, a run whose ticks are the timer's). A new kind of a
+/// service falls under the check by default: `Kinds::All` and `Kinds::Except` take it in, and
+/// `Kinds::Only` takes it in when its list is extended with the bound the probe puts on it.
 pub fn within_b(lines: &[String], tag: &str, kinds: Kinds) -> Result<(), String> {
     match over_bound(lines, tag, crate::TERM_B, kinds) {
         Some(over) => Err(over),

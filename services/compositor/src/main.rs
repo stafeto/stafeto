@@ -449,6 +449,7 @@ fn main(_: u64) -> u64 {
         compositor::CURSOR_W * 4,
         Format::Argb,
         (compositor::CURSOR_W, compositor::CURSOR_H),
+        compositor::POINTER_IMAGE,
     );
     service.keys.link = connect_device(&service.parent, service.keys.name);
     service.pointer.link = connect_device(&service.parent, service.pointer.name);
@@ -1893,8 +1894,13 @@ impl Compositor {
                 if let Some(w) = self.scene.window(i).copied() {
                     let pixels = Pixels(&self.scene);
                     let src = pixels.pixels(i, buffer);
-                    self.raster
-                        .prepare(src, w.stride, w.format, (w.rect.w, w.rect.h));
+                    self.raster.prepare(
+                        src,
+                        w.stride,
+                        w.format,
+                        (w.rect.w, w.rect.h),
+                        compositor::image_of(i, buffer),
+                    );
                 }
                 // A window with an interval is due at its start, whatever else
                 // is waiting for a frame.

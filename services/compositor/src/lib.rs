@@ -1636,6 +1636,16 @@ impl Scene {
     }
 }
 
+/// The number of the surface of buffer `buffer` of window `window` for the raster's table
+/// of images: the same in every band, and different for every buffer of every window
+/// (below `POINTER_IMAGE`).
+pub const fn image_of(window: usize, buffer: u8) -> usize {
+    window * proto_comp::BUFFERS + buffer as usize
+}
+
+/// The number of the pointer's picture, after the buffers of every window.
+pub const POINTER_IMAGE: usize = MAX_WINDOWS * proto_comp::BUFFERS;
+
 /// The size of a band of a damage `damage_w` wide: the layers cost `calls` ticks
 /// in all, `per_row` hundredths of a tick for each line and `per_point`
 /// hundredths for each point. The lines of the damage's width that BAND_TICKS
@@ -1694,7 +1704,10 @@ pub trait Raster {
     /// The points of `src` (a surface of `size` points, `stride` bytes a
     /// line, in `format`) that start at (`from.0`, `from.1`) go to the
     /// screen at `to`, `area` of them: replacing what is there when `over`
-    /// is false, laid over it (premultiplied) when it is true.
+    /// is false, laid over it (premultiplied) when it is true. `image` is the
+    /// number of the surface for the raster's own table of images (`image_of`
+    /// for a window's buffer, `POINTER_IMAGE` for the pointer's picture): the
+    /// same surface has the same number in every band.
     #[allow(clippy::too_many_arguments)]
     fn blit(
         &mut self,
@@ -1707,6 +1720,7 @@ pub trait Raster {
         to: (u32, u32),
         area: (u32, u32),
         over: bool,
+        image: usize,
     );
 }
 
@@ -1805,6 +1819,7 @@ pub fn compose_sized(
             (wx0, wy0),
             (wx1 - wx0, wy1 - wy0),
             w.format == Format::Argb,
+            image_of(k as usize, b),
         );
     }
     if let Some(p) = scene.drawn_pointer() {
@@ -1822,6 +1837,7 @@ pub fn compose_sized(
                 (cx0, cy0),
                 (cx1 - cx0, cy1 - cy0),
                 true,
+                POINTER_IMAGE,
             );
         }
     }
@@ -1875,6 +1891,7 @@ mod tests {
             to: (u32, u32),
             area: (u32, u32),
             over: bool,
+            _: usize,
         ) {
             assert_eq!(over, format == Format::Argb);
             for y in 0..area.1 {
@@ -2842,6 +2859,7 @@ mod tests {
             _: (u32, u32),
             area: (u32, u32),
             over: bool,
+            _: usize,
         ) {
             let p = if over { OVER } else { OPAQUE };
             self.calls += p.call;
@@ -2922,6 +2940,66 @@ mod tests {
             + u64::from(BAND_FIXED) * 100
             + u64::from(LAYER) * 100 * u64::from(over))
         .div_ceil(100)
+    }
+
+    /// The raster is told the number of each surface for its table of images: the
+    /// same in every band, different for every window and buffer, and the pointer's
+    /// picture after all of them.
+    #[test]
+    fn every_blit_names_its_surface_the_same_way_in_every_band() {
+        struct Names(Vec<usize>);
+        impl Raster for Names {
+            fn black(&mut self, _: &mut [u8], _: Rect) {}
+            fn blit(
+                &mut self,
+                _: &mut [u8],
+                _: &[u8],
+                _: u32,
+                _: Format,
+                _: (u32, u32),
+                _: (u32, u32),
+                _: (u32, u32),
+                _: (u32, u32),
+                _: bool,
+                image: usize,
+            ) {
+                self.0.push(image);
+            }
+        }
+        struct Nothing;
+        impl Source for Nothing {
+            fn pixels(&self, _: usize, _: u8) -> &[u8] {
+                &[]
+            }
+        }
+        let mut s = Scene::new();
+        eight_windows(&mut s, 8);
+        s.pointer_to(100, 100);
+        let d = rect(100, 100, 320, 200);
+        let mut fb = screen();
+        let mut seen: Vec<Vec<usize>> = Vec::new();
+        let mut at = Band { row: d.y, col: 0 };
+        for _ in 0..3 {
+            let mut names = Names(Vec::new());
+            at = compose(&s, d, at, &mut fb, &Nothing, &mut names);
+            seen.push(names.0);
+        }
+        // The windows have the same numbers in every band (the pointer is in the
+        // first ones only).
+        assert!(seen.iter().all(|n| n[..8] == seen[0][..8]), "{seen:?}");
+        let band = &seen[0];
+        assert_eq!(band.len(), 9);
+        let (windows, pointer) = band.split_at(8);
+        assert_eq!(pointer, [POINTER_IMAGE]);
+        let mut sorted = windows.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 8);
+        assert!(sorted.iter().all(|&i| i < POINTER_IMAGE));
+        for k in 0..8usize {
+            let w = s.window(k).unwrap();
+            assert!(windows.contains(&image_of(k, w.current.unwrap())));
+        }
     }
 
     #[test]

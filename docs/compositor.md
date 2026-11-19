@@ -314,6 +314,21 @@ soon as the commands are in the device's queue, and the driver says
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
 
+The images pixman wraps around the buffers are kept in a ring of 32 (`lib/pixman`,
+`kept.rs`), the oldest going when a new one comes, and each is made when its buffer is
+posted (`Pixman::prepare`), so that no band makes it. The table also remembers, for each surface the
+service names (`compositor::image_of` for the buffer of a window, `POINTER_IMAGE` for the
+pointer's picture, and one slot for the screen), the slot it last found the image in, so
+that a lookup in a band is one comparison whatever the table holds. A remembered slot is a
+guess: it is used when the key stored in the slot is the one looked for, and otherwise
+(another surface took the slot, or the surface is new) the ring is looked through, at most
+32 entries, and the slot is remembered again, so a stale slot never gives another buffer's
+image. A band can still look through the ring when a surface was not prepared (a window of
+the first revision, whose buffer is read by its first band), or when 32 newer images have
+pushed one out (a long run of windows made and closed): the step then says the images the
+band made in its detail (1000 plus their number). The feature `irq-trace` and the pixman
+feature `scan-count` count the entries looked at, for the probes.
+
 The prices are measured under -icount, where time is instructions: there is no
 cold cache, no miss of a translation and no first touch of a buffer (the buffers
 are mapped in advance), and pixman's table of fast paths, the one cache that can

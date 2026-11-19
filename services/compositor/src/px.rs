@@ -568,6 +568,7 @@ impl Pixman {
             stride: 4,
             width: 1,
             height: 1,
+            hint: pixman::NO_HINT,
         };
         let mut images = Images::new();
         composite(&mut images, true, &mut target, from, (0, 0), (0, 0), (1, 1));
@@ -590,13 +591,14 @@ impl Pixman {
 
     /// The image of a window's buffer is made now (a post), so that no band
     /// pays for the first use of a surface.
-    pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32)) {
+    pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32), image: usize) {
         let source = Source {
             bytes: src,
             format: format(f),
             stride,
             width: size.0,
             height: size.1,
+            hint: image,
         };
         if !prepare(&mut self.images, source) {
             self.refuse("a surface");
@@ -661,6 +663,7 @@ impl Raster for Pixman {
         to: (u32, u32),
         area: (u32, u32),
         over: bool,
+        image: usize,
     ) {
         let mut target = Target {
             bytes: fb,
@@ -675,6 +678,7 @@ impl Raster for Pixman {
             stride,
             width: size.0,
             height: size.1,
+            hint: image,
         };
         #[cfg(feature = "steps")]
         let began = rt::time::now();
@@ -868,6 +872,7 @@ pub mod calibration {
                                 stride,
                                 width,
                                 height,
+                                hint: pixman::NO_HINT,
                             };
                             let images = &mut px.images;
                             let ticks = timed(thread, || {
@@ -1013,6 +1018,7 @@ pub mod calibration {
             to: (u32, u32),
             area: (u32, u32),
             over: bool,
+            image: usize,
         ) {
             let mut target = Target {
                 bytes: self.target,
@@ -1027,6 +1033,7 @@ pub mod calibration {
                 stride,
                 width: size.0,
                 height: size.1,
+                hint: image,
             };
             composite(
                 self.images,
