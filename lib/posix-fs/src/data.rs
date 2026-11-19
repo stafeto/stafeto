@@ -53,6 +53,8 @@ pub mod errno {
     pub const EROFS: i32 = 30;
     pub const ENAMETOOLONG: i32 = 36;
     pub const ENOTEMPTY: i32 = 39;
+    pub const EMLINK: i32 = 31;
+    pub const EXDEV: i32 = 18;
 }
 
 /// The errno of a status code of the service. A code the protocol does not have is EIO. The
@@ -299,6 +301,207 @@ pub fn clone_plan(held: impl IntoIterator<Item = Held>, cwd: Option<u32>) -> Clo
         add(handle);
     }
     plan
+}
+
+/// The flags of the layer's `open` the data volume looks at (the values of `posix_abi::constants`,
+/// which a test of that crate keeps equal).
+pub mod oflag {
+    pub const ACCMODE: i32 = 3;
+    pub const WRONLY: i32 = 1;
+    pub const RDWR: i32 = 2;
+    pub const CREAT: i32 = 0o100;
+    pub const EXCL: i32 = 0o200;
+    pub const TRUNC: i32 = 0o1000;
+    pub const APPEND: i32 = 0o2000;
+    pub const DIRECTORY: i32 = 65536;
+    /// O_DSYNC and O_SYNC of the platform: either asks for every write to be durable.
+    pub const SYNC: i32 = 0o4010000;
+}
+
+/// What an `open` of a path of the volume sends: the flags of the protocol, the mode with the
+/// creation mask applied, and whether the file is truncated by an open of its own first (an
+/// open for reading with O_TRUNC: the service truncates only through a description with write
+/// access, so the layer opens for writing with TRUNCATE, closes it, and opens for reading).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenPlan {
+    pub flags: u32,
+    pub mode: u32,
+    pub truncate_first: bool,
+}
+
+/// Translates the flags of an `open` (and its mode and creation mask) into the plan of the
+/// requests, or the errno: EINVAL for the access mode 3 and for O_CREAT on a directory, EISDIR for
+/// a directory opened for writing or truncated.
+pub fn open_plan(flags: i32, mode: u32, umask: u32) -> Result<OpenPlan, i32> {
+    use oflag as o;
+    let access = flags & o::ACCMODE;
+    let (reads, writes) = match access {
+        0 => (true, false),
+        o::WRONLY => (false, true),
+        o::RDWR => (true, true),
+        _ => return Err(errno::EINVAL),
+    };
+    let directory = flags & o::DIRECTORY != 0;
+    if directory && flags & o::CREAT != 0 {
+        return Err(errno::EINVAL);
+    }
+    if directory && (writes || flags & o::TRUNC != 0) {
+        return Err(errno::EISDIR);
+    }
+    let mut asked = 0;
+    if reads {
+        asked |= p::READ;
+    }
+    if writes {
+        asked |= p::WRITE;
+        // The end of the file and a durable write mean something for a description that writes.
+        if flags & o::APPEND != 0 {
+            asked |= p::APPEND;
+        }
+        if flags & o::SYNC != 0 {
+            asked |= p::SYNC;
+        }
+    }
+    if directory {
+        asked |= p::DIRECTORY;
+    }
+    let creating = flags & o::CREAT != 0;
+    if creating {
+        asked |= p::CREATE;
+        if flags & o::EXCL != 0 {
+            asked |= p::EXCLUSIVE;
+        }
+    }
+    let mut truncate_first = false;
+    if flags & o::TRUNC != 0 {
+        if writes {
+            asked |= p::TRUNCATE;
+        } else {
+            truncate_first = true;
+        }
+    }
+    let mode = if creating {
+        mode & p::MODE_MASK & !(umask & 0o777)
+    } else {
+        0
+    };
+    Ok(OpenPlan {
+        flags: asked,
+        mode,
+        truncate_first,
+    })
+}
+
+/// The open that truncates for an open that only reads: the plan of its first request (write
+/// access, TRUNCATE, and the creation the caller asked for), which closes at once.
+pub fn truncating_open(plan: OpenPlan) -> OpenPlan {
+    OpenPlan {
+        flags: (plan.flags & (p::CREATE | p::EXCLUSIVE)) | p::WRITE | p::TRUNCATE,
+        mode: plan.mode,
+        truncate_first: false,
+    }
+}
+
+/// The reading open that follows it: no creation, no exclusion.
+pub fn reading_open(plan: OpenPlan) -> OpenPlan {
+    OpenPlan {
+        flags: plan.flags & !(p::CREATE | p::EXCLUSIVE),
+        mode: 0,
+        truncate_first: false,
+    }
+}
+
+/// How a write of `total` bytes goes in messages of at most `max` bytes, and what it returns: the
+/// sum of the messages that went, and only when none did the error of the one that failed (the
+/// next call meets the same error: ENOSPC, EFBIG).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Splitter {
+    total: usize,
+    done: usize,
+    max: usize,
+}
+
+impl Splitter {
+    pub const fn new(total: usize, max: usize) -> Splitter {
+        Splitter {
+            total,
+            done: 0,
+            max,
+        }
+    }
+
+    /// The bytes the next message carries, None when all went. A write of no bytes sends none.
+    pub fn next_len(&self) -> Option<usize> {
+        let left = self.total - self.done;
+        (left > 0).then_some(left.min(self.max))
+    }
+
+    /// Where the next message starts in the buffer.
+    pub fn at(&self) -> usize {
+        self.done
+    }
+
+    /// A message of `asked` bytes was taken for `wrote`: whether another follows (the service
+    /// wrote all of it and bytes are left).
+    pub fn took(&mut self, asked: usize, wrote: usize) -> bool {
+        let wrote = wrote.min(asked);
+        self.done += wrote;
+        wrote == asked && self.done < self.total
+    }
+
+    /// The result when a message failed with `error`.
+    pub fn failed(&self, error: i32) -> Result<usize, i32> {
+        if self.done > 0 {
+            Ok(self.done)
+        } else {
+            Err(error)
+        }
+    }
+
+    pub fn written(&self) -> usize {
+        self.done
+    }
+}
+
+/// A time of `utimensat` (the seconds and the nanoseconds or a mark, as the layer holds them) as
+/// the protocol has it: a time outside the range the volume keeps (i64 nanoseconds) is the nearest
+/// end of it.
+pub fn time_spec(seconds: u64, nanos: u64) -> p::TimeSpec {
+    if nanos == proto_fs::TIME_NOW {
+        return p::TimeSpec::Now;
+    }
+    if nanos == proto_fs::TIME_OMIT {
+        return p::TimeSpec::Omit;
+    }
+    let total = i128::from(seconds.cast_signed()) * 1_000_000_000 + i128::from(nanos);
+    let clamped = total.clamp(i128::from(i64::MIN) + 2, i128::from(i64::MAX) - 2);
+    p::TimeSpec::At(clamped as i64)
+}
+
+/// The errno of a `link` whose two paths are both on the volume: the volume has one name for a
+/// file (EMLINK), a directory has no second name (EPERM).
+pub fn link_errno(old_is_directory: bool) -> i32 {
+    if old_is_directory {
+        errno::EPERM
+    } else {
+        errno::EMLINK
+    }
+}
+
+/// Where the two paths of a `rename` or `link` are: both on the volume, or one of them (EXDEV).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Neither,
+    Both,
+    Across,
+}
+
+pub fn route_of(old_on_volume: bool, new_on_volume: bool) -> Route {
+    match (old_on_volume, new_on_volume) {
+        (false, false) => Route::Neither,
+        (true, true) => Route::Both,
+        _ => Route::Across,
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +753,119 @@ mod tests {
             })
             .collect();
         assert_eq!(clone_plan(many, None).count, p::CLONE_MAX);
+    }
+
+    #[test]
+    fn open_flags_become_the_flags_of_the_protocol() {
+        use oflag as o;
+        let plan = |f, m, u| open_plan(f, m, u).unwrap();
+        assert_eq!(plan(0, 0, 0).flags, p::READ);
+        assert_eq!(plan(o::WRONLY, 0, 0).flags, p::WRITE);
+        assert_eq!(plan(o::RDWR, 0, 0).flags, p::READ | p::WRITE);
+        let all = plan(
+            o::WRONLY | o::CREAT | o::EXCL | o::TRUNC | o::APPEND | o::SYNC,
+            0o666,
+            0o022,
+        );
+        assert_eq!(
+            all.flags,
+            p::WRITE | p::CREATE | p::EXCLUSIVE | p::TRUNCATE | p::APPEND | p::SYNC
+        );
+        assert_eq!(all.mode, 0o644, "the creation mask applies");
+        assert!(!all.truncate_first);
+        // O_APPEND is kept for a description that writes: losing it would lose the atomic end.
+        assert!(plan(o::RDWR | o::APPEND, 0, 0).flags & p::APPEND != 0);
+        // And means nothing for one that only reads.
+        assert_eq!(plan(o::APPEND, 0, 0).flags, p::READ);
+        assert_eq!(plan(o::DIRECTORY, 0, 0).flags, p::READ | p::DIRECTORY);
+    }
+
+    #[test]
+    fn a_mode_matters_only_for_a_creation() {
+        use oflag as o;
+        assert_eq!(open_plan(o::WRONLY, 0o777, 0).unwrap().mode, 0);
+        assert_eq!(
+            open_plan(o::WRONLY | o::CREAT, 0o7777, 0o027).unwrap().mode,
+            0o7750
+        );
+        // EXCL with no CREAT asks for nothing.
+        assert_eq!(open_plan(o::EXCL, 0, 0).unwrap().flags, p::READ);
+    }
+
+    #[test]
+    fn open_refuses_what_has_no_meaning() {
+        use oflag as o;
+        assert_eq!(open_plan(3, 0, 0), Err(errno::EINVAL));
+        assert_eq!(open_plan(o::DIRECTORY | o::CREAT, 0, 0), Err(errno::EINVAL));
+        assert_eq!(
+            open_plan(o::DIRECTORY | o::WRONLY, 0, 0),
+            Err(errno::EISDIR)
+        );
+        assert_eq!(open_plan(o::DIRECTORY | o::TRUNC, 0, 0), Err(errno::EISDIR));
+    }
+
+    #[test]
+    fn truncation_with_reading_is_an_open_of_its_own_first() {
+        use oflag as o;
+        let plan = open_plan(o::TRUNC | o::CREAT | o::EXCL, 0o600, 0).unwrap();
+        assert!(plan.truncate_first);
+        assert_eq!(plan.flags & p::TRUNCATE, 0);
+        let first = truncating_open(plan);
+        assert_eq!(
+            first.flags,
+            p::WRITE | p::TRUNCATE | p::CREATE | p::EXCLUSIVE
+        );
+        assert_eq!(first.mode, 0o600);
+        let second = reading_open(plan);
+        assert_eq!(second.flags, p::READ);
+        assert_eq!(second.mode, 0);
+    }
+
+    #[test]
+    fn a_write_goes_in_messages_and_the_sum_comes_back_after_a_failure() {
+        let mut s = Splitter::new(2500, 1012);
+        assert_eq!(s.next_len(), Some(1012));
+        assert!(s.took(1012, 1012));
+        assert_eq!((s.at(), s.next_len()), (1012, Some(1012)));
+        assert!(s.took(1012, 1012));
+        assert_eq!(s.next_len(), Some(476));
+        // No room for the last message: the sum is the result, and the next call fails.
+        assert_eq!(s.failed(errno::ENOSPC), Ok(2024));
+        let first = Splitter::new(10, 4);
+        assert_eq!(first.failed(errno::ENOSPC), Err(errno::ENOSPC));
+        // A short message ends the write.
+        let mut t = Splitter::new(2000, 1012);
+        assert!(!t.took(1012, 500));
+        assert_eq!(t.written(), 500);
+        // A write of no bytes sends none.
+        assert_eq!(Splitter::new(0, 1012).next_len(), None);
+        let mut done = Splitter::new(1012, 1012);
+        assert!(!done.took(1012, 1012));
+        assert_eq!(done.next_len(), None);
+    }
+
+    #[test]
+    fn times_are_marks_or_nanoseconds_inside_the_range() {
+        assert_eq!(time_spec(0, proto_fs::TIME_NOW), p::TimeSpec::Now);
+        assert_eq!(time_spec(0, proto_fs::TIME_OMIT), p::TimeSpec::Omit);
+        assert_eq!(time_spec(5, 7), p::TimeSpec::At(5_000_000_007));
+        assert_eq!(
+            time_spec((-1i64).cast_unsigned(), 0),
+            p::TimeSpec::At(-1_000_000_000)
+        );
+        let p::TimeSpec::At(top) = time_spec(i64::MAX.cast_unsigned(), 0) else {
+            panic!()
+        };
+        assert!(top > i64::MAX - 10, "clamped to the end of the range");
+    }
+
+    #[test]
+    fn a_link_and_a_rename_across_the_mount_are_xdev_by_their_routes() {
+        assert_eq!(route_of(false, false), Route::Neither);
+        assert_eq!(route_of(true, true), Route::Both);
+        assert_eq!(route_of(true, false), Route::Across);
+        assert_eq!(route_of(false, true), Route::Across);
+        assert_eq!(link_errno(false), errno::EMLINK);
+        assert_eq!(link_errno(true), errno::EPERM);
     }
 }
