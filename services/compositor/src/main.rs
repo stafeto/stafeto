@@ -50,6 +50,7 @@
 #![no_main]
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
+use compositor::frame::{self, Fire, Pacer, Wake};
 use compositor::{
     Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
 };
@@ -57,7 +58,8 @@ use core::mem::ManuallyDrop;
 use core::slice;
 use proto_comp::{
     Attach, BUFFER_MAX, Create, Description, EVENTS_BIT, Event, FOCUSED, INPUT_MARK, MANAGER_MARK,
-    MAX_EVENTS, Method as Comp, Post, Rect, SHOWN, WindowRecord, manage,
+    MAX_EVENTS, Method as Comp, Post, RESET, Rect, SHOWN, STATS_WINDOWS, SetBody, StatsReply,
+    WindowRecord, WindowStats, manage, read_stats_request,
 };
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FORMATS_XRGB8888, FRAME_FAILED, FRAME_SHOWN,
@@ -69,7 +71,7 @@ use proto_init::ServiceArgs;
 use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
-use rt::handle::{Channel, Memory, Outgoing, Process};
+use rt::handle::{Channel, Memory, Outgoing, Process, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::wait::Waiter;
 use rt::{Handle, sys};
@@ -128,6 +130,9 @@ const POINTER: u64 = 1 << 57;
 /// revision: the label of the window and this bit. The service serves its
 /// READ (proto_input) from the window's ring, so the keys follow the focus.
 const WINDOW_KEYS: u64 = 1 << 56;
+/// The label of the handle the frame's timer is made through: no session has it
+/// (its marks are bits 56 to 63, the devices' labels bits 57 and 58).
+const TIMER_LABEL: u64 = 1 << 55;
 /// The low bits of a device's label: the generation of the grant.
 const GENERATION: u64 = 0xFFFF;
 /// The service's own bits: the next band of the frame is due, a chunk of
@@ -136,6 +141,10 @@ const GENERATION: u64 = 0xFFFF;
 const BAND: u64 = 1;
 const WORK: u64 = 2;
 const INPUT: u64 = 4;
+/// The timer is to be armed for the start the bands put off by the cap wait
+/// for: a step of its own, so that the kernel call is not in the step of the
+/// band that reached the cap.
+const ARM: u64 = 8;
 /// The events one READ of an input service asks for.
 const READ_MAX: u32 = 32;
 /// The codes of a start that failed, and of the driver's end.
@@ -211,6 +220,18 @@ struct Attaching {
 
 /// The pixels of the windows' buffers, as the mappings hold them.
 struct Pixels<'a>(&'a Scene);
+
+/// The detail of the longest step of the service's own work tells which
+/// work it is: the thousands (1 a band, to which the images it made are added,
+/// 2 the take of a frame, 3 the commit after the last band, 4 the end of a
+/// frame, 5 a step of the service's housekeeping, 6 the arming of the timer
+/// after a band reached the cap).
+const STEP_BAND: u64 = 1000;
+const STEP_TAKE: u64 = 2000;
+const STEP_COMMIT: u64 = 3000;
+const STEP_END: u64 = 4000;
+const STEP_WORK: u64 = 5000;
+const STEP_ARM: u64 = 6000;
 
 impl PixelSource for Pixels<'_> {
     fn pixels(&self, window: usize, buffer: u8) -> &[u8] {
@@ -349,6 +370,17 @@ struct Compositor {
     primary: Option<Pipeline>,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
+    /// The clock of the frame: when a frame is taken, the periods, the counters.
+    pacer: Pacer,
+    /// The timer of the frame, made through a copy of the channel with a label
+    /// of its own; the copy lives as long as the timer.
+    timer: Handle<Timer>,
+    _timer_view: Handle<Channel>,
+}
+
+/// The time on the scale of the counter, in nanoseconds.
+fn now_ns() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
 }
 
 fn main(_: u64) -> u64 {
@@ -369,6 +401,19 @@ fn main(_: u64) -> u64 {
     let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
         return NOT_REGISTERED;
     };
+    let Ok(timer_view) = sys::handle_label(&channel, Rights::RECEIVE, TIMER_LABEL, level) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(timer) = sys::timer_create(&timer_view, level) else {
+        return NOT_REGISTERED;
+    };
+    let (period, cap_ppm, bad) = frame::parse_args(args.map_or(&[], |a| a.own));
+    if bad {
+        rt::println!(
+            "compositor: the arguments of the record are no period and cap, the defaults stand"
+        );
+    }
+    let cap = frame::band_cap(period, cap_ppm);
     let mut service = Compositor {
         channel: Handle::borrowed(channel.raw()),
         notify,
@@ -393,7 +438,19 @@ fn main(_: u64) -> u64 {
         primary: None,
         cleared: None,
         attaching: None,
+        pacer: Pacer::new(now_ns(), period, cap),
+        timer,
+        _timer_view: timer_view,
     };
+    // The image of the pointer's picture is made here, before the first band
+    // the pointer is in.
+    service.raster.prepare(
+        compositor::pointer_picture(),
+        compositor::CURSOR_W * 4,
+        Format::Argb,
+        (compositor::CURSOR_W, compositor::CURSOR_H),
+        compositor::POINTER_IMAGE,
+    );
     service.keys.link = connect_device(&service.parent, service.keys.name);
     service.pointer.link = connect_device(&service.parent, service.pointer.name);
     // The screen is opened here, outside any step (its buffer is 256 pages
@@ -411,6 +468,8 @@ fn main(_: u64) -> u64 {
         service.raster.calibrate(fb);
         service.raster.calibrate_layers(fb);
     }
+    // The periods start when the screen is open (and measured).
+    service.pacer = Pacer::new(now_ns(), period, cap);
     // The devices' focus is the compositor's, once the screen is.
     service.take_own(Which::Keys);
     service.take_own(Which::Pointer);
@@ -990,20 +1049,101 @@ impl Compositor {
 
     // ------------------------------------------------------------ the frame
 
-    /// Starts a frame when none is in progress and the screen is open and
-    /// damage waits: the windows' posted buffers are taken, the FLUSHes
-    /// that wait move to this frame, and the first band is due.
+    /// A change may have come: the free run starts a frame at once when none is
+    /// in progress and damage waits; with a period the change waits for the next
+    /// start of a period (the timer is armed for it), where the windows' posted
+    /// buffers are taken, the FLUSHes that wait move to that frame, and the first
+    /// band is due.
     fn kick(&mut self) {
-        self.start_frame();
+        if self.pacer.is_free() {
+            self.start_free();
+        } else {
+            self.want_frame();
+        }
         self.deliver();
     }
 
-    fn start_frame(&mut self) {
-        if self.screen.is_none() || self.job.is_some() || self.committed {
+    /// A change waits for a frame: the pacer arms the timer for the start of
+    /// the period it is taken at, when no frame is in work.
+    fn want_frame(&mut self) {
+        if self.screen.is_none() || !self.scene.damaged() {
             return;
         }
-        let Some(damage) = self.scene.begin() else {
-            return;
+        let wake = self.pacer.change(now_ns(), None);
+        self.arm(wake);
+    }
+
+    /// The step after a band reached the cap: the timer is armed for the start
+    /// the bands wait for (`Pacer::take_arm`).
+    fn arm_after_cap(&mut self) {
+        rt::service::step_own();
+        rt::service::step_detail(STEP_ARM);
+        if let Some(at) = self.pacer.take_arm() {
+            let _ = sys::timer_set(&self.timer, at);
+        }
+    }
+
+    /// What the pacer says of the timer.
+    fn arm(&mut self, wake: Wake) {
+        match wake {
+            Wake::At(at) => {
+                let _ = sys::timer_set(&self.timer, at);
+            }
+            Wake::Now => self.start_free(),
+            Wake::None => {}
+        }
+    }
+
+    /// The free run: a frame as soon as the screen, the device and damage allow.
+    fn start_free(&mut self) {
+        if self.begin_frame(None) {
+            self.pacer.take_now(now_ns());
+        }
+    }
+
+    /// The timer fired at the start of a period (or the bands put off by the cap
+    /// are due): take the frame, or go on with its bands.
+    fn timer_fired(&mut self) {
+        // The step that takes a frame is judged as a band is (under the band's
+        // limit), with the steps of the service's own work.
+        rt::service::step_own();
+        rt::service::step_detail(STEP_TAKE);
+        let now = now_ns();
+        match self.pacer.fire(now) {
+            Fire::Take(k) => {
+                if self.begin_frame(Some(k)) {
+                    // The windows the frame did not take are owed their start.
+                    if let Some(e) = self.scene.held_until() {
+                        self.pacer.hold(e);
+                    }
+                    self.deliver();
+                } else {
+                    // Nothing was taken (damage that has gone, or only windows
+                    // held for their intervals): they are owed their start.
+                    if let Some(e) = self.scene.held_until() {
+                        self.pacer.hold(e);
+                    }
+                    let wake = self.pacer.nothing_taken(now);
+                    self.arm(wake);
+                }
+            }
+            Fire::Continue => {
+                #[cfg(feature = "irq-trace")]
+                px::cost::trace::mark_expiry();
+                let _ = sys::notify(&self.notify, BAND);
+            }
+            Fire::Idle | Fire::Early => {}
+        }
+    }
+
+    /// Begins a frame (of period `k`, or of the free run) when none is in
+    /// progress and the screen is open and damage waits: whether one began.
+    fn begin_frame(&mut self, k: Option<u64>) -> bool {
+        if self.screen.is_none() || self.job.is_some() || self.committed {
+            return false;
+        }
+        let Some(damage) = self.scene.begin_at(k.unwrap_or(u64::MAX)) else {
+            return false;
         };
         for i in 0..MAX_WINDOWS {
             if self.scene.window(i).is_some_and(|w| w.in_frame) && self.extra[i].queued.is_some() {
@@ -1020,7 +1160,10 @@ impl Compositor {
             damage,
             at: Band { row, col: 0 },
         });
+        #[cfg(feature = "irq-trace")]
+        px::cost::trace::mark_first_of_frame();
         let _ = sys::notify(&self.notify, BAND);
+        true
     }
 
     /// One band of the frame; the step after the last band commits it
@@ -1028,6 +1171,12 @@ impl Compositor {
     /// the step of a band).
     fn band(&mut self) {
         rt::service::step_own();
+        // The bands are put off by the cap until the expiry of the timer says to go on
+        // (which notifies the next band): a notice of a band before that does nothing.
+        if self.pacer.deferred() {
+            return;
+        }
+        rt::service::step_detail(STEP_BAND);
         #[cfg(feature = "steps")]
         let band_began = rt::time::now();
         let Some(job) = self.job.as_mut() else {
@@ -1038,6 +1187,7 @@ impl Compositor {
             self.job = None;
             #[cfg(feature = "steps")]
             px::cost::frame_done();
+            rt::service::step_detail(STEP_COMMIT);
             self.commit(damage);
             return;
         }
@@ -1045,8 +1195,12 @@ impl Compositor {
         // object, read and write, SCREEN_BYTES of its 256 pages; nothing
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
+        let began = now_ns();
+        let made = self.raster.made();
         #[cfg(feature = "steps")]
         px::cost::band_begin();
+        #[cfg(feature = "irq-trace")]
+        let (times_began, scan_began) = (px::cost::trace::times(), self.raster.scanned());
         #[cfg(feature = "steps")]
         let compose_began = rt::time::now();
         job.at = compose(
@@ -1058,12 +1212,41 @@ impl Compositor {
             &mut self.raster,
         );
         #[cfg(feature = "steps")]
-        px::cost::band_end(
+        let (compose_ticks, band_ticks) = (
             rt::time::now() - compose_began,
             rt::time::now() - band_began,
         );
+        #[cfg(feature = "irq-trace")]
+        {
+            let times = px::cost::trace::times();
+            px::cost::trace::band(
+                times.0.saturating_sub(times_began.0),
+                times.1.saturating_sub(times_began.1),
+                self.raster.scanned().wrapping_sub(scan_began),
+            );
+        }
+        #[cfg(feature = "steps")]
+        px::cost::band_end(compose_ticks, band_ticks);
+        // The images this band made (surfaces first used in it) go in the
+        // detail with the band's number, so that a long band is told from a
+        // band of images made.
+        rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
         self.scene.band_done();
-        let _ = sys::notify(&self.notify, BAND);
+        let more = job.at.row < job.damage.y + job.damage.h;
+        let now = now_ns();
+        match self.pacer.band_done(now, now.saturating_sub(began), more) {
+            frame::Band::Go => {
+                let _ = sys::notify(&self.notify, BAND);
+            }
+            // The cap of the period is reached: the next band waits for the
+            // start of the next one, and the timer is armed by a step of its
+            // own (ARM), so that the kernel call is not in the longest band.
+            frame::Band::Defer(_) => {
+                #[cfg(feature = "irq-trace")]
+                px::cost::trace::mark_before_cap();
+                let _ = sys::notify(&self.notify, ARM);
+            }
+        }
     }
 
     /// The frame goes to the driver, which answers at once and says the end
@@ -1102,6 +1285,7 @@ impl Compositor {
                 let mut buffer = [0; MESSAGE_MAX];
                 if status_of(reply.bytes(&mut buffer)) == Some(Status::Ok) {
                     self.committed = true;
+                    self.pacer.committed(now_ns());
                 } else {
                     rt::println!("compositor: COMMIT refused");
                     // A driver that refuses the pool is asked no more: the
@@ -1121,9 +1305,19 @@ impl Compositor {
     /// waited are answered, the buffers it freed are told to their
     /// clients, the windows that went are lines of the log.
     fn finish(&mut self, shown: bool) {
+        let shown_at = now_ns();
         rt::service::step_own();
+        rt::service::step_detail(STEP_END);
         self.committed = false;
+        let direct = self.scene.frame_kind() == FrameKind::Bypass;
         let ended = self.scene.end(shown);
+        // The time of the frame is counted at the beginning of the step in
+        // which the service learned the device was done; a failed frame asks for
+        // the timer again when a change waits.
+        let wake = self.pacer.shown(shown_at, shown, direct);
+        if !self.pacer.is_free() {
+            self.arm(wake);
+        }
         for (i, e) in ended.iter().enumerate() {
             if let Some(b) = e.freed
                 && let Some(notify) = &self.extra[i].notify
@@ -1215,6 +1409,7 @@ impl Compositor {
     /// own bit.
     fn work(&mut self) {
         rt::service::step_own();
+        rt::service::step_detail(STEP_WORK);
         self.regrant();
         if let Some(done) = self.cleared {
             let len = CLEARED.min(POOL_LEN - done);
@@ -1683,21 +1878,122 @@ impl Compositor {
         let Ok(buffer) = u8::try_from(post.buffer) else {
             return Answer::Status(proto_comp::code(proto_comp::INVALID));
         };
-        match self
-            .scene
-            .post(i, buffer, &post.rects[..post.count as usize])
-        {
-            Ok(replaced) => {
+        let rects = &post.rects[..post.count as usize];
+        let now = now_ns();
+        let posted = if self.pacer.is_free() {
+            self.scene.post(i, buffer, rects).map(|r| (r, None))
+        } else {
+            self.scene
+                .post_paced(i, buffer, rects, self.pacer.clock(), now)
+        };
+        match posted {
+            Ok((replaced, due)) => {
                 if let Some(b) = replaced
                     && let Some(notify) = &self.extra[i].notify
                 {
                     let _ = sys::notify(notify, 1 << b);
+                }
+                // The posted buffer's image is made here: the first band that
+                // reads the buffer would pay for it (a few hundred ticks a
+                // layer, and a band of eight windows has eight).
+                if let Some(w) = self.scene.window(i).copied() {
+                    let pixels = Pixels(&self.scene);
+                    let src = pixels.pixels(i, buffer);
+                    self.raster.prepare(
+                        src,
+                        w.stride,
+                        w.format,
+                        (w.rect.w, w.rect.h),
+                        compositor::image_of(i, buffer),
+                    );
+                }
+                // A window with an interval is due at its start, whatever else
+                // is waiting for a frame.
+                if let Some(e) = due {
+                    let wake = self.pacer.change(now, Some(e));
+                    self.arm(wake);
                 }
                 self.kick();
                 Answer::Status(Status::Ok)
             }
             Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
         }
+    }
+
+    /// SET of window `i`: the interval it promises between its posts.
+    fn set(&mut self, i: usize, r: &mut Request<'_>) -> Answer {
+        let set = match SetBody::read(r.body()) {
+            Ok(set) => set,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        // The window of the first revision has no interval.
+        if self.scene.window(i).is_none_or(|w| w.legacy) {
+            return Answer::Status(proto_comp::code(proto_comp::NOT_ALLOWED));
+        }
+        let set_ok = self
+            .scene
+            .pace_mut(i)
+            .is_some_and(|pace| pace.set_interval(set.value));
+        if set_ok {
+            Answer::Status(Status::Ok)
+        } else {
+            Answer::Status(proto_comp::code(proto_comp::INVALID))
+        }
+    }
+
+    /// STATS: the counters of the frame clock and the records of the windows
+    /// the session may see (its own window, the windows of its context, or all
+    /// for the manager and the input). RESET is for the last two alone.
+    fn stats(&mut self, r: &mut Request<'_>, scope: Scope) -> Answer {
+        let flags = match read_stats_request(r.body()) {
+            Ok(flags) => flags,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let reset = flags & RESET != 0;
+        if reset && !matches!(scope, Scope::All) {
+            return Answer::Status(proto_comp::code(proto_comp::NOT_ALLOWED));
+        }
+        let now = now_ns();
+        let mut records = [WindowStats::default(); STATS_WINDOWS];
+        let mut count = 0;
+        for i in 0..MAX_WINDOWS {
+            let visible = self.scene.window(i).is_some_and(|w| match scope {
+                Scope::Window(only) => only == i,
+                Scope::Context(label) => w.ctx == label,
+                Scope::All => true,
+            });
+            // A window that was awaited and passed its start is a miss, whoever
+            // asks.
+            if !self.pacer.is_free()
+                && let Some(pace) = self.scene.pace_mut(i)
+            {
+                pace.settle(self.pacer.clock(), now);
+            }
+            if visible && let Some(pace) = self.scene.pace(i) {
+                records[count] = pace.record(i as u32);
+                count += 1;
+            }
+        }
+        let reply = StatsReply::new(self.pacer.stats(now), &records[..count])
+            .and_then(|reply| reply.write(r.reply()));
+        if let Err(status) = reply {
+            return Answer::Status(status);
+        }
+        if reset {
+            self.pacer.counters.reset(now);
+            for i in 0..MAX_WINDOWS {
+                if let Some(pace) = self.scene.pace_mut(i) {
+                    pace.reset_counts();
+                }
+            }
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// EVENTS of window `i`.
@@ -1757,6 +2053,7 @@ impl Compositor {
             }
             Some(Comp::Manage) => self.manage(r),
             Some(Comp::Describe) => self.describe(r),
+            Some(Comp::Stats) => self.stats(r, Scope::All),
             _ => Compositor::not_allowed(Comp::from_number(method).is_some()),
         }
     }
@@ -1855,7 +2152,16 @@ const METHODS: &[u16] = &[
     Comp::Events.number(),
     Comp::Manage.number(),
     Comp::Inject.number(),
+    Comp::Set.number(),
+    Comp::Stats.number(),
 ];
+
+/// Which windows a STATS shows its session.
+enum Scope {
+    Window(usize),
+    Context(u64),
+    All,
+}
 
 impl Service<1> for Compositor {
     const VERSION: u16 = VERSION;
@@ -1874,6 +2180,7 @@ impl Service<1> for Compositor {
             return match comp {
                 Some(Comp::Inject) => self.inject(r),
                 Some(Comp::Describe) => self.describe(r),
+                Some(Comp::Stats) => self.stats(r, Scope::All),
                 _ => Compositor::not_allowed(comp.is_some()),
             };
         }
@@ -1894,6 +2201,8 @@ impl Service<1> for Compositor {
                 (_, Some(Comp::Attach)) => self.attach(i, r),
                 (_, Some(Comp::Post)) => self.post(i, r),
                 (_, Some(Comp::Events)) => self.events_of_window(i, r),
+                (_, Some(Comp::Set)) => self.set(i, r),
+                (_, Some(Comp::Stats)) => self.stats(r, Scope::Window(i)),
                 _ => Compositor::not_allowed(comp.is_some()),
             };
         }
@@ -1902,6 +2211,7 @@ impl Service<1> for Compositor {
             (Some(Gpu::Clone), _) => self.clone_session(r),
             (_, Some(Comp::Describe)) => self.describe(r),
             (_, Some(Comp::WindowCreate)) => self.window_create(r),
+            (_, Some(Comp::Stats)) => self.stats(r, Scope::Context(label)),
             _ => Compositor::not_allowed(comp.is_some()),
         }
     }
@@ -1962,6 +2272,13 @@ impl Service<1> for Compositor {
             Source::Session if n.label & !GENERATION == POINTER => self.read_device(Which::Pointer),
             // One piece of work to a step: when both bits came, the work's
             // goes again by the service's own bit.
+            Source::Unlabeled if n.bits & ARM != 0 => {
+                self.arm_after_cap();
+                let rest = n.bits & (BAND | WORK);
+                if rest != 0 {
+                    let _ = sys::notify(&self.notify, rest);
+                }
+            }
             Source::Unlabeled if n.bits & BAND != 0 => {
                 self.band();
                 if n.bits & WORK != 0 {
@@ -1969,6 +2286,7 @@ impl Service<1> for Compositor {
                 }
             }
             Source::Unlabeled if n.bits & WORK != 0 => self.work(),
+            Source::Timer if n.label == TIMER_LABEL => self.timer_fired(),
             Source::Session if n.label == DRIVER => {
                 if n.bits & FRAME_SHOWN != 0 {
                     self.finish(true);

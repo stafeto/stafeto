@@ -174,7 +174,9 @@ name = "data-probe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "frame-load",
  "proto-data",
+ "proto-init",
  "proto-wire",
  "rt",
 ]
@@ -405,6 +407,18 @@ dependencies = [
  "proto-gpu",
  "proto-init",
  "proto-input",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "frame-load"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-init",
  "proto-wire",
  "rt",
 ]
@@ -645,6 +659,7 @@ name = "net-probe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "frame-load",
  "proto-init",
  "proto-net",
  "proto-pipe",
@@ -1969,6 +1984,7 @@ dependencies = [
  "entries",
  "fatfs",
  "firmware-tree",
+ "frame-load",
  "fscommon",
  "init",
  "kcore",
@@ -1977,6 +1993,7 @@ dependencies = [
  "pkgfmt",
  "posix-fd",
  "posix-types",
+ "proto-comp",
  "proto-fs",
  "proto-loader",
  "proto-net",

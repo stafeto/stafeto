@@ -68,6 +68,8 @@ mod fast_probe;
 mod fast_scale;
 mod fast_switch;
 mod focus_probe;
+mod frame_image;
+mod frame_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -2347,6 +2349,19 @@ commands:
             the longest steps of the compositor, the display driver and the tablet's driver
   lvgl [--machine hvf] run the LVGL demo by hand: QEMU with the window of the screen (cocoa on a Mac)
             and the console on the terminal; at the prompt of ash type `lvgl-demo`, click its widgets
+  frame-image build the images for the measurements of the frame time (boot-frame.img and
+            boot-frame-steps.img: the screen, a disk and the network together with the loads) on
+            the host and print their sizes
+  frame-loads [steps] boot boot-frame.img (or, with steps, boot-frame-steps.img under -icount) and
+            check that every load is alive: the paced client posts, the client of the first
+            revision flushes, the CPU loop turns, files are written and the network loop makes
+            rounds, each in its phases
+  frame-probe [counters|trace] the frame time under the loads: boot-frame-steps.img under -icount, the eight
+            phases judged against the bounds of the analysis (late, skipped, the time to
+            compose, the steps of the services); with counters, boot-frame.img on QEMU's clock
+            and the counts alone; with trace, the compositor also tells the bands by place
+            and by ticks and what the long ones spent in the kernel and in the table of images
+            (two more calls of the kernel in a band: the steps are not the gates' verdict)
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2832,6 +2847,9 @@ fn main() {
             Some(_) => Err("lvgl-probe [--hvf]".to_owned()),
         },
         Some("lvgl") => lvgl::window(&args[1..]),
+        Some("frame-image") => frame_image::images(),
+        Some("frame-loads") => frame_image::loads(&args[1..]),
+        Some("frame-probe") => frame_probe::probe(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -11395,6 +11413,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "wm",
         "--package",
+        "frame-load",
+        "--package",
         "proto-input",
         "--package",
         "virtio-input",
@@ -14514,6 +14534,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "wm",
         "--package",
+        "frame-load",
+        "--package",
         "virtio-input",
         "--package",
         "virtio-blk",
@@ -14700,6 +14722,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "wm",
         "--package",
+        "frame-load",
+        "--package",
         "gpu-probe",
         "--package",
         "comp-probe",
@@ -14734,7 +14758,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/irq-trace,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",

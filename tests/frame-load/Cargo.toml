@@ -1,0 +1,27 @@
+[package]
+name = "frame-load"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The loads of the frame-time probe: a paced client, a first-revision client, a CPU loop and the conductor that runs the phases, with the pure parts (the phase schedule, the drawing plan, the file and network loops) in a library the other load probes share"
+
+# What the loads decide, apart from the calls they make: tested on the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "frame-load"
+test = false
+bench = false
+
+# The programs alone run on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+abi = { path = "../../lib/abi" }
+proto-comp = { path = "../../proto/comp" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

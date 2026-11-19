@@ -22,6 +22,8 @@
 //! | EVENTS (21) | window or manager | the header alone | status, `count`, `flags` (u32 each: bit 0 is LOST), then `count` events of 16 bytes | NOT_ALLOWED, REVOKED |
 //! | MANAGE (22) | manager | `op`, `a`, `b`, `c` (u32 each); SUBSCRIBE has one handle: a channel with NOTIFY and TRANSFER | the status alone; LIST: status, `count`, then `count` records of 28 bytes | INVALID, NOT_ALLOWED |
 //! | INJECT (23) | input | one event of 16 bytes | the status alone | INVALID, NOT_ALLOWED |
+//! | SET (24) | window | `property`, `value` (u32) | the status alone | INVALID, UNSUPPORTED, NOT_ALLOWED, REVOKED |
+//! | STATS (25) | context, window, manager, input | `flags` (u32) | status, 17 counters, 33 buckets, `count` (u32), then `count` records of 32 bytes | INVALID, NOT_ALLOWED, REVOKED |
 //!
 //! The context is the `Display` session. A window is a session of its own
 //! (a label the service gives): the window goes when the last copy of its
@@ -45,6 +47,21 @@
 //! the bit of its number (bit 0 to 2) on the channel WINDOW_CREATE gave,
 //! and never waits for the client: a buffer the client did not post in time
 //! leaves the window on the screen as it was.
+//!
+//! A POST of a buffer that is not free is BUSY, and nothing is posted. The
+//! rule for the client: it keeps its own mask of the free buffers for the life
+//! of the window, clears a buffer's bit when it posts it, sets it when the
+//! service's bit for it comes, and posts only a buffer whose bit is set. It
+//! never sets the mask afresh while the window lives (a window kept from one
+//! stretch of a run to the next still has the buffers the service holds: the
+//! one on the screen, and one posted and waiting), and it drops no bit. All
+//! buffers are free when ATTACH has answered. With an interval (SET) a buffer
+//! posted before its start waits posted until that start, and the one that was
+//! on the screen is free when the frame that took it is shown; a client that
+//! posts every period with two buffers therefore waits for the bit of the
+//! buffer it posted two periods ago, and a bit that has not come is the
+//! service's frame still in work: the client skips that period's POST (a
+//! frame it did not draw is counted by the service as a miss of the window).
 //!
 //! A window is XRGB8888 (a point is 0x00RRGGBB, opaque) or ARGB8888 (the
 //! colour already multiplied by the alpha in the top byte, laid over what
@@ -154,10 +171,12 @@ pub enum Method {
     Events = 21,
     Manage = 22,
     Inject = 23,
+    Set = 24,
+    Stats = 25,
 }
 
 impl Method {
-    pub const ALL: [Method; 7] = [
+    pub const ALL: [Method; 9] = [
         Method::Describe,
         Method::WindowCreate,
         Method::Attach,
@@ -165,6 +184,8 @@ impl Method {
         Method::Events,
         Method::Manage,
         Method::Inject,
+        Method::Set,
+        Method::Stats,
     ];
 
     pub const fn number(self) -> u16 {
@@ -708,6 +729,326 @@ pub fn union(a: Option<Rect>, b: Rect) -> Rect {
     }
 }
 
+// ------------------------------------------------------- the frame clock
+
+/// The properties of SET (the methods of the frame clock, stage G5). A SET
+/// goes on a window's session, names a property and gives its value; the
+/// numbers leave room for the others of the design (visibility, opacity, a
+/// title).
+///
+/// INTERVAL: the periods a window promises between its posts, 0 to
+/// INTERVAL_MAX. 0 (the default) is "the latest wins" at every frame and no
+/// lateness of the window is counted. N from 1: the window's buffer is taken
+/// at most once in N periods; after a taking at the start of period k the
+/// window is awaited at the start of k + N. A buffer posted by then is on
+/// time; one posted after it and before the start of k + N + 1 is late
+/// (`WindowStats::late`, the time after the start in `late_max_us`); a
+/// window with nothing posted by the start of k + N + 1 has missed
+/// (`WindowStats::missed`) and is awaited no more until its next POST, so a
+/// client that goes quiet gets one `missed` for the pause. A window of the
+/// first revision has no interval: its SET is NOT_ALLOWED.
+pub const INTERVAL: u32 = 1;
+pub const INTERVAL_MAX: u32 = 4;
+
+/// STATS' flags: bit 0 RESET clears the counters and their greatest values
+/// after the reply is made. The counters are shared, so only a session with
+/// MANAGER_MARK or INPUT_MARK may ask it (others: NOT_ALLOWED). A frame taken
+/// before a RESET and shown after it is counted in `frames` of the period
+/// that follows (and not in its `releases`), so in the first period after a
+/// reset `frames` can be one more than `releases`.
+pub const RESET: u32 = 1;
+
+/// The most windows STATS' reply holds records of: MAX_WINDOWS of the service.
+pub const STATS_WINDOWS: usize = 8;
+/// The buckets of the histogram of the time of a frame: 32 of T/16 up to 2 T,
+/// and one for what is more.
+pub const BUCKETS: usize = 33;
+/// The counters before the histogram.
+pub const COUNTERS: usize = 17;
+/// The bytes of a window's record.
+pub const WINDOW_STATS_LEN: usize = 32;
+/// The most bytes of STATS' reply: the status, the counters, the buckets,
+/// the count and the records of every window.
+pub const STATS_MAX: usize = 4 + (COUNTERS + BUCKETS + 1) * 4 + STATS_WINDOWS * WINDOW_STATS_LEN;
+
+/// SET's body: the property and its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetBody {
+    pub property: u32,
+    pub value: u32,
+}
+
+impl SetBody {
+    /// The header and the body.
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::Set.header().write(w)?;
+        w.u32(self.property)?;
+        w.u32(self.value)
+    }
+
+    /// The body after the header: BAD_SIZE unless it is the two numbers,
+    /// UNSUPPORTED for a property the service has not, INVALID for an
+    /// interval past INTERVAL_MAX.
+    pub fn read(mut body: Reader<'_>) -> Result<SetBody, Status> {
+        let set = SetBody {
+            property: body.u32()?,
+            value: body.u32()?,
+        };
+        body.finish()?;
+        match set.property {
+            INTERVAL if set.value > INTERVAL_MAX => Err(code(INVALID)),
+            INTERVAL => Ok(set),
+            _ => Err(code(UNSUPPORTED)),
+        }
+    }
+}
+
+/// STATS' request: the header and the flags.
+pub fn write_stats(flags: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Stats.header().write(w)?;
+    w.u32(flags)
+}
+
+/// The flags of STATS' body: BAD_SIZE unless it is one number, INVALID for
+/// a bit the service has not.
+pub fn read_stats_request(mut body: Reader<'_>) -> Result<u32, Status> {
+    let flags = body.u32()?;
+    body.finish()?;
+    if flags & !RESET != 0 {
+        return Err(code(INVALID));
+    }
+    Ok(flags)
+}
+
+/// The counters of the frame clock since the last reset (times in
+/// microseconds, but `since_ms`). The meaning of each is in the design of the
+/// frame clock (docs/compositor.md, "The frame clock").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// The period and the work cap of a period; `period_us` 0 is the free
+    /// run (a frame as soon as the device is ready).
+    pub period_us: u32,
+    pub cap_us: u32,
+    pub since_ms: u32,
+    /// Takings at the start of a period, shown frames, of which direct.
+    pub releases: u32,
+    pub frames: u32,
+    pub direct: u32,
+    /// Frames shown after the start of the next period, starts of a period
+    /// at which a change waited and nothing was taken, frames the device
+    /// failed, periods in which the cap put bands off, firings of the frame's
+    /// timer.
+    pub late: u32,
+    pub skipped: u32,
+    pub failed: u32,
+    pub capped: u32,
+    pub wakeups: u32,
+    /// The greatest delay of a taking, time to compose, time of the device,
+    /// time of a frame and of a direct frame, and the longest step of a band
+    /// by the wall.
+    pub take_max_us: u32,
+    pub compose_max_us: u32,
+    pub device_max_us: u32,
+    pub frame_max_us: u32,
+    pub direct_max_us: u32,
+    pub band_max_us: u32,
+    /// The time of a frame: 32 buckets of T/16 up to 2 T and one beyond.
+    pub hist: [u32; BUCKETS],
+}
+
+impl Stats {
+    /// Every counter zero.
+    pub const ZERO: Stats = Stats {
+        period_us: 0,
+        cap_us: 0,
+        since_ms: 0,
+        releases: 0,
+        frames: 0,
+        direct: 0,
+        late: 0,
+        skipped: 0,
+        failed: 0,
+        capped: 0,
+        wakeups: 0,
+        take_max_us: 0,
+        compose_max_us: 0,
+        device_max_us: 0,
+        frame_max_us: 0,
+        direct_max_us: 0,
+        band_max_us: 0,
+        hist: [0; BUCKETS],
+    };
+}
+
+impl Default for Stats {
+    fn default() -> Stats {
+        Stats::ZERO
+    }
+}
+
+/// One window's counters: its place, its interval, the POSTs it made, the
+/// buffers taken into a frame, the buffers a newer one replaced before they
+/// were taken, the times it was late and missed (with an interval), and the
+/// greatest lateness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowStats {
+    pub id: u32,
+    pub interval: u32,
+    pub posts: u32,
+    pub taken: u32,
+    pub replaced: u32,
+    pub late: u32,
+    pub missed: u32,
+    pub late_max_us: u32,
+}
+
+impl WindowStats {
+    fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for n in [
+            self.id,
+            self.interval,
+            self.posts,
+            self.taken,
+            self.replaced,
+            self.late,
+            self.missed,
+            self.late_max_us,
+        ] {
+            w.u32(n)?;
+        }
+        Ok(())
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<WindowStats, Status> {
+        Ok(WindowStats {
+            id: r.u32()?,
+            interval: r.u32()?,
+            posts: r.u32()?,
+            taken: r.u32()?,
+            replaced: r.u32()?,
+            late: r.u32()?,
+            missed: r.u32()?,
+            late_max_us: r.u32()?,
+        })
+    }
+}
+
+/// STATS' reply: the counters and the windows (up to STATS_WINDOWS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatsReply {
+    pub stats: Stats,
+    pub windows: [WindowStats; STATS_WINDOWS],
+    pub count: usize,
+}
+
+impl StatsReply {
+    /// The reply of `stats` and `windows` (BAD_SIZE for more than
+    /// STATS_WINDOWS).
+    pub fn new(stats: Stats, windows: &[WindowStats]) -> Result<StatsReply, Status> {
+        if windows.len() > STATS_WINDOWS {
+            return Err(Status::BadSize);
+        }
+        let mut reply = StatsReply {
+            stats,
+            windows: [WindowStats::default(); STATS_WINDOWS],
+            count: windows.len(),
+        };
+        reply.windows[..windows.len()].copy_from_slice(windows);
+        Ok(reply)
+    }
+
+    pub fn windows(&self) -> &[WindowStats] {
+        &self.windows[..self.count]
+    }
+
+    /// Status 0, the counters, the buckets, the count, the records.
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        let s = &self.stats;
+        w.u32(Status::Ok.code())?;
+        for n in [
+            s.period_us,
+            s.cap_us,
+            s.since_ms,
+            s.releases,
+            s.frames,
+            s.direct,
+            s.late,
+            s.skipped,
+            s.failed,
+            s.capped,
+            s.wakeups,
+            s.take_max_us,
+            s.compose_max_us,
+            s.device_max_us,
+            s.frame_max_us,
+            s.direct_max_us,
+            s.band_max_us,
+        ] {
+            w.u32(n)?;
+        }
+        for n in s.hist {
+            w.u32(n)?;
+        }
+        w.u32(self.count as u32)?;
+        for record in self.windows() {
+            record.write(w)?;
+        }
+        Ok(())
+    }
+
+    /// The reply in `reply`: a refusal that carries nothing is its status
+    /// alone and comes back as the error; BAD_SIZE for a count past
+    /// STATS_WINDOWS or any length but the one the count says.
+    pub fn read(reply: &[u8]) -> Result<StatsReply, Status> {
+        let mut r = Reader::new(reply);
+        let status = Status::from_code(r.u32()?);
+        if status != Status::Ok {
+            return Err(status);
+        }
+        let mut c = [0u32; COUNTERS];
+        for n in &mut c {
+            *n = r.u32()?;
+        }
+        let mut hist = [0u32; BUCKETS];
+        for n in &mut hist {
+            *n = r.u32()?;
+        }
+        let count = r.u32()? as usize;
+        if count > STATS_WINDOWS {
+            return Err(Status::BadSize);
+        }
+        let mut windows = [WindowStats::default(); STATS_WINDOWS];
+        for record in &mut windows[..count] {
+            *record = WindowStats::read(&mut r)?;
+        }
+        r.finish()?;
+        Ok(StatsReply {
+            stats: Stats {
+                period_us: c[0],
+                cap_us: c[1],
+                since_ms: c[2],
+                releases: c[3],
+                frames: c[4],
+                direct: c[5],
+                late: c[6],
+                skipped: c[7],
+                failed: c[8],
+                capped: c[9],
+                wakeups: c[10],
+                take_max_us: c[11],
+                compose_max_us: c[12],
+                device_max_us: c[13],
+                frame_max_us: c[14],
+                direct_max_us: c[15],
+                band_max_us: c[16],
+                hist,
+            },
+            windows,
+            count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,7 +1063,7 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23, 24, 25]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header().version, proto_gpu::VERSION);
@@ -947,5 +1288,197 @@ mod tests {
             }
         );
         assert_eq!(union(Some(a), a), a);
+    }
+
+    fn sample_stats() -> Stats {
+        let mut s = Stats {
+            period_us: 16_667,
+            cap_us: 12_500,
+            since_ms: 900,
+            releases: 5,
+            frames: 6,
+            direct: 7,
+            late: 8,
+            skipped: 9,
+            failed: 10,
+            capped: 11,
+            wakeups: 12,
+            take_max_us: 13,
+            compose_max_us: 14,
+            device_max_us: 15,
+            frame_max_us: 16,
+            direct_max_us: 17,
+            band_max_us: 18,
+            hist: [0; BUCKETS],
+        };
+        for (i, n) in s.hist.iter_mut().enumerate() {
+            *n = 100 + i as u32;
+        }
+        s
+    }
+
+    fn window(id: u32) -> WindowStats {
+        WindowStats {
+            id,
+            interval: 1 + id % 4,
+            posts: 10 * id,
+            taken: 11 * id,
+            replaced: 12 * id,
+            late: 13 * id,
+            missed: 14 * id,
+            late_max_us: 15 * id,
+        }
+    }
+
+    fn reply_bytes(reply: &StatsReply) -> Vec<u8> {
+        let mut w = Writer::new();
+        reply.write(&mut w).unwrap();
+        w.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn the_numbers_of_the_frame_clock_methods() {
+        assert_eq!(Method::Set.number(), 24);
+        assert_eq!(Method::Stats.number(), 25);
+        assert_eq!(VERSION, 1);
+        assert_eq!((INTERVAL, INTERVAL_MAX, RESET), (1, 4, 1));
+    }
+
+    #[test]
+    fn a_set_round_trips_and_a_bad_one_is_refused() {
+        for value in 0..=INTERVAL_MAX {
+            let set = SetBody {
+                property: INTERVAL,
+                value,
+            };
+            let mut w = Writer::new();
+            set.write(&mut w).unwrap();
+            let mut r = Reader::new(w.as_bytes());
+            Header::read(&mut r).unwrap();
+            assert_eq!(SetBody::read(r), Ok(set));
+        }
+        let read = |property, value| {
+            let mut w = Writer::new();
+            SetBody { property, value }.write(&mut w).unwrap();
+            let mut r = Reader::new(w.as_bytes());
+            Header::read(&mut r).unwrap();
+            SetBody::read(r)
+        };
+        assert_eq!(read(INTERVAL, 5), Err(code(INVALID)));
+        assert_eq!(read(INTERVAL, u32::MAX), Err(code(INVALID)));
+        assert_eq!(read(2, 0), Err(code(UNSUPPORTED)));
+        assert_eq!(read(0, 0), Err(code(UNSUPPORTED)));
+        // A body of one number or of three is BAD_SIZE.
+        assert_eq!(
+            SetBody::read(Reader::new(&[1, 0, 0, 0])),
+            Err(Status::BadSize)
+        );
+        assert_eq!(SetBody::read(Reader::new(&[0; 12])), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn a_stats_request_carries_the_flags() {
+        let mut w = Writer::new();
+        write_stats(RESET, &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        let header = Header::read(&mut r).unwrap();
+        assert_eq!(header.method, 25);
+        assert_eq!(read_stats_request(r), Ok(RESET));
+        assert_eq!(read_stats_request(Reader::new(&[0; 4])), Ok(0));
+        assert_eq!(
+            read_stats_request(Reader::new(&[2, 0, 0, 0])),
+            Err(code(INVALID))
+        );
+        assert_eq!(
+            read_stats_request(Reader::new(&[0; 3])),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            read_stats_request(Reader::new(&[0; 8])),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
+    fn a_stats_reply_round_trips_with_no_window_and_with_eight() {
+        for count in [0, 1, 8] {
+            let windows: Vec<WindowStats> = (1..=count).map(window).collect();
+            let reply = StatsReply::new(sample_stats(), &windows).unwrap();
+            let bytes = reply_bytes(&reply);
+            assert_eq!(
+                bytes.len(),
+                4 + (COUNTERS + BUCKETS + 1) * 4 + count as usize * WINDOW_STATS_LEN
+            );
+            let back = StatsReply::read(&bytes).unwrap();
+            assert_eq!(back, reply);
+            assert_eq!(back.windows(), &windows[..]);
+        }
+        // The longest reply is the 464 bytes of the design.
+        assert_eq!(STATS_MAX, 464);
+        let full = StatsReply::new(sample_stats(), &(1..=8).map(window).collect::<Vec<_>>());
+        assert_eq!(reply_bytes(&full.unwrap()).len(), 464);
+    }
+
+    #[test]
+    fn a_stats_reply_of_another_length_is_refused() {
+        let reply = StatsReply::new(sample_stats(), &[window(1), window(2)]).unwrap();
+        let bytes = reply_bytes(&reply);
+        // Shorter, longer, and a count that the length does not match.
+        assert_eq!(
+            StatsReply::read(&bytes[..bytes.len() - 1]),
+            Err(Status::BadSize)
+        );
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(StatsReply::read(&longer), Err(Status::BadSize));
+        let at = 4 + (COUNTERS + BUCKETS) * 4;
+        let mut wrong = bytes.clone();
+        wrong[at] = 3;
+        assert_eq!(StatsReply::read(&wrong), Err(Status::BadSize));
+        // A count past 8 is more than 464 bytes can hold.
+        let mut nine = bytes.clone();
+        nine[at] = 9;
+        nine.resize(4 + (COUNTERS + BUCKETS + 1) * 4 + 9 * WINDOW_STATS_LEN, 0);
+        assert!(nine.len() > STATS_MAX);
+        assert_eq!(StatsReply::read(&nine), Err(Status::BadSize));
+        assert_eq!(StatsReply::read(&[0; 3]), Err(Status::BadSize));
+        assert!(StatsReply::new(sample_stats(), &[WindowStats::default(); 9]).is_err());
+        // A refusal is its status alone.
+        let refused = proto_wire::reply(code(NOT_ALLOWED));
+        assert_eq!(StatsReply::read(&refused), Err(code(NOT_ALLOWED)));
+    }
+
+    /// Every field has its own place: a different number in each of the 51
+    /// words of the reply and the 8 of a record comes back in its field.
+    #[test]
+    fn every_field_keeps_its_place_in_the_reply() {
+        let reply = StatsReply::new(sample_stats(), &[window(3)]).unwrap();
+        let bytes = reply_bytes(&reply);
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+        // Status, then the counters in the order of the table.
+        assert_eq!(word(0), 0);
+        let order = [
+            16_667, 12_500, 900, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ];
+        for (i, n) in order.iter().enumerate() {
+            assert_eq!(word(1 + i), *n, "counter {i}");
+        }
+        assert_eq!(word(1 + COUNTERS), 100);
+        assert_eq!(word(COUNTERS + BUCKETS), 132);
+        assert_eq!(word(1 + COUNTERS + BUCKETS), 1);
+        let w = window(3);
+        let record = [
+            w.id,
+            w.interval,
+            w.posts,
+            w.taken,
+            w.replaced,
+            w.late,
+            w.missed,
+            w.late_max_us,
+        ];
+        for (i, n) in record.iter().enumerate() {
+            assert_eq!(word(2 + COUNTERS + BUCKETS + i), *n, "record {i}");
+        }
     }
 }

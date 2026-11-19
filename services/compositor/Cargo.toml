@@ -21,6 +21,10 @@ bench = false
 # feature step-stats), for the measurement under -icount.
 [features]
 steps = ["rt/step-stats"]
+# `irq-trace`: besides `steps`, each band reads the system time of the thread and the
+# entries of the table of images it looked at, to tell what an excess of a band is
+# (xtask frame-probe trace). It adds two calls of the kernel to a band.
+irq-trace = ["steps", "pixman/scan-count"]
 
 [dependencies]
 abi = { path = "../../lib/abi" }
