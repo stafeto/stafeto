@@ -6419,6 +6419,67 @@ fn ram_step_verdict(name: &str, steps: &[(usize, u64, u64)]) -> Result<(), Strin
     }
 }
 
+/// The detail of a lock request that sets (`own_step::SET` of ramfs): the locks of the inode
+/// before (bits 8 to 15) and after (bits 0 to 7).
+fn lock_set_detail(detail: u64) -> Option<(u64, u64)> {
+    (detail >> 48 == 9).then_some(((detail >> 8) & 0xff, detail & 0xff))
+}
+
+/// The detail of a close event (`own_step::CLOSE`): the records of the table before (bits 16 to
+/// 31) and after (bits 0 to 15).
+fn lock_close_detail(detail: u64) -> Option<(u64, u64)> {
+    (detail >> 48 == 10).then_some(((detail >> 16) & 0xffff, detail & 0xffff))
+}
+
+/// The two cases of the page probe in which a live owner releases 64 paid pages in one request
+/// (one unlock of the whole file, one close of the descriptor): their markers must be there, and
+/// the longest kind 50 step and the longest kind 49 step of each case, own work with its
+/// preemptions, are told. The hard checks of the probe judge them with every other step; the
+/// numbers are the measurement. A step the console did not tell stayed at or under the longest
+/// step of its kind before the case.
+fn fragment_release_report(lines: &[String]) -> Result<(), String> {
+    const CASES: [(&str, &str, &str); 2] = [
+        (
+            "unlock of the whole file",
+            "posix-procs: fragmented lock pages unlock of the whole file: begin",
+            "posix-procs: fragmented lock pages close of the descriptor: begin",
+        ),
+        (
+            "close of the descriptor",
+            "posix-procs: fragmented lock pages close of the descriptor: begin",
+            "posix-procs: fragmented lock pages ready:",
+        ),
+    ];
+    for (name, begin, next) in CASES {
+        let end = format!("posix-procs: fragmented lock pages {name}: end, all 64 pages released");
+        if !lines.iter().any(|l| l.contains(&end)) {
+            return Err(format!(
+                "fragmented lock page: the case {name:?} did not end"
+            ));
+        }
+        let unlock = |d: u64| lock_set_detail(d) == Some((64, 0));
+        let close = |d: u64| lock_close_detail(d).is_some_and(|(b, a)| b >= 64 && b - a == 64);
+        for (kind, accepts) in [
+            (50usize, &unlock as &dyn Fn(u64) -> bool),
+            (49, &close as &dyn Fn(u64) -> bool),
+        ] {
+            match step_line::longest_between(lines, begin, next, "2", kind, accepts) {
+                Some(step) => println!(
+                    "fragmented lock page, {name}: kind {kind} step {} ticks raw, {} judged, {} preemptions, detail {}",
+                    step.ticks,
+                    step.judged(),
+                    step.preempts,
+                    step.detail
+                ),
+                None => println!(
+                    "fragmented lock page, {name}: no line of a kind {kind} step with 64 records released (it did not pass the longest step of its kind)"
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -6445,7 +6506,12 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     let ended = run.expect_line(
         "the PID lifetime probe to exit",
         |line| line.starts_with("init: posix-procs ended:"),
-        Duration::from_secs(30),
+        // The page probe builds its 64-page shape three times.
+        Duration::from_secs(if probe == LifetimeProbe::Pages {
+            60
+        } else {
+            30
+        }),
     );
     let mut outcome = run.stop();
     // A line of the audit of ramfs or of the services' timing may land inside a long line.
@@ -6477,6 +6543,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             &outcome,
             "posix-procs: lock sweep share: clients below the service keep their time through the sweep of locked inodes",
         )?;
+        fragment_release_report(&outcome.lines)?;
         let steps = longest_steps(&outcome.lines, "2");
         step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
@@ -14911,6 +14978,50 @@ mod tests {
         let mut marked = all;
         marked.insert(10, "[kernel log: 3 records lost]".into());
         assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
+    }
+
+    #[test]
+    fn the_release_cases_of_the_page_probe_need_their_markers_and_read_their_steps() {
+        let set = (9u64 << 48 | 64 << 8).to_string();
+        let close = (10u64 << 48 | 1954 << 16 | 1890).to_string();
+        let marker = |text: &str| text.to_owned();
+        let lines = vec![
+            marker(
+                "posix-procs: fragmented lock pages unlock of the whole file: begin, 64 paid pages, 64 records of a live PID=7",
+            ),
+            format!("service step: 2 kind 50 17000 ticks detail {set} preempts 1"),
+            marker(
+                "posix-procs: fragmented lock pages unlock of the whole file: end, all 64 pages released",
+            ),
+            marker(
+                "posix-procs: fragmented lock pages close of the descriptor: begin, 64 paid pages, 64 records of a live PID=8",
+            ),
+            format!("service step: 2 kind 49 16000 ticks detail {close}"),
+            marker(
+                "posix-procs: fragmented lock pages close of the descriptor: end, all 64 pages released",
+            ),
+            marker(
+                "posix-procs: fragmented lock pages ready: 64 paid pages, 64 records, PID=9 root=1:1",
+            ),
+        ];
+        assert_eq!(fragment_release_report(&lines), Ok(()));
+        // A case that did not end is an error.
+        let missing: Vec<String> = lines
+            .iter()
+            .filter(|l| !l.contains("close of the descriptor: end"))
+            .cloned()
+            .collect();
+        assert!(
+            fragment_release_report(&missing)
+                .unwrap_err()
+                .contains("close of the descriptor")
+        );
+        assert_eq!(lock_set_detail(9 << 48 | 64 << 8), Some((64, 0)));
+        assert_eq!(
+            lock_close_detail(10 << 48 | 1954 << 16 | 1890),
+            Some((1954, 1890))
+        );
+        assert_eq!(lock_set_detail(10 << 48), None);
     }
 
     #[test]

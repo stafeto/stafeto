@@ -73,6 +73,15 @@ static void pf_run_child(struct pf_child *children, unsigned role, int target) {
                         result = pf_lock(fd, i);
                 }
             } else result = -1;
+        } else if (command.operation == 3 && role == PF_WORKERS) {
+            /* The live owner unlocks the whole file with one request. */
+            struct flock all = {0};
+            all.l_type = F_UNLCK; all.l_whence = SEEK_SET;
+            all.l_start = 0; all.l_len = 0;
+            result = fcntl(target, F_SETLK, &all);
+        } else if (command.operation == 4 && role == PF_WORKERS) {
+            /* The live owner closes the descriptor that owns its locks. */
+            result = close(target);
         } else if (command.operation == 2 && role < PF_WORKERS) {
             for (unsigned i = 0; i < 22; i++) {
                 if (fillers[i] >= 0 && close(fillers[i])) result = -1;
@@ -122,29 +131,66 @@ static int pf_wait(pid_t pid, int killed) {
         nanosleep(&delay, NULL);
     }
 }
-static int public_lock_page_fragments(void) {
+struct pf_world {
     struct pf_child children[PF_CHILDREN];
+    int target;
+    unsigned own[5];
+    unsigned long long baseline;
+};
+static void pf_init(struct pf_world *w) {
+    w->target = -1;
+    w->baseline = 0;
     for (unsigned i = 0; i < PF_CHILDREN; i++) {
-        children[i].pid = -1;
+        w->children[i].pid = -1;
         for (unsigned j = 0; j < 2; j++)
-            children[i].command[j] = children[i].reply[j] = -1;
+            w->children[i].command[j] = w->children[i].reply[j] = -1;
     }
-    int failed = 0, target = -1;
-    unsigned long long baseline = 0, retained = 0, final = 0;
-    unsigned own[5] = {0};
+}
+/* Ends the children, closes the pipes and the target, removes the files: nonzero when
+ * a child did not end by the kill. */
+static int pf_release(struct pf_world *w) {
+    int failed = 0;
+    for (unsigned i = 0; i < PF_CHILDREN; i++) {
+        if (w->children[i].pid > 0) {
+            kill(w->children[i].pid, SIGKILL);
+            if (pf_wait(w->children[i].pid, 1)) failed = 1;
+            w->children[i].pid = -1;
+        }
+        for (unsigned j = 0; j < 2; j++) {
+            if (w->children[i].command[j] >= 0) close(w->children[i].command[j]);
+            if (w->children[i].reply[j] >= 0) close(w->children[i].reply[j]);
+            w->children[i].command[j] = w->children[i].reply[j] = -1;
+        }
+    }
+    if (w->target >= 0) close(w->target);
+    w->target = -1;
+    for (unsigned page = 0; page < PF_PAGES; page++) {
+        char path[48];
+        snprintf(path, sizeof path, "/tmp/lock-fragment-%u", page);
+        if (unlink(path) && errno != ENOENT) failed = 1;
+    }
+    if (unlink("/tmp/lock-fragment-target") && errno != ENOENT) failed = 1;
+    return failed;
+}
 #define PF_CHECK(condition) do { if (!(condition)) { \
     printf("posix-procs: fragmented lock pages failed line=%d errno=%d\n", __LINE__, errno); \
     failed = 1; goto cleanup; } } while (0)
-    target = open("/tmp/lock-fragment-target", O_CREAT | O_RDWR | O_EXCL, 0666);
-    PF_CHECK(target >= 0);
-    PF_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
-    PF_CHECK(ring_identity((unsigned)getpid(), own) == 0 && own[1] == 1);
+/* The public recipe: the target owner (the child PF_WORKERS) locks one record on each of
+ * 64 pages, three workers fill the pages and then close their fillers. On return the
+ * target inode holds 64 records, each alone on its own paid page. */
+static int pf_build(struct pf_world *w) {
+    struct pf_child *children = w->children;
+    int failed = 0;
+    unsigned long long retained = 0;
+    w->target = open("/tmp/lock-fragment-target", O_CREAT | O_RDWR | O_EXCL, 0666);
+    PF_CHECK(w->target >= 0);
+    PF_CHECK(ring_identity((unsigned)getpid(), w->own) == 0 && w->own[1] == 1);
     for (unsigned i = 0; i < PF_CHILDREN; i++) {
         PF_CHECK(pipe(children[i].command) == 0 && pipe(children[i].reply) == 0);
     }
     for (unsigned i = 0; i < PF_CHILDREN; i++) {
         children[i].pid = fork();
-        if (children[i].pid == 0) pf_run_child(children, i, target);
+        if (children[i].pid == 0) pf_run_child(children, i, w->target);
         PF_CHECK(children[i].pid > 0);
     }
     for (unsigned i = 0; i < PF_CHILDREN; i++) {
@@ -154,9 +200,9 @@ static int public_lock_page_fragments(void) {
         unsigned identity[5];
         PF_CHECK(pf_receive(children[i].reply[0], identity, sizeof identity) == 0);
         PF_CHECK(identity[0] == (unsigned)children[i].pid && identity[1] == 1
-                 && identity[2] == own[2] && identity[3] == own[3]);
+                 && identity[2] == w->own[2] && identity[3] == w->own[3]);
     }
-    PF_CHECK(pf_pages(target, &baseline) == 0);
+    PF_CHECK(pf_pages(w->target, &w->baseline) == 0);
     for (unsigned page = 0; page < PF_PAGES; page++) {
         PF_CHECK(pf_exchange(&children[PF_WORKERS], 1, page) == 0);
         PF_CHECK(pf_exchange(&children[page % PF_WORKERS], 1, page) == 0);
@@ -164,65 +210,97 @@ static int public_lock_page_fragments(void) {
     }
     for (unsigned worker = 0; worker < PF_WORKERS; worker++)
         PF_CHECK(pf_exchange(&children[worker], 2, 0) == 0);
-    PF_CHECK(pf_pages(target, &retained) == 0 && baseline == retained + PF_PAGES);
-    /* Every live target record belongs to this exact PID; PID death retires
-     * all of them before any service sweep can reclaim the physical pages. */
-    for (unsigned page = 0; page < PF_PAGES; page++) {
-        struct flock query = {0};
-        query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
-        query.l_start = 2 * page; query.l_len = 1;
-        PF_CHECK(fcntl(target, F_GETLK, &query) == 0 && query.l_type == F_WRLCK
-                 && query.l_pid == children[PF_WORKERS].pid);
+    PF_CHECK(pf_pages(w->target, &retained) == 0 && w->baseline == retained + PF_PAGES);
+    return 0;
+cleanup:
+    return failed;
+}
+/* The same 64 records on 64 pages, held by a live owner, released in one request: the owner
+ * unlocks the whole file (operation 3) or closes the descriptor of the locks (operation 4,
+ * the last close of the description). The markers bound the steps of the file service that
+ * belong to the case. */
+static int pf_live_release(unsigned operation, const char *name) {
+    struct pf_world w;
+    int failed = 0;
+    pf_init(&w);
+    PF_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+    PF_CHECK(pf_build(&w) == 0);
+    PF_CHECK(pf_sleep_latency() == 0);
+    if (operation == 4) {
+        /* The owner's close is then the last close of the description. */
+        PF_CHECK(close(w.target) == 0);
+        w.target = -1;
     }
+    printf("posix-procs: fragmented lock pages %s: begin, 64 paid pages, 64 records of a live PID=%d\n",
+           name, w.children[PF_WORKERS].pid);
+    PF_CHECK(pf_exchange(&w.children[PF_WORKERS], operation, 0) == 0);
+    /* The line of the step goes out after its reply: leave time for it before the end marker. */
+    PF_CHECK(pf_sleep_latency() == 0);
+    {
+        long long start = pf_now();
+        unsigned long long now = 0;
+        PF_CHECK(start >= 0);
+        /* The pages are counted by a descriptor of the parent that stays open (or by a new one). */
+        int probe = w.target >= 0 ? w.target : open("/tmp/lock-fragment-target", O_RDWR);
+        PF_CHECK(probe >= 0);
+        do {
+            PF_CHECK(pf_pages(probe, &now) == 0);
+            if (now == w.baseline) break;
+            PF_CHECK(pf_now() - start < 10000000000LL);
+            const struct timespec delay = {0, 1000000};
+            nanosleep(&delay, NULL);
+        } while (1);
+        if (probe != w.target) close(probe);
+    }
+    printf("posix-procs: fragmented lock pages %s: end, all 64 pages released\n", name);
+cleanup:
+    if (pf_release(&w)) failed = 1;
+    return failed;
+}
+static int public_lock_page_fragments(void) {
+    struct pf_world w;
+    int failed = 0;
+    pf_init(&w);
+    /* The two releases by a live owner come first: their steps are then new longest steps of
+     * their kinds and the console tells them. */
+    if (pf_live_release(3, "unlock of the whole file")) return 1;
+    if (pf_live_release(4, "close of the descriptor")) return 1;
+    PF_CHECK(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
+    PF_CHECK(pf_build(&w) == 0);
     printf("posix-procs: fragmented lock pages ready: 64 paid pages, 64 records, PID=%d root=%u:%u\n",
-           children[PF_WORKERS].pid, own[2], own[3]);
-    PF_CHECK(kill(children[PF_WORKERS].pid, SIGKILL) == 0);
-    PF_CHECK(pf_wait(children[PF_WORKERS].pid, 1) == 0);
-    PF_CHECK(process_lifetime(children[PF_WORKERS].pid) == 0);
+           w.children[PF_WORKERS].pid, w.own[2], w.own[3]);
+    PF_CHECK(kill(w.children[PF_WORKERS].pid, SIGKILL) == 0);
+    PF_CHECK(pf_wait(w.children[PF_WORKERS].pid, 1) == 0);
+    PF_CHECK(process_lifetime(w.children[PF_WORKERS].pid) == 0);
     /* A request that sets finds all 64 records dead: its step is the longest
      * the file service has for a full inode of dead records. */
     {
         struct flock set = {0};
         set.l_type = F_WRLCK; set.l_whence = SEEK_SET;
         set.l_start = 1000; set.l_len = 1;
-        PF_CHECK(fcntl(target, F_SETLK, &set) == 0);
+        PF_CHECK(fcntl(w.target, F_SETLK, &set) == 0);
         set.l_type = F_UNLCK;
-        PF_CHECK(fcntl(target, F_SETLK, &set) == 0);
+        PF_CHECK(fcntl(w.target, F_SETLK, &set) == 0);
     }
     unsigned dead[5];
-    PF_CHECK(ring_identity((unsigned)children[PF_WORKERS].pid, dead) == 0 && dead[1] == 0);
-    children[PF_WORKERS].pid = -1;
+    PF_CHECK(ring_identity((unsigned)w.children[PF_WORKERS].pid, dead) == 0 && dead[1] == 0);
+    w.children[PF_WORKERS].pid = -1;
     struct flock query = {0};
     query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
-    PF_CHECK(fcntl(target, F_GETLK, &query) == 0 && query.l_type == F_UNLCK);
+    PF_CHECK(fcntl(w.target, F_GETLK, &query) == 0 && query.l_type == F_UNLCK);
     long long start = pf_now();
     PF_CHECK(start >= 0);
     do {
-        PF_CHECK(pf_pages(target, &final) == 0);
-        if (final == baseline) break;
+        unsigned long long final = 0;
+        PF_CHECK(pf_pages(w.target, &final) == 0);
+        if (final == w.baseline) break;
         PF_CHECK(pf_now() - start < 10000000000LL);
         const struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
     } while (1);
     puts("posix-procs: fragmented lock pages: 64 paid pages, 64 target records, one PID death, all pages reclaimed");
 cleanup:
-    for (unsigned i = 0; i < PF_CHILDREN; i++) {
-        if (children[i].pid > 0) {
-            kill(children[i].pid, SIGKILL);
-            if (pf_wait(children[i].pid, 1)) failed = 1;
-        }
-        for (unsigned j = 0; j < 2; j++) {
-            if (children[i].command[j] >= 0) close(children[i].command[j]);
-            if (children[i].reply[j] >= 0) close(children[i].reply[j]);
-        }
-    }
-    if (target >= 0) close(target);
-    for (unsigned page = 0; page < PF_PAGES; page++) {
-        char path[48];
-        snprintf(path, sizeof path, "/tmp/lock-fragment-%u", page);
-        if (unlink(path) && errno != ENOENT) failed = 1;
-    }
-    if (unlink("/tmp/lock-fragment-target") && errno != ENOENT) failed = 1;
-#undef PF_CHECK
+    if (pf_release(&w)) failed = 1;
     return failed;
 }
+#undef PF_CHECK
