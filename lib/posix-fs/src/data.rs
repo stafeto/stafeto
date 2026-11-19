@@ -421,6 +421,11 @@ pub fn reading_open(plan: OpenPlan) -> OpenPlan {
     }
 }
 
+/// The bytes one WRITE message carries (`proto_data::MAX_WRITE`) and one PWRITE message: its
+/// offset takes 8 bytes of the same message.
+pub const WRITE_MAX: usize = p::MAX_WRITE;
+pub const PWRITE_MAX: usize = p::MAX_WRITE - 8;
+
 /// How a write of `total` bytes goes in messages of at most `max` bytes, and what it returns: the
 /// sum of the messages that went, and only when none did the error of the one that failed (the
 /// next call meets the same error: ENOSPC, EFBIG).
@@ -866,6 +871,20 @@ mod tests {
         let mut done = Splitter::new(1012, 1012);
         assert!(!done.took(1012, 1012));
         assert_eq!(done.next_len(), None);
+    }
+
+    /// The largest piece of a write and of a pwrite fits one message, and one byte more does not.
+    /// (The planted fault: the length of a WRITE for a PWRITE made every pwrite of more than 1,004
+    /// bytes fail as EIO, and the asynchronous writes of the Open POSIX tests with it.)
+    #[test]
+    fn a_piece_of_a_write_and_of_a_pwrite_fits_one_message() {
+        let mut w = proto_wire::Writer::new();
+        assert!(p::write(1, &[0; WRITE_MAX], &mut w).is_ok());
+        assert!(p::write(1, &[0; WRITE_MAX + 1], &mut proto_wire::Writer::new()).is_err());
+        let mut w = proto_wire::Writer::new();
+        assert!(p::pwrite(1, u64::MAX, &[0; PWRITE_MAX], &mut w).is_ok());
+        assert!(p::pwrite(1, 0, &[0; PWRITE_MAX + 1], &mut proto_wire::Writer::new()).is_err());
+        assert!(p::pwrite(1, 0, &[0; WRITE_MAX], &mut proto_wire::Writer::new()).is_err());
     }
 
     #[test]

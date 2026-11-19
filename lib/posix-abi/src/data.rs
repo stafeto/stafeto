@@ -818,7 +818,7 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 /// other writers of the file (and the end of an O_APPEND write is taken per message); a write of
 /// more than one message can have another writer's bytes between its messages.
 pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
-    let mut split = pure::Splitter::new(bytes.len(), p::MAX_WRITE);
+    let mut split = pure::Splitter::new(bytes.len(), pure::WRITE_MAX);
     while let Some(n) = split.next_len() {
         let at = split.at();
         let sent = ask(|w| p::write(handle, &bytes[at..at + n], w))
@@ -837,7 +837,7 @@ pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
 
 /// pwrite at `offset`, the position of the description untouched, in messages as `write`.
 pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
-    let mut split = pure::Splitter::new(bytes.len(), p::MAX_WRITE);
+    let mut split = pure::Splitter::new(bytes.len(), pure::PWRITE_MAX);
     while let Some(n) = split.next_len() {
         let at = split.at();
         let sent = ask(|w| p::pwrite(handle, offset + at as u64, &bytes[at..at + n], w))
