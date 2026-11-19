@@ -1,0 +1,652 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The names of the volume as the server sees them: the attribute of an entry, the search of a path
+//! with the rights of the caller, the memory of directories and of their counts, the creation, removal
+//! and renaming of names, the changes of attributes, and the listing of a directory. Part of
+//! `server`, split out of it; the tables it works on are the server's.
+
+use super::*;
+
+impl Server {
+    // ---- The attribute of an entry, the search of a path, and what a directory holds ----
+
+    /// The kind and size of the entry at `path`, and its record.
+    pub(super) fn load<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        path: &[u8],
+    ) -> Res<(crate::fs::Info, Record)> {
+        let info = volume(fs.stat(path))?;
+        let entry = entry_of(fs, path, info.kind)?;
+        Ok((info, entry))
+    }
+
+    /// The permission attributes of the directory at `path`, from the memory of the server or the
+    /// volume. NO_ENTRY when it is not there, NOT_DIRECTORY when it is a file.
+    pub(super) fn dir_perm<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        path: &[u8],
+    ) -> Res<perm::Attr> {
+        if let Some(c) = self.cache.iter().find(|c| c.used && c.path.get() == path) {
+            return Ok(c.attr);
+        }
+        let info = volume(fs.stat(path))?;
+        if info.kind != Kind::Directory {
+            return Err(p::code(p::NOT_DIRECTORY));
+        }
+        let entry = entry_of(fs, path, Kind::Directory)?;
+        let attr = entry.attr.perm(Kind::Directory);
+        let hand = self.cache_hand;
+        self.cache_hand = (hand + 1) % DIR_CACHE;
+        self.cache[hand].used = true;
+        self.cache[hand].path.set(path);
+        self.cache[hand].attr = attr;
+        Ok(attr)
+    }
+
+    /// Search permission on every directory of `path` but its last component (rule 3), with the real
+    /// or the effective identifiers.
+    pub(super) fn search<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        real: bool,
+        path: &[u8],
+    ) -> Res<()> {
+        let id = caller.identity(real);
+        for (i, &b) in path.iter().enumerate() {
+            if b != b'/' || path.len() == 1 {
+                continue;
+            }
+            let dir = if i == 0 { &path[..1] } else { &path[..i] };
+            let attr = self.dir_perm(fs, dir)?;
+            if !perm::permits(id, &attr, perm::EXEC) {
+                return Err(p::code(p::ACCESS));
+            }
+        }
+        Ok(())
+    }
+
+    /// What the server remembers of the directories at `path` or under it is dropped: their
+    /// attributes may have changed, or the names under them moved.
+    pub(super) fn forget(&mut self, path: &[u8]) {
+        for c in &mut self.cache {
+            if c.used && within(c.path.get(), path) {
+                c.used = false;
+            }
+        }
+        for c in &mut self.counts {
+            if c.used && within(c.path.get(), path) {
+                c.used = false;
+            }
+        }
+    }
+
+    /// The entries of the directory at `dir`, from the memory of the server or by one scan of the
+    /// directory. TABLE_FULL when every directory place of the volume is held and the scan cannot be
+    /// made.
+    pub(super) fn dir_entries<D: Device>(&mut self, fs: &mut Fs<'_, D>, dir: &[u8]) -> Res<usize> {
+        if let Some(c) = self.counts.iter().find(|c| c.used && c.path.get() == dir) {
+            return Ok(c.entries);
+        }
+        let slot = match fs.opendir(dir) {
+            Ok(slot) => slot,
+            // Every directory place of the volume is held by a description: the count cannot be
+            // made, and a create is not let through unchecked.
+            Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
+            Err(e) => return Err(status_of(e)),
+        };
+        let mut n = 0;
+        loop {
+            match fs.readdir(slot) {
+                Ok(Some(e)) => {
+                    let name = e.name();
+                    if name != b"." && name != b".." && !(dir == b"/" && name == &ORPHANS[1..]) {
+                        n += 1;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = fs.closedir(slot);
+                    return Err(status_of(e));
+                }
+            }
+        }
+        volume(fs.closedir(slot))?;
+        let hand = self.counts_hand;
+        self.counts_hand = (hand + 1) % COUNT_CACHE;
+        self.counts[hand].used = true;
+        self.counts[hand].path.set(dir);
+        self.counts[hand].entries = n;
+        Ok(n)
+    }
+
+    /// A name is about to be added to `dir`: NO_SPACE when it holds `DIR_ENTRIES_MAX` entries.
+    pub(super) fn room_in_dir<D: Device>(&mut self, fs: &mut Fs<'_, D>, dir: &[u8]) -> Res<()> {
+        if self.dir_entries(fs, dir)? >= DIR_ENTRIES_MAX {
+            Err(p::code(p::NO_SPACE))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The remembered count of `dir` follows a name added (`+1`) or removed (`-1`).
+    pub(super) fn count_add(&mut self, dir: &[u8], delta: isize) {
+        if let Some(c) = self
+            .counts
+            .iter_mut()
+            .find(|c| c.used && c.path.get() == dir)
+        {
+            c.entries = (c.entries as isize + delta).max(0) as usize;
+        }
+    }
+
+    /// The reserve (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
+    /// `RESERVE_BLOCKS` free blocks, for a create, a rename and a change of attributes: each may
+    /// split or compact a pair of metadata blocks, which takes blocks the superuser needs to remove
+    /// what fills the volume.
+    pub(super) fn reserve_allows<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+    ) -> Res<()> {
+        if caller.is_superuser() || volume(fs.free_blocks())? >= RESERVE_BLOCKS {
+            Ok(())
+        } else {
+            Err(p::code(p::NO_SPACE))
+        }
+    }
+
+    /// The directory at `path` has its `mtime` and `ctime` set to now (rule 10): a name was added,
+    /// removed or renamed in it. A record this service cannot rewrite is left as it is.
+    pub(super) fn touch<D: Device>(&mut self, fs: &mut Fs<'_, D>, path: &[u8]) {
+        if let Ok(entry) = entry_of(fs, path, Kind::Directory)
+            && entry.standing != Standing::Foreign
+        {
+            let mut attr = entry.attr;
+            attr.mtime = self.now;
+            attr.ctime = self.now;
+            let _ = fs.setattr(path, ATTR_TYPE, &attr.to_bytes());
+        }
+    }
+
+    /// The next file number: from the block of numbers reserved in the counter at the root, which is
+    /// raised by one block with one commit when it is used up.
+    pub(super) fn next_ino<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<u64> {
+        if self.ino_next >= self.ino_end {
+            let mut old = [0u8; 8];
+            let last = match fs.getattr(b"/", ATTR_COUNTER_TYPE, &mut old) {
+                Ok(8) => u64::from_le_bytes(old),
+                Ok(_) | Err(Error::NoAttr) => 2,
+                Err(e) => return Err(status_of(e)),
+            }
+            .max(2);
+            let end = last + INO_BLOCK;
+            volume(fs.setattr(b"/", ATTR_COUNTER_TYPE, &end.to_le_bytes()))?;
+            self.ino_next = last;
+            self.ino_end = end;
+        }
+        let ino = self.ino_next;
+        self.ino_next += 1;
+        Ok(ino)
+    }
+
+    /// The record of a new entry made by `caller` in `parent` (rule 5): the owner and the group by
+    /// the rules of `posix-perm`, the mode as it came (the layer applied the umask), a new number,
+    /// every time now.
+    pub(super) fn new_record<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        parent: &perm::Attr,
+        kind: Kind,
+        mode: u32,
+    ) -> Res<Attr> {
+        let pkind = match kind {
+            Kind::File => perm::Kind::File,
+            Kind::Directory => perm::Kind::Directory,
+        };
+        let made = perm::creation(caller.identity(false), parent, pkind, mode, 0);
+        let ino = self.next_ino(fs)?;
+        Ok(Attr {
+            uid: made.uid,
+            gid: made.gid,
+            mode: made.mode,
+            ino,
+            atime: self.now,
+            mtime: self.now,
+            ctime: self.now,
+        })
+    }
+
+    pub(super) fn do_mkdir<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        mode: u32,
+        path: &[u8],
+    ) -> Res<()> {
+        if path == b"/" {
+            return Err(p::code(p::EXISTS));
+        }
+        self.search(fs, caller, false, path)?;
+        let (parent, _) = split(path);
+        let parent_attr = self.dir_perm(fs, parent)?;
+        perm::place_allowed(caller.identity(false), &parent_attr, None).map_err(denied)?;
+        if fs.stat(path).is_ok() {
+            return Err(p::code(p::EXISTS));
+        }
+        self.room_in_dir(fs, parent)?;
+        self.reserve_allows(fs, caller)?;
+        let record = self.new_record(fs, caller, &parent_attr, Kind::Directory, mode)?;
+        volume(fs.mkdir(path))?;
+        // The record is written in the same job as the name; a cut between the two commits leaves
+        // an entry with no record, which reads as the closed default.
+        if let Err(e) = fs.setattr(path, ATTR_TYPE, &record.to_bytes()) {
+            let _ = fs.remove(path);
+            return Err(status_of(e));
+        }
+        self.count_add(parent, 1);
+        self.touch(fs, parent);
+        Ok(())
+    }
+
+    pub(super) fn do_remove<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        rmdir: bool,
+        path: &[u8],
+    ) -> Res<()> {
+        if path == b"/" {
+            return Err(p::code(p::BUSY));
+        }
+        self.search(fs, caller, false, path)?;
+        let (parent, _) = split(path);
+        let parent_attr = self.dir_perm(fs, parent)?;
+        let (info, entry) = self.load(fs, path)?;
+        perm::remove_allowed(
+            caller.identity(false),
+            &parent_attr,
+            &entry.attr.perm(info.kind),
+        )
+        .map_err(denied)?;
+        match (rmdir, info.kind) {
+            (false, Kind::Directory) => return Err(p::code(p::IS_DIRECTORY)),
+            (true, Kind::File) => return Err(p::code(p::NOT_DIRECTORY)),
+            _ => {}
+        }
+        if info.kind == Kind::Directory {
+            if self.dir_in_use(path) {
+                return Err(p::code(p::BUSY));
+            }
+            volume(fs.remove(path))?;
+            // The two blocks of its pair come back at the next walk.
+            fs.note_freed_blocks(2);
+            self.forget(path);
+        } else {
+            match self.node_at(path) {
+                // Open: the descriptions keep the file, which leaves the tree; its blocks are
+                // counted when the last description closes (`node_unref`).
+                Some(ni) => self.orphan(fs, ni, None)?,
+                None => {
+                    volume(fs.remove(path))?;
+                    fs.note_freed_file(u64::from(info.size));
+                }
+            }
+        }
+        self.count_add(parent, -1);
+        self.touch(fs, parent);
+        Ok(())
+    }
+
+    pub(super) fn do_rename<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        from: &[u8],
+        to: &[u8],
+    ) -> Res<()> {
+        if from == b"/" || to == b"/" {
+            return Err(p::code(p::INVALID));
+        }
+        visible(from)?;
+        visible(to)?;
+        self.search(fs, caller, false, from)?;
+        self.search(fs, caller, false, to)?;
+        let (from_parent, _) = split(from);
+        let (to_parent, _) = split(to);
+        let from_attr = self.dir_perm(fs, from_parent)?;
+        let to_attr = self.dir_perm(fs, to_parent)?;
+        let (source, source_entry) = self.load(fs, from)?;
+        // A directory into its own subtree is INVALID; a file has no subtree (a path through it
+        // already failed the search with NOT_DIRECTORY).
+        if source.kind == Kind::Directory && within(to, from) && to != from {
+            return Err(p::code(p::INVALID));
+        }
+        let replaced = fs.stat(to);
+        let target_entry = match replaced {
+            Ok(target) if target.kind != source.kind => {
+                return Err(p::code(match target.kind {
+                    Kind::Directory => p::IS_DIRECTORY,
+                    Kind::File => p::NOT_DIRECTORY,
+                }));
+            }
+            Ok(target) => Some(entry_of(fs, to, target.kind)?),
+            Err(Error::NoEntry) => None,
+            Err(error) => return Err(status_of(error)),
+        };
+        perm::rename_allowed(
+            caller.identity(false),
+            &from_attr,
+            &source_entry.attr.perm(source.kind),
+            &to_attr,
+            target_entry
+                .as_ref()
+                .map(|e| e.attr.perm(source.kind))
+                .as_ref(),
+            from_parent == to_parent,
+        )
+        .map_err(denied)?;
+        // A rename to itself succeeds and does nothing (XSH `rename()`): no count moves, no time.
+        if from == to {
+            return Ok(());
+        }
+        // A rename may split a directory's pair of blocks: below the reserve it is the superuser's.
+        self.reserve_allows(fs, caller)?;
+        // A name added to another directory counts toward its cap.
+        if from_parent != to_parent && target_entry.is_none() {
+            self.room_in_dir(fs, to_parent)?;
+        }
+        if source.kind == Kind::Directory {
+            if self.dir_in_use(from) || self.dir_in_use(to) {
+                return Err(p::code(p::BUSY));
+            }
+            volume(fs.rename(from, to))?;
+            self.forget(from);
+            self.forget(to);
+        } else {
+            if from == to {
+                return Ok(());
+            }
+            // A file that the rename replaces and that is open goes under the orphans first,
+            // marked with its home name; if the second commit fails it goes back.
+            let target = self.node_at(to);
+            if let Some(t) = target {
+                self.orphan(fs, t, Some(to))?;
+            }
+            #[cfg(test)]
+            let refused = self.fail_second;
+            #[cfg(not(test))]
+            let refused = false;
+            let moved = match self.node_at(from) {
+                _ if refused => Err(p::code(p::NO_SPACE)),
+                Some(ni) => self.move_node(fs, ni, to, None),
+                None => volume(fs.rename(from, to)),
+            };
+            // A file the rename replaced and that nobody had open gave its blocks back.
+            if let (Ok(()), None, Ok(old)) = (&moved, target, replaced) {
+                fs.note_freed_file(u64::from(old.size));
+            }
+            if let Some(t) = target {
+                let at = self.nodes[t].path;
+                match &moved {
+                    Ok(()) => {
+                        let _ = fs.removeattr(at.get(), ATTR_HOME);
+                    }
+                    Err(_) => {
+                        let _ = self.move_node(fs, t, to, None);
+                        let _ = fs.removeattr(to, ATTR_HOME);
+                    }
+                }
+            }
+            moved?;
+        }
+        if from_parent != to_parent {
+            self.count_add(from_parent, -1);
+            if target_entry.is_none() {
+                self.count_add(to_parent, 1);
+            }
+        } else if target_entry.is_some() {
+            self.count_add(to_parent, -1);
+        }
+        if target_entry.is_some() && from_parent != to_parent {
+            // The replaced name is gone from the destination and the source's name came: no change.
+        }
+        self.touch(fs, from_parent);
+        if to_parent != from_parent {
+            self.touch(fs, to_parent);
+        }
+        Ok(())
+    }
+
+    /// CHMOD and FCHMOD (rule 7).
+    pub(super) fn change_mode<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        path: &[u8],
+        mode: u32,
+    ) -> Res<()> {
+        self.fold_pending(fs, path)?;
+        let (info, entry) = self.load(fs, path)?;
+        let new = perm::chmod_result(caller.identity(false), &entry.attr.perm(info.kind), mode)
+            .map_err(denied)?;
+        self.reserve_allows(fs, caller)?;
+        self.write_changed(fs, path, info.kind, entry, |a, now| {
+            a.mode = new;
+            a.ctime = now;
+        })
+    }
+
+    /// CHOWN and FCHOWN (rule 7): `UID_KEEP` leaves a number as it is.
+    pub(super) fn change_owner<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        path: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> Res<()> {
+        self.fold_pending(fs, path)?;
+        let (info, entry) = self.load(fs, path)?;
+        let keep = |v: u32| (v != p::UID_KEEP).then_some(v);
+        let owned = perm::chown_result(
+            caller.identity(false),
+            &entry.attr.perm(info.kind),
+            keep(uid),
+            keep(gid),
+        )
+        .map_err(denied)?;
+        self.reserve_allows(fs, caller)?;
+        self.write_changed(fs, path, info.kind, entry, |a, now| {
+            a.mode = owned.mode;
+            a.uid = owned.uid;
+            a.gid = owned.gid;
+            a.ctime = now;
+        })
+    }
+
+    /// UTIMENS and FUTIMENS (rule 8).
+    pub(super) fn change_times<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        path: &[u8],
+        atime: p::TimeSpec,
+        mtime: p::TimeSpec,
+    ) -> Res<()> {
+        self.fold_pending(fs, path)?;
+        let (info, entry) = self.load(fs, path)?;
+        let request = match (atime, mtime) {
+            (p::TimeSpec::Omit, p::TimeSpec::Omit) => TimesRequest::Omit,
+            (p::TimeSpec::Now, p::TimeSpec::Now) => TimesRequest::Now,
+            _ => TimesRequest::Explicit,
+        };
+        perm::utimens_allowed(caller.identity(false), &entry.attr.perm(info.kind), request)
+            .map_err(denied)?;
+        if request == TimesRequest::Omit {
+            return Ok(());
+        }
+        self.reserve_allows(fs, caller)?;
+        let pick = |t: p::TimeSpec, old: i64, now: i64| match t {
+            p::TimeSpec::Now => now,
+            p::TimeSpec::Omit => old,
+            p::TimeSpec::At(t) => t,
+        };
+        self.write_changed(fs, path, info.kind, entry, |a, now| {
+            a.atime = pick(atime, a.atime, now);
+            a.mtime = pick(mtime, a.mtime, now);
+            a.ctime = now;
+        })
+    }
+
+    /// Writes the record of the entry at `path` after `change` (one commit). A record of a format
+    /// this service does not know is never rewritten: CORRUPT. The memory of the directories is
+    /// dropped for a directory, whose permissions may have changed.
+    pub(super) fn write_changed<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        path: &[u8],
+        kind: Kind,
+        entry: Record,
+        change: impl FnOnce(&mut Attr, i64),
+    ) -> Res<()> {
+        if entry.standing == Standing::Foreign {
+            return Err(p::code(p::CORRUPT));
+        }
+        let mut attr = entry.attr;
+        change(&mut attr, self.now);
+        volume(fs.setattr(path, ATTR_TYPE, &attr.to_bytes()))?;
+        if kind == Kind::Directory {
+            self.forget(path);
+        }
+        Ok(())
+    }
+
+    /// READDIR: the entries of the next batch (rule of the listing): `ino`, `kind` and the name of
+    /// as many as the reply holds, `.` and `..` first. An entry that did not fit waits in the
+    /// description's slot for the next call.
+    pub(super) fn do_readdir<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        di: usize,
+        w: &mut Writer,
+    ) -> Res<()> {
+        let d = self.descriptions[di];
+        if d.kind != Kind::Directory || !d.read {
+            return Err(bad_handle());
+        }
+        let slot = usize::from(d.object);
+        let dir = self.dirs[slot];
+        let root = dir.get() == b"/";
+        let mut batch = p::DirBatch::new();
+        let mut more = false;
+        loop {
+            let next = match self.pending[slot].take() {
+                Some(pending) => pending,
+                None => match volume(fs.readdir(Dir(d.object)))? {
+                    None => break,
+                    Some(entry) if root && entry.name() == &ORPHANS[1..] => continue,
+                    Some(entry) => {
+                        let ino = entry_ino(fs, dir.get(), entry.name(), entry.kind)?;
+                        let mut pending = Pending {
+                            ino,
+                            kind: entry.kind,
+                            name: [0; crate::NAME_MAX],
+                            len: entry.name().len(),
+                        };
+                        pending.name[..pending.len].copy_from_slice(entry.name());
+                        pending
+                    }
+                },
+            };
+            if !batch.push(next.ino, kind_word(next.kind), &next.name[..next.len]) {
+                self.pending[slot] = Some(next);
+                more = true;
+                break;
+            }
+        }
+        batch.write(more, w)
+    }
+}
+
+/// The path split into its directory and its last name; the root splits into itself and nothing.
+pub(super) fn split(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => (&path[..1.min(path.len())], &path[path.len().min(1)..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+    }
+}
+
+/// The status of a refusal of `posix-perm`.
+pub(super) fn denied(denial: Denial) -> Status {
+    p::code(match denial {
+        Denial::Access => p::ACCESS,
+        Denial::Permission => p::PERMISSION,
+    })
+}
+
+/// The record of the entry at `path` of `kind` as it stands on the volume (none: the closed default).
+pub(super) fn entry_of<D: Device>(fs: &mut Fs<'_, D>, path: &[u8], kind: Kind) -> Res<Record> {
+    let mut buf = [0u8; 64];
+    match fs.getattr(path, ATTR_TYPE, &mut buf) {
+        Ok(n) => Ok(read_entry(kind, path, Some(&buf[..n.min(64)]))),
+        Err(Error::NoAttr) => Ok(read_entry(kind, path, None)),
+        Err(e) => Err(status_of(e)),
+    }
+}
+
+/// The number of the entry `name` of the directory `dir` (`.` and `..` name the directory and its
+/// parent): what STAT gives for that name. THE ONE PLACE READDIR READS AN ENTRY'S ATTRIBUTE: it looks
+/// the entry up by its path (the cost grows with the entry's place in a large directory); a later
+/// change of littlefs that reads the attribute of the entry the iterator stands at replaces this body.
+pub(super) fn entry_ino<D: Device>(
+    fs: &mut Fs<'_, D>,
+    dir: &[u8],
+    name: &[u8],
+    kind: Kind,
+) -> Res<u64> {
+    let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
+    let len = if name == b"." {
+        path[..dir.len()].copy_from_slice(dir);
+        dir.len()
+    } else if name == b".." {
+        let (parent, _) = split(dir);
+        path[..parent.len()].copy_from_slice(parent);
+        parent.len()
+    } else {
+        let mut n = dir.len();
+        path[..n].copy_from_slice(dir);
+        if dir != b"/" {
+            path[n] = b'/';
+            n += 1;
+        }
+        path[n..n + name.len()].copy_from_slice(name);
+        n + name.len()
+    };
+    let kind = if name == b"." || name == b".." {
+        Kind::Directory
+    } else {
+        kind
+    };
+    Ok(entry_of(fs, &path[..len], kind)?.attr.ino)
+}
+
+/// The stat record of an entry.
+pub(super) fn stat_record(kind: Kind, size: u32, attr: &Attr, nlink: u32) -> p::Stat {
+    p::Stat {
+        kind: kind_word(kind),
+        mode: attr.mode,
+        uid: attr.uid,
+        gid: attr.gid,
+        size: u64::from(size),
+        ino: attr.ino,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        nlink,
+    }
+}
