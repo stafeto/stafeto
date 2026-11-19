@@ -175,6 +175,24 @@ them for the licence notes of the image.
   (`80ca777e37a2b176770726a02e07a6fb79ef0b39`) and fetch only `src` and
   `include` of it with a sparse shallow checkout, as `tools/build-relibc.py`
   fetches relibc.
+- The demo screen of LVGL (`ports/lvgl/{demo.c,demo.h,scene.h,schedule.c,schedule.h,keys.c,keys.h,crc.c,crc.h}`)
+  is plain C over a small contract that `demo.h` states: two XRGB8888 buffers of
+  640 x 400 that the host program supplies, a post of a finished frame with the
+  rectangles that changed, a wait for a free buffer, events handed in, the time
+  and a log line. `scene.h` holds the places of the widgets and the 22 events of
+  the scenario (16 of them changes). In probe mode the clock is virtual (16 ms a
+  turn) and `schedule.c` hands LVGL one input change at a time, the next only
+  after the frame has settled (no frame drawn, no animation running, one more
+  read of the same device), so the CRC of a frame does not depend on when the
+  events arrived. `tools/build-lvgl.py --host` also builds the reference program
+  `target/lvgl/host/lvgl-ref` (`tools/lvgl-ref/main.c`): the same demo, LVGL and
+  FreeType code on the host, which prints the CRC-32 of the first settled frame
+  and of the frame after the scenario, the state line (`presses 2 option 1
+  switch 1 slider 75 text hi`), and with `--evidence` the determinism evidence of
+  the glyph path (the hinted outline and the bitmap of `a g W 0` at 16 pixels,
+  the multiple-masters flag, the kerning of `AV`, the interpreter version).
+  `python3 -I tools/test_lvgl_port.py` tests the CRC, the key table and the
+  schedule, shows two planted faults failing, and runs the reference twice.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its
