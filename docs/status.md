@@ -42,7 +42,11 @@ crashes or goes silent and marks it broken after five failures in 60 s.
 The PL011 driver (`services/uart`) owns the console on interrupts and
 shows the kernel log; on Apple VZ the Virtio console's driver
 (`services/virtio-console`) does the same with the same protocol, and
-`init` resets its device before its DMA memory goes. A RAM file service (`services/ramfs`) holds files
+`init` resets its device before its DMA memory goes. The console driver runs under a time budget of
+150 us of each 10 ms (1.5 % of CPU 0) and works at level 32 once it is spent. Limit: while the levels
+33 to 59 are saturated, the driver gets only its budget, so the receive FIFO of the PL011 can
+overflow (the interrupt is served late) and the kernel log ring of 64 records can overwrite records
+(the driver reports the count). A RAM file service (`services/ramfs`) holds files
 and directories. Programs build on `lib/rt`, which owns handles, runs
 service loops and starts children through a start protocol.
 

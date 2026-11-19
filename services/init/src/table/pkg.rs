@@ -980,9 +980,9 @@ mod tests {
 
     #[test]
     fn the_budgets_of_cpu_zero_with_the_nvme_service_stay_in_the_room_of_the_shell_image() {
-        // The shell image's budgets on CPU 0 (the network service 60 %, the three services 8 %)
-        // and the NVMe service's 1 %, with the reserve of 3 % for the process service and the
-        // package service: 72 % of the 75 % the table allows.
+        // The shell image's budgets on CPU 0 (the network service 60 %, the three services 8 %,
+        // the console driver 1.5 %) and the NVMe service's 1 %, with the reserve of 3 % for the
+        // process service and the package service: 73.5 % of the 75 % the table allows.
         let table: Vec<Record> = super::super::base::BASE_TABLE
             .iter()
             .map(|r| if r.name == "blk" { NVME_QEMU_BLK } else { *r })
@@ -997,9 +997,9 @@ mod tests {
         assert_eq!(
             on_zero + crate::table::CPU0_RESERVE_PPM,
             if super::super::ramfs::RAM_BUDGET_ON {
-                720_000
+                735_000
             } else {
-                670_000
+                685_000
             }
         );
         assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
