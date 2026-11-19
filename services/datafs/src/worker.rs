@@ -112,6 +112,8 @@ pub struct Disk {
     notify: Handle<Channel>,
     sectors: u64,
     pub flush: bool,
+    /// The reads of the volume since the start, for the line of a walk.
+    pub reads: u64,
 }
 
 enum Got {
@@ -214,6 +216,11 @@ impl Device for Disk {
     }
 
     fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        // A stop notice ends a walk at its next read: the walk only reads, and nothing is lost.
+        if WALKING.load(Acquire) && STOPPING.load(Acquire) {
+            return Err(DeviceError);
+        }
+        self.reads += 1;
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             let key = self
@@ -341,6 +348,7 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, &'static str> {
         dead: AtomicBool::new(false),
         sectors: info.sectors,
         flush: info.flush(),
+        reads: 0,
     })
 }
 
@@ -374,8 +382,9 @@ fn open_volume(disk: Disk) -> Option<Volume> {
     // SAFETY: the storage is the worker's alone, and lives for the life of the process.
     let storage = unsafe { &mut *STORAGE.get() };
     match volume::open(disk, storage, seed) {
-        Ok((mut fs, did, part)) => {
-            let used = fs.used_blocks().unwrap_or(0);
+        Ok((fs, did, part)) => {
+            // No count of the blocks in use here: that is a walk of the whole volume, which the
+            // worker makes after READY, when its queue is empty (`first_walk`).
             let how = match did {
                 Did::Partitioned => "partition table written, data volume formatted",
                 Did::Formatted => "data volume formatted",
@@ -385,7 +394,7 @@ fn open_volume(disk: Disk) -> Option<Volume> {
                 }
             };
             rt::println!(
-                "datafs: {how}, {} blocks, {used} in use, partition at sector {}",
+                "datafs: {how}, {} blocks, partition at sector {}",
                 fs.blocks(),
                 part.first
             );
@@ -445,6 +454,15 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
     }
     let mut server = Server::with_epoch(epoch);
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
+    // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
+    // back. A timer on the kick channel wakes the thread when the queue has been empty for
+    // `IDLE_NS`; without one (the kernel refused it) the refresh does not happen.
+    let timer = sys::timer_create(&kicks, LEVEL).ok();
+    let mut idle = Idle {
+        first_pending: volume.is_some(),
+        last_job: rt::time::ticks_to_ns(rt::time::now()),
+        refresh_failed: false,
+    };
     loop {
         while let Some(i) = oldest() {
             if STOPPING.load(Acquire) && stop_decision() == Drain::GiveUp {
@@ -474,6 +492,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 }
             }
             state(i).store(DONE, Release);
+            idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
                 STOP_JOBS.fetch_add(1, Release);
             }
@@ -488,8 +507,100 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 let _ = sys::receive(&kicks);
             }
         }
+        // The queue is empty: the walks of the idle. Requests that came before this point were
+        // served first; those that come during a walk wait for its end (littlefs walks the volume
+        // in one call that cannot be split).
+        if let Some(fs) = volume.as_mut() {
+            if idle.first_pending {
+                idle.first_pending = false;
+                first_walk(fs);
+                continue;
+            }
+            if refresh_wanted(fs, &idle) {
+                let now = rt::time::ticks_to_ns(rt::time::now());
+                let wait = (idle.last_job + IDLE_NS).saturating_sub(now);
+                if wait == 0 {
+                    idle.refresh_failed = !refresh_walk(fs);
+                    continue;
+                }
+                if let Some(timer) = &timer {
+                    let _ = sys::timer_set(timer, now + wait);
+                }
+            }
+        }
         let _ = sys::receive(&kicks);
     }
+}
+
+/// How long the queue stays empty before the worker walks the volume to count the blocks that
+/// removals gave back.
+const IDLE_NS: u64 = 2_000_000_000;
+
+/// What the worker keeps for its idle walks.
+struct Idle {
+    /// The first walk after the mount has not been made yet.
+    first_pending: bool,
+    /// The instant the last job ended, in nanoseconds.
+    last_job: u64,
+    /// A refresh walk failed: no more of them in this instance (the disk is not answering well).
+    refresh_failed: bool,
+}
+
+/// Whether the blocks that removals and truncations gave back since the last walk are over a
+/// sixteenth of the volume: the free count of STATFS (from the bits of the allocator's window)
+/// is then too low by that much, and a walk sets it right.
+fn refresh_wanted(fs: &Volume, idle: &Idle) -> bool {
+    !idle.refresh_failed && !STOPPING.load(Acquire) && fs.freed_estimate() > fs.blocks() / 16
+}
+
+/// The walk of a volume while no request waits: fills the allocator's window from the tree, so that
+/// every request after it finds the free count and the free blocks with no walk of its own. It
+/// only reads. The worker marks it (`WALKING`), the disk calls it makes stamp the progress the
+/// request thread looks at, and a stop notice ends it at its next read. Returns the reads and the
+/// time it took, and whether it succeeded.
+fn walk(fs: &mut Volume) -> (bool, u64, u64) {
+    let reads_before = fs.device().device.reads;
+    let started = rt::time::ticks_to_ns(rt::time::now());
+    WALKING.store(true, Release);
+    let ok = fs.walk().is_ok();
+    WALKING.store(false, Release);
+    let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1_000_000;
+    (ok, fs.device().device.reads - reads_before, ms)
+}
+
+/// The first walk after the mount, with the line that says how long it took. A request that came
+/// first and made the walk itself (a write, or STATFS) has filled the window already: the line
+/// says so.
+fn first_walk(fs: &mut Volume) {
+    let blocks = fs.blocks();
+    if u64::from(fs.window_state().2) == blocks {
+        let used = blocks.saturating_sub(fs.window_free());
+        rt::println!("datafs: first walk made by a request, {used} blocks used");
+        return;
+    }
+    let (ok, reads, ms) = walk(fs);
+    if ok {
+        let used = blocks.saturating_sub(fs.window_free());
+        rt::println!("datafs: first walk {used} blocks used, {reads} reads, {ms} ms");
+    } else {
+        rt::println!("datafs: first walk failed after {reads} reads, {ms} ms");
+    }
+}
+
+/// The refresh walk. True when it succeeded.
+fn refresh_walk(fs: &mut Volume) -> bool {
+    let freed = fs.freed_estimate();
+    let blocks = fs.blocks();
+    let (ok, reads, ms) = walk(fs);
+    if ok {
+        let used = blocks.saturating_sub(fs.window_free());
+        rt::println!(
+            "datafs: refresh walk {used} blocks used, about {freed} given back, {reads} reads, {ms} ms"
+        );
+    } else {
+        rt::println!("datafs: refresh walk failed after {reads} reads, {ms} ms");
+    }
+    ok
 }
 
 /// The drain step for the jobs queued now, after the time since the stop notice.

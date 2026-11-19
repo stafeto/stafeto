@@ -104,6 +104,12 @@ pub static STOP_JOBS: AtomicU64 = AtomicU64::new(0);
 /// The worker put the volume away.
 pub static UNMOUNTED: AtomicBool = AtomicBool::new(false);
 
+/// The worker is in a walk of the volume (the first one after the mount, or a refresh in the idle):
+/// it runs for as long as the volume needs, and every disk call of it stamps `PROGRESS`, so the
+/// look at the worker (`datafs::watch`) sees steady progress while it lasts. A stop notice ends it
+/// at its next disk call.
+pub static WALKING: AtomicBool = AtomicBool::new(false);
+
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());
 

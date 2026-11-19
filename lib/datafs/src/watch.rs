@@ -4,9 +4,10 @@
 //! The look of the request thread at the worker: whether it has stopped making progress.
 //!
 //! The heartbeat of the service comes from the request thread, which stays alive while the worker is
-//! caught in a loop on a damaged volume. A job can legitimately run for minutes (littlefs walks the
-//! whole file system when its look-ahead window runs out, and `Statfs` does the same walk), so the age
-//! of a job tells nothing. What a healthy worker does all the time is complete disk calls. The worker
+//! caught in a loop on a damaged volume. A job can legitimately run for minutes (the walk of the
+//! whole file system that fills the allocator's window: the first one after the mount, the refresh
+//! walk after many removals, and the one a write or `Statfs` makes when it arrives first; a volume
+//! of 2 GiB takes 14 to 50 s at 10,000 reads a second), so the age of a job tells nothing. What a healthy worker does all the time is complete disk calls. The worker
 //! stamps the instant of every completed disk call, and the request thread ends the service when a
 //! job is in the table and no disk call has completed for `STUCK_NS`: init starts a new instance,
 //! which mounts the volume again.
@@ -66,6 +67,22 @@ mod tests {
         for now in (10..10_000).step_by(10) {
             assert!(!stuck(now, 0, now - 5, [0], 50), "at {now}");
         }
+    }
+
+    #[test]
+    fn a_walk_of_a_slow_disk_is_never_stuck_while_its_reads_come() {
+        // A walk of 90 s (a volume of 2 GiB on a disk of 3,000 reads a second), a job queued at its
+        // start, a read completing every 10 ms: the silence is never over the limit of 20 s.
+        const MS: u64 = 1_000_000;
+        for now in (10..90_000).step_by(10) {
+            assert!(
+                !stuck(now * MS, 0, (now - 10) * MS, [MS], 20_000 * MS),
+                "at {now} ms"
+            );
+        }
+        // The same walk with the disk silent from 30 s on: stuck 20 s later.
+        assert!(!stuck(50_000 * MS, 0, 30_000 * MS, [MS], 20_000 * MS));
+        assert!(stuck(50_001 * MS, 0, 30_000 * MS, [MS], 20_000 * MS));
     }
 
     #[test]

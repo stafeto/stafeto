@@ -46,6 +46,8 @@ pub struct Failures {
     times: [Option<u64>; BREAK_AFTER],
     next: usize,
     in_a_row: u32,
+    /// The failures in a row that were exits with the code the record names in `broken_after`.
+    same_code: u32,
 }
 
 impl Failures {
@@ -54,6 +56,7 @@ impl Failures {
             times: [None; BREAK_AFTER],
             next: 0,
             in_a_row: 0,
+            same_code: 0,
         }
     }
 
@@ -63,6 +66,35 @@ impl Failures {
     /// counts the failures in a row and an instance that lived WINDOW_NS
     /// or longer starts k at 1 again.
     pub fn failed(&mut self, now: u64, lived: u64) -> Verdict {
+        self.failed_with(now, lived, None, None)
+    }
+
+    /// `failed`, for a record that names an exit code in `broken_after` (`code`, `times`): the
+    /// failure ended with exit code `ended_with` (None for a fault, a kill, the watchdog's word or
+    /// a start that did not load). `times` failures in a row that all ended with `code` make the
+    /// record broken at once; a failure that ended in another way starts the count again, so a stuck
+    /// exit followed by an ordinary one is no streak. The record's failures also count toward
+    /// BREAK_AFTER in WINDOW_NS as for any record.
+    pub fn failed_with(
+        &mut self,
+        now: u64,
+        lived: u64,
+        ended_with: Option<u64>,
+        broken_after: Option<(u64, u32)>,
+    ) -> Verdict {
+        let streak = match (broken_after, ended_with) {
+            (Some((code, _)), Some(got)) if got == code => self.same_code.saturating_add(1),
+            _ => 0,
+        };
+        self.same_code = streak;
+        if let Some((_, times)) = broken_after
+            && streak >= times
+        {
+            self.in_a_row = self.in_a_row.saturating_add(1);
+            self.times[self.next] = Some(now);
+            self.next = (self.next + 1) % BREAK_AFTER;
+            return Verdict::Broken;
+        }
         if lived >= WINDOW_NS {
             self.in_a_row = 0;
         }
@@ -76,6 +108,11 @@ impl Failures {
                 pause_ns: pause(self.in_a_row),
             }
         }
+    }
+
+    /// The failures in a row that ended with the exit code of the record's `broken_after` rule.
+    pub fn same_code(&self) -> u32 {
+        self.same_code
     }
 
     /// The failures within WINDOW_NS up to `now` (LIST).
@@ -152,6 +189,56 @@ mod tests {
         pauses(&mut f, &times[..4]);
         assert_eq!(f.recent(WINDOW_NS - 1), 4);
         assert_eq!(f.recent(WINDOW_NS), 3);
+    }
+
+    const STUCK: u64 = 6;
+
+    #[test]
+    fn two_stuck_exits_in_a_row_break_a_record_that_names_them() {
+        let rule = Some((STUCK, 2));
+        let mut f = Failures::new();
+        assert_eq!(
+            f.failed_with(0, 25 * S, Some(STUCK), rule),
+            Verdict::Restart { pause_ns: 100 * MS }
+        );
+        assert_eq!(
+            f.failed_with(30 * S, 25 * S, Some(STUCK), rule),
+            Verdict::Broken
+        );
+    }
+
+    #[test]
+    fn a_stuck_exit_then_an_ordinary_one_is_no_streak() {
+        let rule = Some((STUCK, 2));
+        let mut f = Failures::new();
+        let verdicts = [
+            f.failed_with(0, 25 * S, Some(STUCK), rule),
+            f.failed_with(30 * S, 25 * S, Some(1), rule),
+            f.failed_with(60 * S, 25 * S, Some(STUCK), rule),
+            // A fault, a kill and the watchdog's word end the streak as well.
+            f.failed_with(90 * S, 25 * S, None, rule),
+            f.failed_with(120 * S, 25 * S, Some(STUCK), rule),
+        ];
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| matches!(v, Verdict::Restart { .. })),
+            "{verdicts:?}"
+        );
+        // The next stuck exit after a stuck one breaks it.
+        assert_eq!(
+            f.failed_with(150 * S, 25 * S, Some(STUCK), rule),
+            Verdict::Broken
+        );
+    }
+
+    #[test]
+    fn a_record_without_the_rule_restarts_on_any_exit_code() {
+        let mut f = Failures::new();
+        for i in 0..4 {
+            let v = f.failed_with(i * 30 * S, 25 * S, Some(STUCK), None);
+            assert!(matches!(v, Verdict::Restart { .. }), "{v:?}");
+        }
     }
 
     #[test]

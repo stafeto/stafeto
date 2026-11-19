@@ -39,6 +39,7 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
     Record {
         name: "high",
@@ -67,5 +68,6 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
 ];

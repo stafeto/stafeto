@@ -252,6 +252,7 @@ pub const CONSOLE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 const fn same(a: &str, b: &str) -> bool {

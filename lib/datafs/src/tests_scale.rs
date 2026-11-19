@@ -47,27 +47,18 @@ type Res<T> = Result<T, Error>;
 /// The size of the allocator's window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Win {
-    /// The 128 bytes the service has today: 1024 blocks.
-    Service,
-    /// One bit for every block of the volume, as the plan proposes.
+    /// The 128 bytes release 0.5.1 had: 1024 blocks (set by the test-only switch).
+    Narrow,
+    /// One bit for every block of the volume: the service's window now.
     Whole,
 }
 
 impl Win {
     fn name(self) -> &'static str {
         match self {
-            Win::Service => "128 B",
+            Win::Narrow => "128 B",
             Win::Whole => "whole",
         }
-    }
-}
-
-fn window_bytes(blocks: u64, win: Win) -> usize {
-    match win {
-        Win::Service => 128,
-        Win::Whole => (blocks.div_ceil(8) as usize)
-            .next_multiple_of(8)
-            .min(128 * 1024),
     }
 }
 
@@ -140,12 +131,11 @@ impl Meter {
 }
 
 fn attach(device: MemDevice, win: Win) -> Vol {
-    let blocks = device.sectors() / BLOCK_SECTORS;
     let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
     let mut fs = Fs::new(device, state).unwrap();
-    if win == Win::Whole {
-        let n = window_bytes(blocks, win);
-        fs.set_lookahead(Box::leak(vec![0u8; n].into_boxed_slice()));
+    if win == Win::Narrow {
+        // The window the first release had; the service's own is one bit for every block.
+        fs.set_lookahead(Box::leak(vec![0u8; 128].into_boxed_slice()));
     }
     fs
 }
@@ -303,7 +293,7 @@ fn row(job: &str, state: &str, win: &str, c: Cost, worst: Cost) {
 
 /// The reads of one `used_blocks` on a freshly mounted volume.
 fn traverse_cost(device: &MemDevice) -> (Cost, u64) {
-    let mut fs = mounted(device, Win::Service);
+    let mut fs = mounted(device, Win::Whole);
     let at = now(&mut fs);
     let used = fs.used_blocks().unwrap();
     let cost = now(&mut fs).since(at);
@@ -442,7 +432,7 @@ fn the_wide_window_walks_the_volume_once_where_the_service_window_walks_it_often
     // 4 MiB of new blocks; a window for the whole volume walks once.
     let blocks = 16384u64;
     let img = image(blocks, BIG_FILES, 0);
-    let mut narrow = mounted(&img, Win::Service);
+    let mut narrow = mounted(&img, Win::Narrow);
     let a = write_and_count(&mut narrow, 16 << 20, 1 << 20, "w");
     let mut wide = mounted(&img, Win::Whole);
     let b = write_and_count(&mut wide, 16 << 20, 1 << 20, "w");
@@ -464,7 +454,7 @@ fn a_small_window_crawls_through_a_used_region_in_one_call_and_a_wide_one_does_n
     let (mut crawl, mut narrow_reads, mut wide_reads) = (0, 0, 0);
     for percent in [40, 50, 60, 70] {
         let img = image(16384, BIG_FILES, percent);
-        let mut narrow = mounted(&img, Win::Service);
+        let mut narrow = mounted(&img, Win::Narrow);
         let a = write_and_count(&mut narrow, 4 << 20, 1 << 20, "w");
         let mut wide = mounted(&img, Win::Whole);
         let b = write_and_count(&mut wide, 4 << 20, 1 << 20, "w");
@@ -508,7 +498,7 @@ fn scale_allocator() {
         };
         for &percent in steps {
             let img = image(blocks, layout, percent);
-            for win in [Win::Service, Win::Whole] {
+            for win in [Win::Whole, Win::Narrow] {
                 let mut fs = mounted(&img, win);
                 let run = write_and_count(&mut fs, 64 << 20, 1 << 20, "w");
                 let mean = if run.scans == 0 {
@@ -544,14 +534,14 @@ fn scale_allocator() {
 fn free_blocks_from_the_window_agree_with_the_walk_and_read_nothing() {
     let blocks = 4096u64;
     let mut fs = fresh(blocks, Win::Whole);
-    // The first allocation fills the window.
     let mut m = Meter::new(&mut fs);
     put(&mut fs, &mut m, "/a", 300 << 10).unwrap();
     put(&mut fs, &mut m, "/b", 1 << 20).unwrap();
     fs.mkdir(b"/dir").unwrap();
     put(&mut fs, &mut m, "/dir/c", 5000).unwrap();
+    // The window was filled by the first allocation: the count reads no block.
     let at = now(&mut fs);
-    let free = fs.window_free();
+    let free = fs.free_blocks().unwrap();
     assert_eq!(
         now(&mut fs).since(at).reads,
         0,
@@ -563,19 +553,116 @@ fn free_blocks_from_the_window_agree_with_the_walk_and_read_nothing() {
         blocks - used,
         "the window counts what the walk counts"
     );
+    // After a mount the window is empty: the first count makes the walk, the next ones read nothing.
+    let mut fs = mounted(&settle(fs), Win::Whole);
+    let at = now(&mut fs);
+    let first = fs.free_blocks().unwrap();
+    let walk = now(&mut fs).since(at);
+    assert!(walk.reads > 0 && walk.programs == 0 && walk.erases == 0);
+    let at = now(&mut fs);
+    assert_eq!(fs.free_blocks().unwrap(), first);
+    assert_eq!(now(&mut fs).since(at).reads, 0);
+    assert_eq!(first, blocks - fs.used_blocks().unwrap());
     // Blocks freed after the last walk are not seen: fewer free than there are, never more.
     fs.remove(b"/b").unwrap();
-    let used = fs.used_blocks().unwrap();
-    assert!(fs.window_free() <= blocks - used);
-    assert!(
-        fs.window_free() < blocks - used,
-        "the freed blocks wait for the next walk"
-    );
+    let truth = blocks - fs.used_blocks().unwrap();
+    let seen = fs.free_blocks().unwrap();
+    assert!(seen <= truth, "{seen} free seen, {truth} free");
+    assert!(seen < truth, "the freed blocks wait for the next walk");
+    // The estimate of what was freed names them (256 blocks of the file and its pair).
+    assert!(fs.freed_estimate() >= 256);
+    // A walk sees them and starts the estimate again.
+    fs.walk().unwrap();
+    assert_eq!(fs.freed_estimate(), 0);
+    assert_eq!(fs.free_blocks().unwrap(), truth);
     // The window of 128 bytes sees at most its 1024 blocks: it cannot answer for a larger volume.
-    let mut narrow = fresh(blocks, Win::Service);
+    let mut narrow = fresh(blocks, Win::Narrow);
     let mut m = Meter::new(&mut narrow);
     put(&mut narrow, &mut m, "/a", 4096).unwrap();
     assert!(narrow.window_free() <= 1024);
+}
+
+#[test]
+fn statfs_through_the_server_reads_nothing_after_the_first_walk() {
+    let mut fs = fresh(4096, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    put(&mut fs, &mut m, "/a", 200 << 10).unwrap();
+    let mut fs = mounted(&settle(fs), Win::Whole);
+    let mut server = crate::server::Server::with_epoch(1);
+    let mut statfs = |fs: &mut Vol| {
+        let mut w = proto_wire::Writer::new();
+        proto_data::statfs(&mut w).unwrap();
+        let reply = server.handle(fs, 1, 0, w.as_bytes());
+        let mut r = proto_data::reply(reply.as_bytes()).unwrap();
+        (r.u64().unwrap(), r.u64().unwrap(), r.u32().unwrap())
+    };
+    let (blocks, used, unit) = statfs(&mut fs);
+    assert_eq!((blocks, unit), (4096, 4096));
+    assert_eq!(used, 4096 - fs.free_blocks().unwrap());
+    let at = now(&mut fs);
+    for _ in 0..5 {
+        assert_eq!(statfs(&mut fs), (blocks, used, unit));
+    }
+    assert_eq!(now(&mut fs).since(at).reads, 0, "STATFS reads no block");
+    assert_eq!(used, fs.used_blocks().unwrap());
+}
+
+#[test]
+fn a_walk_only_reads_and_a_failed_one_leaves_a_volume_that_mounts() {
+    // The walk marks blocks in memory and reads the device; it never writes, so a cut of the power
+    // during a walk leaves the medium as it was. The medium is the same bytes after a walk, and a
+    // walk that fails on a dead device leaves nothing to repair.
+    let mut fs = fresh(1024, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    fs.mkdir(b"/d").unwrap();
+    put(&mut fs, &mut m, "/d/f", 100 << 10).unwrap();
+    let mut device = settle(fs);
+    let before = device.medium().to_vec();
+    let mut fs = mounted(&device, Win::Whole);
+    let at = now(&mut fs);
+    fs.walk().unwrap();
+    let c = now(&mut fs).since(at);
+    assert!(c.reads > 0);
+    assert_eq!(
+        (c.programs, c.erases, c.flushes),
+        (0, 0, 0),
+        "a walk writes nothing"
+    );
+    let mut after = fs.into_device();
+    after.flush().unwrap();
+    assert_eq!(after.medium(), &before[..], "the medium is as it was");
+
+    // The device dies (a write after a cut at 0 sectors), then the walk: it fails.
+    let mut fs = mounted(&device, Win::Whole);
+    fs.device().cut_after(Some(0));
+    assert!(fs.mkdir(b"/x").is_err());
+    assert!(fs.walk().is_err(), "a walk on a dead device fails");
+    let mut dead = fs.into_device();
+    dead.power_cycle(Survive::None);
+    let mut fs = attach(dead, Win::Whole);
+    fs.mount().unwrap();
+    assert_eq!(fs.stat(b"/d/f").unwrap().size, 100 << 10);
+    assert_eq!(fs.stat(b"/x"), Err(Error::NoEntry));
+    fs.walk().unwrap();
+    device.power_cycle(Survive::All);
+}
+
+#[test]
+fn removes_and_truncates_are_counted_as_freed() {
+    let mut fs = fresh(1024, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    put(&mut fs, &mut m, "/a", 40 << 10).unwrap();
+    put(&mut fs, &mut m, "/b", 40 << 10).unwrap();
+    assert_eq!(fs.freed_estimate(), 0);
+    fs.remove(b"/a").unwrap();
+    assert_eq!(fs.freed_estimate(), 10);
+    let f = fs.open(b"/b", Open::READ_WRITE).unwrap();
+    fs.truncate(f, 4096).unwrap();
+    assert_eq!(fs.freed_estimate(), 19);
+    fs.close(f).unwrap();
+    // A failed remove counts nothing.
+    assert!(fs.remove(b"/missing").is_err());
+    assert_eq!(fs.freed_estimate(), 19);
 }
 
 #[test]
@@ -990,10 +1077,10 @@ fn a_stat_with_permissions_costs_a_few_reads() {
         .into_iter()
         .find(|j| j.name.starts_with("stat + getattr 48 B, depth 2"))
         .unwrap();
-    let (c, _) = run_job(&device, Win::Service, false, &stat);
+    let (c, _) = run_job(&device, Win::Whole, false, &stat);
     assert!(c.reads <= 24, "a stat of depth 8 reads {} times", c.reads);
     assert_eq!(c.programs, 0);
-    let (c, _) = run_job(&device, Win::Service, false, &both);
+    let (c, _) = run_job(&device, Win::Whole, false, &both);
     assert!(
         c.reads <= 24,
         "a stat with its attribute reads {} times",
@@ -1010,7 +1097,7 @@ fn an_attribute_costs_one_commit() {
         .into_iter()
         .find(|j| j.name.starts_with("setattr 48 B over"))
         .unwrap();
-    let (c, _) = run_job(&device, Win::Service, false, &set);
+    let (c, _) = run_job(&device, Win::Whole, false, &set);
     assert!(c.programs <= 3, "a setattr programs {} times", c.programs);
     assert!(c.flushes <= 2, "a setattr flushes {} times", c.flushes);
 }
@@ -1033,9 +1120,9 @@ fn scale_jobs() {
         for job in jobs() {
             if job.allocs {
                 for (win, warm) in [
-                    (Win::Service, false),
-                    (Win::Service, true),
                     (Win::Whole, false),
+                    (Win::Whole, true),
+                    (Win::Narrow, false),
                 ] {
                     let (c, w) = run_job(&device, win, warm, &job);
                     let label = format!(
@@ -1050,7 +1137,7 @@ fn scale_jobs() {
                     row(&label, state, win.name(), c, w);
                 }
             } else {
-                let (c, w) = run_job(&device, Win::Service, false, &job);
+                let (c, w) = run_job(&device, Win::Whole, false, &job);
                 row(job.name, state, "any", c, w);
             }
         }
@@ -1063,7 +1150,7 @@ fn scale_jobs() {
 
 #[test]
 fn an_attribute_given_at_the_creation_appears_only_after_the_sync() {
-    let mut fs = fresh(512, Win::Service);
+    let mut fs = fresh(512, Win::Whole);
     let f = fs
         .open_with_attr(b"/a", Open::WRITE.with(Open::CREATE), 0x70, &[5u8; 48])
         .unwrap();
@@ -1079,14 +1166,14 @@ fn an_attribute_given_at_the_creation_appears_only_after_the_sync() {
     fs.close(f).unwrap();
 
     // A cut of the power before the sync leaves the file with no attribute.
-    let mut fs = fresh(512, Win::Service);
+    let mut fs = fresh(512, Win::Whole);
     let f = fs
         .open_with_attr(b"/b", Open::WRITE.with(Open::CREATE), 0x70, &[6u8; 48])
         .unwrap();
     fs.write(f, b"data").unwrap();
     let mut device = fs.into_device();
     device.power_cycle(Survive::None);
-    let mut fs = attach(device, Win::Service);
+    let mut fs = attach(device, Win::Whole);
     fs.mount().unwrap();
     assert_eq!(fs.getattr(b"/b", 0x70, &mut buf), Err(Error::NoAttr));
     assert_eq!(fs.stat(b"/b").unwrap().size, 0);
@@ -1181,7 +1268,7 @@ fn lfs_remove_succeeds_on_a_volume_with_no_free_block() {
         let mut fs = fresh(1024, Win::Whole);
         let mut paths = fill_to_the_end(&mut fs, seed, name_len, max_file);
         // The removes run in a service that has just started, with the window of 128 bytes.
-        let mut fs = mounted(&settle(fs), Win::Service);
+        let mut fs = mounted(&settle(fs), Win::Whole);
         let free = fs.blocks() - fs.used_blocks().unwrap();
         assert!(free <= 2, "seed {seed}: {free} blocks free after the fill");
         // Every entry goes, in an order a generator picks. Not one remove asks for a block.
@@ -1226,7 +1313,7 @@ fn full_volume_table(
     let mut table = Vec::new();
 
     let mut run = |name: &'static str, body: &dyn Fn(&mut Vol, &[String], &mut Tally)| {
-        let mut fs = mounted(&device, Win::Service);
+        let mut fs = mounted(&device, Win::Whole);
         let mut t = Tally::default();
         body(&mut fs, &sample, &mut t);
         table.push((name, t));
@@ -1355,7 +1442,7 @@ fn scale_full() {
 #[test]
 fn a_rename_between_directories_survives_a_cut_at_every_sector() {
     let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-    let mut base = fresh(512, Win::Service);
+    let mut base = fresh(512, Win::Whole);
     base.mkdir(b"/a").unwrap();
     base.mkdir(b"/b").unwrap();
     let mut m = Meter::new(&mut base);
@@ -1369,7 +1456,7 @@ fn a_rename_between_directories_survives_a_cut_at_every_sector() {
     medium.flush().unwrap();
 
     // How many sectors the rename writes when nothing stops it.
-    let mut probe = mounted(&medium, Win::Service);
+    let mut probe = mounted(&medium, Win::Whole);
     let before = probe.device().written;
     probe.rename(b"/a/x", b"/b/x").unwrap();
     let sectors = probe.device().written - before;
@@ -1383,12 +1470,12 @@ fn a_rename_between_directories_survives_a_cut_at_every_sector() {
             Survive::Prefix(1),
             Survive::Random(cut + 1),
         ] {
-            let mut fs = mounted(&medium, Win::Service);
+            let mut fs = mounted(&medium, Win::Whole);
             fs.device().cut_after(Some(cut));
             let _ = fs.rename(b"/a/x", b"/b/x");
             let mut device = fs.into_device();
             device.power_cycle(survive);
-            let mut fs = attach(device, Win::Service);
+            let mut fs = attach(device, Win::Whole);
             fs.mount().unwrap();
             let old = fs.stat(b"/a/x");
             let new = fs.stat(b"/b/x");
@@ -1446,25 +1533,25 @@ fn service_mount(device: MemDevice, win: Win) -> (Cost, Vol) {
 #[test]
 fn the_mount_after_a_cut_costs_a_bounded_number_of_calls() {
     let device = with_working_area(8192, BIG_FILES, 0, false);
-    let (clean, _) = service_mount(device.clone(), Win::Service);
+    let (clean, _) = service_mount(device.clone(), Win::Whole);
     assert!(
         clean.reads <= 200,
         "a clean mount reads {} times",
         clean.reads
     );
     // A cut at every sector of a rename between directories: the mount repairs the move.
-    let mut fs = mounted(&device, Win::Service);
+    let mut fs = mounted(&device, Win::Whole);
     let before = fs.device().written;
     fs.rename(b"/w/f1", b"/w/s/g1").unwrap();
     let sectors = fs.device().written - before;
     let mut worst = 0;
     for cut in 0..=sectors {
-        let mut fs = mounted(&device, Win::Service);
+        let mut fs = mounted(&device, Win::Whole);
         fs.device().cut_after(Some(cut));
         let _ = fs.rename(b"/w/f1", b"/w/s/g1");
         let mut d = fs.into_device();
         d.power_cycle(Survive::Random(cut + 3));
-        let (c, _) = service_mount(d, Win::Service);
+        let (c, _) = service_mount(d, Win::Whole);
         worst = worst.max(c.reads);
     }
     assert!(
@@ -1488,7 +1575,7 @@ fn scale_mount() {
     ];
     for (state, layout, percent) in states {
         let device = with_working_area(blocks, layout, percent, true);
-        for win in [Win::Service, Win::Whole] {
+        for win in [Win::Whole, Win::Narrow] {
             let (c, _) = service_mount(device.clone(), win);
             row("mount + recover_orphans, clean", state, win.name(), c, c);
         }
@@ -1513,7 +1600,7 @@ fn scale_mount() {
             }),
         ];
         for (name, script) in scripts {
-            let mut fs = mounted(&device, Win::Service);
+            let mut fs = mounted(&device, Win::Whole);
             let before = fs.device().written;
             script(&mut fs);
             let sectors = (fs.device().written - before).min(40);
@@ -1521,12 +1608,12 @@ fn scale_mount() {
             let (mut low, mut high): (Option<Cost>, Option<Cost>) = (None, None);
             let mut cut = 0;
             while cut <= sectors {
-                let mut fs = mounted(&device, Win::Service);
+                let mut fs = mounted(&device, Win::Whole);
                 fs.device().cut_after(Some(cut));
                 script(&mut fs);
                 let mut d = fs.into_device();
                 d.power_cycle(Survive::Random(cut + 11));
-                let (c, _) = service_mount(d, Win::Service);
+                let (c, _) = service_mount(d, Win::Whole);
                 if low.is_none_or(|l| c.ms() < l.ms()) {
                     low = Some(c);
                 }
@@ -1539,14 +1626,14 @@ fn scale_mount() {
             row(
                 &format!("mount after a cut in: {name} (cheapest)"),
                 state,
-                "128 B",
+                "whole",
                 low,
                 low,
             );
             row(
                 &format!("mount after a cut in: {name} (dearest)"),
                 state,
-                "128 B",
+                "whole",
                 high,
                 high,
             );
@@ -1592,7 +1679,7 @@ fn scale_2gib() {
     std::println!("|---|---:|---|---:|---:|---:|---:|---:|");
     for (layout, percent) in [(BIG_FILES, 0), (BIG_FILES, 25), (BIG_FILES, 50)] {
         let img = image(blocks, layout, percent);
-        for win in [Win::Service, Win::Whole] {
+        for win in [Win::Whole, Win::Narrow] {
             let mut fs = mounted(&img, win);
             let run = write_and_count(&mut fs, 64 << 20, 1 << 20, "w");
             std::println!(

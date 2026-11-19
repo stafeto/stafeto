@@ -1070,9 +1070,11 @@ impl Server {
             }
             Method::Statfs => {
                 r.finish()?;
-                let used = volume(fs.used_blocks())?;
+                // From the bits of the allocator's window: no read of the device once the first
+                // walk is done (`Fs::free_blocks`), and never more free than there are.
+                let free = volume(fs.free_blocks())?;
                 w.u64(fs.blocks())?;
-                w.u64(used)?;
+                w.u64(fs.blocks().saturating_sub(free))?;
                 w.u32(p::BLOCK)
             }
             Method::GetFlags => {

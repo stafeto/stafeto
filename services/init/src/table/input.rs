@@ -95,6 +95,7 @@ pub const INPUT: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The display service as the images that take keys have it: its session
@@ -134,6 +135,7 @@ const PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// A program the table gives no connection to the input service (role

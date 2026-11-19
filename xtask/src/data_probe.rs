@@ -187,6 +187,24 @@ fn datafs_line(lines: &[String], prefix: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The line of the first walk of the volume (`datafs: first walk N blocks used, M reads, T ms`, or
+/// that a request made it), which the worker prints once after READY, when its queue is empty. The
+/// lines of the services come glued to the lines of a step under -icount, so the text is looked for
+/// inside the line. Returns the text from `first walk` on.
+fn first_walk(lines: &[String], what: &str) -> Result<String, String> {
+    let said: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.find("datafs: first walk ").map(|at| &l[at..]))
+        .collect();
+    match said.as_slice() {
+        [one] => Ok((*one).to_owned()),
+        other => Err(format!(
+            "data-probe ({what}): {} lines of the first walk, one expected: {other:?}",
+            other.len()
+        )),
+    }
+}
+
 fn synced(lines: &[String]) -> u32 {
     lines
         .iter()
@@ -214,6 +232,7 @@ pub fn probe() -> Result<(), String> {
     if datafs_line(&lines, "partition table written, data volume formatted").is_none() {
         return Err("data-probe (writing): the volume was not partitioned and formatted".into());
     }
+    let walk_writing = first_walk(&lines, "writing")?;
     let verifier = image("boot-data-probe-verify.img", None, "verify", STEPS)?;
     let lines = run_to_end(
         &built,
@@ -230,6 +249,8 @@ pub fn probe() -> Result<(), String> {
     if datafs_line(&lines, "data volume mounted").is_none() {
         return Err("data-probe (verifying): the service did not only mount the volume".into());
     }
+    let walk_verifying = first_walk(&lines, "verifying")?;
+    println!("data-probe: {walk_writing} (writing), {walk_verifying} (verifying)");
     let rows = steps_verdict(&written, &lines)?;
     println!("data-probe: steps of the request loop (kind, ticks, whole step): {rows:?}");
     println!(

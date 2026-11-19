@@ -1377,10 +1377,12 @@ impl Init {
             return;
         };
         let lived = now().saturating_sub(instance.started);
-        let end = End(
-            sys::process_state(instance.process()),
-            table::table()[place].is_posix(),
-        );
+        let state = sys::process_state(instance.process());
+        let code = match state {
+            Ok(ProcessState::Exited { code }) => Some(code),
+            _ => None,
+        };
+        let end = End(state, table::table()[place].is_posix());
         if self.stopping.is_some() {
             // The end of an instance while the system stops is what init asked
             // for: no failure and no restart.
@@ -1389,7 +1391,7 @@ impl Init {
             return;
         }
         let what = format_args!("ended: {end}");
-        self.failed(place, Some(instance), lived, what, Work::Teardown);
+        self.failed_with_code(place, Some(instance), lived, code, what, Work::Teardown);
     }
 
     /// The watchdog of the service at `place` found it silent (init::watch):
@@ -1423,16 +1425,33 @@ impl Init {
         what: fmt::Arguments,
         work: Work,
     ) {
+        self.failed_with_code(place, gone, lived, None, what, work);
+    }
+
+    /// `failed` for an instance that exited with `code` (None when it did not exit): a record with
+    /// a `broken_after` rule is marked broken when that code repeats.
+    fn failed_with_code(
+        &mut self,
+        place: usize,
+        gone: Option<Instance>,
+        lived: u64,
+        code: Option<u64>,
+        what: fmt::Arguments,
+        work: Work,
+    ) {
         let name = table::table()[place].name;
         let now = now();
         // While the system stops no record restarts.
         let verdict = if self.stopping.is_some() {
             None
         } else {
-            self.accrue(place, now, lived)
+            self.accrue(place, now, lived, code)
         };
         match verdict {
             None => println!("init: {name} {what}, not restarted"),
+            Some(Verdict::Broken) if self.stuck_streak(place) => {
+                println!("init: {name} {what}; stuck twice in a row, marked broken")
+            }
             Some(Verdict::Broken) => println!(
                 "init: {name} {what}; broken: {BREAK_AFTER} failures in {} s",
                 WINDOW_NS / S
@@ -1444,12 +1463,26 @@ impl Init {
         self.settle(place, gone, verdict, work);
     }
 
+    /// The record at `place` has a `broken_after` rule and its last failures were that exit code
+    /// as many times as the rule says.
+    fn stuck_streak(&self, place: usize) -> bool {
+        table::table()[place]
+            .broken_after
+            .is_some_and(|(_, times)| self.entries[place].failures.same_code() >= times)
+    }
+
     /// Records a failure of the record at `place` at `now`, of an instance
     /// that lived `lived` ns: a verdict for a record that restarts, None
     /// for one whose policy is never (init::restart).
-    fn accrue(&mut self, place: usize, now: u64, lived: u64) -> Option<Verdict> {
-        match table::table()[place].restart {
-            Restart::Always => Some(self.entries[place].failures.failed(now, lived)),
+    fn accrue(&mut self, place: usize, now: u64, lived: u64, code: Option<u64>) -> Option<Verdict> {
+        let record = &table::table()[place];
+        match record.restart {
+            Restart::Always => Some(self.entries[place].failures.failed_with(
+                now,
+                lived,
+                code,
+                record.broken_after,
+            )),
             Restart::Never => None,
         }
     }

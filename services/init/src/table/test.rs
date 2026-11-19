@@ -56,6 +56,7 @@ pub(super) const fn echo(
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     }
 }
 

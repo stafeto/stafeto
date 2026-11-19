@@ -11,7 +11,7 @@ use core::fmt;
 /// The longest path the interface takes, in bytes (the file service's `MAX_PATH`).
 pub const PATH_MAX: usize = 511;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
-pub const STORAGE_BYTES: usize = 56 * 1024;
+pub const STORAGE_BYTES: usize = (56 + 128) * 1024;
 
 unsafe extern "C" {
     fn datafs_state_size() -> usize;
@@ -87,16 +87,18 @@ unsafe extern "C" {
         size: u32,
     ) -> c_int;
     fn datafs_removeattr(d: *mut c_void, ctx: *mut c_void, path: *const c_char, kind: u8) -> c_int;
+    fn datafs_walk(d: *mut c_void, ctx: *mut c_void) -> c_int;
+    fn datafs_window_blocks(d: *const c_void) -> u32;
+    fn datafs_window_state(d: *const c_void, out: *mut u32);
+    fn datafs_window_free(d: *const c_void) -> i64;
 }
 
-// The host measurements (`tests_scale`): the window of the allocator, the erase count and a file
-// opened with an attribute in its configuration.
+// The host measurements (`tests_scale`): the window of the allocator at another size, the erase
+// count and a file opened with an attribute in its configuration.
 #[cfg(test)]
 unsafe extern "C" {
     fn datafs_set_lookahead(d: *mut c_void, buffer: *mut u8, size: u32);
     fn datafs_erases(d: *const c_void) -> u32;
-    fn datafs_window_state(d: *const c_void, out: *mut u32);
-    fn datafs_window_free(d: *const c_void) -> i64;
     fn datafs_open_attr(
         d: *mut c_void,
         ctx: *mut c_void,
@@ -398,6 +400,7 @@ pub struct Fs<'a, D: Device> {
     state: &'a mut Storage,
     blocks: u32,
     mounted: bool,
+    freed: u64,
 }
 
 impl<'a, D: Device> Fs<'a, D> {
@@ -422,6 +425,7 @@ impl<'a, D: Device> Fs<'a, D> {
             state,
             blocks,
             mounted: false,
+            freed: 0,
         })
     }
 
@@ -476,6 +480,55 @@ impl<'a, D: Device> Fs<'a, D> {
         check64(self.call(|d, ctx| unsafe { datafs_used(d, ctx) }))
     }
 
+    /// Walks the file system once and fills the allocator's window from it: every block the tree
+    /// refers to is marked, the others are free. The walk only reads. The estimate of freed blocks
+    /// starts again from 0. Make it where no operation is half done (between jobs).
+    pub fn walk(&mut self) -> Res<()> {
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_walk(d, ctx) }))?;
+        self.freed = 0;
+        Ok(())
+    }
+
+    /// The allocator's window: its first block, the next block it hands out and its size in
+    /// blocks. The next block goes back to 0 at each walk of the volume.
+    pub fn window_state(&self) -> (u32, u32, u32) {
+        let mut out = [0u32; 3];
+        // SAFETY: reads fields of the state into three words.
+        unsafe { datafs_window_state(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
+        (out[0], out[1], out[2])
+    }
+
+    /// The free blocks the window still holds, counted from its bits: no device access.
+    pub fn window_free(&self) -> u64 {
+        // SAFETY: reads the window of the state.
+        unsafe { datafs_window_free(self.state.0.as_ptr().cast()) as u64 }
+    }
+
+    /// The blocks the volume is not using, without reading the device when the window holds the
+    /// whole volume and has been filled by a walk: the bits of the window from the next block to
+    /// its end. The count is exact right after a walk and after allocations; blocks given back
+    /// since the walk are not seen, so it is never above the true free count. Before the first walk
+    /// it makes the walk. A volume larger than the window (over 4 GiB) walks the tree on every
+    /// call, as `used_blocks` does.
+    pub fn free_blocks(&mut self) -> Res<u64> {
+        // SAFETY: reads a field of the state.
+        let capacity = u64::from(unsafe { datafs_window_blocks(self.state.0.as_ptr().cast()) });
+        if capacity < self.blocks() {
+            return Ok(self.blocks().saturating_sub(self.used_blocks()?));
+        }
+        if u64::from(self.window_state().2) != self.blocks() {
+            self.walk()?;
+        }
+        Ok(self.window_free())
+    }
+
+    /// The blocks that removes and truncations gave back since the last walk, estimated from the
+    /// sizes of the files (a file's blocks, rounded up). The worker walks again when it is large.
+    pub fn freed_estimate(&self) -> u64 {
+        self.freed
+    }
+
     pub fn open(&mut self, path: &[u8], flags: Open) -> Res<File> {
         let path = CPath::new(path)?;
         // SAFETY: as above; the path is a C string that lives through the call.
@@ -522,9 +575,11 @@ impl<'a, D: Device> Fs<'a, D> {
     }
 
     pub fn truncate(&mut self, file: File, size: u32) -> Res<()> {
+        let before = self.size(file).unwrap_or(0);
         // SAFETY: as above.
-        check(self.call(|d, ctx| unsafe { datafs_truncate(d, ctx, c_int::from(file.0), size) }))
-            .map(drop)
+        check(self.call(|d, ctx| unsafe { datafs_truncate(d, ctx, c_int::from(file.0), size) }))?;
+        self.freed += blocks_of(before).saturating_sub(blocks_of(u64::from(size)));
+        Ok(())
     }
 
     pub fn size(&mut self, file: File) -> Res<u64> {
@@ -540,9 +595,20 @@ impl<'a, D: Device> Fs<'a, D> {
 
     /// Removes a file or an empty directory.
     pub fn remove(&mut self, path: &[u8]) -> Res<()> {
+        let gives = match self.stat(path) {
+            Ok(Info {
+                kind: Kind::File,
+                size,
+            }) => blocks_of(u64::from(size)),
+            // A directory of two blocks, and the entry.
+            Ok(_) => 2,
+            Err(_) => 0,
+        };
         let path = CPath::new(path)?;
         // SAFETY: as above.
-        check(self.call(|d, ctx| unsafe { datafs_remove(d, ctx, path.ptr()) })).map(drop)
+        check(self.call(|d, ctx| unsafe { datafs_remove(d, ctx, path.ptr()) }))?;
+        self.freed += gives;
+        Ok(())
     }
 
     /// Renames, replacing a file or an empty directory at `to` of the same kind. One commit of the
@@ -651,12 +717,13 @@ pub const fn blocks_of(bytes: u64) -> u64 {
     bytes.div_ceil(BLOCK as u64)
 }
 
-/// Calls only the host measurements make: a test-only switch for the allocator's window, the
-/// counters, and the free count read from the window's bits.
+/// Calls only the host measurements make: a test-only switch for the allocator's window (the
+/// service's window is the size of its volume) and the counters.
 #[cfg(test)]
 impl<D: Device> Fs<'_, D> {
     /// Sets the allocator's window to `buffer` (a multiple of 8 bytes) before the next format or
-    /// mount. The service keeps its own 128 bytes.
+    /// mount: the host measurements compare the window of 128 bytes the first release had with
+    /// the window of the volume's size the service has now.
     pub fn set_lookahead(&mut self, buffer: &'static mut [u8]) {
         assert!(buffer.len().is_multiple_of(8) && !buffer.is_empty());
         // SAFETY: the buffer lives for the rest of the process, and littlefs reads the pointer
@@ -674,21 +741,6 @@ impl<D: Device> Fs<'_, D> {
     pub fn erases(&self) -> u64 {
         // SAFETY: reads a counter of the state.
         u64::from(unsafe { datafs_erases(self.state.0.as_ptr().cast()) })
-    }
-
-    /// The allocator's window: its first block, the next block it hands out and its size in
-    /// blocks. The next block goes back to 0 at each walk of the volume.
-    pub fn window_state(&self) -> (u32, u32, u32) {
-        let mut out = [0u32; 3];
-        // SAFETY: reads fields of the state into three words.
-        unsafe { datafs_window_state(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
-        (out[0], out[1], out[2])
-    }
-
-    /// The free blocks the window still holds, counted from its bits: no device access.
-    pub fn window_free(&self) -> u64 {
-        // SAFETY: reads the window of the state.
-        unsafe { datafs_window_free(self.state.0.as_ptr().cast()) as u64 }
     }
 
     /// Opens a file with the attribute `kind` in its configuration: littlefs writes it at the
