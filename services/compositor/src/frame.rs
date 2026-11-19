@@ -1243,10 +1243,11 @@ mod tests {
         let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
         assert_eq!(d, 199_851);
         assert_eq!(bound(d, &all, e, limit), Some(742_193));
-        // F: the whole screen, no load: the 31 bands the table gives, the 33 of a
-        // band of 14 000 ticks, and the limit of 45 that the probe holds.
-        assert_eq!(own(31, false, false), 662_281);
-        assert_eq!(bound(662_281, &console, e, limit), Some(706_900));
+        // F: the whole screen, no load: the 34 bands the table gives (with the
+        // fixed term of a band), the 33 of a band of 14 000 ticks, and the limit of
+        // 45 that the probe holds.
+        assert_eq!(own(34, false, false), 711_265);
+        assert_eq!(bound(711_265, &console, e, limit), Some(755_884));
         assert_eq!(own(33, false, false), 694_937);
         assert_eq!(bound(694_937, &console, e, limit), Some(739_556));
         assert_eq!(own(45, false, false), 890_873);
