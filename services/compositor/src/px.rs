@@ -335,3 +335,277 @@ impl Raster for Pixman {
         );
     }
 }
+
+/// The prices of the three kinds measured on shapes of operations chosen for
+/// each class, under -icount (feature `steps`), before the service takes its
+/// first request: the probes' scenes make the operations of the bands, whose
+/// shapes the prices themselves decide, and the classes of a narrow tall
+/// operation, a tiny one and a large one of a translucent layer do not come
+/// out of them. Each shape is drawn at four offsets of the target and of the
+/// source (the edges before the aligned points), several times, and an
+/// operation during which a thread of a higher level took the CPU off the
+/// service (the count of preemptions of the thread changed) is left out and
+/// counted: what is told is the thread's own work.
+#[cfg(feature = "steps")]
+pub mod calibration {
+    use super::{Pixman, Px, Source, Target, composite, fill};
+    use core::cell::UnsafeCell;
+
+    /// The scratch surfaces, in memory of the program (17 pages of the two): 648 by 13 points for
+    /// the shapes of the width of the screen (640 and the offset of up to 3
+    /// points), and the same memory as 160 by 32 points (stride of 640 bytes)
+    /// for the others.
+    const WIDE: u32 = 648;
+    const WIDE_HEIGHT: u32 = 13;
+    const WIDE_STRIDE: u32 = WIDE * 4;
+    const BYTES: usize = (WIDE_STRIDE * WIDE_HEIGHT) as usize;
+    const NARROW: u32 = 160;
+    const NARROW_HEIGHT: u32 = 32;
+    const NARROW_STRIDE: u32 = NARROW * 4;
+    const NARROW_BYTES: usize = (NARROW_STRIDE * NARROW_HEIGHT) as usize;
+    const _: () = assert!(NARROW_BYTES <= BYTES);
+
+    #[repr(align(64))]
+    struct Surface(UnsafeCell<[u8; BYTES]>);
+    // SAFETY: touched by the main thread, once, at the start of the service.
+    unsafe impl Sync for Surface {}
+    static DST: Surface = Surface(UnsafeCell::new([0; BYTES]));
+    static SRC: Surface = Surface(UnsafeCell::new([0x40; BYTES]));
+
+    /// What one class tells: the least and the greatest of its figure, the
+    /// shapes of each, and how many operations counted.
+    #[derive(Clone, Copy)]
+    struct Spread {
+        least: u64,
+        least_at: (u32, u32),
+        greatest: u64,
+        greatest_at: (u32, u32),
+        n: u64,
+    }
+
+    impl Spread {
+        const fn new() -> Spread {
+            Spread {
+                least: u64::MAX,
+                least_at: (0, 0),
+                greatest: 0,
+                greatest_at: (0, 0),
+                n: 0,
+            }
+        }
+
+        fn add(&mut self, v: u64, at: (u32, u32)) {
+            if v < self.least {
+                self.least = v;
+                self.least_at = at;
+            }
+            if v >= self.greatest {
+                self.greatest = v;
+                self.greatest_at = at;
+            }
+            self.n += 1;
+        }
+
+        fn zero(&self) -> u64 {
+            if self.n == 0 { 0 } else { self.least }
+        }
+    }
+
+    /// The shapes, width by height, with the class each tells: 0 the call, 1 the
+    /// row, 2 the point, 3 only the fit (wider than 8 points, in one row). The
+    /// pairs of one width and two heights give the cost of a row at that width.
+    const SHAPES: [(u32, u32, u8); 26] = [
+        (1, 1, 0),
+        (2, 1, 0),
+        (4, 1, 0),
+        (8, 1, 0),
+        (16, 1, 3),
+        (32, 1, 3),
+        (64, 1, 3),
+        (8, 8, 1),
+        (8, 16, 1),
+        (16, 8, 1),
+        (16, 16, 1),
+        (4, 16, 1),
+        (4, 32, 1),
+        (12, 8, 1),
+        (12, 24, 1),
+        (152, 8, 2),
+        (152, 16, 2),
+        (76, 16, 2),
+        (76, 32, 2),
+        (64, 16, 2),
+        (64, 32, 2),
+        (150, 8, 2),
+        (150, 16, 2),
+        (640, 1, 3),
+        (640, 8, 2),
+        (640, 13, 2),
+    ];
+    const REPEAT: u32 = 3;
+
+    /// One operation of a kind: its ticks, or None when a higher level
+    /// preempted the thread in the middle of it.
+    fn timed(thread: &rt::handle::Handle<rt::handle::Thread>, run: impl FnOnce()) -> Option<u64> {
+        let before = rt::sys::thread_ran_preempts(thread).ok()?;
+        let began = rt::time::now();
+        run();
+        let ended = rt::time::now();
+        let after = rt::sys::thread_ran_preempts(thread).ok()?;
+        (after.1 == before.1).then(|| ended - began)
+    }
+
+    /// Makes the operations of every shape of one kind (0 black, 1 copy, 2
+    /// over) and tells a line for each shape and one for the classes.
+    fn kind(
+        px: &mut Pixman,
+        which: usize,
+        name: &str,
+        thread: &rt::handle::Handle<rt::handle::Thread>,
+    ) {
+        let (mut call, mut row, mut point) = (Spread::new(), Spread::new(), Spread::new());
+        let mut preempted = 0u32;
+        let (mut call_g, mut row_g) = (0u64, 0u64);
+        // The calls first, then the rows, then the points: each class takes off
+        // the greatest of those before it.
+        for order in [0u8, 1, 2] {
+            for &(w, h, class) in &SHAPES {
+                let tells = if class == 3 { 0 } else { class };
+                if tells != order {
+                    continue;
+                }
+                let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
+                for dx in 0..4u32 {
+                    for sx in 0..4u32 {
+                        // One warm-up, which makes the images pixman keeps.
+                        for turn in 0..=REPEAT {
+                            // SAFETY: the main thread alone touches the scratch.
+                            let (dst, src) = unsafe { (&mut *DST.0.get(), &*SRC.0.get()) };
+                            // The width of the screen on the wide surface, the
+                            // others on the narrow one (the same memory).
+                            let (dst, src, stride, width, height) = if w > 160 {
+                                (&mut dst[..], &src[..], WIDE_STRIDE, WIDE, WIDE_HEIGHT)
+                            } else {
+                                (
+                                    &mut dst[..NARROW_BYTES],
+                                    &src[..NARROW_BYTES],
+                                    NARROW_STRIDE,
+                                    NARROW,
+                                    NARROW_HEIGHT,
+                                )
+                            };
+                            let mut target = Target {
+                                bytes: dst,
+                                format: Px::Xrgb8888,
+                                stride,
+                                width,
+                                height,
+                            };
+                            let from = Source {
+                                bytes: src,
+                                format: if which == 2 {
+                                    Px::Argb8888
+                                } else {
+                                    Px::Xrgb8888
+                                },
+                                stride,
+                                width,
+                                height,
+                            };
+                            let images = &mut px.images;
+                            let ticks = timed(thread, || {
+                                if which == 0 {
+                                    fill(&mut target, dx, 0, w, h, 0);
+                                } else {
+                                    composite(
+                                        images,
+                                        which == 2,
+                                        &mut target,
+                                        from,
+                                        (sx, 0),
+                                        (dx, 0),
+                                        (w, h),
+                                    );
+                                }
+                            });
+                            if turn == 0 {
+                                continue;
+                            }
+                            let Some(ticks) = ticks else {
+                                preempted += 1;
+                                continue;
+                            };
+                            least = least.min(ticks);
+                            greatest = greatest.max(ticks);
+                            n += 1;
+                            let points = u64::from(w) * u64::from(h);
+                            match class {
+                                0 => {
+                                    call.add(ticks, (w, h));
+                                    call_g = call_g.max(ticks);
+                                }
+                                1 => {
+                                    let net = ticks.saturating_sub(call_g);
+                                    let v = net * 100 / u64::from(h);
+                                    row.add(v, (w, h));
+                                    row_g = row_g.max(v);
+                                }
+                                2 => {
+                                    let rows = row_g * u64::from(h) / 100;
+                                    let net = ticks.saturating_sub(call_g + rows);
+                                    point.add(net * 100 / points, (w, h));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if n > 0 {
+                    rt::println!(
+                        "service shape: 17 {name} {w} {h} least {least} greatest {greatest} n {n}"
+                    );
+                }
+            }
+        }
+        rt::println!(
+            "service calibration: 17 {name} call {} {} {} {} {} row {} {} {} {} {} point {} {} {} {} {} preempted {preempted}",
+            call.zero(),
+            call.greatest,
+            call.n,
+            call.greatest_at.0,
+            call.greatest_at.1,
+            row.zero(),
+            row.greatest,
+            row.n,
+            row.greatest_at.0,
+            row.greatest_at.1,
+            point.zero(),
+            point.greatest,
+            point.n,
+            point.greatest_at.0,
+            point.greatest_at.1,
+        );
+    }
+
+    impl Pixman {
+        /// Measures the three kinds on the shapes of the classes and tells a
+        /// line each (`service calibration: 17 KIND call L G N W H row L G N W H
+        /// point L G N W H preempted K`: for each class the least and the
+        /// greatest figure, how many operations counted, and the shape of the
+        /// greatest). The call is ticks, the row hundredths of a tick a row
+        /// with the greatest call taken off, the point hundredths of a tick a
+        /// point with the greatest call and the rows (at the greatest row price)
+        /// taken off: the model of `compositor::PRICES`.
+        pub fn calibrate(&mut self) {
+            let Ok(thread) = rt::sys::self_thread() else {
+                rt::println!(
+                    "service calibration: no thread of its own to read the preemptions of"
+                );
+                return;
+            };
+            for (which, name) in [(0, "black"), (1, "copy"), (2, "over")] {
+                kind(self, which, name, &thread);
+            }
+        }
+    }
+}

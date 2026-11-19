@@ -48,6 +48,21 @@
 //! and never waits for the client: a buffer the client did not post in time
 //! leaves the window on the screen as it was.
 //!
+//! A POST of a buffer that is not free is BUSY, and nothing is posted. The
+//! rule for the client: it keeps its own mask of the free buffers for the life
+//! of the window, clears a buffer's bit when it posts it, sets it when the
+//! service's bit for it comes, and posts only a buffer whose bit is set. It
+//! never sets the mask afresh while the window lives (a window kept from one
+//! stretch of a run to the next still has the buffers the service holds: the
+//! one on the screen, and one posted and waiting), and it drops no bit. All
+//! buffers are free when ATTACH has answered. With an interval (SET) a buffer
+//! posted before its start waits posted until that start, and the one that was
+//! on the screen is free when the frame that took it is shown; a client that
+//! posts every period with two buffers therefore waits for the bit of the
+//! buffer it posted two periods ago, and a bit that has not come is the
+//! service's frame still in work: the client skips that period's POST (a
+//! frame it did not draw is counted by the service as a miss of the window).
+//!
 //! A window is XRGB8888 (a point is 0x00RRGGBB, opaque) or ARGB8888 (the
 //! colour already multiplied by the alpha in the top byte, laid over what
 //! is below). Opaque and transparent windows are told apart by the format
@@ -737,7 +752,10 @@ pub const INTERVAL_MAX: u32 = 4;
 
 /// STATS' flags: bit 0 RESET clears the counters and their greatest values
 /// after the reply is made. The counters are shared, so only a session with
-/// MANAGER_MARK or INPUT_MARK may ask it (others: NOT_ALLOWED).
+/// MANAGER_MARK or INPUT_MARK may ask it (others: NOT_ALLOWED). A frame taken
+/// before a RESET and shown after it is counted in `frames` of the period
+/// that follows (and not in its `releases`), so in the first period after a
+/// reset `frames` can be one more than `releases`.
 pub const RESET: u32 = 1;
 
 /// The most windows STATS' reply holds records of: MAX_WINDOWS of the service.

@@ -51,19 +51,29 @@ pub const fn band_cap(period_ns: u64, cap_ppm: u64, band_ticks: u32) -> u32 {
 
 /// The own arguments of the service's record: the period and the cap of the
 /// work of a period in parts a million of it, two u64. No arguments are the
-/// defaults (60 Hz, 750 000); a period of 0 is the free run; bytes past the
-/// sixteen are not read, and fewer than sixteen (a word of one) are the
-/// defaults.
-pub fn parse_args(own: &[u8]) -> (u64, u64) {
+/// defaults (60 Hz, 750 000); a period of 0 is the free run (its cap is not
+/// read); bytes past the sixteen are not read, and fewer than sixteen are the
+/// defaults. A period outside 1 ms to 1 s, or a cap outside 1 to 1 000 000,
+/// makes no sense (a period of a nanosecond would be a storm of skipped
+/// periods, a very long one overflows `band_cap`): the defaults, and the third
+/// word is true so that the caller says so on the console.
+pub fn parse_args(own: &[u8]) -> (u64, u64, bool) {
     let word = |i: usize| {
         let mut b = [0u8; 8];
         b.copy_from_slice(&own[8 * i..8 * i + 8]);
         u64::from_le_bytes(b)
     };
     if own.len() < 16 {
-        return (DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM);
+        return (DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM, !own.is_empty());
     }
-    (word(0), word(1))
+    let (period, cap) = (word(0), word(1));
+    if period == 0 {
+        return (0, cap, false);
+    }
+    if !(1_000_000..=1_000_000_000).contains(&period) || !(1..=1_000_000).contains(&cap) {
+        return (DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM, true);
+    }
+    (period, cap, false)
 }
 
 /// The starts of the periods.
@@ -1011,17 +1021,37 @@ mod tests {
 
     #[test]
     fn the_arguments_are_the_period_and_the_cap_or_the_defaults() {
-        assert_eq!(parse_args(&[]), (16_666_667, 750_000));
-        assert_eq!(parse_args(&[1; 15]), (16_666_667, 750_000));
-        let mut sixteen = Vec::new();
-        sixteen.extend_from_slice(&8_333_333u64.to_le_bytes());
-        sixteen.extend_from_slice(&500_000u64.to_le_bytes());
-        assert_eq!(parse_args(&sixteen), (8_333_333, 500_000));
-        // The free run, and bytes past the sixteen.
-        let mut free = vec![0u8; 16];
-        assert_eq!(parse_args(&free), (0, 0));
+        let words = |a: u64, b: u64| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v
+        };
+        assert_eq!(parse_args(&[]), (16_666_667, 750_000, false));
+        // Fewer than sixteen bytes are a mistake the caller tells of.
+        assert_eq!(parse_args(&[1; 15]), (16_666_667, 750_000, true));
+        assert_eq!(
+            parse_args(&words(8_333_333, 500_000)),
+            (8_333_333, 500_000, false)
+        );
+        // The free run, with bytes past the sixteen.
+        let mut free = words(0, 0);
+        assert_eq!(parse_args(&free), (0, 0, false));
         free.extend_from_slice(&[9; 5]);
-        assert_eq!(parse_args(&free), (0, 0));
+        assert_eq!(parse_args(&free), (0, 0, false));
+        // The edges of the period and of the cap.
+        assert!(!parse_args(&words(1_000_000, 1)).2);
+        assert!(!parse_args(&words(1_000_000_000, 1_000_000)).2);
+        for bad in [
+            words(1, 750_000),
+            words(999_999, 750_000),
+            words(1_000_000_001, 750_000),
+            words(u64::MAX, 750_000),
+            words(16_666_667, 0),
+            words(16_666_667, 1_000_001),
+        ] {
+            assert_eq!(parse_args(&bad), (16_666_667, 750_000, true));
+        }
     }
 
     #[test]
@@ -1213,9 +1243,12 @@ mod tests {
         let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
         assert_eq!(d, 199_851);
         assert_eq!(bound(d, &all, e, limit), Some(742_193));
-        // F: the whole screen, no load: the expected 42 bands and the limit of 45.
-        assert_eq!(own(42, false, false), 841_889);
-        assert_eq!(bound(841_889, &console, e, limit), Some(886_508));
+        // F: the whole screen, no load: the 31 bands the table gives, the 33 of a
+        // band of 14 000 ticks, and the limit of 45 that the probe holds.
+        assert_eq!(own(31, false, false), 662_281);
+        assert_eq!(bound(662_281, &console, e, limit), Some(706_900));
+        assert_eq!(own(33, false, false), 694_937);
+        assert_eq!(bound(694_937, &console, e, limit), Some(739_556));
         assert_eq!(own(45, false, false), 890_873);
         assert_eq!(bound(890_873, &console, e, limit), Some(935_492));
         // The network's budgets of the tables (60 percent of the CPU) leave no

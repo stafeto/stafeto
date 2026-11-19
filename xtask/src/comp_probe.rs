@@ -489,6 +489,288 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
 /// The most bands of a full frame the period of 60 Hz holds without load.
 pub const FULL_FRAME_BANDS_MAX: u32 = 45;
 
+/// One class of the calibration: the least and the greatest figure, the
+/// operations that counted and the shape of the greatest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Class {
+    pub least: u64,
+    pub greatest: u64,
+    pub n: u64,
+    pub w: u64,
+    pub h: u64,
+}
+
+/// The line `service calibration: T KIND call L G N W H row L G N W H point L G
+/// N W H preempted K` of the service under its steps feature (`px::calibration`):
+/// the prices of a kind measured on shapes chosen for each class, with the
+/// operations a higher level preempted left out. The call is ticks, the row and
+/// the point hundredths of a tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Calibration {
+    pub kind: String,
+    pub call: Class,
+    pub row: Class,
+    pub point: Class,
+    pub preempted: u64,
+}
+
+impl Calibration {
+    fn parse(line: &str, tag: &str) -> Option<Calibration> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let ["service", "calibration:", t, kind, "call", c @ ..] = w.as_slice() else {
+            return None;
+        };
+        if *t != tag || c.len() != 5 + 1 + 5 + 1 + 5 + 2 {
+            return None;
+        }
+        let class = |s: &[&str]| -> Option<Class> {
+            Some(Class {
+                least: s[0].parse().ok()?,
+                greatest: s[1].parse().ok()?,
+                n: s[2].parse().ok()?,
+                w: s[3].parse().ok()?,
+                h: s[4].parse().ok()?,
+            })
+        };
+        if c[5] != "row" || c[11] != "point" || c[17] != "preempted" {
+            return None;
+        }
+        Some(Calibration {
+            kind: (*kind).to_owned(),
+            call: class(&c[0..5])?,
+            row: class(&c[6..11])?,
+            point: class(&c[12..17])?,
+            preempted: c[18].parse().ok()?,
+        })
+    }
+}
+
+/// The last calibration line of each kind of the service `tag`.
+pub fn calibrations(lines: &[String], tag: &str) -> Vec<Calibration> {
+    let mut out: Vec<Calibration> = Vec::new();
+    for c in lines.iter().filter_map(|l| Calibration::parse(l, tag)) {
+        match out.iter_mut().find(|o| o.kind == c.kind) {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The line `service shape: T KIND W H least L greatest G n N`: the ticks of an
+/// operation of one shape over its offsets and repeats (those a preemption
+/// landed in left out).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeCost {
+    pub kind: String,
+    pub w: u32,
+    pub h: u32,
+    pub least: u64,
+    pub greatest: u64,
+    pub n: u64,
+}
+
+impl ShapeCost {
+    fn parse(line: &str, tag: &str) -> Option<ShapeCost> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "shape:",
+            t,
+            kind,
+            ww,
+            hh,
+            "least",
+            l,
+            "greatest",
+            g,
+            "n",
+            n,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(ShapeCost {
+            kind: (*kind).to_owned(),
+            w: ww.parse().ok()?,
+            h: hh.parse().ok()?,
+            least: l.parse().ok()?,
+            greatest: g.parse().ok()?,
+            n: n.parse().ok()?,
+        })
+    }
+}
+
+/// The last line of each shape of each kind of the service `tag`.
+pub fn shape_costs(lines: &[String], tag: &str) -> Vec<ShapeCost> {
+    let mut out: Vec<ShapeCost> = Vec::new();
+    for c in lines.iter().filter_map(|l| ShapeCost::parse(l, tag)) {
+        match out
+            .iter_mut()
+            .find(|o| (&o.kind, o.w, o.h) == (&c.kind, c.w, c.h))
+        {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The upper fit of a kind over the greatest ticks of its shapes
+/// (`compositor::fit`): the call in ticks, the row and the point in hundredths
+/// of a tick, with the greatest overstatement of a shape.
+pub fn fit_of(costs: &[ShapeCost], kind: &str) -> Option<(compositor::fit::Fit, u64)> {
+    let shapes: Vec<compositor::fit::Shape> = costs
+        .iter()
+        .filter(|c| c.kind == kind)
+        .map(|c| compositor::fit::Shape {
+            w: c.w,
+            h: c.h,
+            ticks: c.greatest,
+        })
+        .collect();
+    let fit = compositor::fit::envelope(&shapes)?;
+    let slack = shapes.iter().map(|s| fit.slack(*s)).max().unwrap_or(0);
+    Some((fit, slack))
+}
+
+/// The cost of a row at each width that has two heights, in ticks: the
+/// greatest, and the least, ticks of the taller operation less the shorter,
+/// over the rows between them. It is the row price plus the width's points, so
+/// a line of these over the widths is straight when the model of three terms
+/// holds, and bends up at the narrow widths when a narrow row costs more a point.
+pub fn row_costs(costs: &[ShapeCost], kind: &str) -> Vec<(u32, u64, u64)> {
+    let mut out: Vec<(u32, u64, u64)> = Vec::new();
+    let of_kind: Vec<&ShapeCost> = costs.iter().filter(|c| c.kind == kind).collect();
+    for a in &of_kind {
+        for b in &of_kind {
+            if a.w == b.w && a.h < b.h && !out.iter().any(|(w, ..)| *w == a.w) {
+                let rows = u64::from(b.h - a.h);
+                out.push((
+                    a.w,
+                    b.greatest.saturating_sub(a.greatest) / rows,
+                    b.least.saturating_sub(a.least) / rows,
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The fit of each kind and what it means for the bands that matter, told
+/// against the table: the fitted prices (hundredths of a tick for a row and a
+/// point) and their constants with the margin, the greatest overstatement of a
+/// shape, the row cost by width, and the band of a copy over the whole width
+/// (a frame of the whole screen in bands), of a damage the size of the cursor
+/// and of a line of text, and the worst band of eight windows with an alpha,
+/// each by the fitted constants.
+pub fn fit_text(costs: &[ShapeCost]) -> String {
+    use compositor::{BAND_TICKS, band_size, with_margin};
+    let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+    let mut fits = Vec::new();
+    let mut parts = Vec::new();
+    for kind in ["black", "copy", "over"] {
+        let Some((fit, slack)) = fit_of(costs, kind) else {
+            parts.push(format!("{kind}: no fit (shapes missing)"));
+            continue;
+        };
+        let widths: Vec<String> = row_costs(costs, kind)
+            .iter()
+            .map(|(w, g, l)| format!("{w} wide {l}..{g}"))
+            .collect();
+        parts.push(format!(
+            "{kind}: call {} (constant {}), row {} (constant {}), point {} (constant {}), the model overstates a shape by {slack} ticks at most; ticks a row by width, least..greatest: {}",
+            fit.call,
+            with_margin(fit.call as u32),
+            hundredths(fit.row),
+            hundredths(u64::from(with_margin(fit.row as u32))),
+            hundredths(fit.point),
+            hundredths(u64::from(with_margin(fit.point as u32))),
+            widths.join(", ")
+        ));
+        fits.push((kind, fit));
+    }
+    let get = |kind: &str| fits.iter().find(|(k, _)| *k == kind).map(|(_, f)| *f);
+    if let (Some(copy), Some(over), Some(black)) = (get("copy"), get("over"), get("black")) {
+        let c = |f: compositor::fit::Fit| {
+            (
+                with_margin(f.call as u32),
+                with_margin(f.row as u32),
+                with_margin(f.point as u32),
+            )
+        };
+        let (cc, cr, cp) = c(copy);
+        let (oc, or, op) = c(over);
+        let (bc, br, bp) = c(black);
+        // A copy over the whole width: the lines of a band, the bands of the
+        // screen.
+        let (w, rows) = band_size(cc, cr, cp, 640);
+        let full = 400u32.div_ceil(rows);
+        // A damage the size of the cursor (12 by 19) and of a line of text
+        // (200 by 16) over a copy.
+        let (cw, ch) = band_size(cc, cr, cp, 12);
+        let (tw, th) = band_size(cc, cr, cp, 200);
+        // Eight windows with an alpha over the whole screen, and the black.
+        let (ew, er) = band_size(8 * oc + bc, 8 * or + br, 8 * op + bp, 640);
+        let worst = |calls: u32, row: u32, point: u32, w: u32, h: u32| {
+            u64::from(calls)
+                + (u64::from(row) * u64::from(h) + u64::from(point) * u64::from(w) * u64::from(h))
+                    .div_ceil(100)
+        };
+        parts.push(format!(
+            "by the fitted constants: a copy over the whole width is a band of {w} by {rows} and a frame of the whole screen {full} bands (the table gives {}); a damage of the cursor's size a band of {cw} by {ch}, of a line of text {tw} by {th}; eight windows with an alpha a band of {ew} by {er} costing {} ticks by the model (the gate of a band is {BAND_TICKS})",
+            compositor::full_screen_bands(),
+            worst(8 * oc + bc, 8 * or + br, 8 * op + bp, ew, er)
+        ));
+    }
+    parts.join("; ")
+}
+
+/// The calibration against the table, per kind: each price as the least and the
+/// greatest over its class (the greatest goes into the table as the measure, and
+/// the spread between them tells a cost of a shape from a stray), the shape of the
+/// greatest, and the operations a preemption left out.
+pub fn calibration_text(costs: &[Calibration]) -> String {
+    if costs.is_empty() {
+        return "no calibration lines (a run without the steps feature)".to_owned();
+    }
+    let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+    costs
+        .iter()
+        .map(|c| {
+            let p = price(&c.kind);
+            format!(
+                "{}: call least {} greatest {} ({} operations, at {}x{}; table {}), row least {} greatest {} ({}, at {}x{}; table {}), point least {} greatest {} ({}, at {}x{}; table {}), {} preempted and left out",
+                c.kind,
+                c.call.least,
+                c.call.greatest,
+                c.call.n,
+                c.call.w,
+                c.call.h,
+                p.call_measured,
+                hundredths(c.row.least),
+                hundredths(c.row.greatest),
+                c.row.n,
+                c.row.w,
+                c.row.h,
+                hundredths(u64::from(p.row_measured)),
+                hundredths(c.point.least),
+                hundredths(c.point.greatest),
+                c.point.n,
+                c.point.w,
+                c.point.h,
+                hundredths(u64::from(p.point_measured)),
+                c.preempted
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The bands of a frame of one copy over the whole screen by the table, and
 /// the words that say whether the period holds them.
 pub fn full_frame_text() -> String {
@@ -633,11 +915,13 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
+        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}",
         machine.name,
         full_frame_text(),
         compositor::BAND_TICKS,
-        raster_text(&raster_costs(&output.lines, COMP_TAG))
+        raster_text(&raster_costs(&output.lines, COMP_TAG)),
+        calibration_text(&calibrations(&output.lines, COMP_TAG)),
+        fit_text(&shape_costs(&output.lines, COMP_TAG))
     );
     Ok(())
 }
@@ -792,7 +1076,7 @@ mod tests {
         assert_eq!(costs[1].big_worst, 2500);
         let text = raster_text(&costs);
         assert!(text.contains(
-            "copy (table: call 851 constant 979, row 20.00 constant 23.00 (estimate), point 1.90 constant 2.19 (estimate); measured: no classes in this line): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
+            "copy (table: call 759 constant 873, row 56.04 constant 64.45, point 1.37 constant 1.58; measured: no classes in this line): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
         ));
         assert!(raster_text(&[]).contains("no cost lines"));
     }
@@ -825,7 +1109,7 @@ mod tests {
             "20 large operations: least 1.60 at 6144 points, net of the call 1.47, greatest 3.52"
         ));
         assert!(text.contains(
-            "black (table: call 212 constant 244, row 20.00 constant 23.00 (estimate), point 0.53 constant 0.61;"
+            "black (table: call 209 constant 241, row 24.00 constant 27.60, point 0.38 constant 0.44;"
         ));
     }
 
@@ -863,6 +1147,98 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("within the 45"));
+    }
+
+    #[test]
+    fn the_calibration_lines_are_read_and_told_against_the_table() {
+        let lines: Vec<String> = [
+            "service calibration: 17 copy call 700 780 48 8 1 row 1500 2100 72 16 8 point 150 170 120 64 32 preempted 3",
+            "service calibration: 17 black call 200 212 48 8 1 row 800 900 72 4 32 point 40 49 120 152 8 preempted 0",
+            "service calibration: 12 copy call 1 1 1 1 1 row 1 1 1 1 1 point 1 1 1 1 1 preempted 0",
+            "service calibration: 17 over call 1 2 3",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = calibrations(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 2);
+        assert_eq!(costs[0].kind, "copy");
+        assert_eq!(
+            costs[0].call,
+            Class {
+                least: 700,
+                greatest: 780,
+                n: 48,
+                w: 8,
+                h: 1
+            }
+        );
+        assert_eq!(costs[0].point.greatest, 170);
+        assert_eq!(costs[0].preempted, 3);
+        let text = calibration_text(&costs);
+        assert!(
+            text.contains("copy: call least 700 greatest 780 (48 operations, at 8x1; table 759)")
+        );
+        assert!(text.contains("point least 1.50 greatest 1.70 (120, at 64x32; table 1.37)"));
+        assert!(text.contains("3 preempted and left out"));
+        assert!(calibration_text(&[]).contains("no calibration lines"));
+    }
+
+    /// Shapes made from a known model are fitted back to it, the cost of a row
+    /// by width comes out as the row plus the width's points, and the bands by
+    /// the fit are those of the model.
+    #[test]
+    fn the_shapes_are_fitted_and_the_bands_told() {
+        let mut lines = Vec::new();
+        for (kind, call, row, point) in [
+            ("black", 220, 2_000, 50),
+            ("copy", 760, 2_000, 150),
+            ("over", 800, 2_000, 400),
+        ] {
+            for (w, h) in [
+                (1u32, 1u32),
+                (8, 1),
+                (64, 1),
+                (8, 8),
+                (8, 16),
+                (16, 8),
+                (16, 16),
+                (4, 16),
+                (4, 32),
+                (152, 8),
+                (152, 16),
+                (76, 16),
+                (76, 32),
+                (640, 1),
+                (640, 8),
+                (640, 13),
+            ] {
+                let ticks =
+                    call + (row * u64::from(h) + point * u64::from(w) * u64::from(h)).div_ceil(100);
+                lines.push(format!(
+                    "service shape: 17 {kind} {w} {h} least {} greatest {ticks} n 12",
+                    ticks - 1
+                ));
+            }
+        }
+        let shapes = shape_costs(&lines, COMP_TAG);
+        assert_eq!(shapes.len(), 48);
+        let (fit, slack) = fit_of(&shapes, "copy").unwrap();
+        assert!(fit.call >= 760 && fit.call <= 761, "{fit:?}");
+        assert!(slack <= 2, "{slack}");
+        // A row at width 8 costs the row plus eight points: 20 + 12 ticks.
+        let rows = row_costs(&shapes, "copy");
+        assert_eq!(rows.iter().find(|r| r.0 == 8).map(|r| r.1), Some(32));
+        assert_eq!(
+            rows.iter().find(|r| r.0 == 152).map(|r| r.1),
+            Some(20 + 228)
+        );
+        let text = fit_text(&shapes);
+        assert!(text.contains("copy: call 76"));
+        assert!(text.contains("a frame of the whole screen"));
+        assert!(text.contains("eight windows with an alpha"));
+        // Shapes that are missing are said so, and no price is made up.
+        assert!(fit_text(&shapes[..2]).contains("no fit"));
     }
 
     #[test]
