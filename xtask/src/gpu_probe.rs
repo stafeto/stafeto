@@ -63,13 +63,15 @@ pub const READY: &str = "virtio-gpu: screen ready, 640x400, stride 2560";
 pub const RELEASED: &str = "gpu: screen released";
 const PATTERN: &str = "gpu-probe: pattern crc ";
 const PARTIAL: &str = "gpu-probe: partial crc ";
+const POOL: &str = "gpu-probe: pool crc ";
+const TARGET: &str = "gpu-probe: target crc ";
 const ENDED: &str = "init: gpu-probe ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: gpu-probe-b ended: exit code 0, not restarted";
 const B_ENDS: &str = "init: gpu-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 12] = [
+const CHECKS: [(&str, usize); 14] = [
     ("gpu-probe: the owner's handles cannot be duplicated", 1),
     (
         "gpu-probe: screen 640x400, stride 2560, a cleared buffer",
@@ -78,6 +80,14 @@ const CHECKS: [(&str, usize); 12] = [
     ("gpu-probe: rectangles outside the screen are INVALID", 1),
     ("gpu-probe: a second OPEN is BUSY", 1),
     ("gpu-probe: a session calls its own methods only", 1),
+    (
+        "gpu-probe: PIPELINES and SOURCE gave the records and the objects",
+        1,
+    ),
+    (
+        "gpu-probe: LAYERS showed the pool and the target and moved the cursor",
+        1,
+    ),
     (
         "gpu-probe: the screen came back cleared when its owner ended",
         1,
@@ -102,13 +112,16 @@ const CHECKS: [(&str, usize); 12] = [
 /// The tag of the service's lines of steps (rt::service::report_steps).
 const GPU_TAG: &str = "12";
 /// The kinds of the service's steps that must come: OPEN, FLUSH, CLOSE,
-/// CLONE (the methods of proto_gpu), and its own steps: the interrupt and
-/// the portions of clearing (rt::service::step_own).
-const STEP_KINDS: [(usize, &str); 5] = [
+/// CLONE, PIPELINES, SOURCE, LAYERS (the methods of proto_gpu), and its own steps:
+/// the interrupt and the portions of clearing (rt::service::step_own).
+const STEP_KINDS: [(usize, &str); 8] = [
     (1, "Open"),
     (2, "Flush"),
     (3, "Close"),
     (8, "Clone"),
+    (9, "Pipelines"),
+    (10, "Source"),
+    (11, "Layers"),
     (65, "the interrupt and a portion of clearing"),
 ];
 /// The most one step of the service may take (spec 3, section 6): 0.9 of
@@ -149,6 +162,78 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
     let released = count(RELEASED);
     if released < 3 {
         return Err(format!("the screen went back {released} times, 3 expected"));
+    }
+    Ok(())
+}
+
+/// The places the probe moves the cursor to, in order: the first with the
+/// binding (an update), the rest moves.
+const CURSOR_PLACES: [(u32, u32); 5] = [(10, 20), (30, 40), (50, 60), (70, 80), (90, 100)];
+
+/// Whether `wanted` is a subsequence of `got`.
+fn contains_in_order<T: PartialEq>(got: &[T], wanted: &[T]) -> bool {
+    let mut at = got.iter();
+    wanted.iter().all(|w| at.any(|g| g == w))
+}
+
+/// The device's trace against what the probe did: the scanout was set to
+/// resource 1 (OPEN), 2 (the pool) and 1 again (the target) in this order
+/// on the whole screen, and the cursor got an update from resource 3 and
+/// then a move to each of the places that came after the update's, in
+/// order, every move with `res 0x3`: QEMU takes the resource of every
+/// cursor command as the pointer's on flag, so a move with resource 0
+/// would hide the cursor. The update may carry the place of a later move
+/// than the first, when the device had not returned the transfer by the
+/// time the next row came and the moves merged into the update.
+pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
+    use qemu::GpuTrace::{Cursor, Scanout};
+    let scanouts: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            Scanout {
+                id: 0,
+                res,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            } => Some(*res),
+            _ => None,
+        })
+        .collect();
+    if !contains_in_order(&scanouts, &[1, 2, 1]) {
+        return Err(format!(
+            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1 in order expected"
+        ));
+    }
+    let cursor: Vec<(bool, u32, u32, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Cursor { update, x, y, res } => Some((*update, *x, *y, *res)),
+            _ => None,
+        })
+        .collect();
+    let named = format!(
+        "the trace of the cursor is {cursor:?}, an update from resource 3 at one of {:?}, then a move with resource 3 to each later place expected",
+        &CURSOR_PLACES[..4]
+    );
+    // The first update from resource 3 at one of the places before the last.
+    let Some((first, from)) = cursor.iter().enumerate().find_map(|(at, e)| {
+        let (update, x, y, res) = *e;
+        let place = CURSOR_PLACES[..4].iter().position(|p| *p == (x, y));
+        (update && res == 3)
+            .then_some(place)
+            .flatten()
+            .map(|p| (at, p))
+    }) else {
+        return Err(named);
+    };
+    let wanted: Vec<(bool, u32, u32, u32)> = CURSOR_PLACES[from + 1..]
+        .iter()
+        .map(|(x, y)| (false, *x, *y, 3))
+        .collect();
+    if !contains_in_order(&cursor[first + 1..], &wanted) {
+        return Err(named);
     }
     Ok(())
 }
@@ -198,6 +283,11 @@ impl Scratch {
     pub fn picture(&self) -> PathBuf {
         self.0.join("screen.ppm")
     }
+
+    /// The file QEMU writes the trace of the display to.
+    pub fn trace(&self) -> PathBuf {
+        self.0.join("trace.log")
+    }
 }
 
 impl Drop for Scratch {
@@ -241,7 +331,7 @@ pub fn compare(
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
-    for prefix in [PATTERN, PARTIAL] {
+    for prefix in [PATTERN, PARTIAL, POOL, TARGET] {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
         compare(&mut monitor, &scratch.picture(), &line, prefix)?;
     }
@@ -268,13 +358,19 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         scratch.socket().display()
     ));
     cmd.args(qemu::GPU);
+    cmd.args(qemu::gpu_trace(&scratch.trace()));
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch);
     let outcome = run.stop();
     driven.map_err(|e| format!("gpu-probe on {}: {e}", machine.name))?;
     verdict(&outcome.lines).map_err(|e| format!("gpu-probe on {}: {e}", machine.name))?;
+    let text = std::fs::read_to_string(scratch.trace())
+        .map_err(|e| format!("gpu-probe on {}: the trace file: {e}", machine.name))?;
+    let events =
+        qemu::parse_gpu_trace(&text).map_err(|e| format!("gpu-probe on {}: {e}", machine.name))?;
+    trace_verdict(&events).map_err(|e| format!("gpu-probe on {}: {e}", machine.name))?;
     println!(
-        "gpu-probe on {}: the screen matched the guest's frames, one owner, the screen back three times, a restart",
+        "gpu-probe on {}: the screen matched the guest's frames (the pool and the target too, the trace shows the scanout on resources 1, 2, 1 and the cursor's update and moves), one owner, the screen back three times, a restart",
         machine.name
     );
     if !machine.is_hvf() {
@@ -392,18 +488,30 @@ mod tests {
             (2, 2500),
             (3, 900),
             (8, 2000),
+            (9, 1500),
+            (10, 2500),
+            (11, 3000),
             (65, 5000),
             (64, 4000),
         ]
         .iter()
         .map(|&(k, t)| step(k, t))
         .collect();
-        assert_eq!(steps_verdict(&lines).map(|r| r.len()), Ok(6));
+        assert_eq!(steps_verdict(&lines).map(|r| r.len()), Ok(9));
     }
 
     #[test]
     fn a_step_past_the_bound_or_a_missing_kind_fails() {
-        let base = [(1, 3000), (2, 2500), (3, 900), (8, 2000), (65, 5000)];
+        let base = [
+            (1, 3000),
+            (2, 2500),
+            (3, 900),
+            (8, 2000),
+            (9, 1500),
+            (10, 2500),
+            (11, 3000),
+            (65, 5000),
+        ];
         let make = |over: Option<(usize, u64)>, skip: Option<usize>| -> Vec<String> {
             base.iter()
                 .filter(|(k, _)| Some(*k) != skip)
@@ -425,6 +533,74 @@ mod tests {
         );
     }
 
+    fn scanout(res: u32) -> qemu::GpuTrace {
+        qemu::GpuTrace::Scanout {
+            id: 0,
+            res,
+            w: 640,
+            h: 400,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    fn cursor(update: bool, (x, y): (u32, u32), res: u32) -> qemu::GpuTrace {
+        qemu::GpuTrace::Cursor { update, x, y, res }
+    }
+
+    fn good_trace() -> Vec<qemu::GpuTrace> {
+        let mut t = vec![scanout(1), scanout(2), scanout(1)];
+        t.push(cursor(true, CURSOR_PLACES[0], 3));
+        for p in &CURSOR_PLACES[1..] {
+            t.push(cursor(false, *p, 3));
+        }
+        t.push(cursor(true, (0, 0), 0));
+        t.push(scanout(0));
+        t
+    }
+
+    #[test]
+    fn the_trace_of_a_good_run_passes_and_a_wrong_one_is_named() {
+        assert_eq!(trace_verdict(&good_trace()), Ok(()));
+        // The pool never shown.
+        let mut t = good_trace();
+        t.remove(1);
+        assert!(trace_verdict(&t).unwrap_err().contains("SET_SCANOUT"));
+        // The target not shown again.
+        let mut t = good_trace();
+        t.remove(2);
+        assert!(trace_verdict(&t).is_err());
+        // The update from the wrong resource, or a move missing.
+        let mut t = good_trace();
+        t[3] = cursor(true, CURSOR_PLACES[0], 2);
+        assert!(trace_verdict(&t).unwrap_err().contains("cursor"));
+        let mut t = good_trace();
+        t.remove(5);
+        assert!(trace_verdict(&t).is_err());
+    }
+
+    #[test]
+    fn a_move_with_resource_0_fails_the_trace() {
+        // QEMU hides the pointer on such a move.
+        let mut t = good_trace();
+        t[5] = cursor(false, CURSOR_PLACES[2], 0);
+        assert!(trace_verdict(&t).is_err());
+    }
+
+    #[test]
+    fn a_merged_first_move_is_tolerated_and_a_lost_later_one_is_not() {
+        // The device returned the transfer late: the update carries the
+        // place of the second move, and only the moves after it follow.
+        let mut t = vec![scanout(1), scanout(2), scanout(1)];
+        t.push(cursor(true, CURSOR_PLACES[1], 3));
+        for p in &CURSOR_PLACES[2..] {
+            t.push(cursor(false, *p, 3));
+        }
+        assert_eq!(trace_verdict(&t), Ok(()));
+        t.pop();
+        assert!(trace_verdict(&t).is_err());
+    }
+
     #[test]
     fn the_bounds_are_the_specs() {
         assert_eq!(STEP_MAX, 18_369);
@@ -438,6 +614,9 @@ mod tests {
             (2, 2500),
             (3, 900),
             (8, 2000),
+            (9, 1500),
+            (10, 2500),
+            (11, 3000),
             (65, 5000),
             (64, 4000),
         ]
@@ -445,7 +624,7 @@ mod tests {
         .map(|&(k, t)| step(k, t))
         .collect();
         let lost = crate::step_line::tabled(&lines);
-        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(6));
+        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(9));
         let mut missing = lost.clone();
         missing.remove(3);
         assert!(steps_verdict(&missing).unwrap_err().contains("Clone"));

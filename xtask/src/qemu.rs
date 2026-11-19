@@ -226,6 +226,106 @@ pub const GPU: &[&str] = &[
     "virtio-gpu-device,bus=virtio-mmio-bus.23,xres=640,yres=400",
 ];
 
+/// The trace events of QEMU's virtio-gpu that the display probes read
+/// (hw/display/trace-events): `virtio_gpu_update_cursor` with `"scanout %d,
+/// x %d, y %d, %s, res 0x%x"` (the `%s` is `move` or `update`) and
+/// `virtio_gpu_cmd_set_scanout` with `"id %d, res 0x%x, w %d, h %d, x %d,
+/// y %d"`.
+pub const GPU_TRACE_EVENTS: [&str; 2] = ["virtio_gpu_update_cursor", "virtio_gpu_cmd_set_scanout"];
+
+/// The arguments that write those events to `file`. The build of QEMU in CI
+/// has the default `log` backend, which writes through the log (`-D`), so
+/// `-trace enable=` and `-D` are enough. A QEMU built with another trace
+/// backend writes no file, which `parse_gpu_trace` of an empty file
+/// reports.
+pub fn gpu_trace(file: &Path) -> Vec<String> {
+    let mut args = Vec::new();
+    for event in GPU_TRACE_EVENTS {
+        args.push("-trace".to_owned());
+        args.push(format!("enable={event}"));
+    }
+    args.extend(["-D".to_owned(), file.display().to_string()]);
+    args
+}
+
+/// One line of the trace of the display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuTrace {
+    /// SET_SCANOUT: the scanout, the resource, the size and the place.
+    Scanout {
+        id: u32,
+        res: u32,
+        w: u32,
+        h: u32,
+        x: u32,
+        y: u32,
+    },
+    /// UPDATE_CURSOR (`update`, true) or MOVE_CURSOR: the place and the
+    /// resource.
+    Cursor {
+        update: bool,
+        x: u32,
+        y: u32,
+        res: u32,
+    },
+}
+
+/// The number after `key ` in the comma separated fields of `text`;
+/// `0x` for a hexadecimal one.
+fn trace_field(text: &str, key: &str) -> Option<u32> {
+    let value = text
+        .split(", ")
+        .find_map(|f| f.strip_prefix(key)?.strip_prefix(' '))?;
+    match value.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    }
+}
+
+/// The events of the display in the text of the trace file, in order.
+/// A line that is not one of the two events is passed over. An error says
+/// what an empty result means: no line of the file is an event.
+pub fn parse_gpu_trace(text: &str) -> Result<Vec<GpuTrace>, String> {
+    let mut events = Vec::new();
+    for line in text.lines() {
+        if let Some((_, rest)) = line.split_once("virtio_gpu_cmd_set_scanout ") {
+            let field = |k| trace_field(rest, k);
+            if let (Some(id), Some(res), Some(w), Some(h), Some(x), Some(y)) = (
+                field("id"),
+                field("res"),
+                field("w"),
+                field("h"),
+                field("x"),
+                field("y"),
+            ) {
+                events.push(GpuTrace::Scanout {
+                    id,
+                    res,
+                    w,
+                    h,
+                    x,
+                    y,
+                });
+            }
+        } else if let Some((_, rest)) = line.split_once("virtio_gpu_update_cursor ") {
+            let update = rest.split(", ").any(|f| f == "update");
+            let moved = rest.split(", ").any(|f| f == "move");
+            if let (true, Some(x), Some(y), Some(res)) = (
+                update != moved,
+                trace_field(rest, "x"),
+                trace_field(rest, "y"),
+                trace_field(rest, "res"),
+            ) {
+                events.push(GpuTrace::Cursor { update, x, y, res });
+            }
+        }
+    }
+    if events.is_empty() {
+        return Err("the trace file has no event of the display: this QEMU was built with another trace backend (the Homebrew build may be one); run the probe with a QEMU configured with `--enable-trace-backends=log`, the default of ./configure".to_owned());
+    }
+    Ok(events)
+}
+
 /// A port of the host forwarded to a port of the guest (user-mode
 /// networking: the only way in).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2736,5 +2836,84 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             &"comp-probe: OPEN is BUSY while a closed window's mapping is kept".to_string()
         ));
         assert_eq!(unglued(&got, "gpu: screen released"), got);
+    }
+}
+
+#[cfg(test)]
+mod gpu_trace_tests {
+    use super::*;
+
+    const SAMPLE: &str = "\
+12345@1700000000.1:virtio_gpu_cmd_set_scanout id 0, res 0x1, w 640, h 400, x 0, y 0
+12345@1700000000.2:virtio_gpu_update_cursor scanout 0, x 10, y 20, update, res 0x3
+12345@1700000000.3:virtio_gpu_update_cursor scanout 0, x 30, y 40, move, res 0x0
+12345@1700000000.4:virtio_gpu_cmd_set_scanout id 0, res 0x2, w 640, h 400, x 0, y 0
+12345@1700000000.5:virtio_gpu_cmd_res_flush res 0x2, w 640, h 400, x 0, y 0
+";
+
+    #[test]
+    fn the_lines_of_the_two_events_are_read_in_order() {
+        let events = parse_gpu_trace(SAMPLE).expect("events");
+        assert_eq!(
+            events,
+            [
+                GpuTrace::Scanout {
+                    id: 0,
+                    res: 1,
+                    w: 640,
+                    h: 400,
+                    x: 0,
+                    y: 0
+                },
+                GpuTrace::Cursor {
+                    update: true,
+                    x: 10,
+                    y: 20,
+                    res: 3
+                },
+                GpuTrace::Cursor {
+                    update: false,
+                    x: 30,
+                    y: 40,
+                    res: 0
+                },
+                GpuTrace::Scanout {
+                    id: 0,
+                    res: 2,
+                    w: 640,
+                    h: 400,
+                    x: 0,
+                    y: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_file_or_one_with_other_lines_says_why() {
+        assert!(
+            parse_gpu_trace("")
+                .unwrap_err()
+                .contains("another trace backend")
+        );
+        assert!(parse_gpu_trace("12@1.2:other_event a 1\n").is_err());
+        // A cursor line with neither word, or a broken number, is passed over.
+        assert!(
+            parse_gpu_trace("1:virtio_gpu_update_cursor scanout 0, x 1, y 2, res 0x3\n").is_err()
+        );
+        assert!(
+            parse_gpu_trace("1:virtio_gpu_update_cursor scanout 0, x q, y 2, move, res 0x3\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_arguments_enable_both_events_and_name_the_file() {
+        let args = gpu_trace(Path::new("/tmp/t.log"));
+        assert!(args.contains(&"enable=virtio_gpu_update_cursor".to_owned()));
+        assert!(args.contains(&"enable=virtio_gpu_cmd_set_scanout".to_owned()));
+        assert!(!args.contains(&"-d".to_owned()));
+        let at = args.iter().position(|a| a == "-D").expect("-D");
+        assert_eq!(args[at + 1], "/tmp/t.log");
     }
 }

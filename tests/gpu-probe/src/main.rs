@@ -11,8 +11,16 @@
 //!   offset `y * stride + x * 4` is checked by the second screenshot);
 //!   rectangles outside the screen refused; a second OPEN, from the same
 //!   session and from a clone, gets BUSY; the owner's session cannot OPEN
-//!   or CLONE and a `Display` session cannot FLUSH or CLOSE. It ends
-//!   holding the screen: the end of the process returns it.
+//!   or CLONE and a `Display` session cannot FLUSH or CLOSE; the owner
+//!   takes PIPELINES (the two records of the display) and SOURCE (the pool
+//!   and the cursor's picture, each once, as objects of the right size
+//!   that are zero); then LAYERS: a pattern drawn in the pool is shown
+//!   (source 2) and the target comes back (source 1), each with a line of
+//!   the CRC that xtask compares with a screenshot and with the device's
+//!   trace of SET_SCANOUT, and the cursor is bound (source 3) and moved
+//!   three times, which xtask reads in the trace of the cursor's
+//!   commands. It ends holding the screen: the end of the process returns
+//!   it.
 //! - `s`, the second: asks for the screen until it has seen it BUSY and
 //!   then free again, which is after the owner ended; the buffer it finds
 //!   is all zero. It shows a pattern and CLOSEs the screen: a FLUSH of the
@@ -30,8 +38,10 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights};
 use proto_gpu::{
-    BUFFER_BYTES, BUSY, CLEARING, HEIGHT, INVALID, Method, NO_INPUT, NOT_ALLOWED, REVOKED, Rect,
-    STRIDE, Screen, WIDTH, code,
+    BUFFER_BYTES, BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, HEIGHT, INVALID, LIMIT, LayerRow,
+    Layers, Method, NO_INPUT, NOT_ALLOWED, PIPELINE_CURSOR, PIPELINE_PRIMARY, Pipelines, REVOKED,
+    Rect, SOURCE_CURSOR, SOURCE_KIND_CURSOR, SOURCE_KIND_POOL, SOURCE_POOL, SOURCE_TARGET, STRIDE,
+    Screen, SourceInfo, WIDTH, code,
 };
 use proto_init::ServiceArgs;
 use proto_wire::{Status, Writer};
@@ -53,6 +63,17 @@ const SNAPSHOT_NS: u64 = if cfg!(feature = "quick") {
     2_500_000_000
 };
 const RETRY_NS: u64 = 5_000_000;
+/// The pause between the moves of the cursor, so that the device's queue
+/// returns each before the next: the trace then has one move for each.
+const MOVE_PAUSE_NS: u64 = if cfg!(feature = "quick") {
+    0
+} else {
+    300_000_000
+};
+/// The label of the handle the driver tells a frame's end through.
+const FRAME_LABEL: u64 = 7;
+/// The longest wait for the end of a frame.
+const FRAME_NS: u64 = 10_000_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 
 fn main(_: u64) -> u64 {
@@ -75,6 +96,7 @@ fn main(_: u64) -> u64 {
         parent: &start.parent,
         channel,
         waiter,
+        level,
         maps: 0,
     };
     let result = match own {
@@ -118,6 +140,7 @@ struct Probe<'a> {
     parent: &'a Handle<Channel>,
     channel: Handle<Channel>,
     waiter: Waiter,
+    level: u8,
     maps: usize,
 }
 
@@ -163,6 +186,43 @@ fn open(session: &Handle<Channel>) -> Result<Opened, Fail> {
         buffer,
         owner,
     })
+}
+
+/// PIPELINES: the records of the display, or the service's refusal.
+fn pipelines(session: &Handle<Channel>) -> Result<Pipelines, Fail> {
+    let (status, reply) = call(session, &Method::Pipelines.header().bytes())?;
+    if status != Status::Ok {
+        return Err(Fail::Status(status));
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    Pipelines::read(reply.bytes(&mut buffer)).map_err(|_| Fail::Bad("PIPELINES' reply"))
+}
+
+/// SOURCE of `kind`: the layout of the source and its memory object, or the
+/// service's refusal.
+fn source(session: &Handle<Channel>, kind: u32) -> Result<(SourceInfo, Handle<Memory>), Fail> {
+    let mut w = Writer::new();
+    Method::Source
+        .header()
+        .write(&mut w)
+        .map_err(Fail::Status)?;
+    w.u32(kind).map_err(Fail::Status)?;
+    let (status, mut reply) = call(session, w.as_bytes())?;
+    if status != Status::Ok {
+        return Err(Fail::Status(status));
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    let info =
+        SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| Fail::Bad("SOURCE's reply"))?;
+    // `take` leaves the slot in the count: the count is read first.
+    if reply.handles.len() != 1 {
+        return Err(Fail::Bad("SOURCE's handle count"));
+    }
+    let object = reply
+        .handles
+        .take::<Memory>(0)
+        .map_err(|_| Fail::Bad("SOURCE's handle"))?;
+    Ok((info, object))
 }
 
 /// FLUSH of `rect` through the owner's session.
@@ -394,8 +454,253 @@ impl Probe<'_> {
             return Err("a method of the other kind of session was not refused");
         }
         rt::println!("gpu-probe: a session calls its own methods only");
+        let (pool_at, cursor_at) = self.sources(&display, &opened.owner)?;
+        self.layers(
+            &opened.owner,
+            &display,
+            &points[..(WIDTH * HEIGHT) as usize],
+            (pool_at, cursor_at),
+        )?;
         // The process ends with the screen: its end returns it.
         rt::println!("gpu-probe: the owner ends with the screen");
+        Ok(())
+    }
+
+    /// PIPELINES and SOURCE of the owner: the records of the display, a
+    /// pool and a cursor object of the right size, each once; the other
+    /// sessions and the other kinds refused; LAYERS refused a pool or a
+    /// cursor source that SOURCE has not given.
+    fn sources(
+        &mut self,
+        display: &Handle<Channel>,
+        owner: &Handle<Channel>,
+    ) -> Result<(usize, usize), &'static str> {
+        let mut at = [0; 2];
+        if pipelines(owner).map_err(|_| "PIPELINES")? != Pipelines::VIRTIO {
+            return Err("PIPELINES did not give the records of the display");
+        }
+        if pipelines(display) != Err(Fail::Status(code(NOT_ALLOWED)))
+            || source(display, SOURCE_KIND_POOL).err() != Some(Fail::Status(code(NOT_ALLOWED)))
+        {
+            return Err("PIPELINES or SOURCE of a Display session was not refused");
+        }
+        for kind in [0, 3, u32::MAX] {
+            if source(owner, kind).err() != Some(Fail::Status(code(INVALID))) {
+                return Err("SOURCE of a kind that is none was not INVALID");
+            }
+        }
+        // A source that SOURCE has not given the owner is not its to bind:
+        // the pool and the cursor's picture are refused before SOURCE.
+        let unbound_pool = LayerRow::primary(PIPELINE_PRIMARY, SOURCE_POOL, Some(Rect::SCREEN));
+        let unbound_cursor = LayerRow::cursor(PIPELINE_CURSOR, SOURCE_CURSOR, 1, 1, (0, 0));
+        for row in [unbound_pool, unbound_cursor] {
+            if Self::layers_call(owner, &[row]) != Err(Fail::Status(code(INVALID))) {
+                return Err("LAYERS bound a source that SOURCE had not given");
+            }
+        }
+        // The sizes of the objects: 256 pages for the pool, 4 for the
+        // picture of the cursor; both are zero, and the owner may write
+        // them and has no DUPLICATE to copy them with.
+        for (n, (kind, info, bytes)) in [
+            (SOURCE_KIND_POOL, SourceInfo::POOL, u64::from(BUFFER_BYTES)),
+            (SOURCE_KIND_CURSOR, SourceInfo::CURSOR, 4 * 4096),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (got, object) = source(owner, kind).map_err(|f| {
+                rt::println!("gpu-probe: SOURCE {kind}: {f:?}");
+                "SOURCE"
+            })?;
+            if got != info {
+                return Err("SOURCE gave the wrong layout");
+            }
+            let size = sys::memory_info(&object)
+                .map_err(|_| "the size of a source")?
+                .size;
+            if size != bytes || u64::from(got.stride) * u64::from(got.height) > size {
+                return Err("a source's object is not the right size");
+            }
+            if sys::handle_duplicate(&object, Rights::MAP_READ).err() != Some(Error::AccessDenied) {
+                return Err("the owner could duplicate a source");
+            }
+            let map_at = FB_AT + self.maps * FB_STEP;
+            at[n] = map_at;
+            self.maps += 1;
+            sys::mem_map(self.process, &object, 0, bytes, map_at, Access::ReadWrite)
+                .map_err(|_| "map a source")?;
+            // SAFETY: the object was just mapped, read and write, at `map_at`
+            // for `bytes` bytes; the probe is its only user, in one thread.
+            let words =
+                unsafe { core::slice::from_raw_parts_mut(map_at as *mut u32, bytes as usize / 4) };
+            if words.iter().any(|&w| w != 0) {
+                return Err("a source's object is not zero");
+            }
+            words[0] = 0x00DE_AD00;
+            // Once for each kind while the owner has the screen.
+            if source(owner, kind).err() != Some(Fail::Status(LIMIT)) {
+                return Err("a second SOURCE of a kind was not LIMIT_REACHED");
+            }
+            // The owner keeps its copy: the object belongs to it until the
+            // screen goes back.
+            core::mem::forget(object);
+        }
+        rt::println!("gpu-probe: PIPELINES and SOURCE gave the records and the objects");
+        Ok((at[0], at[1]))
+    }
+
+    /// Waits for the end of the frame the driver tells on the channel.
+    fn frame_done(&self) -> Result<(), &'static str> {
+        let end = time::ticks_to_ns(time::now()).saturating_add(FRAME_NS);
+        loop {
+            match self.waiter.receive_until(&self.channel, end) {
+                Ok(rt::wait::Waited::Got(sys::Received::Notification {
+                    label: FRAME_LABEL,
+                    bits,
+                    ..
+                })) => {
+                    if bits & FRAME_FAILED != 0 {
+                        return Err("a frame failed");
+                    }
+                    if bits & FRAME_SHOWN != 0 {
+                        return Ok(());
+                    }
+                }
+                Ok(rt::wait::Waited::Got(_)) => {}
+                _ => return Err("a frame did not end"),
+            }
+        }
+    }
+
+    /// LAYERS with `rows` through `session`; the status.
+    fn layers_call(session: &Handle<Channel>, rows: &[LayerRow]) -> Result<(), Fail> {
+        let mut w = Writer::new();
+        Layers::new(rows)
+            .and_then(|l| l.write(&mut w))
+            .map_err(Fail::Status)?;
+        match call(session, w.as_bytes())? {
+            (Status::Ok, _) => Ok(()),
+            (status, _) => Err(Fail::Status(status)),
+        }
+    }
+
+    /// LAYERS: the rows the service refuses; a pattern in the pool shown
+    /// (source 2) and the target back (source 1), a screenshot of each;
+    /// the cursor bound and moved. `target` is the points of the target
+    /// as drawn, `maps` where the pool and the cursor's picture are mapped.
+    fn layers(
+        &mut self,
+        owner: &Handle<Channel>,
+        display: &Handle<Channel>,
+        target: &[u32],
+        maps: (usize, usize),
+    ) -> Result<(), &'static str> {
+        let pool = |source| LayerRow::primary(PIPELINE_PRIMARY, source, Some(Rect::SCREEN));
+        let invalid = Err(Fail::Status(code(INVALID)));
+        if Self::layers_call(display, &[pool(SOURCE_POOL)]) != Err(Fail::Status(code(NOT_ALLOWED)))
+        {
+            return Err("LAYERS of a Display session was not refused");
+        }
+        // A frame needs the channel of its end.
+        if Self::layers_call(owner, &[pool(SOURCE_POOL)]) != Err(Fail::Status(code(NOT_ALLOWED))) {
+            return Err("LAYERS of a frame before SUBSCRIBE was not refused");
+        }
+        let frame = sys::handle_label(
+            &self.channel,
+            Rights::NOTIFY | Rights::TRANSFER,
+            FRAME_LABEL,
+            self.level,
+        )
+        .map_err(|_| "a handle for the frames")?;
+        let subscribed =
+            sys::send_handles(owner, &Method::Subscribe.header().bytes(), [frame.erase()])
+                .map_err(|_| "SUBSCRIBE")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        if subscribed.bytes(&mut buffer).get(..4) != Some(&[0, 0, 0, 0]) {
+            return Err("SUBSCRIBE was refused");
+        }
+        // Rows that are not good change nothing.
+        let off = LayerRow::off(PIPELINE_PRIMARY);
+        if Self::layers_call(owner, &[pool(SOURCE_CURSOR)]) != invalid
+            || Self::layers_call(owner, &[off]) != invalid
+            || Self::layers_call(owner, &[pool(9)]) != invalid
+        {
+            return Err("a bad row of LAYERS was not INVALID");
+        }
+        // The pool shows a pattern of its own: the target's, mirrored.
+        // SAFETY: `maps` are the addresses `sources` mapped, read and
+        // write, of the pool (a megabyte) and the cursor's picture (16
+        // KiB); the probe is their only user, in one thread.
+        let (words, picture) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(maps.0 as *mut u32, (WIDTH * HEIGHT) as usize),
+                core::slice::from_raw_parts_mut(maps.1 as *mut u32, 64 * 64),
+            )
+        };
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                words[(y * WIDTH + x) as usize] = pattern(WIDTH - 1 - x, y);
+            }
+        }
+        Self::layers_call(owner, &[pool(SOURCE_POOL)]).map_err(|_| "LAYERS of the pool")?;
+        self.frame_done()?;
+        rt::println!("gpu-probe: pool crc {:08x}", screen_crc(words));
+        self.sleep(SNAPSHOT_NS);
+        // Back to the target, which shows what it held: its CRC is the
+        // partial frame's. The area that changed does not matter to a switch.
+        Self::layers_call(
+            owner,
+            &[LayerRow::primary(PIPELINE_PRIMARY, SOURCE_TARGET, None)],
+        )
+        .map_err(|_| "LAYERS of the target")?;
+        self.frame_done()?;
+        rt::println!("gpu-probe: target crc {:08x}", screen_crc(target));
+        self.sleep(SNAPSHOT_NS);
+        // The cursor: a picture, bound at a place, then three moves.
+        for y in 0..19 {
+            for x in 0..12 {
+                picture[y * 64 + x] = 0xFF00_FF00;
+            }
+        }
+        let cursor = |x, y| LayerRow::cursor(PIPELINE_CURSOR, SOURCE_CURSOR, x, y, (0, 0));
+        for (x, y) in [(10, 20), (30, 40), (50, 60), (70, 80)] {
+            Self::layers_call(owner, &[cursor(x, y)]).map_err(|_| "LAYERS of the cursor")?;
+            self.sleep(MOVE_PAUSE_NS);
+        }
+        // The two longest paths of the driver's interrupt, for the steps
+        // under -icount: (a) a changed picture, whose transfer is in the
+        // control queue, followed at once by a switch to the pool: the
+        // interrupt that finishes the transfer sends the update and starts
+        // the queued switch of three chains; (b) a switch back to the
+        // target of three chains followed at once by a changed picture: the
+        // interrupt that reaps the switch starts the cursor's transfer.
+        let changed = |x, y| LayerRow {
+            dw: 64,
+            dh: 64,
+            ..cursor(x, y)
+        };
+        Self::layers_call(owner, &[changed(90, 100)]).map_err(|_| "LAYERS of a changed picture")?;
+        Self::layers_call(owner, &[pool(SOURCE_POOL)]).map_err(|_| "LAYERS of the pool again")?;
+        self.frame_done()?;
+        Self::layers_call(
+            owner,
+            &[LayerRow::primary(PIPELINE_PRIMARY, SOURCE_TARGET, None)],
+        )
+        .map_err(|_| "LAYERS of the target again")?;
+        Self::layers_call(owner, &[changed(90, 100)]).map_err(|_| "LAYERS of a changed picture")?;
+        self.frame_done()?;
+        self.sleep(MOVE_PAUSE_NS);
+        // A frame and a cursor row in one request take effect together.
+        Self::layers_call(
+            owner,
+            &[
+                LayerRow::primary(PIPELINE_PRIMARY, SOURCE_TARGET, None),
+                cursor(90, 100),
+            ],
+        )
+        .map_err(|_| "LAYERS of a frame and the cursor")?;
+        self.frame_done()?;
+        rt::println!("gpu-probe: LAYERS showed the pool and the target and moved the cursor");
         Ok(())
     }
 
