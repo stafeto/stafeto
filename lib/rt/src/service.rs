@@ -454,6 +454,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
     #[cfg_attr(feature = "step-stats", allow(unused_mut, unused_variables))]
     let mut owed = Owed::new(S::OWES_REPLY);
     loop {
+        if let Some(beat) = &mut beat {
+            beat.turn();
+        }
         #[cfg(feature = "step-stats")]
         let (began, incoming) = sys::receive_measured(channel);
         #[cfg(not(feature = "step-stats"))]
@@ -1324,13 +1327,104 @@ fn probe(t0: u64, deadline: u64) {
     }
 }
 
-/// The heartbeat's timer and its deadlines, t0 + k * period.
+/// The heartbeat's timer and its deadlines, t0 + k * period, with the
+/// counts of what went unexpectedly (`Tally`).
 struct Beat<'a> {
+    wire: Wire<'a>,
+    tally: Tally,
+}
+
+/// The timer, the channel to init and the deadline of a heartbeat.
+struct Wire<'a> {
     to: &'a Handle<Channel>,
     timer: Handle<Timer>,
     t0: u64,
     period: u64,
+    priority: u8,
     deadline: u64,
+}
+
+/// What the heartbeat's decision needs of the world, so that the decision
+/// is a function a host test runs with a fake.
+trait Beating {
+    /// Whether the counter reached the deadline the timer was armed for.
+    fn reached(&self) -> bool;
+    /// HEARTBEAT to init.
+    fn send(&mut self);
+    /// The timer armed again for the deadline it has: a deadline already reached fires within
+    /// the call itself.
+    fn arm_again(&mut self) -> Result<(), Error>;
+    /// The timer armed at the first deadline after now.
+    fn arm_next(&mut self) -> Result<(), Error>;
+}
+
+/// The unexpected things a heartbeat met: expiries judged stale and armings
+/// that failed, counted, and whether an arming waits for another try.
+#[derive(Default)]
+struct Tally {
+    stale: u32,
+    failed: u32,
+    retry: bool,
+}
+
+/// What a step of the heartbeat has to tell: the first of each unexpected
+/// thing goes to the console once, and nothing in the normal case.
+#[derive(Debug, PartialEq, Eq)]
+enum Note {
+    Nothing,
+    FirstStale,
+    FirstFailure(Error),
+}
+
+impl Tally {
+    /// The outcome of an arming: a failure is counted and remembered for the
+    /// next turn of the loop, a success clears the memory.
+    fn armed(&mut self, outcome: Result<(), Error>) -> Note {
+        match outcome {
+            Ok(()) => {
+                self.retry = false;
+                Note::Nothing
+            }
+            Err(e) => {
+                self.failed = self.failed.saturating_add(1);
+                self.retry = true;
+                if self.failed == 1 {
+                    Note::FirstFailure(e)
+                } else {
+                    Note::Nothing
+                }
+            }
+        }
+    }
+}
+
+/// An expiry of the timer: one before the deadline is stale (the timer's
+/// slot kept it from an earlier deadline) and arms the timer again for the
+/// same deadline, so that no sign of life is lost to it; else HEARTBEAT goes
+/// and the timer is armed at the next deadline. Init answers HEARTBEAT at
+/// once; what it answers changes nothing here.
+fn expiry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
+    if !wire.reached() {
+        tally.stale = tally.stale.saturating_add(1);
+        let outcome = wire.arm_again();
+        let first = tally.stale == 1;
+        return match (tally.armed(outcome), first) {
+            (Note::Nothing, true) => Note::FirstStale,
+            (note, _) => note,
+        };
+    }
+    wire.send();
+    let outcome = wire.arm_next();
+    tally.armed(outcome)
+}
+
+/// The turn of the loop: an arming that failed is tried again.
+fn retry<W: Beating>(wire: &mut W, tally: &mut Tally) -> Note {
+    if !tally.retry {
+        return Note::Nothing;
+    }
+    let outcome = wire.arm_next();
+    tally.armed(outcome)
 }
 
 /// The t0 of a heartbeat of `period` registered at `now`: now, or with
@@ -1356,17 +1450,48 @@ impl<'a> Beat<'a> {
         }
         let t0 = grid_start(time::ticks_to_ns(time::now()), h.period_ns);
         let timer = sys::timer_create(channel, h.priority)?;
-        let mut beat = Beat {
+        let mut wire = Wire {
             to: h.to,
             timer,
             t0,
             period: h.period_ns,
+            priority: h.priority,
             deadline: t0,
         };
-        beat.arm()?;
-        Ok(beat)
+        wire.arm()?;
+        Ok(Beat {
+            wire,
+            tally: Tally::default(),
+        })
     }
 
+    /// An expiry of the timer (`expiry`).
+    fn expired(&mut self) {
+        let note = expiry(&mut self.wire, &mut self.tally);
+        self.say(note);
+    }
+
+    /// The turn of the loop begins: an arming that failed is tried again.
+    fn turn(&mut self) {
+        let note = retry(&mut self.wire, &mut self.tally);
+        self.say(note);
+    }
+
+    fn say(&self, note: Note) {
+        let (period, priority) = (self.wire.period, self.wire.priority);
+        match note {
+            Note::Nothing => {}
+            Note::FirstStale => crate::println!(
+                "service heartbeat: a stale expiry, armed again (period {period} ns, priority {priority})"
+            ),
+            Note::FirstFailure(e) => crate::println!(
+                "service heartbeat: arming failed with {e:?}, tried again (period {period} ns, priority {priority})"
+            ),
+        }
+    }
+}
+
+impl Wire<'_> {
     /// Arms the timer at the first deadline after now: those that passed
     /// are not made up in a burst (spec 10, 13.4).
     fn arm(&mut self) -> Result<(), Error> {
@@ -1377,17 +1502,23 @@ impl<'a> Beat<'a> {
         probe(self.t0, self.deadline);
         armed
     }
+}
 
-    /// An expiry of the timer: a stale one, before the deadline, changes
-    /// nothing; else HEARTBEAT goes, and the timer is armed again. Init
-    /// answers HEARTBEAT at once; what it answers changes nothing here.
-    fn expired(&mut self) {
-        if !time::reached(self.deadline) {
-            return;
-        }
+impl Beating for Wire<'_> {
+    fn reached(&self) -> bool {
+        time::reached(self.deadline)
+    }
+
+    fn send(&mut self) {
         let _ = sys::send_beat(self.to, &Method::Heartbeat.header().bytes());
-        // The loop's own timer: timer_set has no error to give.
-        let _ = self.arm();
+    }
+
+    fn arm_again(&mut self) -> Result<(), Error> {
+        sys::timer_set(&self.timer, self.deadline)
+    }
+
+    fn arm_next(&mut self) -> Result<(), Error> {
+        self.arm()
     }
 }
 
@@ -1826,7 +1957,102 @@ mod long_portion_tests {
 
 #[cfg(test)]
 mod beat_tests {
-    use super::{next_release, start_on};
+    use super::{Beating, Error, Note, Tally, expiry, next_release, retry, start_on};
+
+    /// A world for the decision: whether the deadline is reached, what the
+    /// armings answer, and what was done.
+    struct Fake {
+        reached: bool,
+        arm_answers: [Result<(), Error>; 3],
+        answered: usize,
+        sent: u32,
+        again: u32,
+        next: u32,
+    }
+
+    impl Fake {
+        fn new(reached: bool) -> Fake {
+            Fake {
+                reached,
+                arm_answers: [Ok(()); 3],
+                answered: 0,
+                sent: 0,
+                again: 0,
+                next: 0,
+            }
+        }
+        fn answer(&mut self) -> Result<(), Error> {
+            let i = self.answered;
+            self.answered += 1;
+            self.arm_answers.get(i).copied().unwrap_or(Ok(()))
+        }
+    }
+
+    impl Beating for Fake {
+        fn reached(&self) -> bool {
+            self.reached
+        }
+        fn send(&mut self) {
+            self.sent += 1;
+        }
+        fn arm_again(&mut self) -> Result<(), Error> {
+            self.again += 1;
+            self.answer()
+        }
+        fn arm_next(&mut self) -> Result<(), Error> {
+            self.next += 1;
+            self.answer()
+        }
+    }
+
+    #[test]
+    fn a_due_expiry_sends_and_arms_at_the_next_deadline_and_says_nothing() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((w.sent, w.again, w.next), (1, 0, 1));
+        assert_eq!((t.stale, t.failed, t.retry), (0, 0, false));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!(w.next, 1, "nothing to try again");
+    }
+
+    #[test]
+    fn a_stale_expiry_arms_the_timer_again_for_the_same_deadline() {
+        let (mut w, mut t) = (Fake::new(false), Tally::default());
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstStale);
+        assert_eq!((w.sent, w.again, w.next), (0, 1, 0));
+        assert_eq!(t.stale, 1);
+        // The second one is counted and armed, and not told again.
+        assert_eq!(expiry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((w.again, t.stale), (2, 2));
+    }
+
+    #[test]
+    fn a_failed_arming_is_counted_told_once_and_tried_again_on_the_next_turn() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        w.arm_answers = [Err(Error::BadState), Err(Error::BadState), Ok(())];
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstFailure(Error::BadState));
+        assert!(t.retry);
+        assert_eq!(
+            retry(&mut w, &mut t),
+            Note::Nothing,
+            "the second is not told"
+        );
+        assert_eq!((t.failed, w.next, t.retry), (2, 2, true));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!((t.failed, w.next, t.retry), (2, 3, false));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert_eq!(w.next, 3, "armed: no more tries");
+    }
+
+    #[test]
+    fn a_stale_expiry_whose_arming_fails_tells_the_failure_and_is_tried_again() {
+        let (mut w, mut t) = (Fake::new(false), Tally::default());
+        w.arm_answers[0] = Err(Error::BadState);
+        assert_eq!(expiry(&mut w, &mut t), Note::FirstFailure(Error::BadState));
+        assert_eq!((t.stale, t.failed, t.retry), (1, 1, true));
+        assert_eq!(retry(&mut w, &mut t), Note::Nothing);
+        assert!(!t.retry);
+    }
 
     /// On the grid two services of one period that register at different
     /// instants send at the same ones; off it each keeps its own phase.

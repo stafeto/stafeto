@@ -57,11 +57,15 @@ pub const PER_CONTEXT: usize = 4;
 /// decide.
 pub const BAND_ROWS: u32 = 16;
 
-/// What a band costs the service in ticks (`Scene::tile`): at most
-/// BAND_TICKS in all. The step of a band is its work and a part of about
-/// 2 400 ticks of the step itself, and the gate of a band is 16 328, so a
-/// band of 15 000 leaves the tenth of a step for the interrupts.
-pub const BAND_TICKS: u32 = 15_000;
+/// The work of a band by the model (`Scene::tile`): the calls, the lines, the
+/// points, the term of each layer after the first and the fixed term of a band
+/// come to at most BAND_TICKS. The step of the band is that work and the cost of
+/// the step around it (the entry, the notice of the next band, the reply to the
+/// loop), which the probes measure at up to about 2 400 ticks, so the work and
+/// the cost stay under the gate of a band, 16 328 ticks. 15 000 left the longest
+/// step of seven translucent windows over a copy at 16 433, 105 over the gate,
+/// and 14 000 leaves it near 15 400.
+pub const BAND_TICKS: u32 = 14_000;
 
 /// The price of one kind of operation (the black a band starts with, a layer
 /// copied, a layer laid over others): what one operation costs is
@@ -185,6 +189,20 @@ pub const PRICES: [Price; 3] = [
 /// (260) is over the 235 the growth gives at 9.
 pub const LAYER_MEASURED: u32 = 226;
 pub const LAYER: u32 = with_margin(LAYER_MEASURED);
+
+/// What every band costs beyond its layers (ticks, once for each band): the
+/// work of `compose` around the band (its place, the clip, the choice of the
+/// buffers), which depends on neither the layers nor the operation. A wide band
+/// hides it inside the overstatement of the fit of its operation; a narrow one
+/// does not: a band of one layer 16 points wide and one line is 1 565 ticks in
+/// the probes against 1 477 by the prices and the term of a layer, 88 ticks
+/// short, and 64 by 1 is 53 short (the bands of 8 by 8 and of 150 points or
+/// wider are over their measure). The measure is the greatest shortfall of a
+/// band of one layer under the prices over all the shapes the calibration
+/// measures (`px::calibration`, the kind `layers1`), and the constant is the
+/// measure with the margin. `band_size` takes it off BAND_TICKS with the calls.
+pub const BAND_FIXED_MEASURED: u32 = 88;
+pub const BAND_FIXED: u32 = with_margin(BAND_FIXED_MEASURED);
 pub const FILL: Price = PRICES[0];
 pub const OPAQUE: Price = PRICES[1];
 pub const OVER: Price = PRICES[2];
@@ -1508,7 +1526,7 @@ pub fn band_size(calls: u32, per_row: u32, per_point: u32, damage_w: u32) -> (u3
     if per_row + per_point == 0 {
         return (damage_w, BAND_ROWS);
     }
-    let budget = u64::from(BAND_TICKS.saturating_sub(calls)) * 100;
+    let budget = u64::from(BAND_TICKS.saturating_sub(calls + BAND_FIXED)) * 100;
     let one_row = u64::from(per_row) + u64::from(damage_w) * u64::from(per_point);
     let rows = budget / one_row;
     if rows >= 1 {
@@ -2054,11 +2072,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + 13).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 12).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(13));
+        assert_eq!(bands, HEIGHT.div_ceil(12));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -2734,9 +2752,9 @@ mod tests {
         let d = s.begin().unwrap();
         s.end(true);
         // One window that covers the damage: lines of the width.
-        // (a copy of a point is 1.58 in the model, with a call of 873 and a row of
-        // 64: 13 lines of 640).
-        assert_eq!(s.tile(d), (640, 13));
+        // (a copy of a point is 1.58 in the model, with a call of 897, a fixed
+        // term of 102 and a row of 63: 12 lines of 640; 13 lines would cost 15 026).
+        assert_eq!(s.tile(d), (640, 12));
         // The pointer over it: a layer laid over others costs more a point and
         // a line, so the band holds fewer lines of the width.
         s.pointer_to(5, 5);
@@ -2781,6 +2799,7 @@ mod tests {
         };
         (u64::from(over) * price(OVER)
             + price(FILL)
+            + u64::from(BAND_FIXED) * 100
             + u64::from(LAYER) * 100 * u64::from(over.saturating_sub(1)))
         .div_ceil(100)
     }
@@ -2802,10 +2821,10 @@ mod tests {
         };
         let (w8, h8) = width_of(8);
         assert_eq!(h8, 1, "eight layers make a part of a line");
-        // By the measured term eight layers get 99 points of a line (a frame of the
-        // 320 by 200 windows is 4 bands a line, 800 in all; 151 points and 600
-        // bands before the term).
-        assert_eq!(w8, 99);
+        // By the measured terms and 14 000 ticks eight layers get 71 points of a line
+        // (a frame of the 320 by 200 windows is 5 bands a line, 1 000 in all; 151
+        // points and 600 bands before the terms).
+        assert_eq!(w8, 71);
         let (w4, _) = width_of(4);
         assert!(w8 < w4);
         // Without the term of a layer the band would be this wide: the term is
@@ -2833,6 +2852,7 @@ mod tests {
             (1, 16, 1, 1_565),
             (1, 64, 1, 1_787),
             (1, 76, 8, 5_689),
+            (1, 8, 8, 1_647),
             (2, 150, 1, 3_980),
             (2, 150, 4, 9_195),
             (2, 76, 8, 10_647),
@@ -2844,6 +2864,7 @@ mod tests {
             (8, 16, 1, 10_483),
             (8, 64, 1, 12_133),
             (8, 76, 8, 40_773),
+            (8, 8, 8, 10_733),
         ];
         let price = |p: Price, w: u32, h: u32| {
             u64::from(p.call)
@@ -2851,18 +2872,23 @@ mod tests {
                     + u64::from(p.point) * u64::from(w) * u64::from(h))
                 .div_ceil(100)
         };
+        let mut short = 0u64;
         for (n, w, h, ticks) in measured {
             let model = price(FILL, w, h)
                 + u64::from(n) * price(OVER, w, h)
                 + u64::from(LAYER) * u64::from(n - 1);
-            // A band of one layer is under its measure by up to 88 ticks at the
-            // narrow shapes (16 by 1: 1 477 against 1 565), which no band of a frame
-            // has: the shapes of a band are 150 points or wider, or of two layers
-            // or more.
-            if n > 1 || w >= 150 {
-                assert!(model >= ticks, "{n} layers {w}x{h}: {model} < {ticks}");
-            }
+            // A band of one layer 16 or 64 points wide is under its measure by 88
+            // and 53 ticks by the prices alone: the fixed term of a band covers it.
+            assert!(
+                model + u64::from(BAND_FIXED) >= ticks,
+                "{n} layers {w}x{h}: {model} + {BAND_FIXED} < {ticks}"
+            );
+            // The greatest shortfall under the prices is the measure of the fixed
+            // term, and the constant covers it with the margin.
+            short = short.max(ticks.saturating_sub(model));
         }
+        assert_eq!(short, u64::from(BAND_FIXED_MEASURED));
+        assert_eq!(BAND_FIXED, with_margin(BAND_FIXED_MEASURED));
     }
 
     /// The term of a layer covers its measure with the margin.
@@ -2975,6 +3001,9 @@ mod tests {
         // The bands of the whole screen, by the prices: loud when it passes 45.
         assert!(bands <= 45, "{bands} bands: the full phase is no promise");
         assert_eq!(bands, full_screen_bands());
+        // With the fixed term of a band a copy over the whole width is 12 lines
+        // (13 cost 15 026 by the prices): 34 bands.
+        assert_eq!(bands, 34);
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
@@ -3019,7 +3048,7 @@ mod tests {
         let mut s = settled(true);
         s.pointer_to(5, 5);
         // The tile of a frame over the pointer is that of a copy alone.
-        assert_eq!(s.tile(SCREEN), (640, 13));
+        assert_eq!(s.tile(SCREEN), (640, 12));
         s.add_damage(SCREEN);
         let d = s.begin().unwrap();
         let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);
