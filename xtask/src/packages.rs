@@ -645,6 +645,7 @@ pub fn check() -> Result<(), String> {
     for image in [
         "boot-ash-dialog.img",
         "boot-doom.img",
+        "boot-lvgl.img",
         "boot-net.img",
         "boot-ssh-probe.img",
         "boot-net-rc.img",
@@ -866,6 +867,13 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         // service.
         "boot-fstack-probe.img" => of(&[Group::Base, Group::Addon, Group::Fstack]),
         "boot-doom.img" | "boot-doom-steps.img" => of(&[Group::Base, Group::Addon, Group::Game]),
+        // The images of the LVGL demo's probe: the games image without Doom and its data.
+        "boot-lvgl.img" | "boot-lvgl-steps.img" => {
+            Ok(of(&[Group::Base, Group::Addon, Group::Game])?
+                .into_iter()
+                .filter(|p| p.name != "doomgeneric" && p.name != "freedoom")
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -1243,8 +1251,19 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 25);
+        assert_eq!(packages.len(), 27);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
+        // FreeType: the library of the text of stage G4, no file of its own.
+        let freetype = get("freetype");
+        assert_eq!(freetype.license, "FTL");
+        assert_eq!(freetype.group(), Group::Game);
+        assert!(freetype.files.is_empty());
+        assert_eq!(freetype.notices.len(), 1);
+        // LVGL links it: the notices of the package carry FreeType's.
+        let lvgl = get("lvgl");
+        assert_eq!(lvgl.license, "MIT AND OFL-1.1");
+        assert_eq!(lvgl.build_depends, ["freetype"]);
+        assert_eq!(lvgl.needs, ["display", "input"]);
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
         assert_eq!(get("f-stack").group(), Group::Fstack);

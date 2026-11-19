@@ -1,0 +1,17 @@
+[package]
+name = "posix-window-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the window library (<stafeto/window.h>): a window, its buffers, the bits, events, fork and close, against QEMU's screenshot"
+build = "build.rs"
+
+[[bin]]
+name = "posix-window-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }

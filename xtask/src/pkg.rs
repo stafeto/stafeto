@@ -139,10 +139,21 @@ fn program_bytes(package: &str, program: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| {
             format!("{package}: no build of the program {program} (PACKAGE_PROGRAMS)")
         })?;
-    let built = crate::target_dir()
-        .join("libc-so")
-        .join("programs")
-        .join(crate::dynamic_name(entry.1, entry.3));
+    // A static program is the ELF file of its own crate's build; a dynamic one
+    // is linked against libc.so from the objects of its package.
+    let built = if crate::is_dynamic(entry.3) {
+        crate::target_dir()
+            .join("libc-so")
+            .join("programs")
+            .join(crate::dynamic_name(entry.1, entry.3)?)
+    } else {
+        crate::cargo_output(
+            &crate::target_dir(),
+            crate::PROGRAM_TARGET,
+            crate::Profile::Release,
+            entry.1,
+        )
+    };
     let work = crate::target_dir().join("pkg/work").join(package);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let elf = work.join(program);
@@ -150,12 +161,43 @@ fn program_bytes(package: &str, program: &str) -> Result<Vec<u8>, String> {
     let objdump = crate::llvm_tool("llvm-objdump")?;
     crate::disasm::erratum_835769(&elf, &objdump)?;
     crate::disasm::erratum_843419(&elf)?;
+    let stack = crate::static_stack(program);
+    if let Some(stack) = stack {
+        crate::check_static_elf(&elf, stack)?;
+    }
     crate::strip_elf(&elf, &crate::llvm_tool("llvm-objcopy")?)?;
+    if stack.is_some() {
+        crate::no_build_path(&elf, &crate::root())?;
+    }
     std::fs::read(&elf).map_err(|e| format!("{}: {e}", elf.display()))
 }
 
-/// Builds what the packages `selected` need: the scripts of their groups and
-/// the dynamic programs.
+/// The builds the programs of `selected` need: the names of the dynamic
+/// programs (linked against libc.so by `build-libc-so.py programs`) and the
+/// crates of the static ones (built by cargo, which links relibc's `libc.a`).
+/// A program with no build is an error.
+#[allow(clippy::type_complexity)]
+fn program_builds(selected: &[&Package]) -> Result<(Vec<&'static str>, Vec<&'static str>), String> {
+    let mut dynamic = Vec::new();
+    let mut statics = Vec::new();
+    for p in selected {
+        if let Some(program) = &p.program {
+            let entry = crate::PACKAGE_PROGRAMS
+                .iter()
+                .find(|e| e.0 == program)
+                .ok_or_else(|| format!("{}: no build of the program {program}", p.name))?;
+            if crate::is_dynamic(entry.3) {
+                dynamic.push(crate::dynamic_name(entry.1, entry.3)?);
+            } else {
+                statics.push(entry.1);
+            }
+        }
+    }
+    Ok((dynamic, statics))
+}
+
+/// Builds what the packages `selected` need: the scripts of their groups,
+/// the dynamic programs and the static ones.
 fn build_outputs(selected: &[&Package]) -> Result<(), String> {
     crate::relibc()?;
     // The scripts in the order of the descriptions (the base first, each
@@ -167,18 +209,23 @@ fn build_outputs(selected: &[&Package]) -> Result<(), String> {
     {
         crate::package_script(p)?;
     }
-    let mut names: Vec<&'static str> = Vec::new();
-    for p in selected {
-        if let Some(program) = &p.program {
-            let entry = crate::PACKAGE_PROGRAMS
-                .iter()
-                .find(|e| e.0 == program)
-                .ok_or_else(|| format!("{}: no build of the program {program}", p.name))?;
-            names.push(crate::dynamic_name(entry.1, entry.3));
-        }
-    }
+    let (names, statics) = program_builds(selected)?;
     if !names.is_empty() {
         crate::dynamic_programs(&names)?;
+    }
+    if !statics.is_empty() {
+        // The static programs link in their own crate's build (the build
+        // script runs the scripts of their packages and links relibc's libc.a).
+        let mut cmd = crate::cargo();
+        cmd.arg("build").args(crate::Profile::Release.args());
+        cmd.args(["--target", crate::PROGRAM_TARGET]);
+        for package in &statics {
+            cmd.args(["--package", package]);
+        }
+        let _building = crate::BUILD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::run_cmd(&mut cmd)?;
     }
     Ok(())
 }
@@ -995,6 +1042,53 @@ pub fn command(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(name: &str) -> Package {
+        packages::load()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap()
+    }
+
+    /// A static program's record builds its outputs with no dynamic step: it
+    /// names its crate for cargo and nothing for libc.so; a dynamic program
+    /// is the other way round.
+    #[test]
+    fn a_static_program_has_no_dynamic_step() {
+        let lvgl = named("lvgl");
+        let (dynamic, statics) = program_builds(&[&lvgl]).unwrap();
+        assert!(dynamic.is_empty(), "{dynamic:?}");
+        assert_eq!(statics, ["lvgl-demo"]);
+        let curl = named("curl");
+        let (dynamic, statics) = program_builds(&[&curl]).unwrap();
+        assert_eq!(dynamic, ["curl"]);
+        assert!(statics.is_empty());
+    }
+
+    /// A package that names a program no build knows is an error with the
+    /// names in it and no panic.
+    #[test]
+    fn a_program_with_no_build_is_an_error() {
+        let mut lvgl = named("lvgl");
+        lvgl.program = Some("ghost".to_owned());
+        let error = program_builds(&[&lvgl]).unwrap_err();
+        assert!(error.contains("no build of the program ghost"), "{error}");
+    }
+
+    /// A dynamic program whose build `dynamic_name` does not know fails with
+    /// a message that tells where programs are listed.
+    #[test]
+    fn a_dynamic_program_with_no_dynamic_build_is_an_error() {
+        let error = crate::dynamic_name("ghost", &["dynamic"]).unwrap_err();
+        assert!(
+            error.contains("no dynamic build of the program ghost"),
+            "{error}"
+        );
+        assert!(error.contains("STATIC_PROGRAMS"), "{error}");
+        // The static program has none, and says so the same way.
+        assert!(crate::dynamic_name("lvgl-demo", &[]).is_err());
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("stafeto-pkg-{tag}-{}", std::process::id()));

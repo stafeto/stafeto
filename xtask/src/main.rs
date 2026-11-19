@@ -83,6 +83,10 @@ mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
+mod lvgl;
+mod lvgl_image;
+#[cfg(test)]
+mod lvgl_scenario;
 mod measure;
 mod monitor;
 mod nano_dialog;
@@ -119,6 +123,7 @@ mod pkg_slot;
 mod pkg_states;
 mod posix_display;
 mod posix_net;
+mod posix_window;
 mod probe_ca;
 mod qemu;
 mod release;
@@ -1049,7 +1054,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1066,7 +1071,26 @@ const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
     ("dropbear", "dropbear", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
+    // A static program on relibc (apps/lvgl-demo): its 256 KiB stack is the
+    // PT_GNU_STACK its build script asks for, and its build script runs the
+    // scripts of LVGL and FreeType.
+    ("lvgl-demo", "lvgl-demo", 0, &[]),
 ];
+/// The static package programs: those of PACKAGE_PROGRAMS without the feature
+/// `dynamic`, which their own crate's build links with relibc's `libc.a`
+/// (no `DT_NEEDED`, no interpreter, no undefined name), with the size of the
+/// `PT_GNU_STACK` that crate's build script asks for (the stack of a program
+/// started from its file). The checks of a dynamic program (the needed
+/// libraries, the symbol versions against libc.so) do not apply to them, and
+/// these (`check_static_elf`) do.
+const STATIC_PROGRAMS: [(&str, u32); 1] = [("lvgl-demo", 256 * 1024)];
+
+/// The stack a static package program's build asks for, or `None` for a
+/// program that is not static.
+fn static_stack(program: &str) -> Option<u32> {
+    STATIC_PROGRAMS.iter().find(|p| p.0 == program).map(|p| p.1)
+}
+
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build. The programs are
@@ -2314,6 +2338,15 @@ commands:
             QEMU's tablet, then the window manager program with a native client and one of
             the first revision (the chord, the keys, the manager's end), and the steps of
             the services under -icount; with --hvf under HVF
+  lvgl-probe [--hvf] run the probe of the LVGL demo in QEMU: the demo's first frame and the frame after
+            the scenario of 22 injected events, each compared three ways: the CRC-32 the demo prints,
+            the CRC-32 of QEMU's screenshot and the CRC-32 the reference program on the host
+            (target/lvgl-host/lvgl-ref) draws; and the state line, the turns, the frames, the glyph
+            evidence, the CRC of each band of 16 rows, the events taken by kind with none lost and
+            the largest use of LVGL's pool; then, on QEMU's own emulation, the same under -icount with
+            the longest steps of the compositor, the display driver and the tablet's driver
+  lvgl [--machine hvf] run the LVGL demo by hand: QEMU with the window of the screen (cocoa on a Mac)
+            and the console on the terminal; at the prompt of ash type `lvgl-demo`, click its widgets
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2442,6 +2475,7 @@ commands:
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -2789,6 +2823,15 @@ fn main() {
             }),
             Some(_) => Err("focus-probe [--hvf]".to_owned()),
         },
+        Some("lvgl-probe") => match args.get(1).map(String::as_str) {
+            None => lvgl::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                lvgl::probe(&qemu::HVF_V3)?;
+                lvgl::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("lvgl-probe [--hvf]".to_owned()),
+        },
+        Some("lvgl") => lvgl::window(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2836,6 +2879,7 @@ fn main() {
         Some("posix-random-net-two") => entropy::random_net_two(false),
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -3695,7 +3739,7 @@ fn write_boot_image_files(
             .iter()
             .filter(|p| is_dynamic(p.3))
             .map(|p| dynamic_name(p.1, p.3))
-            .collect();
+            .collect::<Result<_, _>>()?;
         if !dynamic.is_empty() {
             dynamic_programs(&dynamic)?;
         }
@@ -3704,7 +3748,7 @@ fn write_boot_image_files(
                 target
                     .join("libc-so")
                     .join("programs")
-                    .join(dynamic_name(package, features))
+                    .join(dynamic_name(package, features)?)
             } else {
                 cargo_output(&target, PROGRAM_TARGET, profile, package)
             };
@@ -3746,6 +3790,87 @@ fn write_boot_image_files(
 
 /// Strips the symbols and the non-loadable sections off `elf`, the image's
 /// copy of the linker's file.
+/// The checks of a static program's linked file, before it is stripped: no
+/// `PT_INTERP` and no `PT_DYNAMIC` (so no `DT_NEEDED`), a `PT_GNU_STACK` of
+/// `stack` bytes, and no undefined name.
+fn check_static_elf(elf: &Path, stack: u32) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    static_headers(&bytes, stack).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let nm = Command::new(llvm_tool("llvm-nm")?)
+        .args(["-u", "--format=just-symbols"])
+        .arg(elf)
+        .output()
+        .map_err(|e| format!("llvm-nm: {e}"))?;
+    let undefined = String::from_utf8_lossy(&nm.stdout).into_owned();
+    if !undefined.trim().is_empty() {
+        return Err(format!(
+            "{}: a static program leaves names undefined: {}",
+            elf.display(),
+            undefined.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    Ok(())
+}
+
+/// The program headers of a static program's ELF file: none of the types
+/// PT_INTERP (3) and PT_DYNAMIC (2), and a PT_GNU_STACK (0x6474e551) whose
+/// memory size is `stack`.
+fn static_headers(bytes: &[u8], stack: u32) -> Result<(), String> {
+    let word = |at: usize, len: usize| -> Option<u64> {
+        let field = bytes.get(at..at + len)?;
+        Some(field.iter().rev().fold(0, |n, b| n << 8 | u64::from(*b)))
+    };
+    if bytes.get(..4) != Some(b"\x7fELF".as_slice()) {
+        return Err("is no ELF file".to_owned());
+    }
+    let (Some(table), Some(size), Some(count)) = (word(32, 8), word(54, 2), word(56, 2)) else {
+        return Err("has no program headers".to_owned());
+    };
+    let mut gnu_stack = None;
+    for i in 0..count {
+        let at = (table + i * size) as usize;
+        match word(at, 4) {
+            Some(3) => {
+                return Err("names an interpreter (PT_INTERP): it is dynamically linked".to_owned());
+            }
+            Some(2) => {
+                return Err(
+                    "has a dynamic section (PT_DYNAMIC): it may name libraries (DT_NEEDED)"
+                        .to_owned(),
+                );
+            }
+            Some(0x6474_e551) => gnu_stack = word(at + 40, 8),
+            _ => {}
+        }
+    }
+    match gnu_stack {
+        Some(n) if n == u64::from(stack) => Ok(()),
+        Some(n) => Err(format!(
+            "has a stack segment of {n} bytes, {stack} expected"
+        )),
+        None => Err("has no stack segment (PT_GNU_STACK)".to_owned()),
+    }
+}
+
+/// Fails when the file at `elf` holds the text of `root`, the build directory.
+fn no_build_path(elf: &Path, root: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let text = root.to_string_lossy();
+    if bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+    {
+        return Err(format!(
+            "{} holds the build directory's path {text}",
+            elf.display()
+        ));
+    }
+    Ok(())
+}
+
 fn strip_elf(elf: &Path, objcopy: &Path) -> Result<(), String> {
     run_cmd(Command::new(objcopy).arg("--strip-all").arg(elf))
 }
@@ -3807,6 +3932,9 @@ fn write_elf_image(
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
+        if let Some(stack) = static_stack(file) {
+            check_static_elf(elf, stack)?;
+        }
         if *file == "ramfs" {
             disasm::ram_main_frame(elf, &objdump)?;
         }
@@ -3817,6 +3945,9 @@ fn write_elf_image(
             .windows(READY_MARK.len())
             .any(|w| w == READY_MARK);
         strip_elf(elf, &objcopy)?;
+        if static_stack(file).is_some() {
+            no_build_path(elf, &root())?;
+        }
     }
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
@@ -5141,8 +5272,8 @@ fn is_dynamic(features: &[&str]) -> bool {
 /// The name of the dynamic program of `package` under target/libc-so/programs:
 /// the small BusyBox of the probes, the one with the utilities of the shell
 /// image, or the package's own.
-fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
-    match (package, features.contains(&"utilities")) {
+fn dynamic_name(package: &str, features: &[&str]) -> Result<&'static str, String> {
+    Ok(match (package, features.contains(&"utilities")) {
         ("busybox-probe", false) => "busybox",
         ("busybox-probe", true) => "busybox-utils",
         ("busybox-dyn", _) => "busybox",
@@ -5158,8 +5289,12 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("dropbear", _) => "dropbear",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
-        _ => panic!("no dynamic build of the program {package}"),
-    }
+        _ => {
+            return Err(format!(
+                "no dynamic build of the program {package} (build-libc-so.py programs links the programs of `dynamic_name`); a static program has no `dynamic` feature in PACKAGE_PROGRAMS and a line in STATIC_PROGRAMS"
+            ));
+        }
+    })
 }
 
 /// libc.so and the dynamic programs linked (after the scripts of their
@@ -10755,6 +10890,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             entropy::random_net_two(true)
         }),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        // The window library of C programs against QEMU's screenshots.
+        job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.
         job("display-probe", || display_probe::probe(&qemu::VIRT)),
@@ -10772,6 +10909,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // the steps of the compositor and of the tablet's driver under
         // -icount.
         job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
+        // The LVGL demo with FreeType text in a window of the second
+        // revision: its two frames against QEMU's screenshots and the host
+        // reference program's CRCs, the evidence of the glyph path, and the
+        // steps of the services under -icount.
+        job("lvgl-probe", || lvgl::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
@@ -10912,6 +11054,9 @@ fn host_tests() -> Result<(), String> {
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
+        "tools/test_build_freetype.py",
+        "tools/test_build_lvgl.py",
+        "tools/test_lvgl_port.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
         "tools/test_dist.py",
@@ -14414,6 +14559,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-display-probe",
         "--package",
+        "posix-window-probe",
+        "--package",
         "pkg-slot-probe",
         "--package",
         "display-run",
@@ -14479,6 +14626,82 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The table of the static package programs and PACKAGE_PROGRAMS agree: a
+    /// program without the feature `dynamic` is in the table, with a stack,
+    /// and the table names no other.
+    #[test]
+    fn the_static_programs_are_those_without_the_dynamic_feature() {
+        let statics: Vec<&str> = super::PACKAGE_PROGRAMS
+            .iter()
+            .filter(|p| !super::is_dynamic(p.3))
+            .map(|p| p.0)
+            .collect();
+        let listed: Vec<&str> = super::STATIC_PROGRAMS.iter().map(|p| p.0).collect();
+        assert_eq!(statics, listed);
+        assert!(super::STATIC_PROGRAMS.iter().all(|p| p.1 >= 64 * 1024));
+        assert_eq!(super::static_stack("lvgl-demo"), Some(262_144));
+        assert_eq!(super::static_stack("curl"), None);
+    }
+
+    /// An ELF file of the program headers `types` (type, memory size).
+    fn elf_with(types: &[(u32, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64 + 56 * types.len()];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&(types.len() as u16).to_le_bytes());
+        for (i, (kind, memsz)) in types.iter().enumerate() {
+            let at = 64 + 56 * i;
+            bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            bytes[at + 40..at + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The checks of a static program's headers: no interpreter, no dynamic
+    /// section, and the stack segment the build script asked for.
+    #[test]
+    fn a_static_program_has_no_dynamic_section_and_its_stack() {
+        const LOAD: u32 = 1;
+        const DYNAMIC: u32 = 2;
+        const INTERP: u32 = 3;
+        const STACK: u32 = 0x6474_e551;
+        let good = elf_with(&[(LOAD, 0), (STACK, 262_144)]);
+        assert!(super::static_headers(&good, 262_144).is_ok());
+        let error = super::static_headers(&elf_with(&[(INTERP, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("PT_INTERP"), "{error}");
+        let error = super::static_headers(&elf_with(&[(DYNAMIC, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("DT_NEEDED"), "{error}");
+        let error =
+            super::static_headers(&elf_with(&[(LOAD, 0), (STACK, 65_536)]), 262_144).unwrap_err();
+        assert!(error.contains("65536 bytes, 262144 expected"), "{error}");
+        let error = super::static_headers(&elf_with(&[(LOAD, 0)]), 262_144).unwrap_err();
+        assert!(error.contains("no stack segment"), "{error}");
+        assert!(super::static_headers(b"not an elf", 1).is_err());
+    }
+
+    /// A file that holds the build directory's path is refused, one that does
+    /// not is passed.
+    #[test]
+    fn a_program_that_holds_the_build_directory_is_refused() {
+        let dir = std::env::temp_dir().join(format!("xtask-build-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let clean = dir.join("clean");
+        let dirty = dir.join("dirty");
+        std::fs::write(&clean, b"\x7fELF no path here").unwrap();
+        std::fs::write(&dirty, format!("a {}/src/x.c b", root.display())).unwrap();
+        assert!(no_build_path(&clean, &root).is_ok());
+        let error = no_build_path(&dirty, &root).unwrap_err();
+        assert!(
+            error.contains("holds the build directory's path"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The command `logburst` is for the probes: no release image list has
     /// a program built with the feature `log-burst`.
     #[test]
@@ -16813,6 +17036,7 @@ mod entropy_in_images_tests {
             ),
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
+            ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
             // The images whose lists are built at run time, EC2's among them.
             ("main::shell_programs", shell_programs()),
