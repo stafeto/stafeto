@@ -697,9 +697,25 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
         | O_TRUNC
         | O_APPEND
         | O_NOFOLLOW
-        | O_SYNC;
+        | O_SYNC
+        | O_SEARCH;
     if flags & !known != 0 {
         return Err(EINVAL);
+    }
+    // O_SEARCH (and O_PATH): a directory is opened to be searched alone, a description with no
+    // access bits on which only the path calls and `fchdir` act (the service refuses READDIR on
+    // it); a file named so is opened for reading as any other.
+    if flags & O_SEARCH != 0
+        && flags & (O_CREAT | O_TRUNC | O_ACCMODE) == 0
+        && let Ok(handle) = open_search(vol.bytes())
+    {
+        return insert_description(
+            DataTarget {
+                handle,
+                directory: true,
+            },
+            flags,
+        );
     }
     let mut plan = pure::open_plan(flags, mode, umask)?;
     // A name that ends in a slash is a directory: no file is made or opened for it.
@@ -719,7 +735,12 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
         close_description(handle);
         return Err(ENOTDIR);
     }
-    let target = DataTarget { handle, directory };
+    insert_description(DataTarget { handle, directory }, flags)
+}
+
+/// The lowest free descriptor for the description `target`, with the close-on-exec and
+/// close-on-fork bits of `flags`; the description closes when no descriptor can be made.
+fn insert_description(target: DataTarget, flags: c_int) -> Result<c_int, i32> {
     let flags_of = crate::descriptor_flags(flags);
     let inserted = crate::shared::growing(|files| {
         files
@@ -729,7 +750,7 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
     match inserted {
         Ok(fd) => Ok(fd as c_int),
         Err(errno) => {
-            close_description(handle);
+            close_description(target.handle);
             Err(errno)
         }
     }
