@@ -594,7 +594,8 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
 
 /// What the detail of the compositor's longest own step (kind 65) says it was:
 /// 1000 and the images made for a band, 2000 a take, 3000 the commit after the
-/// last band, 4000 the end of a frame, 5000 housekeeping.
+/// last band, 4000 the end of a frame, 5000 housekeeping, 6000 the arming of
+/// the timer after the cap of a period.
 pub fn own_step_kind(detail: u64) -> String {
     match detail {
         1000..=1999 => format!("a band that made {} images", detail - 1000),
@@ -602,6 +603,7 @@ pub fn own_step_kind(detail: u64) -> String {
         3000..=3999 => "the commit after the last band".to_owned(),
         4000..=4999 => "the end of a frame".to_owned(),
         5000..=5999 => "housekeeping".to_owned(),
+        6000..=6999 => "the arming of the timer after the cap".to_owned(),
         _ => format!("a step of detail {detail}"),
     }
 }
@@ -1133,6 +1135,7 @@ mod tests {
         let tag = crate::comp_probe::COMP_TAG;
         assert_eq!(own_step_kind(1008), "a band that made 8 images");
         assert_eq!(own_step_kind(1000), "a band that made 0 images");
+        assert_eq!(own_step_kind(6000), "the arming of the timer after the cap");
         assert_eq!(own_step_kind(2000), "a take");
         assert_eq!(own_step_kind(3000), "the commit after the last band");
         assert_eq!(own_step_kind(4000), "the end of a frame");
