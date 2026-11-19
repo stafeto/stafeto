@@ -522,7 +522,7 @@ A window's resize, a frame clock that follows the display's own vertical blank
 (the period is the service's, and the free run is the only way without it), the
 sharing of the cap between clients, a call of pixman for the parts of windows that
 do not overlap (eight translucent windows on one place cost eight calls a band and
-19 periods a frame at 60 Hz under -icount), the window manager
+30 periods a frame at 60 Hz under -icount), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`

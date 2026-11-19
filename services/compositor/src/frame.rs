@@ -843,6 +843,7 @@ mod tests {
     #[test]
     fn the_cap_in_bands_is_52_at_60_hz() {
         assert_eq!(band_cap(T, DEFAULT_CAP_PPM, 15_000), 52);
+        assert_eq!(band_cap(T, DEFAULT_CAP_PPM, crate::BAND_TICKS), 55);
         assert_eq!(band_cap(T, 0, 15_000), 1);
         assert_eq!(band_cap(T, 1_000_000, 15_000), 69);
     }
@@ -1243,13 +1244,22 @@ mod tests {
         let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
         assert_eq!(d, 199_851);
         assert_eq!(bound(d, &all, e, limit), Some(742_193));
-        // F: the whole screen, no load: the 34 bands the table gives (with the
-        // fixed term of a band), the 33 of a band of 14 000 ticks, and the limit of
-        // 45 that the probe holds.
-        assert_eq!(own(34, false, false), 711_265);
-        assert_eq!(bound(711_265, &console, e, limit), Some(755_884));
-        assert_eq!(own(33, false, false), 694_937);
-        assert_eq!(bound(694_937, &console, e, limit), Some(739_556));
+        // F: the whole screen, no load: the bands of a copy over the screen by
+        // the prices (37 with the terms of a band and of a layer, pinned here on
+        // purpose; the rest follows from the code), one band fewer, and the limit
+        // of 45 that the probe holds.
+        let full = u64::from(crate::full_screen_bands());
+        assert_eq!(full, 37);
+        assert_eq!(own(full, false, false), 760_249);
+        assert_eq!(
+            bound(own(full, false, false), &console, e, limit),
+            Some(804_868)
+        );
+        assert_eq!(own(full - 1, false, false), 743_921);
+        assert_eq!(
+            bound(own(full - 1, false, false), &console, e, limit),
+            Some(788_540)
+        );
         assert_eq!(own(45, false, false), 890_873);
         assert_eq!(bound(890_873, &console, e, limit), Some(935_492));
         // The network's budgets of the tables (60 percent of the CPU) leave no
