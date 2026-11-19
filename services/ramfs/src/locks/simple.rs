@@ -3,7 +3,7 @@
 
 //! Bounded inode lists backed by pages paid by the exact creating root.
 
-use super::{Kind, Lock, Owner, Range};
+use super::{Kind, Lock, OFFSET_MAX, Owner, Range};
 use crate::storage::{self, LockPage, Pin, Root, Storage, Token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,11 +68,11 @@ impl Page {
         next: NO_PAGE,
     };
 }
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct Entry {
     lock: Lock,
     id: u32,
-    next: u32,
 }
 // The place of an old record and its link; a request reads the body once while it walks.
 #[derive(Clone, Copy)]
@@ -241,6 +241,9 @@ impl Holder {
 struct Holders {
     slots: [Holder; OWNERS],
     used: usize,
+    /// The times the count of an owner was lowered: each is one probe of the table.
+    #[cfg(test)]
+    lowered: usize,
 }
 impl Holders {
     fn home(owner: Owner) -> usize {
@@ -288,6 +291,10 @@ impl Holders {
         true
     }
     fn sub(&mut self, owner: Owner, records: u32) {
+        #[cfg(test)]
+        {
+            self.lowered += 1;
+        }
         let at = self.find(owner).expect("counted owner");
         self.slots[at].records -= records;
         if self.slots[at].records != 0 {
@@ -335,6 +342,8 @@ impl SimpleLocks {
             holders: Holders {
                 slots: [Holder::EMPTY; OWNERS],
                 used: 0,
+                #[cfg(test)]
+                lowered: 0,
             },
             started: None,
             total: 0,
@@ -350,6 +359,8 @@ impl SimpleLocks {
             core::ptr::addr_of_mut!((*destination).total).write(0);
             core::ptr::addr_of_mut!((*destination).started).write(None);
             core::ptr::addr_of_mut!((*destination).holders.used).write(0);
+            #[cfg(test)]
+            core::ptr::addr_of_mut!((*destination).holders.lowered).write(0);
             let slots = core::ptr::addr_of_mut!((*destination).holders.slots).cast::<Holder>();
             for i in 0..OWNERS {
                 slots.add(i).write(Holder::EMPTY);
@@ -398,6 +409,7 @@ impl SimpleLocks {
             .filter(|head| head.generation == inode.generation)
             .map_or(0, |head| head.count as usize)
     }
+    #[cfg(test)]
     #[inline(always)]
     fn entries(
         &self,
@@ -413,7 +425,7 @@ impl SimpleLocks {
         let mut id = head.first;
         for _ in 0..head.count {
             let (lock, next) = self.read(storage, id);
-            out.push(Entry { lock, id, next });
+            out.push(Entry { lock, id });
             id = next;
         }
         assert_eq!(id, NONE);
@@ -530,6 +542,12 @@ impl SimpleLocks {
         let head = self.heads[request.inode.slot as usize];
         if head.count != 0 && head.generation != request.inode.generation {
             return Err(Error::Invalid);
+        }
+        // An unlock of the whole file drops every record of the requester and needs no
+        // fragments, no slot to reuse and no new record: it reads the list once and frees.
+        if kind.is_none() && request.range.first() == 0 && request.range.last() == OFFSET_MAX {
+            self.unlock_all(storage, request, live);
+            return Ok(());
         }
         let count = head.count as usize;
         let mut old: Buffer<Old, PER_INODE> = Buffer::new();
@@ -838,41 +856,153 @@ impl SimpleLocks {
         if first.is_none() && second.is_none() {
             return Ok(false);
         }
-        self.remove(storage, inode, |lock| {
-            Some(lock.owner) == first || Some(lock.owner) == second
+        self.remove(storage, inode, |owner| {
+            Some(owner) == first || Some(owner) == second
         })
     }
     fn remove(
         &mut self,
         storage: &mut Storage<'_>,
         inode: Token,
-        remove: impl FnMut(Lock) -> bool,
+        remove: impl FnMut(Owner) -> bool,
     ) -> Result<bool, Error> {
         self.remove_window(storage, inode, 0..PER_INODE, remove)
     }
-    /// Removes the locks of the inode that `remove` selects among those at the places of
-    /// `window` in the list; the others stay without being asked about.
+    /// Removes the locks of the inode whose owner `remove` selects, among those at the places
+    /// of `window` in the list; the others stay without being asked about. The list is read
+    /// once: `remove` is asked once for a run of records of one owner, and the owner's count
+    /// of records in the table is lowered once for the run.
     fn remove_window(
         &mut self,
         storage: &mut Storage<'_>,
         inode: Token,
         window: core::ops::Range<usize>,
-        mut remove: impl FnMut(Lock) -> bool,
+        mut remove: impl FnMut(Owner) -> bool,
     ) -> Result<bool, Error> {
-        let mut old = Buffer::new();
-        self.entries(storage, inode, &mut old)?;
-        let count = old.len();
-        let mut kept: Buffer<Entry, PER_INODE> = Buffer::new();
+        storage.node(inode).map_err(|_| Error::Invalid)?;
+        let head = self.heads[inode.slot as usize];
+        if head.count != 0 && head.generation != inode.generation {
+            return Err(Error::Invalid);
+        }
+        let count = head.count as usize;
+        let mut kept: Buffer<Old, PER_INODE> = Buffer::new();
         let mut len = 0;
-        for (place, entry) in old[..count].iter().enumerate() {
-            if window.contains(&place) && remove(entry.lock) {
-                self.holders.sub(entry.lock.owner, 1);
+        // The owner of the record seen last and the answer for it; no stored key equals the
+        // first value. `run` is the owner of the records freed since the count was lowered.
+        let mut key = (u64::MAX, u64::MAX);
+        let mut drop_owner = false;
+        let mut run: Option<(Owner, u32)> = None;
+        let mut id = head.first;
+        for place in 0..count {
+            let words = self.words(storage, id);
+            let entry = Old {
+                id,
+                next: words[4] as u32,
+            };
+            id = entry.next;
+            if window.contains(&place) {
+                if (words[2], words[3] & OWNER_BITS) != key {
+                    key = (words[2], words[3] & OWNER_BITS);
+                    drop_owner = remove(Self::owner_of(&words));
+                }
+                if drop_owner {
+                    let owner = Self::owner_of(&words);
+                    match &mut run {
+                        Some((held, records)) if *held == owner => *records += 1,
+                        _ => {
+                            if let Some((held, records)) = run.replace((owner, 1)) {
+                                self.holders.sub(held, records);
+                            }
+                        }
+                    }
+                    self.free(storage, entry.id);
+                    continue;
+                }
+            }
+            kept.push(entry);
+            len += 1;
+        }
+        assert_eq!(id, NONE);
+        if let Some((held, records)) = run {
+            self.holders.sub(held, records);
+        }
+        Ok(self.finish_removal(storage, inode, count, &kept[..len]))
+    }
+    /// The unlock of the whole file by the requester: one pass over the list. A record of the
+    /// requester goes, a record of a dead owner goes while the request has freed fewer than
+    /// `SWEEP_PIECE` of them (the others stay for the sweep), and every other record stays. The
+    /// counts of the owners in the table are lowered once for each run of freed records.
+    fn unlock_all(
+        &mut self,
+        storage: &mut Storage<'_>,
+        request: Request,
+        mut live: impl FnMut(Owner) -> bool,
+    ) {
+        let inode = request.inode;
+        let head = self.heads[inode.slot as usize];
+        let count = head.count as usize;
+        let mut kept: Buffer<Old, PER_INODE> = Buffer::new();
+        let mut len = 0;
+        let mut dead = 0;
+        let mut key = (u64::MAX, u64::MAX);
+        let (mut alive, mut own) = (false, false);
+        let mut run: Option<(Owner, u32)> = None;
+        let mut id = head.first;
+        for _ in 0..count {
+            let words = self.words(storage, id);
+            let entry = Old {
+                id,
+                next: words[4] as u32,
+            };
+            id = entry.next;
+            if (words[2], words[3] & OWNER_BITS) != key {
+                key = (words[2], words[3] & OWNER_BITS);
+                let owner = Self::owner_of(&words);
+                alive = live(owner);
+                own = owner == request.owner;
+            }
+            let freed = if !alive {
+                // The rest of the dead records are left to the sweep.
+                dead < SWEEP_PIECE && {
+                    dead += 1;
+                    true
+                }
+            } else {
+                own
+            };
+            if freed {
+                let owner = Self::owner_of(&words);
+                match &mut run {
+                    Some((held, records)) if *held == owner => *records += 1,
+                    _ => {
+                        if let Some((held, records)) = run.replace((owner, 1)) {
+                            self.holders.sub(held, records);
+                        }
+                    }
+                }
                 self.free(storage, entry.id);
             } else {
-                kept.push(*entry);
+                kept.push(entry);
                 len += 1;
             }
         }
+        assert_eq!(id, NONE);
+        if let Some((held, records)) = run {
+            self.holders.sub(held, records);
+        }
+        self.finish_removal(storage, inode, count, &kept[..len]);
+    }
+    /// The list of `inode` is `kept` (the records of its `count` that stay, in order) once the
+    /// others are freed: links, head, total and the pin of the inode. Tells whether any record
+    /// went.
+    fn finish_removal(
+        &mut self,
+        storage: &mut Storage<'_>,
+        inode: Token,
+        count: usize,
+        kept: &[Old],
+    ) -> bool {
+        let len = kept.len();
         for i in 0..len {
             let next = if i + 1 < len { kept[i + 1].id } else { NONE };
             if kept[i].next != next {
@@ -892,7 +1022,7 @@ impl SimpleLocks {
         if count != 0 && len == 0 {
             storage.unpin(inode, Pin::Lock).expect("last inode lock");
         }
-        Ok(count != len)
+        count != len
     }
     /// Each turn visits a caller-bounded number of inode lists.
     pub fn sweep(
@@ -917,7 +1047,7 @@ impl SimpleLocks {
                     slot: slot as u16,
                     generation: head.generation,
                 };
-                self.remove(storage, token, |lock| !live(lock.owner))
+                self.remove(storage, token, |owner| !live(owner))
                     .expect("pinned sweep inode");
                 result.removed += head.count as usize - self.heads[slot].count as usize;
             }
@@ -964,7 +1094,7 @@ impl SimpleLocks {
             slot: slot as u16,
             generation: head.generation,
         };
-        self.remove_window(storage, token, from..to, |lock| !live(lock.owner))
+        self.remove_window(storage, token, from..to, |owner| !live(owner))
             .expect("pinned sweep inode");
         let after = self.heads[slot];
         let removed = head.count as usize - after.count as usize;
@@ -1094,25 +1224,30 @@ impl SimpleLocks {
     fn free(&mut self, storage: &mut Storage<'_>, id: u32) {
         let physical = (id as usize / SLOTS) as u16;
         let bit = 1u64 << (id as usize % SLOTS);
-        let was_full = self.pages[physical as usize].free == 0;
-        assert_eq!(self.pages[physical as usize].free & bit, 0);
-        self.pages[physical as usize].free |= bit;
-        if was_full {
-            self.link_available(physical);
+        let page = &mut self.pages[physical as usize];
+        let was_full = page.free == 0;
+        assert_eq!(page.free & bit, 0);
+        page.free |= bit;
+        if page.free != u64::MAX {
+            if was_full {
+                self.link_available(physical);
+            }
+            return;
         }
-        if self.pages[physical as usize].free == u64::MAX {
+        // The page is empty. A page that was full is on no list of available pages.
+        if !was_full {
             self.unlink_available(physical);
-            // The emptied page waits on the parking stack for the maintenance to release: the
-            // step does not give back the charge or the anchor.
-            let page = self.pages[physical as usize].paid.take().unwrap();
-            storage.park_lock_page(page);
-            // take already cleared paid. Reset only the remaining live fields;
-            // no full-page metadata copy is needed for its now-free slot.
-            let empty = &mut self.pages[physical as usize];
-            empty.free = 0;
-            empty.previous = NO_PAGE;
-            empty.next = NO_PAGE;
         }
+        // The emptied page waits on the parking stack for the maintenance to release: the
+        // step does not give back the charge or the anchor.
+        let page = &mut self.pages[physical as usize];
+        let paid = page.paid.take().unwrap();
+        // The page is on no list now; no full-page metadata copy is needed for its now-free
+        // slot: `paid` is cleared, the rest is reset.
+        page.free = 0;
+        page.previous = NO_PAGE;
+        page.next = NO_PAGE;
+        storage.park_lock_page(paid);
     }
     #[inline(always)]
     fn words(&self, storage: &Storage<'_>, id: u32) -> [u64; 5] {
@@ -1886,6 +2021,220 @@ mod tests {
         assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
         assert_eq!(ram.storage.open_accounts(), open);
         assert_eq!(ram.storage.available().pages - free_before, held as u16);
+    }
+
+    // A host measurement of the two requests, to run by hand in release mode:
+    // cargo test -p ramfs --release --lib measure_release_shapes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_release_shapes() {
+        use std::time::Instant;
+        let (mut unlock, mut close, mut close_flat) = (Vec::new(), Vec::new(), Vec::new());
+        let rounds = 600;
+        for _ in 0..rounds {
+            for shape in 0..3 {
+                let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+                let target = inode(&mut ram, b"target");
+                let mut table = fresh();
+                let owner = Owner::Process(900);
+                if shape == 2 {
+                    // 63 records of one owner on one inode, all in one page.
+                    for i in 0..63 {
+                        table
+                            .set(
+                                &mut ram.storage,
+                                payer(1),
+                                request(target, owner, 2 * i, 1, Some(Kind::Write)),
+                                |_| true,
+                            )
+                            .unwrap();
+                    }
+                } else {
+                    fragment(&mut ram, &mut table, target, owner);
+                }
+                let begin = Instant::now();
+                if shape == 0 {
+                    table
+                        .set(
+                            &mut ram.storage,
+                            payer(1),
+                            Request {
+                                range: Range::relative(0, 0, 0).unwrap(),
+                                ..request(target, owner, 0, 0, None)
+                            },
+                            |_| true,
+                        )
+                        .unwrap();
+                    unlock.push(begin.elapsed().as_nanos());
+                } else {
+                    table.close(&mut ram.storage, target, owner).unwrap();
+                    if shape == 1 {
+                        close.push(begin.elapsed().as_nanos());
+                    } else {
+                        close_flat.push(begin.elapsed().as_nanos());
+                    }
+                }
+            }
+        }
+        // The mean of the faster 70 percent of the rounds.
+        let trim = |mut v: Vec<u128>| {
+            v.sort();
+            let keep = v.len() * 7 / 10;
+            v[..keep].iter().sum::<u128>() / keep as u128
+        };
+        let (unlock, close, close_flat) = (trim(unlock), trim(close), trim(close_flat));
+        std::println!(
+            "trimmed mean of {rounds}: unlock of 64 pages {} ns, close of 64 pages {} ns, close of 63 records on one page {} ns",
+            unlock,
+            close,
+            close_flat
+        );
+    }
+
+    // The unlock of the whole file has a pass of its own; a range that stops one short of the
+    // end of the file takes the general path. Both must leave the same lists, counts, revisions
+    // and paid pages after any run of requests, dead owners included.
+    #[test]
+    fn the_unlock_of_the_whole_file_matches_the_general_path() {
+        let mut state = 0xc0ffee_u64;
+        let mut ram = [
+            crate::Ram::new(proto_fs::Timestamp::ZERO),
+            crate::Ram::new(proto_fs::Timestamp::ZERO),
+        ];
+        let mut table = [fresh(), fresh()];
+        let files: Vec<Vec<Token>> = ram
+            .iter_mut()
+            .map(|ram| {
+                (0..3)
+                    .map(|i| inode(ram, std::format!("f{i}").as_bytes()))
+                    .collect()
+            })
+            .collect();
+        for step in 0..4_000 {
+            let file = (lcg(&mut state) % 3) as usize;
+            let owner = owner_of((lcg(&mut state) % 8) as u32);
+            let first = 2 * (lcg(&mut state) % 70) as i64;
+            let roll = lcg(&mut state) % 100;
+            let dead_owner = if lcg(&mut state).is_multiple_of(3) {
+                Some(owner_of((lcg(&mut state) % 8) as u32))
+            } else {
+                None
+            };
+            let results: Vec<_> = (0..2)
+                .map(|n| {
+                    let live = |o: Owner| Some(o) != dead_owner;
+                    let (length, kind) = match roll {
+                        0..=59 => (1, Some(Kind::Write)),
+                        60..=79 => (1, None),
+                        // The whole file, by the pass of its own (n == 0) or by the general
+                        // path (n == 1: the range ends one short of the end).
+                        _ if n == 0 => (0, None),
+                        _ => (i64::MAX - 1 - first, None),
+                    };
+                    let at = if roll >= 80 { 0 } else { first };
+                    let length = if roll >= 80 && n == 1 {
+                        i64::MAX - 1
+                    } else {
+                        length
+                    };
+                    table[n].set(
+                        &mut ram[n].storage,
+                        payer(1),
+                        request(files[n][file], owner, at, length, kind),
+                        live,
+                    )
+                })
+                .collect();
+            assert_eq!(results[0], results[1], "step {step}");
+            for (first, second) in files[0].iter().zip(&files[1]) {
+                assert_eq!(
+                    list_of(&table[0], &ram[0], *first),
+                    list_of(&table[1], &ram[1], *second),
+                    "step {step}"
+                );
+                assert_eq!(
+                    table[0].revision(*first),
+                    table[1].revision(*second),
+                    "step {step}"
+                );
+            }
+            assert_eq!(table[0].total(), table[1].total());
+            assert_eq!(
+                ram[0].storage.usage(payer(1)),
+                ram[1].storage.usage(payer(1))
+            );
+            for n in 0..2 {
+                ram[n].storage.assert_pages_exact(&table[n].live_pages());
+            }
+        }
+    }
+
+    // The records of one owner in a run cost one probe of the table of holders, whatever the
+    // run's length: the close of 64 records of one owner takes one, of two owners that
+    // alternate in the list (both closed) one for each run, and the unlock of the whole file
+    // one for the owner's records.
+    #[test]
+    fn the_holders_are_lowered_once_for_each_run_of_one_owner() {
+        let build = |owners: &[Owner]| {
+            let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+            let file = inode(&mut ram, b"runs");
+            let mut table = fresh();
+            for i in 0..PER_INODE {
+                table
+                    .set(
+                        &mut ram.storage,
+                        payer(1),
+                        request(
+                            file,
+                            owners[i % owners.len()],
+                            2 * i as i64,
+                            1,
+                            Some(Kind::Write),
+                        ),
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+            (ram, table, file)
+        };
+        let (a, b) = (Owner::Process(900), Owner::Process(901));
+        // 64 records of one owner: one probe.
+        let (mut ram, mut table, file) = build(&[a]);
+        let before = table.holders.lowered;
+        table.close(&mut ram.storage, file, a).unwrap();
+        assert_eq!(table.count(file), 0);
+        assert_eq!(table.holders.lowered - before, 1);
+        assert!(!table.holds(a));
+        // Two owners that alternate, both closed: 64 runs, 64 probes.
+        let (mut ram, mut table, file) = build(&[a, b]);
+        let before = table.holders.lowered;
+        table
+            .close_owners(&mut ram.storage, file, Some(a), Some(b))
+            .unwrap();
+        assert_eq!(table.holders.lowered - before, PER_INODE);
+        // One of them closed: its 32 records are one run of the removed records.
+        let (mut ram, mut table, file) = build(&[a, b]);
+        let before = table.holders.lowered;
+        table.close(&mut ram.storage, file, a).unwrap();
+        assert_eq!(table.count(file), PER_INODE / 2);
+        assert_eq!(table.holders.lowered - before, 1);
+        assert!(table.holds(b) && !table.holds(a));
+        // The unlock of the whole file by one of two alternating owners: one probe.
+        let (mut ram, mut table, file) = build(&[a, b]);
+        let before = table.holders.lowered;
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                Request {
+                    range: Range::relative(0, 0, 0).unwrap(),
+                    ..request(file, a, 0, 0, None)
+                },
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(table.count(file), PER_INODE / 2);
+        assert_eq!(table.holders.lowered - before, 1);
     }
 
     #[test]
@@ -2664,6 +3013,7 @@ mod tests {
         let mut table = std::boxed::Box::new(Holders {
             slots: [Holder::EMPTY; OWNERS],
             used: 0,
+            lowered: 0,
         });
         let mut reference = std::collections::BTreeMap::<u32, u32>::new();
         let mut state = 0x1234_5678_9abc_def0u64;
