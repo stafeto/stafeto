@@ -1796,6 +1796,12 @@ fn nvme_key_image(
             ));
         }
     }
+    // The first walk (`datafs: first walk ...`) starts after the queue has been empty for 2 s, and
+    // these boots end within seconds of READY, so a line is not required; the ones that come must
+    // be whole, at most one a boot, with no failed walk and at most three walks stopped.
+    for (lines, boot) in [(&first, "first"), (&second, "second")] {
+        crate::data_probe::first_walk(lines, &format!("{name}, {boot} boot"))?;
+    }
     let datakey = |lines: &[String]| {
         lines
             .iter()

@@ -39,6 +39,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     }
 }
 

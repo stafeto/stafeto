@@ -109,6 +109,7 @@ pub const RNG: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The driver on VZ.
@@ -199,6 +200,7 @@ pub const ENTROPY: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The probe: seeds that wait for the first bytes, a seed and the seeds at
@@ -231,6 +233,7 @@ const PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// A second client of the service: its key differs from the first's; on

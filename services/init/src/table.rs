@@ -579,6 +579,11 @@ pub struct Record {
     /// have no budget) leaves the levels above `free` alone. A record with budgets has
     /// it below its level and a record without budgets has 0 (`check_free`).
     pub free: u8,
+    /// A service that ends with `code` this many times in a row is marked broken at once, whatever
+    /// else its failures are (`restart::Failures::failed_with`): the exit code of a failure that
+    /// restarting repeats (the data file service's stuck exit, whose restart mounts the same
+    /// damaged volume again). `None` for every other record.
+    pub broken_after: Option<(u64, u32)>,
 }
 
 /// A service a record waits for: its name, and how long the record waits at
@@ -642,6 +647,7 @@ impl Record {
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     };
 
     /// The watchdog of a service; None for a client.
@@ -2076,6 +2082,7 @@ mod tests {
             waits: &[],
             budgets: &[],
             free: 0,
+            broken_after: None,
         }
     }
 

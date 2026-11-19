@@ -12,7 +12,7 @@
 //!   attribute; one with it is only mounted, and when that fails nothing is written (a damaged
 //!   volume is for its owner to look at).
 
-use crate::fs::{Fs, Storage};
+use crate::fs::{BLOCKS_MAX, Fs, Storage};
 use crate::gpt::{self, Class, FORMATTED, Found, Partition, TYPE_DATA};
 use crate::{BLOCK_SECTORS, BLOCKS_MIN, Device, Window};
 
@@ -25,6 +25,10 @@ pub enum Refusal {
     NoPartition,
     /// The partition is too small for the file system.
     TooSmall,
+    /// The partition is over 4 GiB (`BLOCKS_MAX` blocks), the most this release uses: its window of
+    /// the allocator covers one bit for each block, and a volume beyond it would walk the whole file
+    /// system on every STATFS. The disk is left as it is.
+    TooLarge,
     /// The file system of a formatted partition does not mount.
     Damaged,
     /// The disk is too small for a table, or failed.
@@ -39,6 +43,9 @@ impl Refusal {
             }
             Self::NoPartition => "no data partition in the table",
             Self::TooSmall => "the data partition is too small",
+            Self::TooLarge => {
+                "the data partition is over 4 GiB, which this release does not use, left alone"
+            }
             Self::Damaged => "the data volume does not mount, left alone",
             Self::Device => "the disk failed or is too small",
         }
@@ -70,6 +77,11 @@ pub fn open<D: Device>(
         Class::Foreign(found) => return Err(Refusal::Foreign(found)),
         Class::Blank => {
             let layout = gpt::default_layout(device.sectors()).ok_or(Refusal::Device)?;
+            // Before the table is written: a disk that would get a data partition over the limit
+            // is left blank.
+            if (layout[1].last - layout[1].first + 1) / BLOCK_SECTORS > BLOCKS_MAX {
+                return Err(Refusal::TooLarge);
+            }
             did = Did::Partitioned;
             gpt::create(&mut device, &layout, seed).map_err(|_| Refusal::Device)?
         }
@@ -77,6 +89,9 @@ pub fn open<D: Device>(
     let part = table.find(&TYPE_DATA).ok_or(Refusal::NoPartition)?;
     if part.sectors() / BLOCK_SECTORS < BLOCKS_MIN {
         return Err(Refusal::TooSmall);
+    }
+    if part.sectors() / BLOCK_SECTORS > BLOCKS_MAX {
+        return Err(Refusal::TooLarge);
     }
     let window = Window {
         first: part.first,

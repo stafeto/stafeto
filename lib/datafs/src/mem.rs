@@ -24,8 +24,15 @@ pub struct MemDevice {
     pub written: u64,
     /// The flushes so far.
     pub flushes: u64,
+    /// The calls of `read` and the sectors they read, the calls of `write` (programs), for the
+    /// measurements of the cost of a job.
+    pub reads: u64,
+    pub read_sectors: u64,
+    pub programs: u64,
     cut_after: Option<u64>,
     dead: bool,
+    /// The read that fails, counted by `reads` (one failure, then reads go on).
+    fail_read_at: Option<u64>,
 }
 
 /// Which sectors of the cache a power cut lets through to the medium.
@@ -46,8 +53,12 @@ impl MemDevice {
             cache: BTreeMap::new(),
             written: 0,
             flushes: 0,
+            reads: 0,
+            read_sectors: 0,
+            programs: 0,
             cut_after: None,
             dead: false,
+            fail_read_at: None,
         }
     }
 
@@ -55,6 +66,12 @@ impl MemDevice {
     /// there). `None` turns the cut off.
     pub fn cut_after(&mut self, n: Option<u64>) {
         self.cut_after = n.map(|n| self.written + n);
+    }
+
+    /// The read call number `n` from now on (0 is the next one) fails with an error, once. The
+    /// device is alive after it: the failure of one read, or a walk stopped on purpose.
+    pub fn fail_read_after(&mut self, n: Option<u64>) {
+        self.fail_read_at = n.map(|n| self.reads + n);
     }
 
     pub fn is_dead(&self) -> bool {
@@ -98,8 +115,12 @@ impl MemDevice {
             cache: BTreeMap::new(),
             written: 0,
             flushes: 0,
+            reads: 0,
+            read_sectors: 0,
+            programs: 0,
             cut_after: None,
             dead: false,
+            fail_read_at: None,
         }
     }
 }
@@ -117,6 +138,13 @@ impl Device for MemDevice {
         if sector + count > self.sectors() {
             return Err(DeviceError);
         }
+        if self.fail_read_at == Some(self.reads) {
+            self.fail_read_at = None;
+            self.reads += 1;
+            return Err(DeviceError);
+        }
+        self.reads += 1;
+        self.read_sectors += count;
         for i in 0..count {
             let at = (sector + i) as usize;
             let piece = &mut out[i as usize * SECTOR..][..SECTOR];
@@ -136,6 +164,7 @@ impl Device for MemDevice {
         if sector + count > self.sectors() {
             return Err(DeviceError);
         }
+        self.programs += 1;
         for i in 0..count {
             if self.cut_after == Some(self.written) {
                 self.dead = true;
