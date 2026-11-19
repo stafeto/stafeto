@@ -125,6 +125,10 @@ pub fn queued_job() -> bool {
     (0..JOBS).any(|i| state(i).load(Ordering::Acquire) == QUEUED)
 }
 
+/// The server's tables (descriptions, open files, sessions, the memory of directories): about 50 KiB,
+/// too much for the worker's stack, which overflowed when they lived there. The worker's alone.
+pub static SERVER: Shared<datafs::server::Server> = Shared::new(datafs::server::Server::new());
+
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());
 

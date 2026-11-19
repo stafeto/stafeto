@@ -26,7 +26,7 @@ use rt::sys::{self, Received};
 
 /// The thread's stack: the volume's calls and the 1 KiB buffers of a request. The stack is an object
 /// of its own with no mapping on the page below it, so an overflow faults and ends the process.
-const STACK_SIZE: usize = 96 * 1024;
+const STACK_SIZE: usize = 128 * 1024;
 const STACK_AT: usize = 0x58_2000_0000;
 /// The thread's message buffer: the page after the main thread's.
 const MSGBUF: usize = abi::INIT_MSGBUF as usize + 4096;
@@ -465,7 +465,9 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
         }
     }
-    let mut server = Server::with_epoch(epoch);
+    // SAFETY: the server is the worker's alone and lives for the life of the process.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
+    server.set_epoch(epoch);
     // The clock, the notary session and the identity copies of the bound sessions. The clock and
     // the volume's attributes (`Server::mount_work`) are set up before the first request: the
     // requests that came meanwhile wait in the table of jobs, which the main thread fills.
@@ -527,7 +529,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 if job.kind == REQUEST && !proto_data::is_root(job.owner) {
                     let owner = job.owner;
                     datafs::vouching::before_job(
-                        &mut server,
+                        server,
                         owner,
                         |index| notary.generation(index),
                         || identities.get(owner).and_then(|copy| notary.vouch(copy)),
@@ -553,7 +555,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 {
                     let ready = notary.ready(&parent, &process);
                     let bytes = identity_job(
-                        &mut server,
+                        server,
                         &mut identities,
                         ready,
                         &notary,
@@ -590,7 +592,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             let _ = sys::notify(wake, 1);
         }
         if STOPPING.load(Acquire) {
-            put_away(&mut server, &mut volume);
+            put_away(server, &mut volume);
             UNMOUNTED.store(true, Release);
             let _ = sys::notify(wake, 1);
             // The main thread ends the process once it has sent the replies.

@@ -757,6 +757,16 @@ impl Server {
         }
     }
 
+    /// Sets the epoch of this instance (as `with_epoch` does) on a server made by `new`: the service
+    /// keeps its server in a static, because the tables are too large for the worker's stack.
+    pub fn set_epoch(&mut self, epoch: u32) {
+        self.epoch = if epoch & EPOCH_MASK == 0 {
+            1
+        } else {
+            epoch & EPOCH_MASK
+        };
+    }
+
     pub fn open_count(&self) -> usize {
         self.descriptions.iter().filter(|d| d.used).count()
     }
