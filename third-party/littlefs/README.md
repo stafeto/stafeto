@@ -2,7 +2,7 @@
 
 The sources of littlefs, a small fail-safe file system for microcontrollers, as they stand in the
 release tarball, with the one change that `STAFETO-CHANGES.md` states (three functions that read the
-user attribute of an entry with the entry or along a path, in `lfs.c` and `lfs.h`; the patch is `stafeto-changes.patch`).
+user attribute of an entry with the entry or along a path, and a fourth that counts the metadata pairs, in `lfs.c` and `lfs.h`; the patch is `stafeto-changes.patch`).
 `tools/check-littlefs.py` checks the tree against the checksums below. `lib/datafs` compiles `lfs.c` and `lfs_util.c` with
 the settings its `build.rs` names and is the only user.
 
@@ -30,8 +30,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 With the change (`lfs.c` and `lfs.h` as they stand in this directory):
 
 ```
-7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557  lfs.c
-9c13b195643ccfd5025961fa3fb6029bbb9be0f6ffce9488ec9be958d33163b6  lfs.h
+990fd7fc88fc4e9cff64e9fc0c946b51a658ff58c652a52bb673fbf890906bf5  lfs.c
+89c6aa3d49725ac6cc50f98b366cdd4b6df17d423649b18fa4a84c9ee97fffc7  lfs.h
 ```
 
 `SPEC.md` and `DESIGN.md` describe the on-disk format and the design, for the reader of

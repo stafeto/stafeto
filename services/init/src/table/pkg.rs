@@ -433,16 +433,35 @@ pub const BLK_PROBE: Record = Record {
 /// its client.
 pub const BLK_PROBE_TABLE: &[Record] = &[super::normal::TABLE[0], BLK, BLK_PROBE];
 
-/// The budget of the request thread of the data file service: 100 us of each 10 ms (1 % of CPU 0),
-/// at 32 once spent. A request is a copy of at most 1 KiB into a job and a reply; the work on the
-/// volume is the worker's, which has no budget and runs at 30, below the levels of the budgets.
-pub const DATAFS_BUDGETS: &[Budget] = &[Budget {
-    name: "serve",
-    cpu: 0,
-    c_ns: 100_000,
-    t_ns: 10 * MS,
-    low: super::ramfs::SERVICE_LOW,
-}];
+/// The budgets of the data file service. `serve` is the request thread's: 100 us of each 10 ms
+/// (1 % of CPU 0), at 32 once spent. A request is a copy of at most 1 KiB into a job and a reply.
+/// `work` is the worker thread's, which does the jobs on the volume at 30: 3 ms of each 10 ms (30 %
+/// of CPU 1), at 1 once spent, below every program of POSIX. It stands on CPU 1 because the budgets
+/// of CPU 0 already take 74.5 % of the 75 % the table allows on EC2 (the admission check refuses
+/// 30 % more there); the service puts the worker thread on CPU 1 when it has the budget, and a
+/// machine with one CPU gets no `work` budget (init gives a budget only to an instance whose mask
+/// holds its CPU), so the worker stays on the CPU of the loop with no budget. The budget does not bound the length of
+/// a job: a job of seconds (a walk, an RMDIR in a large volume, a long listing) waits for the disk
+/// nearly all the time, and a wait spends nothing. It bounds the share of the CPU the worker takes
+/// from the programs below 30 in the spans where it computes (the checksums of littlefs over blocks
+/// in its cache, the compaction of a pair of metadata blocks, a walk over blocks already read): 30 %
+/// at 30, and what is left of the period only when nothing else wants the CPU.
+pub const DATAFS_BUDGETS: &[Budget] = &[
+    Budget {
+        name: "serve",
+        cpu: 0,
+        c_ns: 100_000,
+        t_ns: 10 * MS,
+        low: super::ramfs::SERVICE_LOW,
+    },
+    Budget {
+        name: "work",
+        cpu: 1,
+        c_ns: 3 * MS,
+        t_ns: 10 * MS,
+        low: 1,
+    },
+];
 
 /// The data file service (services/datafs): the files of `/data` on the data partition of the disk
 /// service. Its request thread works at 36 under a budget, above the clients of POSIX (ceiling 31) and

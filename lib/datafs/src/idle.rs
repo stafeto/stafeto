@@ -34,6 +34,28 @@ pub const fn may_yield(tries: u32) -> bool {
     tries < MAX_YIELDS
 }
 
+/// Whether the walk about to start may be stopped by a queued job: the first walk after the mount
+/// after `tries` stopped tries as `may_yield` says, and a refresh walk always. A refresh that runs
+/// to its end for a reader that comes late gives nothing: the free count of STATFS is low by what was
+/// given back, and the allocator walks by itself inside a request that needs a block; the reader
+/// would wait the 14 to 50 s of a walk for the exactness of `df`.
+pub const fn walk_may_yield(first: bool, tries: u32) -> bool {
+    !first || may_yield(tries)
+}
+
+/// Whether a walk in the idle would help (the refresh): the blocks that removals, truncations and
+/// replacing renames gave back since the last walk (`freed`) are over a sixteenth of the volume
+/// (`blocks`), or the window holds less than the volume (`window_short`: the allocator wrapped in the
+/// middle of a request). The free count of STATFS comes from the bits of the window, which a removal
+/// does not touch, so it is low by what was given back until a walk fills the window again; a sixteenth
+/// is the most a reader is allowed to be told too little (a `df` after a large `rm` must not lie
+/// for long, whatever the window holds). A volume with a sixteenth or less given back has no
+/// refresh. A first version also asked the window to be nearly full; a probe that removed 384 MiB
+/// from a volume with 23 percent free saw the count stay where it was.
+pub const fn refresh_wanted(blocks: u64, freed: u64, window_short: bool) -> bool {
+    window_short || freed > blocks / 16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,8 +131,62 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_walk_always_yields_and_the_first_walk_yields_three_times() {
+        for tries in [0, 1, 2, 3, 4, 100, u32::MAX] {
+            assert!(
+                walk_may_yield(false, tries),
+                "a refresh after {tries} stops"
+            );
+        }
+        assert!([0, 1, 2].iter().all(|&t| walk_may_yield(true, t)));
+        assert!(!walk_may_yield(true, 3));
+    }
+
+    #[test]
     fn the_fourth_try_runs_to_its_end() {
         assert!([0, 1, 2].iter().all(|&t| may_yield(t)));
         assert!(!may_yield(3) && !may_yield(u32::MAX));
+    }
+
+    const BLOCKS: u64 = 262_144;
+
+    #[test]
+    fn the_refresh_starts_above_a_sixteenth_given_back_and_not_at_a_thirty_second() {
+        assert!(refresh_wanted(BLOCKS, BLOCKS / 16 + 1, false));
+        assert!(
+            !refresh_wanted(BLOCKS, BLOCKS / 16, false),
+            "exactly a sixteenth"
+        );
+        assert!(!refresh_wanted(BLOCKS, BLOCKS / 32, false));
+        // A lot given back refreshes the count whatever the window holds: a volume with most of its
+        // blocks free still tells too little after a large removal.
+        assert!(refresh_wanted(BLOCKS, BLOCKS / 4, false));
+        // A window cut short is walked again whatever was given back.
+        assert!(refresh_wanted(BLOCKS, 0, true));
+    }
+
+    /// Removals of `each` blocks one after another with a quiet time after each: the walks the rule
+    /// asks for (a walk ends with the estimate at 0 and the window full of what was free).
+    fn walks_for(removals: u64, each: u64) -> u64 {
+        let (mut freed, mut walks) = (0, 0);
+        for _ in 0..removals {
+            freed += each;
+            if refresh_wanted(BLOCKS, freed, false) {
+                walks += 1;
+                freed = 0;
+            }
+        }
+        walks
+    }
+
+    #[test]
+    fn many_small_removals_make_few_walks() {
+        // Each removal gives back a sixty-fourth of the volume: a walk after the fifth (5/64 is over
+        // 4/64), so twenty removals make four walks and never one for each removal.
+        assert_eq!(walks_for(20, BLOCKS / 64), 4);
+        // Removals of a thirty-second each stay under a sixteenth for two of every three.
+        assert_eq!(walks_for(30, BLOCKS / 32), 10);
+        // Tiny removals never reach the sixteenth in a hundred.
+        assert_eq!(walks_for(100, 16), 0);
     }
 }

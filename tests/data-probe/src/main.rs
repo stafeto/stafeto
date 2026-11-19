@@ -9,6 +9,15 @@
 //!   of an earlier step), and the number of the step written into `/progress` the same way, after which
 //!   the line `data-probe: synced N` goes out. Then `data-probe: written` and a STATFS, for the host
 //!   that cuts the power in the middle of this series (`cargo xtask data-crash`).
+//! - `convert`: one STATFS, answered when the mount work is over (the conversion of a volume made by
+//!   an older release holds READY), then the probe ends.
+//! - `settle`: no request; with `STAFETO_DATA_PROBE_WAIT_S` the probe sleeps that long, so the
+//!   service converts the volume at mount and walks it in the quiet, and the probe ends.
+//! - `fill`: the volume that `cargo xtask data-image --fill` made (1 GiB, small and large files, a
+//!   directory of 1,000 entries, 200 empty directories) and one boot has converted: the time of the
+//!   first call, of the listing, of RMDIR, of the longest WRITE of a file of 8 MiB, of the removal of
+//!   large files and of the free count before and after the refresh walk, one line each
+//!   (`data-probe: fill ...`), then `data-probe: fill done`.
 //! - `verify`: the tree a cut left, or a clean run left. `/progress` says the last step whose line
 //!   went out or the one after it (`STAFETO_DATA_PROBE_MIN` is the last line the host saw: the steps
 //!   it names must all be there). Every file of the tree is whole (the bytes its name says, no
@@ -30,6 +39,9 @@ use rt::handle::{Channel, Resource};
 use rt::sys::Received;
 use rt::{Handle, sys};
 
+mod names;
+use names::decimal;
+
 rt::entry!(main);
 
 const MODE: &str = match option_env!("STAFETO_DATA_PROBE_MODE") {
@@ -46,6 +58,14 @@ const MIN: u32 = parse(match option_env!("STAFETO_DATA_PROBE_MIN") {
     Some(text) => text,
     None => "0",
 });
+/// The version 3 series (`STAFETO_DATA_PROBE_V3=1`, set for the writing and the verifying boot of
+/// `cargo xtask data-probe`; the crash runs leave it out, since it would move their count of sectors): the
+/// record of a native client's files, a CHMOD that survives the remount, and a session that is
+/// neither marked nor bound.
+const V3: bool = parse(match option_env!("STAFETO_DATA_PROBE_V3") {
+    Some(text) => text,
+    None => "0",
+}) == 1;
 /// 1 when the series ran to its end before the cut (so every step must be there).
 const STEPS: u32 = 12;
 
@@ -81,8 +101,16 @@ fn main(_: u64) -> u64 {
         rt::println!("data-probe: waited {WAIT_S} s");
     }
     let result = match MODE {
-        "write" => write(&client),
+        "write" => write(&client, &start),
         "verify" => verify(&client),
+        // The boot that converts a volume made by an older release and ends (the host then boots
+        // `fill` on the converted volume): nothing to ask, the sleep is the work.
+        "settle" => Ok(()),
+        // One request: it is answered when the data service is ready, which is after the mount work
+        // (the conversion of a full volume takes minutes). Nothing is walked for it (the conversion
+        // left the window full), and the probe ends.
+        "convert" => convert_wait(&client),
+        "fill" => measure_fill(&client, &start),
         _ => Err("unknown mode"),
     };
     match result {
@@ -260,16 +288,6 @@ fn name(j: u32, out: &mut [u8; 16]) -> usize {
     4 + digits
 }
 
-fn decimal(j: u32, out: &mut [u8; 4]) -> usize {
-    let digits = if j >= 10 { 2 } else { 1 };
-    let mut v = j;
-    for i in (0..digits).rev() {
-        out[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    digits
-}
-
 fn wire<T>(r: Result<T, Status>, why: Fail) -> Result<T, Fail> {
     r.map_err(|status| {
         rt::println!("data-probe: {why}: status {}", status.code());
@@ -282,7 +300,7 @@ fn removes(k: u32) -> Option<u32> {
     (k % 4 == 1).then_some(k + 3)
 }
 
-fn write(c: &Client) -> Result<(), Fail> {
+fn write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     match c.mkdir(b"/w") {
         Ok(()) | Err(Status::Unknown(p::EXISTS)) => {}
         Err(_) => return Err("mkdir /w"),
@@ -316,7 +334,142 @@ fn write(c: &Client) -> Result<(), Fail> {
     }
     rt::println!("data-probe: written");
     wire(c.call(p::statfs), "statfs")?;
+    if V3 {
+        v3_write(c, start)?;
+    }
     rt::println!("data-probe: finished");
+    Ok(())
+}
+
+/// The stat record of `path`.
+fn stat_of(c: &Client, path: &[u8]) -> Result<p::Stat, Fail> {
+    let reply = wire(c.call(|w| p::path_call(Method::Stat, path, w)), "stat")?;
+    wire(
+        p::Stat::from_bytes(&reply.bytes[4..reply.len]),
+        "the stat record",
+    )
+}
+
+/// The version 3 series, on the writing boot: the files of a native client (user 0, group 0) have
+/// the mode they were made with and a number each, a CHMOD changes the mode at once, and a session
+/// that is neither marked nor bound answers NOT_BOUND while a BIND with a copy that is no identity
+/// session answers ACCESS.
+fn v3_write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
+    wire(c.put(b"/v3a", 100, 5), "put v3a")?;
+    wire(c.put(b"/v3b", 100, 6), "put v3b")?;
+    wire(c.mkdir(b"/v3d"), "mkdir v3d")?;
+    let (a, b, d) = (
+        stat_of(c, b"/v3a")?,
+        stat_of(c, b"/v3b")?,
+        stat_of(c, b"/v3d")?,
+    );
+    // `put` opens with 0644, MKDIR is sent with 0755; the native client is user 0 and group 0.
+    if (a.mode, a.uid, a.gid) != (0o644, 0, 0) || (d.mode, d.uid, d.gid) != (0o755, 0, 0) {
+        rt::println!(
+            "data-probe: v3 stat {:o} {}:{} and {:o}",
+            a.mode,
+            a.uid,
+            a.gid,
+            d.mode
+        );
+        return Err("the record of a new file is not the mode and owner it was made with");
+    }
+    if a.kind != p::KIND_FILE || d.kind != p::KIND_DIRECTORY {
+        return Err("the kind of a new entry is wrong");
+    }
+    if a.ino == 0 || b.ino == 0 || d.ino == 0 || a.ino == b.ino || a.ino == d.ino || b.ino == d.ino
+    {
+        rt::println!("data-probe: v3 numbers {} {} {}", a.ino, b.ino, d.ino);
+        return Err("the numbers of new entries are not distinct and non-zero");
+    }
+    rt::println!("data-probe: v3 stat 0644 0:0 ino ok");
+    // The number is kept in a file, so that the verifying boot finds the same one.
+    let mut digits = [0u8; 20];
+    let mut n = a.ino;
+    let mut at = digits.len();
+    while n > 0 || at == digits.len() {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let handle = wire(
+        c.open(b"/v3ino", p::WRITE | p::CREATE | p::TRUNCATE),
+        "open v3ino",
+    )?;
+    wire(
+        c.call(|w| p::write(handle, &digits[at..], w)),
+        "write v3ino",
+    )?;
+    wire(
+        c.call(|w| p::handle_call(Method::Fsync, handle, w)),
+        "fsync v3ino",
+    )?;
+    wire(c.close(handle), "close v3ino")?;
+    wire(c.call(|w| p::chmod(b"/v3a", 0o600, w)), "chmod v3a")?;
+    if stat_of(c, b"/v3a")?.mode != 0o600 {
+        return Err("a CHMOD did not change the mode");
+    }
+    // A session of CLONE has neither the mark nor an identity: every request that names a path is
+    // NOT_BOUND until BIND, and a BIND that carries a channel that is no identity session of the
+    // process service is ACCESS (a table with no process service never vouches).
+    let held = wire(c.open(b"/v3a", p::READ), "open v3a")?;
+    let mut w = Writer::new();
+    wire(p::clone(&[held], &mut w), "clone")?;
+    let child = match sys::send(&c.session, w.as_bytes()) {
+        Ok(mut reply) => reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| "CLONE brought no session")?,
+        Err(_) => return Err("CLONE failed"),
+    };
+    let mut w = Writer::new();
+    wire(p::path_call(Method::Stat, b"/v3a", &mut w), "stat request")?;
+    let said = sys::send(&child, w.as_bytes())
+        .map(|r| {
+            let mut buffer = [0u8; MESSAGE_MAX];
+            p::reply(r.bytes(&mut buffer)).err()
+        })
+        .map_err(|_| "no answer from the cloned session")?;
+    if said != Some(Status::Unknown(p::NOT_BOUND)) {
+        rt::println!("data-probe: unbound session said {said:?}");
+        return Err("a session with no mark and no BIND was not refused with NOT_BOUND");
+    }
+    let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+    let foreign = sys::channel_create(level).map_err(|_| "no channel for the copy")?;
+    let bind = proto_wire::Header::new(Method::Bind.number(), p::VERSION).bytes();
+    let said = match sys::send_handles(&child, &bind, [foreign.erase()]) {
+        Ok(r) => {
+            let mut buffer = [0u8; MESSAGE_MAX];
+            p::reply(r.bytes(&mut buffer)).err()
+        }
+        Err(_) => return Err("no answer to BIND"),
+    };
+    if said != Some(Status::Unknown(p::ACCESS)) {
+        rt::println!("data-probe: bind with a foreign copy said {said:?}");
+        return Err("a BIND with a copy that is no identity session was not ACCESS");
+    }
+    rt::println!("data-probe: unbound session refused ok");
+    Ok(())
+}
+
+/// The version 3 series, on the verifying boot: the mode a CHMOD set and the number an entry got
+/// are there after the remount.
+fn v3_verify(c: &Client) -> Result<(), Fail> {
+    let a = stat_of(c, b"/v3a")?;
+    let number = wire(c.number(b"/v3ino"), "read v3ino")?;
+    if (a.mode, a.uid, a.gid) != (0o600, 0, 0) {
+        rt::println!(
+            "data-probe: v3 after the remount {:o} {}:{}",
+            a.mode,
+            a.uid,
+            a.gid
+        );
+        return Err("the mode a CHMOD set did not survive the remount");
+    }
+    if number != Some(a.ino as u32) || a.ino > u64::from(u32::MAX) {
+        return Err("the number of an entry changed over the remount");
+    }
+    rt::println!("data-probe: chmod survives a remount ok");
     Ok(())
 }
 
@@ -438,6 +591,148 @@ fn verify(c: &Client) -> Result<(), Fail> {
         return Err("the file written after the cut reads back wrong");
     }
     wire(c.close(handle), "close after")?;
+    if V3 {
+        v3_verify(c)?;
+    }
     rt::println!("data-probe: verify ok progress={done} files={files}");
+    Ok(())
+}
+
+/// The probe of mode `convert`: a STATFS, which waits for the mount work, and its line.
+fn convert_wait(c: &Client) -> Result<(), Fail> {
+    let at = now_us();
+    let (blocks, free) = statfs(c)?;
+    rt::println!(
+        "data-probe: convert answered after {} us, {blocks} blocks, {free} free",
+        now_us() - at
+    );
+    Ok(())
+}
+
+/// Microseconds since the counter started.
+fn now_us() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now()) / 1000
+}
+
+/// The free blocks and the total of STATFS.
+fn statfs(c: &Client) -> Result<(u64, u64), Fail> {
+    let reply = wire(c.call(p::statfs), "statfs")?;
+    let pair = |at: usize| u64::from(reply.word(at)) | u64::from(reply.word(at + 4)) << 32;
+    Ok((pair(0), pair(8)))
+}
+
+/// How long the probe keeps quiet after its removals: the service starts the refresh walk 2 s after
+/// its queue is empty, and a request that comes during the walk stops it (the reader does not wait
+/// for the walk's end: the request walks by itself), so the probe stays silent for the walk of a
+/// volume this full at the slowest device the bounds allow (60 s) and a little more.
+const QUIET_FOR_REFRESH_NS: u64 = 65_000_000_000;
+
+/// The lines of `fill` (see the head of the file): each is one measurement of the service on a volume
+/// of 1 GiB that is mostly full. The times are the client's, from the send to the reply.
+fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
+    let at = now_us();
+    let (blocks, free) = statfs(c)?;
+    rt::println!(
+        "data-probe: fill first call {} us, {blocks} blocks, {free} free",
+        now_us() - at
+    );
+    // The listing of a directory of 1,000 entries, as the loop of a client reads it.
+    let dir = wire(c.open(b"/rd", p::DIRECTORY | p::READ), "open /rd")?;
+    let (begun, mut calls, mut entries, mut longest) = (now_us(), 0u32, 0u32, 0u64);
+    let mut more = true;
+    while more {
+        let at = now_us();
+        let reply = wire(
+            c.call(|w| p::handle_call(Method::Readdir, dir, w)),
+            "readdir",
+        )?;
+        longest = longest.max(now_us() - at);
+        calls += 1;
+        let mut batch = wire(
+            p::read_dir_reply(proto_wire::Reader::new(&reply.bytes[4..reply.len])),
+            "listing",
+        )?;
+        more = batch.more;
+        while wire(batch.next_entry(), "entry")?.is_some() {
+            entries += 1;
+        }
+    }
+    rt::println!(
+        "data-probe: fill readdir {entries} entries in {calls} calls, total {} us, longest {longest} us",
+        now_us() - begun
+    );
+    wire(c.close(dir), "close /rd")?;
+    // RMDIR of an empty directory in a volume of 200 of them and more.
+    let at = now_us();
+    wire(
+        c.call(|w| p::path_call(Method::Rmdir, b"/rm/e0", w)),
+        "rmdir",
+    )?;
+    rt::println!("data-probe: fill rmdir {} us", now_us() - at);
+    // The rest of the empty directories, the oldest first: a `rm -rf` of 199 directories, each of
+    // which looks the pair before it up in the list of every pair of the volume.
+    let begun = now_us();
+    for n in 1..200u32 {
+        let mut name = [0u8; 16];
+        let len = names::rm_name(n, &mut name);
+        wire(
+            c.call(|w| p::path_call(Method::Rmdir, &name[..len], w)),
+            "rmdir e",
+        )?;
+    }
+    rt::println!(
+        "data-probe: fill rm -rf 199 directories {} us",
+        now_us() - begun
+    );
+    // A file of 8 MiB written in the largest writes: the longest call is the walk or the compaction
+    // that the window and the pairs of the volume take inside one request.
+    let handle = wire(
+        c.open(b"/fill-out", p::WRITE | p::CREATE | p::TRUNCATE),
+        "open fill-out",
+    )?;
+    let chunk = [0x5au8; p::MAX_WRITE];
+    let (begun, mut longest, mut wrote, mut calls) = (now_us(), 0u64, 0usize, 0u32);
+    while wrote < 8 << 20 {
+        let at = now_us();
+        let n = wire(c.call(|w| p::write(handle, &chunk, w)), "write")?.word(0) as usize;
+        longest = longest.max(now_us() - at);
+        if n == 0 {
+            return Err("a write took nothing");
+        }
+        wrote += n;
+        calls += 1;
+    }
+    wire(
+        c.call(|w| p::handle_call(Method::Fsync, handle, w)),
+        "fsync",
+    )?;
+    wire(c.close(handle), "close fill-out")?;
+    rt::println!(
+        "data-probe: fill write {wrote} bytes in {calls} calls, total {} us, longest call {longest} us",
+        now_us() - begun
+    );
+    // Large files removed: 24 of 16 MiB are 384 MiB, over a sixteenth of the volume, so the service
+    // walks again in the quiet after the removals and the free count of STATFS catches up.
+    let (_, before) = statfs(c)?;
+    let (begun, mut longest) = (now_us(), 0u64);
+    for b in 0..24u32 {
+        let mut name = [0u8; 16];
+        let len = names::big_name(b, &mut name);
+        let at = now_us();
+        wire(c.unlink(&name[..len]), "unlink big")?;
+        longest = longest.max(now_us() - at);
+    }
+    rt::println!(
+        "data-probe: fill unlink 24 files of 16 MiB, total {} us, longest {longest} us",
+        now_us() - begun
+    );
+    let (_, low) = statfs(c)?;
+    let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+    sleep(level, QUIET_FOR_REFRESH_NS);
+    let (_, after) = statfs(c)?;
+    rt::println!(
+        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after the quiet"
+    );
+    rt::println!("data-probe: fill done");
     Ok(())
 }

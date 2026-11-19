@@ -12,6 +12,8 @@ use crate::identity::{Identities, Notary};
 use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
+#[cfg(feature = "steps")]
+use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use datafs::gpt::Found;
 use datafs::server::Server;
@@ -54,7 +56,41 @@ pub fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
 /// The level of the thread: below the disk service (39) it calls, below the clients' ceiling.
 pub const LEVEL: u8 = 30;
 
-pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, abi::Error> {
+/// The ticks the worker has spent in the reads of the disk (the request, the disk service's work
+/// and the answer), the steps build: a walk's own work is its time less this.
+#[cfg(feature = "steps")]
+static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The reads, writes and flushes of the disk when the conversion job took its first step.
+static CONVERSION_BASE: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The instant the conversion job took its first step, in nanoseconds (0 before it).
+static CONVERSION_BEGAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The handle of the worker's budget, 0 when it has none.
+static WORK_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The ticks the worker's budget has charged so far and the overruns the kernel has counted (the
+/// steps build, for the line of a walk).
+#[cfg(feature = "steps")]
+fn work_ran() -> (u64, u64) {
+    match WORK_BUDGET.load(Acquire) {
+        0 => (0, 0),
+        raw => {
+            let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
+            sys::budget_info(&budget).map_or((0, 0), |info| (info.ran, info.overruns))
+        }
+    }
+}
+
+/// The name of the worker's budget in the start data (init's table, `DATAFS_BUDGETS`).
+pub const WORK: &str = "work";
+
+pub fn start(
+    process: &Handle<Process>,
+    budget: Option<Handle<rt::handle::Budget>>,
+) -> Result<Handle<rt::handle::Thread>, abi::Error> {
     let stack = sys::mem_create(STACK_SIZE as u64)?;
     sys::mem_map(
         process,
@@ -64,9 +100,12 @@ pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, ab
         STACK_AT,
         Access::ReadWrite,
     )?;
+    // The thread that has the budget stands on CPU 1 (the budget's CPU, which init gives only to an
+    // instance that may use it); a thread with none stands on the CPU of the loop.
+    let on = if budget.is_some() { 2 } else { 0 };
     // SAFETY: the stack is the thread's alone; the page below `STACK_AT` is never mapped.
-    let thread = unsafe {
-        sys::thread_create(
+    let create = |cpu: u8| unsafe {
+        sys::thread_create_on(
             process,
             work,
             STACK_AT + STACK_SIZE,
@@ -74,8 +113,26 @@ pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, ab
             LEVEL,
             abi::Policy::RoundRobin,
             MSGBUF,
+            None,
+            cpu,
         )
-    }?;
+    };
+    let (thread, budget) = match create(on) {
+        Ok(thread) => (thread, budget),
+        // CPU 1 is not up for this process: the thread stands on the loop's CPU and the budget,
+        // which is for CPU 1, goes unused.
+        Err(_) if on != 0 => (create(0)?, None),
+        Err(e) => return Err(e),
+    };
+    // The budget is bound before the thread begins. A kernel that refuses it leaves the worker at 30
+    // with no limit, as it ran before the budget: the line says so, and the service goes on (the
+    // request thread's budget, which the service does not start without, holds its own 1 %).
+    if let Ok(Some(kept)) = rt::budget::bind("datafs", "the worker", budget, &thread) {
+        // The handle stays for the life of the service: the steps build reads the ticks the budget
+        // has charged around a walk (`walk`).
+        WORK_BUDGET.store(kept.raw().0, Release);
+        core::mem::forget(kept);
+    }
     sys::thread_start(&thread)?;
     Ok(thread)
 }
@@ -119,6 +176,10 @@ pub struct Disk {
     pub flush: bool,
     /// The reads of the volume since the start, for the line of a walk.
     pub reads: u64,
+    /// The writes (a call each, up to a cell) and the flushes since the start, for the line of the
+    /// conversion job: each commit of littlefs is some writes and a flush.
+    pub writes: u64,
+    pub flushes: u64,
 }
 
 enum Got {
@@ -236,10 +297,14 @@ impl Device for Disk {
         self.reads += 1;
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
+            #[cfg(feature = "steps")]
+            let asked = rt::time::now();
             let key = self
                 .io(Blk::Read, (chunk.len() / SECTOR) as u32, at)
                 .map_err(|_| DeviceError)?;
             self.finish(key).map_err(|_| DeviceError)?;
+            #[cfg(feature = "steps")]
+            WAITED.fetch_add(rt::time::now().saturating_sub(asked), Relaxed);
             // SAFETY: cell 0 of the mapped buffer; READY: the disk service wrote it, and no
             // request of it is in flight.
             unsafe {
@@ -250,6 +315,7 @@ impl Device for Disk {
     }
 
     fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), DeviceError> {
+        self.writes += 1;
         for (i, chunk) in data.chunks(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             #[cfg_attr(not(feature = "crash"), allow(unused_mut))]
@@ -271,6 +337,7 @@ impl Device for Disk {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
+        self.flushes += 1;
         match self.call(&Blk::Flush.header().bytes(), None) {
             Ok(Got::Wait(key)) => self.finish(key).map_err(|_| DeviceError),
             _ => Err(DeviceError),
@@ -362,6 +429,8 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, &'static str> {
         sectors: info.sectors,
         flush: info.flush(),
         reads: 0,
+        writes: 0,
+        flushes: 0,
     })
 }
 
@@ -369,6 +438,7 @@ type Volume = datafs::Fs<'static, datafs::Window<Disk>>;
 
 extern "C" fn work(_: u64) -> ! {
     let process = view::<Process>(PROCESS);
+    let began = rt::time::ticks_to_ns(rt::time::now());
     let volume = match connect_disk(&process) {
         Ok(disk) => open_volume(disk),
         Err(why) => {
@@ -382,6 +452,16 @@ extern "C" fn work(_: u64) -> ! {
         rt::println!("datafs: no clock service, the times of files are the count since boot");
     }
     mount_work(&mut volume, &mut clock);
+    tell_pairs();
+    if let Some(fs) = volume.as_mut() {
+        // The time from the connection to the disk service to READY: the mount of littlefs and the
+        // mount work (orphans, attributes, epoch). The count of the reads is the device's.
+        let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(began) / 1_000_000;
+        rt::println!(
+            "datafs: ready after {ms} ms, {} reads",
+            fs.device().device.reads
+        );
+    }
     // A volume of a later format is refused: every request answers NOT_READY.
     READY.store(volume.is_some(), Release);
     STARTING.store(false, Release);
@@ -461,10 +541,9 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
     if let Some(fs) = volume.as_mut() {
         // The time of the first job, and of the records the mount work writes, is not 0.
         server.set_now(clock.now_ns());
-        if datafs::server::ensure_orphans(fs).is_err() {
-            rt::println!("datafs: the directory of the orphans could not be made");
-        }
-        match datafs::server::recover_orphans(fs) {
+        // The directory of the orphans is made after READY (see `Server::start_work`).
+        let start = server.start_work(fs);
+        match start.recovered {
             Ok(done) if done.removed + done.restored + done.failed == 0 => {}
             Ok(done) => rt::println!(
                 "datafs: orphans: {} removed, {} put back, {} left",
@@ -474,25 +553,19 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
             ),
             Err(_) => rt::println!("datafs: the orphans could not be dealt with"),
         }
-        match server.mount_work(fs) {
+        match start.mounted {
             Ok(done) if done.refused => {
                 rt::println!(
                     "datafs: the volume's format is newer than this service's: left alone and refused"
                 )
             }
-            Ok(done) if done.converted > 0 || !done.complete => rt::println!(
-                "datafs: {} entries got attributes{}",
-                done.converted,
-                if done.complete {
-                    ""
-                } else {
-                    ", more at the next mount"
-                }
+            Ok(done) if done.pending => rt::println!(
+                "datafs: the volume has no mark 4: the records and the inline files are done after READY, one entry a step"
             ),
             Ok(_) => {}
             Err(_) => rt::println!("datafs: the attributes of the volume could not be made"),
         }
-        match datafs::server::bump_epoch(fs) {
+        match start.epoch {
             Ok(count) => epoch = count,
             Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
         }
@@ -517,6 +590,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
     let timer = sys::timer_create(&kicks, LEVEL).ok();
     let mut idle = Idle {
         first_pending: volume.is_some(),
+        orphans_pending: volume.is_some(),
         last_job: rt::time::ticks_to_ns(rt::time::now()),
         refresh_failed: false,
         tries: 0,
@@ -547,6 +621,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     );
                 }
             }
+            #[cfg(feature = "steps")]
+            let began = rt::time::now();
             match (&mut volume, job.kind) {
                 // At the stop a job that would take blocks from an empty window would walk the
                 // whole volume inside the 3 s of the stop (an aborted walk empties the window):
@@ -613,6 +689,12 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             }
             // The roots of the sessions this job made or ended, for the request thread's count.
             ROOTS.after_job(server, job.kind == GONE, job.owner, job.aux);
+            #[cfg(feature = "steps")]
+            if job.kind == REQUEST {
+                longest_job(request, began);
+            }
+            // A creation that found the estimate at the cap counted the pairs: the line tells it.
+            tell_pairs();
             state(i).store(DONE, Release);
             idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
@@ -628,6 +710,62 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             loop {
                 let _ = sys::receive(&kicks);
             }
+        }
+        // The queue is empty. The first job after READY makes the hidden directory of the orphans: the
+        // commit takes a block, and the first allocation of a volume scans the allocator's window (a
+        // traversal of every file's blocks), which READY must not wait for.
+        if idle.orphans_pending
+            && !STOPPING.load(Acquire)
+            && let Some(fs) = volume.as_mut()
+        {
+            idle.orphans_pending = false;
+            if server.make_orphans(fs).is_err() {
+                rt::println!("datafs: the directory of the orphans could not be made");
+            }
+            tell_pairs();
+            continue;
+        }
+        // The queue is empty. The conversion job of the mount work goes first, one entry a step: the
+        // loop above serves every job that has come before the next step, so a request waits for at
+        // most one entry (a lookup, a record, a move-out). The job is the worker's own work under its
+        // budget; the walks wait until it has ended.
+        if let Some(fs) = volume.as_mut()
+            && server.conversion_pending()
+            && !STOPPING.load(Acquire)
+        {
+            let mut begun = CONVERSION_BEGAN.load(Acquire);
+            if begun == 0 {
+                begun = rt::time::ticks_to_ns(rt::time::now()).max(1);
+                CONVERSION_BEGAN.store(begun, Release);
+                let d = &fs.device().device;
+                CONVERSION_BASE[0].store(d.reads, Release);
+                CONVERSION_BASE[1].store(d.writes, Release);
+                CONVERSION_BASE[2].store(d.flushes, Release);
+            }
+            match server.convert_step(fs) {
+                Ok(datafs::server::Step::More) => {}
+                Ok(datafs::server::Step::Done { converted, moved }) => {
+                    let ms =
+                        rt::time::ticks_to_ns(rt::time::now()).saturating_sub(begun) / 1_000_000;
+                    let d = &fs.device().device;
+                    let (reads, writes, flushes) = (
+                        d.reads - CONVERSION_BASE[0].load(Acquire),
+                        d.writes - CONVERSION_BASE[1].load(Acquire),
+                        d.flushes - CONVERSION_BASE[2].load(Acquire),
+                    );
+                    rt::println!(
+                        "datafs: conversion ended after {ms} ms, {converted} entries got attributes, {moved} inline files moved out; the job read {reads} blocks, made {writes} writes and {flushes} flushes"
+                    );
+                }
+                Err(_) => {
+                    rt::println!(
+                        "datafs: the conversion of the volume failed: the mark stays and the next mount starts again"
+                    );
+                    server.abandon_conversion(fs);
+                }
+            }
+            tell_pairs();
+            continue;
         }
         // The queue is empty. A walk (the first after the mount, or the refresh) starts after the
         // queue has been quiet for `QUIET_NS` from the end of the last job: the requests of a boot
@@ -660,10 +798,53 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
     }
 }
 
+/// The longest job of each method so far, in microseconds, under the feature `steps` (the probe of
+/// the steps of the loop reads the lines): a job that takes longer than the last of its method says
+/// so, `datafs: job <method> longest <us> us`. The time is the worker's whole job, disk waits
+/// included, from the pick-up to the reply.
+#[cfg(feature = "steps")]
+fn longest_job(request: &[u8], began: u64) {
+    static LONGEST: [core::sync::atomic::AtomicU64; 64] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; 64];
+    let Some(number) = request.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let Some(method) = proto_data::Method::from_number(number) else {
+        return;
+    };
+    let us = rt::time::ticks_to_ns(rt::time::now().saturating_sub(began)) / 1000;
+    let slot = &LONGEST[usize::from(number) % LONGEST.len()];
+    if us > slot.load(Relaxed) {
+        slot.store(us, Relaxed);
+        rt::println!("datafs: job {method:?} longest {us} us");
+    }
+}
+
+/// The line of the count of pairs and directories, when the server made one since the last line:
+/// `datafs: pairs N of 2048, directories M of 1024`.
+fn tell_pairs() {
+    // SAFETY: the server is the worker's alone.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
+    if let Some((tracked, counted)) = server.take_dirs_mismatch() {
+        rt::println!(
+            "datafs: the recount found {counted} directories where the service had followed {tracked}"
+        );
+    }
+    if let Some((pairs, dirs)) = server.take_pairs_report() {
+        rt::println!(
+            "datafs: pairs {pairs} of {}, directories {dirs} of {}",
+            datafs::server::PAIRS_MAX,
+            datafs::server::DIRS_MAX
+        );
+    }
+}
+
 /// What the worker keeps for its idle walks.
 struct Idle {
     /// The first walk after the mount has not been made yet.
     first_pending: bool,
+    /// The hidden directory of the orphans is still to be made (the first job after READY).
+    orphans_pending: bool,
     /// The instant the last job ended, in nanoseconds.
     last_job: u64,
     /// A refresh walk failed: no more of them in this instance (the disk is not answering well).
@@ -675,16 +856,14 @@ struct Idle {
 }
 
 /// Whether a walk in the idle would help: the blocks that removals, truncations and replacing
-/// renames gave back since the last walk are over a sixteenth of the volume and the window's free
-/// bits are under a sixteenth too (a walk inside a request is then about to happen, and the free
-/// count of STATFS is low by what was given back); or the window holds less than the volume (the
-/// allocator wrapped in the middle of a request) and the free count is low.
+/// renames gave back since the last walk are over a sixteenth of the volume (the free count of STATFS
+/// is low by that much), or the window holds less than the volume (the allocator wrapped in the
+/// middle of a request) and the free count is low.
 fn refresh_wanted(fs: &Volume, idle: &Idle) -> bool {
     if idle.refresh_failed || STOPPING.load(Acquire) {
         return false;
     }
-    let sixteenth = fs.blocks() / 16;
-    fs.window_short() || (fs.freed_estimate() > sixteenth && fs.window_free() < sixteenth)
+    datafs::idle::refresh_wanted(fs.blocks(), fs.freed_estimate(), fs.window_short())
 }
 
 /// How a walk ended.
@@ -714,7 +893,38 @@ fn walk(fs: &mut Volume, may_yield: bool) -> Walked {
     YIELDED.store(false, Release);
     YIELD_OK.store(may_yield, Release);
     WALKING.store(true, Release);
+    #[cfg(feature = "steps")]
+    let ran = work_ran();
+    #[cfg(feature = "steps")]
+    let waited = WAITED.load(Relaxed);
     let ok = fs.walk().is_ok();
+    #[cfg(feature = "steps")]
+    {
+        // What the walk did besides wait for the disk: the share of its own work, on any number of
+        // CPUs (the budget tells the CPU only where there is one). It is the time of the walk less the
+        // time in the reads, so it counts what other threads took from the worker as its own.
+        let wall = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1000;
+        let wait = rt::time::ticks_to_ns(WAITED.load(Relaxed).saturating_sub(waited)) / 1000;
+        rt::println!(
+            "datafs: walk own work {} us of {wall} us, {wait} us in disk reads",
+            wall.saturating_sub(wait)
+        );
+    }
+    #[cfg(feature = "steps")]
+    if WORK_BUDGET.load(Acquire) != 0 {
+        // The CPU the worker took in the walk against the time it lasted: the share a walk takes
+        // from the programs below 30 under the budget (at most 30 % at level 30). The budget counts
+        // only the time at its own level: the time a thread spends lowered after an overrun is not in
+        // `ran`, so the overruns of the walk are told beside it, and a share is true only when there
+        // are few of them (the probe allows four for each period of the budget).
+        let (after, overruns_after) = work_ran();
+        let cpu = rt::time::ticks_to_ns(after.saturating_sub(ran.0)) / 1000;
+        let wall = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1000;
+        rt::println!(
+            "datafs: walk cpu {cpu} us of {wall} us, {} overruns",
+            overruns_after.saturating_sub(ran.1)
+        );
+    }
     WALKING.store(false, Release);
     YIELD_OK.store(false, Release);
     let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1_000_000;
@@ -744,7 +954,7 @@ fn idle_walk(fs: &mut Volume, idle: &mut Idle, first: bool) {
         return;
     }
     let freed = fs.freed_estimate();
-    match walk(fs, datafs::idle::may_yield(idle.tries)) {
+    match walk(fs, datafs::idle::walk_may_yield(first, idle.tries)) {
         Walked::Done { reads, ms } => {
             let tries = idle.tries;
             idle.tries = 0;
@@ -760,6 +970,12 @@ fn idle_walk(fs: &mut Volume, idle: &mut Idle, first: bool) {
                     "datafs: refresh walk {} blocks used, about {freed} given back, {reads} reads, {ms} ms{by}",
                     used(fs)
                 );
+                // The pairs and the directories are counted with the refresh: the estimate the
+                // creations keep between counts starts again from the exact count.
+                // SAFETY: the server is the worker's alone.
+                let server: &mut Server = unsafe { &mut *SERVER.get() };
+                let _ = server.recount(fs);
+                tell_pairs();
             }
         }
         Walked::Yielded { reads } => {

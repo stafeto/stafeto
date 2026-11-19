@@ -41,6 +41,44 @@ const BUDGET: u64 = 4;
 const STOPPED: u64 = 5;
 const STUCK: u64 = 6;
 
+/// The handle of the loop's own budget, kept for the steps build.
+#[cfg(feature = "steps")]
+static SERVE_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Under the feature `steps`, at each heartbeat in which the loop's budget overran again: the CPU
+/// the loop's budget has charged since the last line, the time since it, and the overruns the kernel
+/// counted, `datafs: serve ran <us> us in <ms> ms, <n> overruns, <m> in this span`. The share the
+/// loop takes of its CPU is `ran` over the span; the budget is 100 us in each 10 ms (1 %).
+#[cfg(feature = "steps")]
+fn serve_line() {
+    use core::sync::atomic::AtomicU64;
+    static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let raw = SERVE_BUDGET.load(Acquire);
+    if raw == 0 {
+        return;
+    }
+    let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
+    let Ok(info) = sys::budget_info(&budget) else {
+        return;
+    };
+    let now = rt::time::ticks_to_ns(rt::time::now());
+    let before = LAST[2].load(Acquire);
+    if info.overruns == before {
+        return;
+    }
+    let (ran, at) = (LAST[0].load(Acquire), LAST[1].load(Acquire));
+    LAST[0].store(info.ran, Release);
+    LAST[1].store(now, Release);
+    LAST[2].store(info.overruns, Release);
+    rt::println!(
+        "datafs: serve ran {} us in {} ms, {} overruns, {} in this span",
+        rt::time::ticks_to_ns(info.ran.saturating_sub(ran)) / 1000,
+        now.saturating_sub(at) / 1_000_000,
+        info.overruns,
+        info.overruns - before
+    );
+}
+
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -49,6 +87,7 @@ fn main(_: u64) -> u64 {
         rt::console::set(console);
     }
     let serve = rt::budget::take(&mut s, rt::budget::SERVE);
+    let work = rt::budget::take(&mut s, worker::WORK);
     let args = ServiceArgs::read(s.args()).ok();
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     // The record `datadisk` is optional: a machine without a data volume has none, and the service
@@ -106,7 +145,7 @@ fn main(_: u64) -> u64 {
         STORAGE.get().cast::<u8>(),
         core::mem::size_of::<datafs::Storage>(),
     );
-    let Ok(_thread) = worker::start(&s.process) else {
+    let Ok(_thread) = worker::start(&s.process, work) else {
         return NOT_REGISTERED;
     };
     #[cfg(feature = "steps")]
@@ -140,8 +179,14 @@ fn main(_: u64) -> u64 {
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
-    if rt::budget::bind("datafs", rt::budget::SERVE, serve, &s.thread).is_err() {
-        return BUDGET;
+    match rt::budget::bind("datafs", rt::budget::SERVE, serve, &s.thread) {
+        Err(_) => return BUDGET,
+        #[cfg(feature = "steps")]
+        Ok(Some(kept)) => {
+            SERVE_BUDGET.store(kept.raw().0, Release);
+            core::mem::forget(kept);
+        }
+        Ok(_) => {}
     }
     // The root of the service goes to the process service, which gives a copy of it to every
     // process that asks (TakeRoot) and to the loader of a set-ID program (LoaderRoot). A thread
@@ -686,6 +731,8 @@ impl Service<0> for Datafs {
     fn maintenance(&mut self, _: &mut [Option<Session<(), 0>>], notice: Notice) {
         if notice.source == Source::Timer && notice.label == 0 {
             self.watch_worker();
+            #[cfg(feature = "steps")]
+            serve_line();
         }
     }
 

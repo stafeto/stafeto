@@ -1054,10 +1054,19 @@ mod tests {
             );
             assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
         }
-        for name in ["datadisk", "datafs"] {
+        let share = |name: &str, cpu: u8| {
             let r = TABLE.iter().find(|r| r.name == name).unwrap();
-            assert_eq!(r.budgets.iter().map(|b| b.share_ppm()).sum::<u64>(), 10_000);
-        }
+            r.budgets
+                .iter()
+                .filter(|b| b.cpu == cpu)
+                .map(|b| b.share_ppm())
+                .sum::<u64>()
+        };
+        assert_eq!(share("datadisk", 0), 10_000);
+        // The data file service: the loop's 1 % on CPU 0, and the worker's 30 % on CPU 1 (CPU 0 has
+        // no room for it).
+        assert_eq!(share("datafs", 0), 10_000);
+        assert_eq!(share("datafs", 1), 300_000);
     }
 
     #[test]

@@ -21,9 +21,15 @@ pub const ATTR_FORMAT_TYPE: u8 = 0x66;
 pub const ATTR_COUNTER_TYPE: u8 = 0x69;
 /// The `format` word of a record.
 pub const ATTR_FORMAT: u32 = 1;
-/// The format mark of the volume at the root: the volume of this service. A volume whose mark is
-/// above it was written by a later service and is refused at the mount.
-pub const VOLUME_FORMAT: u32 = 3;
+/// The format mark of the volume at the root: the volume of this service, 4: every entry has its
+/// record and no file is inline (its bytes in the pair of its directory). A volume whose mark is above
+/// it was written by a later service and is refused at the mount, which is also what an older
+/// service (mark 3) does with this one, so a volume cannot go back to a build that writes inline
+/// files and is then missed. A volume with the mark 3 has the records (the part A build) and may hold
+/// inline files; one with none or an older mark may lack both.
+pub const VOLUME_FORMAT: u32 = 4;
+/// The mark of a volume that has the records of every entry (and may hold inline files).
+pub const RECORDS_FORMAT: u32 = 3;
 /// The bytes of a record.
 pub const ATTR_LEN: usize = 48;
 /// The file numbers one commit of the counter reserves.
@@ -205,7 +211,7 @@ mod tests {
             (ATTR_TYPE, ATTR_FORMAT_TYPE, ATTR_COUNTER_TYPE),
             (0x70, 0x66, 0x69)
         );
-        assert_eq!((RESERVE_BLOCKS, INO_BLOCK, VOLUME_FORMAT), (64, 1024, 3));
+        assert_eq!((RESERVE_BLOCKS, INO_BLOCK, VOLUME_FORMAT), (64, 1024, 4));
     }
 
     #[test]
