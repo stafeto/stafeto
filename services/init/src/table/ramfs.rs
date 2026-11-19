@@ -1262,6 +1262,40 @@ pub const POSIX_DISPLAY_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The probe of the reading paths of `/data` in the POSIX layer (tests/posix-data): the RAM files, the
+/// process and clock services, the pipe service, the disk service of the data volume and the data
+/// file service (which has the clock too, and asks the process service who a client is), and the
+/// probe, a POSIX process that the data service names nowhere: it gets its session from the process
+/// service on its first call under `/data`. It waits for the data service to say READY, so that the
+/// first call finds the service and not the empty directory of the RAM files. The probe starts
+/// its own file for fork, spawn and exec.
+pub const DATA_POSIX_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 6 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::pkg::BLK_DATADISK,
+    super::pkg::DATAFS_CLOCKED,
+    Record {
+        name: "posix-data",
+        program: "posix-data",
+        args: b"posix-data\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: PROCS_QUOTA,
+        waits: &[super::Wait {
+            service: "datafs",
+            deadline_ms: 30_000,
+        }],
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
 /// The probe of the screen and the keys on libc.so (tests/display-run and
 /// tests/posix-so/dyn/display-probe.c, sub-project 3 part 3b): the RAM
 /// files, the process and clock services, the pipe service, the input

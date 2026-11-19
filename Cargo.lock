@@ -912,6 +912,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-data-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-display-probe"
 version = "0.1.0"
 dependencies = [

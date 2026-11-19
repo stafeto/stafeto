@@ -1631,6 +1631,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-random-net") as usize
     + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
+    + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
@@ -1733,6 +1734,7 @@ const _: () = assert!(
     feature = "table-posix-random-net",
     feature = "table-posix-random-net2",
     feature = "table-posix-display",
+    feature = "table-data-posix",
     feature = "table-posix-window",
     feature = "table-display",
     feature = "table-fstack-probe",
@@ -1930,6 +1932,8 @@ pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
 pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
+#[cfg(feature = "table-data-posix")]
+pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-display")]
@@ -2028,6 +2032,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     net::POSIX_RANDOM_NET_TABLE,
     net::POSIX_RANDOM_NET2_TABLE,
     ramfs::POSIX_DISPLAY_TABLE,
+    ramfs::DATA_POSIX_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,
@@ -3713,6 +3718,7 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DATA_POSIX_TABLE,
             ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,
             ramfs::POSIX_POLL_TABLE,
@@ -4187,6 +4193,7 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DATA_POSIX_TABLE,
             lvgl::TABLE,
             window::TABLE,
             ramfs::DISPLAY_TABLE,
@@ -4206,6 +4213,7 @@ mod tests {
                     "rtbench-posix",
                     "posix-random",
                     "posix-display",
+                    "posix-data",
                     "posix-window",
                     "display-run",
                     "posix-pty",
